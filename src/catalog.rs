@@ -157,7 +157,7 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 ///
 /// Seeded here: `feature` (C2's acceptance), `bug` (M1), `chat` (M3), `onboarding` (M4), `migration` (M2),
 /// `capture-learnings` (M7), `steering-author` (M8), `domain-extraction` (M6), `interactive-chat`,
-/// `interactive-draft` and `interactive-edit` (M9), `mcp-server` (M12), `qe-author-tests` (M10) and `demo` (M9b,
+/// `interactive-draft` and `interactive-edit` (M9), `mcp-server` (M12), `editor-plugin` (X3), `qe-author-tests` (M10) and `demo` (M9b,
 /// which replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping them). Every other consumer's preset is added by its migration seam (§14 M1–M10),
 /// which also deletes the def it replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
@@ -167,6 +167,7 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
         ("chat", chat_preset()),
         ("demo", demo_preset()),
         ("domain-extraction", domain_extraction_preset()),
+        ("editor-plugin", editor_plugin_preset()),
         ("feature", feature_preset()),
         (
             "interactive-chat",
@@ -199,10 +200,14 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
 
 /// (QE acceptance, operator ruling 2026-10-10) The instruments a run of a BUILT-IN preset
 /// requires, as a workflow's `required_instruments` declares them: the presets that make
-/// application changes (`feature`, `bug`, `mcp-server`, `migration`) require `qe_acceptance` on top of the
+/// application changes (`feature`, `bug`, `editor-plugin`, `mcp-server`, `migration`) require `qe_acceptance` on top of the
 /// defaults. `None` ⇒ the defaults. Code data beside [`builtin_presets`], so a re-seed never drops it.
 pub(crate) fn builtin_preset_instruments(name: &str) -> Option<Vec<String>> {
-    matches!(name, "feature" | "bug" | "mcp-server" | "migration").then(|| {
+    matches!(
+        name,
+        "feature" | "bug" | "editor-plugin" | "mcp-server" | "migration"
+    )
+    .then(|| {
         [
             crate::assurance::DISTINCT_EVALUATOR,
             crate::assurance::JUDGE,
@@ -544,6 +549,21 @@ fn mcp_server_preset() -> Vec<PlanStep> {
     let plan: crate::plan::PlanSteps =
         serde_json::from_str(include_str!("presets/mcp-server.json"))
             .expect("src/presets/mcp-server.json is a valid plan");
+    plan.steps
+}
+
+/// `editor-plugin` (operator ruling X3, 2026-10-10): make an artifact editor plugin for wicked-studio
+/// as data (`src/presets/editor-plugin.json`), modelled on `mcp-server`. scope → `understand`; design →
+/// `design` (the contract against DES-EDITOR-PLUGINS-001); build → `build` (the
+/// `wicked-garden-editor-scaffold` skill); test → `test`, which runs the editor conformance harness and is
+/// the run's QE phase (`qe_acceptance` required, as for every app-change preset); security-review →
+/// `review` keeping the platform specialist; install-plan and install → `run` with their Tool
+/// commands, install gated `consent_before`. The ids `install-plan` / `install` are the ones a
+/// delivering run's deliver goes before ([`crate::plan_gate`]).
+fn editor_plugin_preset() -> Vec<PlanStep> {
+    let plan: crate::plan::PlanSteps =
+        serde_json::from_str(include_str!("presets/editor-plugin.json"))
+            .expect("src/presets/editor-plugin.json is a valid plan");
     plan.steps
 }
 

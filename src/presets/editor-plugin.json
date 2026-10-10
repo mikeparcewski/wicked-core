@@ -1,0 +1,98 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "scope",
+   "gate": {
+    "human_confirm": {
+     "unconditional": false
+    }
+   },
+   "instructions": "Decide what this artifact editor plugin is: its id (vendor-prefixed, kebab-case, never wicked or wicked-*, which are reserved for the editors that ship inside wicked-studio; read GET $WICKED_CREW_URL/api/v1/editors and pick an id no installed editor holds), its title in plain words, the artifact kinds it opens (page, document, deck, demo-video, walkthrough, rfp-response, or a kind of its own), what it shows and what it lets the user do, the permissions that needs with a plain-words why for each (artifact.read, selection.chip, checks.contribute and ui.fullscreen are allowed by default; artifact.write, composer.draft, checks.read, sources.read, media.read and artifact.export ask the operator; network.media is not offered to a pack editor), and the target: this run's repository, at its root when the repository is new and near-empty, or in a named subdirectory when it already holds code. Say whether the operator wants it installed when the run completes (the install phase asks again at its gate). If the intent names a repository that is not this run's, say that the operator must create it with an initial commit and register it before a run can deliver into it; do not try to create one.",
+   "skill_ref": "wicked-garden-editor-scaffold"
+  },
+  {
+   "catalog": "design",
+   "id": "design",
+   "gate": {
+    "human_confirm": {
+     "unconditional": false
+    }
+   },
+   "instructions": "Produce the contract against DES-EDITOR-PLUGINS-001 (the editor-scaffold skill's section 2 is its checklist): the manifest entry (id, title, version, protocol [1], kinds, sizes with inline required, each permission and its why), the host-to-plugin messages it handles (host.hello, host.ping within 2 s, host.size without a reload or a re-read, host.theme, artifact.changed) and how it ignores an unknown or malformed one, every plugin-to-host request it makes with the permission each needs (least privilege: nothing asked for that no request uses), any edits as text and colour ops only with stale and head_moved shown to the user, the key rules (only Escape, Mod+K, Alt+letter and Tab at the edges forwarded; the first printable key goes to the composer as one ui.typed; Backspace and Delete never remove), content rendered as text never as live markup, no network, keyboard reach and a visible focus ring, and no animation under reduced motion. Name every deviation and why.",
+   "skill_ref": "wicked-garden-editor-scaffold",
+   "depends_on": [
+    "scope"
+   ]
+  },
+  {
+   "catalog": "build",
+   "id": "build",
+   "instructions": "Scaffold the pack with the skill (scripts/editor/scaffold.py) into the target directory: wicked-pack.json spec 2 with one editors[] entry and its one self-contained entry file editors/<id>/index.html, built on the template's wicked.editor/1 plumbing (the first-party wicked-page plugin is the reference for the contract). Write the editor the design named, keep every script and style inline and nothing loaded from outside the file, re-pin the entry hash with scripts/editor/pin.py after every edit, pass pack check, and run the conformance cases (scripts/editor/conformance.py --pack <dir> --json, against $WICKED_CREW_URL); put the conformance JSON in your output. A failed case is a finding to fix, not to report as done.",
+   "skill_ref": "wicked-garden-editor-scaffold",
+   "depends_on": [
+    "design"
+   ]
+  },
+  {
+   "catalog": "test",
+   "id": "test",
+   "instructions": "Run the editor conformance harness against the delivered tree yourself: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/editor/conformance.py --pack <the pack directory> --json (it drives studio's own conformance host page from $WICKED_CREW_URL in headless Chromium; it writes nothing into the tree). Judge its report: every case 0-6 and 8-12 passes for every editor in the pack, the entry's sha256 in the report equals the manifest's, and the gaps it lists are the expected ones. A failed case, a missing editor or no headless browser is a FAIL with the case named. Put the report JSON in your output; it is this run's functional QE evidence.",
+   "skill_ref": "wicked-garden-editor-scaffold",
+   "depends_on": [
+    "build"
+   ]
+  },
+  {
+   "catalog": "review",
+   "id": "security-review",
+   "gate": {
+    "human_confirm": {
+     "unconditional": false
+    }
+   },
+   "instructions": "Review the diff cold as a sandbox and least-privilege review of an editor plugin (DES-EDITOR-PLUGINS-001 sections 6 and 8): every permission the manifest asks for is used by a request in the code that needs it, and no request needs a permission it did not ask for; nothing reaches the network (no fetch, XHR, WebSocket, EventSource, beacon, form, navigation, WebRTC, or a script, stylesheet, image, font or frame from outside the file); artifact content is rendered as text or through DOMParser, never as live markup; messages go only to the host's port after the one plugin.ready, and an unknown or malformed message is ignored; no key or typed text approves, sends, deletes or writes, and only the forwardable keys are forwarded; the entry's sha256 in wicked-pack.json matches the file. Cite file and line for every finding.",
+   "skill_ref": "wicked-garden-platform-security-engineer",
+   "depends_on": [
+    "test"
+   ]
+  },
+  {
+   "catalog": "run",
+   "id": "install-plan",
+   "kind": "build",
+   "gate_type": "execution",
+   "instructions": "Plan the install without writing anything: resolve, on this host and as the daemon user, every file and directory each install choice would write — Install for this daemon (the default: the staged copy under ~/.wicked/editors/<name>/current, the copy it replaces kept in previous, the install record, and the wicked-crew editor registry entry in the daemon's state home) and Install, turned off (the same places, with the editor registered off) — and print them as one JSON plan line, so the install's consent gate can list them before you answer.",
+   "depends_on": [
+    "security-review"
+   ],
+   "executor": {
+    "type": "tool",
+    "cmd": [
+     "bash",
+     "-c",
+     "exec \"${WICKED_GARDEN_ROOT:?the engine handed this Tool phase no garden root; refusing to resolve wicked-garden from PATH}/scripts/wicked-garden\" run scripts/editor/install.py --from-run --dry-run --json"
+    ]
+   }
+  },
+  {
+   "catalog": "run",
+   "id": "install",
+   "kind": "build",
+   "gate_type": "execution",
+   "gate": "consent_before",
+   "instructions": "Install for running — or update the installed copy when this pack is already installed. Nothing has been installed yet: this asks before the install runs, and each answer lists exactly the files it would write (from the install-plan dry run). Install for this daemon (the default) stages the pack from this run's tree into ~/.wicked/editors/<name>/current and registers it with wicked-crew's editors, which re-runs pack check and the conformance cases itself and refuses on any failure; the editor is then listed in studio Settings → Developer → Editor plugins and opens in the editor dev host. Install, turned off does the same and leaves it off until you switch it on there. Both write program-owned places only, on the daemon host as the daemon user. Decline for not now — the pull request already delivered stays as it is.",
+   "depends_on": [
+    "install-plan"
+   ],
+   "executor": {
+    "type": "tool",
+    "cmd": [
+     "bash",
+     "-c",
+     "exec \"${WICKED_GARDEN_ROOT:?the engine handed this Tool phase no garden root; refusing to resolve wicked-garden from PATH}/scripts/wicked-garden\" run scripts/editor/install.py --from-run --target \"${WICKED_CONSENT_CHOICE:?the consent gate recorded no install choice}\" --json"
+    ]
+   }
+  }
+ ]
+}

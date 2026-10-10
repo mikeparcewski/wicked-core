@@ -631,6 +631,7 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
             "chat",
             "demo",
             "domain-extraction",
+            "editor-plugin",
             "feature",
             "interactive-chat",
             "interactive-draft",
@@ -644,7 +645,12 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
     );
     // `demo` (M9b) replaces interactive-demo with the garden demo skill's flow instead of mapping
     // its phases, so it has no §11.2 row; `m9b_demo_*` pins its steps.
-    for (name, steps) in builtins.into_iter().filter(|(n, _)| *n != "demo") {
+    // `editor-plugin` (X3) is a new workflow, not a migrated consumer: it has no §11.2 row either;
+    // `x3_editor_plugin_*` pins its steps.
+    for (name, steps) in builtins
+        .into_iter()
+        .filter(|(n, _)| *n != "demo" && *n != "editor-plugin")
+    {
         let want: Vec<PlanStep> = serde_json::from_value(maps[name]["steps"].clone())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(steps, want, "the built-in `{name}` is its C1 mapping");
@@ -1145,6 +1151,73 @@ fn m12_mcp_server_launches_the_preset_with_its_skills_gates_and_consent() {
         Some("wicked-garden-mcp-scaffold")
     );
     let install = units.iter().find(|u| u.id == "rmcp:install").unwrap();
+    assert_eq!(install.depends_on, vec!["install-plan".to_string()]);
+}
+
+/// X3 (operator ruling 2026-10-10): a launch naming `editor-plugin` runs the built-in preset — scope
+/// and design gated, build on the creator with the editor-scaffold skill, test on the evaluator role
+/// (the catalog's test entry) running the conformance harness, security-review keeping the platform
+/// specialist and its raised gate, install-plan and install as Tool `run` steps with install gated
+/// `consent_before` on its dry run. The PA's `pa-scope` comes first.
+#[test]
+fn x3_editor_plugin_launches_the_preset_with_its_skills_gates_and_consent() {
+    let dir = tmp_dir("editor");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let rig = spawn(&db);
+    rig.core
+        .launch_run(spec("redit", "editor-plugin", None))
+        .unwrap();
+    let units = units_of(&rig.core, "redit");
+    let all = rows("redit", &units);
+    assert_eq!(all[0].0, "pa-scope", "{all:?}");
+    let own_ids = [
+        "scope",
+        "design",
+        "build",
+        "test",
+        "security-review",
+        "install-plan",
+        "install",
+    ];
+    let own: Vec<_> = all
+        .iter()
+        .filter(|r| own_ids.contains(&r.0.as_str()))
+        .cloned()
+        .collect();
+    let f = Some(EVIDENCE_FLOOR_PIN);
+    let h = r#"{"human_confirm":{"unconditional":false}}"#;
+    let v = r#"{"human_confirm_if":"verdict_not_pass"}"#;
+    assert_eq!(
+        own,
+        vec![
+            r("scope", "recon", "neutral", h, None),
+            r("design", "recon", "neutral", h, None),
+            r("build", "build", "creator", "auto", f),
+            r("test", "test", "evaluator", v, f),
+            r("security-review", "review", "evaluator", h, f),
+            r("install-plan", "build", "neutral", "auto", None),
+            r("install", "build", "neutral", "consent_before", None),
+        ],
+        "{all:?}"
+    );
+    let skill = |id: &str| {
+        units
+            .iter()
+            .find(|u| u.id == format!("redit:{id}"))
+            .and_then(|u| u.skill_ref.clone())
+    };
+    for id in ["scope", "design", "build", "test"] {
+        assert_eq!(
+            skill(id).as_deref(),
+            Some("wicked-garden-editor-scaffold"),
+            "{id}"
+        );
+    }
+    assert_eq!(
+        skill("security-review").as_deref(),
+        Some("wicked-garden-platform-security-engineer")
+    );
+    let install = units.iter().find(|u| u.id == "redit:install").unwrap();
     assert_eq!(install.depends_on, vec!["install-plan".to_string()]);
 }
 
