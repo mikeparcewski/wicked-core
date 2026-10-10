@@ -743,17 +743,28 @@ fn with_deliver(plan: &PlanSteps, deliver: Option<&PlanStep>) -> Result<PlanStep
     Ok(out)
 }
 
-/// The step a delivering run's `deliver` goes before (see [`with_deliver`]): the first
-/// `consent_before` step's dry run — its one dependency, when that is a `run` step — else the
-/// consent step itself; `None` for a plan that asks no consent.
+/// The step a delivering run's `deliver` goes before (see [`with_deliver`]): the plan's final
+/// `consent_before` step's dry run — its one dependency, when that is the `run` step right before
+/// it — else the consent step itself; `None` for a plan that asks no consent, or whose consent is
+/// not its last step.
 fn consent_anchor(steps: &[PlanStep]) -> Option<usize> {
     let consent = steps
         .iter()
         .position(|s| matches!(s.gate, Some(crate::workflow::GateSpec::ConsentBefore)))?;
+    // Only a TERMINAL consent chain (codex r1 on #866): the consent step is the plan's last, and
+    // its dry run directly precedes it. Work after the chain must reach the pull request, so a
+    // plan that goes on past its consent keeps the deliver step last.
+    if consent + 1 != steps.len() {
+        return None;
+    }
     let dry_run = match steps[consent].depends_on.as_deref() {
-        Some([dep]) => steps
-            .iter()
-            .position(|s| &s.id == dep && s.catalog == "run"),
+        Some([dep])
+            if consent > 0
+                && &steps[consent - 1].id == dep
+                && steps[consent - 1].catalog == "run" =>
+        {
+            Some(consent - 1)
+        }
         _ => None,
     };
     Some(dry_run.unwrap_or(consent))
@@ -1693,6 +1704,36 @@ mod tests {
         };
         let out = with_deliver(&plain, Some(&deliver_step_for_test())).unwrap();
         assert_eq!(out.steps.last().unwrap().id, "deliver");
+    }
+
+    #[test]
+    fn m12_a_consent_chain_with_work_after_it_keeps_deliver_last() {
+        // codex r1 on #866: work after the chain must reach the pull request.
+        let mut install = ws("install", "run", &["install-plan"]);
+        install.gate = Some(crate::workflow::GateSpec::ConsentBefore);
+        let plan = PlanSteps {
+            steps: vec![
+                ws("build", "build", &[]),
+                ws("install-plan", "run", &["build"]),
+                install,
+                ws("build-2", "build", &["install"]),
+                ws("review-2", "review", &["build-2"]),
+            ],
+            ..Default::default()
+        };
+        let out = with_deliver(&plan, Some(&deliver_step_for_test())).unwrap();
+        let ids: Vec<_> = out.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "build",
+                "install-plan",
+                "install",
+                "build-2",
+                "review-2",
+                "deliver"
+            ]
+        );
     }
     use crate::review_scale::Graph;
     use crate::team::events::{TeamBody, PATH_SCORED, PLAN_ACCEPTED, PLAN_PROPOSED};
