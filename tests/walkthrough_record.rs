@@ -180,6 +180,7 @@ fn run(name: &str, mode: Option<&str>) -> Run {
         evidence_root: Some(evidence.to_string_lossy().into_owned()),
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     })
     .expect("the walkthrough plan launches");
     let mut events = Vec::new();

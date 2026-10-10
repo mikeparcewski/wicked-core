@@ -761,6 +761,12 @@ pub struct LaunchOptions {
     /// `false`) and a creator-seat evaluator is refused at distribution (`NoEligibleSeat`) and a gate
     /// whose required judge was skipped holds (`judge_unavailable`).
     pub reduced_assurance: Option<bool>,
+    /// (X-MIG M9, core#649) The run's DECLARED DELIVERABLES on a plan or preset launch (`plan` or a
+    /// preset `workflow`): absolute paths inside a declared write root (or worktree-relative paths)
+    /// the run must write. They join the `required_deliverables` of the plan's last creator step, so
+    /// the engine's deliverable floor judges them (written by THIS run). Refused on a launch with
+    /// neither a plan nor a preset, and on a plan with no creator step.
+    pub deliverables: Option<Vec<String>>,
 }
 
 /// The body of `Core.considerRules` over the store at `db_path` (read-only).
@@ -815,6 +821,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         evidence_root: o.evidence_root,
         primary: o.primary,
         reduced_assurance: o.reduced_assurance.unwrap_or(false),
+        deliverables: o.deliverables.unwrap_or_default(),
     })
 }
 

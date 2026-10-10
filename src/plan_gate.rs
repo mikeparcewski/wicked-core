@@ -1056,6 +1056,60 @@ pub(crate) fn launch_plan(
     plan: Option<&PlanSteps>,
     workflow: Option<&str>,
     project_id: Option<&str>,
+    deliverables: &[String],
+) -> anyhow::Result<Option<(PlanSteps, Option<String>)>> {
+    let resolved = resolve_launch_plan(store, plan, workflow, project_id)?;
+    match resolved {
+        Some((plan, preset)) => Ok(Some((with_deliverables(plan, deliverables)?, preset))),
+        None if !deliverables.is_empty() => anyhow::bail!(
+            "declared deliverables ride a plan or a preset launch — this launch names neither, so \
+             they would be dropped"
+        ),
+        None => Ok(None),
+    }
+}
+
+/// (X-MIG M9) `plan` with the launch's declared `deliverables` joined to the `required_deliverables`
+/// of its LAST creator step (deduplicated, in order) — the engine's deliverable floor then judges
+/// them on that step. Unchanged when there are none; refused when the plan has no creator step.
+pub(crate) fn with_deliverables(
+    mut plan: PlanSteps,
+    deliverables: &[String],
+) -> anyhow::Result<PlanSteps> {
+    if deliverables.is_empty() {
+        return Ok(plan);
+    }
+    if let Some(d) = deliverables.iter().find(|d| d.trim().is_empty()) {
+        anyhow::bail!("a declared deliverable path must not be blank: {d:?}");
+    }
+    let catalog = crate::catalog::catalog();
+    let Some(step) = plan
+        .steps
+        .iter_mut()
+        .rev()
+        .find(|s| crate::plan::is_creator_step(catalog, s))
+    else {
+        anyhow::bail!(
+            "declared deliverables ride the plan's last creator step — this plan has none, so \
+             nothing would write them"
+        );
+    };
+    let list = step.required_deliverables.get_or_insert_with(Vec::new);
+    for d in deliverables {
+        if !list.contains(d) {
+            list.push(d.clone());
+        }
+    }
+    Ok(plan)
+}
+
+/// The launch's plan before its declared deliverables: a user plan, or the steps of the preset
+/// `workflow` names.
+fn resolve_launch_plan(
+    store: &dyn wicked_apps_core::GraphRead,
+    plan: Option<&PlanSteps>,
+    workflow: Option<&str>,
+    project_id: Option<&str>,
 ) -> anyhow::Result<Option<(PlanSteps, Option<String>)>> {
     match (plan, workflow) {
         (Some(_), Some(w)) => {
@@ -1524,6 +1578,46 @@ mod tests {
 
     fn plan(v: serde_json::Value) -> PlanSteps {
         serde_json::from_value(v).unwrap()
+    }
+
+    /// (X-MIG M9) A launch's declared deliverables join the LAST creator step's
+    /// `required_deliverables` (deduplicated, after any the step already declares); a plan with no
+    /// creator step, a blank path, or a launch with neither a plan nor a preset is refused.
+    #[test]
+    fn declared_deliverables_join_the_last_creator_step() {
+        let plan: PlanSteps = serde_json::from_value(serde_json::json!({"steps": [
+            {"catalog": "understand", "id": "outline"},
+            {"catalog": "produce", "id": "first"},
+            {"catalog": "produce", "id": "draft", "required_deliverables": ["a.md"]},
+            {"catalog": "critique", "id": "read"}
+        ]}))
+        .unwrap();
+        let d = vec!["/w/out.html".to_string(), "a.md".to_string()];
+        let out = with_deliverables(plan.clone(), &d).unwrap();
+        let by = |id: &str| out.steps.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(
+            by("draft").required_deliverables.as_deref(),
+            Some(&["a.md".to_string(), "/w/out.html".to_string()][..])
+        );
+        assert_eq!(by("first").required_deliverables, None);
+        assert_eq!(with_deliverables(plan.clone(), &[]).unwrap(), plan);
+        assert!(with_deliverables(plan, &["  ".to_string()]).is_err());
+        let read_only: PlanSteps =
+            serde_json::from_value(serde_json::json!({"steps": [{"catalog": "understand"}]}))
+                .unwrap();
+        let e = with_deliverables(read_only, &d).unwrap_err().to_string();
+        assert!(
+            e.contains("no creator step") || e.contains("has none"),
+            "{e}"
+        );
+        let store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let e = launch_plan(&store, None, None, None, &d)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("names neither"), "{e}");
+        assert!(launch_plan(&store, None, None, None, &[])
+            .unwrap()
+            .is_none());
     }
 
     /// (DES-ASK-TEAM-CHAT-001 §4.6, ASK-K1b) The plan's `monitors.asked` rides `plan.proposed`

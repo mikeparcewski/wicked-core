@@ -161,6 +161,7 @@ fn launch_team_with(e: &Engine, run: &str, human_confirm: HumanConfirm) {
             evidence_root: None,
             primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
             reduced_assurance: false,
+            deliverables: Vec::new(),
         })
         .expect("launch");
 }
@@ -1702,6 +1703,7 @@ fn t6_16k_a_dispute_approved_with_an_amendment_reruns_the_creator() {
             evidence_root: None,
             primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
             reduced_assurance: false,
+            deliverables: Vec::new(),
         })
         .unwrap();
     wait_status(&e, "t616k", SessionStatus::AwaitingHuman);
@@ -1874,6 +1876,7 @@ fn launch_member_run(e: &Engine, run: &str) {
             evidence_root: None,
             primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
             reduced_assurance: false,
+            deliverables: Vec::new(),
         })
         .expect("launch");
 }
@@ -2650,6 +2653,7 @@ fn launch_plan_run(e: &Engine, run: &str) {
             evidence_root: None,
             primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
             reduced_assurance: false,
+            deliverables: Vec::new(),
         })
         .expect("launch");
 }
@@ -3042,6 +3046,7 @@ fn try_launch_plan(
         evidence_root: None,
         primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     })
 }
 
@@ -3200,6 +3205,7 @@ fn pick_spec(clis: Vec<AgenticCli>, primary: Option<&str>) -> LaunchSpec {
         evidence_root: None,
         primary: primary.map(str::to_string),
         reduced_assurance: false,
+        deliverables: Vec::new(),
     }
 }
 

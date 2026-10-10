@@ -200,6 +200,7 @@ fn spec_with(session_id: &str, problem: &str, workflow: Option<String>) -> Launc
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        deliverables: Vec::new(),
     }
 }
 

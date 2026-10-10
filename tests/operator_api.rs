@@ -386,6 +386,7 @@ mod tests {
             evidence_root: None,
             primary: None,
             reduced_assurance: false,
+            deliverables: Vec::new(),
         })
         .expect("launch_run must not fail");
 

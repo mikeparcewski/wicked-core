@@ -91,6 +91,7 @@ impl RunSpec {
             evidence_root: None,
             primary: None,
             reduced_assurance: false,
+            deliverables: Vec::new(),
         }
     }
 }

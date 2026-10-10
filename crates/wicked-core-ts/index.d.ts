@@ -144,6 +144,14 @@ export interface LaunchOptions {
    * whose required judge was skipped holds (`judge_unavailable`).
    */
   reducedAssurance?: boolean
+  /**
+   * (X-MIG M9, core#649) The run's DECLARED DELIVERABLES on a plan or preset launch (`plan` or a
+   * preset `workflow`): absolute paths inside a declared write root (or worktree-relative paths)
+   * the run must write. They join the `required_deliverables` of the plan's last creator step, so
+   * the engine's deliverable floor judges them (written by THIS run). Refused on a launch with
+   * neither a plan nor a preset, and on a plan with no creator step.
+   */
+  deliverables?: Array<string>
 }
 /**
  * A handle to a wicked-core runtime. Construct with [`Core::spawn`] (production engine: real
