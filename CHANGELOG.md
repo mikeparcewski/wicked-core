@@ -239,6 +239,17 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.7.46** — 2026-10-10 — npm release on main tip adc661a, carrying #851 and #852.
+  **Assurance contract (#852, core#850; codex audit EX-01, EX-02, EX-05)**: a workflow's
+  `required_instruments` (`distinct_evaluator`, `judge`, `qe_acceptance`; default the first two)
+  and the explicit `LaunchOptions.reducedAssurance` opt-in (waives only the first two) are the
+  run's contract, on `sessionStarted.assurance {mode, required}`. Two DEFAULT changes: a
+  creator-seat evaluator is refused (at distribution, `NoEligibleSeat`, and in the gate fold,
+  denial source `same_seat_evaluator`) unless the run is reduced, and a gate whose required judge
+  was skipped holds (`judge_unavailable`). An evaluator pass that errors denies
+  (`evaluator_error`). `gateEvaluated.assurance` and `deliverLiftEvaluated.assurance` carry the
+  receipt `{mode, required, ran, skipped[{instrument, reason, detail}], creator, evaluator, judge,
+  tree, attempt}`. estate's `evidence` CLI verb is fenced as a write. **estate 0.24.0 (#851)**.
 - **core-ts 0.7.45** — 2026-10-10 — npm release on main tip e1f4722, carrying wave 4's CO-1 slices
   plus the CO-2/CO-4 merges since 0.7.44: #816, #818, #821-#836 (#829 reverted by #833), #838,
   #839, #841-#845, #847 and #848. Wire changes are additive. **New core-ts surface**:
