@@ -3007,6 +3007,14 @@ pub(crate) fn run(
                 reply,
             } => {
                 // ── validation ──────────────────────────────────────────────────────────────
+                // (core#572) A ballot-only seat cannot be handed work — refused before anything
+                // is cancelled or re-stored.
+                if let Some(cli) = new_cli.as_deref() {
+                    if let Err(e) = refuse_ballot_only_target(cli) {
+                        let _ = reply.send(Err(e));
+                        continue;
+                    }
+                }
                 let session = match crate::domain::get_session(&store, &run_id) {
                     Ok(Some(s)) => s,
                     Ok(None) => {
@@ -7730,6 +7738,24 @@ enum Reseat {
 /// approve dispatches the unit once, on the new seat. Refused (the run untouched) while a plan
 /// is held for approval, for a unit that is not the cursor, for one that already completed (an
 /// approve advances past it), and for a re-route (`new_cli: None`), which needs a running unit.
+/// (core#572) Refuse a reassignment onto a seat whose registry record says it may vote but not
+/// work (`seat_eligible_for_work = false`). A key with no record (an ad-hoc seat) is not judged.
+fn refuse_ballot_only_target(cli: &str) -> anyhow::Result<()> {
+    let registry = crate::registry_roster();
+    let record = registry.iter().find(|c| c.key == cli).or_else(|| {
+        registry
+            .iter()
+            .find(|c| c.key == wicked_apps_core::spawn::seat_cli_key(cli))
+    });
+    if record.is_some_and(|c| !c.seat_eligible_for_work) {
+        anyhow::bail!(
+            "seat `{cli}` is a ballot-only seat (seat_eligible_for_work = false) and cannot be \
+             reassigned work"
+        );
+    }
+    Ok(())
+}
+
 fn reseat_parked_unit(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
@@ -7737,6 +7763,7 @@ fn reseat_parked_unit(
     ord: u32,
     new_cli: Option<&str>,
 ) -> anyhow::Result<()> {
+    // (core#572) An explicit target was already refused if ballot-only (`ReassignUnit`).
     let run_id = &session.id;
     if let Some(why) = team_gate::dispatch_blocked(session) {
         anyhow::bail!("cannot reassign: {why}");
@@ -24088,5 +24115,37 @@ mod consent_plan_tests {
             HumanDecision::escalation_action("consent:worker").is_some()
                 && HumanDecision::escalation_action("consent:").is_none()
         );
+    }
+}
+
+/// core#572: an explicit reassignment onto a ballot-only seat is refused before anything moves.
+#[cfg(test)]
+mod ballot_only_reassign_tests {
+    #[test]
+    fn a_reassignment_onto_a_ballot_only_seat_is_refused() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!("wicked-572-home-{}", std::process::id()));
+        let cfg = home.join(".config/wicked-council");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("clis.toml"),
+            "[[cli]]\nkey = \"voter\"\ndisplay_name = \"Voter\"\nbinary = \"voter\"\n\
+             headless_invocation = \"voter {PROMPT}\"\nseat_eligible_for_work = false\n",
+        )
+        .unwrap();
+        let prior = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let voter = super::refuse_ballot_only_target("voter");
+        let claude = super::refuse_ballot_only_target("claude");
+        let adhoc = super::refuse_ballot_only_target("no-such-seat");
+        match prior {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(voter.unwrap_err().to_string().contains("ballot-only"));
+        assert!(claude.is_ok() && adhoc.is_ok());
     }
 }
