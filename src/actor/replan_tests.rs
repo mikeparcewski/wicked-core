@@ -485,15 +485,14 @@ fn t4_diff_rescore_into_high_risk_revises_and_pauses_before_the_next_unit_in_aut
             )
         })
         .collect();
-    // §8.5's 70-100 floor on a non-code run, minus what the plan had; the three that precede the
-    // done `produce` in the catalog are late.
+    // §8.5's 70-100 floor on a non-code run (no diff-floored `security_review`, core#649), minus
+    // what the plan had; the three that precede the done `produce` in the catalog are late.
     assert_eq!(
         added,
         vec![
             ("test_plan".to_string(), true),
             ("design".to_string(), true),
             ("architecture".to_string(), true),
-            ("security_review".to_string(), false),
         ]
     );
     // The gate: `plan_approval`, before the first new unit, reviewing the creator. Its
@@ -511,8 +510,7 @@ fn t4_diff_rescore_into_high_risk_revises_and_pauses_before_the_next_unit_in_aut
             "op:test_plan",
             "op:design",
             "op:architecture",
-            "op:critique",
-            "op:security_review"
+            "op:critique"
         ]
     );
     assert_eq!(v.units[0].status, crate::domain::UnitStatus::Done);
@@ -1253,8 +1251,9 @@ fn t8_c_a_human_edit_in_manual_mode_is_accepted_by_its_author_and_floor_filled()
     floor_added.sort();
     assert_eq!(
         floor_added,
-        ["architecture", "design", "security_review", "test_plan"],
-        "the floor the edit owes at the ratcheted score"
+        ["architecture", "design", "test_plan"],
+        "the floor the edit owes at the ratcheted score (a non-code run: no diff-floored \
+         security_review, core#649)"
     );
     let ids: Vec<String> = view(&e, "man").units.iter().map(|u| u.id.clone()).collect();
     assert!(ids.contains(&"man:produce".to_string()), "{ids:?}");
@@ -1325,7 +1324,8 @@ fn t8_r3_a_human_edit_does_not_carry_a_held_floor_raise_past_the_matrix() {
     );
     let pending = tp.pending.as_ref().expect("the raise is held");
     assert!(pending.high_risk);
-    // The human's step is in the held plan, and so is the raise's floor.
+    // The human's step is in the held plan, and so is the raise's floor (a non-code run's: no
+    // diff-floored `security_review`, core#649).
     let cats: Vec<&str> = pending
         .steps
         .steps
@@ -1333,7 +1333,9 @@ fn t8_r3_a_human_edit_does_not_carry_a_held_floor_raise_past_the_matrix() {
         .map(|s| s.catalog.as_str())
         .collect();
     assert!(
-        cats.contains(&"understand") && cats.contains(&"security_review"),
+        cats.contains(&"understand")
+            && cats.contains(&"architecture")
+            && !cats.contains(&"security_review"),
         "{cats:?}"
     );
     release_all(&w);

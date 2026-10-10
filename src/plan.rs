@@ -1244,8 +1244,11 @@ pub struct FloorFilled {
 
 /// The floor phase types a plan owes for a band's `phases` (§8.5): empty for a plan with no creator
 /// step; on a non-code run (no step executes code) `produce` fills the build slot and `critique`
-/// the review slot; `deliver` only for a run that delivers. The one rule [`floor_fill`] and
-/// [`worst_case_floor_additions`] share.
+/// the review slot, and the band's `security_review` is left out — that entry carries the DIFF
+/// evidence floor, which a run that writes no code can never satisfy, so its denial gate's
+/// approve-means-retry loops forever (core#649, X-MIG M6); a held testing rule naming
+/// `step:security_review` still adds it through obligations; `deliver` only for a run that
+/// delivers. The one rule [`floor_fill`] and [`worst_case_floor_additions`] share.
 fn floor_types(
     catalog: &[crate::workflow::PhaseDef],
     plan: &PlanSteps,
@@ -1262,6 +1265,7 @@ fn floor_types(
     phases
         .iter()
         .filter(|p| **p != "deliver" || delivers)
+        .filter(|p| code_run || **p != "security_review")
         .map(|p| match (*p, code_run) {
             ("build", false) => "produce",
             ("review", false) => "critique",
@@ -3075,6 +3079,26 @@ mod tests {
                 ]
             );
             assert_eq!(f.floor, ["produce", "critique"]);
+        }
+
+        /// core#649 (X-MIG M6): a non-code run at band 70-100 owes no `security_review` — that
+        /// entry's diff evidence floor can never pass on a run that writes no code, so the denial
+        /// gate's approve-and-retry would loop forever. A code run still owes it.
+        #[test]
+        fn t2_a_non_code_run_owes_no_diff_floored_security_review() {
+            let p = plan(json!({"steps": [{"catalog": "produce", "id": "draft"}]}));
+            let f = fill(&p, 100, &AUTO, None).unwrap();
+            assert_eq!(f.band, "70-100");
+            assert!(
+                !f.floor.iter().any(|t| t == "security_review"),
+                "{:?}",
+                f.floor
+            );
+            assert!(!phase_ids(&f).contains(&"security_review"));
+            assert!(f.floor.iter().any(|t| t == "critique"));
+            let code = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+            let f = fill(&code, 100, &AUTO, None).unwrap();
+            assert!(f.floor.iter().any(|t| t == "security_review"));
         }
 
         /// A floor-added step whose natural id is taken gets a distinct one.

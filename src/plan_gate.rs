@@ -2288,16 +2288,11 @@ mod tests {
         );
         // No creator step: an empty floor.
         assert!(adds(json!({"steps": [{"catalog": "understand"}]}), None).is_empty());
-        // A non-code run: `critique` fills the review slot.
+        // A non-code run: `critique` fills the review slot, and no diff-floored
+        // `security_review` (core#649).
         assert_eq!(
             adds(json!({"steps": [{"catalog": "produce"}]}), None),
-            [
-                "test_plan",
-                "design",
-                "architecture",
-                "critique",
-                "security_review"
-            ]
+            ["test_plan", "design", "architecture", "critique"]
         );
         // A delivering run carries its deliver step, so `deliver` is never an addition.
         let d: PlanStep = serde_json::from_value(json!({
