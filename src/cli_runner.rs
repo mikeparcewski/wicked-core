@@ -1689,7 +1689,15 @@ fn run_unit_and_judge_on(
                     let guarded = stage == crate::repo_checks::FloorStage::Verify
                         && input.unit.worktree_guarded;
                     let git_dir = baseline.and_then(|b| b.git_dir.as_deref());
-                    match (guarded, current_tree.as_deref(), git_dir) {
+                    // The tree the GUARD checked: its first look, which judged the tree clean
+                    // (the floor does not run over a mutated or unverifiable one).
+                    let guard_tree = match &guard_first_look {
+                        Some(crate::worktree_guard::WorktreeGuardOutcome::Clean {
+                            after, ..
+                        }) => Some(after.tree.as_str()),
+                        _ => None,
+                    };
+                    match (guarded, guard_tree, git_dir) {
                         (true, Some(tree), Some(git_dir)) => {
                             match crate::repo_checks::checkout_guarded_tree(
                                 wd,

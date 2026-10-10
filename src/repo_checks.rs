@@ -3043,13 +3043,122 @@ pub(crate) fn checkout_guarded_tree(
         git_dir: git_dir.to_path_buf(),
         worktree: worktree.to_path_buf(),
     };
+    // `--no-checkout` (codex r1 on the slice): a checkout runs the repository's `post-checkout`
+    // hook and its configured smudge filters OUTSIDE the floor's sandbox. The worktree is made
+    // empty, its files are written from the tree's own blobs (no filter, no attribute), and its
+    // index is set with `read-tree`, which touches no file.
     crate::worktree_guard::git(
         worktree,
-        &["worktree", "add", "--detach", &dir_s, &commit],
+        &[
+            "worktree",
+            "add",
+            "--no-checkout",
+            "--detach",
+            &dir_s,
+            &commit,
+        ],
         &env[..1],
     )
     .map_err(|e| format!("the guarded tree {tree} could not be checked out for the floor: {e}"))?;
+    write_tree_blobs(worktree, git_dir, tree, &dir)
+        .map_err(|e| format!("the guarded tree {tree} could not be written for the floor: {e}"))?;
+    crate::worktree_guard::git(&dir, &["read-tree", &commit], &[])
+        .map_err(|e| format!("the floor checkout's index could not be set: {e}"))?;
     Ok(checkout)
+}
+
+/// Write every entry of `tree` into `dir` from its blob — `ls-tree -r -z` then ONE
+/// `cat-file --batch` — so nothing repository-controlled runs (no checkout, no filter driver, no
+/// `export-ignore`). Regular files keep their executable bit; a symlink entry becomes a symlink
+/// (unix) or a plain file holding its target; a submodule becomes an empty directory. A path that
+/// is absolute or climbs out of `dir` is refused.
+fn write_tree_blobs(worktree: &Path, git_dir: &Path, tree: &str, dir: &Path) -> Result<(), String> {
+    use std::io::{BufRead, Read, Write};
+    let env: [(&str, &Path); 1] = [("GIT_DIR", git_dir)];
+    let listing = crate::worktree_guard::git(worktree, &["ls-tree", "-r", "-z", tree], &env)
+        .map_err(|e| e.to_string())?;
+    let mut entries: Vec<(String, String, PathBuf)> = Vec::new();
+    for rec in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let rec = String::from_utf8_lossy(rec);
+        let (meta, path) = rec
+            .split_once('\t')
+            .ok_or_else(|| format!("unreadable ls-tree entry {rec:?}"))?;
+        let mut parts = meta.split_whitespace();
+        let (mode, _kind, sha) = (
+            parts.next().unwrap_or_default().to_string(),
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default().to_string(),
+        );
+        let rel = Path::new(path);
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(format!("the tree holds an unsafe path {path:?}"));
+        }
+        entries.push((mode, sha, dir.join(rel)));
+    }
+    let blobs: Vec<&(String, String, PathBuf)> =
+        entries.iter().filter(|(m, _, _)| m != "160000").collect();
+    // spawn-audit: hardened — git plumbing reading the run's own object store.
+    let mut cat = Command::new("git");
+    cat.hardened()
+        .args(["cat-file", "--batch"])
+        .current_dir(worktree)
+        .env("GIT_DIR", git_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = cat.spawn().map_err(|e| format!("git cat-file: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("git cat-file has no stdin")?;
+    let shas: Vec<String> = blobs.iter().map(|(_, sha, _)| sha.clone()).collect();
+    let feeder = std::thread::spawn(move || {
+        for sha in shas {
+            if writeln!(stdin, "{sha}").is_err() {
+                break;
+            }
+        }
+    });
+    let mut out = std::io::BufReader::new(child.stdout.take().ok_or("git cat-file has no stdout")?);
+    for (mode, sha, path) in &blobs {
+        let mut header = String::new();
+        out.read_line(&mut header).map_err(|e| e.to_string())?;
+        let size: usize = header
+            .split_whitespace()
+            .nth(2)
+            .and_then(|n| n.parse().ok())
+            .ok_or_else(|| format!("git cat-file answered {header:?} for {sha}"))?;
+        let mut body = vec![0u8; size];
+        out.read_exact(&mut body).map_err(|e| e.to_string())?;
+        let mut nl = [0u8; 1];
+        out.read_exact(&mut nl).map_err(|e| e.to_string())?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        match mode.as_str() {
+            #[cfg(unix)]
+            "120000" => {
+                let target = String::from_utf8_lossy(&body).into_owned();
+                std::os::unix::fs::symlink(target, path).map_err(|e| e.to_string())?;
+            }
+            _ => {
+                std::fs::write(path, &body).map_err(|e| e.to_string())?;
+                #[cfg(unix)]
+                if mode == "100755" {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    }
+    let _ = feeder.join();
+    let _ = child.wait();
+    for (_, _, path) in entries.iter().filter(|(m, _, _)| m == "160000") {
+        std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// The fail-closed report for a verify floor whose guarded checkout could not be made: nothing

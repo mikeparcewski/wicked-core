@@ -937,17 +937,36 @@ pub(crate) fn lift_and_reverify(
     // at verify. No base at all (no remote, no recorded run base) ⇒ any red check denies, as
     // before. The git dir is the PINNED one — never the worktree's own `.git` file.
     let base_head = verified_base.clone().or_else(|| ctx.base_commit.clone());
-    let checks = crate::repo_checks::run_floor(
-        &ctx.worktree,
-        &crate::repo_checks::FloorContext {
-            stage: crate::repo_checks::FloorStage::Verify,
-            force_install: !drift.is_empty(),
-            base_head,
-            git_dir: pinned_git_dir(&ctx.worktree, &ctx.repo_root).ok(),
-            claim_text: None,
-            package_dir: None,
+    let floor_ctx = crate::repo_checks::FloorContext {
+        stage: crate::repo_checks::FloorStage::Verify,
+        force_install: !drift.is_empty(),
+        base_head,
+        git_dir: pinned_git_dir(&ctx.worktree, &ctx.repo_root).ok(),
+        claim_text: None,
+        package_dir: None,
+    };
+    // (core#417, codex r1) The deliver re-verify is a verify floor too: it runs on a clean
+    // checkout of `now.tree` — the tree that ships — never the live worktree, where an ignored
+    // config or shim could steer it while the snapshot comparison stays clean. No pinned git dir
+    // or no checkout ⇒ the floor is refused (fail-closed), never run on the live tree.
+    let checks = match floor_ctx.git_dir.as_deref() {
+        Some(git_dir) => match crate::repo_checks::checkout_guarded_tree(
+            &ctx.worktree,
+            git_dir,
+            &now.tree,
+            &format!("{run_id}-{ord}-deliver"),
+        ) {
+            Ok(checkout) => crate::repo_checks::run_floor(&checkout.dir, &floor_ctx),
+            Err(why) => {
+                crate::repo_checks::guarded_checkout_refused(&ctx.worktree, &floor_ctx, &why)
+            }
         },
-    );
+        None => crate::repo_checks::guarded_checkout_refused(
+            &ctx.worktree,
+            &floor_ctx,
+            "the worktree's pinned git dir could not be resolved",
+        ),
+    };
     eprintln!(
         "wicked-core: deliver re-verify for unit {ord}: {} — {}",
         if checks.passed { "PASS" } else { "FAIL" },
