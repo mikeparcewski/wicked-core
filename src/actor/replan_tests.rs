@@ -835,7 +835,7 @@ fn t4_medium3_a_revision_that_cannot_be_planned_leaves_the_plan_as_it_was() {
 #[test]
 fn t4_b_d_a_pa_revision_in_auto_mode_below_high_risk_does_not_pause() {
     let w = Worker::new(
-        &pa_output(r#"PLAN+ {"steps":[{"catalog":"security_review"}],"reason":"auth code"}"#),
+        &pa_output(r#"PLAN+ {"steps":[{"catalog":"test_plan"}],"reason":"auth code"}"#),
         None,
     );
     let mut e = engine("t4pa", w.clone());
@@ -871,10 +871,11 @@ fn t4_b_d_a_pa_revision_in_auto_mode_below_high_risk_does_not_pause() {
     assert_eq!(last["plan_rev"], 2);
     assert_eq!(
         step_ids(&last["steps"]),
-        ["produce", "critique", "security_review"],
-        "the user's steps, in order, then the PA's"
+        ["test_plan", "produce", "critique"],
+        "the user's steps, in order, with the PA's at its catalog position"
     );
-    assert_eq!(e.worker.calls()[1].2, "pa:critique");
+    // The late `test_plan` is at the cursor; the done `produce` is not dispatched again.
+    assert_eq!(e.worker.calls()[1].2, "pa:test_plan");
     release_all(&w);
 }
 
@@ -888,7 +889,7 @@ fn t4_b_d_a_pa_revision_in_auto_mode_below_high_risk_does_not_pause() {
 #[test]
 fn t4_b_d_manual_every_revision_pauses_and_two_concurrent_proposals_both_land() {
     let w = Worker::new(
-        &pa_output(r#"PLAN+ {"steps":[{"catalog":"security_review"}]}"#),
+        &pa_output(r#"PLAN+ {"steps":[{"catalog":"design"}]}"#),
         None,
     );
     let mut e = engine("t4man", w.clone());
@@ -943,7 +944,7 @@ fn t4_b_d_manual_every_revision_pauses_and_two_concurrent_proposals_both_land() 
     assert_eq!(last["plan_rev"], 3);
     assert_eq!(last["by"], "human");
     let ids = step_ids(&last["steps"]);
-    for want in ["produce", "critique", "security_review", "test_plan"] {
+    for want in ["produce", "critique", "design", "test_plan"] {
         assert!(ids.contains(&want.to_string()), "{want} kept: {ids:?}");
     }
     let (p, c) = (
@@ -968,7 +969,7 @@ fn t4_e_an_accepted_member_request_is_a_revision_from_the_pa_output() {
     let w = Worker::new(
         &pa_output(
             "PLAN c-0123456789abcdef: ACCEPT — the member is right\n\
-             PLAN+ {\"steps\":[{\"catalog\":\"security_review\"}]}",
+             PLAN+ {\"steps\":[{\"catalog\":\"test_plan\"}]}",
         ),
         None,
     );
@@ -1438,6 +1439,64 @@ fn t8_r3_an_edit_that_cannot_be_planned_is_refused_on_the_bus() {
     let tp = view(&e, "rpl").session.team_plan.unwrap();
     assert_eq!((tp.rev, tp.accepted_rev), (1, 1));
     assert!(tp.edits.is_empty());
+    release_all(&w);
+}
+
+/// (core#846) A `security_review` that the PA's `PLAN+` or a human edit adds to a run that writes
+/// no code is refused when the plan is made: a `plan.refused` naming
+/// `security_review_on_non_code_plan`, and the run goes on with its accepted plan (it never
+/// reaches the step whose diff floor would deny and retry forever).
+#[test]
+fn core846_a_security_review_added_to_a_non_code_run_is_refused_and_the_run_goes_on() {
+    let w = Worker::new(
+        &pa_output(r#"PLAN+ {"steps":[{"catalog":"security_review"}],"reason":"auth code"}"#),
+        None,
+    );
+    let mut e = engine("c846pa", w.clone());
+    launch(
+        &e,
+        "pa846",
+        HumanConfirm::None,
+        plan(
+            json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
+                    "touch": ["README.md"]}),
+        ),
+    );
+    wait_for("the next unit to dispatch", || e.worker.calls().len() >= 2);
+    let refused = settled(&e, "pa846", tev::PLAN_REFUSED, 1);
+    assert!(
+        refused[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("security_review_on_non_code_plan"),
+        "{refused:?}"
+    );
+    assert!(payloads(&e, "pa846", tev::PLAN_REVISED).is_empty());
+    assert_eq!(e.worker.calls()[1].2, "pa846:critique");
+    assert!(e.awaiting("pa846").is_empty(), "refused, not paused");
+    release_all(&w);
+
+    let (w, go) = gated_worker();
+    let e = engine("c846ed", w.clone());
+    launch(&e, "ed846", HumanConfirm::None, docs_plan());
+    wait_for("the creator to dispatch", || e.worker.calls().len() == 1);
+    // A human edit is refused synchronously, before anything is held.
+    let err = e
+        .core
+        .propose_plan(
+            "ed846",
+            plan(json!({"steps": [{"catalog": "security_review"}]})),
+            "req-846",
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("security_review_on_non_code_plan"),
+        "{err}"
+    );
+    go.store(true, AtomicOrdering::SeqCst);
+    wait_for("the run to go on", || e.worker.calls().len() >= 2);
+    let tp = view(&e, "ed846").session.team_plan.unwrap();
+    assert_eq!((tp.rev, tp.accepted_rev), (1, 1));
     release_all(&w);
 }
 
