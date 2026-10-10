@@ -4121,8 +4121,9 @@ pub(crate) fn apply_no_code_posture(
 
 /// (core#503) Drop every codex sandbox-mode and working-root spelling from a flag list:
 /// `--sandbox <mode>` / `-s <mode>` / `--sandbox=<mode>`, `-C <dir>` / `--cd <dir>` /
-/// `--cd=<dir>`, every `--add-dir`, and every `-c`/`--config` override of a sandbox key. (A no-code
-/// posture has already rewritten the modes to read-only.)
+/// `--cd=<dir>`, every `--add-dir`, every `-c`/`--config` override of a sandbox key, and every
+/// `-o`/`--output-last-message` (codex writes that file itself, unsandboxed). (A no-code posture
+/// has already rewritten the modes to read-only.)
 fn strip_codex_roots(flags: Vec<String>) -> Vec<String> {
     // A config override that names the sandbox (`sandbox_mode`, `sandbox_workspace_write.*` —
     // `writable_roots` above all) could re-grant the tree: the writable set is built ONLY from
@@ -4132,7 +4133,12 @@ fn strip_codex_roots(flags: Vec<String>) -> Vec<String> {
     let mut i = 0;
     while i < flags.len() {
         let f = flags[i].as_str();
-        if matches!(f, "--sandbox" | "-s" | "-C" | "--cd" | "--add-dir") {
+        // `-o` / `--output-last-message` is written by codex ITSELF, outside its sandbox (codex
+        // r3: `std::fs::write` in codex-rs/exec) — a path into the tree would land there.
+        if matches!(
+            f,
+            "--sandbox" | "-s" | "-C" | "--cd" | "--add-dir" | "-o" | "--output-last-message"
+        ) {
             i += 2;
             continue;
         }
@@ -4151,7 +4157,8 @@ fn strip_codex_roots(flags: Vec<String>) -> Vec<String> {
             || f.starts_with("--add-dir=")
             || f.strip_prefix("--config=").is_some_and(sandbox_override)
             || attached_c.is_some_and(sandbox_override)
-            || (f.len() > 2 && (f.starts_with("-C") || f.starts_with("-s")))
+            || f.starts_with("--output-last-message=")
+            || (f.len() > 2 && (f.starts_with("-C") || f.starts_with("-s") || f.starts_with("-o")))
         {
             i += 1;
             continue;
@@ -9522,6 +9529,10 @@ mod tests {
             "-c=sandbox_workspace_write.writable_roots=[\"/repo/tree\"]",
             "-C/repo/tree",
             "-sworkspace-write",
+            "--output-last-message=/repo/tree/src/lib.rs",
+            "-o",
+            "/repo/tree/a",
+            "-o/repo/tree/b",
             "-c",
             "model=o3",
             "the prompt",
