@@ -756,18 +756,16 @@ fn with_deliver(plan: &PlanSteps, deliver: Option<&PlanStep>) -> Result<PlanStep
 /// cannot depend on it through the hoisted chain and is refused (a forward dependency), never
 /// delivered without it.
 fn consent_anchor(steps: &[PlanStep]) -> Option<usize> {
-    let consent = steps
-        .iter()
-        .position(|s| matches!(s.gate, Some(crate::workflow::GateSpec::ConsentBefore)))?;
-    // Only a TERMINAL consent chain (codex r1 on #866): the consent step is the plan's last, and
-    // its dry run directly precedes it. Work after the chain must reach the pull request, so a
-    // plan that goes on past its consent keeps the deliver step last.
-    // …and an external-install TOOL suffix (codex r2): a creator or other agent step gated
-    // `consent_before` changes the tree, so the deliver step stays after it.
-    if consent + 1 != steps.len() || steps[consent].catalog != "run" {
+    // The plan's LAST step, when it is a Tool `run` gated `consent_before` (codex r1-r4 on #866):
+    // only an external-install suffix is hoisted past, never work after it, a consent-gated agent
+    // step, or an earlier consent gate elsewhere in the plan.
+    let consent = steps.len().checked_sub(1)?;
+    let last = &steps[consent];
+    if last.catalog != "run" || !matches!(last.gate, Some(crate::workflow::GateSpec::ConsentBefore))
+    {
         return None;
     }
-    let dry_run = match steps[consent].depends_on.as_deref() {
+    let dry_run = match last.depends_on.as_deref() {
         Some([dep])
             if consent > 0
                 && &steps[consent - 1].id == dep
@@ -1753,6 +1751,22 @@ mod tests {
                 "deliver"
             ]
         );
+    }
+
+    #[test]
+    fn m12_an_earlier_consent_gate_does_not_hide_the_terminal_install_chain() {
+        // codex r4 on #866: a raised consent gate on build does not stop the install suffix.
+        let mut build = ws("build", "build", &[]);
+        build.gate = Some(crate::workflow::GateSpec::ConsentBefore);
+        let mut install = ws("install", "run", &["install-plan"]);
+        install.gate = Some(crate::workflow::GateSpec::ConsentBefore);
+        let plan = PlanSteps {
+            steps: vec![build, ws("install-plan", "run", &["build"]), install],
+            ..Default::default()
+        };
+        let out = with_deliver(&plan, Some(&deliver_step_for_test())).unwrap();
+        let ids: Vec<_> = out.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["build", "deliver", "install-plan", "install"]);
     }
 
     #[test]
