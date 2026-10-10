@@ -325,21 +325,84 @@ pub(crate) fn fetch_origin(cwd: &Path) -> Result<(), String> {
 }
 
 fn fetch_origin_env(cwd: &Path, env: &[(&str, &Path)]) -> Result<(), String> {
+    // crew#933: an Azure DevOps origin is fetched with the daemon's own credential, as the deliver
+    // script does, rather than failing for want of a credential helper and skipping the lift.
+    let ado = ado_fetch_for(cwd, env)
+        .map_err(|e| format!("could not mint the Azure DevOps credential for the fetch: {e}"))?;
+    fetch_origin_with(cwd, env, ado.as_ref())
+}
+
+fn fetch_origin_with(
+    cwd: &Path,
+    env: &[(&str, &Path)],
+    ado: Option<&AdoFetch>,
+) -> Result<(), String> {
     // spawn-audit: hardened — git plumbing over the run's own worktree; reads no engine state.
     let mut cmd = Command::new("git");
-    cmd.hardened()
-        .args([
-            "-c",
-            "core.askPass=",
-            "-c",
-            "http.lowSpeedLimit=1024",
-            "-c",
-            "http.lowSpeedTime=30",
-            "fetch",
-            "--quiet",
-            "origin",
-        ])
-        .current_dir(cwd)
+    cmd.hardened().args([
+        "-c",
+        "core.askPass=",
+        "-c",
+        "http.lowSpeedLimit=1024",
+        "-c",
+        "http.lowSpeedTime=30",
+    ]);
+    match ado {
+        Some(a) => {
+            let scheme = a.url.split_once("://").map(|(s, _)| s).unwrap_or("https");
+            cmd.args([
+                "-c",
+                "credential.helper=",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "fetch",
+                "--quiet",
+            ])
+            .arg(&a.url)
+            .arg("+refs/heads/*:refs/remotes/origin/*")
+            .env("GIT_ALLOW_PROTOCOL", scheme);
+            // APPENDED after any inherited `GIT_CONFIG_*` entries (an operator's `http.proxy` or
+            // `http.sslCAInfo` keeps applying), never over them.
+            let base: usize = std::env::var("GIT_CONFIG_COUNT")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let entries = [
+                ("http.extraHeader".to_string(), String::new()),
+                (format!("http.{}.extraHeader", a.url), String::new()),
+                (
+                    format!("http.{}.extraHeader", a.url),
+                    format!("Authorization: {}", a.header),
+                ),
+                ("http.followRedirects".to_string(), "false".to_string()),
+            ];
+            for (i, (k, v)) in entries.iter().enumerate() {
+                cmd.env(format!("GIT_CONFIG_KEY_{}", base + i), k)
+                    .env(format!("GIT_CONFIG_VALUE_{}", base + i), v);
+            }
+            cmd.env("GIT_CONFIG_COUNT", (base + entries.len()).to_string());
+            // No inherited trace may record the header (GIT_TRACE_CURL logs request headers,
+            // trace2 can log config values).
+            for t in [
+                "GIT_TRACE",
+                "GIT_TRACE_CURL",
+                "GIT_TRACE_PACKET",
+                "GIT_TRACE_SETUP",
+                "GIT_TRACE2",
+                "GIT_TRACE2_EVENT",
+                "GIT_TRACE2_PERF",
+                "GIT_TRACE2_CONFIG_PARAMS",
+                "GIT_TRACE2_ENV_VARS",
+                "GIT_CURL_VERBOSE",
+            ] {
+                cmd.env_remove(t);
+            }
+        }
+        None => {
+            cmd.args(["fetch", "--quiet", "origin"]);
+        }
+    }
+    cmd.current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1104,6 +1167,255 @@ pub(crate) fn lift_and_reverify(
     })
 }
 
+// ── Azure DevOps origins (crew#933) ────────────────────────────────────────────────────────────
+//
+// An Azure DevOps origin has no git credential helper on most daemons: the deliver script
+// authenticates with a one-command `Authorization` header minted from the daemon's own
+// credential (`AZURE_DEVOPS_EXT_PAT`, or the `CREW_ADO_*` service principal). The engine's
+// fetches (the run-base mint and the pre-deliver lift) take the SAME path, so the lift is decided
+// and re-verified instead of skipped: the header is minted here, handed to that one `git fetch`
+// through `GIT_CONFIG_*` (never argv, a file or the log), scoped to the canonical repository URL
+// after an empty entry resets any ambient extra header; redirects are refused, credential helpers
+// are off and only the canonical URL's own scheme may carry it. It fetches the canonical URL into
+// origin's own tracking refs, exactly like the deliver script.
+
+/// The PAT env var and the service-principal triple the deliver script reads (crew's
+/// `deliver-credentials.ts`); the engine reads them only to mint a fetch header.
+const ADO_PAT_ENV: &str = "AZURE_DEVOPS_EXT_PAT";
+const ADO_SP_ENV: [&str; 3] = [
+    "CREW_ADO_TENANT_ID",
+    "CREW_ADO_CLIENT_ID",
+    "CREW_ADO_CLIENT_SECRET",
+];
+/// Azure DevOps' Entra resource id (the scope the deliver helper requests).
+const ADO_SCOPE: &str = "499b84ac-1321-427f-aa17-267ca6975798/.default";
+
+fn ado_part_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._~%() -".contains(c))
+}
+
+fn pct_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = s.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn pct_encode(s: &str) -> String {
+    // encodeURIComponent's unreserved set.
+    s.bytes()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&c) {
+                (c as char).to_string()
+            } else {
+                format!("%{c:02X}")
+            }
+        })
+        .collect()
+}
+
+/// The canonical `https://dev.azure.com/<org>/<project>/_git/<repo>` of an Azure DevOps remote
+/// URL — the same four spellings crew's `adoRepoOf` accepts — or `None`.
+pub(crate) fn ado_canonical_url(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let (org, project, repo) = if let Some(rest) = s
+        .strip_prefix("ssh://")
+        .unwrap_or(s)
+        .split_once('@')
+        .filter(|(user, _)| !user.contains("://") && !user.contains('/'))
+        .map(|(_, r)| r)
+        .filter(|r| {
+            // The WHOLE host, up to the `:` / `/` delimiter (a suffix host is not Azure DevOps).
+            let host = r
+                .split([':', '/'])
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            host == "ssh.dev.azure.com" || host == "vs-ssh.visualstudio.com"
+        }) {
+        let path = rest.split_once([':', '/'])?.1;
+        let path = path.strip_prefix("v3/")?;
+        let parts: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        (
+            parts[0].to_string(),
+            parts[1].to_string(),
+            parts[2].to_string(),
+        )
+    } else {
+        let rest = s.strip_prefix("https://")?;
+        let (auth_host, path) = rest.split_once('/')?;
+        let host = auth_host.rsplit('@').next()?.to_ascii_lowercase();
+        let segs: Vec<&str> = path.split('/').filter(|x| !x.is_empty()).collect();
+        let g = segs.iter().position(|x| *x == "_git")?;
+        if g + 2 != segs.len() {
+            return None;
+        }
+        if host == "dev.azure.com" {
+            if g != 2 {
+                return None;
+            }
+            (
+                segs[0].to_string(),
+                segs[1].to_string(),
+                segs[3].to_string(),
+            )
+        } else {
+            let org = host.strip_suffix(".visualstudio.com")?;
+            let rest: Vec<&str> = segs[..g]
+                .iter()
+                .enumerate()
+                .filter(|(i, x)| !(*i == 0 && x.eq_ignore_ascii_case("defaultcollection")))
+                .map(|(_, x)| *x)
+                .collect();
+            if rest.len() != 1 || org.is_empty() {
+                return None;
+            }
+            (
+                org.to_string(),
+                rest[0].to_string(),
+                segs[g + 1].to_string(),
+            )
+        }
+    };
+    let repo = repo
+        .strip_suffix(".git")
+        .or_else(|| repo.strip_suffix(".GIT"))
+        .unwrap_or(&repo)
+        .to_string();
+    let parts: Vec<String> = [org, project, repo]
+        .iter()
+        .map(|p| pct_decode(p))
+        .collect::<Option<Vec<_>>>()?;
+    if parts.iter().any(|p| !ado_part_ok(p)) {
+        return None;
+    }
+    Some(format!(
+        "https://dev.azure.com/{}/{}/_git/{}",
+        pct_encode(&parts[0]),
+        pct_encode(&parts[1]),
+        pct_encode(&parts[2])
+    ))
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// The `Authorization` value for an Azure DevOps fetch from the daemon's own credential: the
+/// service principal (an Entra client-credentials token, minted through `curl` with the form on
+/// STDIN so the secret never reaches argv) when all three `CREW_ADO_*` are set, else
+/// `Basic base64(":"+PAT)`. `Ok(None)` = no credential configured; `Err` = minting failed.
+fn ado_auth_header(login_base: &str) -> Result<Option<String>, String> {
+    let sp: Vec<Option<String>> = ADO_SP_ENV.iter().map(|n| env_nonempty(n)).collect();
+    if let [Some(tenant), Some(client), Some(secret)] = sp.as_slice() {
+        let form = format!(
+            "grant_type=client_credentials&client_id={}&client_secret={}&scope={}",
+            pct_encode(client),
+            pct_encode(secret),
+            pct_encode(ADO_SCOPE)
+        );
+        let url = format!(
+            "{}/{}/oauth2/v2.0/token",
+            login_base.trim_end_matches('/'),
+            pct_encode(tenant)
+        );
+        // spawn-audit: hardened — a bounded token request; the secret rides stdin only.
+        let mut child = Command::new("curl")
+            .hardened()
+            .args([
+                "-sS",
+                "--max-time",
+                "30",
+                "--proto",
+                "=https,http",
+                "-X",
+                "POST",
+            ])
+            .args([
+                "-H",
+                "Content-Type: application/x-www-form-urlencoded",
+                "--data-binary",
+                "@-",
+                &url,
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("could not spawn curl to mint the Azure DevOps token: {e}"))?;
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().ok_or("curl has no stdin")?;
+            stdin
+                .write_all(form.as_bytes())
+                .map_err(|e| format!("could not hand the token request to curl: {e}"))?;
+        }
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("curl could not be waited on: {e}"))?;
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        return match json.get("access_token").and_then(|v| v.as_str()) {
+            Some(t) if !t.is_empty() => Ok(Some(format!("Bearer {t}"))),
+            _ => Err(format!(
+                "Entra refused the Azure DevOps service-principal credential{}",
+                json.get("error")
+                    .and_then(|v| v.as_str())
+                    .map(|e| format!(" ({e})"))
+                    .unwrap_or_default()
+            )),
+        };
+    }
+    Ok(env_nonempty(ADO_PAT_ENV).map(|pat| pat_header(&pat)))
+}
+
+/// `Basic base64(":"+PAT)` — the header the deliver helper sends for a personal access token.
+fn pat_header(pat: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!(":{pat}"))
+    )
+}
+
+/// How an Azure DevOps origin is fetched: the canonical URL and the minted header.
+struct AdoFetch {
+    url: String,
+    header: String,
+}
+
+/// `Some` when `origin` is an Azure DevOps remote AND the daemon holds a credential for it;
+/// `Err` when it does but minting failed (disclosed by the caller like a failed fetch).
+fn ado_fetch_for(cwd: &Path, env: &[(&str, &Path)]) -> Result<Option<AdoFetch>, String> {
+    let Ok(raw) = git_string(cwd, &["remote", "get-url", "origin"], env) else {
+        return Ok(None);
+    };
+    let Some(url) = ado_canonical_url(&raw) else {
+        return Ok(None);
+    };
+    match ado_auth_header("https://login.microsoftonline.com")? {
+        Some(header) => Ok(Some(AdoFetch { url, header })),
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1221,6 +1533,106 @@ mod tests {
             &["commit", "-qm", "landed while the run was queued"],
         );
         run_git(&other, &["push", "-q", "origin", "main"]);
+    }
+
+    // ── crew#933: the engine fetches an Azure DevOps origin with the deliver script's header ──
+
+    #[test]
+    fn ado_canonical_url_accepts_the_four_spellings_and_nothing_looser() {
+        let want = Some("https://dev.azure.com/org/My%20Project/_git/repo".to_string());
+        for raw in [
+            "https://dev.azure.com/org/My%20Project/_git/repo",
+            "https://someone@dev.azure.com/org/My%20Project/_git/repo.git",
+            "https://org.visualstudio.com/DefaultCollection/My%20Project/_git/repo",
+            "https://org.visualstudio.com/My%20Project/_git/repo",
+            "git@ssh.dev.azure.com:v3/org/My%20Project/repo",
+            "org@vs-ssh.visualstudio.com:v3/org/My%20Project/repo",
+        ] {
+            assert_eq!(ado_canonical_url(raw), want, "{raw}");
+        }
+        for raw in [
+            "https://github.com/o/r.git",
+            "https://dev.azure.com/org/_git/repo",
+            "http://dev.azure.com/org/p/_git/repo",
+            "https://x@ssh.dev.azure.com/v3/org/p/repo",
+            "https://evil.example/dev.azure.com/org/p/_git/repo",
+            "git@ssh.dev.azure.com.example.org:v3/org/p/repo",
+            "/srv/git@ssh.dev.azure.com:v3/org/p/repo",
+            "org@vs-ssh.visualstudio.com.evil:v3/org/p/repo",
+            "/srv/git/repo.git",
+        ] {
+            assert_eq!(ado_canonical_url(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_pat_becomes_the_deliver_helpers_basic_header() {
+        // base64(":pat") — the exact shape `ado-deliver-helper.ts` mints.
+        assert_eq!(pat_header("pat"), "Basic OnBhdA==");
+    }
+
+    #[test]
+    fn an_ado_fetch_sends_the_minted_header_to_the_canonical_url_only_never_the_ambient_one() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen2 = seen.clone();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            // One request is enough: record its Authorization header and refuse it. Bounded, so a
+            // git that never connects fails the assertion below instead of hanging the suite.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let accepted = loop {
+                match listener.accept() {
+                    Ok(pair) => break Some(pair),
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(20))
+                    }
+                    Err(_) => break None,
+                }
+            };
+            if let Some((mut sock, _)) = accepted {
+                sock.set_nonblocking(false).unwrap();
+                sock.set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                let mut reader = BufReader::new(sock.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if line.to_ascii_lowercase().starts_with("authorization:") {
+                        seen2.lock().unwrap().push(line.trim().to_string());
+                    }
+                    line.clear();
+                }
+                let _ = sock.write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let dir = scratch("ado-fetch-header");
+        run_git(&dir, &["init", "-q"]);
+        // An ambient extra header (what actions/checkout writes) must not ride along.
+        run_git(
+            &dir,
+            &["config", "http.extraHeader", "Authorization: Basic AMBIENT"],
+        );
+        let ado = AdoFetch {
+            url: format!("http://127.0.0.1:{port}/org/p/_git/repo"),
+            header: "Basic MINTED".to_string(),
+        };
+        let err = fetch_origin_with(&dir, &[], Some(&ado)).unwrap_err();
+        server.join().unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["Authorization: Basic MINTED".to_string()]
+        );
+        assert!(
+            !err.contains("MINTED"),
+            "the header never reaches the error text: {err}"
+        );
     }
 
     #[test]
