@@ -151,8 +151,8 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 /// after the workflow it replaces, so a launch naming that id keeps launching; its steps are the
 /// consumer's §11.2 mapping (`tests/fixtures/catalog/mappings.json`, pinned by a test).
 ///
-/// Seeded here: `feature` (C2's acceptance), `chat` (M3), `onboarding` (M4), `migration` (M2) and
-/// `demo` (M9b, which replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping
+/// Seeded here: `feature` (C2's acceptance), `chat` (M3), `onboarding` (M4), `migration` (M2),
+/// `qe-author-tests` (M10) and `demo` (M9b, which replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping
 /// them). Every other consumer's preset is added by its migration seam (§14 M1–M10), which also
 /// deletes the def it replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
@@ -162,6 +162,7 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
         ("feature", feature_preset()),
         ("migration", migration_preset()),
         ("onboarding", onboarding_preset()),
+        ("qe-author-tests", qe_author_tests_preset()),
     ]
 }
 
@@ -401,6 +402,20 @@ fn migration_preset() -> Vec<PlanStep> {
             ..step("build", "cleanup", Some("verify"))
         },
     ]
+}
+
+/// `qe-author-tests` (M10): §11.2's row, moved from crew's def as data
+/// (`src/presets/qe-author-tests.json`, pinned to the C1 mapping by a test). recon → `understand`
+/// (gate type strategy, the QE skill's plan action); author → `build` (the creator that writes
+/// behaviour tests, skill `wicked-garden-qe`); verify → `run`, the deterministic Tool step that
+/// runs every produced test under the repository's own harness, with the evidence-floor pin
+/// ADDED; review → `review` (gate raised to `human_confirm_if`). The verify script is long and
+/// lives in the data file, not in Rust string literals.
+fn qe_author_tests_preset() -> Vec<PlanStep> {
+    let plan: crate::plan::PlanSteps =
+        serde_json::from_str(include_str!("presets/qe-author-tests.json"))
+            .expect("src/presets/qe-author-tests.json is a valid plan");
+    plan.steps
 }
 
 fn build_catalog() -> Vec<PhaseDef> {
@@ -678,6 +693,30 @@ mod tests {
             },
         )
         .unwrap_or_else(|e| panic!("built-in `{name}` composes: {e}"))
+    }
+
+    /// M10: the built-in `qe-author-tests` composes to crew's def: the author is the code-writing
+    /// creator on the QE skill; verify is the Tool step running crew's verify script (the summary
+    /// marker crew reads) with the evidence-floor pin; review is the evaluator gate.
+    #[test]
+    fn qe_author_tests_composes_with_its_verify_tool_and_floor() {
+        let def = composed("qe-author-tests");
+        let by = |id: &str| def.phases.iter().find(|p| p.id == id).unwrap();
+        let author = by("author");
+        assert!(author.executes_code && author.role == PhaseRole::Creator);
+        assert_eq!(author.skill_ref.as_deref(), Some("wicked-garden-qe"));
+        let verify = by("verify");
+        assert_eq!(verify.validator_pin.as_deref(), Some(EVIDENCE_FLOOR_PIN));
+        // The acceptance declaration crew's def carried (crew `qe/acceptance.ts` reads it).
+        assert!(verify.verified_evidence);
+        match &verify.executor {
+            PhaseExecutor::Tool { cmd } => {
+                assert_eq!(cmd.first().map(String::as_str), Some("bash"));
+                assert!(cmd.last().unwrap().contains("QE-VERIFY-SUMMARY:"));
+            }
+            other => panic!("verify is a Tool step, got {other:?}"),
+        }
+        assert_eq!(by("review").role, PhaseRole::Evaluator);
     }
 
     /// M3/M4: `chat` (read-only) and `onboarding` (tool-only) have no creator step, so the PA does

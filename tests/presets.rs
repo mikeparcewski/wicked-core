@@ -612,7 +612,14 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
     let names: Vec<&str> = builtins.iter().map(|(n, _)| *n).collect();
     assert_eq!(
         names,
-        ["chat", "demo", "feature", "migration", "onboarding"]
+        [
+            "chat",
+            "demo",
+            "feature",
+            "migration",
+            "onboarding",
+            "qe-author-tests"
+        ]
     );
     // `demo` (M9b) replaces interactive-demo with the garden demo skill's flow instead of mapping
     // its phases, so it has no §11.2 row; `m9b_demo_*` pins its steps.
@@ -750,6 +757,62 @@ fn m2_migration_launches_the_preset_with_its_bold_cells() {
         .team_plan
         .expect("a preset launch is a team plan");
     assert_eq!(plan.preset.as_deref(), Some("migration"));
+}
+
+/// M10 (DES-TEAMING-002 §14): a launch naming `qe-author-tests` runs the built-in preset: the
+/// author is the code-writing creator, verify the evidence-pinned Tool step, review the evaluator
+/// gate. As a creator plan the PA scopes it first and floor fill applies (§11.3).
+#[test]
+fn m10_qe_author_tests_launches_the_preset() {
+    let dir = tmp_dir("qe");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let rig = spawn(&db);
+    rig.core
+        .launch_run(spec("rqe", "qe-author-tests", None))
+        .unwrap();
+    let units = units_of(&rig.core, "rqe");
+    let hci = r#"{"human_confirm_if":"verdict_not_pass"}"#;
+    let f = Some(EVIDENCE_FLOOR_PIN);
+    // With no declared scope the rig's PA fails closed at 100: floor fill adds `test_plan`,
+    // `design`, `architecture` and `security_review` (the plan already has build and review).
+    assert_eq!(
+        rows("rqe", &units),
+        vec![
+            r("pa-scope", "recon", "neutral", "auto", None),
+            r("recon", "recon", "neutral", "auto", None),
+            r("test_plan", "test", "neutral", "auto", None),
+            r("design", "recon", "neutral", "auto", None),
+            r("architecture", "recon", "neutral", "auto", None),
+            r("author", "build", "creator", "auto", f),
+            r("verify", "test", "neutral", "auto", f),
+            r("review", "review", "evaluator", hci, f),
+            r("security_review", "review", "evaluator", "auto", f),
+        ]
+    );
+    let by = |id: &str| {
+        units
+            .iter()
+            .find(|u| u.id == format!("rqe:{id}"))
+            .unwrap_or_else(|| panic!("no `{id}` in {:?}", rows("rqe", &units)))
+    };
+    assert_eq!(units[0].id, "rqe:pa-scope");
+    assert_eq!(
+        row("rqe", by("author")),
+        r(
+            "author",
+            "build",
+            "creator",
+            "auto",
+            Some(EVIDENCE_FLOOR_PIN)
+        )
+    );
+    let verify = by("verify");
+    assert!(verify.tool_cmd.is_some(), "verify is a Tool step");
+    assert_eq!(
+        verify.validator.as_ref().map(wicked_core::pin).as_deref(),
+        Some(EVIDENCE_FLOOR_PIN)
+    );
+    assert_eq!(row("rqe", by("review")).2, "evaluator");
 }
 
 /// M9b (studio#373): a launch naming `demo` runs the built-in preset — the wicked-garden demo
