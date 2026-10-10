@@ -381,6 +381,22 @@ fn fetch_origin_with(
                     .env(format!("GIT_CONFIG_VALUE_{}", base + i), v);
             }
             cmd.env("GIT_CONFIG_COUNT", (base + entries.len()).to_string());
+            // No inherited trace may record the header (GIT_TRACE_CURL logs request headers,
+            // trace2 can log config values).
+            for t in [
+                "GIT_TRACE",
+                "GIT_TRACE_CURL",
+                "GIT_TRACE_PACKET",
+                "GIT_TRACE_SETUP",
+                "GIT_TRACE2",
+                "GIT_TRACE2_EVENT",
+                "GIT_TRACE2_PERF",
+                "GIT_TRACE2_CONFIG_PARAMS",
+                "GIT_TRACE2_ENV_VARS",
+                "GIT_CURL_VERBOSE",
+            ] {
+                cmd.env_remove(t);
+            }
         }
         None => {
             cmd.args(["fetch", "--quiet", "origin"]);
@@ -1218,7 +1234,7 @@ pub(crate) fn ado_canonical_url(raw: &str) -> Option<String> {
         .strip_prefix("ssh://")
         .unwrap_or(s)
         .split_once('@')
-        .filter(|(user, _)| !user.contains("://"))
+        .filter(|(user, _)| !user.contains("://") && !user.contains('/'))
         .map(|(_, r)| r)
         .filter(|r| {
             // The WHOLE host, up to the `:` / `/` delimiter (a suffix host is not Azure DevOps).
@@ -1541,6 +1557,7 @@ mod tests {
             "https://x@ssh.dev.azure.com/v3/org/p/repo",
             "https://evil.example/dev.azure.com/org/p/_git/repo",
             "git@ssh.dev.azure.com.example.org:v3/org/p/repo",
+            "/srv/git@ssh.dev.azure.com:v3/org/p/repo",
             "org@vs-ssh.visualstudio.com.evil:v3/org/p/repo",
             "/srv/git/repo.git",
         ] {
