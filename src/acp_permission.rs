@@ -157,6 +157,74 @@ fn is_write_tool_name(tool: &str) -> bool {
 /// Classify a permission request as a WRITE-class call, or `None` when it reads/searches/
 /// executes/thinks. Matches by ACP `kind` first (the protocol's vocabulary), then by tool name
 /// (a bridge that omits `kind`, or sends `other`, still names the tool).
+/// (core#563) The pi-governance gate's confirm envelope, re-shaped into an ordinary tool
+/// permission request — applied once, on a pi seat only, before anything judges the request.
+///
+/// The gate (a pi extension loaded by crew's `wicked-pi` under `WICKED_PI_GOVERNANCE`) asks
+/// through pi's `ctx.ui.confirm`, which pi-acp forwards as `session/request_permission` with
+/// `toolCall.kind: "other"`, the bare tool name as the title and the call in
+/// `toolCall.rawInput.message` as a versioned envelope:
+/// `{"pi-governance":1,"toolCallId":"<pi id>","toolName":"write","input":{…}}`. Left as is, a write
+/// is still classified by its title, but its path and a bash command are invisible to the
+/// boundary and to the remote-write fence. The rewrite sets `toolName` and `toolCall.name` to the
+/// tool, `toolCall.rawInput` to its `input`, `toolCall.toolCallId` to the envelope's id (the id pi-acp's
+/// own `tool_call` updates carry) and `toolCall.kind` from the name (`read|grep|find|ls` → `read`,
+/// `edit|write` → `edit`, `bash` → `execute`). Anything that is not such an envelope — another
+/// confirm, a malformed message — is returned unchanged.
+pub(crate) fn normalize_pi_permission_request(mut params: Value) -> Value {
+    let Some(envelope) = pi_envelope(&params) else {
+        return params;
+    };
+    let (id, name, input) = envelope;
+    let kind = match name.as_str() {
+        "read" | "grep" | "find" | "ls" => "read",
+        "edit" | "write" => "edit",
+        "bash" => "execute",
+        _ => "other",
+    };
+    if let Some(obj) = params.as_object_mut() {
+        obj.insert("toolName".into(), Value::String(name.clone()));
+        let tc = obj
+            .entry("toolCall")
+            .or_insert_with(|| Value::Object(Default::default()));
+        if let Some(tc) = tc.as_object_mut() {
+            tc.insert("name".into(), Value::String(name));
+            tc.insert("kind".into(), Value::String(kind.into()));
+            tc.insert("toolCallId".into(), Value::String(id));
+            tc.insert("rawInput".into(), input);
+        }
+    }
+    params
+}
+
+/// The pi-governance envelope a confirm request carries: `(toolCallId, toolName, input)`.
+fn pi_envelope(params: &Value) -> Option<(String, String, Value)> {
+    let raw = params.pointer("/toolCall/rawInput")?;
+    if raw.get("method").and_then(Value::as_str) != Some("confirm") {
+        return None;
+    }
+    let message: Value = serde_json::from_str(raw.get("message")?.as_str()?).ok()?;
+    if message.get("pi-governance").and_then(Value::as_i64) != Some(1) {
+        return None;
+    }
+    let name = message.get("toolName")?.as_str()?.to_string();
+    let id = message.get("toolCallId")?.as_str()?.to_string();
+    if name.is_empty() || id.is_empty() {
+        return None;
+    }
+    let input = message
+        .get("input")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    Some((id, name, input))
+}
+
+/// (core#563) The pi tool call a normalized request asks about: the envelope id
+/// [`normalize_pi_permission_request`] stamped, `None` for anything else.
+pub(crate) fn pi_governed_call_id(original: &Value) -> Option<String> {
+    pi_envelope(original).map(|(id, _, _)| id)
+}
+
 pub(crate) fn write_class_call(params: &Value) -> Option<WriteClassCall> {
     let kind = params
         .pointer("/toolCall/kind")
@@ -1047,6 +1115,63 @@ mod tests {
     /// This test proves both that `toolCall.name` is now resolved AND that it is preferred over
     /// `toolCall.title` when both are present (a display title like "Reading /tmp/foo" is NOT a
     /// valid tool identity for governance evaluation).
+    fn pi_confirm(message: &str) -> Value {
+        json!({"sessionId":"s","toolCall":{"toolCallId":"pi-ui-1","title":"write","kind":"other",
+               "status":"pending","rawInput":{"method":"confirm","title":"write","message":message}},
+               "options":[{"optionId":"yes","name":"Yes","kind":"allow_once"},
+                          {"optionId":"no","name":"No","kind":"reject_once"}]})
+    }
+
+    /// core#563: the pi-governance envelope becomes an ordinary request, so the boundary sees the
+    /// write's path and the fence sees the bash command; anything else is left alone.
+    #[test]
+    fn a_pi_governance_envelope_is_normalized_into_a_tool_request() {
+        let write = normalize_pi_permission_request(pi_confirm(
+            r#"{"pi-governance":1,"toolCallId":"call_4","toolName":"write","input":{"path":"/w/x.txt","content":"hi"}}"#,
+        ));
+        let call = write_class_call(&write).expect("a write-class call");
+        assert_eq!(call.path.as_deref(), Some("/w/x.txt"));
+        assert_eq!(write["toolCall"]["toolCallId"], "call_4");
+        assert_eq!(write["toolCall"]["kind"], "edit");
+        let bash = normalize_pi_permission_request(pi_confirm(
+            r#"{"pi-governance":1,"toolCallId":"call_2","toolName":"bash","input":{"command":"git push origin main"}}"#,
+        ));
+        assert_eq!(
+            execute_command(&bash).as_deref(),
+            Some("git push origin main")
+        );
+        let read = normalize_pi_permission_request(pi_confirm(
+            r#"{"pi-governance":1,"toolCallId":"call_1","toolName":"read","input":{"path":"/w/seed.txt"}}"#,
+        ));
+        assert_eq!(read["toolCall"]["kind"], "read");
+        assert!(write_class_call(&read).is_none());
+        // Not an envelope, a malformed message, a wrong version: unchanged.
+        for other in [
+            pi_confirm("Proceed?"),
+            pi_confirm(r#"{"pi-governance":1,"toolName":"write"}"#),
+            pi_confirm(r#"{"pi-governance":2,"toolCallId":"c","toolName":"write","input":{}}"#),
+        ] {
+            assert_eq!(normalize_pi_permission_request(other.clone()), other);
+            assert_eq!(pi_governed_call_id(&other), None);
+        }
+    }
+
+    /// core#563: a frame captured from pi 0.84.2 + pi-acp 0.0.32 with the gate loaded
+    /// (pi-governance evidence `four-gate-allow`, seq 27).
+    #[test]
+    fn the_captured_pi_write_confirm_normalizes() {
+        let frame: Value = serde_json::from_str(
+            r#"{"sessionId":"01a1228e","toolCall":{"toolCallId":"pi-ui-6367c599","title":"write","kind":"other","status":"pending","rawInput":{"method":"confirm","title":"write","message":"{\"pi-governance\":1,\"toolCallId\":\"call_mock_4\",\"toolName\":\"write\",\"input\":{\"path\":\"/tmp/pi-gov/work/governed-write.txt\",\"content\":\"written\\n\"}}"}},"options":[{"optionId":"yes","name":"Yes","kind":"allow_once"},{"optionId":"no","name":"No","kind":"reject_once"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(pi_governed_call_id(&frame).as_deref(), Some("call_mock_4"));
+        let n = normalize_pi_permission_request(frame);
+        assert_eq!(
+            write_class_call(&n).and_then(|c| c.path).as_deref(),
+            Some("/tmp/pi-gov/work/governed-write.txt")
+        );
+    }
+
     #[test]
     fn tool_name_resolves_from_tool_call_name_when_top_level_is_absent() {
         // Case 1: only `toolCall.name` present (no top-level `toolName`, no `toolCall.title`).
