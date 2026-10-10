@@ -157,7 +157,7 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 ///
 /// Seeded here: `feature` (C2's acceptance), `bug` (M1), `chat` (M3), `onboarding` (M4), `migration` (M2),
 /// `capture-learnings` (M7), `steering-author` (M8), `domain-extraction` (M6), `interactive-chat`,
-/// `interactive-draft` and `interactive-edit` (M9), `qe-author-tests` (M10) and `demo` (M9b,
+/// `interactive-draft` and `interactive-edit` (M9), `mcp-server` (M12), `qe-author-tests` (M10) and `demo` (M9b,
 /// which replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping them). Every other consumer's preset is added by its migration seam (§14 M1–M10),
 /// which also deletes the def it replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
@@ -189,6 +189,7 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
                 "interactive-edit",
             ),
         ),
+        ("mcp-server", mcp_server_preset()),
         ("migration", migration_preset()),
         ("onboarding", onboarding_preset()),
         ("qe-author-tests", qe_author_tests_preset()),
@@ -198,10 +199,10 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
 
 /// (QE acceptance, operator ruling 2026-10-10) The instruments a run of a BUILT-IN preset
 /// requires, as a workflow's `required_instruments` declares them: the presets that make
-/// application changes (`feature`, `bug`, `migration`) require `qe_acceptance` on top of the
+/// application changes (`feature`, `bug`, `mcp-server`, `migration`) require `qe_acceptance` on top of the
 /// defaults. `None` ⇒ the defaults. Code data beside [`builtin_presets`], so a re-seed never drops it.
 pub(crate) fn builtin_preset_instruments(name: &str) -> Option<Vec<String>> {
-    matches!(name, "feature" | "bug" | "migration").then(|| {
+    matches!(name, "feature" | "bug" | "mcp-server" | "migration").then(|| {
         [
             crate::assurance::DISTINCT_EVALUATOR,
             crate::assurance::JUDGE,
@@ -528,6 +529,21 @@ fn migration_preset() -> Vec<PlanStep> {
 fn interactive_preset(json: &str, name: &str) -> Vec<PlanStep> {
     let plan: crate::plan::PlanSteps = serde_json::from_str(json)
         .unwrap_or_else(|e| panic!("src/presets/{name}.json is a valid plan: {e}"));
+    plan.steps
+}
+
+/// `mcp-server` (M12, DES-W7-M12 on core#649): the def's nine phases as data
+/// (`src/presets/mcp-server.json`, pinned to its mapping by a test). scope, source-discovery →
+/// `understand`; design → `design`; build → `build`; test → `test` (the bold cell: role neutral →
+/// evaluator); security-review and observability-review → `review`, each keeping its specialist
+/// skill and its raised gate (`review` leaves the skill unset; the catalog's `security_review` fixes
+/// its own, so the MCP review is a `review` and a high band's floor adds the generic one beside
+/// it); install-plan and install → `run` with their Tool commands, install gated `consent_before`.
+/// Phase ids are kept: crew keys delivery on `install-plan` / `install`.
+fn mcp_server_preset() -> Vec<PlanStep> {
+    let plan: crate::plan::PlanSteps =
+        serde_json::from_str(include_str!("presets/mcp-server.json"))
+            .expect("src/presets/mcp-server.json is a valid plan");
     plan.steps
 }
 

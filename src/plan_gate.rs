@@ -710,9 +710,16 @@ pub(crate) fn check_deliver_step(step: &PlanStep) -> Result<(), String> {
     }
 }
 
-/// `plan` with the run's `deliver` step appended (codex round 6 on #622): ONE source of the
+/// `plan` with the run's `deliver` step added (codex round 6 on #622): ONE source of the
 /// deliver step. A delivering launch whose plan also authors a `deliver` step is refused, never
 /// silently resolved to one of them.
+///
+/// (X-MIG M12, DES-W7-M12) The step is appended, except in a plan that pauses for CONSENT before
+/// a write outside the run (a step gated `consent_before`, mcp-server's `install`): there the pull
+/// request must exist when the consent card asks, so `deliver` goes before the consent chain. The
+/// anchor is the consent step's dry run (its dependency, when that is a `run` step, which is where
+/// the consent offer reads its plan, core#820), else the consent step itself. `deliver` takes the
+/// anchor's `depends_on`, the anchor depends on `deliver`, and `deliver` sits right before it.
 fn with_deliver(plan: &PlanSteps, deliver: Option<&PlanStep>) -> Result<PlanSteps, String> {
     let mut out = plan.clone();
     if let Some(d) = deliver {
@@ -723,9 +730,33 @@ fn with_deliver(plan: &PlanSteps, deliver: Option<&PlanStep>) -> Result<PlanStep
                 own.id
             ));
         }
-        out.steps.push(d.clone());
+        match consent_anchor(&out.steps) {
+            Some(at) => {
+                let mut step = d.clone();
+                step.depends_on = Some(out.steps[at].depends_on.clone().unwrap_or_default());
+                out.steps[at].depends_on = Some(vec![step.id.clone()]);
+                out.steps.insert(at, step);
+            }
+            None => out.steps.push(d.clone()),
+        }
     }
     Ok(out)
+}
+
+/// The step a delivering run's `deliver` goes before (see [`with_deliver`]): the first
+/// `consent_before` step's dry run — its one dependency, when that is a `run` step — else the
+/// consent step itself; `None` for a plan that asks no consent.
+fn consent_anchor(steps: &[PlanStep]) -> Option<usize> {
+    let consent = steps
+        .iter()
+        .position(|s| matches!(s.gate, Some(crate::workflow::GateSpec::ConsentBefore)))?;
+    let dry_run = match steps[consent].depends_on.as_deref() {
+        Some([dep]) => steps
+            .iter()
+            .position(|s| &s.id == dep && s.catalog == "run"),
+        _ => None,
+    };
+    Some(dry_run.unwrap_or(consent))
 }
 
 /// Every `deliver` step of a composed-to-be plan — authored or the launch's — passes the same
@@ -1588,6 +1619,81 @@ pub(crate) fn gate_decided(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // (X-MIG M12) A delivering run's deliver step goes before the consent chain.
+    fn ws(id: &str, catalog: &str, deps: &[&str]) -> PlanStep {
+        PlanStep {
+            catalog: catalog.into(),
+            id: id.into(),
+            depends_on: Some(deps.iter().map(|d| d.to_string()).collect()),
+            ..PlanStep::default()
+        }
+    }
+
+    fn deliver_step_for_test() -> PlanStep {
+        PlanStep {
+            catalog: "deliver".into(),
+            id: "deliver".into(),
+            executor: Some(crate::workflow::PhaseExecutor::Tool {
+                cmd: vec!["true".into()],
+            }),
+            ..PlanStep::default()
+        }
+    }
+
+    #[test]
+    fn m12_deliver_goes_before_the_consent_steps_dry_run() {
+        let mut install = ws("install", "run", &["install-plan"]);
+        install.gate = Some(crate::workflow::GateSpec::ConsentBefore);
+        let plan = PlanSteps {
+            steps: vec![
+                ws("build", "build", &[]),
+                ws("review", "review", &["build"]),
+                ws("install-plan", "run", &["review"]),
+                install,
+            ],
+            ..Default::default()
+        };
+        let out = with_deliver(&plan, Some(&deliver_step_for_test())).unwrap();
+        let ids: Vec<_> = out.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["build", "review", "deliver", "install-plan", "install"]
+        );
+        let deps = |id: &str| {
+            out.steps
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .depends_on
+                .clone()
+        };
+        assert_eq!(deps("deliver"), Some(vec!["review".to_string()]));
+        assert_eq!(deps("install-plan"), Some(vec!["deliver".to_string()]));
+        assert_eq!(deps("install"), Some(vec!["install-plan".to_string()]));
+    }
+
+    #[test]
+    fn m12_deliver_goes_before_a_consent_step_with_no_dry_run_and_is_appended_without_one() {
+        let mut install = ws("install", "run", &["review"]);
+        install.gate = Some(crate::workflow::GateSpec::ConsentBefore);
+        let plan = PlanSteps {
+            steps: vec![ws("review", "review", &[]), install],
+            ..Default::default()
+        };
+        let out = with_deliver(&plan, Some(&deliver_step_for_test())).unwrap();
+        let ids: Vec<_> = out.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["review", "deliver", "install"]);
+        let plain = PlanSteps {
+            steps: vec![
+                ws("build", "build", &[]),
+                ws("review", "review", &["build"]),
+            ],
+            ..Default::default()
+        };
+        let out = with_deliver(&plain, Some(&deliver_step_for_test())).unwrap();
+        assert_eq!(out.steps.last().unwrap().id, "deliver");
+    }
     use crate::review_scale::Graph;
     use crate::team::events::{TeamBody, PATH_SCORED, PLAN_ACCEPTED, PLAN_PROPOSED};
     use serde_json::json;

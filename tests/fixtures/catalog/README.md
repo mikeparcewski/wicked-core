@@ -7,7 +7,7 @@ Read by `tests/catalog_compose.rs`.
   `deliverPrPhase([], ...)` for `deliver` (the phase `composeDeliverWorkflow` appends). `is_system` is dropped because crew strips it before the
   engine sees a def. The consumers core owns are not here: the test reads them live from
   `WorkflowRegistry::with_defaults()` overlaid with `workflows/*.json`.
-- `mappings.json`: for each of the 13 remaining §11.2 consumers, `steps` (the plan that maps today's phases
+- `mappings.json`: for each of the 13 remaining §11.2 consumers plus `mcp-server` (M12, the row DES-W7-M12 adds), `steps` (the plan that maps today's phases
   onto catalog entries) and `bold` (§11.2's bold cells as `"<phase>.<field>": <composed value>`).
   A step carries a field only where today's phase differs from its catalog entry and the cell is
   not bold. `compose` enforces the step rules, so a step that weakened an entry would be refused.
