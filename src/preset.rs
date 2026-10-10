@@ -386,6 +386,7 @@ mod tests {
         assert_eq!(
             seed_builtins(&mut store, 10).unwrap(),
             [
+                "capture-learnings",
                 "chat",
                 "demo",
                 "feature",
@@ -414,6 +415,7 @@ mod tests {
         assert_eq!(
             seed_builtins(&mut store, 5).unwrap(),
             [
+                "capture-learnings",
                 "chat",
                 "demo",
                 "feature",
@@ -443,6 +445,7 @@ mod tests {
         assert_eq!(
             seed_builtins(&mut store, 5).unwrap(),
             [
+                "capture-learnings",
                 "demo",
                 "feature",
                 "migration",
@@ -565,6 +568,7 @@ mod tests {
         assert_eq!(
             listed,
             [
+                ("capture-learnings".to_string(), GLOBAL_SCOPE.to_string()),
                 ("chat".to_string(), GLOBAL_SCOPE.to_string()),
                 ("demo".to_string(), GLOBAL_SCOPE.to_string()),
                 ("feature".to_string(), format!("project:{pid}")),

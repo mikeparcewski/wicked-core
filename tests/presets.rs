@@ -614,6 +614,7 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
     assert_eq!(
         names,
         [
+            "capture-learnings",
             "chat",
             "demo",
             "feature",
@@ -814,6 +815,71 @@ fn m10_qe_author_tests_launches_the_preset() {
         Some(EVIDENCE_FLOOR_PIN)
     );
     assert_eq!(row("rqe", by("review")).2, "evaluator");
+}
+
+/// M7 (DES-TEAMING-002 §14): a launch naming `capture-learnings` runs the built-in preset. It is
+/// a creator plan on a repo (capture → `produce`), so the PA scopes it first (`pa-scope`, ord 1, X1),
+/// and this rig's PA declares nothing, so floor fill adds the 70-100 phases it lacks. Every step
+/// keeps the repo-learn skill, and capture keeps the capture-report floor (BC-80): a run that
+/// submits nothing cannot report `completed`.
+#[test]
+fn m7_capture_learnings_launches_the_preset_with_its_capture_report_floor() {
+    let dir = tmp_dir("capture");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let rig = spawn(&db);
+    rig.core
+        .launch_run(spec("rcap", "capture-learnings", None))
+        .unwrap();
+    let units = units_of(&rig.core, "rcap");
+    // capture → `produce` is the one creator, and it writes nothing (core#649 option A): its PA may
+    // answer `SCOPE {"touch":[]}`, which scores 0. This rig's PA answers nothing, so the plan fails
+    // closed at 100 and floor fill adds the 70-100 phases a non-code run owes (no diff-floored
+    // `security_review`, core#649 / #847).
+    assert_eq!(
+        rows("rcap", &units),
+        vec![
+            r("pa-scope", "recon", "neutral", "auto", None),
+            r("churn", "recon", "neutral", "auto", None),
+            r("hotspots", "recon", "neutral", "auto", None),
+            r("test_plan", "test", "neutral", "auto", None),
+            r("design", "recon", "neutral", "auto", None),
+            r("architecture", "recon", "neutral", "auto", None),
+            r("capture", "build", "creator", "auto", None),
+            r("critique", "review", "evaluator", "auto", None),
+        ]
+    );
+    let by = |id: &str| {
+        units
+            .iter()
+            .find(|u| u.id == format!("rcap:{id}"))
+            .unwrap_or_else(|| panic!("{id} is planned"))
+    };
+    for id in ["churn", "hotspots", "capture"] {
+        assert_eq!(
+            by(id).skill_ref.as_deref(),
+            Some("wicked-garden-repo-learn"),
+            "{id}"
+        );
+    }
+    assert!(by("capture").requires_capture_report);
+    let capture = wicked_core::builtin_presets()
+        .into_iter()
+        .find(|(n, _)| *n == "capture-learnings")
+        .unwrap()
+        .1;
+    let plan = wicked_core::PlanSteps {
+        steps: capture,
+        ..Default::default()
+    };
+    assert!(plan.writes_nothing(), "every creator step writes nothing");
+    assert!(!by("churn").requires_capture_report);
+    assert!(
+        by("capture")
+            .instructions
+            .as_deref()
+            .is_some_and(|t| t.contains("wicked-capture-report")),
+        "capture's instruction mandates the report marker the floor reads"
+    );
 }
 
 /// M9b (studio#373): a launch naming `demo` runs the built-in preset — the wicked-garden demo
