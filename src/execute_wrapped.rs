@@ -4125,40 +4125,76 @@ pub(crate) fn apply_no_code_posture(
 /// `-o`/`--output-last-message` (codex writes that file itself, unsandboxed). (A no-code posture
 /// has already rewritten the modes to read-only.)
 fn strip_codex_roots(flags: Vec<String>) -> Vec<String> {
-    // A config override that names the sandbox (`sandbox_mode`, `sandbox_workspace_write.*` —
-    // `writable_roots` above all) could re-grant the tree: the writable set is built ONLY from
-    // the scratch and the notes root (codex r1 on the slice).
-    let sandbox_override = |v: &str| v.trim_start().starts_with("sandbox");
+    // Config overrides are ALLOWLISTED (codex r2-r4 on the slice found one host-side write after
+    // another: `writable_roots`, `notify`, `sqlite_home`): on a read-only unit only the model
+    // choice and the engine's own MCP off-pin survive; every other `-c`/`--config` is dropped.
+    let allowed_override = |v: &str| {
+        let (key, value) = v.split_once('=').unwrap_or((v, ""));
+        let key = key.trim();
+        matches!(
+            key,
+            "model"
+                | "model_provider"
+                | "model_reasoning_effort"
+                | "model_reasoning_summary"
+                | "model_verbosity"
+        ) || (key.starts_with("mcp_servers.")
+            && key.ends_with(".enabled")
+            && value.trim() == "false")
+    };
     let mut out = Vec::with_capacity(flags.len());
     let mut i = 0;
     while i < flags.len() {
         let f = flags[i].as_str();
         // `-o` / `--output-last-message` is written by codex ITSELF, outside its sandbox (codex
-        // r3: `std::fs::write` in codex-rs/exec) — a path into the tree would land there.
+        // r3: `std::fs::write` in codex-rs/exec); `-p`/`--profile` selects a config profile that
+        // could carry any key the allowlist refuses.
         if matches!(
             f,
-            "--sandbox" | "-s" | "-C" | "--cd" | "--add-dir" | "-o" | "--output-last-message"
+            "--sandbox"
+                | "-s"
+                | "-C"
+                | "--cd"
+                | "--add-dir"
+                | "-o"
+                | "--output-last-message"
+                | "-p"
+                | "--profile"
         ) {
             i += 2;
             continue;
         }
-        if matches!(f, "-c" | "--config") && flags.get(i + 1).is_some_and(|v| sandbox_override(v)) {
+        if matches!(f, "-c" | "--config") {
+            if flags.get(i + 1).is_some_and(|v| allowed_override(v)) {
+                out.push(flags[i].clone());
+                out.push(flags[i + 1].clone());
+            }
             i += 2;
             continue;
         }
-        // Attached spellings too (codex r2): `-cKEY=V` / `-c=KEY=V`, `-C<dir>` / `-C=<dir>`,
-        // `-s<mode>`.
-        let attached_c = f
-            .strip_prefix("-c")
-            .filter(|v| !v.is_empty())
+        // Attached spellings too: `-cKEY=V` / `-c=KEY=V` / `--config=KEY=V`, `-C<dir>`,
+        // `-s<mode>`, `-o<path>`, `-p<profile>`, and every `--flag=value` form of the above.
+        let attached = f
+            .strip_prefix("--config=")
+            .or_else(|| f.strip_prefix("-c").filter(|v| !v.is_empty()))
             .map(|v| v.strip_prefix('=').unwrap_or(v));
-        if f.starts_with("--sandbox=")
-            || f.starts_with("--cd=")
-            || f.starts_with("--add-dir=")
-            || f.strip_prefix("--config=").is_some_and(sandbox_override)
-            || attached_c.is_some_and(sandbox_override)
-            || f.starts_with("--output-last-message=")
-            || (f.len() > 2 && (f.starts_with("-C") || f.starts_with("-s") || f.starts_with("-o")))
+        if let Some(v) = attached {
+            if allowed_override(v) {
+                out.push(flags[i].clone());
+            }
+            i += 1;
+            continue;
+        }
+        if [
+            "--sandbox=",
+            "--cd=",
+            "--add-dir=",
+            "--output-last-message=",
+            "--profile=",
+        ]
+        .iter()
+        .any(|p| f.starts_with(p))
+            || (f.len() > 2 && ["-C", "-s", "-o", "-p"].iter().any(|p| f.starts_with(p)))
         {
             i += 1;
             continue;
@@ -4198,6 +4234,9 @@ impl NoCodeLaunchContext {
             // The writable set is EXACTLY the scratch (the workspace) and the notes root below:
             // no configured `writable_roots` survives, whatever a config file says.
             "sandbox_workspace_write.writable_roots=[]",
+            // Host-side writes codex makes OUTSIDE its command sandbox, pinned whatever a config
+            // file says: no turn-end notify command, and its state database in the scratch.
+            "notify=[]",
             "sandbox_workspace_write.exclude_slash_tmp=true",
             "sandbox_workspace_write.exclude_tmpdir_env_var=true",
             "sandbox_workspace_write.network_access=true",
@@ -4205,6 +4244,11 @@ impl NoCodeLaunchContext {
             f.push("-c".to_string());
             f.push(kv.to_string());
         }
+        f.push("-c".to_string());
+        f.push(format!(
+            "sqlite_home=\"{}\"",
+            self.check_scratch.join("state").display()
+        ));
         if let Some(notes) = &self.notes_root {
             f.push("--add-dir".to_string());
             f.push(notes.to_string_lossy().into_owned());
@@ -9534,6 +9578,20 @@ mod tests {
             "/repo/tree/a",
             "-o/repo/tree/b",
             "-c",
+            "notify=[\"sh\",\"-c\",\"touch /repo/tree/x\"]",
+            "-csqlite_home=\"/repo/tree\"",
+            "--profile",
+            "evil",
+            "-c",
+            "mcp_servers.probe.enabled=false",
+            "-c",
+            "notify=[\"sh\",\"-c\",\"touch /repo/tree/x\"]",
+            "-csqlite_home=\"/repo/tree\"",
+            "--profile",
+            "evil",
+            "-c",
+            "mcp_servers.probe.enabled=false",
+            "-c",
             "model=o3",
             "the prompt",
         ]);
@@ -9550,7 +9608,18 @@ mod tests {
         );
         assert!(
             joined.contains("-c model=o3"),
-            "an unrelated override stays: {joined}"
+            "the model choice stays: {joined}"
+        );
+        assert!(
+            joined.contains("-c mcp_servers.probe.enabled=false"),
+            "the MCP off-pin stays: {joined}"
+        );
+        assert!(
+            joined.contains("-c notify=[]")
+                && joined.contains("sqlite_home=\"/w/checks/run-1/4-a0/state\"")
+                && !joined.contains("evil")
+                && !joined.contains("touch /repo"),
+            "host-side writes are pinned into the scratch: {joined}"
         );
         // Without a scratch (the persistent-session carrier) the lever is the read-only sandbox.
         let mut argv = s(&[&codex, "exec", "the prompt"]);
