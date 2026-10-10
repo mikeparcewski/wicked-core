@@ -326,7 +326,12 @@ fn approve_at_the_dead_seat_gate_dispatches_the_cursor_on_the_provisional_seat()
     let db = db_path("approve");
     let core = engine(db.clone(), Arc::new(OkRunner));
     let ev = core.subscribe();
-    core.launch_run(spec(sid)).expect("launch");
+    // (core#850) The approve releases the PROVISIONAL seating — the review on the builder's seat —
+    // which only a `reduced` run may grade on; a full run's fold refuses it
+    // (`tests/assurance_contract.rs`). This test is about the dispatch, so it opts in.
+    let mut launch = spec(sid);
+    launch.reduced_assurance = true;
+    core.launch_run(launch).expect("launch");
     let evs = collect_until(
         &ev,
         Duration::from_secs(15),
