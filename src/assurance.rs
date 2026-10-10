@@ -35,6 +35,7 @@ pub const SKIP_REDUCED: &str = "reduced_assurance";
 pub const SKIP_NO_DISTINCT_SEAT: &str = "no_distinct_seat";
 pub const SKIP_NO_BOUNDARY: &str = "no_boundary";
 pub const SKIP_ERROR: &str = "error";
+pub const SKIP_NOT_APPLICABLE: &str = "not_applicable";
 
 pub const MODE_FULL: &str = "full";
 pub const MODE_REDUCED: &str = "reduced";

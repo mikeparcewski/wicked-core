@@ -1793,31 +1793,26 @@ pub(crate) fn apply_and_finish_unit(
             }),
             // The checks RAN only when a report shows checks executed (or a prior verdict on this
             // same tree was carried); a refused, missing or empty report is a skip.
-            checks: if carried.is_some()
-                || evidence
-                    .repo_checks
-                    .as_ref()
-                    .is_some_and(|r| !r.checks.is_empty())
-            {
-                Some(Ok(()))
-            } else if let Some(r) = evidence
-                .repo_checks
-                .as_ref()
-                .filter(|r| r.sandbox_error.is_some())
-            {
-                Some(Err((
+            checks: match evidence.repo_checks.as_ref().or(carried.as_ref()) {
+                Some(r) if !r.checks.is_empty() => Some(Ok(())),
+                Some(r) if r.sandbox_error.is_some() => Some(Err((
                     crate::assurance::SKIP_NO_BOUNDARY,
                     r.sandbox_error.clone(),
-                )))
-            } else if checks_ran {
-                Some(Err((
+                ))),
+                Some(r) => Some(Err(match &r.detect_error {
+                    Some(e) => (crate::assurance::SKIP_ERROR, Some(e.clone())),
+                    None => (
+                        crate::assurance::SKIP_NOT_APPLICABLE,
+                        Some("the repository declares no checks the floor runs".into()),
+                    ),
+                })),
+                None if checks_ran => Some(Err((
                     crate::assurance::SKIP_ERROR,
                     Some(
                         "the checks floor applied but no report of executed checks arrived".into(),
                     ),
-                )))
-            } else {
-                None
+                ))),
+                None => None,
             },
             judge: agent_verdict,
             judge_skipped: evidence.judge_skipped.as_deref(),
