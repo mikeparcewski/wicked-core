@@ -1462,7 +1462,10 @@ pub fn units_by_session(
         .iter()
         .filter_map(|n| WorkUnit::from_node(n).ok())
     {
-        groups.entry(unit.session_id.clone()).or_default().push(unit);
+        groups
+            .entry(unit.session_id.clone())
+            .or_default()
+            .push(unit);
     }
     for units in groups.values_mut() {
         units.sort_by_key(|u| u.ord);

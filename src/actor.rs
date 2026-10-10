@@ -13314,9 +13314,14 @@ fn list_sessions(store: &impl GraphRead) -> anyhow::Result<Vec<String>> {
 /// Read every session + its ordered units (the UI's project list).
 fn list_projects(store: &impl GraphRead) -> anyhow::Result<Vec<crate::SessionView>> {
     // One unit scan for the whole fold (wicked-crew#944): a per-session `session_units` here
-    // re-parsed every unit on the store once per session.
+    // re-parsed every unit on the store once per session. Sessions are read first, and a store
+    // with none reads no units, as before.
+    let sessions = crate::domain::all_sessions(store)?;
+    if sessions.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut units = crate::domain::units_by_session(store)?;
-    Ok(crate::domain::all_sessions(store)?
+    Ok(sessions
         .into_iter()
         .map(|session| {
             let units = units.remove(&session.id).unwrap_or_default();
@@ -13393,8 +13398,11 @@ mod sessions_detail_fold_tests {
         views.sort_by(|a, b| a.session.id.cmp(&b.session.id));
         assert_eq!(views.len(), 4);
         for v in &views[..3] {
-            let got: Vec<(String, u32)> =
-                v.units.iter().map(|u| (u.session_id.clone(), u.ord)).collect();
+            let got: Vec<(String, u32)> = v
+                .units
+                .iter()
+                .map(|u| (u.session_id.clone(), u.ord))
+                .collect();
             let want: Vec<(String, u32)> = (1..=4).map(|o| (v.session.id.clone(), o)).collect();
             assert_eq!(got, want, "{}", v.session.id);
         }
