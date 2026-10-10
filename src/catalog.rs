@@ -39,6 +39,10 @@ use crate::workflow::{
 /// The garden QE security specialist `security_review` runs (DES-TEAMING-002 Q6, fixed in C1): the
 /// frontmatter name of `skills/qe-security-test-engineer/SKILL.md` in wicked-garden.
 pub const SECURITY_REVIEW_SKILL: &str = "wicked-garden-qe-security-test-engineer";
+/// The skill domain-extraction's coverage judge runs (`domain_coverage`, X-MIG M6): the one skill
+/// under which a self-verifying evaluator's code run is report-writing, not code work
+/// ([`crate::plan`]'s `code_work_step`).
+pub const DOMAIN_COVERAGE_SKILL: &str = "wicked-garden-domain-coverage";
 
 /// The fifteen catalog ids, in the §8.3 table's order (the two walkthrough entries, WT-C1, sit
 /// after `test`).
@@ -528,7 +532,7 @@ fn domain_extraction_preset() -> Vec<PlanStep> {
         PlanStep {
             executes_code: Some(true),
             required_deliverables: Some(vec!["coverage-report.json".to_string()]),
-            skill_ref: Some("wicked-garden-domain-coverage".to_string()),
+            skill_ref: Some(DOMAIN_COVERAGE_SKILL.to_string()),
             validator_pin: Some(Some(COVERAGE_VALIDATOR_PIN.to_string())),
             ..step("domain_coverage", "coverage", Some("extract"))
         },

@@ -485,8 +485,11 @@ impl PlanSteps {
 /// `domain_coverage`, which runs code only to write the report its coverage validator reads).
 /// Counting it inserted a `build` creator into every domain-extraction plan (DES-TEAMING-002 M6).
 /// Any other evaluator raised to `executes_code` (a `test` that writes) still counts: its write
-/// posture is not narrowed. The ONE predicate [`floor_types`] and [`floor_fill`]'s security-review
-/// refusal (core#846) share: a plan with no such step is a NON-CODE plan.
+/// posture is not narrowed. The exemption holds only for the judge as shipped (codex on the M6
+/// rebase, P1): a step that authors its own `instructions`, or runs any skill but the coverage
+/// skill, could write source under the evaluator's write posture, so it counts as code work. The
+/// ONE predicate [`floor_types`] and [`floor_fill`]'s security-review refusal (core#846) share: a
+/// plan with no such step is a NON-CODE plan.
 fn code_work_step(catalog: &[crate::workflow::PhaseDef], step: &PlanStep) -> bool {
     let self_verifying = |e: &crate::workflow::PhaseDef| {
         e.role == crate::workflow::PhaseRole::Evaluator
@@ -494,6 +497,11 @@ fn code_work_step(catalog: &[crate::workflow::PhaseDef], step: &PlanStep) -> boo
             && e.validator_pin
                 .as_deref()
                 .is_some_and(|p| p != crate::builtin_floors::EVIDENCE_FLOOR_PIN)
+            && step.instructions.is_none()
+            && step
+                .skill_ref
+                .as_deref()
+                .is_none_or(|s| s == crate::catalog::DOMAIN_COVERAGE_SKILL)
     };
     catalog
         .iter()
@@ -3367,6 +3375,35 @@ mod tests {
             let f = fill(&writing_test, 30, &AUTO, None).unwrap();
             assert!(f.floor.iter().any(|t| t == "build"), "{:?}", f.floor);
             assert!(f.floor.iter().any(|t| t == "review"), "{:?}", f.floor);
+            // (codex, M6 rebase) The exemption is the judge as shipped: authored instructions or
+            // another skill make the same step code work.
+            for extra in [
+                json!({"instructions": "edit src/lib.rs, then write the report"}),
+                json!({"skill_ref": "wicked-garden-engineering"}),
+            ] {
+                let mut coverage = json!({"catalog": "domain_coverage", "id": "coverage",
+                                          "executes_code": true});
+                for (k, v) in extra.as_object().unwrap() {
+                    coverage[k] = v.clone();
+                }
+                let p = plan(json!({"steps": [{"catalog": "produce", "id": "extract"}, coverage]}));
+                let f = fill(&p, 30, &AUTO, None).unwrap();
+                assert!(
+                    f.floor.iter().any(|t| t == "build"),
+                    "{extra}: {:?}",
+                    f.floor
+                );
+            }
+            let shipped = plan(json!({"steps": [
+                {"catalog": "produce", "id": "extract"},
+                {"catalog": "domain_coverage", "id": "coverage", "executes_code": true,
+                 "skill_ref": crate::catalog::DOMAIN_COVERAGE_SKILL}
+            ]}));
+            assert!(!fill(&shipped, 30, &AUTO, None)
+                .unwrap()
+                .floor
+                .iter()
+                .any(|t| t == "build"));
         }
 
         /// A floor-added step whose natural id is taken gets a distinct one.
