@@ -14112,6 +14112,75 @@ retry the deliver phase";
         assert_parked_on_the_refusal(&store, &run_id, applied, &session, &unit, &evs);
     }
 
+    /// (wicked-crew 0.9.4 release smoke, F-SMOKE-004) A judge seat that refused while a unit's
+    /// judge rotated is benched by the FOLD, on the STORED session (F-7R3-001). The step's own copy
+    /// of the session was read before the fold, and its later writes dropped that bench: the next
+    /// unit's judge rotated onto the benched seat again (five `seatBenched` frames for one seat in
+    /// one run, the bench never on the session). The bench survives the step's session writes.
+    #[test]
+    fn a_judge_bench_written_by_the_fold_survives_the_steps_own_session_writes() {
+        let run_id = format!("judge-bench-survives-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, "lint", false);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let out = StepOutput {
+            run_id: run_id.clone(),
+            unit_ix: 0,
+            attempt: 0,
+            output: "lint clean".into(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        };
+        let evidence = crate::workflow::UnitEvidence {
+            judge_refusals: vec![crate::workflow::JudgeRefusal {
+                seat: "copilot".into(),
+                reason: "quota_exhausted".into(),
+            }],
+            ..Default::default()
+        };
+        apply_step_result(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            out,
+            None,
+            evidence,
+            "",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let evs = drain(&erx);
+        assert!(
+            evs.iter().any(|e| matches!(e,
+                CoreEvent::SeatBenched { cli, source, .. } if cli == "copilot" && source == "judge")),
+            "the fold benched the refusing judge seat: {evs:?}"
+        );
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session
+                .benched_seats
+                .iter()
+                .map(|b| (b.cli.as_str(), b.source.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("copilot", "judge")],
+            "the judge bench is on the stored session after the step, so the next unit's judge \
+             skips the seat"
+        );
+    }
+
     /// `auto_deliver: true` opts out of the deliver GATE (D-5), not of the refusal — the arm parks
     /// the run all the same.
     #[test]
