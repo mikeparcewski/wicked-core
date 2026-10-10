@@ -479,3 +479,34 @@ fn a_qe_dispatch_carrying_a_floor_fix_is_required() {
     assert_eq!(d.status, "required");
     assert!(d.reason.contains("floor fix"), "{d:?}");
 }
+
+/// codex r3: what a hunk's context window cannot see, the whole files can — a member added far
+/// below its group's opener, and an import group made public, are new public symbols.
+#[test]
+fn whole_files_see_what_the_hunk_window_cannot() {
+    let mut repo = Repo::new("surface", 3);
+    let mut base_lib = String::from("pub use inner::{\n    A,\n");
+    for i in 0..10 {
+        base_lib.push_str(&format!("    M{i},\n"));
+    }
+    base_lib.push_str("};\nuse other::{\n    X,\n};\n");
+    std::fs::write(repo.dir.join("src/lib.rs"), &base_lib).unwrap();
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "lib"]);
+    repo.base = repo.git(&["rev-parse", "HEAD"]);
+    // A member appended far below the opener, and the private group made public.
+    let head_lib = base_lib
+        .replace("    M9,\n};", "    M9,\n    Z,\n};")
+        .replace("use other::{", "pub use other::{");
+    let tree = repo.change(&[("src/lib.rs", &head_lib)]);
+    let git_dir = repo.dir.join(".git");
+    let diff = run_diff(&repo.dir, &git_dir, &repo.base, &tree).unwrap();
+    let mut signals = rs::signals_from_diff(&diff);
+    with_whole_files(&mut signals, &repo.dir, &git_dir, &repo.base, &tree);
+    assert!(
+        signals.new_public_symbols.contains("use inner::Z")
+            && signals.new_public_symbols.contains("use other::X"),
+        "{:?}",
+        signals.new_public_symbols
+    );
+}

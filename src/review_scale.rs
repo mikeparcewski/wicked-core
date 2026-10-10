@@ -1404,6 +1404,35 @@ fn dependency_key(m: Manifest, line: &str, section: &mut Option<String>) -> Opti
     }
 }
 
+/// (QE waiver) The public surface of a whole file — every public or exported symbol its lines
+/// declare, multi-line re-export groups resolved — for a file the diff names. Comparing the base
+/// blob's surface with the head blob's sees what a hunk's context window cannot (a group opener
+/// far above the added member, an import group made public).
+pub(crate) fn public_surface(path: &str, content: &str) -> BTreeSet<String> {
+    let ext = path
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.rsplit_once('.'))
+        .map(|(_, e)| e.to_ascii_lowercase());
+    let mut group = None;
+    content
+        .lines()
+        .flat_map(|l| public_decls(ext.as_deref(), l, &mut group))
+        .collect()
+}
+
+/// (QE waiver) The dependencies a whole manifest or lockfile declares (`None` for any other file).
+pub(crate) fn dependency_surface(path: &str, content: &str) -> Option<BTreeSet<String>> {
+    let m = manifest_kind(path)?;
+    let mut section = None;
+    Some(
+        content
+            .lines()
+            .filter_map(|l| dependency_key(m, l, &mut section))
+            .collect(),
+    )
+}
+
 /// A changed line carries a branch token ([`Thresholds::branch_tokens`]): a word token, or an
 /// operator token anywhere in the line.
 fn is_branch_line(line: &str) -> bool {

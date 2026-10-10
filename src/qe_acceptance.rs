@@ -186,7 +186,68 @@ fn decide_with(
     };
     let mut signals = rs::signals_from_diff(&diff);
     with_history(&mut signals, root, git_dir, base);
+    with_whole_files(&mut signals, root, git_dir, base, tree);
     from_assessment(&score(&signals, root, base), ord, tree)
+}
+
+/// At most this many bytes of a blob are read for its whole-file surface; a larger file keeps the
+/// diff's own signal.
+const SURFACE_BYTES_CAP: usize = 1 << 20;
+
+/// (codex r3) Widen the diff's novelty with the touched files' WHOLE contents: the public symbols
+/// and dependencies the head blob declares that the base blob does not. A diff hunk shows a few
+/// context lines, so a member added far below its re-export group's opener (or an import group
+/// made public) is invisible to it; the whole files are not. Unioned with the diff's own sets, so
+/// it only ever raises. A blob that cannot be read, or is too large, keeps the diff's signal.
+pub(crate) fn with_whole_files(
+    signals: &mut ChangeSignals,
+    root: &Path,
+    git_dir: &Path,
+    base: &str,
+    tree: &str,
+) {
+    let blob = |rev: &str, path: &str| -> Option<String> {
+        if path.is_empty() {
+            return Some(String::new());
+        }
+        let out = crate::worktree_guard::git(
+            root,
+            &["cat-file", "-p", &format!("{rev}:{path}")],
+            &[("GIT_DIR", git_dir)],
+        );
+        match out {
+            Ok(b) if b.len() <= SURFACE_BYTES_CAP => Some(String::from_utf8_lossy(&b).into_owned()),
+            Ok(_) => None,
+            // A path absent on a side (a new or deleted file) has an empty surface there.
+            Err(_) => Some(String::new()),
+        }
+    };
+    let touched: Vec<(String, String)> = signals
+        .touched
+        .iter()
+        .take(HISTORY_PATH_CAP)
+        .map(|f| (f.path.clone(), f.old_path.clone()))
+        .collect();
+    for (path, old_path) in touched {
+        let (Some(old), Some(new)) = (blob(base, &old_path), blob(tree, &path)) else {
+            continue;
+        };
+        let (before, after) = (
+            rs::public_surface(&old_path, &old),
+            rs::public_surface(&path, &new),
+        );
+        signals
+            .new_public_symbols
+            .extend(after.difference(&before).cloned());
+        if let (Some(before), Some(after)) = (
+            rs::dependency_surface(&old_path, &old).or_else(|| rs::dependency_surface(&path, "")),
+            rs::dependency_surface(&path, &new),
+        ) {
+            signals
+                .new_dependencies
+                .extend(after.difference(&before).cloned());
+        }
+    }
 }
 
 /// The decision an assessment makes (pure).
