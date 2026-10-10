@@ -11925,9 +11925,13 @@ pub(crate) fn confirm_gate(
             // its own `plan_approval` gate and the run stays paused on it.
             let rev_before = session.team_plan.as_ref().map_or(0, |t| t.accepted_rev);
             if let Err(e) = team_gate::apply_held_revision(store, subscribers, run_id) {
-                // (core#846) As at the advance: a raise that can never be honoured fails the run.
+                // (core#846) As at the advance: a raise that can never be honoured fails the run —
+                // through the terminal transition, since a gate answer's error only reaches its
+                // caller (codex r3): the run must not stay AwaitingHuman with the raise taken.
                 if team_gate::revision_fails_the_run(&e) {
-                    return Err(e);
+                    in_flight.remove(run_id);
+                    fail_run_by_id(store, subscribers, runner, self_tx, run_id, e);
+                    return Ok(SessionStatus::Failed);
                 }
                 emit_run_error(subscribers, run_id, e);
             }
