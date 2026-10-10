@@ -1126,6 +1126,38 @@ mod tests {
         }
     }
 
+    /// FND-EST-02 (wave-5 audit): the steering golden fixture, copied byte-identical into
+    /// wicked-estate (`crates/wicked-estate-retrieve/tests/fixtures/rules-steering-parity.json`),
+    /// where `rules.recall` runs the same cases — steering_type facet, weight order, legacy
+    /// defaults, retirement, effect-bearing exclusion, an out-of-vocabulary query.
+    #[test]
+    fn recall_matches_the_shared_steering_parity_fixture() {
+        let fx: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/rules-steering-parity.json"))
+                .unwrap();
+        assert_eq!(fx["version"].as_u64(), Some(1), "fixture version");
+        let mut store = open_store(Some(":memory:")).unwrap();
+        for r in fx["rules"].as_array().unwrap() {
+            let rule: ConformanceRule = serde_json::from_value(r.clone()).unwrap();
+            register_rule(&mut store, &rule).unwrap();
+        }
+        for case in fx["cases"].as_array().unwrap() {
+            let q: RuleQuery = serde_json::from_value(case["query"].clone()).unwrap();
+            let want: Vec<&str> = case["expect"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert_eq!(
+                ids(&recall_rules(&store, &q).unwrap()),
+                want,
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
     #[test]
     fn to_node_is_native_rule_kind_and_round_trips() {
         let r = rule(
