@@ -4272,10 +4272,16 @@ impl NoCodeLaunchContext {
         // says: no turn-end notify command, no lifecycle hook, and its state database here.
         f.extend(codex_host_write_pins());
         f.push("-c".to_string());
-        f.push(format!(
-            "sqlite_home=\"{}\"",
-            self.check_scratch.join("state").display()
-        ));
+        // A TOML basic string: a Windows path's `\` must be escaped, or codex reads `\U…` as an
+        // escape and refuses its config.
+        let state = self
+            .check_scratch
+            .join("state")
+            .display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        f.push(format!("sqlite_home=\"{state}\""));
         if let Some(notes) = &self.notes_root {
             f.push("--add-dir".to_string());
             f.push(notes.to_string_lossy().into_owned());
@@ -9659,7 +9665,14 @@ mod tests {
         );
         assert!(
             joined.contains("-c notify=[]")
-                && joined.contains("sqlite_home=\"/w/checks/run-1/4-a0/state\"")
+                && joined.contains(&format!(
+                    "sqlite_home=\"{}\"",
+                    PathBuf::from("/w/checks/run-1/4-a0")
+                        .join("state")
+                        .display()
+                        .to_string()
+                        .replace('\\', "\\\\")
+                ))
                 && !joined.contains("evil")
                 && joined.contains("-c features.hooks=false")
                 && !joined.contains("--enable")
