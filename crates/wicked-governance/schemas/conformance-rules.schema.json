@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://wickedagile.com/schemas/conformance-rules/1.2.0",
-  "title": "wicked conformance-rules (v1.2.0)",
+  "$id": "https://wickedagile.com/schemas/conformance-rules/1.3.0",
+  "title": "wicked conformance-rules (v1.3.0)",
   "description": "PRESCRIPTIVE sibling of the descriptive domain-model — the store of architecture/design PATTERN rules and compliance/security POLICY rules that agent outputs are checked AGAINST (garden STEERS, crew GOVERNS, wicked-testing ASSERTS). Where domain-model facts are MINED FROM code (descriptive), conformance rules are AUTHORED/INGESTED and applied TO code (prescriptive). It rides the SAME spine as @wicked/domain-model-schema: every rule carries a numeric `confidence` in [0,1] AND a `provenance{source, ref, source_kinds}` (identical $def to domain-model), and a rule may bind to code via an OPTIONAL estate `symbol_ref` SymbolId REFERENCE — never a copy of the symbol's code/name/file/line (contract invariant #5). TWO rule_types: `pattern` (architecture/design, e.g. 'the repository layer must not import the web layer') and `policy` (compliance/security, e.g. 'no secret literals in source'). `severity` (info|warn|error|critical) advises the downstream enforcer how hard to fail; the store does NOT enforce — enforcement + any conform/violate verdict is a garden/crew/wicked-testing concern, so a rule carries NO coverage field (coverage in the descriptive world means 'every behavior-bearing SymbolId is accounted for'; the prescriptive analogue — does code CONFORM — is an enforcement-time result owned downstream, not a property of the rule). HARD INVARIANTS mirrored from the donor: `metadata.schema_version` is REQUIRED + `const` '1.0.0' — a consumer REJECTS a schema_version it has no validator for (no silent best-effort); `confidence` is a REQUIRED number in [0,1] (a confidence-less or non-numeric-confidence rule is a hard validation failure, not a warning — here confidence measures INGEST FIDELITY: how sure we are this is a real, correctly-transcribed rule from its source, since a doc-only source rests on source_kinds:['doc'] and is trust-eligible only, not proven); `additionalProperties:false` EVERYWHERE. The `id`/`rule_type` coupling (PAT-* => pattern, POL-* => policy) is enforced WRITE-TIME by conformance-store's enforceConformanceInvariants (INV-C1), not by the schema — the bundle's hand-rolled draft-07 validator supports a single if/then per object but no else/allOf, so a bidirectional two-branch coupling lives in the store exactly as domain-store's INV-1/2/3 do. v1.1.0 (STEERING): the standalone governance Policy model MERGED into this rule model — a rule may now carry steering_type (one of seven steering pages), applies_to/excludes phase scoping, an ordering/priority weight, and the optional enforcement half (effect/trigger/obligations/criteria; a rule WITHOUT effect is recall-only exactly as v1.0.0). All new fields are OPTIONAL with defaulted read-back (steering_type=architecture, weight=1.0), so every 1.0.0 document remains valid; the id pattern is relaxed because migrated policies keep their original (non PAT-/POL-) ids — the PAT-/POL- shape stays enforced write-time (INV-C1) within that reserved namespace.",
   "type": "object",
   "required": [
@@ -32,14 +32,15 @@
         },
         "source_kinds": {
           "type": "array",
-          "description": "The grounding tier: code-body = executable logic read directly; type-def = type/schema/interface declaration; comment = inline prose; doc = README/wiki/external. TRUST RULE (shared with domain-model): a rule is 'trusted' only when grounded in code-body and/or type-def; resting on comment/doc alone makes it trust-eligible, not proven.",
+          "description": "The grounding tier: code-body = executable logic read directly; type-def = type/schema/interface declaration; comment = inline prose; doc = README/wiki/external; operator-words = a rule the operator stated in their own words (rules only — the domain-model spine has no such kind). TRUST RULE (shared with domain-model): a rule is 'trusted' only when grounded in code-body and/or type-def; resting on comment/doc alone makes it trust-eligible, not proven.",
           "items": {
             "type": "string",
             "enum": [
               "code-body",
               "type-def",
               "comment",
-              "doc"
+              "doc",
+              "operator-words"
             ]
           }
         }
@@ -244,9 +245,10 @@
           "enum": [
             "1.0.0",
             "1.1.0",
-            "1.2.0"
+            "1.2.0",
+            "1.3.0"
           ],
-          "description": "The conformance-rules schema contract version. Every emitted document MUST carry this; a consumer REJECTS a schema_version it has no validator for (no silent best-effort). 1.1.0 adds the OPTIONAL steering fields; 1.2.0 adds the OPTIONAL project-rule fields (targets.project, supersedes — DES-decision-capture DC-S1); 1.0.0 and 1.1.0 documents validate unchanged. Independent of the @wicked/domain-model-schema bundle semver (VERSION file)."
+          "description": "The conformance-rules schema contract version. Every emitted document MUST carry this; a consumer REJECTS a schema_version it has no validator for (no silent best-effort). 1.1.0 adds the OPTIONAL steering fields; 1.3.0 adds the `operator-words` source kind (a rule the operator stated in their own words, core#827); 1.2.0 adds the OPTIONAL project-rule fields (targets.project, supersedes — DES-decision-capture DC-S1); 1.0.0 and 1.1.0 documents validate unchanged. Independent of the @wicked/domain-model-schema bundle semver (VERSION file)."
         },
         "source": {
           "type": "string",
