@@ -719,7 +719,8 @@ pub(crate) fn check_deliver_step(step: &PlanStep) -> Result<(), String> {
 /// request must exist when the consent card asks, so `deliver` goes before the consent chain. The
 /// anchor is the consent step's dry run (its dependency, when that is a `run` step, which is where
 /// the consent offer reads its plan, core#820), else the consent step itself. `deliver` takes the
-/// anchor's `depends_on`, the anchor depends on `deliver`, and `deliver` sits right before it.
+/// anchor's `depends_on`, the anchor keeps its own and adds `deliver`, and `deliver` sits right
+/// before it.
 fn with_deliver(plan: &PlanSteps, deliver: Option<&PlanStep>) -> Result<PlanSteps, String> {
     let mut out = plan.clone();
     if let Some(d) = deliver {
@@ -732,9 +733,14 @@ fn with_deliver(plan: &PlanSteps, deliver: Option<&PlanStep>) -> Result<PlanStep
         }
         match consent_anchor(&out.steps) {
             Some(at) => {
+                // The anchor KEEPS its own dependencies and adds `deliver` (codex r3 on #866): the
+                // consent offer reads the consent step's direct dependencies for its dry run.
                 let mut step = d.clone();
-                step.depends_on = Some(out.steps[at].depends_on.clone().unwrap_or_default());
-                out.steps[at].depends_on = Some(vec![step.id.clone()]);
+                let own = out.steps[at].depends_on.clone().unwrap_or_default();
+                step.depends_on = Some(own.clone());
+                let mut deps = own;
+                deps.push(step.id.clone());
+                out.steps[at].depends_on = Some(deps);
                 out.steps.insert(at, step);
             }
             None => out.steps.push(d.clone()),
@@ -1684,7 +1690,10 @@ mod tests {
                 .clone()
         };
         assert_eq!(deps("deliver"), Some(vec!["review".to_string()]));
-        assert_eq!(deps("install-plan"), Some(vec!["deliver".to_string()]));
+        assert_eq!(
+            deps("install-plan"),
+            Some(vec!["review".to_string(), "deliver".to_string()])
+        );
         assert_eq!(deps("install"), Some(vec!["install-plan".to_string()]));
     }
 
@@ -1699,6 +1708,12 @@ mod tests {
         let out = with_deliver(&plan, Some(&deliver_step_for_test())).unwrap();
         let ids: Vec<_> = out.steps.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["review", "deliver", "install"]);
+        // The consent step keeps its own dependencies (its dry-run read) and adds deliver.
+        let install = out.steps.iter().find(|s| s.id == "install").unwrap();
+        assert_eq!(
+            install.depends_on,
+            Some(vec!["review".to_string(), "deliver".to_string()])
+        );
         let plain = PlanSteps {
             steps: vec![
                 ws("build", "build", &[]),
