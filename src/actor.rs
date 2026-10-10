@@ -11372,6 +11372,8 @@ fn replan_for_accepted_edit(
         Vec::new(),
         None,
         session.assurance.reduced(),
+        // A re-plan keeps the run's contract (carried forward from the stub), decision included.
+        &crate::assurance::QeOverride::Auto,
     )?;
     let distributions = crate::distribute::distribute_units_on_benched(
         &pre.units,

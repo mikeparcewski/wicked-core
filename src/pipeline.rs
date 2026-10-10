@@ -74,6 +74,7 @@ pub fn run_session(
         Vec::new(),
         None,
         false,
+        &crate::assurance::QeOverride::Auto,
     )?;
 
     // ── EXECUTE — per unit: produce output (stub, inline here), then gate it. ──
@@ -3063,6 +3064,7 @@ mod resolve_tests {
             Vec::new(),
             None,
             false,
+            &crate::assurance::QeOverride::Auto,
         )
         .expect("a shipped def must never bail on its own built-in floor");
 
@@ -3191,6 +3193,7 @@ mod resolve_tests {
             Vec::new(),
             None,
             false,
+            &crate::assurance::QeOverride::Auto,
         )
         .expect("a shipped drop-in must never require an out-of-band seed to plan");
 
@@ -3589,6 +3592,7 @@ mod resolve_tests {
             Vec::new(),
             None,
             false,
+            &crate::assurance::QeOverride::Auto,
         )
         .expect("plans");
         assert!(!planned.units.is_empty());
@@ -3789,6 +3793,7 @@ mod judge_bench_tests {
             Vec::new(),
             None,
             reduced,
+            &crate::assurance::QeOverride::Auto,
         )
         .expect("plan");
         let evidence = crate::workflow::UnitEvidence {
@@ -3915,6 +3920,7 @@ mod judge_bench_tests {
             Vec::new(),
             None,
             false,
+            &crate::assurance::QeOverride::Auto,
         )
         .expect("plan");
         let evidence = crate::workflow::UnitEvidence {
