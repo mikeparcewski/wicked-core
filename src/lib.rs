@@ -2010,6 +2010,8 @@ mod tests {
         // Same driver, same prose, but `Some("feature")` — the units now come from the feature def's
         // phases (ids + declared stage), NOT the sentence-splitter. This is the proof the slice-1
         // adversarial review's critical finding demanded: a runtime consumer of the registry.
+        // (X-MIG M11) `feature` resolves as the built-in preset, which a boot seeds into the store.
+        crate::preset::seed_builtins(&mut store, 0).expect("seed the built-in presets");
         let feature = crate::feature_def();
         let mut ev2: Vec<CoreEvent> = Vec::new();
         crate::pipeline::run_session(

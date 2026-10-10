@@ -2601,14 +2601,18 @@ mod resolve_tests {
         assert!(resolve_workflow_def(&empty(), None, None, None)
             .unwrap()
             .is_none());
-        // A known built-in resolves to its def.
+        // A built-in resolves as its preset once a boot has seeded it (X-MIG M11: no built-in def).
+        let mut seeded = empty();
+        crate::preset::seed_builtins(&mut seeded, 0).expect("seed the built-in presets");
         assert_eq!(
-            resolve_workflow_def(&empty(), None, Some("feature"), None)
+            resolve_workflow_def(&seeded, None, Some("feature"), None)
                 .unwrap()
                 .unwrap()
                 .id,
             "feature"
         );
+        // An unseeded store with no registry knows no `feature`.
+        assert!(resolve_workflow_def(&empty(), None, Some("feature"), None).is_err());
         // A requested-but-unknown id is a LOUD error (never a silent fall-through to prose planning).
         let err = resolve_workflow_def(&empty(), None, Some("feaure-typo-xyz"), None)
             .unwrap_err()
