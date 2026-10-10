@@ -155,13 +155,14 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 /// after the workflow it replaces, so a launch naming that id keeps launching; its steps are the
 /// consumer's §11.2 mapping (`tests/fixtures/catalog/mappings.json`, pinned by a test).
 ///
-/// Seeded here: `feature` (C2's acceptance), `chat` (M3), `onboarding` (M4), `migration` (M2),
+/// Seeded here: `feature` (C2's acceptance), `bug` (M1), `chat` (M3), `onboarding` (M4), `migration` (M2),
 /// `capture-learnings` (M7), `steering-author` (M8), `domain-extraction` (M6), `interactive-chat`,
 /// `interactive-draft` and `interactive-edit` (M9), `qe-author-tests` (M10) and `demo` (M9b,
 /// which replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping them). Every other consumer's preset is added by its migration seam (§14 M1–M10),
 /// which also deletes the def it replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
     vec![
+        ("bug", bug_preset()),
         ("capture-learnings", capture_learnings_preset()),
         ("chat", chat_preset()),
         ("demo", demo_preset()),
@@ -197,10 +198,10 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
 
 /// (QE acceptance, operator ruling 2026-10-10) The instruments a run of a BUILT-IN preset
 /// requires, as a workflow's `required_instruments` declares them: the presets that make
-/// application changes (`feature`, `migration`) require `qe_acceptance` on top of the defaults.
-/// `None` ⇒ the defaults. Code data beside [`builtin_presets`], so a re-seed never drops it.
+/// application changes (`feature`, `bug`, `migration`) require `qe_acceptance` on top of the
+/// defaults. `None` ⇒ the defaults. Code data beside [`builtin_presets`], so a re-seed never drops it.
 pub(crate) fn builtin_preset_instruments(name: &str) -> Option<Vec<String>> {
-    matches!(name, "feature" | "migration").then(|| {
+    matches!(name, "feature" | "bug" | "migration").then(|| {
         [
             crate::assurance::DISTINCT_EVALUATOR,
             crate::assurance::JUDGE,
@@ -413,6 +414,29 @@ fn feature_preset() -> Vec<PlanStep> {
         },
         step("test", "test", Some("build")),
         step("critique", "review", Some("test")),
+    ]
+}
+
+/// `bug` (M1, §11.2): triage → `understand`; reproduce → `test_plan`; fix → `build` with the
+/// retired-behaviour sweep instructions kept (DES-L9, BC-60); verify → `test`. The entries carry the
+/// rest of the def: fix's evidence-floor pin, creator role and `executes_code`; verify's
+/// `human_confirm_if` gate, pin, evaluator role and re-verified evidence. §11.3: floor fill adds
+/// `review` at band ≥ 20 (the def had none), and the PA's `pa-scope` runs first.
+fn bug_preset() -> Vec<PlanStep> {
+    let step = |catalog: &str, id: &str, after: Option<&str>| PlanStep {
+        catalog: catalog.to_string(),
+        id: id.to_string(),
+        depends_on: after.map(|a| vec![a.to_string()]),
+        ..PlanStep::default()
+    };
+    vec![
+        step("understand", "triage", None),
+        step("test_plan", "reproduce", Some("triage")),
+        PlanStep {
+            instructions: Some(crate::workflow::BUG_FIX_SWEEP_INSTRUCTIONS.to_string()),
+            ..step("build", "fix", Some("reproduce"))
+        },
+        step("test", "verify", Some("fix")),
     ]
 }
 
