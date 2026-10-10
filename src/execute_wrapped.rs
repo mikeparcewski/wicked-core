@@ -9188,6 +9188,8 @@ mod tests {
                 "bug/verify",
                 "demo/review",
                 "domain-extraction/coverage",
+                "editor-plugin/security-review",
+                "editor-plugin/test",
                 "feature/adversarial-review",
                 "feature/review",
                 "feature/test",
