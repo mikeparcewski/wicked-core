@@ -2264,7 +2264,8 @@ fn unwrap_program<'a>(words: &[&'a str]) -> Unwrapped<'a> {
 ///   `blast-radius`, `rank`/`hotspots`, `stats`, `source`, `semantic`, `cross-graph`, `subscribe`,
 ///   `lineage`, `traverse`, `rules-inventory`, `rules-recall`),
 ///   `clusters` WITHOUT `--annotate` and `supports owners|edge` are ALLOWED; the write subcommands
-///   (`index`, `scip`, `tfstate`, `import-telemetry`, `compact`, `watch`, `clusters --annotate`,
+///   (`index`, `scip`, `tfstate`, `import-telemetry`, `compact`, `watch`, `evidence`,
+///   `clusters --annotate`,
 ///   `supports retract`) and any
 ///   unrecognised subcommand are DENIED (fail-closed: a future read verb must be added here).
 /// * **`wicked-estate-mcp`** and the **estate shim** — ALLOWED only when the segment carries
@@ -2548,13 +2549,17 @@ pub const ESTATE_READ_VERBS: [&str; 13] = [
 ];
 /// The `wicked-estate` subcommands that WRITE the graph — named so the reason can say "write
 /// subcommand" rather than "unknown"; anything else unrecognised is denied fail-closed anyway.
-const ESTATE_WRITE_VERBS: [&str; 6] = [
+///
+/// `evidence` (estate 0.24.0) INGESTS a `SemanticEvidence` envelope — its facts replace the
+/// producer's support-plane edges (`replace_edge_supports`) — so it is a write, not a read verb.
+const ESTATE_WRITE_VERBS: [&str; 7] = [
     "index",
     "scip",
     "tfstate",
     "import-telemetry",
     "compact",
     "watch",
+    "evidence",
 ];
 /// Basenames of wicked-garden scripts that ARE the estate stdio shim or spawn it from outside
 /// [`ESTATE_SHIM_DIR`] (DES-GROUNDING-001 §7.3).
@@ -8671,6 +8676,11 @@ mod boundary_tests {
             ),
             (
                 format!("wicked-estate compact --db {shared}"),
+                ESTATE_WHY_WRITE_VERB,
+            ),
+            // estate 0.24.0: `evidence <envelope.json>` ingests support-plane facts — a write.
+            (
+                format!("wicked-estate evidence envelope.json --db {shared}"),
                 ESTATE_WHY_WRITE_VERB,
             ),
             (
