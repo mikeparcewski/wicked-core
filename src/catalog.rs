@@ -151,15 +151,16 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 /// after the workflow it replaces, so a launch naming that id keeps launching; its steps are the
 /// consumer's §11.2 mapping (`tests/fixtures/catalog/mappings.json`, pinned by a test).
 ///
-/// Seeded here: `feature` (C2's acceptance), `chat` (M3), `onboarding` (M4) and `demo` (M9b, which
-/// replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping them). Every other
-/// consumer's preset is added by its migration seam (§14 M1–M10), which also deletes the def it
-/// replaces.
+/// Seeded here: `feature` (C2's acceptance), `chat` (M3), `onboarding` (M4), `migration` (M2) and
+/// `demo` (M9b, which replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping
+/// them). Every other consumer's preset is added by its migration seam (§14 M1–M10), which also
+/// deletes the def it replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
     vec![
         ("chat", chat_preset()),
         ("demo", demo_preset()),
         ("feature", feature_preset()),
+        ("migration", migration_preset()),
         ("onboarding", onboarding_preset()),
     ]
 }
@@ -365,6 +366,40 @@ fn feature_preset() -> Vec<PlanStep> {
         },
         step("test", "test", Some("build")),
         step("critique", "review", Some("test")),
+    ]
+}
+
+/// `migration` (M2): §11.2's row. plan → `design` (gate raised to `human_confirm`); execute →
+/// `build`; cutover → `build` with its UNCONDITIONAL human gate (the one gate the engagement dial
+/// can never downgrade); verify → `test`; cleanup → `build` with no gate type. The bold cells are
+/// the catalog's: cutover and cleanup gain the evidence-floor pin and the creator role, and cleanup
+/// gains `executes_code` (decision 2026-09-24: it removes the old path, so it is code work).
+fn migration_preset() -> Vec<PlanStep> {
+    let step = |catalog: &str, id: &str, after: Option<&str>| PlanStep {
+        catalog: catalog.to_string(),
+        id: id.to_string(),
+        depends_on: after.map(|a| vec![a.to_string()]),
+        ..PlanStep::default()
+    };
+    vec![
+        PlanStep {
+            gate: Some(GateSpec::HumanConfirm {
+                unconditional: false,
+            }),
+            ..step("design", "plan", None)
+        },
+        step("build", "execute", Some("plan")),
+        PlanStep {
+            gate: Some(GateSpec::HumanConfirm {
+                unconditional: true,
+            }),
+            ..step("build", "cutover", Some("execute"))
+        },
+        step("test", "verify", Some("cutover")),
+        PlanStep {
+            gate_type: Some(None),
+            ..step("build", "cleanup", Some("verify"))
+        },
     ]
 }
 

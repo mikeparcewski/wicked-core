@@ -1541,6 +1541,10 @@ pub fn bug_def() -> WorkflowDef {
 
 /// `migration` — plan(strategy) → execute(execution) → cutover(UNCONDITIONAL human) → verify → cleanup(advisory).
 /// `cutover` is the one gate the engagement dial can never downgrade.
+///
+/// Shadowed (DES-TEAMING-002 M2): a launch naming `migration` resolves the built-in PRESET first
+/// (`crate::catalog::builtin_presets`), exactly as `feature` does since C2. This def stays registered
+/// as the same-name fallback until M11 removes `with_defaults` and the shipped JSON copies.
 pub fn migration_def() -> WorkflowDef {
     WorkflowDef {
         base_skill_ref: None,

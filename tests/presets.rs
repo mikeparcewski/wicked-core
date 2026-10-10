@@ -609,7 +609,10 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
     let maps: serde_json::Value = serde_json::from_str(&raw).unwrap();
     let builtins = wicked_core::builtin_presets();
     let names: Vec<&str> = builtins.iter().map(|(n, _)| *n).collect();
-    assert_eq!(names, ["chat", "demo", "feature", "onboarding"]);
+    assert_eq!(
+        names,
+        ["chat", "demo", "feature", "migration", "onboarding"]
+    );
     // `demo` (M9b) replaces interactive-demo with the garden demo skill's flow instead of mapping
     // its phases, so it has no §11.2 row; `m9b_demo_*` pins its steps.
     for (name, steps) in builtins.into_iter().filter(|(n, _)| *n != "demo") {
@@ -677,6 +680,75 @@ fn m3_chat_launches_its_c1_unit_list_with_no_scope_step() {
         plan.max_score, 0,
         "a plan with no creator step scores 0 at launch"
     );
+}
+
+/// M2 (DES-TEAMING-002 §14): a launch naming `migration` runs the built-in preset, not the
+/// shadowed def. §11.2's bold cells reach the units: cutover and cleanup are creators carrying the
+/// evidence floor, and cleanup now executes code. cutover keeps its UNCONDITIONAL human gate. As a
+/// creator plan with no declared `touch`, the PA scopes it first (`pa-scope`, ord 1, X1), and this
+/// rig's PA declares nothing, so the plan fails closed at 100 and floor fill adds the 70-100 phases
+/// migration lacks (`test_plan`, `architecture`, `review`, `security_review`) at their catalog-order
+/// positions.
+#[test]
+fn m2_migration_launches_the_preset_with_its_bold_cells() {
+    let dir = tmp_dir("migration");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let rig = spawn(&db);
+    let preset = rig
+        .core
+        .list_presets(None)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.name == "migration")
+        .expect("the built-in migration preset is listed");
+    assert_eq!(
+        (preset.scope.as_str(), preset.created_by.as_str()),
+        ("global", "builtin")
+    );
+
+    rig.core
+        .launch_run(spec("rmig", "migration", None))
+        .unwrap();
+    let units = units_of(&rig.core, "rmig");
+    let hc = r#"{"human_confirm":{"unconditional":false}}"#;
+    let hcu = r#"{"human_confirm":{"unconditional":true}}"#;
+    let hci = r#"{"human_confirm_if":"verdict_not_pass"}"#;
+    let f = Some(EVIDENCE_FLOOR_PIN);
+    assert_eq!(
+        rows("rmig", &units),
+        vec![
+            r("pa-scope", "recon", "neutral", "auto", None),
+            r("test_plan", "test", "neutral", "auto", None),
+            r("plan", "recon", "neutral", hc, None),
+            r("architecture", "recon", "neutral", "auto", None),
+            r("execute", "build", "creator", "auto", f),
+            r("cutover", "build", "creator", hcu, f),
+            r("verify", "test", "evaluator", hci, f),
+            r("cleanup", "build", "creator", "auto", f),
+            r("review", "review", "evaluator", "auto", f),
+            r("security_review", "review", "evaluator", "auto", f),
+        ]
+    );
+    let cleanup = units
+        .iter()
+        .find(|u| u.id == "rmig:cleanup")
+        .expect("cleanup is planned");
+    assert!(
+        cleanup.executes_code,
+        "cleanup removes the old path: code work"
+    );
+    let view = rig
+        .core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.session.id == "rmig")
+        .unwrap();
+    let plan = view
+        .session
+        .team_plan
+        .expect("a preset launch is a team plan");
+    assert_eq!(plan.preset.as_deref(), Some("migration"));
 }
 
 /// M9b (studio#373): a launch naming `demo` runs the built-in preset — the wicked-garden demo

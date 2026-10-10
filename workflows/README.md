@@ -24,7 +24,10 @@ registry.load_dir("~/.wicked/workflows")?;            // overlay: your drop-in f
   identical). Copy one as a starting point.
 - `chat` and `onboarding` are no longer workflows: they are **built-in presets**
   (`src/catalog.rs` `builtin_presets`, DES-TEAMING-002 M3/M4), launched by the
-  same name. `survey-repo`, `memories`, `domain-graph-slice` and `collab` were
+  same name.
+- `feature` (C2) and `migration` (M2) are **built-in presets too**. A launch resolves
+  a preset before any registered def, so their seeded defs and the JSON copies here are
+  shadowed fallbacks until M11 removes them. `survey-repo`, `memories`, `domain-graph-slice` and `collab` were
   deleted (no launcher used them).
 - `domain-extraction.json` is a **shipped drop-in** (not a seeded built-in): it is
   registered only via `load_dir`, and demonstrates a *gated* workflow — its

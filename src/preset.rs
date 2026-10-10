@@ -385,7 +385,7 @@ mod tests {
         let mut store = mem_store();
         assert_eq!(
             seed_builtins(&mut store, 10).unwrap(),
-            ["chat", "demo", "feature", "onboarding"]
+            ["chat", "demo", "feature", "migration", "onboarding"]
         );
         assert!(seed_builtins(&mut store, 20).unwrap().is_empty());
         let f = resolve(&store, None, "feature").unwrap().unwrap();
@@ -406,7 +406,7 @@ mod tests {
         crate::domain::put_node(&mut store, stale.to_node()).unwrap();
         assert_eq!(
             seed_builtins(&mut store, 5).unwrap(),
-            ["chat", "demo", "feature", "onboarding"]
+            ["chat", "demo", "feature", "migration", "onboarding"]
         );
         let f = resolve(&store, None, "feature").unwrap().unwrap();
         assert_eq!(f.steps.len(), 6);
@@ -428,7 +428,7 @@ mod tests {
         crate::domain::put_node(&mut store, saved.to_node()).unwrap();
         assert_eq!(
             seed_builtins(&mut store, 5).unwrap(),
-            ["demo", "feature", "onboarding"]
+            ["demo", "feature", "migration", "onboarding"]
         );
         assert_eq!(resolve(&store, None, "chat").unwrap(), Some(saved.clone()));
         assert!(
@@ -548,6 +548,7 @@ mod tests {
                 ("chat".to_string(), GLOBAL_SCOPE.to_string()),
                 ("demo".to_string(), GLOBAL_SCOPE.to_string()),
                 ("feature".to_string(), format!("project:{pid}")),
+                ("migration".to_string(), GLOBAL_SCOPE.to_string()),
                 ("onboarding".to_string(), GLOBAL_SCOPE.to_string()),
             ]
         );
