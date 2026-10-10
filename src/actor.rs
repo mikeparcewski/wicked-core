@@ -1257,6 +1257,7 @@ pub(crate) fn run(
                     primary,
                     reduced_assurance,
                     deliverables,
+                    qe_acceptance,
                 } = spec;
                 // (DES-TEAMING-002 T3) A plan — user-composed, or a preset's steps — must reach
                 // its approval gate; this straight-through path honours no gate, so it refuses one
@@ -1290,6 +1291,13 @@ pub(crate) fn run(
                         "a reduced-assurance launch must use launch_run: the straight-through \
                          path does not record the run's assurance contract"
                     )),
+                    // (QE acceptance) …and so is an explicit QE skip or force.
+                    Ok(None) if qe_acceptance != crate::assurance::QeOverride::Auto => {
+                        Err(anyhow::anyhow!(
+                            "a launch that skips or forces QE acceptance must use launch_run: the \
+                             straight-through path does not record the run's assurance contract"
+                        ))
+                    }
                     Ok(None) if deliver_step.is_none() => Ok(()),
                     Ok(_) => Err(anyhow::anyhow!(
                         "a plan or preset launch must use launch_run: its plan_approval gate \
@@ -1463,12 +1471,24 @@ pub(crate) fn run(
                     // below read the plan as it will run: its steps plus the deliver step, composed
                     // once here (never the preset's bare def, which lacks the deliver step).
                     let selected_def = match &launch_plan {
-                        Some((plan, _)) => Some(crate::plan_gate::authored_def(
-                            &run_id,
-                            plan,
-                            spec.deliver_step.as_ref(),
-                            spec.repo_ref.is_none(),
-                        )?),
+                        Some((plan, preset)) => {
+                            let mut def = crate::plan_gate::authored_def(
+                                &run_id,
+                                plan,
+                                spec.deliver_step.as_ref(),
+                                spec.repo_ref.is_none(),
+                            )?;
+                            // (QE acceptance) A built-in preset that makes application changes
+                            // requires QE acceptance, as its workflow twin declares.
+                            if let Some(name) = preset {
+                                def.required_instruments = crate::preset::required_instruments(
+                                    &store,
+                                    spec.project_id.as_deref(),
+                                    name,
+                                )?;
+                            }
+                            Some(def)
+                        }
                         None => pipeline::resolve_workflow_def(
                             &store,
                             spec.project_id.as_deref(),
@@ -1596,7 +1616,11 @@ pub(crate) fn run(
                                 .as_ref()
                                 .and_then(|d| d.required_instruments.as_deref()),
                             spec.reduced_assurance,
-                        ),
+                        )
+                        // (QE acceptance) The operator's explicit skip or force, refused before
+                        // anything persists when it is malformed or has nothing to apply to.
+                        .with_qe_override(&spec.qe_acceptance)
+                        .map_err(|e| anyhow::anyhow!("the launch is refused: {e}"))?,
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
                     // — a crash between "run exists" and "run is in the project" cannot happen.
@@ -1725,6 +1749,7 @@ pub(crate) fn run(
                     Vec::new(),
                     None,
                     spec.reduced_assurance,
+                    &spec.qe_acceptance,
                 ) {
                     Err(e) => {
                         in_flight.remove(&run_id);
@@ -1946,6 +1971,7 @@ pub(crate) fn run(
                         Vec::new(),
                         None,
                         spec.reduced_assurance,
+                        &spec.qe_acceptance,
                     )
                 }) {
                     Err(e) => {
@@ -4070,6 +4096,15 @@ fn team_plan_at_launch(
         deliverables: spec.deliverables.clone(),
         ..Default::default()
     };
+    // (QE acceptance) A built-in preset that makes application changes requires QE acceptance:
+    // the per-run def carries its declaration, so every path that reads the def's contract (the
+    // campaign launch builds the session from it) sees the same requirement.
+    let instruments = match preset.as_deref() {
+        Some(name) => {
+            crate::preset::required_instruments(&*store, spec.project_id.as_deref(), name)?
+        }
+        None => None,
+    };
     // (X1) A plan with a creator step and no declared touch set is scored by the PA: rev 1 is its
     // read-only scope step alone, and the launch plan is decided at that step's boundary
     // (`team_gate::apply_scope`), before any creator step dispatches.
@@ -4083,6 +4118,12 @@ fn team_plan_at_launch(
             prior,
             &spec.human_confirm,
         )?;
+        // (QE acceptance, codex r1) The scope rev's def carries the preset's declaration too: the
+        // campaign launch builds the run's contract from this def.
+        let def = crate::workflow::WorkflowDef {
+            required_instruments: instruments,
+            ..def
+        };
         return register_launch_plan(store, registry, spec, state, def, persist).map(Some);
     }
     let scored = crate::plan_gate::intent_score_for_run(&plan, repo_root, base_commit);
@@ -4119,6 +4160,10 @@ fn team_plan_at_launch(
         }
         crate::plan_gate::Verdict::Accepted { def, .. }
         | crate::plan_gate::Verdict::Held { def, .. } => def,
+    };
+    let def = crate::workflow::WorkflowDef {
+        required_instruments: instruments,
+        ..def
     };
     register_launch_plan(store, registry, spec, decided.state, def, persist).map(Some)
 }
@@ -4289,6 +4334,7 @@ pub(crate) fn launch_run_inner(
         crate::domain::normalize_exclude_seats(&spec.exclude_seats),
         spec.evidence_root.clone(),
         spec.reduced_assurance,
+        &spec.qe_acceptance,
     )?;
     if let Some((state, _, _)) = team {
         let mut s = crate::domain::get_session(store, &run_id)?
@@ -8997,6 +9043,44 @@ fn dispatch_unit(
             }
         }
     }
+    // (QE acceptance) The run's binding QE decision: scored from the run's diff when its QE unit
+    // dispatches (on the tree the unit starts on), revoked when a creator dispatches after a
+    // waiver. Persisted on the session BEFORE the unit runs, published, and stamped on the QE unit
+    // so its prompt says whether to run the acceptance pipeline.
+    {
+        let repo_root = session
+            .repo_ref
+            .as_deref()
+            .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
+            .map(|r| std::path::PathBuf::from(r.root_path));
+        let baseline = unit.worktree_baseline.as_ref().and_then(|b| {
+            b.git_dir
+                .as_deref()
+                .map(|g| (b.tree.as_str(), std::path::Path::new(g)))
+        });
+        let decided =
+            crate::qe_acceptance::on_dispatch(&session, &unit, repo_root.as_deref(), baseline);
+        let mut qe = session.assurance.qe.clone();
+        if let crate::qe_acceptance::Dispatched::Decided(d) = decided {
+            let mut fresh = session.clone();
+            fresh.assurance.qe = Some(d.clone());
+            put_node(store, fresh.to_node())?;
+            emit(
+                subscribers,
+                CoreEvent::QeAcceptanceDecided {
+                    session: run_id.to_string(),
+                    ord: unit.ord,
+                    qe: Box::new(d.clone()),
+                },
+            );
+            qe = Some(d);
+        }
+        let stamp = qe.filter(|_| crate::qe_acceptance::is_qe_unit(&unit));
+        if unit.qe_acceptance != stamp {
+            unit.qe_acceptance = stamp;
+            put_node(store, unit.to_node())?;
+        }
+    }
     let unit = &unit;
     // (DES-STUDIO-COCKPIT-001 §3 B2) UnitDispatched — the durable-rework signal. `dispatch_unit` is the
     // SINGLE funnel every dispatch site reaches (initial advance, `confirm_gate` Approve re-dispatch,
@@ -11294,6 +11378,8 @@ fn replan_for_accepted_edit(
         Vec::new(),
         None,
         session.assurance.reduced(),
+        // A re-plan keeps the run's contract (carried forward from the stub), decision included.
+        &crate::assurance::QeOverride::Auto,
     )?;
     let distributions = crate::distribute::distribute_units_on_benched(
         &pre.units,

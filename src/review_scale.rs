@@ -61,6 +61,23 @@ pub(crate) struct ChangeSignals {
     pub destructive: bool,
     /// The non-docs files, in diff order.
     pub touched: Vec<TouchedFile>,
+    /// (QE waiver, complexity) Changed (`+`/`-`) lines of code and test files that carry a branch
+    /// token ([`Thresholds::branch_tokens`]): the diff's own measure of how much control flow it
+    /// touched. Estate exposes no per-symbol complexity metric, so this is read from the hunks.
+    pub branch_lines: u32,
+    /// (QE waiver, complexity) Changed (`+`/`-`) lines of the non-docs files.
+    pub behavioural_lines: u32,
+    /// (QE waiver, novelty) Dependencies the diff ADDS: a key added to a dependency section of a
+    /// manifest, or a package entry added to a lockfile, that the same file does not also remove
+    /// (a version bump removes and re-adds its key, so it is not new).
+    pub new_dependencies: BTreeSet<String>,
+    /// (QE waiver, novelty) Public or exported symbols the diff DECLARES that it does not also
+    /// remove (a signature edit re-declares its name, so it is not new).
+    pub new_public_symbols: BTreeSet<String>,
+    /// (QE waiver, novelty) Touched pre-existing paths with little history before the run base:
+    /// fewer than [`Thresholds::low_history_commits`] commits, or a history git could not read.
+    /// Filled by [`with_history`], which needs the repository; a pure diff read leaves it 0.
+    pub low_history: u32,
 }
 
 impl ChangeSignals {
@@ -122,6 +139,16 @@ pub(crate) struct ImpactSignals {
     /// A traversal's hop horizon left dependents beyond [`Thresholds::hops`] uncounted
     /// (estate's `Subgraph::depth_horizon_reached`). `dependents` is exact within the horizon.
     pub depth_horizon_reached: bool,
+    /// (complexity) Changed `+`/`-` lines of the non-docs files.
+    pub lines_changed: u32,
+    /// (complexity) [`ChangeSignals::branch_lines`].
+    pub branch_lines: u32,
+    /// (novelty) [`ChangeSignals::new_dependencies`], counted.
+    pub new_dependencies: u32,
+    /// (novelty) [`ChangeSignals::new_public_symbols`], counted.
+    pub new_public_symbols: u32,
+    /// (novelty) [`ChangeSignals::low_history`].
+    pub low_history: u32,
 }
 
 impl ImpactSignals {
@@ -246,6 +273,36 @@ pub(crate) struct Thresholds {
     pub contract_symbol_markers: &'static [&'static str],
     /// A symbol whose name starts with one of these is a test, wherever it lives.
     pub test_name_prefixes: &'static [&'static str],
+    /// (complexity) `(min changed lines, points)`, ascending; the first tier is the lowest band.
+    pub complexity_line_tiers: &'static [(u32, u32)],
+    /// (complexity) `(min branch lines, points)`, ascending.
+    pub complexity_branch_tiers: &'static [(u32, u32)],
+    /// (complexity) `(min changed symbols, points)`, ascending.
+    pub complexity_symbol_tiers: &'static [(u32, u32)],
+    /// The most the complexity terms add together.
+    pub complexity_max: u32,
+    /// Lowercase tokens that mark a changed line as control flow (matched on word boundaries).
+    pub branch_tokens: &'static [&'static str],
+    /// (novelty) Points per new or unindexed file, and the most such steps that count. `unindexed`
+    /// used to earn nothing here (core#711 keeps it out of the TEST GAP, which is unchanged); a
+    /// file the base graph has never seen is new code with no history, so it earns novelty.
+    pub novelty_file_step: u32,
+    pub novelty_file_max_steps: u32,
+    /// (novelty) Any new dependency.
+    pub novelty_dependency_points: u32,
+    /// (novelty) Any new public or exported symbol.
+    pub novelty_public_symbol_points: u32,
+    /// (novelty) Any touched path with little history ([`Self::low_history_commits`]).
+    pub novelty_low_history_points: u32,
+    /// A pre-existing path with fewer commits than this before the base has little history.
+    pub low_history_commits: u32,
+    /// The most the novelty terms add together.
+    pub novelty_max: u32,
+    /// (QE acceptance waiver) The highest final score a run's QE acceptance may be WAIVED at:
+    /// the score a behavioural change earns for reach alone (the first [`Self::reach_tiers`]
+    /// row), so a waiver needs every dimension in its lowest band — no complexity and no
+    /// novelty points, and no span, contract, test-gap, critical or destructive term.
+    pub qe_waiver_max_score: u8,
 }
 
 /// One band's floor (DES-TEAMING-002 §8.5): the minimum phase types, in order, and whether the
@@ -320,6 +377,16 @@ const PLAN_MOST: ReviewPlan = ReviewPlan {
 ///   concurrent seats starve each other.
 /// - **Model hook**: may add 0, 10 or 20 with a rationale, from 20 up. Never subtracts, so the
 ///   deterministic score is a floor.
+/// - **Complexity** (operator correction 2026-10-10, QE waiver): the size of the change, read from
+///   the diff — changed lines (+10 from 51, +20 from 201), branch lines (+10 from 6, +20 from 21)
+///   and changed symbols (+10 from 4), at most +30. Estate exposes no symbol complexity metric, so
+///   the branch count stands in for it. A path-only intent has no lines and scores none here.
+/// - **Novelty**: +10 per new or unindexed file (at most +20), +20 for any new dependency, +10 for
+///   any new public or wire symbol, +10 for any touched path with under three commits of history;
+///   at most +40. Prior memories or rules for the area are NOT read (no cheap estate call at the
+///   scoring seam).
+/// - **QE waiver at 20**: a run's QE acceptance is waived only at a final score of 20 or less AND
+///   no complexity or novelty points — every dimension in its lowest band.
 pub(crate) const THRESHOLDS: Thresholds = Thresholds {
     hops: 3,
     reach_tiers: &[(0, 20), (6, 40), (21, 60), (101, 80)],
@@ -444,7 +511,26 @@ pub(crate) const THRESHOLDS: Thresholds = Thresholds {
         "event", "schema", "tool", "api", "request", "response", "dto", "payload",
     ],
     test_name_prefixes: &["test"],
+    complexity_line_tiers: &[(0, 0), (51, 10), (201, 20)],
+    complexity_branch_tiers: &[(0, 0), (6, 10), (21, 20)],
+    complexity_symbol_tiers: &[(0, 0), (4, 10)],
+    complexity_max: 30,
+    branch_tokens: &[
+        "if", "else", "elif", "match", "case", "switch", "for", "while", "loop", "catch", "except",
+        "try", "&&", "||", "?",
+    ],
+    novelty_file_step: 10,
+    novelty_file_max_steps: 2,
+    novelty_dependency_points: 20,
+    novelty_public_symbol_points: 10,
+    novelty_low_history_points: 10,
+    low_history_commits: 3,
+    novelty_max: 40,
+    qe_waiver_max_score: 20,
 };
+
+// The QE waiver line is the lowest reach tier's score: a waiver means reach alone and nothing else.
+const _: () = assert!(THRESHOLDS.qe_waiver_max_score as u32 == THRESHOLDS.reach_tiers[0].1);
 
 // One floor row per band: a length mismatch is a build error, not a silent missing floor.
 const _: () = assert!(THRESHOLDS.bands.len() == THRESHOLDS.floors.len());
@@ -482,14 +568,23 @@ pub(crate) fn impact_signals<S: GraphRead + ?Sized>(
     diff: &ChangeSignals,
 ) -> anyhow::Result<ImpactSignals> {
     let t = &THRESHOLDS;
+    if !diff.behavioural() {
+        return Ok(ImpactSignals {
+            critical: diff.critical,
+            destructive: diff.destructive,
+            ..Default::default()
+        });
+    }
     let mut s = ImpactSignals {
         critical: diff.critical,
         destructive: diff.destructive,
+        lines_changed: diff.behavioural_lines,
+        branch_lines: diff.branch_lines,
+        new_dependencies: diff.new_dependencies.len() as u32,
+        new_public_symbols: diff.new_public_symbols.len() as u32,
+        low_history: diff.low_history,
         ..Default::default()
     };
-    if !diff.behavioural() {
-        return Ok(s);
-    }
     let nodes = store.all_nodes()?;
     let mut by_file: BTreeMap<&str, Vec<&Node>> = BTreeMap::new();
     for n in &nodes {
@@ -659,6 +754,11 @@ pub(crate) fn impact_score_in(t: &Thresholds, s: &ImpactSignals) -> Score {
             t.critical_points
         ));
     }
+    let (complexity, novelty) = dimension_terms(t, s);
+    for (points, why) in complexity.iter().chain(novelty.iter()) {
+        score += points;
+        reasons.push(why.clone());
+    }
     if s.destructive && score < t.destructive_floor {
         score = t.destructive_floor;
         reasons.push(format!(
@@ -670,6 +770,100 @@ pub(crate) fn impact_score_in(t: &Thresholds, s: &ImpactSignals) -> Score {
         score: score.min(100) as u8,
         reasons,
     }
+}
+
+/// The tier points of `value` in `(min, points)` tiers (0 below the first).
+fn tier(tiers: &[(u32, u32)], value: u32) -> u32 {
+    tiers
+        .iter()
+        .rev()
+        .find(|(min, _)| value >= *min)
+        .map_or(0, |(_, p)| *p)
+}
+
+/// One dimension's scoring terms: `(points, reason line)`.
+type Terms = Vec<(u32, String)>;
+
+/// The complexity and novelty terms of `s`: one reason line per term with points > 0, each
+/// dimension capped at [`Thresholds::complexity_max`] / [`Thresholds::novelty_max`] (the later
+/// terms absorb the cap).
+fn dimension_terms(t: &Thresholds, s: &ImpactSignals) -> (Terms, Terms) {
+    fn capped(dim: &str, terms: Terms, max: u32) -> Terms {
+        let mut left = max;
+        terms
+            .into_iter()
+            .filter_map(|(p, label)| {
+                let p = p.min(left);
+                left -= p;
+                (p > 0).then(|| (p, format!("{dim} +{p}: {label}")))
+            })
+            .collect()
+    }
+    let complexity = vec![
+        (
+            tier(t.complexity_line_tiers, s.lines_changed),
+            format!("{} changed line(s)", s.lines_changed),
+        ),
+        (
+            tier(t.complexity_branch_tiers, s.branch_lines),
+            format!("{} changed branch line(s)", s.branch_lines),
+        ),
+        (
+            tier(t.complexity_symbol_tiers, s.changed_symbols),
+            format!("{} changed symbol(s)", s.changed_symbols),
+        ),
+    ];
+    let any = |n: u32, points: u32| if n > 0 { points } else { 0 };
+    let novelty = vec![
+        (
+            s.unindexed.min(t.novelty_file_max_steps) * t.novelty_file_step,
+            format!("{} new or unindexed file(s)", s.unindexed),
+        ),
+        (
+            any(s.new_dependencies, t.novelty_dependency_points),
+            format!("{} new dependency(ies)", s.new_dependencies),
+        ),
+        (
+            any(s.new_public_symbols, t.novelty_public_symbol_points),
+            format!("{} new public or wire symbol(s)", s.new_public_symbols),
+        ),
+        (
+            any(s.low_history, t.novelty_low_history_points),
+            format!(
+                "{} touched path(s) with under {} commits of history",
+                s.low_history, t.low_history_commits
+            ),
+        ),
+    ];
+    (
+        capped("complexity", complexity, t.complexity_max),
+        capped("novelty", novelty, t.novelty_max),
+    )
+}
+
+/// (QE acceptance) Whether an assessment lets a run's QE acceptance be waived: a deterministic
+/// read of the graph (never the fail-closed score), a final score at most
+/// [`Thresholds::qe_waiver_max_score`], and no complexity or novelty points — every dimension in
+/// its lowest band. `Err` carries why it is required, in the score's own words.
+pub(crate) fn qe_waivable(a: &Assessment) -> Result<(), String> {
+    let t = &THRESHOLDS;
+    let Some(s) = a.signals.as_ref() else {
+        return Err(format!(
+            "impact score {} (the change could not be read: {})",
+            a.score,
+            a.reasons.join("; ")
+        ));
+    };
+    let (complexity, novelty) = dimension_terms(t, s);
+    if a.score > t.qe_waiver_max_score || !complexity.is_empty() || !novelty.is_empty() {
+        return Err(format!(
+            "impact score {} above the waiver line {} ({})",
+            a.score,
+            t.qe_waiver_max_score,
+            a.reasons.join("; ")
+        ));
+    }
+    Ok(())
 }
 
 /// The plan a score lands in.
@@ -824,7 +1018,9 @@ pub(crate) fn signals_from_diff(diff: &str) -> ChangeSignals {
     let mut blocks: Vec<Vec<&str>> = vec![Vec::new()];
     for line in diff.lines() {
         if line.starts_with("diff --git ") {
-            blocks.push(Vec::new());
+            // Kept as the block's first line: the only place a binary or mode-only change names
+            // its paths ([`file_block`] reads it last, as a fallback).
+            blocks.push(vec![line]);
         } else if let Some(block) = blocks.last_mut() {
             block.push(line);
         }
@@ -898,20 +1094,48 @@ fn file_block(lines: &[&str], s: &mut ChangeSignals) {
             new.get_or_insert_with(|| git_unquote(p));
         } else if l.starts_with("deleted file mode") {
             deleted = true;
+        } else if let Some((a, b)) = l
+            .strip_prefix("Binary files ")
+            .and_then(|r| r.strip_suffix(" differ"))
+            .and_then(|r| r.split_once(" and "))
+        {
+            // (codex r1 on the QE PR) A binary change has no `---`/`+++`: its paths are here.
+            old.get_or_insert_with(|| header_path(a, "a/"));
+            let b = header_path(b, "b/");
+            deleted |= b.is_empty();
+            new.get_or_insert(b);
+        }
+    }
+    // Last resort for a block with no header paths at all (a mode-only change, a binary whose
+    // line did not parse): the `diff --git a/X b/Y` line, when it splits unambiguously. A block
+    // that still names nothing counts as code below (fail closed).
+    if old.is_none() && new.is_none() {
+        if let Some((a, b)) = lines
+            .first()
+            .and_then(|l| l.strip_prefix("diff --git "))
+            .and_then(git_header_paths)
+        {
+            old = Some(a);
+            new = Some(b);
         }
     }
     let (old, new) = (old.unwrap_or_default(), new.unwrap_or_default());
     let sides = [old.as_str(), new.as_str()];
     let named = sides.iter().any(|p| !p.is_empty());
-    if !named && hunks == lines.len() {
-        return; // nothing to attribute: no path and no hunk
+    let headed = lines.first().is_some_and(|l| l.starts_with("diff --git "));
+    if !named && hunks == lines.len() && !headed {
+        return; // nothing to attribute: no file header, no path and no hunk
     }
+    // A dependency manifest is never docs, whatever its extension (`requirements.txt`): it is
+    // configuration, and its adds are read for new dependencies below.
+    let manifest = sides.iter().rev().find_map(|p| manifest_kind(p));
     let code: Vec<&str> = sides
         .iter()
         .copied()
-        .filter(|p| !p.is_empty() && classify(p) != Kind::Docs)
+        .filter(|p| !p.is_empty() && (classify(p) != Kind::Docs || manifest_kind(p).is_some()))
         .collect();
     let k = match code.last() {
+        Some(p) if manifest_kind(p).is_some() && classify(p) == Kind::Docs => Kind::Config,
         Some(p) => classify(p),
         None if !named => Kind::Code,
         None => Kind::Docs,
@@ -937,8 +1161,26 @@ fn file_block(lines: &[&str], s: &mut ChangeSignals) {
     }
     // Base-side line number of the next old line in the current hunk.
     let mut old_next: u32 = 0;
+    // (QE waiver) The novelty keys each side of the file declares: dependency keys of a manifest
+    // or lockfile, public symbols of a code file. Only what the `+` side adds and the `-` side
+    // does not remove is new.
+    let (mut deps_added, mut deps_removed) = (BTreeSet::new(), BTreeSet::new());
+    let (mut pub_added, mut pub_removed) = (BTreeSet::new(), BTreeSet::new());
+    // The object/section a line sits in, and an open multi-line export group, PER SIDE (codex r2):
+    // a context line moves both sides, a `-` line the base side, a `+` line the head side.
+    let (mut section_old, mut section_new) = (None::<String>, None::<String>);
+    let (mut group_old, mut group_new) = (None::<String>, None::<String>);
+    let source_ext = code
+        .last()
+        .and_then(|p| p.rsplit('/').next())
+        .and_then(|n| n.rsplit_once('.'))
+        .map(|(_, e)| e.to_ascii_lowercase());
     for line in &lines[hunks..] {
         if let Some(h) = line.strip_prefix("@@") {
+            // A hunk shows only its own lines: what section it sits in is unknown until it says
+            // (codex r1 on the QE PR — a `[package]` in one hunk must not cover the next).
+            (section_old, section_new) = (None, None);
+            (group_old, group_new) = (None, None);
             // `@@ -a[,b] +c[,d] @@`: `a` is the first base-side line (0 for a new file).
             old_next = h
                 .trim_start()
@@ -953,6 +1195,40 @@ fn file_block(lines: &[&str], s: &mut ChangeSignals) {
         let context = line.starts_with(' ') || line.is_empty();
         s.lines_added += u32::from(added);
         s.lines_removed += u32::from(removed);
+        let body = line.get(1..).unwrap_or("");
+        if let Some(m) = manifest {
+            if added || context {
+                if let Some(key) = dependency_key(m, body, &mut section_new).filter(|_| added) {
+                    deps_added.insert(key);
+                }
+            }
+            if removed || context {
+                if let Some(key) = dependency_key(m, body, &mut section_old).filter(|_| removed) {
+                    deps_removed.insert(key);
+                }
+            }
+        }
+        if behavioural && k == Kind::Code && context {
+            public_decls(source_ext.as_deref(), body, &mut group_new);
+            public_decls(source_ext.as_deref(), body, &mut group_old);
+        }
+        if behavioural && (added || removed) {
+            s.behavioural_lines += 1;
+            if matches!(k, Kind::Code | Kind::Test) {
+                s.branch_lines += u32::from(is_branch_line(body));
+                if k == Kind::Code {
+                    if added {
+                        pub_added.extend(public_decls(source_ext.as_deref(), body, &mut group_new));
+                    } else {
+                        pub_removed.extend(public_decls(
+                            source_ext.as_deref(),
+                            body,
+                            &mut group_old,
+                        ));
+                    }
+                }
+            }
+        }
         // Context lines are scanned too (review on #600: a change that only loosens the guard
         // around an existing destructive call leaves the call itself on a context line).
         if behavioural && (added || removed || context) {
@@ -976,6 +1252,372 @@ fn file_block(lines: &[&str], s: &mut ChangeSignals) {
             old_next += 1;
         }
     }
+    s.new_dependencies
+        .extend(deps_added.difference(&deps_removed).cloned());
+    s.new_public_symbols
+        .extend(pub_added.difference(&pub_removed).cloned());
+}
+
+/// A dependency manifest or lockfile, by file name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Manifest {
+    /// `Cargo.toml`, `pyproject.toml`: keys of a `[...dependencies...]` section.
+    Toml,
+    /// `package.json`: `"name": "<range>"` entries.
+    PackageJson,
+    /// `go.mod`: `require` lines.
+    GoMod,
+    /// `requirements*.txt`: one requirement per line.
+    Requirements,
+    /// `Cargo.lock`, `uv.lock`, `poetry.lock`: `name = "<pkg>"` entries.
+    TomlLock,
+    /// `package-lock.json`, `npm-shrinkwrap.json`: `"node_modules/<pkg>": {` entries.
+    NpmLock,
+    /// `go.sum`: `<module> <version> h1:…` lines.
+    GoSum,
+}
+
+/// `package.json` top-level string fields that are never a dependency.
+const PACKAGE_JSON_FIELDS: &[&str] = &[
+    "name",
+    "version",
+    "description",
+    "main",
+    "module",
+    "types",
+    "typings",
+    "type",
+    "license",
+    "author",
+    "homepage",
+    "private",
+    "packageManager",
+    "browser",
+    "sideEffects",
+    "$schema",
+];
+
+fn manifest_kind(path: &str) -> Option<Manifest> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    Some(match name {
+        "Cargo.toml" | "pyproject.toml" => Manifest::Toml,
+        "package.json" => Manifest::PackageJson,
+        "go.mod" => Manifest::GoMod,
+        "Cargo.lock" | "uv.lock" | "poetry.lock" => Manifest::TomlLock,
+        "package-lock.json" | "npm-shrinkwrap.json" => Manifest::NpmLock,
+        "go.sum" => Manifest::GoSum,
+        n if n.starts_with("requirements") && n.ends_with(".txt") => Manifest::Requirements,
+        _ => return None,
+    })
+}
+
+/// The dependency a manifest or lockfile line names, if any. `section` tracks the TOML section a
+/// hunk is in (from the header lines it shows); a key in a hunk whose section is unknown counts
+/// when its value is dependency-shaped (a quoted version or an inline table) — unknown leans
+/// toward "new", never toward a waiver.
+fn dependency_key(m: Manifest, line: &str, section: &mut Option<String>) -> Option<String> {
+    let l = line.trim();
+    if l.is_empty() || l.starts_with('#') {
+        return None;
+    }
+    let unquote = |k: &str| k.trim().trim_matches('"').trim_matches('\'').to_string();
+    match m {
+        Manifest::Toml => {
+            if let Some(h) = l.strip_prefix('[') {
+                let h = h.trim_end_matches(']').trim_matches('[').trim();
+                *section = Some(h.to_ascii_lowercase());
+                // `[dependencies.foo]` names the dependency itself.
+                return h
+                    .rsplit_once("dependencies.")
+                    .map(|(_, name)| unquote(name));
+            }
+            let (key, value) = l.split_once('=')?;
+            let value = value.trim_start();
+            let in_deps = section
+                .as_deref()
+                .is_some_and(|s| s.ends_with("dependencies"));
+            let shaped = value.starts_with('{')
+                || value.strip_prefix('"').is_some_and(|v| {
+                    v.starts_with(|c: char| c.is_ascii_digit() || "^~=<>*".contains(c))
+                });
+            (in_deps || (section.is_none() && shaped)).then(|| unquote(key))
+        }
+        Manifest::PackageJson => {
+            // Track the object a line sits in (`"dependencies": {` … `}`), per hunk.
+            if l.starts_with('}') {
+                *section = None;
+                return None;
+            }
+            let (key, value) = l.split_once(':')?;
+            let key = unquote(key);
+            let value = value.trim().trim_end_matches(',').trim();
+            if value.starts_with('{') {
+                *section = Some(key.to_ascii_lowercase());
+                return None;
+            }
+            value.strip_prefix('"')?;
+            match section.as_deref() {
+                // Inside a dependency object every key is a dependency, whatever its version
+                // syntax (`latest`, a tag, a URL) and whatever its name.
+                Some(s)
+                    if s.ends_with("dependencies") || s == "overrides" || s == "resolutions" =>
+                {
+                    Some(key)
+                }
+                Some(_) => None,
+                // A hunk that never showed its object: anything but a known top-level field
+                // counts (unknown leans toward "new").
+                None => {
+                    (!PACKAGE_JSON_FIELDS.contains(&key.as_str()) && !key.is_empty()).then_some(key)
+                }
+            }
+        }
+        Manifest::GoMod => {
+            let l = l.strip_prefix("require").map_or(l, str::trim);
+            let mut it = l.split_whitespace();
+            let (module, version) = (it.next()?, it.next()?);
+            (version.starts_with('v') && module.contains('.')).then(|| module.to_string())
+        }
+        Manifest::Requirements => {
+            if l.starts_with('-') {
+                return None;
+            }
+            let end = l.find(|c: char| "=<>~!;[ @".contains(c)).unwrap_or(l.len());
+            Some(l[..end].to_ascii_lowercase()).filter(|k| !k.is_empty())
+        }
+        Manifest::TomlLock => l
+            .strip_prefix("name")
+            .map(str::trim_start)
+            .and_then(|r| r.strip_prefix('='))
+            .map(unquote),
+        Manifest::NpmLock => l
+            .strip_prefix("\"node_modules/")
+            .and_then(|r| r.split_once('"'))
+            .filter(|(_, rest)| rest.trim_start().starts_with(':'))
+            .map(|(name, _)| {
+                name.rsplit("node_modules/")
+                    .next()
+                    .unwrap_or(name)
+                    .to_string()
+            }),
+        Manifest::GoSum => l.split_whitespace().next().map(str::to_string),
+    }
+}
+
+/// (QE waiver) The public surface of a whole file — every public or exported symbol its lines
+/// declare, multi-line re-export groups resolved — for a file the diff names. Comparing the base
+/// blob's surface with the head blob's sees what a hunk's context window cannot (a group opener
+/// far above the added member, an import group made public).
+pub(crate) fn public_surface(path: &str, content: &str) -> BTreeSet<String> {
+    let ext = path
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.rsplit_once('.'))
+        .map(|(_, e)| e.to_ascii_lowercase());
+    let mut group = None;
+    content
+        .lines()
+        .flat_map(|l| public_decls(ext.as_deref(), l, &mut group))
+        .collect()
+}
+
+/// (QE waiver) Whether a whole-file surface read can say anything for `path`: a code file whose
+/// language [`public_decl`] reads, or a dependency manifest/lockfile. Everything else (a binary, an
+/// image, a config file) is never read whole.
+pub(crate) fn surface_relevant(path: &str) -> bool {
+    let ext = path
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.rsplit_once('.'))
+        .map(|(_, e)| e.to_ascii_lowercase());
+    manifest_kind(path).is_some()
+        || matches!(
+            ext.as_deref(),
+            Some("rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts" | "py" | "go")
+        )
+}
+
+/// (QE waiver) The dependencies a whole manifest or lockfile declares (`None` for any other file).
+pub(crate) fn dependency_surface(path: &str, content: &str) -> Option<BTreeSet<String>> {
+    let m = manifest_kind(path)?;
+    let mut section = None;
+    Some(
+        content
+            .lines()
+            .filter_map(|l| dependency_key(m, l, &mut section))
+            .collect(),
+    )
+}
+
+/// A changed line carries a branch token ([`Thresholds::branch_tokens`]): a word token, or an
+/// operator token anywhere in the line.
+fn is_branch_line(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    THRESHOLDS.branch_tokens.iter().any(|tok| {
+        if tok.chars().all(|c| c.is_ascii_alphabetic()) {
+            l.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|w| w == *tok)
+        } else {
+            l.contains(tok)
+        }
+    })
+}
+
+/// The public symbols a code line declares, with a multi-line re-export group tracked in `group`
+/// (codex r2): `pub use inner::{` … `};` (Rust) and `export {` … `}` (JS/TS) open a group whose
+/// member lines name symbols without repeating `pub`/`export`. A member is keyed with its group's
+/// head, so adding one to an existing group is new and moving one between groups is not hidden.
+fn public_decls(ext: Option<&str>, line: &str, group: &mut Option<String>) -> Vec<String> {
+    let t = line.trim();
+    if let Some(head) = group.clone() {
+        let (members, closes) = match t.find('}') {
+            Some(i) => (&t[..i], true),
+            None => (t, false),
+        };
+        if closes {
+            *group = None;
+        }
+        return members
+            .split(',')
+            .map(|m| m.trim())
+            .filter(|m| !m.is_empty() && !m.starts_with("//"))
+            .map(|m| format!("{head}{m}"))
+            .collect();
+    }
+    let opens = |prefix: &str| t.starts_with(prefix) && t.ends_with('{');
+    let head = match ext {
+        Some("rs") if opens("pub use ") => {
+            Some(format!("use {}", &t["pub use ".len()..t.len() - 1]))
+        }
+        Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts")
+            if opens("export {") || opens("export type {") =>
+        {
+            Some("export ".to_string())
+        }
+        _ => None,
+    };
+    if let Some(h) = head {
+        *group = Some(h);
+        return Vec::new();
+    }
+    public_decl(ext, line).into_iter().collect()
+}
+
+/// The public or exported symbol a code line declares, by language: Rust `pub` items and fields
+/// (never `pub(crate)`/`pub(super)`), JS/TS `export` declarations, top-level Python `def`/`class`
+/// without a leading underscore, Go exported `func`/`type`.
+fn public_decl(ext: Option<&str>, line: &str) -> Option<String> {
+    let name_of = |w: &str| -> Option<String> {
+        let n: String = w
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+            .collect();
+        (!n.is_empty()).then_some(n)
+    };
+    let mut words = line.split_whitespace();
+    match ext? {
+        "rs" => {
+            if words.next()? != "pub" {
+                return None;
+            }
+            let mut w = words.next()?;
+            while matches!(w, "async" | "unsafe" | "extern" | "\"C\"") {
+                w = words.next()?;
+            }
+            if w == "const" {
+                // `pub const fn x` or `pub const X: T`.
+                let next = words.next()?;
+                return if next == "fn" {
+                    name_of(words.next()?)
+                } else {
+                    name_of(next)
+                };
+            }
+            match w {
+                "fn" | "struct" | "enum" | "trait" | "type" | "static" | "mod" | "union" => {
+                    name_of(words.next()?)
+                }
+                // A re-export widens the public surface by whatever it names.
+                "use" => Some(format!(
+                    "use {}",
+                    line.trim().trim_start_matches("pub use ")
+                )),
+                field if field.ends_with(':') => name_of(field).map(|f| format!(".{f}")),
+                _ => None,
+            }
+        }
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "mts" | "cts" => {
+            if words.next()? != "export" {
+                return None;
+            }
+            let mut w = words.next()?;
+            while matches!(w, "async" | "declare" | "abstract") {
+                w = words.next()?;
+            }
+            if w == "default" {
+                return Some("default".to_string());
+            }
+            // `export { a, b }`, `export * from …`, `export type { T }`: a re-export.
+            if w.starts_with('{') || w.starts_with('*') || (w == "type" && line.contains('{')) {
+                return Some(format!(
+                    "export {}",
+                    line.trim().trim_start_matches("export ")
+                ));
+            }
+            match w {
+                "function" | "function*" | "class" | "const" | "let" | "var" | "interface"
+                | "type" | "enum" | "namespace" => name_of(words.next()?.trim_start_matches('*')),
+                _ => None,
+            }
+        }
+        "py" => {
+            if line.starts_with(char::is_whitespace) {
+                return None;
+            }
+            let mut w = words.next()?;
+            if w == "async" {
+                w = words.next()?;
+            }
+            matches!(w, "def" | "class")
+                .then(|| name_of(words.next()?))
+                .flatten()
+                .filter(|n| !n.starts_with('_'))
+        }
+        "go" => {
+            if line.starts_with(char::is_whitespace) {
+                return None;
+            }
+            let w = words.next()?;
+            let mut name = words.next()?;
+            if w == "func" && name.starts_with('(') {
+                // A method: skip the receiver.
+                let rest = line.split_once(')')?.1;
+                name = rest.split_whitespace().next()?;
+            }
+            matches!(w, "func" | "type")
+                .then(|| name_of(name))
+                .flatten()
+                .filter(|n| n.starts_with(|c: char| c.is_ascii_uppercase()))
+        }
+        _ => None,
+    }
+}
+
+/// The two paths of a `diff --git` header's remainder (`a/X b/Y`, or both git-quoted), only when
+/// the split is unambiguous — exactly one ` b/` boundary — else `None`.
+fn git_header_paths(rest: &str) -> Option<(String, String)> {
+    if let Some(q) = rest.strip_prefix('"') {
+        let end = q.find("\" \"")?;
+        let (a, b) = (format!("\"{}\"", &q[..end]), &q[end + 2..]);
+        return Some((header_path(&a, "a/"), header_path(b, "b/")));
+    }
+    let a = rest.strip_prefix("a/")?;
+    let mut parts = a.match_indices(" b/");
+    let (i, _) = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((a[..i].to_string(), a[i + 3..].to_string()))
 }
 
 /// The path on a `---`/`+++` line: git-unquoted, a trailing `\t<timestamp>` dropped from an

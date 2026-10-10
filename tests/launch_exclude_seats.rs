@@ -115,6 +115,7 @@ fn run_with(name: &str, exclude_seats: Vec<String>) -> Vec<Vec<String>> {
             primary: None,
             reduced_assurance: false,
             deliverables: Vec::new(),
+            qe_acceptance: Default::default(),
         })
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -185,6 +186,7 @@ fn the_straight_through_path_refuses_an_exclusion_instead_of_dropping_it() {
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     });
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {

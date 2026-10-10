@@ -14651,6 +14651,7 @@ No further next steps — both questions fully answered.";
             catalog: None,
             exclude_seats: Vec::new(),
             assurance: None,
+            qe_acceptance: None,
         }
     }
 

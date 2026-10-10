@@ -174,6 +174,23 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
     ]
 }
 
+/// (QE acceptance, operator ruling 2026-10-10) The instruments a run of a BUILT-IN preset
+/// requires, as a workflow's `required_instruments` declares them: the presets that make
+/// application changes (`feature`, `migration`) require `qe_acceptance` on top of the defaults.
+/// `None` ⇒ the defaults. Code data beside [`builtin_presets`], so a re-seed never drops it.
+pub(crate) fn builtin_preset_instruments(name: &str) -> Option<Vec<String>> {
+    matches!(name, "feature" | "migration").then(|| {
+        [
+            crate::assurance::DISTINCT_EVALUATOR,
+            crate::assurance::JUDGE,
+            crate::assurance::QE_ACCEPTANCE,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    })
+}
+
 /// One built-in preset's steps by name (`None` for a name that is not a built-in). Test fixtures.
 #[cfg(test)]
 pub(crate) fn builtin_preset(name: &str) -> Option<Vec<PlanStep>> {

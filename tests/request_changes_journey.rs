@@ -191,6 +191,7 @@ fn a_failed_review_is_sent_back_to_the_creator_and_the_run_completes_on_the_seco
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     })
     .expect("launch");
 

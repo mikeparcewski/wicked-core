@@ -339,6 +339,19 @@ pub fn resolve(
     get_row(store, GLOBAL_SCOPE, name)
 }
 
+/// (QE acceptance) The instruments a launch of preset `name` requires: a built-in's declaration
+/// ([`crate::catalog::builtin_preset_instruments`]) when the preset that resolves IS the built-in;
+/// `None` (the defaults) for a saved preset, including one that shadows a built-in's name.
+pub(crate) fn required_instruments(
+    store: &dyn GraphRead,
+    project_id: Option<&str>,
+    name: &str,
+) -> anyhow::Result<Option<Vec<String>>> {
+    Ok(resolve(store, project_id, name)?
+        .filter(|p| p.created_by == BUILTIN_CREATED_BY)
+        .and_then(|p| crate::catalog::builtin_preset_instruments(&p.name)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

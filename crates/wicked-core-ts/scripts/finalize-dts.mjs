@@ -189,6 +189,14 @@ const HAND_AUTHORED = `${BEGIN}
  * \`error\` | \`not_applicable\`; the delivery receipt aggregates every gate of the run. A gate whose required judge was
  * skipped now denies under \`judge_unavailable\`; an evaluator pass that errored denies under
  * \`denial.source === 'evaluator_error'\`.
+ * QE acceptance (additive, operator ruling 2026-10-10): a run whose contract requires
+ * \`qe_acceptance\` carries its decision as \`assurance.qe: {status: 'required' | 'waived' |
+ * 'skipped', basis: 'plan' | 'operator' | 'diff', score: number | null, threshold, reason,
+ * reasons: string[], ord: number | null, tree: string | null}\` on sessionStarted and on every
+ * gateEvaluated / deliverLiftEvaluated receipt; a waived or skipped one is also a \`skipped[]\`
+ * entry (reason \`qe_waived_by_score\` | \`qe_skipped_by_operator\`, detail = the words). New event
+ * \`qeAcceptanceDecided\` {session, ord, qe}: the run's QE unit scored its diff (waived only when
+ * every dimension is in its lowest band, score <= threshold), or a creator after a waiver revoked it.
  */
 export interface CoreEventJson {
   type: string

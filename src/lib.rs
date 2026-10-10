@@ -79,6 +79,7 @@ mod plan;
 mod plan_gate;
 mod preset;
 mod project;
+mod qe_acceptance;
 mod remote_write_fence;
 mod repo;
 mod repo_checks;
@@ -360,6 +361,13 @@ pub struct LaunchSpec {
     /// output file). Empty = none. Refused on a launch with neither a plan nor a preset, and on a
     /// plan with no creator step (never silently dropped).
     pub deliverables: Vec<String>,
+    /// (QE acceptance, operator ruling 2026-10-10) The operator's EXPLICIT word on QE acceptance:
+    /// `Skip(reason)` (non-empty) skips a required QE acceptance, `Force` requires it whatever the
+    /// run's score says. Persisted on the contract (`assurance.qe`, `basis: "operator"`) and
+    /// labelled on every receipt. `Auto` (the default; absent on the wire) lets the run's diff
+    /// decide at its QE phase. Either word on a run whose workflow does not require QE acceptance
+    /// refuses the launch.
+    pub qe_acceptance: crate::assurance::QeOverride,
 }
 
 /// (core#678 item 1) What this host can contain, known before any run (the boot probe, cached):

@@ -193,7 +193,7 @@ fn ten_line_change_to_a_symbol_with_forty_dependents_scores_60_to_80() {
 }
 
 #[test]
-fn six_hundred_line_new_leaf_file_scores_20() {
+fn six_hundred_line_new_leaf_file_scores_50_and_still_ranks_below_the_hot_edit() {
     let mut hunk = String::from("@@ -0,0 +1,600 @@\n");
     for i in 0..600 {
         hunk.push_str(&format!("+    let v{i} = {i};\n"));
@@ -209,8 +209,10 @@ fn six_hundred_line_new_leaf_file_scores_20() {
     let a = assess(&diff, ready(&store), None);
     let s = a.signals.as_ref().expect("graph was read");
     assert_eq!((s.changed_symbols, s.dependents), (1, 0), "{s:?}");
-    assert_eq!(a.score, 20, "{a:?}");
-    assert_eq!(a.plan, PLAN_STANDARD);
+    // Reach 20, complexity +20 (600 changed lines), novelty +10 (a new file): 50. The ten-line
+    // hot edit (80) still outranks it — reach stays the base.
+    assert_eq!(a.score, 50, "{a:?}");
+    assert_eq!(a.plan, PLAN_DEEP);
 }
 
 #[test]
@@ -584,7 +586,8 @@ fn hot_symbol_shifted_by_an_insertion_above_it_still_scores_80() {
     let base_graph = hot_graph_at(10, false);
     let a = assess(&diff, ready(&base_graph), None);
     assert_eq!(a.signals.as_ref().expect("read").dependents, 40, "{a:?}");
-    assert_eq!((a.score, a.plan), (80, PLAN_MOST), "{a:?}");
+    // Reach 60 + test gap 20 + complexity 10 (110 changed lines).
+    assert_eq!((a.score, a.plan), (90, PLAN_MOST), "{a:?}");
 
     // Indexed at the head: `hot` is at 110-130. Scoring this would say 20; the rule says stale.
     let mut head_graph = hot_graph_at(110, false);
@@ -645,9 +648,10 @@ rename to src/runtime/core.rs
     );
     let a = assess(&new_leaf, ready(&store), None);
     let s = a.signals.as_ref().expect("graph was read");
+    // Reach 20 + novelty 10 (the file is new).
     assert_eq!(
         (s.changed_symbols, s.dependents, a.score),
-        (1, 0, 20),
+        (1, 0, 30),
         "{a:?}"
     );
 }
@@ -678,9 +682,10 @@ copy to src/runtime/core.rs
     );
     let a = assess(&diff, ready(&store), None);
     let s = a.signals.as_ref().expect("graph was read");
+    // Reach 20 + novelty 10: the copy is a new, unindexed file.
     assert_eq!(
         (s.changed_symbols, s.unindexed, s.dependents, a.score),
-        (1, 1, 0, 20),
+        (1, 1, 0, 30),
         "{a:?}"
     );
     assert_eq!(a.plan, PLAN_STANDARD);
@@ -720,7 +725,7 @@ copy to src/runtime/memory.rs
 /// core#711: a changed path the graph never indexed (a new file) is UNKNOWN to the test gap,
 /// not untested — the graph has no edge to read. It still counts as one changed symbol with no
 /// dependents (reach), and the reasons name it as unindexed. A hot, tested symbol beside a new
-/// file scores its reach alone (60), not reach plus half a test gap (70).
+/// file scores its reach and its novelty (80), never reach plus half a test gap.
 #[test]
 fn an_unindexed_changed_path_reads_unindexed_not_untested() {
     let new_file = "diff --git a/scripts/walk.mjs b/scripts/walk.mjs\nnew file mode 100644\n--- /dev/null\n+++ b/scripts/walk.mjs\n@@ -0,0 +1 @@\n+export const walk = 1;\n";
@@ -740,7 +745,8 @@ fn an_unindexed_changed_path_reads_unindexed_not_untested() {
         s.test_gap, 0.0,
         "the indexed symbol is tested; the new file is unknown"
     );
-    assert_eq!(a.score, 60, "{a:?}");
+    // Reach 60, no gap; novelty +10 (the new file) +10 (its new export `walk`).
+    assert_eq!(a.score, 80, "{a:?}");
     assert!(
         a.reasons
             .iter()
@@ -767,7 +773,7 @@ fn an_unindexed_changed_path_reads_unindexed_not_untested() {
     let a = assess(&diff, ready(&untested), None);
     let s = a.signals.as_ref().expect("graph was read");
     assert_eq!(s.test_gap, 1.0, "{s:?}");
-    assert_eq!(a.score, 80, "{a:?}");
+    assert_eq!(a.score, 100, "{a:?}");
     assert!(
         a.reasons.iter().any(
             |r| r.starts_with("test gap +20: 100% of indexed changed symbols")
@@ -975,7 +981,8 @@ rename to docs/memory.md
     assert_eq!(s.touched[0].old_path, "src/memory.rs");
     let store = graph(&[], &[]);
     let a = assess(&s, ready(&store), None);
-    assert_eq!(a.score, 40, "reach 20 + critical 20: {a:?}");
+    // The empty graph does not know the old path: novelty +10 for the unindexed file.
+    assert_eq!(a.score, 50, "reach 20 + critical 20 + novelty 10: {a:?}");
 }
 
 #[test]
@@ -1410,4 +1417,515 @@ fn d9_a_docs_only_design_scope_never_reads_a_stale_graph() {
     ] {
         assert!(signals_from_paths(&[code]).behavioural(), "{code}");
     }
+}
+
+// ── QE waiver: complexity and novelty (operator correction 2026-10-10) ──────────────────────
+
+/// One term each, through the pure table: every term adds its points AND a reason line naming it.
+#[test]
+fn complexity_and_novelty_terms_table() {
+    let leaf = || ImpactSignals {
+        changed_symbols: 1,
+        products: 1,
+        ..Default::default()
+    };
+    let cases: &[(&str, ImpactSignals, u8, &str)] = &[
+        ("a small leaf edit: reach alone", leaf(), 20, "reach 20"),
+        (
+            "50 changed lines: lowest band",
+            ImpactSignals {
+                lines_changed: 50,
+                ..leaf()
+            },
+            20,
+            "reach 20",
+        ),
+        (
+            "51 changed lines",
+            ImpactSignals {
+                lines_changed: 51,
+                ..leaf()
+            },
+            30,
+            "complexity +10: 51 changed line(s)",
+        ),
+        (
+            "201 changed lines",
+            ImpactSignals {
+                lines_changed: 201,
+                ..leaf()
+            },
+            40,
+            "complexity +20: 201 changed line(s)",
+        ),
+        (
+            "5 branch lines: lowest band",
+            ImpactSignals {
+                branch_lines: 5,
+                ..leaf()
+            },
+            20,
+            "reach 20",
+        ),
+        (
+            "6 branch lines",
+            ImpactSignals {
+                branch_lines: 6,
+                ..leaf()
+            },
+            30,
+            "complexity +10: 6 changed branch line(s)",
+        ),
+        (
+            "21 branch lines",
+            ImpactSignals {
+                branch_lines: 21,
+                ..leaf()
+            },
+            40,
+            "complexity +20: 21 changed branch line(s)",
+        ),
+        (
+            "4 changed symbols",
+            ImpactSignals {
+                changed_symbols: 4,
+                ..leaf()
+            },
+            30,
+            "complexity +10: 4 changed symbol(s)",
+        ),
+        (
+            "complexity caps at 30",
+            ImpactSignals {
+                lines_changed: 900,
+                branch_lines: 90,
+                changed_symbols: 9,
+                ..leaf()
+            },
+            50,
+            "complexity +10: 90 changed branch line(s)",
+        ),
+        (
+            "one unindexed file",
+            ImpactSignals {
+                unindexed: 1,
+                ..leaf()
+            },
+            30,
+            "novelty +10: 1 new or unindexed file(s)",
+        ),
+        (
+            "five unindexed files cap at two steps",
+            ImpactSignals {
+                unindexed: 5,
+                ..leaf()
+            },
+            40,
+            "novelty +20: 5 new or unindexed file(s)",
+        ),
+        (
+            "a new dependency",
+            ImpactSignals {
+                new_dependencies: 1,
+                ..leaf()
+            },
+            40,
+            "novelty +20: 1 new dependency(ies)",
+        ),
+        (
+            "a new public symbol",
+            ImpactSignals {
+                new_public_symbols: 2,
+                ..leaf()
+            },
+            30,
+            "novelty +10: 2 new public or wire symbol(s)",
+        ),
+        (
+            "a low-history path",
+            ImpactSignals {
+                low_history: 1,
+                ..leaf()
+            },
+            30,
+            "novelty +10: 1 touched path(s) with under 3 commits",
+        ),
+        (
+            "novelty caps at 40",
+            ImpactSignals {
+                unindexed: 3,
+                new_dependencies: 2,
+                new_public_symbols: 1,
+                low_history: 1,
+                ..leaf()
+            },
+            60,
+            "novelty +20: 2 new dependency(ies)",
+        ),
+    ];
+    for (name, s, want, reason) in cases {
+        let got = impact_score(s);
+        assert_eq!(got.score, *want, "{name}: {s:?} -> {got:?}");
+        assert!(
+            got.reasons.iter().any(|r| r.starts_with(reason)),
+            "{name}: a reason starting {reason:?} in {:?}",
+            got.reasons
+        );
+    }
+}
+
+fn assessed(s: ImpactSignals) -> Assessment {
+    let sc = impact_score(&s);
+    Assessment {
+        deterministic: sc.score,
+        score: sc.score,
+        reasons: sc.reasons,
+        model: None,
+        signals: Some(s),
+        plan: plan_for(sc.score),
+    }
+}
+
+/// The waiver needs EVERY dimension in its lowest band: the reach-only score (20) or docs-only
+/// (0), with no complexity and no novelty term. Each other term alone makes QE required.
+#[test]
+fn qe_waiver_needs_every_dimension_in_its_lowest_band() {
+    let leaf = ImpactSignals {
+        changed_symbols: 1,
+        products: 1,
+        ..Default::default()
+    };
+    assert_eq!(qe_waivable(&assessed(leaf.clone())), Ok(()));
+    assert_eq!(
+        qe_waivable(&assessed(ImpactSignals::default())),
+        Ok(()),
+        "docs-only"
+    );
+    let required: &[(&str, ImpactSignals)] = &[
+        (
+            "6 dependents (reach tier 2)",
+            ImpactSignals {
+                dependents: 6,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "two products",
+            ImpactSignals {
+                products: 2,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "contract",
+            ImpactSignals {
+                contract_change: true,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "test gap",
+            ImpactSignals {
+                dependents: 1,
+                test_gap: 0.1,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "critical",
+            ImpactSignals {
+                critical: true,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "destructive",
+            ImpactSignals {
+                destructive: true,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "51 changed lines",
+            ImpactSignals {
+                lines_changed: 51,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "6 branch lines",
+            ImpactSignals {
+                branch_lines: 6,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "4 changed symbols",
+            ImpactSignals {
+                changed_symbols: 4,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "a new file",
+            ImpactSignals {
+                unindexed: 1,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "a new dependency",
+            ImpactSignals {
+                new_dependencies: 1,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "a new public symbol",
+            ImpactSignals {
+                new_public_symbols: 1,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "a low-history path",
+            ImpactSignals {
+                low_history: 1,
+                ..leaf.clone()
+            },
+        ),
+    ];
+    for (name, s) in required {
+        let why = qe_waivable(&assessed(s.clone())).expect_err(name);
+        assert!(
+            why.contains("above the waiver line 20"),
+            "{name}: the reason names the line: {why}"
+        );
+    }
+    // The fail-closed score (no usable graph) is never a waiver.
+    let a = assess(
+        &signals_from_diff(SMALL_CODE),
+        Graph::Unavailable("no graph".into()),
+        None,
+    );
+    assert!(
+        qe_waivable(&a).unwrap_err().contains("could not be read"),
+        "{a:?}"
+    );
+}
+
+/// The operator's floor: a brand-new file that adds a dependency is never waivable, even with a
+/// blast radius of zero (nothing depends on it, nothing is critical).
+#[test]
+fn a_new_file_with_a_new_dependency_is_never_waivable() {
+    let d = r#"diff --git a/src/leaf.rs b/src/leaf.rs
+new file mode 100644
+--- /dev/null
++++ b/src/leaf.rs
+@@ -0,0 +1,2 @@
++use serde_json::json;
++fn leaf() {}
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -8,2 +8,3 @@
+ [dependencies]
+ anyhow = "1"
++serde_json = "1"
+"#;
+    let diff = signals_from_diff(d);
+    assert_eq!(
+        diff.new_dependencies,
+        BTreeSet::from(["serde_json".to_string()])
+    );
+    let store = graph(
+        &[node("other", NodeKind::Function, "src/other.rs", (1, 5))],
+        &[],
+    );
+    let a = assess(&diff, ready(&store), None);
+    let s = a.signals.as_ref().expect("graph was read");
+    assert_eq!(s.dependents, 0, "zero blast radius: {s:?}");
+    assert!(a.score > THRESHOLDS.qe_waiver_max_score, "{a:?}");
+    let why = qe_waivable(&a).unwrap_err();
+    assert!(
+        why.contains("new dependency") && why.contains("new or unindexed file"),
+        "{why}"
+    );
+}
+
+/// A one-line edit inside an existing leaf function with nothing depending on it is waivable;
+/// docs-only is too.
+#[test]
+fn a_small_leaf_edit_and_docs_only_are_waivable() {
+    let store = graph(
+        &[node("plan", NodeKind::Function, "src/plan.rs", (10, 13))],
+        &[],
+    );
+    let a = assess(&signals_from_diff(SMALL_CODE), ready(&store), None);
+    assert_eq!(a.score, 20, "{a:?}");
+    assert_eq!(qe_waivable(&a), Ok(()), "{a:?}");
+    let a = assess(&signals_from_diff(DOCS_ONLY), ready(&store), None);
+    assert_eq!((a.score, qe_waivable(&a)), (0, Ok(())), "{a:?}");
+}
+
+/// Dependency adds are read per manifest/lockfile format; a version bump (the key removed and
+/// re-added) is not new; a `requirements.txt` is never docs.
+#[test]
+fn new_dependencies_are_read_from_manifests_and_lockfiles() {
+    let cases: &[(&str, &str, &[&str])] = &[
+        ("Cargo.toml", "@@ -1,3 +1,4 @@\n [dev-dependencies]\n+tempfile = \"3\"\n-anyhow = \"1.0\"\n+anyhow = \"1.1\"\n", &["tempfile"]),
+        ("Cargo.toml", "@@ -1,2 +1,3 @@\n [package]\n+version = \"0.2.0\"\n", &[]),
+        ("Cargo.toml", "@@ -9,1 +9,2 @@\n+[dependencies.tokio]\n+version = \"1\"\n", &["tokio"]),
+        ("package.json", "@@ -4,2 +4,4 @@\n   \"dependencies\": {\n+    \"left-pad\": \"^1.3.0\",\n+    \"version\": \"1.0.0\",\n+    \"build\": \"tsc -p .\",\n", &["build", "left-pad", "version"]),
+        ("go.mod", "@@ -3,1 +3,2 @@\n require (\n+\tgithub.com/pkg/errors v0.9.1\n", &["github.com/pkg/errors"]),
+        ("requirements.txt", "@@ -1 +1,2 @@\n flask==2.0\n+requests>=2.31\n", &["requests"]),
+        ("Cargo.lock", "@@ -10,0 +11,3 @@\n+[[package]]\n+name = \"itoa\"\n+version = \"1.0.0\"\n", &["itoa"]),
+        ("package-lock.json", "@@ -10,0 +11,2 @@\n+    \"node_modules/left-pad\": {\n+      \"version\": \"1.3.0\",\n", &["left-pad"]),
+        ("go.sum", "@@ -1,0 +2 @@\n+github.com/pkg/errors v0.9.1 h1:abc=\n", &["github.com/pkg/errors"]),
+    ];
+    for (file, hunk, want) in cases {
+        let d = signals_from_diff(&file_diff(file, hunk));
+        let want: BTreeSet<String> = want.iter().map(|s| s.to_string()).collect();
+        assert_eq!(d.new_dependencies, want, "{file}: {hunk}");
+        assert!(d.behavioural(), "{file} is never docs");
+    }
+}
+
+/// New public symbols per language; a signature edit (removed and re-added) is not new; a crate-
+/// or module-private item, an indented Python def, a lowercase Go func are not public.
+#[test]
+fn new_public_symbols_are_read_per_language() {
+    let cases: &[(&str, &str, &[&str])] = &[
+        ("src/a.rs", "@@ -1 +1,4 @@\n+pub fn alpha() {}\n+pub(crate) fn beta() {}\n+pub struct Gamma;\n+    pub delta: u32,\n", &["alpha", "Gamma", ".delta"]),
+        ("src/a.rs", "@@ -1 +1 @@\n-pub fn alpha(x: u8) {}\n+pub fn alpha(x: u16) {}\n", &[]),
+        ("src/a.ts", "@@ -1 +1,3 @@\n+export async function load() {}\n+export interface Shape {}\n+const local = 1;\n", &["load", "Shape"]),
+        ("lib/a.py", "@@ -1 +1,3 @@\n+def public():\n+def _private():\n+    def nested():\n", &["public"]),
+        ("pkg/a.go", "@@ -1 +1,3 @@\n+func Exported() {}\n+func local() {}\n+func (s *Svc) Serve() {}\n", &["Exported", "Serve"]),
+    ];
+    for (file, hunk, want) in cases {
+        let d = signals_from_diff(&file_diff(file, hunk));
+        let want: BTreeSet<String> = want.iter().map(|s| s.to_string()).collect();
+        assert_eq!(d.new_public_symbols, want, "{file}: {hunk}");
+    }
+}
+
+/// Branch lines are changed lines with a control-flow token, matched as words (so `elsewhere`
+/// and `iffy` are not branches); context lines and config files do not count.
+#[test]
+fn branch_lines_count_changed_control_flow_only() {
+    let hunk = "@@ -1,4 +1,5 @@\n if keep {\n-    a()\n+    if b && c { d() }\n+    let elsewhere = iffy;\n+    x?;\n }\n";
+    let d = signals_from_diff(&file_diff("src/a.rs", hunk));
+    assert_eq!((d.branch_lines, d.behavioural_lines), (2, 4), "{d:?}");
+    let d = signals_from_diff(&file_diff(
+        "config/a.toml",
+        "@@ -1 +1 @@\n-if = 1\n+if = 2\n",
+    ));
+    assert_eq!(d.branch_lines, 0, "{d:?}");
+}
+
+/// codex r1 on the QE PR: a binary or mode-only change has no `---`/`+++` header; it was dropped
+/// (docs-only, 0, waivable). Its paths come from the `Binary files` line or the `diff --git` line.
+#[test]
+fn binary_and_mode_only_changes_are_never_dropped() {
+    let added = "diff --git a/assets/app.wasm b/assets/app.wasm\nnew file mode 100644\nindex 0000000..1111111\nBinary files /dev/null and b/assets/app.wasm differ\n";
+    let d = signals_from_diff(added);
+    assert!(d.behavioural(), "{d:?}");
+    assert_eq!(d.touched[0].path, "assets/app.wasm");
+    assert_eq!(d.touched[0].old_path, "", "a new binary has no base side");
+    let deleted = "diff --git a/bin/tool b/bin/tool\ndeleted file mode 100755\nindex 1111111..0000000\nBinary files a/bin/tool and /dev/null differ\n";
+    let d = signals_from_diff(deleted);
+    assert!(d.behavioural() && d.destructive, "{d:?}");
+    let mode = "diff --git a/scripts/run.sh b/scripts/run.sh\nold mode 100644\nnew mode 100755\n";
+    let d = signals_from_diff(mode);
+    assert!(d.behavioural(), "{d:?}");
+    assert_eq!(d.touched[0].old_path, "scripts/run.sh");
+    // An unparseable header still counts (fail closed): code with no path.
+    let odd = "diff --git a/x b/y b/z\nold mode 100644\nnew mode 100755\n";
+    assert!(signals_from_diff(odd).behavioural());
+}
+
+/// codex r1: a TOML section seen in one hunk must not cover a later hunk that does not show its
+/// own header; there the key counts when it is dependency-shaped.
+#[test]
+fn a_toml_section_does_not_leak_into_the_next_hunk() {
+    let hunk = "@@ -1,2 +1,2 @@\n [package]\n-version = \"0.1.0\"\n+version = \"0.2.0\"\n@@ -20,1 +20,2 @@\n anyhow = \"1\"\n+tokio = \"1\"\n";
+    let d = signals_from_diff(&file_diff("Cargo.toml", hunk));
+    assert_eq!(
+        d.new_dependencies,
+        BTreeSet::from(["tokio".to_string()]),
+        "{d:?}"
+    );
+}
+
+/// codex r1: inside a dependency object every key is a dependency, whatever its version syntax or
+/// name; a hunk that never shows its object counts anything but a known top-level field.
+#[test]
+fn npm_dependencies_are_read_by_object_not_by_version_syntax() {
+    let hunk = "@@ -4,3 +4,6 @@\n   \"dependencies\": {\n+    \"left-pad\": \"latest\",\n+    \"node\": \"^20\",\n   },\n   \"scripts\": {\n+    \"build\": \"tsc\",\n";
+    let d = signals_from_diff(&file_diff("package.json", hunk));
+    assert_eq!(
+        d.new_dependencies,
+        BTreeSet::from(["left-pad".to_string(), "node".to_string()]),
+        "{d:?}"
+    );
+    let blind = "@@ -9,1 +9,2 @@\n     \"a\": \"1.0.0\",\n+    \"b\": \"next\",\n";
+    assert_eq!(
+        signals_from_diff(&file_diff("package.json", blind)).new_dependencies,
+        BTreeSet::from(["b".to_string()])
+    );
+}
+
+/// codex r1: a re-export widens the public surface.
+#[test]
+fn re_exports_are_new_public_symbols() {
+    let rs_ = signals_from_diff(&file_diff(
+        "src/lib.rs",
+        "@@ -1 +1,2 @@\n mod inner;\n+pub use inner::Thing;\n",
+    ));
+    assert_eq!(rs_.new_public_symbols.len(), 1, "{rs_:?}");
+    let ts = signals_from_diff(&file_diff("src/index.ts", "@@ -1 +1,3 @@\n import x from './x';\n+export { a, b } from './ab';\n+export * from './all';\n"));
+    assert_eq!(ts.new_public_symbols.len(), 2, "{ts:?}");
+}
+
+/// codex r2: a member added inside an existing multi-line re-export group is a new public symbol,
+/// though its line repeats neither `pub` nor `export`.
+#[test]
+fn a_member_added_to_a_multi_line_export_group_is_new() {
+    let rs_ = signals_from_diff(&file_diff(
+        "src/lib.rs",
+        "@@ -1,4 +1,5 @@\n pub use inner::{\n     A,\n+    B,\n };\n fn x() {}\n",
+    ));
+    assert_eq!(
+        rs_.new_public_symbols,
+        BTreeSet::from(["use inner::B".to_string()]),
+        "{rs_:?}"
+    );
+    let ts = signals_from_diff(&file_diff(
+        "src/index.ts",
+        "@@ -1,3 +1,4 @@\n export {\n   a,\n+  b,\n } from './ab';\n",
+    ));
+    assert_eq!(
+        ts.new_public_symbols,
+        BTreeSet::from(["export b".to_string()]),
+        "{ts:?}"
+    );
+    // Re-ordering a member within the group is not new.
+    let moved = signals_from_diff(&file_diff(
+        "src/lib.rs",
+        "@@ -1,4 +1,4 @@\n pub use inner::{\n-    A,\n     B,\n+    A,\n };\n",
+    ));
+    assert!(moved.new_public_symbols.is_empty(), "{moved:?}");
+}
+
+/// codex r2: the two sides of a hunk keep their own object state — a removed `"scripts": {` must
+/// not make the added dependency lines below it read as scripts.
+#[test]
+fn each_side_of_a_hunk_keeps_its_own_object() {
+    let hunk = "@@ -3,6 +3,4 @@\n   \"dependencies\": {\n-  },\n-  \"scripts\": {\n-    \"build\": \"tsc\"\n+    \"b\": \"^1\"\n   }\n";
+    let d = signals_from_diff(&file_diff("package.json", hunk));
+    assert_eq!(
+        d.new_dependencies,
+        BTreeSet::from(["b".to_string()]),
+        "{d:?}"
+    );
 }

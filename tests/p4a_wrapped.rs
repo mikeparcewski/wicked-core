@@ -140,6 +140,7 @@ fn real_cli_runs_in_the_worktree_and_output_is_governed_and_persisted() {
         primary: None,
         reduced_assurance: true, // (core#850) one-seat roster: creator-seat review by explicit opt-in
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     })
     .expect("launch");
 

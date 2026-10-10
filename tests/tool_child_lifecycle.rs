@@ -132,6 +132,7 @@ fn spec(sid: &str, workflow: &str) -> LaunchSpec {
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     }
 }
 

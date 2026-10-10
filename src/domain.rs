@@ -1125,6 +1125,11 @@ pub struct WorkUnit {
     /// `gateEvaluated.assurance` carried it. Persisted so a delivery receipt aggregates the run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assurance: Option<crate::assurance::AssuranceReceipt>,
+    /// (QE acceptance) The run's QE decision as this unit's dispatch made or read it — stamped on
+    /// the run's QE unit only, so its prompt says whether to run the acceptance pipeline
+    /// (`qe_acceptance::directive`) and its gate card can show why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qe_acceptance: Option<crate::assurance::QeAcceptance>,
     /// The final unit status: `pending` → `distributed` → `done` | `rejected`.
     pub status: UnitStatus,
 }
@@ -1327,6 +1332,7 @@ impl WorkUnit {
             status: UnitStatus::Pending,
             exclude_seats: Vec::new(),
             assurance: None,
+            qe_acceptance: None,
         }
     }
 

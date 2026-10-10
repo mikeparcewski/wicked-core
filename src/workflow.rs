@@ -1475,6 +1475,24 @@ fn refuse_unpinned_verified_evidence(def: &WorkflowDef) -> Result<(), WorkflowDe
 
 /// `feature` — clarify(value) → design(strategy) → build(execution) → adversarial-review → test → review.
 /// Gates: HumanConfirm after clarify + after adversarial-review; HumanConfirmIf(¬PASS) on test.
+/// (QE acceptance, operator ruling 2026-10-10) What a workflow that makes application changes
+/// requires: the defaults plus `qe_acceptance` — the launcher's QE acceptance PASS before
+/// delivery, waived only by the run's own score (every dimension in its lowest band) or skipped
+/// only by the operator's explicit word. `feature`, `bug`, `migration` and the `mcp-server`
+/// drop-in declare it; `domain-extraction` makes no application change and does not.
+fn app_change_instruments() -> Option<Vec<String>> {
+    Some(
+        [
+            crate::assurance::DISTINCT_EVALUATOR,
+            crate::assurance::JUDGE,
+            crate::assurance::QE_ACCEPTANCE,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+    )
+}
+
 pub fn feature_def() -> WorkflowDef {
     WorkflowDef {
         base_skill_ref: None,
@@ -1517,7 +1535,7 @@ pub fn feature_def() -> WorkflowDef {
                 .gate(GateType::Execution, GateSpec::Auto)
                 .after("test"),
         ],
-        required_instruments: None,
+        required_instruments: app_change_instruments(),
     }
 }
 
@@ -1562,7 +1580,7 @@ pub fn bug_def() -> WorkflowDef {
                 .evidence_floor()
                 .after("fix"),
         ],
-        required_instruments: None,
+        required_instruments: app_change_instruments(),
     }
 }
 
@@ -1609,7 +1627,7 @@ pub fn migration_def() -> WorkflowDef {
                 .after("cutover"),
             PhaseDef::new("cleanup", StageKind::Build).after("verify"),
         ],
-        required_instruments: None,
+        required_instruments: app_change_instruments(),
     }
 }
 

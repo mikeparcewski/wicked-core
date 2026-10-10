@@ -201,6 +201,7 @@ fn spec_with(session_id: &str, problem: &str, workflow: Option<String>) -> Launc
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     }
 }
 

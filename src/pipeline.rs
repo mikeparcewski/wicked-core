@@ -74,6 +74,7 @@ pub fn run_session(
         Vec::new(),
         None,
         false,
+        &crate::assurance::QeOverride::Auto,
     )?;
 
     // ── EXECUTE — per unit: produce output (stub, inline here), then gate it. ──
@@ -420,6 +421,8 @@ pub(crate) fn pre_distribute(
     // (core#850) The launch's explicit reduced-assurance opt-in, recorded on a session this call
     // CREATES; a launch stub's contract is carried forward instead.
     reduced_assurance: bool,
+    // (QE acceptance) The operator's explicit skip or force, applied to the contract.
+    qe_acceptance: &crate::assurance::QeOverride,
 ) -> anyhow::Result<PreDistributed> {
     let workflow_id = format!("wf-{session_id}");
     // (core#572) The run's seat pool — what failover and reassignment pick from — is its
@@ -483,6 +486,16 @@ pub(crate) fn pre_distribute(
             reduced_assurance,
         ),
     };
+    // (QE acceptance) The operator's word applies where the contract is BUILT. A session whose
+    // launch stub already exists carries the stub's contract forward below (the word was applied
+    // there, against the def the launch named), so it is never re-judged against a later rev's def.
+    if !session_already_started {
+        session.assurance = session
+            .assurance
+            .clone()
+            .with_qe_override(qe_acceptance)
+            .map_err(|e| anyhow::anyhow!("the launch is refused: {e}"))?;
+    }
     if session_already_started {
         // (F-7R2-013 / F-7R2-006) The launch stub on the store already carries what the
         // worktree handler recorded (`run_branch`, `base_commit`) and any seats benched before
@@ -892,6 +905,8 @@ pub(crate) fn plan_and_distribute(
     evidence_root: Option<String>,
     // (core#850) The launch's reduced-assurance opt-in, forwarded the same way.
     reduced_assurance: bool,
+    // (QE acceptance) The operator's explicit skip or force, applied to the contract.
+    qe_acceptance: &crate::assurance::QeOverride,
 ) -> anyhow::Result<Planned> {
     let mut pre = pre_distribute(
         store,
@@ -915,6 +930,7 @@ pub(crate) fn plan_and_distribute(
         exclude_seats,
         evidence_root,
         reduced_assurance,
+        qe_acceptance,
     )?;
     let distributions = distribute::distribute_units_on(
         &pre.units,
@@ -3056,6 +3072,7 @@ mod resolve_tests {
             Vec::new(),
             None,
             false,
+            &crate::assurance::QeOverride::Auto,
         )
         .expect("a shipped def must never bail on its own built-in floor");
 
@@ -3184,6 +3201,7 @@ mod resolve_tests {
             Vec::new(),
             None,
             false,
+            &crate::assurance::QeOverride::Auto,
         )
         .expect("a shipped drop-in must never require an out-of-band seed to plan");
 
@@ -3582,6 +3600,7 @@ mod resolve_tests {
             Vec::new(),
             None,
             false,
+            &crate::assurance::QeOverride::Auto,
         )
         .expect("plans");
         assert!(!planned.units.is_empty());
@@ -3782,6 +3801,7 @@ mod judge_bench_tests {
             Vec::new(),
             None,
             reduced,
+            &crate::assurance::QeOverride::Auto,
         )
         .expect("plan");
         let evidence = crate::workflow::UnitEvidence {
@@ -3908,6 +3928,7 @@ mod judge_bench_tests {
             Vec::new(),
             None,
             false,
+            &crate::assurance::QeOverride::Auto,
         )
         .expect("plan");
         let evidence = crate::workflow::UnitEvidence {

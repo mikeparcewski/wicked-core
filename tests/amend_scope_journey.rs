@@ -174,6 +174,7 @@ fn launch(core: &Core, run: &str) -> std::sync::mpsc::Receiver<CoreEvent> {
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     })
     .expect("launch");
     drain_until(&ev, run, |e| matches!(e, CoreEvent::AwaitingHuman { .. }));

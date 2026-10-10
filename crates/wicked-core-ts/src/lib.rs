@@ -767,6 +767,15 @@ pub struct LaunchOptions {
     /// the engine's deliverable floor judges them (written by THIS run). Refused on a launch with
     /// neither a plan nor a preset, and on a plan with no creator step.
     pub deliverables: Option<Vec<String>>,
+    /// (QE acceptance, operator ruling 2026-10-10) SKIP a required QE acceptance, for this reason
+    /// (non-empty): persisted on the contract (`sessionStarted.assurance.qe`, `status: "skipped"`,
+    /// `basis: "operator"`) and labelled on every receipt ("QE acceptance skipped by operator:
+    /// <reason>"). Omit and a required QE acceptance is never skipped. Refused beside
+    /// `forceQeAcceptance`, and on a run whose workflow does not require QE acceptance.
+    pub skip_qe_acceptance_reason: Option<String>,
+    /// (QE acceptance) REQUIRE QE acceptance whatever the run's impact score says (no waiver).
+    /// Refused beside `skipQeAcceptanceReason`, and on a run whose workflow does not require it.
+    pub force_qe_acceptance: Option<bool>,
 }
 
 /// The body of `Core.considerRules` over the store at `db_path` (read-only).
@@ -786,6 +795,19 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
     let clis: Vec<AgenticCli> = serde_json::from_str(&o.clis_json)
         .map_err(|e| err(format!("clisJson is not a valid AgenticCli array: {e}")))?;
     let plan = o.plan_json.as_deref().map(parse_plan).transpose()?;
+    let qe_acceptance = match (
+        o.skip_qe_acceptance_reason,
+        o.force_qe_acceptance.unwrap_or(false),
+    ) {
+        (Some(_), true) => {
+            return Err(err(
+                "skipQeAcceptanceReason and forceQeAcceptance are mutually exclusive",
+            ))
+        }
+        (Some(reason), false) => wicked_core::assurance::QeOverride::Skip(reason),
+        (None, true) => wicked_core::assurance::QeOverride::Force,
+        (None, false) => wicked_core::assurance::QeOverride::Auto,
+    };
     let deliver_step = o
         .deliver_step_json
         .as_deref()
@@ -822,6 +844,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         primary: o.primary,
         reduced_assurance: o.reduced_assurance.unwrap_or(false),
         deliverables: o.deliverables.unwrap_or_default(),
+        qe_acceptance,
     })
 }
 
@@ -3967,6 +3990,25 @@ mod tests {
                 "type", "session", "ord", "attempt", "cli", "carrier", "tool", "kind", "path",
                 "role", "posture", "reason",
             ],
+        );
+        // QE-IN-APP-WORKFLOWS: the run's QE acceptance decision at its QE unit's dispatch.
+        check(
+            CoreEvent::QeAcceptanceDecided {
+                session: s(),
+                ord: 4,
+                qe: Box::new(wicked_core::assurance::QeAcceptance {
+                    status: "waived".into(),
+                    basis: "diff".into(),
+                    score: Some(20),
+                    threshold: 20,
+                    reason: s(),
+                    reasons: vec![],
+                    ord: Some(4),
+                    tree: None,
+                }),
+            },
+            "qeAcceptanceDecided",
+            &["type", "session", "ord", "qe"],
         );
         check(
             CoreEvent::RunBaseResolved {

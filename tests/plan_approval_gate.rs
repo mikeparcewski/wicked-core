@@ -248,6 +248,7 @@ fn spec(run: &str, human_confirm: HumanConfirm, plan: Option<PlanSteps>) -> Laun
         primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     }
 }
 

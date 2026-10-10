@@ -222,6 +222,7 @@ fn spec(run: &str, steps: Vec<Value>) -> LaunchSpec {
         primary: Some("a".into()),
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     }
 }
 

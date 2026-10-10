@@ -1531,6 +1531,7 @@ fn launch_from_event(
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     };
 
     let (reply, rx) = channel();

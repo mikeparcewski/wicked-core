@@ -162,6 +162,7 @@ fn launch_team_with(e: &Engine, run: &str, human_confirm: HumanConfirm) {
             primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
             reduced_assurance: false,
             deliverables: Vec::new(),
+            qe_acceptance: Default::default(),
         })
         .expect("launch");
 }
@@ -1704,6 +1705,7 @@ fn t6_16k_a_dispute_approved_with_an_amendment_reruns_the_creator() {
             primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
             reduced_assurance: false,
             deliverables: Vec::new(),
+            qe_acceptance: Default::default(),
         })
         .unwrap();
     wait_status(&e, "t616k", SessionStatus::AwaitingHuman);
@@ -1877,6 +1879,7 @@ fn launch_member_run(e: &Engine, run: &str) {
             primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
             reduced_assurance: false,
             deliverables: Vec::new(),
+            qe_acceptance: Default::default(),
         })
         .expect("launch");
 }
@@ -2654,6 +2657,7 @@ fn launch_plan_run(e: &Engine, run: &str) {
             primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
             reduced_assurance: false,
             deliverables: Vec::new(),
+            qe_acceptance: Default::default(),
         })
         .expect("launch");
 }
@@ -3047,6 +3051,7 @@ fn try_launch_plan(
         primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     })
 }
 
@@ -3206,6 +3211,7 @@ fn pick_spec(clis: Vec<AgenticCli>, primary: Option<&str>) -> LaunchSpec {
         primary: primary.map(str::to_string),
         reduced_assurance: false,
         deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
     }
 }
 
