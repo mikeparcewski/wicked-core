@@ -156,9 +156,9 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 /// consumer's §11.2 mapping (`tests/fixtures/catalog/mappings.json`, pinned by a test).
 ///
 /// Seeded here: `feature` (C2's acceptance), `chat` (M3), `onboarding` (M4), `migration` (M2),
-/// `capture-learnings` (M7), `steering-author` (M8), `domain-extraction` (M6), `qe-author-tests`
-/// (M10) and `demo` (M9b, which replaces `interactive-demo` and `interactive-demo-reauthor` rather
-/// than mapping them). Every other consumer's preset is added by its migration seam (§14 M1–M10),
+/// `capture-learnings` (M7), `steering-author` (M8), `domain-extraction` (M6), `interactive-chat`,
+/// `interactive-draft` and `interactive-edit` (M9), `qe-author-tests` (M10) and `demo` (M9b,
+/// which replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping them). Every other consumer's preset is added by its migration seam (§14 M1–M10),
 /// which also deletes the def it replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
     vec![
@@ -167,6 +167,27 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
         ("demo", demo_preset()),
         ("domain-extraction", domain_extraction_preset()),
         ("feature", feature_preset()),
+        (
+            "interactive-chat",
+            interactive_preset(
+                include_str!("presets/interactive-chat.json"),
+                "interactive-chat",
+            ),
+        ),
+        (
+            "interactive-draft",
+            interactive_preset(
+                include_str!("presets/interactive-draft.json"),
+                "interactive-draft",
+            ),
+        ),
+        (
+            "interactive-edit",
+            interactive_preset(
+                include_str!("presets/interactive-edit.json"),
+                "interactive-edit",
+            ),
+        ),
         ("migration", migration_preset()),
         ("onboarding", onboarding_preset()),
         ("qe-author-tests", qe_author_tests_preset()),
@@ -470,6 +491,20 @@ fn migration_preset() -> Vec<PlanStep> {
             ..step("build", "cleanup", Some("verify"))
         },
     ]
+}
+
+/// The interactive document presets (M9: `interactive-chat`, `interactive-draft`,
+/// `interactive-edit`): §11.2's rows, moved from crew's defs as data (`src/presets/<name>.json`,
+/// in the form crew registered them with the draft skill held, `withDraftSkill(<def>, true)`;
+/// pinned to the C1 mapping by a test). chat: understand → `understand`, revise → `produce`;
+/// draft: draft → `produce` (crew folded the outline into its one phase); edit: edit → `produce`.
+/// Every agent step runs `wicked-garden-draft`, the document quality floor. They are repo-less creator plans, so
+/// the PA rates their RISK first (§11.3): a routine internal draft proceeds in auto mode, a
+/// high-stakes one pauses.
+fn interactive_preset(json: &str, name: &str) -> Vec<PlanStep> {
+    let plan: crate::plan::PlanSteps = serde_json::from_str(json)
+        .unwrap_or_else(|e| panic!("src/presets/{name}.json is a valid plan: {e}"));
+    plan.steps
 }
 
 /// `qe-author-tests` (M10): §11.2's row, moved from crew's def as data

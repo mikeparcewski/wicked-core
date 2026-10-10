@@ -621,6 +621,9 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
             "demo",
             "domain-extraction",
             "feature",
+            "interactive-chat",
+            "interactive-draft",
+            "interactive-edit",
             "migration",
             "onboarding",
             "qe-author-tests",
@@ -973,6 +976,54 @@ fn a_preset_launchs_declared_deliverables_ride_its_last_creator_unit() {
     legacy.deliverables = vec!["docs/out.md".into()];
     let e = rig.core.launch_run(legacy).unwrap_err().to_string();
     assert!(e.contains("names neither"), "{e}");
+}
+
+/// M9 (DES-TEAMING-002 §14, §11.3): a launch naming `interactive-chat`, `interactive-draft` or
+/// `interactive-edit` runs the built-in preset. Each is a repo-less creator plan (`produce`), so the
+/// PA rates its RISK first (`pa-scope`, ord 1); this rig's PA answers nothing, so it floors at 100
+/// as a non-code run (no `build`, no diff-floored `security_review`). Every preset step keeps the
+/// draft skill, and the steps are crew's, in the form crew registered them with the skill held.
+#[test]
+fn m9_interactive_presets_launch_repo_less_with_the_draft_skill() {
+    let dir = tmp_dir("interactive");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let rig = spawn(&db);
+    for (name, run, own) in [
+        ("interactive-chat", "richat", &["understand", "revise"][..]),
+        ("interactive-draft", "ridraft", &["draft"][..]),
+        ("interactive-edit", "riedit", &["edit"][..]),
+    ] {
+        rig.core.launch_run(spec(run, name, None)).unwrap();
+        let units = units_of(&rig.core, run);
+        assert_eq!(units[0].id, format!("{run}:pa-scope"), "{name}");
+        assert!(
+            units[0]
+                .instructions
+                .as_deref()
+                .is_some_and(|t| t.contains("RISK {")),
+            "{name}: a repo-less run is rated, not scoped"
+        );
+        let ids: Vec<&str> = units
+            .iter()
+            .map(|u| u.id.strip_prefix(&format!("{run}:")).unwrap())
+            .collect();
+        for id in own {
+            let u = units
+                .iter()
+                .find(|u| u.id == format!("{run}:{id}"))
+                .unwrap_or_else(|| panic!("{name}: {id} is planned in {ids:?}"));
+            assert_eq!(
+                u.skill_ref.as_deref(),
+                Some("wicked-garden-draft"),
+                "{name}/{id}"
+            );
+            assert!(!u.executes_code, "{name}/{id}");
+        }
+        assert!(
+            !ids.iter().any(|i| *i == "build" || *i == "security_review"),
+            "{name}: a non-code run owes no build and no security_review: {ids:?}"
+        );
+    }
 }
 
 /// M9b (studio#373): a launch naming `demo` runs the built-in preset — the wicked-garden demo

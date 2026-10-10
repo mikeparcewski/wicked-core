@@ -1,0 +1,11 @@
+{
+ "steps": [
+  {
+   "catalog": "produce",
+   "id": "edit",
+   "instructions": "Read the handoff JSON file named in the task; for EACH entry of its items array: rewrite that item's \"fragment\" (the current outerHTML of one document element) to fulfil the item's \"instruction\", and SAVE the complete edited fragment — the element's full outerHTML only, no document wrapper, no markdown fences — to the item's exact absolute \"output_path\" (create parent directories if needed, overwrite if present). NON-NEGOTIABLE (INV-2): every data-wid attribute in the input fragment MUST survive in your edited fragment byte-for-byte — never remove, rename, or re-value a data-wid, and keep the root element's own data-wid on the root; elements you ADD must carry no data-wid at all (the wicked-interactive service instruments its own anchors). Keep the markup well-formed (balanced tags), change only what the instruction asks, and never fabricate facts or figures. Write every output file before you finish and end your reply with the absolute paths you wrote.",
+   "gate_type": "execution",
+   "skill_ref": "wicked-garden-draft"
+  }
+ ]
+}

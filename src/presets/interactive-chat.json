@@ -1,0 +1,20 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "understand",
+   "instructions": "Understand the revision ask, do not write anything yet: read the CURRENT document — the absolute HTML file path named in the task — and the user's ask, then produce a concise revision plan as plain text: which sections change, what gets added or removed, and what stays untouched (the default is untouched — this is an iteration on a document the user already accepted, not a rewrite). Never invent facts, numbers, or claims the current document and the ask do not support; where the ask needs material the document lacks, plan honest placeholder copy that says what belongs there. Do NOT write HTML and do NOT create any files in this phase.",
+   "skill_ref": "wicked-garden-draft"
+  },
+  {
+   "catalog": "produce",
+   "id": "revise",
+   "instructions": "Using the plan from the prior phase, write the COMPLETE revised HTML document and SAVE it to the absolute output file named in the task (create parent directories if needed, overwrite if present) — the file on disk is the deliverable, so write it before you finish and end your reply with the absolute path you wrote. Contract: start from the CURRENT document (the absolute input path named in the task) and apply the user's ask — change only what the ask touches and keep everything else, including the document's style and structure; produce a full self-contained HTML document (inline CSS, no external network resources, no build step); KEEP every existing data-wid attribute byte-for-byte on elements you keep, and add NO data-wid to elements you create (the wicked-interactive service instruments its own anchors); never fabricate facts or figures; keep the markup semantic and well-formed (balanced tags) so the instrumentation pass lands cleanly.",
+   "gate_type": "execution",
+   "depends_on": [
+    "understand"
+   ],
+   "skill_ref": "wicked-garden-draft"
+  }
+ ]
+}
