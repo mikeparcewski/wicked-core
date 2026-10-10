@@ -822,6 +822,7 @@ mod seccomp {
 
     #[cfg(not(unix))]
     fn write_private() -> Option<std::path::PathBuf> {
+        let _ = af_unix_program(); // the program is Linux's; no jail loads it here
         None
     }
 }
