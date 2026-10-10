@@ -355,6 +355,11 @@ pub struct RepoCheck {
     /// The repo-configured BASE bound (`timeout_s` in [`CONFIG_PATH`]); `None` ⇒ the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_s: Option<u64>,
+    /// (core#817) The package directory the check runs in, relative to the worktree root (`/`
+    /// separated); empty = the root. A change confined to a subdirectory package that the root's
+    /// checks do not cover runs THAT package's checks ([`subdir_packages`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dir: String,
 }
 
 impl RepoCheck {
@@ -402,6 +407,11 @@ pub struct FloorContext {
     pub git_dir: Option<PathBuf>,
     /// The seat's transcript, scanned at the creator stage for a "pre-existing failure" claim.
     pub claim_text: Option<String>,
+    /// (core#817) Set when detecting a SUBDIRECTORY package: the worktree handed to detection
+    /// is `<root>/<package_dir>`, and the change's touched / deleted files are read from the
+    /// root through the pinned git dir and made package-relative — so `{files}`, `{base}` and a
+    /// derived targeted command work in the package as at the root.
+    pub package_dir: Option<String>,
 }
 
 /// The evidence of one check having run.
@@ -1286,6 +1296,7 @@ fn apply(slot: &mut Option<RepoCheck>, r: Resolved, key: &str) {
                 argv,
                 source: format!("{CONFIG_PATH} {key}"),
                 timeout_s: None,
+                dir: String::new(),
             })
         }
     }
@@ -1295,6 +1306,13 @@ fn apply(slot: &mut Option<RepoCheck>, r: Resolved, key: &str) {
 /// copied, modified, renamed) plus untracked-not-ignored files, through the PINNED git dir; the
 /// engine scratch is never a touched path. Empty when the run knows no base.
 fn touched_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, String> {
+    if let Some((root, dir)) = package_root(worktree, ctx) {
+        let root_ctx = FloorContext {
+            package_dir: None,
+            ..ctx.clone()
+        };
+        return Ok(package_relative(touched_files(&root, &root_ctx)?, &dir));
+    }
     let (Some(base), Some(git_dir)) = (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) else {
         return Ok(Vec::new());
     };
@@ -1332,6 +1350,13 @@ fn deletes_a_file(worktree: &Path, ctx: &FloorContext) -> Result<bool, String> {
 /// The tracked paths the change deleted relative to the base (a rename's old path included —
 /// `--no-renames`). Empty when the run knows no base.
 fn deleted_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, String> {
+    if let Some((root, dir)) = package_root(worktree, ctx) {
+        let root_ctx = FloorContext {
+            package_dir: None,
+            ..ctx.clone()
+        };
+        return Ok(package_relative(deleted_files(&root, &root_ctx)?, &dir));
+    }
     let (Some(base), Some(git_dir)) = (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) else {
         return Ok(Vec::new());
     };
@@ -1401,6 +1426,196 @@ pub(crate) fn detect(worktree: &Path) -> Result<Vec<RepoCheck>, String> {
 /// the checks would fail for the wrong reason; always frozen and `--ignore-scripts`). Pure over
 /// the filesystem (one `git diff` when a targeted command asks for `{files}`) — runs nothing.
 pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>, String> {
+    let pkgs = subdir_packages(worktree, ctx)?;
+    if pkgs.dirs.is_empty() {
+        return detect_package(worktree, ctx);
+    }
+    // (core#817) The change lives (at least partly) in a subdirectory package the root's checks
+    // do not cover: that package's own checks run, in its directory. The root's checks run as
+    // well when the change also touches root-owned paths or the repo DECLARES its checks.
+    // The root is detected only then (a malformed root manifest cannot fail a subdir change).
+    let mut out = if pkgs.root_touched || read_config(worktree)?.is_some() {
+        detect_package(worktree, ctx)?
+    } else {
+        Vec::new()
+    };
+    for dir in &pkgs.dirs {
+        let sub_ctx = FloorContext {
+            package_dir: Some(dir.clone()),
+            claim_text: None,
+            ..ctx.clone()
+        };
+        for mut c in detect_package(&worktree.join(dir), &sub_ctx)? {
+            c.source = format!("{dir}/{}", c.source);
+            c.dir = dir.clone();
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
+/// (core#817) For a subdirectory package's context: the repository root (`worktree` minus
+/// `package_dir`) and the dir, or `None` at the root.
+fn package_root(worktree: &Path, ctx: &FloorContext) -> Option<(PathBuf, String)> {
+    let dir = ctx.package_dir.as_deref().filter(|d| !d.is_empty())?;
+    let depth = dir.split('/').filter(|s| !s.is_empty()).count();
+    let root = worktree.ancestors().nth(depth)?.to_path_buf();
+    (root.join(dir) == worktree).then(|| (root, dir.to_string()))
+}
+
+/// Repo-relative paths under `dir/`, made relative to it; others dropped.
+fn package_relative(files: Vec<String>, dir: &str) -> Vec<String> {
+    let prefix = format!("{dir}/");
+    files
+        .into_iter()
+        .filter_map(|f| f.strip_prefix(&prefix).map(str::to_string))
+        .collect()
+}
+
+/// (core#817) Where the change sits relative to the repo's packages.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ChangePackages {
+    /// Subdirectory packages (repo-relative) holding a changed path that the root's checks do not
+    /// cover, sorted.
+    pub dirs: Vec<String>,
+    /// A changed path the root package owns (no nearer uncovered manifest).
+    pub root_touched: bool,
+}
+
+/// The manifests that make a directory a package of its own.
+const PACKAGE_MANIFESTS: &[&str] = &["package.json", "Cargo.toml"];
+
+/// Is `rel` (a directory, repo-relative) free of symlinks along the way? A linked directory is
+/// never followed into — the probe that reads its manifest would read outside the tree.
+fn plain_dir(worktree: &Path, rel: &str) -> bool {
+    let mut p = worktree.to_path_buf();
+    for seg in rel.split('/') {
+        p.push(seg);
+        match std::fs::symlink_metadata(&p) {
+            Ok(m) if m.is_dir() => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Does the ROOT's own check cover the package at `dir` (repo-relative) of `manifest` kind — a
+/// Node workspace member (`dir` matches the root `package.json` `workspaces` globs, or
+/// `pnpm-workspace.yaml` `packages`, `!` exclusions honoured), or any root `Cargo.toml` (a
+/// workspace, or a crate whose members cargo builds)?
+fn root_covers(worktree: &Path, manifest: &str, dir: &str) -> bool {
+    if manifest != "package.json" {
+        return worktree.join("Cargo.toml").is_file();
+    }
+    let mut globs: Vec<String> = Vec::new();
+    if let Some(v) = std::fs::read_to_string(worktree.join("package.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    {
+        // `"workspaces": [...]` or yarn's `"workspaces": {"packages": [...]}`.
+        let ws = v.get("workspaces");
+        let list = ws.and_then(|w| w.get("packages")).or(ws);
+        if let Some(a) = list.and_then(|l| l.as_array()) {
+            globs.extend(a.iter().filter_map(|g| g.as_str().map(str::to_string)));
+        }
+    }
+    if let Some(v) = std::fs::read_to_string(worktree.join("pnpm-workspace.yaml"))
+        .ok()
+        .and_then(|raw| serde_yaml::from_str::<serde_yaml::Value>(&raw).ok())
+    {
+        if let Some(a) = v.get("packages").and_then(|p| p.as_sequence()) {
+            globs.extend(a.iter().filter_map(|g| g.as_str().map(str::to_string)));
+        }
+    }
+    let norm = |g: &str| g.trim_start_matches("./").trim_end_matches('/').to_string();
+    let included = globs
+        .iter()
+        .filter(|g| !g.starts_with('!'))
+        .any(|g| workspace_glob_matches(&norm(g), dir));
+    let excluded = globs
+        .iter()
+        .filter_map(|g| g.strip_prefix('!'))
+        .any(|g| workspace_glob_matches(&norm(g), dir));
+    included && !excluded
+}
+
+/// A workspace glob over `/`-separated segments: `**` matches any number of segments, and inside
+/// a segment `*` matches any run of characters (`packages/*`, `apps/**`, `libs/ui-*`).
+fn workspace_glob_matches(glob: &str, dir: &str) -> bool {
+    fn seg(p: &str, s: &str) -> bool {
+        match p.split_once('*') {
+            None => p == s,
+            Some((pre, rest)) => {
+                let Some(tail) = s.strip_prefix(pre) else {
+                    return false;
+                };
+                (0..=tail.len())
+                    .filter(|i| tail.is_char_boundary(*i))
+                    .any(|i| seg(rest, &tail[i..]))
+            }
+        }
+    }
+    fn go(p: &[&str], d: &[&str]) -> bool {
+        match (p.first(), d.first()) {
+            (None, None) => true,
+            (Some(&"**"), _) => go(&p[1..], d) || (!d.is_empty() && go(p, &d[1..])),
+            (Some(ps), Some(ds)) => seg(ps, ds) && go(&p[1..], &d[1..]),
+            _ => false,
+        }
+    }
+    let p: Vec<&str> = glob.split('/').filter(|s| !s.is_empty()).collect();
+    let d: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+    go(&p, &d)
+}
+
+/// (core#817) The subdirectory packages the change touches: for each changed path (touched or
+/// deleted, relative to the base), the NEAREST ancestor directory below the root that holds a
+/// manifest ([`PACKAGE_MANIFESTS`]) the root does not cover ([`root_covers`]). Paths under
+/// `node_modules/` or the engine scratch never count; a linked directory is never followed. No
+/// base ⇒ nothing (the root's checks, as before).
+pub(crate) fn subdir_packages(
+    worktree: &Path,
+    ctx: &FloorContext,
+) -> Result<ChangePackages, String> {
+    let mut files = touched_files(worktree, ctx)?;
+    files.extend(deleted_files(worktree, ctx)?);
+    let mut out = ChangePackages::default();
+    for f in &files {
+        let mut owner: Option<String> = None;
+        let mut dir = f.rsplit_once('/').map(|(d, _)| d);
+        while let Some(d) = dir.filter(|d| !d.is_empty()) {
+            if d.split('/').any(|s| s == "node_modules")
+                || d == crate::worktree_guard::ENGINE_SCRATCH_DIR
+                || d.starts_with(&format!("{}/", crate::worktree_guard::ENGINE_SCRATCH_DIR))
+            {
+                break;
+            }
+            if let Some(m) = PACKAGE_MANIFESTS
+                .iter()
+                .find(|m| worktree.join(d).join(m).is_file())
+            {
+                if !root_covers(worktree, m, d) && plain_dir(worktree, d) {
+                    owner = Some(d.to_string());
+                }
+                break;
+            }
+            dir = d.rsplit_once('/').map(|(p, _)| p);
+        }
+        match owner {
+            Some(d) => {
+                if !out.dirs.contains(&d) {
+                    out.dirs.push(d);
+                }
+            }
+            None => out.root_touched = true,
+        }
+    }
+    out.dirs.sort();
+    Ok(out)
+}
+
+/// One package's checks — the root's, or (core#817) a subdirectory package's.
+fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>, String> {
     let cfg = read_config(worktree)?.unwrap_or_default();
     let r_typecheck = resolve(&cfg.typecheck, "typecheck")?;
     let r_lint = resolve(&cfg.lint, "lint")?;
@@ -1428,6 +1643,7 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
                     argv,
                     source: format!("{CONFIG_PATH} {key}"),
                     timeout_s: None,
+                    dir: String::new(),
                 });
             }
         }
@@ -1439,6 +1655,7 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
             argv,
             source: format!("{CONFIG_PATH} e2e"),
             timeout_s: None,
+            dir: String::new(),
         }),
         _ => None,
     };
@@ -1526,6 +1743,7 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
                     argv,
                     source,
                     timeout_s: None,
+                    dir: String::new(),
                 });
             }
             for k in wanted {
@@ -1534,6 +1752,7 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
                     argv: s(&[pm, "run", k]),
                     source: format!("package.json scripts.{k}"),
                     timeout_s: None,
+                    dir: String::new(),
                 };
                 match k {
                     "typecheck" => typecheck = Some(check),
@@ -1561,6 +1780,7 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
             argv: s(&["cargo", "fmt", "--all", "--check"]),
             source: "Cargo.toml".into(),
             timeout_s: None,
+            dir: String::new(),
         });
         // `--no-fail-fast` (core#481): cargo otherwise stops at the first failing test binary, so
         // a crate whose red test the base shares would hide every later crate from the baseline
@@ -1574,6 +1794,7 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
             },
             source: "Cargo.toml".into(),
             timeout_s: None,
+            dir: String::new(),
         });
     }
     // The repo config speaks over the manifests.
@@ -1594,6 +1815,7 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
                 argv: argv.clone(),
                 source: format!("{CONFIG_PATH} test"),
                 timeout_s: None,
+                dir: String::new(),
             });
             cargo = None;
         }
@@ -1615,6 +1837,7 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
                 argv,
                 source: format!("{CONFIG_PATH} test_targeted"),
                 timeout_s: None,
+                dir: String::new(),
             });
             cargo = None;
         }
@@ -1753,6 +1976,7 @@ fn derive_targeted(
         argv,
         source: DERIVED_TARGETED_SOURCE.into(),
         timeout_s: None,
+        dir: String::new(),
     }))
 }
 
@@ -1879,13 +2103,21 @@ fn node_modules_gap(
 /// checks so the worktree guard never denies the engine's side effect. Only a file that was
 /// ABSENT at detection time is a candidate: the seat's work is quiesced before detection, so a
 /// file that appears between detection and the end of the checks was written by the checks.
-fn engine_generated_candidates(worktree: &Path, detected: &[RepoCheck]) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if detected.iter().any(|c| {
-        c.argv.first().is_some_and(|b| b == "cargo") && !c.argv.iter().any(|a| a == "--locked")
-    }) && !worktree.join("Cargo.lock").exists()
-    {
-        out.push("Cargo.lock");
+fn engine_generated_candidates(worktree: &Path, detected: &[RepoCheck]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for c in detected {
+        if c.argv.first().is_none_or(|b| b != "cargo") || c.argv.iter().any(|a| a == "--locked") {
+            continue;
+        }
+        // (core#817) Beside the manifest the check ran on — a subdirectory package's own.
+        let rel = if c.dir.is_empty() {
+            "Cargo.lock".to_string()
+        } else {
+            format!("{}/Cargo.lock", c.dir)
+        };
+        if !worktree.join(&rel).exists() && !out.contains(&rel) {
+            out.push(rel);
+        }
     }
     out
 }
@@ -2420,7 +2652,11 @@ pub(crate) fn run_with_sandbox_ctx(
     };
     let candidates = engine_generated_candidates(worktree, &detected);
     let env = scratch.env_record(&sandbox_level);
+    // (core#817) Per package: a subdirectory package's own `baseline_diff: false` holds for it.
+    // The root's opt-out covers the whole repo; a package's own opt-out covers the package.
     let baseline_diff = baseline_diff_enabled(worktree);
+    let baseline_diff_for =
+        |dir: &str| dir.is_empty() || baseline_diff_enabled(&worktree.join(dir));
     let mut checks = Vec::new();
     let mut skipped = Vec::new();
     let mut failed = false;
@@ -2447,7 +2683,7 @@ pub(crate) fn run_with_sandbox_ctx(
             && !is_formatter_check(&check.name)
         {
             match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
-                (Some(head), _) if !baseline_diff => {
+                (Some(head), _) if !(baseline_diff && baseline_diff_for(&check.dir)) => {
                     run.base = Some(Box::new(BaseRun {
                         head: head.to_string(),
                         cached: false,
@@ -2510,16 +2746,23 @@ pub(crate) fn run_with_sandbox_ctx(
     // remove it so the guard's final comparison sees the tree the seat left. Never a symlink.
     let mut engine_writes_removed = Vec::new();
     for rel in candidates {
-        let p = worktree.join(rel);
+        let p = worktree.join(&rel);
         if let Ok(m) = std::fs::symlink_metadata(&p) {
             if m.is_file() && std::fs::remove_file(&p).is_ok() {
-                engine_writes_removed.push(rel.to_string());
+                engine_writes_removed.push(rel);
             }
         }
     }
-    let coverage_note = (ctx.stage == FloorStage::Verify)
-        .then(|| e2e_coverage_note(worktree, ctx, &detected, &checks, &waived))
-        .flatten();
+    let notes: Vec<String> = [
+        (ctx.stage == FloorStage::Verify)
+            .then(|| e2e_coverage_note(worktree, ctx, &detected, &checks, &waived))
+            .flatten(),
+        package_coverage_note(worktree, ctx, &detected),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let coverage_note = (!notes.is_empty()).then(|| notes.join("; "));
     RepoChecksReport {
         passed: !failed,
         detected,
@@ -2538,6 +2781,33 @@ pub(crate) fn run_with_sandbox_ctx(
         requested_rerun: None,
         coverage_note,
     }
+}
+
+/// (core#817) A changed subdirectory package the floor detected NO checks for is named, so a
+/// green floor is never read as having checked it.
+fn package_coverage_note(
+    worktree: &Path,
+    ctx: &FloorContext,
+    detected: &[RepoCheck],
+) -> Option<String> {
+    let pkgs = subdir_packages(worktree, ctx).ok()?;
+    let bare: Vec<String> = pkgs
+        .dirs
+        .into_iter()
+        // An install alone checks nothing.
+        .filter(|d| !detected.iter().any(|c| &c.dir == d && c.name != "install"))
+        .map(|d| format!("{d}/"))
+        .collect();
+    (!bare.is_empty()).then(|| {
+        format!(
+            "the change touches package{} {} and no checks were detected for {} (no test, \
+             typecheck or lint script) — the floor did NOT check {}",
+            if bare.len() == 1 { "" } else { "s" },
+            bare.join(", "),
+            if bare.len() == 1 { "it" } else { "them" },
+            if bare.len() == 1 { "it" } else { "them" },
+        )
+    })
 }
 
 /// (core#432 F-3R2-023) Does `path` look like an end-to-end file: a path segment `e2e`,
@@ -2723,16 +2993,25 @@ fn remove_base_export(scratch: &CheckScratch) -> Result<(), String> {
 }
 
 impl BaseTree {
-    fn cache_path(scratch: &CheckScratch, head: &str, name: &str) -> PathBuf {
-        scratch
-            .root
-            .join("base-cache")
-            .join(format!("{}-{name}.json", &head[..head.len().min(12)]))
+    fn cache_path(scratch: &CheckScratch, head: &str, check: &RepoCheck) -> PathBuf {
+        // (core#817) A subdirectory package's check is its own entry (`dir` with `/` flattened).
+        // Hex-encoded, so the key is injective (`a/b` and `a_b` never share an entry).
+        let dir = if check.dir.is_empty() {
+            String::new()
+        } else {
+            let hex: String = check.dir.bytes().map(|b| format!("{b:02x}")).collect();
+            format!("d{hex}--")
+        };
+        scratch.root.join("base-cache").join(format!(
+            "{}-{dir}{}.json",
+            &head[..head.len().min(12)],
+            check.name
+        ))
     }
 
     /// This run's cached result of `check` on `head`, when an earlier floor of the run paid for it.
     fn cached(scratch: &CheckScratch, head: &str, check: &RepoCheck) -> Option<BaseRun> {
-        let raw = std::fs::read_to_string(Self::cache_path(scratch, head, &check.name)).ok()?;
+        let raw = std::fs::read_to_string(Self::cache_path(scratch, head, check)).ok()?;
         let run = serde_json::from_str::<CheckRun>(&raw).ok()?;
         // The base runs the head's argv, and it can change within a run (a targeted command with
         // the files a rework touches — `{files}`, the derived `-p <crate>` — or a reworked
@@ -2799,7 +3078,7 @@ impl BaseTree {
         sandbox: &WorkerSandbox,
         scratch: &CheckScratch,
     ) -> BaseRun {
-        let cache = Self::cache_path(scratch, &self.head, &check.name);
+        let cache = Self::cache_path(scratch, &self.head, check);
         let fail = |e: String| BaseRun {
             head: self.head.clone(),
             cached: false,
@@ -2812,7 +3091,9 @@ impl BaseTree {
             stage: ctx.stage,
             ..FloorContext::default()
         };
-        let detected = match detect_with(&self.dir, &base_ctx) {
+        // (core#817) A subdirectory package's check is detected in the BASE's copy of that
+        // directory; a package the change introduced has none, and fails closed below.
+        let detected = match detect_with(&self.dir.join(&check.dir), &base_ctx) {
             Ok(d) => d,
             Err(e) => return fail(format!("the base's checks could not be determined: {e}")),
         };
@@ -2824,7 +3105,11 @@ impl BaseTree {
         }
         let target = check.clone();
         if let Some(install) = detected.iter().find(|c| c.name == "install") {
-            let r = run_one(&self.dir, install, sandbox, scratch, Tree::Base);
+            let install = RepoCheck {
+                dir: check.dir.clone(),
+                ..install.clone()
+            };
+            let r = run_one(&self.dir, &install, sandbox, scratch, Tree::Base);
             if !r.passed() {
                 return fail(format!(
                     "the base's dependency install did not pass ({})",
@@ -3140,7 +3425,7 @@ fn rerun_flakes(
     }
     // (core#781) `npm run test` hides its runner behind a script: when the script is a plain
     // `vitest …` command the re-run goes through that runner (`npx --no-install vitest …`).
-    let runner_argv = script_runner_argv(worktree, &check.argv);
+    let runner_argv = script_runner_argv(&worktree.join(&check.dir), &check.argv);
     let plans: Option<Vec<(Vec<String>, String)>> = run
         .regressions
         .iter()
@@ -3172,6 +3457,7 @@ fn rerun_flakes(
             argv,
             source: format!("isolated re-run of `{label}` (core#553)"),
             timeout_s: check.timeout_s,
+            dir: check.dir.clone(),
         };
         let (r, passed) = run_one_watching(worktree, &one, sandbox, scratch, Tree::Head, &names);
         let ok = r.passed() && names.iter().all(|n| passed.iter().any(|p| p == n));
@@ -3414,7 +3700,7 @@ fn rerun_load_class(
         }
     }
     for l in &loads {
-        match worker_start_files(l, worktree) {
+        match worker_start_files(l, &worktree.join(&check.dir)) {
             Ok(fs) => {
                 for f in fs {
                     if !files.contains(&f) {
@@ -3430,7 +3716,8 @@ fn rerun_load_class(
     }
     let refs: Vec<&str> = files.iter().map(String::as_str).collect();
     let argv = vitest_files_rerun_argv(&check.argv, &refs).or_else(|| {
-        script_runner_argv(worktree, &check.argv).and_then(|a| vitest_files_rerun_argv(&a, &refs))
+        script_runner_argv(&worktree.join(&check.dir), &check.argv)
+            .and_then(|a| vitest_files_rerun_argv(&a, &refs))
     });
     let Some(mut argv) = argv else {
         return false;
@@ -3448,6 +3735,7 @@ fn rerun_load_class(
             if files.len() == 1 { "" } else { "s" }
         ),
         timeout_s: check.timeout_s,
+        dir: check.dir.clone(),
     };
     let (r, passed) = run_one_watching(worktree, &one, sandbox, scratch, Tree::Head, &watch);
     let ok = r.passed() && watch.iter().all(|w| passed.contains(w));
@@ -4231,7 +4519,7 @@ fn run_one_watching(
     let mut cmd = Command::new(&full[0]);
     cmd.hardened()
         .args(&full[1..])
-        .current_dir(worktree)
+        .current_dir(worktree.join(&check.dir))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -4477,6 +4765,7 @@ mod tests {
                 argv: s(&["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]),
                 source: "package-lock.json (node_modules absent)".into(),
                 timeout_s: None,
+                dir: String::new(),
             }],
             checks: vec![CheckRun {
                 name: "install".into(),
@@ -5029,6 +5318,7 @@ mod tests {
             ]),
             source: "fixture".into(),
             timeout_s: None,
+            dir: String::new(),
         };
         if !run_one(&wt, &inside, &sandbox, &scratch, Tree::Head).passed() {
             eprintln!("repo_checks: the sandbox wrapper cannot run on this host — skipping the kernel claim");
@@ -5046,6 +5336,7 @@ mod tests {
             ]),
             source: "fixture".into(),
             timeout_s: None,
+            dir: String::new(),
         };
         let r = run_one(&wt, &escaping, &sandbox, &scratch, Tree::Head);
         assert!(!r.passed(), "an outside write must fail the check: {r:?}");
@@ -5064,6 +5355,7 @@ mod tests {
             argv: s(&["sh", "-c", "printf %s \"$HOME\""]),
             source: "fixture".into(),
             timeout_s: None,
+            dir: String::new(),
         };
         let r = run_one(&wt, &home_probe, &sandbox, &scratch, Tree::Head);
         assert!(r.passed());
@@ -5095,6 +5387,7 @@ mod tests {
             argv: s(&["sh", "-c", "env"]),
             source: "fixture".into(),
             timeout_s: None,
+            dir: String::new(),
         };
         let r = run_one(&wt, &env_dump, &sandbox, &scratch, Tree::Head);
         std::env::remove_var(PLANTED);
@@ -5308,6 +5601,7 @@ mod tests {
             argv: s(&["sh", "-c", script]),
             source: "fixture".into(),
             timeout_s: None,
+            dir: String::new(),
         };
         let dead = run_one(
             &wt,
@@ -5378,6 +5672,7 @@ mod tests {
             ]),
             source: "fixture".into(),
             timeout_s: None,
+            dir: String::new(),
         };
         let started = Instant::now();
         let r = run_one(&wt, &holder, &sandbox, &scratch, Tree::Head);
@@ -5449,7 +5744,7 @@ mod tests {
         assert_eq!(checks[1].argv, s(&["cargo", "test", "--no-fail-fast"]));
         assert_eq!(
             engine_generated_candidates(&wt, &checks),
-            vec!["Cargo.lock"]
+            vec!["Cargo.lock".to_string()]
         );
     }
 
@@ -5465,12 +5760,14 @@ mod tests {
                 argv: s(&["definitely-not-a-binary-wicked-xyz", "run"]),
                 source: "fixture".into(),
                 timeout_s: None,
+                dir: String::new(),
             },
             RepoCheck {
                 name: "test".into(),
                 argv: s(&["definitely-not-a-binary-wicked-xyz", "run"]),
                 source: "fixture".into(),
                 timeout_s: None,
+                dir: String::new(),
             },
         ];
         let mut runs = Vec::new();
@@ -5527,6 +5824,7 @@ mod tests {
             ]),
             source: "fixture".into(),
             timeout_s: None,
+            dir: String::new(),
         };
         if crate::validator::find_on_path("sh").is_none() {
             eprintln!("repo_checks: sh not on PATH — skipping the bounded-tail check");
@@ -5587,6 +5885,7 @@ mod tests {
             argv: s(&["sh", "-c", "sleep 30"]),
             source: "fixture".into(),
             timeout_s: Some(1),
+            dir: String::new(),
         };
         let started = Instant::now();
         let r = run_one(&wt, &slow, &sandbox, &scratch, Tree::Head);
@@ -5773,6 +6072,7 @@ mod tests {
             argv: s(&["true"]),
             source: "fixture".into(),
             timeout_s: Some(100),
+            dir: String::new(),
         };
         let (bound, note) = effective_bound(&check);
         assert!(
@@ -5784,6 +6084,7 @@ mod tests {
             argv: s(&["true"]),
             source: "fixture".into(),
             timeout_s: Some(100),
+            dir: String::new(),
         };
         assert_eq!(
             install.base_timeout(),
@@ -5795,6 +6096,7 @@ mod tests {
             argv: s(&["true"]),
             source: "fixture".into(),
             timeout_s: None,
+            dir: String::new(),
         };
         assert_eq!(default.base_timeout(), CHECK_TIMEOUT);
     }
@@ -6384,6 +6686,139 @@ mod tests {
             base_err.contains("declares no `e2e` check") && base_err.contains("introduced it"),
             "{base_err}"
         );
+    }
+
+    /// core#817: a change confined to a NEW subdirectory package runs that package's checks, in
+    /// its directory — not the unrelated root package's; a change touching both runs both; a
+    /// workspace root that covers its members keeps the root's checks; a package with no checks
+    /// is named on the note.
+    #[cfg(unix)]
+    #[test]
+    fn a_change_in_a_subdirectory_package_runs_that_packages_checks_817() {
+        let repo = scratch("subdir-pkg");
+        std::fs::write(repo.join(".gitignore"), "tmp/\nnode_modules/\n").unwrap();
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{"name":"petstore","scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        std::fs::write(repo.join("index.ts"), "export {}\n").unwrap();
+        let base = git_repo_with_commit(&repo);
+        std::fs::create_dir_all(repo.join("giphy/src")).unwrap();
+        std::fs::write(
+            repo.join("giphy/package.json"),
+            r#"{"name":"giphy","scripts":{"test":"vitest run","typecheck":"tsc --noEmit"}}"#,
+        )
+        .unwrap();
+        std::fs::write(repo.join("giphy/src/server.ts"), "export {}\n").unwrap();
+        let ctx = FloorContext {
+            stage: FloorStage::Verify,
+            base_head: Some(base.clone()),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        assert_eq!(
+            subdir_packages(&repo, &ctx).unwrap(),
+            ChangePackages {
+                dirs: vec!["giphy".into()],
+                root_touched: false
+            }
+        );
+        let checks = detect_with(&repo, &ctx).unwrap();
+        assert!(!checks.is_empty(), "{checks:?}");
+        assert!(
+            checks
+                .iter()
+                .all(|c| c.dir == "giphy" && c.source.starts_with("giphy/")),
+            "only giphy's checks, in giphy/: {checks:?}"
+        );
+        assert!(checks.iter().any(|c| c.name == "typecheck"), "{checks:?}");
+        // A root-owned path too: both packages' checks.
+        std::fs::write(repo.join("index.ts"), "export const x = 1\n").unwrap();
+        let checks = detect_with(&repo, &ctx).unwrap();
+        assert!(checks.iter().any(|c| c.dir.is_empty()), "{checks:?}");
+        assert!(checks.iter().any(|c| c.dir == "giphy"), "{checks:?}");
+        // A Node workspace root covers its members: the root's checks only, as before.
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{"name":"petstore","workspaces":["giphy"],"scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        assert!(subdir_packages(&repo, &ctx).unwrap().dirs.is_empty());
+        assert!(detect_with(&repo, &ctx)
+            .unwrap()
+            .iter()
+            .all(|c| c.dir.is_empty()));
+        // ...but only the members its globs name (review: `packages/*` does not cover giphy/).
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{"name":"petstore","workspaces":["packages/*","!packages/x"],"scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        assert_eq!(subdir_packages(&repo, &ctx).unwrap().dirs, vec!["giphy"]);
+        assert!(workspace_glob_matches("packages/*", "packages/a"));
+        assert!(workspace_glob_matches("apps/**", "apps/web/ui"));
+        assert!(workspace_glob_matches("libs/ui-*", "libs/ui-kit"));
+        assert!(!workspace_glob_matches("packages/*", "packages/a/b"));
+        assert!(!workspace_glob_matches("packages/*", "giphy"));
+        // No base known: the root, as before.
+        assert!(subdir_packages(&repo, &FloorContext::default())
+            .unwrap()
+            .dirs
+            .is_empty());
+        // A package with no scripts is named, not silently passed.
+        std::fs::write(
+            repo.join("package.json"),
+            r#"{"name":"petstore","scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        std::fs::write(repo.join("giphy/package.json"), r#"{"name":"giphy"}"#).unwrap();
+        let checks = detect_with(&repo, &ctx).unwrap();
+        let note = package_coverage_note(&repo, &ctx, &checks).expect("the bare package is named");
+        assert!(note.contains("touches package giphy/"), "{checks:?} {note}");
+        // A package-local targeted command sees the change's files RELATIVE to the package
+        // (review r2: the subpackage context kept no base, so `{files}` was never detected).
+        std::fs::create_dir_all(repo.join("giphy/.wicked")).unwrap();
+        std::fs::write(
+            repo.join("giphy").join(CONFIG_PATH),
+            r#"{"test_targeted":["sh","-c","echo","{files}"],"baseline_diff":false}"#,
+        )
+        .unwrap();
+        let checks = detect_with(
+            &repo,
+            &FloorContext {
+                stage: FloorStage::Creator,
+                ..ctx.clone()
+            },
+        )
+        .unwrap();
+        let targeted = checks
+            .iter()
+            .find(|c| c.name == "test_targeted" && c.dir == "giphy")
+            .unwrap_or_else(|| panic!("{checks:?}"));
+        assert!(
+            targeted.argv.iter().any(|a| a == "src/server.ts")
+                && !targeted.argv.iter().any(|a| a.starts_with("giphy/")),
+            "{targeted:?}"
+        );
+        assert!(!baseline_diff_enabled(&repo.join("giphy")) && baseline_diff_enabled(&repo));
+        // The check runs IN its package directory.
+        let sandbox = sandbox_for(&repo);
+        if sandbox.level != SandboxLevel::Sandboxed {
+            return;
+        }
+        let scratch_dir = CheckScratch::prepare(&repo).unwrap();
+        let pwd = RepoCheck {
+            name: "test".into(),
+            argv: s(&["sh", "-c", "pwd"]),
+            source: "fixture".into(),
+            timeout_s: None,
+            dir: "giphy".into(),
+        };
+        let r = run_one(&repo, &pwd, &sandbox, &scratch_dir, Tree::Head);
+        if r.passed() {
+            assert!(r.stdout_tail.trim_end().ends_with("/giphy"), "{r:?}");
+        }
     }
 
     /// core#432 F-3R2-023: a verify floor that ran no end-to-end check over a change touching e2e
@@ -7398,7 +7833,17 @@ mod tests {
         let mut ran = failed_run(&["test t::x [-p b --lib]"], &[]);
         ran.name = "test_targeted".into();
         ran.argv = s(&["cargo", "test", "-p", "b"]);
-        let path = BaseTree::cache_path(&scratch_dir, head, "test_targeted");
+        let path = BaseTree::cache_path(
+            &scratch_dir,
+            head,
+            &RepoCheck {
+                name: "test_targeted".into(),
+                argv: Vec::new(),
+                source: String::new(),
+                timeout_s: None,
+                dir: String::new(),
+            },
+        );
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_string(&ran).unwrap()).unwrap();
         let check = |argv: &[&str]| RepoCheck {
@@ -7406,6 +7851,7 @@ mod tests {
             argv: s(argv),
             source: DERIVED_TARGETED_SOURCE.into(),
             timeout_s: None,
+            dir: String::new(),
         };
         assert!(
             BaseTree::cached(&scratch_dir, head, &check(&["cargo", "test", "-p", "b"])).is_some()
