@@ -360,16 +360,27 @@ fn fetch_origin_with(
             ])
             .arg(&a.url)
             .arg("+refs/heads/*:refs/remotes/origin/*")
-            .env("GIT_CONFIG_COUNT", "4")
-            .env("GIT_CONFIG_KEY_0", "http.extraHeader")
-            .env("GIT_CONFIG_VALUE_0", "")
-            .env("GIT_CONFIG_KEY_1", format!("http.{}.extraHeader", a.url))
-            .env("GIT_CONFIG_VALUE_1", "")
-            .env("GIT_CONFIG_KEY_2", format!("http.{}.extraHeader", a.url))
-            .env("GIT_CONFIG_VALUE_2", format!("Authorization: {}", a.header))
-            .env("GIT_CONFIG_KEY_3", "http.followRedirects")
-            .env("GIT_CONFIG_VALUE_3", "false")
             .env("GIT_ALLOW_PROTOCOL", scheme);
+            // APPENDED after any inherited `GIT_CONFIG_*` entries (an operator's `http.proxy` or
+            // `http.sslCAInfo` keeps applying), never over them.
+            let base: usize = std::env::var("GIT_CONFIG_COUNT")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let entries = [
+                ("http.extraHeader".to_string(), String::new()),
+                (format!("http.{}.extraHeader", a.url), String::new()),
+                (
+                    format!("http.{}.extraHeader", a.url),
+                    format!("Authorization: {}", a.header),
+                ),
+                ("http.followRedirects".to_string(), "false".to_string()),
+            ];
+            for (i, (k, v)) in entries.iter().enumerate() {
+                cmd.env(format!("GIT_CONFIG_KEY_{}", base + i), k)
+                    .env(format!("GIT_CONFIG_VALUE_{}", base + i), v);
+            }
+            cmd.env("GIT_CONFIG_COUNT", (base + entries.len()).to_string());
         }
         None => {
             cmd.args(["fetch", "--quiet", "origin"]);
@@ -1210,8 +1221,13 @@ pub(crate) fn ado_canonical_url(raw: &str) -> Option<String> {
         .filter(|(user, _)| !user.contains("://"))
         .map(|(_, r)| r)
         .filter(|r| {
-            let l = r.to_ascii_lowercase();
-            l.starts_with("ssh.dev.azure.com") || l.starts_with("vs-ssh.visualstudio.com")
+            // The WHOLE host, up to the `:` / `/` delimiter (a suffix host is not Azure DevOps).
+            let host = r
+                .split([':', '/'])
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            host == "ssh.dev.azure.com" || host == "vs-ssh.visualstudio.com"
         }) {
         let path = rest.split_once([':', '/'])?.1;
         let path = path.strip_prefix("v3/")?;
@@ -1525,6 +1541,8 @@ mod tests {
             "http://dev.azure.com/org/p/_git/repo",
             "https://x@ssh.dev.azure.com/v3/org/p/repo",
             "https://evil.example/dev.azure.com/org/p/_git/repo",
+            "git@ssh.dev.azure.com.example.org:v3/org/p/repo",
+            "org@vs-ssh.visualstudio.com.evil:v3/org/p/repo",
             "/srv/git/repo.git",
         ] {
             assert_eq!(ado_canonical_url(raw), None, "{raw}");
@@ -1544,9 +1562,24 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let seen2 = seen.clone();
+        listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
-            // One request is enough: record its Authorization header and refuse it.
-            if let Ok((mut sock, _)) = listener.accept() {
+            // One request is enough: record its Authorization header and refuse it. Bounded, so a
+            // git that never connects fails the assertion below instead of hanging the suite.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let accepted = loop {
+                match listener.accept() {
+                    Ok(pair) => break Some(pair),
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(20))
+                    }
+                    Err(_) => break None,
+                }
+            };
+            if let Some((mut sock, _)) = accepted {
+                sock.set_nonblocking(false).unwrap();
+                sock.set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
                 let mut reader = BufReader::new(sock.try_clone().unwrap());
                 let mut line = String::new();
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
