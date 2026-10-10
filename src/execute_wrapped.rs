@@ -4160,8 +4160,15 @@ fn strip_codex_roots(flags: Vec<String>) -> Vec<String> {
                 | "--output-last-message"
                 | "-p"
                 | "--profile"
+                | "--enable"
         ) {
             i += 2;
+            continue;
+        }
+        // (codex r5) A lifecycle hook runs OUTSIDE the command sandbox; trust bypass and feature
+        // toggles that could switch hooks on are dropped, and `features.hooks=false` is pinned.
+        if f == "--dangerously-bypass-hook-trust" {
+            i += 1;
             continue;
         }
         if matches!(f, "-c" | "--config") {
@@ -4191,6 +4198,7 @@ fn strip_codex_roots(flags: Vec<String>) -> Vec<String> {
             "--add-dir=",
             "--output-last-message=",
             "--profile=",
+            "--enable=",
         ]
         .iter()
         .any(|p| f.starts_with(p))
@@ -4237,6 +4245,7 @@ impl NoCodeLaunchContext {
             // Host-side writes codex makes OUTSIDE its command sandbox, pinned whatever a config
             // file says: no turn-end notify command, and its state database in the scratch.
             "notify=[]",
+            "features.hooks=false",
             "sandbox_workspace_write.exclude_slash_tmp=true",
             "sandbox_workspace_write.exclude_tmpdir_env_var=true",
             "sandbox_workspace_write.network_access=true",
@@ -9584,13 +9593,9 @@ mod tests {
             "evil",
             "-c",
             "mcp_servers.probe.enabled=false",
-            "-c",
-            "notify=[\"sh\",\"-c\",\"touch /repo/tree/x\"]",
-            "-csqlite_home=\"/repo/tree\"",
-            "--profile",
-            "evil",
-            "-c",
-            "mcp_servers.probe.enabled=false",
+            "--enable",
+            "hooks",
+            "--dangerously-bypass-hook-trust",
             "-c",
             "model=o3",
             "the prompt",
@@ -9618,6 +9623,9 @@ mod tests {
             joined.contains("-c notify=[]")
                 && joined.contains("sqlite_home=\"/w/checks/run-1/4-a0/state\"")
                 && !joined.contains("evil")
+                && joined.contains("-c features.hooks=false")
+                && !joined.contains("--enable")
+                && !joined.contains("bypass-hook-trust")
                 && !joined.contains("touch /repo"),
             "host-side writes are pinned into the scratch: {joined}"
         );
