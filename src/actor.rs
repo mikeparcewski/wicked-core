@@ -4115,7 +4115,9 @@ fn team_plan_at_launch(
     // the per-run def carries its declaration, so every path that reads the def's contract (the
     // campaign launch builds the session from it) sees the same requirement.
     let instruments = match preset.as_deref() {
-        Some(name) => crate::preset::required_instruments(&*store, spec.project_id.as_deref(), name)?,
+        Some(name) => {
+            crate::preset::required_instruments(&*store, spec.project_id.as_deref(), name)?
+        }
         None => None,
     };
     let scored = crate::plan_gate::intent_score_for_run(&plan, repo_root, base_commit);

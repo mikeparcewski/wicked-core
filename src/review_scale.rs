@@ -1272,9 +1272,9 @@ fn dependency_key(m: Manifest, line: &str, section: &mut Option<String>) -> Opti
                 .as_deref()
                 .is_some_and(|s| s.ends_with("dependencies"));
             let shaped = value.starts_with('{')
-                || value
-                    .strip_prefix('"')
-                    .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit() || "^~=<>*".contains(c)));
+                || value.strip_prefix('"').is_some_and(|v| {
+                    v.starts_with(|c: char| c.is_ascii_digit() || "^~=<>*".contains(c))
+                });
             (in_deps || (section.is_none() && shaped)).then(|| unquote(key))
         }
         Manifest::PackageJson => {
@@ -1283,9 +1283,17 @@ fn dependency_key(m: Manifest, line: &str, section: &mut Option<String>) -> Opti
             let value = value.trim().trim_end_matches(',').trim();
             let v = value.strip_prefix('"')?;
             let ranged = v.starts_with(|c: char| c.is_ascii_digit() || "^~=<>*".contains(c))
-                || ["workspace:", "npm:", "file:", "link:", "git", "github:", "http"]
-                    .iter()
-                    .any(|p| v.starts_with(p));
+                || [
+                    "workspace:",
+                    "npm:",
+                    "file:",
+                    "link:",
+                    "git",
+                    "github:",
+                    "http",
+                ]
+                .iter()
+                .any(|p| v.starts_with(p));
             (ranged && key != "version" && key != "node" && !key.is_empty()).then_some(key)
         }
         Manifest::GoMod => {
@@ -1298,9 +1306,7 @@ fn dependency_key(m: Manifest, line: &str, section: &mut Option<String>) -> Opti
             if l.starts_with('-') {
                 return None;
             }
-            let end = l
-                .find(|c: char| "=<>~!;[ @".contains(c))
-                .unwrap_or(l.len());
+            let end = l.find(|c: char| "=<>~!;[ @".contains(c)).unwrap_or(l.len());
             Some(l[..end].to_ascii_lowercase()).filter(|k| !k.is_empty())
         }
         Manifest::TomlLock => l
@@ -1312,7 +1318,12 @@ fn dependency_key(m: Manifest, line: &str, section: &mut Option<String>) -> Opti
             .strip_prefix("\"node_modules/")
             .and_then(|r| r.split_once('"'))
             .filter(|(_, rest)| rest.trim_start().starts_with(':'))
-            .map(|(name, _)| name.rsplit("node_modules/").next().unwrap_or(name).to_string()),
+            .map(|(name, _)| {
+                name.rsplit("node_modules/")
+                    .next()
+                    .unwrap_or(name)
+                    .to_string()
+            }),
         Manifest::GoSum => l.split_whitespace().next().map(str::to_string),
     }
 }
@@ -1355,7 +1366,11 @@ fn public_decl(ext: Option<&str>, line: &str) -> Option<String> {
             if w == "const" {
                 // `pub const fn x` or `pub const X: T`.
                 let next = words.next()?;
-                return if next == "fn" { name_of(words.next()?) } else { name_of(next) };
+                return if next == "fn" {
+                    name_of(words.next()?)
+                } else {
+                    name_of(next)
+                };
             }
             match w {
                 "fn" | "struct" | "enum" | "trait" | "type" | "static" | "mod" | "union" => {

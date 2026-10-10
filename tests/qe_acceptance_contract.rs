@@ -151,9 +151,11 @@ fn engine(name: &str) -> Core {
 }
 
 fn started(ev: &std::sync::mpsc::Receiver<CoreEvent>, sid: &str) -> serde_json::Value {
-    let evs = collect_until(ev, Duration::from_secs(20), |e| {
-        matches!(e, CoreEvent::SessionStarted { session, .. } if session == sid)
-    });
+    let evs = collect_until(
+        ev,
+        Duration::from_secs(20),
+        |e| matches!(e, CoreEvent::SessionStarted { session, .. } if session == sid),
+    );
     evs.iter()
         .map(|e| e.to_json())
         .find(|j| j["type"] == "sessionStarted" && j["session"] == sid)
@@ -168,10 +170,13 @@ fn app_change_workflows_require_qe_acceptance_provisionally() {
         let sid = format!("qe-req-{i}");
         let core = engine(&format!("req-{i}"));
         let ev = core.subscribe();
-        core.launch_run(spec(&sid, wf, QeOverride::Auto)).expect("launch");
-        let evs = collect_until(&ev, Duration::from_secs(20), |e| {
-            matches!(e, CoreEvent::SessionStarted { session, .. } if *session == sid)
-        });
+        core.launch_run(spec(&sid, wf, QeOverride::Auto))
+            .expect("launch");
+        let evs = collect_until(
+            &ev,
+            Duration::from_secs(20),
+            |e| matches!(e, CoreEvent::SessionStarted { session, .. } if *session == sid),
+        );
         let s = evs
             .iter()
             .map(|e| e.to_json())
@@ -200,20 +205,40 @@ fn app_change_workflows_require_qe_acceptance_provisionally() {
 fn an_explicit_skip_carries_its_reason_and_force_is_recorded() {
     let core = engine("skip");
     let ev = core.subscribe();
-    core.launch_run(spec("qe-skip", "bug", QeOverride::Skip("docs-only hotfix".into())))
-        .expect("launch");
+    core.launch_run(spec(
+        "qe-skip",
+        "bug",
+        QeOverride::Skip("docs-only hotfix".into()),
+    ))
+    .expect("launch");
     let s = started(&ev, "qe-skip");
     let qe = &s["assurance"]["qe"];
-    assert_eq!((qe["status"].as_str(), qe["basis"].as_str()), (Some("skipped"), Some("operator")));
-    assert_eq!(qe["reason"], "QE acceptance skipped by operator: docs-only hotfix");
+    assert_eq!(
+        (qe["status"].as_str(), qe["basis"].as_str()),
+        (Some("skipped"), Some("operator"))
+    );
+    assert_eq!(
+        qe["reason"],
+        "QE acceptance skipped by operator: docs-only hotfix"
+    );
 
     let core = engine("force");
     let ev = core.subscribe();
-    core.launch_run(spec("qe-force", "bug", QeOverride::Force)).expect("launch");
+    core.launch_run(spec("qe-force", "bug", QeOverride::Force))
+        .expect("launch");
     let s = started(&ev, "qe-force");
     let qe = &s["assurance"]["qe"];
-    assert_eq!((qe["status"].as_str(), qe["basis"].as_str()), (Some("required"), Some("operator")));
-    assert!(qe["reason"].as_str().unwrap().contains("forced by operator"), "{qe}");
+    assert_eq!(
+        (qe["status"].as_str(), qe["basis"].as_str()),
+        (Some("required"), Some("operator"))
+    );
+    assert!(
+        qe["reason"]
+            .as_str()
+            .unwrap()
+            .contains("forced by operator"),
+        "{qe}"
+    );
 }
 
 /// A skip with no reason, and a skip or force on a run that does not require QE acceptance, are
@@ -244,7 +269,8 @@ fn the_qe_unit_makes_the_binding_decision_at_dispatch() {
     let sid = "qe-bind";
     let core = engine("bind");
     let ev = core.subscribe();
-    core.launch_run(spec(sid, "bug", QeOverride::Auto)).expect("launch");
+    core.launch_run(spec(sid, "bug", QeOverride::Auto))
+        .expect("launch");
     let evs = collect_until(&ev, Duration::from_secs(60), |e| {
         e.to_json()["type"] == "qeAcceptanceDecided"
             || matches!(e, CoreEvent::SessionCompleted { session } | CoreEvent::SessionFailed { session, .. } if session == sid)

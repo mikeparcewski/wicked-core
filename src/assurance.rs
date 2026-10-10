@@ -354,10 +354,16 @@ mod tests {
     fn a_contract_requiring_qe_acceptance_starts_provisionally_required() {
         let r = requiring_qe();
         let q = r.qe.as_ref().expect("a decision rides the requirement");
-        assert_eq!((q.status.as_str(), q.basis.as_str()), (QE_REQUIRED, QE_BASIS_PLAN));
+        assert_eq!(
+            (q.status.as_str(), q.basis.as_str()),
+            (QE_REQUIRED, QE_BASIS_PLAN)
+        );
         assert_eq!(q.threshold, 20);
         assert!(r.enforces(QE_ACCEPTANCE));
-        assert!(RunAssurance::default().qe.is_none(), "not required, no decision");
+        assert!(
+            RunAssurance::default().qe.is_none(),
+            "not required, no decision"
+        );
         // Reduced assurance never waives it.
         let declared = vec![QE_ACCEPTANCE.to_string()];
         assert!(RunAssurance::new(Some(&declared), true).enforces(QE_ACCEPTANCE));
@@ -374,7 +380,10 @@ mod tests {
             .unwrap();
         assert!(!r.enforces(QE_ACCEPTANCE));
         let receipt = AssuranceReceipt::for_run(&r, 1);
-        let q = receipt.qe.as_ref().expect("the receipt carries the decision");
+        let q = receipt
+            .qe
+            .as_ref()
+            .expect("the receipt carries the decision");
         assert_eq!(
             q.reason,
             "QE acceptance skipped by operator: hotfix, reviewed by hand"
@@ -393,7 +402,10 @@ mod tests {
     fn force_requires_and_a_word_on_a_run_without_the_requirement_is_refused() {
         let r = requiring_qe().with_qe_override(&QeOverride::Force).unwrap();
         let q = r.qe.as_ref().unwrap();
-        assert_eq!((q.status.as_str(), q.basis.as_str()), (QE_REQUIRED, QE_BASIS_OPERATOR));
+        assert_eq!(
+            (q.status.as_str(), q.basis.as_str()),
+            (QE_REQUIRED, QE_BASIS_OPERATOR)
+        );
         assert!(r.enforces(QE_ACCEPTANCE));
         for over in [QeOverride::Force, QeOverride::Skip("x".into())] {
             assert!(RunAssurance::default()

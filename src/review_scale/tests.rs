@@ -1431,27 +1431,134 @@ fn complexity_and_novelty_terms_table() {
     };
     let cases: &[(&str, ImpactSignals, u8, &str)] = &[
         ("a small leaf edit: reach alone", leaf(), 20, "reach 20"),
-        ("50 changed lines: lowest band", ImpactSignals { lines_changed: 50, ..leaf() }, 20, "reach 20"),
-        ("51 changed lines", ImpactSignals { lines_changed: 51, ..leaf() }, 30, "complexity +10: 51 changed line(s)"),
-        ("201 changed lines", ImpactSignals { lines_changed: 201, ..leaf() }, 40, "complexity +20: 201 changed line(s)"),
-        ("5 branch lines: lowest band", ImpactSignals { branch_lines: 5, ..leaf() }, 20, "reach 20"),
-        ("6 branch lines", ImpactSignals { branch_lines: 6, ..leaf() }, 30, "complexity +10: 6 changed branch line(s)"),
-        ("21 branch lines", ImpactSignals { branch_lines: 21, ..leaf() }, 40, "complexity +20: 21 changed branch line(s)"),
-        ("4 changed symbols", ImpactSignals { changed_symbols: 4, ..leaf() }, 30, "complexity +10: 4 changed symbol(s)"),
+        (
+            "50 changed lines: lowest band",
+            ImpactSignals {
+                lines_changed: 50,
+                ..leaf()
+            },
+            20,
+            "reach 20",
+        ),
+        (
+            "51 changed lines",
+            ImpactSignals {
+                lines_changed: 51,
+                ..leaf()
+            },
+            30,
+            "complexity +10: 51 changed line(s)",
+        ),
+        (
+            "201 changed lines",
+            ImpactSignals {
+                lines_changed: 201,
+                ..leaf()
+            },
+            40,
+            "complexity +20: 201 changed line(s)",
+        ),
+        (
+            "5 branch lines: lowest band",
+            ImpactSignals {
+                branch_lines: 5,
+                ..leaf()
+            },
+            20,
+            "reach 20",
+        ),
+        (
+            "6 branch lines",
+            ImpactSignals {
+                branch_lines: 6,
+                ..leaf()
+            },
+            30,
+            "complexity +10: 6 changed branch line(s)",
+        ),
+        (
+            "21 branch lines",
+            ImpactSignals {
+                branch_lines: 21,
+                ..leaf()
+            },
+            40,
+            "complexity +20: 21 changed branch line(s)",
+        ),
+        (
+            "4 changed symbols",
+            ImpactSignals {
+                changed_symbols: 4,
+                ..leaf()
+            },
+            30,
+            "complexity +10: 4 changed symbol(s)",
+        ),
         (
             "complexity caps at 30",
-            ImpactSignals { lines_changed: 900, branch_lines: 90, changed_symbols: 9, ..leaf() },
+            ImpactSignals {
+                lines_changed: 900,
+                branch_lines: 90,
+                changed_symbols: 9,
+                ..leaf()
+            },
             50,
             "complexity +10: 90 changed branch line(s)",
         ),
-        ("one unindexed file", ImpactSignals { unindexed: 1, ..leaf() }, 30, "novelty +10: 1 new or unindexed file(s)"),
-        ("five unindexed files cap at two steps", ImpactSignals { unindexed: 5, ..leaf() }, 40, "novelty +20: 5 new or unindexed file(s)"),
-        ("a new dependency", ImpactSignals { new_dependencies: 1, ..leaf() }, 40, "novelty +20: 1 new dependency(ies)"),
-        ("a new public symbol", ImpactSignals { new_public_symbols: 2, ..leaf() }, 30, "novelty +10: 2 new public or wire symbol(s)"),
-        ("a low-history path", ImpactSignals { low_history: 1, ..leaf() }, 30, "novelty +10: 1 touched path(s) with under 3 commits"),
+        (
+            "one unindexed file",
+            ImpactSignals {
+                unindexed: 1,
+                ..leaf()
+            },
+            30,
+            "novelty +10: 1 new or unindexed file(s)",
+        ),
+        (
+            "five unindexed files cap at two steps",
+            ImpactSignals {
+                unindexed: 5,
+                ..leaf()
+            },
+            40,
+            "novelty +20: 5 new or unindexed file(s)",
+        ),
+        (
+            "a new dependency",
+            ImpactSignals {
+                new_dependencies: 1,
+                ..leaf()
+            },
+            40,
+            "novelty +20: 1 new dependency(ies)",
+        ),
+        (
+            "a new public symbol",
+            ImpactSignals {
+                new_public_symbols: 2,
+                ..leaf()
+            },
+            30,
+            "novelty +10: 2 new public or wire symbol(s)",
+        ),
+        (
+            "a low-history path",
+            ImpactSignals {
+                low_history: 1,
+                ..leaf()
+            },
+            30,
+            "novelty +10: 1 touched path(s) with under 3 commits",
+        ),
         (
             "novelty caps at 40",
-            ImpactSignals { unindexed: 3, new_dependencies: 2, new_public_symbols: 1, low_history: 1, ..leaf() },
+            ImpactSignals {
+                unindexed: 3,
+                new_dependencies: 2,
+                new_public_symbols: 1,
+                low_history: 1,
+                ..leaf()
+            },
             60,
             "novelty +20: 2 new dependency(ies)",
         ),
@@ -1489,21 +1596,104 @@ fn qe_waiver_needs_every_dimension_in_its_lowest_band() {
         ..Default::default()
     };
     assert_eq!(qe_waivable(&assessed(leaf.clone())), Ok(()));
-    assert_eq!(qe_waivable(&assessed(ImpactSignals::default())), Ok(()), "docs-only");
+    assert_eq!(
+        qe_waivable(&assessed(ImpactSignals::default())),
+        Ok(()),
+        "docs-only"
+    );
     let required: &[(&str, ImpactSignals)] = &[
-        ("6 dependents (reach tier 2)", ImpactSignals { dependents: 6, ..leaf.clone() }),
-        ("two products", ImpactSignals { products: 2, ..leaf.clone() }),
-        ("contract", ImpactSignals { contract_change: true, ..leaf.clone() }),
-        ("test gap", ImpactSignals { dependents: 1, test_gap: 0.1, ..leaf.clone() }),
-        ("critical", ImpactSignals { critical: true, ..leaf.clone() }),
-        ("destructive", ImpactSignals { destructive: true, ..leaf.clone() }),
-        ("51 changed lines", ImpactSignals { lines_changed: 51, ..leaf.clone() }),
-        ("6 branch lines", ImpactSignals { branch_lines: 6, ..leaf.clone() }),
-        ("4 changed symbols", ImpactSignals { changed_symbols: 4, ..leaf.clone() }),
-        ("a new file", ImpactSignals { unindexed: 1, ..leaf.clone() }),
-        ("a new dependency", ImpactSignals { new_dependencies: 1, ..leaf.clone() }),
-        ("a new public symbol", ImpactSignals { new_public_symbols: 1, ..leaf.clone() }),
-        ("a low-history path", ImpactSignals { low_history: 1, ..leaf.clone() }),
+        (
+            "6 dependents (reach tier 2)",
+            ImpactSignals {
+                dependents: 6,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "two products",
+            ImpactSignals {
+                products: 2,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "contract",
+            ImpactSignals {
+                contract_change: true,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "test gap",
+            ImpactSignals {
+                dependents: 1,
+                test_gap: 0.1,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "critical",
+            ImpactSignals {
+                critical: true,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "destructive",
+            ImpactSignals {
+                destructive: true,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "51 changed lines",
+            ImpactSignals {
+                lines_changed: 51,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "6 branch lines",
+            ImpactSignals {
+                branch_lines: 6,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "4 changed symbols",
+            ImpactSignals {
+                changed_symbols: 4,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "a new file",
+            ImpactSignals {
+                unindexed: 1,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "a new dependency",
+            ImpactSignals {
+                new_dependencies: 1,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "a new public symbol",
+            ImpactSignals {
+                new_public_symbols: 1,
+                ..leaf.clone()
+            },
+        ),
+        (
+            "a low-history path",
+            ImpactSignals {
+                low_history: 1,
+                ..leaf.clone()
+            },
+        ),
     ];
     for (name, s) in required {
         let why = qe_waivable(&assessed(s.clone())).expect_err(name);
@@ -1518,15 +1708,17 @@ fn qe_waiver_needs_every_dimension_in_its_lowest_band() {
         Graph::Unavailable("no graph".into()),
         None,
     );
-    assert!(qe_waivable(&a).unwrap_err().contains("could not be read"), "{a:?}");
+    assert!(
+        qe_waivable(&a).unwrap_err().contains("could not be read"),
+        "{a:?}"
+    );
 }
 
 /// The operator's floor: a brand-new file that adds a dependency is never waivable, even with a
 /// blast radius of zero (nothing depends on it, nothing is critical).
 #[test]
 fn a_new_file_with_a_new_dependency_is_never_waivable() {
-    let d = "\
-diff --git a/src/leaf.rs b/src/leaf.rs
+    let d = r#"diff --git a/src/leaf.rs b/src/leaf.rs
 new file mode 100644
 --- /dev/null
 +++ b/src/leaf.rs
@@ -1540,23 +1732,35 @@ diff --git a/Cargo.toml b/Cargo.toml
  [dependencies]
  anyhow = "1"
 +serde_json = "1"
-";
+"#;
     let diff = signals_from_diff(d);
-    assert_eq!(diff.new_dependencies, BTreeSet::from(["serde_json".to_string()]));
-    let store = graph(&[node("other", NodeKind::Function, "src/other.rs", (1, 5))], &[]);
+    assert_eq!(
+        diff.new_dependencies,
+        BTreeSet::from(["serde_json".to_string()])
+    );
+    let store = graph(
+        &[node("other", NodeKind::Function, "src/other.rs", (1, 5))],
+        &[],
+    );
     let a = assess(&diff, ready(&store), None);
     let s = a.signals.as_ref().expect("graph was read");
     assert_eq!(s.dependents, 0, "zero blast radius: {s:?}");
     assert!(a.score > THRESHOLDS.qe_waiver_max_score, "{a:?}");
     let why = qe_waivable(&a).unwrap_err();
-    assert!(why.contains("new dependency") && why.contains("new or unindexed file"), "{why}");
+    assert!(
+        why.contains("new dependency") && why.contains("new or unindexed file"),
+        "{why}"
+    );
 }
 
 /// A one-line edit inside an existing leaf function with nothing depending on it is waivable;
 /// docs-only is too.
 #[test]
 fn a_small_leaf_edit_and_docs_only_are_waivable() {
-    let store = graph(&[node("plan", NodeKind::Function, "src/plan.rs", (10, 13))], &[]);
+    let store = graph(
+        &[node("plan", NodeKind::Function, "src/plan.rs", (10, 13))],
+        &[],
+    );
     let a = assess(&signals_from_diff(SMALL_CODE), ready(&store), None);
     assert_eq!(a.score, 20, "{a:?}");
     assert_eq!(qe_waivable(&a), Ok(()), "{a:?}");
@@ -1612,6 +1816,9 @@ fn branch_lines_count_changed_control_flow_only() {
     let hunk = "@@ -1,4 +1,5 @@\n if keep {\n-    a()\n+    if b && c { d() }\n+    let elsewhere = iffy;\n+    x?;\n }\n";
     let d = signals_from_diff(&file_diff("src/a.rs", hunk));
     assert_eq!((d.branch_lines, d.behavioural_lines), (2, 4), "{d:?}");
-    let d = signals_from_diff(&file_diff("config/a.toml", "@@ -1 +1 @@\n-if = 1\n+if = 2\n"));
+    let d = signals_from_diff(&file_diff(
+        "config/a.toml",
+        "@@ -1 +1 @@\n-if = 1\n+if = 2\n",
+    ));
     assert_eq!(d.branch_lines, 0, "{d:?}");
 }

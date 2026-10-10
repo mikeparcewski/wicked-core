@@ -795,7 +795,10 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
     let clis: Vec<AgenticCli> = serde_json::from_str(&o.clis_json)
         .map_err(|e| err(format!("clisJson is not a valid AgenticCli array: {e}")))?;
     let plan = o.plan_json.as_deref().map(parse_plan).transpose()?;
-    let qe_acceptance = match (o.skip_qe_acceptance_reason, o.force_qe_acceptance.unwrap_or(false)) {
+    let qe_acceptance = match (
+        o.skip_qe_acceptance_reason,
+        o.force_qe_acceptance.unwrap_or(false),
+    ) {
         (Some(_), true) => {
             return Err(err(
                 "skipQeAcceptanceReason and forceQeAcceptance are mutually exclusive",

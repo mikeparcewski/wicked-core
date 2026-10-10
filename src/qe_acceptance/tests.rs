@@ -124,7 +124,11 @@ fn a_creator_after_a_waiver_revokes_it() {
         panic!("revoked");
     };
     assert_eq!(d.status, "required");
-    assert!(d.reason.contains("creator unit 5 runs after the waiver at unit 4"), "{d:?}");
+    assert!(
+        d.reason
+            .contains("creator unit 5 runs after the waiver at unit 4"),
+        "{d:?}"
+    );
     // A non-creator after the waiver (a review, the deliver tool) leaves it standing.
     let mut review = WorkUnit::pending("s:review", "s", 5, "review");
     review.role = PhaseRole::Evaluator;
@@ -148,7 +152,11 @@ fn the_run_diff_and_history_come_from_the_repository() {
             .current_dir(&dir)
             .output()
             .unwrap();
-        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
     git(&["init", "-q"]);
@@ -170,7 +178,10 @@ fn the_run_diff_and_history_come_from_the_repository() {
         "{diff}"
     );
     with_history(&mut signals, &dir, &git_dir, &base);
-    assert_eq!(signals.low_history, 1, "src/a.rs has one commit; src/b.rs is new");
+    assert_eq!(
+        signals.low_history, 1,
+        "src/a.rs has one commit; src/b.rs is new"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -189,8 +200,15 @@ fn the_decision_words_name_the_score_and_the_line() {
         plan: rs::plan_for(20),
     };
     let d = from_assessment(&a_, 4, "t1");
-    assert_eq!((d.status.as_str(), d.score, d.threshold), ("waived", Some(20), 20));
-    assert!(d.reason.starts_with("waived: impact score 20 at or below the waiver line 20"), "{d:?}");
+    assert_eq!(
+        (d.status.as_str(), d.score, d.threshold),
+        ("waived", Some(20), 20)
+    );
+    assert!(
+        d.reason
+            .starts_with("waived: impact score 20 at or below the waiver line 20"),
+        "{d:?}"
+    );
     let a_ = rs::Assessment {
         score: 30,
         deterministic: 30,
@@ -204,7 +222,11 @@ fn the_decision_words_name_the_score_and_the_line() {
     };
     let d = from_assessment(&a_, 4, "t1");
     assert_eq!(d.status, "required");
-    assert!(d.reason.starts_with("required: impact score 30 above the waiver line 20"), "{d:?}");
+    assert!(
+        d.reason
+            .starts_with("required: impact score 30 above the waiver line 20"),
+        "{d:?}"
+    );
 }
 
 #[test]
@@ -213,7 +235,10 @@ fn the_prompt_directive_says_run_or_do_not_run() {
     assert!(directive(&q, "wicked-garden:qe").contains("do not run the acceptance pipeline"));
     q.status = a::QE_REQUIRED.into();
     let line = directive(&q, "wicked-garden:qe");
-    assert!(line.contains("\"wicked-garden:qe\" accept") && line.contains("WICKED_RUN_ID"), "{line}");
+    assert!(
+        line.contains("\"wicked-garden:qe\" accept") && line.contains("WICKED_RUN_ID"),
+        "{line}"
+    );
     q.status = a::QE_SKIPPED.into();
     assert!(directive(&q, "x").contains("skipped by the operator"));
 }
