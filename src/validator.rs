@@ -3985,11 +3985,14 @@ mod tests {
         let pid = std::process::id();
         let agent_dir = tmp.join(format!("ssh-wicked515-{pid}"));
         let dir = tmp.join(format!("wicked-val-515-{pid}"));
+        // The agent dir is never deleted (see the end of the test): a stale one from a reused pid
+        // is kept and only its socket replaced, so no concurrent jail sees a mask vanish.
+        let _ = std::fs::remove_dir_all(&dir);
         for d in [&agent_dir, &dir] {
-            let _ = std::fs::remove_dir_all(d);
             std::fs::create_dir_all(d).unwrap();
         }
         let sock = agent_dir.join(format!("agent.{pid}"));
+        let _ = std::fs::remove_file(&sock);
         let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind the stub agent");
         {
             use std::os::unix::fs::FileTypeExt;
@@ -4059,7 +4062,11 @@ mod tests {
             }
         }
         drop(_listener);
-        let _ = std::fs::remove_dir_all(&agent_dir);
+        // The agent dir STAYS (empty, pid-named): every jail a concurrent test builds while this
+        // one runs masks the `ssh-*` dirs it saw under the temp dir, and bwrap's `--tmpfs` fails
+        // ("Can't mkdir … Read-only file system") on a mask that vanished before it spawned — the
+        // race that turned ubuntu CI red. Only the socket goes.
+        let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
