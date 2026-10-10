@@ -1817,7 +1817,9 @@ fn eligible_agent_seats<'a>(
     excluded_keys: &[&str],
     roster: &'a [AgenticCli],
 ) -> Vec<&'a AgenticCli> {
-    let usable = |c: &AgenticCli| !c.headless_invocation.trim().is_empty();
+    // (core#572) Judging is work: a ballot-only seat is never the agent judge.
+    let usable =
+        |c: &AgenticCli| !c.headless_invocation.trim().is_empty() && c.seat_eligible_for_work;
     let excluded_ids: std::collections::HashSet<String> = excluded_keys
         .iter()
         .map(|k| excluded_identity(k, roster))
@@ -4671,6 +4673,26 @@ mod tests {
         assert_eq!(select_agent_seat(&["agy"], &roster).unwrap().key, "claude");
         // Author not in the roster ⇒ the first usable distinct seat is chosen.
         assert_eq!(select_agent_seat(&["pi"], &roster).unwrap().key, "claude");
+    }
+
+    /// core#572: judging is work — a ballot-only seat is never the agent judge.
+    #[test]
+    fn a_ballot_only_seat_is_never_the_agent_judge() {
+        let mut voter = seat("agy", "agy run {PROMPT}");
+        voter.seat_eligible_for_work = false;
+        let roster = vec![seat("claude", "claude -p {PROMPT}"), voter];
+        assert!(select_agent_seat(&[DETERMINISTIC_VALIDATOR_SEAT], &roster).is_none());
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            roster[1].clone(),
+            seat("pi", "pi -p {PROMPT}"),
+        ];
+        assert_eq!(
+            select_agent_seat(&[DETERMINISTIC_VALIDATOR_SEAT], &roster)
+                .unwrap()
+                .key,
+            "pi"
+        );
     }
 
     #[test]

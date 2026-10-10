@@ -3234,6 +3234,23 @@ fn a_primary_not_on_the_roster_refuses_the_launch() {
     assert_eq!(keys(&spec), ["a", "b"], "nothing moved");
 }
 
+/// core#572: the PA does work — a ballot-only seat is refused as a chosen primary and never drawn.
+#[test]
+fn a_ballot_only_seat_is_never_the_primary() {
+    let mut voter = cli("v");
+    voter.seat_eligible_for_work = false;
+    let mut spec = pick_spec(vec![cli("a"), voter.clone()], Some("v"));
+    let err = super::pick_primary(&mut spec, true).unwrap_err();
+    assert!(err.to_string().contains("ballot-only"), "{err}");
+    for _ in 0..8 {
+        let mut spec = pick_spec(vec![voter.clone(), cli("a")], None);
+        let pick = super::pick_primary(&mut spec, true)
+            .unwrap()
+            .expect("a pick");
+        assert_eq!(pick.cli, "a", "only the work-eligible seat is drawn");
+    }
+}
+
 /// A legacy run with no choice is untouched: no pick, the roster as the launcher gave it.
 #[test]
 fn a_legacy_run_without_a_choice_keeps_its_roster_and_records_no_pick() {
