@@ -380,7 +380,8 @@ pub(crate) fn boundary_tool() -> Result<&'static str, FloorUnarmed> {
 /// floor will do here — `contained` (its checks run inside the boundary), `uncontained` (no
 /// boundary, but the operator opted in: the checks run, disclosed) or `refused` (no boundary and no
 /// opt-in: every check-running floor denies, which used to be learned only at verify). The probe is
-/// [`boundary_tool`]'s, cached: taken once at boot ([`crate::Core`] spawn) and read for free after.
+/// the floor's own ([`crate::repo_checks::floor_probe`], on top of [`boundary_tool`]), cached:
+/// taken once at boot ([`crate::Core`] spawn) and read for free after.
 pub(crate) fn host_boundary() -> serde_json::Value {
     let opted_in = matches!(
         std::env::var(crate::repo_checks::UNSANDBOXED_OPT_IN_ENV)
@@ -388,10 +389,13 @@ pub(crate) fn host_boundary() -> serde_json::Value {
             .trim(),
         "1" | "true"
     );
-    // The floor arms only what this same cached probe arms (`repo_checks::arm_probed`), so the
-    // prediction and the floor cannot disagree (codex r1).
-    let probe = boundary_tool();
-    host_boundary_from(probe, opted_in, std::env::consts::OS)
+    // The repo-checks floor's OWN cached execution probe (codex r1, r2): the floor arms only what
+    // it says arms (`repo_checks::arm_probed`), so the prediction and the floor cannot disagree.
+    host_boundary_from(
+        crate::repo_checks::floor_probe(),
+        opted_in,
+        std::env::consts::OS,
+    )
 }
 
 /// [`host_boundary`] over explicit inputs — the testable seam.

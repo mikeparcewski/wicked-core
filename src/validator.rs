@@ -787,23 +787,42 @@ mod seccomp {
         if !cfg!(target_os = "linux") {
             return None;
         }
+        static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+        PATH.get_or_init(write_private).clone()
+    }
+
+    /// The program in a directory only this process's user can enter (codex r2): created fresh
+    /// with mode 0700 — never reused, so another local user cannot pre-create it or swap the file
+    /// between this write and the jail's open — and the file created exclusively inside it.
+    /// Written once per process; `None` (the jail refuses to arm) on any failure.
+    #[cfg(unix)]
+    fn write_private() -> Option<std::path::PathBuf> {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
         let bytes = af_unix_program()?;
-        let dir = std::env::temp_dir().join("wicked-core-seccomp");
-        std::fs::create_dir_all(&dir).ok()?;
-        let path = dir.join("no-af-unix.bpf");
-        if std::fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) {
-            return Some(path);
-        }
-        // A name of its own per call (codex r1): concurrent first launches must not race.
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let tmp = dir.join(format!(
-            "no-af-unix.{}.{}.tmp",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-core-seccomp-{}-{nonce}",
+            std::process::id()
         ));
-        std::fs::write(&tmp, &bytes).ok()?;
-        std::fs::rename(&tmp, &path).ok()?;
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).ok()?;
+        let path = dir.join("no-af-unix.bpf");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .ok()?;
+        f.write_all(&bytes).ok()?;
         Some(path)
+    }
+
+    #[cfg(not(unix))]
+    fn write_private() -> Option<std::path::PathBuf> {
+        None
     }
 }
 

@@ -2455,7 +2455,7 @@ pub fn run_floor_rerun(
         worktree.to_path_buf(),
         scratch.tmp.path().to_path_buf(),
     ]);
-    let sandbox = arm_probed(sandbox, crate::worker_sandbox::boundary_tool());
+    let sandbox = arm_probed(sandbox, floor_probe());
     let mut report = run_with_sandbox_ctx(worktree, sandbox, ctx, scratch, rerun);
     report.rerun = rerun.map(|r| r.mode);
     report
@@ -2477,6 +2477,46 @@ fn arm_probed(
         },
         _ => sandbox,
     }
+}
+
+/// (core#678, codex r2) Whether THIS floor's launcher arms on this host, probed once by executing
+/// the floor's own wrapper (bwrap with `--unshare-pid`, the SBPL deny-writes profile) around
+/// `sh -c 'exit 0'` — not the worker boundary's lighter probe, which a host can pass (mount
+/// namespaces allowed) while the floor's launch fails (PID namespaces refused). `Err` is why no
+/// boundary arms; `hostBoundary()` and [`run_floor`] both read this one cached value.
+pub(crate) fn floor_probe() -> Result<&'static str, crate::worker_sandbox::FloorUnarmed> {
+    static PROBE: std::sync::OnceLock<Result<&'static str, crate::worker_sandbox::FloorUnarmed>> =
+        std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| {
+        let tool = crate::worker_sandbox::boundary_tool()?;
+        let dir = std::env::temp_dir().join(format!("wicked-floor-probe-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let armed = dir.canonicalize().ok().is_some_and(|d| {
+            let sandbox = crate::validator::detect_worker_sandbox(std::slice::from_ref(&d));
+            if sandbox.level != crate::validator::SandboxLevel::Sandboxed
+                || sandbox.wrapper.is_empty()
+            {
+                return false;
+            }
+            // spawn-audit: hardened — the floor's own launcher around a no-op, run once per process.
+            Command::new(&sandbox.wrapper[0])
+                .hardened()
+                .args(&sandbox.wrapper[1..])
+                .args(["/bin/sh", "-c", "exit 0"])
+                .current_dir(&d)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        if armed {
+            Ok(tool)
+        } else {
+            Err(crate::worker_sandbox::FloorUnarmed::CannotArm)
+        }
+    })
 }
 
 /// [`run_floor`] against an explicit sandbox probe — the injectable seam, so the fail-closed branch
