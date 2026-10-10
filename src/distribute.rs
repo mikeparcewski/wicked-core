@@ -270,7 +270,8 @@ pub(crate) fn distribute_units_against(
     distribute_units_against_benched(units, clis, session_id, snapshot, &[])
 }
 
-/// The seats of `clis` a run may still route to: not in `benched`, and not declared unusable by
+/// The seats of `clis` a run may still route to: eligible for WORK (core#572 — a ballot-only
+/// seat is never seated, evaluator included), not in `benched`, and not declared unusable by
 /// the launcher's health probe ([`AgenticCli::health`]). Pure; the ONE eligibility rule routing,
 /// the evaluator≠creator reassignment, the failover ladder and the judge/triage seat selection
 /// all read (F-7R2-006).
@@ -279,6 +280,7 @@ pub(crate) fn eligible_seats<'a>(
     benched: &[BenchedSeat],
 ) -> Vec<&'a AgenticCli> {
     clis.iter()
+        .filter(|c| c.seat_eligible_for_work)
         .filter(|c| !benched.iter().any(|b| b.cli == c.key))
         .filter(|c| c.health.as_ref().is_none_or(|h| h.usable))
         .collect()
@@ -1036,6 +1038,20 @@ mod tests {
     use super::*;
     use wicked_council::types::{Category, Confidence, InputMode};
 
+    /// core#572: a ballot-only seat (`seat_eligible_for_work = false`) is no seat for work —
+    /// not routed, not the evaluator the fence moves a review onto, not a failover pick.
+    #[test]
+    fn a_ballot_only_seat_is_never_eligible_for_work() {
+        let mut ballot_only = seat("b");
+        ballot_only.seat_eligible_for_work = false;
+        let roster = [seat("a"), ballot_only, seat("c")];
+        let keys: Vec<&str> = eligible_seats(&roster, &[])
+            .iter()
+            .map(|c| c.key.as_str())
+            .collect();
+        assert_eq!(keys, ["a", "c"]);
+    }
+
     fn seat(key: &str) -> AgenticCli {
         AgenticCli {
             key: key.into(),
@@ -1049,6 +1065,7 @@ mod tests {
             alt_binaries: vec![],
             confidence: Confidence::default(),
             enabled_for_council: true,
+            seat_eligible_for_work: true,
             // (crew#477) A stub seat ENFORCES input governance (an admitted ACP adapter), so the
             // routing these tests pin is roster order; the governance preference has its own
             // tests below, on seats that do not.

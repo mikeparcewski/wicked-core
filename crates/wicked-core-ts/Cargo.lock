@@ -2985,6 +2985,8 @@ dependencies = [
  "wicked-apps-core",
  "wicked-estate-core",
  "wicked-estate-knowledge",
+ "wicked-estate-memory",
+ "wicked-estate-memory-core",
  "wicked-estate-overlay",
  "wicked-estate-retrieve",
  "wicked-estate-store",

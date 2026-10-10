@@ -1813,11 +1813,28 @@ fn select_agent_seat<'a>(
 /// lives in ONE place. `agent_validate` needs the whole ordering: a seat whose CLI cannot run at all
 /// is an infrastructure failure, not a judgment, and the judge should move to the next eligible seat
 /// rather than failing the run (core#132).
+/// (core#572) The single-runner judge fallback runs the [`DETERMINISTIC_VALIDATOR_SEAT`]'s CLI; a
+/// roster that records that seat as ballot-only has no judge to fall back to.
+fn refuse_ballot_only_fallback(roster: &[AgenticCli]) -> anyhow::Result<()> {
+    if roster
+        .iter()
+        .any(|c| c.key == DETERMINISTIC_VALIDATOR_SEAT && !c.seat_eligible_for_work)
+    {
+        anyhow::bail!(
+            "no work-eligible judge seat: the fallback seat `{DETERMINISTIC_VALIDATOR_SEAT}` is \
+             ballot-only (seat_eligible_for_work = false)"
+        );
+    }
+    Ok(())
+}
+
 fn eligible_agent_seats<'a>(
     excluded_keys: &[&str],
     roster: &'a [AgenticCli],
 ) -> Vec<&'a AgenticCli> {
-    let usable = |c: &AgenticCli| !c.headless_invocation.trim().is_empty();
+    // (core#572) Judging is work: a ballot-only seat is never the agent judge.
+    let usable =
+        |c: &AgenticCli| !c.headless_invocation.trim().is_empty() && c.seat_eligible_for_work;
     let excluded_ids: std::collections::HashSet<String> = excluded_keys
         .iter()
         .map(|k| excluded_identity(k, roster))
@@ -2129,6 +2146,7 @@ fn agent_validate_in(
         // invocation from the [`DETERMINISTIC_VALIDATOR_SEAT`] seat when the roster lists it, else
         // the documented `claude -p {PROMPT}` default (that seat authors via `claude -p`). This
         // keeps the fallback consistent with the author instead of hardcoding `claude`.
+        refuse_ballot_only_fallback(roster)?;
         let invocation = roster
             .iter()
             .find(|c| c.key == DETERMINISTIC_VALIDATOR_SEAT)
@@ -2235,6 +2253,7 @@ pub fn triage_failure(
             unit.assigned_invocation = Some(seat.headless_invocation.clone());
         }
         None => {
+            refuse_ballot_only_fallback(roster)?;
             let invocation = roster
                 .iter()
                 .find(|c| c.key == DETERMINISTIC_VALIDATOR_SEAT)
@@ -4643,6 +4662,7 @@ mod tests {
             alt_binaries: vec![],
             confidence: Confidence::default(),
             enabled_for_council: true,
+            seat_eligible_for_work: true,
             acp: None,
             capabilities: None,
             login_invocation: None,
@@ -4670,6 +4690,43 @@ mod tests {
         assert_eq!(select_agent_seat(&["agy"], &roster).unwrap().key, "claude");
         // Author not in the roster ⇒ the first usable distinct seat is chosen.
         assert_eq!(select_agent_seat(&["pi"], &roster).unwrap().key, "claude");
+    }
+
+    /// core#572: the single-runner judge fallback runs the deterministic author's seat; a roster
+    /// that records it ballot-only has no judge to fall back to.
+    #[test]
+    fn the_judge_fallback_refuses_a_ballot_only_seat() {
+        let mut claude = seat(DETERMINISTIC_VALIDATOR_SEAT, "claude -p {PROMPT}");
+        assert!(refuse_ballot_only_fallback(std::slice::from_ref(&claude)).is_ok());
+        assert!(
+            refuse_ballot_only_fallback(&[]).is_ok(),
+            "no record: the documented default"
+        );
+        claude.seat_eligible_for_work = false;
+        assert!(refuse_ballot_only_fallback(&[claude])
+            .unwrap_err()
+            .to_string()
+            .contains("ballot-only"));
+    }
+
+    /// core#572: judging is work — a ballot-only seat is never the agent judge.
+    #[test]
+    fn a_ballot_only_seat_is_never_the_agent_judge() {
+        let mut voter = seat("agy", "agy run {PROMPT}");
+        voter.seat_eligible_for_work = false;
+        let roster = vec![seat("claude", "claude -p {PROMPT}"), voter];
+        assert!(select_agent_seat(&[DETERMINISTIC_VALIDATOR_SEAT], &roster).is_none());
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            roster[1].clone(),
+            seat("pi", "pi -p {PROMPT}"),
+        ];
+        assert_eq!(
+            select_agent_seat(&[DETERMINISTIC_VALIDATOR_SEAT], &roster)
+                .unwrap()
+                .key,
+            "pi"
+        );
     }
 
     #[test]
@@ -5694,6 +5751,7 @@ mod triage_parse_tests {
             alt_binaries: vec![],
             confidence: Confidence::default(),
             enabled_for_council: true,
+            seat_eligible_for_work: true,
             acp: None,
             capabilities: None,
             login_invocation: None,

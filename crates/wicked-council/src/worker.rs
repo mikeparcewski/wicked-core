@@ -635,6 +635,7 @@ mod tests {
             alt_binaries: vec![],
             confidence: crate::types::Confidence::Verified,
             enabled_for_council: true,
+            seat_eligible_for_work: true,
             acp: None,
             capabilities: None,
             login_invocation: None,

@@ -362,6 +362,13 @@ pub(crate) fn convene_decision(
             req.options.len()
         );
     }
+    // (core#572) Only a seat enabled for the council casts a ballot; a work-only seat never votes.
+    let voters: Vec<AgenticCli> = clis
+        .iter()
+        .filter(|c| c.enabled_for_council)
+        .cloned()
+        .collect();
+    let clis: &[AgenticCli] = &voters;
     if clis.is_empty() {
         anyhow::bail!(
             "no seat to convene a decision council for {} unit {}",
@@ -480,6 +487,7 @@ mod tests {
             alt_binaries: vec![],
             confidence: Confidence::default(),
             enabled_for_council: true,
+            seat_eligible_for_work: true,
             acp: None,
             capabilities: Some(format!("{key} capabilities")),
             login_invocation: None,
@@ -617,6 +625,36 @@ mod tests {
                 && topic.contains("src/Retire.tsx:12"),
             "{topic}"
         );
+    }
+
+    /// core#572: a decision balloting a run's seats convenes only the council-enabled ones — a
+    /// work-only seat is never balloted.
+    #[test]
+    fn a_work_only_seat_casts_no_ballot() {
+        let s = stub(vec![
+            ("a", "2 — refutation holds"),
+            ("b", "2 — keyed on scope"),
+            ("w", "1 — never asked"),
+        ]);
+        let mut work_only = seat("w");
+        work_only.enabled_for_council = false;
+        let v = convene_decision(
+            &dispute(),
+            &[seat("a"), seat("b"), work_only],
+            &s.dispatcher,
+            None,
+            None,
+        )
+        .expect("the council rules");
+        let balloted: Vec<String> = s
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.key.clone())
+            .collect();
+        assert!(!balloted.contains(&"w".to_string()), "{balloted:?}");
+        assert_eq!(v.seated, 2);
     }
 
     /// A split council still rules, and the minority is on the record as dissent.

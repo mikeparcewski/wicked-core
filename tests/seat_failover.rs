@@ -30,6 +30,7 @@ fn cli(key: &str) -> AgenticCli {
         trust_flags: Vec::new(),
         confidence: Confidence::default(),
         enabled_for_council: true,
+        seat_eligible_for_work: true,
         acp: None,
         capabilities: None,
         login_invocation: None,

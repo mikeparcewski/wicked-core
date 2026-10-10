@@ -201,6 +201,17 @@ pub(crate) fn pick_primary(
 ) -> anyhow::Result<Option<PrimaryPick>> {
     let cli = match spec.primary.as_deref() {
         Some(key) => {
+            if spec
+                .clis
+                .iter()
+                .any(|c| c.key == key && !c.seat_eligible_for_work)
+            {
+                // (core#572) The PA does work; a ballot-only seat cannot be it.
+                anyhow::bail!(
+                    "primary seat `{key}` is a ballot-only seat (seat_eligible_for_work = false) \
+                     and cannot run the path's work"
+                );
+            }
             if !spec.clis.iter().any(|c| c.key == key) {
                 anyhow::bail!(
                     "primary seat `{key}` is not on the roster [{}]",
@@ -218,14 +229,14 @@ pub(crate) fn pick_primary(
             }
         }
         None if team_run => {
-            let usable: Vec<&str> = spec
-                .clis
-                .iter()
+            // (core#572) Only a work-eligible seat can be the PA.
+            let workers = || spec.clis.iter().filter(|c| c.seat_eligible_for_work);
+            let usable: Vec<&str> = workers()
                 .filter(|c| c.health.as_ref().is_none_or(|h| h.usable))
                 .map(|c| c.key.as_str())
                 .collect();
             let pool: Vec<&str> = if usable.is_empty() {
-                spec.clis.iter().map(|c| c.key.as_str()).collect()
+                workers().map(|c| c.key.as_str()).collect()
             } else {
                 usable
             };

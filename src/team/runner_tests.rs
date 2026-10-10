@@ -356,6 +356,7 @@ fn seat(key: &str) -> crate::AgenticCli {
         alt_binaries: vec![],
         confidence: Default::default(),
         enabled_for_council: true,
+        seat_eligible_for_work: true,
         acp: None,
         capabilities: None,
         login_invocation: None,

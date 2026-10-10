@@ -418,7 +418,13 @@ pub(crate) fn pre_distribute(
     evidence_root: Option<String>,
 ) -> anyhow::Result<PreDistributed> {
     let workflow_id = format!("wf-{session_id}");
-    let cli_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
+    // (core#572) The run's seat pool — what failover and reassignment pick from — is its
+    // WORK-eligible seats; a ballot-only seat is not part of it.
+    let cli_keys: Vec<String> = clis
+        .iter()
+        .filter(|c| c.seat_eligible_for_work)
+        .map(|c| c.key.clone())
+        .collect();
 
     let selected_def =
         resolve_workflow_def(&*store, project_id.as_deref(), workflow, workflow_registry)?;
@@ -3230,6 +3236,7 @@ mod resolve_tests {
                 alt_binaries: vec![],
                 confidence: Confidence::default(),
                 enabled_for_council: true,
+                seat_eligible_for_work: true,
                 acp: None,
                 capabilities: None,
                 login_invocation: None,
@@ -3386,6 +3393,7 @@ mod judge_bench_tests {
             trust_flags: Vec::new(),
             confidence: Confidence::default(),
             enabled_for_council: true,
+            seat_eligible_for_work: true,
             acp: None,
             capabilities: None,
             login_invocation: None,
