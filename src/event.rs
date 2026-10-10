@@ -152,6 +152,8 @@ pub enum CoreEvent {
         cli_count: u32,
         governed: bool,
         entity_mode: String,
+        /// (core#850) The run's assurance contract: `{mode: "full"|"reduced", required: [...]}`.
+        assurance: crate::assurance::RunAssurance,
     },
     /// A work unit was planned (one per decomposed piece).
     UnitPlanned {
@@ -198,6 +200,10 @@ pub enum CoreEvent {
         ///   dominates when both would apply.
         ///
         /// The paragraph below is about `creator_seat` only.
+        ///
+        /// (core#850) `creator_seat` reaches the wire only on a run whose assurance contract does
+        /// not enforce `distinct_evaluator` — a `reducedAssurance` launch, or a workflow whose
+        /// `required_instruments` omits it; every other run refuses it at distribution.
         ///
         /// The roster is always BENCH-FREE when this is set (core#560/#567): a bench that leaves a
         /// review/test unit no distinct seat REFUSES the plan instead, so that case never reaches
@@ -401,6 +407,10 @@ pub enum CoreEvent {
         /// Evaluator unit wrote no verdict line at all — that case denies too, with the contract
         /// text as `denial.reason`, so the denial is the machine-readable twin. Additive.
         evaluator_verdict: Option<String>,
+        /// (core#850) What assured this decision — the run's contract (`mode`, `required`), the
+        /// instruments that `ran` and the ones `skipped` (each with its reason), the `creator` /
+        /// `evaluator` / `judge` seats, the `tree` and the `attempt`. Also persisted on the unit.
+        assurance: crate::assurance::AssuranceReceipt,
     },
     /// (DES-STUDIO-COCKPIT-001 §3 B2) A unit was dispatched to a worker — emitted at EVERY dispatch
     /// (initial + each re-dispatch), so a client sees rework happen. `attempt` increments on re-dispatch;
@@ -947,6 +957,10 @@ pub enum CoreEvent {
         tree_after: Option<String>,
         conflicts: Vec<String>,
         note: Option<String>,
+        /// (core#850) The DELIVERY's receipt: the run's contract, what this lift re-verified
+        /// (`repo_checks` when the lifted tree was re-checked), every instrument any gate of the run
+        /// skipped (aggregated from the units' receipts), the tree delivered and the attempt.
+        assurance: crate::assurance::AssuranceReceipt,
     },
     /// (F-3R2-009, core#431; F-4R2-004) A FENCED unit asked to run a WRITE-CLASS tool
     /// (edit/write/delete/move, by ACP `kind` or by tool name) and the engine REFUSED the call at
@@ -1457,6 +1471,7 @@ impl CoreEvent {
                 cli_count,
                 governed,
                 entity_mode,
+                assurance,
             } => {
                 json!({
                     "type": "sessionStarted",
@@ -1466,6 +1481,7 @@ impl CoreEvent {
                     "cliCount": cli_count,
                     "governed": governed,
                     "entityMode": entity_mode,
+                    "assurance": assurance,
                 })
             }
             CoreEvent::UnitPlanned {
@@ -1653,8 +1669,10 @@ impl CoreEvent {
                 floor_note,
                 judge_skipped_reason,
                 evaluator_verdict,
+                assurance,
             } => json!({
                 "type": "gateEvaluated",
+                "assurance": assurance,
                 "session": session,
                 "ord": ord,
                 "criterion": criterion,
@@ -2320,8 +2338,10 @@ impl CoreEvent {
                 tree_after,
                 conflicts,
                 note,
+                assurance,
             } => json!({
                 "type": "deliverLiftEvaluated",
+                "assurance": assurance,
                 "session": session,
                 "ord": ord,
                 "attempt": attempt,
@@ -2956,6 +2976,7 @@ mod tests {
             floor_note: None,
             judge_skipped_reason: None,
             evaluator_verdict: None,
+            assurance: Default::default(),
         };
         let j = ev(Some(("codex", true))).to_json();
         assert_eq!(j["type"], "gateEvaluated");
@@ -3136,6 +3157,7 @@ mod tests {
             tree_after: None,
             conflicts: vec!["testid-inventory.json".into()],
             note: None,
+            assurance: Default::default(),
         }
         .to_json();
         assert_eq!(j["type"], "deliverLiftEvaluated");

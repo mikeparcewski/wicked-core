@@ -73,6 +73,7 @@ pub fn run_session(
         crate::actor::in_process_governance().is_some(), // propagate governance from calling thread
         Vec::new(),
         None,
+        false,
     )?;
 
     // ── EXECUTE — per unit: produce output (stub, inline here), then gate it. ──
@@ -416,6 +417,9 @@ pub(crate) fn pre_distribute(
     // (WT-C2) The launch's evidence root, recorded the same way: in the write that creates the
     // session, or carried forward from a launch stub.
     evidence_root: Option<String>,
+    // (core#850) The launch's explicit reduced-assurance opt-in, recorded on a session this call
+    // CREATES; a launch stub's contract is carried forward instead.
+    reduced_assurance: bool,
 ) -> anyhow::Result<PreDistributed> {
     let workflow_id = format!("wf-{session_id}");
     // (core#572) The run's seat pool — what failover and reassignment pick from — is its
@@ -472,6 +476,12 @@ pub(crate) fn pre_distribute(
         team_plan: None,
         exclude_seats,
         evidence_root,
+        assurance: crate::assurance::RunAssurance::new(
+            selected_def
+                .as_ref()
+                .and_then(|d| d.required_instruments.as_deref()),
+            reduced_assurance,
+        ),
     };
     if session_already_started {
         // (F-7R2-013 / F-7R2-006) The launch stub on the store already carries what the
@@ -486,6 +496,8 @@ pub(crate) fn pre_distribute(
             session.exclude_seats = existing.exclude_seats;
             // (WT-C2) …and so is its evidence root.
             session.evidence_root = existing.evidence_root;
+            // (core#850) …and its assurance contract.
+            session.assurance = existing.assurance;
             // (DES-TEAMING-002 T3) The team state (P1's transport, path floor and gate counter)
             // and the plan state are the run's, not the plan's: a plan written onto a launch stub
             // (or re-planned at an edit) keeps them.
@@ -504,6 +516,7 @@ pub(crate) fn pre_distribute(
                 EntityMode::Shared => "shared".to_string(),
                 EntityMode::Isolated => "isolated".to_string(),
             },
+            assurance: session.assurance.clone(),
         });
     }
 
@@ -877,6 +890,8 @@ pub(crate) fn plan_and_distribute(
     exclude_seats: Vec<String>,
     // (WT-C2) The launch's evidence root, forwarded to `pre_distribute` the same way.
     evidence_root: Option<String>,
+    // (core#850) The launch's reduced-assurance opt-in, forwarded the same way.
+    reduced_assurance: bool,
 ) -> anyhow::Result<Planned> {
     let mut pre = pre_distribute(
         store,
@@ -899,8 +914,16 @@ pub(crate) fn plan_and_distribute(
         governed,
         exclude_seats,
         evidence_root,
+        reduced_assurance,
     )?;
-    let distributions = distribute::distribute_units_on(&pre.units, clis, session_id)?;
+    let distributions = distribute::distribute_units_on(
+        &pre.units,
+        clis,
+        session_id,
+        !pre.session
+            .assurance
+            .enforces(crate::assurance::DISTINCT_EVALUATOR),
+    )?;
     apply_distributions(store, &mut pre, distributions, emit)?;
     Ok(Planned {
         session: pre.session,
@@ -1271,6 +1294,29 @@ pub(crate) fn apply_and_finish_unit(
     // ran `claude -p`; here we only interpret its `(pass, reasoning)` via `combine_verdict`). An agent
     // REJECT denies; the agent can never be the SOLE approver. `None` ⇒ no pinned validator.
     let agent_denial = agent_verdict_denial(agent_verdict);
+    // (core#850, EX-02) The run's assurance contract. A judge the unit WANTED but could not
+    // convene (no seat distinct from the work's author) is a HOLD when the contract requires the
+    // judge: the gate denies under `judge_unavailable` (sign a judge seat in, approve to re-run),
+    // never a deterministic-only approve. A `reduced` run keeps the disclosed skip.
+    let assurance = run_session
+        .as_ref()
+        .map(|s| s.assurance.clone())
+        .unwrap_or_default();
+    let judge_hold = evidence
+        .judge_skipped
+        .as_ref()
+        .filter(|_| agent_verdict.is_none() && assurance.enforces(crate::assurance::JUDGE))
+        .map(|why| {
+            crate::domain::UnitDenial::new(
+                crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE,
+                format!(
+                    "the run requires a judge ({}) and none could run: {why}. Sign a judge seat \
+                     distinct from the work's author in, then approve to re-run the phase \
+                     (or relaunch with reduced assurance, disclosed)",
+                    crate::assurance::JUDGE
+                ),
+            )
+        });
 
     // (DES-L1 PR-1A, D-9 — core#488 / F-RC1-131) EVALUATOR VERDICT — the reviewer's OWN stated
     // verdict, read from THIS unit's output (which the fold already holds). Until now the only
@@ -1333,16 +1379,22 @@ pub(crate) fn apply_and_finish_unit(
     } else {
         output.to_string()
     };
-    let eval = execute::evaluate_unit(
-        store,
-        unit,
-        &review_output,
+    // (core#850, EX-05) An evaluator pass that could not RUN (a policy store that would not read,
+    // a claim that would not persist) is a structured denial below — never an absent layer the
+    // gate approves without.
+    let (eval, eval_error, evaluator_denial) = evaluator_layer(
+        execute::evaluate_unit(
+            store,
+            unit,
+            &review_output,
+            &evaluator_cli,
+            &collection_scope,
+            &crate::scope::unit_phase(unit.ord),
+            eval_at,
+        ),
         &evaluator_cli,
-        &collection_scope,
-        &crate::scope::unit_phase(unit.ord),
-        eval_at,
-    )
-    .ok();
+        unit.ord,
+    );
     let evaluator_claim_id = eval.as_ref().map(|e| e.claim_id.clone());
     // (S2) The evaluator≠creator second-pass result, surfaced on `GateEvaluated` so the denying layer is
     // visible: `Some(false)` when this layer denied (det may still have passed + no agent judge ran),
@@ -1355,20 +1407,6 @@ pub(crate) fn apply_and_finish_unit(
         .as_ref()
         .map(|e| e.policies.clone())
         .unwrap_or_default();
-    let evaluator_denial = eval.as_ref().and_then(|e| {
-        (!e.approved).then(|| crate::domain::UnitDenial {
-            source: "evaluator".to_string(),
-            reason: format!(
-                "evaluator ({evaluator_cli}) rejected unit {} (evaluator≠creator second pass, decision={})",
-                unit.ord, e.decision
-            ),
-            claim_id: Some(e.claim_id.clone()),
-            rule_ids: e.policies.clone(),
-            denied_tool: None,
-            phase: None, // filled in by apply_unit with the unit-phase token
-            findings_trimmed: false,
-        })
-    });
 
     // (input governance — DES-OUTGOV-003 §1) Fold this unit's INPUT-hook decisions into the SAME
     // deny-dominant gate rather than a competing phase resolver: read the run's decisions log, conform
@@ -1453,13 +1491,45 @@ pub(crate) fn apply_and_finish_unit(
     // verdict rendered over it. The evaluator's own verdict sits after the floors and BEFORE the
     // judge (DES-L1 review Q2): when both deny, the reviewer's findings — not the judge's prose —
     // name the gate and feed the rework; deny-dominant either way.
+    // (core#850, EX-01) The contract checked against the FACT, not only at distribution: a
+    // Review/Test unit that ran on a seat that built the work it checks — a dead-seat gate's
+    // provisional seating, an operator's reassignment — denies when the run requires a distinct
+    // evaluator, under the dead-seat class (reassign it to a distinct seat, or relaunch reduced).
+    let same_seat_denial = if assurance.enforces(crate::assurance::DISTINCT_EVALUATOR) {
+        let units = crate::domain::session_units(&*store, session_id).unwrap_or_default();
+        evaluator_relation(&units, unit)
+            .filter(|rel| rel.on_builder_seat)
+            .and_then(|_| unit.assigned_cli.clone())
+            .map(|seat| {
+                crate::domain::UnitDenial::new(
+                    DENIAL_SOURCE_SAME_SEAT_EVALUATOR,
+                    format!(
+                        "unit {} checks work built on `{seat}` and ran on that same seat; the run \
+                         requires a distinct evaluator ({}) — reassign it to a distinct signed-in \
+                         seat and approve to re-run, or relaunch with reduced assurance",
+                        unit.ord,
+                        crate::assurance::DISTINCT_EVALUATOR
+                    ),
+                )
+            })
+    } else {
+        None
+    };
+    // What the pinned validator concluded, for the receipt: `None` passed; a "failed" reason is a
+    // verdict it REACHED; a timeout or an unrunnable script reached none.
+    let det_reached_verdict = det_denial
+        .as_deref()
+        .is_none_or(|r| r.starts_with("pinned validator failed"));
+    let det_note = det_denial.clone();
     let validator_denial = guard_denial
         .map(|r| crate::domain::UnitDenial::new("worktree_guard", r))
+        .or(same_seat_denial)
         .or(det_denial.map(|r| crate::domain::UnitDenial::new("pinned_validator", r)))
         .or(checks_denial.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
         .or(capture_denial)
         .or(evaluator_verdict_denial)
         .or(agent_denial.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
+        .or(judge_hold)
         .or(evaluator_denial)
         .or(hook_denial);
 
@@ -1704,9 +1774,59 @@ pub(crate) fn apply_and_finish_unit(
     } else {
         outcome.denial.clone()
     };
+    // (core#850) The receipt: what assured this decision, persisted on the unit and on the wire.
+    let receipt = gate_receipt(
+        store,
+        session_id,
+        unit,
+        &assurance,
+        attempt,
+        GateFacts {
+            pinned: unit.validator.as_ref().filter(|v| v.approved).map(|_| {
+                if workdir.is_some() && det_reached_verdict {
+                    Ok(())
+                } else {
+                    Err(det_note
+                        .clone()
+                        .unwrap_or_else(|| "no worktree to re-verify against".to_string()))
+                }
+            }),
+            // The checks RAN only when a report shows checks executed (or a prior verdict on this
+            // same tree was carried); a refused, missing or empty report is a skip.
+            checks: match evidence.repo_checks.as_ref().or(carried.as_ref()) {
+                Some(r) if !r.checks.is_empty() => Some(Ok(())),
+                Some(r) if r.sandbox_error.is_some() => Some(Err((
+                    crate::assurance::SKIP_NO_BOUNDARY,
+                    r.sandbox_error.clone(),
+                ))),
+                Some(r) => Some(Err(match &r.detect_error {
+                    Some(e) => (crate::assurance::SKIP_ERROR, Some(e.clone())),
+                    None => (
+                        crate::assurance::SKIP_NOT_APPLICABLE,
+                        Some("the repository declares no checks the floor runs".into()),
+                    ),
+                })),
+                None if checks_ran => Some(Err((
+                    crate::assurance::SKIP_ERROR,
+                    Some(
+                        "the checks floor applied but no report of executed checks arrived".into(),
+                    ),
+                ))),
+                None => None,
+            },
+            judge: agent_verdict,
+            judge_skipped: evidence.judge_skipped.as_deref(),
+            eval_ran: eval.as_ref().is_some_and(|e| !e.policies.is_empty()),
+            eval_error: eval_error.as_deref(),
+            tree: evidence.verified_tree.clone(),
+        },
+    );
+    unit.assurance = Some(receipt.clone());
+    put_node(store, unit.to_node())?;
     emit(CoreEvent::GateEvaluated {
         session: session_id.to_string(),
         ord: unit.ord,
+        assurance: receipt,
         criterion,
         has_deterministic_floor,
         deterministic_pass,
@@ -2130,6 +2250,191 @@ pub(crate) fn creator_output_for(
 }
 
 /// Pure selector: the highest-`ord` unit before `evaluator_ord` whose role is `Creator`.
+/// (core#850, EX-05) [`crate::domain::UnitDenial::source`] when the evaluator≠creator second pass
+/// could not run at all (an error, not a verdict).
+pub(crate) const DENIAL_SOURCE_EVALUATOR_ERROR: &str = "evaluator_error";
+
+/// (core#850, EX-05) The evaluator≠creator second pass as the fold reads it: the outcome, the
+/// error text when the pass could not RUN, and the layer's denial — a REJECT names the pass's
+/// decision and claim; an ERROR is its own structured denial ([`DENIAL_SOURCE_EVALUATOR_ERROR`]),
+/// never an absent layer the gate approves without (the `.ok()` this replaces dropped it).
+fn evaluator_layer(
+    result: anyhow::Result<execute::EvaluationOutcome>,
+    evaluator_cli: &str,
+    ord: u32,
+) -> (
+    Option<execute::EvaluationOutcome>,
+    Option<String>,
+    Option<crate::domain::UnitDenial>,
+) {
+    match result {
+        Ok(e) => {
+            let denial = (!e.approved).then(|| crate::domain::UnitDenial {
+                source: "evaluator".to_string(),
+                reason: format!(
+                    "evaluator ({evaluator_cli}) rejected unit {ord} (evaluator\u{2260}creator second \
+                     pass, decision={})",
+                    e.decision
+                ),
+                claim_id: Some(e.claim_id.clone()),
+                rule_ids: e.policies.clone(),
+                denied_tool: None,
+                phase: None, // filled in by apply_unit with the unit-phase token
+                findings_trimmed: false,
+            });
+            (Some(e), None, denial)
+        }
+        Err(e) => {
+            let why = format!("{e:#}");
+            let denial = crate::domain::UnitDenial::new(
+                DENIAL_SOURCE_EVALUATOR_ERROR,
+                format!(
+                    "the evaluator\u{2260}creator second pass ({evaluator_cli}) could not evaluate \
+                     unit {ord}: {why} \u{2014} the gate does not approve without it"
+                ),
+            );
+            (None, Some(why), Some(denial))
+        }
+    }
+}
+
+/// (core#850) [`crate::domain::UnitDenial::source`] when a Review/Test unit ran on a seat that
+/// built the work it checks, on a run whose contract requires a distinct evaluator.
+pub(crate) const DENIAL_SOURCE_SAME_SEAT_EVALUATOR: &str = "same_seat_evaluator";
+
+/// A Review/Test agent unit's relation to the work it checks, as distribution draws it: the
+/// Build/Recon agent units before it are its builders.
+struct EvaluatorRelation {
+    /// The most recent builder's seat.
+    creator: Option<String>,
+    /// Whether the unit's own seat is one of its builders' seats.
+    on_builder_seat: bool,
+}
+
+/// `None` for a unit that is not a Review/Test agent unit or has no builder before it.
+fn evaluator_relation(
+    units: &[crate::domain::WorkUnit],
+    unit: &crate::domain::WorkUnit,
+) -> Option<EvaluatorRelation> {
+    use crate::domain::StageKind;
+    if unit.tool_cmd.is_some() || !matches!(unit.stage, StageKind::Review | StageKind::Test) {
+        return None;
+    }
+    let builders: Vec<&crate::domain::WorkUnit> = units
+        .iter()
+        .filter(|u| {
+            u.ord < unit.ord
+                && u.tool_cmd.is_none()
+                && matches!(u.stage, StageKind::Build | StageKind::Recon)
+        })
+        .collect();
+    if builders.is_empty() {
+        return None;
+    }
+    Some(EvaluatorRelation {
+        creator: builders
+            .iter()
+            .max_by_key(|u| u.ord)
+            .and_then(|c| c.assigned_cli.clone()),
+        on_builder_seat: unit
+            .assigned_cli
+            .as_ref()
+            .is_some_and(|e| builders.iter().any(|b| b.assigned_cli.as_ref() == Some(e))),
+    })
+}
+
+/// What the fold observed, for [`gate_receipt`].
+struct GateFacts<'a> {
+    /// `None`: no pinned validator; `Some(Ok)`: it reached a verdict; `Some(Err)`: it reached none.
+    pinned: Option<Result<(), String>>,
+    /// `None`: the floor did not apply; `Some(Ok)`: checks executed; `Some(Err((reason, detail)))`.
+    checks: Option<Result<(), (&'static str, Option<String>)>>,
+    judge: Option<&'a crate::validator::AgentVerdict>,
+    judge_skipped: Option<&'a str>,
+    eval_ran: bool,
+    eval_error: Option<&'a str>,
+    tree: Option<String>,
+}
+
+/// (core#850) A gate's assurance receipt: the run's contract, the instruments that ran and the
+/// ones that did not (and why), the creator / evaluator / judge seats, the tree and the attempt.
+/// `distinct_evaluator` is read from the FACT — an Evaluator-role unit's seat against its
+/// creator's — never from a disclosure.
+fn gate_receipt(
+    store: &dyn wicked_apps_core::GraphStore,
+    session_id: &str,
+    unit: &crate::domain::WorkUnit,
+    run: &crate::assurance::RunAssurance,
+    attempt: u32,
+    f: GateFacts<'_>,
+) -> crate::assurance::AssuranceReceipt {
+    use crate::assurance as a;
+    let mut r = a::AssuranceReceipt::for_run(run, attempt);
+    r.tree = f.tree;
+    let seat = unit.assigned_cli.clone();
+    // The evaluator≠creator relation exactly as distribution draws it ([`evaluator_relation`]).
+    let units = crate::domain::session_units(store, session_id).unwrap_or_default();
+    match evaluator_relation(&units, unit) {
+        Some(rel) => {
+            r.creator = rel.creator;
+            r.evaluator = seat.clone();
+            match (&seat, rel.on_builder_seat) {
+                (Some(e), true) => r.skip(
+                    a::DISTINCT_EVALUATOR,
+                    if run.reduced() {
+                        a::SKIP_REDUCED
+                    } else {
+                        a::SKIP_NO_DISTINCT_SEAT
+                    },
+                    Some(format!("evaluated on a seat that built the work, `{e}`")),
+                ),
+                (Some(_), false) => r.ran(a::DISTINCT_EVALUATOR),
+                (None, _) => {}
+            }
+        }
+        None => r.creator = seat,
+    }
+    match f.pinned {
+        Some(Ok(())) => r.ran(a::PINNED_VALIDATOR),
+        Some(Err(why)) => r.skip(a::PINNED_VALIDATOR, a::SKIP_ERROR, Some(why)),
+        None => {}
+    }
+    match f.checks {
+        Some(Ok(())) => r.ran(a::REPO_CHECKS),
+        Some(Err((reason, detail))) => r.skip(a::REPO_CHECKS, reason, detail),
+        None => {}
+    }
+    match (f.judge, f.judge_skipped) {
+        // A judge RAN only when a seat answered: the bus path's transport failure and an
+        // unanswered request carry no `judge_cli` and are a skip, not a verdict (codex r1).
+        (Some(v), _) if v.seat_failure.is_none() && v.judge_cli.is_some() => {
+            r.ran(a::JUDGE);
+            r.judge = v.judge_cli.clone();
+        }
+        (Some(v), _) => r.skip(
+            a::JUDGE,
+            a::SKIP_ERROR,
+            v.seat_failure.clone().or_else(|| Some(v.reasoning.clone())),
+        ),
+        (None, Some(why)) => r.skip(
+            a::JUDGE,
+            if run.reduced() {
+                a::SKIP_REDUCED
+            } else {
+                a::SKIP_NO_DISTINCT_SEAT
+            },
+            Some(why.to_string()),
+        ),
+        (None, None) => {}
+    }
+    if f.eval_ran {
+        r.ran(a::EVALUATOR_PASS);
+    } else if let Some(e) = f.eval_error {
+        r.skip(a::EVALUATOR_PASS, a::SKIP_ERROR, Some(e.to_string()));
+    }
+    r
+}
+
 pub(crate) fn most_recent_prior_creator(
     units: &[crate::domain::WorkUnit],
     evaluator_ord: u32,
@@ -2750,6 +3055,7 @@ mod resolve_tests {
             false,
             Vec::new(),
             None,
+            false,
         )
         .expect("a shipped def must never bail on its own built-in floor");
 
@@ -2877,6 +3183,7 @@ mod resolve_tests {
             false,
             Vec::new(),
             None,
+            false,
         )
         .expect("a shipped drop-in must never require an out-of-band seed to plan");
 
@@ -3274,6 +3581,7 @@ mod resolve_tests {
             false,
             Vec::new(),
             None,
+            false,
         )
         .expect("plans");
         assert!(!planned.units.is_empty());
@@ -3405,6 +3713,164 @@ mod judge_bench_tests {
         }
     }
 
+    /// core#850 (EX-05): the evaluator pass that could not RUN is a structured denial naming the
+    /// error — before, `.ok()` turned it into an absent layer and the gate approved without it. A
+    /// REJECT keeps its own source; an approve denies nothing.
+    #[test]
+    fn ex05_an_evaluator_pass_that_errors_denies_instead_of_vanishing() {
+        let (eval, err, denial) = evaluator_layer(
+            Err(anyhow::anyhow!("claim write failed: disk full")),
+            "codex",
+            3,
+        );
+        assert!(eval.is_none());
+        assert_eq!(err.as_deref(), Some("claim write failed: disk full"));
+        let d = denial.expect("an error denies");
+        assert_eq!(d.source, DENIAL_SOURCE_EVALUATOR_ERROR);
+        assert!(
+            d.reason.contains("codex") && d.reason.contains("unit 3"),
+            "{}",
+            d.reason
+        );
+        assert!(d.reason.contains("disk full"), "{}", d.reason);
+        let outcome = |approved: bool| execute::EvaluationOutcome {
+            evaluator_identity: "wicked-evaluator:codex".into(),
+            claim_id: "c1".into(),
+            decision: if approved { "allow" } else { "deny" }.into(),
+            approved,
+            policies: vec!["p1".into()],
+        };
+        let (_, _, rejected) = evaluator_layer(Ok(outcome(false)), "codex", 3);
+        assert_eq!(rejected.expect("a reject denies").source, "evaluator");
+        let (eval, err, none) = evaluator_layer(Ok(outcome(true)), "codex", 3);
+        assert!(eval.is_some() && err.is_none() && none.is_none());
+    }
+
+    /// The fold of one creator unit on a one-seat run whose judge was SKIPPED (no seat distinct
+    /// from the author), under the contract `reduced` selects. Returns the outcome's approval, its
+    /// denial source and the `gateEvaluated.assurance` receipt.
+    fn fold_with_skipped_judge(
+        sid: &str,
+        reduced: bool,
+    ) -> (bool, Option<String>, crate::assurance::AssuranceReceipt) {
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let mut sink = |_e: CoreEvent| {};
+        let Planned {
+            mut units,
+            workflow_id,
+            cli_keys,
+            ..
+        } = plan_and_distribute(
+            &mut store,
+            &[cli("a")],
+            "Do step one.",
+            EntityMode::Shared,
+            sid,
+            crate::domain::HumanConfirm::None,
+            false,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            &mut sink,
+            None,
+            false,
+            false,
+            Vec::new(),
+            None,
+            reduced,
+        )
+        .expect("plan");
+        let evidence = crate::workflow::UnitEvidence {
+            judge_skipped: Some("no eligible judge seat distinct from creator 'a'".into()),
+            ..Default::default()
+        };
+        let mut seen: Vec<CoreEvent> = Vec::new();
+        let output = crate::workflow::stub_output(&units[0]);
+        let outcome = apply_and_finish_unit(
+            &mut store,
+            &mut units[0],
+            &output,
+            &workflow_id,
+            EntityMode::Shared,
+            sid,
+            0,
+            false,
+            false,
+            &cli_keys,
+            None,
+            &evidence,
+            &mut |e| seen.push(e),
+            None,
+        )
+        .expect("apply");
+        let receipt = seen
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::GateEvaluated { assurance, .. } => Some(assurance.clone()),
+                _ => None,
+            })
+            .expect("gateEvaluated");
+        let persisted = crate::domain::session_units(&store, sid).unwrap()[0]
+            .assurance
+            .clone();
+        assert_eq!(
+            persisted.as_ref(),
+            Some(&receipt),
+            "the receipt is persisted on the unit"
+        );
+        (outcome.approved, outcome.denial.map(|d| d.source), receipt)
+    }
+
+    /// core#850 (EX-02): a run whose contract requires the judge HOLDS when the judge could not
+    /// run — the gate denies under `judge_unavailable` (sign a judge seat in, approve to re-run) —
+    /// and its receipt says the judge was skipped for want of a distinct seat. Before, the gate
+    /// approved deterministic-only and said so only in `agentVerdict: "skipped"`.
+    #[test]
+    fn ex02_a_required_judge_that_was_skipped_holds_the_gate() {
+        let (approved, source, r) = fold_with_skipped_judge("ex02-full", false);
+        assert!(
+            !approved,
+            "a full-assurance gate does not approve without its judge"
+        );
+        assert_eq!(
+            source.as_deref(),
+            Some(crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE)
+        );
+        assert_eq!(r.mode, "full");
+        assert_eq!(r.required, ["distinct_evaluator", "judge"]);
+        assert_eq!(r.creator.as_deref(), Some("a"));
+        assert!(r.judge.is_none());
+        let skip = r
+            .skipped
+            .iter()
+            .find(|s| s.instrument == "judge")
+            .expect("judge skipped");
+        assert_eq!(skip.reason, "no_distinct_seat");
+        assert!(skip
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("distinct")));
+    }
+
+    /// core#850 (EX-02): the explicit `reduced` opt-in keeps the disclosed skip — the gate
+    /// approves and its receipt says `mode: "reduced"` and why the judge is absent.
+    #[test]
+    fn ex02_a_reduced_run_passes_with_the_skip_disclosed() {
+        let (approved, source, r) = fold_with_skipped_judge("ex02-reduced", true);
+        assert!(approved, "{source:?}");
+        assert_eq!(r.mode, "reduced");
+        let skip = r
+            .skipped
+            .iter()
+            .find(|s| s.instrument == "judge")
+            .expect("judge skipped");
+        assert_eq!(skip.reason, "reduced_assurance");
+    }
+
     /// A JUDGE seat that refused on quota is benched for the run (`source: "judge"`) and the bench
     /// is on the wire once, as `seatBenched`, with the persisted reason. A second refusal by the
     /// same seat adds nothing and emits nothing (the bench is already there; the first reason
@@ -3441,6 +3907,7 @@ mod judge_bench_tests {
             false,
             Vec::new(),
             None,
+            false,
         )
         .expect("plan");
         let evidence = crate::workflow::UnitEvidence {

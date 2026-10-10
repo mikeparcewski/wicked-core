@@ -117,6 +117,7 @@ mod tests {
             structured_description: false,
             catalog: None,
             exclude_seats: Vec::new(),
+            assurance: None,
         }
     }
 
@@ -384,6 +385,7 @@ mod tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             primary: None,
+            reduced_assurance: false,
         })
         .expect("launch_run must not fail");
 

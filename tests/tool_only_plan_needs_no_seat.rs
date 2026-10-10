@@ -173,6 +173,7 @@ fn spec(session_id: &str, workflow: &str, repo_ref: Option<String>) -> LaunchSpe
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
+        reduced_assurance: false,
     }
 }
 

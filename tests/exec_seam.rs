@@ -129,6 +129,7 @@ fn spec(session_id: &str) -> LaunchSpec {
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
+        reduced_assurance: false,
     }
 }
 
@@ -564,6 +565,7 @@ fn a_conditional_gate_approve_re_runs_the_unit_under_exec_mediation() {
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
+        reduced_assurance: false,
     })
     .expect("launch the bug-shaped workflow");
 

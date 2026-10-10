@@ -189,6 +189,7 @@ fn a_failed_review_is_sent_back_to_the_creator_and_the_run_completes_on_the_seco
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
+        reduced_assurance: false,
     })
     .expect("launch");
 

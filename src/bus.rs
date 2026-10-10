@@ -1529,6 +1529,7 @@ fn launch_from_event(
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
+        reduced_assurance: false,
     };
 
     let (reply, rx) = channel();

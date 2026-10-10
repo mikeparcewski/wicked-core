@@ -433,6 +433,8 @@ fn launch(core: &Core, run_id: &str, repo_ref: &str) {
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
+        // (core#850) One seat: the review rides the creator's seat by the explicit opt-in.
+        reduced_assurance: true,
     })
     .expect("launch domain-extraction");
 }

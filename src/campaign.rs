@@ -90,6 +90,7 @@ impl RunSpec {
             exclude_seats: Vec::new(),
             evidence_root: None,
             primary: None,
+            reduced_assurance: false,
         }
     }
 }
@@ -2311,6 +2312,7 @@ mod tests {
             team_plan: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
+            assurance: Default::default(),
         };
         put_node(&mut store, session.to_node()).unwrap();
         put_node(
@@ -2478,6 +2480,7 @@ mod tests {
                 team_plan: None,
                 exclude_seats: Vec::new(),
                 evidence_root: None,
+                assurance: Default::default(),
             };
             put_node(&mut store, session.to_node()).unwrap();
             put_node(

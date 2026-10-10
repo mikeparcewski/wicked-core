@@ -675,6 +675,7 @@ mod tests {
             cli_count: 1,
             governed: false,
             entity_mode: "shared".to_string(),
+            assurance: Default::default(),
         }
         .to_json();
         assert_eq!(

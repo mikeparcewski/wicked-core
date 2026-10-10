@@ -854,6 +854,7 @@ mod tests {
             status: UnitStatus::Pending,
             catalog: None,
             exclude_seats: Vec::new(),
+            assurance: None,
         }
     }
 

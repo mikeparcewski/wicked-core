@@ -159,6 +159,8 @@ fn spec(session_id: &str, workflow: &str) -> LaunchSpec {
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
+        // (core#850) One seat: the review rides the creator's seat by the explicit opt-in.
+        reduced_assurance: true,
     }
 }
 

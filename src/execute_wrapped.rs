@@ -13303,6 +13303,7 @@ mod project_graph_end_to_end_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             primary: None,
+            reduced_assurance: false,
         };
 
         // 1. BOUND.

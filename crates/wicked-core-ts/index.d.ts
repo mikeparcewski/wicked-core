@@ -136,6 +136,14 @@ export interface LaunchOptions {
    * on the roster REJECTS the launch. The roster is re-ordered so the pick is first.
    */
   primary?: string
+  /**
+   * (core#850, EX-01/EX-02) The EXPLICIT opt-in to reduced assurance: the run may evaluate on its
+   * creator's seat and pass a pinned gate whose judge had no distinct seat — both disclosed on every
+   * receipt (`sessionStarted.assurance.mode: "reduced"`, `gateEvaluated.assurance`). Omit (or
+   * `false`) and a creator-seat evaluator is refused at distribution (`NoEligibleSeat`) and a gate
+   * whose required judge was skipped holds (`judge_unavailable`).
+   */
+  reducedAssurance?: boolean
 }
 /**
  * A handle to a wicked-core runtime. Construct with [`Core::spawn`] (production engine: real
@@ -1113,6 +1121,17 @@ export declare class Subscription {
  * 0 = off). `acpProcessRestarted` {session, ord, attempt, cliKey, reason, ms} — the session that
  * opened replaces one the engine closed itself (reason `posture_switch` |
  * `fenced_unit_quiesced` | `turn_settled`); ms is the cold-start cost.
+ * core#850 (additive; EX-01..EX-05): sessionStarted carries `assurance: {mode: 'full' | 'reduced',
+ * required: string[]}` — the run's contract (`required` ⊆ `distinct_evaluator`, `judge`,
+ * `qe_acceptance`; a workflow's `required_instruments`, else the first two; `reduced` only when
+ * the launch set `reducedAssurance`, and it waives only the first two). gateEvaluated and
+ * deliverLiftEvaluated carry `assurance: {mode, required, ran: string[], skipped: {instrument,
+ * reason, detail: string | null}[], creator, evaluator, judge, tree: string | null, attempt}` —
+ * instruments `pinned_validator` | `repo_checks` | `judge` | `evaluator_pass` |
+ * `distinct_evaluator`, reasons `reduced_assurance` | `no_distinct_seat` | `no_boundary` |
+ * `error` | `not_applicable`; the delivery receipt aggregates every gate of the run. A gate whose required judge was
+ * skipped now denies under `judge_unavailable`; an evaluator pass that errored denies under
+ * `denial.source === 'evaluator_error'`.
  */
 export interface CoreEventJson {
   type: string

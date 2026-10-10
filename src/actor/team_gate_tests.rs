@@ -159,7 +159,8 @@ fn launch_team_with(e: &Engine, run: &str, human_confirm: HumanConfirm) {
             deliver_step: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
-            primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`
+            primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
+            reduced_assurance: false,
         })
         .expect("launch");
 }
@@ -1699,7 +1700,8 @@ fn t6_16k_a_dispute_approved_with_an_amendment_reruns_the_creator() {
             deliver_step: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
-            primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`
+            primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
+            reduced_assurance: false,
         })
         .unwrap();
     wait_status(&e, "t616k", SessionStatus::AwaitingHuman);
@@ -1870,7 +1872,8 @@ fn launch_member_run(e: &Engine, run: &str) {
             deliver_step: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
-            primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`
+            primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
+            reduced_assurance: false,
         })
         .expect("launch");
 }
@@ -2645,7 +2648,8 @@ fn launch_plan_run(e: &Engine, run: &str) {
             deliver_step: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
-            primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`
+            primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
+            reduced_assurance: false,
         })
         .expect("launch");
 }
@@ -3036,7 +3040,8 @@ fn try_launch_plan(
         deliver_step,
         exclude_seats: Vec::new(),
         evidence_root: None,
-        primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`
+        primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
+        reduced_assurance: false,
     })
 }
 
@@ -3194,6 +3199,7 @@ fn pick_spec(clis: Vec<AgenticCli>, primary: Option<&str>) -> LaunchSpec {
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: primary.map(str::to_string),
+        reduced_assurance: false,
     }
 }
 

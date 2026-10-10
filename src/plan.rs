@@ -987,6 +987,7 @@ pub fn compose(
         id: COMPOSED_DEF_ID.to_string(),
         phases,
         base_skill_ref: None,
+        required_instruments: None,
     };
     // The composed def is judged exactly as a registered one is, by the engine's own entry
     // (`WorkflowRegistry::register_composed`): every rule but the user-workflow-only ones — the
@@ -1929,6 +1930,7 @@ mod tests {
                     p
                 },
             ],
+            required_instruments: None,
         };
         let mut units = plan_from_def(&def, "fix it", "s");
         let before = units.clone();
@@ -2340,6 +2342,7 @@ mod tests {
                     ..PhaseDef::new("build", StageKind::Build)
                 },
             ],
+            required_instruments: None,
         };
         let units = plan_from_def(&def, "add SSO", "s");
         let d = &units[0].description;
@@ -2387,6 +2390,7 @@ mod tests {
                 },
                 PhaseDef::new("c", StageKind::Recon),
             ],
+            required_instruments: None,
         };
         let units = plan_from_def(&def, "survey the repo", "s");
 
@@ -2437,6 +2441,7 @@ mod tests {
                     ..PhaseDef::new("b", StageKind::Recon)
                 },
             ],
+            required_instruments: None,
         };
         let units = plan_from_def(&def, "  ", "s");
         assert_eq!(

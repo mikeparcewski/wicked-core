@@ -256,7 +256,13 @@ impl LiftReport {
         }
     }
 
-    pub(crate) fn to_event(&self, session: &str, ord: u32, attempt: u32) -> CoreEvent {
+    pub(crate) fn to_event(
+        &self,
+        session: &str,
+        ord: u32,
+        attempt: u32,
+        assurance: &crate::assurance::AssuranceReceipt,
+    ) -> CoreEvent {
         // The one invariant a consumer reads as a claim about the base (core#684, F1): an
         // `unchanged` lift whose base moved is self-contradictory, and one with no base at all
         // renders as "still at ?". The guarantee in a release build is STRUCTURAL — the only
@@ -285,6 +291,15 @@ impl LiftReport {
             tree_after: self.tree_after.clone(),
             conflicts: self.conflicts.clone(),
             note: self.note.clone(),
+            assurance: crate::assurance::AssuranceReceipt {
+                attempt,
+                tree: self
+                    .tree_after
+                    .clone()
+                    .or_else(|| self.tree_before.clone())
+                    .or_else(|| assurance.tree.clone()),
+                ..assurance.clone()
+            },
         }
     }
 }
@@ -692,6 +707,29 @@ pub(crate) struct LiftContext {
     /// deliver re-verify when the lift was skipped (no tip to measure against); a lift that
     /// reached the remote tip measures against THAT instead (DES-L2 2E, D-22 / core #489).
     pub base_commit: Option<String>,
+    /// (core#850) The delivery's receipt, aggregated on the actor thread from the run's contract
+    /// and every unit's gate receipt; `deliverLiftEvaluated.assurance` stamps it with the attempt
+    /// and the tree delivered.
+    pub assurance: crate::assurance::AssuranceReceipt,
+}
+
+/// (core#850) What assured the run being delivered: its contract, every instrument any of its
+/// gates ran, and every one any gate skipped (first reason per instrument), with the verified tree.
+pub(crate) fn delivery_receipt(
+    session: &crate::domain::AgentSession,
+    units: &[crate::domain::WorkUnit],
+) -> crate::assurance::AssuranceReceipt {
+    let mut r = crate::assurance::AssuranceReceipt::for_run(&session.assurance, 0);
+    for g in units.iter().filter_map(|u| u.assurance.as_ref()) {
+        for i in &g.ran {
+            r.ran(i);
+        }
+        for k in &g.skipped {
+            r.skip(&k.instrument, &k.reason, k.detail.clone());
+        }
+    }
+    r.tree = session.verified_tree.clone();
+    r
 }
 
 /// Resolve the [`LiftContext`] for `unit` on the actor thread (store access).
@@ -706,11 +744,13 @@ pub(crate) fn lift_context(
     let worktree = PathBuf::from(session.workdir.as_deref()?);
     let repo_ref = session.repo_ref.as_deref()?;
     let repo = crate::repo::get_repo(store, repo_ref).ok().flatten()?;
+    let units = crate::domain::session_units(store, &session.id).unwrap_or_default();
     Some(LiftContext {
         worktree,
         repo_root: PathBuf::from(repo.root_path),
         verified_tree: session.verified_tree.clone(),
         base_commit: session.base_commit.clone(),
+        assurance: delivery_receipt(session, &units),
     })
 }
 
@@ -824,7 +864,7 @@ pub(crate) fn lift_and_reverify(
         ));
     }
     let report = lift_onto_remote_default(&ctx.worktree, &ctx.repo_root);
-    emit(report.to_event(run_id, ord, attempt));
+    emit(report.to_event(run_id, ord, attempt, &ctx.assurance));
     let base_ref = report
         .base_ref
         .as_deref()
@@ -1247,7 +1287,7 @@ mod tests {
             conflicts: Vec::new(),
             note: None,
         };
-        let _ = contradictory.to_event("run", 0, 1);
+        let _ = contradictory.to_event("run", 0, 1, &Default::default());
     }
 
     /// The F-3R2-013 shape with a NON-conflicting landing: the remote moved (a new file), the run's
@@ -1491,6 +1531,7 @@ mod tests {
             repo_root: clone.to_path_buf(),
             verified_tree,
             base_commit: None,
+            assurance: Default::default(),
         }
     }
 

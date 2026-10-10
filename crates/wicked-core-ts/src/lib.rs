@@ -755,6 +755,12 @@ pub struct LaunchOptions {
     /// (`path.started{selection:"random"}`); a legacy run keeps the roster's first seat. A key not
     /// on the roster REJECTS the launch. The roster is re-ordered so the pick is first.
     pub primary: Option<String>,
+    /// (core#850, EX-01/EX-02) The EXPLICIT opt-in to reduced assurance: the run may evaluate on its
+    /// creator's seat and pass a pinned gate whose judge had no distinct seat — both disclosed on every
+    /// receipt (`sessionStarted.assurance.mode: "reduced"`, `gateEvaluated.assurance`). Omit (or
+    /// `false`) and a creator-seat evaluator is refused at distribution (`NoEligibleSeat`) and a gate
+    /// whose required judge was skipped holds (`judge_unavailable`).
+    pub reduced_assurance: Option<bool>,
 }
 
 /// The body of `Core.considerRules` over the store at `db_path` (read-only).
@@ -808,6 +814,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         exclude_seats: o.exclude_seats.unwrap_or_default(),
         evidence_root: o.evidence_root,
         primary: o.primary,
+        reduced_assurance: o.reduced_assurance.unwrap_or(false),
     })
 }
 
@@ -3119,6 +3126,7 @@ mod tests {
                 cli_count: 1,
                 governed: false,
                 entity_mode: s(),
+                assurance: Default::default(),
             },
             "sessionStarted",
             &[
@@ -3129,6 +3137,8 @@ mod tests {
                 "cliCount",
                 "governed",
                 "entityMode",
+                // (core#850) the run's assurance contract.
+                "assurance",
             ],
         );
         check(
@@ -3263,6 +3273,7 @@ mod tests {
                 floor_note: None,
                 judge_skipped_reason: None,
                 evaluator_verdict: None,
+                assurance: Default::default(),
             },
             "gateEvaluated",
             &[
@@ -3287,6 +3298,8 @@ mod tests {
                 "judgeSkippedReason",
                 // (DES-L1 PR-1A) the evaluator's own verdict token, `null` when unread/missing.
                 "evaluatorVerdict",
+                // (core#850) the gate's assurance receipt.
+                "assurance",
             ],
         );
         check(
@@ -3908,6 +3921,7 @@ mod tests {
                 tree_after: Some(s()),
                 conflicts: vec![],
                 note: None,
+                assurance: Default::default(),
             },
             "deliverLiftEvaluated",
             &[
@@ -3923,6 +3937,8 @@ mod tests {
                 "treeAfter",
                 "conflicts",
                 "note",
+                // (core#850) the delivery's assurance receipt.
+                "assurance",
             ],
         );
         check(

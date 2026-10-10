@@ -43,7 +43,8 @@ fn launch_preset(e: &Engine, run: &str, workflow: &str, repo_ref: Option<&str>, 
             deliver_step: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
-            primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`
+            primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
+            reduced_assurance: false,
         })
         .expect("launch");
 }
@@ -272,7 +273,8 @@ fn a_scoped_launch_refuses_an_authored_step_named_pa_scope() {
         deliver_step: None,
         exclude_seats: Vec::new(),
         evidence_root: None,
-        primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`
+        primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
+        reduced_assurance: false,
     };
     let authored = json!([{"catalog": "produce", "id": "pa-scope"}]);
     let err = e
@@ -324,7 +326,8 @@ fn the_campaign_launch_path_refuses_an_authored_pa_scope_step() {
         deliver_step: None,
         exclude_seats: Vec::new(),
         evidence_root: None,
-        primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`
+        primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
+        reduced_assurance: false,
     };
     let Err(err) =
         crate::actor::team_plan_at_launch(&mut store, &registry, &spec, None, None, false)
@@ -824,7 +827,8 @@ fn launch_preset_into(e: &Engine, run: &str, workflow: &str, inbox: &std::path::
             deliver_step: None,
             exclude_seats: Vec::new(),
             evidence_root: None,
-            primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`
+            primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
+            reduced_assurance: false,
         })
         .expect("launch");
 }

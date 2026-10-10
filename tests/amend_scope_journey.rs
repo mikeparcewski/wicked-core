@@ -172,6 +172,7 @@ fn launch(core: &Core, run: &str) -> std::sync::mpsc::Receiver<CoreEvent> {
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
+        reduced_assurance: false,
     })
     .expect("launch");
     drain_until(&ev, run, |e| matches!(e, CoreEvent::AwaitingHuman { .. }));

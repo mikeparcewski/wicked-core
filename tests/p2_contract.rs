@@ -199,6 +199,7 @@ fn spec_with(session_id: &str, problem: &str, workflow: Option<String>) -> Launc
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
+        reduced_assurance: false,
     }
 }
 
