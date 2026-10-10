@@ -152,5 +152,60 @@
         "validator_pin": "e2e7af1db9e48454"
       }
     ]
+  },
+  "capture-learnings": {
+    "id": "capture-learnings",
+    "phases": [
+      {
+        "id": "churn",
+        "kind": "recon",
+        "instructions": "Phase 1/3 CHURN: produce a ranked list of this repo's most actively-changed files and directories over the last ~12 months, plus the repo's real name (manifest or git remote) and parent project. Use the skill's bounded/sampled git-churn method — never stream the whole history. Do not read code deeply yet; the next phase targets these areas.",
+        "gate_type": "value",
+        "gate": "auto",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [],
+        "role": "neutral",
+        "skill_ref": "wicked-garden-repo-learn",
+        "allowed_skills": [],
+        "validator_pin": null
+      },
+      {
+        "id": "hotspots",
+        "kind": "recon",
+        "instructions": "Phase 2/3 HOTSPOTS: cross-reference the prior churn ranking with wicked-estate hotspot / blast-radius signals to find the load-bearing code, then READ it through the estate shim (`wicked-garden run scripts/_estate_client.py --readonly call …`, the skill's grounding path) to build a real technical understanding of how the system fits together — not a file listing. Reuse wicked-garden-search for the hotspot signals; follow the skill.",
+        "gate_type": "value",
+        "gate": "auto",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "churn"
+        ],
+        "role": "neutral",
+        "skill_ref": "wicked-garden-repo-learn",
+        "allowed_skills": [],
+        "validator_pin": null
+      },
+      {
+        "id": "capture",
+        "kind": "build",
+        "instructions": "Phase 3/3 CAPTURE: from the prior churn + hotspot understanding, submit durable learnings as estate proposals through the shim's `propose` per the skill's capture contract — BOTH memories (facts / how-it-works) and policies (enforced conventions), one proposal per item, tagged repo/project. Each is inert until human review; never include secrets or personal data. END with `wicked-capture-report {\"derived\": N, \"submitted\": M, \"failed\": K}` — always, even on a degrade or a legitimate 0 (which is acceptable).",
+        "gate_type": "value",
+        "gate": "auto",
+        "executes_code": false,
+        "requires_capture_report": true,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "hotspots"
+        ],
+        "role": "creator",
+        "skill_ref": "wicked-garden-repo-learn",
+        "allowed_skills": [],
+        "validator_pin": null
+      }
+    ]
   }
 }

@@ -26,12 +26,13 @@ const EVIDENCE_FLOOR_PIN: &str = "e2e7af1db9e48454";
 const COVERAGE_PIN: &str = "bfe4020a365c598b";
 
 /// The acceptance tuple, in the DES's order.
-const FIELDS: [&str; 9] = [
+const FIELDS: [&str; 10] = [
     "kind",
     "role",
     "gate",
     "validator_pin",
     "executes_code",
+    "requires_capture_report",
     "executor",
     "skill_ref",
     "instructions",
@@ -445,7 +446,7 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
     let entries: Vec<PhaseDef> = serde_json::from_value(json!([
         {"id": "full", "kind": "build", "role": "creator", "instructions": "own",
          "gate_type": "execution", "gate": {"human_confirm": {"unconditional": false}},
-         "executes_code": true, "verified_evidence": true, "budget_secs": 600, "pool": 3, "required_deliverables": ["r.json"],
+         "executes_code": true, "verified_evidence": true, "requires_capture_report": true, "budget_secs": 600, "pool": 3, "required_deliverables": ["r.json"],
          "skill_ref": "own-skill", "allowed_skills": ["a"], "validator_pin": EVIDENCE_FLOOR_PIN},
         {"id": "tool", "kind": "recon", "executor": {"type": "tool", "cmd": []}}
     ]))
@@ -454,7 +455,7 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
     // A fully populated step serializes every field: the table must name exactly those.
     let full_step = json!({"catalog": "full", "id": "x", "instructions": "own", "gate": "auto",
         "gate_type": "value", "validator_pin": "p", "executes_code": true,
-        "writes_nothing": true, "verified_evidence": true, "budget_secs": 1,
+        "writes_nothing": true, "verified_evidence": true, "requires_capture_report": true, "budget_secs": 1,
         "pool": 1, "skill_ref": "s",
         "allowed_skills": [], "required_deliverables": [], "depends_on": [],
         "executor": {"type": "agent"}, "owner": "team", "kind": "build", "role": "creator",
@@ -573,6 +574,17 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
                     "verified_evidence_lowered",
                 )],
                 ("full", json!({"verified_evidence": true})),
+            ),
+        ),
+        (
+            "requires_capture_report",
+            (
+                vec![(
+                    "full",
+                    json!({"requires_capture_report": false}),
+                    "capture_report_lowered",
+                )],
+                ("full", json!({"requires_capture_report": true})),
             ),
         ),
         (

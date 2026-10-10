@@ -576,6 +576,11 @@ pub struct PlanStep {
     /// qe-author-tests `verify` Tool step keeps the acceptance declaration crew's def carried).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_evidence: Option<bool>,
+    /// (BC-80, core#535) The step's output must end with a `wicked-capture-report` marker, which
+    /// the engine's capture-report floor reads. May be raised to `true`; never lowered on an entry
+    /// that sets it (DES-TEAMING-002 M7: capture-learnings' capture step).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_capture_report: Option<bool>,
     /// (ASK-K1b) The step's wall budget in seconds: may only LOWER the entry's (an entry with no
     /// budget takes any; the carrier's ceiling still applies above it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -662,6 +667,8 @@ pub enum PlanRefusal {
     VerifiedEvidenceLowered { step: String, catalog: String },
     /// (core#649) The step sets `writes_nothing: true` but composes to a code-executing phase.
     WritesNothingOnCode { step: String, catalog: String },
+    /// The step sets `requires_capture_report: false` on an entry that sets it.
+    CaptureReportLowered { step: String, catalog: String },
     /// The step sets a `kind` other than its entry's on an entry other than `run`.
     KindNotAllowed { step: String, catalog: String },
     /// The step sets an `executor` on an Agent entry.
@@ -738,6 +745,7 @@ impl PlanRefusal {
             PlanRefusal::ExecutesCodeLowered { .. } => "executes_code_lowered",
             PlanRefusal::VerifiedEvidenceLowered { .. } => "verified_evidence_lowered",
             PlanRefusal::WritesNothingOnCode { .. } => "writes_nothing_on_code",
+            PlanRefusal::CaptureReportLowered { .. } => "capture_report_lowered",
             PlanRefusal::KindNotAllowed { .. } => "kind_not_allowed",
             PlanRefusal::ExecutorNotAllowed { .. } => "executor_not_allowed",
             PlanRefusal::ToolCommandMissing { .. } => "tool_command_missing",
@@ -813,6 +821,10 @@ impl std::fmt::Display for PlanRefusal {
                 f,
                 "{r}: step {step} says it writes nothing, but {catalog} executes code — only a \
                  step whose phase executes no code may declare writes_nothing"
+            ),
+            PlanRefusal::CaptureReportLowered { step, catalog } => write!(
+                f,
+                "{r}: step {step} sets requires_capture_report false on {catalog}, which sets it"
             ),
             PlanRefusal::KindNotAllowed { step, catalog } => write!(
                 f,
@@ -963,6 +975,7 @@ pub const STEP_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("executes_code", FieldRule::TightenOnly),
     ("writes_nothing", FieldRule::PlanFact),
     ("verified_evidence", FieldRule::TightenOnly),
+    ("requires_capture_report", FieldRule::TightenOnly),
     ("budget_secs", FieldRule::TightenOnly),
     ("pool", FieldRule::TightenOnly),
     ("required_deliverables", FieldRule::TightenOnly),
@@ -1151,6 +1164,13 @@ fn apply_step(
     // writes_nothing (core#649) — a plan fact, only on a phase that executes no code.
     if step.writes_nothing == Some(true) && phase.executes_code {
         return refuse(|step, catalog| PlanRefusal::WritesNothingOnCode { step, catalog });
+    }
+    // requires_capture_report — TightenOnly (false → true).
+    if let Some(report) = step.requires_capture_report {
+        if !report && entry.requires_capture_report {
+            return refuse(|step, catalog| PlanRefusal::CaptureReportLowered { step, catalog });
+        }
+        phase.requires_capture_report = report;
     }
     // budget_secs — TightenOnly: lower the entry's wall budget, never raise it (ASK-K1b).
     if let Some(budget) = step.budget_secs {
