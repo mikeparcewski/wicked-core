@@ -11095,17 +11095,6 @@ fn stage_edit(
             }
         };
     }
-    // (X-MIG M9, codex r1 on #858) A whole-plan edit keeps the launch's declared deliverables:
-    // they are the launcher's contract, re-joined to the edited plan's last creator step.
-    let edit = match crate::plan_gate::with_deliverables(edit, &state.deliverables) {
-        Ok(edit) => edit,
-        Err(e) => {
-            return Ok(StagedEdit::Refused {
-                reason: format!("{e:#}"),
-                events: Vec::new(),
-            })
-        }
-    };
     let repo_root = session
         .repo_ref
         .as_deref()

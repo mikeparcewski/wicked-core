@@ -95,9 +95,9 @@ pub struct TeamPlanState {
     /// floor (§8.5). `None` for a run that does not deliver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deliver_step: Option<PlanStep>,
-    /// (X-MIG M9) The launch's declared deliverables (`LaunchSpec.deliverables`), kept so a
-    /// whole-plan edit at the initial approval gate cannot drop them: they are re-joined to the
-    /// edited plan's last creator step (codex r1 on #858). Empty for a run that declared none.
+    /// (X-MIG M9) The launch's declared deliverables (`LaunchSpec.deliverables`), kept so every
+    /// plan [`decide`] judges carries them — a whole-plan edit at the initial approval gate cannot
+    /// drop them (codex r1 on #858). Empty for a run that declared none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deliverables: Vec<String>,
     /// The accepted rev's `plan.accepted` body (a P1 required transition published before the
@@ -874,6 +874,17 @@ pub(crate) fn decide(
     let (plan, deliver_refusal) = match with_deliver(&proposal.plan, prior.deliver_step.as_ref()) {
         Ok(p) => (with_default_ids(&p), None),
         Err(why) => (with_default_ids(&proposal.plan), Some(why)),
+    };
+    // (X-MIG M9) The launch's declared deliverables ride every plan this pipeline decides — the
+    // launch plan, the PA-scoped plan, a whole-plan edit at the initial gate (codex r1/r2 on #858)
+    // — joined to its last creator step (idempotent); a plan with no creator step is refused with
+    // its facts like any other refusal.
+    let (plan, deliver_refusal) = match deliver_refusal {
+        Some(why) => (plan, Some(why)),
+        None => match with_deliverables(plan.clone(), &prior.deliverables) {
+            Ok(p) => (p, None),
+            Err(e) => (plan, Some(format!("{e:#}"))),
+        },
     };
     let deliver = deliver_cmd(prior.deliver_step.as_ref());
     let proposal_id = ev::mint_proposal_id(run_id, &proposal.by, &proposal.source);
