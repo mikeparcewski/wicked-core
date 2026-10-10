@@ -1710,6 +1710,36 @@ mod tests {
         assert!(!marked("clarify") && !marked("design") && !marked("adversarial-review"));
     }
 
+    /// (X-MIG M12, core#820) A preset step can express the `mcp-server` install's consent pause
+    /// with no new field: a `run` Tool step RAISES its gate to `consent_before` (the top of the
+    /// §8.3 ladder), depends on the dry-run step before it, and the composed unit carries both —
+    /// the gate the actor pauses on before dispatch and the `depends_on` the consent offer reads
+    /// its write plan through.
+    #[test]
+    fn a_run_step_raised_to_consent_before_composes_the_install_pause() {
+        use crate::workflow::GateSpec;
+        let catalog = crate::catalog::catalog();
+        let plan: PlanSteps = serde_json::from_value(serde_json::json!({"steps": [
+            {"catalog": "run", "id": "install-plan",
+             "executor": {"type": "tool", "cmd": ["install.py", "--dry-run", "--json"]}},
+            {"catalog": "run", "id": "install", "gate": "consent_before",
+             "depends_on": ["install-plan"],
+             "executor": {"type": "tool", "cmd": ["install.py", "--target", "worker"]}}
+        ]}))
+        .unwrap();
+        let def = compose(catalog, &plan).expect("the install pair composes");
+        assert_eq!(def.phases[0].gate, GateSpec::Auto);
+        assert_eq!(def.phases[1].gate, GateSpec::ConsentBefore);
+        let units = plan_from_def(&def, "install the server", "r1");
+        assert_eq!(
+            units[1].gate,
+            GateSpec::ConsentBefore,
+            "the unit pauses before it runs"
+        );
+        assert_eq!(units[1].depends_on, vec!["install-plan".to_string()]);
+        assert!(units[1].tool_cmd.is_some(), "and runs as a Tool unit");
+    }
+
     /// (DES-ASK-TEAM-CHAT-001 §4.4, ASK-K1b) `budget_secs` composes: a step lowers an entry that
     /// has none to its own value, lowers one that has a budget, may not raise it (named refusal),
     /// and the composed phase's budget lands on the unit like its gate — the `understand`
