@@ -239,6 +239,25 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.7.45** — 2026-10-10 — npm release on main tip e1f4722, carrying wave 4's CO-1 slices
+  plus the CO-2/CO-4 merges since 0.7.44: #816, #818, #821-#836 (#829 reverted by #833), #838,
+  #839, #841-#845, #847 and #848. Wire changes are additive. **New core-ts surface**:
+  `Core.hostBoundary()` (#845, core#678) — `{platform, armed, tool, reason, reasonText,
+  unsandboxedOptIn, verifyFloor: contained|uncontained|refused}` from the repo-checks floor's own
+  cached execution probe; `unitTranscript(unitId, attempt?)` per-attempt transcripts (#822, core#791).
+  **Events**: `acpTurnSettled` / `acpProcessRestarted` (#826, core#762/#418); the consent gate's
+  three choices with exact write targets (#823, core#820). **Seats**: pi admitted to ACP input
+  governance (#830, core#563); read-only codex units check in a scratch with the network and
+  copilot runs under `--deny-tool write` (#834, core#503/#366); may-vote split from may-work,
+  `seat_eligible_for_work` (#835, core#572); an ACP codex seat with an enabled MCP server is
+  refused and agy's API-key/Vertex credentials are pinned (#825, core#660/#585). **Floors and
+  gates**: a guarded verify floor runs on a clean checkout of the guard's tree (#842, core#417);
+  Send back on a judged Tool unit rewinds to the creator (#838, core#753) and hands it the
+  evaluator's pinned edit (#844, core#432); a non-code run owes no diff-floored `security_review`
+  (#847, core#649); subdirectory package checks (#824, core#817). **Governance**: steering rules may
+  cite `operator-words` (#836, core#827); evals memory axis (#831, core#397). **Presets**:
+  migration and qe-author-tests are built in (#828, #843). **Sandbox**: on Linux the loopback-only
+  walkthrough jail refuses AF_UNIX sockets, datagram AF_UNIX pairs and io_uring (#845, core#703).
 - **core-ts 0.7.44** — 2026-10-09 — npm release on main tip 5e32cce, carrying #811, #813 and
   #814. Wire changes are additive. **Floor fix (#811, core#782)**: approving a read-only phase's
   repo-checks floor gate with a note arms `requestedRerun{mode: floor_fix, fix{note, seat}}` — a
