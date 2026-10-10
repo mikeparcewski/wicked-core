@@ -666,6 +666,15 @@ export declare class Core {
    */
   steeringImport(batchJson: string): Promise<string>
   /**
+   * What this host can contain, known before any run (core#678 item 1 — the boot probe,
+   * cached), as a JSON object: `{ platform, armed, tool: "sandbox-exec"|"bwrap"|null,
+   * reason: "no_launcher"|"cannot_arm"|null, reasonText, unsandboxedOptIn,
+   * verifyFloor: "contained"|"uncontained"|"refused" }`. `refused` means every check-running
+   * verify floor on this host will deny (no OS write boundary and no
+   * `WICKED_REPO_CHECKS_UNSANDBOXED=1`): crew's diagnostics and studio say so before a run.
+   */
+  hostBoundary(): Promise<string>
+  /**
    * Governance rules eval — run an eval corpus through the REAL SELECT→DECIDE gate path and
    * score every sample (the engine seam behind crew's `POST /api/v1/testing/evals/run`).
    * `args_json` is `{ type?, corpus?, knowledgeDb?, memoryDb?, dbPath }` (camelCase keys are the PINNED

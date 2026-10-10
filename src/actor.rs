@@ -9840,9 +9840,13 @@ fn run_walkthrough_record(
     env.extend(rec.env.iter().cloned());
     // (core#798) Tell the recorder it is jailed, and by what: only reached with a `Sandboxed`
     // launcher armed above, so the variable is never set on an unjailed run.
-    let kind = std::path::Path::new(&launcher.wrapper[0])
-        .file_name()
+    // The launcher by NAME — past a `sh` prefix that opens the seccomp program (core#703).
+    let kind = launcher
+        .wrapper
+        .iter()
+        .filter_map(|a| std::path::Path::new(a).file_name())
         .map(|n| n.to_string_lossy().into_owned())
+        .find(|n| n == "bwrap" || n == "sandbox-exec")
         .unwrap_or_else(|| launcher.wrapper[0].clone());
     env.push((wt::JAIL_ENV.to_string(), kind));
     if let Some(root) = garden_root {

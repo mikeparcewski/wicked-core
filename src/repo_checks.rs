@@ -2455,9 +2455,68 @@ pub fn run_floor_rerun(
         worktree.to_path_buf(),
         scratch.tmp.path().to_path_buf(),
     ]);
+    let sandbox = arm_probed(sandbox, floor_probe());
     let mut report = run_with_sandbox_ctx(worktree, sandbox, ctx, scratch, rerun);
     report.rerun = rerun.map(|r| r.mode);
     report
+}
+
+/// (core#678, codex r1) The floor arms only what the host's cached EXECUTION probe says arms: a
+/// launcher on `PATH` whose probe failed here (bwrap with user namespaces disabled) is no boundary,
+/// so the detection is downgraded and the operator's unsandboxed opt-in applies — exactly what
+/// `hostBoundary().verifyFloor` predicts — instead of bwrap failing every check at run time.
+fn arm_probed(
+    sandbox: WorkerSandbox,
+    probe: Result<&'static str, crate::worker_sandbox::FloorUnarmed>,
+) -> WorkerSandbox {
+    match probe {
+        Err(why) if sandbox.level == crate::validator::SandboxLevel::Sandboxed => WorkerSandbox {
+            wrapper: Vec::new(),
+            level: crate::validator::SandboxLevel::BestEffort,
+            downgrade_reason: Some(why.describe().to_string()),
+        },
+        _ => sandbox,
+    }
+}
+
+/// (core#678, codex r2) Whether THIS floor's launcher arms on this host, probed once by executing
+/// the floor's own wrapper (bwrap with `--unshare-pid`, the SBPL deny-writes profile) around
+/// `sh -c 'exit 0'` — not the worker boundary's lighter probe, which a host can pass (mount
+/// namespaces allowed) while the floor's launch fails (PID namespaces refused). `Err` is why no
+/// boundary arms; `hostBoundary()` and [`run_floor`] both read this one cached value.
+pub(crate) fn floor_probe() -> Result<&'static str, crate::worker_sandbox::FloorUnarmed> {
+    static PROBE: std::sync::OnceLock<Result<&'static str, crate::worker_sandbox::FloorUnarmed>> =
+        std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| {
+        let tool = crate::worker_sandbox::boundary_tool()?;
+        let dir = std::env::temp_dir().join(format!("wicked-floor-probe-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let armed = dir.canonicalize().ok().is_some_and(|d| {
+            let sandbox = crate::validator::detect_worker_sandbox(std::slice::from_ref(&d));
+            if sandbox.level != crate::validator::SandboxLevel::Sandboxed
+                || sandbox.wrapper.is_empty()
+            {
+                return false;
+            }
+            // spawn-audit: hardened — the floor's own launcher around a no-op, run once per process.
+            Command::new(&sandbox.wrapper[0])
+                .hardened()
+                .args(&sandbox.wrapper[1..])
+                .args(["/bin/sh", "-c", "exit 0"])
+                .current_dir(&d)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        if armed {
+            Ok(tool)
+        } else {
+            Err(crate::worker_sandbox::FloorUnarmed::CannotArm)
+        }
+    })
 }
 
 /// [`run_floor`] against an explicit sandbox probe — the injectable seam, so the fail-closed branch
@@ -5152,6 +5211,24 @@ mod tests {
     /// boundary. Deterministic by injection: a best-effort probe (what a host with no
     /// `sandbox-exec`/`bwrap` yields) makes the floor FAIL with the reason, and nothing runs —
     /// even a check that would have passed.
+    /// (core#678, codex r1) A launcher whose execution probe failed is no boundary: the floor
+    /// downgrades the detection (so the opt-in applies) instead of running a bwrap that cannot arm.
+    #[test]
+    fn the_floor_downgrades_a_launcher_whose_probe_failed() {
+        let armed = || WorkerSandbox {
+            wrapper: vec!["bwrap".to_string()],
+            level: crate::validator::SandboxLevel::Sandboxed,
+            downgrade_reason: None,
+        };
+        let kept = arm_probed(armed(), Ok("bwrap"));
+        assert_eq!(kept.level, crate::validator::SandboxLevel::Sandboxed);
+        assert_eq!(kept.wrapper, vec!["bwrap".to_string()]);
+        let down = arm_probed(armed(), Err(crate::worker_sandbox::FloorUnarmed::CannotArm));
+        assert_eq!(down.level, crate::validator::SandboxLevel::BestEffort);
+        assert!(down.wrapper.is_empty());
+        assert!(down.downgrade_reason.unwrap().starts_with("cannot_arm"));
+    }
+
     #[test]
     fn without_a_write_boundary_the_floor_fails_closed_and_runs_nothing() {
         // Reads an environment variable another test MUTATES (the core#416 opt-in below), so it
