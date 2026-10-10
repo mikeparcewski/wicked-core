@@ -12379,8 +12379,18 @@ fn rewind_to_creator_scoped(
     // workflow reserves for its consent-gated Tool phase. A Tool unit that has NOT run (the
     // deliver gate before the push) still sends its note back to the creator: there the operator
     // is reviewing the creator's work.
-    let failed_tool_unit =
-        cursor.tool_cmd.is_some() && cursor.status == crate::domain::UnitStatus::Rejected;
+    //
+    // (core#753) …but a Tool unit that RAN and was then judged — its pinned validator denied the
+    // result (`walkthrough_review`: the recorded walkthrough has a FAIL chapter) — is a VERDICT on
+    // the creator's work, not a broken command. Re-running it re-judges the same work and denies
+    // again (the loop on run pay-once); its send-back goes to the creator like any evaluator's.
+    let judged = cursor
+        .denial
+        .as_ref()
+        .is_some_and(|d| d.source == "pinned_validator" || d.source == "evaluator_verdict");
+    let failed_tool_unit = cursor.tool_cmd.is_some()
+        && cursor.status == crate::domain::UnitStatus::Rejected
+        && !judged;
     let target_ix = if cursor.role == crate::workflow::PhaseRole::Creator || failed_tool_unit {
         cursor_ix
     } else {
@@ -16685,6 +16695,62 @@ mod request_changes_tests {
             );
             assert!(u.rework_of.is_none(), "unit {} is not reworked", u.ord);
         }
+    }
+
+    /// core#753 — Send back on a Tool unit whose PINNED VALIDATOR denied its result (the
+    /// `walkthrough_review` recorder: the walkthrough found a FAIL chapter) is a verdict on the
+    /// creator's work: it rewinds to the creator, never re-runs the Tool to be judged again.
+    #[test]
+    fn request_changes_on_a_judged_tool_unit_rewinds_to_the_creator() {
+        let run_id = format!("rc-judged-tool-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug_with_deliver(&mut store, &run_id);
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        let creator_ord = units
+            .iter()
+            .filter(|u| u.ord < 5 && u.role == crate::workflow::PhaseRole::Creator)
+            .map(|u| u.ord)
+            .max()
+            .expect("the seed has a creator before unit 5");
+        let tool = units.iter_mut().find(|u| u.ord == 5).unwrap();
+        tool.tool_cmd = Some(vec!["record".to_string()]);
+        tool.status = UnitStatus::Rejected;
+        tool.last_attempt = Some(0);
+        let why = "pinned validator failed: the walkthrough's sealed result is PASS".to_string();
+        tool.denial_reason = Some(why.clone());
+        tool.denial = Some(crate::domain::UnitDenial::new("pinned_validator", why));
+        put_node(&mut store, tool.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::RequestChanges {
+                note: Some("chapter 3 failed: the checkout total is wrong".into()),
+            },
+        )
+        .unwrap();
+        let amended: Vec<u32> = drain(&erx)
+            .iter()
+            .filter_map(|e| match e {
+                CoreEvent::UnitReworkAmended { ord, .. } => Some(*ord),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(amended, vec![creator_ord], "the creator gets the fix");
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let creator = units.iter().find(|u| u.ord == creator_ord).unwrap();
+        assert!(creator
+            .rework_amendment
+            .as_deref()
+            .is_some_and(|a| a.contains("checkout total")));
+        assert_eq!(
+            units.iter().find(|u| u.ord == 5).unwrap().status,
+            UnitStatus::Pending,
+            "the recorder runs again after the fix, on the fixed tree"
+        );
     }
 
     /// DES §7 (11): at the intake gate (cursor on triage, no creator before it) the arm is refused
