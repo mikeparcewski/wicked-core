@@ -313,7 +313,10 @@ impl ConformanceRule {
         // (the write-time boundary all persist paths route through) so a wicked-core producer can
         // never emit an out-of-enum source_kind its cross-product consumers' schema would reject.
         for sk in &self.provenance.source_kinds {
-            if !RULE_SOURCE_KINDS.contains(&sk.as_str()) {
+            // The spine, or the one rule-only kind the rule vocabulary adds.
+            if !(VALID_SOURCE_KINDS.contains(&sk.as_str())
+                || RULE_SOURCE_KINDS.contains(&sk.as_str()))
+            {
                 anyhow::bail!(
                     "INV-C4: provenance.source_kinds contains {sk:?}, not one of {RULE_SOURCE_KINDS:?}"
                 );
