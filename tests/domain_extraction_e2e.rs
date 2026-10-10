@@ -34,8 +34,8 @@ use wicked_governance::{
 
 use wicked_core::{
     provision_and_approve_coverage_validator, Core, CoreEvent, EntityMode, HumanConfirm,
-    HumanDecision, LaunchSpec, RepoSpec, SessionStatus, StepInput, StepOutput, StepRunner,
-    StepStatus, UnitStatus,
+    HumanDecision, LaunchSpec, RepoSpec, SessionStatus, SessionView, StepInput, StepOutput,
+    StepRunner, StepStatus, UnitStatus,
 };
 
 /// The crew-shaped skills snapshot fixture (shared with `skills_plan_admission.rs`): the
@@ -46,9 +46,10 @@ use wicked_core::{
 #[path = "support/skills_snapshot_fixture.rs"]
 mod skills_fixture;
 
-/// The skills the `domain-extraction` preset's plan names: the three domain skills, plus the security
-/// reviewer's, because the plan the rig approves (an un-teamed scope, 100) is floor-filled with
-/// `security_review` (DES-TEAMING-002 M6), and the Tool step's admission judges the whole plan.
+/// The skills the `domain-extraction` preset's plan names: the three domain skills. The security
+/// reviewer's stays in the fixture although the plan no longer carries `security_review` (a
+/// non-code run owes none, core#649 / #847: the coverage judge is a self-verifying evaluator, so
+/// the run is not code work); an extra skill in the snapshot admits nothing the plan lacks.
 const DOMAIN_EXTRACTION_SKILLS: &[&str] = &[
     "wicked-garden-domain",
     "wicked-garden-domain-extractor",
@@ -469,34 +470,119 @@ fn launch(core: &Core, run_id: &str, repo_ref: &str) {
 
 /// Derive the run's worktree from the repo root `setup` returns (not by re-deriving the temp-path
 /// scheme — so a change to the repo naming can't silently break this).
-/// (M6) The preset run's first pause is its plan-approval gate: a creator plan the PA scopes, which
-/// on this un-teamed rig scores 100 (high risk) and pauses even in auto mode. Approve it so the
-/// domain-extraction steps run.
-fn approve_plan(core: &Core, run_id: &str) {
-    wait_status(core, run_id, SessionStatus::AwaitingHuman)
-        .expect("the PA-scoped plan pauses for approval (high risk on an un-teamed repo run)");
-    core.confirm_gate(
-        run_id,
-        HumanDecision::Approve {
-            amend: None,
-            amend_scope: Default::default(),
-        },
-    )
-    .expect("approve the plan");
-    // The approve is applied on the actor; wait until the run has left the gate.
+/// (M6) Drive a preset run until `done` holds, approving every human gate it pauses at first. The
+/// first pause is the plan-approval gate (a creator plan the PA scopes, which on this un-teamed rig
+/// scores 100 and pauses even in auto mode); a floor-added phase may pause too. Returns the phases
+/// whose gates were approved (the unit before the cursor: `unit_ix` is the NEXT unit to execute),
+/// for the assertion messages.
+fn drive_until(
+    core: &Core,
+    run_id: &str,
+    what: &str,
+    done: impl Fn(&SessionView) -> bool,
+) -> Vec<String> {
+    let mut approved: Vec<String> = Vec::new();
     let deadline = Instant::now() + RUN_DEADLINE;
+    let mut last = String::new();
     while Instant::now() < deadline {
-        let left = core
+        let Some(view) = core
             .sessions_detail()
             .ok()
             .and_then(|vs| vs.into_iter().find(|v| v.session.id == run_id))
-            .is_some_and(|v| v.session.status != SessionStatus::AwaitingHuman);
-        if left {
-            return;
+        else {
+            std::thread::sleep(Duration::from_millis(15));
+            continue;
+        };
+        if done(&view) {
+            return approved;
+        }
+        assert!(
+            !is_terminal(view.session.status),
+            "run {run_id} ended {:?} before {what} (gates approved: {approved:?})",
+            view.session.status
+        );
+        let mut units = view.units.clone();
+        units.sort_by_key(|u| u.ord);
+        last = format!(
+            "{:?} at ix {} ({})",
+            view.session.status,
+            view.session.unit_ix,
+            units
+                .iter()
+                .map(|u| format!(
+                    "{}={:?}",
+                    u.id.rsplit(':').next().unwrap_or_default(),
+                    u.status
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if view.session.status == SessionStatus::AwaitingHuman {
+            let gated = view
+                .session
+                .unit_ix
+                .checked_sub(1)
+                .and_then(|i| units.get(i))
+                .map(|u| u.id.rsplit(':').next().unwrap_or_default().to_string())
+                .unwrap_or_default();
+            assert!(
+                approved.len() < 8,
+                "run {run_id} kept pausing before {what}: {approved:?}, now at `{gated}`"
+            );
+            core.confirm_gate(
+                run_id,
+                HumanDecision::Approve {
+                    amend: None,
+                    amend_scope: Default::default(),
+                },
+            )
+            .unwrap_or_else(|e| panic!("approve the `{gated}` gate: {e}"));
+            approved.push(gated);
+            // Let the approve land before reading the run again.
+            let ix = view.session.unit_ix;
+            let settle = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < settle {
+                let moved = core
+                    .sessions_detail()
+                    .ok()
+                    .and_then(|vs| vs.into_iter().find(|v| v.session.id == run_id))
+                    .is_some_and(|v| {
+                        v.session.status != SessionStatus::AwaitingHuman || v.session.unit_ix != ix
+                    });
+                if moved {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            continue;
         }
         std::thread::sleep(Duration::from_millis(15));
     }
-    panic!("run {run_id} stayed at the plan gate after the approve");
+    panic!(
+        "run {run_id} never reached {what} within {}s; last: {last}; gates approved: {approved:?}",
+        RUN_DEADLINE.as_secs()
+    );
+}
+
+/// The run is paused at the human gate on `phase` (the unit before the cursor).
+fn paused_at(view: &SessionView, phase: &str) -> bool {
+    if view.session.status != SessionStatus::AwaitingHuman {
+        return false;
+    }
+    let mut units = view.units.clone();
+    units.sort_by_key(|u| u.ord);
+    view.session
+        .unit_ix
+        .checked_sub(1)
+        .and_then(|i| units.get(i))
+        .is_some_and(|u| u.id.rsplit(':').next() == Some(phase))
+}
+
+/// `phase`'s unit has been rejected (a denied gate on it).
+fn rejected(view: &SessionView, phase: &str) -> bool {
+    view.units
+        .iter()
+        .any(|u| u.id.rsplit(':').next() == Some(phase) && u.status == UnitStatus::Rejected)
 }
 
 fn worktree(repo_root: &std::path::Path, run_id: &str) -> std::path::PathBuf {
@@ -519,11 +605,10 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
     );
     let events = core.subscribe();
     launch(&core, "run-happy", &repo_id);
-    approve_plan(&core, "run-happy");
-
-    // The domain-graph phase carries a human-confirm gate → the run parks awaiting a human.
-    wait_status(&core, "run-happy", SessionStatus::AwaitingHuman)
-        .expect("the run reaches the domain-graph human-confirm gate");
+    // The domain-graph phase carries a human-confirm gate → the run parks awaiting a human there.
+    drive_until(&core, "run-happy", "the domain-graph gate", |v| {
+        paused_at(v, "domain-graph")
+    });
     // core#396: the run was admitted against the fixture generation and against nothing else —
     // the domain-graph Tool unit's plan-wide admission reports the verified generation it judged
     // the plan by (`path: "tool_cmd"`), the way a worker handoff would.
@@ -581,10 +666,11 @@ fn a_policy_violation_denies_a_phase_and_halts_the_run() {
         register_policy(&mut store, &deny_policy("extract", "LEAKTOKEN")).unwrap();
     }
     launch(&core, "run-deny", &repo_id);
-    approve_plan(&core, "run-deny");
-
-    wait_status(&core, "run-deny", SessionStatus::AwaitingHuman)
-        .expect("a policy violation in the extractor phase's output denies it → the run pauses at the escalation gate (core#464)");
+    // A policy violation in the extractor phase's output denies it → the run pauses at the
+    // escalation gate on that phase (core#464).
+    drive_until(&core, "run-deny", "the extract deny", |v| {
+        rejected(v, "extract")
+    });
     // Attribute the failure to the EXTRACTOR phase specifically — not an unrelated gate — so the test
     // proves the policy-over-output deny, not just "some failure".
     let views = core.sessions_detail().unwrap();
@@ -637,9 +723,9 @@ fn a_conformance_rule_is_recalled_onto_the_run_claims() {
     }
     let events = core.subscribe();
     launch(&core, "run-recall", &repo_id);
-    approve_plan(&core, "run-recall");
-    wait_status(&core, "run-recall", SessionStatus::AwaitingHuman)
-        .expect("the run reaches the domain-graph gate");
+    drive_until(&core, "run-recall", "the domain-graph gate", |v| {
+        paused_at(v, "domain-graph")
+    });
     // core#396: admitted against the fixture generation, and only it (see TEST 1).
     let snapshot = skills_snapshot_root();
     let handed = handed_generations(&events, "run-recall");
@@ -702,7 +788,11 @@ fn a_coverage_hole_is_denied_by_the_pinned_validator_in_a_run() {
         false, // a BARE function → an unaccounted hole → coverage < 1.0
     );
     launch(&core, "run-hole", &repo_id);
-    approve_plan(&core, "run-hole");
+    // The coverage validator's deny escalates to the human gate on `coverage`; approve every gate
+    // before it (the plan's, and any floor phase's).
+    let approved = drive_until(&core, "run-hole", "the coverage deny", |v| {
+        rejected(v, "coverage")
+    });
 
     // Poll until the coverage phase is REJECTED — the deterministic coverage
     // validator denied the sub-1.0 report. A not-pass verdict on the `human_confirm_if verdict_not_pass`
@@ -727,7 +817,7 @@ fn a_coverage_hole_is_denied_by_the_pinned_validator_in_a_run() {
         rejected,
         "the pinned coverage validator DENIES a sub-1.0 coverage report in a run (the gate has teeth; \
          the agent-PASS shim does not rescue a hole) — the coverage unit was never rejected within {}s; \
-         last seen: {last:?}",
+         last seen: {last:?}; gates approved first: {approved:?}",
         RUN_DEADLINE.as_secs()
     );
     let wt = worktree(&repo, "run-hole");
