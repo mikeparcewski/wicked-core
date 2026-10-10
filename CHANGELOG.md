@@ -239,6 +239,17 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.7.49** — 2026-10-10 — npm release on main tip 666319b, carrying #861. **#861
+  (QE-IN-APP-WORKFLOWS)**: `feature`, `bug`, `migration` and `mcp-server` (defs, JSON mirrors and
+  the `feature`/`migration` built-in presets) require `qe_acceptance`. The impact scorer gains a
+  complexity dimension (changed lines, branch lines, changed symbols) and a novelty dimension (new
+  or unindexed files, new dependencies, new public symbols, low git history). The run's QE unit
+  decides from the run's actual diff, and waives only when every dimension is in its lowest band
+  (score <= 20, no complexity or novelty points); a later tree-changing unit revokes a waiver. The
+  decision rides `RunAssurance.qe`, every receipt and the new `qeAcceptanceDecided` event.
+  `LaunchOptions.skipQeAcceptanceReason` (a non-empty reason, labelled everywhere) and
+  `forceQeAcceptance` (additive) are the operator's explicit word; either one on a run that does not
+  require QE acceptance is refused.
 - **core-ts 0.7.48** — 2026-10-10 — npm release on main tip 026ece3, carrying #858, and recording
   that the `core-ts-v0.7.47` tag (f868e35) also carried #855, #856 and #837, which merged before
   #859. **#858 (X-MIG M9 prerequisite, core#649)**: `LaunchOptions.deliverables` (additive) lets a
