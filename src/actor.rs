@@ -12721,6 +12721,42 @@ fn rewind_to_creator(
     )
 }
 
+/// The most of a conversation's history a re-run carries (characters; the newest turns win).
+const CONVERSATION_MAX_CHARS: usize = 16_000;
+
+/// One follow-up turn of a conversational step (DES-learn-workflow §3.1): the history so far, then
+/// the step's own last answer and the operator's new question, clipped to the newest
+/// [`CONVERSATION_MAX_CHARS`] on a char boundary.
+pub(crate) fn conversation_turn(
+    history: Option<&str>,
+    last_answer: Option<&str>,
+    question: &str,
+    turn: u32,
+) -> String {
+    let mut out = String::new();
+    match history {
+        Some(h) if !h.trim().is_empty() => out.push_str(h.trim_end()),
+        _ => out.push_str(
+            "CONVERSATION — the operator is asking follow-up questions about your output. Answer \
+             each question, re-teach what was unclear, keep what still holds, and end by inviting \
+             the next question or the approval.",
+        ),
+    }
+    out.push_str(&format!(
+        "\n\n--- turn {turn} ---\nYour previous answer:\n{}\n\nThe operator asks:\n{}",
+        last_answer.unwrap_or("(no output recorded)").trim(),
+        question.trim()
+    ));
+    if out.chars().count() > CONVERSATION_MAX_CHARS {
+        let skip = out.chars().count() - CONVERSATION_MAX_CHARS;
+        out = format!(
+            "(earlier turns clipped)\n{}",
+            out.chars().skip(skip).collect::<String>()
+        );
+    }
+    out
+}
+
 /// [`rewind_to_creator`] with the `unitReworkAmended.scope` token the rewind is booked under
 /// (`request_changes`, or core#467's `accept_suggestion`).
 #[allow(clippy::too_many_arguments)]
@@ -12775,7 +12811,30 @@ fn rewind_to_creator_scoped(
     let failed_tool_unit = cursor.tool_cmd.is_some()
         && cursor.status == crate::domain::UnitStatus::Rejected
         && command_failed;
-    let target_ix = if cursor.role == crate::workflow::PhaseRole::Creator || failed_tool_unit {
+    // (DES-learn-workflow §3.1, F-LEARN-2) A CONVERSATION: at the gate BETWEEN steps — the cursor
+    // has not run yet, so the work under review is the step before it — when that step ran, is not
+    // a Tool and is not a creator, and no creator precedes it (learn's walkthrough), "send back" is
+    // a follow-up question to THAT step: it re-runs with the operator's note and the turns so far,
+    // and its own gate returns. Before this, the send-back was refused ("no creator phase
+    // precedes") or re-ran a creator that had not run yet with the question as its instruction.
+    let conversation_ix = (scope == "request_changes"
+        && cursor.last_attempt.is_none()
+        && matches!(
+            cursor.status,
+            crate::domain::UnitStatus::Pending | crate::domain::UnitStatus::Distributed
+        )
+        && !failed_tool_unit)
+        .then(|| cursor_ix.checked_sub(1))
+        .flatten()
+        .filter(|&i| {
+            units[i].tool_cmd.is_none()
+                && units[i].role != crate::workflow::PhaseRole::Creator
+                && units[i].status == crate::domain::UnitStatus::Done
+                && crate::pipeline::most_recent_prior_creator(&units, units[i].ord).is_none()
+        });
+    let target_ix = if let Some(i) = conversation_ix {
+        i
+    } else if cursor.role == crate::workflow::PhaseRole::Creator || failed_tool_unit {
         cursor_ix
     } else {
         let creator_id = crate::pipeline::most_recent_prior_creator(&units, cursor.ord)
@@ -12811,6 +12870,15 @@ fn rewind_to_creator_scoped(
             format!("{amendment}\n{}", evaluator_suggestion_note(m, cursor.ord))
         }
         _ => amendment,
+    };
+    let amendment = match conversation_ix {
+        Some(i) => conversation_turn(
+            units[i].rework_amendment.as_deref(),
+            crate::domain::get_work_output(store, &units[i].id).as_deref(),
+            note.as_deref().unwrap_or(""),
+            round,
+        ),
+        None => amendment,
     };
     let target_ord = units[target_ix].ord;
     let review_attempt = cursor.last_attempt.unwrap_or(0);
@@ -17490,6 +17558,151 @@ mod request_changes_tests {
 
     /// DES §7 (11): at the intake gate (cursor on triage, no creator before it) the arm is refused
     /// with the operator's remedy; nothing moves.
+    /// DES-learn-workflow §3.1 (F-LEARN-2): at the gate after learn's walkthrough — a Neutral step
+    /// that ran, with no creator before it — "send back" is a follow-up QUESTION to the walkthrough:
+    /// the cursor returns to it at a fresh attempt, carrying the operator's question and the step's
+    /// own last answer, and a second follow-up keeps the first turn in the history.
+    #[test]
+    fn send_back_after_a_conversational_step_re_runs_it_with_the_history() {
+        let run_id = format!("rc-converse-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let session = AgentSession {
+            intent_amendments: Vec::new(),
+            id: run_id.clone(),
+            workflow_id: format!("wf-{run_id}"),
+            problem: "learn SQLite WAL".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec!["claude".into()],
+            status: SessionStatus::AwaitingHuman,
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            unit_ix: 2,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            project_id: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
+            team: None,
+            team_plan: None,
+            exclude_seats: Vec::new(),
+            evidence_root: None,
+            assurance: crate::assurance::RunAssurance::new(None, true),
+        };
+        put_node(&mut store, session.to_node()).unwrap();
+        for (ix, (phase, role)) in [
+            ("scope", PhaseRole::Neutral),
+            ("walkthrough", PhaseRole::Neutral),
+            ("author", PhaseRole::Creator),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut u = WorkUnit::pending(
+                format!("{run_id}:{phase}"),
+                &run_id,
+                ix as u32 + 1,
+                format!("{phase} it"),
+            );
+            u.role = *role;
+            u.assigned_cli = Some("claude".into());
+            if ix < 2 {
+                u.status = UnitStatus::Done;
+                u.last_attempt = Some(0);
+            }
+            put_node(&mut store, u.to_node()).unwrap();
+        }
+        let put_output = |store: &mut dyn GraphStore, text: &str| {
+            let mut node = wicked_apps_core::Node::new(
+                wicked_apps_core::synthetic_symbol(
+                    crate::execute::WORK_OUTPUT,
+                    &format!("{run_id}:walkthrough"),
+                ),
+                wicked_apps_core::NodeKind::Other(crate::execute::WORK_OUTPUT.to_string()),
+                format!("{run_id}:walkthrough"),
+                wicked_apps_core::Language::new(wicked_apps_core::SYMBOL_SCHEME),
+                wicked_apps_core::Location::new("work_output/x", wicked_apps_core::Span::ZERO),
+            );
+            node.metadata
+                .insert("output".into(), serde_json::Value::String(text.into()));
+            put_node(store, node).unwrap();
+        };
+        put_output(
+            &mut store,
+            "LESSON ONE: WAL lets readers and the writer run together.",
+        );
+        let mut subs = crate::event_log::EventSink::default();
+        gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::RequestChanges {
+                note: Some("What starves a checkpoint?".into()),
+            },
+        )
+        .expect("a follow-up on the walkthrough is accepted");
+        let s = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.unit_ix, 1,
+            "the cursor returns to the walkthrough, not the creator after it"
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(units[1].status, UnitStatus::Distributed);
+        let a = units[1].rework_amendment.clone().unwrap_or_default();
+        assert!(
+            a.contains("LESSON ONE")
+                && a.contains("What starves a checkpoint?")
+                && a.contains("--- turn"),
+            "{a}"
+        );
+        assert_eq!(
+            units[2].status,
+            UnitStatus::Pending,
+            "the author waits for the approval"
+        );
+
+        // Turn 2: the walkthrough answered; the operator asks again — the history keeps turn 1.
+        let mut u = units[1].clone();
+        u.status = UnitStatus::Done;
+        u.last_attempt = Some(1);
+        put_node(&mut store, u.to_node()).unwrap();
+        put_output(&mut store, "LESSON TWO: a long reader pins the checkpoint.");
+        let mut s = s;
+        s.unit_ix = 2;
+        s.status = SessionStatus::AwaitingHuman;
+        put_node(&mut store, s.to_node()).unwrap();
+        gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::RequestChanges {
+                note: Some("And on NFS?".into()),
+            },
+        )
+        .unwrap();
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let a = units[1].rework_amendment.clone().unwrap_or_default();
+        for want in [
+            "LESSON ONE",
+            "What starves a checkpoint?",
+            "LESSON TWO",
+            "And on NFS?",
+        ] {
+            assert!(a.contains(want), "{want} in {a}");
+        }
+    }
+
     #[test]
     fn request_changes_with_no_preceding_creator_is_refused_naming_the_remedy() {
         let run_id = format!("rc-intake-{}", std::process::id());
