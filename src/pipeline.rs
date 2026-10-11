@@ -435,6 +435,8 @@ pub(crate) fn pre_distribute(
         EntityMode::Isolated => None,
     };
 
+    // (F-EDIT-5 / F-LEARN-3) The worktree bench, on every launch route (campaign, synchronous).
+    let worktree_bench = crate::distribute::worktree_benched(clis, repo_ref.is_some());
     let mut session = AgentSession {
         intent_amendments: Vec::new(),
         id: session_id.to_string(),
@@ -460,7 +462,7 @@ pub(crate) fn pre_distribute(
         run_branch: None,
         base_commit: None,
         finished_at: None,
-        benched_seats: Vec::new(),
+        benched_seats: worktree_bench,
         team: None,
         team_plan: None,
         exclude_seats,
@@ -2333,6 +2335,7 @@ fn evaluator_relation(
     if builders.is_empty() {
         return None;
     }
+    let authors = work_authors(units, unit.ord);
     Some(EvaluatorRelation {
         creator: builders
             .iter()
@@ -2341,8 +2344,28 @@ fn evaluator_relation(
         on_builder_seat: unit
             .assigned_cli
             .as_ref()
-            .is_some_and(|e| builders.iter().any(|b| b.assigned_cli.as_ref() == Some(e))),
+            .is_some_and(|e| authors.iter().any(|a| a == e)),
     })
+}
+
+/// (crew#972) Every seat that authored the work a unit at `ord` checks: each earlier Build/Recon
+/// agent unit's current seat AND every seat it was ever dispatched on
+/// ([`crate::domain::WorkUnit::authored_by`] — reassigned and failed-over creators included).
+pub(crate) fn work_authors(units: &[crate::domain::WorkUnit], ord: u32) -> Vec<String> {
+    use crate::domain::StageKind;
+    let mut out: Vec<String> = Vec::new();
+    for u in units.iter().filter(|u| {
+        u.ord < ord
+            && u.tool_cmd.is_none()
+            && matches!(u.stage, StageKind::Build | StageKind::Recon)
+    }) {
+        for s in u.assigned_cli.iter().chain(u.authored_by.iter()) {
+            if !out.contains(s) {
+                out.push(s.clone());
+            }
+        }
+    }
+    out
 }
 
 /// What the fold observed, for [`gate_receipt`].
