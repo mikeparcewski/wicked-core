@@ -1848,8 +1848,11 @@ fn judge_refusal_text(output: &str) -> &str {
 /// Whether a judge answer names a verdict word (`PASS` / `REJECT`) on any line: a seat that did
 /// has ANSWERED, and its words are parsed fail-closed by `parse_agent_verdict`.
 pub(crate) fn names_a_verdict(output: &str) -> bool {
+    // A STATED verdict: a line whose FIRST token is the keyword (the contract line
+    // `parse_agent_verdict` reads). A keyword inside prose ("the tests pass, but…") is not one
+    // (codex r1 #1 on #902).
     output.lines().any(|l| {
-        l.split_whitespace().any(|t| {
+        l.split_whitespace().next().is_some_and(|t| {
             let t = t
                 .trim_matches(|c: char| !c.is_alphanumeric())
                 .to_uppercase();
