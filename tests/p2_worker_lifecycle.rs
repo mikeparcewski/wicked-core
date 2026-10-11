@@ -104,6 +104,7 @@ mod tests {
             executes_code: false,
             tool_cmd: None,
             worker_failed_clis: Vec::new(),
+            authored_by: Vec::new(),
             team_run: false,
             team: None,
             member_step: None,

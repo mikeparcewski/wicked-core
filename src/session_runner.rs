@@ -830,6 +830,7 @@ mod tests {
             executes_code: false,
             tool_cmd: None,
             worker_failed_clis: Vec::new(),
+            authored_by: Vec::new(),
             depends_on: Vec::new(),
             pre_build_scope: false,
             team_run: false,

@@ -941,6 +941,13 @@ pub struct WorkUnit {
     /// resume/restart. `#[serde(default)]` for back-compat with units persisted before this field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub worker_failed_clis: Vec<String>,
+    /// (crew#972) EVERY seat this Build/Recon unit was dispatched on — its first seat and each seat
+    /// a reassign, failover or bench reseat moved it to. Stamped at dispatch, never cleared: a seat
+    /// that built any attempt of the work is one of its authors, so no Review/Test unit or judge of
+    /// that work may run on it (run 7d8c9c98: after the build was reassigned codex -> claude, the
+    /// test and security-review units were dispatched onto claude, then codex).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authored_by: Vec<String>,
     /// The PHASE IDS this unit's work depends on — carried verbatim from the backing phase's
     /// [`depends_on`](crate::workflow::PhaseDef::depends_on) at plan time (FINDING-024).
     ///
@@ -1313,6 +1320,7 @@ impl WorkUnit {
             capture_report: None,
             tool_cmd: None,
             worker_failed_clis: Vec::new(),
+            authored_by: Vec::new(),
             depends_on: Vec::new(),
             pre_build_scope: false,
             team_run: false,

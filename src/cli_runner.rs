@@ -1262,7 +1262,13 @@ fn run_unit_and_judge_on(
     // Instance AND cli key: excluding `claude#2` excludes a `claude` seat too.
     let mut team_excluded: Vec<String> = Vec::new();
     // (EP-K3) The launch's judge exclusion is UNIONED in (never replaces): it can only narrow.
-    for a in team_authors.iter().chain(&input.unit.exclude_seats) {
+    // (crew#972) So is every seat this unit was ever dispatched on: a reassigned or failed-over
+    // creator authored part of the work and never judges it.
+    for a in team_authors
+        .iter()
+        .chain(&input.unit.exclude_seats)
+        .chain(&input.unit.authored_by)
+    {
         for k in [a.as_str(), crate::team::runner::seat_key(a)] {
             if !team_excluded.iter().any(|e| e == k) {
                 team_excluded.push(k.to_string());

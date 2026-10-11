@@ -6540,16 +6540,35 @@ fn apply_step_result(
     let code_without_diff = unit.role == crate::workflow::PhaseRole::Creator
         && unit.executes_code
         && session.workdir.is_some();
+    // (crew#972, run 7d8c9c98) "No change" is THIS unit's: its tree against its own dispatch
+    // baseline (`evidence.tree_changed`), not only a worktree clean at HEAD — a creator whose
+    // writes were all denied passed its gate because EARLIER phases had already changed the
+    // worktree. Only an explicit declaration (a line `NO CHANGE NEEDED`) exempts it.
+    let clean = worktree_is_clean(session.workdir.as_deref());
+    let declared_no_change = output
+        .output
+        .lines()
+        .any(|l| l.trim().eq_ignore_ascii_case(NO_CHANGE_NEEDED));
+    let left_no_change = clean || evidence.tree_changed == Some(false);
     if output.governed
-        && (no_prose || code_without_diff)
-        && worktree_is_clean(session.workdir.as_deref())
+        && ((no_prose && clean) || (code_without_diff && !declared_no_change && left_no_change))
     {
         const NO_SUBSTANCE: &str = "phase produced no reviewable substance";
         const NO_DIFF: &str = "executes-code phase reported done but left no change in the \
                                worktree (done is re-derived from the diff, never asserted)";
+        const NO_OWN_DIFF: &str = "the build step changed nothing in the worktree (its writes \
+                                   may have been refused); it did not declare NO CHANGE NEEDED, \
+                                   so done is not accepted — retry it on a seat that can write, \
+                                   or reassign";
         // `no_prose` wins the tie so the pre-existing rejection keeps its exact record shape —
         // the new arm only ever rejects folds that previously passed.
-        let why: &'static str = if no_prose { NO_SUBSTANCE } else { NO_DIFF };
+        let why: &'static str = if no_prose && clean {
+            NO_SUBSTANCE
+        } else if clean {
+            NO_DIFF
+        } else {
+            NO_OWN_DIFF
+        };
         unit.status = crate::domain::UnitStatus::Rejected;
         unit.denial_reason = Some(why.to_string());
         unit.denial = Some(crate::domain::UnitDenial::new("substance", why));
@@ -7529,6 +7548,30 @@ pub(crate) fn worktree_retained(session: &crate::domain::AgentSession, now_ms: i
 
 /// (F-7R2-006) The run's roster keys a failover may move work to: the configured `clis` minus
 /// every benched seat. One rule with `distribute::eligible_seats`.
+/// (crew#972) The seat a Review/Test agent unit should run on instead of its assigned one, when its
+/// assigned seat AUTHORED the work it checks ([`crate::pipeline::work_authors`]): the first run
+/// seat, unbenched and in roster order, that authored nothing. `None` when the unit is not a
+/// Review/Test agent unit, is not on an author's seat, or no distinct seat is left (the gate's
+/// `same_seat_evaluator` denial then escalates).
+fn distinct_evaluator_seat(
+    session: &crate::domain::AgentSession,
+    units: &[crate::domain::WorkUnit],
+    unit: &crate::domain::WorkUnit,
+) -> Option<String> {
+    use crate::domain::StageKind;
+    if unit.tool_cmd.is_some() || !matches!(unit.stage, StageKind::Review | StageKind::Test) {
+        return None;
+    }
+    let seat = unit.assigned_cli.as_ref()?;
+    let authors = crate::pipeline::work_authors(units, unit.ord);
+    if !authors.contains(seat) {
+        return None;
+    }
+    eligible_roster_keys(session)
+        .into_iter()
+        .find(|k| !authors.contains(k))
+}
+
 fn eligible_roster_keys(session: &crate::domain::AgentSession) -> Vec<String> {
     session
         .clis
@@ -9007,6 +9050,36 @@ fn dispatch_unit(
     }
     // DES-TEAMING-002 §8.8 (T6): a member's step records the member seat it belongs to.
     team_changed |= team_gate::stamp_member_step(&session, &mut unit);
+    // (crew#972) AUTHORS. A Build/Recon agent unit records every seat it is dispatched on, so a
+    // reassigned or failed-over creator stays one of the work's authors.
+    let builds = unit.tool_cmd.is_none()
+        && matches!(
+            unit.stage,
+            crate::domain::StageKind::Build | crate::domain::StageKind::Recon
+        );
+    if builds {
+        if let Some(seat) = unit.assigned_cli.clone() {
+            if !unit.authored_by.contains(&seat) {
+                unit.authored_by.push(seat);
+                team_changed = true;
+            }
+        }
+    }
+    // …and a Review/Test agent unit never dispatches onto an author's seat: it moves to the first
+    // run seat (unbenched, in roster order) that authored nothing. With none left it stays put and
+    // its gate denies `same_seat_evaluator` under a distinct-evaluator contract — the explicit
+    // escalation, never a silent reuse.
+    if let Some(alt) = distinct_evaluator_seat(&session, &units, &unit) {
+        eprintln!(
+            "wicked-core: unit {} of run {run_id} was seated on `{}`, which authored the work it \
+             checks; dispatching it on `{alt}` instead (crew#972)",
+            unit.ord,
+            unit.assigned_cli.as_deref().unwrap_or("")
+        );
+        unit.assigned_cli = Some(alt);
+        unit.assigned_invocation = None;
+        team_changed = true;
+    }
     // (core#810) The worker pool is re-filled against the run's CURRENT seats at every dispatch:
     // a failover, a bench reseat or an operator reassign moves `assigned_cli` after distribution,
     // and a seat benched since then is no longer signed in. Re-derived through the one rule
@@ -10498,6 +10571,10 @@ fn run_tool_cmd_jailed(
 ///
 /// Actor-thread subprocess, deliberately: both are fast plumbing reads, and this runs ONLY on the
 /// short-output governed path (rare), never per unit.
+/// (crew#972) The line a creator writes when its step legitimately needs no change to the tree; the
+/// code-evidence floor accepts an unchanged tree only with it.
+pub(crate) const NO_CHANGE_NEEDED: &str = "NO CHANGE NEEDED";
+
 fn worktree_is_clean(workdir: Option<&str>) -> bool {
     let Some(wd) = workdir else {
         return true;
@@ -24953,5 +25030,111 @@ mod ballot_only_reassign_tests {
         let _ = std::fs::remove_dir_all(&home);
         assert!(voter.unwrap_err().to_string().contains("ballot-only"));
         assert!(claude.is_ok() && adhoc.is_ok());
+    }
+}
+
+/// crew#972, editor E2E run 7d8c9c98: the build unit ran on codex (writes refused), was reassigned
+/// to claude, and the later test / security-review units were still dispatched onto claude and
+/// then codex — every attempt's seat built the work. Every seat that authored ANY attempt of a
+/// Build/Recon unit is excluded from evaluating it, at dispatch and at the gate.
+#[cfg(test)]
+mod work_author_tests {
+    use super::*;
+    use crate::domain::{AgentSession, BenchedSeat, StageKind, WorkUnit};
+
+    fn session(clis: &[&str], benched: &[&str]) -> AgentSession {
+        AgentSession {
+            intent_amendments: Vec::new(),
+            id: "run-7d8c".into(),
+            workflow_id: "wf-run-7d8c".into(),
+            problem: "p".into(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            collection_scope: None,
+            clis: clis.iter().map(|c| c.to_string()).collect(),
+            status: crate::domain::SessionStatus::Executing,
+            human_confirm: crate::domain::HumanConfirm::None,
+            auto_deliver: false,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            project_id: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: benched
+                .iter()
+                .map(|c| BenchedSeat {
+                    cli: (*c).to_string(),
+                    reason: "quota_exhausted".into(),
+                    source: "worker".into(),
+                })
+                .collect(),
+            team: None,
+            team_plan: None,
+            exclude_seats: Vec::new(),
+            evidence_root: None,
+            assurance: Default::default(),
+        }
+    }
+
+    fn unit(ord: u32, stage: StageKind, seat: &str, authored: &[&str]) -> WorkUnit {
+        let mut u = WorkUnit::pending(format!("run-7d8c:{ord}"), "run-7d8c", ord, "u");
+        u.stage = stage;
+        u.assigned_cli = Some(seat.to_string());
+        u.authored_by = authored.iter().map(|s| s.to_string()).collect();
+        u
+    }
+
+    /// The exact shape: build authored by codex then claude (reassigned), test seated on claude.
+    #[test]
+    fn a_review_unit_never_dispatches_onto_any_seat_that_built_the_work() {
+        let s = session(&["claude", "pi", "opencode", "codex"], &[]);
+        let build = unit(4, StageKind::Build, "claude", &["codex", "claude"]);
+        let test = unit(5, StageKind::Test, "claude", &[]);
+        let units = vec![build.clone(), test.clone()];
+        assert_eq!(
+            crate::pipeline::work_authors(&units, 5),
+            vec!["claude".to_string(), "codex".to_string()]
+        );
+        assert_eq!(
+            distinct_evaluator_seat(&s, &units, &test).as_deref(),
+            Some("pi")
+        );
+        // The failed-over creator's seat is an author too: a review on codex moves as well.
+        let on_codex = unit(5, StageKind::Test, "codex", &[]);
+        assert_eq!(
+            distinct_evaluator_seat(&s, &[build.clone(), on_codex.clone()], &on_codex).as_deref(),
+            Some("pi")
+        );
+        // A review already on a non-author seat stays put.
+        let on_pi = unit(5, StageKind::Review, "pi", &[]);
+        assert_eq!(
+            distinct_evaluator_seat(&s, &[build.clone(), on_pi.clone()], &on_pi),
+            None
+        );
+    }
+
+    /// No distinct seat left (the rest benched): the unit stays, and its gate's
+    /// `same_seat_evaluator` denial is the explicit escalation — never a silent reuse.
+    #[test]
+    fn with_every_unbenched_seat_an_author_the_review_unit_is_left_for_the_gate_to_refuse() {
+        let s = session(&["claude", "pi", "opencode", "codex"], &["pi", "opencode"]);
+        let build = unit(4, StageKind::Build, "claude", &["codex", "claude"]);
+        let test = unit(5, StageKind::Test, "codex", &[]);
+        assert_eq!(
+            distinct_evaluator_seat(&s, &[build.clone(), test.clone()], &test),
+            None
+        );
+        assert!(
+            crate::pipeline::work_authors(&[build, test.clone()], 5).contains(&"codex".to_string()),
+            "the gate counts the failed-over creator as a builder"
+        );
     }
 }
