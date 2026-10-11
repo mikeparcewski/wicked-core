@@ -11725,9 +11725,12 @@ pub(crate) fn confirm_gate(
                 );
             }
             crate::workflow::HumanDecision::RequestChanges { .. } => {
+                // (F-LEARN-2 live, run 55a1fac3) a follow-up on a conversational step is a send-back
+                // too: the pre-check refused it before the rewind could route it.
                 let has_creator = cursor
                     .is_some_and(|c| c.role == crate::workflow::PhaseRole::Creator)
-                    || crate::pipeline::most_recent_prior_creator(&units, cursor_ord).is_some();
+                    || crate::pipeline::most_recent_prior_creator(&units, cursor_ord).is_some()
+                    || conversation_target(&units, session.unit_ix).is_some();
                 if !has_creator {
                     anyhow::bail!(
                         "no creator phase precedes unit {cursor_ord} — approve (retry) or reject"
@@ -12721,6 +12724,32 @@ fn rewind_to_creator(
     )
 }
 
+/// (DES-learn-workflow §3.1) The conversational step a `request_changes` at a gate BETWEEN steps
+/// re-runs: the cursor has not run, and the step before it ran, is neither a Tool nor a creator, and
+/// has no creator before it (learn's walkthrough). `None` everywhere else. The ONE rule both the
+/// gate's pre-check and the rewind read.
+pub(crate) fn conversation_target(
+    units: &[crate::domain::WorkUnit],
+    cursor_ix: usize,
+) -> Option<usize> {
+    let cursor = units.get(cursor_ix)?;
+    if cursor.last_attempt.is_some()
+        || !matches!(
+            cursor.status,
+            crate::domain::UnitStatus::Pending | crate::domain::UnitStatus::Distributed
+        )
+    {
+        return None;
+    }
+    let i = cursor_ix.checked_sub(1)?;
+    let prior = &units[i];
+    (prior.tool_cmd.is_none()
+        && prior.role != crate::workflow::PhaseRole::Creator
+        && prior.status == crate::domain::UnitStatus::Done
+        && crate::pipeline::most_recent_prior_creator(units, prior.ord).is_none())
+    .then_some(i)
+}
+
 /// The most of a conversation's history a re-run carries (characters; the newest turns win).
 const CONVERSATION_MAX_CHARS: usize = 16_000;
 
@@ -12817,21 +12846,9 @@ fn rewind_to_creator_scoped(
     // a follow-up question to THAT step: it re-runs with the operator's note and the turns so far,
     // and its own gate returns. Before this, the send-back was refused ("no creator phase
     // precedes") or re-ran a creator that had not run yet with the question as its instruction.
-    let conversation_ix = (scope == "request_changes"
-        && cursor.last_attempt.is_none()
-        && matches!(
-            cursor.status,
-            crate::domain::UnitStatus::Pending | crate::domain::UnitStatus::Distributed
-        )
-        && !failed_tool_unit)
-        .then(|| cursor_ix.checked_sub(1))
-        .flatten()
-        .filter(|&i| {
-            units[i].tool_cmd.is_none()
-                && units[i].role != crate::workflow::PhaseRole::Creator
-                && units[i].status == crate::domain::UnitStatus::Done
-                && crate::pipeline::most_recent_prior_creator(&units, units[i].ord).is_none()
-        });
+    let conversation_ix = (scope == "request_changes" && !failed_tool_unit)
+        .then(|| conversation_target(&units, cursor_ix))
+        .flatten();
     let target_ix = if let Some(i) = conversation_ix {
         i
     } else if cursor.role == crate::workflow::PhaseRole::Creator || failed_tool_unit {
@@ -17602,6 +17619,152 @@ mod request_changes_tests {
         for (ix, (phase, role)) in [
             ("scope", PhaseRole::Neutral),
             ("walkthrough", PhaseRole::Neutral),
+            ("author", PhaseRole::Creator),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut u = WorkUnit::pending(
+                format!("{run_id}:{phase}"),
+                &run_id,
+                ix as u32 + 1,
+                format!("{phase} it"),
+            );
+            u.role = *role;
+            u.assigned_cli = Some("claude".into());
+            if ix < 2 {
+                u.status = UnitStatus::Done;
+                u.last_attempt = Some(0);
+            }
+            put_node(&mut store, u.to_node()).unwrap();
+        }
+        let put_output = |store: &mut dyn GraphStore, text: &str| {
+            let mut node = wicked_apps_core::Node::new(
+                wicked_apps_core::synthetic_symbol(
+                    crate::execute::WORK_OUTPUT,
+                    &format!("{run_id}:walkthrough"),
+                ),
+                wicked_apps_core::NodeKind::Other(crate::execute::WORK_OUTPUT.to_string()),
+                format!("{run_id}:walkthrough"),
+                wicked_apps_core::Language::new(wicked_apps_core::SYMBOL_SCHEME),
+                wicked_apps_core::Location::new("work_output/x", wicked_apps_core::Span::ZERO),
+            );
+            node.metadata
+                .insert("output".into(), serde_json::Value::String(text.into()));
+            put_node(store, node).unwrap();
+        };
+        put_output(
+            &mut store,
+            "LESSON ONE: WAL lets readers and the writer run together.",
+        );
+        let mut subs = crate::event_log::EventSink::default();
+        gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::RequestChanges {
+                note: Some("What starves a checkpoint?".into()),
+            },
+        )
+        .expect("a follow-up on the walkthrough is accepted");
+        let s = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.unit_ix, 1,
+            "the cursor returns to the walkthrough, not the creator after it"
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(units[1].status, UnitStatus::Distributed);
+        let a = units[1].rework_amendment.clone().unwrap_or_default();
+        assert!(
+            a.contains("LESSON ONE")
+                && a.contains("What starves a checkpoint?")
+                && a.contains("--- turn"),
+            "{a}"
+        );
+        assert_eq!(
+            units[2].status,
+            UnitStatus::Pending,
+            "the author waits for the approval"
+        );
+
+        // Turn 2: the walkthrough answered; the operator asks again — the history keeps turn 1.
+        let mut u = units[1].clone();
+        u.status = UnitStatus::Done;
+        u.last_attempt = Some(1);
+        put_node(&mut store, u.to_node()).unwrap();
+        put_output(&mut store, "LESSON TWO: a long reader pins the checkpoint.");
+        let mut s = s;
+        s.unit_ix = 2;
+        s.status = SessionStatus::AwaitingHuman;
+        put_node(&mut store, s.to_node()).unwrap();
+        gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::RequestChanges {
+                note: Some("And on NFS?".into()),
+            },
+        )
+        .unwrap();
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let a = units[1].rework_amendment.clone().unwrap_or_default();
+        for want in [
+            "LESSON ONE",
+            "What starves a checkpoint?",
+            "LESSON TWO",
+            "And on NFS?",
+        ] {
+            assert!(a.contains(want), "{want} in {a}");
+        }
+    }
+
+    /// The live run 55a1fac3 (F-LEARN-2): the floor put a NEUTRAL `test_plan` after the walkthrough,
+    /// so the cursor at its gate is not a creator. The gate's pre-check refused the follow-up ("no
+    /// creator phase precedes") before the rewind could route it. It is accepted now.
+    #[test]
+    fn send_back_after_a_conversational_step_passes_the_gate_precheck_when_the_next_step_is_neutral(
+    ) {
+        let run_id = format!("rc-converse-n-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let session = AgentSession {
+            intent_amendments: Vec::new(),
+            id: run_id.clone(),
+            workflow_id: format!("wf-{run_id}"),
+            problem: "learn SQLite WAL".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec!["claude".into()],
+            status: SessionStatus::AwaitingHuman,
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            unit_ix: 2,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            project_id: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
+            team: None,
+            team_plan: None,
+            exclude_seats: Vec::new(),
+            evidence_root: None,
+            assurance: crate::assurance::RunAssurance::new(None, true),
+        };
+        put_node(&mut store, session.to_node()).unwrap();
+        for (ix, (phase, role)) in [
+            ("scope", PhaseRole::Neutral),
+            ("walkthrough", PhaseRole::Neutral),
+            ("test_plan", PhaseRole::Neutral),
             ("author", PhaseRole::Creator),
         ]
         .iter()
