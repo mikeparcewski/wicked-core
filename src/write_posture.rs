@@ -215,6 +215,23 @@ pub(crate) fn admitted_roots(
     }
 }
 
+/// [`admitted_roots`] for a dispatched `unit` — what every carrier arms: under the read-only
+/// posture the unit's notes root and then (wicked-crew#951) its QE LEDGER ROOT
+/// (`WorkUnit::qe_ledger_root`, the run's ledger outside the tree, set at dispatch on the QE unit)
+/// — the two engine-minted places outside the tree a read-only unit may write. The notes root
+/// stays FIRST: the read-only refusal names the first admitted root as where notes go.
+pub(crate) fn unit_admitted_roots(
+    posture: WritePosture,
+    unit: &WorkUnit,
+    extra_write_roots: &[String],
+) -> Vec<PathBuf> {
+    let mut roots = admitted_roots(posture, unit.notes_root.as_deref(), extra_write_roots);
+    if posture == WritePosture::ReadOnly {
+        roots.extend(unit.qe_ledger_root.iter().map(PathBuf::from));
+    }
+    roots
+}
+
 /// The env spelling of [`admitted_roots`] for the hook-subprocess carrier: the roots joined
 /// with the platform's PATH separator, exactly as `WICKED_WRITE_ROOTS` is. `None` when a root
 /// contains the separator and cannot be joined — the launcher then arms an EMPTY list rather than
@@ -487,6 +504,36 @@ mod tests {
     /// DES-L4 PR-②: ONE admitted-roots derivation per posture — the creator's extras under
     /// deliverable-roots, the notes root (or nothing) under read-only, nothing under full — so the
     /// wrapped env, the ACP fence and the gate hook cannot disagree about where a fenced write may go.
+    /// wicked-crew#951: a dispatched read-only unit admits its notes root and THEN its QE ledger
+    /// root (the notes root stays first — the refusal names it as where notes go); a creator's
+    /// list is its extras, untouched by either; a unit without a QE root admits the notes root
+    /// alone. Mutation: drop the `extend` → the first assert loses the QE root.
+    #[test]
+    fn a_read_only_unit_admits_its_notes_root_then_its_qe_ledger_root() {
+        let mut u = unit(PhaseRole::Evaluator, false);
+        u.notes_root = Some("/notes/u4".into());
+        u.qe_ledger_root = Some("/evidence/run/.wicked-qe".into());
+        let extras = vec!["/run/author".to_string()];
+        assert_eq!(
+            unit_admitted_roots(WritePosture::ReadOnly, &u, &extras),
+            vec![
+                PathBuf::from("/notes/u4"),
+                PathBuf::from("/evidence/run/.wicked-qe")
+            ]
+        );
+        assert_eq!(
+            unit_admitted_roots(WritePosture::DeliverableRoots, &u, &extras),
+            vec![PathBuf::from("/run/author")],
+            "a creator's admitted roots are exactly its extras"
+        );
+        assert!(unit_admitted_roots(WritePosture::Full, &u, &extras).is_empty());
+        u.qe_ledger_root = None;
+        assert_eq!(
+            unit_admitted_roots(WritePosture::ReadOnly, &u, &extras),
+            vec![PathBuf::from("/notes/u4")]
+        );
+    }
+
     #[test]
     fn admitted_roots_are_the_extras_for_a_creator_the_notes_root_for_read_only_and_none_for_full()
     {

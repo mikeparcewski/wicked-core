@@ -6453,6 +6453,15 @@ impl AcpStepRunner {
                     self.mark_restart(&session_key, "posture_switch", Some(Instant::now()));
                     SessionProbe::Vacant
                 }
+                // (wicked-crew#951) The QE unit's worker must carry `WICKED_QE_LEDGER_DIR`, and a
+                // process's env is fixed at its spawn: a cached one never received it, so the QE
+                // unit always opens a fresh process.
+                SessionProbe::Live(arc) if input.unit.qe_ledger_root.is_some() => {
+                    drop(arc);
+                    self.drop_session_key(&session_key);
+                    self.mark_restart(&session_key, "qe_ledger_env", Some(Instant::now()));
+                    SessionProbe::Vacant
+                }
                 other => other,
             };
         let turn = match &probe {
@@ -6707,9 +6716,9 @@ impl AcpStepRunner {
                     // `g.extra_write_roots` under deliverable-roots, the evaluator's notes root
                     // under read-only — the list the wrapped launcher arms on
                     // `WICKED_DELIVERABLE_ROOTS` for its hook (`write_posture::admitted_roots`).
-                    deliverable_roots: crate::write_posture::admitted_roots(
+                    deliverable_roots: crate::write_posture::unit_admitted_roots(
                         write_posture,
-                        input.unit.notes_root.as_deref(),
+                        &input.unit,
                         &g.extra_write_roots,
                     ),
                     // (issue #463) Whether the AGENT child's environment pins the estate store
@@ -6919,7 +6928,7 @@ impl AcpStepRunner {
                 // Provenance for the estate MCP's `proposal.submit`, stamped from the run/unit/agent
                 // that owns this session (DES-MEM-FACETED-001 follow-on) — same source fields and helper
                 // as the wrapped carrier, formatted into the ACP `env` array by the spawn.
-                let estate_provenance = crate::execute_wrapped::estate_provenance_env(
+                let mut estate_provenance = crate::execute_wrapped::estate_provenance_env(
                     &input.run_id,
                     input.unit.ord,
                     input.unit.assigned_cli.as_deref(),
@@ -6930,6 +6939,8 @@ impl AcpStepRunner {
                         .as_ref()
                         .and_then(|g| g.project_id.as_deref()),
                 );
+                // (wicked-crew#951) The QE unit's ledger root, on the same spawn env.
+                estate_provenance.extend(crate::qe_acceptance::ledger_env(&input.unit));
                 // (core#418) A restart's cost is measured to the opened session.
                 let spawn_started = Instant::now();
                 match start_acp_process_with_write_roots(
@@ -7324,9 +7335,9 @@ impl AcpStepRunner {
             // The posture's ADMITTED roots — the creator's launch-validated extra_write_roots or
             // the evaluator's notes root — the same list the gate hook judges
             // (`write_posture::admitted_roots`, F-02 / DES-L4 PR-②).
-            deliverable_roots: crate::write_posture::admitted_roots(
+            deliverable_roots: crate::write_posture::unit_admitted_roots(
                 write_posture,
-                input.unit.notes_root.as_deref(),
+                &input.unit,
                 input
                     .governance
                     .as_ref()
@@ -7528,7 +7539,10 @@ impl AcpStepRunner {
                         output_bytes: result.output.len(),
                     });
                 }
-                if wants_no_code || result.settled.is_some() {
+                // (wicked-crew#951) …and the QE unit's process: its env carries the run's QE ledger
+                // root, which no later unit may inherit through a cached process.
+                if wants_no_code || result.settled.is_some() || input.unit.qe_ledger_root.is_some()
+                {
                     // F-036 QUIESCE (adversarial review on #414): a NO-CODE unit's process — the
                     // bridge, the CLI it wraps and anything either backgrounded — dies with the
                     // unit, group and all, BEFORE this returns and the worker thread takes the
@@ -14633,6 +14647,7 @@ No further next steps — both questions fully answered.";
             worktree_baseline: None,
             worktree_mutation: None,
             notes_root: None,
+            qe_ledger_root: None,
             run_base_commit: None,
             repo_checks_floor: false,
             default_floor: false,

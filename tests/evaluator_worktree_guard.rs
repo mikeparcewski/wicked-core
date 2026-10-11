@@ -71,6 +71,9 @@ enum VerifyBehaviour {
     RewritesTheFix,
     /// A well-behaved evaluator: reads, runs things, writes nothing.
     LeavesTreeAlone,
+    /// wicked-crew#951: the QE unit records its acceptance verdict where the engine told it to —
+    /// under `WorkUnit::qe_ledger_root` (garden's `qe accept` honours `WICKED_QE_LEDGER_DIR`).
+    RecordsItsQeVerdictUnderTheLedgerRoot,
 }
 
 /// What the fake seat does when it runs the `reproduce` phase — the read-only recon rung whose
@@ -191,13 +194,28 @@ impl StepRunner for ScriptedSeat {
                         std::fs::write(wd.join("NOTES.md"), format!("# {phase}\n")).unwrap();
                     }
                 }
-                "verify" => {
-                    if let VerifyBehaviour::RewritesTheFix = self.verify {
+                "verify" => match self.verify {
+                    VerifyBehaviour::RewritesTheFix => {
                         // Exactly F-036: the evaluator "improves" the fix under review.
                         std::fs::write(wd.join("src/app.ts"), "evaluator's rewrite\n").unwrap();
                         std::fs::remove_file(wd.join("src/fix.ts")).unwrap();
                     }
-                }
+                    VerifyBehaviour::RecordsItsQeVerdictUnderTheLedgerRoot => {
+                        if let Some(root) = input.unit.qe_ledger_root.as_deref() {
+                            let verdicts = Path::new(root).join("verdicts");
+                            std::fs::create_dir_all(&verdicts).unwrap();
+                            std::fs::write(
+                                verdicts.join("v1.json"),
+                                format!(
+                                    "{{\"id\":\"v1\",\"verdict\":\"PASS\",\"crew_run_id\":\"{}\"}}\n",
+                                    input.run_id
+                                ),
+                            )
+                            .unwrap();
+                        }
+                    }
+                    VerifyBehaviour::LeavesTreeAlone => {}
+                },
                 _ => {}
             }
         }
@@ -1428,6 +1446,101 @@ fn rejecting_the_denial_gate_on_a_clean_recon_tree_cancels_without_failing() {
     ));
     assert!(!session_failed(&before) && !session_failed(&evs));
     let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// wicked-crew#951: the run's QE unit (`verify`, the `verified_evidence` phase after the
+/// creator) carries its run's QE LEDGER ROOT — `<evidence root>/.wicked-qe`, outside the worktree
+/// and the clone, joined into its own write boundary, on no other unit — and a verdict recorded
+/// there never trips the guard. Before the fix the seat's only ledger was `<worktree>/.wicked-qe`:
+/// the guard discarded it (with the PASS) and the launcher's acceptance check found nothing.
+#[test]
+fn the_qe_unit_records_its_verdict_under_the_run_qe_ledger_root_without_tripping_the_guard() {
+    let repo = make_git_repo("qe-ledger-root", None);
+    let evidence =
+        std::env::temp_dir().join(format!("wicked-qe-ledger-evidence-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&evidence);
+    std::fs::create_dir_all(evidence.join("author")).unwrap();
+    let (core, _ran, inputs) = core_with(
+        "qe-ledger-root",
+        VerifyBehaviour::RecordsItsQeVerdictUnderTheLedgerRoot,
+        ReproduceBehaviour::LeavesTreeAlone,
+    );
+    let entry = core
+        .register_repo(RepoSpec {
+            name: "qe-ledger-root".into(),
+            root_path: repo.to_str().unwrap().into(),
+            registered_at: 1,
+        })
+        .expect("register");
+    let events = core.subscribe();
+    let mut spec = bug_run("r-qe-ledger-root", &entry.id);
+    spec.evidence_root = Some(evidence.to_string_lossy().into_owned());
+    spec.extra_write_roots = vec![evidence.join("author").to_string_lossy().into_owned()];
+    core.launch_run(spec).expect("launch");
+    let evs = wait_for_event(&events, |e| {
+        matches!(e, CoreEvent::GateEvaluated { ord: 4, .. })
+    })
+    .expect("the run reached the QE unit's gate");
+    assert!(
+        !evs.iter()
+            .any(|e| matches!(e, CoreEvent::EvaluatorMutatedWorktree { ord: 4, .. })),
+        "a verdict under the QE ledger root is not a mutation of the tree under review"
+    );
+
+    let inputs = inputs.lock().unwrap().clone();
+    let verify = inputs
+        .iter()
+        .find(|i| i.unit.phase_id() == Some("verify"))
+        .expect("the verify input");
+    let expected = evidence.join(".wicked-qe");
+    let root = verify
+        .unit
+        .qe_ledger_root
+        .as_deref()
+        .expect("the QE unit of a run with an evidence root carries a QE ledger root");
+    assert_eq!(
+        Path::new(root),
+        expected.as_path(),
+        "<evidence root>/.wicked-qe"
+    );
+    let wt = repo.join("wicked-worktrees").join("r-qe-ledger-root");
+    assert!(
+        !Path::new(root).starts_with(&wt) && !Path::new(root).starts_with(&repo),
+        "the QE ledger root is outside the worktree and the clone: {root}"
+    );
+    assert!(
+        verify
+            .governance
+            .as_ref()
+            .is_some_and(|g| g.extra_write_roots.iter().any(|r| r == root)),
+        "the QE unit's write boundary admits its ledger root: {:?}",
+        verify.governance.as_ref().map(|g| &g.extra_write_roots)
+    );
+    assert!(
+        expected.join("verdicts").join("v1.json").is_file(),
+        "the verdict landed where the seat was told"
+    );
+    assert!(
+        !wt.join(".wicked-qe").exists(),
+        "the worktree holds no QE ledger"
+    );
+    for other in inputs
+        .iter()
+        .filter(|i| i.unit.phase_id() != Some("verify"))
+    {
+        assert!(
+            other.unit.qe_ledger_root.is_none(),
+            "only the QE unit carries the ledger root, not {:?}",
+            other.unit.phase_id()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&evidence);
+    if let Some(notes) = verify.unit.notes_root.as_deref() {
+        if let Some(run_dir) = Path::new(notes).parent() {
+            let _ = std::fs::remove_dir_all(run_dir);
+        }
+    }
 }
 
 /// core#464 item 2: a bound read-only unit carries a NOTES ROOT — outside the worktree and the

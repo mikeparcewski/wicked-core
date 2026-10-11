@@ -239,6 +239,14 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.8.5** — 2026-10-11 — npm release on branch `release-0.8.x` (core-ts-v0.8.4 + #878; main
+  carries #871, which ships as 0.9.0). **#878 (wicked-crew#951)**: a governed run's QE unit records its
+  acceptance verdict in the run's QE ledger, `<evidence root>/.wicked-qe`. The root is handed as
+  `WICKED_QE_LEDGER_DIR` on both carriers and admitted in its read-only boundary (after the notes root,
+  excluded from the witness, `--add-dir` for codex). Before, the verdict went into the worktree, whose
+  guard discarded it. The root is vouched for at every dispatch (a plain directory directly under the
+  evidence root). The OS floor never admits a grant root whose leaf is a link, and a launch-declared
+  write root that is a link is refused at launch.
 - **core-ts 0.8.4** — 2026-10-11 — npm release on main tip b75b4ab, carrying #872 and #876.
   **#872 (X3)**: `editor-plugin` is a built-in preset (create an editor plugin; a delivering run puts
   deliver before its install dry run). **#876 (wicked-crew 0.9.4 release smoke, F-SMOKE-004)**: a
