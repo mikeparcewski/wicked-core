@@ -163,6 +163,26 @@ fn started(ev: &std::sync::mpsc::Receiver<CoreEvent>, sid: &str) -> serde_json::
         .unwrap_or_else(|| panic!("sessionStarted for {sid}: {evs:?}"))
 }
 
+/// DES-learn-workflow §7: `learn` changes knowledge files and text-only skills, not the application,
+/// so it requires the default instruments only (no `qe_acceptance`).
+#[test]
+fn learn_does_not_require_qe_acceptance() {
+    let core = engine("learn");
+    let ev = core.subscribe();
+    core.launch_run(spec("qe-learn", "learn", QeOverride::Auto))
+        .expect("launch");
+    let s = started(&ev, "qe-learn");
+    let required = s["assurance"]["required"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !required.iter().any(|r| r == "qe_acceptance"),
+        "learn requires no QE acceptance: {}",
+        s["assurance"]
+    );
+}
+
 /// `bug`, `feature` and `migration` (built-in presets since M1) and `editor-plugin` (X3, whose test step
 /// runs the editor conformance harness) require QE acceptance;
 /// the launch's decision is provisional and `required` (a plan has no diff to waive on).

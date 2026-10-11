@@ -636,6 +636,7 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
             "interactive-chat",
             "interactive-draft",
             "interactive-edit",
+            "learn",
             "mcp-server",
             "migration",
             "onboarding",
@@ -646,10 +647,10 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
     // `demo` (M9b) replaces interactive-demo with the garden demo skill's flow instead of mapping
     // its phases, so it has no §11.2 row; `m9b_demo_*` pins its steps.
     // `editor-plugin` (X3) is a new workflow, not a migrated consumer: it has no §11.2 row either;
-    // `x3_editor_plugin_*` pins its steps.
+    // `x3_editor_plugin_*` pins its steps. `learn` (DES-learn-workflow) is new too; `learn_*` pins it.
     for (name, steps) in builtins
         .into_iter()
-        .filter(|(n, _)| *n != "demo" && *n != "editor-plugin")
+        .filter(|(n, _)| *n != "demo" && *n != "editor-plugin" && *n != "learn")
     {
         let want: Vec<PlanStep> = serde_json::from_value(maps[name]["steps"].clone())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -1341,4 +1342,56 @@ fn m9b_demo_launches_plan_record_review_on_the_demo_skill() {
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
     wicked_apps_core::emit::hermetic_test_spool();
+}
+
+/// DES-learn-workflow: a launch naming `learn` runs the built-in preset — scope gated, research and
+/// synthesize ungated neutral `understand` steps, the walkthrough behind an UNCONDITIONAL human gate
+/// (the chat walkthrough the engagement dial can never skip), author on the creator `build` entry
+/// (evidence floor), review on the evaluator `review` entry. Every step runs `wicked-garden-learn`.
+#[test]
+fn learn_launches_the_preset_with_its_skill_and_the_unconditional_walkthrough() {
+    let dir = tmp_dir("learn");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let rig = spawn(&db);
+    rig.core.launch_run(spec("rlearn", "learn", None)).unwrap();
+    let units = units_of(&rig.core, "rlearn");
+    let all = rows("rlearn", &units);
+    assert_eq!(all[0].0, "pa-scope", "{all:?}");
+    let own_ids = [
+        "scope",
+        "research",
+        "synthesize",
+        "walkthrough",
+        "author",
+        "review",
+    ];
+    let own: Vec<_> = all
+        .iter()
+        .filter(|r| own_ids.contains(&r.0.as_str()))
+        .cloned()
+        .collect();
+    let f = Some(EVIDENCE_FLOOR_PIN);
+    let h = r#"{"human_confirm":{"unconditional":false}}"#;
+    let hu = r#"{"human_confirm":{"unconditional":true}}"#;
+    assert_eq!(
+        own,
+        vec![
+            r("scope", "recon", "neutral", h, None),
+            r("research", "recon", "neutral", "auto", None),
+            r("synthesize", "recon", "neutral", "auto", None),
+            r("walkthrough", "recon", "neutral", hu, None),
+            r("author", "build", "creator", "auto", f),
+            r("review", "review", "evaluator", h, f),
+        ],
+        "{all:?}"
+    );
+    for id in own_ids {
+        let u = units
+            .iter()
+            .find(|u| u.id == format!("rlearn:{id}"))
+            .unwrap_or_else(|| panic!("{id} in {all:?}"));
+        assert_eq!(u.skill_ref.as_deref(), Some("wicked-garden-learn"), "{id}");
+    }
+    let author = units.iter().find(|u| u.id == "rlearn:author").unwrap();
+    assert_eq!(author.depends_on, vec!["walkthrough".to_string()]);
 }

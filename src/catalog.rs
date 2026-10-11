@@ -157,7 +157,7 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 ///
 /// Seeded here: `feature` (C2's acceptance), `bug` (M1), `chat` (M3), `onboarding` (M4), `migration` (M2),
 /// `capture-learnings` (M7), `steering-author` (M8), `domain-extraction` (M6), `interactive-chat`,
-/// `interactive-draft` and `interactive-edit` (M9), `mcp-server` (M12), `editor-plugin` (X3), `qe-author-tests` (M10) and `demo` (M9b,
+/// `interactive-draft` and `interactive-edit` (M9), `mcp-server` (M12), `editor-plugin` (X3), `learn` (DES-learn-workflow), `qe-author-tests` (M10) and `demo` (M9b,
 /// which replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping them). Every other consumer's preset is added by its migration seam (§14 M1–M10),
 /// which also deletes the def it replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
@@ -190,6 +190,7 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
                 "interactive-edit",
             ),
         ),
+        ("learn", learn_preset()),
         ("mcp-server", mcp_server_preset()),
         ("migration", migration_preset()),
         ("onboarding", onboarding_preset()),
@@ -564,6 +565,23 @@ fn editor_plugin_preset() -> Vec<PlanStep> {
     let plan: crate::plan::PlanSteps =
         serde_json::from_str(include_str!("presets/editor-plugin.json"))
             .expect("src/presets/editor-plugin.json is a valid plan");
+    plan.steps
+}
+
+/// `learn` (DES-learn-workflow, lane w9-learn 2026-10-11): learn a topic or an event from outside
+/// sources into the repository as KNOWLEDGE, as data (`src/presets/learn.json`). scope, research,
+/// synthesize → `understand` (neutral: they write nothing; their output is the record the next step
+/// reads); walkthrough → `understand` behind an UNCONDITIONAL human gate (the chat walkthrough: the
+/// operator approves or sends it back with questions, and the engagement dial can never skip it);
+/// author → `build` (the creator, evidence floor, `executes_code`, so a repo-scoped launch delivers a
+/// pull request by default) writing `.wicked/knowledge/<slug>/` and text-only skills; review →
+/// `review` on a distinct evaluator seat. Every step runs `wicked-garden-learn`. No `qe_acceptance`:
+/// the run changes knowledge files and text-only skills, not the application (the skill's check
+/// refuses an executable in a learn skill). Indexing into estate happens outside the run, from merged
+/// content (a run's estate is read-only).
+fn learn_preset() -> Vec<PlanStep> {
+    let plan: crate::plan::PlanSteps = serde_json::from_str(include_str!("presets/learn.json"))
+        .expect("src/presets/learn.json is a valid plan");
     plan.steps
 }
 
