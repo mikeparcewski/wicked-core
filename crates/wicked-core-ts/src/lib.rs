@@ -1206,6 +1206,9 @@ impl Core {
         action: Option<String>,
         amend_scope: Option<String>,
         plan_json: Option<String>,
+        // (operator ruling 2026-10-11) WHO answered, as the gate API recorded it. Optional and
+        // trailing, so an older caller that omits it still answers (recorded as `operator`).
+        actor: Option<String>,
     ) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
@@ -1221,7 +1224,7 @@ impl Core {
                     json,
                 )?;
                 return core
-                    .confirm_gate(&run_id, decision)
+                    .confirm_gate_as(&run_id, decision, actor.clone())
                     .map(status_token)
                     .map_err(err);
             }
@@ -1313,7 +1316,7 @@ impl Core {
                     )))
                 }
             };
-            core.confirm_gate(&run_id, decision)
+            core.confirm_gate_as(&run_id, decision, actor.clone())
                 .map(status_token)
                 .map_err(err)
         })

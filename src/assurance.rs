@@ -38,6 +38,24 @@ pub const WAIVABLE: [&str; 2] = [DISTINCT_EVALUATOR, JUDGE];
 pub const PINNED_VALIDATOR: &str = "pinned_validator";
 pub const REPO_CHECKS: &str = "repo_checks";
 pub const EVALUATOR_PASS: &str = "evaluator_pass";
+/// (operator ruling 2026-10-11) The operator judged the work at a `judge_unavailable` gate.
+pub const OPERATOR_JUDGE: &str = "operator_judge";
+
+/// (operator ruling 2026-10-11) "Judged by operator": the operator's explicit approve at a gate
+/// whose judge could not rule. Labelled on every receipt, like reduced assurance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorJudgment {
+    /// The actor the gate API recorded (the operator, or the agent acting for them).
+    pub by: String,
+    /// When, unix millis.
+    pub at: i64,
+    /// The operator's note, if any.
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Why the judge could not rule (the gate's denial reason).
+    #[serde(default)]
+    pub reason: Option<String>,
+}
 
 /// Why an instrument is absent from a receipt.
 pub const SKIP_REDUCED: &str = "reduced_assurance";
@@ -270,6 +288,10 @@ pub struct AssuranceReceipt {
     /// Absent when the attempt convened none (the routine case).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub councils: Vec<crate::team::Dispute>,
+    /// (operator ruling 2026-10-11) "Judged by operator" — every gate the operator judged because
+    /// no judge could rule; absent when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operator_judges: Vec<OperatorJudgment>,
 }
 
 impl AssuranceReceipt {

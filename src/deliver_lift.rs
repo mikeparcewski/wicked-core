@@ -798,6 +798,8 @@ pub(crate) fn delivery_receipt(
         }
         // Every council the run's gates recorded: who decided its disputes.
         r.councils.extend(g.councils.iter().cloned());
+        // …and every gate the operator judged ("judged by operator").
+        r.operator_judges.extend(g.operator_judges.iter().cloned());
     }
     // …and every council a member-step review convened after its gate (a PA rejection the member
     // held): those rulings land on the step's review record, not on a gate receipt (codex r1).

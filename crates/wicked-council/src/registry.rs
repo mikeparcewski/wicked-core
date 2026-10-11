@@ -149,6 +149,18 @@ impl From<TomlCli> for AgenticCli {
 /// environment (**claude, agy, codex, copilot, opencode, pi**; agy listed but
 /// council-disabled — no timed ballot on record). The full roster is data, not logic;
 /// it grows by appending records here or via the user TOML.
+/// (operator ruling 2026-10-11) OPT-IN seats: never in a DEFAULT pool — launch defaults, judge and
+/// council pools drawn beyond the run's own roster — only where the operator picked them (the run's
+/// configured roster, a clis.toml / launch choice). opencode keeps wedging (30-minute silent ACP
+/// turns, hangs in both modes).
+pub const OPT_IN_SEATS: &[&str] = &["opencode"];
+
+/// Whether `key` (any instance, `opencode#2` included) is an [`OPT_IN_SEATS`] seat.
+pub fn is_opt_in(key: &str) -> bool {
+    let cli = key.split('#').next().unwrap_or(key);
+    OPT_IN_SEATS.contains(&cli)
+}
+
 pub fn builtin() -> Vec<AgenticCli> {
     vec![
         AgenticCli {
@@ -1337,5 +1349,20 @@ headless_invocation = "codex exec \"{PROMPT}\""
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod opt_in_tests {
+    use super::*;
+
+    /// (operator ruling 2026-10-11) opencode — every instance — is opt-in; nothing else is.
+    #[test]
+    fn opencode_is_the_one_opt_in_seat() {
+        assert!(is_opt_in("opencode"));
+        assert!(is_opt_in("opencode#2"));
+        for k in ["claude", "codex", "pi", "copilot", "claude-eval"] {
+            assert!(!is_opt_in(k), "{k}");
+        }
     }
 }

@@ -1008,7 +1008,12 @@ fn judge_pool<'a>(
     roster
         .iter()
         .filter(|c| configured(c))
-        .chain(roster.iter().filter(|c| !configured(c)))
+        // (operator ruling 2026-10-11) An opt-in seat (opencode) judges only when the run picked it.
+        .chain(
+            roster
+                .iter()
+                .filter(|c| !configured(c) && !wicked_council::registry::is_opt_in(&c.key)),
+        )
         .collect()
 }
 
@@ -5178,6 +5183,34 @@ mod tests {
             seat("quota", "quota -p {PROMPT}"),
         ];
         assert!(!outside_seats_only(&["creator"], &run_unbenched));
+    }
+
+    /// (operator ruling 2026-10-11) opencode is OPT-IN: never drawn from outside the run's roster as a
+    /// judge; a run that picked it still judges on it.
+    #[test]
+    fn an_opt_in_seat_judges_only_when_the_run_picked_it() {
+        let registry = [
+            seat("claude", "claude -p {PROMPT}"),
+            seat("pi", "pi -p {PROMPT}"),
+            seat("opencode", "opencode run {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+        ];
+        let run: Vec<String> = vec!["claude".into(), "pi".into()];
+        let pool: Vec<&str> = judge_pool(&registry, &run)
+            .iter()
+            .map(|c| c.key.as_str())
+            .collect();
+        assert_eq!(
+            pool,
+            vec!["claude", "pi", "codex"],
+            "opencode is not a default judge"
+        );
+        let picked: Vec<String> = vec!["claude".into(), "opencode".into()];
+        let pool2: Vec<&str> = judge_pool(&registry, &picked)
+            .iter()
+            .map(|c| c.key.as_str())
+            .collect();
+        assert!(pool2.contains(&"opencode"), "{pool2:?}");
     }
 
     /// Editor E2E run bad4d9df (coordinator, 2026-10-11): the run seated claude, pi and opencode;

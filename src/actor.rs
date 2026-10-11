@@ -2316,9 +2316,10 @@ pub(crate) fn run(
             Command::ConfirmGate {
                 run_id,
                 decision,
+                actor,
                 reply,
             } => {
-                let res = confirm_gate(
+                let res = confirm_gate_as(
                     &mut store,
                     &mut subscribers,
                     &runner,
@@ -2326,6 +2327,7 @@ pub(crate) fn run(
                     &mut in_flight,
                     &run_id,
                     decision,
+                    actor,
                     &lifecycle_maps,
                     &actor_maps,
                     process_gen,
@@ -2881,7 +2883,8 @@ pub(crate) fn run(
                             .filter(|c| {
                                 // By CLI key: a run configured `codex#2` keeps the `codex`
                                 // ballot record the registry hands (codex r2).
-                                session.clis.is_empty()
+                                (session.clis.is_empty()
+                                    && !wicked_council::registry::is_opt_in(&c.key))
                                     || !c.seat_eligible_for_work
                                     || roster
                                         .iter()
@@ -2889,7 +2892,11 @@ pub(crate) fn run(
                             })
                             .collect()
                     }
-                    _ => clis,
+                    // No run roster to say the operator picked them: opt-in seats sit out.
+                    _ => clis
+                        .into_iter()
+                        .filter(|c| !wicked_council::registry::is_opt_in(&c.key))
+                        .collect(),
                 };
                 // The system setting (size, stagger) and a fresh seed, read per council.
                 let pick = crate::decision::CouncilPick::from_env();
@@ -11559,6 +11566,7 @@ fn replan_for_accepted_edit(
 /// unit's instruction) clears the pause and dispatches the unit at the cursor directly (no re-pause
 /// on it); `Reject` cancels the run.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn confirm_gate(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
@@ -11567,6 +11575,38 @@ pub(crate) fn confirm_gate(
     in_flight: &mut HashSet<String>,
     run_id: &str,
     decision: crate::workflow::HumanDecision,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
+) -> anyhow::Result<SessionStatus> {
+    confirm_gate_as(
+        store,
+        subscribers,
+        runner,
+        self_tx,
+        in_flight,
+        run_id,
+        decision,
+        None,
+        lifecycle_maps,
+        actor_maps,
+        process_gen,
+        is_acp,
+    )
+}
+
+/// [`confirm_gate`] naming WHO answered (`actor`, as the gate API recorded it).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn confirm_gate_as(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    in_flight: &mut HashSet<String>,
+    run_id: &str,
+    decision: crate::workflow::HumanDecision,
+    actor: Option<String>,
     lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     process_gen: uuid::Uuid,
@@ -11914,6 +11954,39 @@ pub(crate) fn confirm_gate(
     }
 
     // (core#761) LAND WITH CARRIED ITEMS — the capped review's approve.
+    // (operator ruling 2026-10-11) OPERATOR AS JUDGE: the cursor unit's gate escalated because no
+    // judge could rule (`judge_unavailable` — no eligible seat, or a judge that gave no verdict).
+    // The operator's explicit APPROVE there IS the judgment: the unit counts, the run moves on,
+    // and every receipt says "judged by operator" (who, when, the note). Re-running the review
+    // only walked back into the same dead end (run b9ada134). Never automatic: only this answer.
+    let judge_unavailable_gate = crate::domain::session_units(store, run_id)?
+        .get(session.unit_ix)
+        .is_some_and(|u| {
+            u.status == crate::domain::UnitStatus::Rejected
+                && u.denial
+                    .as_ref()
+                    .is_some_and(|d| d.source == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE)
+        });
+    if judge_unavailable_gate && !adjudication_open {
+        if let crate::workflow::HumanDecision::Approve { amend, .. } = &decision {
+            return judge_by_operator(
+                store,
+                subscribers,
+                runner,
+                self_tx,
+                in_flight,
+                session,
+                run_id,
+                actor,
+                amend.clone(),
+                lifecycle_maps,
+                actor_maps,
+                process_gen,
+                is_acp,
+            );
+        }
+    }
+
     if adjudication_open {
         if let crate::workflow::HumanDecision::Approve { amend, .. } = &decision {
             return land_with_carried_items(
@@ -12578,6 +12651,130 @@ fn apply_suggestion(
 /// (`gateDecided{allow}` + `unitDone`, as a team dispute's approve counts a unit) and the run
 /// advances. Evaluator ≠ creator is untouched: the human decides, no seat re-grades.
 #[allow(clippy::too_many_arguments)]
+/// (operator ruling 2026-10-11) An approve at a `judge_unavailable` escalation: the operator's
+/// judgment. The cursor unit counts (Done), its receipt records `operatorJudges` (who / when / the
+/// note) and `operator_judge` among the instruments that ran, and the run advances — the
+/// `land_with_carried_items` mechanics, minus the carried items.
+#[allow(clippy::too_many_arguments)]
+fn judge_by_operator(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    in_flight: &mut HashSet<String>,
+    session: crate::domain::AgentSession,
+    run_id: &str,
+    actor: Option<String>,
+    note: Option<String>,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
+) -> anyhow::Result<SessionStatus> {
+    if phase_boundary_denied(store, &session, run_id)? {
+        let result = cancel_run(store, subscribers, runner, self_tx, run_id, lifecycle_maps);
+        if result.is_ok() {
+            in_flight.remove(run_id);
+        }
+        return result;
+    }
+    let units = crate::domain::session_units(store, run_id)?;
+    let ix = session.unit_ix;
+    let mut u = units
+        .get(ix)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor to judge"))?;
+    let attempt = u.last_attempt.unwrap_or(0);
+    let at = crate::interaction::now_millis();
+    let by = actor
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| "operator".to_string());
+    let note = note.filter(|n| !n.trim().is_empty());
+    let judgment = crate::assurance::OperatorJudgment {
+        by: by.clone(),
+        at,
+        note: note.clone(),
+        reason: u.denial_reason.clone(),
+    };
+    let mut receipt = u.assurance.clone().unwrap_or_else(|| {
+        crate::assurance::AssuranceReceipt::for_run(&session.assurance, attempt)
+    });
+    receipt.ran(crate::assurance::OPERATOR_JUDGE);
+    receipt.judge = Some(format!("operator:{by}"));
+    receipt.operator_judges.push(judgment);
+    u.assurance = Some(receipt);
+    u.operator_rulings.push(crate::domain::OperatorRuling {
+        action: "judge".to_string(),
+        text: note.unwrap_or_else(|| format!("judged by operator ({by})")),
+        attempt,
+        at,
+    });
+    u.status = crate::domain::UnitStatus::Done;
+    u.denial = None;
+    u.denial_reason = None;
+    let ord = u.ord;
+    let mut s = session;
+    s.unit_ix = ix + 1;
+    s.attempt = units.get(ix + 1).map(next_attempt).unwrap_or(0);
+    s.status = SessionStatus::Executing;
+    crate::domain::put_nodes(store, &[u.to_node(), s.to_node()])?;
+    eprintln!(
+        "wicked-core: unit {ord} of run {run_id} judged by operator `{by}` at its \
+         judge_unavailable gate"
+    );
+    emit(
+        subscribers,
+        CoreEvent::Resumed {
+            session: run_id.to_string(),
+            ord,
+        },
+    );
+    emit(
+        subscribers,
+        CoreEvent::GateDecided {
+            session: run_id.to_string(),
+            ord,
+            allow: true,
+        },
+    );
+    emit(
+        subscribers,
+        CoreEvent::UnitDone {
+            session: run_id.to_string(),
+            ord,
+        },
+    );
+    in_flight.insert(run_id.to_string());
+    match advance_or_pause(
+        store,
+        subscribers,
+        runner,
+        self_tx,
+        run_id,
+        ix + 1,
+        lifecycle_maps,
+        actor_maps,
+        process_gen,
+        is_acp,
+    ) {
+        Ok(Progress::Dispatched) | Ok(Progress::Deferred) => Ok(SessionStatus::Executing),
+        Ok(Progress::Paused) => {
+            in_flight.remove(run_id);
+            Ok(SessionStatus::AwaitingHuman)
+        }
+        Ok(Progress::Done) => {
+            in_flight.remove(run_id);
+            finalize_run(store, subscribers, runner, self_tx, run_id)?;
+            Ok(SessionStatus::Completed)
+        }
+        Err(e) => {
+            in_flight.remove(run_id);
+            Err(e)
+        }
+    }
+}
+
 fn land_with_carried_items(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
@@ -18182,6 +18379,119 @@ mod request_changes_tests {
         );
         let fresh = WorkUnit::pending("s:c", "s", 3, "c");
         assert_eq!(redrive_attempt(true, 5, Some(&fresh)), 0);
+    }
+
+    /// (operator ruling 2026-10-11, run b9ada134) A judge that could not rule — no eligible seat,
+    /// or a verdict-less answer — escalates `judge_unavailable`; the operator's explicit APPROVE
+    /// there IS the judgment. The unit counts, the run moves on to deliver, and every receipt
+    /// says "judged by operator" with the actor the gate API recorded — never a re-run of the
+    /// review into the same dead end.
+    fn seed_judge_unavailable_verify(store: &mut dyn GraphStore, run_id: &str) {
+        seed_bug_with_deliver(store, run_id);
+        let mut session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        session.unit_ix = 3;
+        put_node(store, session.to_node()).unwrap();
+        let mut units = crate::domain::session_units(store, run_id).unwrap();
+        let v = &mut units[3];
+        v.status = UnitStatus::Rejected;
+        v.denial = Some(UnitDenial::new(
+            crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE,
+            "opencode (judge gave no verdict)",
+        ));
+        v.denial_reason = Some("opencode (judge gave no verdict)".into());
+        put_node(store, v.to_node()).unwrap();
+    }
+
+    #[test]
+    fn approve_at_judge_unavailable_is_the_operators_judgment_and_the_run_proceeds_labelled() {
+        let run_id = format!("op-judge-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_judge_unavailable_verify(&mut store, &run_id);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        confirm_gate_as(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            &run_id,
+            HumanDecision::Approve {
+                amend: Some("I read the diff; the fix is right".into()),
+                amend_scope: crate::workflow::AmendScope::Cursor,
+            },
+            Some("coordinator-agent".into()),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.unit_ix, 4,
+            "the run moved on to deliver, not back into the review"
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let v = &units[3];
+        assert_eq!(v.status, UnitStatus::Done);
+        let r = v.assurance.as_ref().expect("a receipt");
+        assert!(
+            r.ran.iter().any(|i| i == crate::assurance::OPERATOR_JUDGE),
+            "{r:?}"
+        );
+        assert_eq!(r.judge.as_deref(), Some("operator:coordinator-agent"));
+        assert_eq!(r.operator_judges.len(), 1);
+        assert_eq!(r.operator_judges[0].by, "coordinator-agent");
+        assert_eq!(
+            r.operator_judges[0].note.as_deref(),
+            Some("I read the diff; the fix is right")
+        );
+        let delivery = crate::deliver_lift::delivery_receipt(&session, &units);
+        assert_eq!(
+            delivery.operator_judges.len(),
+            1,
+            "the delivery receipt says it too"
+        );
+        assert!(drain(&erx).iter().any(|e| matches!(
+            e,
+            CoreEvent::GateDecided {
+                ord: 4,
+                allow: true,
+                ..
+            }
+        )));
+    }
+
+    /// …and no other answer — and no automatic path — makes an operator judgment: request
+    /// changes rewinds as today, with no judgment recorded.
+    #[test]
+    fn only_an_explicit_approve_judges_request_changes_at_judge_unavailable_records_none() {
+        let run_id = format!("op-judge-rc-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_judge_unavailable_verify(&mut store, &run_id);
+        let mut subs = crate::event_log::EventSink::default();
+        gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::RequestChanges {
+                note: Some("try another judge".into()),
+            },
+        )
+        .unwrap();
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert!(units.iter().all(|u| u
+            .assurance
+            .as_ref()
+            .is_none_or(|r| r.operator_judges.is_empty())));
+        assert_ne!(units[3].status, UnitStatus::Done);
     }
 }
 
