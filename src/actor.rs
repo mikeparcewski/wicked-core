@@ -8950,7 +8950,8 @@ fn dispatch_unit(
     // widens THIS unit's write boundary below and reaches its worker as `WICKED_QE_LEDGER_DIR`.
     // Created and vouched for here (a plain directory directly under the evidence root, never a
     // planted link), so the boundary's containment check resolves a real, expected directory.
-    let qe_ledger_root = if crate::qe_acceptance::is_qe_unit(&unit) && session.workdir.is_some() {
+    let mints_qe_root = crate::qe_acceptance::is_qe_unit(&unit) && session.workdir.is_some();
+    let qe_ledger_root = if mints_qe_root {
         match crate::qe_acceptance::mint_ledger_root(&session) {
             Some(Ok(dir)) => Some(dir.to_string_lossy().into_owned()),
             Some(Err(why)) => {
@@ -9008,7 +9009,10 @@ fn dispatch_unit(
         unit.exclude_seats = session.exclude_seats.clone();
         team_changed = true;
     }
-    let qe_root_changed = qe_ledger_root.is_some() && unit.qe_ledger_root != qe_ledger_root;
+    // Re-derived at EVERY dispatch of the QE unit and assigned whatever it is (codex r2 on
+    // core#878): a root refused now (a link planted since the last dispatch) must not stay granted
+    // through the copy persisted then.
+    let qe_root_changed = mints_qe_root && unit.qe_ledger_root != qe_ledger_root;
     if (notes_root.is_some() && unit.notes_root != notes_root)
         || qe_root_changed
         || attempt_changed
@@ -9017,7 +9021,7 @@ fn dispatch_unit(
         if notes_root.is_some() {
             unit.notes_root = notes_root;
         }
-        if qe_ledger_root.is_some() {
+        if mints_qe_root {
             unit.qe_ledger_root = qe_ledger_root;
         }
         put_node(store, unit.to_node())?;
