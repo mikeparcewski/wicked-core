@@ -1277,7 +1277,13 @@ fn run_unit_and_judge_on(
     }
     // What the bus-path request names as excluded: the team monitors plus the launch exclusion.
     let mut bus_excluded: Vec<String> = team_authors.clone();
-    for s in &input.unit.exclude_seats {
+    // (crew#972, codex r1) …and every seat this unit was ever dispatched on, as on the inline path.
+    for s in input
+        .unit
+        .exclude_seats
+        .iter()
+        .chain(&input.unit.authored_by)
+    {
         if !bus_excluded.contains(s) {
             bus_excluded.push(s.clone());
         }

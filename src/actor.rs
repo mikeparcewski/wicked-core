@@ -6554,10 +6554,7 @@ fn apply_step_result(
     // writes were all denied passed its gate because EARLIER phases had already changed the
     // worktree. Only an explicit declaration (a line `NO CHANGE NEEDED`) exempts it.
     let clean = worktree_is_clean(session.workdir.as_deref());
-    let declared_no_change = output
-        .output
-        .lines()
-        .any(|l| l.trim().eq_ignore_ascii_case(NO_CHANGE_NEEDED));
+    let declared_no_change = output.output.lines().any(|l| l.trim() == NO_CHANGE_NEEDED);
     let left_no_change = clean || evidence.tree_changed == Some(false);
     if output.governed
         && ((no_prose && clean) || (code_without_diff && !declared_no_change && left_no_change))
@@ -7571,14 +7568,21 @@ fn distinct_evaluator_seat(
     if unit.tool_cmd.is_some() || !matches!(unit.stage, StageKind::Review | StageKind::Test) {
         return None;
     }
+    // A team member's step (and the PA's review of it) is seated by the team gate, which owns its
+    // own exclusions (codex r1 on #898): never reseated here.
+    if unit.member_step.is_some() || unit.owner == crate::workflow::StepOwner::Team {
+        return None;
+    }
     let seat = unit.assigned_cli.as_ref()?;
     let authors = crate::pipeline::work_authors(units, unit.ord);
     if !authors.contains(seat) {
         return None;
     }
+    // Only a seat whose skills admit the unit (the rule distribution used); with none, the unit
+    // stays and the gate decides (codex r1 on #898).
     eligible_roster_keys(session)
         .into_iter()
-        .find(|k| !authors.contains(k))
+        .find(|k| !authors.contains(k) && crate::distribute::seat_admits_unit(unit, k, None))
 }
 
 fn eligible_roster_keys(session: &crate::domain::AgentSession) -> Vec<String> {
