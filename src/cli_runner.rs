@@ -1376,13 +1376,6 @@ fn run_unit_and_judge_on(
                         "answered nothing",
                         crate::validator::JUDGE_EMPTY_ANSWER_REASON,
                     ))
-                })
-                // (operator ruling 2026-10-11) …and one whose answer named no verdict.
-                .or_else(|| {
-                    (!crate::validator::names_a_verdict(out)).then_some((
-                        "answered without a verdict",
-                        crate::validator::JUDGE_NO_VERDICT_REASON,
-                    ))
                 });
             if let Some((verb, token)) = reason {
                 let mut v = judge_refusals.borrow_mut();
@@ -1652,9 +1645,13 @@ fn run_unit_and_judge_on(
             // decides under reduced assurance, and a required judge still holds the gate
             // (`judge_unavailable`) — never a seat-failure pause the run's own roster never asked
             // for. The refusals above are still reported for the bench.
+            // A judge that ANSWERED without a verdict is not a failed seat: it escalates to the
+            // human (operator ruling, revised), never the skip.
             let all_failed = match &verdict {
                 Ok(av) => av.seat_failure.is_some(),
-                Err(_) => true,
+                Err(e) => e
+                    .downcast_ref::<crate::validator::JudgeNoVerdict>()
+                    .is_none(),
             };
             if outside_only && all_failed {
                 judge_skipped = Some(format!(
