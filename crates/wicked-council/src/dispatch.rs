@@ -784,6 +784,15 @@ impl RealDispatcher {
 }
 
 impl Dispatcher for RealDispatcher {
+    fn seat_benched(&self, key: &str) -> bool {
+        let seats = self.seats.lock().unwrap_or_else(|e| e.into_inner());
+        match seats.get(key) {
+            Some(SeatHealth::Benched { until, .. }) => Instant::now() < *until,
+            Some(SeatHealth::Probation { .. }) => true,
+            _ => false,
+        }
+    }
+
     fn dispatch(&self, cli: &AgenticCli, task: &CouncilTask) -> Option<Vote> {
         self.dispatch_prompt(cli, task, &render_scaffold(task))
             .into_vote()

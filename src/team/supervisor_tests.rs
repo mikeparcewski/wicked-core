@@ -195,6 +195,9 @@ impl FakeCouncil {
             seated: 3,
             dissent: vec!["one seat disagreed".into()],
             no_ruling_reason: winner.is_none().then(|| "no quorum".into()),
+            seats: vec!["s1".into(), "s2".into(), "s3".into()],
+            seed: 9,
+            eligible: vec!["s1".into(), "s2".into(), "s3".into(), "s4".into()],
         })
     }
     pub fn yes() -> Self {

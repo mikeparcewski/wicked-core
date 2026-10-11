@@ -771,7 +771,11 @@ pub struct Dispute {
     pub verdict: Verdict,
     pub agreement_pct: Option<u8>,
     pub dissent: Option<u32>,
+    /// The seats that sat on the council (operator ruling 2026-10-11: who decided).
     pub seats: Vec<String>,
+    /// The random draw's seed; `null` when no council was drawn (or recorded before the field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
     pub reason: Option<NoVerdictReason>,
 }
 

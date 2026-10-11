@@ -2373,6 +2373,16 @@ fn gate_receipt(
     use crate::assurance as a;
     let mut r = a::AssuranceReceipt::for_run(run, attempt);
     r.tree = f.tree;
+    // Who decided this attempt's disputes: the councils its team ledger recorded on findings.
+    // (A member-step review's council lands on the step's review record after its gate; the
+    // delivery receipt carries those — one source each, so nothing is counted twice.)
+    if let Some(ledger) = unit.team.as_ref().and_then(|t| t.ledger.as_ref()) {
+        r.councils = ledger
+            .findings
+            .iter()
+            .filter_map(|f| f.dispute.clone())
+            .collect();
+    }
     let seat = unit.assigned_cli.clone();
     // The evaluator≠creator relation exactly as distribution draws it ([`evaluator_relation`]).
     let units = crate::domain::session_units(store, session_id).unwrap_or_default();

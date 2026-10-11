@@ -1578,6 +1578,14 @@ pub trait Dispatcher {
             ran_ms: started.elapsed().as_millis() as u64,
         }
     }
+
+    /// Whether this dispatcher would abstain the seat right now without dispatching (its
+    /// consecutive-failure bench, or a probation ballot already in flight). The council draw
+    /// (`crate::pick`) leaves such a seat out instead of spending a chair on a certain abstention.
+    /// The default — a dispatcher with no health gate — benches nothing.
+    fn seat_benched(&self, _key: &str) -> bool {
+        false
+    }
 }
 
 /// Per-`(cli × work-kind)` ranking memory.
