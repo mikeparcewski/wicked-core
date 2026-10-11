@@ -305,7 +305,6 @@ pub struct PollStatus {
 ///
 /// Free function (not a method) so it owns only the cloned handles, never `&self` —
 /// reinforcing that no part of this needs the requesting agent.
-#[allow(clippy::too_many_arguments)]
 /// The stagger a ballot of `seats` actually uses: the setting, shrunk so the last seat starts at
 /// most [`MAX_STAGGER_SPREAD`] after the first.
 fn effective_stagger(stagger: Duration, seats: usize) -> Duration {
@@ -315,6 +314,7 @@ fn effective_stagger(stagger: Duration, seats: usize) -> Duration {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_council(
     ledger: &Ledger,
     // `Sync` because seats are dispatched concurrently; the `Worker` already holds it as
