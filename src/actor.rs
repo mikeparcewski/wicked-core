@@ -8908,30 +8908,6 @@ fn dispatch_unit(
     let Some(mut unit) = units.get(unit_ix).cloned() else {
         return Ok(false);
     };
-    // (core#464) NOTES ROOT — the sanctioned place a READ-ONLY unit may write. A bound agent unit
-    // whose write posture is read-only (an evaluator or recon rung with a tree to protect) gets
-    // an engine-owned directory OUTSIDE the worktree (`worktree_guard::notes_root`): it rides the
-    // unit (persisted, so a redrive keeps the same path), widens THIS unit's write boundary in the
-    // governance context below, and the guard-only prompt names it. Created here so the seat's
-    // first write does not have to. A creator keeps its declared write roots; an unbound run's
-    // cwd is already a throwaway sandbox; a Tool unit is the engine's own command.
-    let notes_root = (unit.tool_cmd.is_none()
-        && session.workdir.is_some()
-        && crate::write_posture::WritePosture::of(&unit, true)
-            == crate::write_posture::WritePosture::ReadOnly)
-        .then(|| crate::worktree_guard::notes_root(run_id, unit.ord))
-        .and_then(|dir| match std::fs::create_dir_all(&dir) {
-            Ok(()) => Some(dir.to_string_lossy().into_owned()),
-            Err(e) => {
-                eprintln!(
-                    "wicked-core: could not create the notes root {} for unit {} of run \
-                     {run_id}: {e} — the unit runs without one (its output is still its record)",
-                    dir.display(),
-                    unit.ord
-                );
-                None
-            }
-        });
     // (wicked-crew#951) QE LEDGER ROOT — where the run's QE unit records its acceptance verdict:
     // `<evidence root>/.wicked-qe`, outside every worktree (the guard discarded a verdict written
     // into the tree, with the PASS) and exactly where the launcher's acceptance check reads the
@@ -8956,6 +8932,37 @@ fn dispatch_unit(
     } else {
         None
     };
+    // Assigned NOW, before the notes-root decision below: the root decides this unit's write
+    // posture (deliverable-roots, wicked-core#881), and a root refused at this dispatch must not
+    // stay granted through the copy persisted at an earlier one (codex r2 on core#878).
+    let qe_root_changed = mints_qe_root && unit.qe_ledger_root != qe_ledger_root;
+    if mints_qe_root {
+        unit.qe_ledger_root = qe_ledger_root;
+    }
+    // (core#464) NOTES ROOT — the sanctioned place a READ-ONLY unit may write. A bound agent unit
+    // whose write posture is read-only (an evaluator or recon rung with a tree to protect) gets
+    // an engine-owned directory OUTSIDE the worktree (`worktree_guard::notes_root`): it rides the
+    // unit (persisted, so a redrive keeps the same path), widens THIS unit's write boundary in the
+    // governance context below, and the guard-only prompt names it. Created here so the seat's
+    // first write does not have to. A creator keeps its declared write roots; an unbound run's
+    // cwd is already a throwaway sandbox; a Tool unit is the engine's own command.
+    let notes_root = (unit.tool_cmd.is_none()
+        && session.workdir.is_some()
+        && crate::write_posture::WritePosture::of(&unit, true)
+            == crate::write_posture::WritePosture::ReadOnly)
+        .then(|| crate::worktree_guard::notes_root(run_id, unit.ord))
+        .and_then(|dir| match std::fs::create_dir_all(&dir) {
+            Ok(()) => Some(dir.to_string_lossy().into_owned()),
+            Err(e) => {
+                eprintln!(
+                    "wicked-core: could not create the notes root {} for unit {} of run \
+                     {run_id}: {e} — the unit runs without one (its output is still its record)",
+                    dir.display(),
+                    unit.ord
+                );
+                None
+            }
+        });
     // (DES-L1 PR-1B) Record the attempt this dispatch mints ON the unit — `last_attempt` is the
     // unit's own dispatch history, so `next_attempt` stays fresh whatever the attempt's outcome
     // (a worker exit never reaches the fold's write) and `None` means exactly "never dispatched"
@@ -8998,10 +9005,6 @@ fn dispatch_unit(
         unit.exclude_seats = session.exclude_seats.clone();
         team_changed = true;
     }
-    // Re-derived at EVERY dispatch of the QE unit and assigned whatever it is (codex r2 on
-    // core#878): a root refused now (a link planted since the last dispatch) must not stay granted
-    // through the copy persisted then.
-    let qe_root_changed = mints_qe_root && unit.qe_ledger_root != qe_ledger_root;
     if (notes_root.is_some() && unit.notes_root != notes_root)
         || qe_root_changed
         || attempt_changed
@@ -9009,9 +9012,6 @@ fn dispatch_unit(
     {
         if notes_root.is_some() {
             unit.notes_root = notes_root;
-        }
-        if mints_qe_root {
-            unit.qe_ledger_root = qe_ledger_root;
         }
         put_node(store, unit.to_node())?;
     }
