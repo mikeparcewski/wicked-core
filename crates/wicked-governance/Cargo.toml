@@ -8,22 +8,22 @@ publish = false
 
 [dependencies]
 wicked-apps-core = { path = "../wicked-apps-core" }
-wicked-estate-core = "0.28.0"
-wicked-estate-store = "0.28.0"
+wicked-estate-core = "0.29.0"
+wicked-estate-store = "0.29.0"
 # The fan-out's knowledge lane (AW-5) + the knowledge.relate_code seam for relink (AW-9):
 # rationale chunks + about-xedges through the SAME engine the estate MCP serves. Cargo unifies
 # the 0.14 line to one version.
-wicked-estate-knowledge = "0.28.0"
+wicked-estate-knowledge = "0.29.0"
 # `Embedder`/`HashEmbedder` for the eval lane's gap hints (`rules eval`): query vectors must come
 # from the SAME embedder family the knowledge engine's compile-time default writes with, and the
 # knowledge crate does not re-export the trait. Already a transitive dep of -knowledge (same 0.14
 # line, no semantic/ONNX features), so this adds no build weight — hence no cargo feature gate.
-wicked-estate-retrieve = "0.28.0"
-wicked-estate-overlay = "0.28.0"
+wicked-estate-retrieve = "0.29.0"
+wicked-estate-overlay = "0.29.0"
 # The eval memory axis (core#397): the SAME `MemoryApi::recall` a worker's `memory.recall` runs,
 # in-process over a read-only store. Already in the workspace graph through the root crate.
-wicked-estate-memory = "0.28.0"
-wicked-estate-memory-core = "0.28.0"
+wicked-estate-memory = "0.29.0"
+wicked-estate-memory-core = "0.29.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
