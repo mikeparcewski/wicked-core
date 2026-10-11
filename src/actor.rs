@@ -17874,6 +17874,18 @@ mod code_evidence_floor_tests {
         output_text: &str,
         governed: bool,
     ) -> (AgentSession, WorkUnit) {
+        fold_ev(store, subs, run_id, output_text, governed, evidence)
+    }
+
+    /// [`fold`] with the worker's evidence (e.g. `tree_changed` against the dispatch baseline).
+    fn fold_ev(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+        output_text: &str,
+        governed: bool,
+        evidence: crate::workflow::UnitEvidence,
+    ) -> (AgentSession, WorkUnit) {
         let (tx, _rx) = channel::<Command>();
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
         let out = StepOutput {
@@ -17946,6 +17958,65 @@ mod code_evidence_floor_tests {
             saw_step_failed,
             "the code-evidence rejection must ride the standard failure path \
              (StepFailed, kinded SubstanceRejected)"
+        );
+    }
+
+    /// crew#972, run 7d8c9c98: the codex creator's writes were all refused, so its build step left
+    /// the tree exactly as it was dispatched — but EARLIER phases had already changed the
+    /// worktree, so "clean at HEAD" was false and the step passed its gate. The unit's OWN
+    /// evidence (`tree_changed: false` against its dispatch baseline) now rejects it, with a plain
+    /// reason, through the same escalation.
+    #[test]
+    fn a_code_creator_that_changed_nothing_over_an_already_dirty_worktree_is_rejected() {
+        let wt = git_worktree("denied-writes");
+        // An earlier phase's change, already in the worktree when the build was dispatched.
+        std::fs::write(wt.join("design-notes.md"), "plan\n").unwrap();
+        let run_id = "code-floor-denied-writes";
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            run_id,
+            PhaseRole::Creator,
+            true,
+            Some(wt.to_string_lossy().into_owned()),
+        );
+        let mut subs = crate::event_log::EventSink::default();
+        let evidence = crate::workflow::UnitEvidence {
+            tree_changed: Some(false),
+            ..Default::default()
+        };
+        let (session, unit) = fold_ev(&mut store, &mut subs, run_id, &prose(), true, evidence);
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        let why = unit.denial_reason.clone().unwrap_or_default();
+        assert!(why.contains("changed nothing"), "{why}");
+    }
+
+    /// …and an explicit `NO CHANGE NEEDED` line is the one way such a step passes the floor.
+    #[test]
+    fn a_code_creator_that_declares_no_change_needed_clears_the_floor() {
+        let wt = git_worktree("no-change-needed");
+        std::fs::write(wt.join("design-notes.md"), "plan\n").unwrap();
+        let run_id = "code-floor-no-change-needed";
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            run_id,
+            PhaseRole::Creator,
+            true,
+            Some(wt.to_string_lossy().into_owned()),
+        );
+        let mut subs = crate::event_log::EventSink::default();
+        let evidence = crate::workflow::UnitEvidence {
+            tree_changed: Some(false),
+            ..Default::default()
+        };
+        let text = format!("{}\nNO CHANGE NEEDED\n", prose());
+        let (_session, unit) = fold_ev(&mut store, &mut subs, run_id, &text, true, evidence);
+        assert!(
+            unit.denial.as_ref().is_none_or(|d| d.source != "substance"),
+            "{:?}",
+            unit.denial
         );
     }
 
