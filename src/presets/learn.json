@@ -1,0 +1,70 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "scope",
+   "gate": {
+    "human_confirm": {
+     "unconditional": false
+    }
+   },
+   "skill_ref": "wicked-garden-learn",
+   "instructions": "Follow the wicked-garden-learn skill's scope action. Name the topic's slug (kebab-case, at most 64 characters), its kind (topic or event), the 3 to 7 questions this run answers, what is out of scope, and the source policy (primary sources first; dated reporting for an event). Read .wicked/knowledge/<slug>/ in the worktree: when it exists this run is a REFRESH (the skill's refs/refresh.md) and you list its active claims and refreshed_at. Write nothing into the repository."
+  },
+  {
+   "catalog": "understand",
+   "id": "research",
+   "skill_ref": "wicked-garden-learn",
+   "depends_on": [
+    "scope"
+   ],
+   "instructions": "Follow the wicked-garden-learn skill's research action. Fetch sources for the scope's questions with your web tools or curl -sL. For each source give its URL, title, published date when the page states one, and observed_at (the UTC time you fetched it). Draft candidate claims, each tied to the sources that support it; on a refresh, re-fetch the sources of every active claim. With no network write 'research: no web access' and stop: never answer from memory as if it were sourced. Write nothing into the repository."
+  },
+  {
+   "catalog": "understand",
+   "id": "synthesize",
+   "skill_ref": "wicked-garden-learn",
+   "depends_on": [
+    "research"
+   ],
+   "instructions": "Follow the wicked-garden-learn skill's synthesize action and its refs/claims.md: turn the candidates into the claims ledger, one atomic checkable statement per claim with its sources and observed_at, ids from check.py --claim-id, only claims that would help a fresh session in 3 months. On a refresh, output the diff against the existing ledger, one row per claim id (confirmed, superseded, contradicted, retired with reason and evidence, new), and the counts. Put the full draft ledger in your output as one json block. Write nothing into the repository."
+  },
+  {
+   "catalog": "understand",
+   "id": "walkthrough",
+   "gate": {
+    "human_confirm": {
+     "unconditional": true
+    }
+   },
+   "skill_ref": "wicked-garden-learn",
+   "depends_on": [
+    "synthesize"
+   ],
+   "instructions": "Follow the wicked-garden-learn skill's walkthrough action. Teach the topic to the operator in your output: a 5-line summary, a worked example, what changed since the last refresh (on a refresh), open questions, and 3 to 5 check questions. This step stops for the operator: they approve, or send it back with answers, questions or corrections. On a send-back, answer each point, re-teach what was unclear, and say which corrections you verified against a source (a verified correction becomes a claim with that source; an unverified one is an operator note, which is memory, not a claim). Write nothing into the repository."
+  },
+  {
+   "catalog": "build",
+   "id": "author",
+   "skill_ref": "wicked-garden-learn",
+   "depends_on": [
+    "walkthrough"
+   ],
+   "instructions": "Follow the wicked-garden-learn skill's author action. Write .wicked/knowledge/<slug>/topic.json, claims.jsonl and README.md from the synthesized ledger and the walkthrough's outcome, plus text-only skills for the procedures it yields, in the skill dir that check.py --skill-dir prints. On a refresh, never delete a claim line: a removal is a status change with its reason and evidence, removed from the README and from every skill. Then run the check: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/learn/check.py --repo . --slug <slug>, paste its JSON and exit code, and fix every finding before you finish."
+  },
+  {
+   "catalog": "review",
+   "id": "review",
+   "gate": {
+    "human_confirm": {
+     "unconditional": false
+    }
+   },
+   "skill_ref": "wicked-garden-learn",
+   "depends_on": [
+    "author"
+   ],
+   "instructions": "Follow the wicked-garden-learn skill's review action as the evaluator. Re-run \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/learn/check.py --repo . yourself and paste its exit code. Re-fetch and spot-check at least 3 active claims against their sources, and the evidence of every superseded, contradicted or retired claim. Judge the durability test (would this help a fresh session in 3 months?), that every skill rests on active claims, and that nothing was silently dropped from claims.jsonl. Cite file and claim id for every finding. Make the last line VERDICT: PASS or VERDICT: FAIL."
+  }
+ ]
+}
