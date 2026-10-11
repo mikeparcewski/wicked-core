@@ -172,7 +172,10 @@ fn learn_does_not_require_qe_acceptance() {
     core.launch_run(spec("qe-learn", "learn", QeOverride::Auto))
         .expect("launch");
     let s = started(&ev, "qe-learn");
-    let required = s["assurance"]["required"].as_array().cloned().unwrap_or_default();
+    let required = s["assurance"]["required"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
         !required.iter().any(|r| r == "qe_acceptance"),
         "learn requires no QE acceptance: {}",

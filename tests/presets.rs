@@ -1357,7 +1357,14 @@ fn learn_launches_the_preset_with_its_skill_and_the_unconditional_walkthrough() 
     let units = units_of(&rig.core, "rlearn");
     let all = rows("rlearn", &units);
     assert_eq!(all[0].0, "pa-scope", "{all:?}");
-    let own_ids = ["scope", "research", "synthesize", "walkthrough", "author", "review"];
+    let own_ids = [
+        "scope",
+        "research",
+        "synthesize",
+        "walkthrough",
+        "author",
+        "review",
+    ];
     let own: Vec<_> = all
         .iter()
         .filter(|r| own_ids.contains(&r.0.as_str()))
