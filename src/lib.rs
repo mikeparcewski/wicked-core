@@ -186,8 +186,8 @@ pub use wicked_governance::{
 };
 
 pub use catalog::{
-    builtin_presets, catalog, catalog_entries, catalog_entry, CatalogEntry, CATALOG_IDS,
-    SECURITY_REVIEW_SKILL,
+    builtin_preset_instruments, builtin_presets, catalog, catalog_entries, catalog_entry,
+    CatalogEntry, CATALOG_IDS, SECURITY_REVIEW_SKILL,
 };
 pub use graph_browser::{
     browse_nodes, graph_kinds, list_node_notes, node_detail, NeighborEdge, NodeDetail, NodeNote,
@@ -207,7 +207,11 @@ pub use plan::{
 pub use plan_gate::{
     PendingPlan, PlanPreview, PlanProposal, ScopeAnswer, ScopeHold, TeamPlanState,
 };
-pub use preset::{Preset, PresetError, PresetSpec, BUILTIN_CREATED_BY, GLOBAL_SCOPE, PLAN_PRESET};
+pub use preset::{
+    compose_preset, gated_preset_name, list_all_presets, put_preset, put_preset_requiring,
+    resolve as resolve_preset, Preset, PresetError, PresetSpec, BUILTIN_CREATED_BY, GLOBAL_SCOPE,
+    PLAN_PRESET,
+};
 pub use project::{
     get_project, list_members, list_projects, member_projects, members_of_kind, MemberSpec,
     Project, ProjectGraphBinding, ProjectMember, ProjectPatch, ProjectStatus, DEFAULT_PROJECT_ID,
@@ -240,9 +244,10 @@ pub use validator_vault::{
 };
 pub use wicked_council::AgenticCli;
 pub use workflow::{
-    bug_def, feature_def, migration_def, AmendScope, GateCond, GateSpec, GateType, HumanDecision,
-    PhaseDef, PhaseRole, StepInput, StepOutput, StepOwner, StepRunner, StepStatus, StubStepRunner,
-    UnitEvidence, Usage, WorkflowDef, WorkflowDefError, WorkflowRegistry,
+    bug_def, feature_def, leftover_drop_ins, migration_def, AmendScope, GateCond, GateSpec,
+    GateType, HumanDecision, PhaseDef, PhaseRole, StepInput, StepOutput, StepOwner, StepRunner,
+    StepStatus, StubStepRunner, UnitEvidence, Usage, WorkflowDef, WorkflowDefError,
+    WorkflowRegistry,
 };
 pub use worktree_guard::{ChangedPath, WorktreeGuardOutcome, WorktreeMutation, WorktreeSnapshot};
 
@@ -2006,6 +2011,8 @@ mod tests {
         // Same driver, same prose, but `Some("feature")` — the units now come from the feature def's
         // phases (ids + declared stage), NOT the sentence-splitter. This is the proof the slice-1
         // adversarial review's critical finding demanded: a runtime consumer of the registry.
+        // (X-MIG M11) `feature` resolves as the built-in preset, which a boot seeds into the store.
+        crate::preset::seed_builtins(&mut store, 0).expect("seed the built-in presets");
         let feature = crate::feature_def();
         let mut ev2: Vec<CoreEvent> = Vec::new();
         crate::pipeline::run_session(

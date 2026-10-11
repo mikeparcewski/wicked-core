@@ -1251,9 +1251,8 @@ impl WorkflowDef {
     }
 }
 
-/// The registry of known workflows — id → def. `with_defaults()` seeds the built-ins
-/// (feature/bug/migration). `chat` and `onboarding` are built-in PRESETS now
-/// (`crate::catalog::builtin_presets`, DES-TEAMING-002 M3/M4).
+/// The registry of runtime-registered and per-run workflow defs — id → def (X-MIG M11: it seeds
+/// no built-in; every built-in is a PRESET, `crate::catalog::builtin_presets`, resolved first).
 /// Registering a new workflow is a data insert (Law 2); the reducer only ever `get`s a def.
 #[derive(Debug, Clone, Default)]
 pub struct WorkflowRegistry {
@@ -1261,8 +1260,12 @@ pub struct WorkflowRegistry {
 }
 
 impl WorkflowRegistry {
-    /// The built-in workflows (feature/bug/migration), each validated at construction.
-    pub fn with_defaults() -> Self {
+    /// TEST FIXTURES ONLY (X-MIG M11): the three retired built-in defs (`feature`, `bug`,
+    /// `migration`) as a registry, for tests that want a def of that shape. The engine never
+    /// registers them — every built-in is a preset (`crate::catalog::builtin_presets`), and the
+    /// actor's registry holds only runtime-registered and per-run defs.
+    #[doc(hidden)]
+    pub fn legacy_fixtures() -> Self {
         let mut r = WorkflowRegistry::default();
         for def in [feature_def(), bug_def(), migration_def()] {
             r.register(def).expect("built-in workflow defs are valid");
@@ -1309,25 +1312,6 @@ impl WorkflowRegistry {
         self.register_judged(def)
     }
 
-    /// Overwrite one phase's `validator_pin` on a registered def. Returns false when the workflow or
-    /// phase is absent.
-    ///
-    /// This corrects an INSTALLED def that disagrees with the binary about a pin the binary owns
-    /// (wicked-core#186). Repair rather than removal is deliberate: `register` overwrites by id, so
-    /// removing leaves NO def behind — there is no shadowed built-in to fall back to, and a drop-in
-    /// like `domain-extraction` has no compiled form at all. Removal would trade a wrong gate for an
-    /// unknown-workflow failure.
-    pub fn repin(&mut self, id: &str, phase_id: &str, pin: &str) -> bool {
-        let Some(def) = self.defs.get_mut(id) else {
-            return false;
-        };
-        let Some(phase) = def.phases.iter_mut().find(|p| p.id == phase_id) else {
-            return false;
-        };
-        phase.validator_pin = Some(pin.to_string());
-        true
-    }
-
     pub fn get(&self, id: &str) -> Option<&WorkflowDef> {
         self.defs.get(id)
     }
@@ -1335,56 +1319,6 @@ impl WorkflowRegistry {
         let mut v: Vec<String> = self.defs.keys().cloned().collect();
         v.sort();
         v
-    }
-
-    /// Overlay every `*.json` workflow file in `dir` (non-recursive) onto this registry, validating
-    /// and registering each in filename order. A file whose `id` matches a built-in REPLACES it, so
-    /// operators tune the shipped workflows and add new ones by dropping a data file — no recompile,
-    /// no edit to this crate (the Law-2 seam). A missing `dir` is `Ok(vec![])` (nothing to overlay).
-    ///
-    /// **Resilient per-file:** a malformed or invalid file is SKIPPED with a warning naming it (so one
-    /// bad drop-in can't disable every other one) — not a hard error that aborts the whole overlay.
-    /// The loud, per-file error is available via [`def_from_file`](WorkflowRegistry::def_from_file) for
-    /// an explicit `workflow lint`. Returns the ids that loaded, in load order. (A caller that requested
-    /// a SPECIFIC workflow still learns if it's missing — see the resolver, which errors on an unknown
-    /// requested id rather than silently falling back.)
-    pub fn load_dir(&mut self, dir: impl AsRef<Path>) -> anyhow::Result<Vec<String>> {
-        let dir = dir.as_ref();
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut paths: Vec<_> = std::fs::read_dir(dir)
-            .with_context(|| format!("reading workflow dir {}", dir.display()))?
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            // A regular file (following symlinks) ending in `.json`. Guards against a subdirectory
-            // or symlink-to-dir named `x.json`, which would otherwise be read and abort the load.
-            .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("json"))
-            .collect();
-        paths.sort(); // deterministic load order regardless of filesystem enumeration
-        let mut loaded = Vec::new();
-        for path in paths {
-            let outcome = Self::def_from_file(&path).and_then(|def| {
-                let id = def.id.clone();
-                self.register(def)
-                    .map_err(|e| anyhow::anyhow!("workflow {id} in {}: {e}", path.display()))?;
-                Ok(id)
-            });
-            match outcome {
-                Ok(id) => loaded.push(id),
-                // Skip the offending file, keep the rest — but loudly (named), never silently.
-                // The CAUSE is the whole point: `{e}` renders only anyhow's outermost context,
-                // so this line used to print the path twice and no reason. See `diagnostic`.
-                Err(e) => eprintln!(
-                    "wicked-core: {}",
-                    crate::diagnostic::with_cause(
-                        &format!("skipping workflow file {}", path.display()),
-                        &e
-                    )
-                ),
-            }
-        }
-        Ok(loaded)
     }
 
     /// Parse + validate one [`WorkflowDef`] from a JSON file (no registration). Public so a caller
@@ -1400,6 +1334,23 @@ impl WorkflowRegistry {
             .map_err(|e| anyhow::anyhow!("invalid workflow in {}: {e}", path.display()))?;
         Ok(def)
     }
+}
+
+/// (X-MIG M11) The `*.json` files left in a retired workflow overlay dir (`$WICKED_WORKFLOWS_DIR`,
+/// else `~/.config/wicked-core/workflows`), sorted. The engine no longer loads them — a launch
+/// resolves presets, then runtime-registered defs — so the actor names each ONCE at boot: an
+/// operator who relied on a drop-in saves a preset instead. A missing or unreadable dir has none.
+pub fn leftover_drop_ins(dir: &Path) -> Vec<std::path::PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<_> = rd
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    out.sort();
+    out
 }
 
 /// A user-supplied workflow id may not take the reserved per-run plan shape — decided by the SAME
@@ -1542,8 +1493,7 @@ pub fn feature_def() -> WorkflowDef {
 /// `bug` — triage(value) → reproduce(value) → fix(execution) → verify. Reproduce-first: `fix`
 /// depends on `reproduce`; a bug is not fixed until the repro goes red→green.
 /// The `bug` def's `fix` phase instructions (DES-L9, BC-60) — ONE line, folded onto the creator's
-/// prompt after ` ||| `. Crew's `BUILTIN_WORKFLOWS.bug` mirror carries the same literal and pins
-/// it in a unit test, so the two carriers cannot drift silently. SHORT (≤ 90 ASCII bytes) on
+/// prompt after ` ||| `. The `bug` preset (X-MIG M1) carries this one constant. SHORT (≤ 90 ASCII bytes) on
 /// purpose: the PTY carrier's canonical line is 1000 B for the WHOLE prompt (`PTY_PROMPT_LIMIT`),
 /// and `execute_wrapped`'s budget test keeps ≥ 300 B of intent headroom fresh and ≥ 150 B after two
 /// rework markers — the DES's 227 B wording left 19 B.
@@ -1587,9 +1537,8 @@ pub fn bug_def() -> WorkflowDef {
 /// `migration` — plan(strategy) → execute(execution) → cutover(UNCONDITIONAL human) → verify → cleanup(advisory).
 /// `cutover` is the one gate the engagement dial can never downgrade.
 ///
-/// Shadowed (DES-TEAMING-002 M2): a launch naming `migration` resolves the built-in PRESET first
-/// (`crate::catalog::builtin_presets`), exactly as `feature` does since C2. This def stays registered
-/// as the same-name fallback until M11 removes `with_defaults` and the shipped JSON copies.
+/// A TEST FIXTURE since X-MIG M11 (`WorkflowRegistry::legacy_fixtures`): a launch naming
+/// `migration` runs the built-in preset (M2); the engine never registers this def.
 pub fn migration_def() -> WorkflowDef {
     WorkflowDef {
         base_skill_ref: None,
@@ -1642,7 +1591,7 @@ mod workflow_def_tests {
 
     #[test]
     fn registry_seeds_the_builtin_workflows() {
-        let r = WorkflowRegistry::with_defaults();
+        let r = WorkflowRegistry::legacy_fixtures();
         assert_eq!(r.ids(), vec!["bug", "feature", "migration"]);
     }
 
@@ -1950,33 +1899,6 @@ mod workflow_def_tests {
         assert!(!fix_unit.description.contains('\n'));
     }
 
-    #[test]
-    #[ignore = "generator: run with --ignored --nocapture to (re)emit the shipped data files"]
-    fn emit_builtin_data_files() {
-        for def in [feature_def(), bug_def(), migration_def()] {
-            println!("===FILE workflows/{}.json===", def.id);
-            println!("{}", serde_json::to_string_pretty(&def).unwrap());
-        }
-    }
-
-    #[test]
-    fn shipped_data_files_match_the_seed_builders() {
-        // The `workflows/*.json` files are the human-editable, copy-paste mirror of the compiled
-        // seed builders. This guard keeps them in lock-step: if a builder changes, regenerate the
-        // files (emit_builtin_data_files) — otherwise a non-maintainer reads stale example data.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
-        for def in [feature_def(), bug_def(), migration_def()] {
-            let path = root.join(format!("{}.json", def.id));
-            let from_file =
-                WorkflowRegistry::def_from_file(&path).unwrap_or_else(|e| panic!("{e}"));
-            assert_eq!(
-                from_file, def,
-                "{} data file drifted from its builder",
-                def.id
-            );
-        }
-    }
-
     /// core#468: the base skill's precedence — the def's own field wins (a name, or the explicit
     /// `""` opt-out), else the engine-config default; blank anywhere means "no base skill" — and
     /// the field round-trips through the drop-in JSON while a def that declares none serializes
@@ -2038,221 +1960,16 @@ mod workflow_def_tests {
         assert_eq!(def, back);
     }
 
-    #[test]
-    fn load_dir_registers_a_dropped_in_workflow_without_touching_code() {
-        // A non-maintainer's brand-new workflow, authored as pure data — no Rust, no builder fn.
-        let dir = ScratchDir::new("dropin");
-        dir.write(
-            "spike.json",
-            r#"{
-                "id": "spike",
-                "phases": [
-                    { "id": "explore", "kind": "recon" },
-                    { "id": "prototype", "kind": "build", "depends_on": ["explore"] }
-                ]
-            }"#,
-        );
-        let mut reg = WorkflowRegistry::with_defaults();
-        let loaded = reg.load_dir(&dir.0).unwrap();
-        assert_eq!(loaded, vec!["spike"]);
-        let spike = reg.get("spike").expect("spike registered from data");
-        let ids: Vec<&str> = spike.phases.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(ids, vec!["explore", "prototype"]);
-        // built-ins still present alongside the drop-in
-        assert!(reg.get("feature").is_some());
-    }
-
-    #[test]
-    fn load_dir_lets_a_data_file_override_a_builtin() {
-        let dir = ScratchDir::new("override");
-        // Same id as a built-in, one phase — replaces the shipped feature workflow.
-        dir.write(
-            "feature.json",
-            r#"{ "id": "feature", "phases": [ { "id": "ship-it", "kind": "build" } ] }"#,
-        );
-        let mut reg = WorkflowRegistry::with_defaults();
-        reg.load_dir(&dir.0).unwrap();
-        let feature = reg.get("feature").unwrap();
-        assert_eq!(feature.phases.len(), 1);
-        assert_eq!(feature.phases[0].id, "ship-it");
-    }
-
-    /// FINDING-049 → codex review on #414. A drop-in that shadows a built-in and drops its gate is
-    /// REFUSED as authored — the mirror does not replace the built-in, and `load_dir` says why.
-    ///
-    /// This is how the evidence floor was nullified in practice: a consumer wrote a hand-transcribed
-    /// mirror of the shipped `feature` def into the overlay dir, every phase `validator_pin: null`,
-    /// and `register` overwrote the gated built-in. The first fix carried the shadowed pin forward;
-    /// that was still a gate nobody chose. Now the mirror is rejected and the built-in stands.
-    #[test]
-    fn a_drop_in_that_ungates_the_builtin_it_shadows_is_refused_and_the_builtin_stands() {
-        let dir = ScratchDir::new("ungate");
-        let base = feature_def();
-        // The mirror: the code phase with its pin stripped (exactly as transcribed), plus a phase
-        // of its own so a silent acceptance would be observable.
-        dir.write(
-            "feature.json",
-            r#"{ "id": "feature", "phases": [
-                { "id": "build", "kind": "build", "role": "creator", "executes_code": true },
-                { "id": "mirror-only", "kind": "build" }
-            ] }"#,
-        );
-        let mut reg = WorkflowRegistry::with_defaults();
-        let loaded = reg.load_dir(&dir.0).unwrap();
-        assert!(
-            !loaded.iter().any(|id| id == "feature"),
-            "the ungating mirror must not register: {loaded:?}"
-        );
-        let feature = reg.get("feature").unwrap();
-        assert_eq!(
-            feature.phases.len(),
-            base.phases.len(),
-            "the shipped built-in stands untouched"
-        );
-        assert_eq!(
-            feature
-                .phases
-                .iter()
-                .find(|p| p.id == "build")
-                .unwrap()
-                .validator_pin,
-            base.phases
-                .iter()
-                .find(|p| p.id == "build")
-                .unwrap()
-                .validator_pin
-        );
-        // The same def through the runtime registration path names the phase.
-        let err = reg
-            .register(WorkflowDef {
-                base_skill_ref: None,
-                id: "feature".to_string(),
-                phases: vec![PhaseDef::new("build", StageKind::Build)
-                    .codes()
-                    .role(PhaseRole::Creator)],
-                required_instruments: None,
-            })
-            .expect_err("refused");
-        assert_eq!(
-            err,
-            WorkflowDefError::GateEvaluatesNothing {
-                phase: "build".to_string()
-            }
-        );
-    }
-
-    /// A shadow that states its OWN pin is honoured as authored, and a fresh id inherits nothing —
-    /// a def is taken exactly as written, gates included.
-    #[test]
-    fn a_drop_in_with_its_own_pin_is_taken_as_authored() {
-        let dir = ScratchDir::new("ungate-own");
-        dir.write(
-            "feature.json",
-            r#"{ "id": "feature", "phases": [
-                { "id": "build", "kind": "build", "role": "creator", "executes_code": true,
-                  "validator_pin": "operators-own-pin" }
-            ] }"#,
-        );
-        // A brand-new id with a non-code phase and no pin is fine as authored: nothing to gate.
-        dir.write(
-            "fresh.json",
-            r#"{ "id": "fresh", "phases": [ { "id": "review", "kind": "review" } ] }"#,
-        );
-        let mut reg = WorkflowRegistry::with_defaults();
-        reg.load_dir(&dir.0).unwrap();
-        assert_eq!(
-            reg.get("feature").unwrap().phases[0]
-                .validator_pin
-                .as_deref(),
-            Some("operators-own-pin"),
-            "an operator changing the criterion is the point of the seam"
-        );
-        assert!(
-            reg.get("fresh").unwrap().phases[0].validator_pin.is_none(),
-            "a fresh id carries exactly what it authored"
-        );
-    }
-
-    #[test]
-    fn load_dir_on_a_missing_dir_is_empty_not_an_error() {
-        let mut reg = WorkflowRegistry::with_defaults();
-        let loaded = reg.load_dir("/no/such/wicked/workflows/dir").unwrap();
-        assert!(loaded.is_empty());
-    }
-
-    #[test]
-    fn load_dir_skips_an_invalid_file_and_still_loads_the_rest() {
-        let dir = ScratchDir::new("invalid");
-        // A semantically invalid file (self-referential dep) that sorts FIRST, next to a good one.
-        // The old behavior aborted the whole overlay on the first bad file; now it skips + continues.
-        dir.write(
-            "aaa-broken.json",
-            r#"{ "id": "broken", "phases": [ { "id": "a", "kind": "build", "depends_on": ["a"] } ] }"#,
-        );
-        dir.write(
-            "zzz-good.json",
-            r#"{ "id": "custom", "phases": [ { "id": "do", "kind": "build" } ] }"#,
-        );
-        let mut reg = WorkflowRegistry::with_defaults();
-        let loaded = reg.load_dir(&dir.0).unwrap();
-        assert_eq!(
-            loaded,
-            vec!["custom"],
-            "the good drop-in loads; the broken one is skipped"
-        );
-        assert!(reg.get("custom").is_some());
-        assert!(
-            reg.get("broken").is_none(),
-            "the invalid file is not registered"
-        );
-    }
-
-    /// Every shipped drop-in parses, validates, and carries the id its filename claims.
-    ///
-    /// Enumerates the directory rather than listing names. The list version had to be edited in
-    /// lockstep with `workflows/` and nothing failed when it was not: a new drop-in was simply never
-    /// validated, and a deleted one broke the test for the wrong reason. Same shape as the defect
-    /// this test now guards against — two artifacts that must agree, with only diligence between
-    /// them.
-    #[test]
-    fn shipped_drop_in_workflows_load_and_validate() {
-        let workflows_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
-        let mut seen = 0;
-        for entry in std::fs::read_dir(&workflows_dir).expect("workflows/ is readable") {
-            let path = entry.expect("readable dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .expect("utf-8 filename")
-                .to_string();
-            let def = WorkflowRegistry::def_from_file(&path)
-                .unwrap_or_else(|e| panic!("{stem}.json must parse + validate: {e}"));
-            assert_eq!(def.id, stem, "{stem}.json id field must match filename");
-            seen += 1;
-        }
-        // Without this the test passes vacuously if the directory moves or empties — validating
-        // nothing while reporting success.
-        assert!(
-            seen > 0,
-            "workflows/ shipped no drop-in defs; the directory moved or emptied"
-        );
-    }
-
-    /// The `mcp-server` drop-in is governed exactly as designed (DES-mcp-server-workflow): nine
+    /// The `mcp-server` preset is governed exactly as designed (DES-mcp-server-workflow): nine
     /// phases in order, one creator (`build`, evidence-floor pin), one verify-floor phase (`test`),
     /// two cold evaluators after `test`, the `install-plan` dry run (core#820) and an
     /// operator-gated Tool phase `install` that carries no pin (it leaves the tree unchanged, so the
     /// evidence floor would deny it) and runs the choice its gate recorded. No `deliver` phase —
-    /// wicked-crew composes it per run.
+    /// a delivering launch hands the engine its deliver step (M12 places it before the consent chain).
     #[test]
     fn mcp_server_drop_in_is_governed_as_designed() {
-        let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/mcp-server.json");
-        let def =
-            WorkflowRegistry::def_from_file(&path).expect("mcp-server.json parses + validates");
+        // (X-MIG M12/M11) The shipped def is the built-in preset as the engine composes it.
+        let def = crate::preset::builtin_preset_def("mcp-server");
         assert_eq!(def.id, "mcp-server");
         assert!(def.base_skill_ref.is_none(), "no base_skill_ref");
         let ids: Vec<&str> = def.phases.iter().map(|p| p.id.as_str()).collect();
@@ -2535,8 +2252,8 @@ mod workflow_def_tests {
             "the shipped def stands"
         );
         // Every shipped built-in already carries its pins: the lint is silent on them.
-        for id in WorkflowRegistry::with_defaults().ids() {
-            let def = WorkflowRegistry::with_defaults();
+        for id in WorkflowRegistry::legacy_fixtures().ids() {
+            let def = WorkflowRegistry::legacy_fixtures();
             assert!(
                 ungated_code_phases(def.get(&id).unwrap()).is_empty(),
                 "built-in `{id}` ships a code phase with no gate"
@@ -2622,8 +2339,8 @@ mod workflow_def_tests {
     ///
     /// `feature`'s `test` phase declared `verified_evidence` and gated nothing: the flag has no
     /// reader; the one re-verify mechanism is the validator pin, and the phase pinned none.
-    /// Asserted on the REGISTERED registry — `with_defaults` + the shipped drop-in overlay, the
-    /// exact stack `pipeline::resolve` clones defs out of and `attach_pinned_validators` reads —
+    /// Asserted on the legacy defs and every built-in preset's composed def (X-MIG M11: the shipped
+    /// set), the defs `attach_pinned_validators` reads —
     /// not on the builder, whose JSON mirror deliberately stays untouched (registration is where
     /// the declaration is made true).
     ///
@@ -2631,9 +2348,13 @@ mod workflow_def_tests {
     /// flag without a pin, so a new workflow shipping the same inert declaration fails here.
     #[test]
     fn no_registered_phase_declares_verified_evidence_it_cannot_deliver() {
-        let mut reg = WorkflowRegistry::with_defaults();
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
-        reg.load_dir(&dir).expect("shipped drop-ins load");
+        let mut reg = WorkflowRegistry::legacy_fixtures();
+        // (X-MIG M11) The built-in presets' composed defs are the registered set that ships now.
+        for (name, _) in crate::catalog::builtin_presets() {
+            let def = crate::preset::builtin_preset_def(name);
+            reg.register_composed(def)
+                .expect("a composed built-in registers");
+        }
 
         // The instance the finding named.
         let test_phase = reg
@@ -2849,7 +2570,7 @@ mod workflow_def_tests {
         }
     }
 
-    /// The drop-in path refuses it too, so an overlay file cannot smuggle it in.
+    /// A def file is refused it too (the parse-and-validate helper a lint uses).
     #[test]
     fn a_drop_in_file_cannot_claim_the_per_run_plan_namespace() {
         let dir = ScratchDir::new("d1-reserved");
@@ -2863,9 +2584,6 @@ mod workflow_def_tests {
             err.to_string().contains("reserved workflow id: r1:plan-1"),
             "{err}"
         );
-        let mut reg = WorkflowRegistry::default();
-        assert_eq!(reg.load_dir(&dir.0).unwrap(), Vec::<String>::new());
-        assert!(reg.get("r1:plan-1").is_none());
     }
 
     /// Only the engine's composed-def path registers it — and that def plans as a TEAM run, while

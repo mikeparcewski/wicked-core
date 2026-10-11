@@ -1,48 +1,40 @@
-//! Proves the `gate-phase` seam lets an operator arm a gate on a phase of their choosing: a produced
-//! drop-in workflow genuinely ENGAGES the rev0.4 dual-validator gate. The built-ins now ship a
-//! deterministic floor on their Evaluator phases (FINDING-025 item 1), but every OTHER phase is still
-//! unpinned — `feature`'s `build` among them — so an operator who wants a criterion of their own on a
-//! specific phase still needs this seam. `gate-phase` pins an APPROVED validator onto a phase and
-//! writes a re-id'd drop-in, leaving the shipped floors and the built-in itself untouched. This test
-//! re-derives that produced
-//! artifact WITHOUT a live `claude` call: it builds an approved `DeterministicValidator` directly,
-//! vaults it, pins it onto a `feature_def` phase, serializes to a temp overlay dir, and then loads the
-//! drop-in back through the SAME registry the planner uses — asserting the phase carries the pin and the
-//! pin resolves to the approved validator (i.e. `attach_pinned_validators` would attach it and gate).
+//! Proves the `gate-phase` seam lets an operator arm a gate of their own on a step of a preset (X-MIG
+//! M11: the built-ins are presets and the drop-in overlay is retired). `gate-phase` pins an APPROVED
+//! validator onto a step whose catalog entry carries no pin and saves the result as a NEW preset,
+//! leaving the base preset untouched. This test re-derives that produced artifact WITHOUT a live
+//! `claude` call: it vaults an approved `DeterministicValidator` directly, pins it onto `feature`'s
+//! `design` step, saves the preset through the same `put_preset` the command calls, resolves it back
+//! and composes it — asserting the step carries the pin and the pin resolves to the approved validator.
 //!
-//! Plus an arg-parse smoke that the `gate-phase` subcommand validates its flags and is advertised in
-//! the usage string (mirrors the existing `cli_smoke` provision/approve checks) — no live CLI.
+//! Plus arg-parse smokes: the flags are required, an unknown preset or step is named, a step of a
+//! pinned entry is refused before anything is authored, and the usage string advertises it.
 
 use std::process::Command;
 
 use wicked_core::{
-    feature_def, load_validator, pin, store_validator, DeterministicValidator, WorkflowRegistry,
+    builtin_preset_instruments, builtin_presets, compose_preset, load_validator, pin,
+    put_preset_requiring, resolve_preset, store_validator, DeterministicValidator, PresetSpec,
 };
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_wicked-core")
 }
 
-/// The heart of the gap-closure: a drop-in produced by pinning an approved validator onto a phase
-/// (exactly what `gate-phase` writes) loads back with the pin ON the phase, and that pin resolves to
-/// the approved validator in the vault — so the planner's `attach_pinned_validators` would attach it
-/// and the dual-validator gate ENGAGES. Done deterministically (no `claude`): store the validator +
-/// serialize the def ourselves, then reload through `WorkflowRegistry::with_defaults().load_dir(dir)`.
+/// The heart of the gap-closure: a preset produced by pinning an approved validator onto a step (what
+/// `gate-phase` saves) resolves with the pin ON the step, composes with the pin on that phase, and the
+/// pin resolves to the approved validator in the vault — so the planner attaches it and the gate engages.
 #[test]
-fn gate_phase_drop_in_makes_a_shipped_style_workflow_actually_gate() {
+fn gate_phase_preset_makes_a_step_actually_gate() {
     let dir = std::env::temp_dir().join(format!("wicked-gate-phase-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-
-    // A vault store (the sole writer, like the `gate-phase` command opens it).
     let mut store =
         wicked_apps_core::open_store(Some(dir.join("vault.db").to_str().unwrap())).unwrap();
 
-    // 1. An APPROVED deterministic validator — the artifact `provision_validator` + `approve_and_store`
-    //    would produce, but built directly so this test never calls `claude`.
+    // 1. An APPROVED deterministic validator (what provision + approve would produce, minus `claude`).
     let validator = DeterministicValidator {
-        criterion: "the build produced a non-empty CHANGELOG entry".to_string(),
-        script: "test -s CHANGELOG.md".to_string(),
+        criterion: "the design names a rollback plan".to_string(),
+        script: "grep -q rollback DESIGN.md".to_string(),
         approved: true,
     };
     let approved_pin = store_validator(&mut store, &validator).expect("vault the validator");
@@ -52,125 +44,80 @@ fn gate_phase_drop_in_makes_a_shipped_style_workflow_actually_gate() {
         "store returns the content pin"
     );
 
-    // 2. The `build` phase ships with the GENERIC evidence floor (wicked-core F-039: a code-writing
-    //    Creator's gate must evaluate something). Prove that, so the pinning below is a genuine
-    //    change of state for THIS phase — the generic floor REPLACED by a phase-specific validator,
-    //    which `gate-phase` exists to do — rather than an overwrite of the same value.
-    let base = feature_def();
-    const PHASE: &str = "build";
-    let base_build = base
-        .phases
-        .iter()
-        .find(|p| p.id == PHASE)
-        .expect("feature def has a build phase");
-    // The generic floor's pin, read off the shipped Evaluator that has always carried it rather
-    // than transcribed — so this premise cannot drift from the constant it names.
-    let generic_floor = base
-        .phases
-        .iter()
-        .find(|p| p.id == "adversarial-review")
-        .and_then(|p| p.validator_pin.clone())
-        .expect("the shipped adversarial-review phase carries the generic evidence floor");
-    assert_eq!(
-        base_build.validator_pin.as_deref(),
-        Some(generic_floor.as_str()),
-        "the shipped feature `build` phase carries the generic evidence floor (F-039); this seam \
-         replaces it with a phase-specific pin"
-    );
-    assert_ne!(
-        approved_pin, generic_floor,
-        "premise: the phase-specific validator must not collide with the generic floor"
+    // 2. `feature`'s `design` step: its catalog entry carries no pin, so a step may set one.
+    const STEP: &str = "design";
+    let base = builtin_presets()
+        .into_iter()
+        .find(|(n, _)| *n == "feature")
+        .expect("feature is a built-in preset")
+        .1;
+    assert!(
+        base.iter().any(|s| s.id == STEP),
+        "feature has a design step"
     );
 
-    // 3. Pin the approved validator onto that phase and RE-ID the def (what `gate-phase` does), then
-    //    serialize the drop-in to the overlay dir as pretty JSON.
-    let new_id = format!("{PHASE}-gated-{}", base.id);
-    let mut gated = base.clone();
-    gated.id = new_id.clone();
-    for p in gated.phases.iter_mut() {
-        if p.id == PHASE {
-            p.validator_pin = Some(approved_pin.clone());
-        }
-    }
-    let overlay = dir.join("workflows");
-    std::fs::create_dir_all(&overlay).unwrap();
-    std::fs::write(
-        overlay.join(format!("{new_id}.json")),
-        serde_json::to_string_pretty(&gated).unwrap(),
+    // 3. Pin it and save the gated preset under a fresh name (what `gate-phase` does).
+    let name = format!("{STEP}-gated-feature");
+    let steps: Vec<_> = base
+        .iter()
+        .cloned()
+        .map(|mut s| {
+            if s.id == STEP {
+                s.validator_pin = Some(Some(approved_pin.clone()));
+            }
+            s
+        })
+        .collect();
+    put_preset_requiring(
+        &mut store,
+        PresetSpec {
+            name: name.clone(),
+            project_id: None,
+            steps,
+            created_by: "gate-phase".to_string(),
+        },
+        builtin_preset_instruments("feature"),
+        1,
     )
-    .unwrap();
+    .expect("the gated preset saves (the step rules accept a pin on an unpinned entry)");
 
-    // 4. Reload through the SAME registry seam the planner uses: built-ins + the operator overlay dir.
-    let mut reg = WorkflowRegistry::with_defaults();
-    let loaded_ids = reg.load_dir(&overlay).expect("load_dir the overlay");
-    assert!(
-        loaded_ids.contains(&new_id),
-        "the drop-in registered under its new id: {loaded_ids:?}"
+    // 4. It resolves by name, and its composed def carries the pin on that phase and nowhere new.
+    let saved = resolve_preset(&store, None, &name)
+        .expect("resolve")
+        .expect("the gated preset resolves");
+    let gated = saved.steps.iter().find(|s| s.id == STEP).unwrap();
+    assert_eq!(gated.validator_pin, Some(Some(approved_pin.clone())));
+    assert_eq!(
+        saved.steps.iter().map(|s| &s.id).collect::<Vec<_>>(),
+        base.iter().map(|s| &s.id).collect::<Vec<_>>(),
+        "gate-phase reproduces the base step list exactly"
     );
 
-    // The new id resolves and did NOT clobber the built-in (both are present).
-    let resolved = reg.get(&new_id).expect("the gated drop-in resolves");
-    assert!(
-        reg.get(&base.id).is_some(),
-        "the built-in `{}` is untouched — the drop-in used a fresh id",
-        base.id
-    );
-
-    // 5a. The reloaded def carries the pin ON the target phase (and nowhere else).
-    let reloaded_build = resolved
+    // 4b. The COMPOSED def — what a launch runs — carries the pin on that phase (codex r1: the
+    //     stored step alone does not prove the composition keeps it), and the gated copy keeps
+    //     `feature`'s required instruments (its QE acceptance contract).
+    let def = compose_preset(&saved).expect("the gated preset composes");
+    let phase = def
         .phases
         .iter()
-        .find(|p| p.id == PHASE)
-        .expect("gated def has the build phase");
+        .find(|p| p.id == STEP)
+        .expect("the design phase");
+    assert_eq!(phase.validator_pin.as_deref(), Some(approved_pin.as_str()));
     assert_eq!(
-        reloaded_build.validator_pin.as_deref(),
-        Some(approved_pin.as_str()),
-        "the build phase carries the approved pin — the gate is armed"
+        saved.required_instruments,
+        builtin_preset_instruments("feature")
     );
-    // `gate-phase` adds ONE pin and disturbs nothing else. Two assertions, in order, because the
-    // second is only meaningful given the first: `zip` stops at the shorter side, so a produced def
-    // that dropped, added, or reordered phases would slip through a pin-only comparison — the loop
-    // would simply compare fewer pairs, or the right pins against the wrong phases, and still pass.
-    assert_eq!(
-        resolved.phases.iter().map(|p| &p.id).collect::<Vec<_>>(),
-        base.phases.iter().map(|p| &p.id).collect::<Vec<_>>(),
-        "gate-phase must reproduce the base phase list exactly — same phases, same order"
-    );
-    // Compared against the REGISTERED built-in rather than against `None` or the raw builder,
-    // because pins are no longer uniformly authored: `feature`'s `adversarial-review` ships the
-    // evidence floor in the builder (FINDING-025 item 1), and registration itself arms `test`'s
-    // `verified_evidence` declaration with the floor (FINDING-055). Both defs here crossed the
-    // same `register` normalization, so this stays a like-for-like "gate-phase changed ONE pin"
-    // comparison; the raw builder would make normalization look like gate-phase's doing.
-    let registered_base = reg.get(&base.id).expect("the built-in is registered");
-    for (got, want) in resolved
-        .phases
-        .iter()
-        .zip(registered_base.phases.iter())
-        .filter(|(p, _)| p.id != PHASE)
-    {
-        assert_eq!(
-            got.validator_pin, want.validator_pin,
-            "gate-phase changed the pin on `{}`, which it was not asked to gate",
-            got.id
-        );
-    }
+    assert!(saved
+        .required_instruments
+        .as_ref()
+        .is_some_and(|r| r.iter().any(|i| i == "qe_acceptance")));
 
-    // 5b. That pin resolves to the APPROVED validator in the vault — the exact read
-    //     `attach_pinned_validators` performs to attach it and engage the gate. This is the proof the
-    //     produced drop-in genuinely gates, not just that a string was copied.
-    let resolved_validator =
-        load_validator(&store, reloaded_build.validator_pin.as_deref().unwrap())
-            .expect("load must not error")
-            .expect("the pinned validator is in the vault");
-    assert!(
-        resolved_validator.approved,
-        "the pin resolves to an APPROVED validator — the planner attaches it (fail-closed on unapproved)"
-    );
-    assert_eq!(
-        resolved_validator, validator,
-        "the pinned validator is exactly the one we approved"
-    );
+    // 5. The pin resolves to the APPROVED validator — the read `attach_pinned_validators` performs.
+    let resolved = load_validator(&store, &approved_pin)
+        .expect("load must not error")
+        .expect("the pinned validator is in the vault");
+    assert!(resolved.approved);
+    assert_eq!(resolved, validator);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -194,7 +141,7 @@ fn gate_phase_requires_its_flags() {
     );
 }
 
-/// `gate-phase` fails closed on an unknown workflow id, naming the known workflows — and never spawns
+/// `gate-phase` fails closed on an unknown preset name, naming the built-in presets — and never spawns
 /// the actor or calls `claude` (the check happens before any store write).
 #[test]
 fn gate_phase_rejects_an_unknown_workflow() {
@@ -223,12 +170,12 @@ fn gate_phase_rejects_an_unknown_workflow() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         err.contains("unknown workflow") && err.contains("feature"),
-        "the error names the bad id and lists the known workflows: {err}"
+        "the error names the bad id and lists the built-in presets: {err}"
     );
     let _ = std::fs::remove_file(&db);
 }
 
-/// `gate-phase` fails closed on an unknown PHASE id, naming the valid phases of the resolved workflow.
+/// `gate-phase` fails closed on an unknown STEP id, naming the valid steps of the resolved preset.
 #[test]
 fn gate_phase_rejects_an_unknown_phase_naming_the_valid_ones() {
     let db = std::env::temp_dir().join(format!(
@@ -252,11 +199,42 @@ fn gate_phase_rejects_an_unknown_phase_naming_the_valid_ones() {
     assert!(!out.status.success(), "an unknown phase must exit non-zero");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("no phase `no-such-phase`")
-            && err.contains("valid phases")
+        err.contains("no step `no-such-phase`")
+            && err.contains("valid steps")
             && err.contains("build"),
-        "the error names the bad phase and lists the valid phases: {err}"
+        "the error names the bad step and lists the valid steps: {err}"
     );
+    let _ = std::fs::remove_file(&db);
+}
+
+/// A step of a PINNED entry (`feature`'s `build`: the evidence floor) is refused before anything is
+/// authored — a step may never swap its entry's floor.
+#[test]
+fn gate_phase_refuses_a_step_whose_entry_pins_its_own_floor() {
+    let db = std::env::temp_dir().join(format!(
+        "wicked-gate-phase-pinned-{}.db",
+        std::process::id()
+    ));
+    let out = Command::new(bin())
+        .args([
+            "gate-phase",
+            "--workflow",
+            "feature",
+            "--phase",
+            "build",
+            "--criterion",
+            "anything",
+            "--db",
+        ])
+        .arg(&db)
+        .output()
+        .expect("run wicked-core");
+    assert!(
+        !out.status.success(),
+        "a pinned entry's step must exit non-zero"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("pins its own floor"), "names why: {err}");
     let _ = std::fs::remove_file(&db);
 }
 

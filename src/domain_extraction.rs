@@ -1,9 +1,8 @@
-//! DOMAIN-EXTRACTION — the authored artifacts that make the drop-in `workflows/domain-extraction.json`
+//! DOMAIN-EXTRACTION — the authored artifacts that make the `domain-extraction` built-in preset
 //! GATED (DES-DOMAIN-BRAIN-CONTRACT §5, CONTRACT-3 §2/§4).
 //!
-//! The `domain-extraction` workflow is pure DATA (`workflows/domain-extraction.json`, loaded via
-//! [`WorkflowRegistry::load_dir`](crate::workflow::WorkflowRegistry::load_dir) — zero core edit, Law 2).
-//! Its `coverage` phase carries a [`validator_pin`](crate::workflow::PhaseDef::validator_pin) so the
+//! The `domain-extraction` workflow is DATA: the built-in preset (`crate::catalog`, X-MIG M6; the
+//! retired `workflows/domain-extraction.json` drop-in is gone since M11). Its `coverage` step carries a [`validator_pin`](crate::workflow::PhaseDef::validator_pin) so the
 //! rev0.4 dual-validator gate ENGAGES: at gate time crew re-runs an APPROVED deterministic validator in
 //! the phase worktree with **no LLM**, and deny dominates (a `< 1.0` result rejects the phase before any
 //! `work_output` is written).
@@ -22,7 +21,7 @@
 
 use crate::validator::DeterministicValidator;
 
-/// The registered id of the drop-in workflow this module gates (`workflows/domain-extraction.json`).
+/// The id of the built-in preset this module gates (`domain-extraction`).
 pub const DOMAIN_EXTRACTION_WORKFLOW_ID: &str = "domain-extraction";
 
 /// The acceptance criterion of the coverage gate — anti-legacy GATE_3 / `coverage.py` DoD
@@ -74,7 +73,7 @@ pub const COVERAGE_SCRIPT: &str = r#"( test -n "${WICKED_COVERAGE_DB}" && "${WIC
 /// it and, on the fallback branch, causes it to be written), `wicked-core coverage` (which writes it
 /// into its cwd), and the denial diagnostic that reads it back to report what was measured.
 ///
-/// `workflows/domain-extraction.json` also lists the file in the `coverage` phase's
+/// The preset's `coverage` step also lists the file in its
 /// `required_deliverables`, but that field is deserialized into
 /// [`PhaseDef`](crate::workflow::PhaseDef) and never read by anything — it documents an intent the
 /// engine does not enforce, so it is NOT a fourth agreeing artifact (review; filed as FINDING-101).
@@ -93,78 +92,12 @@ pub const COVERAGE_SCRIPT: &str = r#"( test -n "${WICKED_COVERAGE_DB}" && "${WIC
 /// disturbing the hash.
 pub const COVERAGE_REPORT_FILE: &str = "coverage-report.json";
 
-/// The APPROVED content-address pin the `coverage` phase carries in `workflows/domain-extraction.json`.
+/// The APPROVED content-address pin the preset's `coverage` step carries.
 /// Content-hash over `(COVERAGE_CRITERION, COVERAGE_SCRIPT, approved=true)` — see
 /// [`crate::validator_vault::pin`]. Re-derived and asserted equal to the vaulted approved copy and to
 /// the JSON's embedded pin by [`tests::embedded_pin_matches_the_approved_vaulted_validator`]; if the
 /// criterion or script ever changes, that test fails loudly and this const must be regenerated.
 pub const COVERAGE_VALIDATOR_PIN: &str = "bfe4020a365c598b";
-
-/// Phases whose `validator_pin` the BINARY has an opinion about, as `(workflow, phase, pin)`.
-///
-/// The engine dispatches the def installed in the user's config dir, NOT the one in this repo. Those
-/// two drift the moment a pin changes and an install is not refreshed — observed live: the installed
-/// `domain-extraction.json` still pinned `4a4b10bf4277bd34` while this binary had moved to
-/// `e7f84b91d030fdcc`, so a run would have gated on the PRE-substance-rule validator and reported
-/// success (FINDING-080).
-///
-/// `lockstep.rs` already asserts this constant matches the REPO's JSON. Nothing asserted it against
-/// the INSTALLED JSON, which is the only copy that ever executes — one artifact further out than any
-/// existing guard reached (wicked-core#186).
-pub const BINARY_PINNED_PHASES: &[(&str, &str, &str)] =
-    &[("domain-extraction", "coverage", COVERAGE_VALIDATOR_PIN)];
-
-/// An installed def whose pinned phase disagrees with this binary.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PinMismatch {
-    pub workflow: String,
-    pub phase: String,
-    /// What the INSTALLED def carries — `None` when the phase lost its pin entirely, which is worse:
-    /// the phase would run ungated.
-    pub installed: Option<String>,
-    /// What this binary expects.
-    pub expected: &'static str,
-}
-
-impl std::fmt::Display for PinMismatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "installed workflow `{}` phase `{}` pins {} but this engine expects {} — the installed \
-             def is stale. Re-install the drop-in defs, and seed/approve the validator FIRST \
-             (`wicked-core seed-domain-validators --db <store>`) or every run will fail closed on an \
-             unresolvable pin",
-            self.workflow,
-            self.phase,
-            self.installed.as_deref().unwrap_or("NOTHING (phase is ungated)"),
-            self.expected
-        )
-    }
-}
-
-/// Compare every installed def against [`BINARY_PINNED_PHASES`].
-///
-/// Returns the disagreements rather than logging them, so the caller decides the policy: the actor
-/// removes the def (a stale gate must not dispatch), while a test can assert on the list.
-#[must_use]
-pub fn installed_pin_mismatches(reg: &crate::workflow::WorkflowRegistry) -> Vec<PinMismatch> {
-    let mut out = Vec::new();
-    for (wf, phase_id, expected) in BINARY_PINNED_PHASES {
-        let Some(def) = reg.get(wf) else { continue };
-        let Some(phase) = def.phases.iter().find(|p| p.id == *phase_id) else {
-            continue;
-        };
-        if phase.validator_pin.as_deref() != Some(*expected) {
-            out.push(PinMismatch {
-                workflow: (*wf).to_string(),
-                phase: (*phase_id).to_string(),
-                installed: phase.validator_pin.clone(),
-                expected,
-            });
-        }
-    }
-    out
-}
 
 /// The authored (UNAPPROVED) coverage validator — the artifact a human/council reviews before it can
 /// gate. Authoring never authorizes running: `approved == false` (rev0.4 fork 3). Route it through the
@@ -202,163 +135,15 @@ pub fn provision_and_approve_coverage_validator(
 
 #[cfg(test)]
 mod tests {
-    /// FINDING-080 / wicked-core#186: the def that DISPATCHES is the installed one, and nothing
-    /// compared it to the binary. Observed live — the installed `domain-extraction.json` still
-    /// pinned `4a4b10bf4277bd34` while the binary had moved to `e7f84b91d030fdcc`, so a run would
-    /// have gated on the pre-substance-rule validator and reported success.
-    #[test]
-    fn an_installed_def_pinning_a_validator_this_binary_does_not_know_is_reported() {
-        // `domain-extraction` ships as a DROP-IN, not a compiled built-in (FINDING-074), so it must
-        // be loaded the way the engine loads it — from the workflows dir.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
-        let mut reg = crate::workflow::WorkflowRegistry::with_defaults();
-        reg.load_dir(&dir).expect("overlay loads");
-        // The SHIPPED def must already agree with the binary — otherwise the guard would fire on a
-        // clean tree and this test could not distinguish stale from normal.
-        assert!(
-            installed_pin_mismatches(&reg).is_empty(),
-            "the SHIPPED drop-in already disagrees with this binary's pins"
-        );
-
-        let mut def = reg
-            .get("domain-extraction")
-            .expect("domain-extraction is registered")
-            .clone();
-        let phase = def
-            .phases
-            .iter_mut()
-            .find(|p| p.id == "coverage")
-            .expect("coverage phase");
-        phase.validator_pin = Some("4a4b10bf4277bd34".to_string()); // the real stale pin
-        reg.register(def).expect("replace with the stale def");
-
-        let found = installed_pin_mismatches(&reg);
-        assert_eq!(found.len(), 1, "expected exactly one mismatch: {found:?}");
-        assert_eq!(found[0].installed.as_deref(), Some("4a4b10bf4277bd34"));
-        assert_eq!(found[0].expected, COVERAGE_VALIDATOR_PIN);
-        // The message has to be actionable: both values AND the seed-first ordering, because
-        // refreshing the def before seeding the validator fails every run closed.
-        let msg = found[0].to_string();
-        assert!(
-            msg.contains("4a4b10bf4277bd34") && msg.contains(COVERAGE_VALIDATOR_PIN),
-            "{msg}"
-        );
-        assert!(
-            msg.contains("seed-domain-validators"),
-            "no remedy named: {msg}"
-        );
-    }
-
-    /// Review of the first version of this fix caught that `remove()` cannot "fall back to the
-    /// compiled built-in": `register` overwrites by id, so nothing is left behind — and
-    /// `domain-extraction` has no compiled form at all, being a drop-in. Removal traded a wrong gate
-    /// for an unknown-workflow failure.
-    ///
-    /// So the repair must leave the workflow AVAILABLE and correctly pinned. Both halves are
-    /// asserted, because fixing the pin while losing the workflow is not a fix.
-    #[test]
-    fn repairing_a_stale_pin_corrects_it_and_keeps_the_workflow_dispatchable() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
-        let mut reg = crate::workflow::WorkflowRegistry::with_defaults();
-        reg.load_dir(&dir).expect("overlay loads");
-
-        let mut def = reg.get("domain-extraction").expect("registered").clone();
-        def.phases
-            .iter_mut()
-            .find(|p| p.id == "coverage")
-            .expect("coverage phase")
-            .validator_pin = Some("4a4b10bf4277bd34".to_string());
-        reg.register(def).expect("install the stale def");
-        assert_eq!(
-            installed_pin_mismatches(&reg).len(),
-            1,
-            "stale def should be flagged"
-        );
-
-        for m in installed_pin_mismatches(&reg) {
-            assert!(
-                reg.repin(&m.workflow, &m.phase, m.expected),
-                "repin should succeed"
-            );
-        }
-
-        assert!(
-            installed_pin_mismatches(&reg).is_empty(),
-            "the pin was not corrected"
-        );
-        // The half `remove()` got wrong: the workflow must still be there to dispatch.
-        let after = reg.get("domain-extraction").expect(
-            "the workflow must remain registered — removing it trades a wrong gate for an unknown one",
-        );
-        assert_eq!(
-            after
-                .phases
-                .iter()
-                .find(|p| p.id == "coverage")
-                .and_then(|p| p.validator_pin.as_deref()),
-            Some(COVERAGE_VALIDATOR_PIN)
-        );
-    }
-
-    /// The sibling case — a replacement that DROPS the pin — turns out to be unreachable through
-    /// the registry: registration judges a def AS AUTHORED (codex review on #414) and REFUSES a
-    /// code phase whose gate evaluates nothing, so a hand-copied def cannot take a gate back out —
-    /// silently or otherwise; the registered def stands.
-    ///
-    /// So this asserts that EXISTING protection rather than the mismatch reporter. `PinMismatch`
-    /// still models `installed: None` defensively, but nothing in the registry can produce it, and
-    /// a test asserting otherwise would be asserting an impossible state.
-    #[test]
-    fn a_replacement_that_drops_the_pin_is_refused_and_the_installed_def_stands() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
-        let mut reg = crate::workflow::WorkflowRegistry::with_defaults();
-        reg.load_dir(&dir).expect("overlay loads");
-
-        let mut def = reg.get("domain-extraction").expect("registered").clone();
-        def.phases
-            .iter_mut()
-            .find(|p| p.id == "coverage")
-            .expect("coverage phase")
-            .validator_pin = None;
-        // `coverage` executes code (it writes `coverage-report.json` into the worktree) under a
-        // conditional gate: with its pin gone its gate evaluates nothing, and the def is refused
-        // exactly as authored — the registry never repairs it.
-        assert_eq!(
-            reg.register(def).expect_err("refused as authored"),
-            crate::workflow::WorkflowDefError::GateEvaluatesNothing {
-                phase: "coverage".to_string()
-            }
-        );
-
-        let after = reg
-            .get("domain-extraction")
-            .and_then(|d| d.phases.iter().find(|p| p.id == "coverage"))
-            .and_then(|p| p.validator_pin.clone());
-        assert_eq!(
-            after.as_deref(),
-            Some(COVERAGE_VALIDATOR_PIN),
-            "the installed def stands untouched by a refused replacement"
-        );
-        assert!(
-            installed_pin_mismatches(&reg).is_empty(),
-            "the installed pin still matches the binary, so nothing is stale"
-        );
-    }
-
     use super::*;
     use crate::validator::run_validator;
     use crate::validator_vault::{load_validator, pin};
-    use crate::workflow::{GateCond, GateSpec, GateType, PhaseRole, WorkflowRegistry};
+    use crate::workflow::{GateCond, GateSpec, GateType, PhaseRole};
     use crate::{domain::StageKind, plan::plan_from_def};
 
-    /// Load the shipped drop-in `workflows/domain-extraction.json` exactly as an operator's `load_dir`
-    /// overlay would — parse + validate through the real registry path.
+    /// The shipped def: the built-in preset as the engine composes it (X-MIG M6/M11).
     fn load_shipped_def() -> crate::workflow::WorkflowDef {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("workflows")
-            .join("domain-extraction.json");
-        WorkflowRegistry::def_from_file(&path)
-            .unwrap_or_else(|e| panic!("domain-extraction.json must parse + validate: {e}"))
+        crate::preset::builtin_preset_def(DOMAIN_EXTRACTION_WORKFLOW_ID)
     }
 
     #[test]
@@ -373,21 +158,6 @@ mod tests {
         );
         // The whole thing must satisfy the DAG/uniqueness invariants (backward-only depends_on).
         def.validate().expect("shipped def is a valid WorkflowDef");
-    }
-
-    #[test]
-    fn load_dir_registers_the_drop_in_alongside_the_builtins() {
-        // Law-2 proof: the real registry overlay path picks the file up with zero core edit, and the
-        // built-ins survive alongside it.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
-        let mut reg = WorkflowRegistry::with_defaults();
-        let loaded = reg.load_dir(&dir).expect("overlay loads");
-        assert!(
-            loaded.contains(&DOMAIN_EXTRACTION_WORKFLOW_ID.to_string()),
-            "domain-extraction registered from data; loaded = {loaded:?}"
-        );
-        assert!(reg.get("feature").is_some(), "built-ins remain");
-        assert!(reg.get(DOMAIN_EXTRACTION_WORKFLOW_ID).is_some());
     }
 
     #[test]
@@ -568,7 +338,7 @@ mod tests {
 
     #[test]
     fn embedded_pin_matches_the_approved_vaulted_validator() {
-        // The load-bearing tie: the pin embedded in workflows/domain-extraction.json == the pin of the
+        // The load-bearing tie: the pin the built-in preset's coverage step carries == the pin of the
         // APPROVED coverage validator, minted through the real vault provision/approve path. A drifted
         // script would change the pin and fail here (tamper-evidence at author time).
         use wicked_apps_core::open_store;

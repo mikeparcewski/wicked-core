@@ -924,38 +924,18 @@ pub(crate) fn run(
     team_gate::drain_at_boot(team_boot.drain);
     let team_boot_cancels = team_boot.cancels;
     let team_boot_applies = team_boot.applies;
-    let mut registry = crate::workflow::WorkflowRegistry::with_defaults();
+    // X-MIG M11: the registry seeds NO built-in (every built-in is a preset, resolved first) and
+    // loads no overlay: it holds the defs registered at runtime (`Command::RegisterWorkflow`) and the
+    // engine's per-run defs. A `*.json` left in the retired overlay dir is named ONCE here and never
+    // registered — the operator saves a preset instead (DES-TEAMING-002 §11.3).
+    let mut registry = crate::workflow::WorkflowRegistry::default();
     if let Some(dir) = pipeline::workflow_overlay_dir() {
-        if let Err(e) = registry.load_dir(&dir) {
+        for f in crate::workflow::leftover_drop_ins(&dir) {
             eprintln!(
-                "wicked-core: workflow overlay {} failed to load ({e}); using built-ins only",
-                dir.display()
+                "wicked-core: ignoring the workflow drop-in {} — the workflow overlay is retired \
+                 (X-MIG M11); save it as a preset (`PUT /api/v1/presets/:name`) instead",
+                f.display()
             );
-        }
-        // The def that DISPATCHES is the installed one, and it drifts from this binary the moment a
-        // pin changes without a re-install — worse, crew REWRITES it from a hardcoded copy, so the
-        // stale pin restores itself (FINDING-080/084). A stale pin means the run is gated by a
-        // validator this engine no longer stands behind, and it reports success either way.
-        //
-        // REPAIR rather than remove. Removing was the first attempt and it is wrong: `register`
-        // overwrites by id, so there is no shadowed built-in left to fall back to — and
-        // `domain-extraction` ships only as a drop-in, so removal makes the id UNKNOWN and dispatch
-        // fails with "no such workflow", trading a wrong gate for a confusing one. The binary owns
-        // this pin (it is the value the vault was seeded with), so writing it into the loaded def is
-        // the correction, and the workflow stays available and correctly gated.
-        for m in crate::domain_extraction::installed_pin_mismatches(&registry) {
-            eprintln!("wicked-core: {m}");
-            match registry.repin(&m.workflow, &m.phase, m.expected) {
-                true => eprintln!(
-                    "wicked-core: repaired installed `{}` phase `{}` to {} for this process; the \
-                     file on disk is still stale and will be read again on the next start",
-                    m.workflow, m.phase, m.expected
-                ),
-                false => eprintln!(
-                    "wicked-core: could NOT repair `{}` phase `{}`; refusing to serve it",
-                    m.workflow, m.phase
-                ),
-            }
         }
     }
     // ── DES-002 T6: ACP elicitation lifecycle ──────────────────────────────────
@@ -13063,21 +13043,26 @@ fn register_deny_policy(
 ) -> anyhow::Result<()> {
     use wicked_governance::{register_policy, Effect, Policy, Severity, Trigger};
     let phase = phase.trim();
-    let known_workflow_phase = registry
+    // The phase tokens a run can carry (X-MIG M11: the built-ins are presets, so the registry
+    // alone no longer names them): every registered def's phases, every global preset's step ids
+    // (the seeded built-ins included, and every project's), the catalog's entry ids (a floor-added step takes its entry's
+    // id) and the PA's scope step.
+    let mut known: Vec<String> = registry
         .ids()
         .iter()
         .filter_map(|id| registry.get(id))
-        .flat_map(|def| def.phases.iter())
-        .any(|p| p.id == phase);
+        .flat_map(|def| def.phases.iter().map(|p| p.id.clone()))
+        .collect();
+    // Every scope's presets: a project preset launches in its project (codex r1 on core#871).
+    for p in crate::preset::list_all_presets(&*store)? {
+        known.extend(p.steps.into_iter().map(|s| s.id));
+    }
+    known.extend(crate::catalog::CATALOG_IDS.iter().map(|c| c.to_string()));
+    known.push("pa-scope".to_string()); // `plan_gate::scope::SCOPE_STEP_ID`
+    known.sort();
+    known.dedup();
+    let known_workflow_phase = known.iter().any(|p| p == phase);
     if !known_workflow_phase && !is_synthetic_unit_phase(phase) {
-        let mut known: Vec<String> = registry
-            .ids()
-            .iter()
-            .filter_map(|id| registry.get(id))
-            .flat_map(|def| def.phases.iter().map(|p| p.id.clone()))
-            .collect();
-        known.sort();
-        known.dedup();
         anyhow::bail!(
             "phase `{phase}` names no phase of any registered workflow and no synthetic unit form \
              (`unit-<N>` or `u<N>`, 1..={DENY_PHASE_SPAN}) — refusing to register: a deny scoped \
@@ -19809,7 +19794,7 @@ mod deny_policy_tests {
     #[test]
     fn a_deny_scoped_to_a_phase_fires_there_and_nowhere_else() {
         let mut store = open_store(Some(":memory:")).unwrap();
-        let registry = crate::workflow::WorkflowRegistry::with_defaults();
+        let registry = crate::workflow::WorkflowRegistry::legacy_fixtures();
         // `build` is a real phase of the built-in `feature` workflow.
         register_deny_policy(&mut store, &registry, "build", "rm -rf").unwrap();
 
@@ -19831,9 +19816,41 @@ mod deny_policy_tests {
     }
 
     #[test]
+    fn a_step_only_a_project_preset_names_is_a_known_phase() {
+        // codex r1 on core#871: a drop-in migrated to a PROJECT preset must stay deny-scopable.
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let registry = crate::workflow::WorkflowRegistry::default();
+        let pid = crate::project::create_project(&mut store, "alpha", None, 1)
+            .unwrap()
+            .id;
+        crate::preset::put_preset(
+            &mut store,
+            crate::preset::PresetSpec {
+                name: "audit".into(),
+                project_id: Some(pid),
+                steps: vec![crate::plan::PlanStep {
+                    catalog: "understand".into(),
+                    id: "project-audit".into(),
+                    ..Default::default()
+                }],
+                created_by: "api".into(),
+            },
+            2,
+        )
+        .unwrap();
+        register_deny_policy(&mut store, &registry, "project-audit", "DENYME").unwrap();
+        assert_eq!(
+            select_any(&store, "s", &["project-audit"], &ctx())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn an_unknown_phase_is_rejected_and_nothing_lands_on_the_store() {
         let mut store = open_store(Some(":memory:")).unwrap();
-        let registry = crate::workflow::WorkflowRegistry::with_defaults();
+        let registry = crate::workflow::WorkflowRegistry::legacy_fixtures();
         // A typo of `review`. Narrowing WITHOUT this rejection would register an inert policy —
         // the operator believes a guard is standing and nothing ever fires (FINDING-021's shape).
         let err = register_deny_policy(&mut store, &registry, "reviw", "DENYME")
@@ -19859,7 +19876,7 @@ mod deny_policy_tests {
     #[test]
     fn synthetic_unit_forms_are_accepted_only_in_canonical_spelling_within_the_span() {
         let mut store = open_store(Some(":memory:")).unwrap();
-        let registry = crate::workflow::WorkflowRegistry::with_defaults();
+        let registry = crate::workflow::WorkflowRegistry::legacy_fixtures();
         // Canonical synthetic forms: the engine-derived `unit-<ord>` and the ad-hoc `u<ord>`.
         register_deny_policy(&mut store, &registry, "unit-65", "X").unwrap();
         register_deny_policy(&mut store, &registry, "u7", "X").unwrap();

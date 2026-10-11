@@ -382,15 +382,11 @@ fn setup(
         let mut store = open_store(Some(&db)).unwrap();
         provision_and_approve_coverage_validator(&mut store).unwrap();
     }
-    // domain-extraction is an operator drop-in, not a built-in — point the resolver at repo/workflows.
+    // domain-extraction is a built-in preset (X-MIG M6); no workflow overlay is read (M11).
     // `set_var` is a data race under parallel test threads: set it EXACTLY ONCE (every caller sets the
     // same value, so a single init is correct).
     static WORKFLOWS_DIR_INIT: std::sync::Once = std::sync::Once::new();
     WORKFLOWS_DIR_INIT.call_once(|| {
-        std::env::set_var(
-            "WICKED_WORKFLOWS_DIR",
-            format!("{}/workflows", env!("CARGO_MANIFEST_DIR")),
-        );
         // core#237: the domain-graph Tool phase runs `wicked-core domain-graph`, which `run_tool_cmd`
         // resolves via `resolve_wicked_core_exe` ($WICKED_CORE_EXE → current_exe → PATH → bare). Under
         // `cargo test` current_exe is THIS test harness — spawning it as `wicked-core` would re-exec

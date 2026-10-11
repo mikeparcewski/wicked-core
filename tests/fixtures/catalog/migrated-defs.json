@@ -325,5 +325,633 @@
         "validator_pin": null
       }
     ]
+  },
+  "feature": {
+    "id": "feature",
+    "phases": [
+      {
+        "id": "clarify",
+        "kind": "recon",
+        "gate_type": "value",
+        "gate": {
+          "human_confirm": {
+            "unconditional": false
+          }
+        },
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [],
+        "role": "neutral",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": null,
+        "executor": {
+          "type": "agent"
+        }
+      },
+      {
+        "id": "design",
+        "kind": "recon",
+        "gate_type": "strategy",
+        "gate": "auto",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "clarify"
+        ],
+        "role": "neutral",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": null,
+        "executor": {
+          "type": "agent"
+        }
+      },
+      {
+        "id": "build",
+        "kind": "build",
+        "gate_type": "execution",
+        "gate": "auto",
+        "executes_code": true,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "design"
+        ],
+        "role": "creator",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": "e2e7af1db9e48454",
+        "executor": {
+          "type": "agent"
+        }
+      },
+      {
+        "id": "adversarial-review",
+        "kind": "review",
+        "gate_type": "execution",
+        "gate": {
+          "human_confirm": {
+            "unconditional": false
+          }
+        },
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "build"
+        ],
+        "role": "evaluator",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": "e2e7af1db9e48454",
+        "executor": {
+          "type": "agent"
+        }
+      },
+      {
+        "id": "test",
+        "kind": "test",
+        "gate_type": "execution",
+        "gate": {
+          "human_confirm_if": "verdict_not_pass"
+        },
+        "executes_code": false,
+        "verified_evidence": true,
+        "required_deliverables": [],
+        "depends_on": [
+          "build"
+        ],
+        "role": "neutral",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": "e2e7af1db9e48454",
+        "executor": {
+          "type": "agent"
+        }
+      },
+      {
+        "id": "review",
+        "kind": "review",
+        "gate_type": "execution",
+        "gate": "auto",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "test"
+        ],
+        "role": "neutral",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": null,
+        "executor": {
+          "type": "agent"
+        }
+      }
+    ],
+    "required_instruments": [
+      "distinct_evaluator",
+      "judge",
+      "qe_acceptance"
+    ]
+  },
+  "bug": {
+    "id": "bug",
+    "phases": [
+      {
+        "id": "triage",
+        "kind": "recon",
+        "gate_type": "value",
+        "gate": "auto",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [],
+        "role": "neutral",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": null,
+        "executor": {
+          "type": "agent"
+        }
+      },
+      {
+        "id": "reproduce",
+        "kind": "test",
+        "gate_type": "value",
+        "gate": "auto",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "triage"
+        ],
+        "role": "neutral",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": null,
+        "executor": {
+          "type": "agent"
+        }
+      },
+      {
+        "id": "fix",
+        "kind": "build",
+        "instructions": "Update every consumer of behaviour this fix retires or changes: tests, docs, comments.",
+        "gate_type": "execution",
+        "gate": "auto",
+        "executes_code": true,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "reproduce"
+        ],
+        "role": "creator",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": "e2e7af1db9e48454",
+        "executor": {
+          "type": "agent"
+        }
+      },
+      {
+        "id": "verify",
+        "kind": "test",
+        "gate_type": "execution",
+        "gate": {
+          "human_confirm_if": "verdict_not_pass"
+        },
+        "executes_code": false,
+        "verified_evidence": true,
+        "required_deliverables": [],
+        "depends_on": [
+          "fix"
+        ],
+        "role": "evaluator",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": "e2e7af1db9e48454",
+        "executor": {
+          "type": "agent"
+        }
+      }
+    ],
+    "required_instruments": [
+      "distinct_evaluator",
+      "judge",
+      "qe_acceptance"
+    ]
+  },
+  "migration": {
+    "id": "migration",
+    "phases": [
+      {
+        "id": "plan",
+        "kind": "recon",
+        "gate_type": "strategy",
+        "gate": {
+          "human_confirm": {
+            "unconditional": false
+          }
+        },
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [],
+        "role": "neutral",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": null,
+        "executor": {
+          "type": "agent"
+        }
+      },
+      {
+        "id": "execute",
+        "kind": "build",
+        "gate_type": "execution",
+        "gate": "auto",
+        "executes_code": true,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "plan"
+        ],
+        "role": "creator",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": "e2e7af1db9e48454",
+        "executor": {
+          "type": "agent"
+        }
+      },
+      {
+        "id": "cutover",
+        "kind": "build",
+        "gate_type": "execution",
+        "gate": {
+          "human_confirm": {
+            "unconditional": true
+          }
+        },
+        "executes_code": true,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "execute"
+        ],
+        "role": "neutral",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": null,
+        "executor": {
+          "type": "agent"
+        }
+      },
+      {
+        "id": "verify",
+        "kind": "test",
+        "gate_type": "execution",
+        "gate": {
+          "human_confirm_if": "verdict_not_pass"
+        },
+        "executes_code": false,
+        "verified_evidence": true,
+        "required_deliverables": [],
+        "depends_on": [
+          "cutover"
+        ],
+        "role": "evaluator",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": "e2e7af1db9e48454",
+        "executor": {
+          "type": "agent"
+        }
+      },
+      {
+        "id": "cleanup",
+        "kind": "build",
+        "gate_type": null,
+        "gate": "auto",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "verify"
+        ],
+        "role": "neutral",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": null,
+        "executor": {
+          "type": "agent"
+        }
+      }
+    ],
+    "required_instruments": [
+      "distinct_evaluator",
+      "judge",
+      "qe_acceptance"
+    ]
+  },
+  "mcp-server": {
+    "id": "mcp-server",
+    "phases": [
+      {
+        "id": "scope",
+        "kind": "recon",
+        "gate_type": "value",
+        "gate": {
+          "human_confirm": {
+            "unconditional": false
+          }
+        },
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [],
+        "role": "neutral",
+        "skill_ref": "wicked-garden-mcp-scaffold",
+        "allowed_skills": [],
+        "validator_pin": null,
+        "instructions": "Decide what this MCP server exposes (tools, resources, prompts), the upstream's authentication scheme (bearer, API key, basic, OAuth2 client credentials — the server reads ONE secret variable <SERVER>_TOKEN and every other auth parameter from its committed mcp-server.config.json), the transport (stdio by default; httpStream only when the intent asks for a hosted server), and the target: this run's repository, at its root when the repository is new and near-empty, or in a named subdirectory when it already holds code. Say whether an OpenAPI document was given (URL or file), and whether the operator wants the server installed for running when the run completes (the install phase asks again at its gate). If the intent names a repository that is not this run's, say that the operator must create it with an initial commit and register it before a run can deliver into it; do not try to create one."
+      },
+      {
+        "id": "source-discovery",
+        "kind": "recon",
+        "gate_type": null,
+        "gate": "auto",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "scope"
+        ],
+        "role": "neutral",
+        "skill_ref": "wicked-garden-mcp-scaffold",
+        "allowed_skills": [],
+        "validator_pin": null,
+        "instructions": "With an OpenAPI document: run the skill's openapi action against the conversion service and report every tool it yields with its class (read, write, destructive), its input schema summary and its request mapping, plus the skipped operations and why. Without one: inventory the integration surface (SDK calls, CLI, database, events) into a candidate tool list with the same columns. Do not write code in this phase."
+      },
+      {
+        "id": "design",
+        "kind": "recon",
+        "gate_type": "strategy",
+        "gate": {
+          "human_confirm": {
+            "unconditional": false
+          }
+        },
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "source-discovery"
+        ],
+        "role": "neutral",
+        "skill_ref": "wicked-garden-mcp-scaffold",
+        "allowed_skills": [],
+        "validator_pin": null,
+        "instructions": "Produce the design: the final tool table (name, description, input schema, annotations, class), the resources and prompts if any, the authentication plan (the one secret variable, the committed non-secret parameters, which header, what fails at startup), and the observability plan (span names and attributes, the three instruments, log fields, what leaves the process and only when). Check each against the MCP-server steering rules MCPS-1001 to MCPS-1007 (recall them with rules.recall, scope wiki:governance, when an estate store is present; otherwise use the checklist in the skill) and against MCP-D2 and MCP-D4. If a rule cannot be recalled, say so, cite the skill's checklist instead, and never state what a rule id means when you could not read it. Name every deviation and why."
+      },
+      {
+        "id": "build",
+        "kind": "build",
+        "gate_type": "execution",
+        "gate": "auto",
+        "executes_code": true,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "design"
+        ],
+        "role": "creator",
+        "skill_ref": "wicked-garden-mcp-scaffold",
+        "allowed_skills": [],
+        "validator_pin": "e2e7af1db9e48454",
+        "instructions": "Scaffold the TypeScript server with the skill (--lang typescript) into the target directory. Branch A, with a tools.json from the conversion service: the generated tools ride the skeleton's REST runtime; adapt names, descriptions and annotations to the design. Branch B, without one: write each tool by hand with a zod schema on the same skeleton. Either way: the one secret variable and the committed mcp-server.config.json the design named, the conformance smoke and one contract test per tool under npm test, the typecheck, lint and test scripts present, an SPDX header on every source file, telemetry exporters armed only by OTEL_EXPORTER_OTLP_ENDPOINT. Build it and run the skill's probe; put the probe JSON in your output."
+      },
+      {
+        "id": "test",
+        "kind": "test",
+        "gate_type": "execution",
+        "gate": {
+          "human_confirm_if": "verdict_not_pass"
+        },
+        "executes_code": false,
+        "verified_evidence": true,
+        "required_deliverables": [],
+        "depends_on": [
+          "build"
+        ],
+        "role": "neutral",
+        "skill_ref": "wicked-garden-qe-contract-testing-engineer",
+        "allowed_skills": [],
+        "validator_pin": "e2e7af1db9e48454",
+        "instructions": "Judge the verify floor's report of the repository's own checks (typecheck, lint, test) and the tests themselves: every tool in the design has a contract test, the conformance smoke covers initialize, tools/list, tools/call, the missing-credential startup failure and the httpStream 401 path, and nothing in the tree holds a secret value. A tool without a test, or a smoke that does not exercise the failure paths, is a FAIL with the tool named."
+      },
+      {
+        "id": "security-review",
+        "kind": "review",
+        "gate_type": "execution",
+        "gate": {
+          "human_confirm": {
+            "unconditional": false
+          }
+        },
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "test"
+        ],
+        "role": "evaluator",
+        "skill_ref": "wicked-garden-platform-security-engineer",
+        "allowed_skills": [],
+        "validator_pin": "e2e7af1db9e48454",
+        "instructions": "Review the diff cold against MCPS-1004 and MCPS-1005 and MCP-D2: the one secret read from the environment only and never logged, returned or accepted as an argument; non-secret auth parameters in the committed config; authentication on every tool and resource (authenticate on httpStream, canAccess on every tool); input validated before the handler runs; upstream requests pinned to the configured base URL with allowlisted arguments and no redirects; a rate limit that answers a user error. Cite file and line for every finding."
+      },
+      {
+        "id": "observability-review",
+        "kind": "review",
+        "gate_type": "execution",
+        "gate": {
+          "human_confirm_if": "verdict_not_pass"
+        },
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "test"
+        ],
+        "role": "evaluator",
+        "skill_ref": "wicked-garden-qe-observability-test-engineer",
+        "allowed_skills": [],
+        "validator_pin": "e2e7af1db9e48454",
+        "instructions": "Review the diff cold against MCPS-1002 and MCPS-1003: one span per tool call with the server, tool, request id and outcome attributes and a child span per upstream request; the three instruments recorded; logs through loglayer with trace and span ids stamped, a request-scoped child logger per call, console output on stderr only; nothing exported unless the operator sets an OTLP endpoint. Cite file and line for every finding."
+      },
+      {
+        "id": "install-plan",
+        "kind": "build",
+        "gate_type": "execution",
+        "gate": "auto",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "security-review",
+          "observability-review"
+        ],
+        "role": "neutral",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": null,
+        "executor": {
+          "type": "tool",
+          "cmd": [
+            "bash",
+            "-c",
+            "exec \"${WICKED_GARDEN_ROOT:?the engine handed this Tool phase no garden root; refusing to resolve wicked-garden from PATH}/scripts/wicked-garden\" run scripts/mcp/install.py --from-run --dry-run --json"
+          ]
+        },
+        "instructions": "Plan the install without writing anything: resolve, on this host and as the daemon user, every file and directory each install choice would write — Install for workers (the default: the staged copy under ~/.wicked/mcp-servers/<key>/current, the wicked-crew MCP tools registry and the worker homes' CLI configurations under ~/.wicked-worker) and Also install into my CLIs (the worker set plus your own CLI configurations, such as ~/.claude.json, ~/.codex/config.toml and the opencode configuration) — and print them as one JSON plan line, so the install's consent gate can list them before you answer."
+      },
+      {
+        "id": "install",
+        "kind": "build",
+        "gate_type": "execution",
+        "gate": "consent_before",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "install-plan"
+        ],
+        "role": "neutral",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": null,
+        "executor": {
+          "type": "tool",
+          "cmd": [
+            "bash",
+            "-c",
+            "exec \"${WICKED_GARDEN_ROOT:?the engine handed this Tool phase no garden root; refusing to resolve wicked-garden from PATH}/scripts/wicked-garden\" run scripts/mcp/install.py --from-run --target \"${WICKED_CONSENT_CHOICE:?the consent gate recorded no install choice}\" --json"
+          ]
+        },
+        "instructions": "Install for running — or update the installed copy when this server key is already installed. Nothing has been installed yet: this asks before the install runs, and each answer lists exactly the files it would write (from the install-plan dry run). Install for workers (the default) builds the server from this run's tree into ~/.wicked/mcp-servers/<key>/current, registers it in wicked-crew's MCP tools under its key (an existing entry is re-registered in place; the first use of a changed tool still asks) and writes it into the worker homes' CLI MCP configurations — program-owned files only. Also install into my CLIs does the same and also writes it into your own CLI MCP configurations through wicked-installer (one entry per key, never a second copy; CLI entries carry no secret). Both probe tools/list. The one secret variable <SERVER>_TOKEN is named, never written: when the daemon cannot resolve it the registration is reported as pending with the remedy. Writes happen on the daemon host as the daemon user. Decline for not now — the pull request already delivered stays as it is."
+      }
+    ],
+    "required_instruments": [
+      "distinct_evaluator",
+      "judge",
+      "qe_acceptance"
+    ]
+  },
+  "domain-extraction": {
+    "id": "domain-extraction",
+    "phases": [
+      {
+        "id": "survey",
+        "kind": "recon",
+        "gate_type": null,
+        "gate": "auto",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [],
+        "role": "neutral",
+        "skill_ref": "wicked-garden-domain",
+        "allowed_skills": [],
+        "validator_pin": null
+      },
+      {
+        "id": "analyze",
+        "kind": "recon",
+        "gate_type": null,
+        "gate": "auto",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "survey"
+        ],
+        "role": "neutral",
+        "skill_ref": "wicked-garden-domain",
+        "allowed_skills": [],
+        "validator_pin": null
+      },
+      {
+        "id": "extract",
+        "kind": "recon",
+        "gate_type": "value",
+        "gate": "auto",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "analyze"
+        ],
+        "role": "creator",
+        "skill_ref": "wicked-garden-domain-extractor",
+        "allowed_skills": [],
+        "validator_pin": null
+      },
+      {
+        "id": "coverage",
+        "kind": "test",
+        "gate_type": "execution",
+        "gate": {
+          "human_confirm_if": "verdict_not_pass"
+        },
+        "executes_code": true,
+        "verified_evidence": true,
+        "required_deliverables": [
+          "coverage-report.json"
+        ],
+        "depends_on": [
+          "extract"
+        ],
+        "role": "evaluator",
+        "skill_ref": "wicked-garden-domain-coverage",
+        "allowed_skills": [],
+        "validator_pin": "bfe4020a365c598b"
+      },
+      {
+        "id": "domain-graph",
+        "kind": "build",
+        "gate_type": "strategy",
+        "gate": {
+          "human_confirm": {
+            "unconditional": false
+          }
+        },
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "coverage"
+        ],
+        "role": "neutral",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": null,
+        "executor": {
+          "type": "tool",
+          "cmd": [
+            "wicked-core",
+            "domain-graph",
+            "--db",
+            "{code_graph_db}",
+            "--out",
+            "requirements_graph.json"
+          ]
+        }
+      }
+    ]
   }
 }
