@@ -11968,7 +11968,13 @@ pub(crate) fn confirm_gate_as(
                     .as_ref()
                     .is_some_and(|d| d.source == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE)
         });
-    if judge_unavailable_gate && !adjudication_open {
+    // A team run's steps owe their team accounting (PA review, member step, dispute ledger): they
+    // keep today's answer here (codex r1 on #907).
+    let team_unit = session.team.is_some()
+        || crate::domain::session_units(store, run_id)?
+            .get(session.unit_ix)
+            .is_some_and(|u| u.member_step.is_some());
+    if judge_unavailable_gate && !adjudication_open && !team_unit {
         if let crate::workflow::HumanDecision::Approve { amend, .. } = &decision {
             return judge_by_operator(
                 store,
@@ -12644,14 +12650,6 @@ fn apply_suggestion(
     ))
 }
 
-/// (core#761) LAND WITH CARRIED ITEMS — approve at a `review_adjudication` gate. The layer-3
-/// boundary check runs first (deny-dominates: a policy veto cancels, as on every approve). Then
-/// ONE write for the cursor (Evaluator) unit: it counts (`Done`), its denial is cleared, its FAIL
-/// items are recorded as [`carried_items`](crate::domain::WorkUnit::carried_items), the round is
-/// booked `landed` and an operator note rides `operator_rulings`; the cursor moves past it
-/// (`gateDecided{allow}` + `unitDone`, as a team dispute's approve counts a unit) and the run
-/// advances. Evaluator ≠ creator is untouched: the human decides, no seat re-grades.
-#[allow(clippy::too_many_arguments)]
 /// (operator ruling 2026-10-11) An approve at a `judge_unavailable` escalation: the operator's
 /// judgment. The cursor unit counts (Done), its receipt records `operatorJudges` (who / when / the
 /// note) and `operator_judge` among the instruments that ran, and the run advances — the
@@ -12714,6 +12712,27 @@ fn judge_by_operator(
     u.status = crate::domain::UnitStatus::Done;
     u.denial = None;
     u.denial_reason = None;
+    // (codex r1 on #907) The judged output becomes the unit's APPROVED output, so a later
+    // evaluator and context injection read it (`get_work_output`), with the judgment's provenance.
+    let wo_id = wicked_apps_core::synthetic_symbol(crate::execute::WORK_OUTPUT, &u.id);
+    if let Ok(Some(mut wo)) = store.get_node(&wo_id) {
+        if wo
+            .metadata
+            .get(crate::execute::RESOLUTION_KEY)
+            .and_then(|v| v.as_str())
+            == Some(crate::execute::RESOLUTION_REJECTED)
+        {
+            wo.metadata.insert(
+                crate::execute::RESOLUTION_KEY.to_string(),
+                serde_json::json!(crate::execute::RESOLUTION_RESOLVED),
+            );
+            wo.metadata.insert(
+                "resolved_by".to_string(),
+                serde_json::json!(format!("operator:{by}")),
+            );
+            put_node(store, wo)?;
+        }
+    }
     let ord = u.ord;
     let mut s = session;
     s.unit_ix = ix + 1;
@@ -12776,6 +12795,14 @@ fn judge_by_operator(
     }
 }
 
+/// (core#761) LAND WITH CARRIED ITEMS — approve at a `review_adjudication` gate. The layer-3
+/// boundary check runs first (deny-dominates: a policy veto cancels, as on every approve). Then
+/// ONE write for the cursor (Evaluator) unit: it counts (`Done`), its denial is cleared, its FAIL
+/// items are recorded as [`carried_items`](crate::domain::WorkUnit::carried_items), the round is
+/// booked `landed` and an operator note rides `operator_rulings`; the cursor moves past it
+/// (`gateDecided{allow}` + `unitDone`, as a team dispute's approve counts a unit) and the run
+/// advances. Evaluator ≠ creator is untouched: the human decides, no seat re-grades.
+#[allow(clippy::too_many_arguments)]
 fn land_with_carried_items(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,

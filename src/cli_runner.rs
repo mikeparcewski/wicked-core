@@ -1009,11 +1009,13 @@ fn judge_pool<'a>(
         .iter()
         .filter(|c| configured(c))
         // (operator ruling 2026-10-11) An opt-in seat (opencode) judges only when the run picked it.
-        .chain(
-            roster
+        .chain(roster.iter().filter(|c| {
+            // An opt-in seat the run picked under an instance key (`opencode#2`) counts.
+            let picked = run_roster
                 .iter()
-                .filter(|c| !configured(c) && !wicked_council::registry::is_opt_in(&c.key)),
-        )
+                .any(|k| wicked_apps_core::spawn::seat_cli_key(k) == c.key);
+            !configured(c) && (!wicked_council::registry::is_opt_in(&c.key) || picked)
+        }))
         .collect()
 }
 
