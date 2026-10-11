@@ -108,6 +108,20 @@ impl WritePosture {
                 WritePosture::ReadOnly
             };
         }
+        // (wicked-core#881, wicked-crew#951) The run's QE unit records its acceptance verdict
+        // through garden's pipeline — an interpreter writing the run's QE ledger root — so on a
+        // bound run it takes the deliverable-roots posture, admitting ONLY its own roots
+        // ([`unit_admitted_roots`]): interpreters run, every path write is fenced to those roots,
+        // and the worktree guard still restores and escalates any change to the tree. Read-only,
+        // its fenced seats (claude, opencode) refused `node` and could never record the verdict.
+        // Decided before the guard marker, like the walkthrough author.
+        if crate::qe_acceptance::carries_ledger_root(unit) {
+            return if bound {
+                WritePosture::DeliverableRoots
+            } else {
+                WritePosture::ReadOnly
+            };
+        }
         if !crate::worktree_guard::applies_to(unit) {
             return WritePosture::Full;
         }
@@ -225,11 +239,18 @@ pub(crate) fn unit_admitted_roots(
     unit: &WorkUnit,
     extra_write_roots: &[String],
 ) -> Vec<PathBuf> {
-    let mut roots = admitted_roots(posture, unit.notes_root.as_deref(), extra_write_roots);
-    if posture == WritePosture::ReadOnly {
-        roots.extend(unit.qe_ledger_root.iter().map(PathBuf::from));
+    // (wicked-core#881) A fenced unit carrying a QE ledger root — the QE unit, deliverable-roots
+    // on a bound run — admits exactly its own roots, never the launch extras (another phase's
+    // deliverables, e.g. the walkthrough author's dir).
+    if posture != WritePosture::Full && crate::qe_acceptance::carries_ledger_root(unit) {
+        return unit
+            .notes_root
+            .iter()
+            .chain(unit.qe_ledger_root.iter())
+            .map(PathBuf::from)
+            .collect();
     }
-    roots
+    admitted_roots(posture, unit.notes_root.as_deref(), extra_write_roots)
 }
 
 /// The env spelling of [`admitted_roots`] for the hook-subprocess carrier: the roots joined
@@ -504,6 +525,95 @@ mod tests {
     /// DES-L4 PR-②: ONE admitted-roots derivation per posture — the creator's extras under
     /// deliverable-roots, the notes root (or nothing) under read-only, nothing under full — so the
     /// wrapped env, the ACP fence and the gate hook cannot disagree about where a fenced write may go.
+    /// wicked-core#881: the QE unit carrying a QE ledger root is deliverable-roots on a bound run
+    /// (it runs garden's pipeline — an interpreter — into its own root), read-only unbound; the
+    /// same evaluator without a root keeps the read-only posture. Mutation: drop the rule → the
+    /// first assert reads ReadOnly.
+    #[test]
+    fn the_qe_unit_with_a_ledger_root_takes_the_deliverable_roots_posture() {
+        let mut qe = unit(PhaseRole::Evaluator, false);
+        qe.repo_checks_floor = true;
+        assert_eq!(WritePosture::of(&qe, true), WritePosture::ReadOnly);
+        qe.qe_ledger_root = Some("/evidence/run/.wicked-qe".into());
+        assert_eq!(WritePosture::of(&qe, true), WritePosture::DeliverableRoots);
+        assert_eq!(WritePosture::of(&qe, false), WritePosture::ReadOnly);
+        // A floor-fix creator cloned from the QE unit is not the QE unit (codex r1 on #889).
+        let fixer = crate::cli_runner::floor_fix_unit(
+            &qe,
+            &crate::repo_checks::FloorFix {
+                note: "fix it".into(),
+                seat: "claude".into(),
+            },
+        );
+        assert_eq!(fixer.qe_ledger_root, None);
+        assert_eq!(WritePosture::of(&fixer, true), WritePosture::Full);
+        qe.tool_cmd = Some(vec!["true".to_string()]);
+        assert_ne!(
+            WritePosture::of(&qe, true),
+            WritePosture::DeliverableRoots,
+            "a Tool unit is the engine's own command"
+        );
+    }
+
+    /// wicked-core#881, the live finding of wicked-crew#951 (rig run 46fb2c04): under the QE unit's
+    /// posture the fence the claude/ACP carriers share lets garden's pipeline run — `node -e`
+    /// and a write into the QE ledger root are admitted — while a write into the tree is still
+    /// refused (and the worktree guard still restores one that escapes). Read-only, the same
+    /// `node -e` is refused: that refusal stranded the run. Mutation: drop the posture rule → the
+    /// node call is refused.
+    #[cfg(unix)]
+    #[test]
+    fn the_qe_unit_fence_runs_the_pipeline_into_its_root_and_still_refuses_the_tree() {
+        let base = std::env::temp_dir().join(format!("wicked-881-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let qe_root = base.join("evidence").join(".wicked-qe");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&qe_root).unwrap();
+        let mut qe = unit(PhaseRole::Evaluator, false);
+        qe.repo_checks_floor = true;
+        qe.qe_ledger_root = Some(qe_root.to_string_lossy().into_owned());
+        let posture = WritePosture::of(&qe, true);
+        let roots = unit_admitted_roots(posture, &qe, &["/run/author".to_string()]);
+        assert_eq!(roots, vec![qe_root.clone()]);
+        let bash = |p: WritePosture, cmd: &str| {
+            crate::gate_hook::bash_write_phase_scope(false, p, cmd, &wt, None, &roots)
+        };
+        let node = "node -e \"import('wicked-ledger').then(m => m.createDomainStore())\"";
+        assert!(
+            bash(posture, node).is_none(),
+            "the pipeline's node call runs"
+        );
+        assert!(
+            bash(WritePosture::ReadOnly, node).is_some(),
+            "read-only refuses it (what stranded the run)"
+        );
+        let into_root = format!("echo x > {}", qe_root.join("verdicts.json").display());
+        assert!(
+            bash(posture, &into_root).is_none(),
+            "a write into the QE root is admitted"
+        );
+        let into_tree = format!("echo x > {}", wt.join("src.js").display());
+        assert!(
+            bash(posture, &into_tree).is_some(),
+            "a write into the tree is refused"
+        );
+        let write = |p: &std::path::Path| {
+            crate::gate_hook::phase_scope_denial(
+                false,
+                posture,
+                &serde_json::json!({ "path": p.to_string_lossy() }),
+                "Write",
+                &wt,
+                None,
+                &roots,
+            )
+        };
+        assert!(write(&qe_root.join("config.json")).is_none());
+        assert!(write(&wt.join("src.js")).is_some());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// wicked-crew#951: a dispatched read-only unit admits its notes root and THEN its QE ledger
     /// root (the notes root stays first — the refusal names it as where notes go); a creator's
     /// list is its extras, untouched by either; a unit without a QE root admits the notes root
@@ -511,6 +621,7 @@ mod tests {
     #[test]
     fn a_read_only_unit_admits_its_notes_root_then_its_qe_ledger_root() {
         let mut u = unit(PhaseRole::Evaluator, false);
+        u.repo_checks_floor = true; // the QE unit (qe_acceptance::is_qe_unit)
         u.notes_root = Some("/notes/u4".into());
         u.qe_ledger_root = Some("/evidence/run/.wicked-qe".into());
         let extras = vec!["/run/author".to_string()];
@@ -523,6 +634,16 @@ mod tests {
         );
         assert_eq!(
             unit_admitted_roots(WritePosture::DeliverableRoots, &u, &extras),
+            vec![
+                PathBuf::from("/notes/u4"),
+                PathBuf::from("/evidence/run/.wicked-qe")
+            ],
+            "the QE unit (deliverable-roots) admits its own roots, never the extras (core#881)"
+        );
+        let mut creator = unit(PhaseRole::Creator, false);
+        creator.notes_root = None;
+        assert_eq!(
+            unit_admitted_roots(WritePosture::DeliverableRoots, &creator, &extras),
             vec![PathBuf::from("/run/author")],
             "a creator's admitted roots are exactly its extras"
         );

@@ -824,6 +824,8 @@ pub(crate) fn floor_fix_unit(
     u.skill_ref = None;
     u.validator = None;
     u.repo_checks_floor = false;
+    // (codex r1 on wicked-core#889) The fixer is not the QE unit: no QE ledger root, no grant.
+    u.qe_ledger_root = None;
     u.required_deliverables.clear();
     u.member_step = None;
     u.team = None;

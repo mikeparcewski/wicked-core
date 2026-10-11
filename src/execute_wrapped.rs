@@ -1818,8 +1818,13 @@ impl WrappedCliStepRunner {
         // denial — it is the worker reporting the checks it could not run as FAILING checks
         // ("derived 7 / submitted 7 / failed 5", "Verdict: CONDITIONAL" on a correct tree), so
         // the prompt says what cannot run and where the checks' exit codes actually are.
+        // (wicked-core#881) The QE unit (deliverable-roots for its interpreters) KEEPS its seat's
+        // read-only argv lever — codex's scratch sandbox with the QE root added, pi's tool
+        // denylist — so the tree stays protected by the seat itself (codex r1 on #889).
+        let takes_lever = write_posture == crate::write_posture::WritePosture::ReadOnly
+            || crate::qe_acceptance::carries_ledger_root(&input.unit);
         let sandbox_cannot_run_checks = !is_claude
-            && write_posture == crate::write_posture::WritePosture::ReadOnly
+            && takes_lever
             && matches!(
                 no_code_posture(&binary, resolve_seat_posture(&cli_key)),
                 Ok(NoCodePosture {
@@ -1943,7 +1948,7 @@ impl WrappedCliStepRunner {
             // no code (`DeliverableRoots`) must still write its deliverable into the run's
             // declared roots, which a seat-wide read-only sandbox would refuse — it runs under the
             // seat's ordinary posture, guard-only, and the record says so below.
-            if write_posture == crate::write_posture::WritePosture::ReadOnly {
+            if takes_lever {
                 match apply_no_code_posture(&mut argv, posture, codex_checks.as_ref()) {
                     Ok(ReadOnlyLever::None) => {
                         let note = format!(

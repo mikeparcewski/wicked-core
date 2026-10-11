@@ -184,6 +184,9 @@ impl PersistentStepRunner {
             inject_claude_stream_flags(&mut argv);
         } else if crate::write_posture::WritePosture::of(&input.unit, input.workdir.is_some())
             == crate::write_posture::WritePosture::ReadOnly
+            // (wicked-core#881) the QE unit keeps its seat's read-only lever here too (codex r2 on
+            // #889): the tree stays protected by the seat on every carrier.
+            || crate::qe_acceptance::carries_ledger_root(&input.unit)
         {
             // F-036: a READ-ONLY phase (an `executes_code: false` evaluator/recon rung — never a
             // creator, F-4R2-004) on a non-claude seat crosses the shared launch boundary —
