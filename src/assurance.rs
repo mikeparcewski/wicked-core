@@ -265,6 +265,11 @@ pub struct AssuranceReceipt {
     /// require QE acceptance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qe: Option<Box<QeAcceptance>>,
+    /// (operator ruling 2026-10-11) The councils this unit's attempt convened on its disputes, in
+    /// ledger order: each one's verdict and WHO decided — the seats drawn and the draw's seed.
+    /// Absent when the attempt convened none (the routine case).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub councils: Vec<crate::team::Dispute>,
 }
 
 impl AssuranceReceipt {
