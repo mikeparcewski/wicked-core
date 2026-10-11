@@ -27,7 +27,7 @@
    "depends_on": [
     "research"
    ],
-   "instructions": "Follow the wicked-garden-learn skill's synthesize action and its refs/claims.md: turn the candidates into the claims ledger, one atomic checkable statement per claim with its sources and observed_at, ids from check.py --claim-id, only claims that would help a fresh session in 3 months. On a refresh, output the diff against the existing ledger, one row per claim id (confirmed, superseded, contradicted, retired with reason and evidence, new), and the counts. Put the full draft ledger in your output as one json block. Write nothing into the repository."
+   "instructions": "Follow the wicked-garden-learn skill's synthesize action and its refs/claims.md: turn the candidates into the claims ledger, one atomic checkable statement per claim with its sources and observed_at, claim ids left to the author step (it computes them with check.py --claim-id; on a refresh keep each existing claim's id), only claims that would help a fresh session in 3 months. On a refresh, output the diff against the existing ledger, one row per claim id (confirmed, superseded, contradicted, retired with reason and evidence, new), and the counts. Put the full draft ledger in your output as one json block. Write nothing into the repository."
   },
   {
    "catalog": "understand",
@@ -50,7 +50,7 @@
    "depends_on": [
     "walkthrough"
    ],
-   "instructions": "Follow the wicked-garden-learn skill's author action. Write .wicked/knowledge/<slug>/topic.json, claims.jsonl and README.md from the synthesized ledger and the walkthrough's outcome, plus text-only skills for the procedures it yields, in the skill dir that check.py --skill-dir prints. On a refresh, never delete a claim line: a removal is a status change with its reason and evidence, removed from the README and from every skill. Then run the check: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/learn/check.py --repo . --slug <slug>, paste its JSON and exit code, and fix every finding before you finish."
+   "instructions": "Follow the wicked-garden-learn skill's author action. Compute every new claim's id with \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/learn/check.py --claim-id \"<text>\" (an existing claim keeps its id). Write .wicked/knowledge/<slug>/topic.json, claims.jsonl and README.md from the synthesized ledger and the walkthrough's outcome, plus text-only skills for the procedures it yields, in the skill dir that check.py --skill-dir prints. On a refresh, never delete a claim line: a removal is a status change with its reason and evidence, removed from the README and from every skill. Then run the check: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/learn/check.py --repo . --slug <slug>, paste its JSON and exit code, and fix every finding before you finish."
   },
   {
    "catalog": "review",
