@@ -90,6 +90,10 @@ pub const ENV_DEADLINE_SECS: &str = "WICKED_COUNCIL_DEADLINE_SECS";
 /// override serves rosters and hosts that deliberate slower.
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(180);
 
+/// The longest a ballot's staggered spawns may be spread: the last seat starts at most this long
+/// after the first (a tenth of the default deadline), so staggering never eats the budget.
+pub const MAX_STAGGER_SPREAD: Duration = Duration::from_secs(18);
+
 /// The detached worker. Holds the shared ledger plus the injected seams (dispatcher, rank
 /// store, event sink) so the same engine wiring serves both the real CLI and the
 /// deterministic E2E test (which injects fakes).
@@ -104,6 +108,10 @@ pub struct Worker {
     work_kind: String,
     /// Wall-clock budget across all ballots (see [`DEFAULT_DEADLINE`]).
     deadline: Duration,
+    /// The pause between two seat spawns of one ballot (operator ruling 2026-10-11): seat `i`
+    /// starts `i × stagger` after the ballot opens, so a council never forks its whole roster of
+    /// heavy CLIs in the same instant. From [`crate::pick::spawn_stagger`].
+    stagger: Duration,
 }
 
 impl Worker {
@@ -127,7 +135,14 @@ impl Worker {
                 std::env::var(ENV_DEADLINE_SECS).ok(),
                 DEFAULT_DEADLINE,
             ),
+            stagger: crate::pick::spawn_stagger(),
         }
+    }
+
+    /// Override the spawn stagger (the constructor reads [`crate::pick::ENV_SPAWN_STAGGER_MS`]).
+    pub fn with_stagger(mut self, stagger: Duration) -> Self {
+        self.stagger = stagger;
+        self
     }
 
     /// Override the wall-clock deadline (the constructor reads [`ENV_DEADLINE_SECS`], falling
@@ -180,6 +195,7 @@ impl Worker {
         let roster = Arc::clone(&self.roster);
         let work_kind = self.work_kind.clone();
         let deadline = self.deadline;
+        let stagger = self.stagger;
         let task_for_thread = task;
 
         let ledger_for_panic = ledger.clone();
@@ -199,6 +215,7 @@ impl Worker {
                     &roster,
                     &work_kind,
                     deadline,
+                    stagger,
                     &task_for_thread,
                 );
             }));
@@ -288,6 +305,15 @@ pub struct PollStatus {
 ///
 /// Free function (not a method) so it owns only the cloned handles, never `&self` —
 /// reinforcing that no part of this needs the requesting agent.
+/// The stagger a ballot of `seats` actually uses: the setting, shrunk so the last seat starts at
+/// most [`MAX_STAGGER_SPREAD`] after the first.
+fn effective_stagger(stagger: Duration, seats: usize) -> Duration {
+    match u32::try_from(seats.saturating_sub(1)) {
+        Ok(gaps) if gaps > 0 => stagger.min(MAX_STAGGER_SPREAD / gaps),
+        _ => stagger,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_council(
     ledger: &Ledger,
@@ -299,6 +325,7 @@ fn run_council(
     roster: &[AgenticCli],
     work_kind: &str,
     deadline: Duration,
+    stagger: Duration,
     task: &CouncilTask,
 ) {
     ledger.update(&task.id, |rec| rec.state = TaskState::Running);
@@ -318,6 +345,9 @@ fn run_council(
     // if the ballot lands below APPROVAL_THRESHOLD, a runoff shares the tally + dissent
     // arguments with every seat so the council can converge like a real deliberating
     // body. MAX_BALLOTS caps the loop; the final ballot's plurality stands regardless.
+    // The stagger never spreads one ballot's spawns over more than MAX_STAGGER_SPREAD, however
+    // large the roster and the setting (codex r1: 9 seats x 30 s would outlast the deadline).
+    let stagger = effective_stagger(stagger, roster.len());
     let mut ballot: u32 = 1;
     let mut prior_tally: Vec<(String, u32)> = Vec::new();
     let mut dissent_arguments: Vec<String> = Vec::new();
@@ -356,6 +386,11 @@ fn run_council(
                         dissent_arguments: dissent_arguments.clone(),
                     };
                     scope.spawn(move || {
+                        // The spawn stagger: seat `i` opens its ballot `i × stagger` late. Its
+                        // own budget starts when it is dispatched, so the wait costs it nothing.
+                        if i > 0 && !stagger.is_zero() {
+                            std::thread::sleep(stagger.saturating_mul(i as u32));
+                        }
                         let started = Instant::now();
                         // Catch the unwind HERE rather than at the join, so a seat that panicked
                         // after doing real work still reports the time it spent. Reporting 0
@@ -755,6 +790,8 @@ mod tests {
         // environment must not be able to end a deliberation early and flip an assertion.
         // Tests about the deadline itself override this again with their own value.
         .with_deadline(Duration::from_secs(600))
+        // Hermetic for the same reason: the shipped stagger would add seconds to every ballot.
+        .with_stagger(Duration::ZERO)
     }
 
     fn task() -> CouncilTask {
@@ -920,6 +957,66 @@ mod tests {
         );
     }
 
+    /// Records when each seat's ballot was dispatched; every seat agrees, so one ballot ends it.
+    struct StartRecorder {
+        starts: Mutex<Vec<(String, Instant)>>,
+    }
+    impl Dispatcher for StartRecorder {
+        fn dispatch(&self, cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            self.starts
+                .lock()
+                .unwrap()
+                .push((cli.key.clone(), Instant::now()));
+            Some(vote(&cli.key, "1 — fits"))
+        }
+    }
+
+    #[test]
+    fn seat_spawns_are_staggered_not_simultaneous() {
+        // Operator ruling 2026-10-11: a council never forks its whole roster in one instant.
+        // Seat i opens its ballot no earlier than i x stagger after the ballot opened. Measured
+        // from one reference taken before the council is queued, and `sleep` never returns
+        // early, so the lower bounds hold however the scheduler orders the threads.
+        let stagger = Duration::from_millis(120);
+        let rec = Arc::new(StartRecorder {
+            starts: Mutex::new(Vec::new()),
+        });
+        let worker = worker_with(rec.clone(), &["a", "b", "c"]).with_stagger(stagger);
+        let opened = Instant::now();
+        let id = worker.queue_blocking(task());
+        assert_eq!(worker.poll(&id).expect("status").state, TaskState::Voted);
+
+        let starts = rec.starts.lock().unwrap().clone();
+        assert_eq!(starts.len(), 3, "one ballot, three seats: {starts:?}");
+        let at = |k: &str| starts.iter().find(|(c, _)| c == k).expect(k).1;
+        assert!(at("b").duration_since(opened) >= stagger, "{starts:?}");
+        assert!(at("c").duration_since(opened) >= stagger * 2, "{starts:?}");
+    }
+
+    #[test]
+    fn the_stagger_spread_is_capped_however_large_the_setting() {
+        // 9 seats x 30 s would start the last seat 240 s late, past the 180 s deadline.
+        for seats in 0..=9usize {
+            for ms in [0u64, 3_000, 30_000] {
+                let eff = effective_stagger(Duration::from_millis(ms), seats);
+                let gaps = seats.saturating_sub(1) as u32;
+                assert!(
+                    eff <= Duration::from_millis(ms),
+                    "never larger than the setting"
+                );
+                assert!(
+                    eff * gaps <= MAX_STAGGER_SPREAD,
+                    "{seats} seats, {ms} ms: {eff:?}"
+                );
+            }
+        }
+        // The shipped default on the shipped size is untouched.
+        assert_eq!(
+            effective_stagger(Duration::from_millis(3_000), 3),
+            Duration::from_millis(3_000)
+        );
+    }
+
     /// Panics on one named seat; every other seat votes.
     struct PanickingSeatDispatcher {
         victim: String,
@@ -983,7 +1080,8 @@ mod tests {
             "general",
         )
         // Hermetic against an exported WICKED_COUNCIL_DEADLINE_SECS, like `worker_with_parts`.
-        .with_deadline(Duration::from_secs(600));
+        .with_deadline(Duration::from_secs(600))
+        .with_stagger(Duration::ZERO);
         let id = worker.queue_blocking(task());
         worker.poll(&id).expect("the council must still resolve");
 

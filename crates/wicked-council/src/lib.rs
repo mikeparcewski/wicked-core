@@ -29,6 +29,7 @@
 pub mod bus;
 pub mod dispatch;
 pub mod ids;
+pub mod pick;
 pub mod probe;
 pub mod registry;
 pub mod store;
