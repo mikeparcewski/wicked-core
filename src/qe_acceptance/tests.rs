@@ -238,6 +238,32 @@ fn the_decision_words_name_the_score_and_the_line() {
     );
 }
 
+/// wicked-crew#951: the run's QE ledger is `<evidence root>/.wicked-qe` — outside every worktree —
+/// and a run without an evidence root (or a blank one) has none; only a unit carrying the root is
+/// handed `WICKED_QE_LEDGER_DIR`.
+#[test]
+fn the_run_qe_ledger_root_is_the_evidence_roots_ledger_and_rides_only_its_unit() {
+    let mut s = session(requiring());
+    assert_eq!(ledger_root(&s), None, "no evidence root, no QE ledger root");
+    s.evidence_root = Some("  ".into());
+    assert_eq!(ledger_root(&s), None, "a blank evidence root is none");
+    s.evidence_root = Some("/home/u/.wicked/walkthroughs/run-1".into());
+    assert_eq!(
+        ledger_root(&s),
+        Some(Path::new("/home/u/.wicked/walkthroughs/run-1").join(".wicked-qe"))
+    );
+    let mut u = qe_unit(4);
+    assert!(ledger_env(&u).is_empty(), "no root, no variable");
+    u.qe_ledger_root = Some("/e/.wicked-qe".into());
+    assert_eq!(
+        ledger_env(&u),
+        vec![(
+            "WICKED_QE_LEDGER_DIR".to_string(),
+            "/e/.wicked-qe".to_string()
+        )]
+    );
+}
+
 #[test]
 fn the_prompt_directive_says_run_or_do_not_run() {
     let mut q = waived_at(4);
@@ -246,6 +272,11 @@ fn the_prompt_directive_says_run_or_do_not_run() {
     let line = directive(&q, "wicked-garden:qe");
     assert!(
         line.contains("\"wicked-garden:qe\" accept") && line.contains("WICKED_RUN_ID"),
+        "{line}"
+    );
+    // (wicked-crew#951) …and names the ledger root it is handed, outside the worktree.
+    assert!(
+        line.contains("$WICKED_QE_LEDGER_DIR") && line.contains("outside the worktree"),
         "{line}"
     );
     q.status = a::QE_SKIPPED.into();

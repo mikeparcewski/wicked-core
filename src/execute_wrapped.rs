@@ -2399,6 +2399,9 @@ impl WrappedCliStepRunner {
                     .and_then(|g| g.project_id.as_deref()),
             );
             stamp_run_markers(&mut cmd, &provenance);
+            // (wicked-crew#951) The QE unit is handed its run's QE ledger root (outside the tree),
+            // stamped the same way: garden's `qe accept` records its verdict there.
+            stamp_run_markers(&mut cmd, &crate::qe_acceptance::ledger_env(&input.unit));
             // D-7 (DES-L4 PR-⑦): garden's estate shim spawns `wicked-estate-mcp --readonly` by
             // default on EVERY wrapped worker — the read-only default the deleted CLI-registered MCP
             // used to carry as a process flag now rides garden's own env contract; the fence's
@@ -2478,9 +2481,9 @@ impl WrappedCliStepRunner {
                 // repo-graph key dir). An unjoinable root arms an EMPTY list: the hook then
                 // refuses every fenced write (fail closed) rather than judging a partial list.
                 if write_posture.fences_writes() {
-                    let roots = crate::write_posture::admitted_roots(
+                    let roots = crate::write_posture::unit_admitted_roots(
                         write_posture,
-                        input.unit.notes_root.as_deref(),
+                        &input.unit,
                         &g.extra_write_roots,
                     );
                     let joined = crate::write_posture::deliverable_roots_env(&roots)
@@ -6949,6 +6952,57 @@ mod tests {
             out.output.contains("SEEN=[UNSET]"),
             "the worker must not inherit an estate store from the environment; got: {}",
             out.output
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// wicked-crew#951: the run's QE unit is handed its QE ledger root (`WorkUnit::qe_ledger_root`,
+    /// outside the tree) as `WICKED_QE_LEDGER_DIR` on its OWN worker environment, so garden's
+    /// `qe accept` (wicked-ledger's `resolveLedgerRoot`) records the verdict there instead of in the
+    /// worktree the guard restores; a unit without one is handed nothing. A real child records
+    /// what it saw. Mutation: drop the `ledger_env` stamp → the first assert reads `UNSET`.
+    #[cfg(unix)]
+    #[test]
+    fn the_qe_unit_worker_is_handed_its_run_qe_ledger_root() {
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("wicked-qe-ledger-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join("probe.sh");
+        std::fs::write(&probe, "echo \"SEEN=[${WICKED_QE_LEDGER_DIR:-UNSET}]\"\n").unwrap();
+        let ledger = dir.join("evidence").join(".wicked-qe");
+        let run = |qe_root: Option<&std::path::Path>| {
+            let mut u = WorkUnit::pending("s:u4", "s", 4, "verify it");
+            u.assigned_cli = Some("probe".to_string());
+            u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
+            u.qe_ledger_root = qe_root.map(|p| p.to_string_lossy().into_owned());
+            let input = StepInput {
+                run_id: "run-qe-ledger".to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-x".to_string(),
+                entity_mode: crate::scope::EntityMode::Shared,
+                workdir: Some(dir.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            };
+            WrappedCliStepRunner::default().run_unit(&input).output
+        };
+        let seen = run(Some(&ledger));
+        assert!(
+            seen.contains(&format!("SEEN=[{}]", ledger.display())),
+            "the QE unit's worker must see its run's QE ledger root; got: {seen}"
+        );
+        let _none = VarGuard::unset(crate::qe_acceptance::LEDGER_DIR_ENV);
+        let seen = run(None);
+        assert!(
+            seen.contains("SEEN=[UNSET]"),
+            "a unit with no QE ledger root is handed none; got: {seen}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

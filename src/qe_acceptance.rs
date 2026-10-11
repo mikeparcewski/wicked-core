@@ -24,6 +24,38 @@ use crate::assurance::{self as a, QeAcceptance};
 use crate::domain::{AgentSession, WorkUnit};
 use crate::review_scale::{self as rs, ChangeSignals, Graph};
 
+/// (wicked-crew#951) The variable that hands the QE unit its run's QE ledger root — the one
+/// wicked-ledger's `resolveLedgerRoot` (>= 0.6.0), garden's QE runner and crew's acceptance
+/// reader all honour (an absolute value IS the root).
+pub(crate) const LEDGER_DIR_ENV: &str = "WICKED_QE_LEDGER_DIR";
+
+/// The ledger dirname under the run's evidence root — the wire contract's own name, so the run's
+/// ledger reads like any repo's (`<base>/.wicked-qe`).
+pub(crate) const LEDGER_DIRNAME: &str = ".wicked-qe";
+
+/// (wicked-crew#951) The run's QE LEDGER ROOT: `<session.evidence_root>/.wicked-qe`. The evidence
+/// root is minted per repo-bound run by the launcher OUTSIDE every worktree and state home, so a
+/// verdict recorded here is never in the tree the worktree guard protects (which discarded it,
+/// with the PASS, when the QE seat wrote `<worktree>/.wicked-qe`), never swept into the PR, and
+/// is exactly where crew's acceptance check reads this run's verdict. `None` for a run without an
+/// evidence root (the QE seat then gets no root and its verdict cannot satisfy delivery).
+pub(crate) fn ledger_root(session: &AgentSession) -> Option<std::path::PathBuf> {
+    session
+        .evidence_root
+        .as_deref()
+        .filter(|r| !r.trim().is_empty())
+        .map(|r| Path::new(r).join(LEDGER_DIRNAME))
+}
+
+/// The worker variable a unit carrying a QE ledger root is handed (both carriers stamp it beside
+/// the run markers); empty for every other unit.
+pub(crate) fn ledger_env(unit: &WorkUnit) -> Vec<(String, String)> {
+    unit.qe_ledger_root
+        .as_ref()
+        .map(|root| vec![(LEDGER_DIR_ENV.to_string(), root.clone())])
+        .unwrap_or_default()
+}
+
 /// At most this many touched paths have their history read (each is one `git rev-list`).
 const HISTORY_PATH_CAP: usize = 50;
 
@@ -338,8 +370,9 @@ pub(crate) fn directive(qe: &QeAcceptance, skill: &str) -> String {
         a::QE_REQUIRED => format!(
             " QE ACCEPTANCE IS REQUIRED: run \"{skill}\" accept (writer, executor, isolated \
              reviewer) on a scenario written from this run's acceptance list, so its verdict \
-             lands in the QE ledger stamped with WICKED_RUN_ID; delivery is refused without a \
-             PASS."
+             lands in the QE ledger stamped with WICKED_RUN_ID; that ledger is \
+             ${LEDGER_DIR_ENV}, outside the worktree (never write .wicked-qe into the tree); \
+             delivery is refused without a PASS."
         ),
         a::QE_WAIVED => {
             " QE acceptance is waived for this run (impact score in the lowest band); do not run \
