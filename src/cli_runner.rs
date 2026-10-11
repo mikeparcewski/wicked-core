@@ -1559,8 +1559,16 @@ fn run_unit_and_judge_on(
             // (#539) Pre-check: only run the judge when an identity-distinct seat exists.
             // Without this check, agent_validate falls back to the single default runner — a
             // self-grade when the creator is claude. Mirror the default-floor path (F-7R2-005).
+            // When only outside seats could ever judge, the bench is read against the run's OWN
+            // pre-bench pool (the pre-#893 meaning): an outside seat benched by an earlier unit
+            // leaves the skip below, never a seat-failure pause (codex r1 on #895).
+            let bench_pool: &[crate::AgenticCli] = if outside_only {
+                &unbenched_run
+            } else {
+                &unbenched
+            };
             if let Some(v) =
-                benched_judge_unavailable("agent validator", &excluded, roster, &unbenched, benched)
+                benched_judge_unavailable("agent validator", &excluded, roster, bench_pool, benched)
             {
                 break 'pinned Some(v);
             }
