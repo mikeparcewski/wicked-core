@@ -306,6 +306,15 @@ pub struct PollStatus {
 /// Free function (not a method) so it owns only the cloned handles, never `&self` —
 /// reinforcing that no part of this needs the requesting agent.
 #[allow(clippy::too_many_arguments)]
+/// The stagger a ballot of `seats` actually uses: the setting, shrunk so the last seat starts at
+/// most [`MAX_STAGGER_SPREAD`] after the first.
+fn effective_stagger(stagger: Duration, seats: usize) -> Duration {
+    match u32::try_from(seats.saturating_sub(1)) {
+        Ok(gaps) if gaps > 0 => stagger.min(MAX_STAGGER_SPREAD / gaps),
+        _ => stagger,
+    }
+}
+
 fn run_council(
     ledger: &Ledger,
     // `Sync` because seats are dispatched concurrently; the `Worker` already holds it as
@@ -338,11 +347,7 @@ fn run_council(
     // body. MAX_BALLOTS caps the loop; the final ballot's plurality stands regardless.
     // The stagger never spreads one ballot's spawns over more than MAX_STAGGER_SPREAD, however
     // large the roster and the setting (codex r1: 9 seats x 30 s would outlast the deadline).
-    let stagger = if roster.len() > 1 {
-        stagger.min(MAX_STAGGER_SPREAD / (roster.len() as u32 - 1))
-    } else {
-        stagger
-    };
+    let stagger = effective_stagger(stagger, roster.len());
     let mut ballot: u32 = 1;
     let mut prior_tally: Vec<(String, u32)> = Vec::new();
     let mut dissent_arguments: Vec<String> = Vec::new();
@@ -990,18 +995,25 @@ mod tests {
 
     #[test]
     fn the_stagger_spread_is_capped_however_large_the_setting() {
-        // 4 seats x 30 s would start the last seat 90 s late; the spread is capped instead.
-        let rec = Arc::new(StartRecorder {
-            starts: Mutex::new(Vec::new()),
-        });
-        let worker =
-            worker_with(rec.clone(), &["a", "b", "c", "d"]).with_stagger(Duration::from_secs(30));
-        let opened = Instant::now();
-        worker.queue_blocking(task());
-        let elapsed = opened.elapsed();
-        assert!(
-            elapsed >= MAX_STAGGER_SPREAD && elapsed < MAX_STAGGER_SPREAD * 2,
-            "{elapsed:?}"
+        // 9 seats x 30 s would start the last seat 240 s late, past the 180 s deadline.
+        for seats in 0..=9usize {
+            for ms in [0u64, 3_000, 30_000] {
+                let eff = effective_stagger(Duration::from_millis(ms), seats);
+                let gaps = seats.saturating_sub(1) as u32;
+                assert!(
+                    eff <= Duration::from_millis(ms),
+                    "never larger than the setting"
+                );
+                assert!(
+                    eff * gaps <= MAX_STAGGER_SPREAD,
+                    "{seats} seats, {ms} ms: {eff:?}"
+                );
+            }
+        }
+        // The shipped default on the shipped size is untouched.
+        assert_eq!(
+            effective_stagger(Duration::from_millis(3_000), 3),
+            Duration::from_millis(3_000)
         );
     }
 

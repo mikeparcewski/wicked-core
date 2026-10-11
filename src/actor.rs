@@ -2870,9 +2870,13 @@ pub(crate) fn run(
                         clis.into_iter()
                             .filter(|c| !session.benched_seats.iter().any(|b| b.cli == c.key))
                             .filter(|c| {
+                                // By CLI key: a run configured `codex#2` keeps the `codex`
+                                // ballot record the registry hands (codex r2).
                                 session.clis.is_empty()
                                     || !c.seat_eligible_for_work
-                                    || roster.iter().any(|k| k == &c.key)
+                                    || roster
+                                        .iter()
+                                        .any(|k| wicked_apps_core::spawn::seat_cli_key(k) == c.key)
                             })
                             .collect()
                     }

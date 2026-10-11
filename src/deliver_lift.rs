@@ -803,11 +803,8 @@ pub(crate) fn delivery_receipt(
     // held): those rulings land on the step's review record, not on a gate receipt (codex r1).
     for u in units {
         if let Some(m) = u.member_step.as_ref() {
-            for d in m.reviews.iter().filter_map(|x| x.dispute.clone()) {
-                if !r.councils.contains(&d) {
-                    r.councils.push(d);
-                }
-            }
+            r.councils
+                .extend(m.reviews.iter().filter_map(|x| x.dispute.clone()));
         }
     }
     r.tree = session.verified_tree.clone();

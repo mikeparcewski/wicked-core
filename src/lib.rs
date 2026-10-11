@@ -2214,9 +2214,14 @@ mod tests {
                 ["a", "b", "c", "d", "e"].iter().map(|k| seat(k)).collect(),
             )
             .expect("the council rules");
-        // The CI environment exports no WICKED_COUNCIL_SIZE, so the shipped default (3) holds.
-        assert_eq!(calls.load(Ordering::SeqCst), 3, "three ballots, not five");
-        assert_eq!(verdict.seated, 3);
+        // The configured size (the shipped default, 3, when nothing is exported), never all five.
+        let size = wicked_council::pick::council_size().min(5);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            size,
+            "{size} ballots, not five"
+        );
+        assert_eq!(verdict.seated as usize, size);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
