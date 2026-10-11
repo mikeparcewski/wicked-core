@@ -239,6 +239,18 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.9.3** — 2026-10-11 — npm release on main, carrying #886 and #890 (with #888 and #889,
+  already in 0.9.2). **#886**: the `learn` built-in preset — learn a topic or event into the repository
+  as knowledge. **#890 + this release**: wicked-estate 0.28.0 -> 0.29.1 (`--readonly` creates no store,
+  wicked-crew#931; Working-tier TTL and consolidation; 0.29.1 fixes a consolidation scope leak in 0.29.0).
+- **core-ts 0.9.2** — 2026-10-11 — npm release from `release-0.9.x` (main 4a4d396 + #888), carrying #884, #885,
+  #888 and #889 (and NOT #890: estate 0.29.0 waits for 0.29.1, which fixes a consolidation scope leak).
+  **#889 (wicked-crew#951, #881)**: the QE unit runs garden's pipeline into its own roots (the
+  deliverable-roots posture), so a fenced QE seat can finish its verdict. **#888**: a council seats
+  `WICKED_COUNCIL_SIZE` members (default 3) drawn at random from the eligible seats with a recorded seed,
+  spawns are staggered (`WICKED_COUNCIL_SPAWN_STAGGER_MS`), and the receipt carries the seats and seed.
+  **#884**: wicked-estate 0.27.0 -> 0.28.0 (Lineage/BlastRadius paging). **#885** (CI only): a maintenance release below npm's
+  `latest` publishes under `release-<major>.<minor>`.
 - **core-ts 0.9.1** — 2026-10-11 — npm release on main d74c35b, carrying #880 and #878 on the 0.9 line.
   **#878 (wicked-crew#951)**: the QE unit records its verdict in the run's own ledger
   (`WICKED_QE_LEDGER_DIR=<evidence root>/.wicked-qe`, admitted at the worker boundary), the same fix
