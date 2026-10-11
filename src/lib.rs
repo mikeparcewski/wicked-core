@@ -2140,6 +2140,85 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Operator ruling 2026-10-11 — the council size is a system setting (default 3), so a
+    /// dispute handed five eligible seats ballots three of them, not all five. Driven through the
+    /// unchanged public entry point, so it is red on an engine that seats every handed seat.
+    #[test]
+    fn a_council_seats_the_configured_size_not_every_eligible_seat() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
+        use wicked_council::CouncilTask;
+        struct Counts(Arc<AtomicUsize>);
+        impl Dispatcher for Counts {
+            fn dispatch(&self, cli: &AgenticCli, _t: &CouncilTask) -> Option<Vote> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Some(Vote {
+                    cli: cli.key.clone(),
+                    recommendation: "2 — the refutation holds".into(),
+                    top_risk: "none".into(),
+                    change_my_mind: "no".into(),
+                    disqualifier: None,
+                    confidence: Confidence::default(),
+                    provenance: "stub".into(),
+                })
+            }
+        }
+        let seat = |key: &str| AgenticCli {
+            key: key.into(),
+            display_name: key.into(),
+            binary: "unused".into(),
+            headless_invocation: "unused {PROMPT}".into(),
+            category: Category::default(),
+            input_mode: InputMode::default(),
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::default(),
+            enabled_for_council: true,
+            seat_eligible_for_work: true,
+            acp: None,
+            capabilities: None,
+            login_invocation: None,
+            logout_invocation: None,
+            governance_class: None,
+            credential: None,
+            free_tier: None,
+            health: None,
+        };
+        struct NoRun;
+        impl crate::workflow::StepRunner for NoRun {
+            fn run_unit(&self, _i: &crate::workflow::StepInput) -> crate::workflow::StepOutput {
+                unreachable!("no unit runs in a decision council")
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("wcore-council-size-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let core = Core::spawn_with_engine(
+            dir.join("core.db").to_str().unwrap(),
+            Arc::new(Counts(calls.clone())),
+            Arc::new(NoRun),
+        );
+        let verdict = core
+            .convene_decision(
+                DecisionRequest {
+                    session_id: "run-size".into(),
+                    ord: 1,
+                    question: "Is the finding at src/a.rs:10 a defect?".into(),
+                    options: vec!["Monitor: yes".into(), "Worker: no".into()],
+                    evidence: "src/a.rs:10".into(),
+                },
+                ["a", "b", "c", "d", "e"].iter().map(|k| seat(k)).collect(),
+            )
+            .expect("the council rules");
+        // The CI environment exports no WICKED_COUNCIL_SIZE, so the shipped default (3) holds.
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "three ballots, not five");
+        assert_eq!(verdict.seated, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 // ── Test-harness hygiene (core#311) — the LIB test binary's pre-main arming ──────────────────
