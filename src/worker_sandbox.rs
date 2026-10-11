@@ -696,14 +696,15 @@ pub(crate) mod tests {
         let planted = base.join("evidence").join(".wicked-qe");
         std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&sibling, &planted).unwrap();
-        let b = repo_boundary(&own, &[planted.clone()]).expect("a linked worktree has a boundary");
+        let b = repo_boundary(&own, std::slice::from_ref(&planted))
+            .expect("a linked worktree has a boundary");
         let sibling_real = sibling.canonicalize().unwrap();
         assert!(
             !b.admitted.contains(&sibling_real),
             "a planted link must not admit the sibling worktree: {:?}",
             b.admitted
         );
-        let b = repo_boundary(&own, &[sibling.clone()]).expect("a boundary");
+        let b = repo_boundary(&own, std::slice::from_ref(&sibling)).expect("a boundary");
         assert!(
             b.admitted.contains(&sibling_real),
             "a real root inside the clone is still admitted (the check is the link, not the place)"
