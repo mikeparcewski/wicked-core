@@ -1018,7 +1018,24 @@ fn author_identities(excluded: &[&str], registry: &[crate::AgenticCli]) -> Vec<S
     excluded
         .iter()
         .map(|k| crate::validator::excluded_identity(k, registry))
-        .filter(|id| !excluded.contains(&id.as_str()))
+        .collect()
+}
+
+/// `seats` minus every seat that is not itself an author key but invokes an author's binary
+/// (`author_ids`, resolved against the full registry). The authors' own seats stay: the rotation
+/// anchors on them and excludes them by identity itself.
+fn without_author_binaries(
+    seats: &[crate::AgenticCli],
+    excluded: &[&str],
+    author_ids: &[String],
+) -> Vec<crate::AgenticCli> {
+    seats
+        .iter()
+        .filter(|c| {
+            excluded.contains(&c.key.as_str())
+                || !author_ids.contains(&crate::validator::seat_identity(c))
+        })
+        .cloned()
         .collect()
 }
 
@@ -1501,11 +1518,13 @@ fn run_unit_and_judge_on(
                 vec![crate::validator::DETERMINISTIC_VALIDATOR_SEAT, work_author];
             excluded.extend(team_excluded.iter().map(String::as_str));
             // The authors' invocation identities, resolved against the FULL registry before any
-            // bench/health filter: a benched creator alias must not leave its binary looking
-            // distinct on an outside seat (codex r1 on #893).
+            // bench/health filter, drop every other seat sharing one: a benched creator alias must
+            // not leave its binary looking distinct on another seat (codex r1/r2 on #893).
             let author_ids = author_identities(&excluded, roster);
-            excluded.extend(author_ids.iter().map(String::as_str));
-            let roster = judge_roster(&excluded, &eligible_configured, &eligible);
+            let eligible_x = without_author_binaries(&eligible, &excluded, &author_ids);
+            let configured_x =
+                without_author_binaries(&eligible_configured, &excluded, &author_ids);
+            let roster = judge_roster(&excluded, &configured_x, &eligible_x);
             // (#539) Pre-check: only run the judge when an identity-distinct seat exists.
             // Without this check, agent_validate falls back to the single default runner — a
             // self-grade when the creator is claude. Mirror the default-floor path (F-7R2-005).
@@ -1593,11 +1612,13 @@ fn run_unit_and_judge_on(
             let mut excluded: Vec<&str> = vec![work_author];
             excluded.extend(team_excluded.iter().map(String::as_str));
             // The authors' invocation identities, resolved against the FULL registry before any
-            // bench/health filter: a benched creator alias must not leave its binary looking
-            // distinct on an outside seat (codex r1 on #893).
+            // bench/health filter, drop every other seat sharing one: a benched creator alias must
+            // not leave its binary looking distinct on another seat (codex r1/r2 on #893).
             let author_ids = author_identities(&excluded, roster);
-            excluded.extend(author_ids.iter().map(String::as_str));
-            let roster = judge_roster(&excluded, &eligible_configured, &eligible);
+            let eligible_x = without_author_binaries(&eligible, &excluded, &author_ids);
+            let configured_x =
+                without_author_binaries(&eligible_configured, &excluded, &author_ids);
+            let roster = judge_roster(&excluded, &configured_x, &eligible_x);
             if let Some(v) =
                 benched_judge_unavailable("default judge", &excluded, roster, &unbenched, benched)
             {
@@ -5149,16 +5170,51 @@ mod tests {
             .filter(|c| run.contains(&c.key))
             .cloned()
             .collect();
-        let mut excluded: Vec<&str> = vec!["writer", "pi"];
+        let excluded: Vec<&str> = vec!["writer", "pi"];
         let ids = author_identities(&excluded, &reg);
-        excluded.extend(ids.iter().map(String::as_str));
         let keys = crate::validator::distinct_judge_keys(
             &excluded,
-            judge_roster(&excluded, &configured, &eligible),
+            judge_roster(
+                &excluded,
+                &without_author_binaries(&configured, &excluded, &ids),
+                &without_author_binaries(&eligible, &excluded, &ids),
+            ),
         );
         assert!(
             keys.is_empty(),
             "the creator's binary never judges: {keys:?}"
+        );
+
+        // (codex r2) A registry KEY that collides with an author's identity (`codex` invokes pi)
+        // must not redirect the exclusion: `codex-secondary` invokes the benched creator's binary.
+        let reg2 = [
+            seat("writer", "codex exec {PROMPT}"),
+            seat("codex", "pi -p {PROMPT}"),
+            seat("codex-secondary", "codex exec {PROMPT}"),
+            seat("pi", "pi -p {PROMPT}"),
+        ];
+        let eligible2: Vec<crate::AgenticCli> = judge_pool(&reg2, &run)
+            .into_iter()
+            .filter(|c| !bench.contains(&c.key))
+            .cloned()
+            .collect();
+        let configured2: Vec<crate::AgenticCli> = eligible2
+            .iter()
+            .filter(|c| run.contains(&c.key))
+            .cloned()
+            .collect();
+        let ids2 = author_identities(&excluded, &reg2);
+        let keys2 = crate::validator::distinct_judge_keys(
+            &excluded,
+            judge_roster(
+                &excluded,
+                &without_author_binaries(&configured2, &excluded, &ids2),
+                &without_author_binaries(&eligible2, &excluded, &ids2),
+            ),
+        );
+        assert!(
+            !keys2.iter().any(|k| k == "codex-secondary"),
+            "the creator's binary never judges: {keys2:?}"
         );
     }
 }
