@@ -12721,22 +12721,27 @@ fn rewind_to_creator_scoped(
     let failed_tool_unit = cursor.tool_cmd.is_some()
         && cursor.status == crate::domain::UnitStatus::Rejected
         && command_failed;
-    // (DES-learn-workflow §3.1, F-LEARN-2) A CONVERSATION: at the gate after a step that ran and
-    // is not a Tool, with no creator anywhere before it (learn's walkthrough), "send back" is a
-    // follow-up question to THAT step: it re-runs with the operator's note and the turns so far,
-    // and its gate returns. Before this, the same send-back was refused ("no creator phase
-    // precedes"), so the change only opens a path that had none.
+    // (DES-learn-workflow §3.1, F-LEARN-2) A CONVERSATION: at the gate BETWEEN steps — the cursor
+    // has not run yet, so the work under review is the step before it — when that step ran, is not
+    // a Tool and is not a creator, and no creator precedes it (learn's walkthrough), "send back" is
+    // a follow-up question to THAT step: it re-runs with the operator's note and the turns so far,
+    // and its own gate returns. Before this, the send-back was refused ("no creator phase
+    // precedes") or re-ran a creator that had not run yet with the question as its instruction.
     let conversation_ix = (scope == "request_changes"
-        && cursor.role != crate::workflow::PhaseRole::Creator
-        && !failed_tool_unit
-        && crate::pipeline::most_recent_prior_creator(&units, cursor.ord).is_none())
-    .then(|| cursor_ix.checked_sub(1))
-    .flatten()
-    .filter(|&i| {
-        units[i].tool_cmd.is_none()
-            && units[i].role != crate::workflow::PhaseRole::Creator
-            && units[i].status == crate::domain::UnitStatus::Done
-    });
+        && cursor.last_attempt.is_none()
+        && matches!(
+            cursor.status,
+            crate::domain::UnitStatus::Pending | crate::domain::UnitStatus::Distributed
+        )
+        && !failed_tool_unit)
+        .then(|| cursor_ix.checked_sub(1))
+        .flatten()
+        .filter(|&i| {
+            units[i].tool_cmd.is_none()
+                && units[i].role != crate::workflow::PhaseRole::Creator
+                && units[i].status == crate::domain::UnitStatus::Done
+                && crate::pipeline::most_recent_prior_creator(&units, units[i].ord).is_none()
+        });
     let target_ix = if let Some(i) = conversation_ix {
         i
     } else if cursor.role == crate::workflow::PhaseRole::Creator || failed_tool_unit {
