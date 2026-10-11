@@ -2224,6 +2224,16 @@ fn agent_verdict_denial(
     match crate::validator::combine_verdict(true, Some(verdict)) {
         crate::validator::GateVerdict::Approve => None,
         crate::validator::GateVerdict::Reject => Some(match &verdict.seat_failure {
+            // (operator ruling, revised) The judge ANSWERED without a verdict: a human decides,
+            // with the answer in the details. Not benched, not a REJECT (codex r1 #3 on #902).
+            Some(failures) if failures.contains(crate::validator::JUDGE_NO_VERDICT) => (
+                crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE,
+                format!(
+                    "{failures}: the judge answered without a PASS/REJECT verdict, so a human \
+                     decides — nothing is benched and the work is not rejected. {}",
+                    verdict.reasoning
+                ),
+            ),
             Some(failures) => (
                 crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE,
                 format!(

@@ -1730,6 +1730,20 @@ impl AgentVerdict {
     /// pre-#772 shape (`"{who} errored (fail-closed): {e}"`). `who` names the judge for the
     /// record ("agent validator" / "default judge").
     pub(crate) fn from_judge_error(who: &str, e: anyhow::Error) -> Self {
+        // (operator ruling, revised) A verdict-less answer: no verdict, not a REJECT — the gate
+        // escalates `judge_unavailable` with the judge's raw answer behind details.
+        if let Some(nv) = e.downcast_ref::<JudgeNoVerdict>() {
+            return AgentVerdict {
+                pass: false,
+                reasoning: format!(
+                    "{who}: {JUDGE_NO_VERDICT} — the judge's answer:\n{}",
+                    nv.raw
+                ),
+                judge_cli: None,
+                judge_distinct: None,
+                seat_failure: Some(format!("{} ({JUDGE_NO_VERDICT})", nv.seat)),
+            };
+        }
         match e.downcast_ref::<JudgeUnavailable>() {
             Some(u) => AgentVerdict {
                 pass: false,
@@ -1780,6 +1794,37 @@ impl std::fmt::Display for JudgeUnavailable {
 
 impl std::error::Error for JudgeUnavailable {}
 
+/// (operator ruling 2026-10-11, revised) A judge seat that RAN and answered without a PASS/REJECT
+/// verdict. No other judge is asked — re-asking until one says PASS is verdict-shopping — and it is
+/// never booked as a REJECT: the gate escalates `judge_unavailable` ("judge gave no verdict") with
+/// the raw answer for the human to read, and the seat is not benched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JudgeNoVerdict {
+    pub seat: String,
+    /// The judge's own answer, bounded.
+    pub raw: String,
+}
+
+/// The reason a verdict-less judge answer escalates with.
+pub const JUDGE_NO_VERDICT: &str = "judge gave no verdict";
+
+impl std::fmt::Display for JudgeNoVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{JUDGE_NO_VERDICT} (seat {})", self.seat)
+    }
+}
+
+impl std::error::Error for JudgeNoVerdict {}
+
+/// [`JudgeNoVerdict`] for `seat`'s answer `out`, the answer bounded for the gate's details.
+fn no_verdict_error(seat: &str, out: &str) -> anyhow::Error {
+    JudgeNoVerdict {
+        seat: seat.to_string(),
+        raw: out.trim().chars().take(4000).collect(),
+    }
+    .into()
+}
+
 /// (core#772) Is this judge ANSWER a seat failure rather than a verdict? A seat that ran, exited 0
 /// and printed a provider refusal — copilot's `Error: You have exceeded your monthly quota`, a
 /// `Not logged in` line, a host-forced approval refusal — has not judged anything; nor has one
@@ -1803,8 +1848,11 @@ fn judge_refusal_text(output: &str) -> &str {
 /// Whether a judge answer names a verdict word (`PASS` / `REJECT`) on any line: a seat that did
 /// has ANSWERED, and its words are parsed fail-closed by `parse_agent_verdict`.
 pub(crate) fn names_a_verdict(output: &str) -> bool {
+    // A STATED verdict: a line whose FIRST token is the keyword (the contract line
+    // `parse_agent_verdict` reads). A keyword inside prose ("the tests pass, but…") is not one
+    // (codex r1 #1 on #902).
     output.lines().any(|l| {
-        l.split_whitespace().any(|t| {
+        l.split_whitespace().next().is_some_and(|t| {
             let t = t
                 .trim_matches(|c: char| !c.is_alphanumeric())
                 .to_uppercase();
@@ -1812,10 +1860,6 @@ pub(crate) fn names_a_verdict(output: &str) -> bool {
         })
     })
 }
-
-/// (operator ruling 2026-10-11) The bench reason token for a judge seat whose answer named no
-/// verdict.
-pub(crate) const JUDGE_NO_VERDICT_REASON: &str = "no_verdict";
 
 /// (core#772) The refusal text reported for a judge seat that exited clean and printed NOTHING.
 pub(crate) const JUDGE_EMPTY_ANSWER: &str = "(judge seat answered nothing: empty output)";
@@ -1868,7 +1912,8 @@ pub(crate) fn judge_seat_refusal(output: &str) -> Option<String> {
             .chars()
             .take(160)
             .collect();
-        Some(format!("answered without a PASS/REJECT verdict: {head}"))
+        let _ = head;
+        None
     };
     // (codex r2) …and a provider refusal is SHORT: the CLI's one error line (a banner above it at
     // most). A longer verdict-less answer is the judge's own (malformed) prose — its verdict,
@@ -2260,6 +2305,11 @@ fn agent_validate_in(
                     refusals.push(format!("{} ({cause})", seat.key));
                     continue;
                 }
+                // The seat ANSWERED: no further judge is asked. Without a verdict word the answer
+                // escalates to the human — never a REJECT, never a re-ask (verdict-shopping).
+                if !names_a_verdict(&out.output) {
+                    return Err(no_verdict_error(&seat.key, &out.output));
+                }
                 return Ok(parse_agent_verdict(&out.output).judged_by(&seat.key, true));
             }
             // An operator stopped this run, or the seat burned its whole turn ceiling.
@@ -2332,6 +2382,9 @@ fn agent_validate_in(
             refusals: vec![format!("{DETERMINISTIC_VALIDATOR_SEAT} ({cause})")],
         }
         .into());
+    }
+    if !names_a_verdict(&out.output) {
+        return Err(no_verdict_error(DETERMINISTIC_VALIDATOR_SEAT, &out.output));
     }
     // The single-runner FALLBACK: the deterministic validator's own seat judged — prompt-only
     // independence, and the record says so (`judge_distinct = false`, core#431).
@@ -5278,14 +5331,12 @@ mod tests {
             calls: Mutex::new(0),
         };
         let r = agent_validate("c", "w", &[DETERMINISTIC_VALIDATOR_SEAT], &roster, &g);
-        assert!(
-            r.is_err(),
-            "no seat could judge — judge_unavailable, not a REJECT: {r:?}"
-        );
+        let e = r.expect_err("no verdict — escalates, never a REJECT");
+        assert!(e.downcast_ref::<JudgeNoVerdict>().is_some(), "{e:#}");
         assert_eq!(
             *g.calls.lock().unwrap(),
-            2,
-            "each distinct seat (agy, codex) asked once; none re-asked"
+            1,
+            "the seat ANSWERED: no other judge is asked (no verdict-shopping)"
         );
     }
 
@@ -5298,7 +5349,7 @@ mod tests {
     /// (reported for the bench), the next seat's real verdict decides — and with nobody left the
     /// call is `JudgeUnavailable` (the gate's explicit `judge_unavailable`), never a REJECT.
     #[test]
-    fn a_judge_answer_with_no_verdict_is_a_seat_that_could_not_judge_never_a_reject() {
+    fn a_negative_unlabelled_judge_answer_escalates_and_the_next_judge_is_never_asked() {
         use crate::workflow::{StepOutput, StepRunner};
         struct ProseFirst;
         impl StepRunner for ProseFirst {
@@ -5329,33 +5380,48 @@ mod tests {
             seat("opencode", "opencode run {PROMPT}"),
             seat("copilot", "copilot -p {PROMPT}"),
         ];
+        let asked = std::sync::Mutex::new(Vec::<String>::new());
+        struct Recording<'a>(&'a std::sync::Mutex<Vec<String>>);
+        impl StepRunner for Recording<'_> {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(input.unit.assigned_cli.clone().unwrap_or_default());
+                ProseFirst.run_unit(input)
+            }
+        }
         let (verdict, refused) = agent_validate_with_refusals(
             "c",
             "w",
             &[DETERMINISTIC_VALIDATOR_SEAT, "pi"],
             &roster,
-            &ProseFirst,
+            &Recording(&asked),
         );
-        let v = verdict.expect("the next seat judged");
-        assert!(v.pass, "copilot's real PASS decides: {v:?}");
-        assert_eq!(v.judge_cli.as_deref(), Some("copilot"));
-        assert_eq!(refused.len(), 1, "{refused:?}");
-        assert_eq!(refused[0].0, "opencode");
-        // Nobody but the prose seat: no verdict at all, never a fail-closed REJECT.
-        let only = vec![
-            seat("claude", "claude -p {PROMPT}"),
-            seat("pi", "pi run {PROMPT}"),
-            seat("opencode", "opencode run {PROMPT}"),
-        ];
-        let (verdict2, refused2) = agent_validate_with_refusals(
-            "c",
-            "w",
-            &[DETERMINISTIC_VALIDATOR_SEAT, "pi"],
-            &only,
-            &ProseFirst,
+        let e = verdict.expect_err("no verdict: escalate, never PASS by re-asking");
+        let nv = e
+            .downcast_ref::<JudgeNoVerdict>()
+            .expect("a JudgeNoVerdict");
+        assert_eq!(nv.seat, "opencode");
+        assert!(nv.raw.contains("looks reasonable"), "{}", nv.raw);
+        assert!(
+            refused.is_empty(),
+            "an answering seat is not benched: {refused:?}"
         );
-        assert!(verdict2.is_err(), "no seat could judge: {verdict2:?}");
-        assert_eq!(refused2.len(), 1);
+        assert_eq!(
+            asked.lock().unwrap().clone(),
+            vec!["opencode".to_string()],
+            "copilot (which would PASS) is never asked"
+        );
+        let v = AgentVerdict::from_judge_error("agent validator", e);
+        assert!(!v.pass && v.judge_cli.is_none());
+        assert!(
+            v.seat_failure
+                .as_deref()
+                .is_some_and(|f| f.contains(JUDGE_NO_VERDICT)),
+            "{v:?}"
+        );
+        assert!(v.reasoning.contains("looks reasonable"));
     }
 
     /// SEAT failure: reported for the bench (with the seat's own words), and the rotation moves
@@ -5580,8 +5646,10 @@ mod tests {
         // fails closed to REJECT as that seat's verdict, never rotated past.
         // (operator ruling 2026-10-11) A verdict-less answer is a seat that could not judge —
         // benched and rotated past, never a REJECT — and it is not called a sign-in refusal.
-        let c = judge_seat_refusal("The handler accepts unauthenticated requests.").unwrap();
-        assert!(c.contains("without a PASS/REJECT verdict"), "{c}");
+        assert!(
+            judge_seat_refusal("The handler accepts unauthenticated requests.").is_none(),
+            "a verdict-less finding is the seat's ANSWER (it escalates; it is not a refusal)"
+        );
         assert!(
             judge_seat_refusal("Error: authentication required").is_some(),
             "the same word in a CLI's error frame is a sign-in refusal"
@@ -5591,8 +5659,8 @@ mod tests {
                 "line one\nline two\nline three\n{}",
                 "Error: You have exceeded your monthly quota"
             ))
-            .is_some_and(|c| c.contains("without a PASS/REJECT verdict")),
-            "a long verdict-less answer is a seat that could not judge, not a quota refusal"
+            .is_none(),
+            "a long verdict-less answer is the judge's own answer, not a provider refusal"
         );
         assert!(
             judge_seat_refusal(
@@ -5606,8 +5674,8 @@ mod tests {
             "a generic quota WORD without the refusal frame is prose"
         );
         assert!(
-            judge_seat_refusal("I'm not sure, it depends").is_some(),
-            "a verdict-less answer is a seat that could not judge (release smoke S04)"
+            judge_seat_refusal("I'm not sure, it depends").is_none(),
+            "a verdict-less answer is the seat's answer — it escalates, it is never rotated past"
         );
         let cause = judge_seat_refusal("Error: You have exceeded your monthly quota").unwrap();
         assert!(
