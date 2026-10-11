@@ -239,6 +239,14 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.9.4** — 2026-10-11 — the train's final core-ts: npm release on main, carrying #893, #894,
+  #895, #896 and wicked-estate 0.29.2. **#893 + #894 + #895** (the editor E2E's `judge_unavailable`):
+  when the run's own seats are all parties, the judge pool reaches every other enabled seat (#893);
+  the default judge's pool is the run's own seats again (#894), and an all-refused outside judge falls
+  back to the pre-#893 skip (#895). **#896** (learn E2E F-LEARN-1): the `learn`
+  preset's author computes claim ids. **wicked-estate 0.29.1 -> 0.29.2** (estate#331): repair of
+  orphaned and scratch consolidation summaries, kind-based Working expiry, and K3, the knowledge
+  proposal type.
 - **core-ts 0.9.3** — 2026-10-11 — npm release on main, carrying #886 and #890 (with #888 and #889,
   already in 0.9.2). **#886**: the `learn` built-in preset — learn a topic or event into the repository
   as knowledge. **#890 + this release**: wicked-estate 0.28.0 -> 0.29.1 (`--readonly` creates no store,
