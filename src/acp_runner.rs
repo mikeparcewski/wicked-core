@@ -7539,7 +7539,10 @@ impl AcpStepRunner {
                         output_bytes: result.output.len(),
                     });
                 }
-                if wants_no_code || result.settled.is_some() {
+                // (wicked-crew#951) …and the QE unit's process: its env carries the run's QE ledger
+                // root, which no later unit may inherit through a cached process.
+                if wants_no_code || result.settled.is_some() || input.unit.qe_ledger_root.is_some()
+                {
                     // F-036 QUIESCE (adversarial review on #414): a NO-CODE unit's process — the
                     // bridge, the CLI it wraps and anything either backgrounded — dies with the
                     // unit, group and all, BEFORE this returns and the worker thread takes the

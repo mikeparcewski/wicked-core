@@ -8948,22 +8948,24 @@ fn dispatch_unit(
     // into the tree, with the PASS) and exactly where the launcher's acceptance check reads the
     // run's verdict. Like the notes root: it rides the unit (persisted, so a redrive keeps it),
     // widens THIS unit's write boundary below and reaches its worker as `WICKED_QE_LEDGER_DIR`.
-    // Created here so the boundary's containment check resolves a real directory.
-    let qe_ledger_root = crate::qe_acceptance::ledger_root(&session)
-        .filter(|_| crate::qe_acceptance::is_qe_unit(&unit) && session.workdir.is_some())
-        .and_then(|dir| match std::fs::create_dir_all(&dir) {
-            Ok(()) => Some(dir.to_string_lossy().into_owned()),
-            Err(e) => {
+    // Created and vouched for here (a plain directory directly under the evidence root, never a
+    // planted link), so the boundary's containment check resolves a real, expected directory.
+    let qe_ledger_root = if crate::qe_acceptance::is_qe_unit(&unit) && session.workdir.is_some() {
+        match crate::qe_acceptance::mint_ledger_root(&session) {
+            Some(Ok(dir)) => Some(dir.to_string_lossy().into_owned()),
+            Some(Err(why)) => {
                 eprintln!(
-                    "wicked-core: could not create the QE ledger root {} for unit {} of run \
-                     {run_id}: {e} — the unit runs without one (its verdict cannot satisfy \
-                     delivery)",
-                    dir.display(),
+                    "wicked-core: the QE ledger root for unit {} of run {run_id} is refused: \
+                     {why} — the unit runs without one (its verdict cannot satisfy delivery)",
                     unit.ord
                 );
                 None
             }
-        });
+            None => None,
+        }
+    } else {
+        None
+    };
     // (DES-L1 PR-1B) Record the attempt this dispatch mints ON the unit — `last_attempt` is the
     // unit's own dispatch history, so `next_attempt` stays fresh whatever the attempt's outcome
     // (a worker exit never reaches the fold's write) and `None` means exactly "never dispatched"

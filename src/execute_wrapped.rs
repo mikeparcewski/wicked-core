@@ -1834,6 +1834,7 @@ impl WrappedCliStepRunner {
                 Ok(check_scratch) => Some(NoCodeLaunchContext {
                     check_scratch,
                     notes_root: input.unit.notes_root.as_ref().map(PathBuf::from),
+                    qe_ledger_root: input.unit.qe_ledger_root.as_ref().map(PathBuf::from),
                 }),
                 Err(why) => return posture_refusal(input, &why),
             }
@@ -4248,6 +4249,9 @@ pub(crate) struct NoCodeLaunchContext {
     pub(crate) check_scratch: PathBuf,
     /// The unit's notes root (core#483), the one other writable place.
     pub(crate) notes_root: Option<PathBuf>,
+    /// (wicked-crew#951) The QE unit's run QE ledger root, added beside the notes root so codex's
+    /// sandbox lets `qe accept` record its verdict there (never the tree).
+    pub(crate) qe_ledger_root: Option<PathBuf>,
 }
 
 impl NoCodeLaunchContext {
@@ -4286,9 +4290,9 @@ impl NoCodeLaunchContext {
             .replace('\\', "\\\\")
             .replace('"', "\\\"");
         f.push(format!("sqlite_home=\"{state}\""));
-        if let Some(notes) = &self.notes_root {
+        for root in self.notes_root.iter().chain(self.qe_ledger_root.iter()) {
             f.push("--add-dir".to_string());
-            f.push(notes.to_string_lossy().into_owned());
+            f.push(root.to_string_lossy().into_owned());
         }
         f
     }
@@ -9630,6 +9634,8 @@ mod tests {
         let ctx = NoCodeLaunchContext {
             check_scratch: PathBuf::from("/w/checks/run-1/4-a0"),
             notes_root: Some(PathBuf::from("/w/notes/run-1/u4")),
+            // wicked-crew#951: the QE unit's run ledger is the other added dir.
+            qe_ledger_root: Some(PathBuf::from("/w/evidence/run-1/.wicked-qe")),
         };
         for template in [
             s(&[&codex, "exec", "--skip-git-repo-check", "the prompt"]),
@@ -9665,6 +9671,7 @@ mod tests {
                 "-c sandbox_workspace_write.exclude_tmpdir_env_var=true",
                 "-c sandbox_workspace_write.network_access=true",
                 "--add-dir /w/notes/run-1/u4",
+                "--add-dir /w/evidence/run-1/.wicked-qe",
             ] {
                 assert!(joined.contains(kv), "{kv}: {joined}");
             }
@@ -9760,6 +9767,7 @@ mod tests {
         let ctx = NoCodeLaunchContext {
             check_scratch: scratch.clone(),
             notes_root: None,
+            qe_ledger_root: None,
         };
         // spawn-audit: test-only — never spawned; only its env map is read.
         let mut cmd = Command::new("true");

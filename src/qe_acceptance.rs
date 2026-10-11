@@ -47,6 +47,39 @@ pub(crate) fn ledger_root(session: &AgentSession) -> Option<std::path::PathBuf> 
         .map(|r| Path::new(r).join(LEDGER_DIRNAME))
 }
 
+/// Create the run's QE ledger root at dispatch and VOUCH for it before any boundary is widened by
+/// it: a plain directory directly under the run's evidence root — never a planted link or a path
+/// that resolves elsewhere (the walkthrough proof root's rule; codex r1 on core#878). `None` for a
+/// run without an evidence root; `Some(Err(why))` when the root cannot be created or vouched for
+/// (the unit then runs without one, and its verdict cannot satisfy delivery — fail closed).
+pub(crate) fn mint_ledger_root(
+    session: &AgentSession,
+) -> Option<Result<std::path::PathBuf, String>> {
+    let dir = ledger_root(session)?;
+    Some(vouch_ledger_root(&dir).map(|()| dir))
+}
+
+fn vouch_ledger_root(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("it could not be created: {e}"))?;
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| format!("it could not be read: {e}"))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err("it is not a plain directory (a link or a file is in its place)".to_string());
+    }
+    let parent = dir
+        .parent()
+        .ok_or_else(|| "it has no parent directory".to_string())?;
+    let real = std::fs::canonicalize(dir).map_err(|e| format!("it could not be resolved: {e}"))?;
+    let real_parent = std::fs::canonicalize(parent)
+        .map_err(|e| format!("its evidence root could not be resolved: {e}"))?;
+    if real != real_parent.join(LEDGER_DIRNAME) {
+        return Err(format!(
+            "it resolves to {}, outside the run's evidence root",
+            real.display()
+        ));
+    }
+    Ok(())
+}
+
 /// The worker variable a unit carrying a QE ledger root is handed (both carriers stamp it beside
 /// the run markers); empty for every other unit.
 pub(crate) fn ledger_env(unit: &WorkUnit) -> Vec<(String, String)> {

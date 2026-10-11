@@ -264,6 +264,41 @@ fn the_run_qe_ledger_root_is_the_evidence_roots_ledger_and_rides_only_its_unit()
     );
 }
 
+/// codex r1 on core#878: the minted QE ledger root is vouched for before it widens a boundary — a
+/// plain directory directly under the evidence root is minted; a planted link in its place is
+/// refused (it would admit writes wherever it points).
+#[cfg(unix)]
+#[test]
+fn the_qe_ledger_root_is_minted_plain_and_a_planted_link_is_refused() {
+    let base = std::env::temp_dir().join(format!("wicked-qe-mint-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let evidence = base.join("evidence");
+    let elsewhere = base.join("elsewhere");
+    std::fs::create_dir_all(&evidence).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let mut s = session(requiring());
+    assert!(
+        mint_ledger_root(&s).is_none(),
+        "no evidence root, nothing minted"
+    );
+    s.evidence_root = Some(evidence.to_string_lossy().into_owned());
+    let minted = mint_ledger_root(&s)
+        .expect("an evidence root")
+        .expect("minted");
+    assert_eq!(minted, evidence.join(".wicked-qe"));
+    assert!(minted.is_dir());
+    std::fs::remove_dir(&minted).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &minted).unwrap();
+    let refused = mint_ledger_root(&s).expect("an evidence root");
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|why| why.contains("not a plain directory")),
+        "{refused:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn the_prompt_directive_says_run_or_do_not_run() {
     let mut q = waived_at(4);
