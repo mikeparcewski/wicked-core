@@ -70,6 +70,13 @@
       "worker_read": "none (a governed worker reaches its OWN graph through the estate MCP / $WICKED_ESTATE_DB, and the boundary grants exactly its <key>/ dir for WAL siblings; the file tools are denied the whole subtree — every other repo's graph is one sibling over)"
     },
     {
+      "name": "learn-schedules.json",
+      "kind": "file",
+      "owner": "crew",
+      "source": "src/learn/schedule-store.ts — join(crewStateHome(), 'learn-schedules.json')",
+      "worker_read": "none"
+    },
+    {
       "name": "project-settings.json",
       "kind": "file",
       "owner": "crew",
