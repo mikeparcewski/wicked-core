@@ -5053,9 +5053,11 @@ mod tests {
             "no benched seat is re-drawn"
         );
 
-        // (editor E2E bad4d9df) The same retry with the FULL registry: every configured distinct
-        // seat is benched, so an enabled seat the launch never configured judges — a real
-        // verdict, never the creator, never a benched seat.
+        // (crew main red 2026-10-11, crew run 38124235121) The DEFAULT judge (no pinned validator)
+        // never walks seats the run did not configure: with the FULL registry and every
+        // configured distinct seat benched, the retry is still the seat failure above — an
+        // outside seat (on CI, an unauthenticated codex) must not turn the floor's answer into a
+        // human pause. Only a PINNED validator's required judge reaches outside seats (bad4d9df).
         seats.judged_on.lock().unwrap().clear();
         let (_, verdict5, _) = run_unit_and_judge_with_roster(
             &runner,
@@ -5066,18 +5068,12 @@ mod tests {
             &only_failing,
             &benched_all,
         );
-        let v5 = verdict5.expect("an outside seat judged");
-        assert!(v5.pass, "{v5:?}");
-        assert!(
-            matches!(v5.judge_cli.as_deref(), Some("alive") | Some("stranger")),
-            "{v5:?}"
-        );
+        let v5 = verdict5.expect("the same seat-failure verdict as with the run-only registry");
+        assert!(!v5.pass && v5.judge_cli.is_none(), "{v5:?}");
         let judged5 = seats.judged_on.lock().unwrap().clone();
         assert!(
-            !judged5
-                .iter()
-                .any(|s| s == "creator" || benched_all.contains(s)),
-            "{judged5:?}"
+            !judged5.iter().any(|s| s == "alive" || s == "stranger"),
+            "the default judge never reaches a seat the run did not configure: {judged5:?}"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
