@@ -9402,14 +9402,25 @@ fn dispatch_unit(
             // notes root (core#464): an engine-derived, per-unit widening under the temp dir, so
             // the boundary every carrier arms from this one list admits the read-only seat's
             // note exactly where the guard never looks.
-            extra_write_roots: session
-                .extra_write_roots
-                .iter()
-                .cloned()
-                .chain(unit.notes_root.clone())
-                // (wicked-crew#951) …and its QE ledger root, the same per-unit widening.
-                .chain(unit.qe_ledger_root.clone())
-                .collect(),
+            // (wicked-core#881) The QE unit's boundary is its OWN roots only (notes + QE root):
+            // its interpreters run, so the launch extras (another phase's deliverables) are not
+            // widened onto it (codex r1 on #889).
+            extra_write_roots: if crate::qe_acceptance::carries_ledger_root(unit) {
+                unit.notes_root
+                    .iter()
+                    .chain(unit.qe_ledger_root.iter())
+                    .cloned()
+                    .collect()
+            } else {
+                session
+                    .extra_write_roots
+                    .iter()
+                    .cloned()
+                    .chain(unit.notes_root.clone())
+                    // (wicked-crew#951) …and its QE ledger root, the same per-unit widening.
+                    .chain(unit.qe_ledger_root.clone())
+                    .collect()
+            },
             extra_read_roots: session.extra_read_roots.clone(),
             // BC-79: the run's studio project, from the SESSION (persisted at launch), so a
             // resume/redrive re-arms the same scope. Threaded to the worker env as

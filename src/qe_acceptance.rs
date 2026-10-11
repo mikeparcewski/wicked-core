@@ -80,6 +80,13 @@ fn vouch_ledger_root(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// (wicked-core#881) The run's QE unit carrying its QE ledger root — the ONE predicate behind its
+/// deliverable-roots posture, its own-roots-only boundary and its seat's read-only argv lever. A
+/// floor-fix creator cloned from it is no longer the QE unit (`repo_checks_floor` cleared).
+pub(crate) fn carries_ledger_root(unit: &WorkUnit) -> bool {
+    is_qe_unit(unit) && unit.qe_ledger_root.is_some()
+}
+
 /// The worker variable a unit carrying a QE ledger root is handed (both carriers stamp it beside
 /// the run markers); empty for every other unit.
 pub(crate) fn ledger_env(unit: &WorkUnit) -> Vec<(String, String)> {

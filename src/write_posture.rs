@@ -115,7 +115,7 @@ impl WritePosture {
         // and the worktree guard still restores and escalates any change to the tree. Read-only,
         // its fenced seats (claude, opencode) refused `node` and could never record the verdict.
         // Decided before the guard marker, like the walkthrough author.
-        if unit.tool_cmd.is_none() && unit.qe_ledger_root.is_some() {
+        if crate::qe_acceptance::carries_ledger_root(unit) {
             return if bound {
                 WritePosture::DeliverableRoots
             } else {
@@ -242,7 +242,7 @@ pub(crate) fn unit_admitted_roots(
     // (wicked-core#881) A fenced unit carrying a QE ledger root — the QE unit, deliverable-roots
     // on a bound run — admits exactly its own roots, never the launch extras (another phase's
     // deliverables, e.g. the walkthrough author's dir).
-    if posture != WritePosture::Full && unit.qe_ledger_root.is_some() {
+    if posture != WritePosture::Full && crate::qe_acceptance::carries_ledger_root(unit) {
         return unit
             .notes_root
             .iter()
@@ -537,6 +537,16 @@ mod tests {
         qe.qe_ledger_root = Some("/evidence/run/.wicked-qe".into());
         assert_eq!(WritePosture::of(&qe, true), WritePosture::DeliverableRoots);
         assert_eq!(WritePosture::of(&qe, false), WritePosture::ReadOnly);
+        // A floor-fix creator cloned from the QE unit is not the QE unit (codex r1 on #889).
+        let fixer = crate::cli_runner::floor_fix_unit(
+            &qe,
+            &crate::repo_checks::FloorFix {
+                note: "fix it".into(),
+                seat: "claude".into(),
+            },
+        );
+        assert_eq!(fixer.qe_ledger_root, None);
+        assert_eq!(WritePosture::of(&fixer, true), WritePosture::Full);
         qe.tool_cmd = Some(vec!["true".to_string()]);
         assert_ne!(
             WritePosture::of(&qe, true),
@@ -611,6 +621,7 @@ mod tests {
     #[test]
     fn a_read_only_unit_admits_its_notes_root_then_its_qe_ledger_root() {
         let mut u = unit(PhaseRole::Evaluator, false);
+        u.repo_checks_floor = true; // the QE unit (qe_acceptance::is_qe_unit)
         u.notes_root = Some("/notes/u4".into());
         u.qe_ledger_root = Some("/evidence/run/.wicked-qe".into());
         let extras = vec!["/run/author".to_string()];
