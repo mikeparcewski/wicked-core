@@ -239,6 +239,16 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.9.0** — 2026-10-11 — npm release on main 196c08b, carrying #871 (X-MIG M11, core D).
+  **Breaking (minor on 0.x):** operator workflow drop-ins are retired. The engine no longer loads
+  `$WICKED_WORKFLOWS_DIR` / `~/.config/wicked-core/workflows`; it names each leftover file once at boot,
+  and none of them runs (save a preset instead). `resolve_workflow_def` resolves presets, then
+  runtime-registered defs, then refuses with the known names. `WorkflowRegistry` holds runtime defs only.
+  The built-in `feature`/`bug`/`migration` defs and the repo's `workflows/` are gone; every built-in is a
+  preset. `gate-phase` saves a gated preset that keeps its base's required instruments
+  (`Preset.required_instruments`, `put_preset_requiring`, `gated_preset_name`). The deny-policy phase
+  check reads every scope's preset step ids. Crew pairs it with wicked-crew#955 (no overlay
+  reads or writes; `POST /workflows` answers 410).
 - **core-ts 0.8.4** — 2026-10-11 — npm release on main tip b75b4ab, carrying #872 and #876.
   **#872 (X3)**: `editor-plugin` is a built-in preset (create an editor plugin; a delivering run puts
   deliver before its install dry run). **#876 (wicked-crew 0.9.4 release smoke, F-SMOKE-004)**: a
