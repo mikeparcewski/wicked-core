@@ -773,15 +773,19 @@ mod tests {
         assert_eq!(v.seats.len(), 3);
         assert_eq!(v.seed, 0xC0FFEE);
         assert_eq!(v.eligible, vec!["a", "b", "c", "d", "e"]);
-        let balloted: Vec<String> = s
+        // Seats ballot concurrently, so the dispatch order is not the roster order: compare sets.
+        let mut balloted: Vec<String> = s
             .seen
             .lock()
             .unwrap()
             .iter()
             .map(|c| c.key.clone())
             .collect();
+        balloted.sort();
+        let mut recorded = v.seats.clone();
+        recorded.sort();
         assert_eq!(
-            balloted, v.seats,
+            balloted, recorded,
             "the recorded seats are the seats that voted"
         );
         let redrawn: Vec<String> = wicked_council::pick::pick_seats(&roster, 3, v.seed)
