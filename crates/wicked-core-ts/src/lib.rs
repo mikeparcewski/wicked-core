@@ -1198,6 +1198,7 @@ impl Core {
     /// as the next plan rev (floor phases added, never refused for being below the floor) or, if it
     /// refuses it, re-opens the gate with a new gate id.
     #[napi(ts_return_type = "Promise<string>")]
+    #[allow(clippy::too_many_arguments)]
     pub fn confirm_gate(
         &self,
         run_id: String,
