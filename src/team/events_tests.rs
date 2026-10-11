@@ -909,6 +909,9 @@ impl Stream {
                 },
                 returned: if convened { 3 } else { 0 },
                 seated: if convened { 3 } else { 0 },
+                seats: Vec::new(),
+                seed: None,
+                eligible: Vec::new(),
             }),
         )
     }
@@ -2109,4 +2112,42 @@ fn the_governance_wire_fields_round_trip_absent_and_present() {
     };
     assert_eq!(b.governance_class.as_deref(), Some("os_sandbox"));
     assert_eq!(ev.to_payload().unwrap(), new);
+}
+
+/// Operator ruling 2026-10-11: a ruling names who decided — the drawn seats and the draw's seed
+/// ride `council.ruled` into the ledger's dispute (and from there onto the gate's receipt).
+#[test]
+fn a_ruling_records_the_drawn_seats_and_the_seed_on_the_dispute() {
+    let r = CouncilRuled {
+        subject: subject_finding(4),
+        verdict: Verdict::Yes,
+        reason: None,
+        task_id: Some("task-1".into()),
+        consensus: true,
+        agreement_pct: 100,
+        dissent: vec![],
+        returned: 3,
+        seated: 3,
+        seats: vec!["codex".into(), "opencode".into(), "pi".into()],
+        seed: Some(77),
+        eligible: vec![
+            "codex".into(),
+            "copilot".into(),
+            "opencode".into(),
+            "pi".into(),
+        ],
+    };
+    let d = dispute_of(&r);
+    assert_eq!(d.seats, vec!["codex", "opencode", "pi"]);
+    assert_eq!(d.seed, Some(77));
+    let wire = serde_json::to_value(&r).unwrap();
+    assert_eq!(wire["seats"], json!(["codex", "opencode", "pi"]));
+    assert_eq!(wire["seed"], json!(77));
+    // A ruling recorded before the fields still loads, with no seats and no seed.
+    let mut old = wire.clone();
+    for k in ["seats", "seed", "eligible"] {
+        old.as_object_mut().unwrap().remove(k);
+    }
+    let back: CouncilRuled = serde_json::from_value(old).unwrap();
+    assert!(back.seats.is_empty() && back.seed.is_none());
 }

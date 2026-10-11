@@ -1047,6 +1047,16 @@ pub struct CouncilRuled {
     pub dissent: Vec<String>,
     pub returned: u32,
     pub seated: u32,
+    /// (operator ruling 2026-10-11) The seats drawn onto the council: who decided. Absent on a
+    /// ruling recorded before the field, and when nothing was convened.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seats: Vec<String>,
+    /// The draw's seed (`wicked_council::pick::pick_seats(eligible, seats.len(), seed)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    /// The eligible seats the draw was made from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub eligible: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1798,7 +1808,8 @@ pub fn dispute_of(r: &CouncilRuled) -> Dispute {
             verdict: r.verdict,
             agreement_pct: Some(r.agreement_pct),
             dissent: Some(r.dissent.len() as u32),
-            seats: Vec::new(),
+            seats: r.seats.clone(),
+            seed: r.seed,
             reason: r.reason,
         },
         Verdict::NoVerdict => no_verdict(r.reason.unwrap_or(NoVerdictReason::Error)),
@@ -1835,6 +1846,7 @@ pub(crate) fn no_verdict(reason: NoVerdictReason) -> Dispute {
         agreement_pct: None,
         dissent: None,
         seats: Vec::new(),
+        seed: None,
         reason: Some(reason),
     }
 }

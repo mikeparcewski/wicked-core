@@ -2858,6 +2858,21 @@ pub(crate) fn run(
                 }
             }
             Command::ConveneDecision { req, clis, reply } => {
+                // (operator ruling 2026-10-11) Eligible = the RUN's roster minus its benches
+                // (quota, auth, dead seats — `benched_seats`), intersected with what the caller
+                // handed (which already excludes the dispute's parties, so evaluator≠creator
+                // holds). A run with no configured roster (an ad-hoc caller) keeps the caller's.
+                let clis = match crate::domain::get_session(&store, &req.session_id) {
+                    Ok(Some(session)) if !session.clis.is_empty() => {
+                        let keys = eligible_roster_keys(&session);
+                        clis.into_iter()
+                            .filter(|c| keys.iter().any(|k| k == &c.key))
+                            .collect()
+                    }
+                    _ => clis,
+                };
+                // The system setting (size, stagger) and a fresh seed, read per council.
+                let pick = crate::decision::CouncilPick::from_env();
                 // (core#590 S5) The ballots are slow subprocess turns: run them off the actor
                 // thread, relaying the council's lifecycle events back through the emit point.
                 let disp = dispatcher.clone();
@@ -2871,6 +2886,7 @@ pub(crate) fn run(
                             &disp,
                             Some(relay),
                             op_home.as_deref(),
+                            pick,
                         )
                     }))
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("decision council thread panicked")));

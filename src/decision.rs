@@ -321,6 +321,14 @@ pub struct DecisionVerdict {
     pub seated: u32,
     /// The minority recommendations the verdict recorded, verbatim.
     pub dissent: Vec<String>,
+    /// (operator ruling 2026-10-11) The seats the draw put on this council, in drawn order: who
+    /// decided. Empty when nothing was convened.
+    pub seats: Vec<String>,
+    /// The seed the draw used: `wicked_council::pick::pick_seats(eligible, seats.len(), seed)`
+    /// re-draws `seats` exactly.
+    pub seed: u64,
+    /// The eligible seats the draw was made from (the run's unbenched roster minus the parties).
+    pub eligible: Vec<String>,
     /// WHY there is no ruling, when `winner` is `None` — named as specifically as the council's
     /// record allows (the seats' own failures, the council's own failure, or its state).
     pub no_ruling_reason: Option<String>,
@@ -338,12 +346,35 @@ fn named_option(recommendation: &str, options: usize) -> Option<usize> {
         .map(|n| n - 1)
 }
 
+/// How a council is seated (operator ruling 2026-10-11): `size` seats drawn at random with `seed`
+/// from the eligible roster, their ballot spawns `stagger` apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CouncilPick {
+    pub size: usize,
+    pub stagger: std::time::Duration,
+    pub seed: u64,
+}
+
+impl CouncilPick {
+    /// The system setting (crew exports `WICKED_COUNCIL_SIZE` / `WICKED_COUNCIL_SPAWN_STAGGER_MS`)
+    /// with a fresh seed — read per council, so a settings change is live on the next one.
+    pub fn from_env() -> Self {
+        CouncilPick {
+            size: wicked_council::pick::council_size(),
+            stagger: wicked_council::pick::spawn_stagger(),
+            seed: wicked_council::pick::fresh_seed(),
+        }
+    }
+}
+
 /// Convene a council on ONE disputed decision and return its ruling (core#590 S5) — the single
 /// engine entry point for a council, reached through `Core::convene_decision`.
 ///
 /// Refuses (an `Err`, no ballot dispatched) a request with fewer than two positions or an empty
-/// question, and an empty roster. Every seat of `clis` is convened; the caller hands only the
-/// seats it may use (a run's eligible, unbenched seats). A council that votes but names no
+/// question, and an empty roster. The caller hands only the seats it may use (a run's eligible,
+/// unbenched seats, minus the dispute's parties); of those, the ones the dispatcher would abstain
+/// right now (`Dispatcher::seat_benched`) are left out and `pick.size` are drawn at random with
+/// `pick.seed`, distinct model families first. The drawn seats and the seed ride the verdict. A council that votes but names no
 /// position, or cannot reach a vote at all, is NOT an error: it is a verdict with `winner: None`
 /// and the reason — the caller (the gate) decides what an absent ruling means.
 pub(crate) fn convene_decision(
@@ -352,6 +383,7 @@ pub(crate) fn convene_decision(
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     relay: Option<EventRelay>,
     operational_home: Option<&std::path::Path>,
+    pick: CouncilPick,
 ) -> anyhow::Result<DecisionVerdict> {
     if req.question.trim().is_empty() {
         anyhow::bail!("a decision council needs a question to rule on");
@@ -366,9 +398,12 @@ pub(crate) fn convene_decision(
     let voters: Vec<AgenticCli> = clis
         .iter()
         .filter(|c| c.enabled_for_council)
+        .filter(|c| !dispatcher.seat_benched(&c.key))
         .cloned()
         .collect();
-    let clis: &[AgenticCli] = &voters;
+    let eligible: Vec<String> = voters.iter().map(|c| c.key.clone()).collect();
+    let drawn = wicked_council::pick::pick_seats(&voters, pick.size.max(1), pick.seed);
+    let clis: &[AgenticCli] = &drawn;
     if clis.is_empty() {
         anyhow::bail!(
             "no seat to convene a decision council for {} unit {}",
@@ -393,6 +428,7 @@ pub(crate) fn convene_decision(
     };
     let criteria: Vec<String> = DECISION_CRITERIA.iter().map(|s| s.to_string()).collect();
     let work_kind = work_kind_for(&criteria);
+    let seated: Vec<String> = seats.iter().map(|c| c.key.clone()).collect();
     let worker = Worker::new(
         ledger,
         dispatcher.clone(),
@@ -400,7 +436,8 @@ pub(crate) fn convene_decision(
         events,
         seats,
         work_kind,
-    );
+    )
+    .with_stagger(pick.stagger);
     let task = CouncilTask {
         id: ids::new_task_id(),
         topic: format!(
@@ -417,7 +454,11 @@ pub(crate) fn convene_decision(
     };
     let task_id = worker.queue_blocking(task);
     let status = worker.poll(&task_id);
-    Ok(ruling(task_id, status.as_ref(), req.options.len()))
+    let mut verdict = ruling(task_id, status.as_ref(), req.options.len());
+    verdict.seats = seated;
+    verdict.seed = pick.seed;
+    verdict.eligible = eligible;
+    Ok(verdict)
 }
 
 /// Read the council's poll status as a ruling over `options` positions.
@@ -431,6 +472,9 @@ fn ruling(task_id: String, status: Option<&PollStatus>, options: usize) -> Decis
         seated,
         dissent: Vec::new(),
         no_ruling_reason: Some(reason),
+        seats: Vec::new(),
+        seed: 0,
+        eligible: Vec::new(),
     };
     let Some(status) = status else {
         return none("council returned no status".to_string(), 0, 0);
@@ -465,6 +509,9 @@ fn ruling(task_id: String, status: Option<&PollStatus>, options: usize) -> Decis
         seated: status.seated,
         dissent: verdict.dissent.clone(),
         no_ruling_reason,
+        seats: Vec::new(),
+        seed: 0,
+        eligible: Vec::new(),
     }
 }
 
@@ -563,6 +610,22 @@ mod tests {
         }
     }
 
+    /// The pre-ruling seating: every eligible seat, no stagger (what these tests were written for).
+    fn convene_all(
+        req: &DecisionRequest,
+        clis: &[AgenticCli],
+        dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
+        relay: Option<EventRelay>,
+        home: Option<&std::path::Path>,
+    ) -> anyhow::Result<DecisionVerdict> {
+        let pick = CouncilPick {
+            size: clis.len().max(1),
+            stagger: std::time::Duration::ZERO,
+            seed: 1,
+        };
+        convene_decision(req, clis, dispatcher, relay, home, pick)
+    }
+
     /// The stub dispute: a monitor flagged a finding, the worker refuted it with evidence.
     fn dispute() -> DecisionRequest {
         DecisionRequest {
@@ -589,7 +652,7 @@ mod tests {
             ("b", "2 — refutation holds"),
             ("c", "2 — keyed on scope"),
         ]);
-        let v = convene_decision(
+        let v = convene_all(
             &dispute(),
             &[seat("a"), seat("b"), seat("c")],
             &s.dispatcher,
@@ -638,7 +701,7 @@ mod tests {
         ]);
         let mut work_only = seat("w");
         work_only.enabled_for_council = false;
-        let v = convene_decision(
+        let v = convene_all(
             &dispute(),
             &[seat("a"), seat("b"), work_only],
             &s.dispatcher,
@@ -666,7 +729,7 @@ mod tests {
             ("c", "2 — keyed on scope"),
             ("d", "2 — remount cancels"),
         ]);
-        let v = convene_decision(
+        let v = convene_all(
             &dispute(),
             &[seat("a"), seat("b"), seat("c"), seat("d")],
             &s.dispatcher,
@@ -685,11 +748,101 @@ mod tests {
         );
     }
 
+    /// Operator ruling 2026-10-11: the council size is the system setting, its seats drawn at
+    /// random from the eligible roster, and the ruling names the seats and the seed — re-drawing
+    /// with that seed seats the same council.
+    #[test]
+    fn the_council_size_honours_the_setting_and_the_seed_reproduces_the_draw() {
+        let s = stub(vec![
+            ("a", "2 — refutation holds"),
+            ("b", "2 — refutation holds"),
+            ("c", "2 — refutation holds"),
+            ("d", "2 — refutation holds"),
+            ("e", "2 — refutation holds"),
+        ]);
+        let roster = [seat("a"), seat("b"), seat("c"), seat("d"), seat("e")];
+        let pick = CouncilPick {
+            size: 3,
+            stagger: std::time::Duration::ZERO,
+            seed: 0xC0FFEE,
+        };
+        let v = convene_decision(&dispute(), &roster, &s.dispatcher, None, None, pick)
+            .expect("the council rules");
+        assert_eq!(s.calls.load(Ordering::SeqCst), 3, "three ballots, not five");
+        assert_eq!(v.seated, 3);
+        assert_eq!(v.seats.len(), 3);
+        assert_eq!(v.seed, 0xC0FFEE);
+        assert_eq!(v.eligible, vec!["a", "b", "c", "d", "e"]);
+        let balloted: Vec<String> = s
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.key.clone())
+            .collect();
+        assert_eq!(
+            balloted, v.seats,
+            "the recorded seats are the seats that voted"
+        );
+        let redrawn: Vec<String> = wicked_council::pick::pick_seats(&roster, 3, v.seed)
+            .into_iter()
+            .map(|c| c.key)
+            .collect();
+        assert_eq!(redrawn, v.seats, "the recorded seed reproduces the draw");
+
+        // A size of 2 seats two.
+        let s2 = stub(vec![("a", "2 — x"), ("b", "2 — x"), ("c", "2 — x")]);
+        let v2 = convene_decision(
+            &dispute(),
+            &roster[..3],
+            &s2.dispatcher,
+            None,
+            None,
+            CouncilPick { size: 2, ..pick },
+        )
+        .expect("the council rules");
+        assert_eq!((s2.calls.load(Ordering::SeqCst), v2.seats.len()), (2, 2));
+    }
+
+    /// A seat the dispatcher would abstain right now (its health bench) is not drawn: the chair
+    /// goes to an eligible seat instead of a certain abstention.
+    #[test]
+    fn a_dispatcher_benched_seat_is_never_drawn() {
+        struct BenchesB(Arc<dyn Dispatcher + Send + Sync>);
+        impl Dispatcher for BenchesB {
+            fn dispatch(&self, cli: &AgenticCli, task: &CouncilTask) -> Option<Vote> {
+                self.0.dispatch(cli, task)
+            }
+            fn seat_benched(&self, key: &str) -> bool {
+                key == "b"
+            }
+        }
+        let s = stub(vec![("a", "2 — x"), ("b", "2 — x"), ("c", "2 — x")]);
+        let d: Arc<dyn Dispatcher + Send + Sync> = Arc::new(BenchesB(s.dispatcher.clone()));
+        for seed in 0..16u64 {
+            let v = convene_decision(
+                &dispute(),
+                &[seat("a"), seat("b"), seat("c")],
+                &d,
+                None,
+                None,
+                CouncilPick {
+                    size: 3,
+                    stagger: std::time::Duration::ZERO,
+                    seed,
+                },
+            )
+            .expect("the council rules");
+            assert_eq!(v.seats, vec!["a", "c"], "seed {seed}");
+            assert_eq!(v.eligible, vec!["a", "c"]);
+        }
+    }
+
     /// A council that cannot vote is a verdict WITHOUT a ruling, naming why — not an error.
     #[test]
     fn a_council_with_no_vote_returns_no_ruling_and_names_the_cause() {
         let s = stub(vec![]);
-        let v = convene_decision(
+        let v = convene_all(
             &dispute(),
             &[seat("a"), seat("b")],
             &s.dispatcher,
@@ -708,7 +861,7 @@ mod tests {
     #[test]
     fn a_recommendation_naming_no_position_is_no_ruling() {
         let s = stub(vec![("a", "9 — neither"), ("b", "9 — neither")]);
-        let v = convene_decision(
+        let v = convene_all(
             &dispute(),
             &[seat("a"), seat("b")],
             &s.dispatcher,
@@ -730,15 +883,15 @@ mod tests {
         let s = stub(vec![("a", "1")]);
         let mut one = dispute();
         one.options.truncate(1);
-        let err = convene_decision(&one, &[seat("a")], &s.dispatcher, None, None).unwrap_err();
+        let err = convene_all(&one, &[seat("a")], &s.dispatcher, None, None).unwrap_err();
         assert_eq!(
             err.to_string(),
             "a decision council needs at least two positions to choose between (got 1)"
         );
         let mut blank = dispute();
         blank.question = "  ".into();
-        assert!(convene_decision(&blank, &[seat("a")], &s.dispatcher, None, None).is_err());
-        let err = convene_decision(&dispute(), &[], &s.dispatcher, None, None).unwrap_err();
+        assert!(convene_all(&blank, &[seat("a")], &s.dispatcher, None, None).is_err());
+        let err = convene_all(&dispute(), &[], &s.dispatcher, None, None).unwrap_err();
         assert_eq!(
             err.to_string(),
             "no seat to convene a decision council for run-1 unit 3"
@@ -753,7 +906,7 @@ mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = seen.clone();
         let relay: EventRelay = Arc::new(move |ev| sink.lock().unwrap().push(ev));
-        convene_decision(
+        convene_all(
             &dispute(),
             &[seat("a"), seat("b")],
             &s.dispatcher,
@@ -864,7 +1017,7 @@ mod tests {
             seen: Arc::clone(&seen),
         });
         // No claude ballot ⇒ nothing is written, no seat is touched.
-        convene_decision(
+        convene_all(
             &dispute(),
             &[seat("codex"), seat("pi")],
             &dispatcher,
@@ -884,7 +1037,7 @@ mod tests {
         seen.lock().unwrap().clear();
         // A claude ballot ⇒ the shared fence exists with the shared rules, and the claude seat's
         // argv carries the state-home rules — the operational home included; codex is untouched.
-        convene_decision(
+        convene_all(
             &dispute(),
             &[claude_seat("claude"), seat("codex")],
             &dispatcher,
@@ -977,7 +1130,7 @@ mod tests {
             seen: Arc::clone(&seen),
         });
 
-        convene_decision(
+        convene_all(
             &dispute(),
             &[claude_seat("claude#2")],
             &dispatcher,

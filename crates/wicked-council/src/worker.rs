@@ -104,6 +104,10 @@ pub struct Worker {
     work_kind: String,
     /// Wall-clock budget across all ballots (see [`DEFAULT_DEADLINE`]).
     deadline: Duration,
+    /// The pause between two seat spawns of one ballot (operator ruling 2026-10-11): seat `i`
+    /// starts `i × stagger` after the ballot opens, so a council never forks its whole roster of
+    /// heavy CLIs in the same instant. From [`crate::pick::spawn_stagger`].
+    stagger: Duration,
 }
 
 impl Worker {
@@ -127,7 +131,14 @@ impl Worker {
                 std::env::var(ENV_DEADLINE_SECS).ok(),
                 DEFAULT_DEADLINE,
             ),
+            stagger: crate::pick::spawn_stagger(),
         }
+    }
+
+    /// Override the spawn stagger (the constructor reads [`crate::pick::ENV_SPAWN_STAGGER_MS`]).
+    pub fn with_stagger(mut self, stagger: Duration) -> Self {
+        self.stagger = stagger;
+        self
     }
 
     /// Override the wall-clock deadline (the constructor reads [`ENV_DEADLINE_SECS`], falling
@@ -180,6 +191,7 @@ impl Worker {
         let roster = Arc::clone(&self.roster);
         let work_kind = self.work_kind.clone();
         let deadline = self.deadline;
+        let stagger = self.stagger;
         let task_for_thread = task;
 
         let ledger_for_panic = ledger.clone();
@@ -199,6 +211,7 @@ impl Worker {
                     &roster,
                     &work_kind,
                     deadline,
+                    stagger,
                     &task_for_thread,
                 );
             }));
@@ -299,6 +312,7 @@ fn run_council(
     roster: &[AgenticCli],
     work_kind: &str,
     deadline: Duration,
+    stagger: Duration,
     task: &CouncilTask,
 ) {
     ledger.update(&task.id, |rec| rec.state = TaskState::Running);
@@ -356,6 +370,11 @@ fn run_council(
                         dissent_arguments: dissent_arguments.clone(),
                     };
                     scope.spawn(move || {
+                        // The spawn stagger: seat `i` opens its ballot `i × stagger` late. Its
+                        // own budget starts when it is dispatched, so the wait costs it nothing.
+                        if i > 0 && !stagger.is_zero() {
+                            std::thread::sleep(stagger.saturating_mul(i as u32));
+                        }
                         let started = Instant::now();
                         // Catch the unwind HERE rather than at the join, so a seat that panicked
                         // after doing real work still reports the time it spent. Reporting 0
@@ -755,6 +774,8 @@ mod tests {
         // environment must not be able to end a deliberation early and flip an assertion.
         // Tests about the deadline itself override this again with their own value.
         .with_deadline(Duration::from_secs(600))
+        // Hermetic for the same reason: the shipped stagger would add seconds to every ballot.
+        .with_stagger(Duration::ZERO)
     }
 
     fn task() -> CouncilTask {
@@ -920,6 +941,50 @@ mod tests {
         );
     }
 
+    /// Records when each seat's ballot was dispatched; every seat agrees, so one ballot ends it.
+    struct StartRecorder {
+        starts: Mutex<Vec<(String, Instant)>>,
+    }
+    impl Dispatcher for StartRecorder {
+        fn dispatch(&self, cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            self.starts
+                .lock()
+                .unwrap()
+                .push((cli.key.clone(), Instant::now()));
+            Some(vote(&cli.key, "1 — fits"))
+        }
+    }
+
+    #[test]
+    fn seat_spawns_are_staggered_not_simultaneous() {
+        // Operator ruling 2026-10-11: a council never forks its whole roster in one instant.
+        // Seat i opens its ballot i × stagger after the first.
+        let stagger = Duration::from_millis(120);
+        let rec = Arc::new(StartRecorder {
+            starts: Mutex::new(Vec::new()),
+        });
+        let worker = worker_with(rec.clone(), &["a", "b", "c"]).with_stagger(stagger);
+        let id = worker.queue_blocking(task());
+        assert_eq!(worker.poll(&id).expect("status").state, TaskState::Voted);
+
+        let starts = rec.starts.lock().unwrap().clone();
+        assert_eq!(starts.len(), 3, "one ballot, three seats: {starts:?}");
+        let at = |k: &str| starts.iter().find(|(c, _)| c == k).expect(k).1;
+        assert!(at("b").duration_since(at("a")) >= stagger, "{starts:?}");
+        assert!(at("c").duration_since(at("a")) >= stagger * 2, "{starts:?}");
+
+        // Zero is "spawn together": no seat waits a stagger.
+        let rec0 = Arc::new(StartRecorder {
+            starts: Mutex::new(Vec::new()),
+        });
+        let worker0 = worker_with(rec0.clone(), &["a", "b", "c"]);
+        worker0.queue_blocking(task());
+        let s0 = rec0.starts.lock().unwrap().clone();
+        let first = s0.iter().map(|(_, t)| *t).min().unwrap();
+        let last = s0.iter().map(|(_, t)| *t).max().unwrap();
+        assert!(last.duration_since(first) < stagger, "{s0:?}");
+    }
+
     /// Panics on one named seat; every other seat votes.
     struct PanickingSeatDispatcher {
         victim: String,
@@ -983,7 +1048,8 @@ mod tests {
             "general",
         )
         // Hermetic against an exported WICKED_COUNCIL_DEADLINE_SECS, like `worker_with_parts`.
-        .with_deadline(Duration::from_secs(600));
+        .with_deadline(Duration::from_secs(600))
+        .with_stagger(Duration::ZERO);
         let id = worker.queue_blocking(task());
         worker.poll(&id).expect("the council must still resolve");
 

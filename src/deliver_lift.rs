@@ -796,6 +796,8 @@ pub(crate) fn delivery_receipt(
         {
             r.skip(&k.instrument, &k.reason, k.detail.clone());
         }
+        // Every council the run's gates recorded: who decided its disputes.
+        r.councils.extend(g.councils.iter().cloned());
     }
     r.tree = session.verified_tree.clone();
     r
