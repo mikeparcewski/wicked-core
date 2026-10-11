@@ -5239,11 +5239,13 @@ mod tests {
         );
     }
 
-    /// The boundary rotation must NOT cross: a seat that RUNS and returns something unreadable has
-    /// rendered a judgment. That fails closed to REJECT — asking a different seat would be shopping
-    /// for a verdict.
+    /// (operator ruling 2026-10-11, release smoke S04 — supersedes the pre-ruling "garbage is a
+    /// REJECT" pin) A seat that RUNS and answers with NO verdict word has not judged: every such
+    /// seat is rotated past (each once — never re-asked), and with nobody left the call is
+    /// `JudgeUnavailable`, the gate's explicit `judge_unavailable` — never a fail-closed REJECT.
+    /// An answer that DOES name a verdict is still final (no verdict-shopping).
     #[test]
-    fn a_seat_that_runs_but_answers_garbage_is_a_reject_not_a_rotation() {
+    fn a_seat_that_runs_but_answers_garbage_is_rotated_past_and_never_a_reject() {
         use crate::workflow::{StepOutput, StepRunner};
         use std::sync::Mutex;
 
@@ -5275,12 +5277,15 @@ mod tests {
         let g = Garbage {
             calls: Mutex::new(0),
         };
-        let v = agent_validate("c", "w", &[DETERMINISTIC_VALIDATOR_SEAT], &roster, &g).expect("ok");
-        assert!(!v.pass, "unparseable output must fail closed to REJECT");
+        let r = agent_validate("c", "w", &[DETERMINISTIC_VALIDATOR_SEAT], &roster, &g);
+        assert!(
+            r.is_err(),
+            "no seat could judge — judge_unavailable, not a REJECT: {r:?}"
+        );
         assert_eq!(
             *g.calls.lock().unwrap(),
-            1,
-            "a seat that answered must end the validation; rotating here is verdict-shopping"
+            2,
+            "each distinct seat (agy, codex) asked once; none re-asked"
         );
     }
 
