@@ -1834,6 +1834,7 @@ impl WrappedCliStepRunner {
                 Ok(check_scratch) => Some(NoCodeLaunchContext {
                     check_scratch,
                     notes_root: input.unit.notes_root.as_ref().map(PathBuf::from),
+                    qe_ledger_root: input.unit.qe_ledger_root.as_ref().map(PathBuf::from),
                 }),
                 Err(why) => return posture_refusal(input, &why),
             }
@@ -2399,6 +2400,9 @@ impl WrappedCliStepRunner {
                     .and_then(|g| g.project_id.as_deref()),
             );
             stamp_run_markers(&mut cmd, &provenance);
+            // (wicked-crew#951) The QE unit is handed its run's QE ledger root (outside the tree),
+            // stamped the same way: garden's `qe accept` records its verdict there.
+            stamp_run_markers(&mut cmd, &crate::qe_acceptance::ledger_env(&input.unit));
             // D-7 (DES-L4 PR-⑦): garden's estate shim spawns `wicked-estate-mcp --readonly` by
             // default on EVERY wrapped worker — the read-only default the deleted CLI-registered MCP
             // used to carry as a process flag now rides garden's own env contract; the fence's
@@ -2478,9 +2482,9 @@ impl WrappedCliStepRunner {
                 // repo-graph key dir). An unjoinable root arms an EMPTY list: the hook then
                 // refuses every fenced write (fail closed) rather than judging a partial list.
                 if write_posture.fences_writes() {
-                    let roots = crate::write_posture::admitted_roots(
+                    let roots = crate::write_posture::unit_admitted_roots(
                         write_posture,
-                        input.unit.notes_root.as_deref(),
+                        &input.unit,
                         &g.extra_write_roots,
                     );
                     let joined = crate::write_posture::deliverable_roots_env(&roots)
@@ -4245,6 +4249,9 @@ pub(crate) struct NoCodeLaunchContext {
     pub(crate) check_scratch: PathBuf,
     /// The unit's notes root (core#483), the one other writable place.
     pub(crate) notes_root: Option<PathBuf>,
+    /// (wicked-crew#951) The QE unit's run QE ledger root, added beside the notes root so codex's
+    /// sandbox lets `qe accept` record its verdict there (never the tree).
+    pub(crate) qe_ledger_root: Option<PathBuf>,
 }
 
 impl NoCodeLaunchContext {
@@ -4283,9 +4290,9 @@ impl NoCodeLaunchContext {
             .replace('\\', "\\\\")
             .replace('"', "\\\"");
         f.push(format!("sqlite_home=\"{state}\""));
-        if let Some(notes) = &self.notes_root {
+        for root in self.notes_root.iter().chain(self.qe_ledger_root.iter()) {
             f.push("--add-dir".to_string());
-            f.push(notes.to_string_lossy().into_owned());
+            f.push(root.to_string_lossy().into_owned());
         }
         f
     }
@@ -6953,6 +6960,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// wicked-crew#951: the run's QE unit is handed its QE ledger root (`WorkUnit::qe_ledger_root`,
+    /// outside the tree) as `WICKED_QE_LEDGER_DIR` on its OWN worker environment, so garden's
+    /// `qe accept` (wicked-ledger's `resolveLedgerRoot`) records the verdict there instead of in the
+    /// worktree the guard restores; a unit without one is handed nothing. A real child records
+    /// what it saw. Mutation: drop the `ledger_env` stamp → the first assert reads `UNSET`.
+    #[cfg(unix)]
+    #[test]
+    fn the_qe_unit_worker_is_handed_its_run_qe_ledger_root() {
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("wicked-qe-ledger-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join("probe.sh");
+        std::fs::write(&probe, "echo \"SEEN=[${WICKED_QE_LEDGER_DIR:-UNSET}]\"\n").unwrap();
+        let ledger = dir.join("evidence").join(".wicked-qe");
+        let run = |qe_root: Option<&std::path::Path>| {
+            let mut u = WorkUnit::pending("s:u4", "s", 4, "verify it");
+            u.assigned_cli = Some("probe".to_string());
+            u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
+            u.qe_ledger_root = qe_root.map(|p| p.to_string_lossy().into_owned());
+            let input = StepInput {
+                run_id: "run-qe-ledger".to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-x".to_string(),
+                entity_mode: crate::scope::EntityMode::Shared,
+                workdir: Some(dir.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            };
+            WrappedCliStepRunner::default().run_unit(&input).output
+        };
+        let seen = run(Some(&ledger));
+        assert!(
+            seen.contains(&format!("SEEN=[{}]", ledger.display())),
+            "the QE unit's worker must see its run's QE ledger root; got: {seen}"
+        );
+        let _none = VarGuard::unset(crate::qe_acceptance::LEDGER_DIR_ENV);
+        let seen = run(None);
+        assert!(
+            seen.contains("SEEN=[UNSET]"),
+            "a unit with no QE ledger root is handed none; got: {seen}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// codex r2, PR#413: a NON-claude WRAPPED worker (the carrier here is `sh`) gets no ambient
     /// claude configuration path — the daemon's own `CLAUDE_CONFIG_DIR` is STRIPPED, not inherited.
     /// A real child records what it saw.
@@ -9576,6 +9634,8 @@ mod tests {
         let ctx = NoCodeLaunchContext {
             check_scratch: PathBuf::from("/w/checks/run-1/4-a0"),
             notes_root: Some(PathBuf::from("/w/notes/run-1/u4")),
+            // wicked-crew#951: the QE unit's run ledger is the other added dir.
+            qe_ledger_root: Some(PathBuf::from("/w/evidence/run-1/.wicked-qe")),
         };
         for template in [
             s(&[&codex, "exec", "--skip-git-repo-check", "the prompt"]),
@@ -9611,6 +9671,7 @@ mod tests {
                 "-c sandbox_workspace_write.exclude_tmpdir_env_var=true",
                 "-c sandbox_workspace_write.network_access=true",
                 "--add-dir /w/notes/run-1/u4",
+                "--add-dir /w/evidence/run-1/.wicked-qe",
             ] {
                 assert!(joined.contains(kv), "{kv}: {joined}");
             }
@@ -9706,6 +9767,7 @@ mod tests {
         let ctx = NoCodeLaunchContext {
             check_scratch: scratch.clone(),
             notes_root: None,
+            qe_ledger_root: None,
         };
         // spawn-audit: test-only — never spawned; only its env map is read.
         let mut cmd = Command::new("true");

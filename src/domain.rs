@@ -1043,6 +1043,15 @@ pub struct WorkUnit {
     /// cwd is already a throwaway sandbox). Persisted so a redrive keeps the same path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes_root: Option<String>,
+    /// (wicked-crew#951) The run's QE LEDGER ROOT ([`crate::qe_acceptance::ledger_root`]:
+    /// `<session.evidence_root>/.wicked-qe`), set at dispatch on the run's QE unit
+    /// ([`crate::qe_acceptance::is_qe_unit`]) of a bound run with an evidence root. Joined into
+    /// that unit's write boundary (admitted under the read-only posture beside the notes root) and
+    /// handed to its worker as `WICKED_QE_LEDGER_DIR`, so the acceptance verdict lands outside the
+    /// tree the guard protects and where the launcher's acceptance check reads it. `None` for
+    /// every other unit. Persisted so a redrive keeps the same path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qe_ledger_root: Option<String>,
     /// (F-RC2-009) The run base commit (`runBaseResolved.baseCommit`, the session's
     /// `base_commit`) as of this unit's dispatch — the commit the repo-checks floor's BASELINE
     /// DIFF runs a failing check on, so only a regression denies. Recorded beside
@@ -1315,6 +1324,7 @@ impl WorkUnit {
             worktree_baseline: None,
             worktree_mutation: None,
             notes_root: None,
+            qe_ledger_root: None,
             run_base_commit: None,
             repo_checks_floor: false,
             default_floor: false,

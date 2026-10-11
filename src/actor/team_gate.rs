@@ -3535,6 +3535,7 @@ pub(super) fn revise_units(
                 k.worktree_baseline = o.worktree_baseline.clone();
                 k.worktree_mutation = o.worktree_mutation.clone();
                 k.notes_root = o.notes_root.clone();
+                k.qe_ledger_root = o.qe_ledger_root.clone();
                 k.run_base_commit = o.run_base_commit.clone();
                 k.repo_checks = o.repo_checks.clone();
                 k.rework_of = o.rework_of;
