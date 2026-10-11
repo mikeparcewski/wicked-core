@@ -11567,7 +11567,6 @@ fn replan_for_accepted_edit(
 /// unit's instruction) clears the pause and dispatches the unit at the cursor directly (no re-pause
 /// on it); `Reject` cancels the run.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn confirm_gate(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
