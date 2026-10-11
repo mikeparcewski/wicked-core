@@ -1506,7 +1506,12 @@ pub(crate) fn run(
                         None => true,
                     };
                     if needs_seat && !spec.clis.is_empty() {
-                        let benched = crate::distribute::launcher_benched(&spec.clis);
+                        let mut benched = crate::distribute::launcher_benched(&spec.clis);
+                        for seat in
+                            crate::distribute::worktree_benched(&spec.clis, repo_ref.is_some())
+                        {
+                            crate::domain::bench_seat(&mut benched, seat);
+                        }
                         if crate::distribute::eligible_seats(&spec.clis, &benched).is_empty() {
                             return Err(NoEligibleSeat {
                                 run_id: run_id.to_string(),
@@ -1583,7 +1588,11 @@ pub(crate) fn run(
                         run_branch: None,
                         base_commit: None,
                         finished_at: None,
-                        benched_seats: Vec::new(),
+                        // (F-EDIT-5 / F-LEARN-3) codex seats are benched on a worktree-bound run.
+                        benched_seats: crate::distribute::worktree_benched(
+                            &spec.clis,
+                            repo_ref.is_some(),
+                        ),
                         team: None,
                         team_plan: None,
                         exclude_seats: crate::domain::normalize_exclude_seats(&spec.exclude_seats),
@@ -17951,7 +17960,14 @@ mod code_evidence_floor_tests {
         output_text: &str,
         governed: bool,
     ) -> (AgentSession, WorkUnit) {
-        fold_ev(store, subs, run_id, output_text, governed, evidence)
+        fold_ev(
+            store,
+            subs,
+            run_id,
+            output_text,
+            governed,
+            crate::workflow::UnitEvidence::default(),
+        )
     }
 
     /// [`fold`] with the worker's evidence (e.g. `tree_changed` against the dispatch baseline).
@@ -17983,7 +17999,7 @@ mod code_evidence_floor_tests {
             &tx,
             out,
             None,
-            crate::workflow::UnitEvidence::default(),
+            evidence,
             "",
             &None,
             &None,

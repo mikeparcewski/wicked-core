@@ -1370,6 +1370,13 @@ fn run_unit_and_judge_on(
                         "answered nothing",
                         crate::validator::JUDGE_EMPTY_ANSWER_REASON,
                     ))
+                })
+                // (operator ruling 2026-10-11) …and one whose answer named no verdict.
+                .or_else(|| {
+                    (!crate::validator::names_a_verdict(out)).then_some((
+                        "answered without a verdict",
+                        crate::validator::JUDGE_NO_VERDICT_REASON,
+                    ))
                 });
             if let Some((verb, token)) = reason {
                 let mut v = judge_refusals.borrow_mut();

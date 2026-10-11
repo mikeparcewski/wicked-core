@@ -312,6 +312,43 @@ pub(crate) fn eligible_seats<'a>(
         .collect()
 }
 
+/// (F-EDIT-5 / F-LEARN-3, core#769) Why a codex seat is benched for a worktree-bound run.
+pub(crate) const CODEX_WORKTREE_BENCH: &str = "codex cannot work in this run's worktree on this \
+    host: its commands come back `approval request failed` (the account's approval policy has no \
+    approver), so it can neither read nor write the repository — benched for worktree-bound runs \
+    (set WICKED_CODEX_WORKTREE_OK=1 on a host where codex runs commands)";
+
+/// (F-EDIT-5 / F-LEARN-3) The worktree bench: on a run BOUND to a repository, every codex seat
+/// (any instance) is benched with [`CODEX_WORKTREE_BENCH`], so it is never routed a unit, failed
+/// over to, or seated as a judge — a codex seat that cannot run a command used to pass a build it
+/// never wrote (run 7d8c9c98) and FAIL a review it never read (run 07965bf6). Unbound runs, and
+/// hosts that set `WICKED_CODEX_WORKTREE_OK=1`, keep codex.
+pub(crate) fn worktree_benched(clis: &[AgenticCli], bound: bool) -> Vec<BenchedSeat> {
+    worktree_benched_with(
+        clis,
+        bound,
+        std::env::var_os("WICKED_CODEX_WORKTREE_OK").is_some(),
+    )
+}
+
+pub(crate) fn worktree_benched_with(
+    clis: &[AgenticCli],
+    bound: bool,
+    codex_ok: bool,
+) -> Vec<BenchedSeat> {
+    if !bound || codex_ok {
+        return Vec::new();
+    }
+    clis.iter()
+        .filter(|c| model_of(&c.key) == "codex")
+        .map(|c| BenchedSeat {
+            cli: c.key.clone(),
+            reason: CODEX_WORKTREE_BENCH.to_string(),
+            source: "launcher".to_string(),
+        })
+        .collect()
+}
+
 /// (F-7R2-006) The launcher-declared bench: every seat whose roster record says
 /// `health.usable == false`, with the launcher's reason.
 pub(crate) fn launcher_benched(clis: &[AgenticCli]) -> Vec<BenchedSeat> {
@@ -3103,5 +3140,49 @@ mod walkthrough_routing_tests {
         let mut tool = author.clone();
         tool.tool_cmd = Some(vec!["true".into()]);
         assert!(!needs_governed_seat(&tool));
+    }
+}
+
+/// F-EDIT-5 / F-LEARN-3 (core#769): on a worktree-bound run every codex seat is benched with a
+/// plain reason (it cannot run a command there on this host); unbound runs and an operator
+/// opt-out keep it.
+#[cfg(test)]
+mod worktree_bench_tests {
+    use super::*;
+
+    fn seat(key: &str) -> AgenticCli {
+        let mut c = crate::registry_roster()
+            .into_iter()
+            .next()
+            .expect("a builtin seat");
+        c.key = key.to_string();
+        c
+    }
+
+    #[test]
+    fn a_bound_run_benches_every_codex_seat_with_a_plain_reason() {
+        let clis = [seat("claude"), seat("codex"), seat("codex#2"), seat("pi")];
+        let b = worktree_benched_with(&clis, true, false);
+        let keys: Vec<&str> = b.iter().map(|s| s.cli.as_str()).collect();
+        assert_eq!(keys, vec!["codex", "codex#2"]);
+        assert!(
+            b[0].reason.contains("approval request failed"),
+            "{}",
+            b[0].reason
+        );
+        // The bench is what routing, failover and the judge read: codex is never seated.
+        let eligible: Vec<&str> = eligible_seats(&clis, &b)
+            .iter()
+            .map(|c| c.key.as_str())
+            .collect();
+        assert_eq!(eligible, vec!["claude", "pi"]);
+        assert!(
+            worktree_benched_with(&clis, false, false).is_empty(),
+            "unbound run"
+        );
+        assert!(
+            worktree_benched_with(&clis, true, true).is_empty(),
+            "operator opt-out"
+        );
     }
 }
