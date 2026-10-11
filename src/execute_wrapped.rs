@@ -9251,6 +9251,7 @@ mod tests {
                 "feature/adversarial-review",
                 "feature/review",
                 "feature/test",
+                "learn/review",
                 "mcp-server/observability-review",
                 "mcp-server/security-review",
                 "mcp-server/test",
