@@ -239,6 +239,11 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.9.7** — 2026-10-11 — patch release on main 961990d, carrying #907 (operator rulings 19:00Z): an
+  operator approve at a `judge_unavailable` gate IS the judgment (the unit is done; the receipt records
+  `operator_judge`, judge `operator:<actor>` and `operatorJudges {by, at, note, reason}`, aggregated on the
+  delivery receipt); `judge_unavailable` wins only when no other layer denied; team steps are excluded.
+  opencode is opt-in in the judge and council pools.
 - **core-ts 0.9.6** — 2026-10-11 — patch release on main 961c10c, carrying #904 (learn E2E F-LEARN-2, run
   55a1fac3): the gate pre-check accepts "Ask a follow-up" on a conversational step of a floor-filled plan,
   so the learn walkthrough loop (#899) works on the final stack.
