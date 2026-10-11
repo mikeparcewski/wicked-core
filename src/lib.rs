@@ -899,11 +899,23 @@ impl Core {
         run_id: &str,
         decision: HumanDecision,
     ) -> anyhow::Result<SessionStatus> {
+        self.confirm_gate_as(run_id, decision, None)
+    }
+
+    /// [`Self::confirm_gate`] naming WHO answered (the gate API's actor). An approve at a
+    /// `judge_unavailable` escalation is then recorded as the operator's judgment by that actor.
+    pub fn confirm_gate_as(
+        &self,
+        run_id: &str,
+        decision: HumanDecision,
+        actor: Option<String>,
+    ) -> anyhow::Result<SessionStatus> {
         let (reply, rx) = channel();
         self.tx
             .send(Command::ConfirmGate {
                 run_id: run_id.to_string(),
                 decision,
+                actor,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;

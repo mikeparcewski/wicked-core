@@ -1525,6 +1525,12 @@ pub(crate) fn apply_and_finish_unit(
         .as_deref()
         .is_none_or(|r| r.starts_with("pinned validator failed"));
     let det_note = det_denial.clone();
+    let (unavailable, judged) = match agent_denial {
+        Some((source, r)) if source == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE => {
+            (Some((source, r)), None)
+        }
+        other => (None, other),
+    };
     let validator_denial = guard_denial
         .map(|r| crate::domain::UnitDenial::new("worktree_guard", r))
         .or(same_seat_denial)
@@ -1532,10 +1538,14 @@ pub(crate) fn apply_and_finish_unit(
         .or(checks_denial.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
         .or(capture_denial)
         .or(evaluator_verdict_denial)
-        .or(agent_denial.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
+        .or(judged.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
         .or(judge_hold)
         .or(evaluator_denial)
-        .or(hook_denial);
+        .or(hook_denial)
+        // (operator ruling 2026-10-11, codex r1 on #907) A judge that could not rule wins only when
+        // NO other layer denied — the operator's judgment at its gate then answers the one open
+        // question, never a governance veto hidden behind it.
+        .or(unavailable.map(|(source, r)| crate::domain::UnitDenial::new(source, r)));
 
     // Resolve the governance gate WITH the pre-computed deny folded in: a validator/evaluator deny
     // drives the phase Rejected + suppresses the work_output write (see `execute::apply_unit`).

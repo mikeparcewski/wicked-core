@@ -89,6 +89,10 @@ pub(crate) enum Command {
     ConfirmGate {
         run_id: String,
         decision: HumanDecision,
+        /// (operator ruling 2026-10-11) WHO answered, as the gate API recorded it — the operator or
+        /// the coordinating agent acting for them. Recorded when the answer is an operator judgment
+        /// (`judged by operator`); `None` from callers that do not say.
+        actor: Option<String>,
         reply: Sender<anyhow::Result<SessionStatus>>,
     },
     /// Cancel a run — mark it terminally `Cancelled` and stop dispatching. (Real subprocess kill of an

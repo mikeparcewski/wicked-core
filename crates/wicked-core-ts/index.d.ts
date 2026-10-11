@@ -326,7 +326,7 @@ export declare class Core {
    * as the next plan rev (floor phases added, never refused for being below the floor) or, if it
    * refuses it, re-opens the gate with a new gate id.
    */
-  confirmGate(runId: string, approve: boolean, amend?: string | undefined | null, action?: string | undefined | null, amendScope?: string | undefined | null, planJson?: string | undefined | null): Promise<string>
+  confirmGate(runId: string, approve: boolean, amend?: string | undefined | null, action?: string | undefined | null, amendScope?: string | undefined | null, planJson?: string | undefined | null, actor?: string | undefined | null): Promise<string>
   /**
    * Cancel a run — mark it terminally `Cancelled` and stop advancing it. Resolves to the status
    * token. Safe whether the run is executing or paused.
