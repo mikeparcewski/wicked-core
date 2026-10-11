@@ -2875,29 +2875,30 @@ pub(crate) fn run(
                 // holds). A run with no configured roster (an ad-hoc caller) keeps the caller's.
                 // A ballot-only seat (`seat_eligible_for_work: false`) is never in the work roster
                 // `clis` persists, so it stays eligible unless benched (codex r1).
-                let clis = match crate::domain::get_session(&store, &req.session_id) {
-                    Ok(Some(session)) => {
-                        let roster = eligible_roster_keys(&session);
-                        clis.into_iter()
-                            .filter(|c| !session.benched_seats.iter().any(|b| b.cli == c.key))
-                            .filter(|c| {
-                                // By CLI key: a run configured `codex#2` keeps the `codex`
-                                // ballot record the registry hands (codex r2).
-                                (session.clis.is_empty()
-                                    && !wicked_council::registry::is_opt_in(&c.key))
-                                    || !c.seat_eligible_for_work
-                                    || roster
-                                        .iter()
-                                        .any(|k| wicked_apps_core::spawn::seat_cli_key(k) == c.key)
-                            })
-                            .collect()
-                    }
-                    // No run roster to say the operator picked them: opt-in seats sit out.
-                    _ => clis
-                        .into_iter()
-                        .filter(|c| !wicked_council::registry::is_opt_in(&c.key))
-                        .collect(),
-                };
+                let clis: Vec<crate::AgenticCli> =
+                    match crate::domain::get_session(&store, &req.session_id) {
+                        Ok(Some(session)) => {
+                            let roster = eligible_roster_keys(&session);
+                            clis.into_iter()
+                                .filter(|c| !session.benched_seats.iter().any(|b| b.cli == c.key))
+                                .filter(|c| {
+                                    // By CLI key: a run configured `codex#2` keeps the `codex`
+                                    // ballot record the registry hands (codex r2).
+                                    (session.clis.is_empty()
+                                        && !wicked_council::registry::is_opt_in(&c.key))
+                                        || !c.seat_eligible_for_work
+                                        || roster.iter().any(|k| {
+                                            wicked_apps_core::spawn::seat_cli_key(k) == c.key
+                                        })
+                                })
+                                .collect()
+                        }
+                        // No run roster to say the operator picked them: opt-in seats sit out.
+                        _ => clis
+                            .into_iter()
+                            .filter(|c| !wicked_council::registry::is_opt_in(&c.key))
+                            .collect(),
+                    };
                 // The system setting (size, stagger) and a fresh seed, read per council.
                 let pick = crate::decision::CouncilPick::from_env();
                 // (core#590 S5) The ballots are slow subprocess turns: run them off the actor
