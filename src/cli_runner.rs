@@ -1311,6 +1311,25 @@ fn run_unit_and_judge_on(
         .filter(|c| run_roster.iter().any(|k| k == &c.key))
         .cloned()
         .collect();
+    // The DEFAULT judge's pool is the run's own (pre-#893): its configured seats, or the whole
+    // registry only for a roster that names no registry seat. A default judge is never required,
+    // so a seat the launch never configured must not turn a skipped judge into a human pause
+    // (crew main red 2026-10-11: an unauthenticated codex on CI parked a one-seat run).
+    let run_has_registry_seat = roster
+        .iter()
+        .any(|c| run_roster.iter().any(|k| k == &c.key));
+    let in_run_pool =
+        |c: &crate::AgenticCli| !run_has_registry_seat || run_roster.iter().any(|k| k == &c.key);
+    let unbenched_run: Vec<crate::AgenticCli> = unbenched
+        .iter()
+        .filter(|c| in_run_pool(c))
+        .cloned()
+        .collect();
+    let eligible_run: Vec<crate::AgenticCli> = eligible
+        .iter()
+        .filter(|c| in_run_pool(c))
+        .cloned()
+        .collect();
     // (review RT-1 / F-7R3-001) Judge seats that REFUSED while the rotation passed over them —
     // an authentication failure, a quota refusal, a binary that could not start — reported for
     // the fold to bench (`source: "judge"`; a quota refusal benches only a seat with no
@@ -1615,13 +1634,15 @@ fn run_unit_and_judge_on(
             // bench/health filter, drop every other seat sharing one: a benched creator alias must
             // not leave its binary looking distinct on another seat (codex r1/r2 on #893).
             let author_ids = author_identities(&excluded, roster);
-            let eligible_x = without_author_binaries(&eligible, &excluded, &author_ids);
-            let configured_x =
-                without_author_binaries(&eligible_configured, &excluded, &author_ids);
-            let roster = judge_roster(&excluded, &configured_x, &eligible_x);
-            if let Some(v) =
-                benched_judge_unavailable("default judge", &excluded, roster, &unbenched, benched)
-            {
+            let run_x = without_author_binaries(&eligible_run, &excluded, &author_ids);
+            let roster = run_x.as_slice();
+            if let Some(v) = benched_judge_unavailable(
+                "default judge",
+                &excluded,
+                roster,
+                &unbenched_run,
+                benched,
+            ) {
                 Some(v)
             } else if crate::validator::distinct_judge_available(&excluded, roster) {
                 let criterion = crate::validator::default_judge_criterion(&input.unit);
