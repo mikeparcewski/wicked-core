@@ -1294,6 +1294,7 @@ mod tests {
             "interactive-chat-ledger.json",
             "project-graphs",
             "project-settings.json",
+            "learn-schedules.json",
             "repo-graphs",
             "skills",
             // crew-placed by a `join(<state home>, …)`: the chat transcripts (`chats`) and the
