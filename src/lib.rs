@@ -208,8 +208,9 @@ pub use plan_gate::{
     PendingPlan, PlanPreview, PlanProposal, ScopeAnswer, ScopeHold, TeamPlanState,
 };
 pub use preset::{
-    compose_preset, list_all_presets, put_preset, put_preset_requiring, resolve as resolve_preset,
-    Preset, PresetError, PresetSpec, BUILTIN_CREATED_BY, GLOBAL_SCOPE, PLAN_PRESET,
+    compose_preset, gated_preset_name, list_all_presets, put_preset, put_preset_requiring,
+    resolve as resolve_preset, Preset, PresetError, PresetSpec, BUILTIN_CREATED_BY, GLOBAL_SCOPE,
+    PLAN_PRESET,
 };
 pub use project::{
     get_project, list_members, list_projects, member_projects, members_of_kind, MemberSpec,

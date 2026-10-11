@@ -749,6 +749,8 @@ fn gate_phase_cmd(args: &[String]) {
             return;
         }
     }
+    // The name it saves under, bounded to a valid preset name BEFORE anything is authored.
+    let new_name = wicked_core::gated_preset_name(&workflow, &phase);
     // 3. AUTHOR + APPROVE a validator for the criterion (live `claude`), as the sole store writer.
     let runner = WrappedCliStepRunner::default();
     let unapproved = match wicked_core::provision_validator(&criterion, &runner, &mut store) {
@@ -773,7 +775,6 @@ fn gate_phase_cmd(args: &[String]) {
         }
     };
     // 4. PIN it onto the step and save the gated preset under a fresh name.
-    let new_name = format!("{phase}-gated-{workflow}");
     let steps: Vec<_> = base_steps
         .iter()
         .cloned()

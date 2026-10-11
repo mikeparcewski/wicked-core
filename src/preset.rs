@@ -171,6 +171,22 @@ fn valid_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
+/// The name `gate-phase` saves a gated copy of `workflow` under: `<phase>-gated-<workflow>`, or —
+/// when that would not be a valid preset name (over 64 characters) — `gated-<16 hex of
+/// sha256(workflow NUL phase)>`, deterministic per pair (codex r2 on core#871).
+pub fn gated_preset_name(workflow: &str, phase: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let readable = format!("{phase}-gated-{workflow}");
+    if valid_name(&readable) {
+        return readable;
+    }
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(format!("{workflow}\0{phase}").as_bytes())
+    );
+    format!("gated-{}", &digest[..16])
+}
+
 fn is_builtin_name(name: &str) -> bool {
     crate::catalog::builtin_presets()
         .iter()
@@ -656,6 +672,20 @@ mod tests {
             .unwrap()
             .iter()
             .any(|p| p.steps.iter().any(|st| st.id == "project-audit")));
+    }
+
+    #[test]
+    fn a_gated_name_is_always_a_valid_preset_name() {
+        assert_eq!(
+            gated_preset_name("feature", "design"),
+            "design-gated-feature"
+        );
+        let long = "a".repeat(64);
+        let n = gated_preset_name(&long, "design");
+        assert!(valid_name(&n), "{n}");
+        assert!(n.starts_with("gated-") && n.len() == 22);
+        assert_eq!(n, gated_preset_name(&long, "design"));
+        assert_ne!(n, gated_preset_name(&long, "build"));
     }
 
     #[test]
