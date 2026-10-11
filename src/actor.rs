@@ -2862,11 +2862,18 @@ pub(crate) fn run(
                 // (quota, auth, dead seats — `benched_seats`), intersected with what the caller
                 // handed (which already excludes the dispute's parties, so evaluator≠creator
                 // holds). A run with no configured roster (an ad-hoc caller) keeps the caller's.
+                // A ballot-only seat (`seat_eligible_for_work: false`) is never in the work roster
+                // `clis` persists, so it stays eligible unless benched (codex r1).
                 let clis = match crate::domain::get_session(&store, &req.session_id) {
-                    Ok(Some(session)) if !session.clis.is_empty() => {
-                        let keys = eligible_roster_keys(&session);
+                    Ok(Some(session)) => {
+                        let roster = eligible_roster_keys(&session);
                         clis.into_iter()
-                            .filter(|c| keys.iter().any(|k| k == &c.key))
+                            .filter(|c| !session.benched_seats.iter().any(|b| b.cli == c.key))
+                            .filter(|c| {
+                                session.clis.is_empty()
+                                    || !c.seat_eligible_for_work
+                                    || roster.iter().any(|k| k == &c.key)
+                            })
                             .collect()
                     }
                     _ => clis,

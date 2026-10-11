@@ -799,6 +799,17 @@ pub(crate) fn delivery_receipt(
         // Every council the run's gates recorded: who decided its disputes.
         r.councils.extend(g.councils.iter().cloned());
     }
+    // …and every council a member-step review convened after its gate (a PA rejection the member
+    // held): those rulings land on the step's review record, not on a gate receipt (codex r1).
+    for u in units {
+        if let Some(m) = u.member_step.as_ref() {
+            for d in m.reviews.iter().filter_map(|x| x.dispute.clone()) {
+                if !r.councils.contains(&d) {
+                    r.councils.push(d);
+                }
+            }
+        }
+    }
     r.tree = session.verified_tree.clone();
     r
 }

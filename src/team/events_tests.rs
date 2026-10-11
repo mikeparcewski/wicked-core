@@ -2150,4 +2150,14 @@ fn a_ruling_records_the_drawn_seats_and_the_seed_on_the_dispute() {
     }
     let back: CouncilRuled = serde_json::from_value(old).unwrap();
     assert!(back.seats.is_empty() && back.seed.is_none());
+    // A council that was drawn but reached no verdict still names who sat.
+    let none = CouncilRuled {
+        verdict: Verdict::NoVerdict,
+        reason: Some(NoVerdictReason::NoQuorum),
+        ..r
+    };
+    let d = dispute_of(&none);
+    assert_eq!(d.verdict, Verdict::NoVerdict);
+    assert_eq!(d.seats, vec!["codex", "opencode", "pi"]);
+    assert_eq!(d.seed, Some(77));
 }

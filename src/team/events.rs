@@ -1812,7 +1812,12 @@ pub fn dispute_of(r: &CouncilRuled) -> Dispute {
             seed: r.seed,
             reason: r.reason,
         },
-        Verdict::NoVerdict => no_verdict(r.reason.unwrap_or(NoVerdictReason::Error)),
+        // A council that was drawn but reached no verdict still names who sat (codex r1).
+        Verdict::NoVerdict => Dispute {
+            seats: r.seats.clone(),
+            seed: r.seed,
+            ..no_verdict(r.reason.unwrap_or(NoVerdictReason::Error))
+        },
     }
 }
 

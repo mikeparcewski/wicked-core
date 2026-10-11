@@ -54,9 +54,11 @@ pub fn spawn_stagger() -> Duration {
     spawn_stagger_from(std::env::var(ENV_SPAWN_STAGGER_MS).ok().as_deref())
 }
 
-/// A seat's model family: its registry key up to the first `-` (`claude-eval` is a `claude`).
+/// A seat's model family: its CLI key (instance suffix dropped, `claude#2` is a `claude`) up to
+/// the first `-` (`claude-eval` is a `claude`).
 pub fn family(key: &str) -> &str {
-    key.split('-').next().unwrap_or(key)
+    let cli = wicked_apps_core::spawn::seat_cli_key(key);
+    cli.split('-').next().unwrap_or(cli)
 }
 
 /// A fresh seed for one council: wall-clock nanos mixed with a per-process counter, so two
@@ -178,7 +180,7 @@ mod tests {
 
     #[test]
     fn distinct_families_come_first_when_the_pool_allows() {
-        let pool = seats(&["claude", "claude-eval", "codex", "pi"]);
+        let pool = seats(&["claude", "claude-eval", "claude#2", "codex", "pi"]);
         for seed in 0..64u64 {
             let p = keys(&pick_seats(&pool, 3, seed));
             let fams: std::collections::BTreeSet<&str> = p.iter().map(|k| family(k)).collect();
@@ -218,6 +220,7 @@ mod tests {
             Duration::from_millis(3000)
         );
         assert_eq!(family("claude-eval"), "claude");
+        assert_eq!(family("claude#2"), "claude");
         assert_eq!(family("codex"), "codex");
     }
 }

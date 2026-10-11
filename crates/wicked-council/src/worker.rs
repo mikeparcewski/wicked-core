@@ -90,6 +90,10 @@ pub const ENV_DEADLINE_SECS: &str = "WICKED_COUNCIL_DEADLINE_SECS";
 /// override serves rosters and hosts that deliberate slower.
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(180);
 
+/// The longest a ballot's staggered spawns may be spread: the last seat starts at most this long
+/// after the first (a tenth of the default deadline), so staggering never eats the budget.
+pub const MAX_STAGGER_SPREAD: Duration = Duration::from_secs(18);
+
 /// The detached worker. Holds the shared ledger plus the injected seams (dispatcher, rank
 /// store, event sink) so the same engine wiring serves both the real CLI and the
 /// deterministic E2E test (which injects fakes).
@@ -332,6 +336,13 @@ fn run_council(
     // if the ballot lands below APPROVAL_THRESHOLD, a runoff shares the tally + dissent
     // arguments with every seat so the council can converge like a real deliberating
     // body. MAX_BALLOTS caps the loop; the final ballot's plurality stands regardless.
+    // The stagger never spreads one ballot's spawns over more than MAX_STAGGER_SPREAD, however
+    // large the roster and the setting (codex r1: 9 seats x 30 s would outlast the deadline).
+    let stagger = if roster.len() > 1 {
+        stagger.min(MAX_STAGGER_SPREAD / (roster.len() as u32 - 1))
+    } else {
+        stagger
+    };
     let mut ballot: u32 = 1;
     let mut prior_tally: Vec<(String, u32)> = Vec::new();
     let mut dissent_arguments: Vec<String> = Vec::new();
@@ -958,31 +969,40 @@ mod tests {
     #[test]
     fn seat_spawns_are_staggered_not_simultaneous() {
         // Operator ruling 2026-10-11: a council never forks its whole roster in one instant.
-        // Seat i opens its ballot i × stagger after the first.
+        // Seat i opens its ballot no earlier than i x stagger after the ballot opened. Measured
+        // from one reference taken before the council is queued, and `sleep` never returns
+        // early, so the lower bounds hold however the scheduler orders the threads.
         let stagger = Duration::from_millis(120);
         let rec = Arc::new(StartRecorder {
             starts: Mutex::new(Vec::new()),
         });
         let worker = worker_with(rec.clone(), &["a", "b", "c"]).with_stagger(stagger);
+        let opened = Instant::now();
         let id = worker.queue_blocking(task());
         assert_eq!(worker.poll(&id).expect("status").state, TaskState::Voted);
 
         let starts = rec.starts.lock().unwrap().clone();
         assert_eq!(starts.len(), 3, "one ballot, three seats: {starts:?}");
         let at = |k: &str| starts.iter().find(|(c, _)| c == k).expect(k).1;
-        assert!(at("b").duration_since(at("a")) >= stagger, "{starts:?}");
-        assert!(at("c").duration_since(at("a")) >= stagger * 2, "{starts:?}");
+        assert!(at("b").duration_since(opened) >= stagger, "{starts:?}");
+        assert!(at("c").duration_since(opened) >= stagger * 2, "{starts:?}");
+    }
 
-        // Zero is "spawn together": no seat waits a stagger.
-        let rec0 = Arc::new(StartRecorder {
+    #[test]
+    fn the_stagger_spread_is_capped_however_large_the_setting() {
+        // 4 seats x 30 s would start the last seat 90 s late; the spread is capped instead.
+        let rec = Arc::new(StartRecorder {
             starts: Mutex::new(Vec::new()),
         });
-        let worker0 = worker_with(rec0.clone(), &["a", "b", "c"]);
-        worker0.queue_blocking(task());
-        let s0 = rec0.starts.lock().unwrap().clone();
-        let first = s0.iter().map(|(_, t)| *t).min().unwrap();
-        let last = s0.iter().map(|(_, t)| *t).max().unwrap();
-        assert!(last.duration_since(first) < stagger, "{s0:?}");
+        let worker =
+            worker_with(rec.clone(), &["a", "b", "c", "d"]).with_stagger(Duration::from_secs(30));
+        let opened = Instant::now();
+        worker.queue_blocking(task());
+        let elapsed = opened.elapsed();
+        assert!(
+            elapsed >= MAX_STAGGER_SPREAD && elapsed < MAX_STAGGER_SPREAD * 2,
+            "{elapsed:?}"
+        );
     }
 
     /// Panics on one named seat; every other seat votes.
