@@ -18183,6 +18183,43 @@ mod request_changes_tests {
         let fresh = WorkUnit::pending("s:c", "s", 3, "c");
         assert_eq!(redrive_attempt(true, 5, Some(&fresh)), 0);
     }
+
+    /// Red pin (operator ruling 2026-10-11): approve at a judge_unavailable gate must proceed.
+    #[test]
+    fn red_approve_at_judge_unavailable_proceeds() {
+        let run_id = format!("op-judge-red-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug_with_deliver(&mut store, &run_id);
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        session.unit_ix = 3;
+        put_node(&mut store, session.to_node()).unwrap();
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        units[3].status = UnitStatus::Rejected;
+        units[3].denial = Some(UnitDenial::new(
+            crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE,
+            "opencode (judge gave no verdict)",
+        ));
+        put_node(&mut store, units[3].to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::Approve {
+                amend: Some("checked".into()),
+                amend_scope: crate::workflow::AmendScope::Cursor,
+            },
+        )
+        .unwrap();
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(units[3].status, UnitStatus::Done, "approve is the judgment");
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.unit_ix, 4);
+    }
 }
 
 /// crew#311 / core#297 §2 — the CODE-EVIDENCE floor: a governed `executes_code` CREATOR phase of
