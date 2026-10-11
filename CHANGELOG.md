@@ -239,6 +239,11 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.9.2** — 2026-10-11 — npm release on main 742b8ca, carrying #884, #885, #889 and #890.
+  **#889 (wicked-crew#951, #881)**: the QE unit runs garden's pipeline into its own roots (the
+  deliverable-roots posture), so a fenced QE seat can finish its verdict. **#884, #890**: wicked-estate
+  0.27.0 -> 0.29.0 (0.28.0: Lineage/BlastRadius paging; 0.29.0: `--readonly` creates no store, wicked-crew#931). **#885** (CI only): a maintenance release below npm's
+  `latest` publishes under `release-<major>.<minor>`.
 - **core-ts 0.9.1** — 2026-10-11 — npm release on main d74c35b, carrying #880 and #878 on the 0.9 line.
   **#878 (wicked-crew#951)**: the QE unit records its verdict in the run's own ledger
   (`WICKED_QE_LEDGER_DIR=<evidence root>/.wicked-qe`, admitted at the worker boundary), the same fix
