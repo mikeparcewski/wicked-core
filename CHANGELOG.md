@@ -239,6 +239,18 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.9.5** — 2026-10-11 — the train's final core-ts: npm release on main, carrying #898, #899 and #902
+  (wicked-crew#972, operator-approved invariants). (1) An evaluator, a review re-seat and every judge
+  (inline and bus) exclude EVERY seat that built any part of the work (`WorkUnit.authored_by`,
+  `work_authors`), so a reassigned creator never reviews; with none left the gate escalates explicitly.
+  (2) A build step whose own tree is unchanged against its dispatch baseline cannot pass the code-evidence
+  floor unless it says `NO CHANGE NEEDED`. (3) codex seats are benched on worktree-bound runs (wicked-core#769:
+  its forced approval policy has no approver), with a plain reason; opt out with `WICKED_CODEX_WORKTREE_OK=1`.
+  (4) **#902**: a judge answer with no PASS/REJECT verdict escalates to the human as `judge_unavailable`
+  ("judge gave no verdict") instead of rotating to another judge (no verdict shopping), and never records a
+  REJECT that cancels the run (the crew 0.9.7 known issue).
+  **#899** (learn): the walkthrough is a multi-turn loop: a send-back between steps re-runs the
+  conversational step with its conversation history.
 - **core-ts 0.9.4** — 2026-10-11 — the train's final core-ts: npm release on main, carrying #893, #894,
   #895, #896 and wicked-estate 0.29.2. **#893 + #894 + #895** (the editor E2E's `judge_unavailable`):
   when the run's own seats are all parties, the judge pool reaches every other enabled seat (#893);
