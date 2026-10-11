@@ -776,10 +776,12 @@ fn compute_witness_roots(boundary: Option<&BoundaryCtx>) -> Vec<std::path::PathB
             graph_write_dir_from_env(),
         ),
     };
-    let notes_root = notes_roots.first().cloned();
+    // EVERY admitted root is an expected write: under the read-only posture (the only one the
+    // witness runs for) that is the notes root and, on the QE unit, its QE ledger root
+    // (wicked-crew#951) — a verdict recorded there is not an escape.
     write_roots
         .into_iter()
-        .filter(|r| notes_root.as_ref() != Some(r))
+        .filter(|r| !notes_roots.contains(r))
         .filter(|r| graph_dir.as_ref() != Some(r))
         .collect()
 }
@@ -6647,6 +6649,29 @@ mod tests {
         let wr = compute_witness_roots(Some(&boundary));
         assert_eq!(wr, vec![wt.clone()], "witness roots = write minus notes");
         assert!(!wr.contains(&notes), "notes root excluded from witness");
+        // wicked-crew#951: the QE unit admits its QE ledger root AFTER the notes root — every
+        // admitted root is excluded, not only the first (a verdict recorded there is no escape).
+        let qe_root = base.join("evidence").join(".wicked-qe");
+        let qe_boundary = BoundaryCtx {
+            roots: AllowedRoots {
+                write: vec![wt.clone(), notes.clone(), qe_root.clone()],
+                read: vec![],
+            },
+            cwd: wt.clone(),
+            home: None,
+            claude_config_dir: None,
+            pre_build_scope: false,
+            write_posture: WritePosture::ReadOnly,
+            deliverable_roots: vec![notes.clone(), qe_root.clone()],
+            estate_store_pinned: false,
+            graph_write_dir: None,
+            graph_store_db: None,
+        };
+        assert_eq!(
+            compute_witness_roots(Some(&qe_boundary)),
+            vec![wt.clone()],
+            "witness roots = write minus every admitted root"
+        );
 
         // --- item 3: changed paths named in diff ---
         let sidecar = base.join("decisions").join("witness-test-phase");

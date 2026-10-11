@@ -837,6 +837,7 @@ mod tests {
             worktree_baseline: None,
             worktree_mutation: None,
             notes_root: None,
+            qe_ledger_root: None,
             run_base_commit: None,
             repo_checks_floor: false,
             default_floor: false,

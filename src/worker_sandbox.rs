@@ -142,6 +142,16 @@ pub(crate) fn repo_boundary(cwd: &Path, write_roots: &[PathBuf]) -> Option<RepoB
         }
     }
     for root in write_roots {
+        // A grant root whose LEAF is a symbolic link is never admitted into the clone (codex r3 on
+        // core#878): the engine mints its roots as plain directories (the notes root, the QE
+        // ledger root, vouched at dispatch), so a link in one's place was planted after the
+        // fact — and following it would grant the clone or a sibling worktree.
+        if root
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            continue;
+        }
         if let Ok(p) = root.canonicalize() {
             if protected.iter().any(|g| p.starts_with(g)) && !admitted.contains(&p) {
                 admitted.push(p);
@@ -672,6 +682,32 @@ pub(crate) mod tests {
                 .any(|p| p.ends_with("run2") || p == &clone),
             "neither the sibling nor the clone root is admitted: {:?}",
             b.admitted
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// codex r3 on core#878: a grant root swapped for a LINK into the clone after it was minted
+    /// (the QE ledger root, the notes root) is never admitted — while a real root inside the clone
+    /// still is. Mutation: drop the leaf-link check → the sibling worktree is admitted.
+    #[cfg(unix)]
+    #[test]
+    fn a_grant_root_that_is_a_link_into_the_clone_is_never_admitted() {
+        let (base, _clone, own, sibling) = clone_with_two_runs("linkroot");
+        let planted = base.join("evidence").join(".wicked-qe");
+        std::fs::create_dir_all(planted.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&sibling, &planted).unwrap();
+        let b = repo_boundary(&own, std::slice::from_ref(&planted))
+            .expect("a linked worktree has a boundary");
+        let sibling_real = sibling.canonicalize().unwrap();
+        assert!(
+            !b.admitted.contains(&sibling_real),
+            "a planted link must not admit the sibling worktree: {:?}",
+            b.admitted
+        );
+        let b = repo_boundary(&own, std::slice::from_ref(&sibling)).expect("a boundary");
+        assert!(
+            b.admitted.contains(&sibling_real),
+            "a real root inside the clone is still admitted (the check is the link, not the place)"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

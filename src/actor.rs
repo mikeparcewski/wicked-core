@@ -8952,6 +8952,30 @@ fn dispatch_unit(
                 None
             }
         });
+    // (wicked-crew#951) QE LEDGER ROOT — where the run's QE unit records its acceptance verdict:
+    // `<evidence root>/.wicked-qe`, outside every worktree (the guard discarded a verdict written
+    // into the tree, with the PASS) and exactly where the launcher's acceptance check reads the
+    // run's verdict. Like the notes root: it rides the unit (persisted, so a redrive keeps it),
+    // widens THIS unit's write boundary below and reaches its worker as `WICKED_QE_LEDGER_DIR`.
+    // Created and vouched for here (a plain directory directly under the evidence root, never a
+    // planted link), so the boundary's containment check resolves a real, expected directory.
+    let mints_qe_root = crate::qe_acceptance::is_qe_unit(&unit) && session.workdir.is_some();
+    let qe_ledger_root = if mints_qe_root {
+        match crate::qe_acceptance::mint_ledger_root(&session) {
+            Some(Ok(dir)) => Some(dir.to_string_lossy().into_owned()),
+            Some(Err(why)) => {
+                eprintln!(
+                    "wicked-core: the QE ledger root for unit {} of run {run_id} is refused: \
+                     {why} — the unit runs without one (its verdict cannot satisfy delivery)",
+                    unit.ord
+                );
+                None
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     // (DES-L1 PR-1B) Record the attempt this dispatch mints ON the unit — `last_attempt` is the
     // unit's own dispatch history, so `next_attempt` stays fresh whatever the attempt's outcome
     // (a worker exit never reaches the fold's write) and `None` means exactly "never dispatched"
@@ -8994,9 +9018,20 @@ fn dispatch_unit(
         unit.exclude_seats = session.exclude_seats.clone();
         team_changed = true;
     }
-    if (notes_root.is_some() && unit.notes_root != notes_root) || attempt_changed || team_changed {
+    // Re-derived at EVERY dispatch of the QE unit and assigned whatever it is (codex r2 on
+    // core#878): a root refused now (a link planted since the last dispatch) must not stay granted
+    // through the copy persisted then.
+    let qe_root_changed = mints_qe_root && unit.qe_ledger_root != qe_ledger_root;
+    if (notes_root.is_some() && unit.notes_root != notes_root)
+        || qe_root_changed
+        || attempt_changed
+        || team_changed
+    {
         if notes_root.is_some() {
             unit.notes_root = notes_root;
+        }
+        if mints_qe_root {
+            unit.qe_ledger_root = qe_ledger_root;
         }
         put_node(store, unit.to_node())?;
     }
@@ -9392,6 +9427,8 @@ fn dispatch_unit(
                 .iter()
                 .cloned()
                 .chain(unit.notes_root.clone())
+                // (wicked-crew#951) …and its QE ledger root, the same per-unit widening.
+                .chain(unit.qe_ledger_root.clone())
                 .collect(),
             extra_read_roots: session.extra_read_roots.clone(),
             // BC-79: the run's studio project, from the SESSION (persisted at launch), so a

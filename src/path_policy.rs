@@ -385,6 +385,19 @@ fn validate_extra_roots(
                  character join_paths refuses); refused at launch rather than degraded at spawn"
             ));
         }
+        // A WRITE root is a real directory, never a link (codex r4 on core#878): the OS floor never
+        // admits a leaf link as a grant (`worker_sandbox::repo_boundary` — a minted root swapped
+        // for one is the escape), so a declared one is refused HERE, loudly, rather than dropped
+        // at spawn. Name the link's target instead.
+        if kind == "write"
+            && p.symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            return Err(format!(
+                "extra write root {raw} is a symbolic link; declare the directory it points to \
+                 instead (a link is never granted as a write root)"
+            ));
+        }
         let resolved =
             resolve_symlinks_for_root(p).map_err(|e| format!("extra {kind} root {e}; refused"))?;
         if resolved_is_within(&resolved, &config_tree)
@@ -1085,6 +1098,28 @@ mod tests {
 /// `crate::actor::deliverable_floor_tests`; these cover the rules themselves.
 #[cfg(test)]
 mod deliverables_tests {
+    /// codex r4 on core#878: a launch-declared WRITE root that is itself a link is refused at
+    /// launch (the OS floor never grants a leaf link); a READ root may be one; a real directory is
+    /// accepted.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_root_that_is_a_link_is_refused_at_launch() {
+        let base = std::env::temp_dir().join(format!("wicked-pp-linkroot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        let home = base.join("home");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let s = |p: &std::path::Path| vec![p.to_string_lossy().into_owned()];
+        let err = super::validate_extra_write_roots(&s(&link), Some(&home)).unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(super::validate_extra_write_roots(&s(&real), Some(&home)).is_ok());
+        assert!(super::validate_extra_read_roots(&s(&link), Some(&home)).is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
