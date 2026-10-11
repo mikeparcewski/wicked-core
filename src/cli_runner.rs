@@ -991,6 +991,43 @@ pub(crate) fn run_unit_and_judge_with_team(
     )
 }
 
+/// The seats a judge may be drawn from, in preference order: the run's CONFIGURED registry seats
+/// first (review RT-1: an ordinary run is judged on its own seats), then every other registry
+/// seat. The rotation ([`crate::validator::distinct_judge_keys`]) walks this order and skips the
+/// work's authors by identity, so a seat the launch never configured (codex on the rig, which is
+/// kept off CREATOR seats but not off judging) judges only when no configured seat is distinct —
+/// editor E2E run bad4d9df: claude/pi/opencode were all parties and the gate escalated
+/// `judge_unavailable` with codex signed in. A seat that refuses (signed out, out of quota) is
+/// reported and benched like any judge refusal, so "no distinct judge" still reaches the gate
+/// explicitly; the creator is never reused.
+fn judge_pool<'a>(
+    roster: &'a [crate::AgenticCli],
+    run_roster: &[String],
+) -> Vec<&'a crate::AgenticCli> {
+    let configured = |c: &crate::AgenticCli| run_roster.iter().any(|k| k == &c.key);
+    roster
+        .iter()
+        .filter(|c| configured(c))
+        .chain(roster.iter().filter(|c| !configured(c)))
+        .collect()
+}
+
+/// The roster a judge rotation walks: the run's configured seats when one of them is distinct from
+/// the work's authors (`excluded`), else the whole ordered pool ([`judge_pool`]: configured
+/// first, then the registry's other seats). Keeping the rotation on the configured seats whenever
+/// they suffice is what makes an outside seat a last resort rather than a rotation peer.
+fn judge_roster<'a>(
+    excluded: &[&str],
+    configured: &'a [crate::AgenticCli],
+    all: &'a [crate::AgenticCli],
+) -> &'a [crate::AgenticCli] {
+    if crate::validator::distinct_judge_available(excluded, configured) {
+        configured
+    } else {
+        all
+    }
+}
+
 /// (core#772) When NO identity-distinct judge remains on the run's unbenched roster but one
 /// WOULD exist without the run's bench, the judge is unavailable because of SEAT FAILURES earlier
 /// in the run (a quota / sign-in / empty answer while judging) — not because the run never had
@@ -1225,15 +1262,7 @@ fn run_unit_and_judge_on(
     // The pool is the run's configured seats when any of them is a registry seat; a run whose
     // roster names NO registry seat (an ad-hoc launch roster, a test's fabricated keys) keeps
     // the registry as its pool — there is nothing to intersect with, and a judge must exist.
-    let configured: Vec<&crate::AgenticCli> = roster
-        .iter()
-        .filter(|c| run_roster.iter().any(|k| k == &c.key))
-        .collect();
-    let pool: Vec<&crate::AgenticCli> = if configured.is_empty() {
-        roster.iter().collect()
-    } else {
-        configured
-    };
+    let pool = judge_pool(roster, run_roster);
     // (core#772) The same pool BEFORE the run's bench: a judge seat benched earlier in this run
     // (a quota / sign-in refusal while judging) must not turn "no distinct judge" into an
     // UNGATED pass on the retry — when the only distinct judges left are benched ones, the gate
@@ -1248,7 +1277,13 @@ fn run_unit_and_judge_on(
         .filter(|c| !benched.iter().any(|b| b == &c.key))
         .cloned()
         .collect();
-    let roster = eligible.as_slice();
+    // The run's own configured seats among them: the rotation stays on these whenever one is
+    // distinct from the work's authors ([`judge_roster`]).
+    let eligible_configured: Vec<crate::AgenticCli> = eligible
+        .iter()
+        .filter(|c| run_roster.iter().any(|k| k == &c.key))
+        .cloned()
+        .collect();
     // (review RT-1 / F-7R3-001) Judge seats that REFUSED while the rotation passed over them —
     // an authentication failure, a quota refusal, a binary that could not start — reported for
     // the fold to bench (`source: "judge"`; a quota refusal benches only a seat with no
@@ -1455,6 +1490,7 @@ fn run_unit_and_judge_on(
             let mut excluded: Vec<&str> =
                 vec![crate::validator::DETERMINISTIC_VALIDATOR_SEAT, work_author];
             excluded.extend(team_excluded.iter().map(String::as_str));
+            let roster = judge_roster(&excluded, &eligible_configured, &eligible);
             // (#539) Pre-check: only run the judge when an identity-distinct seat exists.
             // Without this check, agent_validate falls back to the single default runner — a
             // self-grade when the creator is claude. Mirror the default-floor path (F-7R2-005).
@@ -1541,6 +1577,7 @@ fn run_unit_and_judge_on(
                 .unwrap_or(crate::validator::DETERMINISTIC_VALIDATOR_SEAT);
             let mut excluded: Vec<&str> = vec![work_author];
             excluded.extend(team_excluded.iter().map(String::as_str));
+            let roster = judge_roster(&excluded, &eligible_configured, &eligible);
             if let Some(v) =
                 benched_judge_unavailable("default judge", &excluded, roster, &unbenched, benched)
             {
@@ -4946,14 +4983,20 @@ mod tests {
         // the unbenched roster, but one existed before the bench. That is still a SEAT FAILURE
         // (the human gate opens) — never a skipped judge, which would pass the retry on the
         // deterministic floor alone.
+        // The registry here holds only the run's own seats: no outside seat can judge either.
         seats.judged_on.lock().unwrap().clear();
         let benched_all = ["dead".to_string(), "quota".to_string(), "empty".to_string()];
+        let run_only: Vec<crate::AgenticCli> = registry
+            .iter()
+            .filter(|c| only_failing.contains(&c.key))
+            .cloned()
+            .collect();
         let (_, verdict4, evidence4) = run_unit_and_judge_with_roster(
             &runner,
             &input3,
             None,
             noop,
-            &registry,
+            &run_only,
             &only_failing,
             &benched_all,
         );
@@ -4968,7 +5011,105 @@ mod tests {
             seats.judged_on.lock().unwrap().is_empty() && evidence4.judge_refusals.is_empty(),
             "no benched seat is re-drawn"
         );
+
+        // (editor E2E bad4d9df) The same retry with the FULL registry: every configured distinct
+        // seat is benched, so an enabled seat the launch never configured judges — a real
+        // verdict, never the creator, never a benched seat.
+        seats.judged_on.lock().unwrap().clear();
+        let (_, verdict5, _) = run_unit_and_judge_with_roster(
+            &runner,
+            &input3,
+            None,
+            noop,
+            &registry,
+            &only_failing,
+            &benched_all,
+        );
+        let v5 = verdict5.expect("an outside seat judged");
+        assert!(v5.pass, "{v5:?}");
+        assert!(
+            matches!(v5.judge_cli.as_deref(), Some("alive") | Some("stranger")),
+            "{v5:?}"
+        );
+        let judged5 = seats.judged_on.lock().unwrap().clone();
+        assert!(
+            !judged5
+                .iter()
+                .any(|s| s == "creator" || benched_all.contains(s)),
+            "{judged5:?}"
+        );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Editor E2E run bad4d9df (coordinator, 2026-10-11): the run seated claude, pi and opencode;
+    /// pi created the work, claude authored the validator, opencode monitored — every seated
+    /// identity is a party. codex is kept off the rig's CREATOR seats only (it is not in the
+    /// launch roster), copilot is out of quota (benched). The judge pool must still reach codex,
+    /// and with no codex it must come back EMPTY (the gate's explicit `judge_unavailable` / judge
+    /// skipped path) — never a party.
+    #[test]
+    fn a_three_seat_run_whose_seats_are_all_parties_is_judged_by_an_enabled_outside_seat() {
+        let registry = [
+            seat("claude", "claude -p {PROMPT}"),
+            seat("copilot", "copilot -p {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+            seat("pi", "pi -p {PROMPT}"),
+            seat("opencode", "opencode run {PROMPT}"),
+        ];
+        let run_roster: Vec<String> = ["claude", "pi", "opencode"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let benched = ["copilot".to_string()];
+        let parties = [
+            crate::validator::DETERMINISTIC_VALIDATOR_SEAT, // claude, the validator's author
+            "pi",                                           // the creator
+            "opencode",                                     // the monitor
+        ];
+        let pool_for = |registry: &[crate::AgenticCli]| -> Vec<String> {
+            let eligible: Vec<crate::AgenticCli> = judge_pool(registry, &run_roster)
+                .into_iter()
+                .filter(|c| !benched.contains(&c.key))
+                .cloned()
+                .collect();
+            let configured: Vec<crate::AgenticCli> = eligible
+                .iter()
+                .filter(|c| run_roster.contains(&c.key))
+                .cloned()
+                .collect();
+            let roster = judge_roster(&parties, &configured, &eligible);
+            crate::validator::distinct_judge_keys(&parties, roster)
+        };
+        assert_eq!(pool_for(&registry), vec!["codex".to_string()]);
+        // No codex on the host: nobody is left, and the caller's explicit escalation applies.
+        let without_codex: Vec<crate::AgenticCli> = registry
+            .iter()
+            .filter(|c| c.key != "codex")
+            .cloned()
+            .collect();
+        assert!(pool_for(&without_codex).is_empty());
+        // A configured distinct seat always wins over an outside one (review RT-1).
+        let configured_ok: Vec<String> = ["claude", "pi", "opencode"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let eligible: Vec<crate::AgenticCli> = judge_pool(&registry, &configured_ok)
+            .into_iter()
+            .cloned()
+            .collect();
+        let configured: Vec<crate::AgenticCli> = eligible
+            .iter()
+            .filter(|c| configured_ok.contains(&c.key))
+            .cloned()
+            .collect();
+        let picked = crate::validator::distinct_judge_keys(
+            &["pi"],
+            judge_roster(&["pi"], &configured, &eligible),
+        );
+        assert!(
+            !picked.is_empty() && picked.iter().all(|k| k != "codex"),
+            "{picked:?}"
+        );
     }
 }
 
