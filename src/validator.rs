@@ -5358,6 +5358,52 @@ mod tests {
         assert_eq!(refused2.len(), 1);
     }
 
+    /// Red pin (operator ruling, revised): negative prose with no verdict line, then a seat that
+    /// would PASS — the gate must NOT pass by re-asking.
+    #[test]
+    fn red_a_negative_unlabelled_answer_is_not_followed_by_a_pass() {
+        use crate::workflow::{StepOutput, StepRunner};
+        struct R(std::sync::Mutex<Vec<String>>);
+        impl StepRunner for R {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let cli = input.unit.assigned_cli.clone().unwrap_or_default();
+                self.0.lock().unwrap().push(cli.clone());
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: if cli == "opencode" {
+                        "This exposes every account to unauthenticated writes; it must not ship."
+                            .into()
+                    } else {
+                        "PASS\nfine\nPASS".into()
+                    },
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("pi", "pi run {PROMPT}"),
+            seat("opencode", "opencode run {PROMPT}"),
+            seat("copilot", "copilot -p {PROMPT}"),
+        ];
+        let r = R(std::sync::Mutex::new(Vec::new()));
+        let (verdict, _) = agent_validate_with_refusals(
+            "c",
+            "w",
+            &[DETERMINISTIC_VALIDATOR_SEAT, "pi"],
+            &roster,
+            &r,
+        );
+        assert!(verdict.is_err(), "no PASS by re-asking: {verdict:?}");
+        assert_eq!(r.0.lock().unwrap().clone(), vec!["opencode".to_string()]);
+    }
+
     /// SEAT failure: reported for the bench (with the seat's own words), and the rotation moves
     /// to the next identity-distinct seat, whose real verdict decides.
     #[test]
