@@ -1039,6 +1039,12 @@ fn without_author_binaries(
         .collect()
 }
 
+/// Whether a pinned judge can come only from seats the run did not configure: the run's own
+/// unbenched seats (`run_unbenched`, authors' binaries removed) hold no distinct judge.
+fn outside_seats_only(excluded: &[&str], run_unbenched: &[crate::AgenticCli]) -> bool {
+    !crate::validator::distinct_judge_available(excluded, run_unbenched)
+}
+
 /// The roster a judge rotation walks: the run's configured seats when one of them is distinct from
 /// the work's authors (`excluded`), else the whole ordered pool ([`judge_pool`]: configured
 /// first, then the registry's other seats). Keeping the rotation on the configured seats whenever
@@ -1543,6 +1549,12 @@ fn run_unit_and_judge_on(
             let eligible_x = without_author_binaries(&eligible, &excluded, &author_ids);
             let configured_x =
                 without_author_binaries(&eligible_configured, &excluded, &author_ids);
+            // Whether only OUTSIDE seats can judge: the run's own unbenched seats never had a
+            // distinct judge (the pre-#893 "judge skipped" condition).
+            let outside_only = outside_seats_only(
+                &excluded,
+                &without_author_binaries(&unbenched_run, &excluded, &author_ids),
+            );
             let roster = judge_roster(&excluded, &configured_x, &eligible_x);
             // (#539) Pre-check: only run the judge when an identity-distinct seat exists.
             // Without this check, agent_validate falls back to the single default runner — a
@@ -1607,6 +1619,32 @@ fn run_unit_and_judge_on(
                 &**runner,
             );
             note_refusals(&refused);
+            // (crew main red 2026-10-11) An outside seat is a LAST RESORT that replaces a skipped
+            // judge: when only outside seats could judge and every one of them failed as a seat
+            // (signed out, out of quota), the gate gets the skip it had before #893 — the floor
+            // decides under reduced assurance, and a required judge still holds the gate
+            // (`judge_unavailable`) — never a seat-failure pause the run's own roster never asked
+            // for. The refusals above are still reported for the bench.
+            let all_failed = match &verdict {
+                Ok(av) => av.seat_failure.is_some(),
+                Err(_) => true,
+            };
+            if outside_only && all_failed {
+                judge_skipped = Some(format!(
+                    "no judge seat distinct from creator '{work_author}' and validator author                      '{}'{monitors_note} on the run's own seats, and every other enabled seat                      failed to judge ({})",
+                    crate::validator::DETERMINISTIC_VALIDATOR_SEAT,
+                    if refused.is_empty() {
+                        "no answer".to_string()
+                    } else {
+                        refused
+                            .iter()
+                            .map(|(k, why)| format!("{k}: {why}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                ));
+                break 'pinned None;
+            }
             Some(match verdict {
                 // Carries the judge seat + distinctness for `gateEvaluated` (core#431).
                 Ok(av) => av,
@@ -5097,6 +5135,25 @@ mod tests {
             "the default judge never reaches a seat the run did not configure: {judged5:?}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (crew main red 2026-10-11, crew run 38124235121) When does an all-refused OUTSIDE judge fall
+    /// back to the pre-#893 skip? Only when the run's own unbenched seats never had a distinct
+    /// judge: the crew smoke's one-seat run (creator `copilot`, validator author `claude`) does;
+    /// the core#772 retry (distinct run seats that were BENCHED) does not — that stays a seat
+    /// failure, never a skip.
+    #[test]
+    fn an_all_refused_outside_judge_is_a_skip_only_when_the_run_never_had_a_distinct_judge() {
+        let copilot = seat("copilot", "node floor-seat-cli.cjs {PROMPT}");
+        let parties = [crate::validator::DETERMINISTIC_VALIDATOR_SEAT, "copilot"];
+        assert!(outside_seats_only(&parties, std::slice::from_ref(&copilot)));
+        // The run's own pre-bench pool held distinct seats (`dead`, `quota`): not outside-only.
+        let run_unbenched = [
+            seat("creator", "creator -p {PROMPT}"),
+            seat("dead", "dead -p {PROMPT}"),
+            seat("quota", "quota -p {PROMPT}"),
+        ];
+        assert!(!outside_seats_only(&["creator"], &run_unbenched));
     }
 
     /// Editor E2E run bad4d9df (coordinator, 2026-10-11): the run seated claude, pi and opencode;
