@@ -239,6 +239,12 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.8.4** — 2026-10-11 — npm release on main tip b75b4ab, carrying #872 and #876.
+  **#872 (X3)**: `editor-plugin` is a built-in preset (create an editor plugin; a delivering run puts
+  deliver before its install dry run). **#876 (wicked-crew 0.9.4 release smoke, F-SMOKE-004)**: a
+  judge seat the fold benches for a refusal stays on the session. `apply_step_result` adopts the
+  stored benches right after the fold, so its pre-fold copy no longer drops them and the next unit's
+  judge stops rotating onto the benched seat.
 - **core-ts 0.8.3** — 2026-10-10 — npm release (tag on 774994b, main after #873), carrying #869 and
   #873. **#869
   (wicked-crew#944)**: the sessions-detail fold (`list_projects`, behind every `GET /runs` and
