@@ -317,6 +317,22 @@ jobs:
         run: |
           find npm -maxdepth 2 -name package.json -o -name '*.node' | sort
 
+      # A MAINTENANCE release (a version below npm's current `latest`, e.g. 0.8.5 after 0.9.0) cannot
+      # take the implicit `latest` tag — npm refuses it — and must not move `latest` backwards.
+      # It publishes under `release-<major>.<minor>`; a range pin (`^0.8.5`) resolves it either way.
+      - name: Choose the npm dist-tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#core-ts-v}"
+          LATEST="$(npm view wicked-core-ts dist-tags.latest 2>/dev/null || true)"
+          TAG=latest
+          if [ -n "$LATEST" ] && [ "$(printf '%s\n%s\n' "$VERSION" "$LATEST" | sort -V | tail -n1)" != "$VERSION" ]; then
+            TAG="release-$(echo "$VERSION" | cut -d. -f1,2)"
+          fi
+          echo "wicked-core-ts@$VERSION publishes under dist-tag '$TAG' (npm latest: ${LATEST:-none})"
+          echo "NPM_DIST_TAG=$TAG" >> "$GITHUB_ENV"
+
       # Publish the 5 platform packages first, then the main package (whose optionalDependencies
       # reference them). --provenance emits a build-provenance attestation via OIDC (id-token: write);
       # publishing is via npm trusted publishing (tokenless OIDC), matching the wicked-ci pattern.
@@ -326,12 +342,12 @@ jobs:
           set -euo pipefail
           for dir in npm/*/; do
             echo "==> npm publish $dir"
-            npm publish "$dir" --access public --provenance
+            npm publish "$dir" --access public --provenance --tag "$NPM_DIST_TAG"
           done
 
       - name: Publish main package
         shell: bash
-        run: npm publish --access public --provenance
+        run: npm publish --access public --provenance --tag "$NPM_DIST_TAG"
 
   # ── re-stamp main's lockfile against the packages that now exist on npm (#422) ───────────────────
   #
