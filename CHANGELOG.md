@@ -239,6 +239,9 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.9.6** — 2026-10-11 — patch release on main 961c10c, carrying #904 (learn E2E F-LEARN-2, run
+  55a1fac3): the gate pre-check accepts "Ask a follow-up" on a conversational step of a floor-filled plan,
+  so the learn walkthrough loop (#899) works on the final stack.
 - **core-ts 0.9.5** — 2026-10-11 — the train's final core-ts: npm release on main, carrying #898, #899 and #902
   (wicked-crew#972, operator-approved invariants). (1) An evaluator, a review re-seat and every judge
   (inline and bus) exclude EVERY seat that built any part of the work (`WorkUnit.authored_by`,
