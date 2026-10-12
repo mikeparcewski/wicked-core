@@ -147,8 +147,8 @@ pub use decision::{DecisionRequest, DecisionVerdict};
 pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
 pub use domain::{
     all_sessions, get_session, get_unit_transcript, get_unit_transcript_at, get_work_output,
-    put_node, put_nodes, session_units, AgentSession, HumanConfirm, RoutingInfo, SessionStatus,
-    SessionView, StageKind, UnitDenial, UnitStatus, UnitTranscript, WorkUnit,
+    put_node, put_nodes, session_units, AgentSession, BenchedSeat, HumanConfirm, RoutingInfo,
+    SessionStatus, SessionView, StageKind, UnitDenial, UnitStatus, UnitTranscript, WorkUnit,
 };
 pub use domain_extraction::{
     coverage_eq_one_validator, provision_and_approve_coverage_validator, COVERAGE_CRITERION,
@@ -381,6 +381,16 @@ pub struct LaunchSpec {
 /// means every check-running verify floor on this host will deny — say so before the run.
 pub fn host_boundary() -> serde_json::Value {
     crate::worker_sandbox::host_boundary()
+}
+
+/// (core#769, crew Agents page A5) The engine's worktree bench as a pure predicate: the seats a run
+/// BOUND to one repository benches before routing, with the reason that run would persist on
+/// [`AgentSession::benched_seats`] (source `launcher`). Today that is every codex seat, unless the
+/// host sets `WICKED_CODEX_WORKTREE_OK` (read at call time, as the launch reads it). An unbound run
+/// benches none. Exported so a consumer (crew's roster) can say a seat will be benched on repository
+/// work without restating the rule.
+pub fn worktree_benched(clis: &[AgenticCli], bound: bool) -> Vec<BenchedSeat> {
+    crate::distribute::worktree_benched(clis, bound)
 }
 
 /// Resolve the council roster from the registry (built-ins merged with the user's

@@ -926,6 +926,19 @@ impl Core {
         serde_json::to_string(&wicked_core::registry_roster()).map_err(err)
     }
 
+    /// (core#769, crew Agents page A5) The engine's worktree bench as a pure predicate: given a
+    /// JSON array of `AgenticCli` seats (the engine-shaped roster, as `launchRun`'s `clisJson`) and
+    /// whether the run is BOUND to one repository, the JSON array of `BenchedSeat` (`{cli, reason,
+    /// source: "launcher"}`) the launch would bench before routing. Reads
+    /// `WICKED_CODEX_WORKTREE_OK` at call time, as the launch does. An addon without this static
+    /// predates it; crew keys on its presence.
+    #[napi]
+    pub fn worktree_benched(clis_json: String, bound: bool) -> napi::Result<String> {
+        let clis: Vec<AgenticCli> = serde_json::from_str(&clis_json)
+            .map_err(|e| err(format!("clisJson is not a valid AgenticCli array: {e}")))?;
+        serde_json::to_string(&wicked_core::worktree_benched(&clis, bound)).map_err(err)
+    }
+
     /// Whether this addon carries DES-TEAMING-002 T3's plan launch: `LaunchOptions.planJson` /
     /// `deliverStepJson` and `confirmGate(…, planJson)`. napi IGNORES an undeclared object field,
     /// so a launcher keys on this static's presence before it sends a plan — an older addon would
@@ -2686,6 +2699,34 @@ impl Drop for Subscription {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (core#769, A5) `Core.worktreeBenched()`: a bound run benches every codex seat with the
+    /// launcher's reason, an unbound run none, and a malformed roster is refused.
+    #[test]
+    fn worktree_benched_answers_the_launch_bench_as_json() {
+        let seat = |k: &str| serde_json::json!({"key": k, "display_name": k, "binary": k, "headless_invocation": "x {PROMPT}"});
+        let roster =
+            serde_json::to_string(&[seat("claude"), seat("codex"), seat("codex#2"), seat("pi")])
+                .unwrap();
+        let bound: Vec<serde_json::Value> =
+            serde_json::from_str(&Core::worktree_benched(roster.clone(), true).unwrap()).unwrap();
+        if std::env::var_os("WICKED_CODEX_WORKTREE_OK").is_none() {
+            let keys: Vec<&str> = bound.iter().filter_map(|b| b["cli"].as_str()).collect();
+            assert_eq!(keys, vec!["codex", "codex#2"]);
+            assert!(bound.iter().all(|b| b["source"] == "launcher"), "{bound:?}");
+            assert!(bound[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("approval request failed"));
+        } else {
+            // The runner's own opt-out: the binding must honour it (both branches of the rule
+            // itself are pinned env-free by `distribute::worktree_bench_tests`).
+            assert!(bound.is_empty(), "{bound:?}");
+        }
+        let unbound = Core::worktree_benched(roster, false).unwrap();
+        assert_eq!(unbound, "[]");
+        assert!(Core::worktree_benched("{}".into(), true).is_err());
+    }
 
     /// (DC-S1) `Core.considerRules()`: the binding answers the governance split as JSON — a
     /// project rule is in force for its own project and set aside `out_of_scope` for another, a

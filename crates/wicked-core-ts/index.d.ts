@@ -188,6 +188,15 @@ export declare class Core {
    */
   static registryRoster(): string
   /**
+   * (core#769, crew Agents page A5) The engine's worktree bench as a pure predicate: given a
+   * JSON array of `AgenticCli` seats (the engine-shaped roster, as `launchRun`'s `clisJson`) and
+   * whether the run is BOUND to one repository, the JSON array of `BenchedSeat` (`{cli, reason,
+   * source: "launcher"}`) the launch would bench before routing. Reads
+   * `WICKED_CODEX_WORKTREE_OK` at call time, as the launch does. An addon without this static
+   * predates it; crew keys on its presence.
+   */
+  static worktreeBenched(clisJson: string, bound: boolean): string
+  /**
    * Whether this addon carries DES-TEAMING-002 T3's plan launch: `LaunchOptions.planJson` /
    * `deliverStepJson` and `confirmGate(…, planJson)`. napi IGNORES an undeclared object field,
    * so a launcher keys on this static's presence before it sends a plan — an older addon would
