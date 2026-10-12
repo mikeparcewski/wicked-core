@@ -282,7 +282,7 @@ impl McpUnit {
                 .clone()
                 .unwrap_or_else(|| "claude".to_string()),
             mode,
-            decisions_path: crate::gate_hook::decisions_path_for(&input.run_id, input.attempt),
+            decisions_path: crate::gate_hook::decisions_path_for_input(input),
             db_path: db_path.to_string(),
         }
     }

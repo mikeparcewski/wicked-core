@@ -1115,6 +1115,10 @@ fn run_unit_and_judge_on(
     Option<crate::validator::AgentVerdict>,
     crate::workflow::UnitEvidence,
 ) {
+    // (DES-QE-EVERY-SEAT) This attempt's start, before its executor turn: a QE run that turn names
+    // must have been created at or after it (no grace; a resumed run is bound by its id instead).
+    // Never the worktree baseline, which a resume or redrive keeps from an earlier attempt.
+    let qe_not_before = crate::interaction::now_millis();
     // DES-TEAMING-002 T5 — the worker-thread seam, shared by the in-process worker and the bus
     // worker. `step.claimed` goes out BEFORE the turn starts (so it precedes every row of the
     // turn, §4.3); a claim that failed AND could not be tombstoned fails the step here, before
@@ -1224,6 +1228,19 @@ fn run_unit_and_judge_on(
             }
         }
         None => runner.run_unit_streaming(advised.as_ref().unwrap_or(input), emit_delta),
+    };
+    // (DES-QE-EVERY-SEAT) THE ISOLATED QE REVIEWER. For the run's QE unit with a `required`
+    // decision, the turn above was the EXECUTOR (writer + executor, no QE verdict); the engine now
+    // runs the reviewer as its own fresh worker session on a run seat, handed only the evidence
+    // path, and binds the verdict it recorded. Each reviewer turn's governance is its OWN decisions
+    // log, folded as that turn's (the record carries its nonce and flags); the unit's output stays
+    // the executor's. A floor re-run runs no reviewer (the seat does not run again): it carries or
+    // invalidates the last record.
+    let qe_review = match floor_rerun {
+        Some(r) => crate::qe_acceptance::review::on_floor_rerun(&input.unit, r.fix.is_some()),
+        None => {
+            crate::qe_acceptance::review::run(runner, input, &output, qe_not_before, emit_delta)
+        }
     };
     // T5: `step.completed`, then the bounded gate wait for S's `ledger.folded` (fail-closed
     // synthesis on timeout). The snapshot is the attempt's `UnitEvidence.team`.
@@ -1992,6 +2009,7 @@ fn run_unit_and_judge_on(
         judge_auth_refusals,
         judge_refusals,
         team: team_snapshot,
+        qe_review,
     };
     (output, agent_verdict, evidence)
 }

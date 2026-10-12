@@ -2261,7 +2261,7 @@ impl WrappedCliStepRunner {
                 if let Some(cli) = argv.first() {
                     let marker = floor.as_ref().map_err(|e| e.clone()).and_then(|tool| {
                         crate::gate_hook::write_os_sandbox_marker(
-                            &crate::gate_hook::decisions_path_for(&input.run_id, input.attempt),
+                            &crate::gate_hook::decisions_path_for_input(input),
                             &crate::scope::unit_phase(input.unit.ord),
                             &worker_write_roots,
                             tool,
@@ -3428,7 +3428,7 @@ fn arm_input_governance(
 ) -> std::io::Result<GovLaunch> {
     let scope = crate::scope::resolve_scope(input.entity_mode, &input.run_id, &input.unit.id);
     let phase = crate::scope::unit_phase(input.unit.ord);
-    let decisions_path = crate::gate_hook::decisions_path_for(&input.run_id, input.attempt);
+    let decisions_path = crate::gate_hook::decisions_path_for_input(input);
     // Resolve the wicked-core binary path for the gate-hook command.
     //
     // When wicked-core runs as a napi-rs addon loaded by Node.js (the wicked-crew TS layer),
@@ -4835,13 +4835,11 @@ pub(crate) fn skill_prompt(
         .unwrap_or_default();
     // (QE acceptance) The run's QE unit says whether to run garden's acceptance pipeline, in the
     // seat's own spelling of the QE skill; every other unit carries nothing here.
-    let qe = unit
-        .qe_acceptance
-        .as_ref()
-        .map(|q| {
-            crate::qe_acceptance::directive(q, &plugin_skill_invocation(QE_SKILL, form, skills))
-        })
-        .unwrap_or_default();
+    let qe = if unit.qe_acceptance.is_some() {
+        crate::qe_acceptance::unit_directive(unit, &plugin_skill_invocation(QE_SKILL, form, skills))
+    } else {
+        String::new()
+    };
     let mut prompt = format!(
         "{lead}{qe}{layout}{}",
         crate::assumptions::PROMPT_CONVENTION

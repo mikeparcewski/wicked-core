@@ -74,6 +74,11 @@ enum VerifyBehaviour {
     /// wicked-crew#951: the QE unit records its acceptance verdict where the engine told it to —
     /// under `WorkUnit::qe_ledger_root` (garden's `qe accept` honours `WICKED_QE_LEDGER_DIR`).
     RecordsItsQeVerdictUnderTheLedgerRoot,
+    /// DES-QE-EVERY-SEAT: a seat with NO sub-agent (pi-like). Its executor turn runs garden's
+    /// `accept --phase evidence` — writes the ledger run, plan, scenario copy and evidence, and
+    /// names the dir on its `QE-EVIDENCE:` line, recording no verdict. The engine's reviewer turn
+    /// (`qe_review_session` set) records the verdict stamped with that session's nonce.
+    ProducesQeEvidenceWithoutASubAgent,
 }
 
 /// What the fake seat does when it runs the `reproduce` phase — the read-only recon rung whose
@@ -214,6 +219,46 @@ impl StepRunner for ScriptedSeat {
                             .unwrap();
                         }
                     }
+                    VerifyBehaviour::ProducesQeEvidenceWithoutASubAgent => {
+                        let root = Path::new(input.unit.qe_ledger_root.as_deref().unwrap());
+                        match input.unit.qe_review_session.as_deref() {
+                            None => {
+                                let id = "0b6b5f0e-2c1d-4a8e-9f1e-3d2c1b0a9f8e";
+                                let dir = root.join("evidence").join(id);
+                                std::fs::create_dir_all(&dir).unwrap();
+                                std::fs::create_dir_all(root.join("runs")).unwrap();
+                                std::fs::write(dir.join("test-plan.md"), "# plan\n").unwrap();
+                                std::fs::write(dir.join("scenario.md"), "# scenario\n").unwrap();
+                                std::fs::write(dir.join("evidence.json"), "{}\n").unwrap();
+                                std::fs::write(
+                                    root.join("runs").join(format!("{id}.json")),
+                                    serde_json::json!({
+                                        "id": id, "created_at": iso_now(),
+                                        "status": "running", "crew_run_id": input.run_id,
+                                        "evidence_path": dir.to_string_lossy(),
+                                    })
+                                    .to_string(),
+                                )
+                                .unwrap();
+                                output.push_str(&format!("\nQE-EVIDENCE: {}", dir.display()));
+                            }
+                            Some(nonce) => {
+                                let verdicts = root.join("verdicts");
+                                std::fs::create_dir_all(&verdicts).unwrap();
+                                std::fs::write(
+                                    verdicts.join("v-review.json"),
+                                    serde_json::json!({
+                                        "id": "v-review", "created_at": iso_now(),
+                                        "run_id": "0b6b5f0e-2c1d-4a8e-9f1e-3d2c1b0a9f8e",
+                                        "verdict": "PASS", "crew_run_id": input.run_id,
+                                        "review_session": nonce,
+                                    })
+                                    .to_string(),
+                                )
+                                .unwrap();
+                            }
+                        }
+                    }
                     VerifyBehaviour::LeavesTreeAlone => {}
                 },
                 _ => {}
@@ -239,6 +284,32 @@ impl StepRunner for ScriptedSeat {
             governed: false,
         }
     }
+}
+
+/// Now, as `Date.prototype.toISOString` writes it (what wicked-ledger stamps `created_at` with).
+fn iso_now() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let (days, rem) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000));
+    // Civil date from days (H. Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rem / 3_600_000,
+        rem / 60_000 % 60,
+        rem / 1000 % 60,
+        rem % 1000
+    )
 }
 
 fn cli(key: &str) -> AgenticCli {
@@ -1541,6 +1612,126 @@ fn the_qe_unit_records_its_verdict_under_the_run_qe_ledger_root_without_tripping
             let _ = std::fs::remove_dir_all(run_dir);
         }
     }
+}
+
+/// DES-QE-EVERY-SEAT (operator ruling 2026-10-12, "QE should be everyone"): the in-process proof.
+/// A bound run that requires QE acceptance, on three seats, whose QE unit lands on a seat with NO
+/// sub-agent. The executor turn produces evidence only; the ENGINE runs the isolated reviewer as
+/// its own fresh worker session on the run's third seat (neither the creator's nor the
+/// executor's), handed only the evidence path — no prior outputs, no executor directive — and the
+/// verdict it recorded, stamped with that session's nonce, binds and the QE unit's gate passes.
+#[test]
+fn qe_acceptance_on_a_seat_without_a_sub_agent_is_reviewed_by_the_engine_in_isolation() {
+    let repo = make_git_repo("qe-every-seat", None);
+    let evidence = std::env::temp_dir().join(format!(
+        "wicked-qe-every-seat-evidence-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&evidence);
+    std::fs::create_dir_all(evidence.join("author")).unwrap();
+    let (core, _ran, inputs) = core_with(
+        "qe-every-seat",
+        VerifyBehaviour::ProducesQeEvidenceWithoutASubAgent,
+        ReproduceBehaviour::LeavesTreeAlone,
+    );
+    let mut def: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/workflows/bug-def.json")).unwrap();
+    def["id"] = serde_json::json!("bug-def-qe");
+    def["required_instruments"] =
+        serde_json::json!(["distinct_evaluator", "judge", "qe_acceptance"]);
+    core.register_workflow(def.to_string())
+        .expect("the QE-requiring bug def registers");
+    let entry = core
+        .register_repo(RepoSpec {
+            name: "qe-every-seat".into(),
+            root_path: repo.to_str().unwrap().into(),
+            registered_at: 1,
+        })
+        .expect("register");
+    let events = core.subscribe();
+    let mut spec = bug_run("r-qe-every-seat", &entry.id);
+    spec.workflow = Some("bug-def-qe".into());
+    spec.clis = vec![cli("a"), cli("b"), cli("c")];
+    spec.evidence_root = Some(evidence.to_string_lossy().into_owned());
+    spec.extra_write_roots = vec![evidence.join("author").to_string_lossy().into_owned()];
+    core.launch_run(spec).expect("launch");
+    let evs = wait_for_event(&events, |e| {
+        matches!(e, CoreEvent::GateEvaluated { ord: 4, .. })
+    })
+    .expect("the run reached the QE unit's gate");
+    let gate = gate_for(&evs, 4);
+    let inputs = inputs.lock().unwrap().clone();
+    let fix_seat = inputs
+        .iter()
+        .find(|i| i.unit.phase_id() == Some("fix"))
+        .and_then(|i| i.unit.assigned_cli.clone())
+        .expect("the fix ran");
+    let executor = inputs
+        .iter()
+        .find(|i| i.unit.phase_id() == Some("verify") && i.unit.qe_review_session.is_none())
+        .expect("the QE executor turn ran");
+    let reviewer = inputs
+        .iter()
+        .find(|i| i.unit.qe_review_session.is_some())
+        .expect("the engine ran the isolated reviewer turn");
+    let executor_seat = executor.unit.assigned_cli.clone().unwrap();
+    let reviewer_seat = reviewer.unit.assigned_cli.clone().unwrap();
+    assert!(
+        reviewer_seat != fix_seat && reviewer_seat != executor_seat,
+        "the reviewer runs on a run seat distinct from the creator ({fix_seat}) and the executor \
+         ({executor_seat}), not {reviewer_seat}"
+    );
+    assert!(
+        reviewer.prior_outputs.is_empty(),
+        "the reviewer is handed no prior context"
+    );
+    assert!(
+        reviewer.unit.qe_acceptance.is_none(),
+        "and no executor directive"
+    );
+    assert!(
+        reviewer
+            .unit
+            .description
+            .contains("accept --phase review --evidence"),
+        "{}",
+        reviewer.unit.description
+    );
+    assert_eq!(
+        reviewer.unit.qe_ledger_root, executor.unit.qe_ledger_root,
+        "the reviewer keeps the run's ledger root (its verdict lands where crew reads it)"
+    );
+    if checks_refused_without_a_boundary(&gate) {
+        // No OS write boundary on this host (Windows): the repo-checks floor fails the gate closed
+        // whatever QE says. The reviewer half is asserted below either way.
+        assert_fail_closed_without_boundary(&evs, &gate, 4);
+    } else {
+        assert!(
+            gate.combined,
+            "the bound reviewer PASS leaves the QE unit's gate green: {:?} {:?}",
+            gate.denial_source, gate.denial_reason
+        );
+    }
+    let view = core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.session.id == "r-qe-every-seat")
+        .expect("the run");
+    let review = view
+        .units
+        .iter()
+        .find(|u| u.phase_id() == Some("verify"))
+        .and_then(|u| u.qe_review.clone())
+        .expect("the QE unit persists its reviewer record");
+    assert_eq!(review.outcome, "pass", "{review:?}");
+    assert_eq!(review.verdict.as_deref(), Some("PASS"));
+    assert_eq!(review.attempts.len(), 1);
+    assert_eq!(review.attempts[0].seat, reviewer_seat);
+    assert_eq!(review.attempts[0].basis, "distinct");
+    let _ = core.cancel_run("r-qe-every-seat");
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&evidence);
 }
 
 /// core#464 item 2: a bound read-only unit carries a NOTES ROOT — outside the worktree and the

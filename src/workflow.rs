@@ -371,6 +371,10 @@ pub struct UnitEvidence {
     /// `stream_gap` (pauses). `None` for a non-team unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team: Option<crate::domain::UnitTeamSnapshot>,
+    /// (DES-QE-EVERY-SEAT §3.5) The isolated QE reviewer's record for this attempt — `None` for a
+    /// unit that ran no reviewer turn. The fold persists it on the unit and folds its outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qe_review: Option<crate::domain::QeReview>,
 }
 
 /// (F-7R3-001) One judge seat's refusal during the agent judge's rotation

@@ -6301,6 +6301,21 @@ impl AcpStepRunner {
         delivered
     }
 
+    /// The queued operator messages THIS turn delivers: drained for every unit turn — except the
+    /// engine's isolated QE reviewer (DES-QE-EVERY-SEAT), whose whole input is the evidence path;
+    /// its seat's queued messages stay queued for the run's next turn.
+    fn operator_messages_for_turn(
+        &self,
+        unit: &crate::domain::WorkUnit,
+        run_id: &str,
+        cli_key: &str,
+    ) -> Vec<(String, PriorUnitOutput)> {
+        if unit.qe_review_session.is_some() {
+            return Vec::new();
+        }
+        self.drain_operator_messages(run_id, cli_key)
+    }
+
     /// Probe the session cache for `session_key`, purging a dead husk (crew#340).
     ///
     /// `kill -9` on a cached bridge between turns leaves `Some(arc)` in the map pointing at
@@ -6530,7 +6545,7 @@ impl AcpStepRunner {
         // appended AFTER the cross-CLI context blocks so they read as the most recent
         // guidance. Consumed here even if the turn later falls back to the wrapped path —
         // the same at-most-once posture as the cross-CLI context those paths also drop.
-        let operator_msgs = self.drain_operator_messages(&run_id, &cli_key);
+        let operator_msgs = self.operator_messages_for_turn(&input.unit, &run_id, &cli_key);
         for (orig_target, block) in &operator_msgs {
             self.emit_event(CoreEvent::WorkerMessageInjected {
                 session: run_id.clone(),
@@ -6659,8 +6674,7 @@ impl AcpStepRunner {
                 let scope =
                     crate::scope::resolve_scope(input.entity_mode, &input.run_id, &input.unit.id);
                 let phase = crate::scope::unit_phase(input.unit.ord);
-                let decisions_path =
-                    crate::gate_hook::decisions_path_for(&input.run_id, input.attempt);
+                let decisions_path = crate::gate_hook::decisions_path_for_input(input);
                 let decisions_path = decisions_path.to_string_lossy().into_owned();
                 // The ARMED marker before the first tool call, exactly as the wrapped path writes
                 // it: the fold uses its presence to tell a governed unit that legitimately made no
@@ -7274,7 +7288,7 @@ impl AcpStepRunner {
         if floor_pending {
             let marker = proc.floor.clone().and_then(|tool| {
                 crate::gate_hook::write_os_sandbox_marker(
-                    &crate::gate_hook::decisions_path_for(&input.run_id, input.attempt),
+                    &crate::gate_hook::decisions_path_for_input(input),
                     &crate::scope::unit_phase(input.unit.ord),
                     &proc.floor_roots,
                     tool,
@@ -14200,6 +14214,27 @@ transport = "stdio"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// (DES-QE-EVERY-SEAT) The engine's isolated QE reviewer turn drains no queued operator
+    /// message: they stay queued for the run's next ordinary turn.
+    #[test]
+    fn the_isolated_qe_reviewer_turn_never_drains_queued_operator_messages() {
+        let r = runner();
+        assert!(r.queue_operator_message("run1", &InjectTarget::All, "the tests looked flaky"));
+        let mut reviewer = crate::domain::WorkUnit::pending("run1:test", "run1", 3, "review");
+        reviewer.qe_review_session = Some("nonce".into());
+        assert!(r
+            .operator_messages_for_turn(&reviewer, "run1", "claude")
+            .is_empty());
+        let ordinary = crate::domain::WorkUnit::pending("run1:deliver", "run1", 4, "deliver");
+        let next = r.operator_messages_for_turn(&ordinary, "run1", "claude");
+        assert_eq!(
+            next.len(),
+            1,
+            "the message waited for the next ordinary turn"
+        );
+        assert_eq!(next[0].1.output, "the tests looked flaky");
+    }
+
     #[test]
     fn queued_messages_deliver_to_matching_cli_and_stay_for_others() {
         let r = runner();
@@ -14754,6 +14789,9 @@ No further next steps — both questions fully answered.";
             exclude_seats: Vec::new(),
             assurance: None,
             qe_acceptance: None,
+            qe_reviewer_seats: Vec::new(),
+            qe_review_session: None,
+            qe_review: None,
         }
     }
 

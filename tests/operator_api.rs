@@ -121,6 +121,9 @@ mod tests {
             exclude_seats: Vec::new(),
             assurance: None,
             qe_acceptance: None,
+            qe_reviewer_seats: Vec::new(),
+            qe_review_session: None,
+            qe_review: None,
         }
     }
 

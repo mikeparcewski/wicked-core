@@ -89,11 +89,17 @@ pub(crate) fn carries_ledger_root(unit: &WorkUnit) -> bool {
 
 /// The worker variable a unit carrying a QE ledger root is handed (both carriers stamp it beside
 /// the run markers); empty for every other unit.
+/// (DES-QE-EVERY-SEAT) …and the engine's reviewer turn alone also gets its nonce
+/// ([`review::REVIEW_SESSION_ENV`]).
 pub(crate) fn ledger_env(unit: &WorkUnit) -> Vec<(String, String)> {
-    unit.qe_ledger_root
-        .as_ref()
-        .map(|root| vec![(LEDGER_DIR_ENV.to_string(), root.clone())])
-        .unwrap_or_default()
+    let Some(root) = unit.qe_ledger_root.as_ref() else {
+        return Vec::new();
+    };
+    let mut env = vec![(LEDGER_DIR_ENV.to_string(), root.clone())];
+    if let Some(nonce) = unit.qe_review_session.as_ref() {
+        env.push((review::REVIEW_SESSION_ENV.to_string(), nonce.clone()));
+    }
+    env
 }
 
 /// At most this many touched paths have their history read (each is one `git rev-list`).
@@ -423,6 +429,21 @@ pub(crate) fn directive(qe: &QeAcceptance, skill: &str) -> String {
             .to_string(),
     }
 }
+
+/// The QE line a unit's prompt carries: for the QE unit the engine runs a reviewer for
+/// ([`review::applies`]) the evidence-only directive (resuming the last QE run on a same-tree
+/// retry), else [`directive`].
+pub(crate) fn unit_directive(unit: &WorkUnit, skill: &str) -> String {
+    if review::applies(unit) {
+        return review::evidence_directive(skill, review::resume_dir(unit));
+    }
+    unit.qe_acceptance
+        .as_ref()
+        .map(|q| directive(q, skill))
+        .unwrap_or_default()
+}
+
+pub(crate) mod review;
 
 #[cfg(test)]
 mod tests;
