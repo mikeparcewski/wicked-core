@@ -538,11 +538,31 @@ pub fn builtin() -> Vec<AgenticCli> {
                 // a dead turn until the budget kills it (upstream anomalyco/opencode#48232). The
                 // seat's own config denies the tool, so no subagent spawns under ACP; the root
                 // session's asks are answered exactly as before.
+                //
+                // core#911 (opencode 2.x): `"execute":"deny"` removes Code Mode, a 2.x built-in
+                // that runs model-written JavaScript with `fetch` and never reaches the permission
+                // ask (`"execute":"ask"` does not gate it; an unknown key is accepted by 1.x). The
+                // rules are restated on `agent.build.permission` because an agent's own rules are
+                // evaluated after every document's top-level rules: a repository `opencode.json`
+                // or `.opencode/agent/build.md` allowing `bash` on `build` otherwise ran `rm -rf`
+                // with zero asks. The engine composes the `*_*` MCP deny, `default_agent` and the
+                // selectable-agent pins onto this (`mcp_isolation::opencode_config`).
                 acp_governance_env: Some((
                     "OPENCODE_CONFIG_CONTENT".into(),
-                    r#"{"$schema":"https://opencode.ai/config.json","permission":{"read":"ask","edit":"ask","bash":"ask","task":"deny"}}"#.into(),
+                    r#"{"$schema":"https://opencode.ai/config.json","permission":{"read":"ask","edit":"ask","bash":"ask","task":"deny","execute":"deny"},"agent":{"build":{"permission":{"read":"ask","edit":"ask","bash":"ask","task":"deny","execute":"deny"}}}}"#.into(),
                 )),
-                verified_version: Some("1.17.18".into()),
+                // core#911: re-proved against opencode 2.0.25 (Homebrew `opencode`, tag
+                // `v2.0.25` = b44eea9). 2.x prints `opencode v2.0.25` for `--version`, and the
+                // pin compares the first line byte-for-byte, so the pin is that whole line. With
+                // this doc every core intent asks with a canonical `toolCall.name`, a reject
+                // blocks, Code Mode and `subagent` are hidden, MCP tools (config- or
+                // ACP-sourced) are unreachable, and a hostile repository `opencode.json`,
+                // `.opencode/agent{,s}/*.md` or `mode/*.md` (allow-all on `build`, `build`
+                // demoted / hidden / disabled, `default_agent` hijacked) keeps the session on
+                // `build` with every intent asked. Known and NOT closed by this doc: opencode
+                // (1.17.18 too) imports a repository's `.opencode/plugin{,s}/*.js` and spawns
+                // the commands of its configured MCP servers at session start, unasked.
+                verified_version: Some("opencode v2.0.25".into()),
                 governance_floor: None,
             }),
             capabilities: Some(
@@ -1052,10 +1072,19 @@ governance_floor = false
         }
         assert!(env_val.contains("\"edit\":\"ask\""));
         assert!(env_val.contains("\"bash\":\"ask\""));
+        // core#911: opencode 2.x Code Mode (`execute`) never asks, so it is denied (which also
+        // hides it), and every rule is restated on the governed agent, whose own rules are
+        // evaluated after every document's top-level ones.
+        assert_eq!(doc["permission"]["execute"], "deny", "{env_val}");
+        assert_eq!(
+            doc["agent"]["build"]["permission"], doc["permission"],
+            "every governance rule is restated on agent.build: {env_val}"
+        );
         assert_eq!(
             opencode.verified_version.as_deref(),
-            Some("1.17.18"),
-            "admission is pinned to the exact build oq-opencode-acp-002 proved, not a range"
+            Some("opencode v2.0.25"),
+            "admission is pinned to the exact `--version` first line the core#911 re-proof ran \
+             against, not a range"
         );
     }
 

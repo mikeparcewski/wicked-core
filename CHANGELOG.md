@@ -14,6 +14,37 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **opencode 2.x: the seat's governance document closes three holes, and the admission pin moves to
+  `opencode v2.0.25` (#911).** Re-proved live against opencode 2.0.25 with the scripted-model ACP
+  harness. Three holes in the document the engine composed:
+  - **Code Mode was ungated.** `execute` (new in 2.x) runs model-written JavaScript with `fetch` and
+    never asks; `"execute":"ask"` does not gate it either. The document now carries
+    `"execute":"deny"`, which also hides the tool.
+  - **The `build` agent's own rules won.** opencode evaluates an agent's own rules after every
+    document's top-level ones. A repository `opencode.json` or `.opencode/agent/build.md` allowing
+    `bash` or `"*"` on `build` let `rm -rf` run with zero asks, on 1.17.18 as well. The seat's
+    rules are now restated on `agent.build.permission`.
+  - **The session could leave `build`.** A repository that demotes `build` (`mode: subagent`) or
+    hides it moved the session onto any primary agent the repository defines, on both builds.
+    `mcp_isolation::opencode_config` now pins `build` selectable (`mode: "primary"`,
+    `hidden: false`, `disable: false`) next to `default_agent`.
+
+  Under the new document on 2.0.25:
+  - every core intent asks with a canonical `toolCall.name`, and a reject blocks;
+  - `subagent` and `execute` are hidden, against hostile repo configs too;
+  - MCP tools, whether config- or ACP-sourced, are unreachable;
+  - `.opencode/agent{,s}/*.md` and `mode/*.md` overrides, a `default_agent` hijack, and allows on
+    `plan`, `general` or `explore` all keep the session on `build` with every intent asked.
+
+  1.17.18 accepts the new keys, and the same checks pass on it. The pin is the whole first line
+  2.x prints for `--version`, since the comparison is unchanged and byte-for-byte; a 1.17.18 host
+  is now a drifted pin and runs ungoverned-disclosed. opencode stays opt-in. Known gaps this
+  document does not close, on both builds:
+  - opencode imports a repository's `.opencode/plugin{,s}/*.js` and spawns its configured MCP
+    server commands at session start, without asking;
+  - `webfetch` GETs are ungated;
+  - an outside-workspace read is denied outright rather than asked.
+
 - **IG1-core-1 — a seat's governance CLASS, the `os_sandbox` marker carrier, and why the floor did
   not arm.** (1) `wicked_council::governance_class(&AgenticCli) -> GovernanceClass`
   (`AcpInputGovernance | OsSandboxFloor | None`, wire `acp_input_governance | os_sandbox | none`):
