@@ -18535,6 +18535,99 @@ mod request_changes_tests {
         )));
     }
 
+    /// (DES-QE-EVERY-SEAT §3.4.1) No run seat could review the QE evidence in isolation: the
+    /// gate escalates `qe_reviewer_unavailable` (class `judge_unavailable`), and the operator's
+    /// explicit approve is the judgment — the unit counts, and the run's required QE decision
+    /// becomes the operator's (`skipped` / `operator`, "judged by operator", the evidence path),
+    /// which crew's delivery honours and labels. Never a ledger PASS.
+    #[test]
+    fn approve_at_qe_reviewer_unavailable_records_the_operators_qe_judgment() {
+        let run_id = format!("op-judge-qe-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_judge_unavailable_verify(&mut store, &run_id);
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        session.assurance.qe = Some(crate::assurance::QeAcceptance {
+            status: crate::assurance::QE_REQUIRED.into(),
+            basis: crate::assurance::QE_BASIS_DIFF.into(),
+            score: Some(60),
+            threshold: 20,
+            reason: "required".into(),
+            reasons: Vec::new(),
+            ord: Some(4),
+            tree: Some("t".into()),
+        });
+        put_node(&mut store, session.to_node()).unwrap();
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        let v = &mut units[3];
+        v.denial = Some(UnitDenial::new(
+            crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE,
+            "QE acceptance: every reviewer seat failed as a seat",
+        ));
+        v.qe_review = Some(crate::domain::QeReview {
+            outcome: crate::qe_acceptance::review::OUTCOME_UNAVAILABLE.into(),
+            reason: "every reviewer seat failed as a seat (pi: seat_failure:quota_exhausted)"
+                .into(),
+            evidence_dir: Some("/e/.wicked-qe/evidence/abc".into()),
+            qe_run_id: Some("abc".into()),
+            tree: Some("t".into()),
+            verdict: None,
+            attempts: Vec::new(),
+        });
+        put_node(&mut store, v.to_node()).unwrap();
+        assert_eq!(denial_class(v.denial.as_ref(), false), "judge_unavailable");
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        confirm_gate_as(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            &run_id,
+            HumanDecision::Approve {
+                amend: Some("I read the evidence; it passes".into()),
+                amend_scope: crate::workflow::AmendScope::Cursor,
+            },
+            Some("coordinator-agent".into()),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.unit_ix, 4, "the run moved on");
+        let qe = session.assurance.qe.as_ref().expect("a QE decision");
+        assert_eq!(
+            (qe.status.as_str(), qe.basis.as_str()),
+            (
+                crate::assurance::QE_SKIPPED,
+                crate::assurance::QE_BASIS_OPERATOR
+            )
+        );
+        assert!(
+            qe.reason
+                .starts_with("judged by operator (coordinator-agent)")
+                && qe.reason.contains("/e/.wicked-qe/evidence/abc"),
+            "{}",
+            qe.reason
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let r = units[3].assurance.as_ref().expect("a receipt");
+        assert!(r.ran.iter().any(|i| i == crate::assurance::OPERATOR_JUDGE));
+        assert!(drain(&erx)
+            .iter()
+            .any(|e| matches!(e, CoreEvent::QeAcceptanceDecided { .. })));
+    }
+
     /// …and no other answer — and no automatic path — makes an operator judgment: request
     /// changes rewinds as today, with no judgment recorded.
     #[test]

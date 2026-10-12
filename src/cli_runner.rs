@@ -1237,14 +1237,16 @@ fn run_unit_and_judge_on(
     let mut output = output;
     let qe_review = match floor_rerun {
         Some(r) => crate::qe_acceptance::review::on_floor_rerun(&input.unit, r.fix.is_some()),
-        None => crate::qe_acceptance::review::run(runner, input, &output, qe_not_before, emit_delta)
-            .map(|r| {
-                output.files.extend(r.files);
-                output.tools.extend(r.tools);
-                // The fold reads the decisions log when ANY turn of the attempt armed the hook.
-                output.governed |= r.governed;
-                r.review
-            }),
+        None => {
+            crate::qe_acceptance::review::run(runner, input, &output, qe_not_before, emit_delta)
+                .map(|r| {
+                    output.files.extend(r.files);
+                    output.tools.extend(r.tools);
+                    // The fold reads the decisions log when ANY turn of the attempt armed the hook.
+                    output.governed |= r.governed;
+                    r.review
+                })
+        }
     };
     // T5: `step.completed`, then the bounded gate wait for S's `ledger.folded` (fail-closed
     // synthesis on timeout). The snapshot is the attempt's `UnitEvidence.team`.

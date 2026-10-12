@@ -64,9 +64,7 @@ pub(crate) fn resume_dir(unit: &WorkUnit) -> Option<&str> {
 
 /// The executor turn's directive (rides the unit prompt; short — the PTY line budget).
 pub(crate) fn evidence_directive(skill: &str, resume: Option<&str>) -> String {
-    let resume = resume
-        .map(|d| format!(" --resume {d}"))
-        .unwrap_or_default();
+    let resume = resume.map(|d| format!(" --resume {d}")).unwrap_or_default();
     format!(
         " QE ACCEPTANCE IS REQUIRED: run \"{skill}\" accept --phase evidence{resume} (writer and \
          executor only; no review, no QE verdict) on a scenario written from this run's \
@@ -165,11 +163,7 @@ pub(crate) fn candidates(
         .filter(|k| crate::distribute::seat_admits_unit(&shape, k, None))
         .collect();
     let is_author = |k: &str| authors.iter().any(|a| a == k);
-    let same_cli = |k: &str| {
-        authors
-            .iter()
-            .any(|a| a != k && seat_key(a) == seat_key(k))
-    };
+    let same_cli = |k: &str| authors.iter().any(|a| a != k && seat_key(a) == seat_key(k));
     let executor = unit.assigned_cli.as_deref();
     let seat = |k: &str, basis: &str| QeReviewerSeat {
         seat: k.to_string(),
@@ -196,17 +190,14 @@ pub(crate) fn candidates(
 
 /// The LAST `QE-EVIDENCE:` line's path (decoration — bullets, emphasis, code ticks — tolerated).
 pub(crate) fn parse_marker(output: &str) -> Option<String> {
-    output
-        .lines()
-        .filter_map(|l| {
-            let at = l.find(EVIDENCE_MARKER)?;
-            let rest = l[at + EVIDENCE_MARKER.len()..]
-                .trim()
-                .trim_matches(|c: char| c == '`' || c == '*' || c == '"' || c == '\'')
-                .trim();
-            (!rest.is_empty()).then(|| rest.to_string())
-        })
-        .last()
+    output.lines().rev().find_map(|l| {
+        let at = l.find(EVIDENCE_MARKER)?;
+        let rest = l[at + EVIDENCE_MARKER.len()..]
+            .trim()
+            .trim_matches(|c: char| c == '`' || c == '*' || c == '"' || c == '\'')
+            .trim();
+        (!rest.is_empty()).then(|| rest.to_string())
+    })
 }
 
 /// Read one canonical ledger record (`<root>/<table>/<id>.json`).
@@ -221,7 +212,9 @@ fn read_record(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>
 }
 
 fn field<'a>(rec: &'a serde_json::Map<String, serde_json::Value>, k: &str) -> Option<&'a str> {
-    rec.get(k).and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+    rec.get(k)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
 }
 
 fn deleted(rec: &serde_json::Map<String, serde_json::Value>) -> bool {
@@ -271,7 +264,9 @@ pub(crate) fn bind_evidence(
 ) -> Result<(String, PathBuf), String> {
     let dir = Path::new(marker);
     if !dir.is_absolute() {
-        return Err(format!("the evidence dir `{marker}` is not an absolute path"));
+        return Err(format!(
+            "the evidence dir `{marker}` is not an absolute path"
+        ));
     }
     let id = dir
         .file_name()
@@ -283,7 +278,9 @@ pub(crate) fn bind_evidence(
     let meta = std::fs::symlink_metadata(dir)
         .map_err(|e| format!("the evidence dir `{marker}` could not be read: {e}"))?;
     if meta.file_type().is_symlink() || !meta.is_dir() {
-        return Err(format!("the evidence dir `{marker}` is not a plain directory"));
+        return Err(format!(
+            "the evidence dir `{marker}` is not a plain directory"
+        ));
     }
     let root = std::fs::canonicalize(ledger_root)
         .map_err(|e| format!("the run's QE ledger could not be resolved: {e}"))?;
@@ -312,7 +309,9 @@ pub(crate) fn bind_evidence(
         .and_then(|p| std::fs::canonicalize(p).ok())
         .is_some_and(|p| p == real);
     if !points_here {
-        return Err(format!("QE run {id}'s evidence_path is not this evidence dir"));
+        return Err(format!(
+            "QE run {id}'s evidence_path is not this evidence dir"
+        ));
     }
     let resumed = resume
         .and_then(|r| std::fs::canonicalize(r).ok())
@@ -344,7 +343,8 @@ pub(crate) fn bind_verdict(
     })?;
     let mut newest: Option<(String, serde_json::Map<String, serde_json::Value>)> = None;
     for entry in names {
-        let entry = entry.map_err(|e| format!("the QE ledger's verdicts could not be read: {e}"))?;
+        let entry =
+            entry.map_err(|e| format!("the QE ledger's verdicts could not be read: {e}"))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if !name.ends_with(".json") {
             continue;
@@ -414,7 +414,11 @@ pub(crate) fn run(
     if !applies(&input.unit) || executor.status != StepStatus::Ok {
         return None;
     }
-    let tree = input.unit.worktree_baseline.as_ref().map(|b| b.tree.clone());
+    let tree = input
+        .unit
+        .worktree_baseline
+        .as_ref()
+        .map(|b| b.tree.clone());
     let mut review = QeReview {
         outcome: OUTCOME_INVALID.to_string(),
         reason: String::new(),

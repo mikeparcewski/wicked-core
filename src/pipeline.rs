@@ -1539,7 +1539,9 @@ pub(crate) fn apply_and_finish_unit(
         .as_ref()
         .and_then(crate::qe_acceptance::review::denial)
     {
-        Some(d) if d.source == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE => {
+        Some(d)
+            if d.source == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE =>
+        {
             (Some(d), None)
         }
         other => (None, other),
@@ -3912,6 +3914,144 @@ mod judge_bench_tests {
             "the receipt is persisted on the unit"
         );
         (outcome.approved, outcome.denial.map(|d| d.source), receipt)
+    }
+
+    /// (DES-QE-EVERY-SEAT §3.4) The fold of one unit carrying an isolated QE reviewer's record:
+    /// its approval, its winning denial source, and the record as persisted on the unit.
+    fn fold_with_qe_review(
+        sid: &str,
+        outcome: &str,
+        floor_fix_seat: Option<&str>,
+    ) -> (bool, Option<String>, crate::domain::WorkUnit) {
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let mut sink = |_e: CoreEvent| {};
+        let Planned {
+            mut units,
+            workflow_id,
+            cli_keys,
+            ..
+        } = plan_and_distribute(
+            &mut store,
+            &[cli("a")],
+            "Do step one.",
+            EntityMode::Shared,
+            sid,
+            crate::domain::HumanConfirm::None,
+            false,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            &mut sink,
+            None,
+            false,
+            false,
+            Vec::new(),
+            None,
+            true,
+            &crate::assurance::QeOverride::Auto,
+        )
+        .expect("plan");
+        if let Some(seat) = floor_fix_seat {
+            let mut report: crate::repo_checks::RepoChecksReport =
+                serde_json::from_value(serde_json::json!({
+                    "detected": [], "checks": [], "skipped": [], "passed": true,
+                    "sandbox_level": "none"
+                }))
+                .expect("a report");
+            report.requested_rerun = Some(crate::repo_checks::FloorRerun {
+                mode: crate::repo_checks::FloorRerunMode::FloorFix,
+                waive: Vec::new(),
+                output: String::new(),
+                fix: Some(crate::repo_checks::FloorFix {
+                    note: "fix it".into(),
+                    seat: seat.into(),
+                }),
+            });
+            units[0].repo_checks = Some(report);
+        }
+        let review = crate::domain::QeReview {
+            outcome: outcome.into(),
+            reason: format!("the reviewer said {outcome}"),
+            evidence_dir: Some("/l/.wicked-qe/evidence/x".into()),
+            qe_run_id: Some("x".into()),
+            tree: Some("t".into()),
+            verdict: None,
+            attempts: Vec::new(),
+        };
+        let evidence = crate::workflow::UnitEvidence {
+            qe_review: Some(review),
+            ..Default::default()
+        };
+        let output = crate::workflow::stub_output(&units[0]);
+        let outcome = apply_and_finish_unit(
+            &mut store,
+            &mut units[0],
+            &output,
+            &workflow_id,
+            EntityMode::Shared,
+            sid,
+            0,
+            false,
+            false,
+            &cli_keys,
+            None,
+            &evidence,
+            &mut |_e| {},
+            None,
+        )
+        .expect("apply");
+        let persisted = crate::domain::session_units(&store, sid).unwrap()[0].clone();
+        (
+            outcome.approved,
+            outcome.denial.map(|d| d.source),
+            persisted,
+        )
+    }
+
+    /// (DES-QE-EVERY-SEAT §3.4) A reviewer FAIL or a broken binding is a substantive veto under
+    /// its own source; no isolated reviewer is the operator-judgment gate; a PASS adds nothing.
+    /// The record is persisted on the unit either way.
+    #[test]
+    fn the_isolated_qe_reviewer_record_folds_into_the_gate() {
+        let (approved, source, unit) = fold_with_qe_review("qe-fold-fail", "fail", None);
+        assert!(!approved);
+        assert_eq!(source.as_deref(), Some("qe_review"));
+        assert_eq!(
+            unit.qe_review.as_ref().map(|r| r.outcome.as_str()),
+            Some("fail")
+        );
+        let (approved, source, _) = fold_with_qe_review("qe-fold-invalid", "invalid", None);
+        assert!(!approved);
+        assert_eq!(source.as_deref(), Some("qe_review"));
+        let (approved, source, _) = fold_with_qe_review("qe-fold-unavail", "unavailable", None);
+        assert!(!approved);
+        assert_eq!(source.as_deref(), Some("qe_reviewer_unavailable"));
+        let (approved, source, unit) = fold_with_qe_review("qe-fold-pass", "pass", None);
+        assert!(approved, "{source:?}");
+        assert_eq!(
+            unit.qe_review.as_ref().map(|r| r.outcome.as_str()),
+            Some("pass")
+        );
+    }
+
+    /// (DES-QE-EVERY-SEAT §3.2, codex r2 F15) The fold of a floor-fix attempt records the fixing
+    /// seat as an author of the unit's tree, so no later reviewer or judge of it runs there.
+    #[test]
+    fn a_floor_fix_seat_becomes_an_author_of_the_unit() {
+        let (_, _, unit) = fold_with_qe_review("qe-fold-fixer", "invalid", Some("claude"));
+        assert!(
+            unit.authored_by.contains(&"claude".to_string()),
+            "{:?}",
+            unit.authored_by
+        );
+        assert!(unit
+            .repo_checks
+            .as_ref()
+            .is_some_and(|r| r.requested_rerun.is_none()));
     }
 
     /// core#850 (EX-02): a run whose contract requires the judge HOLDS when the judge could not
