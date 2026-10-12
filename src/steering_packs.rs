@@ -6,6 +6,9 @@
 //! (`wicked-core rules ingest governance/packs/<pack>` or Steering → Import), and nothing at launch
 //! said so: on the rig the store held 14 rules and none of them, the design unit's recall came back
 //! empty, and the seat invented meanings for rule ids it could not read (run `c3aa0bfb`).
+//! `stack-builtins` (POL-2101, operator ruling 2026-10-12: check what the chosen stack already
+//! provides before writing code) seeds the same way, so every build and review phase can recall it
+//! on a fresh daemon. Its doc lives only here; the AW-13 seed run stages it beside the corpus.
 //!
 //! The docs are EMBEDDED (`include_bytes!`, the shipped binary has no pack directory) and parsed
 //! by the same markdown path `rules ingest` uses ([`wicked_governance::EmbeddedMarkdownAdapter`]),
@@ -60,6 +63,10 @@ const SHIPPED_PACKS: &[ShippedPack] = &[
             pack_doc!("review-loop", "review-loop-one-slice-intent.md"),
             pack_doc!("review-loop", "review-loop-stateful-verdicts.md"),
         ],
+    },
+    ShippedPack {
+        name: "stack-builtins",
+        docs: &[pack_doc!("stack-builtins", "stack-builtins.md")],
     },
 ];
 
@@ -157,7 +164,13 @@ mod tests {
         b.sort();
         assert_eq!(a, b);
         let ids: Vec<&str> = a.iter().map(|(id, _, _)| id.as_str()).collect();
-        for want in ["MCPS-1001", "MCPS-1007", "RVWL-1001", "RVWL-1004"] {
+        for want in [
+            "MCPS-1001",
+            "MCPS-1007",
+            "RVWL-1001",
+            "RVWL-1004",
+            "POL-2101",
+        ] {
             assert!(ids.contains(&want), "{want} ships: {ids:?}");
         }
     }

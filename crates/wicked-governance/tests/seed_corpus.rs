@@ -1,7 +1,9 @@
 //! The shipped doctrine seed corpus (`seed/corpus/`) ingests through the ONE markdown parse
 //! path, mints exactly the rule ids the seed manifest and the runbook driver expect, groups them
 //! under the documented RuleSets, and STEERING.md's tour line counts what the corpus really
-//! holds — so adding a seed rule cannot drift from the docs that cite it.
+//! holds — so adding a seed rule cannot drift from the docs that cite it. POL-2101 is not in the
+//! corpus: its one doc is the boot-seeded `governance/packs/stack-builtins` pack, which the seed
+//! run stages beside the corpus, and no rule id may live in both the corpus and a pack.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -13,14 +15,18 @@ fn corpus_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("seed/corpus")
 }
 
+fn packs_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../governance/packs")
+}
+
 /// Every rule the seed corpus mints (estate ADR-011's POL-1101..POL-1104 are staged at run
-/// time by `seed_wiki.py`, not committed here).
+/// time by `seed_wiki.py`, not committed here; POL-2101 is staged from its pack, below).
 const SEED_RULE_IDS: &[&str] = &[
     "POL-1301", "PAT-1302", "PAT-1303", "PAT-1304", "PAT-1305", "PAT-1306", "PAT-1307", "PAT-1308",
     "POL-1401", "PAT-1402", "PAT-1403", "POL-1501", "PAT-1502", "PAT-1601", "PAT-1602", "PAT-1603",
     "PAT-1604", "PAT-1605", "PAT-1606", "PAT-1607", "PAT-1701", "PAT-1702", "PAT-1703", "POL-1704",
     "POL-1801", "POL-1802", "PAT-1901", "PAT-1902", "PAT-1903", "PAT-1904", "POL-2001", "POL-2002",
-    "PAT-2003", "PAT-2004", "PAT-2005", "PAT-2006", "POL-2101",
+    "PAT-2003", "PAT-2004", "PAT-2005", "PAT-2006",
 ];
 
 #[test]
@@ -70,14 +76,44 @@ fn the_seed_corpus_mints_exactly_the_expected_rules_and_rulesets() {
     assert!(steering.contains(&tour), "STEERING.md states {tour:?}");
 }
 
+/// One rule id, one doc: no id the corpus mints is also declared by a governance pack (the
+/// boot-seeded packs included), so a seed run and a boot seed never write two rows for one id.
+#[test]
+fn no_rule_id_lives_in_both_the_corpus_and_a_pack() {
+    wicked_apps_core::emit::hermetic_test_spool();
+    let corpus: BTreeSet<String> = ingest_from(&MarkdownAdapter::new(corpus_root()))
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    let mut packs = 0;
+    for entry in std::fs::read_dir(packs_root()).unwrap() {
+        let dir = entry.unwrap().path();
+        if !dir.is_dir() {
+            continue;
+        }
+        packs += 1;
+        for r in ingest_from(&MarkdownAdapter::new(&dir)).unwrap() {
+            assert!(
+                !corpus.contains(&r.id),
+                "{} is in both seed/corpus and {}",
+                r.id,
+                dir.display()
+            );
+        }
+    }
+    assert!(packs >= 7, "read every pack ({packs})");
+}
+
 /// POL-2101 (operator ruling 2026-10-12): the chosen stack's built-ins come first. It is a
 /// development rule under engineering-doctrine, applies to build and review, and its statement
 /// carries all four obligations: the stack is chosen for the agent, the check comes before
-/// code, the check is recorded in the step output, and reviewers flag every duplicate.
+/// code, the check is recorded in the step output, and reviewers flag every duplicate. Its doc
+/// is the boot-seeded `stack-builtins` pack (the root crate's `steering_packs` embeds it).
 #[test]
 fn pol_2101_check_the_chosen_stack_is_a_development_rule() {
     wicked_apps_core::emit::hermetic_test_spool();
-    let adapter = MarkdownAdapter::new(corpus_root());
+    let adapter = MarkdownAdapter::new(packs_root().join("stack-builtins"));
     let mut store = SqliteStore::in_memory().unwrap();
     for r in ingest_from(&adapter).unwrap() {
         register_rule(&mut store, &r).unwrap();
