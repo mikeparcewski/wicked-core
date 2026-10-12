@@ -49,7 +49,11 @@ use wicked_apps_core::{open_store_ro, synthetic_symbol, GraphRead};
 pub(crate) const GRANTS_LEDGER: &str = "EDITOR-GRANTS";
 
 /// The permissions an editor can ask for (§6.1). Anything else is a bad request.
-pub const EDITOR_PERMISSIONS: [&str; 11] = [
+///
+/// `mcp.session` (DES-MCP-INSPECTOR-001 §4) lets an editor talk, through the host, to an MCP server
+/// the operator connected. It starts and drives processes, so no posture rule allows it: it asks
+/// until the operator's install consent for THAT editor build writes its token into the ledger.
+pub const EDITOR_PERMISSIONS: [&str; 12] = [
     "artifact.read",
     "artifact.write",
     "selection.chip",
@@ -61,7 +65,12 @@ pub const EDITOR_PERMISSIONS: [&str; 11] = [
     "artifact.export",
     "ui.fullscreen",
     "network.media",
+    "mcp.session",
 ];
+
+/// Permissions only the approvals ledger can allow: an `allow` rule never grants them, so the one
+/// way in is the per-build token the operator's install consent writes (a deny still dominates).
+pub const LEDGER_ONLY_PERMISSIONS: [&str; 1] = ["mcp.session"];
 
 /// The evaluation scope the grant claims are judged under.
 const SCOPE: &str = "wicked-editor/grants";
@@ -283,7 +292,11 @@ pub fn evaluate_editor_grants(
         } else if ledger.contains(&token) {
             ("allow", vec![GRANTS_LEDGER.to_string()])
         } else {
-            let allows = fired_with(wicked_governance::Effect::Allow);
+            let allows = if LEDGER_ONLY_PERMISSIONS.contains(&permission.as_str()) {
+                Vec::new()
+            } else {
+                fired_with(wicked_governance::Effect::Allow)
+            };
             if allows.is_empty() {
                 ("ask", Vec::new())
             } else {
@@ -418,7 +431,12 @@ mod tests {
         let all = EDITOR_PERMISSIONS;
         let first = evaluate_editor_grants(&store, &req("wicked-page", &all, true), 1).unwrap();
         assert!(
-            first.grants.iter().all(|g| g.decision == "allow"),
+            first.grants.iter().all(|g| g.decision
+                == if g.permission == "mcp.session" {
+                    "ask"
+                } else {
+                    "allow"
+                }),
             "{:?}",
             decisions(&first)
         );
@@ -450,6 +468,97 @@ mod tests {
                 .unwrap();
         assert_eq!(decisions(&forged), vec![("artifact.write", "ask")]);
         assert!(!forged.first_party);
+    }
+
+    #[test]
+    fn mcp_session_asks_for_every_editor_until_its_own_install_grant() {
+        let mut store = seeded();
+        // No posture rule allows it: a third-party editor, a first-party one and a forged
+        // first-party id all ask (the host refuses `mcp.request` on anything but "allow").
+        for (id, first) in [
+            ("acme-inspect", false),
+            ("wicked-page", true),
+            ("wicked-x", false),
+        ] {
+            let got = evaluate_editor_grants(&store, &req(id, &["mcp.session"], first), 1).unwrap();
+            assert_eq!(decisions(&got), vec![("mcp.session", "ask")], "{id}");
+            assert!(got.grants[0].rule_ids.is_empty(), "{id}: no rule fired");
+        }
+        // The install consent writes the per-build token: that editor, and only it, is allowed.
+        approve(
+            &mut store,
+            &grant_token("acme-inspect", "1.0.0", SHA, "mcp.session"),
+        );
+        let granted =
+            evaluate_editor_grants(&store, &req("acme-inspect", &["mcp.session"], false), 1)
+                .unwrap();
+        assert_eq!(decisions(&granted), vec![("mcp.session", "allow")]);
+        assert_eq!(granted.grants[0].rule_ids, vec![GRANTS_LEDGER.to_string()]);
+        let other =
+            evaluate_editor_grants(&store, &req("acme-notes", &["mcp.session"], false), 1).unwrap();
+        assert_eq!(
+            decisions(&other),
+            vec![("mcp.session", "ask")],
+            "another plugin never inherits the grant"
+        );
+        let mut rebuilt = req("acme-inspect", &["mcp.session"], false);
+        rebuilt.sha256 = SHA2.into();
+        assert_eq!(
+            decisions(&evaluate_editor_grants(&store, &rebuilt, 1).unwrap()),
+            vec![("mcp.session", "ask")],
+            "a changed bundle asks again"
+        );
+        // An ordinary allow rule over every editor never grants it (codex r1): only the ledger does.
+        let blanket: wicked_governance::ConformanceRule =
+            serde_json::from_value(serde_json::json!({
+                "id": "OPS-ALLOW-ALL-EDITORS",
+                "rule_type": "policy",
+                "statement": "Every editor may do everything.",
+                "severity": "info",
+                "confidence": 1.0,
+                "steering_type": "security",
+                "applies_to": ["editor"],
+                "effect": "allow",
+                "trigger": {"contains": "\"permission\":"},
+            }))
+            .unwrap();
+        let dynstore: &mut dyn GraphStore = &mut store;
+        dynstore.upsert_nodes(&[blanket.to_node()]).unwrap();
+        assert_eq!(
+            decisions(
+                &evaluate_editor_grants(&store, &req("acme-notes", &["mcp.session"], false), 1)
+                    .unwrap()
+            ),
+            vec![("mcp.session", "ask")],
+            "an allow rule is not an install grant"
+        );
+        assert_eq!(
+            decisions(
+                &evaluate_editor_grants(&store, &req("acme-notes", &["checks.read"], false), 1)
+                    .unwrap()
+            ),
+            vec![("checks.read", "allow")],
+            "the blanket rule does fire for an ordinary permission"
+        );
+        // A deny on the permission dominates the install grant.
+        let deny: wicked_governance::ConformanceRule = serde_json::from_value(serde_json::json!({
+            "id": "OPS-NO-MCP-EDITORS",
+            "rule_type": "policy",
+            "statement": "No editor talks to MCP servers.",
+            "severity": "error",
+            "confidence": 1.0,
+            "steering_type": "security",
+            "applies_to": ["editor-perm:mcp.session"],
+            "effect": "deny",
+            "trigger": {"contains": "mcp.session"},
+        }))
+        .unwrap();
+        let dynstore: &mut dyn GraphStore = &mut store;
+        dynstore.upsert_nodes(&[deny.to_node()]).unwrap();
+        let denied =
+            evaluate_editor_grants(&store, &req("acme-inspect", &["mcp.session"], false), 1)
+                .unwrap();
+        assert_eq!(decisions(&denied), vec![("mcp.session", "deny")]);
     }
 
     #[test]
