@@ -68,6 +68,10 @@ pub const EDITOR_PERMISSIONS: [&str; 12] = [
     "mcp.session",
 ];
 
+/// Permissions only the approvals ledger can allow: an `allow` rule never grants them, so the one
+/// way in is the per-build token the operator's install consent writes (a deny still dominates).
+pub const LEDGER_ONLY_PERMISSIONS: [&str; 1] = ["mcp.session"];
+
 /// The evaluation scope the grant claims are judged under.
 const SCOPE: &str = "wicked-editor/grants";
 
@@ -288,7 +292,11 @@ pub fn evaluate_editor_grants(
         } else if ledger.contains(&token) {
             ("allow", vec![GRANTS_LEDGER.to_string()])
         } else {
-            let allows = fired_with(wicked_governance::Effect::Allow);
+            let allows = if LEDGER_ONLY_PERMISSIONS.contains(&permission.as_str()) {
+                Vec::new()
+            } else {
+                fired_with(wicked_governance::Effect::Allow)
+            };
             if allows.is_empty() {
                 ("ask", Vec::new())
             } else {
@@ -499,6 +507,38 @@ mod tests {
             decisions(&evaluate_editor_grants(&store, &rebuilt, 1).unwrap()),
             vec![("mcp.session", "ask")],
             "a changed bundle asks again"
+        );
+        // An ordinary allow rule over every editor never grants it (codex r1): only the ledger does.
+        let blanket: wicked_governance::ConformanceRule =
+            serde_json::from_value(serde_json::json!({
+                "id": "OPS-ALLOW-ALL-EDITORS",
+                "rule_type": "policy",
+                "statement": "Every editor may do everything.",
+                "severity": "info",
+                "confidence": 1.0,
+                "steering_type": "security",
+                "applies_to": ["editor"],
+                "effect": "allow",
+                "trigger": {"contains": "\"permission\":"},
+            }))
+            .unwrap();
+        let dynstore: &mut dyn GraphStore = &mut store;
+        dynstore.upsert_nodes(&[blanket.to_node()]).unwrap();
+        assert_eq!(
+            decisions(
+                &evaluate_editor_grants(&store, &req("acme-notes", &["mcp.session"], false), 1)
+                    .unwrap()
+            ),
+            vec![("mcp.session", "ask")],
+            "an allow rule is not an install grant"
+        );
+        assert_eq!(
+            decisions(
+                &evaluate_editor_grants(&store, &req("acme-notes", &["checks.read"], false), 1)
+                    .unwrap()
+            ),
+            vec![("checks.read", "allow")],
+            "the blanket rule does fire for an ordinary permission"
         );
         // A deny on the permission dominates the install grant.
         let deny: wicked_governance::ConformanceRule = serde_json::from_value(serde_json::json!({

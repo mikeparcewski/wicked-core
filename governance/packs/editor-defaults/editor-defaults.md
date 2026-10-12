@@ -53,7 +53,8 @@ endpoint that can act on the machine. So it is granted per editor build only: th
 consent ("This plugin can start and talk to MCP servers") writes that build's
 `editor:<id>@<version>#<sha256>/mcp.session` token into `EDITOR-GRANTS`. An editor that does not
 declare it never has it, a new version or hash asks again, and revoking it is removing that token
-in Steering. A `deny` on `editor-perm:mcp.session` dominates the grant.
+in Steering. No `allow` rule grants it, however broad: only that token does. A `deny` on
+`editor-perm:mcp.session` dominates the grant.
 
 ## Rules
 
