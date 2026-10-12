@@ -14,15 +14,16 @@ applies_to: [build, review]
 Operator ruling, 2026-10-12. The user and the steering policies choose the framework or
 library. An agent works inside that choice. It does not swap in a different stack, and it does
 not rebuild what the chosen one already ships. Where this came from: an MCP server had to be
-exposed as an HTTP/REST API with an OpenAPI description. fastmcp, the chosen framework, has
-that built in, but the plan was a hand-written generator. This doc groups under the
-`engineering-doctrine` RuleSet beside the Universal Don'ts.
+exposed as an HTTP/REST API with an OpenAPI description, and the plan was a hand-written
+generator, made before anyone checked what fastmcp, the chosen framework, already offers for
+HTTP and OpenAPI. This doc groups under the `engineering-doctrine` RuleSet beside the
+Universal Don'ts.
 
 The check is cheap and it leaves a record. Before writing code, read the chosen stack's docs
 or source at the pinned version to see what it already offers. Write down what you checked and
 what you found in the step output. If you still write custom code that duplicates a built-in,
-say why the built-in does not fit (a missing feature at the pinned version, a measured defect,
-a policy conflict). A reviewer flags every piece of custom code that duplicates a built-in as
+say why the built-in does not fit (for example, a feature missing at the pinned version, a
+measured defect, or a policy conflict). A reviewer flags every piece of custom code that duplicates a built-in as
 a finding, whether or not it carries a reason, and judges whether the stated reason holds.
 
 ## Rules
@@ -38,5 +39,5 @@ a finding, whether or not it carries a reason, and judges whether the stated rea
 
 - Operator ruling 2026-10-12 (program NEXT-SESSION item 7): the framework is chosen by the user
   and policies; check built-ins, record the check, justify duplicates, reviewers flag them.
-- Origin case: MCP-as-API uses fastmcp's built-in HTTP/REST and OpenAPI support, not a
-  hand-written generator.
+- Origin case: MCP-as-API checks fastmcp's built-in HTTP/REST and OpenAPI support at the
+  pinned version before anyone writes a generator.
