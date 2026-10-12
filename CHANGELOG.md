@@ -304,6 +304,12 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.9.9** — 2026-10-12 — patch release on main 3978a78, carrying #917 (QE acceptance on every seat): the
+  engine runs the QE reviewer itself as a fresh, isolated worker session inside the QE unit's attempt (directive
+  `accept --phase evidence`, then a reviewer turn handed only the evidence path, its verdict bound to a per-turn
+  `WICKED_QE_REVIEW_SESSION` nonce), on the run's own seats (distinct non-author first). When no reviewer is possible
+  the unit parks at `qe_reviewer_unavailable`, where the operator's approve is the judgment, labelled "judged by
+  operator". Needs wicked-garden 12.54.0+ (`accept --phase`); an older garden fails closed (`invalid`).
 - **core-ts 0.9.8** — 2026-10-12 — patch release on main 0cfc91e, carrying #909 (editor `mcp.session` permission,
   granted per editor build at install consent; no global allow), #910 + #915 (POL-2101 "check the chosen stack's
   built-ins first", boot-seeded from the `stack-builtins` pack), #913 (opencode 2.x governed; admission pin moves to
