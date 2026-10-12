@@ -280,20 +280,33 @@ pub fn builtin() -> Vec<AgenticCli> {
             // path: wicked-core's boundary gate is claude-specific (`gate_hook` PreToolUse), so a
             // codex worker with no sandbox AND no gate would be UNBOUNDED — free to write outside
             // its worktree. `--sandbox workspace-write` is codex's native bounded mode: writes are
-            // confined to the workspace (the worktree + in-boundary scratch) and DENIED outside,
-            // and `codex exec` is already non-interactive so no approval flag is needed — CAVEAT
-            // (core#769): an account whose signed requirements bundle forbids `never` turns exec
-            // into `on-request` with no approver, every command is `Rejected("approval request
-            // failed")`, and no flag passed here changes that (`--approve-for-me`, codex-cli
-            // 0.160, is the candidate where a policy allows the `auto_review` reviewer — unproven
-            // on such an account). The engine benches the seat instead
-            // (`SeatFailureReason::in_tool_approval_refusals`). codex's
-            // own workspace-write sandbox is then the boundary — aligned with path_policy's intent
-            // that the worktree is the write root — which is safe WITHOUT the claude-only gate.
+            // confined to the workspace (the worktree + in-boundary scratch) and DENIED outside.
+            // codex's own workspace-write sandbox is the boundary — aligned with path_policy's
+            // intent that the worktree is the write root — which is safe WITHOUT the claude-only
+            // gate.
+            //
+            // APPROVALS (core#769): `approvals_reviewer=auto_review` routes any approval request to
+            // codex's automatic reviewer instead of a human. An account whose signed requirements
+            // bundle forbids `approval_policy = never` runs exec under `on-request`; with the
+            // default `user` reviewer there is nobody to ask in `codex exec`, so every command
+            // that needs approval comes back `Rejected("approval request failed")`, reads
+            // included. Where the policy is `never` (no bundle) nothing asks, and the setting does
+            // nothing. It does not widen the sandbox: on such an account (codex-cli 0.162.1) a
+            // write outside the workspace, even a retry requesting escalation, is declined. Not
+            // `--approve-for-me`: clap refuses it together with `--sandbox`, and the explicit
+            // `--sandbox` is the posture the engine checks (`codex_sandbox_is_bounded`). An account
+            // that also forbids `auto_review` still refuses every command; the engine benches that
+            // seat at runtime (`SeatFailureReason::in_tool_approval_refusals`).
+            //
             // Operators overriding codex in their wicked-council clis.toml (see `default_user_path`;
             // `~/.config/...` on Unix, `%USERPROFILE%\...` on Windows) should mirror this:
-            //   trust_flags = ["--sandbox", "workspace-write"]
-            trust_flags: vec!["--sandbox".into(), "workspace-write".into()],
+            //   trust_flags = ["--sandbox", "workspace-write", "-c", "approvals_reviewer=auto_review"]
+            trust_flags: vec![
+                "--sandbox".into(),
+                "workspace-write".into(),
+                "-c".into(),
+                "approvals_reviewer=auto_review".into(),
+            ],
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,

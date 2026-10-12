@@ -435,8 +435,6 @@ pub(crate) fn pre_distribute(
         EntityMode::Isolated => None,
     };
 
-    // (F-EDIT-5 / F-LEARN-3) The worktree bench, on every launch route (campaign, synchronous).
-    let worktree_bench = crate::distribute::worktree_benched(clis, repo_ref.is_some());
     let mut session = AgentSession {
         intent_amendments: Vec::new(),
         id: session_id.to_string(),
@@ -462,7 +460,7 @@ pub(crate) fn pre_distribute(
         run_branch: None,
         base_commit: None,
         finished_at: None,
-        benched_seats: worktree_bench,
+        benched_seats: Vec::new(),
         team: None,
         team_plan: None,
         exclude_seats,

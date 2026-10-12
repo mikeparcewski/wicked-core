@@ -4156,7 +4156,10 @@ fn codex_host_write_pins() -> Vec<String> {
 fn strip_codex_roots(flags: Vec<String>) -> Vec<String> {
     // Config overrides are ALLOWLISTED (codex r2-r4 on the slice found one host-side write after
     // another: `writable_roots`, `notify`, `sqlite_home`): on a read-only unit only the model
-    // choice and the engine's own MCP off-pin survive; every other `-c`/`--config` is dropped.
+    // choice, the approvals reviewer and the engine's own MCP off-pin survive; every other
+    // `-c`/`--config` is dropped. `approvals_reviewer` (core#769) adds no writable root and no
+    // host-side write: it only decides who answers an approval request, and without it a forced
+    // `on-request` account refuses every command of the unit, reads included.
     let allowed_override = |v: &str| {
         let (key, value) = v.split_once('=').unwrap_or((v, ""));
         let key = key.trim();
@@ -4167,6 +4170,7 @@ fn strip_codex_roots(flags: Vec<String>) -> Vec<String> {
                 | "model_reasoning_effort"
                 | "model_reasoning_summary"
                 | "model_verbosity"
+                | "approvals_reviewer"
         ) || (key.starts_with("mcp_servers.")
             && key.ends_with(".enabled")
             && value.trim() == "false")
@@ -7489,8 +7493,16 @@ mod tests {
         let posture = seat_posture_from("codex", None);
         assert_eq!(
             posture,
-            vec!["--sandbox".to_string(), "workspace-write".to_string()],
-            "the built-in codex seat must declare the BOUNDED workspace-write posture"
+            [
+                "--sandbox",
+                "workspace-write",
+                "-c",
+                "approvals_reviewer=auto_review"
+            ]
+            .map(String::from)
+            .to_vec(),
+            "the built-in codex seat must declare the BOUNDED workspace-write posture, with an \
+             approvals reviewer that needs no human (core#769)"
         );
         assert!(
             !posture.iter().any(|f| f.contains("dangerously-bypass")),
@@ -7509,8 +7521,8 @@ mod tests {
         );
         apply_seat_posture(&mut argv, &posture);
         assert_eq!(
-            &argv[argv.len() - 2..],
-            &["--sandbox".to_string(), "workspace-write".to_string()],
+            &argv[argv.len() - posture.len()..],
+            posture.as_slice(),
             "the exact posture flags must appear, in order, on the argv"
         );
     }
@@ -9717,7 +9729,7 @@ mod tests {
             "model=o3",
             "the prompt",
         ]);
-        apply_no_code_posture(&mut argv, Vec::new(), Some(&ctx)).unwrap();
+        apply_no_code_posture(&mut argv, seat_posture_from("codex", None), Some(&ctx)).unwrap();
         let joined = argv.join(" ");
         assert!(!joined.contains("/repo/tree"), "{joined}");
         assert!(
@@ -9731,6 +9743,12 @@ mod tests {
         assert!(
             joined.contains("-c model=o3"),
             "the model choice stays: {joined}"
+        );
+        // (core#769) The built-in posture's approvals reviewer survives the allowlist: without it
+        // a forced `on-request` account refuses every command of the read-only unit.
+        assert!(
+            joined.contains("-c approvals_reviewer=auto_review"),
+            "the approvals reviewer stays: {joined}"
         );
         assert!(
             joined.contains("-c mcp_servers.probe.enabled=false"),

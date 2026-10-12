@@ -1506,12 +1506,7 @@ pub(crate) fn run(
                         None => true,
                     };
                     if needs_seat && !spec.clis.is_empty() {
-                        let mut benched = crate::distribute::launcher_benched(&spec.clis);
-                        for seat in
-                            crate::distribute::worktree_benched(&spec.clis, repo_ref.is_some())
-                        {
-                            crate::domain::bench_seat(&mut benched, seat);
-                        }
+                        let benched = crate::distribute::launcher_benched(&spec.clis);
                         if crate::distribute::eligible_seats(&spec.clis, &benched).is_empty() {
                             return Err(NoEligibleSeat {
                                 run_id: run_id.to_string(),
@@ -1588,11 +1583,7 @@ pub(crate) fn run(
                         run_branch: None,
                         base_commit: None,
                         finished_at: None,
-                        // (F-EDIT-5 / F-LEARN-3) codex seats are benched on a worktree-bound run.
-                        benched_seats: crate::distribute::worktree_benched(
-                            &spec.clis,
-                            repo_ref.is_some(),
-                        ),
+                        benched_seats: Vec::new(),
                         team: None,
                         team_plan: None,
                         exclude_seats: crate::domain::normalize_exclude_seats(&spec.exclude_seats),
