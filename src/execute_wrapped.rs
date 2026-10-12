@@ -2261,7 +2261,7 @@ impl WrappedCliStepRunner {
                 if let Some(cli) = argv.first() {
                     let marker = floor.as_ref().map_err(|e| e.clone()).and_then(|tool| {
                         crate::gate_hook::write_os_sandbox_marker(
-                            &crate::gate_hook::decisions_path_for(&input.run_id, input.attempt),
+                            &crate::gate_hook::decisions_path_for_input(input),
                             &crate::scope::unit_phase(input.unit.ord),
                             &worker_write_roots,
                             tool,

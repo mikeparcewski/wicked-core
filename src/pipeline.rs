@@ -1458,17 +1458,28 @@ pub(crate) fn apply_and_finish_unit(
     // the executor's.
     let mut qe_hook_denial: Option<crate::domain::UnitDenial> = None;
     for t in evidence.qe_review.iter().flat_map(|r| r.attempts.iter()) {
-        if t.session.is_empty() || qe_hook_denial.is_some() {
+        if t.session.is_empty() {
             continue;
         }
-        qe_hook_denial = crate::gate_hook::fold_input_denial_in(
+        // The log of the attempt the turn RAN in: a floor re-run carries an earlier attempt's
+        // review (codex r2 on the code).
+        let log = crate::gate_hook::qe_review_decisions_path(session_id, t.attempt, &t.session);
+        let denial = crate::gate_hook::fold_input_denial_in(
             store,
-            &crate::gate_hook::qe_review_decisions_path(session_id, attempt, &t.session),
+            &log,
             &crate::scope::unit_phase(unit.ord),
             t.governed,
             t.tool_activity,
             floor_passed,
         )?;
+        qe_hook_denial = qe_hook_denial.or(denial);
+        // Disclosed under the reviewer's own seat, as the executor's record is under its own —
+        // only for a turn of THIS attempt (a carried review was disclosed when it ran).
+        if t.attempt == attempt {
+            let mut seat = unit.clone();
+            seat.assigned_cli = Some(t.seat.clone());
+            disclose_hook_record_in(&log, session_id, attempt, &seat, t.governed, emit);
+        }
     }
     let hook_denial = hook_denial.or(qe_hook_denial);
     // Capture whether the hook denied NOW, before `hook_denial` is moved into the deny-dominance
@@ -1955,11 +1966,32 @@ pub(crate) fn disclose_hook_record(
     governed: bool,
     emit: &mut dyn FnMut(CoreEvent),
 ) {
+    disclose_hook_record_in(
+        &crate::gate_hook::decisions_path_for(session_id, attempt),
+        session_id,
+        attempt,
+        unit,
+        governed,
+        emit,
+    );
+}
+
+/// [`disclose_hook_record`] over one decisions log `path` — the attempt's, or one engine-run QE
+/// reviewer turn's own (DES-QE-EVERY-SEAT), so the reviewer's refusals and hook decisions reach
+/// the wire under its own seat like the executor's.
+pub(crate) fn disclose_hook_record_in(
+    path: &std::path::Path,
+    session_id: &str,
+    attempt: u32,
+    unit: &crate::domain::WorkUnit,
+    governed: bool,
+    emit: &mut dyn FnMut(CoreEvent),
+) {
     let phase = crate::scope::unit_phase(unit.ord);
     // (DES-MCP-TOOLS-001 §4.4) A brokered MCP call the gate refused: blocked, the seat continued.
     // Disclosed for EVERY unit, governed by its runner or not — the broker, not the carrier, is
     // what governs an MCP call, so a codex or pi unit's refusals are as real as a claude one's.
-    for rec in crate::gate_hook::collect_hook_decisions(session_id, attempt, &phase) {
+    for rec in crate::gate_hook::collect_hook_decisions_in(path, &phase) {
         if let Some((reason, subject, remedy)) = rec.mcp_refusal() {
             emit(CoreEvent::WorkerToolCallDenied {
                 session: session_id.to_string(),
@@ -1983,7 +2015,7 @@ pub(crate) fn disclose_hook_record(
     if !governed {
         return;
     }
-    for rec in crate::gate_hook::collect_hook_decisions(session_id, attempt, &phase) {
+    for rec in crate::gate_hook::collect_hook_decisions_in(path, &phase) {
         // (F-7R2-012) The wrapped carrier's gate hook refused a `git push` / `gh pr create`:
         // the hook is a subprocess with no emit seam, so the fold discloses the refusal here
         // from its durable record — the ACP carrier emits the same event live.
@@ -4098,11 +4130,36 @@ mod judge_bench_tests {
             session: format!("no-log-{}", std::process::id()),
             governed: true,
             tool_activity: true,
+            attempt: 0,
         };
         let (approved, source, _) =
             fold_with_qe_review_and("qe-fold-gov", "pass", None, false, vec![turn]);
         assert!(!approved);
         assert_eq!(source.as_deref(), Some("input_governance"));
+    }
+
+    /// (codex r2 on the code) A floor re-run CARRIES an earlier attempt's review: its reviewer
+    /// turn's governance is read from the log of the attempt it ran in, not the re-run's.
+    #[test]
+    fn a_carried_reviewer_turn_is_folded_from_the_attempt_it_ran_in() {
+        let session = format!("carried-{}", std::process::id());
+        let log = crate::gate_hook::qe_review_decisions_path("qe-fold-carried", 7, &session);
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir("qe-fold-carried"));
+        crate::gate_hook::write_armed_marker(&log, "unit-1").unwrap();
+        let turn = crate::domain::QeReviewAttempt {
+            seat: "b".into(),
+            basis: "distinct".into(),
+            same_cli: false,
+            status: "verdict".into(),
+            session,
+            governed: true,
+            tool_activity: false,
+            attempt: 7,
+        };
+        let (approved, source, _) =
+            fold_with_qe_review_and("qe-fold-carried", "pass", None, false, vec![turn]);
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir("qe-fold-carried"));
+        assert!(approved, "{source:?}");
     }
 
     /// (DES-QE-EVERY-SEAT §3.2, codex r2 F15) The fold of a floor-fix attempt records the fixing

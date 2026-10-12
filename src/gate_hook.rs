@@ -4535,8 +4535,13 @@ impl HookDecisionRecord {
 /// store it. Only a log an older hook version wrote degrades to `"(unknown)"`: every recorder in
 /// this build writes the annotation in the same buffer as its claim (issue #570).
 pub fn collect_hook_decisions(run_id: &str, attempt: u32, phase: &str) -> Vec<HookDecisionRecord> {
-    let path = decisions_path_for(run_id, attempt);
-    let raw = match std::fs::read_to_string(&path) {
+    collect_hook_decisions_in(&decisions_path_for(run_id, attempt), phase)
+}
+
+/// [`collect_hook_decisions`] over one decisions log `path` — the attempt's, or one engine-run QE
+/// reviewer turn's own ([`qe_review_decisions_path`]).
+pub fn collect_hook_decisions_in(path: &std::path::Path, phase: &str) -> Vec<HookDecisionRecord> {
+    let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(_) => return Vec::new(), // log absent or unreadable — no events to emit
     };

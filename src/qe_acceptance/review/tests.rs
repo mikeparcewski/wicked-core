@@ -921,3 +921,21 @@ fn a_candidate_carries_the_run_rosters_invocation() {
         Some("opencode --model x run {PROMPT}")
     );
 }
+
+/// (codex r1/r2 on the code) A reviewer turn's hook writes its OWN decisions log, under its
+/// attempt's dir, keyed by its nonce — never the executor's.
+#[test]
+fn the_reviewer_turns_decisions_log_is_its_own() {
+    let ledger = Path::new("/l/.wicked-qe");
+    let executor = input_for(qe_unit("pi", ledger));
+    let reviewer = reviewer_input(&executor, &seat("claude", BASIS_DISTINCT), "/d", "n-9");
+    let exec_log = crate::gate_hook::decisions_path_for_input(&executor);
+    let rev_log = crate::gate_hook::decisions_path_for_input(&reviewer);
+    assert_eq!(exec_log, crate::gate_hook::decisions_path_for(RUN, 1));
+    assert_eq!(
+        rev_log,
+        crate::gate_hook::qe_review_decisions_path(RUN, 1, "n-9")
+    );
+    assert_ne!(exec_log, rev_log);
+    assert!(rev_log.starts_with(exec_log.parent().unwrap()));
+}

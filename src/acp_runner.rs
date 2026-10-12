@@ -6674,8 +6674,7 @@ impl AcpStepRunner {
                 let scope =
                     crate::scope::resolve_scope(input.entity_mode, &input.run_id, &input.unit.id);
                 let phase = crate::scope::unit_phase(input.unit.ord);
-                let decisions_path =
-                    crate::gate_hook::decisions_path_for(&input.run_id, input.attempt);
+                let decisions_path = crate::gate_hook::decisions_path_for_input(input);
                 let decisions_path = decisions_path.to_string_lossy().into_owned();
                 // The ARMED marker before the first tool call, exactly as the wrapped path writes
                 // it: the fold uses its presence to tell a governed unit that legitimately made no
@@ -7289,7 +7288,7 @@ impl AcpStepRunner {
         if floor_pending {
             let marker = proc.floor.clone().and_then(|tool| {
                 crate::gate_hook::write_os_sandbox_marker(
-                    &crate::gate_hook::decisions_path_for(&input.run_id, input.attempt),
+                    &crate::gate_hook::decisions_path_for_input(input),
                     &crate::scope::unit_phase(input.unit.ord),
                     &proc.floor_roots,
                     tool,

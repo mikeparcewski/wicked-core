@@ -1225,6 +1225,10 @@ pub struct QeReviewAttempt {
     /// Whether the turn made tool calls (its `StepOutput::tools` was non-empty).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tool_activity: bool,
+    /// The unit attempt the turn ran in — its decisions log lives under that attempt's dir, which
+    /// a floor re-run's carried record still names.
+    #[serde(default)]
+    pub attempt: u32,
 }
 
 /// Lifecycle status of a [`WorkUnit`].

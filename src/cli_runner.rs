@@ -1115,15 +1115,10 @@ fn run_unit_and_judge_on(
     Option<crate::validator::AgentVerdict>,
     crate::workflow::UnitEvidence,
 ) {
-    // (DES-QE-EVERY-SEAT) The attempt's dispatch time (its baseline snapshot, else now): a QE run
-    // the executor turn names must have been created at or after it.
-    let qe_not_before = input
-        .unit
-        .worktree_baseline
-        .as_ref()
-        .and_then(|b| i64::try_from(b.taken_at_ms).ok())
-        .filter(|t| *t > 0)
-        .unwrap_or_else(crate::interaction::now_millis);
+    // (DES-QE-EVERY-SEAT) This attempt's start, before its executor turn: a QE run that turn names
+    // must have been created at or after it (no grace; a resumed run is bound by its id instead).
+    // Never the worktree baseline, which a resume or redrive keeps from an earlier attempt.
+    let qe_not_before = crate::interaction::now_millis();
     // DES-TEAMING-002 T5 — the worker-thread seam, shared by the in-process worker and the bus
     // worker. `step.claimed` goes out BEFORE the turn starts (so it precedes every row of the
     // turn, §4.3); a claim that failed AND could not be tombstoned fails the step here, before

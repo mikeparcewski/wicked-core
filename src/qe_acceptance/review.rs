@@ -552,6 +552,7 @@ pub(crate) fn run(
             session: nonce.clone(),
             governed: out.governed,
             tool_activity: !out.tools.is_empty(),
+            attempt: input.attempt,
         };
         if let Some(why) = seat_failure(&out) {
             review.attempts.push(attempt(format!("seat_failure:{why}")));
