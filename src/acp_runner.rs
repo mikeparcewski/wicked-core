@@ -9757,6 +9757,42 @@ sleep 30
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// core#911: the opencode pin is the WHOLE first line opencode 2.x prints for `--version`
+    /// (`opencode v2.0.25`). The comparison stays byte-for-byte, so a bare `2.0.25`, the 1.x
+    /// spelling, or another 2.x build does not match it.
+    #[cfg(unix)]
+    #[test]
+    fn the_opencode_pin_matches_only_the_proven_2x_version_line() {
+        let pin = wicked_council::registry::builtin()
+            .into_iter()
+            .find(|c| c.key == "opencode")
+            .and_then(|c| c.acp)
+            .and_then(|a| a.verified_version)
+            .expect("the opencode seat is pinned");
+        assert_eq!(pin, "opencode v2.0.25");
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-opencode-pin-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (reported, matches) in [
+            ("opencode v2.0.25", true),
+            ("2.0.25", false),
+            ("1.17.18", false),
+            ("opencode v2.0.27", false),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            let bin = stub_bridge_with_version(&dir, reported);
+            assert_eq!(
+                probe_resolved_binary_version(&bin.to_string_lossy(), &pin).matched,
+                matches,
+                "{reported}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// core#581 — A DRIFTED PIN MUST BE ABLE TO SAY WHAT DRIFTED.
     ///
     /// Before this the engine kept only a bool: the resolved binary "did not match its pinned
@@ -12074,6 +12110,28 @@ cat >/dev/null
         drop(second);
         assert!(!d2.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#911: the exact `OPENCODE_CONFIG_CONTENT` a delivery-less governed opencode unit gets
+    /// (the registry's governance content with the MCP deny, `default_agent` and the
+    /// selectable-agent pins composed on) is byte-for-byte the document the opencode 2.x
+    /// admission re-proof ran. Changing either side without re-running that proof fails here.
+    #[test]
+    fn the_composed_opencode_seat_doc_is_the_one_the_2x_proof_ran() {
+        const PROVEN: &str = r#"{"$schema":"https://opencode.ai/config.json","agent":{"build":{"disable":false,"hidden":false,"mode":"primary","permission":{"*_*":"deny","bash":"ask","edit":"ask","execute":"deny","read":"ask","task":"deny"}}},"default_agent":"build","permission":{"*_*":"deny","bash":"ask","edit":"ask","execute":"deny","read":"ask","task":"deny"}}"#;
+        let acp = wicked_council::registry::builtin()
+            .into_iter()
+            .find(|c| c.key == "opencode")
+            .and_then(|c| c.acp)
+            .expect("opencode ships an ACP config");
+        let doc = opencode_launch_config(
+            &acp,
+            &crate::skills_snapshot::SkillsDelivery::None,
+            wicked_apps_core::spawn::SeatCli::Opencode,
+        )
+        .expect("the seat's content composes")
+        .expect("an opencode seat always sets the variable");
+        assert_eq!(doc, PROVEN);
     }
 
     /// (v3.2 × codex round 3, the ACP carrier's chokepoint) A malformed `OPENCODE_CONFIG_CONTENT`

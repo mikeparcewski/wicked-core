@@ -387,6 +387,21 @@ pub(crate) const OPENCODE_MCP_TOOL_PATTERN: &str = "*_*";
 /// the session on it.
 pub(crate) const OPENCODE_GOVERNED_AGENT: &str = "build";
 
+/// What keeps [`OPENCODE_GOVERNED_AGENT`] the agent a session actually runs as (core#911).
+/// `default_agent` alone does not: opencode picks the configured default only while that agent is
+/// selectable (not `mode: "subagent"`, not `hidden`), and otherwise falls through to the first
+/// selectable agent. So a repository `opencode.json` or `.opencode/agent/build.md` that demotes or
+/// hides `build` moved the session onto any primary agent the repository defines, with that
+/// agent's own `"*": "allow"` evaluated after every governance rule (measured on opencode 2.0.25:
+/// `rm -rf` ran with zero asks). These are SET, like `default_agent`, so ambient content cannot
+/// keep its value. `disable` is restated for the same reason (opencode 1.x's key; 2.0.25 reads the
+/// legacy key and re-creates a removed agent from this document anyway).
+fn pin_governed_agent_selectable(governed: &mut serde_json::Map<String, Value>) {
+    governed.insert("disable".to_string(), Value::Bool(false));
+    governed.insert("hidden".to_string(), Value::Bool(false));
+    governed.insert("mode".to_string(), Value::String("primary".to_string()));
+}
+
 /// `OPENCODE_CONFIG_CONTENT` for an opencode seat: `existing` (the seat's governance content, the
 /// skills-composed document, or nothing) with every MCP tool denied and hidden. Composed, never
 /// replaced: every other key is kept, except a rule in the same permission object that would be
@@ -403,6 +418,16 @@ pub(crate) const OPENCODE_GOVERNED_AGENT: &str = "build";
 /// the inherit hatch is outranked like any other ambient file. Two sources load AFTER it and are
 /// not overridden here: a signed-in opencode console org's remote config, and the admin-managed
 /// config directory (the opencode analog of claude's managed settings).
+///
+/// opencode 2.0.25 (`packages/core/src/config.ts` `load`) keeps the same tail: well-known (console
+/// org) entries, global, `OPENCODE_CONFIG`, project files, project `.opencode` directories (agent
+/// markdown included), then `OPENCODE_CONFIG_CONTENT` LAST. Each document's top-level rules are
+/// pushed onto every agent first, then each document's per-agent rules in document order
+/// (`config/plugin/agent.ts`), and the last match wins. So a rule this document states on the
+/// governed agent outranks every ambient rule for that agent, and a rule it states only at the top
+/// level does not outrank an ambient `agent.build.permission` (core#911); the seat's governance
+/// content restates its rules on the agent for that reason (registry `acp_governance_env`). The
+/// governed agent is also pinned selectable ([`pin_governed_agent_selectable`]).
 ///
 /// Fails closed like the skills composition: a value that is not a JSON object, or whose
 /// `permission` / `agent` / `agent.build` / `agent.build.permission` is not an object, is an
@@ -432,6 +457,7 @@ pub(crate) fn opencode_config(existing: Option<&str>) -> Result<String, String> 
     let agent = object_entry(obj, "agent", VAR)?;
     let governed = object_entry(agent, OPENCODE_GOVERNED_AGENT, VAR)?;
     deny_mcp_in(governed, "permission")?;
+    pin_governed_agent_selectable(governed);
     obj.insert(
         "default_agent".to_string(),
         Value::String(OPENCODE_GOVERNED_AGENT.to_string()),
@@ -712,6 +738,23 @@ mod tests {
         // No existing content: a bare document still carries the deny.
         let doc: Value = serde_json::from_str(&opencode_config(None).unwrap()).unwrap();
         assert_eq!(doc["permission"]["*_*"], "deny");
+    }
+
+    /// core#911: the governed agent stays selectable. Content that demotes, hides or disables it
+    /// is overwritten, so opencode cannot fall through to another primary agent.
+    #[test]
+    fn the_opencode_config_keeps_the_governed_agent_selectable() {
+        for existing in [
+            None,
+            Some(r#"{"agent":{"build":{"mode":"subagent","hidden":true,"disable":true}}}"#),
+        ] {
+            let doc: Value = serde_json::from_str(&opencode_config(existing).unwrap()).unwrap();
+            let build = &doc["agent"]["build"];
+            assert_eq!(build["mode"], "primary", "{existing:?}");
+            assert_eq!(build["hidden"], false, "{existing:?}");
+            assert_eq!(build["disable"], false, "{existing:?}");
+            assert_eq!(doc["default_agent"], "build");
+        }
     }
 
     /// Review of #659: an allow for an MCP-shaped pattern INSIDE the composed document is not
