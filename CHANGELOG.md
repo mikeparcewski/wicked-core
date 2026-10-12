@@ -14,6 +14,27 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Governed claude seats load the worktree's `CLAUDE.md` again.** Since #914 they ran with no
+  filesystem setting scope, which also dropped the repository's instructions. A claude unit now
+  passes its tree as an additional directory and sets `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1`,
+  claude's own switch for loading an additional directory's instructions. Wrapped units use
+  `--add-dir <tree>`, placed directly before `--setting-sources ""`. ACP unit sessions list the tree
+  in `additionalDirectories` and set the variable on the bridge. The scope selection is unchanged.
+
+  Measured offline on claude 2.1.287, wrapped and through claude-agent-acp 0.73.0, with a scripted
+  model. The repository carried hooks, a settings `env`, an allow-all, `.mcp.json` with
+  `enableAllProjectMcpServers`, and a skill, agent and command of its own:
+  - **Loaded:** `CLAUDE.md`, `.claude/CLAUDE.md`, unconditional `.claude/rules/*.md`, and the
+    files they `@import`.
+  - **Still not loaded:** any repository hook, the settings `env` or permission rules, MCP servers
+    (none spawned, even without `--strict-mcp-config`), skills, agents or commands. The engine's own
+    `--settings` hook and plugin still load.
+  - **Not loaded either:** `CLAUDE.local.md`, a nested `<dir>/CLAUDE.md` and path-scoped rules.
+    The CLI gates these on the `project`/`local` sources.
+  - Either half alone loads nothing.
+
+  Council ballots run in a per-seat temp directory, not the worktree, so they are unchanged. Chats are
+  unchanged too. opencode is unchanged: `AGENTS.md` still does not load on its seats.
 - **Governed seats no longer load a repository's own agent configuration (#914).** Before this
   change, a repository could run code on a governed seat at session start without being asked:
   - opencode imported its `.opencode/plugin{,s}/*.js` and spawned the commands of the MCP servers
