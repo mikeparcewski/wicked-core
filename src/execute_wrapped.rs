@@ -611,10 +611,13 @@ pub(crate) fn denied_bash_rules() -> impl Iterator<Item = &'static str> {
 ///     depends on whose laptop it is on is not reproducible. `--setting-sources ""` drops user
 ///     scope while leaving auth alone — and (core#914) the repository's `project`/`local` scopes
 ///     too: a governed seat never loads a repository's own agent configuration (its hooks,
-///     permission rules, MCP servers, skills, agents or `CLAUDE.md`). What the engine hands the
-///     worker rides separate sources that still apply: `--settings`, `--plugin-dir`,
-///     `--disallowedTools` and the strict MCP pin ([`crate::acp_runner::ENGINE_SETTING_SOURCES`]
-///     has the measurement).
+///     permission rules, MCP servers, skills or agents). What the engine hands the worker rides
+///     separate sources that still apply: `--settings`, `--plugin-dir`, `--disallowedTools` and
+///     the strict MCP pin ([`crate::acp_runner::ENGINE_SETTING_SOURCES`] has the measurement).
+///     The repository's INSTRUCTIONS are not configuration: `instructions_root` (the unit's
+///     tree) rides `--add-dir`, and with [`crate::acp_runner::CLAUDE_MD_ADDITIONAL_DIRS_ENV`] set
+///     at the spawn its `CLAUDE.md` loads and nothing else does (that constant has the
+///     measurement).
 ///
 ///  2. **No filesystem boundary.** 41 of 331 path-bearing tool calls left the worktree.
 ///     `--disallowedTools` denies the file tools a path into the directories above.
@@ -685,6 +688,7 @@ pub(crate) fn inject_isolation_flags(
     skills_plugin: Option<&Path>,
     prompt: Option<&str>,
     operational_home: Option<&Path>,
+    instructions_root: Option<&Path>,
 ) -> Result<(), String> {
     // Conflicts are judged against the TEMPLATE, not against the built argv. The argv also holds
     // the prompt, which is workflow- and model-authored, and `build_argv` may place it as a bare
@@ -739,6 +743,15 @@ pub(crate) fn inject_isolation_flags(
             .iter()
             .map(|a| a.to_string()),
     );
+    // The unit's working tree as an additional directory, so its `CLAUDE.md` loads (the launch
+    // also sets `CLAUDE_MD_ADDITIONAL_DIRS_ENV`, which is what makes claude read an additional
+    // directory's instruction files): the scope selection below is untouched, so no repository
+    // hook, setting or MCP server loads with it. Placed directly before `--setting-sources`, an
+    // option, so the variadic `--add-dir` can never take a bare token after it for a directory.
+    if let Some(root) = instructions_root {
+        flags.push("--add-dir".into());
+        flags.push(root.to_string_lossy().into_owned());
+    }
     // core#914: the scope selection rides EVERY launch — the hatch inherits the operator's `user`
     // scope (what the hatch means), never the repository's `project`/`local` scopes; before, the
     // hatch withheld the flag and the CLI's default loaded the repository's hooks too.
@@ -1905,6 +1918,10 @@ impl WrappedCliStepRunner {
             && inject_codex_json_flag(&mut argv);
         let pi_json =
             seat_cli == wicked_apps_core::spawn::SeatCli::Pi && inject_pi_json_mode(&mut argv);
+        // Run in the worktree if the run targets a repo; else a per-run temp sandbox (never the
+        // orchestrator's own cwd).
+        let cwd = input.workdir.clone().unwrap_or_else(|| sandbox_for(input));
+
         if is_claude {
             inject_claude_stream_flags(&mut argv);
             // Before governance arms: isolation applies to EVERY claude unit, governed or not. An
@@ -1918,6 +1935,9 @@ impl WrappedCliStepRunner {
                 handed.map(|s| s.root.as_path()),
                 Some(&prompt),
                 operational_home,
+                // The tree the unit runs in, so its `CLAUDE.md` loads (the env half is set at the
+                // spawn below).
+                Some(&cwd),
             ) {
                 return isolation_refusal(input, &why);
             }
@@ -2154,9 +2174,6 @@ impl WrappedCliStepRunner {
             (None, _) => None,
         };
 
-        // Run in the worktree if the run targets a repo; else a per-run temp sandbox (never the
-        // orchestrator's own cwd).
-        let cwd = input.workdir.clone().unwrap_or_else(|| sandbox_for(input));
         let _ = std::fs::create_dir_all(&cwd);
 
         let (status, output, usage, files, tools) = if argv.is_empty() {
@@ -2317,6 +2334,12 @@ impl WrappedCliStepRunner {
             // delivery and applied here AFTER `hardened()`: this seat's own configuration-home
             // variable set, every foreign one stripped, the inherit hatch touching nothing.
             seat_config.apply(&mut cmd);
+            // The env half of the claude unit's `CLAUDE.md` (its tree rides `--add-dir`, see
+            // `inject_isolation_flags`): claude reads an additional directory's instruction files
+            // only with this set.
+            if is_claude {
+                cmd.env(crate::acp_runner::CLAUDE_MD_ADDITIONAL_DIRS_ENV, "1");
+            }
             // v3.2 §2, opencode's lever: `OPENCODE_CONFIG_CONTENT` composed WITH whatever the
             // daemon's environment already carries (the operator's own content, if any), gaining
             // `skills.paths` — one path per portable skill in the snapshot. Set AFTER `hardened()`
@@ -5544,7 +5567,7 @@ mod tests {
         invocation: &str,
         skills_plugin: Option<&Path>,
     ) {
-        super::inject_isolation_flags(argv, invocation, skills_plugin, None, None)
+        super::inject_isolation_flags(argv, invocation, skills_plugin, None, None, None)
             .expect("the isolation flags inject");
     }
 
@@ -7069,6 +7092,97 @@ mod tests {
             "a non-claude wrapped worker must see NO claude config dir — the daemon's is stripped; \
              got: {}",
             out.output
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A claude wrapped unit gets its working tree's `CLAUDE.md` through claude's own mechanism,
+    /// while the scope selection stays the engine's: the launched argv carries `--add-dir <tree>`
+    /// directly before `--setting-sources ""` (an option, so the variadic `--add-dir` takes no
+    /// bare token), and the process runs with `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1`.
+    /// Neither half alone loads anything (measured on claude 2.1.287, see
+    /// [`crate::acp_runner::CLAUDE_MD_ADDITIONAL_DIRS_ENV`]). A fake `claude` records both.
+    /// Mutation: drop either half in `run_unit` and this fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_wrapped_unit_loads_its_trees_claude_md_and_still_no_repository_scope() {
+        if wicked_apps_core::spawn::inherits_operator_config() {
+            // Under the hatch the scope is the operator's `user`; covered by the hatch tests.
+            return;
+        }
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("wicked-claude-md-wrapped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        let worker_home = dir.join("worker");
+        let wt = dir.join("wt");
+        for d in [&bin, &worker_home, &wt] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let ledger = dir.join("seen.txt");
+        let claude = bin.join("claude");
+        std::fs::write(
+            &claude,
+            format!(
+                "#!/bin/sh\n{{ printf 'ENV=%s\\n' \"${{{}:-UNSET}}\"; for a in \"$@\"; do printf 'ARG=%s\\n' \"$a\"; done; }} > \"{}\"\nexit 0\n",
+                crate::acp_runner::CLAUDE_MD_ADDITIONAL_DIRS_ENV,
+                ledger.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _home = VarGuard::set(wicked_apps_core::spawn::WORKER_HOME_ENV, &worker_home);
+
+        let mut u = WorkUnit::pending("s:u1", "s", 1, "do it");
+        u.assigned_cli = Some("claude".to_string());
+        u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", claude.display()));
+        let input = StepInput {
+            run_id: "run-claude-md-wrapped".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(wt.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let _out = WrappedCliStepRunner::default().run_unit(&input);
+        let seen = std::fs::read_to_string(&ledger).expect("the fake claude ran and recorded");
+        let mut env = None;
+        let mut argv: Vec<String> = Vec::new();
+        for line in seen.lines() {
+            if let Some(v) = line.strip_prefix("ENV=") {
+                env = Some(v.to_string());
+            } else if let Some(a) = line.strip_prefix("ARG=") {
+                argv.push(a.to_string());
+            }
+        }
+        assert_eq!(env.as_deref(), Some("1"), "{seen}");
+        let tree = wt.to_string_lossy().into_owned();
+        let at = argv
+            .windows(4)
+            .position(|w| w[0] == "--add-dir" && w[1] == tree && w[2] == "--setting-sources")
+            .unwrap_or_else(|| {
+                panic!("`--add-dir <tree>` directly before the scope flag: {argv:?}")
+            });
+        assert_eq!(
+            argv[at + 3],
+            "",
+            "the scope selection is unchanged: {argv:?}"
+        );
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--add-dir").count(),
+            1,
+            "{argv:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10805,7 +10919,7 @@ mod tests {
         ] {
             let inv = format!("claude {stated} -p {{PROMPT}}");
             let mut argv = build_argv(&inv, "hi", &[]);
-            let err = super::inject_isolation_flags(&mut argv, &inv, None, Some("hi"), None)
+            let err = super::inject_isolation_flags(&mut argv, &inv, None, Some("hi"), None, None)
                 .expect_err("a template stating an engine-owned MCP flag is refused");
             assert!(err.contains(&inv) && err.contains("MCP"), "{err}");
         }
@@ -10934,7 +11048,7 @@ mod tests {
         ] {
             let inv = format!("claude {stated} -p {{PROMPT}}");
             let mut argv = build_argv(&inv, "hi", &[]);
-            let err = super::inject_isolation_flags(&mut argv, &inv, None, Some("hi"), None)
+            let err = super::inject_isolation_flags(&mut argv, &inv, None, Some("hi"), None, None)
                 .expect_err("a template stating an engine-owned flag is refused");
             assert!(
                 err.contains(&inv)
@@ -10952,7 +11066,7 @@ mod tests {
         ] {
             let inv = format!("claude {stated} -p {{PROMPT}}");
             let mut argv = build_argv(&inv, "hi", &[]);
-            super::inject_isolation_flags(&mut argv, &inv, None, Some("hi"), None)
+            super::inject_isolation_flags(&mut argv, &inv, None, Some("hi"), None, None)
                 .expect("a template may ADD denies");
             let flags: Vec<&String> = argv
                 .iter()
@@ -11166,17 +11280,29 @@ mod tests {
         let inv = "claude -p {PROMPT}";
         let mut argv = build_argv(inv, "hi", &[]);
         let before = argv.clone();
-        let why =
-            super::inject_isolation_flags(&mut argv, inv, None, Some("hi"), Some(&comma_home))
-                .expect_err("the launch is refused");
+        let why = super::inject_isolation_flags(
+            &mut argv,
+            inv,
+            None,
+            Some("hi"),
+            Some(&comma_home),
+            None,
+        )
+        .expect_err("the launch is refused");
         assert!(names(&why), "{why}");
         assert_eq!(argv, before, "nothing is injected on a refusal");
         // Under the inherit hatch too.
         {
             let _hatch = VarGuard::set(INHERIT_OPERATOR_CONFIG_ENV, std::path::Path::new("1"));
-            let why =
-                super::inject_isolation_flags(&mut argv, inv, None, Some("hi"), Some(&comma_home))
-                    .expect_err("refused under the hatch as well");
+            let why = super::inject_isolation_flags(
+                &mut argv,
+                inv,
+                None,
+                Some("hi"),
+                Some(&comma_home),
+                None,
+            )
+            .expect_err("refused under the hatch as well");
             assert!(names(&why), "{why}");
             assert_eq!(argv, before);
         }
@@ -11244,7 +11370,7 @@ mod tests {
             // round-8 built-argv strip/lift off it.
             let inv = "claude -p {PROMPT}";
             let mut argv = build_argv(inv, hostile, &[]);
-            super::inject_isolation_flags(&mut argv, inv, None, Some(hostile), None).unwrap();
+            super::inject_isolation_flags(&mut argv, inv, None, Some(hostile), None, None).unwrap();
             assert!(
                 states_pair(&argv, "--setting-sources", ""),
                 "prompt `{hostile}` suppressed the scope isolation: {argv:?}"
@@ -11444,8 +11570,15 @@ mod tests {
         // untouched (only the operator's stated literal is ever stripped).
         let inv = "claude -p {PROMPT}";
         let mut argv = build_argv(inv, "--plugin-dir", &[]);
-        super::inject_isolation_flags(&mut argv, inv, Some(snapshot), Some("--plugin-dir"), None)
-            .unwrap();
+        super::inject_isolation_flags(
+            &mut argv,
+            inv,
+            Some(snapshot),
+            Some("--plugin-dir"),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             argv.iter().filter(|a| *a == "--plugin-dir").count(),
             2,
@@ -11524,7 +11657,8 @@ mod tests {
             argv.iter().any(|a| a == "a,b/x"),
             "the placeholder expanded into the built value: {argv:?}"
         );
-        super::inject_isolation_flags(&mut argv, inv, Some(snapshot), Some("hi"), None).unwrap();
+        super::inject_isolation_flags(&mut argv, inv, Some(snapshot), Some("hi"), None, None)
+            .unwrap();
         assert_eq!(
             plugin_dirs(&argv),
             vec!["/snapshots/5"],
@@ -11539,6 +11673,7 @@ mod tests {
             Some(snapshot),
             Some("--plugin-dir=/etc"),
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -11552,7 +11687,7 @@ mod tests {
             "/x".to_string(),
             "--plugin-dir".to_string(),
         ];
-        let err = super::inject_isolation_flags(&mut argv, inv, Some(snapshot), None, None)
+        let err = super::inject_isolation_flags(&mut argv, inv, Some(snapshot), None, None, None)
             .expect_err("a dangling --plugin-dir the strip cannot pair is a refusal");
         assert!(err.contains("exactly 1"), "{err}");
     }
@@ -12067,7 +12202,7 @@ mod tests {
             // Through the injector: the argv carries the operational home's rule.
             let inv = "claude -p {PROMPT}";
             let mut argv = build_argv(inv, "hi", &[]);
-            super::inject_isolation_flags(&mut argv, inv, None, Some("hi"), op).unwrap();
+            super::inject_isolation_flags(&mut argv, inv, None, Some("hi"), op, None).unwrap();
             let denies = flag_value(&argv, "--disallowedTools").unwrap();
             assert!(denies.contains(&format!("Read({op_rule}/**)")), "{argv:?}");
             // A snapshot published FROM the operational home: the registry replaces the blanket,

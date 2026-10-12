@@ -2081,8 +2081,11 @@ pub(crate) struct SessionOptions<'a> {
     /// `additionalDirectories` — the SDK's "directories Claude may also access": a CHAT's scoped
     /// repository roots (core#410 / crew#502), so a seat whose cwd is the chat's scratch root can
     /// read the repos it was pointed at without a permission round-trip per file. Appended to an
-    /// existing list (never replacing one). Empty for unit sessions — a unit's read roots are the
-    /// in-process boundary's business (`assemble_read_roots`), not the SDK's.
+    /// existing list (never replacing one). On a claude UNIT session it is the unit's own working
+    /// tree and nothing else: a unit's read roots are the in-process boundary's business
+    /// (`assemble_read_roots`), not the SDK's, and the tree is listed only so its `CLAUDE.md`
+    /// loads ([`CLAUDE_MD_ADDITIONAL_DIRS_ENV`]); it is the session's `cwd` already, so no access
+    /// is widened.
     pub additional_directories: &'a [String],
     /// `settingSources` — the ACP analog of the wrapped path's `--setting-sources` (codex round
     /// 8): the engine OWNS the scope selection, so this is SET (not merged — a list that kept an
@@ -2095,8 +2098,10 @@ pub(crate) struct SessionOptions<'a> {
 /// The scopes a worker session reads its settings from — NONE (core#914). Not the operator's
 /// `user` scope (FINDING-047), and not the repository's `project`/`local` scopes either: a
 /// governed seat never loads a repository's own agent configuration — its hooks, permission
-/// rules, MCP servers, skills, agents, or its `CLAUDE.md` (the CLI loads that only from the
-/// `project` source). `[]` is the SDK's isolation mode; the bridge passes it to the CLI as
+/// rules, MCP servers, skills or agents. Its `CLAUDE.md` would go too (the CLI loads it from the
+/// `project` source), so a unit session lists its tree as an additional directory with
+/// [`CLAUDE_MD_ADDITIONAL_DIRS_ENV`] set, which loads the instructions alone. `[]` is the SDK's
+/// isolation mode; the bridge passes it to the CLI as
 /// `--setting-sources=`. What the ENGINE hands the session is a separate source and still
 /// applies: the per-session settings file (`settings`), the skills snapshot (`plugins`), the deny
 /// fence (`disallowedTools`) and the strict MCP pin. Measured on claude 2.1.287 through
@@ -2122,6 +2127,32 @@ pub(crate) fn setting_sources_arg(inherit: bool) -> String {
     }
     .join(",")
 }
+
+/// claude's own switch for loading the instruction files of its ADDITIONAL directories
+/// (`--add-dir` on the CLI, `additionalDirectories` in the SDK). Set to `1` on every governed
+/// claude unit launch, wrapped and ACP, together with the unit's working tree as an additional
+/// directory: the ONE way to give a seat its repository's `CLAUDE.md` back while the scope
+/// selection stays [`ENGINE_SETTING_SOURCES`] (core#914 took the `project` source away, and
+/// `CLAUDE.md` went with it).
+///
+/// Measured on claude 2.1.287 (wrapped `claude -p`, and through claude-agent-acp 0.73.0) with a
+/// scripted model against a repository carrying hooks in `.claude/settings{,.local}.json`, a
+/// settings `env`, an allow-all, `.mcp.json` with `enableAllProjectMcpServers`, and a repo skill,
+/// agent and command. With `--setting-sources ""`, the tree as an additional directory and this
+/// variable:
+///
+/// - LOADED: `CLAUDE.md`, `.claude/CLAUDE.md`, unconditional `.claude/rules/*.md`, and the
+///   files they `@import`;
+/// - NOT loaded (the CLI gates these on the `project`/`local` sources): `CLAUDE.local.md`, a
+///   nested `<dir>/CLAUDE.md` (also not after a file under it is read), and a path-scoped rule
+///   (`paths:` frontmatter);
+/// - still NOT loaded: every repository hook, the settings `env` and permission rules, the
+///   repository's MCP servers (not spawned, even without `--strict-mcp-config`), and its skills,
+///   agents and commands. The engine's own `--settings` hook and plugin still load.
+///
+/// The additional directory alone (no variable) loads nothing, and so does the variable alone.
+pub(crate) const CLAUDE_MD_ADDITIONAL_DIRS_ENV: &str =
+    "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD";
 
 #[cfg(test)]
 impl SessionOptions<'_> {
@@ -2420,11 +2451,24 @@ fn start_acp_process_with_write_roots(
         }
         _ => None,
     };
+    // A claude UNIT session gets its working tree's `CLAUDE.md` through claude's own mechanism:
+    // the tree as an additional directory plus `CLAUDE_MD_ADDITIONAL_DIRS_ENV` on the bridge
+    // (set below). The scope selection stays the engine's, so no repository hook, setting or MCP
+    // server loads with it. A chat (no unit session) runs in its scratch root and gets neither.
+    let instructions_root: Option<String> = (session.is_some()
+        && seat_cli == wicked_apps_core::spawn::SeatCli::Claude)
+        .then(|| cwd.to_string_lossy().into_owned());
+    let mut session_dirs: Vec<String> = additional_read_roots.to_vec();
+    if let Some(root) = &instructions_root {
+        if !session_dirs.contains(root) {
+            session_dirs.push(root.clone());
+        }
+    }
     let session_options = SessionOptions {
         skills_plugin,
         deny: &deny,
         settings: session_settings.as_deref(),
-        additional_directories: additional_read_roots,
+        additional_directories: &session_dirs,
         setting_sources: Some(if inherit {
             INHERIT_SETTING_SOURCES
         } else {
@@ -2619,6 +2663,11 @@ fn start_acp_process_with_write_roots(
         // claude configuration path (PR#413) and a claude one never carries theirs (core#410).
         // The inherit hatch sets and strips nothing, on purpose.
         seat_config.apply(&mut cmd);
+        // The other half of the claude unit session's `CLAUDE.md` (see `instructions_root`): the
+        // bridge hands its environment to the CLI it spawns.
+        if instructions_root.is_some() {
+            cmd.env(CLAUDE_MD_ADDITIONAL_DIRS_ENV, "1");
+        }
         // UNCONDITIONAL — never gated on whether THIS unit is governed (DES-INPUT-GOV-006 §3.3).
         // A session is spawned once and cached/reused across turns (`probe_cached_session`); a
         // process spawned before a later turn's governance decision would have no way to
@@ -12419,6 +12468,115 @@ transport = "stdio"
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// A claude UNIT session gets its working tree's `CLAUDE.md` through claude's own mechanism,
+    /// while the scope selection stays the engine's: the `session/new` frame lists the tree (the
+    /// session's `cwd`) as its one `additionalDirectories` entry, `settingSources` is still `[]`
+    /// (so no repository hook, setting or MCP server loads), and the bridge runs with
+    /// `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1`, which it hands to the CLI it spawns.
+    /// Neither half alone loads anything (measured on claude 2.1.287 through claude-agent-acp
+    /// 0.73.0, see [`super::CLAUDE_MD_ADDITIONAL_DIRS_ENV`]). Mutation: drop either half in
+    /// `start_acp_process_with_write_roots` and this fails.
+    #[test]
+    #[cfg(unix)]
+    fn a_claude_unit_session_loads_its_trees_claude_md_and_still_no_repository_scope() {
+        use crate::skills_snapshot::test_support::{
+            gen_dir, scratch as canonical_scratch, snapshot_root,
+        };
+        use crate::workflow::{StepInput, StepRunner};
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        if crate::execute_wrapped::inherits_operator_config() {
+            // Under the hatch the scope list is the operator's `user`; covered by the hatch tests.
+            return;
+        }
+        let home = canonical_scratch("acp-claude-md");
+        let _home = EnvPin::set("HOME", &home);
+        let snapshot = snapshot_root(
+            &gen_dir(&home.join(".wicked-crew"), "1"),
+            "1",
+            &[("domain", "wicked-garden-domain")],
+        );
+        let _snap = EnvPin::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &snapshot);
+        let ledger = home.join("ledger.ndjson");
+        let bridge = write_recording_bridge(&home);
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                r#"
+[[cli]]
+key = "md-seat"
+display_name = "CLAUDE.md seat"
+binary = "claude"
+headless_invocation = "claude -p \"{{PROMPT}}\""
+
+[cli.acp]
+binary = "{bridge}"
+start_args = ["{ledger}"]
+transport = "stdio"
+"#,
+                bridge = bridge.display(),
+                ledger = ledger.display(),
+            ),
+        )
+        .unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner = AcpStepRunner::new(tx);
+        let mut u = crate::domain::WorkUnit::pending("run-md:u1", "run-md", 1, "do the thing");
+        u.assigned_cli = Some("md-seat".to_string());
+        u.skill_ref = Some("wicked-garden-domain".to_string());
+        let input = StepInput {
+            run_id: "run-md".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-md".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: Some(wt.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let entries = ledger_entries(&ledger);
+        let new = &entries[0];
+        let options = &new["new"]["_meta"]["claudeCode"]["options"];
+        let cwd = new["new"]["cwd"].as_str().expect("the frame names its cwd");
+        assert_eq!(
+            options["additionalDirectories"],
+            serde_json::json!([cwd]),
+            "the tree rides as the one additional directory: {new}"
+        );
+        assert_eq!(
+            std::fs::canonicalize(cwd).unwrap(),
+            std::fs::canonicalize(&wt).unwrap(),
+            "{new}"
+        );
+        assert_eq!(
+            options["settingSources"],
+            serde_json::json!([]),
+            "the scope selection is unchanged: no repository scope loads: {new}"
+        );
+        assert_eq!(
+            new["claude_md_env"],
+            serde_json::json!("1"),
+            "the bridge runs with the CLAUDE.md switch for additional directories: {new}"
+        );
+        assert_eq!(
+            super::CLAUDE_MD_ADDITIONAL_DIRS_ENV,
+            "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"
+        );
+        runner.drop_session("run-md");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// Review of #659 (codex, HIGH): an opencode seat whose inline config cannot take the MCP deny
     /// (`permission` is not an object), on a unit handed NO skills, is refused BEFORE the spawn as
     /// a launch error naming the variable and the seat. The reachable source is the inherit hatch,
@@ -12724,7 +12882,9 @@ while True:
             "protocolVersion": "2025-03-26", "capabilities": {},
             "serverInfo": {"name": "recording", "version": "0"}}})
     elif method == "session/new":
-        record({"new": req.get("params")})
+        import os
+        record({"new": req.get("params"),
+                "claude_md_env": os.environ.get("CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD")})
         w({"jsonrpc": "2.0", "id": req["id"], "result": {
             "sessionId": "recording-session", "protocolVersion": "2025-03-26"}})
     elif method == "session/prompt":
