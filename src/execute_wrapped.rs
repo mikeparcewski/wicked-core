@@ -3428,7 +3428,7 @@ fn arm_input_governance(
 ) -> std::io::Result<GovLaunch> {
     let scope = crate::scope::resolve_scope(input.entity_mode, &input.run_id, &input.unit.id);
     let phase = crate::scope::unit_phase(input.unit.ord);
-    let decisions_path = crate::gate_hook::decisions_path_for(&input.run_id, input.attempt);
+    let decisions_path = crate::gate_hook::decisions_path_for_input(input);
     // Resolve the wicked-core binary path for the gate-hook command.
     //
     // When wicked-core runs as a napi-rs addon loaded by Node.js (the wicked-crew TS layer),

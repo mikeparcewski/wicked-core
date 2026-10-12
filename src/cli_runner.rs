@@ -1115,9 +1115,15 @@ fn run_unit_and_judge_on(
     Option<crate::validator::AgentVerdict>,
     crate::workflow::UnitEvidence,
 ) {
-    // (DES-QE-EVERY-SEAT) The attempt's start: a QE run the executor turn names must have been
-    // created at or after it (a small allowance for clock rounding).
-    let qe_not_before = crate::interaction::now_millis() - 2_000;
+    // (DES-QE-EVERY-SEAT) The attempt's dispatch time (its baseline snapshot, else now): a QE run
+    // the executor turn names must have been created at or after it.
+    let qe_not_before = input
+        .unit
+        .worktree_baseline
+        .as_ref()
+        .and_then(|b| i64::try_from(b.taken_at_ms).ok())
+        .filter(|t| *t > 0)
+        .unwrap_or_else(crate::interaction::now_millis);
     // DES-TEAMING-002 T5 — the worker-thread seam, shared by the in-process worker and the bus
     // worker. `step.claimed` goes out BEFORE the turn starts (so it precedes every row of the
     // turn, §4.3); a claim that failed AND could not be tombstoned fails the step here, before
@@ -1231,21 +1237,14 @@ fn run_unit_and_judge_on(
     // (DES-QE-EVERY-SEAT) THE ISOLATED QE REVIEWER. For the run's QE unit with a `required`
     // decision, the turn above was the EXECUTOR (writer + executor, no QE verdict); the engine now
     // runs the reviewer as its own fresh worker session on a run seat, handed only the evidence
-    // path, and binds the verdict it recorded. Its tool calls are this attempt's (the floor fix's
-    // rule): they fold with the executor's output, which stays the unit's output. A floor re-run
-    // runs no reviewer (the seat does not run again): it carries or invalidates the last record.
-    let mut output = output;
+    // path, and binds the verdict it recorded. Each reviewer turn's governance is its OWN decisions
+    // log, folded as that turn's (the record carries its nonce and flags); the unit's output stays
+    // the executor's. A floor re-run runs no reviewer (the seat does not run again): it carries or
+    // invalidates the last record.
     let qe_review = match floor_rerun {
         Some(r) => crate::qe_acceptance::review::on_floor_rerun(&input.unit, r.fix.is_some()),
         None => {
             crate::qe_acceptance::review::run(runner, input, &output, qe_not_before, emit_delta)
-                .map(|r| {
-                    output.files.extend(r.files);
-                    output.tools.extend(r.tools);
-                    // The fold reads the decisions log when ANY turn of the attempt armed the hook.
-                    output.governed |= r.governed;
-                    r.review
-                })
         }
     };
     // T5: `step.completed`, then the bounded gate wait for S's `ledger.folded` (fail-closed

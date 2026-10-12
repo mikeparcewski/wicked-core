@@ -3513,6 +3513,29 @@ pub fn decisions_path_for(run_id: &str, attempt: u32) -> std::path::PathBuf {
         .join("decisions.ndjson")
 }
 
+/// (DES-QE-EVERY-SEAT, codex r1 on the code) The decisions log of ONE engine-run QE reviewer
+/// turn — its own file under its attempt's dir, keyed by the turn's nonce — so its armed marker,
+/// hook proof and claims are judged as that turn's alone, never mixed with the executor's (the
+/// liveness checks read one carrier and one hook proof per log).
+pub fn qe_review_decisions_path(run_id: &str, attempt: u32, session: &str) -> std::path::PathBuf {
+    let safe: String = session
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    gov_run_dir(run_id)
+        .join(format!("attempt-{attempt}"))
+        .join(format!("qe-review-{safe}"))
+        .join("decisions.ndjson")
+}
+
+/// The decisions log a turn's hook writes: the attempt's, or a QE reviewer turn's own.
+pub(crate) fn decisions_path_for_input(input: &crate::workflow::StepInput) -> std::path::PathBuf {
+    match input.unit.qe_review_session.as_deref() {
+        Some(session) => qe_review_decisions_path(&input.run_id, input.attempt, session),
+        None => decisions_path_for(&input.run_id, input.attempt),
+    }
+}
+
 /// Append one serialized [`ConformanceClaim`] line to the absolute decisions NDJSON path, creating the
 /// file (and parent dir) if needed. Append-only so concurrent hook processes never clobber. The
 /// complete `json + '\n'` line is written in a SINGLE `write_all`: a lone append write of a small buffer
@@ -4681,14 +4704,33 @@ pub(crate) fn fold_input_denial_after_floor(
     tool_activity: bool,
     floor_passed: bool,
 ) -> anyhow::Result<Option<crate::domain::UnitDenial>> {
+    fold_input_denial_in(
+        store,
+        &decisions_path_for(run_id, attempt),
+        phase,
+        governed,
+        tool_activity,
+        floor_passed,
+    )
+}
+
+/// [`fold_input_denial_after_floor`] over one decisions log `path` — the attempt's, or one
+/// engine-run QE reviewer turn's own ([`qe_review_decisions_path`]).
+pub(crate) fn fold_input_denial_in(
+    store: &mut dyn GraphStore,
+    path: &std::path::Path,
+    phase: &str,
+    governed: bool,
+    tool_activity: bool,
+    floor_passed: bool,
+) -> anyhow::Result<Option<crate::domain::UnitDenial>> {
     // Every denial this fold produces is an input-governance deny for `phase`.
     let fail_closed = |reason: String| {
         let mut d = crate::domain::UnitDenial::new("input_governance", reason);
         d.phase = Some(phase.to_string());
         d
     };
-    let path = decisions_path_for(run_id, attempt);
-    let raw = match std::fs::read_to_string(&path) {
+    let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         // No log at all: a GOVERNED unit MUST have its launcher-written armed marker → its absence means
         // the evidence was never written or the whole gov dir was erased → fail CLOSED. An ungoverned

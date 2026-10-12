@@ -93,15 +93,15 @@ pub(crate) fn reviewer_brief(dir: &str) -> String {
 /// base skill, validator, deliverables, team or floor report.
 pub(crate) fn reviewer_unit(
     unit: &WorkUnit,
-    seat: &str,
+    seat: &QeReviewerSeat,
     dir: &str,
     nonce: Option<&str>,
 ) -> WorkUnit {
     let mut u = unit.clone();
     u.description = reviewer_brief(dir);
-    if u.assigned_cli.as_deref() != Some(seat) {
-        u.assigned_cli = Some(seat.to_string());
-        u.assigned_invocation = None;
+    if u.assigned_cli.as_deref() != Some(seat.seat.as_str()) {
+        u.assigned_cli = Some(seat.seat.clone());
+        u.assigned_invocation = seat.invocation.clone();
     }
     u.skill_ref = Some(crate::execute_wrapped::QE_SKILL.to_string());
     u.allowed_skills.clear();
@@ -124,7 +124,12 @@ pub(crate) fn reviewer_unit(
 
 /// The reviewer turn's input: a NEW `StepInput` — no prior outputs (the executor's reply, the
 /// team boundary, nothing), the reviewer unit, the run's own identity and boundary.
-pub(crate) fn reviewer_input(input: &StepInput, seat: &str, dir: &str, nonce: &str) -> StepInput {
+pub(crate) fn reviewer_input(
+    input: &StepInput,
+    seat: &QeReviewerSeat,
+    dir: &str,
+    nonce: &str,
+) -> StepInput {
     StepInput {
         unit: reviewer_unit(&input.unit, seat, dir, Some(nonce)),
         prior_outputs: Vec::new(),
@@ -154,13 +159,34 @@ pub(crate) fn candidates(
             .iter()
             .any(|e| e == k || e == seat_key(k))
     };
-    let shape = reviewer_unit(unit, "", "", None);
+    // (codex r1 on the code) The launch roster's template for a seat, read off a unit the roster
+    // seated there — what the reviewer turn will actually run, and what admission judges.
+    let invocation = |k: &str| -> Option<String> {
+        if unit.assigned_cli.as_deref() == Some(k) {
+            return unit.assigned_invocation.clone();
+        }
+        units
+            .iter()
+            .filter(|u| u.assigned_cli.as_deref() == Some(k))
+            .find_map(|u| u.assigned_invocation.clone())
+    };
+    let shape = reviewer_unit(
+        unit,
+        &QeReviewerSeat {
+            seat: String::new(),
+            basis: String::new(),
+            same_cli: false,
+            invocation: None,
+        },
+        "",
+        None,
+    );
     let pool: Vec<&String> = session
         .clis
         .iter()
         .filter(|k| !session.benched_seats.iter().any(|b| &b.cli == *k))
         .filter(|k| !excluded(k))
-        .filter(|k| crate::distribute::seat_admits_unit(&shape, k, None))
+        .filter(|k| crate::distribute::seat_admits_unit(&shape, k, invocation(k)))
         .collect();
     let is_author = |k: &str| authors.iter().any(|a| a == k);
     let same_cli = |k: &str| authors.iter().any(|a| a != k && seat_key(a) == seat_key(k));
@@ -169,6 +195,7 @@ pub(crate) fn candidates(
         seat: k.to_string(),
         basis: basis.to_string(),
         same_cli: same_cli(k),
+        invocation: invocation(k),
     };
     let mut out: Vec<QeReviewerSeat> = pool
         .iter()
@@ -201,11 +228,13 @@ pub(crate) fn parse_marker(output: &str) -> Option<String> {
 }
 
 /// Read one canonical ledger record (`<root>/<table>/<id>.json`).
+/// A record without a non-empty string `id` is refused, as crew's reader refuses it.
 fn read_record(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("{} could not be read: {e}", path.display()))?;
     match serde_json::from_str::<serde_json::Value>(&raw) {
-        Ok(serde_json::Value::Object(m)) => Ok(m),
+        Ok(serde_json::Value::Object(m)) if field(&m, "id").is_some() => Ok(m),
+        Ok(serde_json::Value::Object(_)) => Err(format!("{} has no record id", path.display())),
         Ok(_) => Err(format!("{} is not a record object", path.display())),
         Err(e) => Err(format!("{} is not valid JSON: {e}", path.display())),
     }
@@ -217,29 +246,69 @@ fn field<'a>(rec: &'a serde_json::Map<String, serde_json::Value>, k: &str) -> Op
         .filter(|s| !s.is_empty())
 }
 
+/// Soft-deleted, read the way crew's reader reads it: any truthy `deleted` (JS truthiness).
 fn deleted(rec: &serde_json::Map<String, serde_json::Value>) -> bool {
-    rec.get("deleted")
-        .is_some_and(|v| v.as_i64() == Some(1) || v.as_bool() == Some(true))
+    use serde_json::Value as V;
+    match rec.get("deleted") {
+        None | Some(V::Null) => false,
+        Some(V::Bool(b)) => *b,
+        Some(V::Number(n)) => n.as_f64().is_some_and(|f| f != 0.0 && !f.is_nan()),
+        Some(V::String(s)) => !s.is_empty(),
+        Some(V::Array(_)) | Some(V::Object(_)) => true,
+    }
 }
 
 /// Unix millis of an ISO-8601 UTC timestamp as `Date.prototype.toISOString` writes it
-/// (`YYYY-MM-DDTHH:MM:SS[.fff]Z`); `None` for anything else.
+/// (`YYYY-MM-DDTHH:MM:SS[.fff]Z`, year 1970–9999); `None` for anything else — an impossible date
+/// included.
 pub(crate) fn iso_millis(s: &str) -> Option<i64> {
+    let digits = |p: &str, n: usize| -> Option<i64> {
+        (p.len() == n && p.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| p.parse().ok())
+            .flatten()
+    };
     let s = s.strip_suffix('Z')?;
     let (date, time) = s.split_once('T')?;
-    let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
-    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
-    if d.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+    let d: Vec<&str> = date.split('-').collect();
+    let [y, m, day] = d.as_slice() else {
+        return None;
+    };
+    let (y, m, day) = (digits(y, 4)?, digits(m, 2)?, digits(day, 2)?);
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let month_days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if !(1970..=9999).contains(&y) || !(1..=12).contains(&m) {
         return None;
     }
-    let (hms, frac) = time.split_once('.').unwrap_or((time, "0"));
-    let mut t = hms.split(':').map(|p| p.parse::<i64>().ok());
-    let (hh, mm, ss) = (t.next()??, t.next()??, t.next()??);
-    if t.next().is_some() || hh > 23 || mm > 59 || ss > 60 {
+    if day < 1 || day > month_days[(m - 1) as usize] {
         return None;
     }
-    let ms: i64 = format!("{:0<3}", frac).get(..3)?.parse().ok()?;
-    // Days from the civil date (H. Hinnant's algorithm).
+    let (hms, frac) = time.split_once('.').unwrap_or((time, "000"));
+    let t: Vec<&str> = hms.split(':').collect();
+    let [hh, mm, ss] = t.as_slice() else {
+        return None;
+    };
+    let (hh, mm, ss) = (digits(hh, 2)?, digits(mm, 2)?, digits(ss, 2)?);
+    if hh > 23 || mm > 59 || ss > 59 || frac.is_empty() || frac.len() > 9 {
+        return None;
+    }
+    if !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let ms: i64 = format!("{frac:0<3}")[..3].parse().ok()?;
+    // Days from the civil date (H. Hinnant's algorithm); every input is range-checked above.
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -354,6 +423,12 @@ pub(crate) fn bind_verdict(
             continue;
         }
         let at = field(&rec, "created_at").unwrap_or_default().to_string();
+        if iso_millis(&at).is_none() {
+            return Err(format!(
+                "verdict {} on QE run {id} has no valid created_at",
+                field(&rec, "id").unwrap_or("?")
+            ));
+        }
         if newest.as_ref().is_none_or(|(n, _)| at > *n) {
             newest = Some((at, rec));
         }
@@ -380,19 +455,15 @@ pub(crate) fn bind_verdict(
     Ok(verdict)
 }
 
-/// What the reviewer turns add to the unit's envelope (the floor fix's rule: their tool calls
-/// are this attempt's), beside the record.
-pub(crate) struct Reviewed {
-    pub review: QeReview,
-    pub files: Vec<String>,
-    pub tools: Vec<String>,
-    pub governed: bool,
-}
-
-/// A reviewer turn that failed AS A SEAT (sign-in, quota, not installed, could not start) — the
-/// only ending that moves on to the next candidate. The judge rotation's classifiers.
+/// A reviewer turn that failed AS A SEAT — a FAILED launch or turn whose output the judge
+/// rotation's classifiers name (sign-in, quota, not installed, could not start). The only ending
+/// that moves on to the next candidate: a timeout, a cancel, an unclassified failure and a turn
+/// that completed but broke its contract are `invalid` (codex r1 on the code).
 fn seat_failure(out: &StepOutput) -> Option<&'static str> {
     use wicked_council::types::SeatFailureReason;
+    if out.status != StepStatus::Failed {
+        return None;
+    }
     let nonzero = crate::execute_wrapped::wrapped_exit_code(&out.output).is_some_and(|c| c != 0);
     SeatFailureReason::classify_refusal(&out.output, nonzero)
         .or_else(|| {
@@ -403,14 +474,16 @@ fn seat_failure(out: &StepOutput) -> Option<&'static str> {
 }
 
 /// (§3.1) Run the reviewer for an executor turn that folded Ok, or `None` when this unit's attempt
-/// runs none. `not_before` is the attempt's start (unix millis).
+/// runs none. `not_before` is the attempt's dispatch time (unix millis). Each reviewer turn is
+/// recorded with its nonce and governance flags: its own decisions log is folded as its own
+/// (`gate_hook::qe_review_decisions_path`), so the unit's output envelope stays the executor's.
 pub(crate) fn run(
     runner: &Arc<dyn StepRunner>,
     input: &StepInput,
     executor: &StepOutput,
     not_before: i64,
     emit: &DeltaSink,
-) -> Option<Reviewed> {
+) -> Option<QeReview> {
     if !applies(&input.unit) || executor.status != StepStatus::Ok {
         return None;
     }
@@ -419,20 +492,18 @@ pub(crate) fn run(
         .worktree_baseline
         .as_ref()
         .map(|b| b.tree.clone());
+    // (§3.7, codex r1 on the code) A same-tree retry keeps the QE run it was told to resume even
+    // when this attempt fails to bind, so the next retry still resumes it (its newest verdict
+    // governs it in crew's reader) instead of minting a run beside a FAIL that never retires.
+    let lineage = resume_dir(&input.unit).and(input.unit.qe_review.as_ref());
     let mut review = QeReview {
         outcome: OUTCOME_INVALID.to_string(),
         reason: String::new(),
-        evidence_dir: None,
-        qe_run_id: None,
+        evidence_dir: lineage.and_then(|r| r.evidence_dir.clone()),
+        qe_run_id: lineage.and_then(|r| r.qe_run_id.clone()),
         tree,
         verdict: None,
         attempts: Vec::new(),
-    };
-    let mut done = Reviewed {
-        review: review.clone(),
-        files: Vec::new(),
-        tools: Vec::new(),
-        governed: false,
     };
     let ledger = input.unit.qe_ledger_root.as_deref().map(Path::new)?;
     let Some(marker) = parse_marker(&executor.output) else {
@@ -440,8 +511,7 @@ pub(crate) fn run(
             "the QE executor turn named no evidence (no `{EVIDENCE_MARKER}` line; wicked-garden \
              may be older than the engine-run reviewer)"
         );
-        done.review = review;
-        return Some(done);
+        return Some(review);
     };
     let (id, dir) = match bind_evidence(
         ledger,
@@ -453,8 +523,7 @@ pub(crate) fn run(
         Ok(b) => b,
         Err(why) => {
             review.reason = format!("the QE evidence could not be bound: {why}");
-            done.review = review;
-            return Some(done);
+            return Some(review);
         }
     };
     let dir_s = dir.to_string_lossy().into_owned();
@@ -466,8 +535,7 @@ pub(crate) fn run(
         review.reason = "no run seat can review the QE evidence in isolation: every seat is \
                          benched, excluded, an author of the work, or does not admit the QE skill"
             .to_string();
-        done.review = review;
-        return Some(done);
+        return Some(review);
     }
     for c in seats {
         let nonce = uuid::Uuid::new_v4().to_string();
@@ -475,22 +543,19 @@ pub(crate) fn run(
             "QE reviewer: seat {} ({}, fresh session) reviews {dir_s}",
             c.seat, c.basis
         ));
-        let out = runner.run_unit_streaming(&reviewer_input(input, &c.seat, &dir_s, &nonce), emit);
-        done.files.extend(out.files.iter().cloned());
-        done.tools.extend(out.tools.iter().cloned());
-        done.governed |= out.governed;
+        let out = runner.run_unit_streaming(&reviewer_input(input, c, &dir_s, &nonce), emit);
         let attempt = |status: String| QeReviewAttempt {
             seat: c.seat.clone(),
             basis: c.basis.clone(),
             same_cli: c.same_cli,
             status,
+            session: nonce.clone(),
+            governed: out.governed,
+            tool_activity: !out.tools.is_empty(),
         };
-        let token = crate::validator::parse_evaluator_verdict(&out.output).token;
-        if token.is_none() {
-            if let Some(why) = seat_failure(&out) {
-                review.attempts.push(attempt(format!("seat_failure:{why}")));
-                continue;
-            }
+        if let Some(why) = seat_failure(&out) {
+            review.attempts.push(attempt(format!("seat_failure:{why}")));
+            continue;
         }
         if out.status != StepStatus::Ok {
             review.attempts.push(attempt(OUTCOME_INVALID.to_string()));
@@ -499,14 +564,12 @@ pub(crate) fn run(
                  classify",
                 c.seat, out.status
             );
-            done.review = review;
-            return Some(done);
+            return Some(review);
         }
-        let Some(token) = token else {
+        let Some(token) = crate::validator::parse_evaluator_verdict(&out.output).token else {
             review.attempts.push(attempt(OUTCOME_INVALID.to_string()));
             review.reason = format!("the reviewer on `{}` ended with no VERDICT line", c.seat);
-            done.review = review;
-            return Some(done);
+            return Some(review);
         };
         match bind_verdict(ledger, &id, &input.run_id, &nonce, &token) {
             Ok(v) => {
@@ -529,8 +592,7 @@ pub(crate) fn run(
             }
         }
         emit(&format!("QE reviewer: {}", review.reason));
-        done.review = review;
-        return Some(done);
+        return Some(review);
     }
     review.outcome = OUTCOME_UNAVAILABLE.to_string();
     review.reason = format!(
@@ -542,8 +604,7 @@ pub(crate) fn run(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    done.review = review;
-    Some(done)
+    Some(review)
 }
 
 /// (§3.6) A floor re-run's record: no reviewer turn runs (the seat does not run again). A floor

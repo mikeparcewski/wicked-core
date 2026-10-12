@@ -1175,6 +1175,10 @@ pub struct QeReviewerSeat {
     /// The seat shares its CLI with an author of the work (another instance of it).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub same_cli: bool,
+    /// The launch roster's invocation template for this seat, read off a unit of the run that
+    /// the roster seated there (`None`: the registry resolves it, as for any reseat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation: Option<String>,
 }
 
 /// (DES-QE-EVERY-SEAT §3.5) The isolated QE reviewer's record for one attempt of the QE unit.
@@ -1211,6 +1215,16 @@ pub struct QeReviewAttempt {
     pub same_cli: bool,
     /// `verdict` | `seat_failure:<reason>` | `invalid`.
     pub status: String,
+    /// The turn's nonce: it names the turn's OWN decisions log
+    /// (`gate_hook::qe_review_decisions_path`), which the fold judges as this turn's alone.
+    #[serde(default)]
+    pub session: String,
+    /// Whether the turn's carrier armed governance (its `StepOutput::governed`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub governed: bool,
+    /// Whether the turn made tool calls (its `StepOutput::tools` was non-empty).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tool_activity: bool,
 }
 
 /// Lifecycle status of a [`WorkUnit`].

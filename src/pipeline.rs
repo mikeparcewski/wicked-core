@@ -1190,6 +1190,14 @@ pub(crate) fn apply_and_finish_unit(
                 .filter(|r| r.tree.is_some() && r.tree.as_deref() == baseline_tree)
         })
         .flatten();
+    // (DES-QE-EVERY-SEAT §3.2, codex r1 on the code) A floor-fix attempt's fixing seat, read
+    // BEFORE a fresh floor report replaces the request that names it.
+    let floor_fixer: Option<String> = unit
+        .repo_checks
+        .as_ref()
+        .and_then(|r| r.requested_rerun.as_ref())
+        .and_then(|q| q.fix.as_ref())
+        .map(|f| f.seat.clone());
     let checks_denial: Option<(&'static str, String)> =
         match &evidence.repo_checks {
             Some(report) => {
@@ -1444,6 +1452,25 @@ pub(crate) fn apply_and_finish_unit(
         tool_activity,
         floor_passed,
     )?;
+    // (DES-QE-EVERY-SEAT, codex r1 on the code) Each engine-run QE reviewer turn wrote its OWN
+    // decisions log: folded as that turn's alone (its carrier, its hook proof, its claims), so one
+    // turn's proof never masks the other's missing one. The first denial among them stands beside
+    // the executor's.
+    let mut qe_hook_denial: Option<crate::domain::UnitDenial> = None;
+    for t in evidence.qe_review.iter().flat_map(|r| r.attempts.iter()) {
+        if t.session.is_empty() || qe_hook_denial.is_some() {
+            continue;
+        }
+        qe_hook_denial = crate::gate_hook::fold_input_denial_in(
+            store,
+            &crate::gate_hook::qe_review_decisions_path(session_id, attempt, &t.session),
+            &crate::scope::unit_phase(unit.ord),
+            t.governed,
+            t.tool_activity,
+            floor_passed,
+        )?;
+    }
+    let hook_denial = hook_denial.or(qe_hook_denial);
     // Capture whether the hook denied NOW, before `hook_denial` is moved into the deny-dominance
     // fold below and its source identity is lost in `validator_denial`. The actor uses this flag to
     // block HumanConfirmIf routing on hook vetoes (a hook-sourced deny must hard-fail the run, not
@@ -1588,14 +1615,14 @@ pub(crate) fn apply_and_finish_unit(
     // (core#469) An operator's floor re-run is consumed by the attempt that ran it — whatever
     // this fold decided, the next dispatch is an ordinary one unless the gate arms another.
     if let Some(r) = unit.repo_checks.as_mut() {
-        // (DES-QE-EVERY-SEAT §3.2, codex r2 F15) A floor fix's seat changed this unit's tree: it
-        // is an AUTHOR of that tree from now on, so no later reviewer or judge of it runs there.
-        if let Some(fix) = r.requested_rerun.as_ref().and_then(|q| q.fix.as_ref()) {
-            if !unit.authored_by.contains(&fix.seat) {
-                unit.authored_by.push(fix.seat.clone());
-            }
-        }
         r.requested_rerun = None;
+    }
+    // (DES-QE-EVERY-SEAT §3.2, codex r2 F15) A floor fix's seat changed this unit's tree: it is an
+    // AUTHOR of that tree from now on, so no later reviewer or judge of it runs there.
+    if let Some(seat) = floor_fixer {
+        if !unit.authored_by.contains(&seat) {
+            unit.authored_by.push(seat);
+        }
     }
     // (DES-QE-EVERY-SEAT §3.5) The isolated QE reviewer's record — evidence on the persisted unit,
     // kept whichever way it went; `None` (no reviewer this attempt) leaves the last one.
@@ -3923,6 +3950,18 @@ mod judge_bench_tests {
         outcome: &str,
         floor_fix_seat: Option<&str>,
     ) -> (bool, Option<String>, crate::domain::WorkUnit) {
+        fold_with_qe_review_and(sid, outcome, floor_fix_seat, false, Vec::new())
+    }
+
+    /// [`fold_with_qe_review`] with a FRESH floor report in the evidence (a floor-fix attempt's
+    /// own checks) and the reviewer turns' records.
+    fn fold_with_qe_review_and(
+        sid: &str,
+        outcome: &str,
+        floor_fix_seat: Option<&str>,
+        fresh_floor_report: bool,
+        attempts: Vec<crate::domain::QeReviewAttempt>,
+    ) -> (bool, Option<String>, crate::domain::WorkUnit) {
         let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
         let mut sink = |_e: CoreEvent| {};
         let Planned {
@@ -3980,10 +4019,18 @@ mod judge_bench_tests {
             qe_run_id: Some("x".into()),
             tree: Some("t".into()),
             verdict: None,
-            attempts: Vec::new(),
+            attempts,
         };
+        let fresh: Option<crate::repo_checks::RepoChecksReport> = fresh_floor_report.then(|| {
+            serde_json::from_value(serde_json::json!({
+                "detected": [], "checks": [], "skipped": [], "passed": true,
+                "sandbox_level": "none"
+            }))
+            .expect("a report")
+        });
         let evidence = crate::workflow::UnitEvidence {
             qe_review: Some(review),
+            repo_checks: fresh,
             ..Default::default()
         };
         let output = crate::workflow::stub_output(&units[0]);
@@ -4038,6 +4085,26 @@ mod judge_bench_tests {
         );
     }
 
+    /// (DES-QE-EVERY-SEAT, codex r1 on the code) Each reviewer turn's governance is folded from its
+    /// OWN decisions log: a governed reviewer turn whose log is missing denies the unit, whatever
+    /// the reviewer's verdict — the executor's log can never vouch for it.
+    #[test]
+    fn a_governed_reviewer_turn_with_no_decisions_log_denies() {
+        let turn = crate::domain::QeReviewAttempt {
+            seat: "b".into(),
+            basis: "distinct".into(),
+            same_cli: false,
+            status: "verdict".into(),
+            session: format!("no-log-{}", std::process::id()),
+            governed: true,
+            tool_activity: true,
+        };
+        let (approved, source, _) =
+            fold_with_qe_review_and("qe-fold-gov", "pass", None, false, vec![turn]);
+        assert!(!approved);
+        assert_eq!(source.as_deref(), Some("input_governance"));
+    }
+
     /// (DES-QE-EVERY-SEAT §3.2, codex r2 F15) The fold of a floor-fix attempt records the fixing
     /// seat as an author of the unit's tree, so no later reviewer or judge of it runs there.
     #[test]
@@ -4047,6 +4114,19 @@ mod judge_bench_tests {
             unit.authored_by.contains(&"claude".to_string()),
             "{:?}",
             unit.authored_by
+        );
+        // …also when the attempt's own fresh floor report replaces the request (codex r1).
+        let (_, _, fresh) = fold_with_qe_review_and(
+            "qe-fold-fixer-2",
+            "invalid",
+            Some("claude"),
+            true,
+            Vec::new(),
+        );
+        assert!(
+            fresh.authored_by.contains(&"claude".to_string()),
+            "{:?}",
+            fresh.authored_by
         );
         assert!(unit
             .repo_checks

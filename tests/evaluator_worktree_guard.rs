@@ -233,7 +233,7 @@ impl StepRunner for ScriptedSeat {
                                 std::fs::write(
                                     root.join("runs").join(format!("{id}.json")),
                                     serde_json::json!({
-                                        "id": id, "created_at": "2099-01-01T00:00:00.000Z",
+                                        "id": id, "created_at": iso_now(),
                                         "status": "running", "crew_run_id": input.run_id,
                                         "evidence_path": dir.to_string_lossy(),
                                     })
@@ -248,7 +248,7 @@ impl StepRunner for ScriptedSeat {
                                 std::fs::write(
                                     verdicts.join("v-review.json"),
                                     serde_json::json!({
-                                        "id": "v-review", "created_at": "2099-01-01T00:00:09.000Z",
+                                        "id": "v-review", "created_at": iso_now(),
                                         "run_id": "0b6b5f0e-2c1d-4a8e-9f1e-3d2c1b0a9f8e",
                                         "verdict": "PASS", "crew_run_id": input.run_id,
                                         "review_session": nonce,
@@ -284,6 +284,32 @@ impl StepRunner for ScriptedSeat {
             governed: false,
         }
     }
+}
+
+/// Now, as `Date.prototype.toISOString` writes it (what wicked-ledger stamps `created_at` with).
+fn iso_now() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let (days, rem) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000));
+    // Civil date from days (H. Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rem / 3_600_000,
+        rem / 60_000 % 60,
+        rem / 1000 % 60,
+        rem % 1000
+    )
 }
 
 fn cli(key: &str) -> AgenticCli {

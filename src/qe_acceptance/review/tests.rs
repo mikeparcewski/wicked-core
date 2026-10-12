@@ -201,6 +201,18 @@ fn iso_timestamps_parse_as_node_writes_them() {
     );
     assert_eq!(iso_millis("2026-10-12 14:02:03"), None);
     assert_eq!(iso_millis("2026-13-12T14:02:03Z"), None);
+    // Impossible dates, signs, short fields and out-of-range years are refused, never wrapped.
+    assert_eq!(iso_millis("2026-02-31T00:00:00.000Z"), None);
+    assert_eq!(iso_millis("2025-02-29T00:00:00.000Z"), None);
+    assert!(
+        iso_millis("2024-02-29T00:00:00.000Z").is_some(),
+        "a leap day"
+    );
+    assert_eq!(iso_millis("2026-10-12T-1:00:00.000Z"), None);
+    assert_eq!(iso_millis("2026-1-12T01:00:00.000Z"), None);
+    assert_eq!(iso_millis("1969-12-31T23:59:59.999Z"), None);
+    assert_eq!(iso_millis("99999999999-01-01T00:00:00.000Z"), None);
+    assert_eq!(iso_millis("2026-10-12T14:02:03.Z"), None);
 }
 
 #[test]
@@ -242,7 +254,7 @@ fn evidence_binds_only_to_this_runs_ledger_dir_from_this_attempt() {
 
 #[cfg(unix)]
 #[test]
-fn a_linked_evidence_dir_or_parent_is_refused() {
+fn a_linked_evidence_dir_is_refused_and_containment_is_canonical() {
     let l = Ledger::new("link");
     let (id, dir) = l.evidence(RUN, &now_iso());
     // The dir itself a link to the real one.
@@ -373,14 +385,20 @@ fn the_reviewer_unit_carries_only_the_path_the_skill_and_the_nonce() {
     let ledger = Path::new("/l/.wicked-qe");
     let mut u = qe_unit("pi", ledger);
     u.amendments = vec!["operator note".into()];
-    u.qe_reviewer_seats = vec![QeReviewerSeat {
+    u.qe_reviewer_seats = vec![seat("claude", BASIS_DISTINCT)];
+    let claude = QeReviewerSeat {
         seat: "claude".into(),
         basis: BASIS_DISTINCT.into(),
         same_cli: false,
-    }];
-    let r = reviewer_unit(&u, "claude", "/l/.wicked-qe/evidence/x", Some("n-1"));
+        invocation: Some("claude -p {PROMPT}".into()),
+    };
+    let r = reviewer_unit(&u, &claude, "/l/.wicked-qe/evidence/x", Some("n-1"));
     assert_eq!(r.assigned_cli.as_deref(), Some("claude"));
-    assert_eq!(r.assigned_invocation, None);
+    assert_eq!(
+        r.assigned_invocation.as_deref(),
+        Some("claude -p {PROMPT}"),
+        "the run roster's template for that seat, not the registry default"
+    );
     assert_eq!(
         r.skill_ref.as_deref(),
         Some(crate::execute_wrapped::QE_SKILL)
@@ -511,6 +529,11 @@ impl StepRunner for Scripted {
                 StepStatus::Failed,
                 "Error: not logged in. Run /login".to_string(),
             ),
+            "timeout-signed-out" => (
+                StepStatus::TimedOut,
+                "Error: not logged in. Run /login".to_string(),
+            ),
+            "ok-signed-out" => (StepStatus::Ok, "it said: not logged in".to_string()),
             "silent" => (StepStatus::Ok, "I looked at it.".to_string()),
             _ => (StepStatus::Failed, "boom".to_string()),
         };
@@ -568,13 +591,14 @@ fn seat(s: &str, basis: &str) -> QeReviewerSeat {
         seat: s.into(),
         basis: basis.into(),
         same_cli: false,
+        invocation: None,
     }
 }
 
 fn review_with(
     answers: Vec<(&'static str, &'static str)>,
     seats: Vec<QeReviewerSeat>,
-) -> (Option<Reviewed>, Vec<StepInput>) {
+) -> (Option<QeReview>, Vec<StepInput>) {
     let l = Ledger::new("run");
     let (id, dir) = l.evidence(RUN, &now_iso());
     let mut u = qe_unit("pi", &l.root);
@@ -604,9 +628,9 @@ fn a_pi_executor_is_reviewed_in_a_fresh_isolated_session_and_the_verdict_binds()
         vec![seat("claude", BASIS_DISTINCT), seat("pi", BASIS_EXECUTOR)],
     );
     let got = got.expect("the QE unit runs a reviewer");
-    assert_eq!(got.review.outcome, OUTCOME_PASS, "{:?}", got.review);
-    assert_eq!(got.review.verdict.as_deref(), Some("PASS"));
-    assert_eq!(got.review.tree.as_deref(), Some("t1"));
+    assert_eq!(got.outcome, OUTCOME_PASS, "{:?}", got);
+    assert_eq!(got.verdict.as_deref(), Some("PASS"));
+    assert_eq!(got.tree.as_deref(), Some("t1"));
     assert_eq!(seen.len(), 1);
     let r = &seen[0];
     assert!(
@@ -616,9 +640,10 @@ fn a_pi_executor_is_reviewed_in_a_fresh_isolated_session_and_the_verdict_binds()
     assert!(r.unit.qe_acceptance.is_none());
     assert!(r.unit.description.contains("--phase review --evidence"));
     assert!(r.unit.qe_review_session.is_some());
-    // The reviewer's tool calls are this attempt's.
-    assert_eq!(got.tools, vec!["claude:Read".to_string()]);
-    assert!(got.governed);
+    // The reviewer turn's governance is recorded per turn: its nonce names its own decisions log.
+    let a = &got.attempts[0];
+    assert!(a.governed && a.tool_activity, "{a:?}");
+    assert_eq!(Some(&a.session), r.unit.qe_review_session.as_ref());
 }
 
 #[test]
@@ -628,8 +653,8 @@ fn a_reviewer_fail_binds_as_fail() {
         vec![seat("claude", BASIS_DISTINCT)],
     );
     let got = got.unwrap();
-    assert_eq!(got.review.outcome, OUTCOME_FAIL);
-    let d = denial(&got.review).unwrap();
+    assert_eq!(got.outcome, OUTCOME_FAIL);
+    let d = denial(&got).unwrap();
     assert_eq!(d.source, DENIAL_SOURCE_QE_REVIEW);
 }
 
@@ -640,9 +665,9 @@ fn only_a_classified_seat_failure_moves_on_to_the_next_seat() {
         vec![seat("claude", BASIS_DISTINCT), seat("pi", BASIS_EXECUTOR)],
     );
     let got = got.unwrap();
-    assert_eq!(got.review.outcome, OUTCOME_PASS, "{:?}", got.review);
+    assert_eq!(got.outcome, OUTCOME_PASS, "{:?}", got);
     assert_eq!(seen.len(), 2);
-    assert_eq!(got.review.attempts[0].status, "seat_failure:not_logged_in");
+    assert_eq!(got.attempts[0].status, "seat_failure:not_logged_in");
     assert_ne!(
         seen[0].unit.qe_review_session, seen[1].unit.qe_review_session,
         "a fresh nonce per reviewer turn"
@@ -652,7 +677,7 @@ fn only_a_classified_seat_failure_moves_on_to_the_next_seat() {
         vec![("claude", "boom"), ("pi", "pass")],
         vec![seat("claude", BASIS_DISTINCT), seat("pi", BASIS_EXECUTOR)],
     );
-    assert_eq!(got.unwrap().review.outcome, OUTCOME_INVALID);
+    assert_eq!(got.unwrap().outcome, OUTCOME_INVALID);
     assert_eq!(seen.len(), 1);
     // A completed turn with no verdict line is invalid.
     let (got, _) = review_with(
@@ -660,24 +685,24 @@ fn only_a_classified_seat_failure_moves_on_to_the_next_seat() {
         vec![seat("claude", BASIS_DISTINCT)],
     );
     let got = got.unwrap();
-    assert_eq!(got.review.outcome, OUTCOME_INVALID);
-    assert!(got.review.reason.contains("no VERDICT line"));
+    assert_eq!(got.outcome, OUTCOME_INVALID);
+    assert!(got.reason.contains("no VERDICT line"));
 }
 
 #[test]
 fn no_seat_or_every_seat_failing_is_unavailable_for_the_operator() {
     let (got, _) = review_with(vec![], vec![]);
     let got = got.unwrap();
-    assert_eq!(got.review.outcome, OUTCOME_UNAVAILABLE);
+    assert_eq!(got.outcome, OUTCOME_UNAVAILABLE);
     assert_eq!(
-        denial(&got.review).unwrap().source,
+        denial(&got).unwrap().source,
         DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE
     );
     let (got, _) = review_with(
         vec![("claude", "signed-out")],
         vec![seat("claude", BASIS_DISTINCT)],
     );
-    let review = got.unwrap().review;
+    let review = got.unwrap();
     assert_eq!(review.outcome, OUTCOME_UNAVAILABLE);
     let mut u = WorkUnit::pending("r:test", "r", 3, "v");
     u.qe_review = Some(review);
@@ -706,12 +731,8 @@ fn no_marker_or_no_requirement_runs_no_reviewer() {
     let mut out = executor_output("x");
     out.output = "VERDICT: PASS".into();
     let got = run(&runner, &input_for(u.clone()), &out, 0, &|_: &str| {}).unwrap();
-    assert_eq!(got.review.outcome, OUTCOME_INVALID);
-    assert!(
-        got.review.reason.contains("QE-EVIDENCE"),
-        "{}",
-        got.review.reason
-    );
+    assert_eq!(got.outcome, OUTCOME_INVALID);
+    assert!(got.reason.contains("QE-EVIDENCE"), "{}", got.reason);
     let mut waived = u.clone();
     waived.qe_acceptance.as_mut().unwrap().status = a::QE_WAIVED.into();
     assert!(run(&runner, &input_for(waived), &out, 0, &|_: &str| {}).is_none());
@@ -793,19 +814,110 @@ fn the_worker_seam_runs_the_executor_then_the_isolated_reviewer() {
         output.output.contains("QE-EVIDENCE:"),
         "the unit's output is the executor's"
     );
-    assert_eq!(
-        output.tools,
-        vec!["pi:Bash".to_string(), "claude:Read".to_string()]
-    );
-    assert!(
-        output.governed,
-        "the reviewer turn armed the hook, so the fold reads the log"
-    );
+    // The envelope stays the executor's: the reviewer turn's governance is folded from its own
+    // decisions log, by the flags its attempt record carries.
+    assert_eq!(output.tools, vec!["pi:Bash".to_string()]);
+    assert!(!output.governed);
     let review = evidence.qe_review.expect("the reviewer ran");
+    assert!(review.attempts[0].governed && review.attempts[0].tool_activity);
     assert_eq!(review.outcome, OUTCOME_PASS, "{review:?}");
     assert_eq!(review.qe_run_id.as_deref(), Some(id.as_str()));
     assert_eq!(seam.executor_inputs.lock().unwrap().len(), 1);
     let reviewed = seam.reviewer.seen.lock().unwrap();
     assert_eq!(reviewed.len(), 1);
     assert_eq!(reviewed[0].unit.assigned_cli.as_deref(), Some("claude"));
+}
+
+/// (codex r1 on the code) Rotation only on a FAILED turn the classifiers name: a timeout or a
+/// completed turn that merely mentions a sign-in refusal is `invalid`, never the next seat.
+#[test]
+fn a_timeout_or_a_completed_turn_with_refusal_text_is_invalid_not_rotated() {
+    for answer in ["timeout-signed-out", "ok-signed-out"] {
+        let (got, seen) = review_with(
+            vec![("claude", answer), ("pi", "pass")],
+            vec![seat("claude", BASIS_DISTINCT), seat("pi", BASIS_EXECUTOR)],
+        );
+        assert_eq!(got.unwrap().outcome, OUTCOME_INVALID, "{answer}");
+        assert_eq!(seen.len(), 1, "{answer}: no second reviewer seat");
+    }
+}
+
+/// (§3.7, codex r1 on the code) A same-tree retry that fails to bind keeps the QE run it was told
+/// to resume, so the next retry still resumes it.
+#[test]
+fn an_invalid_same_tree_retry_keeps_the_resumed_qe_run() {
+    let l = Ledger::new("lineage");
+    let (id, dir) = l.evidence(RUN, "2020-01-01T00:00:00.000Z");
+    let mut u = qe_unit("pi", &l.root);
+    u.qe_review = Some(QeReview {
+        outcome: OUTCOME_FAIL.into(),
+        reason: "failed".into(),
+        evidence_dir: Some(dir.to_string_lossy().into_owned()),
+        qe_run_id: Some(id.clone()),
+        tree: Some("t1".into()),
+        verdict: Some("FAIL".into()),
+        attempts: Vec::new(),
+    });
+    let runner: Arc<dyn StepRunner> = Arc::new(crate::workflow::StubStepRunner);
+    let mut out = executor_output("x");
+    out.output = "forgot the marker\nVERDICT: PASS".into();
+    let got = run(&runner, &input_for(u.clone()), &out, 0, &|_: &str| {}).unwrap();
+    assert_eq!(got.outcome, OUTCOME_INVALID);
+    assert_eq!(
+        got.qe_run_id.as_deref(),
+        Some(id.as_str()),
+        "the lineage survives"
+    );
+    let mut next = u;
+    next.qe_review = Some(got);
+    assert_eq!(resume_dir(&next), Some(dir.to_string_lossy().as_ref()));
+}
+
+/// (codex r1 on the code) The engine reads the ledger the way crew does: a record with no id is
+/// refused, any truthy `deleted` drops a row, and a verdict with no valid timestamp does not bind.
+#[test]
+fn the_ledger_is_read_with_crews_record_rules() {
+    let l = Ledger::new("shape");
+    let (id, dir) = l.evidence(RUN, &now_iso());
+    let run_file = l.root.join("runs").join(format!("{id}.json"));
+    let mut rec: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&run_file).unwrap()).unwrap();
+    rec.as_object_mut().unwrap().remove("id");
+    std::fs::write(&run_file, rec.to_string()).unwrap();
+    assert!(bind_evidence(&l.root, &dir.to_string_lossy(), RUN, 0, None)
+        .unwrap_err()
+        .contains("no record id"));
+    rec["id"] = serde_json::json!(id);
+    rec["deleted"] = serde_json::json!("1");
+    std::fs::write(&run_file, rec.to_string()).unwrap();
+    assert!(bind_evidence(&l.root, &dir.to_string_lossy(), RUN, 0, None)
+        .unwrap_err()
+        .contains("deleted"));
+    // A nonced PASS without a valid created_at never binds.
+    write_verdict(&l.root, &id, "PASS", Some("n"), RUN, "yesterday");
+    assert!(bind_verdict(&l.root, &id, RUN, "n", "PASS")
+        .unwrap_err()
+        .contains("no valid created_at"));
+}
+
+/// (codex r1 on the code) A reviewer seat carries the launch roster's template for it, read off a
+/// unit the roster seated there.
+#[test]
+fn a_candidate_carries_the_run_rosters_invocation() {
+    let ledger = Path::new("/l/.wicked-qe");
+    let s = session(&["claude", "pi", "opencode#2"], false);
+    let mut other = creator(1, "opencode#2");
+    other.role = PhaseRole::Neutral;
+    other.stage = crate::domain::StageKind::Test;
+    other.assigned_invocation = Some("opencode --model x run {PROMPT}".into());
+    let units = vec![other, creator(2, "claude")];
+    let got = candidates(&s, &units, &qe_unit("pi", ledger));
+    let oc = got
+        .iter()
+        .find(|c| c.seat == "opencode#2")
+        .expect("opencode#2");
+    assert_eq!(
+        oc.invocation.as_deref(),
+        Some("opencode --model x run {PROMPT}")
+    );
 }
