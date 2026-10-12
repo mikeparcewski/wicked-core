@@ -188,6 +188,14 @@ export declare class Core {
    */
   static registryRoster(): string
   /**
+   * (crew Agents page A4) Whether this host's skill routing admits the seat `key` (run with its
+   * roster `invocation` template, when given) to the engine's isolated QE reviewer turn
+   * (wicked-core#917) — the reviewer runs the QE skill, and a skills root that makes it
+   * Claude-only admits claude seats only. Run-specific exclusions are not judged. An addon
+   * without this static predates it; crew keys on its presence.
+   */
+  static qeReviewerAdmitted(key: string, invocation?: string | undefined | null): boolean
+  /**
    * (core#769, crew Agents page A5) The engine's worktree bench as a pure predicate: given a
    * JSON array of `AgenticCli` seats (the engine-shaped roster, as `launchRun`'s `clisJson`) and
    * whether the run is BOUND to one repository, the JSON array of `BenchedSeat` (`{cli, reason,
