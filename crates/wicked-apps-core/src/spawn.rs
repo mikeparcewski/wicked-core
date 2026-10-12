@@ -435,6 +435,23 @@ pub const OPENCODE_CONFIG_FILE_ENV: &str = "OPENCODE_CONFIG";
 pub const CLAUDEAI_MCP_SERVERS_ENV: &str = "ENABLE_CLAUDEAI_MCP_SERVERS";
 /// See [`OPENCODE_CONFIG_FILE_ENV`].
 pub const OPENCODE_AUTH_CONTENT_ENV: &str = "OPENCODE_AUTH_CONTENT";
+/// opencode's built-in switch for ignoring the WORKING DIRECTORY's configuration (core#914). Set
+/// to `1` on EVERY seat spawn by [`SeatConfig::apply`]: a governed seat never loads a repository's
+/// own agent configuration. Measured with a scripted model on opencode 2.0.25 (the admitted pin):
+/// it drops the repository's `opencode.json` (its permission rules and its MCP servers, so their
+/// commands are never spawned), `.opencode/` agents, plugins and skills, the `.claude/skills`
+/// compatibility root, and `AGENTS.md`. What the engine hands the seat is unaffected:
+/// `OPENCODE_CONFIG_CONTENT` (the governance document and its `skills.paths`) and the seat root's
+/// global configuration still load, and every core intent still asks. On 1.17.18 (no longer the
+/// pin, so ungoverned-disclosed) it drops the same except two residuals over ACP: a repository
+/// `.opencode/plugin{,s}/*.js` module is still IMPORTED (its plugin function is not called), and
+/// the `.claude/skills` root still loads. Harmless to a CLI that does not read it.
+pub const OPENCODE_DISABLE_PROJECT_CONFIG_ENV: &str = "OPENCODE_DISABLE_PROJECT_CONFIG";
+/// opencode 2.x's other spelling of [`OPENCODE_DISABLE_PROJECT_CONFIG_ENV`], read FIRST
+/// (`OPENCODE_CONFIG_PROJECT_DISABLE ?? OPENCODE_DISABLE_PROJECT_CONFIG`), so an inherited
+/// `OPENCODE_CONFIG_PROJECT_DISABLE=0` would switch the repository's configuration back on.
+/// REMOVED from every seat spawn by [`SeatConfig::apply`]; 1.17.18 does not read it.
+pub const OPENCODE_CONFIG_PROJECT_DISABLE_ENV: &str = "OPENCODE_CONFIG_PROJECT_DISABLE";
 /// The process home directory — agy's ONLY configuration-home lever, and the one variable a seat
 /// decision sets that is not a CLI's own. agy (Antigravity) publishes no `AGY_HOME` / `GEMINI_HOME`
 /// / `ANTIGRAVITY_HOME`: it resolves `~/.gemini/antigravity-cli/` (its `antigravity-oauth-token`
@@ -1136,7 +1153,10 @@ impl SeatConfig {
     /// Apply this decision to `cmd` — AFTER `hardened()`: strip the foreign variables, then set
     /// this seat's own. `Inherit` touches no CLI configuration.
     ///
-    /// BOTH variants also set [`CLAUDEAI_MCP_SERVERS_ENV`]` = false` (core#657).
+    /// BOTH variants also set [`CLAUDEAI_MCP_SERVERS_ENV`]` = false` (core#657), and
+    /// [`OPENCODE_DISABLE_PROJECT_CONFIG_ENV`]` = 1` with its competing spelling
+    /// [`OPENCODE_CONFIG_PROJECT_DISABLE_ENV`] removed (core#914): the inherit hatch keeps the
+    /// OPERATOR's configuration, never the repository's.
     ///
     /// BOTH variants apply the remote-write credential fence ([`fence_remote_credentials`],
     /// F-7R2-012): a seat is a creator or an evaluator, never the deliverer, so it runs without
@@ -1166,6 +1186,11 @@ impl SeatConfig {
         // variants, like the credential fence: the hatch inherits the operator's configuration,
         // never an ungoverned tool channel. Harmless to a CLI that does not read it.
         cmd.env(CLAUDEAI_MCP_SERVERS_ENV, "false");
+        // core#914: no seat loads the repository's own opencode configuration — both variants,
+        // like the connector switch above. The 2.x alias is read first, so it is removed rather
+        // than left to override the value set here.
+        cmd.env_remove(OPENCODE_CONFIG_PROJECT_DISABLE_ENV);
+        cmd.env(OPENCODE_DISABLE_PROJECT_CONFIG_ENV, "1");
     }
 
     /// The seat root this decision runs the CLI under, when isolated with a known root.
@@ -2121,6 +2146,7 @@ mod tests {
             },
         ] {
             let mut cmd = Command::new("true");
+            cmd.hardened();
             cmd.env(CLAUDEAI_MCP_SERVERS_ENV, "true");
             decision.apply(&mut cmd);
             let value = cmd
@@ -2130,6 +2156,61 @@ mod tests {
             assert_eq!(value.as_deref(), Some("false"), "{decision:?}");
         }
         assert_eq!(CLAUDEAI_MCP_SERVERS_ENV, "ENABLE_CLAUDEAI_MCP_SERVERS");
+    }
+
+    /// core#914: EVERY seat spawn — both variants, the inherit hatch included — runs with
+    /// opencode's project-configuration switch on, so a repository's `opencode.json` (its MCP
+    /// server commands), `.opencode/` plugins, agents and skills never load on a governed seat.
+    /// An operator's `OPENCODE_DISABLE_PROJECT_CONFIG=0` does not survive, and the 2.x alias that
+    /// is read FIRST is removed rather than left to switch it back. Mutation: drop either line in
+    /// `apply` and this fails.
+    #[test]
+    fn every_seat_spawn_ignores_the_repositorys_opencode_config() {
+        for decision in [
+            SeatConfig::Inherit,
+            SeatConfig::Isolated {
+                cli: SeatCli::Opencode,
+                root: None,
+                set: vec![],
+                strip: SEAT_CONFIG_ENV.to_vec(),
+            },
+            SeatConfig::Isolated {
+                cli: SeatCli::Claude,
+                root: None,
+                set: vec![],
+                strip: SEAT_CONFIG_ENV.to_vec(),
+            },
+        ] {
+            let mut cmd = Command::new("true");
+            cmd.hardened();
+            cmd.env(OPENCODE_DISABLE_PROJECT_CONFIG_ENV, "0");
+            cmd.env(OPENCODE_CONFIG_PROJECT_DISABLE_ENV, "0");
+            decision.apply(&mut cmd);
+            let value = |key: &str| -> Option<Option<String>> {
+                cmd.get_envs()
+                    .find(|(k, _)| k.to_string_lossy() == key)
+                    .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+            };
+            assert_eq!(
+                value(OPENCODE_DISABLE_PROJECT_CONFIG_ENV),
+                Some(Some("1".to_string())),
+                "{decision:?}"
+            );
+            assert_eq!(
+                value(OPENCODE_CONFIG_PROJECT_DISABLE_ENV),
+                Some(None),
+                "the alias read first is removed: {decision:?}"
+            );
+        }
+        // The spellings opencode reads (2.x `server-process.ts`; 1.17.18 reads the first only).
+        assert_eq!(
+            OPENCODE_DISABLE_PROJECT_CONFIG_ENV,
+            "OPENCODE_DISABLE_PROJECT_CONFIG"
+        );
+        assert_eq!(
+            OPENCODE_CONFIG_PROJECT_DISABLE_ENV,
+            "OPENCODE_CONFIG_PROJECT_DISABLE"
+        );
     }
 
     #[test]
