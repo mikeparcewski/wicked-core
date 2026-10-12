@@ -304,6 +304,12 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.9.8** — 2026-10-12 — patch release on main 0cfc91e, carrying #909 (editor `mcp.session` permission,
+  granted per editor build at install consent; no global allow), #910 + #915 (POL-2101 "check the chosen stack's
+  built-ins first", boot-seeded from the `stack-builtins` pack), #913 (opencode 2.x governed; admission pin moves to
+  opencode v2.0.25) and #916 (governed seats never load a repository's own agent configuration: opencode runs with
+  `OPENCODE_DISABLE_PROJECT_CONFIG=1`, claude workers with no project setting sources; repo CLAUDE.md/AGENTS.md no
+  longer auto-load on governed seats).
 - **core-ts 0.9.7** — 2026-10-11 — patch release on main 961990d, carrying #907 (operator rulings 19:00Z): an
   operator approve at a `judge_unavailable` gate IS the judgment (the unit is done; the receipt records
   `operator_judge`, judge `operator:<actor>` and `operatorJudges {by, at, note, reason}`, aggregated on the
