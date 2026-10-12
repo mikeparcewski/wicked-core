@@ -47,3 +47,11 @@ Every recalled rule cites its id (`PAT-`/`POL-`, INV-C1) and its provenance ref
 | [`phase-scope/`](phase-scope/phase-scope.md) | `operations` | Pre-build phases write documentation only (phase-scope write-denies) | `engine:pre-build-scope` (`gate_hook::phase_scope_denial`, core#306) + completion-path `phase_scope_warning` backstop |
 | [`mcp-server/`](mcp-server/mcp-server-language.md) | `architecture` · `operations` · `security` · `testing` · `compliance` | Defaults for MCP servers the `mcp-server` workflow builds (MCPS-1001..1007: TypeScript + fastmcp, OpenTelemetry, loglayer, authentication with one secret, input validation and egress pinning, contract tests, license and default egress) | none (`guidance`; the workflow's design and review phases recall it) |
 | [`review-loop/`](review-loop/review-loop-stateful-verdicts.md) | `testing` · `development` · `operations` | How governed review loops converge (RVWL-1001..1004: stateful verdicts with prior verdicts and human rulings, foreground pasted evidence, rework bounded at two send-backs then a human adjudication, one slice per intent) | none (`guidance`; the planned gate for RVWL-1003 is `engine:review-adjudication`) |
+| [`stack-builtins/`](stack-builtins/stack-builtins.md) | `development` | Use what the chosen stack already provides (POL-2101: the user and policies choose the framework; check its built-ins at the pinned version before writing code, record the check, justify any duplicate; reviewers flag every duplicate). Groups under `engineering-doctrine`; the AW-13 seed run stages this doc beside the corpus | none (`guidance`; build and review phases recall it) |
+
+`mcp-server`, `review-loop` and `stack-builtins` are **boot-seeded**: the daemon embeds their docs
+(`src/steering_packs.rs`) and writes their rules into the store at start, insert-only, so
+`rules.recall` finds them without a `rules ingest` and a retired rule stays retired. A newer doc
+reaches an existing store through `rules ingest governance/packs/<pack>`. `phase-scope` is
+enforcing and stays an explicit ingest; `mcp-defaults` and `editor-defaults` are seeded by their
+gates.

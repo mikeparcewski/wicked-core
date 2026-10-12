@@ -7,7 +7,8 @@
     "seed_projection": "a committed, frontmattered rule doc under seed/corpus/ derived from an upstream source that is not itself adapter-ingestable; provenance.ref cites the projection, the projection's Sources section + this manifest cite the upstream",
     "direct_ingest": "the upstream doc already parses under the MarkdownAdapter convention and is staged verbatim into the ingest root",
     "knowledge_scope": "wiki:<area> per arch-R5; rationale chunks are stamped by `rules fanout --knowledge-scope`, bulk docs by `knowledge.ingest {scope}`",
-    "ruleset_grouping": "frontmatter `domain:` selects the NodeKind::RuleSet parent; membership = native Contains edges (AW-13)"
+    "ruleset_grouping": "frontmatter `domain:` selects the NodeKind::RuleSet parent; membership = native Contains edges (AW-13)",
+    "boot_pack": "the source doc is a boot-seeded governance pack (wicked-core src/steering_packs.rs embeds it, so every daemon store holds its rules at start); the seed run stages that doc into the ingest root rather than keeping a corpus copy, so no rule id has two docs"
   },
   "assumptions": [
     "TARGET-ARCHITECTURE.md lives at the WORKSPACE root's scratch/ directory, which is not inside any git repo; its owned home is parked decision P-4 (RECON-ARCH-WIKI open question 4). Until it lands in an owned repo, the seed ships a projection (corpus/plane-boundaries.md) and this manifest pins the upstream content digest.",
@@ -108,8 +109,8 @@
       "repo": "operator ruling (no upstream doc; the projection is the source)",
       "enforcement_class": "guidance",
       "ruleset_domain": "engineering-doctrine",
-      "lane": "seed_projection",
-      "seed_doc": "corpus/stack-builtins.md (POL-2101)",
+      "lane": "boot_pack",
+      "seed_doc": "governance/packs/stack-builtins/stack-builtins.md (POL-2101; the boot-seeded pack is the only copy, seed_wiki.py stages it beside the corpus)",
       "knowledge": { "scope": "wiki:architecture", "bulk_ingest": false }
     }
   ],

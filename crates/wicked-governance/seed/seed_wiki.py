@@ -212,6 +212,10 @@ def main() -> None:
     shutil.copytree(HERE / "corpus", staging)
     adr_src = estate_src / "docs" / "adr"
     shutil.copytree(adr_src, staging / "adr")
+    # POL-2101's only doc is the boot-seeded stack-builtins pack (manifest source 9, lane
+    # boot_pack); stage it beside the corpus so the seed run still mints it.
+    for doc in (HERE.parents[2] / "governance" / "packs" / "stack-builtins").glob("*.md"):
+        shutil.copy2(doc, staging / doc.name)
     estate_rev = run_checked(["git", "-C", estate_src, "rev-parse", "HEAD"]).strip()
     print(f"staged: corpus + {len(list((staging / 'adr').glob('*.md')))} ADRs (estate @ {estate_rev})")
 
