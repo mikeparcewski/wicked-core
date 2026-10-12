@@ -101,6 +101,16 @@
       "lane": "seed_projection",
       "seed_doc": "corpus/cross-platform.md (PAT-1901..PAT-1904)",
       "knowledge": { "scope": "wiki:architecture", "bulk_ingest": false }
+    },
+    {
+      "order": 9,
+      "source": "Operator ruling 2026-10-12 — the chosen stack's built-ins come first (origin: MCP-as-API on fastmcp's built-in HTTP/REST + OpenAPI, not a hand-written generator)",
+      "repo": "operator ruling (no upstream doc; the projection is the source)",
+      "enforcement_class": "guidance",
+      "ruleset_domain": "engineering-doctrine",
+      "lane": "seed_projection",
+      "seed_doc": "corpus/stack-builtins.md (POL-2101)",
+      "knowledge": { "scope": "wiki:architecture", "bulk_ingest": false }
     }
   ],
   "rule_id_blocks": {
@@ -112,6 +122,7 @@
     "18xx": "event-grammar",
     "19xx": "cross-platform",
     "20xx": "universal-donts (engineering-doctrine)",
+    "21xx": "stack-builtins (engineering-doctrine; operator ruling 2026-10-12)",
     "reserved": "PAT-100 (studio RuleManager template), POL-1101/PAT-1102/PAT-1103/POL-1104 (estate ADR-011)"
   },
   "rulesets": [

@@ -96,7 +96,7 @@ orthogonal — every type can hold guidance and gates alike.
 | Type | Governs | Examples |
 |---|---|---|
 | `architecture` | system shape: planes, contracts, storage, events, MCP surfaces | "Every cross-plane interaction goes through the owning plane's contract" (POL-1301); event grammar `wicked.<domain>.<noun>.<verb>`; "MCP tools are read-only on the estate surface" |
-| `development` | how code gets written: agent behavior, engineering don'ts, portability | "No grandfathering — warnings go to zero by fixing code" (POL-2001); "Stable IDs only — never key a node by content hash" (PAT-2004); cross-platform shell rules |
+| `development` | how code gets written: agent behavior, engineering don'ts, portability | "No grandfathering — warnings go to zero by fixing code" (POL-2001); "Stable IDs only — never key a node by content hash" (PAT-2004); "Check what the chosen stack already provides before writing code" (POL-2101); cross-platform shell rules |
 | `security` | secrets, authz, attack surface | "Workers never receive raw credentials"; a **tool-calling policy** whose trigger is exfiltration-shaped (e.g. deny a network-egress tool when the context contains a secret ref) |
 | `testing` | evidence and verification doctrine | "Evaluator ≠ creator — a worker never grades its own output"; "done is re-derived from ledger evidence, never asserted" |
 | `operations` | run/gate behavior, tool and phase discipline, release protocol | **tool-calling policy** — which tools a worker may call in which phase (deny-listed tool ⇒ `deny`; the canonical example); "pre-build phases write documentation only" (the `phase-scope` pack); kill-switch and release rules |
@@ -199,7 +199,7 @@ From a `wicked-core` checkout, against a scratch store — no daemon, no real st
 ```sh
 cargo build --bin wicked-core
 
-# 1. Ingest the shipped seed corpus (8 doctrine docs → 36 rules under 7 RuleSets)
+# 1. Ingest the shipped seed corpus (9 doctrine docs → 37 rules under 7 RuleSets)
 target/debug/wicked-core rules ingest crates/wicked-governance/seed/corpus --db /tmp/steering-demo.db
 
 # 2. Recall what applies — severity-ordered, every rule citing its provenance
