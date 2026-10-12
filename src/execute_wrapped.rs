@@ -4158,8 +4158,10 @@ fn strip_codex_roots(flags: Vec<String>) -> Vec<String> {
     // another: `writable_roots`, `notify`, `sqlite_home`): on a read-only unit only the model
     // choice, the approvals reviewer and the engine's own MCP off-pin survive; every other
     // `-c`/`--config` is dropped. `approvals_reviewer` (core#769) adds no writable root and no
-    // host-side write: it only decides who answers an approval request, and without it a forced
-    // `on-request` account refuses every command of the unit, reads included.
+    // host-side write of its own: it decides who answers an approval request, and without it a
+    // forced `on-request` account refuses every command of the unit, reads included. On such an
+    // account it also answers escalation requests (see the codex record in wicked-council's
+    // registry.rs): the read-only boundary is then the sandbox plus that reviewer.
     let allowed_override = |v: &str| {
         let (key, value) = v.split_once('=').unwrap_or((v, ""));
         let key = key.trim();

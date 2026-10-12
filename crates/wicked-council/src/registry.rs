@@ -291,8 +291,14 @@ pub fn builtin() -> Vec<AgenticCli> {
             // default `user` reviewer there is nobody to ask in `codex exec`, so every command
             // that needs approval comes back `Rejected("approval request failed")`, reads
             // included. Where the policy is `never` (no bundle) nothing asks, and the setting does
-            // nothing. It does not widen the sandbox: on such an account (codex-cli 0.162.1) a
-            // write outside the workspace, even a retry requesting escalation, is declined. Not
+            // nothing. CAVEAT (codex r1, P1; operator decision pending): under `on-request` the
+            // reviewer also answers ESCALATION requests (a command asking to run outside the
+            // sandbox), so on such an account the boundary is the sandbox plus the account's
+            // automatic reviewer, not the kernel alone. On codex-cli 0.162.1 under one enterprise
+            // bundle it declined every write outside the workspace, including an explicit
+            // escalation retry; that is a reviewer decision, not a guarantee. A granular policy
+            // with `sandbox_approval = false` would refuse escalations mechanically, but the same
+            // bundle disallows it (falls back to `on-request`). Not
             // `--approve-for-me`: clap refuses it together with `--sandbox`, and the explicit
             // `--sandbox` is the posture the engine checks (`codex_sandbox_is_bounded`). An account
             // that also forbids `auto_review` still refuses every command; the engine benches that
