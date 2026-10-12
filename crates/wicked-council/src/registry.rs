@@ -559,9 +559,13 @@ pub fn builtin() -> Vec<AgenticCli> {
                 // ACP-sourced) are unreachable, and a hostile repository `opencode.json`,
                 // `.opencode/agent{,s}/*.md` or `mode/*.md` (allow-all on `build`, `build`
                 // demoted / hidden / disabled, `default_agent` hijacked) keeps the session on
-                // `build` with every intent asked. Known and NOT closed by this doc: opencode
-                // (1.17.18 too) imports a repository's `.opencode/plugin{,s}/*.js` and spawns
-                // the commands of its configured MCP servers at session start, unasked.
+                // `build` with every intent asked. Not closable by this doc, closed by the spawn
+                // instead (core#914): opencode imports a repository's `.opencode/plugin{,s}/*.js`
+                // and spawns the commands of its configured MCP servers at session start, unasked
+                // — every seat spawn sets `OPENCODE_DISABLE_PROJECT_CONFIG=1`
+                // (`wicked_apps_core::spawn::SeatConfig::apply`), so no repository opencode
+                // configuration loads at all (1.17.18 over ACP still IMPORTS a repository plugin
+                // module, which runs its top-level code, but does not call its plugin function).
                 verified_version: Some("opencode v2.0.25".into()),
                 governance_floor: None,
             }),

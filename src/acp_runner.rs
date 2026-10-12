@@ -2084,15 +2084,44 @@ pub(crate) struct SessionOptions<'a> {
     /// existing list (never replacing one). Empty for unit sessions — a unit's read roots are the
     /// in-process boundary's business (`assemble_read_roots`), not the SDK's.
     pub additional_directories: &'a [String],
-    /// `settingSources` — the ACP analog of the wrapped path's `--setting-sources project,local`
-    /// (codex round 8): the engine OWNS the scope selection, so this is SET (not merged — a list
-    /// that kept an existing `user` would defeat the isolation) when present; `None` under the
-    /// inherit-config hatch, where the bridge's own default (`user,project,local`) applies.
+    /// `settingSources` — the ACP analog of the wrapped path's `--setting-sources` (codex round
+    /// 8): the engine OWNS the scope selection, so this is SET (not merged — a list that kept an
+    /// existing `user` or `project` would defeat the isolation) when present:
+    /// [`ENGINE_SETTING_SOURCES`] on a worker, [`INHERIT_SETTING_SOURCES`] under the
+    /// inherit-config hatch. `None` only for a session that attaches no options at all.
     pub setting_sources: Option<&'a [&'a str]>,
 }
 
-/// The scopes a worker session reads its settings from — never the operator's `user` scope.
-pub(crate) const ENGINE_SETTING_SOURCES: &[&str] = &["project", "local"];
+/// The scopes a worker session reads its settings from — NONE (core#914). Not the operator's
+/// `user` scope (FINDING-047), and not the repository's `project`/`local` scopes either: a
+/// governed seat never loads a repository's own agent configuration — its hooks, permission
+/// rules, MCP servers, skills, agents, or its `CLAUDE.md` (the CLI loads that only from the
+/// `project` source). `[]` is the SDK's isolation mode; the bridge passes it to the CLI as
+/// `--setting-sources=`. What the ENGINE hands the session is a separate source and still
+/// applies: the per-session settings file (`settings`), the skills snapshot (`plugins`), the deny
+/// fence (`disallowedTools`) and the strict MCP pin. Measured on claude 2.1.287 through
+/// claude-agent-acp 0.73.0 with a scripted model: no repository hook ran, no repository MCP
+/// server spawned, the garden snapshot's skills (the governed-worker base skill included) were
+/// offered, and the engine's own `PreToolUse` hook fired.
+pub(crate) const ENGINE_SETTING_SOURCES: &[&str] = &[];
+
+/// The scopes a session reads under the [`crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV`]
+/// hatch: the operator's own `user` scope — what the hatch means — and never the repository's
+/// (core#914). Before, the hatch sent no `settingSources` and the bridge's default
+/// (`user,project,local`) loaded the repository's hooks too.
+pub(crate) const INHERIT_SETTING_SOURCES: &[&str] = &["user"];
+
+/// The `--setting-sources` VALUE for a claude CLI argv, from the same lists the ACP frame carries
+/// (one source of truth for both carriers): `""` on a worker — the CLI loads no filesystem scope
+/// — and `user` under the hatch.
+pub(crate) fn setting_sources_arg(inherit: bool) -> String {
+    if inherit {
+        INHERIT_SETTING_SOURCES
+    } else {
+        ENGINE_SETTING_SOURCES
+    }
+    .join(",")
+}
 
 #[cfg(test)]
 impl SessionOptions<'_> {
@@ -2369,7 +2398,8 @@ fn start_acp_process_with_write_roots(
     // configuration only: the `session/new` options and, for a unit session, its per-session
     // settings file under the worker home. Nothing launch-dependent touches the shared worker
     // home. ALWAYS injected — the inherit escape hatch inherits the operator's scopes (no
-    // engine-minted worker home, no `settingSources` override), never the fence (codex round 8;
+    // engine-minted worker home, `settingSources` = the operator's `user` scope only, never the
+    // repository's — core#914), never the fence (codex round 8;
     // the wrapped path does the same). Attached for every bridge: only the Claude bridge reads
     // `_meta.claudeCode.options`, and the others ignore the extension — one code path, exercised
     // by every stub the tests drive.
@@ -2395,11 +2425,11 @@ fn start_acp_process_with_write_roots(
         deny: &deny,
         settings: session_settings.as_deref(),
         additional_directories: additional_read_roots,
-        setting_sources: if inherit {
-            None
+        setting_sources: Some(if inherit {
+            INHERIT_SETTING_SOURCES
         } else {
-            Some(ENGINE_SETTING_SOURCES)
-        },
+            ENGINE_SETTING_SOURCES
+        }),
     };
     // v3.2: opencode's lever rides the SAME variable its governance content does — composed,
     // never replaced. The seat's registry value is the base when it names that variable; else
@@ -11566,14 +11596,10 @@ sleep 30
         let options = &fenced["_meta"]["claudeCode"]["options"];
         assert_eq!(options["disallowedTools"], serde_json::json!(deny));
         assert_eq!(options["settings"], "/wh/sessions/r-claude/settings.json");
-        // codex round 8 (M2): the production frame carries the engine's scope selection — the
-        // ACP analog of `--setting-sources project,local` — and SETS it (an existing `user`
-        // kept by a merge would defeat the isolation); `None` (the hatch) leaves it absent.
-        assert_eq!(
-            options["settingSources"],
-            serde_json::json!(["project", "local"]),
-            "{fenced}"
-        );
+        // codex round 8 (M2) + core#914: the production frame carries the engine's scope
+        // selection — NO filesystem scope, the ACP analog of `--setting-sources ""` — and SETS
+        // it (an existing `user` or `project` kept by a merge would defeat the isolation).
+        assert_eq!(options["settingSources"], serde_json::json!([]), "{fenced}");
         assert!(options.get("plugins").is_none(), "{fenced}");
         let mut params = serde_json::json!({
             "cwd": "/wt", "mcpServers": [],
@@ -11591,8 +11617,8 @@ sleep 30
         );
         assert_eq!(
             params["_meta"]["claudeCode"]["options"]["settingSources"],
-            serde_json::json!(["project", "local"]),
-            "an existing `user` scope is REPLACED, not merged: {params}"
+            serde_json::json!([]),
+            "an existing `user`/`project`/`local` selection is REPLACED, not merged: {params}"
         );
         let mut hatch = serde_json::json!({"cwd": "/wt", "mcpServers": []});
         attach_session_options(
@@ -11602,14 +11628,14 @@ sleep 30
                 deny: &deny,
                 settings: None,
                 additional_directories: &[],
-                setting_sources: None,
+                setting_sources: Some(INHERIT_SETTING_SOURCES),
             },
         );
-        assert!(
-            hatch["_meta"]["claudeCode"]["options"]
-                .get("settingSources")
-                .is_none(),
-            "under the hatch no scope selection is attached: {hatch}"
+        assert_eq!(
+            hatch["_meta"]["claudeCode"]["options"]["settingSources"],
+            serde_json::json!(["user"]),
+            "under the hatch the operator's `user` scope loads, never the repository's \
+             (core#914): {hatch}"
         );
         assert_eq!(
             params["_meta"]["claudeCode"]["options"]["disallowedTools"],
@@ -13390,8 +13416,8 @@ transport = "stdio"
                     "under the hatch the snapshot is still handed at session/new: {}",
                     entries[2]
                 );
-                // codex round 8: the hatch inherits the operator's SCOPES (no engine
-                // `settingSources` override) — never the fence, which rides the frame under it.
+                // codex round 8: the hatch inherits the operator's SCOPE — never the fence,
+                // which rides the frame under it, and never the repository's scopes (core#914).
                 assert!(
                     entries[2]["new"]["_meta"]["claudeCode"]["options"]["disallowedTools"]
                         .as_array()
@@ -13399,9 +13425,11 @@ transport = "stdio"
                     "the deny fence rides the frame even under the hatch: {}",
                     entries[2]
                 );
-                assert!(
-                    entries[2]["new"]["_meta"]["claudeCode"]["options"]["settingSources"].is_null(),
-                    "under the hatch the operator's scopes are inherited (no engine override): {}",
+                assert_eq!(
+                    entries[2]["new"]["_meta"]["claudeCode"]["options"]["settingSources"],
+                    serde_json::json!(["user"]),
+                    "under the hatch the operator's `user` scope is inherited, the repository's \
+                     `project`/`local` scopes are not (core#914): {}",
                     entries[2]
                 );
                 assert!(

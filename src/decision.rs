@@ -147,6 +147,12 @@ fn is_claude_ballot(cli: &AgenticCli) -> bool {
     wicked_apps_core::spawn::binary_is_claude(ballot_program(&cli.headless_invocation))
 }
 
+/// The `--setting-sources` a claude ballot runs with (core#914): `user` only. On a ballot the
+/// `user` scope IS the engine's — the council runs the seat under the worker home, whose
+/// `settings.json` is the shared deny fence written by `acp_runner::ensure_shared_worker_fence` —
+/// so it stays; the repository's `project`/`local` scopes never load.
+const BALLOT_SETTING_SOURCES: &str = "user";
+
 /// The roster the council convenes with: every claude ballot's `trust_flags` gain
 /// `--disallowedTools <state-home rules>` (`execute_wrapped::ballot_deny_rules`) — the half of the
 /// fence the shared worker file omits by design — AND `--strict-mcp-config` (core#660 item 3), so
@@ -175,6 +181,14 @@ fn fenced_roster(
                         c.trust_flags.push(arg.to_string());
                     }
                 }
+                // core#914: a ballot loads only the seat's `user` scope — the worker home, where
+                // the shared fence lives (the operator's own under the hatch) — never the
+                // repository's `project`/`local` scopes (its hooks, permission rules, MCP servers,
+                // skills, agents). Appended after the template, so the engine's value is the one
+                // the CLI keeps (a repeated `--setting-sources` resolves to the last; measured on
+                // claude 2.1.287).
+                c.trust_flags.push("--setting-sources".into());
+                c.trust_flags.push(BALLOT_SETTING_SOURCES.into());
                 if !rules.is_empty() {
                     c.trust_flags.push("--disallowedTools".into());
                     c.trust_flags.push(rules.join(","));
@@ -1086,6 +1100,10 @@ mod tests {
                 // seat's own signed-in account. It ran with the deny fence and
                 // `ENABLE_CLAUDEAI_MCP_SERVERS=false` but never with this flag.
                 "--strict-mcp-config".to_string(),
+                // core#914: the worker home's user scope (the shared fence), never the
+                // repository's project/local scopes.
+                "--setting-sources".to_string(),
+                "user".to_string(),
                 "--disallowedTools".to_string(),
                 expected.join(","),
             ],

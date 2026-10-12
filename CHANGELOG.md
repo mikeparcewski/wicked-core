@@ -14,6 +14,40 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Governed seats no longer load a repository's own agent configuration (#914).** Before this
+  change, a repository could run code on a governed seat at session start without being asked:
+  - opencode imported its `.opencode/plugin{,s}/*.js` and spawned the commands of the MCP servers
+    its `opencode.json` configures, on 1.17.18 and 2.0.25;
+  - claude loaded its `project` and `local` settings, hooks included.
+
+  Each seat now uses its CLI's built-in switch:
+  - **opencode:** every seat spawn sets `OPENCODE_DISABLE_PROJECT_CONFIG=1` and removes the 2.x
+    alias `OPENCODE_CONFIG_PROJECT_DISABLE`, which opencode reads first. This covers wrapped, ACP and
+    council ballots, the inherit hatch included (`SeatConfig::apply`).
+  - **claude workers:** they run with no filesystem setting scope: `--setting-sources ""` when
+    wrapped, `settingSources: []` over ACP. Before, they ran with `project,local`.
+  - **claude ballots:** they run with `--setting-sources user`. On a ballot, `user` is the worker
+    home that holds the shared deny fence.
+  - **the hatch:** `WICKED_WORKER_INHERIT_OPERATOR_CONFIG` now narrows to the operator's `user` scope.
+    Before, it loaded the CLI's default, which includes the repository's scopes.
+
+  Measured offline with scripted models in scratch homes:
+  - claude 2.1.287, wrapped and through claude-agent-acp 0.73.0: no repository or local hook ran,
+    and no repository MCP server spawned, even with `--strict-mcp-config` removed. The engine's
+    `--settings` `PreToolUse` hook still fired. The garden skills snapshot's skills, the
+    `governed-worker` base skill among them, were still offered. Bash still saw the engine's
+    environment.
+  - opencode 2.0.25: no plugin was imported and no MCP command was spawned. Every core intent still
+    asked. The skill the engine hands through `skills.paths` still loaded.
+
+  Changes a repository will notice:
+  - a repository's `CLAUDE.md` and `AGENTS.md` are no longer auto-loaded on these seats. The CLIs
+    load them only with project config. They stay readable as files in the worktree.
+  - repository skills, agents and permission rules no longer apply.
+
+  Residuals on opencode 1.17.18, which is no longer the admitted pin, over ACP only:
+  - a repository plugin module is still imported, though its plugin function is not called;
+  - a repository's `.claude/skills` are still offered.
 - **opencode 2.x: the seat's governance document closes three holes, and the admission pin moves to
   `opencode v2.0.25` (#911).** Re-proved live against opencode 2.0.25 with the scripted-model ACP
   harness. Three holes in the document the engine composed:

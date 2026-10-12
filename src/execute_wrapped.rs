@@ -608,8 +608,13 @@ pub(crate) fn denied_bash_rules() -> impl Iterator<Item = &'static str> {
 ///     their permission defaults, their plugins. Observed consequences: 8 blocked writes from an
 ///     operator memory hook, 4 skill calls into a brain indexed on an unrelated repo, and 2 writes
 ///     refused because the operator's settings put the session in `dontAsk`. A run whose behaviour
-///     depends on whose laptop it is on is not reproducible. `--setting-sources project,local`
-///     drops user scope while leaving auth and the repo's own settings alone.
+///     depends on whose laptop it is on is not reproducible. `--setting-sources ""` drops user
+///     scope while leaving auth alone — and (core#914) the repository's `project`/`local` scopes
+///     too: a governed seat never loads a repository's own agent configuration (its hooks,
+///     permission rules, MCP servers, skills, agents or `CLAUDE.md`). What the engine hands the
+///     worker rides separate sources that still apply: `--settings`, `--plugin-dir`,
+///     `--disallowedTools` and the strict MCP pin ([`crate::acp_runner::ENGINE_SETTING_SOURCES`]
+///     has the measurement).
 ///
 ///  2. **No filesystem boundary.** 41 of 331 path-bearing tool calls left the worktree.
 ///     `--disallowedTools` denies the file tools a path into the directories above.
@@ -650,9 +655,10 @@ pub(crate) fn denied_bash_rules() -> impl Iterator<Item = &'static str> {
 /// snapshot stay denied by the governance boundary, and reads pass through the read roots
 /// ([`assemble_read_roots`]).
 ///
-/// Under the [`INHERIT_OPERATOR_CONFIG_ENV`] escape hatch the three ISOLATION flags are withheld
-/// — that is what the hatch means: the worker inherits the operator's own scopes, mode and (no)
-/// fence — but the skills half is unchanged (codex round 6): the template's `--plugin-dir` is
+/// Under the [`INHERIT_OPERATOR_CONFIG_ENV`] escape hatch the mode flag is withheld and the scope
+/// selection narrows to the operator's own `user` scope — that is what the hatch means: the worker
+/// inherits the operator's scope and mode, never the repository's scopes (core#914) and never an
+/// absent fence — and the skills half is unchanged (codex round 6): the template's `--plugin-dir` is
 /// stripped and the snapshot rides its one `--plugin-dir` exactly as without the hatch. Rounds
 /// 2–5 returned before either, so under the hatch the stale hand copy survived in the argv and the
 /// admitted snapshot was never handed.
@@ -664,7 +670,8 @@ pub(crate) fn denied_bash_rules() -> impl Iterator<Item = &'static str> {
 /// effect on explicit deny rules is UNMEASURED on the current CLI — see LIMITS above — and which
 /// is the engine's mode to state either way) without the explicit hatch. The ONLY way to inherit the operator's
 /// configuration is [`INHERIT_OPERATOR_CONFIG_ENV`], and even then the deny fence is injected: the
-/// hatch withholds the two scope/mode flags, never the `--disallowedTools` list. A template's OWN
+/// hatch withholds the mode flag and narrows the scopes to the operator's `user` scope (never the
+/// repository's, core#914), never the `--disallowedTools` list. A template's OWN
 /// `--disallowedTools` is UNIONED into the engine's (templates may add denies, never remove one):
 /// its entries are lifted out of the built argv and re-emitted in the one engine-owned flag.
 ///
@@ -688,8 +695,9 @@ pub(crate) fn inject_isolation_flags(
     for (flag, why) in [
         (
             "--setting-sources",
-            "workers always run with `--setting-sources project,local` (the operator's user scope \
-             — hooks, plugins, permission defaults — is never inherited)",
+            "workers always run with `--setting-sources \"\"` (neither the operator's user scope \
+             nor the repository's project/local scopes — hooks, plugins, permission defaults, MCP \
+             servers — is ever loaded; core#914)",
         ),
         (
             "--permission-mode",
@@ -731,9 +739,14 @@ pub(crate) fn inject_isolation_flags(
             .iter()
             .map(|a| a.to_string()),
     );
+    // core#914: the scope selection rides EVERY launch — the hatch inherits the operator's `user`
+    // scope (what the hatch means), never the repository's `project`/`local` scopes; before, the
+    // hatch withheld the flag and the CLI's default loaded the repository's hooks too.
+    flags.push("--setting-sources".into());
+    flags.push(crate::acp_runner::setting_sources_arg(
+        inherits_operator_config(),
+    ));
     if !inherits_operator_config() {
-        flags.push("--setting-sources".into());
-        flags.push("project,local".into());
         // Dropping user scope also drops whatever permission mode lived there, and a `-p` session
         // with no mode denies its own Write calls — verified: the same probe that wrote `probe.txt`
         // under `acceptEdits` got "Claude requested permissions to write to …" with the mode left
@@ -880,7 +893,7 @@ fn strip_plugin_dir(argv: &mut Vec<String>, prompt_ix: Option<usize>) -> Vec<Str
 ///
 /// Manual check against the live CLI (no automated test spawns claude): in a scratch config dir,
 /// `printf '{"permissions":{"deny":["Read(/tmp/fence/**)","Edit(/tmp/fence/**)"]}}' > s.json`,
-/// then `claude -p --settings s.json --setting-sources project,local --permission-mode acceptEdits
+/// then `claude -p --settings s.json --setting-sources "" --permission-mode acceptEdits
 /// 'use the Write tool to create /tmp/fence/probe.txt'` — expect NO `Permission deny rule` line on
 /// stderr, the write refused in the transcript, and no `/tmp/fence/probe.txt` afterwards.
 fn enforceable_rule(rule: String) -> String {
@@ -10741,8 +10754,9 @@ mod tests {
 
         assert_eq!(
             flag_value(&argv, "--setting-sources"),
-            Some("project,local"),
-            "project and local scope stay; the operator's user scope does not"
+            Some(""),
+            "no filesystem scope loads: not the operator's user scope, and not the \
+             repository's project/local scopes (core#914)"
         );
         let guard = argv.iter().position(|a| a == "--").expect("the -- guard");
         let flag = argv
@@ -10976,7 +10990,7 @@ mod tests {
                 );
             }
             assert!(
-                states_pair(&argv, "--setting-sources", "project,local")
+                states_pair(&argv, "--setting-sources", "")
                     && states_pair(&argv, "--permission-mode", "acceptEdits"),
                 "{argv:?}"
             );
@@ -11132,7 +11146,7 @@ mod tests {
     /// readable while the rest of the list read as complete. Fail closed everywhere the fence is
     /// built: the operational state home, the live config dir (`CLAUDE_CONFIG_DIR`), the argv
     /// injector (nothing is injected on a refusal), the shared worker-home file — and under the
-    /// inherit hatch too: the hatch withholds the scope/mode flags, never the fence.
+    /// inherit hatch too: the hatch withholds the mode flag, never the fence.
     #[test]
     fn an_unspellable_protected_directory_refuses_the_launch_even_under_the_hatch() {
         use crate::skills_snapshot::test_support::scratch;
@@ -11234,7 +11248,7 @@ mod tests {
             let mut argv = build_argv(inv, hostile, &[]);
             super::inject_isolation_flags(&mut argv, inv, None, Some(hostile), None).unwrap();
             assert!(
-                states_pair(&argv, "--setting-sources", "project,local"),
+                states_pair(&argv, "--setting-sources", ""),
                 "prompt `{hostile}` suppressed the scope isolation: {argv:?}"
             );
             assert!(
@@ -11399,8 +11413,8 @@ mod tests {
     /// template that states none loses nothing even when the PROMPT is the flag's literal text;
     /// and with NO snapshot the template's flag is stripped all the same — a template is not a
     /// skills input, and the ladder (not the operator's hand copy) decides what a worker gets.
-    /// Under the inherit-config escape hatch (codex round 6) the ISOLATION flags are withheld but
-    /// the skills half is identical: one `--plugin-dir`, the snapshot, the template's stripped.
+    /// Under the inherit-config escape hatch (codex round 6) the mode flag is withheld and the
+    /// scopes narrow to `user` (core#914), but the skills half is identical: one `--plugin-dir`, the snapshot, the template's stripped.
     #[test]
     fn the_snapshot_rides_plugin_dir_exactly_once_and_supersedes_the_template_hand_copy() {
         // `inject_isolation_flags` reads the inherit-config escape hatch (and HOME, for the deny
@@ -11475,13 +11489,19 @@ mod tests {
                 "under the hatch: one --plugin-dir, the snapshot: {argv:?}"
             );
             assert!(!argv.iter().any(|a| a.contains(stale)), "{argv:?}");
-            for isolation in ["--setting-sources", "--permission-mode"] {
-                assert!(
-                    !argv.iter().any(|a| a == isolation),
-                    "the hatch withholds {isolation}: {argv:?}"
-                );
-            }
-            // codex round 8: the hatch inherits the operator's scopes and mode, NEVER the fence —
+            assert!(
+                !argv.iter().any(|a| a == "--permission-mode"),
+                "the hatch withholds --permission-mode: {argv:?}"
+            );
+            // core#914: the hatch narrows the scopes to the operator's own `user` scope — never
+            // the repository's project/local scopes.
+            assert_eq!(
+                argv.iter().filter(|a| *a == "--setting-sources").count(),
+                1,
+                "{argv:?}"
+            );
+            assert!(states_pair(&argv, "--setting-sources", "user"), "{argv:?}");
+            // codex round 8: the hatch inherits the operator's scope and mode, NEVER the fence —
             // the deny rules are injected under it too.
             assert!(
                 argv.windows(2)
@@ -12686,8 +12706,8 @@ mod tests {
     /// EXACTLY ONE `--plugin-dir`, the snapshot, with the registry's stripped; the isolation flags
     /// ride beside it; the directive names the skill in Claude's plugin form by the directory
     /// DISCOVERED through the index; the snapshot tree is byte-identical afterwards. Then the SAME
-    /// launch under the inherit-config escape hatch: the isolation flags are gone (the operator's
-    /// configuration is inherited) but the snapshot still rides its one `--plugin-dir` and the
+    /// launch under the inherit-config escape hatch: the mode flag is gone and the scopes narrow to
+    /// the operator's `user` scope (core#914) but the snapshot still rides its one `--plugin-dir` and the
     /// registry's stale copy is still stripped — the hatch decides what is inherited IN ADDITION
     /// to the snapshot, never whether it is handed. HOME is pinned so the registry, the deny rules
     /// and the ladder resolve deterministically.
@@ -12796,7 +12816,7 @@ headless_invocation = "claude --plugin-dir {stale} -p {{PROMPT}}"
             "the directive names the skill by the directory DISCOVERED through the index: {argv:?}"
         );
         assert!(
-            states_pair(&argv, "--setting-sources", "project,local")
+            states_pair(&argv, "--setting-sources", "")
                 && states_pair(&argv, "--permission-mode", "acceptEdits")
                 && argv.iter().any(|a| a == "--disallowedTools"),
             "the isolation rides beside the snapshot: {argv:?}"
@@ -12807,8 +12827,8 @@ headless_invocation = "claude --plugin-dir {stale} -p {{PROMPT}}"
             "the snapshot is immutable: the launch wrote nothing into it"
         );
 
-        // The escape hatch (codex round 6): the operator's configuration is inherited — no
-        // isolation flag — and the skills half is unchanged: one --plugin-dir, the snapshot, the
+        // The escape hatch (codex round 6): the operator's configuration is inherited — no mode
+        // flag, the operator's `user` scope only (core#914) — and the skills half is unchanged: one --plugin-dir, the snapshot, the
         // registry's stale copy stripped, the same directive.
         {
             let _hatch = VarGuard::set(INHERIT_OPERATOR_CONFIG_ENV, std::path::Path::new("1"));
@@ -12822,12 +12842,14 @@ headless_invocation = "claude --plugin-dir {stale} -p {{PROMPT}}"
                 !argv.iter().any(|a| a.contains(stale_str.as_ref())),
                 "under the hatch the registry's stale hand copy is still stripped: {argv:?}"
             );
-            for isolation in ["--setting-sources", "--permission-mode"] {
-                assert!(
-                    !argv.iter().any(|a| a == isolation),
-                    "the hatch withholds {isolation}: {argv:?}"
-                );
-            }
+            assert!(
+                !argv.iter().any(|a| a == "--permission-mode"),
+                "the hatch withholds --permission-mode: {argv:?}"
+            );
+            assert!(
+                states_pair(&argv, "--setting-sources", "user"),
+                "core#914: under the hatch only the operator's user scope loads: {argv:?}"
+            );
             assert!(
                 argv.iter().any(|a| a == "--disallowedTools"),
                 "codex round 8: the deny fence is injected even under the hatch: {argv:?}"
