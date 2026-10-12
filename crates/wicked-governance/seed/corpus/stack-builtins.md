@@ -22,8 +22,8 @@ The check is cheap and it leaves a record. Before writing code, read the chosen 
 or source at the pinned version to see what it already offers. Write down what you checked and
 what you found in the step output. If you still write custom code that duplicates a built-in,
 say why the built-in does not fit (a missing feature at the pinned version, a measured defect,
-a policy conflict). A reviewer who finds custom code that duplicates a built-in flags it as a
-finding.
+a policy conflict). A reviewer flags every piece of custom code that duplicates a built-in as
+a finding, whether or not it carries a reason, and judges whether the stated reason holds.
 
 ## Rules
 
@@ -31,7 +31,8 @@ finding.
   do not substitute another. Before writing code, check what the chosen stack already
   provides at its pinned version and record that check in the step output: what you looked
   at and what it offers. Custom code that duplicates a built-in needs a stated reason the
-  built-in does not fit. Reviewers flag any unjustified duplicate as a finding.
+  built-in does not fit. Reviewers flag every duplicate of a built-in as a finding and judge
+  whether its stated reason holds.
 
 ## Sources
 

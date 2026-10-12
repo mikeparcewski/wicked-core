@@ -73,7 +73,7 @@ fn the_seed_corpus_mints_exactly_the_expected_rules_and_rulesets() {
 /// POL-2101 (operator ruling 2026-10-12): the chosen stack's built-ins come first. It is a
 /// development rule under engineering-doctrine, applies to build and review, and its statement
 /// carries all four obligations: the stack is chosen for the agent, the check comes before
-/// code, the check is recorded in the step output, and reviewers flag unjustified duplicates.
+/// code, the check is recorded in the step output, and reviewers flag every duplicate.
 #[test]
 fn pol_2101_check_the_chosen_stack_is_a_development_rule() {
     wicked_apps_core::emit::hermetic_test_spool();
@@ -100,7 +100,8 @@ fn pol_2101_check_the_chosen_stack_is_a_development_rule() {
         "check what the chosen stack already",
         "record that check in the step output",
         "duplicates a built-in needs a stated reason",
-        "Reviewers flag",
+        "Reviewers flag every duplicate of a built-in as a finding",
+        "judge whether its stated reason holds",
     ] {
         assert!(
             rule.statement.contains(needle),
