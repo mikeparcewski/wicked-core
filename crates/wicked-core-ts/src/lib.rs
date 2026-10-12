@@ -2718,6 +2718,10 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("approval request failed"));
+        } else {
+            // The runner's own opt-out: the binding must honour it (both branches of the rule
+            // itself are pinned env-free by `distribute::worktree_bench_tests`).
+            assert!(bound.is_empty(), "{bound:?}");
         }
         let unbound = Core::worktree_benched(roster, false).unwrap();
         assert_eq!(unbound, "[]");
