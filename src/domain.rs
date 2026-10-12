@@ -1146,8 +1146,71 @@ pub struct WorkUnit {
     /// (`qe_acceptance::directive`) and its gate card can show why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qe_acceptance: Option<crate::assurance::QeAcceptance>,
+    /// (DES-QE-EVERY-SEAT §3.2) The seats the engine may run this QE unit's ISOLATED REVIEWER on, in
+    /// order — stamped at dispatch on the run's QE unit when its decision is `required`, from the
+    /// run's own seats only. Empty for every other unit (skipped on the wire).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub qe_reviewer_seats: Vec<QeReviewerSeat>,
+    /// (DES-QE-EVERY-SEAT §3.1) Set ONLY on the engine's reviewer turn (a fresh worker session):
+    /// the nonce its child receives as `WICKED_QE_REVIEW_SESSION` and stamps on the verdict it
+    /// records. Never persisted on a stored unit (the reviewer input is built on the worker).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qe_review_session: Option<String>,
+    /// (DES-QE-EVERY-SEAT §3.5) What the isolated QE reviewer of this unit's last attempt did:
+    /// the evidence it was handed, the verdict it recorded, the seats it was tried on. `None` for
+    /// every unit that ran no reviewer (skipped on the wire).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qe_review: Option<QeReview>,
     /// The final unit status: `pending` → `distributed` → `done` | `rejected`.
     pub status: UnitStatus,
+}
+
+/// (DES-QE-EVERY-SEAT §3.2) One seat the QE reviewer may run on, and why it qualifies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QeReviewerSeat {
+    /// The run roster key (a seat instance, e.g. `claude#2`).
+    pub seat: String,
+    /// `distinct` | `executor_seat` | `reduced_assurance_creator`.
+    pub basis: String,
+    /// The seat shares its CLI with an author of the work (another instance of it).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub same_cli: bool,
+}
+
+/// (DES-QE-EVERY-SEAT §3.5) The isolated QE reviewer's record for one attempt of the QE unit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QeReview {
+    /// `pass` | `fail` | `invalid` | `unavailable`.
+    pub outcome: String,
+    /// Why, in words (the gate's denial reason for every outcome but `pass`).
+    pub reason: String,
+    /// The evidence dir the executor turn named and the engine bound (`<ledger>/evidence/<id>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_dir: Option<String>,
+    /// The bound QE (ledger) run id — the evidence dir's basename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qe_run_id: Option<String>,
+    /// The tree the executor turn started on (the dispatch baseline): a later same-tree retry
+    /// resumes [`Self::qe_run_id`] (§3.7), a floor re-run carries this record only on this tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
+    /// The verdict the reviewer recorded and the engine bound (`PASS` | `FAIL`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    /// Every reviewer turn of the attempt, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<QeReviewAttempt>,
+}
+
+/// One reviewer turn: the seat, its basis and how the turn ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QeReviewAttempt {
+    pub seat: String,
+    pub basis: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub same_cli: bool,
+    /// `verdict` | `seat_failure:<reason>` | `invalid`.
+    pub status: String,
 }
 
 /// Lifecycle status of a [`WorkUnit`].
@@ -1351,6 +1414,9 @@ impl WorkUnit {
             exclude_seats: Vec::new(),
             assurance: None,
             qe_acceptance: None,
+            qe_reviewer_seats: Vec::new(),
+            qe_review_session: None,
+            qe_review: None,
         }
     }
 

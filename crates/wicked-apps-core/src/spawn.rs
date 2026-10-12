@@ -92,6 +92,10 @@ pub const ENGINE_INTERNAL_ENV: &[&str] = &[
     // it is the daemon's own value, typically the operator's live checkout exported by the Claude
     // Code garden plugin, so a seat nothing was delivered to would run unpinned skills.
     "WICKED_GARDEN_ROOT",
+    // (DES-QE-EVERY-SEAT) The isolated QE reviewer's nonce: the engine stamps it on the ONE child
+    // it starts for a QE review, and garden reads it as "this session was started for the review
+    // alone". Inherited by any other child, it would license an inline (self-graded) review.
+    "WICKED_QE_REVIEW_SESSION",
 ];
 
 /// The env var the engine's ACP spawn path resolves the persistent worker config home from

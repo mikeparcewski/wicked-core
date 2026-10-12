@@ -1531,6 +1531,19 @@ pub(crate) fn apply_and_finish_unit(
         }
         other => (None, other),
     };
+    // (DES-QE-EVERY-SEAT §3.4) The isolated QE reviewer's record: a `fail` / `invalid` is a
+    // substantive veto beside the evaluator's own verdict; `unavailable` (no run seat could review
+    // in isolation) is the operator-judgment gate, and wins only when nothing else denied.
+    let (qe_unavailable, qe_veto) = match evidence
+        .qe_review
+        .as_ref()
+        .and_then(crate::qe_acceptance::review::denial)
+    {
+        Some(d) if d.source == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE => {
+            (Some(d), None)
+        }
+        other => (None, other),
+    };
     let validator_denial = guard_denial
         .map(|r| crate::domain::UnitDenial::new("worktree_guard", r))
         .or(same_seat_denial)
@@ -1538,6 +1551,7 @@ pub(crate) fn apply_and_finish_unit(
         .or(checks_denial.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
         .or(capture_denial)
         .or(evaluator_verdict_denial)
+        .or(qe_veto)
         .or(judged.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
         .or(judge_hold)
         .or(evaluator_denial)
@@ -1545,7 +1559,8 @@ pub(crate) fn apply_and_finish_unit(
         // (operator ruling 2026-10-11, codex r1 on #907) A judge that could not rule wins only when
         // NO other layer denied — the operator's judgment at its gate then answers the one open
         // question, never a governance veto hidden behind it.
-        .or(unavailable.map(|(source, r)| crate::domain::UnitDenial::new(source, r)));
+        .or(unavailable.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
+        .or(qe_unavailable);
 
     // Resolve the governance gate WITH the pre-computed deny folded in: a validator/evaluator deny
     // drives the phase Rejected + suppresses the work_output write (see `execute::apply_unit`).
@@ -1571,7 +1586,19 @@ pub(crate) fn apply_and_finish_unit(
     // (core#469) An operator's floor re-run is consumed by the attempt that ran it — whatever
     // this fold decided, the next dispatch is an ordinary one unless the gate arms another.
     if let Some(r) = unit.repo_checks.as_mut() {
+        // (DES-QE-EVERY-SEAT §3.2, codex r2 F15) A floor fix's seat changed this unit's tree: it
+        // is an AUTHOR of that tree from now on, so no later reviewer or judge of it runs there.
+        if let Some(fix) = r.requested_rerun.as_ref().and_then(|q| q.fix.as_ref()) {
+            if !unit.authored_by.contains(&fix.seat) {
+                unit.authored_by.push(fix.seat.clone());
+            }
+        }
         r.requested_rerun = None;
+    }
+    // (DES-QE-EVERY-SEAT §3.5) The isolated QE reviewer's record — evidence on the persisted unit,
+    // kept whichever way it went; `None` (no reviewer this attempt) leaves the last one.
+    if let Some(review) = evidence.qe_review.as_ref() {
+        unit.qe_review = Some(review.clone());
     }
     if outcome.approved {
         unit.rework_of = None;

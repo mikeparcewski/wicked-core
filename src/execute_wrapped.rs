@@ -4835,13 +4835,14 @@ pub(crate) fn skill_prompt(
         .unwrap_or_default();
     // (QE acceptance) The run's QE unit says whether to run garden's acceptance pipeline, in the
     // seat's own spelling of the QE skill; every other unit carries nothing here.
-    let qe = unit
-        .qe_acceptance
-        .as_ref()
-        .map(|q| {
-            crate::qe_acceptance::directive(q, &plugin_skill_invocation(QE_SKILL, form, skills))
-        })
-        .unwrap_or_default();
+    let qe = if unit.qe_acceptance.is_some() {
+        crate::qe_acceptance::unit_directive(
+            unit,
+            &plugin_skill_invocation(QE_SKILL, form, skills),
+        )
+    } else {
+        String::new()
+    };
     let mut prompt = format!(
         "{lead}{qe}{layout}{}",
         crate::assumptions::PROMPT_CONVENTION

@@ -6530,7 +6530,13 @@ impl AcpStepRunner {
         // appended AFTER the cross-CLI context blocks so they read as the most recent
         // guidance. Consumed here even if the turn later falls back to the wrapped path —
         // the same at-most-once posture as the cross-CLI context those paths also drop.
-        let operator_msgs = self.drain_operator_messages(&run_id, &cli_key);
+        // (DES-QE-EVERY-SEAT) …never into the engine's isolated QE reviewer turn: its whole input
+        // is the evidence path. Queued messages stay queued for the run's next turn.
+        let operator_msgs = if input.unit.qe_review_session.is_some() {
+            Vec::new()
+        } else {
+            self.drain_operator_messages(&run_id, &cli_key)
+        };
         for (orig_target, block) in &operator_msgs {
             self.emit_event(CoreEvent::WorkerMessageInjected {
                 session: run_id.clone(),
@@ -14754,6 +14760,9 @@ No further next steps — both questions fully answered.";
             exclude_seats: Vec::new(),
             assurance: None,
             qe_acceptance: None,
+            qe_reviewer_seats: Vec::new(),
+            qe_review_session: None,
+            qe_review: None,
         }
     }
 
