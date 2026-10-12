@@ -47,6 +47,14 @@ operator retired.
 | `EDITOR-BUILTIN-PAGE-MEDIA` | Allows `network.media` for the first-party page editor only. |
 | `EDITOR-OPEN-DEFAULTS` | Allows every editor `artifact.read`, `selection.chip`, `checks.contribute` and `ui.fullscreen`. |
 
+`mcp.session` (DES-MCP-INSPECTOR-001) is in no posture rule. It lets an editor talk, through
+studio's host, to an MCP server the operator connected, and an MCP server is a process or an
+endpoint that can act on the machine. So it is granted per editor build only: the editor's install
+consent ("This plugin can start and talk to MCP servers") writes that build's
+`editor:<id>@<version>#<sha256>/mcp.session` token into `EDITOR-GRANTS`. An editor that does not
+declare it never has it, a new version or hash asks again, and revoking it is removing that token
+in Steering. A `deny` on `editor-perm:mcp.session` dominates the grant.
+
 ## Rules
 
 - `ED-1` (critical): An editor without `artifact.write` changes nothing. It can still point
@@ -54,7 +62,9 @@ operator retired.
 - `ED-2` (critical): With or without grants, an editor never sends, launches, approves, decides,
   delivers or remembers, and never reaches the network by fetch, XHR, WebSocket, EventSource,
   beacon, form or navigation. No message exists for these, and the editor's own policy carries
-  `connect-src 'none'` and `form-action 'none'`.
+  `connect-src 'none'` and `form-action 'none'`. The one bridge is `mcp.request` under a granted
+  `mcp.session`: it reaches only the MCP server the operator connected in the host's own chrome,
+  and a tool call only on the operator's click in the editor.
 - `ED-3` (critical): An editor never sees ids, file paths, URLs, run roots, tokens, other artifacts
   or other projects. Content is passed in, stripped of paths.
 - `ED-4` (critical): An evaluator verdict is never authored by an editor. Its contributed checks
