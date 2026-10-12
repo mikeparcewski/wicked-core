@@ -1701,11 +1701,17 @@ fn qe_acceptance_on_a_seat_without_a_sub_agent_is_reviewed_by_the_engine_in_isol
         reviewer.unit.qe_ledger_root, executor.unit.qe_ledger_root,
         "the reviewer keeps the run's ledger root (its verdict lands where crew reads it)"
     );
-    assert!(
-        gate.combined,
-        "the bound reviewer PASS leaves the QE unit's gate green: {:?} {:?}",
-        gate.denial_source, gate.denial_reason
-    );
+    if checks_refused_without_a_boundary(&gate) {
+        // No OS write boundary on this host (Windows): the repo-checks floor fails the gate closed
+        // whatever QE says. The reviewer half is asserted below either way.
+        assert_fail_closed_without_boundary(&evs, &gate, 4);
+    } else {
+        assert!(
+            gate.combined,
+            "the bound reviewer PASS leaves the QE unit's gate green: {:?} {:?}",
+            gate.denial_source, gate.denial_reason
+        );
+    }
     let view = core
         .sessions_detail()
         .unwrap()
