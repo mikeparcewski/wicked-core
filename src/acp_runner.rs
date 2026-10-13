@@ -7596,29 +7596,11 @@ impl AcpStepRunner {
                 reason,
             });
         }
-        // (step 0) A governed turn runs only in a process spawned under the seat floor (a session
-        // an ungoverned unit opened earlier in the run did not arm it), and records that floor in
-        // the shadow log before its first tool call.
+        // (step 0) A governed turn records the seat floor its process spawned under in the shadow
+        // log before its first tool call.
         if input.governance.is_some() {
             match &proc.seat_floor {
-                None => {
-                    let cause = format!(
-                        "[wicked-core] the ACP session for '{cli_key}' was opened without the \
-                         seat floor (by an ungoverned unit), so it cannot carry a governed unit"
-                    );
-                    drop(proc);
-                    self.drop_session_key(&session_key);
-                    return self.fall_back_or_refuse(
-                        &run_id,
-                        &cli_key,
-                        Some(fallback_kind::BINARY_UNAVAILABLE),
-                        &cause,
-                        "",
-                        refuse_fallback,
-                        input,
-                        emit,
-                    );
-                }
+                None => {}
                 Some(sf) => {
                     let dp = crate::gate_hook::decisions_path_for_input(input);
                     let ph = crate::scope::unit_phase(input.unit.ord);
@@ -20129,7 +20111,11 @@ transport = "stdio"
         )
         .unwrap();
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let ledger = home.join("ledger.ndjson");
+        // A HANDED write root: under the step-0 seat floor a governed session writes nowhere
+        // else outside its tree.
+        let ledger_dir = home.join("ledger");
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let ledger = ledger_dir.join("ledger.ndjson");
         let bridge = match acp_binary {
             Some(b) => b.to_path_buf(),
             None => {
@@ -20180,7 +20166,7 @@ acp_input_governance = true
                 human_confirm: Default::default(),
                 db_path: home.join("estate.db").to_string_lossy().to_string(),
                 code_graph_db: None,
-                extra_write_roots: Vec::new(),
+                extra_write_roots: vec![ledger_dir.to_string_lossy().into_owned()],
                 extra_read_roots: Vec::new(),
                 project_id: None,
             }),
@@ -21310,7 +21296,11 @@ while True:
             &[("domain", "wicked-garden-domain")],
         );
         let _snap = EnvPin::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &gen1);
-        let ledger = home.join("ledger.ndjson");
+        // A HANDED write root: under the step-0 seat floor a governed session writes nowhere
+        // else outside its tree.
+        let ledger_dir = home.join("ledger");
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let ledger = ledger_dir.join("ledger.ndjson");
         let bridge = write_permission_asking_bridge(&home);
         let council = home.join(".config").join("wicked-council");
         std::fs::create_dir_all(&council).unwrap();
@@ -21363,7 +21353,7 @@ acp_input_governance = true
                     human_confirm: Default::default(),
                     db_path: db.to_string_lossy().to_string(),
                     code_graph_db: None,
-                    extra_write_roots: Vec::new(),
+                    extra_write_roots: vec![ledger_dir.to_string_lossy().into_owned()],
                     extra_read_roots: Vec::new(),
                     project_id: None,
                 }),
@@ -21562,7 +21552,11 @@ while True:
         .unwrap();
         std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o755)).unwrap();
         let bridge = write_pi_acp_standin(&home);
-        let ledger = home.join("ledger.ndjson");
+        // The stand-in's ledger lives in a HANDED write root: under the step-0 seat floor a
+        // governed session may write nowhere else outside its tree.
+        let ledger_dir = home.join("ledger");
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        let ledger = ledger_dir.join("ledger.ndjson");
         let council = home.join(".config").join("wicked-council");
         std::fs::create_dir_all(&council).unwrap();
         std::fs::write(
@@ -21598,7 +21592,7 @@ acp_input_governance = true
             human_confirm: Default::default(),
             db_path: home.join("estate.db").to_string_lossy().to_string(),
             code_graph_db: None,
-            extra_write_roots: Vec::new(),
+            extra_write_roots: vec![ledger_dir.to_string_lossy().into_owned()],
             extra_read_roots: Vec::new(),
             project_id: None,
         });

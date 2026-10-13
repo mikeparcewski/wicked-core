@@ -3766,12 +3766,20 @@ mod resolve_tests {
             distributed.len(),
             "one sandboxPosture per distributed agent unit"
         );
+        // (step 0) Every governed unit runs under the seat floor, bound to a worktree or not:
+        // the prediction is the host's launcher, else `advisory` naming why.
+        let host = crate::worker_sandbox::predicted_posture(&clis[0], None);
         for (posture, reason) in &postures {
-            assert_eq!(posture, "advisory");
-            // (IG1-core-3) The stub seats sit on the floor, but the run is not bound to a
-            // worktree: the reason names that failure.
-            assert!(reason.contains("not_a_worktree"), "{reason}");
-            assert!(reason.contains("best-effort"), "{reason}");
+            match host {
+                Ok(tool) => {
+                    assert_eq!(posture, "os");
+                    assert!(reason.contains(tool), "{reason}");
+                }
+                Err(_) => {
+                    assert_eq!(posture, "advisory");
+                    assert!(reason.contains("best-effort"), "{reason}");
+                }
+            }
         }
         let session = crate::domain::get_session(&store, &sid).unwrap().unwrap();
         assert_eq!(session.benched_seats.len(), 1);

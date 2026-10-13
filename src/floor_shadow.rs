@@ -9,10 +9,12 @@
 //! (`<decisions dir>/floor-shadow.ndjson`), each line tagged with the unit's phase:
 //!
 //! - `arm`: what the floor was at spawn: the launcher (`sandbox-exec` | `bwrap` | `none`), the
-//!   profile (`governed` | `read-only`), the roots, masks and network grants — or, on Windows, the
-//!   label `no OS floor`. The armed spec is also written to `floor-spec-<phase>.json`, which the
+//!   profile (`governed` | `read-only`), the roots, masks and network grants, and a label:
+//!   `macOS interim floor` for Seatbelt (the interim fallback until the container floor), `no OS
+//!   floor` on Windows. The armed spec is also written to `floor-spec-<phase>.json`, which the
 //!   hook subprocess reads to judge each call against the same floor.
-//! - `call`: one per tool call the old layer judged: the old verdict (`allow` | `deny`), the
+//! - `call`: one per tool call the old layer judged, tagged with the carrier that judged it
+//!   (`wrapped_cli`: the claude gate hook; `acp`: the in-process ACP permission gate): the old verdict (`allow` | `deny`), the
 //!   floor's verdict for the same call (`allow` | `deny` | `unknown` | `none`) with its basis,
 //!   and the agreement class. The floor's verdict is a STATIC prediction from the call's paths
 //!   (a path tool's path; a shell command's literal write targets) judged against the armed spec
@@ -125,7 +127,9 @@ pub(crate) fn record_arm(
             }
             serde_json::json!({
                 "v": SHADOW_VERSION, "kind": "arm", "phase": phase, "carrier": carrier,
-                "cli": cli, "floor": tool, "label": null, "profile": spec.profile,
+                "cli": cli, "floor": tool,
+                "label": (*tool == "sandbox-exec").then_some(crate::worker_sandbox::MACOS_INTERIM_FLOOR),
+                "profile": spec.profile,
                 "tree": spec.tree, "writable": spec.writable, "protected": spec.protected,
                 "readmitted": spec.readmitted, "masks": spec.masks, "net": spec.net,
                 "ts": now_ms(),
@@ -440,9 +444,11 @@ pub(crate) fn agreement(old_allows: bool, floor: FloorVerdict) -> &'static str {
 /// Record one judged tool call: the old layer's verdict (`old_allows`) beside the floor's.
 /// Only for a unit whose floor was recorded at arm time (a spec, or `null` for `no OS floor`, read
 /// as no floor). A call with neither is not a governed floor unit: nothing is recorded.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_call(
     decisions_path: &Path,
     phase: &str,
+    carrier: &str,
     tool: &str,
     input: &serde_json::Value,
     cwd: &Path,
@@ -464,7 +470,7 @@ pub(crate) fn record_call(
         })
         .collect();
     let line = serde_json::json!({
-        "v": SHADOW_VERSION, "kind": "call", "phase": phase, "tool": tool,
+        "v": SHADOW_VERSION, "kind": "call", "phase": phase, "carrier": carrier, "tool": tool,
         "old": if old_allows { "allow" } else { "deny" },
         "floor": p.verdict.as_str(), "basis": p.basis, "targets": targets,
         "agreement": agreement(old_allows, p.verdict), "ts": now_ms(),
@@ -668,10 +674,37 @@ mod tests {
         assert_eq!(load_spec(&decisions, "unit-1").as_ref(), Some(&s));
         let cwd = d.join("wt");
         let outside = serde_json::json!({"file_path": d.join("out/x")});
-        record_call(&decisions, "unit-1", "Write", &outside, &cwd, None, false);
-        record_call(&decisions, "unit-1", "Write", &outside, &cwd, None, true);
+        record_call(
+            &decisions,
+            "unit-1",
+            "wrapped_cli",
+            "Write",
+            &outside,
+            &cwd,
+            None,
+            false,
+        );
+        record_call(
+            &decisions,
+            "unit-1",
+            "wrapped_cli",
+            "Write",
+            &outside,
+            &cwd,
+            None,
+            true,
+        );
         let inside = serde_json::json!({"file_path": "ok.txt"});
-        record_call(&decisions, "unit-1", "Write", &inside, &cwd, None, false);
+        record_call(
+            &decisions,
+            "unit-1",
+            "wrapped_cli",
+            "Write",
+            &inside,
+            &cwd,
+            None,
+            false,
+        );
         let sum = summarize(&decisions, "unit-1").expect("armed unit has a summary");
         assert_eq!(sum["calls"], 3);
         assert_eq!(sum["agree"], 1);
@@ -679,7 +712,9 @@ mod tests {
         assert_eq!(sum["old_denies_floor_allows"], 1);
         record_arm(&decisions, "unit-2", "acp", "pi", &ArmOutcome::NoOsFloor);
         assert!(load_spec(&decisions, "unit-2").is_none());
-        record_call(&decisions, "unit-2", "Write", &inside, &cwd, None, true);
+        record_call(
+            &decisions, "unit-2", "acp", "Write", &inside, &cwd, None, true,
+        );
         let sum2 = summarize(&decisions, "unit-2").unwrap();
         assert_eq!(sum2["no_floor"], 1);
         let text = std::fs::read_to_string(shadow_path(&decisions)).unwrap();

@@ -489,6 +489,11 @@ pub(crate) fn default_worker_sandbox(
 /// The record label of a governed unit that runs with no OS floor (Windows, step 0).
 pub(crate) const NO_OS_FLOOR: &str = "no OS floor";
 
+/// The record label of the macOS (Seatbelt) seat floor: the INTERIM fallback until the container
+/// floor (a required container runtime for governed runs) replaces it. Its profile logic is
+/// isolated in [`sbpl_seat_profile`] so it can be removed cleanly.
+pub(crate) const MACOS_INTERIM_FLOOR: &str = "macOS interim floor";
+
 /// The macOS socket every DNS lookup goes through: without it a host name never resolves.
 const MDNS_SOCKET: &str = "/private/var/run/mDNSResponder";
 
@@ -716,7 +721,11 @@ pub(crate) fn floor_net_grants(env: impl Fn(&str) -> Option<String>) -> Vec<NetG
         }
     };
     for key in FLOOR_URL_ENVS {
-        if let Some((host, port)) = env(key).as_deref().and_then(url_host_port) {
+        if let Some((host, port)) = env(key)
+            .as_deref()
+            .and_then(url_host_port)
+            .filter(|(_, p)| *p != 0)
+        {
             push(if is_loopback_host(&host) {
                 NetGrant::Loopback { port }
             } else {
@@ -730,6 +739,9 @@ pub(crate) fn floor_net_grants(env: impl Fn(&str) -> Option<String>) -> Vec<NetG
             let Ok(port) = port.parse::<u16>() else {
                 continue;
             };
+            if port == 0 {
+                continue;
+            }
             match host {
                 "localhost" | "127.0.0.1" => push(NetGrant::Loopback { port }),
                 "*" => push(NetGrant::AnyHost { port }),
@@ -1294,7 +1306,7 @@ pub(crate) fn plan_seat_floor(launch: SeatLaunch<'_>, write_roots: Vec<PathBuf>)
         env.push(("CLAUDE_CODE_TMPDIR", tmp));
     }
     let mut net = floor_net_grants(|k| std::env::var(k).ok());
-    for p in launch.own_ports {
+    for p in launch.own_ports.iter().filter(|p| **p != 0) {
         let g = NetGrant::Loopback { port: *p };
         if !net.contains(&g) {
             net.push(g);
@@ -1691,6 +1703,7 @@ print('commit=' + str(r.returncode) + ' ' + r.stderr.strip().replace('\n', ' | '
             SeatCli::Claude => vec![(CLAUDE_CONFIG_DIR_ENV, root.to_path_buf())],
             SeatCli::Codex => vec![(CODEX_HOME_ENV, root.to_path_buf())],
             SeatCli::Pi => vec![(PI_AGENT_DIR_ENV, root.to_path_buf())],
+            SeatCli::Copilot => vec![(COPILOT_HOME_ENV, root.to_path_buf())],
             SeatCli::Opencode => vec![
                 (XDG_CONFIG_HOME_ENV, root.join("config")),
                 (XDG_DATA_HOME_ENV, root.join("data")),
@@ -1749,6 +1762,7 @@ print('commit=' + str(r.returncode) + ' ' + r.stderr.strip().replace('\n', ' | '
             .current_dir(&f.own)
             .stdin(std::process::Stdio::null())
             .env("HOME", &f.home)
+            .env("OPH", &f.home)
             .env("TMPDIR", f.own.join("tmp"))
             .env("OUT", &f.outside)
             .env("SIB", &f.sibling)
@@ -1767,11 +1781,20 @@ print('commit=' + str(r.returncode) + ' ' + r.stderr.strip().replace('\n', ' | '
             cmd.env(k, v);
         }
         let out = cmd.output().expect("the floored worker spawns");
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|l| l.split_once('='))
-            .map(|(k, v)| (k.to_string(), v.trim().to_string()))
-            .collect()
+        let mut r: std::collections::BTreeMap<String, String> =
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.trim().to_string()))
+                .collect();
+        r.insert(
+            "_stderr".to_string(),
+            String::from_utf8_lossy(&out.stderr)
+                .chars()
+                .take(2000)
+                .collect(),
+        );
+        r
     }
 
     /// The spike's actions as one shell script: each prints `name=ok` or `name=denied`.
@@ -1784,11 +1807,11 @@ t write_out_shell 'echo x > "$OUT/shell-outside.txt"'
 t child_sh_out "/bin/sh -c 'echo c > \"\$OUT/child-sh.txt\"'"
 t child_bash_out "bash -c 'echo c > \"\$OUT/child-bash.txt\"'"
 t sibling_write 'echo x > "$SIB/pwned"'
-t operator_home_write 'echo x > "$HOME/planted"'
+t operator_home_write 'echo x > "$OPH/planted"'
 t seat_home_write 'echo x > "$SEAT/state.json"'
 t tmp_write 'mkdir -p "$TMPDIR" && echo x > "$TMPDIR/t"'
 t notes_write 'echo x > "$NOTES/n.md"'
-t secret_read 'cat "$HOME/.ssh/id_rsa"'
+t secret_read 'cat "$OPH/.ssh/id_rsa"'
 t commit 'git add -A && git commit -qm floor'
 t git_push 'git push -q origin HEAD:refs/heads/escape'
 t nested_sandbox '/usr/bin/sandbox-exec -p "(version 1)(allow default)" /usr/bin/true'
