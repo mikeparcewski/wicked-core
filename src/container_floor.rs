@@ -73,7 +73,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const REAP_TIMEOUT: Duration = Duration::from_secs(20);
 const SWEEP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
-const GATEWAY_PORTS: &[u16] = &[3000, 4000, 6000];
+/// The gateway's listeners a seat may connect to: CONNECT 3000, Anthropic 4000, OpenAI 4001,
+/// MCP 6000 ([`crate::seat_gateway`]).
+const GATEWAY_PORTS: &[u16] = &[3000, 4000, 4001, 6000];
 const SEAT_ENTRY: &str = "/usr/local/bin/wicked-seat-entry";
 const CANARY_FILE: &str = "/wicked-canary/probe";
 
@@ -115,7 +117,7 @@ pub(crate) struct Runtime {
 }
 
 impl Runtime {
-    fn cmd(&self) -> Command {
+    pub(crate) fn cmd(&self) -> Command {
         let mut c = Command::new(&self.cli);
         c.hardened().stdin(Stdio::null());
         if let Some(path) = client_path(&self.cli, std::env::var_os("PATH").as_deref()) {
@@ -962,6 +964,22 @@ pub(crate) fn reap(seat: &SeatContainer) {
     let mut c = rt.cmd();
     c.args(["rm", "--force", name]);
     let _ = output_within(c, REAP_TIMEOUT);
+    // Detach whatever else is attached (the gateway) so the network can go.
+    let mut members = rt.cmd();
+    members.args([
+        "network",
+        "inspect",
+        "--format",
+        "{{range .Containers}}{{.Name}} {{end}}",
+        name,
+    ]);
+    if let Some(o) = output_within(members, PROBE_TIMEOUT).filter(|o| o.status.success()) {
+        for m in String::from_utf8_lossy(&o.stdout).split_whitespace() {
+            let mut d = rt.cmd();
+            d.args(["network", "disconnect", "--force", name, m]);
+            let _ = output_within(d, REAP_TIMEOUT);
+        }
+    }
     // Its own network goes with it. The runtime detaches the container's endpoint asynchronously
     // after `--rm`, so a first removal can find it still in use: retry briefly. An offline seat
     // has no network of its own (`network inspect` fails at once and the loop ends).
@@ -1081,6 +1099,46 @@ pub(crate) struct ArmedContainer {
     pub(crate) argv: Vec<String>,
     pub(crate) tool: &'static str,
     pub(crate) spec: SeatFloor,
+    /// The env the seat reaches the gateway with (its placeholder key, the model base URLs,
+    /// the CONNECT proxy); empty for an offline seat.
+    pub(crate) env: Vec<(String, String)>,
+    /// The seat's gateway registration, released after the unit ([`GatewayLease::release`]).
+    pub(crate) lease: Option<GatewayLease>,
+}
+
+/// One seat's registration on the daemon's gateway: its key is revoked and its records read
+/// when the unit ends.
+#[derive(Debug)]
+pub(crate) struct GatewayLease {
+    runtime: Runtime,
+    dir: PathBuf,
+    gateway: crate::seat_gateway::Gateway,
+    key: String,
+    /// `<run>#<ord>`: the identity the gateway's records carry for this seat.
+    pub(crate) unit: String,
+    since: String,
+}
+
+impl GatewayLease {
+    /// Revoke the seat's key and return what the gateway recorded for it (model requests:
+    /// status, model, tool calls, text, usage — never a credential).
+    pub(crate) fn release(self) -> Vec<crate::seat_gateway::GatewayRecord> {
+        let records = crate::seat_gateway::collect_unit_records(
+            &self.runtime,
+            &self.gateway,
+            &self.since,
+            &self.unit,
+        );
+        if let Err(e) =
+            crate::seat_gateway::deregister_live(&self.runtime, &self.gateway, &self.dir, &self.key)
+        {
+            eprintln!(
+                "wicked-core: gateway key for {} not revoked: {e}",
+                self.unit
+            );
+        }
+        records
+    }
 }
 
 fn tool_name(cli: &Path) -> &'static str {
@@ -1118,6 +1176,7 @@ pub(crate) fn arm(
     argv: &[String],
     run_id: &str,
     ord: u32,
+    gateway_dir: Option<&Path>,
 ) -> Result<ArmedContainer, (FloorUnarmed, String)> {
     let cli = argv
         .first()
@@ -1142,6 +1201,34 @@ pub(crate) fn arm(
     let name = container_name(cli, run_id, ord);
     let network =
         ensure_seat_network(&rt, &name).map_err(|e| (FloorUnarmed::ContainerRuntimeDown, e))?;
+    // The seat's only egress: the daemon's gateway, attached to its network as `agw`, with a
+    // fresh placeholder key. No gateway dir (an engine with no state home) = no egress at all.
+    let (env, lease) = match gateway_dir.filter(|_| network != "none") {
+        Some(dir) => {
+            let down = |e: String| (FloorUnarmed::GatewayUnavailable, e);
+            let gw = crate::seat_gateway::ensure_gateway(&rt, dir).map_err(down)?;
+            crate::seat_gateway::attach(&rt, &gw, &network).map_err(down)?;
+            let unit = format!("{run_id}#{ord}");
+            let key = crate::seat_gateway::UnitKey::new(run_id, &unit, cli);
+            let since = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs().saturating_sub(1).to_string())
+                .unwrap_or_default();
+            crate::seat_gateway::register_live(&rt, &gw, dir, key.clone()).map_err(down)?;
+            (
+                crate::seat_gateway::seat_env_all(&key.key),
+                Some(GatewayLease {
+                    runtime: rt.clone(),
+                    dir: dir.to_path_buf(),
+                    gateway: gw,
+                    key: key.key,
+                    unit,
+                    since,
+                }),
+            )
+        }
+        None => (Vec::new(), None),
+    };
     let user = operator_user();
     let workdir = inp.cwd.canonicalize().unwrap_or_else(|_| inp.cwd.clone());
     let memory = std::env::var(MEMORY_ENV).ok();
@@ -1170,6 +1257,8 @@ pub(crate) fn arm(
         argv: image_argv(argv, cli),
         tool: tool_name(&rt.cli),
         spec,
+        env,
+        lease,
     })
 }
 

@@ -305,6 +305,9 @@ pub(crate) enum FloorUnarmed {
     /// Container floor: the unit's gate hook is a host command the seat container cannot run, and
     /// no hook route from the seat to the engine exists.
     GateHookUnreachable,
+    /// Container floor: the daemon's model gateway (the seat's only egress) could not be started
+    /// or attached.
+    GatewayUnavailable,
 }
 
 impl FloorUnarmed {
@@ -348,6 +351,10 @@ impl FloorUnarmed {
                  container cannot run, and no hook route from the seat to the engine is configured \
                  — refusing rather than running its tool calls unchecked"
             }
+            FloorUnarmed::GatewayUnavailable => {
+                "gateway_unavailable: the daemon's model gateway (agentgateway, the seat's only \
+                 egress) could not be started or attached to the seat's network"
+            }
         }
     }
 
@@ -363,6 +370,7 @@ impl FloorUnarmed {
             FloorUnarmed::NoSeatImage => "no_seat_image",
             FloorUnarmed::ContainerUnsupportedHost => "container_unsupported_host",
             FloorUnarmed::GateHookUnreachable => "gate_hook_unreachable",
+            FloorUnarmed::GatewayUnavailable => "gateway_unavailable",
         }
     }
 }
