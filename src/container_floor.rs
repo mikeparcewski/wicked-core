@@ -200,15 +200,23 @@ pub(crate) fn runtime_candidates(
 pub(crate) fn output_within(mut cmd: Command, limit: Duration) -> Option<std::process::Output> {
     use std::io::Read;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        // Its own group: a deadline kills every helper it started, not only the client.
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd.spawn().ok()?;
     let drain = |p: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             if let Some(mut p) = p {
                 let _ = p.read_to_end(&mut buf);
             }
-            buf
-        })
+            let _ = tx.send(buf);
+        });
+        rx
     };
     let out = drain(
         child
@@ -228,14 +236,21 @@ pub(crate) fn output_within(mut cmd: Command, limit: Duration) -> Option<std::pr
             Ok(Some(s)) => break Some(s),
             Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(50)),
             _ => {
+                #[cfg(unix)]
+                // SAFETY: killpg on the child's own process group (pgid == its pid).
+                unsafe {
+                    libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
             }
         }
     };
-    let stdout = out.join().unwrap_or_default();
-    let stderr = err.join().unwrap_or_default();
+    // Bounded: a descendant still holding a pipe cannot hold this past the deadline.
+    let grace = Duration::from_secs(2);
+    let stdout = out.recv_timeout(grace).unwrap_or_default();
+    let stderr = err.recv_timeout(grace).unwrap_or_default();
     status.map(|status| std::process::Output {
         status,
         stdout,
@@ -758,6 +773,7 @@ fn landrun_end(args: &[String], img: usize) -> Option<usize> {
 }
 
 /// Reaps a seat container when dropped (the end of the run, however it ends).
+#[derive(Debug)]
 pub(crate) struct ReapOnDrop(pub(crate) Option<SeatContainer>);
 
 impl Drop for ReapOnDrop {
@@ -840,6 +856,9 @@ pub(crate) fn finalize(cmd: Command) -> Command {
     let mut land_extra: Vec<String> = Vec::new();
     let mut envs: Vec<(String, Option<std::ffi::OsString>)> = Vec::new();
     let mut ro: Vec<PathBuf> = Vec::new();
+    // Only the variables the carrier set EXPLICITLY reach the seat. Nothing the daemon merely
+    // inherited does — by design: a seat's model credentials come from the gateway's broker,
+    // never from the daemon's environment (an inherited OPENAI_API_KEY stays on the host).
     for (k, v) in cmd.get_envs() {
         let key = k.to_string_lossy().into_owned();
         envs.push((key.clone(), v.map(|v| v.to_os_string())));
@@ -920,6 +939,7 @@ const PATH_OPTS: &[&str] = &[
     "--append-system-prompt-file",
     "--cd",
     "-C",
+    "--skill",
 ];
 
 /// The existing absolute paths `tail` (the CLI argv) names as a [`PATH_OPTS`] value, before
@@ -931,6 +951,15 @@ fn argv_paths(tail: &[String]) -> Vec<PathBuf> {
         let a = tail[i].as_str();
         if a == "--" {
             break;
+        }
+        // A prompt passed as an option's value is text, whatever it spells.
+        // (claude's `-p` is a bare flag: a following `--` still ends the options.)
+        if matches!(a, "-p" | "--prompt" | "-i" | "--interactive") {
+            if tail.get(i + 1).map(String::as_str) == Some("--") {
+                break;
+            }
+            i += 2;
+            continue;
         }
         let value = if PATH_OPTS.contains(&a) {
             i += 1;
@@ -1081,6 +1110,9 @@ pub(crate) struct ArmedContainer {
     pub(crate) argv: Vec<String>,
     pub(crate) tool: &'static str,
     pub(crate) spec: SeatFloor,
+    /// Removes the seat's container and network on every path out of the unit (held by the
+    /// caller until the unit ends; `run_bounded`'s own reap makes it a no-op on the normal path).
+    pub(crate) cleanup: ReapOnDrop,
 }
 
 fn tool_name(cli: &Path) -> &'static str {
@@ -1118,6 +1150,7 @@ pub(crate) fn arm(
     argv: &[String],
     run_id: &str,
     ord: u32,
+    read_roots: &[PathBuf],
 ) -> Result<ArmedContainer, (FloorUnarmed, String)> {
     let cli = argv
         .first()
@@ -1138,10 +1171,40 @@ pub(crate) fn arm(
     static SWEEP: Once = Once::new();
     SWEEP.call_once(|| sweep(&rt, SWEEP_AGE));
     let image = ensure_seat_image(&rt, cli).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
-    let mounts = mount_plan(&spec).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
+    // A seat's only route out is the daemon's model gateway; this engine has none, so only an
+    // offline seat runs (an `--internal` network alone still reaches the VM host's services).
+    if !offline_seats() {
+        return Err((
+            FloorUnarmed::GatewayUnavailable,
+            format!("no model gateway is configured; set {NETWORK_ENV}=none for an offline seat"),
+        ));
+    }
+    // The engine's launch files are bound read-only: each must exist before the mounts are
+    // rendered (a fresh phase's floor spec is written after arming).
+    for p in &spec.pinned {
+        if !p.exists() {
+            let made = p
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|_| std::fs::File::create(p).map(|_| ()));
+            if let Err(e) = made {
+                return Err((
+                    FloorUnarmed::RootUnresolvable,
+                    format!("pinned launch file {}: {e}", p.display()),
+                ));
+            }
+        }
+    }
+    let mut mounts = mount_plan(&spec).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
+    add_read_roots(&mut mounts, read_roots);
     let name = container_name(cli, run_id, ord);
     let network =
         ensure_seat_network(&rt, &name).map_err(|e| (FloorUnarmed::ContainerRuntimeDown, e))?;
+    // Owned from here: whatever happens before the seat runs, its network goes.
+    let cleanup = ReapOnDrop(Some(SeatContainer {
+        runtime: rt.cli.clone(),
+        name: name.clone(),
+    }));
     let user = operator_user();
     let workdir = inp.cwd.canonicalize().unwrap_or_else(|_| inp.cwd.clone());
     let memory = std::env::var(MEMORY_ENV).ok();
@@ -1170,7 +1233,28 @@ pub(crate) fn arm(
         argv: image_argv(argv, cli),
         tool: tool_name(&rt.cli),
         spec,
+        cleanup,
     })
+}
+
+/// Mount the unit's read roots (its governance read roots, its skills delivery) read-only when
+/// no mount exposes them yet and no mask covers them. They are readable on the host floor; in a
+/// container only what is mounted exists.
+pub(crate) fn add_read_roots(mounts: &mut Vec<Mount>, read_roots: &[PathBuf]) {
+    for r in read_roots {
+        let Some(p) = crate::worker_sandbox::canon_lenient(r) else {
+            continue;
+        };
+        let masked = mounts
+            .iter()
+            .any(|m| !matches!(m, Mount::Bind { .. }) && p.starts_with(m.dst()));
+        let covered = mounts
+            .iter()
+            .any(|m| matches!(m, Mount::Bind { .. }) && p.starts_with(m.dst()));
+        if p.exists() && mountable(&p) && !masked && !covered {
+            mounts.push(Mount::Bind { path: p, rw: false });
+        }
+    }
 }
 
 /// `wicked-core seat-image build [<cli>…|all]` / `seat-image status`: build the seat images
@@ -1813,6 +1897,10 @@ mod tests {
         assert!(argv_paths(&s(&["codex", "exec", "--", &format!("--settings={p}")])).is_empty());
         assert!(argv_paths(&s(&["claude", "-p", &p])).is_empty());
         assert!(argv_paths(&s(&["claude", "--model", &p])).is_empty());
+        // Codex review r2: a prompt passed as an option value is text.
+        assert!(argv_paths(&s(&["copilot", "-p", &format!("--settings={p}")])).is_empty());
+        // claude's bare `-p` before the guard still ends at `--`.
+        assert!(argv_paths(&s(&["claude", "-p", "--", &format!("--settings={p}")])).is_empty());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1910,6 +1998,71 @@ mod tests {
         let has = |pair: &[&str]| land.windows(2).any(|w| w == pair);
         assert!(has(&["--bind-tcp", "4567"]) && has(&["--connect-tcp", "4567"]));
         assert!(!has(&["--bind-tcp", "3000"]));
+    }
+
+    /// Codex review r2 (P2): read roots and the skills delivery are mounted read-only for every
+    /// container launch, never over a mask.
+    #[test]
+    fn read_roots_are_mounted_read_only_unless_covered_or_masked() {
+        let base = tmp("rr");
+        let (tree, skills, home, secret) = (
+            base.join("wt"),
+            base.join("skills"),
+            base.join("home"),
+            base.join("home/.ssh"),
+        );
+        for d in [&tree, &skills, &secret] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let mut mounts = vec![
+            Mount::Bind {
+                path: tree.clone(),
+                rw: true,
+            },
+            Mount::Tmpfs {
+                path: secret.clone(),
+            },
+        ];
+        add_read_roots(
+            &mut mounts,
+            &[
+                skills.clone(),
+                tree.join("sub"),
+                secret.join("id"),
+                base.join("missing"),
+            ],
+        );
+        assert_eq!(
+            mounts,
+            vec![
+                Mount::Bind {
+                    path: tree.clone(),
+                    rw: true
+                },
+                Mount::Tmpfs {
+                    path: secret.clone()
+                },
+                Mount::Bind {
+                    path: skills.clone(),
+                    rw: false
+                },
+            ]
+        );
+        let _ = home;
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Codex review r2 (P2): a runtime call past its deadline returns at the deadline even when
+    /// a descendant keeps its pipes open.
+    #[cfg(unix)]
+    #[test]
+    fn a_deadline_holds_even_when_a_descendant_keeps_the_pipes() {
+        // spawn-audit: test-only — a shell whose background child holds stdout for 30 s.
+        let mut c = Command::new("sh");
+        c.args(["-c", "sleep 30 & sleep 30"]);
+        let t = Instant::now();
+        assert!(output_within(c, Duration::from_millis(300)).is_none());
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
     }
 
     #[test]

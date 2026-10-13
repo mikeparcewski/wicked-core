@@ -2216,6 +2216,9 @@ impl WrappedCliStepRunner {
             // The environment the seat runs with under its floor (caches and temp redirected into
             // dirs the floor admits), applied after every other temp redirect below.
             let mut floor_env: Vec<(&'static str, PathBuf)> = Vec::new();
+            // Container floor: the armed seat's container + network, removed however the unit
+            // ends (held to the end of this scope).
+            let mut seat_cleanup: Option<crate::container_floor::ReapOnDrop> = None;
             let mut opencode_password: Option<String> = None;
             // A1: a requested kernel floor that cannot arm DISCLOSES AND CONTINUES rather than
             // failing the unit — `detect_worker_sandbox` returns a best-effort (empty-wrapper)
@@ -2319,13 +2322,23 @@ impl WrappedCliStepRunner {
                         crate::worker_sandbox::FloorUnarmed::GateHookUnreachable,
                     )
                 } else if crate::container_floor::container_mode() {
+                    // What the unit may read beyond its tree: the launch's read roots and its
+                    // skills delivery (only mounted paths exist in a container).
+                    let read_roots: Vec<PathBuf> = input
+                        .governance
+                        .iter()
+                        .flat_map(|g| g.extra_read_roots.iter().map(PathBuf::from))
+                        .chain(handed.map(|s| s.root.clone()))
+                        .collect();
                     match crate::container_floor::arm(
                         &plan.inputs,
                         &argv,
                         &input.run_id,
                         input.unit.ord,
+                        &read_roots,
                     ) {
                         Ok(c) => {
+                            seat_cleanup = Some(c.cleanup);
                             argv = c.argv;
                             crate::worker_sandbox::GovernedFloor::Armed(Box::new(
                                 crate::worker_sandbox::ArmedFloor {
@@ -2785,6 +2798,8 @@ impl WrappedCliStepRunner {
             let timeout = crate::workflow::effective_timeout(self.timeout, input.unit.budget_secs);
             let bounded = run_bounded(cmd, timeout, emit, adapter, Some(cancel_token.clone()));
             self.unregister_token(input, &cancel_token);
+            // The seat ran (and `run_bounded` reaped it); release the arm-time guard now.
+            drop(seat_cleanup.take());
             // Step 0 shadow mode: the per-unit comparison of the text fences' and the floor's
             // decisions, appended to the governance log once the unit ends.
             if governed {
