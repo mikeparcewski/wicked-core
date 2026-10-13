@@ -72,28 +72,31 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const REAP_TIMEOUT: Duration = Duration::from_secs(20);
 const SWEEP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const GATEWAY_PORTS: &[u16] = &[3000, 4000, 6000];
-const SEAT_ENTRY: &str = "/usr/local/bin/wicked-seat-entry";
+/// The engine's trusted launcher, from the floor image mounted read-only at [`FLOOR_DIR`]: the
+/// seat's entrypoint, so no code from the seat image runs before the floor holds.
+const SEAT_ENTRY: &str = "/floor/launch";
+/// landrun (static) from the floor image.
+const LANDRUN: &str = "/floor/landrun";
+/// Where the floor image is mounted in every seat.
+const FLOOR_DIR: &str = "/floor";
 const CANARY_FILE: &str = "/wicked-canary/probe";
+/// The loopback port the launcher's network canary listens on (outside every grant; the
+/// launcher refuses a policy that grants it).
+pub(crate) const CANARY_PORT: u16 = 47913;
 
-/// The seat Dockerfiles, by CLI (the registry's seat keys).
-const DOCKERFILES: &[(&str, &str)] = &[
-    (
-        "claude",
-        include_str!("../containers/seats/claude.Dockerfile"),
-    ),
-    (
-        "codex",
-        include_str!("../containers/seats/codex.Dockerfile"),
-    ),
-    ("pi", include_str!("../containers/seats/pi.Dockerfile")),
-    (
-        "opencode",
-        include_str!("../containers/seats/opencode.Dockerfile"),
-    ),
-    (
-        "copilot",
-        include_str!("../containers/seats/copilot.Dockerfile"),
-    ),
+/// The one seat Dockerfile; each CLI is its published package ([`SEAT_PACKAGES`]).
+const SEAT_DOCKERFILE: &str = include_str!("../containers/seats/seat.Dockerfile");
+/// The floor image: static busybox, static landrun and the launcher, never run as a container.
+const FLOOR_DOCKERFILE: &str = include_str!("../containers/floor.Dockerfile");
+
+/// The CLIs the engine ships a seat image for (the registry's seat keys), each with the npm
+/// package at the version the engine is verified against.
+const SEAT_PACKAGES: &[(&str, &str)] = &[
+    ("claude", "@anthropic-ai/claude-code@2.1.287"),
+    ("codex", "@openai/codex@0.162.1"),
+    ("pi", "@earendil-works/pi-coding-agent@1.1.0"),
+    ("opencode", "@opencode/cli@2.0.25"),
+    ("copilot", "@github/copilot@1.0.96"),
 ];
 
 /// Whether governed units run in the container floor on this host ([`SEAT_FLOOR_ENV`]).
@@ -296,14 +299,17 @@ pub(crate) fn runtime() -> Result<Runtime, FloorUnarmed> {
     Err(FloorUnarmed::ContainerRuntimeDown)
 }
 
-/// The seat Dockerfile for `cli`, when the engine ships one.
-pub(crate) fn dockerfile(cli: &str) -> Option<&'static str> {
-    DOCKERFILES.iter().find(|(k, _)| *k == cli).map(|(_, d)| *d)
+/// The npm package of `cli`'s seat image, when the engine ships one.
+pub(crate) fn seat_package(cli: &str) -> Option<&'static str> {
+    SEAT_PACKAGES
+        .iter()
+        .find(|(k, _)| *k == cli)
+        .map(|(_, p)| *p)
 }
 
 /// The CLIs the engine ships a seat image for.
 pub(crate) fn seat_clis() -> impl Iterator<Item = &'static str> {
-    DOCKERFILES.iter().map(|(k, _)| *k)
+    SEAT_PACKAGES.iter().map(|(k, _)| *k)
 }
 
 /// The base image the seat images build on ([`BASE_IMAGE_ENV`], else the default).
@@ -315,20 +321,33 @@ fn base_image() -> String {
         .unwrap_or_else(|| DEFAULT_BASE.to_string())
 }
 
-/// The tag of `cli`'s seat image built on `base`: `wicked-seat-<cli>:<12 hex of sha256(Dockerfile,
-/// base)>`, so an edited Dockerfile or another base is a new image, never a stale one.
-pub(crate) fn seat_image_tag(cli: &str, base: &str) -> Option<String> {
+/// 12 hex of sha256 over `parts` (NUL-separated): an image tag that changes with its inputs.
+fn content_tag(parts: &[&str]) -> String {
     use sha2::{Digest, Sha256};
-    let df = dockerfile(cli)?;
     let mut h = Sha256::new();
-    h.update(df.as_bytes());
-    h.update([0u8]);
-    h.update(base.as_bytes());
-    let hex: String = h.finalize()[..6]
+    for p in parts {
+        h.update(p.as_bytes());
+        h.update([0u8]);
+    }
+    h.finalize()[..6]
         .iter()
         .map(|b| format!("{b:02x}"))
-        .collect();
-    Some(format!("wicked-seat-{cli}:{hex}"))
+        .collect()
+}
+
+/// The tag of `cli`'s seat image built on `base`: `wicked-seat-<cli>:<12 hex of sha256(Dockerfile,
+/// package, base)>`, so an edited Dockerfile, package or base is a new image, never a stale one.
+pub(crate) fn seat_image_tag(cli: &str, base: &str) -> Option<String> {
+    let package = seat_package(cli)?;
+    Some(format!(
+        "wicked-seat-{cli}:{}",
+        content_tag(&[SEAT_DOCKERFILE, package, base])
+    ))
+}
+
+/// The floor image's tag: `wicked-floor:<12 hex of sha256(its Dockerfile)>`.
+pub(crate) fn floor_image_tag() -> String {
+    format!("wicked-floor:{}", content_tag(&[FLOOR_DOCKERFILE]))
 }
 
 /// The operator's own image for `cli` (`WICKED_SEAT_IMAGE_<CLI>`), used as-is.
@@ -340,29 +359,218 @@ fn image_override(cli: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// The image id `tag` names now, so a run uses exactly what was checked.
+fn image_id(rt: &Runtime, tag: &str) -> Option<String> {
+    let mut c = rt.cmd();
+    c.args(["image", "inspect", "--format", "{{.Id}}", tag]);
+    output_within(c, PROBE_TIMEOUT)
+        .filter(|o| o.status.success())
+        .and_then(|o| valid_image_id(String::from_utf8_lossy(&o.stdout).trim()))
+}
+
+/// An immutable local image id as the runtime spells it: docker's `sha256:<64 hex>` or podman's
+/// bare `<64 hex>` (codex ln-r2). Kept in that spelling for the runtime's own later commands.
+fn valid_image_id(id: &str) -> Option<String> {
+    let hex = id.strip_prefix("sha256:").unwrap_or(id);
+    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_string())
+}
+
 fn image_present(rt: &Runtime, tag: &str) -> bool {
     let mut c = rt.cmd();
     c.args(["image", "inspect", "--format", "{{.Id}}", tag]);
     output_within(c, PROBE_TIMEOUT).is_some_and(|o| o.status.success())
 }
 
-/// Build `cli`'s seat image from its Dockerfile alone (no build context), streaming the
-/// runtime's progress to the engine's stderr. `Err` carries the runtime's last words.
+/// Build `cli`'s seat image from the seat Dockerfile alone (no build context).
 pub(crate) fn build_seat_image(rt: &Runtime, cli: &str) -> Result<String, String> {
-    let df = dockerfile(cli).ok_or_else(|| format!("no seat image is defined for `{cli}`"))?;
+    let package =
+        seat_package(cli).ok_or_else(|| format!("no seat image is defined for `{cli}`"))?;
     let base = base_image();
-    let tag = seat_image_tag(cli, &base).expect("dockerfile exists");
+    let tag = seat_image_tag(cli, &base).expect("package exists");
+    build_image(
+        rt,
+        SEAT_DOCKERFILE,
+        &tag,
+        &[
+            format!("BASE={base}"),
+            format!("CLI={cli}"),
+            format!("CLI_PACKAGE={package}"),
+        ],
+    )
+}
+
+/// The floor image ([`FLOOR_DOCKERFILE`]), built on first use (one build at a time).
+pub(crate) fn ensure_floor_image(rt: &Runtime) -> Result<String, String> {
+    static BUILD: Mutex<()> = Mutex::new(());
+    let tag = floor_image_tag();
+    if image_present(rt, &tag) {
+        return Ok(tag);
+    }
+    let _one = BUILD.lock();
+    if image_present(rt, &tag) {
+        return Ok(tag);
+    }
+    eprintln!("wicked-core: building floor image {tag} (first use)");
+    build_image(rt, FLOOR_DOCKERFILE, &tag, &[])
+}
+
+/// What the engine learned about one seat image (by image id): the paths in its root filesystem
+/// that are symbolic links, and whether it declares volumes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ImageFacts {
+    /// The image id the facts are about: the seat runs THIS id, never a tag that could move
+    /// between the inspection and the run.
+    pub(crate) id: String,
+    pub(crate) symlinks: std::collections::BTreeSet<PathBuf>,
+    pub(crate) volumes: Vec<String>,
+    /// The image declares an active `HEALTHCHECK`: the runtime would exec it beside the seat,
+    /// outside `/floor/launch` and its Landlock domain.
+    pub(crate) healthcheck: bool,
+}
+
+/// The facts of `image`, read by the engine's OWN code on its OWN root filesystem: the floor image
+/// runs `find -type l` over the seat image mounted as data (`--mount type=image`), so nothing of
+/// the seat image runs and none of its links is followed. Memoized per image id.
+pub(crate) fn inspect_seat_image(
+    rt: &Runtime,
+    floor: &str,
+    image: &str,
+) -> Result<ImageFacts, String> {
+    static SEEN: Mutex<Option<std::collections::HashMap<String, ImageFacts>>> = Mutex::new(None);
     let mut c = rt.cmd();
     c.args([
-        "build",
-        "--label",
-        &format!("{SEAT_LABEL}=1"),
-        "--build-arg",
-        &format!("BASE={base}"),
-        "-t",
-        &tag,
-        "-",
+        "image",
+        "inspect",
+        "--format",
+        "{{.Id}} {{json .Config}}",
+        image,
     ]);
+    let out = output_within(c, PROBE_TIMEOUT)
+        .filter(|o| o.status.success())
+        .ok_or_else(|| format!("could not inspect seat image {image}"))?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let (id, config) = text
+        .trim()
+        .split_once(' ')
+        .and_then(|(id, c)| Some((valid_image_id(id)?, c)))
+        .ok_or_else(|| format!("could not inspect seat image {image}"))?;
+    let id = id.as_str();
+    if let Some(f) = SEEN.lock().ok().and_then(|m| m.as_ref()?.get(id).cloned()) {
+        return Ok(f);
+    }
+    let config: serde_json::Value = serde_json::from_str(config).unwrap_or_default();
+    let volumes: Vec<String> = config
+        .get("Volumes")
+        .and_then(|v| v.as_object())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    // `{"Test": ["NONE"]}` (or no test) is a disabled check; anything else would run.
+    let healthcheck = config
+        .pointer("/Healthcheck/Test")
+        .and_then(|t| t.as_array())
+        .and_then(|t| t.first())
+        .and_then(|t| t.as_str())
+        .is_some_and(|first| first != "NONE");
+    let mut c = rt.cmd();
+    c.args([
+        "run",
+        "--rm",
+        "--pull",
+        "never",
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        // Read every directory of the image, whatever its modes (no write, no other privilege).
+        "--cap-add",
+        "DAC_READ_SEARCH",
+        "--security-opt",
+        "no-new-privileges",
+        "--user",
+        "0:0",
+        "--mount",
+        &format!("type=image,src={id},dst=/seat"),
+        "--entrypoint",
+        "/busybox",
+        floor,
+        "find",
+        "/seat",
+        "-xdev",
+        "-type",
+        "l",
+        "-print0",
+    ]);
+    let out = output_within(c, Duration::from_secs(120))
+        .ok_or_else(|| format!("inspecting seat image {image} did not finish"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "inspecting seat image {image} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let symlinks = out
+        .stdout
+        .split(|b| *b == 0)
+        .filter_map(|p| std::str::from_utf8(p).ok())
+        .filter_map(|p| p.strip_prefix("/seat"))
+        .filter(|p| p.starts_with('/'))
+        .map(PathBuf::from)
+        .collect();
+    let facts = ImageFacts {
+        id: id.to_string(),
+        symlinks,
+        volumes,
+        healthcheck,
+    };
+    if let Ok(mut m) = SEEN.lock() {
+        m.get_or_insert_with(Default::default)
+            .insert(id.to_string(), facts.clone());
+    }
+    Ok(facts)
+}
+
+/// Refuse a seat image that could move a mount: a declared volume (the runtime mounts it from the
+/// image, deeper mounts win), or a symbolic link at any path a mount lands on, or at any of its
+/// ancestors (the runtime follows image links when it resolves a mount destination, so a link at
+/// `/floor` or at a worktree's path would put the trusted launcher, or the seat's writable tree,
+/// somewhere the image chose).
+pub(crate) fn check_seat_image(facts: &ImageFacts, dests: &[PathBuf]) -> Result<(), String> {
+    if let Some(v) = facts.volumes.first() {
+        return Err(format!(
+            "the seat image declares a volume ({v}); seat images may not declare volumes"
+        ));
+    }
+    if facts.healthcheck {
+        return Err(
+            "the seat image declares a HEALTHCHECK, which the runtime would run outside the seat \
+             launcher; seat images may not declare one (use HEALTHCHECK NONE)"
+                .into(),
+        );
+    }
+    let reserved = [FLOOR_DIR, "/wicked-canary", "/tmp", "/home/seat"].map(PathBuf::from);
+    for d in reserved.iter().chain(dests) {
+        if let Some(link) = d.ancestors().find(|a| facts.symlinks.contains(*a)) {
+            return Err(format!(
+                "the seat image has a symbolic link at {} (where the mount {} resolves); refusing it",
+                link.display(),
+                d.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Build `df` alone (no build context) as `tag`, streaming the runtime's progress to the engine's
+/// stderr. `Err` carries the runtime's last words.
+fn build_image(rt: &Runtime, df: &str, tag: &str, build_args: &[String]) -> Result<String, String> {
+    let tag = tag.to_string();
+    let mut c = rt.cmd();
+    c.args(["build", "--label", &format!("{SEAT_LABEL}=1")]);
+    for a in build_args {
+        c.args(["--build-arg", a]);
+    }
+    c.args(["-t", &tag, "-"]);
     c.stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped());
@@ -520,6 +728,11 @@ fn mountable(p: &Path) -> bool {
     p.is_absolute()
         && p.to_str()
             .is_some_and(|s| !s.contains([',', '"', '\'', '\n', '=']))
+        // The engine's own paths in the seat: a host bind there would shadow the trusted launcher
+        // or the canary.
+        && ![FLOOR_DIR, "/wicked-canary"]
+            .iter()
+            .any(|r| p.starts_with(r))
 }
 
 /// The mounts that render `f`, in the floor's order (later wins at one path): the writable roots
@@ -598,6 +811,8 @@ pub(crate) struct ContainerLaunch<'a> {
     /// `uid:gid` the seat runs as (the operator's, so its writes land owned by them).
     pub(crate) user: &'a str,
     pub(crate) mounts: &'a [Mount],
+    /// The floor image (the trusted launcher), mounted read-only at [`FLOOR_DIR`].
+    pub(crate) floor: &'a str,
     pub(crate) memory: &'a str,
     /// The only TCP destination ports the CLI may connect to.
     pub(crate) gateway_ports: &'a [u16],
@@ -620,6 +835,7 @@ const VALUE_OPTS: &[&str] = &[
     "--workdir",
     "--mount",
     "--env",
+    "--entrypoint",
 ];
 const FLAG_OPTS: &[&str] = &["--rm", "--interactive", "--init", "--read-only"];
 
@@ -636,11 +852,13 @@ fn memory_from(choice: Option<&str>) -> &str {
 /// entry's second invocation checks enforcement inside this domain before executing the CLI.
 fn landrun_prefix(mounts: &[Mount], gateway_ports: &[u16], own_ports: &[u16]) -> Vec<String> {
     let mut out = vec![
-        "landrun".into(),
+        LANDRUN.into(),
         "--best-effort".into(),
         "--ignore-missing".into(),
     ];
-    for p in ["/usr", "/bin", "/lib", "/lib64", "/sbin", "/opt", "/etc"] {
+    for p in [
+        "/usr", "/bin", "/lib", "/lib64", "/sbin", "/opt", "/etc", FLOOR_DIR,
+    ] {
         out.extend(["--rox".into(), p.into()]);
     }
     // Kernel metadata and devices are image facilities, not host bind mounts. `/dev/null`
@@ -728,8 +946,15 @@ pub(crate) fn run_argv(l: &ContainerLaunch<'_>) -> Vec<String> {
         w.push("--mount".into());
         w.push(m.render());
     }
+    // The engine's trusted launcher, read-only from its floor image: the entrypoint, so the
+    // seat image's own entrypoint never runs (a custom or operator image cannot run code before
+    // the canary and Landlock hold).
+    w.push("--mount".into());
+    w.push(format!("type=image,src={},dst={FLOOR_DIR}", l.floor));
+    w.push("--entrypoint".into());
+    w.push(SEAT_ENTRY.into());
     w.push(l.image.into());
-    w.extend([SEAT_ENTRY.into(), CANARY_FILE.into(), "--".into()]);
+    w.extend([CANARY_FILE.into(), "--".into()]);
     w.extend(landrun_prefix(l.mounts, l.gateway_ports, l.own_ports));
     w
 }
@@ -763,11 +988,18 @@ fn image_index(args: &[String]) -> Option<usize> {
 /// The end of our landrun options, walking their dialect rather than searching the CLI's argv
 /// (a prompt may contain `--`, `landrun` or the entry's name).
 fn landrun_end(args: &[String], img: usize) -> Option<usize> {
-    let head = args.get(img + 1..img + 5)?;
-    if head != [SEAT_ENTRY, CANARY_FILE, "--", "landrun"] {
+    let head = args.get(img + 1..img + 4)?;
+    if head != [CANARY_FILE, "--", LANDRUN] {
         return None;
     }
-    let mut i = img + 5;
+    // The launcher must be ours: the floor mount and the entrypoint precede the image.
+    if !args[..img]
+        .windows(2)
+        .any(|w| w == ["--entrypoint", SEAT_ENTRY])
+    {
+        return None;
+    }
+    let mut i = img + 4;
     while let Some(a) = args.get(i) {
         match a.as_str() {
             "--best-effort" | "--ignore-missing" => i += 1,
@@ -900,7 +1132,7 @@ pub(crate) fn finalize(cmd: Command) -> Command {
         if !HOST_ONLY_ENV.contains(&key.as_str()) {
             extra.push("--env".into());
             extra.push(key.clone());
-            if !args[img + 4..land_end]
+            if !args[img + 3..land_end]
                 .windows(2)
                 .any(|w| w == ["--env", &key])
             {
@@ -1254,7 +1486,7 @@ pub(crate) fn arm(
         .first()
         .map(|b| wicked_apps_core::spawn::SeatCli::from_binary(b))
         .and_then(|c| c.root_name())
-        .filter(|c| dockerfile(c).is_some() || image_override(c).is_some())
+        .filter(|c| seat_package(c).is_some() || image_override(c).is_some())
         .ok_or_else(|| {
             (
                 FloorUnarmed::NoSeatImage,
@@ -1289,6 +1521,9 @@ pub(crate) fn arm(
     static SWEEP: Once = Once::new();
     SWEEP.call_once(|| sweep(&rt, SWEEP_AGE));
     let image = ensure_seat_image(&rt, cli).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
+    let floor_image = ensure_floor_image(&rt)
+        .and_then(|t| image_id(&rt, &t).ok_or_else(|| format!("floor image {t} vanished")))
+        .map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
     // A seat's only route out is the daemon's model gateway; this engine has none, so only an
     // offline seat runs (an `--internal` network alone still reaches the VM host's services).
     if !offline_seats() {
@@ -1303,6 +1538,17 @@ pub(crate) fn arm(
     add_read_roots(&mut mounts, read_roots);
     let mut argv = argv.to_vec();
     mount_argv_paths(&mut mounts, &mut argv, prompt);
+    // The seat image cannot move a mount (a link where one lands, a declared volume).
+    let dests: Vec<PathBuf> = mounts
+        .iter()
+        .map(|m| m.dst().to_path_buf())
+        .chain(std::iter::once(
+            inp.cwd.canonicalize().unwrap_or_else(|_| inp.cwd.clone()),
+        ))
+        .collect();
+    let image = inspect_seat_image(&rt, &floor_image, &image)
+        .and_then(|f| check_seat_image(&f, &dests).map(|()| f.id))
+        .map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
     let name = container_name(cli, run_id, ord);
     let network =
         ensure_seat_network(&rt, &name).map_err(|e| (FloorUnarmed::ContainerRuntimeDown, e))?;
@@ -1330,6 +1576,7 @@ pub(crate) fn arm(
         workdir: &workdir,
         user: &user,
         mounts: &mounts,
+        floor: &floor_image,
         memory: memory_from(memory.as_deref()),
         gateway_ports: GATEWAY_PORTS,
         own_ports: &own_ports,
@@ -1517,6 +1764,13 @@ pub fn seat_image_main(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("build") => {
             let mut rc = 0;
+            match ensure_floor_image(&rt) {
+                Ok(tag) => println!("floor: {tag}"),
+                Err(e) => {
+                    eprintln!("floor: {e}");
+                    rc = 1;
+                }
+            }
             for cli in &wanted {
                 match build_seat_image(&rt, cli) {
                     Ok(tag) => println!("{cli}: built {tag}"),
@@ -1530,6 +1784,15 @@ pub fn seat_image_main(args: &[String]) -> i32 {
         }
         Some("status") => {
             println!("runtime: {}", rt.cli.display());
+            let floor = floor_image_tag();
+            println!(
+                "floor: {floor} {}",
+                if image_present(&rt, &floor) {
+                    "present"
+                } else {
+                    "missing"
+                }
+            );
             for cli in &wanted {
                 let tag = image_override(cli)
                     .or_else(|| seat_image_tag(cli, &base_image()))
@@ -1614,11 +1877,16 @@ mod tests {
     }
 
     #[test]
-    fn every_seat_cli_has_a_dockerfile_on_an_oss_base_and_a_stable_hashed_tag() {
+    fn every_seat_cli_has_a_package_on_the_one_oss_seat_image_and_a_stable_hashed_tag() {
+        assert!(SEAT_DOCKERFILE.contains("FROM ${BASE}"));
+        assert!(SEAT_DOCKERFILE.contains("wicked.seat.cli=${CLI}"));
+        assert!(SEAT_DOCKERFILE.contains("ENTRYPOINT []"));
+        let mut tags = Vec::new();
         for cli in ["claude", "codex", "pi", "opencode", "copilot"] {
-            let df = dockerfile(cli).unwrap_or_else(|| panic!("{cli} has a Dockerfile"));
-            assert!(df.contains("FROM ${BASE}"), "{cli}");
-            assert!(df.contains(&format!("wicked.seat.cli={cli}")), "{cli}");
+            let pkg = seat_package(cli).unwrap_or_else(|| panic!("{cli} has a package"));
+            assert!(pkg
+                .rsplit_once('@')
+                .is_some_and(|(n, v)| !n.is_empty() && !v.is_empty()));
             let a = seat_image_tag(cli, DEFAULT_BASE).unwrap();
             assert_eq!(a, seat_image_tag(cli, DEFAULT_BASE).unwrap());
             assert!(a.starts_with(&format!("wicked-seat-{cli}:")), "{a}");
@@ -1627,8 +1895,142 @@ mod tests {
                 seat_image_tag(cli, "debian:trixie").unwrap(),
                 "base is in the tag"
             );
+            tags.push(a.split_once(':').unwrap().1.to_string());
         }
-        assert!(dockerfile("agy").is_none());
+        tags.dedup();
+        assert_eq!(tags.len(), 5, "the package is in the tag");
+        assert!(seat_package("agy").is_none());
+    }
+
+    /// The floor image is static and never runs as a container: the trusted launcher, a static
+    /// busybox and landrun built static from source (the release asset links glibc).
+    /// Codex ln-r1 (P1): a seat image cannot move a mount: a declared volume, or a link at a
+    /// mount destination or any of its ancestors (`/floor`, a worktree's path), is refused.
+    #[test]
+    fn a_seat_image_that_could_move_a_mount_is_refused() {
+        let facts = |links: &[&str], vols: &[&str]| ImageFacts {
+            id: "sha256:t".into(),
+            symlinks: links.iter().map(PathBuf::from).collect(),
+            volumes: vols.iter().map(|v| v.to_string()).collect(),
+            healthcheck: false,
+        };
+        let dests = vec![
+            PathBuf::from("/Users/op/wt"),
+            PathBuf::from("/Users/op/clone/.git"),
+        ];
+        // A Debian base's own links (/bin, /lib, /var/run) are not on any mount's path.
+        assert!(check_seat_image(&facts(&["/bin", "/lib", "/var/run"], &[]), &dests).is_ok());
+        for bad in [
+            "/floor",
+            "/wicked-canary",
+            "/tmp",
+            "/home",
+            "/Users",
+            "/Users/op/wt",
+        ] {
+            let e = check_seat_image(&facts(&[bad], &[]), &dests).unwrap_err();
+            assert!(e.contains("symbolic link"), "{bad}: {e}");
+        }
+        let e = check_seat_image(&facts(&[], &["/opt/evil"]), &dests).unwrap_err();
+        assert!(e.contains("declares a volume"), "{e}");
+        // Codex ln-r3 (P1): a health check is runtime-exec'd outside the launcher's Landlock.
+        let mut hc = facts(&[], &[]);
+        hc.healthcheck = true;
+        let e = check_seat_image(&hc, &dests).unwrap_err();
+        assert!(e.contains("HEALTHCHECK"), "{e}");
+    }
+
+    /// LIVE (`WICKED_CONTAINER_LIVE=1`): codex ln-r1's hostile image (`/floor` -> a dir it then
+    /// declares as a volume, with its own `launch`) is refused by the engine's inspection, which
+    /// runs only the floor's own busybox over the image as data; the engine's seat image passes.
+    #[cfg(unix)]
+    #[test]
+    fn live_a_hostile_seat_image_is_refused_before_it_runs() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        let rt = runtime().expect("a container runtime answers");
+        let floor = ensure_floor_image(&rt).expect("the floor image");
+        let good = ensure_seat_image(&rt, "claude").expect("the claude seat image");
+        let dests = vec![PathBuf::from("/Users/op/wt")];
+        let f = inspect_seat_image(&rt, &floor, &good).expect("inspected");
+        assert!(
+            f.symlinks.contains(Path::new("/bin")),
+            "the base's own links are seen"
+        );
+        check_seat_image(&f, &dests).expect("the engine's seat image passes");
+        assert!(
+            valid_image_id(&f.id).is_some(),
+            "the seat runs the inspected id: {}",
+            f.id
+        );
+        let df = "FROM busybox:1.37-musl\nRUN mkdir -p /opt/evil && ln -s /opt/evil /floor && printf '#!/bin/sh\\necho BYPASSED\\n' > /opt/evil/launch && chmod 0755 /opt/evil/launch\nVOLUME [\"/opt/evil\"]\n";
+        let tag = "wicked-test-hostile-seat:1";
+        build_image(&rt, df, tag, &[]).expect("hostile image built");
+        let f = inspect_seat_image(&rt, &floor, tag).expect("inspected");
+        assert!(f.symlinks.contains(Path::new("/floor")), "{f:?}");
+        let e = check_seat_image(&f, &dests).unwrap_err();
+        assert!(e.contains("volume") || e.contains("symbolic link"), "{e}");
+        // Codex ln-r3's image: no volume, no link, an active HEALTHCHECK -> refused.
+        let df = "FROM busybox:1.37-musl\nHEALTHCHECK --interval=100ms CMD [\"/bin/sh\", \"-c\", \"printf BYPASSED > /wicked-canary/healthcheck-bypass\"]\n";
+        let hc_tag = "wicked-test-healthcheck-seat:1";
+        build_image(&rt, df, hc_tag, &[]).expect("healthcheck image built");
+        let f = inspect_seat_image(&rt, &floor, hc_tag).expect("inspected");
+        assert!(f.healthcheck, "{f:?}");
+        let e = check_seat_image(&f, &dests).unwrap_err();
+        assert!(e.contains("HEALTHCHECK"), "{e}");
+        let mut rm = rt.cmd();
+        rm.args(["image", "rm", "-f", tag, hc_tag]);
+        let _ = output_within(rm, PROBE_TIMEOUT);
+    }
+
+    /// Codex ln-r2 (P2): both runtimes' image id spellings are immutable ids; nothing else is.
+    #[test]
+    fn image_ids_in_both_runtime_spellings_are_accepted() {
+        let hex = "a".repeat(64);
+        assert_eq!(
+            valid_image_id(&format!("sha256:{hex}")),
+            Some(format!("sha256:{hex}"))
+        );
+        assert_eq!(valid_image_id(&hex), Some(hex.clone()));
+        for bad in [
+            "",
+            "sha256:",
+            "seat:test",
+            &"a".repeat(63),
+            &format!("sha256:{}", "g".repeat(64)),
+        ] {
+            assert_eq!(valid_image_id(bad), None, "{bad}");
+        }
+    }
+
+    /// No host path is ever mounted over the trusted launcher or the canary.
+    #[test]
+    fn the_launcher_and_canary_paths_are_never_mounted_over() {
+        for p in ["/floor", "/floor/launch", "/wicked-canary/probe"] {
+            assert!(!mountable(Path::new(p)), "{p}");
+        }
+        assert!(mountable(Path::new("/floorplans/x")));
+        let mut mounts = Vec::new();
+        add_read_roots(&mut mounts, &[PathBuf::from("/floor")]);
+        assert!(mounts.is_empty());
+    }
+
+    #[test]
+    fn the_floor_image_is_the_static_trusted_launcher() {
+        let df = FLOOR_DOCKERFILE;
+        assert!(df.contains("FROM scratch"));
+        assert!(df.contains("CGO_ENABLED=0"));
+        assert!(df.contains("github.com/zouuup/landrun/cmd/landrun@v0.1.17"));
+        assert!(df.contains("busybox:1.37-musl"));
+        assert!(df.contains(&format!("port={CANARY_PORT}")));
+        assert!(df.contains("#!/floor/busybox sh"));
+        assert_eq!(floor_image_tag(), floor_image_tag());
+        assert!(floor_image_tag().starts_with("wicked-floor:"));
     }
 
     #[test]
@@ -1645,6 +2047,7 @@ mod tests {
             workdir: Path::new("/w/tree"),
             user: "502:20",
             mounts: &mounts,
+            floor: "wicked-floor:t",
             memory: "3g",
             gateway_ports: GATEWAY_PORTS,
             own_ports: &[],
@@ -1664,6 +2067,13 @@ mod tests {
         assert!(has(&["--memory", "3g"]));
         let img = image_index(&w[1..]).unwrap();
         assert_eq!(w[img + 1], "wicked-seat-claude:abc");
+        // The trusted launcher: the floor image mounted read-only, its launcher the entrypoint.
+        assert!(has(&[
+            "--mount",
+            "type=image,src=wicked-floor:t,dst=/floor"
+        ]));
+        assert!(has(&["--entrypoint", "/floor/launch"]));
+        assert_eq!(&w[img + 2..img + 5], &[CANARY_FILE, "--", LANDRUN]);
         assert_eq!(
             &w[w.len() - 5..],
             &["--", SEAT_ENTRY, "--check", CANARY_FILE, "--"]
@@ -1762,6 +2172,7 @@ mod tests {
             workdir: Path::new("/tmp"),
             user: "1000:1000",
             mounts: &[],
+            floor: "wicked-floor:t",
             memory: memory_from(Some(" 6g ")),
             gateway_ports: &[],
             own_ports: &[],
@@ -1855,6 +2266,7 @@ mod tests {
             workdir: &tree,
             user: "1:1",
             mounts: &mounts,
+            floor: "wicked-floor:t",
             memory: "3g",
             gateway_ports: GATEWAY_PORTS,
             own_ports: &[],
@@ -1905,7 +2317,7 @@ mod tests {
                 "runtime receives {key}"
             );
             assert!(
-                has_in(&args[img + 4..land_end], &["--env", key]),
+                has_in(&args[img + 3..land_end], &["--env", key]),
                 "landrun receives {key}"
             );
         }
@@ -1920,12 +2332,12 @@ mod tests {
             "the seat's PATH = mounted carrier entries + the image's: {args:?}"
         );
         assert!(
-            has_in(&args[img + 4..land_end], &["--env", "PATH"]),
+            has_in(&args[img + 3..land_end], &["--env", "PATH"]),
             "landrun forwards the IMAGE path"
         );
         for key in ["HOME", "TMPDIR", "LANG"] {
             assert_eq!(
-                args[img + 4..land_end]
+                args[img + 3..land_end]
                     .windows(2)
                     .filter(|w| *w == ["--env", key])
                     .count(),
@@ -1952,7 +2364,7 @@ mod tests {
         // A prompt word that happens to be a path is not a mount.
         assert!(!args.iter().any(|a| a.contains("dst=/etc/passwd")));
         assert!(has_in(
-            &args[img + 4..land_end],
+            &args[img + 3..land_end],
             &["--rox", skills.to_str().unwrap()]
         ));
         assert_eq!(
@@ -2019,6 +2431,7 @@ mod tests {
             return;
         }
         let rt = runtime().expect("a container runtime answers");
+        let floor = ensure_floor_image(&rt).expect("the floor image");
         let image = ensure_seat_image(&rt, "claude").expect("the claude seat image");
         let base = tmp("live");
         let clone = base.join("clone");
@@ -2060,6 +2473,7 @@ mod tests {
             workdir: &tree,
             user: &user,
             mounts: &mounts,
+            floor: &floor,
             memory: "3g",
             gateway_ports: GATEWAY_PORTS,
             own_ports: &[],
@@ -2094,7 +2508,7 @@ mod tests {
         eprintln!("--- seat stdout ---\n{so}--- seat stderr ---\n{se}");
         assert!(out.status.success(), "{so}\n{se}");
         assert!(
-            se.contains("wicked-seat-entry: Landlock canary passed"),
+            se.contains("wicked-seat-launch: floor canary passed"),
             "{se}"
         );
         let (uid, gid) = user.split_once(':').unwrap();
@@ -2235,6 +2649,7 @@ mod tests {
             workdir: &tree,
             user: "1:1",
             mounts: &mounts,
+            floor: "wicked-floor:t",
             memory: "1g",
             gateway_ports: &[],
             own_ports: &[],

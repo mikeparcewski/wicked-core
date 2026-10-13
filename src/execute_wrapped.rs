@@ -6333,6 +6333,7 @@ mod tests {
             workdir: &dir,
             user: "1:1",
             mounts: &[],
+            floor: "wicked-floor:t",
             memory: "1g",
             gateway_ports: &[],
             own_ports: &[],

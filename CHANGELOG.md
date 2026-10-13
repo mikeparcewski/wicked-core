@@ -14,6 +14,18 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Container seats start through the engine's trusted launcher.** Every seat's entrypoint is
+  `/floor/launch` from the engine's floor image, mounted read-only (`--mount type=image`): static
+  busybox, landrun built static from source, and the launcher. So no code from the seat image runs
+  before the floor holds, which also covers an operator image (`WICKED_SEAT_IMAGE_<CLI>`). The
+  launcher's canary now proves both Landlock filesystem and network enforcement empirically: an
+  out-of-policy write must fail, and a connect outside the grants must fail with Landlock's own
+  denial (EACCES at connect time; a refused or reached connect refuses the CLI). This replaces the
+  image's Python ABI probe. The engine inspects each seat image with its own code (the floor
+  image's busybox over the image as data) and refuses one that declares volumes or has a link where
+  a mount lands; seats and the floor run by the inspected image id. One shared seat Dockerfile, with
+  the CLI's npm package as a build argument, replaces the five per-CLI files.
+
 - **Container seat floor (opt-in: `WICKED_SEAT_FLOOR=container`).** A governed unit's CLI runs in a
   hardened OCI container rendered for the runtime's own CLI (`docker`, `podman` or `nerdctl`; the
   operator's `WICKED_CONTAINER_RUNTIME`, else the first found): the operator's uid, a read-only root
