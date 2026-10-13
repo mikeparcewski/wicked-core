@@ -1655,6 +1655,7 @@ print('commit=' + str(r.returncode) + ' ' + r.stderr.strip().replace('\n', ' | '
 
     use wicked_apps_core::spawn::{SeatCli, SeatConfig};
 
+    #[cfg(unix)]
     /// One lane-local fixture: a clone with two run worktrees, a bare remote OUTSIDE the tree, an
     /// outside dir, a fake operator home with a fake secret, a seat home, a notes root.
     struct Fixture {
@@ -1667,6 +1668,7 @@ print('commit=' + str(r.returncode) + ' ' + r.stderr.strip().replace('\n', ' | '
         notes: PathBuf,
     }
 
+    #[cfg(unix)]
     fn fixture(tag: &str) -> Fixture {
         let (base, _clone, own, sibling) = clone_with_two_runs(tag);
         let outside = base.join("outside");
@@ -1719,6 +1721,7 @@ print('commit=' + str(r.returncode) + ' ' + r.stderr.strip().replace('\n', ' | '
         }
     }
 
+    #[cfg(unix)]
     /// The floor for `cli` in `f`, planned exactly as a carrier plans it, with the fixture's fake
     /// operator home under the masks and `admit` as a pinned loopback port.
     fn plan_for(f: &Fixture, cli: SeatCli, read_only: bool, admit: u16) -> SeatFloorPlan {
@@ -1746,6 +1749,7 @@ print('commit=' + str(r.returncode) + ' ' + r.stderr.strip().replace('\n', ' | '
         plan
     }
 
+    #[cfg(unix)]
     /// Run `script` (sh) as the seat's worker under its armed floor; `KEY=value` lines out.
     fn run_under(
         f: &Fixture,
@@ -1797,6 +1801,7 @@ print('commit=' + str(r.returncode) + ' ' + r.stderr.strip().replace('\n', ' | '
         r
     }
 
+    #[cfg(unix)]
     /// The spike's actions as one shell script: each prints `name=ok` or `name=denied`.
     const SPIKE_ACTIONS: &str = r#"
 t() { if eval "$2" >/dev/null 2>&1; then echo "$1=ok"; else echo "$1=denied"; fi; }

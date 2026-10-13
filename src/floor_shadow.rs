@@ -550,6 +550,7 @@ mod tests {
         d.canonicalize().unwrap()
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_path_tool_is_judged_against_the_spec_and_the_agreement_names_the_disagreement() {
         let d = tmp("path");
@@ -601,6 +602,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_shell_call_is_judged_by_its_literal_targets_or_is_unknown() {
         let d = tmp("shell");
