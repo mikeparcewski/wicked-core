@@ -3634,7 +3634,11 @@ fn arm_input_governance(
         // `allow` is EMPTY (D-7, DES-L4 PR-⑦): no MCP server is registered for the worker any more,
         // so there is nothing to allow-list; grounding calls are ordinary Bash (the shim), judged by
         // the gate hook like every other tool call.
-        "permissions": { "deny": deny, "allow": [] }
+        "permissions": { "deny": deny, "allow": [] },
+        // Step 0: claude's OWN sandbox stays off — the engine's OS floor is the boundary, and
+        // macOS refuses a nested sandbox apply, so a claude sandbox inside it would fail every
+        // Bash call (exit 71). Explicit, so an operator's inherited settings cannot switch it on.
+        "sandbox": { "enabled": false }
     });
     let dir = decisions_path
         .parent()
