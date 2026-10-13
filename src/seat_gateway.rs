@@ -45,6 +45,10 @@ pub(crate) struct GatewayConfig {
     pub(crate) units: Vec<UnitKey>,
     pub(crate) providers: Vec<ModelRoute>,
     pub(crate) egress_hosts: Vec<String>,
+    /// `host:port` of the engine's gate-hook relay as the gateway reaches it (the host's
+    /// loopback through the runtime's host alias); `None` = no hook route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) hook_upstream: Option<String>,
 }
 
 /// A seat's revocable placeholder key and the identity authenticated requests carry.
@@ -139,6 +143,7 @@ impl Default for GatewayConfig {
                 .map(|h| h.trim().to_string())
                 .filter(|h| !h.is_empty())
                 .collect(),
+            hook_upstream: None,
         }
     }
 }
@@ -213,6 +218,17 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
         })
         .collect();
     binds.push(json!({"port": 3000, "tunnelProtocol": "connect", "listeners": []}));
+    // The seat's gate hook: `/hook/<token>` to the engine's relay; the token in the path is the
+    // relay's credential (unknown tokens are denied there).
+    if let Some(up) = &config.hook_upstream {
+        binds.push(json!({
+            "port": crate::hook_relay::HOOK_PORT,
+            "listeners": [{ "routes": [{
+                "matches": [{"path": {"pathPrefix": "/hook/"}}],
+                "backends": [{"host": up}]
+            }]}]
+        }));
+    }
     json!({
         "config": {
             "adminAddr": "off",
@@ -407,7 +423,64 @@ fn load_config(dir: &Path) -> Result<GatewayConfig, String> {
     let mut config: GatewayConfig =
         read_json(&dir.join("config/gateway.json"))?.unwrap_or_default();
     config.units = read_json(&dir.join("config/units.json"))?.unwrap_or_default();
+    if config.hook_upstream.is_none() {
+        config.hook_upstream = HOOK_UPSTREAM.get().cloned().flatten();
+    }
     Ok(config)
+}
+
+/// The relay's address as this process's gateway reaches it, probed once (see [`probe_hook`]).
+static HOOK_UPSTREAM: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// The host aliases the container desktops give for the host's loopback, in probe order.
+const HOST_ALIASES: &[&str] = &[
+    "host.lima.internal",
+    "host.docker.internal",
+    "host.containers.internal",
+    "host.rancher-desktop.internal",
+];
+
+/// Find which host alias reaches the engine's gate-hook relay from the gateway's network (a
+/// `GET /ping` from the helper image), once per process. `None` when no alias answers.
+#[cfg(unix)]
+fn probe_hook(rt: &Runtime, gw: &Gateway) -> Option<String> {
+    HOOK_UPSTREAM
+        .get_or_init(|| {
+            let port = crate::hook_relay::port()?;
+            HOST_ALIASES.iter().find_map(|alias| {
+                let up = format!("{alias}:{port}");
+                let argv: Vec<String> = [
+                    "run",
+                    "--rm",
+                    "--network",
+                    &gw.external_network,
+                    "--cap-drop",
+                    "ALL",
+                    HELPER_IMAGE,
+                    "wget",
+                    "-q",
+                    "-T",
+                    "3",
+                    "-O",
+                    "-",
+                    &format!("http://{up}/ping"),
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+                cli(rt, &argv, CLI_TIMEOUT)
+                    .filter(|o| {
+                        o.status.success() && String::from_utf8_lossy(&o.stdout).contains("pong")
+                    })
+                    .map(|_| up)
+            })
+        })
+        .clone()
+}
+
+/// Whether this process's gateway carries the gate-hook route (the relay answered).
+pub(crate) fn hook_route_ready() -> bool {
+    HOOK_UPSTREAM.get().is_some_and(Option::is_some)
 }
 
 fn persist_units(dir: &Path, config: &GatewayConfig) -> Result<(), String> {
@@ -489,6 +562,7 @@ pub(crate) fn publish(rt: &Runtime, gw: &Gateway, dir: &Path) -> Result<(), Stri
 /// Store a provider credential in the broker (`/broker/<file>`), the only place it lives: the
 /// gateway reads it to authenticate upstream; no seat ever mounts the broker.
 #[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))] // the C4 sign-in flow is its production caller
 pub(crate) fn set_broker_credential(
     rt: &Runtime,
     gw: &Gateway,
@@ -719,6 +793,9 @@ pub(crate) fn ensure_gateway(rt: &Runtime, dir: &Path) -> Result<Gateway, String
     }
     let gw = Gateway::for_dir(dir);
     if running(rt, &gw, CLI_TIMEOUT) {
+        // A gateway an earlier engine started: this process's relay listens on a new port, so
+        // probe it now; the next publish (the first unit's key) carries the fresh route.
+        let _ = probe_hook(rt, &gw);
         return Ok(gw);
     }
     // A stopped container still owns its name. Removing it is best effort; `run` reports any
@@ -743,6 +820,7 @@ pub(crate) fn ensure_gateway(rt: &Runtime, dir: &Path) -> Result<Gateway, String
             return Err("could not create or reuse the gateway's external bridge".into());
         }
     }
+    let _ = probe_hook(rt, &gw);
     let mut config = load_config(dir)?;
     config.units.clear();
     persist_units(dir, &config)?;
@@ -958,6 +1036,7 @@ mod tests {
                 credential_file: PathBuf::from("/broker/anthropic.key"),
             }],
             egress_hosts: vec!["registry.npmjs.org".into()],
+            hook_upstream: None,
         }
     }
 
@@ -969,6 +1048,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn live_a_seat_reaches_the_model_only_through_the_gateway_with_its_unit_key() {
+        // The process-wide hook route (set by the live test's probe) must not change mid-test.
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
         if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
             eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
             return;
@@ -1011,6 +1094,7 @@ mod tests {
                     credential_file: PathBuf::from("/broker/anthropic.key"),
                 }],
                 egress_hosts: vec![],
+                hook_upstream: None,
             },
         )
         .unwrap();
@@ -1107,6 +1191,30 @@ mod tests {
             "a revoked key is refused: {revoked}"
         );
         assert!(!all_logs.contains("broker-secret") && !all_logs.contains(&key.key));
+    }
+
+    #[test]
+    fn the_hook_route_renders_only_when_the_relay_is_reachable() {
+        let none = render(&plain_config());
+        assert!(!none["binds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["port"] == crate::hook_relay::HOOK_PORT));
+        let cfg = GatewayConfig {
+            hook_upstream: Some("host.lima.internal:51234".into()),
+            ..plain_config()
+        };
+        let r = render(&cfg);
+        let hook = r["binds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["port"] == crate::hook_relay::HOOK_PORT)
+            .expect("the hook bind");
+        let route = &hook["listeners"][0]["routes"][0];
+        assert_eq!(route["matches"][0]["path"]["pathPrefix"], "/hook/");
+        assert_eq!(route["backends"][0]["host"], "host.lima.internal:51234");
     }
 
     fn json_file(path: &Path) -> Value {
@@ -1249,6 +1357,10 @@ mod tests {
 
     #[test]
     fn registration_and_revocation_atomically_replace_config_and_preserve_routes() {
+        // The process-wide hook route (set by the live test's probe) must not change mid-test.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new();
         broker_key(&temp.0);
         configure_gateway(&temp.0, &plain_config()).unwrap();
@@ -1339,6 +1451,10 @@ mod tests {
 
     #[test]
     fn concurrent_registration_does_not_lose_keys() {
+        // The process-wide hook route (set by the live test's probe) must not change mid-test.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let temp = TempDir::new();
         broker_key(&temp.0);
         configure_gateway(&temp.0, &plain_config()).unwrap();

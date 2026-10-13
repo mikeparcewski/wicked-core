@@ -2318,9 +2318,12 @@ impl WrappedCliStepRunner {
                 ];
                 // The container floor (opt-in until the C5 shadow proof): the same resolved
                 // floor rendered as a hardened seat container instead of a host profile.
-                let chosen = if crate::container_floor::container_mode() && gov_env.is_some() {
-                    // A claude unit's gate hook is `<host wicked-core> gate-hook`: inside the
-                    // seat that command does not exist, so its tool calls would run unjudged.
+                let chosen = if crate::container_floor::container_mode()
+                    && gov_env.is_some()
+                    && (crate::hook_relay::port().is_none() || self.operational_home.is_none())
+                {
+                    // A claude unit's gate hook runs on the host; without the relay (or without
+                    // a gateway to route it) its tool calls would run unjudged.
                     crate::worker_sandbox::GovernedFloor::Refused(
                         crate::worker_sandbox::FloorUnarmed::GateHookUnreachable,
                     )
@@ -2342,6 +2345,16 @@ impl WrappedCliStepRunner {
                         &read_roots,
                         gateway_dir.as_deref(),
                     ) {
+                        // The hook route rides the gateway: a claude unit whose relay the gateway
+                        // could not reach is refused, never run with its hook calls failing open.
+                        Ok(c) if gov_env.is_some() && !crate::seat_gateway::hook_route_ready() => {
+                            if let Some(lease) = c.lease {
+                                let _ = lease.release();
+                            }
+                            crate::worker_sandbox::GovernedFloor::Refused(
+                                crate::worker_sandbox::FloorUnarmed::GateHookUnreachable,
+                            )
+                        }
                         Ok(c) => {
                             seat_cleanup = Some(c.cleanup);
                             seat_gateway_env = c.env;
@@ -2806,7 +2819,20 @@ impl WrappedCliStepRunner {
             let cancel_token = self.register_token(input);
             // (ASK-K1b) The ceiling, lowered to the unit's own budget when its phase set one.
             let timeout = crate::workflow::effective_timeout(self.timeout, input.unit.budget_secs);
+            // Container floor: the relay judges this unit's hook calls with exactly the env the
+            // seat command carries (what a command hook would have inherited).
+            let hook_token = gov_env.as_ref().and_then(|g| g.hook_token.clone());
+            if let Some(t) = &hook_token {
+                let env: Vec<(std::ffi::OsString, std::ffi::OsString)> = cmd
+                    .get_envs()
+                    .filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string())))
+                    .collect();
+                crate::hook_relay::register(t, env);
+            }
             let bounded = run_bounded(cmd, timeout, emit, adapter, Some(cancel_token.clone()));
+            if let Some(t) = &hook_token {
+                crate::hook_relay::revoke(t);
+            }
             self.unregister_token(input, &cancel_token);
             // The seat ran (and `run_bounded` reaped it); release the arm-time guard now.
             drop(seat_cleanup.take());
@@ -3443,6 +3469,8 @@ fn which_binary(name: &str) -> Result<String, ()> {
 /// ENV (never interpolated into the shell hook command) so caller-controlled ids cannot inject shell
 /// metacharacters.
 struct GovLaunch {
+    /// Container floor: the unit's gate-hook relay token (its settings name an HTTP hook).
+    hook_token: Option<String>,
     decisions_path: PathBuf,
     db_path: String,
     scope: String,
@@ -3685,6 +3713,17 @@ fn arm_input_governance(
     // can't be shell-expanded (POSIX single-quote disables ALL expansion; on Windows cmd `$`/backtick are
     // not special, so double-quote for spaces — a `"` is illegal in a Windows path anyway).
     let command = quote_exe_command(&exe);
+    // Container floor: the seat cannot run the host binary, so its hook is an HTTP hook to the
+    // engine's relay through the gateway (`crate::hook_relay`), keyed by a per-unit token.
+    let hook_token = crate::container_floor::container_mode().then(crate::hook_relay::mint_token);
+    let hook = match &hook_token {
+        Some(t) => serde_json::json!({
+            "type": "http",
+            "url": crate::hook_relay::hook_url(t),
+            "timeout": 90
+        }),
+        None => serde_json::json!({ "type": "command", "command": command }),
+    };
     // D-7 (DES-L4 PR-⑦): the CLI-registered estate MCP is NO LONGER handed to the worker — no
     // `--mcp-config` file, no `mcpServers`, no `permissions.allow` for it. Grounding is the estate
     // SHIM garden's skills run (`wicked-garden run scripts/_estate_client.py --readonly …`), which
@@ -3701,7 +3740,7 @@ fn arm_input_governance(
     let settings = serde_json::json!({
         "hooks": {
             "PreToolUse": [
-                { "matcher": "*", "hooks": [ { "type": "command", "command": command } ] }
+                { "matcher": "*", "hooks": [ hook ] }
             ]
         },
         // deny: the same boundary `inject_isolation_flags` puts on argv, restated in the file. Belt and
@@ -3752,6 +3791,7 @@ fn arm_input_governance(
         extra_write_roots: gov.extra_write_roots.clone(),
         extra_read_roots: gov.extra_read_roots.clone(),
         skills_root: skills_root.map(Path::to_path_buf),
+        hook_token,
     })
 }
 
@@ -9374,6 +9414,7 @@ mod tests {
         let graph = graph.as_str();
         let read = |code_graph_db: Option<&str>| {
             let gov = GovLaunch {
+                hook_token: None,
                 decisions_path: std::path::PathBuf::from("/tmp/decisions.ndjson"),
                 db_path: op.to_string(),
                 scope: "s".to_string(),
