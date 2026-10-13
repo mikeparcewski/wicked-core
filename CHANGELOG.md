@@ -14,6 +14,20 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The Bash write check judges the path the shell writes (#922).** It used to judge each target
+  word as spelled, quotes included. A quoted absolute path was joined onto the worktree, so
+  `echo x > "/outside/f"` (and the same with `'…'`, `>>`, `2>`, `tee`, `mkdir`, `touch`, `cp`, `mv`,
+  `dd of=`, `ln`, `sh -c`, `cd "<out>" &&`, `git -C`, `"../…"` and `$HOME`) **passed the filesystem
+  boundary**. A quoted path into a declared write root was refused by the phase scope (rig run
+  d33b131e). Target words, `cd` destinations and `sh -c` strings are now read as POSIX sh reads
+  them: quote removal, escapes, line continuations, `$HOME` / `${HOME}` / a leading `~`. A target
+  the text cannot resolve **fails closed** with an advisory refusal that names the word. That covers
+  any other variable, `$(…)`, backticks, globs, braces, `~user`, `$'…'`, `/dev/fd/N`, a `sh -c`
+  string carrying an outer expansion, and `~`/`$HOME` in a command that may set `HOME`.
+  Redirections no longer stand in for a `cp`/`mv`/`install` destination, and `<>FILE` and `>&FILE`
+  count as writes. On Windows, an unquoted `\` word is judged under both the native and the Git
+  Bash reading.
+
 - **Governed claude seats load the worktree's `CLAUDE.md` again.** Since #914 they ran with no
   filesystem setting scope, which also dropped the repository's instructions. A claude unit now
   passes its tree as an additional directory and sets `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1`,
