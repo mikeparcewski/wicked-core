@@ -955,6 +955,10 @@ struct AcpProcess {
     /// (IG1-core-2) The write roots the boundary admitted at spawn — `armed_write_root_paths`
     /// verbatim — named by the `os_sandbox` ARMED marker.
     floor_roots: Vec<std::path::PathBuf>,
+    /// (step 0) The seat floor this process spawned under, for a GOVERNED unit session: `Ok(spec)`
+    /// when it armed, `Err(())` for a governed session with no floor (Windows: `no OS floor`),
+    /// `None` for an ungoverned session. Each governed turn records it in the shadow log.
+    seat_floor: Option<Result<(&'static str, crate::worker_sandbox::SeatFloor), ()>>,
     /// (core#581) `Some(..)` when this seat claims ACP input governance and its `verified_version`
     /// pin did NOT match the resolved binary — the disclosure detail behind
     /// `governance_verified == false`. Computed ONCE at spawn.
@@ -2011,6 +2015,7 @@ fn start_acp_process(
         "",
         None,
         operational_home,
+        None,
     )
 }
 
@@ -2304,6 +2309,33 @@ fn same_plugin_path(existing: &str, root: &std::path::Path) -> bool {
     }
 }
 
+/// (step 0) What a GOVERNED unit session asks of the seat floor at spawn
+/// (`worker_sandbox::governed_floor`). `None` at the spawn for an ungoverned session or a chat,
+/// which keep the repository boundary only.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AcpFloor {
+    /// A fenced posture (read-only / deliverable-roots): the read-only profile.
+    pub(crate) read_only: bool,
+    /// A fenced unit's check scratch (its temp, build output and caches; never the tree).
+    pub(crate) scratch: Option<std::path::PathBuf>,
+    /// The write roots under a fenced posture (the posture's admitted roots); unused under the
+    /// full posture, whose roots are the spawn's armed write set.
+    pub(crate) fenced_roots: Vec<std::path::PathBuf>,
+}
+
+/// Whether an ACP bridge arms its OWN sandbox with no lever to switch it off, so the ungoverned
+/// repository boundary must not wrap it (a nested Seatbelt apply fails every command, exit 71).
+/// Only `codex-acp`: its sandbox is one of three hard-coded agent-mode presets and no config
+/// reaches it (`registry.rs`, OQ-CODEX-ACP-001). A GOVERNED codex unit never rides it: the seat
+/// is not admitted to ACP input governance, so the unit takes the wrapped carrier, where codex
+/// runs `--sandbox danger-full-access` under the engine's floor.
+pub(crate) fn acp_bridge_keeps_its_own_sandbox(binary: &str) -> bool {
+    std::path::Path::new(binary)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s == "codex-acp")
+}
+
 /// The actual ACP spawn chokepoint. `extra_write_roots` comes from the same launch-validated
 /// governance context used to arm `WICKED_WRITE_ROOTS`; Boundary 1 is WRITE containment only,
 /// not exfiltration protection, a read jail, or a replacement for ACP governance.
@@ -2354,6 +2386,9 @@ fn start_acp_process_with_write_roots(
     session: Option<(&str, &str)>,
     // The engine's OWN operational state home (codex round 8) — fenced on every launch.
     operational_home: Option<&std::path::Path>,
+    // (step 0) `Some` for a GOVERNED unit session: the seat floor arms (fail closed on macOS /
+    // Linux, `no OS floor` on Windows). `None`: the ungoverned repository boundary.
+    governed_floor: Option<&AcpFloor>,
 ) -> anyhow::Result<AcpProcess> {
     use crate::skills_snapshot::SkillsDelivery;
     // FINDING-061: decided BEFORE the spawn closure so both spawn attempts (the bare binary and
@@ -2553,9 +2588,21 @@ fn start_acp_process_with_write_roots(
     // failure. We wrap ONLY when the floor actually armed, and surface the gap on the `AcpProcess`
     // so the caller emits exactly ONE `SandboxUnenforced` per spawn (the session is cached and
     // reused across turns, so the disclosure belongs to the spawn, not each turn).
+    let mut floor_env: Vec<(&'static str, std::path::PathBuf)> = Vec::new();
+    let mut seat_floor: Option<Result<(&'static str, crate::worker_sandbox::SeatFloor), ()>> = None;
     let (worker_sandbox, sandbox_downgrade, floor) = if config.os_sandbox {
         let ws = crate::validator::detect_worker_sandbox(&worker_write_roots);
         match ws.downgrade_reason {
+            // Step 0: a governed session on macOS / Linux never spawns unconfined.
+            Some(reason) if governed_floor.is_some() && !cfg!(windows) => {
+                anyhow::bail!(
+                    "{} ({reason})",
+                    crate::worker_sandbox::floor_refusal_text(
+                        seat_key,
+                        crate::worker_sandbox::FloorUnarmed::CannotArm
+                    )
+                )
+            }
             Some(reason) => (
                 None,
                 Some((ws.level.as_wire().to_string(), reason.clone())),
@@ -2566,17 +2613,73 @@ fn start_acp_process_with_write_roots(
                 (Some(ws), None, Ok(tool))
             }
         }
+    } else if let Some(gf) = governed_floor {
+        // Step 0: ONE OS floor for every governed seat (DES-PROC-GOVERNANCE §12). The ACP gate
+        // runs in the daemon, outside the floor, so no governance-log dir is admitted here.
+        let roots = if gf.read_only {
+            gf.fenced_roots.clone()
+        } else {
+            worker_write_roots.clone()
+        };
+        let plan = crate::worker_sandbox::plan_seat_floor(
+            crate::worker_sandbox::SeatLaunch {
+                cwd,
+                cli: seat_cli,
+                config: &seat_config,
+                read_only: gf.read_only,
+                scratch: gf.scratch.as_deref(),
+                gov_log_dir: None,
+                own_ports: &[],
+            },
+            roots,
+        );
+        match crate::worker_sandbox::governed_floor(&plan.inputs) {
+            crate::worker_sandbox::GovernedFloor::Armed(armed) => {
+                floor_env = plan.env;
+                seat_floor = armed.spec.clone().map(|spec| Ok((armed.tool, spec)));
+                let tool = armed.tool;
+                (Some(armed.sandbox), None, Ok(tool))
+            }
+            crate::worker_sandbox::GovernedFloor::NoOsFloor => {
+                seat_floor = Some(Err(()));
+                let why = format!(
+                    "{}: Windows has no OS floor the engine can arm yet; the session runs under \
+                     the text fences and the worktree guard only",
+                    crate::worker_sandbox::NO_OS_FLOOR
+                );
+                (
+                    None,
+                    Some((
+                        crate::validator::SandboxLevel::BestEffort
+                            .as_wire()
+                            .to_string(),
+                        why.clone(),
+                    )),
+                    Err(why),
+                )
+            }
+            crate::worker_sandbox::GovernedFloor::Refused(why) => {
+                anyhow::bail!(
+                    "{}",
+                    crate::worker_sandbox::floor_refusal_text(seat_key, why)
+                )
+            }
+        }
+    } else if acp_bridge_keeps_its_own_sandbox(&config.binary) {
+        (
+            None,
+            None,
+            Err(format!(
+                "'{}' arms its own sandbox and has no lever to switch it off, so the repository \
+                 boundary does not wrap it (a nested sandbox apply fails every command)",
+                config.binary
+            )),
+        )
     } else {
-        // core#548: the default repository boundary — the unit's own tree writable, the clone
-        // and its sibling worktrees read-only at the OS (`worker_sandbox`). Not armed (a chat's
-        // scratch root, a self-sandboxing seat such as codex-acp, no launcher) spawns as before.
-        // On this carrier codex-acp's own sandbox mode is the bridge's, not the trust flags the
-        // seat's class reads, so `SeatArmsItsOwn` is not counted as an armed floor here.
-        match crate::worker_sandbox::default_worker_sandbox(
-            cwd,
-            &worker_write_roots,
-            &config.binary,
-        ) {
+        // core#548: the default repository boundary for an UNGOVERNED session — the unit's own
+        // tree writable, the clone and its sibling worktrees read-only at the OS
+        // (`worker_sandbox`). Not armed (a chat's scratch root, no launcher) spawns as before.
+        match crate::worker_sandbox::default_worker_sandbox(cwd, &worker_write_roots) {
             Ok(armed) => (Some(armed.sandbox), None, Ok(armed.tool)),
             Err(why) => (None, None, Err(why.describe().to_string())),
         }
@@ -2706,6 +2809,10 @@ fn start_acp_process_with_write_roots(
                 cmd.env("TMP", tmp);
                 cmd.env("TEMP", tmp);
             }
+        }
+        // Step 0: the seat's caches and (fenced) temp inside dirs its floor admits.
+        for (k, v) in &floor_env {
+            cmd.env(k, v);
         }
         cmd.args(&config.start_args);
         cmd.args(&mcp_pins);
@@ -3002,6 +3109,7 @@ fn start_acp_process_with_write_roots(
         sandbox_downgrade,
         floor,
         floor_roots: worker_write_roots.clone(),
+        seat_floor,
         version_pin_drift,
         // Bound by the unit runner right after the spawn (it holds the admitted snapshot; this
         // chokepoint only knows the delivery it put in the handshake).
@@ -7160,6 +7268,36 @@ impl AcpStepRunner {
                 );
                 // (wicked-crew#951) The QE unit's ledger root, on the same spawn env.
                 estate_provenance.extend(crate::qe_acceptance::ledger_env(&input.unit));
+                // (step 0) A GOVERNED unit session arms the seat floor; a fenced one runs the
+                // read-only profile with its temp and build output in a check scratch.
+                let acp_floor: Option<AcpFloor> = if input.governance.is_some() {
+                    let scratch = if wants_no_code && !cfg!(windows) {
+                        match crate::execute_wrapped::codex_check_scratch(input) {
+                            Ok(dir) => Some(dir),
+                            Err(why) => {
+                                return crate::execute_wrapped::posture_refusal(input, &why)
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let mut fenced_roots = crate::write_posture::unit_admitted_roots(
+                        write_posture,
+                        &input.unit,
+                        extra_write_roots,
+                    );
+                    fenced_roots.extend(crate::execute_wrapped::graph_write_dir(
+                        code_graph_db,
+                        self.operational_home.as_deref(),
+                    ));
+                    Some(AcpFloor {
+                        read_only: wants_no_code,
+                        scratch,
+                        fenced_roots,
+                    })
+                } else {
+                    None
+                };
                 // (core#418) A restart's cost is measured to the opened session.
                 let spawn_started = Instant::now();
                 match start_acp_process_with_write_roots(
@@ -7175,6 +7313,7 @@ impl AcpStepRunner {
                     &cli_key,
                     Some((run_id.as_str(), cli_key.as_str())),
                     self.operational_home.as_deref(),
+                    acp_floor.as_ref(),
                 ) {
                     Ok(mut proc) => {
                         // core#396: BIND the admitted snapshot to the process it was handed to.
@@ -7457,6 +7596,46 @@ impl AcpStepRunner {
                 reason,
             });
         }
+        // (step 0) A governed turn runs only in a process spawned under the seat floor (a session
+        // an ungoverned unit opened earlier in the run did not arm it), and records that floor in
+        // the shadow log before its first tool call.
+        if input.governance.is_some() {
+            match &proc.seat_floor {
+                None => {
+                    let cause = format!(
+                        "[wicked-core] the ACP session for '{cli_key}' was opened without the \
+                         seat floor (by an ungoverned unit), so it cannot carry a governed unit"
+                    );
+                    drop(proc);
+                    self.drop_session_key(&session_key);
+                    return self.fall_back_or_refuse(
+                        &run_id,
+                        &cli_key,
+                        Some(fallback_kind::BINARY_UNAVAILABLE),
+                        &cause,
+                        "",
+                        refuse_fallback,
+                        input,
+                        emit,
+                    );
+                }
+                Some(sf) => {
+                    let dp = crate::gate_hook::decisions_path_for_input(input);
+                    let ph = crate::scope::unit_phase(input.unit.ord);
+                    let outcome = match sf {
+                        Ok((tool, spec)) => crate::floor_shadow::ArmOutcome::Armed { tool, spec },
+                        Err(()) => crate::floor_shadow::ArmOutcome::NoOsFloor,
+                    };
+                    crate::floor_shadow::record_arm(
+                        &dp,
+                        &ph,
+                        crate::gate_hook::CARRIER_ACP,
+                        &cli_key,
+                        &outcome,
+                    );
+                }
+            }
+        }
         // (IG1-core-2) A governed unit on an `os_sandbox`-class seat: the floor this process
         // spawned under armed ⇒ the ARMED marker names the `os_sandbox` carrier, the spawn's write
         // roots verbatim and the launcher, BEFORE the turn's prompt is sent, and the unit is
@@ -7660,6 +7839,13 @@ impl AcpStepRunner {
         );
         // The unit's turn is over: its token resolves to nothing until the next unit binds it.
         drop(mcp_binding);
+        // Step 0 shadow mode: the per-unit comparison, appended once the turn ends.
+        if input.governance.is_some() {
+            crate::floor_shadow::summarize(
+                &crate::gate_hook::decisions_path_for_input(input),
+                &crate::scope::unit_phase(input.unit.ord),
+            );
+        }
         let superseded = {
             let maps = self
                 .elicitation_maps
@@ -8006,15 +8192,14 @@ fn monitor_admission(
     }
     match class {
         Some(wicked_council::GovernanceClass::AcpInputGovernance) => {}
-        // A seat whose CLI arms its own OS sandbox (codex) is not wrapped again — a nested
-        // `sandbox_apply` fails on macOS; every other floor-class member gets the strict profile.
+        // A bridge that arms its own OS sandbox with no lever to switch it off (codex-acp) is not
+        // wrapped again — a nested `sandbox_apply` fails on macOS; every other floor-class member
+        // gets the strict profile.
         // Its ACP adapter's own sandbox is NOT proven by the record (the CLI trust flags do not
         // ride `start_args`), so `monitor_ensure`'s scoped admission still refuses such a member
         // over a repository scope — fail-closed until the adapter's posture is proven.
         Some(wicked_council::GovernanceClass::OsSandboxFloor) => {
-            if !crate::worker_sandbox::seat_arms_its_own_os_sandbox(&config.binary)
-                && !crate::worker_sandbox::seat_arms_its_own_os_sandbox(seat)
-            {
+            if !acp_bridge_keeps_its_own_sandbox(&config.binary) {
                 config.os_sandbox = true;
             }
         }
@@ -8119,6 +8304,7 @@ impl AcpStepRunner {
             seat,
             None,
             self.operational_home.as_deref(),
+            None,
         )
         .map_err(|e| e.to_string())?;
         scoped_seat_runtime_admission(
@@ -8648,6 +8834,7 @@ mod tests {
             wicked_apps_core::spawn::SeatCli::Claude,
             "",
             session,
+            None,
             None,
         )
     }
@@ -9590,7 +9777,7 @@ sleep 30
         ]);
         let cwd = clone.join("wicked-worktrees").join("r1");
         let sibling_file = clone.join("wicked-worktrees").join("r2").join("pwned");
-        if crate::worker_sandbox::default_worker_sandbox(&cwd, &[], "claude-agent-acp").is_err() {
+        if crate::worker_sandbox::default_worker_sandbox(&cwd, &[]).is_err() {
             eprintln!("acp_runner: no launcher can arm here — the #548 carrier proof skips");
             let _ = std::fs::remove_dir_all(&base);
             return;
@@ -11156,6 +11343,7 @@ sleep 30
                 seat_key,
                 Some(("run-instance", seat_key)),
                 None,
+                None,
             );
             let seen = std::fs::read_to_string(&ledger)
                 .map(|s| s.trim().to_string())
@@ -12464,6 +12652,7 @@ cat >/dev/null
                 wicked_apps_core::spawn::SeatCli::Opencode,
                 "",
                 Some(("r", "opencode")),
+                None,
                 None,
             )
             .expect("the opencode seat starts");
@@ -19624,6 +19813,7 @@ transport = "stdio"
                 wicked_apps_core::spawn::SeatCli::Pi,
                 "pi",
                 Some(("r", "pi")),
+                None,
                 None,
             )
             .expect("start");

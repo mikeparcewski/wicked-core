@@ -3631,6 +3631,52 @@ pub(crate) fn evaluate_tool_call(
     scope: &str,
     phase: &str,
     phase_alias: Option<&str>,
+    catalog_alias: Option<&str>,
+    db: Option<&str>,
+    decisions_path: &str,
+    context: &serde_json::Value,
+    tool: &str,
+    boundary: Option<&BoundaryCtx>,
+) -> i32 {
+    let verdict = evaluate_tool_call_judged(
+        scope,
+        phase,
+        phase_alias,
+        catalog_alias,
+        db,
+        decisions_path,
+        context,
+        tool,
+        boundary,
+    );
+    // Step-0 SHADOW MODE: the verdict above is authoritative; the seat floor's view of the same
+    // call is recorded beside it (`floor_shadow`), never consulted for the answer.
+    let (cwd, home) = match boundary {
+        Some(b) => (b.cwd.clone(), b.home.clone()),
+        None => (
+            std::env::current_dir().unwrap_or_default(),
+            std::env::var_os("HOME").map(std::path::PathBuf::from),
+        ),
+    };
+    let input = context.get("tool_input").unwrap_or(context);
+    crate::floor_shadow::record_call(
+        Path::new(decisions_path),
+        phase,
+        tool,
+        input,
+        &cwd,
+        home.as_deref(),
+        verdict == 0,
+    );
+    verdict
+}
+
+/// [`evaluate_tool_call`]'s judgement, before the step-0 shadow record.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_tool_call_judged(
+    scope: &str,
+    phase: &str,
+    phase_alias: Option<&str>,
     // (DES-TEAMING-002 T3, #627) The unit's phase-catalog id, passed by EVERY carrier as data: the
     // hook subprocess from its argv/env (resolved in the binary), the in-process ACP bridge from
     // the unit — this function never reads env for it.

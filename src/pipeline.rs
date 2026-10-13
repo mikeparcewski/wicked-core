@@ -793,31 +793,24 @@ pub(crate) fn apply_distributions(
         // command-text fences only, which a shell can evade. A Tool unit has no seat to disclose.
         if !matches!(dist.routing, RoutingInfo::Tool) {
             if let Some(seat) = pre.clis.iter().find(|c| c.key == dist.assigned_cli) {
-                // (IG1-core-3) `os` only when the seat sits on the OS-sandbox floor AND the run
-                // is bound to a linked worktree AND this host's launcher arms; else `advisory`,
-                // naming which of the three failed. A prediction: the arm site's marker is the fact.
+                // (IG1-core-3, step 0) `os` when this host's launcher arms: every governed unit
+                // gets the seat floor, whatever its seat or tree; else `advisory`, naming why. A
+                // prediction: the arm site's marker is the fact.
                 let workdir = pre.session.workdir.as_deref().map(std::path::Path::new);
                 let (posture, reason) =
                     match crate::worker_sandbox::predicted_posture(seat, workdir) {
                         Ok(boundary) => (
                             "os",
                             format!(
-                                "the seat sits on the OS-sandbox floor and the run is bound to a \
-                                 worktree: the kernel write boundary arms ({boundary}), so writes \
-                                 outside the repository boundary are refused by the OS"
+                                "every governed unit runs under the seat floor: the kernel \
+                                 boundary arms ({boundary}), so writes outside the unit's roots, \
+                                 its seat home and its temp are refused by the OS"
                             ),
                         ),
                         Err(gap) => {
-                            let why = match gap {
-                                crate::worker_sandbox::PostureGap::NotOnTheFloor => format!(
-                                    "the seat is not on the OS-sandbox floor (governance class \
-                                     {}, acp.os_sandbox: false), so it arms no OS write boundary",
-                                    wicked_council::governance_class(seat).as_wire()
-                                ),
-                                crate::worker_sandbox::PostureGap::Unarmed(u) => {
-                                    format!("the OS write boundary will not arm — {}", u.describe())
-                                }
-                            };
+                            let crate::worker_sandbox::PostureGap::Unarmed(u) = gap;
+                            let why =
+                                format!("the OS write boundary will not arm — {}", u.describe());
                             (
                                 "advisory",
                                 format!(

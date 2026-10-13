@@ -2205,18 +2205,39 @@ impl WrappedCliStepRunner {
                 |g| armed_write_root_paths(&cwd, &g.extra_write_roots, graph_write.as_deref()),
             );
             let os_sandbox = worker_os_sandbox_enabled(&cli_key);
+            let governed = input.governance.is_some();
+            // Step 0 (DES-PROC-GOVERNANCE §12): where this governed unit's decisions log, and so
+            // its floor-shadow record, lives — and the phase its gate hook records under.
+            let decisions_path = crate::gate_hook::decisions_path_for_input(input);
+            let shadow_phase = gov_env
+                .as_ref()
+                .map(|g| g.phase.clone())
+                .unwrap_or_else(|| crate::scope::unit_phase(input.unit.ord));
+            // The environment the seat runs with under its floor (caches and temp redirected into
+            // dirs the floor admits), applied after every other temp redirect below.
+            let mut floor_env: Vec<(&'static str, PathBuf)> = Vec::new();
+            let mut opencode_password: Option<String> = None;
             // A1: a requested kernel floor that cannot arm DISCLOSES AND CONTINUES rather than
             // failing the unit — `detect_worker_sandbox` returns a best-effort (empty-wrapper)
             // sandbox with a downgrade reason, and we emit a `SandboxUnenforced` disclosure (the
             // WRITE-containment sibling of `GovernanceUnenforced`) before proceeding unsandboxed.
             // This covers the no-launcher hosts (all of Windows), firejail-only Linux, and a
             // canonicalize failure. It NEVER fires when `os_sandbox` is OFF or the floor armed.
+            // Step 0: a GOVERNED unit on macOS / Linux is refused instead (fail closed).
             // (IG1-core-2) What armed the write boundary (`Ok(launcher)`), or why none did and
             // whether that was already disclosed — read by the `os_sandbox`-class arm below.
             let floor: Result<&'static str, (String, bool)>;
             let sandbox = if os_sandbox {
                 let ws = crate::validator::detect_worker_sandbox(&worker_write_roots);
                 if let Some(reason) = &ws.downgrade_reason {
+                    if governed && !cfg!(windows) {
+                        eprintln!("wicked-core: unit {}: {reason}", input.unit.ord);
+                        return floor_refused(
+                            input,
+                            &cli_key,
+                            crate::worker_sandbox::FloorUnarmed::CannotArm,
+                        );
+                    }
                     if let Some(cli) = argv.first() {
                         self.emit_event(crate::event::CoreEvent::SandboxUnenforced {
                             session: input.run_id.clone(),
@@ -2233,36 +2254,145 @@ impl WrappedCliStepRunner {
                     floor = Ok(crate::worker_sandbox::launcher_name_of(&ws.wrapper));
                     Some(ws)
                 }
-            } else {
-                // core#548: with no strict per-seat profile, every worker in a run worktree
-                // still gets the repository boundary — its own tree writable, the clone and its
-                // sibling worktrees read-only at the OS (`worker_sandbox`). Not armed (not a run
-                // worktree, a self-sandboxing seat, no launcher) spawns exactly as before.
-                match crate::worker_sandbox::default_worker_sandbox(
-                    &cwd,
-                    &worker_write_roots,
-                    &cli_key,
-                ) {
-                    Ok(armed) => {
+            } else if governed {
+                // Step 0: ONE OS floor for every governed seat, codex included — writes denied by
+                // default (the tree, its git state, the handed roots, the seat's home, cache and
+                // temp, and the governance-log dir allowed back; none of the tree under a fenced
+                // posture), secret reads masked, outbound pinned (macOS). The text fences above
+                // stay authoritative; the floor sits under them and its view of every call is
+                // recorded beside theirs (`floor_shadow`).
+                let fenced = write_posture.fences_writes();
+                let scratch: Option<PathBuf> = match (&codex_checks, fenced) {
+                    (Some(ctx), _) => Some(ctx.check_scratch.clone()),
+                    (None, true) if !cfg!(windows) => match codex_check_scratch(input) {
+                        Ok(dir) => Some(dir),
+                        Err(why) => return posture_refusal(input, &why),
+                    },
+                    _ => None,
+                };
+                let floor_roots: Vec<PathBuf> = if fenced {
+                    let mut r = crate::write_posture::unit_admitted_roots(
+                        write_posture,
+                        &input.unit,
+                        &input
+                            .governance
+                            .as_ref()
+                            .map(|g| g.extra_write_roots.clone())
+                            .unwrap_or_default(),
+                    );
+                    r.extend(graph_write.iter().cloned());
+                    r
+                } else {
+                    worker_write_roots.clone()
+                };
+                let opencode_port = (!cfg!(windows))
+                    .then(|| {
+                        crate::worker_sandbox::opencode_pinned_server_argv(&argv, 0)
+                            .and(crate::worker_sandbox::free_loopback_port())
+                    })
+                    .flatten();
+                let own_ports: Vec<u16> = opencode_port.into_iter().collect();
+                let gov_dir = decisions_path.parent().map(Path::to_path_buf);
+                let mut plan = crate::worker_sandbox::plan_seat_floor(
+                    crate::worker_sandbox::SeatLaunch {
+                        cwd: &cwd,
+                        cli: seat_cli,
+                        config: &seat_config,
+                        read_only: fenced,
+                        scratch: scratch.as_deref(),
+                        gov_log_dir: gov_dir.as_deref(),
+                        own_ports: &own_ports,
+                    },
+                    floor_roots,
+                );
+                // The engine's own launch files in that dir stay read-only to the worker.
+                plan.inputs.pinned = vec![
+                    crate::floor_shadow::spec_path(&decisions_path, &shadow_phase),
+                    decisions_path.with_file_name(format!("settings-{shadow_phase}.json")),
+                ];
+                match crate::worker_sandbox::governed_floor(&plan.inputs) {
+                    crate::worker_sandbox::GovernedFloor::Armed(armed) => {
+                        if let Some(spec) = &armed.spec {
+                            crate::floor_shadow::record_arm(
+                                &decisions_path,
+                                &shadow_phase,
+                                crate::gate_hook::CARRIER_WRAPPED_CLI,
+                                &cli_key,
+                                &crate::floor_shadow::ArmOutcome::Armed {
+                                    tool: armed.tool,
+                                    spec,
+                                },
+                            );
+                        }
+                        // Each CLI's own sandbox OFF under ours: macOS refuses a nested apply.
+                        if crate::worker_sandbox::codex_sandbox_off_under_floor(&mut argv) {
+                            eprintln!(
+                                "wicked-core: unit {} on '{cli_key}': codex runs --sandbox \
+                                 danger-full-access under the engine's OS floor ({})",
+                                input.unit.ord, armed.tool
+                            );
+                        }
+                        if let Some(port) = opencode_port {
+                            if let Some(pinned) =
+                                crate::worker_sandbox::opencode_pinned_server_argv(&argv, port)
+                            {
+                                argv = pinned;
+                                opencode_password = Some(uuid::Uuid::new_v4().simple().to_string());
+                            }
+                        }
+                        floor_env = plan.env;
                         floor = Ok(armed.tool);
                         Some(armed.sandbox)
                     }
-                    // codex's own `--sandbox workspace-write|read-only` is its boundary; its class
-                    // is `os_sandbox` only while its trust flags carry that mode (IG1-core-1). The
-                    // record is not the process: the boundary counts only when the LAUNCHED argv
-                    // runs codex itself with that bounded mode and no bypass flag.
-                    Err(crate::worker_sandbox::FloorUnarmed::SeatArmsItsOwn) => {
-                        floor = if launches_bounded_codex(&argv) {
-                            Ok(crate::worker_sandbox::SEAT_CODEX_BOUNDARY)
-                        } else {
-                            Err((
-                                "the launched invocation does not run codex with its own bounded \
-                                 --sandbox mode"
+                    crate::worker_sandbox::GovernedFloor::NoOsFloor => {
+                        crate::floor_shadow::record_arm(
+                            &decisions_path,
+                            &shadow_phase,
+                            crate::gate_hook::CARRIER_WRAPPED_CLI,
+                            &cli_key,
+                            &crate::floor_shadow::ArmOutcome::NoOsFloor,
+                        );
+                        let why = format!(
+                            "{}: Windows has no OS floor the engine can arm yet; the unit runs \
+                             under the text fences and the worktree guard only",
+                            crate::worker_sandbox::NO_OS_FLOOR
+                        );
+                        if let Some(cli) = argv.first() {
+                            self.emit_event(crate::event::CoreEvent::SandboxUnenforced {
+                                session: input.run_id.clone(),
+                                ord: input.unit.ord,
+                                attempt: input.attempt,
+                                cli: cli.clone(),
+                                level: crate::validator::SandboxLevel::BestEffort
+                                    .as_wire()
                                     .to_string(),
-                                false,
-                            ))
-                        };
+                                reason: why.clone(),
+                            });
+                        }
+                        floor = Err((why, true));
                         None
+                    }
+                    crate::worker_sandbox::GovernedFloor::Refused(why) => {
+                        eprintln!(
+                            "wicked-core: unit {}: the OS floor did not arm ({}); refusing the \
+                             governed unit (fail closed)",
+                            input.unit.ord,
+                            why.describe()
+                        );
+                        return floor_refused(input, &cli_key, why);
+                    }
+                }
+            } else {
+                // core#548: an UNGOVERNED worker in a run worktree still gets the repository
+                // boundary — its own tree writable, the clone and its sibling worktrees read-only
+                // at the OS (`worker_sandbox`). Not armed (not a run worktree, no launcher) spawns
+                // exactly as before.
+                match crate::worker_sandbox::default_worker_sandbox(&cwd, &worker_write_roots) {
+                    Ok(armed) => {
+                        // A wrapped codex's own sandbox would nest-fail under ours.
+                        crate::worker_sandbox::codex_sandbox_off_under_floor(&mut argv);
+                        floor = Ok(armed.tool);
+                        Some(armed.sandbox)
                     }
                     Err(why) => {
                         floor = Err((why.describe().to_string(), false));
@@ -2410,6 +2540,16 @@ impl WrappedCliStepRunner {
             // sandbox denies: its temp, cargo target and npm cache go to the check scratch.
             if let Some(ctx) = &codex_checks {
                 ctx.apply_env(&mut cmd);
+            }
+            // Step 0: the seat's caches and (fenced) temp inside dirs its floor admits, and the
+            // per-spawn password of opencode's pinned server (the floor admits only its port).
+            for (k, v) in &floor_env {
+                cmd.env(k, v);
+            }
+            if let Some(pw) = &opencode_password {
+                for k in crate::worker_sandbox::OPENCODE_PASSWORD_ENVS {
+                    cmd.env(k, pw);
+                }
             }
             // Even seats without a hook receive the exact root set the kernel launcher got. This
             // does not turn the env into a boundary; it keeps descendant tools and diagnostics
@@ -2602,6 +2742,11 @@ impl WrappedCliStepRunner {
             let timeout = crate::workflow::effective_timeout(self.timeout, input.unit.budget_secs);
             let bounded = run_bounded(cmd, timeout, emit, adapter, Some(cancel_token.clone()));
             self.unregister_token(input, &cancel_token);
+            // Step 0 shadow mode: the per-unit comparison of the text fences' and the floor's
+            // decisions, appended to the governance log once the unit ends.
+            if governed {
+                crate::floor_shadow::summarize(&decisions_path, &shadow_phase);
+            }
             drop(mcp_channel);
             match bounded {
                 // FINDING-100. A unit may background work and return — domain-extraction's extract
@@ -2803,18 +2948,6 @@ pub(crate) fn build_worker_command(
     cmd.args(&full[1..]);
     cmd.hardened();
     cmd
-}
-
-/// (IG1-core-2, review) Whether `argv` — the command a unit actually launches — runs codex itself
-/// (its program's stem is `codex`) with its own sandbox in a bounded mode and no bypass flag. The
-/// seat record's class is a prediction; a wrapper or an invocation that drops the mode is refused.
-fn launches_bounded_codex(argv: &[String]) -> bool {
-    argv.first().is_some_and(|bin| {
-        std::path::Path::new(bin)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .is_some_and(|s| s == "codex")
-    }) && wicked_council::codex_sandbox_is_bounded(argv.get(1..).unwrap_or_default())
 }
 
 /// (IG1-core-2) The governance class of seat `cli_key`, off the merged registry record (the same
@@ -4512,6 +4645,26 @@ pub(crate) fn governance_refusal(input: &StepInput, why: &str) -> StepOutput {
     }
 }
 
+/// (step 0) The [`StepOutput`] for a governed unit whose OS floor did not arm on macOS / Linux:
+/// nothing ran. The text says `could not run`, read as a seat failure, so the run fails over.
+pub(crate) fn floor_refused(
+    input: &StepInput,
+    cli_key: &str,
+    why: crate::worker_sandbox::FloorUnarmed,
+) -> StepOutput {
+    StepOutput {
+        run_id: input.run_id.clone(),
+        unit_ix: input.unit_ix,
+        attempt: input.attempt,
+        output: crate::worker_sandbox::floor_refusal_text(cli_key, why),
+        status: StepStatus::Failed,
+        usage: None,
+        files: Vec::new(),
+        tools: Vec::new(),
+        governed: false,
+    }
+}
+
 pub(crate) fn posture_refusal(input: &StepInput, why: &str) -> StepOutput {
     StepOutput {
         run_id: input.run_id.clone(),
@@ -6131,7 +6284,7 @@ mod tests {
         let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
         let (base, _clone, own, _sibling) =
             crate::worker_sandbox::tests::clone_with_two_runs("ig1c2-wrapped");
-        if crate::worker_sandbox::default_worker_sandbox(&own, &[], "agy").is_err() {
+        if crate::worker_sandbox::default_worker_sandbox(&own, &[]).is_err() {
             eprintln!("execute_wrapped: no launcher can arm here — the IG1-core-2 proof skips");
             let _ = std::fs::remove_dir_all(&base);
             return;
@@ -6205,43 +6358,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// IG1-core-2 (review): codex's own sandbox counts as the floor only when the LAUNCHED argv
-    /// runs codex with a bounded mode — the record's class is a prediction, not the process.
+    /// Step 0: codex's own sandbox goes OFF wherever the engine's floor wraps it (a nested
+    /// Seatbelt apply is refused, exit 71) — every mode spelling becomes `danger-full-access`,
+    /// `--full-auto` and a `sandbox_mode` override are dropped, the mode is added when none is
+    /// spelled, and a non-codex argv is untouched.
     #[test]
-    fn the_seat_owned_codex_boundary_is_judged_on_the_launched_argv() {
+    fn codex_runs_with_its_own_sandbox_off_under_the_floor() {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(launches_bounded_codex(&v(&[
-            "codex",
-            "exec",
-            "--sandbox",
-            "workspace-write",
-            "p"
-        ])));
-        assert!(launches_bounded_codex(&v(&[
+        let mut a = v(&["codex", "exec", "--sandbox", "workspace-write", "p"]);
+        assert!(crate::worker_sandbox::codex_sandbox_off_under_floor(&mut a));
+        assert_eq!(
+            a,
+            v(&["codex", "exec", "--sandbox", "danger-full-access", "p"])
+        );
+        let mut a = v(&[
             "/usr/local/bin/codex",
             "--sandbox=read-only",
-            "p"
-        ])));
-        assert!(!launches_bounded_codex(&v(&[
-            "/bin/echo",
-            "--sandbox",
-            "workspace-write"
-        ])));
-        assert!(!launches_bounded_codex(&v(&["codex", "exec", "p"])));
-        assert!(!launches_bounded_codex(&v(&[
-            "codex",
-            "--sandbox",
-            "workspace-write",
-            "--dangerously-bypass-approvals-and-sandbox",
-        ])));
-        assert!(!launches_bounded_codex(&[]));
+            "--full-auto",
+            "p",
+        ]);
+        assert!(crate::worker_sandbox::codex_sandbox_off_under_floor(&mut a));
+        assert_eq!(
+            a,
+            v(&["/usr/local/bin/codex", "--sandbox=danger-full-access", "p"])
+        );
+        let mut a = v(&["codex", "exec", "-c", "sandbox_mode=read-only", "p"]);
+        assert!(crate::worker_sandbox::codex_sandbox_off_under_floor(&mut a));
+        assert_eq!(
+            a,
+            v(&["codex", "exec", "--sandbox", "danger-full-access", "p"])
+        );
+        let mut a = v(&["codex", "exec", "-s", "read-only", "--", "-s", "x"]);
+        crate::worker_sandbox::codex_sandbox_off_under_floor(&mut a);
+        assert_eq!(
+            a,
+            v(&["codex", "exec", "-s", "danger-full-access", "--", "-s", "x"]),
+            "nothing after a `--` guard is touched"
+        );
+        let mut a = v(&["/bin/echo", "--sandbox", "workspace-write"]);
+        assert!(!crate::worker_sandbox::codex_sandbox_off_under_floor(
+            &mut a
+        ));
+        assert_eq!(a, v(&["/bin/echo", "--sandbox", "workspace-write"]));
     }
 
-    /// IG1-core-2 (review): a governed unit on the `codex` seat whose invocation does not launch
-    /// codex is NOT governed by codex's sandbox — no marker, `governed: false`, both disclosures.
+    /// Step 0: a governed unit on the `codex` seat is governed by the ENGINE's floor (codex's own
+    /// sandbox is no longer the boundary, and the codex exception is gone): whatever the
+    /// invocation launches, the floor arms around it, the ARMED marker is written and the unit is
+    /// governed — no `governanceUnenforced`. Skips where no launcher can arm.
     #[cfg(unix)]
     #[test]
-    fn a_codex_seat_launching_another_binary_is_not_governed_by_codex_sandbox() {
+    fn a_governed_codex_seat_is_governed_by_the_engine_floor_whatever_it_launches() {
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
         if seat_governance_class("codex") != wicked_council::GovernanceClass::OsSandboxFloor {
@@ -6283,26 +6450,24 @@ mod tests {
         let events: Vec<_> = rx.try_iter().collect();
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(!out.governed, "an echo is not codex's sandbox");
+        if crate::worker_sandbox::boundary_tool().is_err() {
+            eprintln!("execute_wrapped: no launcher can arm here — the step-0 codex proof skips");
+            return;
+        }
         assert!(
-            events.iter().any(|c| matches!(
-                c,
-                crate::command::Command::EmitEvent(
-                    crate::event::CoreEvent::GovernanceUnenforced { reason, .. }
-                ) if reason.contains("does not run codex with its own bounded")
-            )),
-            "{} events, none matched",
-            events.len()
+            out.governed,
+            "the engine floor governs the codex seat: {}",
+            out.output
         );
         assert!(
-            events.iter().any(|c| matches!(
+            !events.iter().any(|c| matches!(
                 c,
                 crate::command::Command::EmitEvent(
-                    crate::event::CoreEvent::SandboxUnenforced { .. }
+                    crate::event::CoreEvent::GovernanceUnenforced { .. }
+                        | crate::event::CoreEvent::SandboxUnenforced { .. }
                 )
             )),
-            "{} events, none matched",
-            events.len()
+            "no unenforced disclosure when the floor armed"
         );
     }
 
