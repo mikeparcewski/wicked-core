@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use crate::domain::WorkUnit;
 use crate::skills_snapshot::SkillsSnapshot;
 use crate::workflow::{DeltaSink, StepInput, StepOutput, StepRunner, StepStatus, Usage};
+use wicked_apps_core::spawn::SeatCli;
 use wicked_apps_core::HardenedCommand;
 
 /// The structured signals an [`OutputAdapter`] extracts from ONE raw stdout line (DES-STUDIO-COCKPIT-001
@@ -39,20 +40,20 @@ pub struct AdapterOut {
 }
 
 /// Per-CLI stdout adapter: turns a binary's raw stdout into readable deltas plus optional structured
-/// signals (usage, files). Selected by the resolved binary — `claude` → [`ClaudeStreamJson`], everything
-/// else → [`Passthrough`]. The default (passthrough) path is byte-identical to the pre-adapter behavior
-/// (every line is one delta, no usage/files), so a non-claude run is unchanged.
+/// signals (usage, files). Selected by the resolved binary and its JSON mode: claude stream-json,
+/// codex JSONL, pi JSON, or opencode JSON. The default ([`Passthrough`]) path is byte-identical to the
+/// pre-adapter behavior (every line is one delta, no usage/files).
 pub trait OutputAdapter: Send {
     /// Consume one raw stdout line; return the readable deltas + any structured signals it carried.
     fn on_line(&mut self, line: &str) -> AdapterOut;
-    /// Flush any buffered state when stdout closes (both current adapters are stateless → empty).
+    /// Flush any buffered state when stdout closes (stateless adapters return empty).
     fn finish(&mut self) -> AdapterOut {
         AdapterOut::default()
     }
 }
 
-/// Default adapter for every non-claude binary: each raw line is exactly one readable delta, no usage or
-/// files. Byte-identical to the original raw-line streaming.
+/// Default adapter when no structured mode is selected: each raw line is exactly one readable delta,
+/// no usage or files. Byte-identical to the original raw-line streaming.
 struct Passthrough;
 
 impl OutputAdapter for Passthrough {
@@ -392,6 +393,159 @@ impl OutputAdapter for PiJson {
             ..AdapterOut::default()
         }
     }
+}
+
+/// The `opencode run --format json` NDJSON adapter. `text` parts are readable deltas; `tool_use`
+/// parts carry tool names and write/edit paths in `state.input.path`. Usage is summed over
+/// `step_finish` parts (fresh + cache-read + cache-write input, output, and cost). There is no
+/// terminal event — stdout closes after the last part, and the caller judges the process exit.
+/// Anything that is not JSON passes through as one text delta.
+#[derive(Default)]
+pub(crate) struct OpencodeJson {
+    usage: Option<Usage>,
+}
+
+impl OutputAdapter for OpencodeJson {
+    fn on_line(&mut self, line: &str) -> AdapterOut {
+        if line.trim().is_empty() {
+            return AdapterOut::default();
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return AdapterOut {
+                text: vec![line.to_string()],
+                ..AdapterOut::default()
+            };
+        };
+        let mut out = AdapterOut::default();
+        let Some(part) = v.get("part") else {
+            return out;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                    if !t.is_empty() {
+                        out.text.push(t.to_string());
+                    }
+                }
+            }
+            Some("tool_use") => {
+                if let Some(tool) = part.get("tool").and_then(|t| t.as_str()) {
+                    if !tool.is_empty() {
+                        out.tools.push(tool.to_string());
+                    }
+                    if matches!(tool, "write" | "edit") {
+                        if let Some(path) = part
+                            .get("state")
+                            .and_then(|s| s.get("input"))
+                            .and_then(|i| i.get("path"))
+                            .and_then(|p| p.as_str())
+                        {
+                            if !path.is_empty() {
+                                out.files.push(path.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Some("step_finish") => {
+                let tokens = part.get("tokens");
+                let cost = part.get("cost").and_then(|c| c.as_f64());
+                if tokens.is_some() || cost.is_some() {
+                    let field = |k: &str| {
+                        tokens
+                            .and_then(|t| t.get(k))
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(0)
+                    };
+                    let cache = tokens.and_then(|t| t.get("cache"));
+                    let cache_field = |k: &str| {
+                        cache
+                            .and_then(|c| c.get(k))
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(0)
+                    };
+                    let cache_read = cache_field("read");
+                    let cache_write = cache_field("write");
+                    let prev = self.usage.take();
+                    let total = Usage {
+                        input_tokens: field("input")
+                            .saturating_add(cache_read)
+                            .saturating_add(cache_write)
+                            .saturating_add(prev.as_ref().map_or(0, |p| p.input_tokens)),
+                        output_tokens: field("output")
+                            .saturating_add(prev.as_ref().map_or(0, |p| p.output_tokens)),
+                        cache_read_tokens: cache_read
+                            .saturating_add(prev.as_ref().map_or(0, |p| p.cache_read_tokens)),
+                        cache_creation_tokens: cache_write
+                            .saturating_add(prev.as_ref().map_or(0, |p| p.cache_creation_tokens)),
+                        cost_usd: match (prev.as_ref().and_then(|p| p.cost_usd), cost) {
+                            (Some(a), Some(b)) => Some(a + b),
+                            (a, b) => a.or(b),
+                        },
+                    };
+                    self.usage = Some(total.clone());
+                    out.usage = Some(total);
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+}
+
+/// Whether an opencode argv explicitly selects JSON output. Only flags before the `--` guard
+/// count; a prompt containing `--format json` keeps the passthrough adapter.
+fn opencode_json_mode(binary: &str, argv: &[String]) -> bool {
+    if SeatCli::from_binary(binary) != SeatCli::Opencode {
+        return false;
+    }
+    let flags = &argv[..argv.iter().position(|a| a == "--").unwrap_or(argv.len())];
+    if let Some(i) = flags.iter().position(|a| a == "--format") {
+        return flags.get(i + 1).is_some_and(|f| f == "json");
+    }
+    flags.iter().any(|a| a == "--format=json")
+}
+
+/// Extract the CLI's resume id from one headless JSON line. Only the session-opening event
+/// qualifies for claude/codex/pi; opencode carries `sessionID` on every part's envelope.
+#[allow(dead_code)] // Resume consumers land separately from this parser slice.
+pub(crate) fn headless_session_id(cli: SeatCli, line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let event = v.get("type").and_then(|t| t.as_str());
+    let key = match cli {
+        SeatCli::Claude
+            if event == Some("system")
+                && v.get("subtype").and_then(|s| s.as_str()) == Some("init") =>
+        {
+            "session_id"
+        }
+        SeatCli::Codex if event == Some("thread.started") => "thread_id",
+        SeatCli::Pi if event == Some("session") => "id",
+        SeatCli::Opencode => "sessionID",
+        _ => return None,
+    };
+    v.get(key)
+        .and_then(|id| id.as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// Whether a headless turn emitted its terminal event. `Some(false)` identifies a stream that
+/// ended without completion; `None` means the CLI has no known terminal event (opencode uses
+/// the process exit code). Invalid JSON and unrelated events never count as completion.
+#[allow(dead_code)] // Completion consumers land separately from this parser slice.
+pub(crate) fn headless_turn_completed(cli: SeatCli, lines: &[&str]) -> Option<bool> {
+    let terminal = match cli {
+        SeatCli::Claude => "result",
+        SeatCli::Codex => "turn.completed",
+        SeatCli::Pi => "agent_end",
+        _ => return None,
+    };
+    Some(lines.iter().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .is_some_and(|v| v.get("type").and_then(|t| t.as_str()) == Some(terminal))
+    }))
 }
 
 /// (core#412) Add `--mode json` to a WRAPPED `pi` print launch (`-p` / `--print`), before any `--`
@@ -1910,7 +2064,7 @@ impl WrappedCliStepRunner {
         let mut no_lever_note: Option<String> = None;
 
         // Per-binary output adapter (B-runner). claude → stream-json (+ the two flags, injected before the
-        // `--` guard); every other binary → passthrough (byte-identical to the pre-adapter raw-line stream).
+        // `--` guard); binaries without a JSON mode → passthrough (byte-identical raw-line stream).
         // (core#412) codex → `exec --json`, pi → `-p --mode json`, each with its JSON adapter, so
         // the seat's usage is captured; the unit's text stays what plain mode printed.
         let seat_cli = wicked_apps_core::spawn::SeatCli::from_binary(&binary);
@@ -2191,6 +2345,8 @@ impl WrappedCliStepRunner {
                 Box::<CodexJsonl>::default()
             } else if pi_json {
                 Box::<PiJson>::default()
+            } else if opencode_json_mode(&binary, &argv) {
+                Box::<OpencodeJson>::default()
             } else {
                 Box::new(Passthrough)
             };
@@ -10717,6 +10873,303 @@ mod tests {
         }
         absorb(adapter.finish());
         acc
+    }
+
+    /// Full tool-loop turns and two captures of the same resumed session, straight from containers.
+    const HEADLESS_FIXTURES: &[(SeatCli, &str, &str, &str, &str)] = &[
+        (
+            SeatCli::Claude,
+            include_str!("../tests/fixtures/headless/claude-gw.ndjson"),
+            include_str!("../tests/fixtures/headless/claude-resume-t1.ndjson"),
+            include_str!("../tests/fixtures/headless/claude-resume-t2.ndjson"),
+            "34015248-a744-4330-971c-6856c23feeb9",
+        ),
+        (
+            SeatCli::Codex,
+            include_str!("../tests/fixtures/headless/codex-gw.ndjson"),
+            include_str!("../tests/fixtures/headless/codex-resume-t1.ndjson"),
+            include_str!("../tests/fixtures/headless/codex-resume-t2.ndjson"),
+            "01a13334-cda7-7b73-aa5d-346bc3b141d4",
+        ),
+        (
+            SeatCli::Pi,
+            include_str!("../tests/fixtures/headless/pi-gw.ndjson"),
+            include_str!("../tests/fixtures/headless/pi-resume-t1.ndjson"),
+            include_str!("../tests/fixtures/headless/pi-resume-t2.ndjson"),
+            "3851611b-fc6a-4d5f-80b9-0f8b06976f58",
+        ),
+        (
+            SeatCli::Opencode,
+            include_str!("../tests/fixtures/headless/opencode-gw.ndjson"),
+            include_str!("../tests/fixtures/headless/opencode-resume-t1.ndjson"),
+            include_str!("../tests/fixtures/headless/opencode-resume-t2.ndjson"),
+            "ses_spike5c08f950195c43a5a183",
+        ),
+    ];
+
+    /// Every resume capture must expose exactly the first turn's session id, never a message/part id.
+    fn assert_headless_session_resumes(cli: SeatCli) {
+        let (_, gw, t1, t2, expected) = HEADLESS_FIXTURES
+            .iter()
+            .find(|(seat, ..)| *seat == cli)
+            .expect("fixture for CLI");
+        for capture in [t1, t2] {
+            let ids: Vec<_> = capture
+                .lines()
+                .filter_map(|line| headless_session_id(cli, line))
+                .collect();
+            assert!(!ids.is_empty(), "{cli:?}: resume id missing");
+            assert!(
+                ids.iter().all(|id| id.as_str() == *expected),
+                "{cli:?}: {ids:?}"
+            );
+            for line in capture.lines() {
+                let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+                let key = match cli {
+                    SeatCli::Claude => "session_id",
+                    SeatCli::Codex => "thread_id",
+                    SeatCli::Pi => "id",
+                    SeatCli::Opencode => "sessionID",
+                    _ => unreachable!(),
+                };
+                v.as_object_mut().unwrap().remove(key);
+                assert_eq!(headless_session_id(cli, &v.to_string()), None);
+                v[key] = serde_json::json!("");
+                assert_eq!(headless_session_id(cli, &v.to_string()), None);
+            }
+        }
+        assert!(gw
+            .lines()
+            .any(|line| headless_session_id(cli, line).is_some()));
+        assert_eq!(headless_session_id(cli, "not JSON"), None);
+        assert_eq!(headless_session_id(cli, ""), None);
+        if cli != SeatCli::Opencode {
+            let last = t1.lines().last().unwrap();
+            assert_eq!(headless_session_id(cli, last), None, "not a session opener");
+        }
+    }
+
+    #[test]
+    fn headless_claude_session_id_survives_resume() {
+        assert_headless_session_resumes(SeatCli::Claude);
+    }
+
+    #[test]
+    fn headless_codex_thread_id_survives_resume() {
+        assert_headless_session_resumes(SeatCli::Codex);
+    }
+
+    #[test]
+    fn headless_pi_session_id_survives_resume() {
+        assert_headless_session_resumes(SeatCli::Pi);
+    }
+
+    #[test]
+    fn headless_opencode_session_id_survives_resume() {
+        assert_headless_session_resumes(SeatCli::Opencode);
+    }
+
+    /// Cutting a capture before its terminal event models cancellation, even if the process exits 0.
+    #[test]
+    fn headless_terminal_events_distinguish_completed_from_cancelled_turns() {
+        for (cli, gw, t1, t2, _) in HEADLESS_FIXTURES {
+            for capture in [gw, t1, t2] {
+                let lines: Vec<_> = capture.lines().collect();
+                if *cli == SeatCli::Opencode {
+                    assert_eq!(headless_turn_completed(*cli, &lines), None);
+                    assert_eq!(headless_turn_completed(*cli, &lines[..1]), None);
+                    assert_eq!(headless_turn_completed(*cli, &[]), None);
+                    continue;
+                }
+                assert_eq!(headless_turn_completed(*cli, &lines), Some(true));
+                let terminal = match cli {
+                    SeatCli::Claude => "result",
+                    SeatCli::Codex => "turn.completed",
+                    SeatCli::Pi => "agent_end",
+                    _ => unreachable!(),
+                };
+                let at = lines
+                    .iter()
+                    .position(|line| {
+                        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                        v["type"] == terminal
+                    })
+                    .unwrap();
+                assert_eq!(headless_turn_completed(*cli, &lines[..at]), Some(false));
+                let without_terminal: Vec<_> = lines
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, line)| (i != at).then_some(*line))
+                    .collect();
+                assert_eq!(
+                    headless_turn_completed(*cli, &without_terminal),
+                    Some(false)
+                );
+                assert_eq!(headless_turn_completed(*cli, &[lines[at]]), Some(true));
+                assert_eq!(
+                    headless_turn_completed(*cli, &["not JSON", ""]),
+                    Some(false)
+                );
+                assert_eq!(headless_turn_completed(*cli, &[]), Some(false));
+            }
+        }
+        assert_eq!(headless_turn_completed(SeatCli::Other, &[]), None);
+        assert_eq!(
+            headless_session_id(
+                SeatCli::Other,
+                HEADLESS_FIXTURES[0].2.lines().next().unwrap()
+            ),
+            None
+        );
+    }
+
+    /// No tool output leaks into prose; each step contributes usage, including failed tool calls.
+    #[test]
+    fn the_opencode_adapter_extracts_text_tools_files_and_sums_usage() {
+        let lines: Vec<_> = include_str!("../tests/fixtures/headless/opencode-gw.ndjson")
+            .lines()
+            .collect();
+        let out = drive(&mut OpencodeJson::default(), &lines);
+        assert_eq!(out.text, vec!["STUB-DONE".to_string()]);
+        let mut tools = vec!["shell".to_string(); 20];
+        tools[0] = "write".to_string();
+        tools[1] = "write".to_string();
+        tools[16] = "write".to_string();
+        assert_eq!(out.tools, tools);
+        assert_eq!(
+            out.files,
+            vec![
+                "/work/edited-by-agent.txt".to_string(),
+                "/tmp/outside/filetool-outside.txt".to_string(),
+                "/work/held/filetool.txt".to_string(),
+            ]
+        );
+        assert_eq!(
+            out.usage,
+            Some(Usage {
+                input_tokens: 20,
+                output_tokens: 20,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                cost_usd: Some(0.0),
+            })
+        );
+    }
+
+    /// The resumed text-only capture has no step usage; neither text nor `finish` invents a total.
+    #[test]
+    fn the_opencode_adapter_handles_resume_and_missing_usage() {
+        let t1: Vec<_> = include_str!("../tests/fixtures/headless/opencode-resume-t1.ndjson")
+            .lines()
+            .collect();
+        let t2: Vec<_> = include_str!("../tests/fixtures/headless/opencode-resume-t2.ndjson")
+            .lines()
+            .collect();
+        let first = drive(&mut OpencodeJson::default(), &t1);
+        assert_eq!(first.text, vec!["STUB-DONE".to_string()]);
+        assert_eq!(first.tools, vec!["write".to_string()]);
+        assert_eq!(first.files, vec!["/work/edited-by-agent.txt".to_string()]);
+        assert_eq!(
+            first
+                .usage
+                .as_ref()
+                .map(|u| (u.input_tokens, u.output_tokens)),
+            Some((1, 1))
+        );
+        let resumed = drive(&mut OpencodeJson::default(), &t2);
+        assert_eq!(resumed.text, vec!["STUB-DONE".to_string()]);
+        assert!(resumed.tools.is_empty() && resumed.files.is_empty());
+        assert_eq!(resumed.usage, None);
+
+        let mut step: serde_json::Value = serde_json::from_str(t1[2]).unwrap();
+        step["part"].as_object_mut().unwrap().remove("tokens");
+        step["part"].as_object_mut().unwrap().remove("cost");
+        let out = drive(
+            &mut OpencodeJson::default(),
+            &[&step.to_string(), "not JSON", ""],
+        );
+        assert_eq!(out.text, vec!["not JSON".to_string()]);
+        assert_eq!(out.usage, None);
+    }
+
+    /// Vary the captured token/cache/cost fields to exercise the split and cumulative totals.
+    #[test]
+    fn the_opencode_adapter_counts_cached_input_and_reported_cost() {
+        let line = include_str!("../tests/fixtures/headless/opencode-resume-t1.ndjson")
+            .lines()
+            .nth(2)
+            .unwrap();
+        let mut step: serde_json::Value = serde_json::from_str(line).unwrap();
+        step["part"]["tokens"]["input"] = serde_json::json!(10);
+        step["part"]["tokens"]["output"] = serde_json::json!(3);
+        step["part"]["tokens"]["cache"]["read"] = serde_json::json!(20);
+        step["part"]["tokens"]["cache"]["write"] = serde_json::json!(5);
+        step["part"]["cost"] = serde_json::json!(0.25);
+        let first = step.to_string();
+        step["part"].as_object_mut().unwrap().remove("cost");
+        let second = step.to_string();
+        let out = drive(&mut OpencodeJson::default(), &[&first, &second, &first]);
+        assert_eq!(
+            out.usage,
+            Some(Usage {
+                input_tokens: 105,
+                output_tokens: 9,
+                cache_read_tokens: 60,
+                cache_creation_tokens: 15,
+                cost_usd: Some(0.5),
+            })
+        );
+        let no_cost = drive(&mut OpencodeJson::default(), &[&second]);
+        assert_eq!(no_cost.usage.unwrap().cost_usd, None);
+    }
+
+    /// Only an opencode binary with an explicit JSON flag selects its adapter; argv is never mutated.
+    #[test]
+    fn the_opencode_json_mode_requires_the_binary_and_format_flag() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        for binary in ["opencode", "/usr/local/bin/opencode", "opencode.exe"] {
+            for args in [
+                s(&["opencode", "run", "--format", "json", "prompt"]),
+                s(&["opencode", "run", "--format=json", "--", "prompt"]),
+            ] {
+                assert!(opencode_json_mode(binary, &args));
+            }
+        }
+        for (binary, args) in [
+            ("opencode", s(&["opencode", "run", "prompt"])),
+            (
+                "opencode",
+                s(&["opencode", "run", "--format", "default", "prompt"]),
+            ),
+            (
+                "opencode",
+                s(&["opencode", "run", "--format=default", "prompt"]),
+            ),
+            ("opencode", s(&["opencode", "run", "--format"])),
+            (
+                "opencode",
+                s(&["opencode", "run", "--", "--format", "json"]),
+            ),
+            ("opencode", s(&["opencode", "run", "--", "--format=json"])),
+            ("pi", s(&["pi", "-p", "--format", "json", "prompt"])),
+            (
+                "opencode-wrapper",
+                s(&["opencode-wrapper", "run", "--format=json"]),
+            ),
+        ] {
+            let original = args.clone();
+            assert!(!opencode_json_mode(binary, &args));
+            assert_eq!(args, original);
+            let lines: Vec<_> =
+                include_str!("../tests/fixtures/headless/opencode-resume-t2.ndjson")
+                    .lines()
+                    .chain(["  plain text  ", ""])
+                    .collect();
+            let out = drive(&mut Passthrough, &lines);
+            assert_eq!(out.text, lines);
+            assert!(out.files.is_empty() && out.tools.is_empty());
+            assert_eq!(out.usage, None);
+        }
     }
 
     /// Faithful structural slice of the empirical `/tmp/cj.ndjson` capture (DES §6b): a system init, an
