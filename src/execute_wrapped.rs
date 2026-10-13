@@ -2213,6 +2213,9 @@ impl WrappedCliStepRunner {
             // opencode server password) and its container + network, removed however the unit
             // ends (held to the end of this scope).
             let mut floor_env: Vec<(&'static str, PathBuf)> = Vec::new();
+            // Container floor: the seat's gateway env and registration.
+            let mut seat_gateway_env: Vec<(String, String)> = Vec::new();
+            let mut gateway_lease: Option<crate::container_floor::GatewayLease> = None;
             let mut opencode_password: Option<String> = None;
             let mut seat_cleanup: Option<crate::container_floor::ReapOnDrop> = None;
             let mut scratch_guard: Option<crate::container_floor::RemoveOnDrop> = None;
@@ -2297,15 +2300,31 @@ impl WrappedCliStepRunner {
                     .flat_map(|g| g.extra_read_roots.iter().map(PathBuf::from))
                     .chain(handed.map(|s| s.root.clone()))
                     .collect();
-                if gov_env.is_some() {
-                    // A claude unit's gate hook is `<host wicked-core> gate-hook`: inside the
-                    // seat that command does not exist, so its tool calls would run unjudged.
+                // A claude unit's gate hook runs on the host, reached through the gateway's hook
+                // route; without the relay (or a gateway to route it) its tool calls would run
+                // unjudged. An offline seat has no gateway at all (agy gw-r1 F-02): refused up
+                // front, never launched with a hook it cannot reach.
+                // The hook fails closed only on the pinned claude (codex gw-r4 P2): an operator
+                // image's claude version is unverified, so a governed unit refuses it.
+                if gov_env.is_some() && crate::container_floor::image_override("claude").is_some() {
+                    return floor_refused(
+                        input,
+                        &cli_key,
+                        crate::worker_sandbox::FloorUnarmed::UnverifiedHookImage,
+                    );
+                }
+                if gov_env.is_some()
+                    && (crate::hook_relay::port().is_none()
+                        || self.operational_home.is_none()
+                        || crate::container_floor::offline_seats())
+                {
                     return floor_refused(
                         input,
                         &cli_key,
                         crate::worker_sandbox::FloorUnarmed::GateHookUnreachable,
                     );
                 }
+                let gateway_dir = self.operational_home.as_deref().map(|h| h.join("gateway"));
                 match crate::container_floor::arm(
                     &plan.inputs,
                     &argv,
@@ -2313,9 +2332,24 @@ impl WrappedCliStepRunner {
                     input.unit.ord,
                     &read_roots,
                     Some(prompt.as_str()),
+                    gateway_dir.as_deref(),
                 ) {
+                    // The hook route rides the gateway: a claude unit whose relay the gateway
+                    // could not reach is refused, never run with its hook calls failing open.
+                    Ok(c) if gov_env.is_some() && !crate::seat_gateway::hook_route_ready() => {
+                        if let Some(lease) = c.lease {
+                            let _ = lease.release();
+                        }
+                        return floor_refused(
+                            input,
+                            &cli_key,
+                            crate::worker_sandbox::FloorUnarmed::GateHookUnreachable,
+                        );
+                    }
                     Ok(c) => {
                         seat_cleanup = Some(c.cleanup);
+                        seat_gateway_env = c.env;
+                        gateway_lease = c.lease;
                         argv = c.argv;
                         // Each CLI's own sandbox off inside ours (codex's cannot run in a
                         // container: it needs user namespaces).
@@ -2553,6 +2587,9 @@ impl WrappedCliStepRunner {
             for (k, v) in &floor_env {
                 cmd.env(k, v);
             }
+            for (k, v) in &seat_gateway_env {
+                cmd.env(k, v);
+            }
             if let Some(pw) = &opencode_password {
                 for k in crate::worker_sandbox::OPENCODE_PASSWORD_ENVS {
                     cmd.env(k, pw);
@@ -2744,14 +2781,52 @@ impl WrappedCliStepRunner {
             // is governed. Bound until the worker exits (the guard drops after `run_bounded`); an
             // ungoverned unit or a daemon with no broker gets neither variable.
             let mcp_channel = crate::mcp_gate::arm_worker_mcp_channel(&mut cmd, input);
+            // A container seat reaches the broker only through its gateway's MCP route (the
+            // daemon's loopback URL names the seat's own loopback); no route, no broker URL.
+            if mcp_channel.is_some() && gateway_lease.is_some() {
+                if crate::seat_gateway::mcp_route_ready() {
+                    cmd.env(crate::mcp_gate::CREW_URL_ENV, crate::seat_gateway::MCP_URL);
+                } else {
+                    cmd.env_remove(crate::mcp_gate::CREW_URL_ENV);
+                }
+            }
             let cancel_token = self.register_token(input);
             // (ASK-K1b) The ceiling, lowered to the unit's own budget when its phase set one.
             let timeout = crate::workflow::effective_timeout(self.timeout, input.unit.budget_secs);
+            // Container floor: the relay judges this unit's hook calls with exactly the env the
+            // seat command carries (what a command hook would have inherited).
+            // Revoked when this guard drops: after the seat, or on any early return or unwind.
+            let hook_registration = gov_env
+                .as_ref()
+                .and_then(|g| g.hook_token.as_deref())
+                .and_then(|t| {
+                    let env = cmd
+                        .get_envs()
+                        .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+                        .collect();
+                    let cwd = cmd.get_current_dir().map(Path::to_path_buf);
+                    crate::hook_relay::register(t, crate::hook_relay::HookContext { env, cwd })
+                });
             let bounded = run_bounded(cmd, timeout, emit, adapter, Some(cancel_token.clone()));
+            drop(hook_registration);
             self.unregister_token(input, &cancel_token);
             // The seat ran (and `run_bounded` reaped it); release the arm-time guards now.
             drop(seat_cleanup.take());
             drop(scratch_guard.take());
+            // Revoke the seat's gateway key and keep what the gateway recorded for it (each
+            // model request's status, model, tool calls, text and usage) as the unit's evidence.
+            if let Some(lease) = gateway_lease.take() {
+                let records = lease.release();
+                let phase = gov_env
+                    .as_ref()
+                    .map(|g| g.phase.clone())
+                    .unwrap_or_else(|| crate::scope::unit_phase(input.unit.ord));
+                crate::seat_gateway::write_records(
+                    &crate::gate_hook::decisions_path_for_input(input)
+                        .with_file_name(format!("gateway-{phase}.ndjson")),
+                    &records,
+                );
+            }
             drop(mcp_channel);
             match bounded {
                 // FINDING-100. A unit may background work and return — domain-extraction's extract
@@ -3064,6 +3139,19 @@ fn quote_exe_command(exe: &str) -> String {
     {
         format!("\"{exe}\" gate-hook")
     }
+}
+
+/// A container seat's gate hook: an HTTP hook to the engine's relay through the gateway. A hook
+/// that cannot reach the relay (connection failure, non-2xx, timeout) is a NON-blocking error
+/// unless `onFailure` says block (claude >= 2.1.295, the seat image's pin): an unreachable judge
+/// must deny, never wave the tool call through (`probe/hookfail`: without it a Write ran).
+pub(crate) fn container_gate_hook(token: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "http",
+        "url": crate::hook_relay::hook_url(token),
+        "timeout": 90,
+        "onFailure": "block"
+    })
 }
 
 /// Resolve the absolute path to the `wicked-core` binary for the gate-hook command.
@@ -3383,6 +3471,8 @@ fn which_binary(name: &str) -> Result<String, ()> {
 /// ENV (never interpolated into the shell hook command) so caller-controlled ids cannot inject shell
 /// metacharacters.
 struct GovLaunch {
+    /// Container floor: the unit's gate-hook relay token (its settings name an HTTP hook).
+    hook_token: Option<String>,
     decisions_path: PathBuf,
     db_path: String,
     scope: String,
@@ -3625,6 +3715,13 @@ fn arm_input_governance(
     // can't be shell-expanded (POSIX single-quote disables ALL expansion; on Windows cmd `$`/backtick are
     // not special, so double-quote for spaces — a `"` is illegal in a Windows path anyway).
     let command = quote_exe_command(&exe);
+    // Container floor: the seat cannot run the host binary, so its hook is an HTTP hook to the
+    // engine's relay through the gateway (`crate::hook_relay`), keyed by a per-unit token.
+    let hook_token = crate::container_floor::container_mode().then(crate::hook_relay::mint_token);
+    let hook = match &hook_token {
+        Some(t) => container_gate_hook(t),
+        None => serde_json::json!({ "type": "command", "command": command }),
+    };
     // D-7 (DES-L4 PR-⑦): the CLI-registered estate MCP is NO LONGER handed to the worker — no
     // `--mcp-config` file, no `mcpServers`, no `permissions.allow` for it. Grounding is the estate
     // SHIM garden's skills run (`wicked-garden run scripts/_estate_client.py --readonly …`), which
@@ -3641,7 +3738,7 @@ fn arm_input_governance(
     let settings = serde_json::json!({
         "hooks": {
             "PreToolUse": [
-                { "matcher": "*", "hooks": [ { "type": "command", "command": command } ] }
+                { "matcher": "*", "hooks": [ hook ] }
             ]
         },
         // deny: the same boundary `inject_isolation_flags` puts on argv, restated in the file. Belt and
@@ -3688,6 +3785,7 @@ fn arm_input_governance(
         extra_write_roots: gov.extra_write_roots.clone(),
         extra_read_roots: gov.extra_read_roots.clone(),
         skills_root: skills_root.map(Path::to_path_buf),
+        hook_token,
     })
 }
 
@@ -5719,6 +5817,19 @@ mod tests {
         );
     }
     use super::*;
+
+    /// Codex gw-r1 (P1): the container seat's HTTP gate hook fails CLOSED when the relay cannot
+    /// be reached, and its URL carries only the unit's token.
+    #[test]
+    fn the_container_gate_hook_blocks_when_the_relay_fails() {
+        let hook = container_gate_hook("ab12");
+        assert_eq!(hook["type"], "http");
+        assert_eq!(hook["onFailure"], "block");
+        assert_eq!(
+            hook["url"],
+            format!("http://agw:{}/hook/ab12", crate::hook_relay::HOOK_PORT)
+        );
+    }
 
     /// The fence and injector entry points with NO operational state home (the tests here fence
     /// nothing but the defaults and the handed snapshot's home); shadow the glob imports. The
@@ -9301,6 +9412,7 @@ mod tests {
         let graph = graph.as_str();
         let read = |code_graph_db: Option<&str>| {
             let gov = GovLaunch {
+                hook_token: None,
                 decisions_path: std::path::PathBuf::from("/tmp/decisions.ndjson"),
                 db_path: op.to_string(),
                 scope: "s".to_string(),

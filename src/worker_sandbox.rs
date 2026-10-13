@@ -315,6 +315,9 @@ pub(crate) enum FloorUnarmed {
     /// Container floor: the daemon's model gateway (the seat's only egress) could not be started
     /// or attached.
     GatewayUnavailable,
+    /// Container floor: a governed claude seat on an operator-supplied image, whose claude the
+    /// engine cannot verify honours the blocking HTTP gate hook.
+    UnverifiedHookImage,
 }
 
 impl FloorUnarmed {
@@ -371,6 +374,11 @@ impl FloorUnarmed {
                 "gateway_unavailable: the daemon's model gateway (agentgateway, the seat's only \
                  egress) could not be started or attached to the seat's network"
             }
+            FloorUnarmed::UnverifiedHookImage => {
+                "unverified_hook_image: a governed claude seat runs only the engine's pinned claude \
+                 image (2.1.295 or later fails its HTTP gate hook closed); unset \
+                 WICKED_SEAT_IMAGE_CLAUDE for governed runs"
+            }
         }
     }
 
@@ -389,6 +397,7 @@ impl FloorUnarmed {
             FloorUnarmed::GateHookUnreachable => "gate_hook_unreachable",
             FloorUnarmed::HostOnlyCarrier => "host_only_carrier",
             FloorUnarmed::GatewayUnavailable => "gateway_unavailable",
+            FloorUnarmed::UnverifiedHookImage => "unverified_hook_image",
         }
     }
 }

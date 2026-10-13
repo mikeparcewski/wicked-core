@@ -43,6 +43,7 @@ mod execute;
 mod execute_wrapped;
 mod gate_hook;
 mod graph_browser;
+mod hook_relay;
 mod install_fence;
 mod interaction;
 mod knowledge;
@@ -90,6 +91,7 @@ mod review_context;
 #[allow(dead_code)]
 mod review_scale;
 mod scope;
+mod seat_gateway;
 mod session_runner;
 mod skills_snapshot;
 mod sources;

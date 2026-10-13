@@ -71,7 +71,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const REAP_TIMEOUT: Duration = Duration::from_secs(20);
 const SWEEP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
-const GATEWAY_PORTS: &[u16] = &[3000, 4000, 6000];
+/// The gateway's listeners a seat may connect to: CONNECT 3000, Anthropic 4000, OpenAI 4001,
+/// the ask MCP 8700 and the gate hook 8711 ([`crate::seat_gateway`], [`crate::hook_relay`]).
+pub(crate) const GATEWAY_PORTS: &[u16] = &[3000, 4000, 4001, 8700, crate::hook_relay::HOOK_PORT];
 /// The engine's trusted launcher, from the floor image mounted read-only at [`FLOOR_DIR`]: the
 /// seat's entrypoint, so no code from the seat image runs before the floor holds.
 const SEAT_ENTRY: &str = "/floor/launch";
@@ -92,7 +94,8 @@ const FLOOR_DOCKERFILE: &str = include_str!("../containers/floor.Dockerfile");
 /// The CLIs the engine ships a seat image for (the registry's seat keys), each with the npm
 /// package at the version the engine is verified against.
 const SEAT_PACKAGES: &[(&str, &str)] = &[
-    ("claude", "@anthropic-ai/claude-code@2.1.287"),
+    // 2.1.295+: an HTTP hook honours `onFailure: "block"` (the gate hook fails closed).
+    ("claude", "@anthropic-ai/claude-code@2.1.296"),
     ("codex", "@openai/codex@0.162.1"),
     ("pi", "@earendil-works/pi-coding-agent@1.1.0"),
     ("opencode", "@opencode/cli@2.0.25"),
@@ -116,7 +119,7 @@ pub(crate) struct Runtime {
 }
 
 impl Runtime {
-    fn cmd(&self) -> Command {
+    pub(crate) fn cmd(&self) -> Command {
         let mut c = Command::new(&self.cli);
         c.hardened().stdin(Stdio::null());
         if let Some(path) = client_path(&self.cli, std::env::var_os("PATH").as_deref()) {
@@ -351,7 +354,7 @@ pub(crate) fn floor_image_tag() -> String {
 }
 
 /// The operator's own image for `cli` (`WICKED_SEAT_IMAGE_<CLI>`), used as-is.
-fn image_override(cli: &str) -> Option<String> {
+pub(crate) fn image_override(cli: &str) -> Option<String> {
     let key = format!("WICKED_SEAT_IMAGE_{}", cli.to_ascii_uppercase());
     std::env::var(key)
         .ok()
@@ -375,7 +378,7 @@ fn valid_image_id(id: &str) -> Option<String> {
     (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_string())
 }
 
-fn image_present(rt: &Runtime, tag: &str) -> bool {
+pub(crate) fn image_present(rt: &Runtime, tag: &str) -> bool {
     let mut c = rt.cmd();
     c.args(["image", "inspect", "--format", "{{.Id}}", tag]);
     output_within(c, PROBE_TIMEOUT).is_some_and(|o| o.status.success())
@@ -561,6 +564,28 @@ pub(crate) fn check_seat_image(facts: &ImageFacts, dests: &[PathBuf]) -> Result<
     Ok(())
 }
 
+/// The seat network sidecar's Dockerfile (alpine + iptables; see the file).
+const NETNS_DOCKERFILE: &str = include_str!("../containers/seats/netns.Dockerfile");
+
+/// The sidecar image, built on first use (tagged by its Dockerfile's hash).
+pub(crate) fn ensure_netns_image(rt: &Runtime) -> Result<String, String> {
+    let tag = format!("wicked-seat-netns:{}", content_tag(&[NETNS_DOCKERFILE]));
+    if image_present(rt, &tag) {
+        return Ok(tag);
+    }
+    static BUILD: Mutex<()> = Mutex::new(());
+    let _one = BUILD.lock();
+    if image_present(rt, &tag) {
+        return Ok(tag);
+    }
+    build_image(
+        rt,
+        NETNS_DOCKERFILE,
+        &tag,
+        &["BASE=alpine:3.22".to_string()],
+    )
+}
+
 /// Build `df` alone (no build context) as `tag`, streaming the runtime's progress to the engine's
 /// stderr. `Err` carries the runtime's last words.
 fn build_image(rt: &Runtime, df: &str, tag: &str, build_args: &[String]) -> Result<String, String> {
@@ -658,7 +683,7 @@ pub(crate) fn ensure_seat_image(rt: &Runtime, cli: &str) -> Result<String, Strin
 }
 
 /// Whether seats run with no network at all ([`NETWORK_ENV`]` = none`).
-fn offline_seats() -> bool {
+pub(crate) fn offline_seats() -> bool {
     std::env::var(NETWORK_ENV).is_ok_and(|v| v.trim() == "none")
 }
 
@@ -1319,8 +1344,24 @@ pub(crate) fn reap(seat: &SeatContainer) {
     };
     let name = seat.name.as_str();
     let mut c = rt.cmd();
-    c.args(["rm", "--force", name]);
+    c.args(["rm", "--force", name, &netns_name(name)]);
     let _ = output_within(c, REAP_TIMEOUT);
+    // Detach whatever else is attached (the gateway) so the network can go.
+    let mut members = rt.cmd();
+    members.args([
+        "network",
+        "inspect",
+        "--format",
+        "{{range .Containers}}{{.Name}} {{end}}",
+        name,
+    ]);
+    if let Some(o) = output_within(members, PROBE_TIMEOUT).filter(|o| o.status.success()) {
+        for m in String::from_utf8_lossy(&o.stdout).split_whitespace() {
+            let mut d = rt.cmd();
+            d.args(["network", "disconnect", "--force", name, m]);
+            let _ = output_within(d, REAP_TIMEOUT);
+        }
+    }
     // Its own network goes with it. The runtime detaches the container's endpoint asynchronously
     // after `--rm`, so a first removal can find it still in use: retry briefly. An offline seat
     // has no network of its own (`network inspect` fails at once and the loop ends).
@@ -1442,6 +1483,84 @@ pub(crate) struct ArmedContainer {
     /// Removes the seat's container and network on every path out of the unit (held by the
     /// caller until the unit ends; `run_bounded`'s own reap makes it a no-op on the normal path).
     pub(crate) cleanup: ReapOnDrop,
+    /// The env the seat reaches the gateway with (its placeholder key, the model base URLs,
+    /// the CONNECT proxy); empty for an offline seat.
+    pub(crate) env: Vec<(String, String)>,
+    /// The seat's gateway registration, released after the unit ([`GatewayLease::release`]).
+    pub(crate) lease: Option<GatewayLease>,
+}
+
+/// How many times a lease retries an unconfirmed revocation before quarantining the gateway.
+const REVOKE_ATTEMPTS: usize = 3;
+
+/// One seat's registration on the daemon's gateway: its key is revoked and its records read
+/// when the unit ends.
+#[derive(Debug)]
+pub(crate) struct GatewayLease {
+    runtime: Runtime,
+    dir: PathBuf,
+    gateway: crate::seat_gateway::Gateway,
+    key: String,
+    /// `<run>#<ord>@<nonce>`: the identity the gateway's records carry for this execution.
+    pub(crate) unit: String,
+    since: String,
+}
+
+impl GatewayLease {
+    /// Revoke the seat's key and return what the gateway recorded for it (model requests:
+    /// status, model, tool calls, text, usage — never a credential).
+    pub(crate) fn release(mut self) -> Vec<crate::seat_gateway::GatewayRecord> {
+        let records = crate::seat_gateway::collect_unit_records(
+            &self.runtime,
+            &self.gateway,
+            &self.since,
+            &self.unit,
+        );
+        self.revoke();
+        records
+    }
+
+    /// Revoke the key once; evidence collection is optional, revocation is not. A revocation
+    /// the gateway does not confirm is retried, and if it still is not confirmed the gateway is
+    /// removed (codex gw-r2 P2): no served policy outlives a key the engine meant to revoke. The
+    /// next unit starts a fresh gateway with no keys.
+    fn revoke(&mut self) {
+        let key = std::mem::take(&mut self.key);
+        if key.is_empty() {
+            return;
+        }
+        let mut last = String::new();
+        for _ in 0..REVOKE_ATTEMPTS {
+            match crate::seat_gateway::deregister_live(
+                &self.runtime,
+                &self.gateway,
+                &self.dir,
+                &key,
+            ) {
+                Ok(()) => return,
+                Err(e) => last = e,
+            }
+        }
+        let removed = crate::seat_gateway::quarantine(&self.runtime, &self.gateway);
+        eprintln!(
+            "wicked-core: gateway key for {} not revoked ({last}); gateway {} {}",
+            self.unit,
+            self.gateway.name,
+            if removed {
+                "removed"
+            } else {
+                "could NOT be removed"
+            }
+        );
+    }
+}
+
+/// A lease dropped without [`GatewayLease::release`] (an early refusal after arming, a panic
+/// while the seat runs) still revokes its key.
+impl Drop for GatewayLease {
+    fn drop(&mut self) {
+        self.revoke();
+    }
 }
 
 fn tool_name(cli: &Path) -> &'static str {
@@ -1481,6 +1600,7 @@ pub(crate) fn arm(
     ord: u32,
     read_roots: &[PathBuf],
     prompt: Option<&str>,
+    gateway_dir: Option<&Path>,
 ) -> Result<ArmedContainer, (FloorUnarmed, String)> {
     let cli = argv
         .first()
@@ -1524,9 +1644,10 @@ pub(crate) fn arm(
     let floor_image = ensure_floor_image(&rt)
         .and_then(|t| image_id(&rt, &t).ok_or_else(|| format!("floor image {t} vanished")))
         .map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
-    // A seat's only route out is the daemon's model gateway; this engine has none, so only an
-    // offline seat runs (an `--internal` network alone still reaches the VM host's services).
-    if !offline_seats() {
+    // A seat's only route out is the daemon's model gateway: an engine with no gateway dir (no
+    // state home) runs only offline seats (an `--internal` network alone still reaches the VM
+    // host's services).
+    if !offline_seats() && gateway_dir.is_none() {
         return Err((
             FloorUnarmed::GatewayUnavailable,
             format!("no model gateway is configured; set {NETWORK_ENV}=none for an offline seat"),
@@ -1538,6 +1659,8 @@ pub(crate) fn arm(
     add_read_roots(&mut mounts, read_roots);
     let mut argv = argv.to_vec();
     mount_argv_paths(&mut mounts, &mut argv, prompt);
+    cover_gateway_dir(&mut mounts, gateway_dir)
+        .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
     // The seat image cannot move a mount (a link where one lands, a declared volume).
     let dests: Vec<PathBuf> = mounts
         .iter()
@@ -1557,6 +1680,43 @@ pub(crate) fn arm(
         runtime: rt.cli.clone(),
         name: name.clone(),
     }));
+    // The seat's only egress: the daemon's gateway, attached to its network as `agw`, with a
+    // fresh placeholder key. No gateway dir (an engine with no state home) = no egress at all.
+    let (env, lease) = match gateway_dir.filter(|_| network != "none") {
+        Some(dir) => {
+            let down = |e: String| (FloorUnarmed::GatewayUnavailable, e);
+            let gw = crate::seat_gateway::ensure_gateway(&rt, dir).map_err(down)?;
+            crate::seat_gateway::attach(&rt, &gw, &network).map_err(down)?;
+            // The seat's namespace: a sidecar allows output only to the gateway's own address on
+            // its ports (an internal network alone still reaches the VM host's services).
+            let gw_ip = gateway_ip(&rt, &gw.name, &network).map_err(down)?;
+            start_netns_sidecar(&rt, &name, &network, &gw_ip).map_err(down)?;
+            // One execution's identity (codex gw-r1 P3): a retry or a reviewer session of the
+            // same unit ordinal never reads another execution's requests as its own.
+            let unit = format!(
+                "{run_id}#{ord}@{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..8]
+            );
+            let key = crate::seat_gateway::UnitKey::new(run_id, &unit, cli);
+            let since = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs().saturating_sub(1).to_string())
+                .unwrap_or_default();
+            // The lease owns the key BEFORE the first registration step (codex gw-r2 P2): a
+            // failed persist, publish or readiness check drops it, which revokes the key.
+            let lease = GatewayLease {
+                runtime: rt.clone(),
+                dir: dir.to_path_buf(),
+                gateway: gw.clone(),
+                key: key.key.clone(),
+                unit,
+                since,
+            };
+            crate::seat_gateway::register_live(&rt, &gw, dir, key.clone()).map_err(down)?;
+            (crate::seat_gateway::seat_env_all(&key.key), Some(lease))
+        }
+        None => (Vec::new(), None),
+    };
     let user = operator_user();
     let workdir = inp.cwd.canonicalize().unwrap_or_else(|_| inp.cwd.clone());
     let memory = std::env::var(MEMORY_ENV).ok();
@@ -1568,11 +1728,17 @@ pub(crate) fn arm(
             crate::worker_sandbox::NetGrant::AnyHost { .. } => None,
         })
         .collect();
+    // Online seats join their sidecar's namespace; an offline seat has no network.
+    let seat_network = if network == "none" {
+        network.clone()
+    } else {
+        format!("container:{}", netns_name(&name))
+    };
     let wrapper = run_argv(&ContainerLaunch {
         runtime: &rt.cli,
         image: &image,
         name: &name,
-        network: &network,
+        network: &seat_network,
         workdir: &workdir,
         user: &user,
         mounts: &mounts,
@@ -1586,6 +1752,8 @@ pub(crate) fn arm(
         argv: image_argv(&argv, cli),
         tool: tool_name(&rt.cli),
         cleanup,
+        env,
+        lease,
     })
 }
 
@@ -1727,9 +1895,149 @@ pub(crate) fn trust_pin(p: &Path) -> Result<(), String> {
     }
 }
 
+/// The seat's network sidecar container name.
+pub(crate) fn netns_name(seat: &str) -> String {
+    format!("{seat}-netns")
+}
+
+/// `container`'s address on `network`.
+pub(crate) fn gateway_ip(rt: &Runtime, container: &str, network: &str) -> Result<String, String> {
+    let mut c = rt.cmd();
+    c.args([
+        "inspect",
+        "--format",
+        &format!("{{{{(index .NetworkSettings.Networks \"{network}\").IPAddress}}}}"),
+        container,
+    ]);
+    let o = output_within(c, PROBE_TIMEOUT).ok_or("inspecting the gateway timed out")?;
+    let ip = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    if o.status.success() && ip.parse::<std::net::IpAddr>().is_ok() {
+        Ok(ip)
+    } else {
+        Err(format!("the gateway has no address on {network}"))
+    }
+}
+
+/// The sidecar's argv: on the seat network, only the capabilities iptables needs, and the
+/// allowed gateway endpoints as arguments.
+pub(crate) fn netns_argv(
+    rt: &Path,
+    image: &str,
+    seat: &str,
+    network: &str,
+    gw_ip: &str,
+) -> Vec<String> {
+    let mut v: Vec<String> = [
+        "run",
+        "-d",
+        "--rm",
+        "--name",
+        &netns_name(seat),
+        "--label",
+        &format!("{SEAT_LABEL}=1"),
+        "--network",
+        network,
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--cap-add",
+        "NET_ADMIN",
+        "--cap-add",
+        "NET_RAW",
+        "--security-opt",
+        "no-new-privileges",
+        "--pids-limit",
+        "16",
+        "--memory",
+        "32m",
+        image,
+        "wicked-netns",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    v.extend(GATEWAY_PORTS.iter().map(|p| format!("{gw_ip}:{p}")));
+    v.insert(0, rt.to_string_lossy().into_owned());
+    v
+}
+
+/// Start seat `seat`'s sidecar and wait for its rules to be in place (fail closed).
+pub(crate) fn start_netns_sidecar(
+    rt: &Runtime,
+    seat: &str,
+    network: &str,
+    gw_ip: &str,
+) -> Result<(), String> {
+    let image = ensure_netns_image(rt)?;
+    let argv = netns_argv(&rt.cli, &image, seat, network, gw_ip);
+    let mut c = rt.cmd();
+    c.args(&argv[1..]);
+    let o = output_within(c, PROBE_TIMEOUT).ok_or("starting the network sidecar timed out")?;
+    if !o.status.success() {
+        return Err(format!(
+            "the network sidecar did not start: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ));
+    }
+    let start = Instant::now();
+    while start.elapsed() < PROBE_TIMEOUT {
+        let mut l = rt.cmd();
+        l.args(["logs", &netns_name(seat)]);
+        if output_within(l, PROBE_TIMEOUT)
+            .is_some_and(|o| String::from_utf8_lossy(&o.stdout).contains("wicked-netns-ready"))
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err("the network sidecar's rules did not come up".into())
+}
+
 /// Mount the unit's read roots (its governance read roots, its skills delivery) read-only when
 /// no mount exposes them yet and no mask covers them. They are readable on the host floor; in a
 /// container only what is mounted exists.
+/// The gateway's state directory is never seat-visible, wherever the daemon's state home sits
+/// (a store beside a checkout would otherwise ride the repository mount): its rendered config
+/// holds every live unit's key. Nothing a unit is handed lives under it, so a cover is exact.
+/// Laid AFTER the read roots and argv paths, replacing every bind at or under it. The directory
+/// is created first (codex gw-r2 P1: the first seat's cover was skipped because the gateway had
+/// not created it yet), and a cover that cannot be laid refuses the seat.
+pub(crate) fn cover_gateway_dir(
+    mounts: &mut Vec<Mount>,
+    gateway_dir: Option<&Path>,
+) -> Result<(), String> {
+    let Some(dir) = gateway_dir else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("could not create the gateway directory: {e}"))?;
+    let dir = dir
+        .canonicalize()
+        .map_err(|e| format!("could not resolve the gateway directory: {e}"))?;
+    if !dir.is_dir() || !mountable(&dir) {
+        return Err(format!(
+            "the gateway directory {} cannot be covered in a seat",
+            dir.display()
+        ));
+    }
+    // Under a seat-WRITABLE tree the seat could rename an ancestor away and recreate the path,
+    // leaving the cover over the moved directory while the engine writes the next unit's key
+    // into the new one (codex gw-r3 P1): refuse instead of covering.
+    if let Some(w) = mounts.iter().find_map(|m| match m {
+        Mount::Bind { path, rw: true } if dir.starts_with(path) => Some(path),
+        _ => None,
+    }) {
+        return Err(format!(
+            "the daemon's gateway state {} lies inside the seat-writable {}; move the state home out of it",
+            dir.display(),
+            w.display()
+        ));
+    }
+    mounts.retain(|m| !m.dst().starts_with(&dir));
+    mounts.push(Mount::Tmpfs { path: dir });
+    Ok(())
+}
+
 pub(crate) fn add_read_roots(mounts: &mut Vec<Mount>, read_roots: &[PathBuf]) {
     for r in read_roots {
         let Some(p) = crate::worker_sandbox::canon_lenient(r) else {
@@ -2006,6 +2314,72 @@ mod tests {
         ] {
             assert_eq!(valid_image_id(bad), None, "{bad}");
         }
+    }
+
+    /// Codex gw-r1 (P1): a gateway directory inside a mounted checkout (a daemon whose store sits
+    /// beside it) is covered: its rendered config holds every live unit's key.
+    #[test]
+    fn the_gateway_dir_is_covered_even_inside_a_mounted_checkout() {
+        let base = std::env::temp_dir().join(format!("wicked-gw-cover-{}", std::process::id()));
+        let gw = base.join("repo/.state/gateway");
+        std::fs::create_dir_all(&gw).unwrap();
+        let repo = base.join("repo").canonicalize().unwrap();
+        let gw = gw.canonicalize().unwrap();
+        let mut mounts = vec![
+            Mount::Bind {
+                path: repo.clone(),
+                rw: false,
+            },
+            Mount::Bind {
+                path: gw.clone(),
+                rw: false,
+            },
+            // A descendant bind would reopen the covered subtree.
+            Mount::Bind {
+                path: gw.join("config"),
+                rw: false,
+            },
+        ];
+        cover_gateway_dir(&mut mounts, Some(&gw)).unwrap();
+        assert_eq!(
+            mounts,
+            vec![
+                Mount::Bind {
+                    path: repo.clone(),
+                    rw: false
+                },
+                Mount::Tmpfs { path: gw.clone() }
+            ]
+        );
+        let before = mounts.clone();
+        cover_gateway_dir(&mut mounts, None).unwrap();
+        assert_eq!(mounts, before);
+        // Codex gw-r2 (P1): the FIRST seat runs before the gateway creates its directory; the
+        // cover creates it and is laid anyway.
+        let fresh = base.join("repo/.state2/gateway");
+        let mut mounts = vec![Mount::Bind {
+            path: repo.clone(),
+            rw: false,
+        }];
+        cover_gateway_dir(&mut mounts, Some(&fresh)).unwrap();
+        assert_eq!(
+            mounts.last(),
+            Some(&Mount::Tmpfs {
+                path: fresh.canonicalize().unwrap()
+            })
+        );
+        // Codex gw-r3 (P1): under a seat-WRITABLE bind the cover is refused (a renamed ancestor
+        // would leave it over the moved directory).
+        let mut writable = vec![Mount::Bind {
+            path: repo.clone(),
+            rw: true,
+        }];
+        let err = cover_gateway_dir(&mut writable, Some(&gw)).unwrap_err();
+        assert!(err.contains("seat-writable"), "{err}");
+        // An unmountable spelling refuses instead of skipping the cover.
+        let bad = base.join("re,po/gateway");
+        assert!(cover_gateway_dir(&mut mounts, Some(&bad)).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// No host path is ever mounted over the trusted launcher or the canary.
