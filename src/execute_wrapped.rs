@@ -2312,6 +2312,7 @@ impl WrappedCliStepRunner {
                     &input.run_id,
                     input.unit.ord,
                     &read_roots,
+                    Some(prompt.as_str()),
                 ) {
                     Ok(c) => {
                         seat_cleanup = Some(c.cleanup);

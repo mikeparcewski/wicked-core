@@ -851,8 +851,8 @@ const HOST_ONLY_ENV: &[&str] = &[
 /// Make a seat `cmd` (one [`run_argv`] rendered, then given its env by the carrier) complete:
 /// every variable the carrier set explicitly is passed in by NAME to both the runtime and
 /// landrun (`--env KEY`: each reads its own environment, so no value is on a command line), and the
-/// unit's read roots plus the absolute paths its argv names are mounted read-only when no mount
-/// covers them yet. Any other command is returned unchanged.
+/// unit's read roots are mounted read-only when no mount covers them yet. Any other command is
+/// returned unchanged.
 pub(crate) fn finalize(cmd: Command) -> Command {
     let args: Vec<String> = cmd
         .get_args()
@@ -908,11 +908,6 @@ pub(crate) fn finalize(cmd: Command) -> Command {
             }
         }
     }
-    // Absolute paths the CLI argv names as the value of an option that takes a path (the
-    // engine's own `--settings <file>`, `--plugin-dir <dir>`, `--mcp-config=<file>`, ...). Only
-    // those options, and only before the CLI's `--`: a prompt is text even when it spells an
-    // existing path or looks like an option.
-    ro.extend(argv_paths(&args[land_end + 5..]));
     for p in ro {
         let Some(p) = crate::worker_sandbox::canon_lenient(&p) else {
             continue;
@@ -949,18 +944,9 @@ pub(crate) fn finalize(cmd: Command) -> Command {
     out.args(&args[img..land_end]);
     out.args(&land_extra);
     // Mounts sit at canonical paths; a host alias the launch spelled (`/tmp` for `/private/tmp`
-    // on macOS) does not exist inside, so path option values and env values are re-spelled.
-    // The same parser that found the values (codex r5: `--opt=value` too, never past `--`).
-    let mut tail: Vec<String> = args[land_end..].to_vec();
-    const CLI_AT: usize = 5; // past `-- <entry> --check <canary> --`
-    for (i, at) in path_option_slots(&tail[CLI_AT.min(tail.len())..]) {
-        let arg = &mut tail[CLI_AT + i];
-        let value = canonical_spelling(std::ffi::OsStr::new(&arg[at..]), &existing)
-            .to_string_lossy()
-            .into_owned();
-        *arg = format!("{}{value}", &arg[..at]);
-    }
-    out.args(&tail);
+    // on macOS) does not exist inside, so env values are re-spelled (argv path options were
+    // re-spelled at arm time, [`mount_argv_paths`], where the prompt is known).
+    out.args(&args[land_end..]);
     if let Some(dir) = cmd.get_current_dir() {
         out.current_dir(dir);
     }
@@ -1024,14 +1010,21 @@ const PATH_OPTS: &[&str] = &[
 ];
 
 /// Where `tail` (the CLI argv) carries a [`PATH_OPTS`] value, before any `--`: `(index, offset)`
-/// of each value — `--opt <value>` is `(i + 1, 0)`, `--opt=<value>` is `(i, "--opt=".len())`. A
-/// prompt passed as an option's value is text, whatever it spells. The one parser for both
-/// discovering the paths to mount and re-spelling them at their mounted spelling.
-fn path_option_slots(tail: &[String]) -> Vec<(usize, usize)> {
+/// of each value — `--opt <value>` is `(i + 1, 0)`, `--opt=<value>` is `(i, "--opt=".len())`.
+/// The prompt is text, whatever it spells: a token equal to `prompt` is never read as an option
+/// or a value (agy r1: a template may place the prompt after any bare flag, e.g. `-m {PROMPT}`,
+/// where no `--` guards it), and neither is the value after `-p`/`--prompt`. The one parser for
+/// both discovering the paths to mount and re-spelling them at their mounted spelling.
+fn path_option_slots(tail: &[String], prompt: Option<&str>) -> Vec<(usize, usize)> {
+    let is_prompt = |i: usize| prompt.is_some_and(|p| tail.get(i).map(String::as_str) == Some(p));
     let mut out = Vec::new();
     let mut i = 0;
     while i < tail.len() {
         let a = tail[i].as_str();
+        if is_prompt(i) {
+            i += 1;
+            continue;
+        }
         if a == "--" {
             break;
         }
@@ -1044,7 +1037,7 @@ fn path_option_slots(tail: &[String]) -> Vec<(usize, usize)> {
             continue;
         }
         if PATH_OPTS.contains(&a) {
-            if i + 1 < tail.len() {
+            if i + 1 < tail.len() && !is_prompt(i + 1) {
                 out.push((i + 1, 0));
             }
             i += 2;
@@ -1060,15 +1053,29 @@ fn path_option_slots(tail: &[String]) -> Vec<(usize, usize)> {
     out
 }
 
-/// The existing absolute paths `tail` (the CLI argv) names as a [`PATH_OPTS`] value, before
-/// any `--` ([`path_option_slots`]).
-fn argv_paths(tail: &[String]) -> Vec<PathBuf> {
-    path_option_slots(tail)
-        .into_iter()
-        .map(|(i, at)| Path::new(&tail[i][at..]))
+/// The CLI argv's path-option values ([`path_option_slots`]: the engine's own `--settings`,
+/// `--plugin-dir`, `--mcp-config=<file>`, codex's `-C`, ...; never the prompt) mounted read-only
+/// when no mount exposes them yet and no mask covers them, then re-spelled at the canonical path
+/// their mount sits at (a macOS alias such as `/tmp` does not exist inside).
+pub(crate) fn mount_argv_paths(mounts: &mut Vec<Mount>, argv: &mut [String], prompt: Option<&str>) {
+    let slots = path_option_slots(argv, prompt);
+    let paths: Vec<PathBuf> = slots
+        .iter()
+        .map(|(i, at)| PathBuf::from(&argv[*i][*at..]))
         .filter(|p| p.is_absolute() && p.exists())
-        .map(Path::to_path_buf)
-        .collect()
+        .collect();
+    add_read_roots(mounts, &paths);
+    let binds: Vec<PathBuf> = mounts
+        .iter()
+        .filter(|m| matches!(m, Mount::Bind { .. }))
+        .map(|m| m.dst().to_path_buf())
+        .collect();
+    for (i, at) in slots {
+        let value = canonical_spelling(std::ffi::OsStr::new(&argv[i][at..]), &binds)
+            .to_string_lossy()
+            .into_owned();
+        argv[i] = format!("{}{value}", &argv[i][..at]);
+    }
 }
 
 /// Remove seat container `name` (after its client exited or was killed: a killed client leaves
@@ -1241,6 +1248,7 @@ pub(crate) fn arm(
     run_id: &str,
     ord: u32,
     read_roots: &[PathBuf],
+    prompt: Option<&str>,
 ) -> Result<ArmedContainer, (FloorUnarmed, String)> {
     let cli = argv
         .first()
@@ -1293,6 +1301,8 @@ pub(crate) fn arm(
     // rendered (a fresh phase's floor spec is written after arming).
     let mut mounts = mount_plan(&spec).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     add_read_roots(&mut mounts, read_roots);
+    let mut argv = argv.to_vec();
+    mount_argv_paths(&mut mounts, &mut argv, prompt);
     let name = container_name(cli, run_id, ord);
     let network =
         ensure_seat_network(&rt, &name).map_err(|e| (FloorUnarmed::ContainerRuntimeDown, e))?;
@@ -1326,7 +1336,7 @@ pub(crate) fn arm(
     });
     Ok(ArmedContainer {
         wrapper,
-        argv: image_argv(argv, cli),
+        argv: image_argv(&argv, cli),
         tool: tool_name(&rt.cli),
         cleanup,
     })
@@ -1809,7 +1819,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_passes_env_by_name_and_mounts_read_roots_and_argv_paths() {
+    fn finalize_passes_env_by_name_and_mounts_read_roots() {
         let base = tmp("fin");
         let tree = base.join("wt");
         let skills = base.join("skills");
@@ -1922,16 +1932,13 @@ mod tests {
         );
         let ro = |p: &Path| format!("type=bind,src={p},dst={p},readonly", p = p.display());
         assert!(has(&["--mount", &ro(&skills)]), "{args:?}");
-        assert!(has(&["--mount", &ro(&settings)]), "{args:?}");
+        // Argv path options are mounted at arm time ([`mount_argv_paths`]), not here.
+        assert!(!has(&["--mount", &ro(&settings)]), "{args:?}");
         // A prompt word that happens to be a path is not a mount.
         assert!(!args.iter().any(|a| a.contains("dst=/etc/passwd")));
         assert!(has_in(
             &args[img + 4..land_end],
             &["--rox", skills.to_str().unwrap()]
-        ));
-        assert!(has_in(
-            &args[img + 4..land_end],
-            &["--rox", settings.to_str().unwrap()]
         ));
         assert_eq!(
             seat_container(&fin),
@@ -2114,6 +2121,41 @@ mod tests {
         let mut ni = rt.cmd();
         ni.args(["network", "inspect", &name]);
         assert!(!output_within(ni, PROBE_TIMEOUT).unwrap().status.success());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn argv_paths_for(tail: &[String], prompt: Option<&str>) -> Vec<PathBuf> {
+        path_option_slots(tail, prompt)
+            .into_iter()
+            .map(|(i, at)| PathBuf::from(&tail[i][at..]))
+            .filter(|p| p.is_absolute() && p.exists())
+            .collect()
+    }
+
+    fn argv_paths(tail: &[String]) -> Vec<PathBuf> {
+        argv_paths_for(tail, None)
+    }
+
+    /// agy review r1 (P1): a template may place the prompt after any bare flag (`-m {PROMPT}`:
+    /// no `--` guards it); the prompt token is never read as an option or a value.
+    #[test]
+    fn the_prompt_token_never_names_a_mount() {
+        let base = tmp("argvprompt");
+        let p = base.to_string_lossy().into_owned();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let glued = format!("--skill={p}");
+        let argv = s(&["custom-runner", "-m", &glued]);
+        assert_eq!(argv_paths(&argv), vec![base.clone()], "unguarded: the hole");
+        assert!(argv_paths_for(&argv, Some(&glued)).is_empty());
+        // The prompt as a path option's separate value is not a path either.
+        let argv = s(&["custom-runner", "--settings", &p]);
+        assert!(argv_paths_for(&argv, Some(&p)).is_empty());
+        // Through arm's mount step: nothing mounted, the prompt token unchanged.
+        let mut mounts = Vec::new();
+        let mut argv = s(&["custom-runner", "-m", &glued]);
+        mount_argv_paths(&mut mounts, &mut argv, Some(&glued));
+        assert!(mounts.is_empty());
+        assert_eq!(argv[2], glued);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2505,37 +2547,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Codex review r5 (P2): the attached `--opt=<alias>` spelling is re-spelled through
-    /// `finalize` like the separate one; a value after the CLI's `--` stays as written.
+    /// Codex review r5 (P2): the attached `--opt=<alias>` spelling is re-spelled like the
+    /// separate one, and mounted read-only; a value after the CLI's `--` stays as written.
     #[cfg(unix)]
     #[test]
-    fn finalize_respells_attached_and_separate_path_options() {
+    fn argv_path_options_are_mounted_and_respelled_in_both_spellings() {
         let base = tmp("alias-fin");
         let real = base.join("real");
         std::fs::create_dir_all(&real).unwrap();
         let alias = base.join("alias");
         std::os::unix::fs::symlink(&real, &alias).unwrap();
-        let mounts = vec![Mount::Bind {
-            path: real.clone(),
-            rw: true,
-        }];
-        let w = run_argv(&ContainerLaunch {
-            runtime: Path::new("docker"),
-            image: "img:1",
-            name: "wicked-seat-x",
-            network: "none",
-            workdir: &real,
-            user: "1:1",
-            mounts: &mounts,
-            memory: "3g",
-            gateway_ports: GATEWAY_PORTS,
-            own_ports: &[],
-        });
+        let real = real.canonicalize().unwrap();
         let a = alias.to_string_lossy().into_owned();
-        // spawn-audit: test-only — renders the wrapper argv; never spawned.
-        let mut cmd = Command::new(&w[0]);
-        cmd.args(&w[1..]);
-        cmd.args([
+        let r = real.to_string_lossy().into_owned();
+        let mut argv: Vec<String> = [
             "codex",
             "exec",
             &format!("--cd={a}"),
@@ -2543,16 +2568,22 @@ mod tests {
             &a,
             "--",
             &format!("--cd={a}"),
-        ]);
-        let args: Vec<String> = finalize(cmd)
-            .get_args()
-            .map(|x| x.to_string_lossy().into_owned())
-            .collect();
-        let r = real.to_string_lossy().into_owned();
-        let at = args.iter().position(|x| x == "codex").unwrap();
+        ]
+        .iter()
+        .map(|x| x.to_string())
+        .collect();
+        let mut mounts = Vec::new();
+        mount_argv_paths(&mut mounts, &mut argv, Some("the prompt"));
         assert_eq!(
-            &args[at..],
-            &[
+            mounts,
+            vec![Mount::Bind {
+                path: real.clone(),
+                rw: false
+            }]
+        );
+        assert_eq!(
+            argv,
+            vec![
                 "codex".to_string(),
                 "exec".into(),
                 format!("--cd={r}"),
@@ -2560,7 +2591,7 @@ mod tests {
                 r.clone(),
                 "--".into(),
                 format!("--cd={a}"),
-            ][..]
+            ]
         );
         let _ = std::fs::remove_dir_all(&base);
     }
