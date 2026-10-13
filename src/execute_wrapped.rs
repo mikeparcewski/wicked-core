@@ -2282,6 +2282,13 @@ impl WrappedCliStepRunner {
                 // The engine's own launch file (claude's settings) stays read-only to the seat.
                 plan.inputs.pinned =
                     vec![decisions_path.with_file_name(format!("settings-{phase}.json"))];
+                // The git anchor: the dir the actor pinned from the registered repository.
+                plan.inputs.trusted_git_dir = input
+                    .unit
+                    .worktree_baseline
+                    .as_ref()
+                    .and_then(|b| b.git_dir.as_deref())
+                    .map(PathBuf::from);
                 // What the unit may read beyond its tree: the launch's read roots and its
                 // skills delivery (only mounted paths exist in a container).
                 let read_roots: Vec<PathBuf> = input

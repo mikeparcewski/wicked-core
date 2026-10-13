@@ -616,6 +616,10 @@ pub(crate) struct FloorInputs {
     pub(crate) net: Vec<NetGrant>,
     /// The operator's home the secret masks resolve under (the process `HOME`).
     pub(crate) home: Option<PathBuf>,
+    /// The git dir the engine pinned for this unit from the REGISTERED repository at dispatch
+    /// (`worktree_baseline.git_dir`): the only anchor the container floor trusts for git grants
+    /// outside the tree (the worktree's own `.git` is seat-writable).
+    pub(crate) trusted_git_dir: Option<PathBuf>,
 }
 
 /// The seat floor as resolved for one spawn: what the container floor renders as mounts and
@@ -1103,6 +1107,7 @@ pub(crate) fn plan_seat_floor(launch: SeatLaunch<'_>, write_roots: Vec<PathBuf>)
             pinned: Vec::new(),
             net,
             home,
+            trusted_git_dir: None,
         },
         env,
     }

@@ -950,20 +950,15 @@ pub(crate) fn finalize(cmd: Command) -> Command {
     out.args(&land_extra);
     // Mounts sit at canonical paths; a host alias the launch spelled (`/tmp` for `/private/tmp`
     // on macOS) does not exist inside, so path option values and env values are re-spelled.
+    // The same parser that found the values (codex r5: `--opt=value` too, never past `--`).
     let mut tail: Vec<String> = args[land_end..].to_vec();
-    let mut i = 5; // past `-- <entry> --check <canary> --`
-    while i < tail.len() {
-        if tail[i] == "--" {
-            break;
-        }
-        if PATH_OPTS.contains(&tail[i].as_str()) && i + 1 < tail.len() {
-            tail[i + 1] = canonical_spelling(std::ffi::OsStr::new(&tail[i + 1]), &existing)
-                .to_string_lossy()
-                .into_owned();
-            i += 2;
-            continue;
-        }
-        i += 1;
+    const CLI_AT: usize = 5; // past `-- <entry> --check <canary> --`
+    for (i, at) in path_option_slots(&tail[CLI_AT.min(tail.len())..]) {
+        let arg = &mut tail[CLI_AT + i];
+        let value = canonical_spelling(std::ffi::OsStr::new(&arg[at..]), &existing)
+            .to_string_lossy()
+            .into_owned();
+        *arg = format!("{}{value}", &arg[..at]);
     }
     out.args(&tail);
     if let Some(dir) = cmd.get_current_dir() {
@@ -1028,9 +1023,11 @@ const PATH_OPTS: &[&str] = &[
     "--skill",
 ];
 
-/// The existing absolute paths `tail` (the CLI argv) names as a [`PATH_OPTS`] value, before
-/// any `--`.
-fn argv_paths(tail: &[String]) -> Vec<PathBuf> {
+/// Where `tail` (the CLI argv) carries a [`PATH_OPTS`] value, before any `--`: `(index, offset)`
+/// of each value — `--opt <value>` is `(i + 1, 0)`, `--opt=<value>` is `(i, "--opt=".len())`. A
+/// prompt passed as an option's value is text, whatever it spells. The one parser for both
+/// discovering the paths to mount and re-spelling them at their mounted spelling.
+fn path_option_slots(tail: &[String]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < tail.len() {
@@ -1038,7 +1035,6 @@ fn argv_paths(tail: &[String]) -> Vec<PathBuf> {
         if a == "--" {
             break;
         }
-        // A prompt passed as an option's value is text, whatever it spells.
         // (claude's `-p` is a bare flag: a following `--` still ends the options.)
         if matches!(a, "-p" | "--prompt" | "-i" | "--interactive") {
             if tail.get(i + 1).map(String::as_str) == Some("--") {
@@ -1047,23 +1043,32 @@ fn argv_paths(tail: &[String]) -> Vec<PathBuf> {
             i += 2;
             continue;
         }
-        let value = if PATH_OPTS.contains(&a) {
-            i += 1;
-            tail.get(i).map(String::as_str)
-        } else {
-            a.split_once('=')
-                .filter(|(f, _)| PATH_OPTS.contains(f))
-                .map(|(_, v)| v)
-        };
-        if let Some(v) = value {
-            let p = Path::new(v);
-            if p.is_absolute() && p.exists() {
-                out.push(p.to_path_buf());
+        if PATH_OPTS.contains(&a) {
+            if i + 1 < tail.len() {
+                out.push((i + 1, 0));
+            }
+            i += 2;
+            continue;
+        }
+        if let Some((f, _)) = a.split_once('=') {
+            if PATH_OPTS.contains(&f) {
+                out.push((i, f.len() + 1));
             }
         }
         i += 1;
     }
     out
+}
+
+/// The existing absolute paths `tail` (the CLI argv) names as a [`PATH_OPTS`] value, before
+/// any `--` ([`path_option_slots`]).
+fn argv_paths(tail: &[String]) -> Vec<PathBuf> {
+    path_option_slots(tail)
+        .into_iter()
+        .map(|(i, at)| Path::new(&tail[i][at..]))
+        .filter(|p| p.is_absolute() && p.exists())
+        .map(Path::to_path_buf)
+        .collect()
 }
 
 /// Remove seat container `name` (after its client exited or was killed: a killed client leaves
@@ -1251,9 +1256,11 @@ pub(crate) fn arm(
                 ),
             )
         })?;
-    // The worktree's git pointer is seat-writable: verify it against git's own back-pointer
-    // before anything resolves (or creates) the git dirs it names.
-    verify_linked_worktree(&inp.cwd).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
+    // The worktree's git pointer and metadata are seat-writable: verify them against the git dir
+    // the engine pinned from the registered repository before anything resolves (or creates)
+    // the git dirs they name.
+    verify_linked_worktree(&inp.cwd, inp.trusted_git_dir.as_deref())
+        .map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     // The engine's launch files, checked at their TRUSTED spelling before anything resolves
     // them: never a symlink (a worker could plant one to bind a host file in, or to make the
     // engine create one), and created exclusively when absent.
@@ -1325,25 +1332,46 @@ pub(crate) fn arm(
     })
 }
 
-/// A linked worktree's `.git` file (which a full-posture seat can rewrite) is trusted only
-/// when it names a `<common>/.git/worktrees/<n>` dir whose `commondir` leads back to that
-/// common dir and whose `gitdir` back-pointer names THIS worktree's `.git` — git's own
-/// bookkeeping, which the seat cannot write. A redirected pointer is refused. Not a linked
-/// worktree (a main checkout, a scratch dir): nothing to verify.
-pub(crate) fn verify_linked_worktree(cwd: &Path) -> Result<(), String> {
-    let Some(root) = cwd.ancestors().find(|a| a.join(".git").exists()) else {
+/// A linked worktree's `.git` file (which a full-posture seat can rewrite) and the git metadata
+/// it leads to (whose files a seat can also write: the gitdir, `objects`, `refs`, `logs` are
+/// bound writable) are trusted only against `pinned`, the git dir the ENGINE pinned for this
+/// unit from the registered repository at dispatch (`worktree_baseline.git_dir`, see
+/// [`crate::worktree_guard::pinned_git_dir`]), never against their own self-consistency (codex
+/// r5: a forged `gitdir`/`commondir`/back-pointer triple inside the tree agrees with itself).
+/// The pointer must name exactly the pinned dir; the common dir is the pinned dir's
+/// `<common>/worktrees/<id>` parent, its `commondir` must lead back to it, and none of the
+/// granted shared-state roots may be a link. A linked worktree with no pin is refused. Not a
+/// linked worktree (a main checkout, a scratch dir): nothing outside the tree is granted.
+pub(crate) fn verify_linked_worktree(cwd: &Path, pinned: Option<&Path>) -> Result<(), String> {
+    let Some(root) = cwd
+        .ancestors()
+        .find(|a| std::fs::symlink_metadata(a.join(".git")).is_ok())
+    else {
         return Ok(());
     };
     let dot_git = root.join(".git");
-    if std::fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_dir()) {
-        return Ok(());
-    }
+    let meta = std::fs::symlink_metadata(&dot_git).map_err(|e| e.to_string())?;
     let bad = |why: &str| {
         format!(
             "the worktree's git pointer {} {why}; refusing it",
             dot_git.display()
         )
     };
+    if meta.file_type().is_symlink() {
+        return Err(bad("is a symbolic link"));
+    }
+    if meta.is_dir() {
+        return Ok(());
+    }
+    let pinned = pinned
+        .ok_or_else(|| bad("has no git dir pinned by the engine from the registered repository"))?;
+    let is_link = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    if is_link(pinned) {
+        return Err(bad("leads to a pinned git dir that is a symbolic link"));
+    }
+    let pinned = pinned
+        .canonicalize()
+        .map_err(|_| bad("leads to a pinned git dir that is missing"))?;
     let text = std::fs::read_to_string(&dot_git).map_err(|_| bad("is unreadable"))?;
     let raw = text
         .lines()
@@ -1358,31 +1386,61 @@ pub(crate) fn verify_linked_worktree(cwd: &Path) -> Result<(), String> {
     let gitdir = gitdir
         .canonicalize()
         .map_err(|_| bad("names a missing gitdir"))?;
-    if gitdir.parent().and_then(Path::file_name) != Some(std::ffi::OsStr::new("worktrees")) {
-        return Err(bad("does not name a <repo>/.git/worktrees/<name> dir"));
+    if gitdir != pinned {
+        return Err(bad("names a gitdir other than the one the engine pinned"));
     }
-    let common_expected = gitdir
+    if pinned.parent().and_then(Path::file_name) != Some(std::ffi::OsStr::new("worktrees")) {
+        return Err(bad(
+            "leads to a pinned dir that is not <repo>/.git/worktrees/<name>",
+        ));
+    }
+    let common = pinned
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| bad("has no common dir"))?
         .to_path_buf();
-    let common = std::fs::read_to_string(gitdir.join("commondir"))
-        .map_err(|_| bad("names a gitdir without commondir"))?;
-    let common = gitdir
-        .join(common.trim())
-        .canonicalize()
-        .map_err(|_| bad("names a gitdir whose commondir is missing"))?;
-    if common != common_expected {
-        return Err(bad("names a gitdir whose commondir leads elsewhere"));
+    let named = std::fs::read_to_string(pinned.join("commondir"))
+        .map_err(|_| bad("leads to a gitdir without commondir"))?;
+    let named = Path::new(named.trim());
+    let named = if named.is_absolute() {
+        named.to_path_buf()
+    } else {
+        pinned.join(named)
+    };
+    if named.canonicalize().ok().as_deref() != Some(common.as_path()) {
+        return Err(bad("leads to a gitdir whose commondir leads elsewhere"));
     }
-    let back = std::fs::read_to_string(gitdir.join("gitdir"))
-        .map_err(|_| bad("names a gitdir without a back-pointer"))?;
+    let back = std::fs::read_to_string(pinned.join("gitdir"))
+        .map_err(|_| bad("leads to a gitdir without a back-pointer"))?;
     let back = Path::new(back.trim())
         .canonicalize()
-        .map_err(|_| bad("names a gitdir whose back-pointer is missing"))?;
+        .map_err(|_| bad("leads to a gitdir whose back-pointer is missing"))?;
     let ours = dot_git.canonicalize().map_err(|_| bad("is unresolvable"))?;
     if back != ours {
-        return Err(bad("names another worktree's gitdir"));
+        return Err(bad("leads to another worktree's gitdir"));
+    }
+    // The shared-state roots the floor grants: each a real entry directly under the common dir
+    // (a link there would carry the grant to wherever it points).
+    for sub in ["objects", "refs", "logs", "packed-refs", "commondir"] {
+        let p = if sub == "commondir" {
+            pinned.join(sub)
+        } else {
+            common.join(sub)
+        };
+        if is_link(&p) {
+            return Err(bad(&format!(
+                "leads to a redirected {sub} ({})",
+                p.display()
+            )));
+        }
+        if let Ok(c) = p.canonicalize() {
+            if c.parent() != p.parent().and_then(|d| d.canonicalize().ok()).as_deref() {
+                return Err(bad(&format!(
+                    "leads to a redirected {sub} ({})",
+                    p.display()
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -2279,7 +2337,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Codex review r4 (P1): a rewritten `.git` pointer never names the dirs a seat is granted.
+    /// Codex review r4 + r5 (P1): a rewritten `.git` pointer, or a forged gitdir triple that
+    /// agrees with itself, never names the dirs a seat is granted: the anchor is the git dir the
+    /// engine pinned from the registered repository.
     #[test]
     fn a_redirected_git_pointer_is_refused() {
         let base = tmp("gitptr");
@@ -2287,7 +2347,13 @@ mod tests {
         let wtgit = common.join("worktrees/wt1");
         let wt = base.join("wt1");
         let other = base.join("private-project");
-        for d in [&wtgit, &wt, &other] {
+        for d in [
+            &wtgit,
+            &wt,
+            &other,
+            &common.join("objects"),
+            &common.join("refs"),
+        ] {
             std::fs::create_dir_all(d).unwrap();
         }
         std::fs::write(wtgit.join("commondir"), "../..\n").unwrap();
@@ -2299,33 +2365,96 @@ mod tests {
         let point = |to: &Path| {
             std::fs::write(wt.join(".git"), format!("gitdir: {}\n", to.display())).unwrap()
         };
+        let pin = Some(wtgit.as_path());
         point(&wtgit);
-        assert!(verify_linked_worktree(&wt).is_ok());
+        assert!(verify_linked_worktree(&wt, pin).is_ok());
         assert!(
-            verify_linked_worktree(&wt.join("sub")).is_ok(),
+            verify_linked_worktree(&wt.join("sub"), pin).is_ok(),
             "a subdir resolves its worktree"
         );
-        point(&other);
-        assert!(verify_linked_worktree(&wt)
+        // No pin from the registered repository: a linked worktree is refused.
+        assert!(verify_linked_worktree(&wt, None)
             .unwrap_err()
-            .contains("worktrees"));
-        // Another worktree's gitdir: its back-pointer names that worktree, not this one.
-        let wt2git = common.join("worktrees/wt2");
-        std::fs::create_dir_all(&wt2git).unwrap();
-        std::fs::write(wt2git.join("commondir"), "../..\n").unwrap();
+            .contains("pinned by the engine"));
+        point(&other);
+        assert!(verify_linked_worktree(&wt, pin)
+            .unwrap_err()
+            .contains("other than the one the engine pinned"));
+        // r5: a forged triple entirely inside the tree, self-consistent, objects -> a host dir.
+        let forged = wt.join("tmp/forged/.git");
+        let fgit = forged.join("worktrees/x");
+        std::fs::create_dir_all(&fgit).unwrap();
+        std::fs::write(fgit.join("commondir"), "../..\n").unwrap();
         std::fs::write(
-            wt2git.join("gitdir"),
-            format!("{}\n", base.join("wt2/.git").display()),
+            fgit.join("gitdir"),
+            format!("{}\n", wt.join(".git").display()),
         )
         .unwrap();
-        std::fs::create_dir_all(base.join("wt2")).unwrap();
-        std::fs::write(base.join("wt2/.git"), "x").unwrap();
+        std::os::unix::fs::symlink(&other, forged.join("objects")).unwrap();
+        point(&fgit);
+        assert!(
+            verify_linked_worktree(&wt, pin).is_err(),
+            "forged triple refused"
+        );
+        // Another worktree's gitdir: refused against the pin.
+        let wt2git = common.join("worktrees/wt2");
+        std::fs::create_dir_all(&wt2git).unwrap();
         point(&wt2git);
-        assert!(verify_linked_worktree(&wt)
+        assert!(verify_linked_worktree(&wt, pin).is_err());
+        // The pinned dir's commondir redirected, or a shared root replaced by a link.
+        point(&wtgit);
+        std::fs::write(wtgit.join("commondir"), "../../../../tmp/forged/.git\n").unwrap();
+        assert!(verify_linked_worktree(&wt, pin)
             .unwrap_err()
-            .contains("another worktree"));
-        // A main checkout has no pointer to verify.
-        assert!(verify_linked_worktree(&base.join("clone")).is_ok());
+            .contains("commondir leads elsewhere"));
+        std::fs::write(wtgit.join("commondir"), "../..\n").unwrap();
+        std::fs::remove_dir_all(common.join("objects")).unwrap();
+        std::os::unix::fs::symlink(&other, common.join("objects")).unwrap();
+        assert!(verify_linked_worktree(&wt, pin)
+            .unwrap_err()
+            .contains("redirected objects"));
+        // A `.git` that is itself a link is refused; a main checkout grants nothing outside.
+        std::fs::remove_file(wt.join(".git")).unwrap();
+        std::os::unix::fs::symlink(&wtgit, wt.join(".git")).unwrap();
+        assert!(verify_linked_worktree(&wt, pin)
+            .unwrap_err()
+            .contains("symbolic link"));
+        assert!(verify_linked_worktree(&base.join("clone"), None).is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The pin the actor really takes (`worktree_guard::pinned_git_dir` from the registered
+    /// repository) over a real `git worktree add` is accepted; the worktree's `.git` rewritten to
+    /// another dir afterwards is refused against that same pin.
+    #[test]
+    fn the_actors_pin_of_a_real_linked_worktree_is_accepted() {
+        let base = tmp("realwt");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            // spawn-audit: test-only — local git over a temp repo.
+            let out = Command::new("git")
+                .hardened()
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{:?}", out);
+        };
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "i"]);
+        let wt = base.join("wt");
+        git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let pin = crate::worktree_guard::pinned_git_dir(&wt, &repo).unwrap();
+        assert!(verify_linked_worktree(&wt, Some(&pin)).is_ok());
+        let decoy = base.join("decoy/.git/worktrees/x");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", decoy.display())).unwrap();
+        assert!(verify_linked_worktree(&wt, Some(&pin)).is_err());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2371,6 +2500,66 @@ mod tests {
         assert_eq!(
             canonical_spelling(unmounted.as_os_str(), &mounts),
             unmounted.into_os_string()
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Codex review r5 (P2): the attached `--opt=<alias>` spelling is re-spelled through
+    /// `finalize` like the separate one; a value after the CLI's `--` stays as written.
+    #[cfg(unix)]
+    #[test]
+    fn finalize_respells_attached_and_separate_path_options() {
+        let base = tmp("alias-fin");
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let mounts = vec![Mount::Bind {
+            path: real.clone(),
+            rw: true,
+        }];
+        let w = run_argv(&ContainerLaunch {
+            runtime: Path::new("docker"),
+            image: "img:1",
+            name: "wicked-seat-x",
+            network: "none",
+            workdir: &real,
+            user: "1:1",
+            mounts: &mounts,
+            memory: "3g",
+            gateway_ports: GATEWAY_PORTS,
+            own_ports: &[],
+        });
+        let a = alias.to_string_lossy().into_owned();
+        // spawn-audit: test-only — renders the wrapper argv; never spawned.
+        let mut cmd = Command::new(&w[0]);
+        cmd.args(&w[1..]);
+        cmd.args([
+            "codex",
+            "exec",
+            &format!("--cd={a}"),
+            "-C",
+            &a,
+            "--",
+            &format!("--cd={a}"),
+        ]);
+        let args: Vec<String> = finalize(cmd)
+            .get_args()
+            .map(|x| x.to_string_lossy().into_owned())
+            .collect();
+        let r = real.to_string_lossy().into_owned();
+        let at = args.iter().position(|x| x == "codex").unwrap();
+        assert_eq!(
+            &args[at..],
+            &[
+                "codex".to_string(),
+                "exec".into(),
+                format!("--cd={r}"),
+                "-C".into(),
+                r.clone(),
+                "--".into(),
+                format!("--cd={a}"),
+            ][..]
         );
         let _ = std::fs::remove_dir_all(&base);
     }
