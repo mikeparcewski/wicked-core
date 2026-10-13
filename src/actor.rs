@@ -4681,6 +4681,20 @@ pub(crate) fn resume_run_inner(
     // (done units stay done; "done" is re-derived from evidence, never re-asserted) and put the
     // session back on the executing path. The R1 planning guard below still applies: a run that
     // never planned has no cursor to resume from.
+    // The run's terminal transition fenced its runner sessions (`on_run_complete`); the new
+    // lifecycle reopens them (codex hl-r4).
+    if session.status == SessionStatus::Failed {
+        // Every launch the failed lifecycle minted is obsolete for the new one (codex hl-r5).
+        let floor = lifecycle_maps
+            .as_ref()
+            .map(|m| {
+                m.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .current_launch_seq(run_id)
+            })
+            .unwrap_or(0);
+        runner.on_run_resumed(run_id, floor);
+    }
     let session = if session.status == SessionStatus::Failed {
         let mut units = crate::domain::session_units(store, run_id)?;
         // core#282: a unit that reached terminal failure through WORKER errors carries the seats

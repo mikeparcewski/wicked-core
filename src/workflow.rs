@@ -523,6 +523,12 @@ pub trait StepRunner: Send + Sync {
     /// errors silently — the run is already gone; a send failure is expected and harmless.
     fn on_run_complete(&self, _run_id: &str) {}
 
+    /// Called by the actor when a FAILED run is reactivated (`ResumeRun`, crew#277): a runner that
+    /// fenced the run's sessions at its terminal transition reopens them for the new lifecycle.
+    /// `min_launch_seq` is the highest launch sequence the failed lifecycle minted: a launch at
+    /// or below it is obsolete (codex hl-r5). The default is a no-op. Must not block the actor.
+    fn on_run_resumed(&self, _run_id: &str, _min_launch_seq: u64) {}
+
     /// Stop the single wrapped child superseded by `ReassignUnit`. `epoch` and `launch_seq` are
     /// the actor-minted identity of the old attempt; implementations must not cancel a newer
     /// launch for the same run. Stateless and persistent-only runners have nothing to do.

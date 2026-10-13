@@ -6566,7 +6566,8 @@ impl AcpStepRunner {
         // thread's seam (`team::runner::complete`), on every carrier, after this returns.
         // Container floor: no seat runs over ACP (the ACP bridges run on the host, outside any
         // seat container). Every unit — governed or not, chats included — runs its CLI's
-        // headless mode on the wrapped carrier, which puts governed units in a seat container.
+        // headless mode on the wrapped carrier, which puts governed units in a seat container
+        // and resumes the run's session per seat (`crate::headless`).
         let output = if crate::container_floor::container_mode() {
             self.fallback.run_unit_streaming(input, emit)
         } else {
@@ -8308,6 +8309,10 @@ impl StepRunner for AcpStepRunner {
     /// (via `finalize_run`/`fail_run`/`cancel_run`). Dropping `AcpProcess` calls `kill()` +
     /// `wait()` on the child process, which blocks. Doing that on the actor thread would stall
     /// the entire actor while waiting for the subprocess to exit.
+    fn on_run_resumed(&self, run_id: &str, min_launch_seq: u64) {
+        self.fallback.reopen_run_sessions(run_id, min_launch_seq);
+    }
+
     fn on_run_complete(&self, run_id: &str) {
         // DES-TEAMING-002: the run's member sessions close with it (off this thread); the
         // supervisor forgets the run on its `path.ended` row.
@@ -8358,6 +8363,8 @@ impl StepRunner for AcpStepRunner {
     /// re-dispatching to a different CLI. Registry/session removal is synchronous so the
     /// replacement cannot race with cleanup; kill/wait remains on a background thread.
     fn close_cli_session(&self, run_id: &str, cli_key: &str) {
+        // The container carrier's headless sessions on that seat go too (codex hl-r1).
+        self.fallback.forget_seat_sessions(run_id, cli_key);
         let run_id = run_id.to_string();
         let cli_key = cli_key.to_string();
         let kill_handles: Vec<Arc<KillHandle>> = {

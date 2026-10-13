@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"01a13334-cda7-7b73-aa5d-346bc3b141d4"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for `gpt-5.4` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc \"printf '%s' 'agent edit inside the worktree' > /work/edited-by-agent.txt; echo rc=\"'$?'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc \"printf '%s' 'agent edit inside the worktree' > /work/edited-by-agent.txt; echo rc=\"'$?'","aggregated_output":"rc=0\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"STUB-DONE"}}
+{"type":"turn.completed","usage":{"input_tokens":2,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0}}

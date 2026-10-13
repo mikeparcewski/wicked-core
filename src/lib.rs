@@ -43,6 +43,7 @@ mod execute;
 mod execute_wrapped;
 mod gate_hook;
 mod graph_browser;
+mod headless;
 mod hook_relay;
 mod install_fence;
 mod interaction;

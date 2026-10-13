@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use crate::domain::WorkUnit;
 use crate::skills_snapshot::SkillsSnapshot;
 use crate::workflow::{DeltaSink, StepInput, StepOutput, StepRunner, StepStatus, Usage};
+use wicked_apps_core::spawn::SeatCli;
 use wicked_apps_core::HardenedCommand;
 
 /// The structured signals an [`OutputAdapter`] extracts from ONE raw stdout line (DES-STUDIO-COCKPIT-001
@@ -39,20 +40,20 @@ pub struct AdapterOut {
 }
 
 /// Per-CLI stdout adapter: turns a binary's raw stdout into readable deltas plus optional structured
-/// signals (usage, files). Selected by the resolved binary — `claude` → [`ClaudeStreamJson`], everything
-/// else → [`Passthrough`]. The default (passthrough) path is byte-identical to the pre-adapter behavior
-/// (every line is one delta, no usage/files), so a non-claude run is unchanged.
+/// signals (usage, files). Selected by the resolved binary and its JSON mode: claude stream-json,
+/// codex JSONL, pi JSON, or opencode JSON. The default ([`Passthrough`]) path is byte-identical to the
+/// pre-adapter behavior (every line is one delta, no usage/files).
 pub trait OutputAdapter: Send {
     /// Consume one raw stdout line; return the readable deltas + any structured signals it carried.
     fn on_line(&mut self, line: &str) -> AdapterOut;
-    /// Flush any buffered state when stdout closes (both current adapters are stateless → empty).
+    /// Flush any buffered state when stdout closes (stateless adapters return empty).
     fn finish(&mut self) -> AdapterOut {
         AdapterOut::default()
     }
 }
 
-/// Default adapter for every non-claude binary: each raw line is exactly one readable delta, no usage or
-/// files. Byte-identical to the original raw-line streaming.
+/// Default adapter when no structured mode is selected: each raw line is exactly one readable delta,
+/// no usage or files. Byte-identical to the original raw-line streaming.
 struct Passthrough;
 
 impl OutputAdapter for Passthrough {
@@ -392,6 +393,258 @@ impl OutputAdapter for PiJson {
             ..AdapterOut::default()
         }
     }
+}
+
+/// The `opencode run --format json` NDJSON adapter. `text` parts are readable deltas; `tool_use`
+/// parts carry tool names and write/edit paths in `state.input.path`. Usage is summed over
+/// `step_finish` parts (fresh + cache-read + cache-write input, output, and cost). There is no
+/// terminal event — stdout closes after the last part, and the caller judges the process exit.
+/// Anything that is not JSON passes through as one text delta.
+#[derive(Default)]
+pub(crate) struct OpencodeJson {
+    usage: Option<Usage>,
+}
+
+impl OutputAdapter for OpencodeJson {
+    fn on_line(&mut self, line: &str) -> AdapterOut {
+        if line.trim().is_empty() {
+            return AdapterOut::default();
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return AdapterOut {
+                text: vec![line.to_string()],
+                ..AdapterOut::default()
+            };
+        };
+        let mut out = AdapterOut::default();
+        // An error event's message stays in the unit's output (refusal/auth classification).
+        if let Some(msg) = opencode_error(line) {
+            out.text.push(msg);
+            return out;
+        }
+        let Some(part) = v.get("part") else {
+            return out;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                    if !t.is_empty() {
+                        out.text.push(t.to_string());
+                    }
+                }
+            }
+            Some("tool_use") => {
+                if let Some(tool) = part.get("tool").and_then(|t| t.as_str()) {
+                    if !tool.is_empty() {
+                        out.tools.push(tool.to_string());
+                    }
+                    let state = part.get("state");
+                    let completed = state.and_then(|s| s.get("status")).and_then(|s| s.as_str())
+                        == Some("completed");
+                    // Only a write that happened is a file used (a refused one is not).
+                    if completed && matches!(tool, "write" | "edit") {
+                        if let Some(path) = state
+                            .and_then(|s| s.get("input"))
+                            .and_then(|i| i.get("path"))
+                            .and_then(|p| p.as_str())
+                        {
+                            if !path.is_empty() {
+                                out.files.push(path.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Some("step_finish") => {
+                let tokens = part.get("tokens");
+                let cost = part.get("cost").and_then(|c| c.as_f64());
+                if tokens.is_some() || cost.is_some() {
+                    let field = |k: &str| {
+                        tokens
+                            .and_then(|t| t.get(k))
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(0)
+                    };
+                    let cache = tokens.and_then(|t| t.get("cache"));
+                    let cache_field = |k: &str| {
+                        cache
+                            .and_then(|c| c.get(k))
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(0)
+                    };
+                    let cache_read = cache_field("read");
+                    let cache_write = cache_field("write");
+                    let prev = self.usage.take();
+                    let total = Usage {
+                        input_tokens: field("input")
+                            .saturating_add(cache_read)
+                            .saturating_add(cache_write)
+                            .saturating_add(prev.as_ref().map_or(0, |p| p.input_tokens)),
+                        output_tokens: field("output")
+                            .saturating_add(prev.as_ref().map_or(0, |p| p.output_tokens)),
+                        cache_read_tokens: cache_read
+                            .saturating_add(prev.as_ref().map_or(0, |p| p.cache_read_tokens)),
+                        cache_creation_tokens: cache_write
+                            .saturating_add(prev.as_ref().map_or(0, |p| p.cache_creation_tokens)),
+                        cost_usd: match (prev.as_ref().and_then(|p| p.cost_usd), cost) {
+                            (Some(a), Some(b)) => Some(a + b),
+                            (a, b) => a.or(b),
+                        },
+                    };
+                    self.usage = Some(total.clone());
+                    out.usage = Some(total);
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+}
+
+/// The message of an opencode `--format json` `error` event (`error.data.message`, else
+/// `error.message`, else `error.name`); `None` for any other line.
+pub(crate) fn opencode_error(line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("error") {
+        return None;
+    }
+    let e = v.get("error");
+    let pick = |p: &str| e.and_then(|e| e.pointer(p)).and_then(|m| m.as_str());
+    Some(
+        pick("/data/message")
+            .or_else(|| pick("/message"))
+            .or_else(|| pick("/name"))
+            .unwrap_or("opencode reported an error")
+            .to_string(),
+    )
+}
+
+/// (C2) Add `--format json` to a wrapped `opencode run` launch, before any `--` guard, unless the
+/// template already chose a format — the opencode twin of [`inject_pi_json_mode`], so the seat's
+/// text, tools and usage are read by [`OpencodeJson`]. Any other subcommand is left alone.
+pub(crate) fn inject_opencode_json_format(argv: &mut Vec<String>) -> bool {
+    if argv.get(1).map(String::as_str) != Some("run") {
+        return false;
+    }
+    let at = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    if argv[..at]
+        .iter()
+        .any(|a| a == "--format" || a.starts_with("--format="))
+    {
+        return false;
+    }
+    argv.insert(at, "json".to_string());
+    argv.insert(at, "--format".to_string());
+    true
+}
+
+/// Whether a claude argv streams JSON (`--output-format stream-json`): a template may keep its
+/// own `--output-format text` (codex hl-r2), which has no `result` event to judge.
+fn claude_stream_mode(argv: &[String]) -> bool {
+    let flags = &argv[..argv.iter().position(|a| a == "--").unwrap_or(argv.len())];
+    flags
+        .windows(2)
+        .any(|w| w[0] == "--output-format" && w[1] == "stream-json")
+        || flags.iter().any(|a| a == "--output-format=stream-json")
+}
+
+/// Whether an opencode argv explicitly selects JSON output. Only flags before the `--` guard
+/// count; a prompt containing `--format json` keeps the passthrough adapter.
+fn opencode_json_mode(binary: &str, argv: &[String]) -> bool {
+    if SeatCli::from_binary(binary) != SeatCli::Opencode {
+        return false;
+    }
+    let flags = &argv[..argv.iter().position(|a| a == "--").unwrap_or(argv.len())];
+    if let Some(i) = flags.iter().position(|a| a == "--format") {
+        return flags.get(i + 1).is_some_and(|f| f == "json");
+    }
+    flags.iter().any(|a| a == "--format=json")
+}
+
+/// Extract the CLI's resume id from one headless JSON line. Only the session-opening event
+/// qualifies for claude/codex/pi; opencode carries `sessionID` on every part's envelope.
+pub(crate) fn headless_session_id(cli: SeatCli, line: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let event = v.get("type").and_then(|t| t.as_str());
+    let key = match cli {
+        SeatCli::Claude
+            if event == Some("system")
+                && v.get("subtype").and_then(|s| s.as_str()) == Some("init") =>
+        {
+            "session_id"
+        }
+        SeatCli::Codex if event == Some("thread.started") => "thread_id",
+        SeatCli::Pi if event == Some("session") => "id",
+        SeatCli::Opencode => "sessionID",
+        _ => return None,
+    };
+    v.get(key)
+        .and_then(|id| id.as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// Whether a headless turn emitted its terminal event. `Some(false)` identifies a stream that
+/// ended without completion; `None` means the CLI has no known terminal event (opencode uses
+/// the process exit code). Invalid JSON and unrelated events never count as completion.
+pub(crate) fn headless_turn_completed(cli: SeatCli, lines: &[&str]) -> Option<bool> {
+    let terminal = match cli {
+        SeatCli::Claude => "result",
+        SeatCli::Codex => "turn.completed",
+        SeatCli::Pi => "agent_end",
+        _ => return None,
+    };
+    Some(lines.iter().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .is_some_and(|v| {
+                v.get("type").and_then(|t| t.as_str()) == Some(terminal)
+                    && (cli != SeatCli::Pi || pi_turn_succeeded(&v))
+            })
+    }))
+}
+
+/// One line's effect on the turn being judged: `Some(false)` a turn started (not yet done) or
+/// ended without success, `Some(true)` it ended successfully, `None` neither (or a CLI with no
+/// terminal event).
+pub(crate) fn headless_turn_event(cli: SeatCli, line: &str) -> Option<bool> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let t = v.get("type").and_then(|t| t.as_str())?;
+    let start = match cli {
+        SeatCli::Claude => {
+            t == "system" && v.get("subtype").and_then(|s| s.as_str()) == Some("init")
+        }
+        SeatCli::Codex => t == "turn.started",
+        SeatCli::Pi => t == "agent_start",
+        _ => return None,
+    };
+    if start {
+        return Some(false);
+    }
+    headless_turn_completed(cli, &[line])
+        .filter(|&done| done)
+        .or_else(|| (cli == SeatCli::Pi && t == "agent_end").then_some(false))
+}
+
+/// pi's `agent_end` also closes a failed turn (codex hl-r1): it counts as done only when no
+/// retry is pending and the last assistant message did not stop on an error or an abort.
+fn pi_turn_succeeded(agent_end: &serde_json::Value) -> bool {
+    if agent_end.get("willRetry").and_then(|w| w.as_bool()) == Some(true) {
+        return false;
+    }
+    let last = agent_end
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|m| {
+            m.iter()
+                .rev()
+                .find(|x| x.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+        });
+    !matches!(
+        last.and_then(|m| m.get("stopReason"))
+            .and_then(|r| r.as_str()),
+        Some("error" | "aborted")
+    )
 }
 
 /// (core#412) Add `--mode json` to a WRAPPED `pi` print launch (`-p` / `--print`), before any `--`
@@ -1551,6 +1804,9 @@ pub struct WrappedCliStepRunner {
     /// the `Default` path (no-tx contexts such as standalone tests); `Some` when constructed via
     /// [`WrappedCliStepRunner::with_tx`] (the actor path, seeded from `AcpStepRunner::new`).
     tx: Option<std::sync::mpsc::Sender<crate::command::Command>>,
+    /// (C2) The CLI sessions this runner's container units resume, its own (never another
+    /// engine's in the same process).
+    sessions: std::sync::Arc<crate::headless::Sessions>,
 }
 
 type CancelToken = std::sync::Arc<std::sync::atomic::AtomicBool>;
@@ -1587,6 +1843,7 @@ impl Default for WrappedCliStepRunner {
             tx: None,
             cancel_tokens: Default::default(),
             operational_home: None,
+            sessions: Default::default(),
         }
     }
 }
@@ -1600,6 +1857,7 @@ impl WrappedCliStepRunner {
             tx: Some(tx),
             cancel_tokens: Default::default(),
             operational_home: None,
+            sessions: Default::default(),
         }
     }
 
@@ -1649,10 +1907,22 @@ impl WrappedCliStepRunner {
         }
     }
 
+    /// Reopen `run_id`'s container sessions for a reactivated run (its launches are admitted
+    /// again; a superseded launch of the old lifecycle stays fenced by its `launch_seq`).
+    pub(crate) fn reopen_run_sessions(&self, run_id: &str, min_launch_seq: u64) {
+        self.sessions.reopen_run(run_id, min_launch_seq);
+    }
+
+    /// Forget the container carrier's sessions of `run_id` on seat `cli_key`.
+    pub(crate) fn forget_seat_sessions(&self, run_id: &str, cli_key: &str) {
+        self.sessions.forget_seat(run_id, cli_key);
+    }
+
     /// Kill every in-flight wrapped worker of `run_id` (crew#277). Called from the runner's
     /// `on_run_complete`, which the actor invokes on every run-terminal transition — cancel
     /// included. Idempotent; a token with no live child is a no-op.
     pub(crate) fn cancel_run_workers(&self, run_id: &str) {
+        self.sessions.forget_run(run_id);
         let tokens = {
             let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
             let keys: Vec<WrappedWorkerKey> = guard
@@ -1709,6 +1979,10 @@ impl StepRunner for WrappedCliStepRunner {
 
     fn run_unit_streaming(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
         self.exec(input, emit)
+    }
+
+    fn on_run_resumed(&self, run_id: &str, min_launch_seq: u64) {
+        self.reopen_run_sessions(run_id, min_launch_seq);
     }
 
     fn on_run_complete(&self, run_id: &str) {
@@ -1910,7 +2184,7 @@ impl WrappedCliStepRunner {
         let mut no_lever_note: Option<String> = None;
 
         // Per-binary output adapter (B-runner). claude → stream-json (+ the two flags, injected before the
-        // `--` guard); every other binary → passthrough (byte-identical to the pre-adapter raw-line stream).
+        // `--` guard); binaries without a JSON mode → passthrough (byte-identical raw-line stream).
         // (core#412) codex → `exec --json`, pi → `-p --mode json`, each with its JSON adapter, so
         // the seat's usage is captured; the unit's text stays what plain mode printed.
         let seat_cli = wicked_apps_core::spawn::SeatCli::from_binary(&binary);
@@ -1918,6 +2192,12 @@ impl WrappedCliStepRunner {
             && inject_codex_json_flag(&mut argv);
         let pi_json =
             seat_cli == wicked_apps_core::spawn::SeatCli::Pi && inject_pi_json_mode(&mut argv);
+        // opencode's JSON mode is the container carrier's only (outside it, the wrapped
+        // opencode launch stays byte-identical to before: codex hl-r1).
+        let container = crate::container_floor::container_mode();
+        if container && seat_cli == wicked_apps_core::spawn::SeatCli::Opencode {
+            inject_opencode_json_format(&mut argv);
+        }
         // Run in the worktree if the run targets a repo; else a per-run temp sandbox (never the
         // orchestrator's own cwd).
         let cwd = input.workdir.clone().unwrap_or_else(|| sandbox_for(input));
@@ -2188,15 +2468,24 @@ impl WrappedCliStepRunner {
                 Vec::new(),
             )
         } else {
-            let adapter: Box<dyn OutputAdapter> = if is_claude {
+            let mut adapter: Box<dyn OutputAdapter> = if is_claude {
                 Box::<ClaudeStreamJson>::default()
             } else if codex_json {
                 Box::<CodexJsonl>::default()
             } else if pi_json {
                 Box::<PiJson>::default()
+            } else if container && opencode_json_mode(&binary, &argv) {
+                Box::<OpencodeJson>::default()
             } else {
                 Box::new(Passthrough)
             };
+            // Whether the launch speaks the CLI's headless JSON protocol: only then is a turn's
+            // session or end-of-turn event read off its stream (codex hl-r1: `pi --mode text`
+            // has no `agent_end` and must not be judged cut off).
+            let structured = (is_claude && claude_stream_mode(&argv))
+                || codex_json
+                || pi_json
+                || (container && opencode_json_mode(&binary, &argv));
             // Boundary 1 is deliberately layered below the existing Claude gate-hook, ACP
             // admission, and wrapped deny fence. It is WRITE containment only — not a read jail
             // or exfiltration/DLP protection; worker model egress remains open.
@@ -2499,6 +2788,38 @@ impl WrappedCliStepRunner {
             // boundary that depends on the daemon's environment is not a boundary. Hardening happens
             // FIRST (in the builder) so the gate-hook variables set below survive as deliberate
             // exceptions.
+            // C2, headless multi-turn: in the container floor a unit resumes its run's session on
+            // this seat (same posture), as the ACP carrier's per-(run, seat) session did; on the
+            // host the wrapped carrier stays single-shot.
+            // Every container JSON launch is judged by its end-of-turn event; an isolated QE
+            // review session never resumes (or records) the run's ordinary session on this seat
+            // (codex hl-r1 P1 / hl-r2: a reviewer on the executor's seat would read its history).
+            let headless = (container && structured).then(|| {
+                let turn = input.unit.qe_review_session.is_none().then(|| {
+                    self.sessions.begin(
+                        crate::headless::SessionKey {
+                            run_id: input.run_id.clone(),
+                            cli_key: cli_key.clone(),
+                            posture: format!("{write_posture:?}"),
+                        },
+                        input.launch_seq,
+                    )
+                });
+                let prior = turn.as_ref().and_then(|t| t.prior.clone());
+                let fresh = crate::headless::fresh_id(seat_cli);
+                let engine_id = crate::headless::inject_session(
+                    seat_cli,
+                    &mut argv,
+                    prior.as_deref(),
+                    fresh.as_deref(),
+                );
+                let (tap, seen) = crate::headless::SessionTap::new(
+                    std::mem::replace(&mut adapter, Box::new(Passthrough)),
+                    seat_cli,
+                );
+                adapter = Box::new(tap);
+                (turn, engine_id, seen)
+            });
             let mut cmd = build_worker_command(&argv, sandbox.as_ref());
             cmd.current_dir(&cwd);
             // The seat-aware configuration decision (core#410), decided above alongside the
@@ -2826,6 +3147,22 @@ impl WrappedCliStepRunner {
                         .with_file_name(format!("gateway-{phase}.ndjson")),
                     &records,
                 );
+            }
+            let mut bounded = bounded;
+            if let Some((turn, engine_id, seen)) = headless {
+                let seen = seen.lock().map(|g| g.clone()).unwrap_or_default();
+                let next = match &bounded {
+                    Ok((0, ..)) => {
+                        crate::headless::session_after_turn(seat_cli, engine_id.as_deref(), &seen)
+                    }
+                    _ => None,
+                };
+                if let Some(turn) = turn {
+                    self.sessions.finish(turn, next);
+                }
+                if let Ok((code, out, ..)) = &mut bounded {
+                    crate::headless::settle_cut_off_turn(&seen, code, out, &cli_key);
+                }
             }
             drop(mcp_channel);
             match bounded {
@@ -10790,6 +11127,346 @@ mod tests {
         }
         absorb(adapter.finish());
         acc
+    }
+
+    /// Full tool-loop turns and two captures of the same resumed session, straight from containers.
+    const HEADLESS_FIXTURES: &[(SeatCli, &str, &str, &str, &str)] = &[
+        (
+            SeatCli::Claude,
+            include_str!("../tests/fixtures/headless/claude-gw.ndjson"),
+            include_str!("../tests/fixtures/headless/claude-resume-t1.ndjson"),
+            include_str!("../tests/fixtures/headless/claude-resume-t2.ndjson"),
+            "34015248-a744-4330-971c-6856c23feeb9",
+        ),
+        (
+            SeatCli::Codex,
+            include_str!("../tests/fixtures/headless/codex-gw.ndjson"),
+            include_str!("../tests/fixtures/headless/codex-resume-t1.ndjson"),
+            include_str!("../tests/fixtures/headless/codex-resume-t2.ndjson"),
+            "01a13334-cda7-7b73-aa5d-346bc3b141d4",
+        ),
+        (
+            SeatCli::Pi,
+            include_str!("../tests/fixtures/headless/pi-gw.ndjson"),
+            include_str!("../tests/fixtures/headless/pi-resume-t1.ndjson"),
+            include_str!("../tests/fixtures/headless/pi-resume-t2.ndjson"),
+            "3851611b-fc6a-4d5f-80b9-0f8b06976f58",
+        ),
+        (
+            SeatCli::Opencode,
+            include_str!("../tests/fixtures/headless/opencode-gw.ndjson"),
+            include_str!("../tests/fixtures/headless/opencode-resume-t1.ndjson"),
+            include_str!("../tests/fixtures/headless/opencode-resume-t2.ndjson"),
+            "ses_spike5c08f950195c43a5a183",
+        ),
+    ];
+
+    /// Every resume capture must expose exactly the first turn's session id, never a message/part id.
+    fn assert_headless_session_resumes(cli: SeatCli) {
+        let (_, gw, t1, t2, expected) = HEADLESS_FIXTURES
+            .iter()
+            .find(|(seat, ..)| *seat == cli)
+            .expect("fixture for CLI");
+        for capture in [t1, t2] {
+            let ids: Vec<_> = capture
+                .lines()
+                .filter_map(|line| headless_session_id(cli, line))
+                .collect();
+            assert!(!ids.is_empty(), "{cli:?}: resume id missing");
+            assert!(
+                ids.iter().all(|id| id.as_str() == *expected),
+                "{cli:?}: {ids:?}"
+            );
+            for line in capture.lines() {
+                let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+                let key = match cli {
+                    SeatCli::Claude => "session_id",
+                    SeatCli::Codex => "thread_id",
+                    SeatCli::Pi => "id",
+                    SeatCli::Opencode => "sessionID",
+                    _ => unreachable!(),
+                };
+                v.as_object_mut().unwrap().remove(key);
+                assert_eq!(headless_session_id(cli, &v.to_string()), None);
+                v[key] = serde_json::json!("");
+                assert_eq!(headless_session_id(cli, &v.to_string()), None);
+            }
+        }
+        assert!(gw
+            .lines()
+            .any(|line| headless_session_id(cli, line).is_some()));
+        assert_eq!(headless_session_id(cli, "not JSON"), None);
+        assert_eq!(headless_session_id(cli, ""), None);
+        if cli != SeatCli::Opencode {
+            let last = t1.lines().last().unwrap();
+            assert_eq!(headless_session_id(cli, last), None, "not a session opener");
+        }
+    }
+
+    #[test]
+    fn a_wrapped_opencode_run_gets_json_format_unless_the_template_chose_one() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let mut a = s(&["opencode", "run", "--", "do it"]);
+        assert!(inject_opencode_json_format(&mut a));
+        assert_eq!(
+            a,
+            s(&["opencode", "run", "--format", "json", "--", "do it"])
+        );
+        assert!(opencode_json_mode("opencode", &a));
+        let mut b = s(&["opencode", "run", "--format", "default", "x"]);
+        assert!(!inject_opencode_json_format(&mut b));
+        let mut c = s(&["opencode", "serve"]);
+        assert!(!inject_opencode_json_format(&mut c));
+        assert_eq!(c, s(&["opencode", "serve"]));
+    }
+
+    #[test]
+    fn headless_claude_session_id_survives_resume() {
+        assert_headless_session_resumes(SeatCli::Claude);
+    }
+
+    #[test]
+    fn headless_codex_thread_id_survives_resume() {
+        assert_headless_session_resumes(SeatCli::Codex);
+    }
+
+    #[test]
+    fn headless_pi_session_id_survives_resume() {
+        assert_headless_session_resumes(SeatCli::Pi);
+    }
+
+    #[test]
+    fn headless_opencode_session_id_survives_resume() {
+        assert_headless_session_resumes(SeatCli::Opencode);
+    }
+
+    /// Cutting a capture before its terminal event models cancellation, even if the process exits 0.
+    /// codex hl-r1: pi closes a failed or aborted turn with `agent_end` too (exit 0 in JSON
+    /// mode); only a turn whose last assistant message stopped normally, with no retry pending,
+    /// is done (and resumable).
+    #[test]
+    fn a_pi_turn_that_ended_on_an_error_or_abort_is_not_done() {
+        let end = |stop: &str, retry: bool| {
+            format!(
+                r#"{{"type":"agent_end","messages":[{{"role":"user","content":[]}},{{"role":"assistant","content":[],"stopReason":"{stop}"}}],"willRetry":{retry}}}"#
+            )
+        };
+        for (line, done) in [
+            (end("stop", false), true),
+            (end("toolUse", false), true),
+            (end("error", false), false),
+            (end("aborted", false), false),
+            (end("stop", true), false),
+        ] {
+            assert_eq!(
+                headless_turn_completed(SeatCli::Pi, &[line.as_str()]),
+                Some(done),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn headless_terminal_events_distinguish_completed_from_cancelled_turns() {
+        for (cli, gw, t1, t2, _) in HEADLESS_FIXTURES {
+            for capture in [gw, t1, t2] {
+                let lines: Vec<_> = capture.lines().collect();
+                if *cli == SeatCli::Opencode {
+                    assert_eq!(headless_turn_completed(*cli, &lines), None);
+                    assert_eq!(headless_turn_completed(*cli, &lines[..1]), None);
+                    assert_eq!(headless_turn_completed(*cli, &[]), None);
+                    continue;
+                }
+                assert_eq!(headless_turn_completed(*cli, &lines), Some(true));
+                let terminal = match cli {
+                    SeatCli::Claude => "result",
+                    SeatCli::Codex => "turn.completed",
+                    SeatCli::Pi => "agent_end",
+                    _ => unreachable!(),
+                };
+                let at = lines
+                    .iter()
+                    .position(|line| {
+                        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                        v["type"] == terminal
+                    })
+                    .unwrap();
+                assert_eq!(headless_turn_completed(*cli, &lines[..at]), Some(false));
+                let without_terminal: Vec<_> = lines
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, line)| (i != at).then_some(*line))
+                    .collect();
+                assert_eq!(
+                    headless_turn_completed(*cli, &without_terminal),
+                    Some(false)
+                );
+                assert_eq!(headless_turn_completed(*cli, &[lines[at]]), Some(true));
+                assert_eq!(
+                    headless_turn_completed(*cli, &["not JSON", ""]),
+                    Some(false)
+                );
+                assert_eq!(headless_turn_completed(*cli, &[]), Some(false));
+            }
+        }
+        assert_eq!(headless_turn_completed(SeatCli::Other, &[]), None);
+        assert_eq!(
+            headless_session_id(
+                SeatCli::Other,
+                HEADLESS_FIXTURES[0].2.lines().next().unwrap()
+            ),
+            None
+        );
+    }
+
+    /// No tool output leaks into prose; each step contributes usage, including failed tool calls.
+    #[test]
+    fn the_opencode_adapter_extracts_text_tools_files_and_sums_usage() {
+        let lines: Vec<_> = include_str!("../tests/fixtures/headless/opencode-gw.ndjson")
+            .lines()
+            .collect();
+        let out = drive(&mut OpencodeJson::default(), &lines);
+        assert_eq!(out.text, vec!["STUB-DONE".to_string()]);
+        let mut tools = vec!["shell".to_string(); 20];
+        tools[0] = "write".to_string();
+        tools[1] = "write".to_string();
+        tools[16] = "write".to_string();
+        assert_eq!(out.tools, tools);
+        assert_eq!(
+            out.files,
+            // The refused write outside the tree (`status: "error"`) is a tool call, not a file
+            // used (codex hl-r1 P3).
+            vec![
+                "/work/edited-by-agent.txt".to_string(),
+                "/work/held/filetool.txt".to_string(),
+            ]
+        );
+        assert_eq!(
+            out.usage,
+            Some(Usage {
+                input_tokens: 20,
+                output_tokens: 20,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                cost_usd: Some(0.0),
+            })
+        );
+    }
+
+    /// The resumed text-only capture has no step usage; neither text nor `finish` invents a total.
+    #[test]
+    fn the_opencode_adapter_handles_resume_and_missing_usage() {
+        let t1: Vec<_> = include_str!("../tests/fixtures/headless/opencode-resume-t1.ndjson")
+            .lines()
+            .collect();
+        let t2: Vec<_> = include_str!("../tests/fixtures/headless/opencode-resume-t2.ndjson")
+            .lines()
+            .collect();
+        let first = drive(&mut OpencodeJson::default(), &t1);
+        assert_eq!(first.text, vec!["STUB-DONE".to_string()]);
+        assert_eq!(first.tools, vec!["write".to_string()]);
+        assert_eq!(first.files, vec!["/work/edited-by-agent.txt".to_string()]);
+        assert_eq!(
+            first
+                .usage
+                .as_ref()
+                .map(|u| (u.input_tokens, u.output_tokens)),
+            Some((1, 1))
+        );
+        let resumed = drive(&mut OpencodeJson::default(), &t2);
+        assert_eq!(resumed.text, vec!["STUB-DONE".to_string()]);
+        assert!(resumed.tools.is_empty() && resumed.files.is_empty());
+        assert_eq!(resumed.usage, None);
+
+        let mut step: serde_json::Value = serde_json::from_str(t1[2]).unwrap();
+        step["part"].as_object_mut().unwrap().remove("tokens");
+        step["part"].as_object_mut().unwrap().remove("cost");
+        let out = drive(
+            &mut OpencodeJson::default(),
+            &[&step.to_string(), "not JSON", ""],
+        );
+        assert_eq!(out.text, vec!["not JSON".to_string()]);
+        assert_eq!(out.usage, None);
+    }
+
+    /// Vary the captured token/cache/cost fields to exercise the split and cumulative totals.
+    #[test]
+    fn the_opencode_adapter_counts_cached_input_and_reported_cost() {
+        let line = include_str!("../tests/fixtures/headless/opencode-resume-t1.ndjson")
+            .lines()
+            .nth(2)
+            .unwrap();
+        let mut step: serde_json::Value = serde_json::from_str(line).unwrap();
+        step["part"]["tokens"]["input"] = serde_json::json!(10);
+        step["part"]["tokens"]["output"] = serde_json::json!(3);
+        step["part"]["tokens"]["cache"]["read"] = serde_json::json!(20);
+        step["part"]["tokens"]["cache"]["write"] = serde_json::json!(5);
+        step["part"]["cost"] = serde_json::json!(0.25);
+        let first = step.to_string();
+        step["part"].as_object_mut().unwrap().remove("cost");
+        let second = step.to_string();
+        let out = drive(&mut OpencodeJson::default(), &[&first, &second, &first]);
+        assert_eq!(
+            out.usage,
+            Some(Usage {
+                input_tokens: 105,
+                output_tokens: 9,
+                cache_read_tokens: 60,
+                cache_creation_tokens: 15,
+                cost_usd: Some(0.5),
+            })
+        );
+        let no_cost = drive(&mut OpencodeJson::default(), &[&second]);
+        assert_eq!(no_cost.usage.unwrap().cost_usd, None);
+    }
+
+    /// Only an opencode binary with an explicit JSON flag selects its adapter; argv is never mutated.
+    #[test]
+    fn the_opencode_json_mode_requires_the_binary_and_format_flag() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        for binary in ["opencode", "/usr/local/bin/opencode", "opencode.exe"] {
+            for args in [
+                s(&["opencode", "run", "--format", "json", "prompt"]),
+                s(&["opencode", "run", "--format=json", "--", "prompt"]),
+            ] {
+                assert!(opencode_json_mode(binary, &args));
+            }
+        }
+        for (binary, args) in [
+            ("opencode", s(&["opencode", "run", "prompt"])),
+            (
+                "opencode",
+                s(&["opencode", "run", "--format", "default", "prompt"]),
+            ),
+            (
+                "opencode",
+                s(&["opencode", "run", "--format=default", "prompt"]),
+            ),
+            ("opencode", s(&["opencode", "run", "--format"])),
+            (
+                "opencode",
+                s(&["opencode", "run", "--", "--format", "json"]),
+            ),
+            ("opencode", s(&["opencode", "run", "--", "--format=json"])),
+            ("pi", s(&["pi", "-p", "--format", "json", "prompt"])),
+            (
+                "opencode-wrapper",
+                s(&["opencode-wrapper", "run", "--format=json"]),
+            ),
+        ] {
+            let original = args.clone();
+            assert!(!opencode_json_mode(binary, &args));
+            assert_eq!(args, original);
+            let lines: Vec<_> =
+                include_str!("../tests/fixtures/headless/opencode-resume-t2.ndjson")
+                    .lines()
+                    .chain(["  plain text  ", ""])
+                    .collect();
+            let out = drive(&mut Passthrough, &lines);
+            assert_eq!(out.text, lines);
+            assert!(out.files.is_empty() && out.tools.is_empty());
+            assert_eq!(out.usage, None);
+        }
     }
 
     /// Faithful structural slice of the empirical `/tmp/cj.ndjson` capture (DES §6b): a system init, an
