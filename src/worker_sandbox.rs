@@ -302,6 +302,9 @@ pub(crate) enum FloorUnarmed {
     NoSeatImage,
     /// Container floor: native Windows (seat containers mount host paths at the same path).
     ContainerUnsupportedHost,
+    /// Container floor: the unit's gate hook is a host command the seat container cannot run, and
+    /// no hook route from the seat to the engine exists.
+    GateHookUnreachable,
 }
 
 impl FloorUnarmed {
@@ -340,6 +343,11 @@ impl FloorUnarmed {
                  which native Windows paths cannot be — run the daemon inside WSL2 with a container \
                  runtime"
             }
+            FloorUnarmed::GateHookUnreachable => {
+                "gate_hook_unreachable: the unit's PreToolUse gate hook is a host command the seat \
+                 container cannot run, and no hook route from the seat to the engine is configured \
+                 — refusing rather than running its tool calls unchecked"
+            }
         }
     }
 
@@ -354,6 +362,7 @@ impl FloorUnarmed {
             FloorUnarmed::ContainerRuntimeDown => "container_runtime_down",
             FloorUnarmed::NoSeatImage => "no_seat_image",
             FloorUnarmed::ContainerUnsupportedHost => "container_unsupported_host",
+            FloorUnarmed::GateHookUnreachable => "gate_hook_unreachable",
         }
     }
 }

@@ -13,8 +13,9 @@
 //! **What the container is.** One image per CLI, built from an in-repo Dockerfile on an OSS base
 //! (`containers/seats/<cli>.Dockerfile`, tagged by the file's hash so an edit rebuilds); the
 //! operator's uid (`--user`), `no-new-privileges`, every capability dropped, a read-only root
-//! filesystem with a tmpfs `/tmp` and `HOME`, a pids limit, and an internal network
-//! ([`SEAT_NETWORK`]) whose only egress is the model gateway. Every host path is bind-mounted at the
+//! filesystem with a tmpfs `/tmp` and `HOME`, a pids limit, and an internal network of its own
+//! (one per seat container, named after it: seats sharing a network could reach each other) whose
+//! only egress is the model gateway attached to it. Every host path is bind-mounted at the
 //! SAME absolute path, so the unit's cwd, its argv paths and its env paths need no translation.
 //!
 //! **The mounts are the floor.** They are rendered from the step-0 [`SeatFloor`] the interim floor
@@ -50,12 +51,10 @@ pub(crate) const RUNTIME_ENV: &str = "WICKED_CONTAINER_RUNTIME";
 /// A Debian-based base image to build the seat images on instead of the default (a project's own
 /// toolchain image). Part of the image tag, so a change rebuilds.
 pub(crate) const BASE_IMAGE_ENV: &str = "WICKED_SEAT_BASE_IMAGE";
-/// The network seats join (default [`SEAT_NETWORK`]); `none` for an offline seat.
+/// `none` runs seats with no network at all; otherwise each seat gets its own internal network.
 pub(crate) const NETWORK_ENV: &str = "WICKED_SEAT_NETWORK";
 /// The record label of a governed unit that ran in the container floor.
 pub(crate) const CONTAINER_FLOOR: &str = "container floor";
-/// The internal network every seat joins: no route out except the gateway attached to it.
-pub(crate) const SEAT_NETWORK: &str = "wicked-seat-int";
 /// The label on every seat container (and the seat network), for the reap and the sweep.
 pub(crate) const SEAT_LABEL: &str = "wicked.seat";
 
@@ -66,8 +65,14 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The seat Dockerfiles, by CLI (the registry's seat keys).
 const DOCKERFILES: &[(&str, &str)] = &[
-    ("claude", include_str!("../containers/seats/claude.Dockerfile")),
-    ("codex", include_str!("../containers/seats/codex.Dockerfile")),
+    (
+        "claude",
+        include_str!("../containers/seats/claude.Dockerfile"),
+    ),
+    (
+        "codex",
+        include_str!("../containers/seats/codex.Dockerfile"),
+    ),
     ("pi", include_str!("../containers/seats/pi.Dockerfile")),
     (
         "opencode",
@@ -119,7 +124,9 @@ pub(crate) fn runtime_candidates(
     if let Some(c) = choice.map(str::trim).filter(|c| !c.is_empty()) {
         let p = Path::new(c);
         if p.is_absolute() {
-            push(p.to_path_buf());
+            if p.is_file() {
+                push(p.to_path_buf());
+            }
         } else if let Some(found) = on_path(c) {
             push(found);
         }
@@ -132,7 +139,11 @@ pub(crate) fn runtime_candidates(
         }
     }
     if let Some(h) = home {
-        for rel in [".rd/bin/docker", ".orbstack/bin/docker", ".colima/bin/docker"] {
+        for rel in [
+            ".rd/bin/docker",
+            ".orbstack/bin/docker",
+            ".colima/bin/docker",
+        ] {
             let p = h.join(rel);
             if p.is_file() {
                 push(p);
@@ -175,8 +186,15 @@ fn output_within(mut cmd: Command, limit: Duration) -> Option<std::process::Outp
 /// The runtime this host runs seats with, probed (`<cli> version` must reach the engine). A
 /// success is cached for the process; a failure is not, so starting the runtime later is enough.
 pub(crate) fn runtime() -> Result<Runtime, FloorUnarmed> {
-    static OK: Mutex<Option<Runtime>> = Mutex::new(None);
-    if let Some(rt) = OK.lock().ok().and_then(|g| g.clone()) {
+    // Keyed by the operator's choice, so a changed `WICKED_CONTAINER_RUNTIME` is honoured.
+    static OK: Mutex<Option<(Option<String>, Runtime)>> = Mutex::new(None);
+    let choice = std::env::var(RUNTIME_ENV).ok();
+    if let Some((_, rt)) = OK
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .filter(|(c, _)| *c == choice)
+    {
         return Ok(rt);
     }
     if cfg!(windows) {
@@ -184,7 +202,7 @@ pub(crate) fn runtime() -> Result<Runtime, FloorUnarmed> {
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let cands = runtime_candidates(
-        std::env::var(RUNTIME_ENV).ok().as_deref(),
+        choice.as_deref(),
         home.as_deref(),
         crate::validator::find_on_path,
     );
@@ -197,7 +215,7 @@ pub(crate) fn runtime() -> Result<Runtime, FloorUnarmed> {
         probe.args(["version", "--format", "{{.Server.Version}}"]);
         if output_within(probe, PROBE_TIMEOUT).is_some_and(|o| o.status.success()) {
             if let Ok(mut g) = OK.lock() {
-                *g = Some(rt.clone());
+                *g = Some((choice.clone(), rt.clone()));
             }
             return Ok(rt);
         }
@@ -207,10 +225,7 @@ pub(crate) fn runtime() -> Result<Runtime, FloorUnarmed> {
 
 /// The seat Dockerfile for `cli`, when the engine ships one.
 pub(crate) fn dockerfile(cli: &str) -> Option<&'static str> {
-    DOCKERFILES
-        .iter()
-        .find(|(k, _)| *k == cli)
-        .map(|(_, d)| *d)
+    DOCKERFILES.iter().find(|(k, _)| *k == cli).map(|(_, d)| *d)
 }
 
 /// The CLIs the engine ships a seat image for.
@@ -336,33 +351,17 @@ pub(crate) fn ensure_seat_image(rt: &Runtime, cli: &str) -> Result<String, Strin
     build_seat_image(rt, cli)
 }
 
-/// The network a seat joins ([`NETWORK_ENV`], else [`SEAT_NETWORK`]), created internal on first
-/// use. `none` and the runtime's built-ins are used as named.
-pub(crate) fn ensure_seat_network(rt: &Runtime) -> Result<String, String> {
-    let name = std::env::var(NETWORK_ENV)
-        .ok()
-        .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| SEAT_NETWORK.to_string());
-    if matches!(name.as_str(), "none" | "host" | "bridge") {
-        if name == "host" {
-            return Err("the host network is never a seat network".into());
-        }
-        return Ok(name);
-    }
-    let mut inspect = rt.cmd();
-    inspect.args(["network", "inspect", "--format", "{{.Internal}}", &name]);
-    if let Some(o) = output_within(inspect, PROBE_TIMEOUT) {
-        if o.status.success() {
-            return if String::from_utf8_lossy(&o.stdout).trim() == "true" {
-                Ok(name)
-            } else {
-                Err(format!(
-                    "network `{name}` exists but is not internal; a seat network must have no \
-                     route out except the gateway"
-                ))
-            };
-        }
+/// Whether seats run with no network at all ([`NETWORK_ENV`]` = none`).
+fn offline_seats() -> bool {
+    std::env::var(NETWORK_ENV).is_ok_and(|v| v.trim() == "none")
+}
+
+/// Create seat `name`'s own internal network (named after the container, labelled for the
+/// sweep), or `none` for an offline seat. An internal network has no route out: the only egress
+/// a seat gets is the gateway the engine attaches to it.
+pub(crate) fn ensure_seat_network(rt: &Runtime, name: &str) -> Result<String, String> {
+    if offline_seats() {
+        return Ok("none".into());
     }
     let mut create = rt.cmd();
     create.args([
@@ -371,15 +370,15 @@ pub(crate) fn ensure_seat_network(rt: &Runtime) -> Result<String, String> {
         "--internal",
         "--label",
         &format!("{SEAT_LABEL}=1"),
-        &name,
+        name,
     ]);
     match output_within(create, PROBE_TIMEOUT) {
-        Some(o) if o.status.success() => Ok(name),
+        Some(o) if o.status.success() => Ok(name.to_string()),
         Some(o) => Err(format!(
-            "could not create network `{name}`: {}",
+            "could not create the seat network `{name}`: {}",
             String::from_utf8_lossy(&o.stderr).trim()
         )),
-        None => Err(format!("creating network `{name}` timed out")),
+        None => Err(format!("creating the seat network `{name}` timed out")),
     }
 }
 
@@ -421,8 +420,7 @@ impl Mount {
 /// A path a `--mount` value can carry: absolute, UTF-8, no comma, quote or newline.
 fn mountable(p: &Path) -> bool {
     p.is_absolute()
-        && p
-            .to_str()
+        && p.to_str()
             .is_some_and(|s| !s.contains([',', '"', '\'', '\n', '=']))
 }
 
@@ -573,7 +571,8 @@ fn image_index(args: &[String]) -> Option<usize> {
     while i < args.len() {
         let a = args[i].as_str();
         if VALUE_OPTS.contains(&a) {
-            if a == "--label" && args.get(i + 1).map(String::as_str) == Some(&format!("{SEAT_LABEL}=1"))
+            if a == "--label"
+                && args.get(i + 1).map(String::as_str) == Some(&format!("{SEAT_LABEL}=1"))
             {
                 ours = true;
             }
@@ -587,8 +586,16 @@ fn image_index(args: &[String]) -> Option<usize> {
     None
 }
 
-/// The container name of a seat `cmd` (one [`run_argv`] rendered), for the reap.
-pub(crate) fn seat_container_name(cmd: &Command) -> Option<String> {
+/// A seat container to reap: the runtime CLI that launched it and its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SeatContainer {
+    pub(crate) runtime: PathBuf,
+    pub(crate) name: String,
+}
+
+/// The seat container a `cmd` (one [`run_argv`] rendered) launches, for the reap: the reap uses
+/// the same runtime CLI, never a fresh probe (the operator's choice may have changed since).
+pub(crate) fn seat_container(cmd: &Command) -> Option<SeatContainer> {
     let args: Vec<String> = cmd
         .get_args()
         .map(|a| a.to_string_lossy().into_owned())
@@ -597,12 +604,22 @@ pub(crate) fn seat_container_name(cmd: &Command) -> Option<String> {
     args[..img]
         .windows(2)
         .find(|w| w[0] == "--name")
-        .map(|w| w[1].clone())
+        .map(|w| SeatContainer {
+            runtime: PathBuf::from(cmd.get_program()),
+            name: w[1].clone(),
+        })
 }
 
 /// Environment variables never passed into a seat: the image's own `PATH` (the host's points at
 /// host binaries) and the host's temp / home spelling the container replaces.
-const HOST_ONLY_ENV: &[&str] = &["PATH", "PWD", "OLDPWD", "SHELL", "DYLD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES"];
+const HOST_ONLY_ENV: &[&str] = &[
+    "PATH",
+    "PWD",
+    "OLDPWD",
+    "SHELL",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+];
 
 /// Make a seat `cmd` (one [`run_argv`] rendered, then given its env by the carrier) complete:
 /// every variable the carrier set explicitly is passed in by NAME (`--env KEY`: the runtime CLI
@@ -698,11 +715,53 @@ pub(crate) fn finalize(cmd: Command) -> Command {
 /// Remove seat container `name` (after its client exited or was killed: a killed client leaves
 /// the container running). Best effort and bounded; `--rm` already removed a container whose
 /// client saw it exit.
-pub(crate) fn reap(name: &str) {
-    let Ok(rt) = runtime() else { return };
+pub(crate) fn reap(seat: &SeatContainer) {
+    let rt = Runtime {
+        cli: seat.runtime.clone(),
+    };
+    let name = seat.name.as_str();
     let mut c = rt.cmd();
     c.args(["rm", "--force", name]);
     let _ = output_within(c, REAP_TIMEOUT);
+    // Its own network goes with it. The runtime detaches the container's endpoint asynchronously
+    // after `--rm`, so a first removal can find it still in use: retry briefly. An offline seat
+    // has no network of its own (`network inspect` fails at once and the loop ends).
+    let start = Instant::now();
+    loop {
+        let mut n = rt.cmd();
+        n.args(["network", "rm", name]);
+        if output_within(n, REAP_TIMEOUT).is_some_and(|o| o.status.success()) {
+            return;
+        }
+        let mut i = rt.cmd();
+        i.args(["network", "inspect", "--format", "{{.Name}}", name]);
+        let exists = output_within(i, PROBE_TIMEOUT).is_some_and(|o| o.status.success());
+        if !exists || start.elapsed() > REAP_TIMEOUT {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// The runtime CLI's own failure code (`docker run` / `podman run` / `nerdctl run`): the
+/// container never started, so nothing of the seat ran.
+const RUNTIME_START_FAILED: i32 = 125;
+
+/// A seat client's stderr, with a leading line naming the cause when the container itself never
+/// started (exit 125: the image, a mount source the runtime's VM does not share, the engine).
+pub(crate) fn explain_start_failure(name: &str, code: i32, err: String) -> String {
+    if code != RUNTIME_START_FAILED {
+        return err;
+    }
+    let hint = if err.contains("bind source path does not exist") {
+        " — a mounted host path is not visible to the container runtime (share it with the \
+         runtime's VM, e.g. Rancher Desktop / Colima / Podman machine mounts)"
+    } else {
+        ""
+    };
+    format!(
+        "wicked-core: seat container {name} did not start (runtime exit {RUNTIME_START_FAILED}){hint}\n{err}"
+    )
 }
 
 /// The CLI argv rewritten for the image: the host's resolved binary path (`argv[0]`, and every
@@ -801,9 +860,10 @@ pub(crate) fn arm(
     let spec = crate::worker_sandbox::resolve_seat_floor(inp).map_err(|w| (w, String::new()))?;
     let rt = runtime().map_err(|w| (w, String::new()))?;
     let image = ensure_seat_image(&rt, cli).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
-    let network = ensure_seat_network(&rt).map_err(|e| (FloorUnarmed::ContainerRuntimeDown, e))?;
     let mounts = mount_plan(&spec).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     let name = container_name(cli, run_id, ord);
+    let network =
+        ensure_seat_network(&rt, &name).map_err(|e| (FloorUnarmed::ContainerRuntimeDown, e))?;
     let user = operator_user();
     let workdir = inp.cwd.canonicalize().unwrap_or_else(|_| inp.cwd.clone());
     let wrapper = run_argv(&ContainerLaunch {
@@ -858,7 +918,10 @@ pub fn seat_image_main(args: &[String]) -> i32 {
                     .or_else(|| seat_image_tag(cli, &base_image()))
                     .unwrap_or_else(|| "(no image defined)".into());
                 let present = image_present(&rt, &tag);
-                println!("{cli}: {tag} {}", if present { "present" } else { "missing" });
+                println!(
+                    "{cli}: {tag} {}",
+                    if present { "present" } else { "missing" }
+                );
             }
             0
         }
@@ -896,12 +959,17 @@ mod tests {
             runtime_candidates(Some("podman"), None, found),
             vec![PathBuf::from("/bin/podman")]
         );
+        let dir = tmp("rt");
+        let nerdctl = dir.join("nerdctl");
+        std::fs::write(&nerdctl, "").unwrap();
         assert_eq!(
-            runtime_candidates(Some("/opt/x/nerdctl"), None, |_| None),
-            vec![PathBuf::from("/opt/x/nerdctl")]
+            runtime_candidates(Some(nerdctl.to_str().unwrap()), None, |_| None),
+            vec![nerdctl.clone()]
         );
+        let _ = std::fs::remove_dir_all(&dir);
         // Not found: no silent fallback to another runtime.
         assert!(runtime_candidates(Some("podman"), None, |_| None).is_empty());
+        assert!(runtime_candidates(Some("/nonexistent/docker"), None, found).is_empty());
         let all = runtime_candidates(None, None, found);
         assert_eq!(
             &all[..3],
@@ -922,7 +990,11 @@ mod tests {
             let a = seat_image_tag(cli, DEFAULT_BASE).unwrap();
             assert_eq!(a, seat_image_tag(cli, DEFAULT_BASE).unwrap());
             assert!(a.starts_with(&format!("wicked-seat-{cli}:")), "{a}");
-            assert_ne!(a, seat_image_tag(cli, "debian:trixie").unwrap(), "base is in the tag");
+            assert_ne!(
+                a,
+                seat_image_tag(cli, "debian:trixie").unwrap(),
+                "base is in the tag"
+            );
         }
         assert!(dockerfile("agy").is_none());
     }
@@ -937,7 +1009,7 @@ mod tests {
             runtime: Path::new("/usr/bin/docker"),
             image: "wicked-seat-claude:abc",
             name: "wicked-seat-claude-r-1-n",
-            network: SEAT_NETWORK,
+            network: "wicked-seat-claude-r-1-n",
             workdir: Path::new("/w/tree"),
             user: "502:20",
             mounts: &mounts,
@@ -947,10 +1019,12 @@ mod tests {
         assert!(has(&["--user", "502:20"]));
         assert!(has(&["--cap-drop", "ALL"]));
         assert!(has(&["--security-opt", "no-new-privileges"]));
-        assert!(has(&["--network", SEAT_NETWORK]));
+        assert!(has(&["--network", "wicked-seat-claude-r-1-n"]));
         assert!(has(&["--mount", "type=bind,src=/w/tree,dst=/w/tree"]));
         assert!(w.contains(&"--read-only".to_string()));
-        assert!(!w.iter().any(|a| a == "--privileged" || a.starts_with("--cap-add")));
+        assert!(!w
+            .iter()
+            .any(|a| a == "--privileged" || a.starts_with("--cap-add")));
         assert_eq!(w.last().unwrap(), "wicked-seat-claude:abc");
         assert_eq!(image_index(&w[1..]), Some(w.len() - 2));
     }
@@ -1036,7 +1110,14 @@ mod tests {
         // The opencode pinned-server script names the host binary again as `$1`.
         assert_eq!(
             image_argv(
-                &s(&["/opt/oc/opencode", "-c", "script", "n", "/opt/oc/opencode", "4096"]),
+                &s(&[
+                    "/opt/oc/opencode",
+                    "-c",
+                    "script",
+                    "n",
+                    "/opt/oc/opencode",
+                    "4096"
+                ]),
                 "opencode"
             ),
             s(&["opencode", "-c", "script", "n", "opencode", "4096"])
@@ -1099,11 +1180,160 @@ mod tests {
         // The CLI argv still follows the image, untouched.
         let img = args.iter().position(|a| a == "img:1").unwrap();
         assert_eq!(args[img + 1], "claude");
-        assert_eq!(seat_container_name(&fin).as_deref(), Some("wicked-seat-x"));
+        assert_eq!(
+            seat_container(&fin),
+            Some(SeatContainer {
+                runtime: PathBuf::from("docker"),
+                name: "wicked-seat-x".into()
+            })
+        );
         // Not one of ours: unchanged.
         let mut plain = Command::new("claude");
         plain.args(["run", "--name", "x"]);
-        assert!(seat_container_name(&plain).is_none());
+        assert!(seat_container(&plain).is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_container_that_never_started_is_named_as_such() {
+        let e = explain_start_failure(
+            "wicked-seat-x",
+            125,
+            "docker: Error response from daemon: invalid mount config for type \"bind\": bind \
+             source path does not exist: /opt/x"
+                .into(),
+        );
+        assert!(
+            e.starts_with("wicked-core: seat container wicked-seat-x did not start"),
+            "{e}"
+        );
+        assert!(e.contains("not visible to the container runtime"), "{e}");
+        assert!(
+            e.ends_with("/opt/x"),
+            "the runtime's own words are kept: {e}"
+        );
+        assert_eq!(
+            explain_start_failure("x", 1, "cli error".into()),
+            "cli error"
+        );
+    }
+
+    /// LIVE (needs a container runtime; `WICKED_CONTAINER_LIVE=1`, skipped otherwise): a seat
+    /// container rendered from a seat floor, run for real. Inside it: the operator's uid, no
+    /// capabilities, no-new-privileges, a read-only root, the tree writable (the write lands on
+    /// the host owned by the operator), the clone read-only, a masked secret empty, a sibling of
+    /// the tree absent, and no network route out. The reap removes the container and its network.
+    #[cfg(unix)]
+    #[test]
+    fn live_a_seat_container_is_the_floor() {
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        let rt = runtime().expect("a container runtime answers");
+        let image = ensure_seat_image(&rt, "claude").expect("the claude seat image");
+        let base = tmp("live");
+        let clone = base.join("clone");
+        let tree = base.join("wt");
+        let sibling = base.join("wt-other");
+        let home = base.join("home");
+        let ssh = home.join(".ssh");
+        for d in [&clone, &tree, &sibling, &home, &ssh] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(clone.join("README"), "clone").unwrap();
+        std::fs::write(sibling.join("other"), "sibling").unwrap();
+        std::fs::write(ssh.join("id_ed25519"), "FAKE-SECRET-CANARY").unwrap();
+        let token = home.join(".token");
+        std::fs::write(&token, "FAKE-TOKEN-CANARY").unwrap();
+        let spec = SeatFloor {
+            profile: "governed".into(),
+            tree: tree.clone(),
+            writable: vec![tree.clone(), home.clone()],
+            protected: vec![clone.clone()],
+            readmitted: vec![],
+            readmitted_files: vec![],
+            masks: vec![ssh.clone(), token.clone()],
+            pinned: vec![],
+            net: vec![],
+        };
+        let mounts = mount_plan(&spec).unwrap();
+        let name = container_name("claude", "live", 1);
+        let network = ensure_seat_network(&rt, &name).expect("the seat network");
+        let user = operator_user();
+        let mut w = run_argv(&ContainerLaunch {
+            runtime: &rt.cli,
+            image: &image,
+            name: &name,
+            network: &network,
+            workdir: &tree,
+            user: &user,
+            mounts: &mounts,
+        });
+        let script = format!(
+            "id -u; id -g; grep -E '^(CapEff|NoNewPrivs)' /proc/self/status; \
+             echo in-tree > {t}/wrote && echo TREE_OK; \
+             (echo x > {c}/x) 2>/dev/null && echo CLONE_WRITABLE || echo CLONE_RO; \
+             (echo x > /usr/x) 2>/dev/null && echo ROOT_WRITABLE || echo ROOT_RO; \
+             echo SECRET=[$(cat {k}/id_ed25519 2>/dev/null)] TOKEN=[$(cat {tok} 2>/dev/null)]; \
+             test -e {s}/other && echo SIBLING_VISIBLE || echo SIBLING_ABSENT; \
+             (curl -sS --max-time 4 -o /dev/null https://example.com 2>/dev/null) && echo NET_OUT || echo NET_BLOCKED; \
+             echo hello > /tmp/scratch && echo TMP_OK",
+            t = tree.display(),
+            c = clone.display(),
+            k = ssh.display(),
+            tok = token.display(),
+            s = sibling.display(),
+        );
+        w.extend(["sh".into(), "-c".into(), script]);
+        let mut cmd = Command::new(&w[0]);
+        cmd.args(&w[1..]);
+        let out = output_within(cmd, Duration::from_secs(60)).expect("the seat ran");
+        reap(&SeatContainer {
+            runtime: rt.cli.clone(),
+            name: name.clone(),
+        });
+        let so = String::from_utf8_lossy(&out.stdout).to_string();
+        let se = String::from_utf8_lossy(&out.stderr).to_string();
+        eprintln!("--- seat stdout ---\n{so}--- seat stderr ---\n{se}");
+        let (uid, gid) = user.split_once(':').unwrap();
+        let lines: Vec<&str> = so.lines().collect();
+        assert_eq!(lines.first().copied(), Some(uid), "{so}");
+        assert_eq!(lines.get(1).copied(), Some(gid), "{so}");
+        assert!(so.contains("CapEff:\t0000000000000000"), "{so}");
+        assert!(so.contains("NoNewPrivs:\t1"), "{so}");
+        for want in [
+            "TREE_OK",
+            "CLONE_RO",
+            "ROOT_RO",
+            "SECRET=[] TOKEN=[]",
+            "SIBLING_ABSENT",
+            "NET_BLOCKED",
+            "TMP_OK",
+        ] {
+            assert!(so.contains(want), "{want} missing:\n{so}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(tree.join("wrote")).unwrap().trim(),
+            "in-tree"
+        );
+        {
+            use std::os::unix::fs::MetadataExt;
+            let md = std::fs::metadata(tree.join("wrote")).unwrap();
+            assert_eq!(
+                md.uid().to_string(),
+                uid,
+                "the write lands owned by the operator"
+            );
+        }
+        assert!(!clone.join("x").exists());
+        // The reap removed the container and its network.
+        let mut ps = rt.cmd();
+        ps.args(["container", "inspect", &name]);
+        assert!(!output_within(ps, PROBE_TIMEOUT).unwrap().status.success());
+        let mut ni = rt.cmd();
+        ni.args(["network", "inspect", &name]);
+        assert!(!output_within(ni, PROBE_TIMEOUT).unwrap().status.success());
         let _ = std::fs::remove_dir_all(&base);
     }
 

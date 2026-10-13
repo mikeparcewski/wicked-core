@@ -2312,7 +2312,13 @@ impl WrappedCliStepRunner {
                 ];
                 // The container floor (opt-in until the C5 shadow proof): the same resolved
                 // floor rendered as a hardened seat container instead of a host profile.
-                let chosen = if crate::container_floor::container_mode() {
+                let chosen = if crate::container_floor::container_mode() && gov_env.is_some() {
+                    // A claude unit's gate hook is `<host wicked-core> gate-hook`: inside the
+                    // seat that command does not exist, so its tool calls would run unjudged.
+                    crate::worker_sandbox::GovernedFloor::Refused(
+                        crate::worker_sandbox::FloorUnarmed::GateHookUnreachable,
+                    )
+                } else if crate::container_floor::container_mode() {
                     match crate::container_floor::arm(
                         &plan.inputs,
                         &argv,
@@ -2321,7 +2327,7 @@ impl WrappedCliStepRunner {
                     ) {
                         Ok(c) => {
                             argv = c.argv;
-                            crate::worker_sandbox::GovernedFloor::Armed(
+                            crate::worker_sandbox::GovernedFloor::Armed(Box::new(
                                 crate::worker_sandbox::ArmedFloor {
                                     sandbox: crate::validator::WorkerSandbox {
                                         wrapper: c.wrapper,
@@ -2331,7 +2337,7 @@ impl WrappedCliStepRunner {
                                     tool: c.tool,
                                     spec: Some(c.spec),
                                 },
-                            )
+                            ))
                         }
                         Err((why, detail)) => {
                             if !detail.is_empty() {
@@ -4823,10 +4829,10 @@ fn run_bounded(
     // A seat container (the container floor): pass the carrier's env in by name and mount its
     // read roots; remembered so the container is removed however the client ends.
     let mut cmd = crate::container_floor::finalize(cmd);
-    let seat_container = crate::container_floor::seat_container_name(&cmd);
+    let seat_container = crate::container_floor::seat_container(&cmd);
     let reap_seat = |_: ()| {
-        if let Some(name) = &seat_container {
-            crate::container_floor::reap(name);
+        if let Some(seat) = &seat_container {
+            crate::container_floor::reap(seat);
         }
     };
     let mut child = match cmd.spawn() {
@@ -4946,6 +4952,10 @@ fn run_bounded(
         // Preserve what the CLI produced before the kill (debugging context on a hang).
         Ok((-1, out, sentinel.to_string(), usage, files, tools))
     } else {
+        let err = match &seat_container {
+            Some(seat) => crate::container_floor::explain_start_failure(&seat.name, code, err),
+            None => err,
+        };
         Ok((code, out, err, usage, files, tools))
     }
 }
@@ -6326,6 +6336,83 @@ mod tests {
             assert!(!out.governed);
         }
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir("run-unenf"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Container floor (C1): with `WICKED_SEAT_FLOOR=container` and no container runtime, a
+    /// governed unit is REFUSED with the reason (a runtime is required) — never run on the host.
+    #[cfg(unix)]
+    #[test]
+    fn container_mode_without_a_runtime_refuses_the_governed_unit_with_the_reason() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-cf-noruntime-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        // A stub named `pi` (a seat with an image), so the refusal is the runtime's, not the image's.
+        let stub = dir.join("pi");
+        std::fs::write(&stub, "#!/bin/sh\necho ran-on-host\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _mode = VarGuard::set(
+            crate::container_floor::SEAT_FLOOR_ENV,
+            std::path::Path::new("container"),
+        );
+        let _rt = VarGuard::set(
+            crate::container_floor::RUNTIME_ENV,
+            &dir.join("no-such-runtime"),
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner = WrappedCliStepRunner::with_tx(tx);
+        let mut u = WorkUnit::pending("s:u7", "s", 7, "verify the work");
+        u.assigned_cli = Some("pi".to_string());
+        u.assigned_invocation = Some(format!("{} {{PROMPT}}", stub.display()));
+        let input = StepInput {
+            run_id: "run-cf-noruntime".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: Some(crate::workflow::GovernanceContext {
+                human_confirm: Default::default(),
+                db_path: dir.join("estate.db").to_string_lossy().to_string(),
+                code_graph_db: None,
+                extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
+                project_id: None,
+            }),
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir("run-cf-noruntime"));
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(!out.governed);
+        assert!(
+            out.output.contains("could not run this governed unit")
+                && out.output.contains("no_container_runtime")
+                && out.output.contains("a container runtime is required"),
+            "{}",
+            out.output
+        );
+        assert!(
+            !out.output.contains("ran-on-host"),
+            "never run on the host: {}",
+            out.output
+        );
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir("run-cf-noruntime"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
