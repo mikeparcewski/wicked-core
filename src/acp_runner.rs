@@ -5965,6 +5965,12 @@ pub(crate) mod fallback_kind {
     /// lever is an argv fact (`--exclude-tools edit,write`, `--sandbox read-only`; a lever-less
     /// seat with a write grant is refused there — F-036). Not a failure; a disclosed route.
     pub const READ_ONLY_REQUIRES_WRAPPED: &str = "read_only_requires_wrapped";
+    /// (crew#998) NO fallback: the unit is governed, its seat is admitted to ACP input governance,
+    /// and its ACP carrier could not carry it (the cause is in the reason: a startup failure, a
+    /// session death, an unproven pin, …). The wrapped carrier arms no input governance for the
+    /// seat, so the unit is refused rather than run there unchecked; it fails, and the actor
+    /// fails it over. A seat-health failure signal, unlike the two `*_requires_wrapped` routes.
+    pub const GOVERNED_REQUIRES_ACP: &str = "governed_requires_acp";
     // RETIRED: `handshake_failed`. Its only emitter was the governed-ACP branch removed with
     // FINDING-060. The shared session path reports every startup failure — spawn or handshake — as
     // `binary_unavailable`, so the slug is no longer produced; a consumer still switching on it is
@@ -6311,7 +6317,8 @@ impl AcpStepRunner {
     /// or — when that fallback would run a governed unit unchecked on a seat reported as governed
     /// (`refuse`, [`governed_fallback_runs_unchecked`]) — a refusal with no fallback (crew#998).
     /// `cause` names what went wrong, `detail` is appended after the route (a bridge stderr tail);
-    /// `kind`, when set, is the [`CoreEvent::AcpFallback`] slug emitted with the same words.
+    /// `kind`, when set, is the [`CoreEvent::AcpFallback`] slug a FALLBACK is emitted with. A
+    /// refusal is always emitted, as [`fallback_kind::GOVERNED_REQUIRES_ACP`].
     #[allow(clippy::too_many_arguments)]
     fn fall_back_or_refuse(
         &self,
@@ -6335,6 +6342,13 @@ impl AcpStepRunner {
             format!("{cause}; using single-shot fallback{detail}")
         };
         eprintln!("{reason}");
+        // A refusal is named by its own kind (one meaning: nothing fell back), whatever the cause;
+        // the cause's kind would tell a consumer the unit continued single-shot.
+        let kind = if refuse {
+            Some(fallback_kind::GOVERNED_REQUIRES_ACP)
+        } else {
+            kind
+        };
         if let Some(kind) = kind {
             self.emit_event(CoreEvent::AcpFallback {
                 session: run_id.to_string(),
@@ -7385,23 +7399,27 @@ impl AcpStepRunner {
             &input.unit,
             input.workdir.is_some(),
         ) {
-            let reason = format!(
+            // crew#998 (codex r1): the wrapped carrier's read-only lever is not input governance —
+            // a GOVERNED unit on an admitted non-claude seat is refused here too, never run there.
+            let cause = format!(
                 "[wicked-core] unit {} (phase `{}`) declares executes_code:false, and seat \
                  '{cli_key}' is admitted to input governance but the resolved ACP binary did not \
                  match its pinned verified_version at spawn time — its permission behaviour is \
-                 unproven for this build, so the ACP read-only posture cannot be relied on; \
-                 running it single-shot on the wrapped carrier with the seat's read-only lever \
+                 unproven for this build, so the ACP read-only posture cannot be relied on \
                  (F-036 / core#431)",
                 input.unit.ord,
                 input.unit.phase_id().unwrap_or("?"),
             );
-            self.emit_event(CoreEvent::AcpFallback {
-                session: run_id.clone(),
-                cli_key: cli_key.clone(),
-                reason: reason.clone(),
-                fallback_kind: fallback_kind::READ_ONLY_REQUIRES_WRAPPED.to_string(),
-            });
-            return fallback_with_warning(reason, input, emit, &self.fallback);
+            return self.fall_back_or_refuse(
+                &run_id,
+                &cli_key,
+                Some(fallback_kind::READ_ONLY_REQUIRES_WRAPPED),
+                &cause,
+                "",
+                refuse_fallback,
+                input,
+                emit,
+            );
         }
         // core#581: the version-pin disclosure, emitted from ONE place and only for a unit that
         // actually starts a turn on the drifted bridge.
@@ -21338,6 +21356,7 @@ while True:
         tag: &str,
         mode: &str,
         governed: bool,
+        extra_acp: &str,
     ) -> (std::path::PathBuf, std::path::PathBuf, StepInput) {
         use std::os::unix::fs::PermissionsExt;
         let home = crate::skills_snapshot::test_support::scratch(tag);
@@ -21371,6 +21390,7 @@ binary = "{bridge}"
 start_args = ["{mode}", "{ledger}"]
 transport = "stdio"
 acp_input_governance = true
+{extra_acp}
 "#,
                 bridge = bridge.display(),
                 ledger = ledger.display(),
@@ -21423,6 +21443,9 @@ acp_input_governance = true
             &home.join("worker"),
         );
         let _nosnap = EnvPin::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        // The isolated fixture, whatever the host's environment (codex r1 on #925): with the
+        // operator-config hatch present the seat would read the operator's own homes.
+        let _isolated = EnvPin::unset(wicked_apps_core::spawn::INHERIT_OPERATOR_CONFIG_ENV);
         let (tx, rx) = std::sync::mpsc::channel();
         let runner = AcpStepRunner::new(tx);
         let outs: Vec<StepOutput> = inputs.iter().map(|i| runner.run_unit(i)).collect();
@@ -21447,12 +21470,9 @@ acp_input_governance = true
     #[test]
     #[cfg(unix)]
     fn a_governed_unit_on_an_admitted_pi_seat_whose_acp_start_fails_is_refused_not_run_unchecked() {
-        if wicked_apps_core::spawn::inherits_operator_config() {
-            return;
-        }
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
-        let (home, ran, input) = admitted_pi_seat("998-start", "fail_new", true);
+        let (home, ran, input) = admitted_pi_seat("998-start", "fail_new", true, "");
         let mut second = input.clone();
         second.unit_ix = 1;
         second.unit.ord = 2;
@@ -21489,24 +21509,29 @@ acp_input_governance = true
                 .any(|e| matches!(e, CoreEvent::GovernanceUnenforced { .. })),
             "nothing ran unchecked, so nothing is disclosed as unchecked: {events:?}"
         );
-        let fallbacks: Vec<&String> = events
+        let kinds: Vec<&str> = events
             .iter()
             .filter_map(|e| match e {
                 CoreEvent::AcpFallback {
-                    reason,
                     fallback_kind: kind,
                     ..
-                } if kind == fallback_kind::BINARY_UNAVAILABLE => Some(reason),
+                } => Some(kind.as_str()),
                 _ => None,
             })
             .collect();
-        assert_eq!(fallbacks.len(), 1, "one startup, one event: {events:?}");
-        assert!(
-            fallbacks[0].contains("NOT falling back")
-                && !fallbacks[0].contains("using single-shot"),
-            "{}",
-            fallbacks[0]
+        assert_eq!(
+            kinds,
+            vec![fallback_kind::GOVERNED_REQUIRES_ACP; 2],
+            "one refusal event per refused turn, never a kind that reads as a fallback: {events:?}"
         );
+        for e in &events {
+            if let CoreEvent::AcpFallback { reason, .. } = e {
+                assert!(
+                    reason.contains("NOT falling back") && !reason.contains("using single-shot"),
+                    "{reason}"
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&input.run_id));
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -21517,12 +21542,9 @@ acp_input_governance = true
     #[cfg(unix)]
     fn a_governed_unit_on_an_admitted_pi_seat_whose_acp_session_dies_is_refused_not_rerun_unchecked(
     ) {
-        if wicked_apps_core::spawn::inherits_operator_config() {
-            return;
-        }
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
-        let (home, ran, input) = admitted_pi_seat("998-death", "die_prompt", true);
+        let (home, ran, input) = admitted_pi_seat("998-death", "die_prompt", true, "");
         let (outs, events) = run_on_admitted_pi(&home, &[&input]);
         assert_eq!(outs[0].status, StepStatus::Failed, "{}", outs[0].output);
         assert!(
@@ -21546,7 +21568,9 @@ acp_input_governance = true
             events.iter().any(|e| matches!(
                 e,
                 CoreEvent::AcpFallback { fallback_kind: kind, reason, .. }
-                    if kind == fallback_kind::SESSION_DIED && reason.contains("NOT falling back")
+                    if kind == fallback_kind::GOVERNED_REQUIRES_ACP
+                        && reason.contains("NOT falling back")
+                        && (reason.contains("ACP session exited") || reason.contains("ACP error"))
             )),
             "{events:?}"
         );
@@ -21554,17 +21578,64 @@ acp_input_governance = true
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// crew#998 (codex r1 on #925): EVERY route from the ACP carrier to the wrapped one in
+    /// `exec_turn_inner` goes through `fall_back_or_refuse`, so a governed unit on an admitted
+    /// non-claude seat can never reach the wrapped carrier. Two direct routes remain, and both are
+    /// legitimate: the STATIC read-only reroute (only for an UNADMITTED adapter,
+    /// `acp_read_only_requires_wrapped`) and the seat with no `[cli.acp]` at all (never admitted).
+    /// The process-level pin reroute (`acp_read_only_unproven_at_spawn`, which needs the registry's
+    /// built-in pin a test cannot set) is covered by this guard: a new direct call fails it.
+    #[test]
+    fn every_acp_to_wrapped_route_after_admission_can_refuse() {
+        let src = include_str!("acp_runner.rs");
+        let body = &src[src
+            .find("    fn exec_turn_inner(")
+            .expect("exec_turn_inner")..];
+        let body = &body[..body.find("\n    }\n").expect("end of exec_turn_inner")];
+        let direct = body.matches("fallback_with_warning(").count();
+        assert_eq!(
+            direct, 1,
+            "only the static unadmitted read-only reroute may call fallback_with_warning directly"
+        );
+        let static_reroute = body.find("acp_read_only_requires_wrapped(").unwrap();
+        let admission = body.find("let refuse_fallback =").unwrap();
+        assert!(
+            body.find("fallback_with_warning(").unwrap() > static_reroute
+                && body.find("fallback_with_warning(").unwrap() > admission,
+            "the one direct call is the static reroute"
+        );
+        let bare: Vec<usize> = body
+            .match_indices("self.fallback.run_unit_streaming(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            bare.len(),
+            2,
+            "no-ACP-config route + the tombstone after its refusal"
+        );
+        let tombstone_refusal = body.find("if refuse_fallback {").unwrap();
+        assert!(
+            body[..bare[0]].trim_end().ends_with("None => return"),
+            "the first is the no-`[cli.acp]` route, whose seat is never admitted"
+        );
+        assert!(
+            bare[1] > tombstone_refusal,
+            "the tombstone's fallback runs only after its refusal check"
+        );
+        assert!(
+            body.matches("self.fall_back_or_refuse(").count() >= 8,
+            "the routes through the one exit"
+        );
+    }
+
     /// crew#998, the control: an UNGOVERNED unit on the same seat keeps the single-shot fallback —
     /// nothing is claimed for it, so the wrapped carrier runs it.
     #[test]
     #[cfg(unix)]
     fn an_ungoverned_unit_on_an_admitted_pi_seat_whose_acp_start_fails_still_falls_back() {
-        if wicked_apps_core::spawn::inherits_operator_config() {
-            return;
-        }
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
-        let (home, ran, input) = admitted_pi_seat("998-ungov", "fail_new", false);
+        let (home, ran, input) = admitted_pi_seat("998-ungov", "fail_new", false, "");
         let (outs, events) = run_on_admitted_pi(&home, &[&input]);
         assert_eq!(outs[0].status, StepStatus::Ok, "{}", outs[0].output);
         assert!(ran.exists(), "the wrapped carrier ran the ungoverned unit");
