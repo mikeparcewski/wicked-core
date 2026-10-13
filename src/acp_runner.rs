@@ -6674,7 +6674,8 @@ impl AcpStepRunner {
         // thread's seam (`team::runner::complete`), on every carrier, after this returns.
         // Container floor: no seat runs over ACP (the ACP bridges run on the host, outside any
         // seat container). Every unit — governed or not, chats included — runs its CLI's
-        // headless mode on the wrapped carrier, which puts governed units in a seat container.
+        // headless mode on the wrapped carrier, which puts governed units in a seat container
+        // and resumes the run's session per seat (`crate::headless`).
         let output = if crate::container_floor::container_mode() {
             self.fallback.run_unit_streaming(input, emit)
         } else {

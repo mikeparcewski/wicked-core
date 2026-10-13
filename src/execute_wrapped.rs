@@ -493,6 +493,25 @@ impl OutputAdapter for OpencodeJson {
     }
 }
 
+/// (C2) Add `--format json` to a wrapped `opencode run` launch, before any `--` guard, unless the
+/// template already chose a format — the opencode twin of [`inject_pi_json_mode`], so the seat's
+/// text, tools and usage are read by [`OpencodeJson`]. Any other subcommand is left alone.
+pub(crate) fn inject_opencode_json_format(argv: &mut Vec<String>) -> bool {
+    if argv.get(1).map(String::as_str) != Some("run") {
+        return false;
+    }
+    let at = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    if argv[..at]
+        .iter()
+        .any(|a| a == "--format" || a.starts_with("--format="))
+    {
+        return false;
+    }
+    argv.insert(at, "json".to_string());
+    argv.insert(at, "--format".to_string());
+    true
+}
+
 /// Whether an opencode argv explicitly selects JSON output. Only flags before the `--` guard
 /// count; a prompt containing `--format json` keeps the passthrough adapter.
 fn opencode_json_mode(binary: &str, argv: &[String]) -> bool {
@@ -508,7 +527,6 @@ fn opencode_json_mode(binary: &str, argv: &[String]) -> bool {
 
 /// Extract the CLI's resume id from one headless JSON line. Only the session-opening event
 /// qualifies for claude/codex/pi; opencode carries `sessionID` on every part's envelope.
-#[allow(dead_code)] // Resume consumers land separately from this parser slice.
 pub(crate) fn headless_session_id(cli: SeatCli, line: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let event = v.get("type").and_then(|t| t.as_str());
@@ -533,7 +551,6 @@ pub(crate) fn headless_session_id(cli: SeatCli, line: &str) -> Option<String> {
 /// Whether a headless turn emitted its terminal event. `Some(false)` identifies a stream that
 /// ended without completion; `None` means the CLI has no known terminal event (opencode uses
 /// the process exit code). Invalid JSON and unrelated events never count as completion.
-#[allow(dead_code)] // Completion consumers land separately from this parser slice.
 pub(crate) fn headless_turn_completed(cli: SeatCli, lines: &[&str]) -> Option<bool> {
     let terminal = match cli {
         SeatCli::Claude => "result",
@@ -1807,6 +1824,7 @@ impl WrappedCliStepRunner {
     /// `on_run_complete`, which the actor invokes on every run-terminal transition — cancel
     /// included. Idempotent; a token with no live child is a no-op.
     pub(crate) fn cancel_run_workers(&self, run_id: &str) {
+        crate::headless::forget_run(run_id);
         let tokens = {
             let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
             let keys: Vec<WrappedWorkerKey> = guard
@@ -2072,6 +2090,9 @@ impl WrappedCliStepRunner {
             && inject_codex_json_flag(&mut argv);
         let pi_json =
             seat_cli == wicked_apps_core::spawn::SeatCli::Pi && inject_pi_json_mode(&mut argv);
+        if seat_cli == wicked_apps_core::spawn::SeatCli::Opencode {
+            inject_opencode_json_format(&mut argv);
+        }
         // Run in the worktree if the run targets a repo; else a per-run temp sandbox (never the
         // orchestrator's own cwd).
         let cwd = input.workdir.clone().unwrap_or_else(|| sandbox_for(input));
@@ -2339,7 +2360,7 @@ impl WrappedCliStepRunner {
                 Vec::new(),
             )
         } else {
-            let adapter: Box<dyn OutputAdapter> = if is_claude {
+            let mut adapter: Box<dyn OutputAdapter> = if is_claude {
                 Box::<ClaudeStreamJson>::default()
             } else if codex_json {
                 Box::<CodexJsonl>::default()
@@ -2657,6 +2678,30 @@ impl WrappedCliStepRunner {
             // boundary that depends on the daemon's environment is not a boundary. Hardening happens
             // FIRST (in the builder) so the gate-hook variables set below survive as deliberate
             // exceptions.
+            // C2, headless multi-turn: in the container floor a unit resumes its run's session on
+            // this seat (same posture), as the ACP carrier's per-(run, seat) session did; on the
+            // host the wrapped carrier stays single-shot.
+            let headless = crate::container_floor::container_mode().then(|| {
+                let key = crate::headless::SessionKey {
+                    run_id: input.run_id.clone(),
+                    cli_key: cli_key.clone(),
+                    fenced: write_posture.fences_writes(),
+                };
+                let prior = crate::headless::resumable(&key);
+                let fresh = crate::headless::fresh_id(seat_cli);
+                let engine_id = crate::headless::inject_session(
+                    seat_cli,
+                    &mut argv,
+                    prior.as_deref(),
+                    fresh.as_deref(),
+                );
+                let (tap, seen) = crate::headless::SessionTap::new(
+                    std::mem::replace(&mut adapter, Box::new(Passthrough)),
+                    seat_cli,
+                );
+                adapter = Box::new(tap);
+                (key, engine_id, seen)
+            });
             let mut cmd = build_worker_command(&argv, sandbox.as_ref());
             cmd.current_dir(&cwd);
             // The seat-aware configuration decision (core#410), decided above alongside the
@@ -2941,6 +2986,18 @@ impl WrappedCliStepRunner {
             let timeout = crate::workflow::effective_timeout(self.timeout, input.unit.budget_secs);
             let bounded = run_bounded(cmd, timeout, emit, adapter, Some(cancel_token.clone()));
             self.unregister_token(input, &cancel_token);
+            if let Some((key, engine_id, seen)) = headless {
+                let seen = seen.lock().map(|g| g.clone()).unwrap_or_default();
+                match &bounded {
+                    Ok((0, ..)) => {
+                        match crate::headless::session_after_turn(engine_id.as_deref(), &seen) {
+                            Some(id) => crate::headless::remember(key, id),
+                            None => crate::headless::forget(&key),
+                        }
+                    }
+                    _ => crate::headless::forget(&key),
+                }
+            }
             // Step 0 shadow mode: the per-unit comparison of the text fences' and the floor's
             // decisions, appended to the governance log once the unit ends.
             if governed {
@@ -10947,6 +11004,23 @@ mod tests {
             let last = t1.lines().last().unwrap();
             assert_eq!(headless_session_id(cli, last), None, "not a session opener");
         }
+    }
+
+    #[test]
+    fn a_wrapped_opencode_run_gets_json_format_unless_the_template_chose_one() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let mut a = s(&["opencode", "run", "--", "do it"]);
+        assert!(inject_opencode_json_format(&mut a));
+        assert_eq!(
+            a,
+            s(&["opencode", "run", "--format", "json", "--", "do it"])
+        );
+        assert!(opencode_json_mode("opencode", &a));
+        let mut b = s(&["opencode", "run", "--format", "default", "x"]);
+        assert!(!inject_opencode_json_format(&mut b));
+        let mut c = s(&["opencode", "serve"]);
+        assert!(!inject_opencode_json_format(&mut c));
+        assert_eq!(c, s(&["opencode", "serve"]));
     }
 
     #[test]
