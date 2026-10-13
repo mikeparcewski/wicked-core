@@ -1625,8 +1625,8 @@ const OPAQUE_EXPANSION: char = '\u{E000}';
 /// ([`ShellTarget::Unresolved`]). POSIX-shell rules: `'…'` is fully literal; inside `"…"` a `\`
 /// escapes only `$`, `` ` ``, `"`, `\` and newline; a bare `\` escapes the next character; only an
 /// UNQUOTED leading `~` (alone or before `/`) is the home dir. The first of
-/// [`resolve_shell_readings`] (the readings the judges use; this is the tests' single view).
-#[cfg(test)]
+/// [`resolve_shell_readings`] (the readings the judges use; this is the unix lexer table's view).
+#[cfg(all(test, unix))]
 fn resolve_shell_word(raw: &str, home: Option<&Path>) -> Option<String> {
     resolve_shell_readings(raw, home)?.into_iter().next()
 }
