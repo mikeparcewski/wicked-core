@@ -113,6 +113,14 @@ impl Provider {
         }
     }
 
+    /// The provider's variant name in agentgateway's config (`openAI`, not `openai`).
+    fn config_key(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAI => "openAI",
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",
@@ -181,7 +189,7 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
                 }),
             };
             let mut provider = serde_json::Map::new();
-            provider.insert(route.provider.name().into(), json!({}));
+            provider.insert(route.provider.config_key().into(), json!({}));
             let location = match route.provider {
                 Provider::Anthropic => json!({"header": {"name": "x-api-key"}}),
                 // v1.6.0 schema/config.json: LocalAPIKeys.location / AuthorizationLocation.
@@ -258,6 +266,15 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
             "backends": [{"dynamic": {}}]
         })] }
     })
+}
+
+/// A gateway error line, kept only when it carries no credential shape.
+fn redact_tail(line: &str) -> String {
+    if redact_check(line) {
+        line.chars().take(400).collect()
+    } else {
+        "(redacted)".into()
+    }
 }
 
 /// A stable container name for the daemon's explicit state directory, without reading it.
@@ -423,10 +440,16 @@ fn load_config(dir: &Path) -> Result<GatewayConfig, String> {
     let mut config: GatewayConfig =
         read_json(&dir.join("config/gateway.json"))?.unwrap_or_default();
     config.units = read_json(&dir.join("config/units.json"))?.unwrap_or_default();
-    if config.hook_upstream.is_none() {
-        config.hook_upstream = HOOK_UPSTREAM.get().cloned().flatten();
-    }
     Ok(config)
+}
+
+/// `config` as served: with this process's gate-hook route when the relay was reached.
+fn effective(config: &GatewayConfig) -> GatewayConfig {
+    let mut c = config.clone();
+    if c.hook_upstream.is_none() {
+        c.hook_upstream = HOOK_UPSTREAM.get().cloned().flatten();
+    }
+    c
 }
 
 /// The relay's address as this process's gateway reaches it, probed once (see [`probe_hook`]).
@@ -487,7 +510,7 @@ fn persist_units(dir: &Path, config: &GatewayConfig) -> Result<(), String> {
     // Authoritative units first; a failed config replacement is reported and a retry re-renders
     // from this list. Successful deregistration guarantees the served config no longer has it.
     atomic_json(&dir.join("config/units.json"), &config.units)?;
-    atomic_json(&dir.join("config/config.json"), &render(config))
+    atomic_json(&dir.join("config/config.json"), &render(&effective(config)))
 }
 
 /// The env a seat needs to reach every model route and the CONNECT allowlist through `agw`,
@@ -847,6 +870,31 @@ pub(crate) fn ensure_gateway(rt: &Runtime, dir: &Path) -> Result<Gateway, String
         let remaining = START_TIMEOUT.saturating_sub(start.elapsed());
         if running(rt, &gw, CLI_TIMEOUT.min(remaining)) {
             return Ok(gw);
+        }
+        // Exited (a config it refused): say why now, from its last log line (the gateway logs
+        // no credential: sensitive headers are redacted, and the config holds file paths only).
+        let state = cli(
+            rt,
+            &[
+                "container".into(),
+                "inspect".into(),
+                "--format".into(),
+                "{{.State.Status}}".into(),
+                gw.name.clone(),
+            ],
+            CLI_TIMEOUT,
+        )
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+        if state == "exited" {
+            let why = cli(
+                rt,
+                &["logs".into(), "--tail".into(), "1".into(), gw.name.clone()],
+                CLI_TIMEOUT,
+            )
+            .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+            .unwrap_or_default();
+            return Err(format!("gateway {} exited: {}", gw.name, redact_tail(&why)));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -1217,6 +1265,115 @@ mod tests {
         assert_eq!(route["backends"][0]["host"], "host.lima.internal:51234");
     }
 
+    /// LIVE (`WICKED_CONTAINER_LIVE=1`): the per-seat firewall sidecar. A seat in its namespace
+    /// reaches the gateway (`agw:4000` answers 401 to no key) and nothing else: not the internal
+    /// bridge's host address (the VM host's services), not the internet; and the seat, with no
+    /// capabilities, cannot flush the rules.
+    #[cfg(unix)]
+    #[test]
+    fn live_the_seat_sidecar_admits_only_the_gateway() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        let rt = crate::container_floor::runtime().expect("a container runtime answers");
+        let image = crate::container_floor::ensure_seat_image(&rt, "claude").unwrap();
+        let temp = TempDir::new();
+        let dir = temp.0.clone();
+        let run = |argv: &[&str]| {
+            let mut c = rt.cmd();
+            c.args(argv);
+            crate::container_floor::output_within(c, Duration::from_secs(60)).unwrap()
+        };
+        let gw = ensure_gateway(&rt, &dir).expect("the gateway starts");
+        let seat = format!("{}-sc", gw.name);
+        run(&["rm", "-f", &crate::container_floor::netns_name(&seat)]);
+        run(&["network", "rm", &seat]);
+        assert!(run(&["network", "create", "--internal", &seat])
+            .status
+            .success());
+        attach(&rt, &gw, &seat).unwrap();
+        let ip = crate::container_floor::gateway_ip(&rt, &gw.name, &seat).unwrap();
+        crate::container_floor::start_netns_sidecar(&rt, &seat, &seat, &ip).expect("sidecar up");
+        let bridge = String::from_utf8_lossy(
+            &run(&[
+                "network",
+                "inspect",
+                "--format",
+                "{{(index .IPAM.Config 0).Gateway}}",
+                &seat,
+            ])
+            .stdout,
+        )
+        .trim()
+        .to_string();
+        let ns = format!("container:{}", crate::container_floor::netns_name(&seat));
+        let probe = |url: &str| -> String {
+            let o = run(&[
+                "run",
+                "--rm",
+                "--network",
+                &ns,
+                "--user",
+                "502:20",
+                "--cap-drop",
+                "ALL",
+                &image,
+                "curl",
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "--max-time",
+                "3",
+                url,
+            ]);
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        let to_gw = probe("http://agw:4000/v1/messages");
+        let to_bridge = probe(&format!("http://{bridge}:4000/"));
+        let to_bridge_k8s = probe(&format!("https://{bridge}:6443/"));
+        let to_net = probe("http://1.1.1.1/");
+        let flush = run(&[
+            "run",
+            "--rm",
+            "--network",
+            &ns,
+            "--cap-drop",
+            "ALL",
+            "--user",
+            "0",
+            &crate::container_floor::ensure_netns_image(&rt).unwrap(),
+            "iptables",
+            "-F",
+        ]);
+        run(&[
+            "rm",
+            "-f",
+            &crate::container_floor::netns_name(&seat),
+            &gw.name,
+        ]);
+        run(&["network", "rm", &seat, &gw.external_network]);
+        let (cfg, broker) = volumes(&gw);
+        run(&["volume", "rm", &cfg, &broker]);
+        eprintln!(
+            "gw={to_gw} bridge={to_bridge} bridge6443={to_bridge_k8s} net={to_net} flush={:?}",
+            flush.status
+        );
+        assert_eq!(to_gw, "401", "the gateway answers (no key)");
+        assert_eq!(to_bridge, "000", "the VM host is unreachable");
+        assert_eq!(to_bridge_k8s, "000", "the k3s API is unreachable");
+        assert_eq!(to_net, "000", "the internet is unreachable");
+        assert!(
+            !flush.status.success(),
+            "a seat without capabilities cannot flush the rules"
+        );
+    }
+
     fn json_file(path: &Path) -> Value {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
     }
@@ -1260,7 +1417,7 @@ mod tests {
         );
         assert_eq!(
             openai["backends"][0]["ai"]["provider"],
-            json!({"openai": {}})
+            json!({"openAI": {}})
         );
         assert_eq!(
             openai["policies"]["apiKey"]["location"],
@@ -1428,7 +1585,7 @@ mod tests {
         assert_eq!(config.units, vec![b.clone()]);
         assert_eq!(config.providers, changed_routes.providers);
         assert_eq!(config.egress_hosts, changed_routes.egress_hosts);
-        assert_eq!(json_file(&config_path), render(&config));
+        assert_eq!(json_file(&config_path), render(&effective(&config)));
         deregister_unit(&temp.0, &b.key).unwrap();
         assert!(load_config(&temp.0).unwrap().units.is_empty());
         assert_eq!(
@@ -1475,7 +1632,7 @@ mod tests {
         assert!(keys.iter().all(|key| config.units.contains(key)));
         assert_eq!(
             json_file(&temp.0.join("config/config.json")),
-            render(&config)
+            render(&effective(&config))
         );
     }
 

@@ -356,6 +356,34 @@ pub(crate) fn build_seat_image(rt: &Runtime, cli: &str) -> Result<String, String
     let df = dockerfile(cli).ok_or_else(|| format!("no seat image is defined for `{cli}`"))?;
     let base = base_image();
     let tag = seat_image_tag(cli, &base).expect("dockerfile exists");
+    build_image(rt, df, &base, &tag)
+}
+
+/// The seat network sidecar's Dockerfile (alpine + iptables; see the file).
+const NETNS_DOCKERFILE: &str = include_str!("../containers/seats/netns.Dockerfile");
+
+/// The sidecar image, built on first use (tagged by its Dockerfile's hash).
+pub(crate) fn ensure_netns_image(rt: &Runtime) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let hex: String = Sha256::digest(NETNS_DOCKERFILE.as_bytes())[..6]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let tag = format!("wicked-seat-netns:{hex}");
+    if image_present(rt, &tag) {
+        return Ok(tag);
+    }
+    static BUILD: Mutex<()> = Mutex::new(());
+    let _one = BUILD.lock();
+    if image_present(rt, &tag) {
+        return Ok(tag);
+    }
+    build_image(rt, NETNS_DOCKERFILE, "alpine:3.22", &tag)
+}
+
+/// Build `df` (no build context) as `tag` with `BASE=base`, streaming the runtime's progress.
+fn build_image(rt: &Runtime, df: &str, base: &str, tag: &str) -> Result<String, String> {
+    let tag = tag.to_string();
     let mut c = rt.cmd();
     c.args([
         "build",
@@ -991,7 +1019,7 @@ pub(crate) fn reap(seat: &SeatContainer) {
     };
     let name = seat.name.as_str();
     let mut c = rt.cmd();
-    c.args(["rm", "--force", name]);
+    c.args(["rm", "--force", name, &netns_name(name)]);
     let _ = output_within(c, REAP_TIMEOUT);
     // Detach whatever else is attached (the gateway) so the network can go.
     let mut members = rt.cmd();
@@ -1271,6 +1299,10 @@ pub(crate) fn arm(
             let down = |e: String| (FloorUnarmed::GatewayUnavailable, e);
             let gw = crate::seat_gateway::ensure_gateway(&rt, dir).map_err(down)?;
             crate::seat_gateway::attach(&rt, &gw, &network).map_err(down)?;
+            // The seat's namespace: a sidecar allows output only to the gateway's own address on
+            // its ports (an internal network alone still reaches the VM host's services).
+            let gw_ip = gateway_ip(&rt, &gw.name, &network).map_err(down)?;
+            start_netns_sidecar(&rt, &name, &network, &gw_ip).map_err(down)?;
             let unit = format!("{run_id}#{ord}");
             let key = crate::seat_gateway::UnitKey::new(run_id, &unit, cli);
             let since = std::time::SystemTime::now()
@@ -1303,11 +1335,17 @@ pub(crate) fn arm(
             crate::worker_sandbox::NetGrant::AnyHost { .. } => None,
         })
         .collect();
+    // Online seats join their sidecar's namespace; an offline seat has no network.
+    let seat_network = if network == "none" {
+        network.clone()
+    } else {
+        format!("container:{}", netns_name(&name))
+    };
     let wrapper = run_argv(&ContainerLaunch {
         runtime: &rt.cli,
         image: &image,
         name: &name,
-        network: &network,
+        network: &seat_network,
         workdir: &workdir,
         user: &user,
         mounts: &mounts,
@@ -1324,6 +1362,104 @@ pub(crate) fn arm(
         env,
         lease,
     })
+}
+
+/// The seat's network sidecar container name.
+pub(crate) fn netns_name(seat: &str) -> String {
+    format!("{seat}-netns")
+}
+
+/// `container`'s address on `network`.
+pub(crate) fn gateway_ip(rt: &Runtime, container: &str, network: &str) -> Result<String, String> {
+    let mut c = rt.cmd();
+    c.args([
+        "inspect",
+        "--format",
+        &format!("{{{{(index .NetworkSettings.Networks \"{network}\").IPAddress}}}}"),
+        container,
+    ]);
+    let o = output_within(c, PROBE_TIMEOUT).ok_or("inspecting the gateway timed out")?;
+    let ip = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    if o.status.success() && ip.parse::<std::net::IpAddr>().is_ok() {
+        Ok(ip)
+    } else {
+        Err(format!("the gateway has no address on {network}"))
+    }
+}
+
+/// The sidecar's argv: on the seat network, only the capabilities iptables needs, and the
+/// allowed gateway endpoints as arguments.
+pub(crate) fn netns_argv(
+    rt: &Path,
+    image: &str,
+    seat: &str,
+    network: &str,
+    gw_ip: &str,
+) -> Vec<String> {
+    let mut v: Vec<String> = [
+        "run",
+        "-d",
+        "--rm",
+        "--name",
+        &netns_name(seat),
+        "--label",
+        &format!("{SEAT_LABEL}=1"),
+        "--network",
+        network,
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--cap-add",
+        "NET_ADMIN",
+        "--cap-add",
+        "NET_RAW",
+        "--security-opt",
+        "no-new-privileges",
+        "--pids-limit",
+        "16",
+        "--memory",
+        "32m",
+        image,
+        "wicked-netns",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    v.extend(GATEWAY_PORTS.iter().map(|p| format!("{gw_ip}:{p}")));
+    v.insert(0, rt.to_string_lossy().into_owned());
+    v
+}
+
+/// Start seat `seat`'s sidecar and wait for its rules to be in place (fail closed).
+pub(crate) fn start_netns_sidecar(
+    rt: &Runtime,
+    seat: &str,
+    network: &str,
+    gw_ip: &str,
+) -> Result<(), String> {
+    let image = ensure_netns_image(rt)?;
+    let argv = netns_argv(&rt.cli, &image, seat, network, gw_ip);
+    let mut c = rt.cmd();
+    c.args(&argv[1..]);
+    let o = output_within(c, PROBE_TIMEOUT).ok_or("starting the network sidecar timed out")?;
+    if !o.status.success() {
+        return Err(format!(
+            "the network sidecar did not start: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ));
+    }
+    let start = Instant::now();
+    while start.elapsed() < PROBE_TIMEOUT {
+        let mut l = rt.cmd();
+        l.args(["logs", &netns_name(seat)]);
+        if output_within(l, PROBE_TIMEOUT)
+            .is_some_and(|o| String::from_utf8_lossy(&o.stdout).contains("wicked-netns-ready"))
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err("the network sidecar's rules did not come up".into())
 }
 
 /// Mount the unit's read roots (its governance read roots, its skills delivery) read-only when
