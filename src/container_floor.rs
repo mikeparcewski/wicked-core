@@ -28,6 +28,13 @@
 //! repo graph's key dir, the launch's read extras — [`crate::gate_hook::READ_ROOTS_ENV`]) and the
 //! absolute paths its argv names are mounted read-only at spawn ([`finalize`]).
 //!
+//! **Landlock inside the seat.** The image's entry requires a TCP-capable Landlock ABI and checks
+//! a writable canary tmpfs before entering `landrun`, then requires an out-of-tree write to fail
+//! inside the CLI's own domain.
+//! Landlock admits writes and execution in the writable mounts, `/home/seat` and `/tmp`, reads
+//! and execution in the image and read mounts, and TCP connects only to the gateway ports.
+//! A failed canary refuses the CLI even when `--best-effort` degraded to no enforcement.
+//!
 //! **Fail closed.** A governed unit whose container cannot start — no runtime, the engine not
 //! answering, no seat image, native Windows — is refused with the reason (the failover ladder moves
 //! the work), never run on the host.
@@ -36,10 +43,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 use crate::worker_sandbox::{FloorUnarmed, SeatFloor};
+use wicked_apps_core::HardenedCommand;
 
 /// Selects the seat floor for governed units: `container` runs them in the container floor.
 /// Anything else (unset included) keeps the step-0 host floor until slice C5 makes the container
@@ -53,6 +61,8 @@ pub(crate) const RUNTIME_ENV: &str = "WICKED_CONTAINER_RUNTIME";
 pub(crate) const BASE_IMAGE_ENV: &str = "WICKED_SEAT_BASE_IMAGE";
 /// `none` runs seats with no network at all; otherwise each seat gets its own internal network.
 pub(crate) const NETWORK_ENV: &str = "WICKED_SEAT_NETWORK";
+/// The container's memory limit, otherwise `3g`.
+pub(crate) const MEMORY_ENV: &str = "WICKED_SEAT_MEMORY";
 /// The record label of a governed unit that ran in the container floor.
 pub(crate) const CONTAINER_FLOOR: &str = "container floor";
 /// The label on every seat container (and the seat network), for the reap and the sweep.
@@ -62,6 +72,10 @@ const DEFAULT_BASE: &str = "node:22-trixie-slim";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const REAP_TIMEOUT: Duration = Duration::from_secs(20);
+const SWEEP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const GATEWAY_PORTS: &[u16] = &[3000, 4000, 6000];
+const SEAT_ENTRY: &str = "/usr/local/bin/wicked-seat-entry";
+const CANARY_FILE: &str = "/wicked-canary/probe";
 
 /// The seat Dockerfiles, by CLI (the registry's seat keys).
 const DOCKERFILES: &[(&str, &str)] = &[
@@ -103,7 +117,7 @@ pub(crate) struct Runtime {
 impl Runtime {
     fn cmd(&self) -> Command {
         let mut c = Command::new(&self.cli);
-        c.stdin(Stdio::null());
+        c.hardened().stdin(Stdio::null());
         if let Some(path) = client_path(&self.cli, std::env::var_os("PATH").as_deref()) {
             c.env("PATH", path);
         }
@@ -512,6 +526,9 @@ pub(crate) struct ContainerLaunch<'a> {
     /// `uid:gid` the seat runs as (the operator's, so its writes land owned by them).
     pub(crate) user: &'a str,
     pub(crate) mounts: &'a [Mount],
+    pub(crate) memory: &'a str,
+    /// The only TCP destination ports the CLI may connect to.
+    pub(crate) gateway_ports: &'a [u16],
 }
 
 /// The options of ours that take a value, and those that do not: [`finalize`] walks the wrapper
@@ -524,6 +541,7 @@ const VALUE_OPTS: &[&str] = &[
     "--cap-drop",
     "--security-opt",
     "--pids-limit",
+    "--memory",
     "--network",
     "--workdir",
     "--mount",
@@ -531,8 +549,61 @@ const VALUE_OPTS: &[&str] = &[
 ];
 const FLAG_OPTS: &[&str] = &["--rm", "--interactive", "--init", "--read-only"];
 
-/// The wrapper argv that runs a seat in a container, ending with the image: the CLI argv follows
-/// it. Pure (no runtime call), so the hardening is pinned by tests.
+/// The memory limit selected by the operator, or the default when unset or blank.
+fn memory_from(choice: Option<&str>) -> &str {
+    choice
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or("3g")
+}
+
+/// The Landlock policy from the same mounts as the runtime: writable trees are executable too
+/// (test runners exec from them), and read mounts admit executable skills and toolchains. The
+/// entry's second invocation checks enforcement inside this domain before executing the CLI.
+fn landrun_prefix(mounts: &[Mount], gateway_ports: &[u16]) -> Vec<String> {
+    let mut out = vec![
+        "landrun".into(),
+        "--best-effort".into(),
+        "--ignore-missing".into(),
+    ];
+    for p in ["/usr", "/bin", "/lib", "/lib64", "/sbin", "/opt", "/etc"] {
+        out.extend(["--rox".into(), p.into()]);
+    }
+    // Kernel metadata and devices are image facilities, not host bind mounts. `/dev/null`
+    // needs write access for ordinary shell redirection; no writable directory is admitted.
+    for p in ["/proc", "/dev", "/wicked-canary"] {
+        out.extend(["--ro".into(), p.into()]);
+    }
+    out.extend(["--rw".into(), "/dev/null".into()]);
+    for p in ["/home/seat", "/tmp"] {
+        out.extend(["--rwx".into(), p.into()]);
+    }
+    for m in mounts {
+        let access = match m {
+            Mount::Bind { rw: true, .. } => "--rwx",
+            Mount::Bind { rw: false, .. } => "--rox",
+            Mount::NullFile { .. } | Mount::Tmpfs { .. } => "--ro",
+        };
+        out.extend([access.into(), m.dst().to_string_lossy().into_owned()]);
+    }
+    for port in gateway_ports {
+        out.extend(["--connect-tcp".into(), port.to_string()]);
+    }
+    for name in ["PATH", "HOME", "TMPDIR", "LANG"] {
+        out.extend(["--env".into(), name.into()]);
+    }
+    out.extend([
+        "--".into(),
+        SEAT_ENTRY.into(),
+        "--check".into(),
+        CANARY_FILE.into(),
+        "--".into(),
+    ]);
+    out
+}
+
+/// The wrapper argv that runs a seat in a container and then under Landlock: the CLI argv
+/// follows it. Pure (no runtime call), so the hardening is pinned by tests.
 pub(crate) fn run_argv(l: &ContainerLaunch<'_>) -> Vec<String> {
     let mut w: Vec<String> = vec![
         l.runtime.to_string_lossy().into_owned(),
@@ -553,12 +624,17 @@ pub(crate) fn run_argv(l: &ContainerLaunch<'_>) -> Vec<String> {
         "/tmp:rw,exec,mode=1777,size=2g".into(),
         "--tmpfs".into(),
         "/home/seat:rw,exec,mode=1777,size=512m".into(),
+        // Writable before Landlock, denied afterwards: a read-only root cannot fake a pass.
+        "--tmpfs".into(),
+        "/wicked-canary:rw,noexec,mode=1777,size=1m".into(),
         "--cap-drop".into(),
         "ALL".into(),
         "--security-opt".into(),
         "no-new-privileges".into(),
         "--pids-limit".into(),
         "4096".into(),
+        "--memory".into(),
+        l.memory.into(),
         "--network".into(),
         l.network.into(),
         "--workdir".into(),
@@ -575,6 +651,8 @@ pub(crate) fn run_argv(l: &ContainerLaunch<'_>) -> Vec<String> {
         w.push(m.render());
     }
     w.push(l.image.into());
+    w.extend([SEAT_ENTRY.into(), CANARY_FILE.into(), "--".into()]);
+    w.extend(landrun_prefix(l.mounts, l.gateway_ports));
     w
 }
 
@@ -599,6 +677,31 @@ fn image_index(args: &[String]) -> Option<usize> {
             i += 1;
         } else {
             return ours.then_some(i);
+        }
+    }
+    None
+}
+
+/// The end of our landrun options, walking their dialect rather than searching the CLI's argv
+/// (a prompt may contain `--`, `landrun` or the entry's name).
+fn landrun_end(args: &[String], img: usize) -> Option<usize> {
+    let head = args.get(img + 1..img + 5)?;
+    if head != [SEAT_ENTRY, CANARY_FILE, "--", "landrun"] {
+        return None;
+    }
+    let mut i = img + 5;
+    while let Some(a) = args.get(i) {
+        match a.as_str() {
+            "--best-effort" | "--ignore-missing" => i += 1,
+            "--ro" | "--rox" | "--rw" | "--rwx" | "--connect-tcp" | "--env" => {
+                args.get(i + 1)?;
+                i += 2;
+            }
+            "--" => {
+                return (args.get(i + 1..i + 5)? == [SEAT_ENTRY, "--check", CANARY_FILE, "--"])
+                    .then_some(i);
+            }
+            _ => return None,
         }
     }
     None
@@ -632,6 +735,8 @@ pub(crate) fn seat_container(cmd: &Command) -> Option<SeatContainer> {
 /// host binaries) and the host's temp / home spelling the container replaces.
 const HOST_ONLY_ENV: &[&str] = &[
     "PATH",
+    "HOME",
+    "TMPDIR",
     "PWD",
     "OLDPWD",
     "SHELL",
@@ -640,8 +745,8 @@ const HOST_ONLY_ENV: &[&str] = &[
 ];
 
 /// Make a seat `cmd` (one [`run_argv`] rendered, then given its env by the carrier) complete:
-/// every variable the carrier set explicitly is passed in by NAME (`--env KEY`: the runtime CLI
-/// reads the value from its own environment, so no value is ever on a command line), and the
+/// every variable the carrier set explicitly is passed in by NAME to both the runtime and
+/// landrun (`--env KEY`: each reads its own environment, so no value is on a command line), and the
 /// unit's read roots plus the absolute paths its argv names are mounted read-only when no mount
 /// covers them yet. Any other command is returned unchanged.
 pub(crate) fn finalize(cmd: Command) -> Command {
@@ -650,6 +755,9 @@ pub(crate) fn finalize(cmd: Command) -> Command {
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     let Some(img) = image_index(&args) else {
+        return cmd;
+    };
+    let Some(land_end) = landrun_end(&args, img) else {
         return cmd;
     };
     let mut existing: Vec<PathBuf> = Vec::new();
@@ -662,6 +770,7 @@ pub(crate) fn finalize(cmd: Command) -> Command {
     }
     let covered = |p: &Path, existing: &[PathBuf]| existing.iter().any(|m| p.starts_with(m));
     let mut extra: Vec<String> = Vec::new();
+    let mut land_extra: Vec<String> = Vec::new();
     let mut envs: Vec<(String, Option<std::ffi::OsString>)> = Vec::new();
     let mut ro: Vec<PathBuf> = Vec::new();
     for (k, v) in cmd.get_envs() {
@@ -673,13 +782,25 @@ pub(crate) fn finalize(cmd: Command) -> Command {
         }
         if !HOST_ONLY_ENV.contains(&key.as_str()) {
             extra.push("--env".into());
-            extra.push(key);
+            extra.push(key.clone());
+            if !args[img + 4..land_end]
+                .windows(2)
+                .any(|w| w == ["--env", &key])
+            {
+                land_extra.extend(["--env".into(), key]);
+            }
         }
     }
     // Absolute paths the CLI argv names (`--settings <file>`, `--plugin-dir <dir>`,
     // `--mcp-config=<file>`): an option's value, never a free-standing word (a prompt).
-    let tail = &args[img + 1..];
+    let tail = &args[land_end + 5..];
     for (i, a) in tail.iter().enumerate() {
+        // A prompt is text even when it spells an existing absolute path.
+        if (i > 0 && matches!(tail[i - 1].as_str(), "-p" | "--prompt"))
+            || a.starts_with("--prompt=")
+        {
+            continue;
+        }
         let after_flag = i > 0 && tail[i - 1].starts_with('-');
         let value = match a.split_once('=') {
             Some((flag, v)) if flag.starts_with("--") => Some(v),
@@ -708,12 +829,17 @@ pub(crate) fn finalize(cmd: Command) -> Command {
             }
             .render(),
         );
+        land_extra.extend(["--rox".into(), p.to_string_lossy().into_owned()]);
         existing.push(p);
     }
+    // The seat command was hardened where the carrier built it; re-harden the rebuilt one too.
     let mut out = Command::new(cmd.get_program());
+    out.hardened();
     out.args(&args[..img]);
     out.args(&extra);
-    out.args(&args[img..]);
+    out.args(&args[img..land_end]);
+    out.args(&land_extra);
+    out.args(&args[land_end..]);
     if let Some(dir) = cmd.get_current_dir() {
         out.current_dir(dir);
     }
@@ -758,6 +884,43 @@ pub(crate) fn reap(seat: &SeatContainer) {
             return;
         }
         std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// The runtime's own prune commands for what a crashed engine left behind: stopped seat
+/// containers and unused seat networks (`wicked.seat=1`) older than `older_than`. A live seat
+/// is never touched (prune skips running containers and networks in use).
+pub(crate) fn sweep_argv(older_than: Duration) -> [Vec<String>; 2] {
+    let until = format!("until={}h", older_than.as_secs() / 3600);
+    let label = format!("label={SEAT_LABEL}=1");
+    [
+        vec![
+            "container".into(),
+            "prune".into(),
+            "--force".into(),
+            "--filter".into(),
+            label.clone(),
+            "--filter".into(),
+            until.clone(),
+        ],
+        vec![
+            "network".into(),
+            "prune".into(),
+            "--force".into(),
+            "--filter".into(),
+            label,
+            "--filter".into(),
+            until,
+        ],
+    ]
+}
+
+/// Run [`sweep_argv`], best effort and bounded. The first [`arm`] calls it once per process.
+pub(crate) fn sweep(rt: &Runtime, older_than: Duration) {
+    for argv in sweep_argv(older_than) {
+        let mut c = rt.cmd();
+        c.args(&argv);
+        let _ = output_within(c, REAP_TIMEOUT);
     }
 }
 
@@ -877,6 +1040,8 @@ pub(crate) fn arm(
         })?;
     let spec = crate::worker_sandbox::resolve_seat_floor(inp).map_err(|w| (w, String::new()))?;
     let rt = runtime().map_err(|w| (w, String::new()))?;
+    static SWEEP: Once = Once::new();
+    SWEEP.call_once(|| sweep(&rt, SWEEP_AGE));
     let image = ensure_seat_image(&rt, cli).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
     let mounts = mount_plan(&spec).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     let name = container_name(cli, run_id, ord);
@@ -884,6 +1049,7 @@ pub(crate) fn arm(
         ensure_seat_network(&rt, &name).map_err(|e| (FloorUnarmed::ContainerRuntimeDown, e))?;
     let user = operator_user();
     let workdir = inp.cwd.canonicalize().unwrap_or_else(|_| inp.cwd.clone());
+    let memory = std::env::var(MEMORY_ENV).ok();
     let wrapper = run_argv(&ContainerLaunch {
         runtime: &rt.cli,
         image: &image,
@@ -892,6 +1058,8 @@ pub(crate) fn arm(
         workdir: &workdir,
         user: &user,
         mounts: &mounts,
+        memory: memory_from(memory.as_deref()),
+        gateway_ports: GATEWAY_PORTS,
     });
     Ok(ArmedContainer {
         wrapper,
@@ -1018,7 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn the_run_argv_is_hardened_and_ends_with_the_image() {
+    fn the_run_argv_is_hardened_and_ends_with_the_guard() {
         let mounts = vec![Mount::Bind {
             path: PathBuf::from("/w/tree"),
             rw: true,
@@ -1031,6 +1199,8 @@ mod tests {
             workdir: Path::new("/w/tree"),
             user: "502:20",
             mounts: &mounts,
+            memory: "3g",
+            gateway_ports: GATEWAY_PORTS,
         });
         let has = |pair: &[&str]| w.windows(pair.len()).any(|x| x == pair);
         assert_eq!(w[0], "/usr/bin/docker");
@@ -1044,8 +1214,14 @@ mod tests {
         assert!(!w
             .iter()
             .any(|a| a == "--privileged" || a.starts_with("--cap-add")));
-        assert_eq!(w.last().unwrap(), "wicked-seat-claude:abc");
-        assert_eq!(image_index(&w[1..]), Some(w.len() - 2));
+        assert!(has(&["--memory", "3g"]));
+        let img = image_index(&w[1..]).unwrap();
+        assert_eq!(w[img + 1], "wicked-seat-claude:abc");
+        assert_eq!(
+            &w[w.len() - 5..],
+            &["--", SEAT_ENTRY, "--check", CANARY_FILE, "--"]
+        );
+        assert_eq!(landrun_end(&w[1..], img), Some(w.len() - 6));
     }
 
     #[test]
@@ -1096,7 +1272,73 @@ mod tests {
                 },
             ]
         );
+        let land = landrun_prefix(&plan, &[3100, 4100]);
+        let has = |flag: &str, path: &Path| {
+            land.windows(2)
+                .any(|w| w[0] == flag && Path::new(&w[1]) == path)
+        };
+        for p in [
+            tree.as_path(),
+            home.as_path(),
+            Path::new("/home/seat"),
+            Path::new("/tmp"),
+        ] {
+            assert!(has("--rwx", p), "{land:?}");
+        }
+        for p in [&clone, &pinned] {
+            assert!(has("--rox", p), "{land:?}");
+            assert!(!has("--rwx", p));
+        }
+        assert!(has("--ro", &secret));
+        assert!(!has("--rwx", &base.join("missing")));
+        assert!(land.contains(&"--best-effort".to_string()));
+        let ports: Vec<&str> = land
+            .windows(2)
+            .filter(|w| w[0] == "--connect-tcp")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(ports, ["3100", "4100"]);
+        assert!(!land.iter().any(|a| a.starts_with("--unrestricted")));
+        assert!(!landrun_prefix(&plan, &[]).contains(&"--connect-tcp".to_string()));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn container_memory_defaults_and_honours_an_operator_override() {
+        assert_eq!(memory_from(None), "3g");
+        assert_eq!(memory_from(Some("  ")), "3g");
+        let w = run_argv(&ContainerLaunch {
+            runtime: Path::new("docker"),
+            image: "img",
+            name: "wicked-seat-x",
+            network: "none",
+            workdir: Path::new("/tmp"),
+            user: "1000:1000",
+            mounts: &[],
+            memory: memory_from(Some(" 6g ")),
+            gateway_ports: &[],
+        });
+        assert!(w.windows(2).any(|w| w == ["--memory", "6g"]));
+        assert_eq!(w[image_index(&w[1..]).unwrap() + 1], "img");
+    }
+
+    #[test]
+    fn the_sweep_prunes_only_labelled_seat_leftovers_past_the_age() {
+        let [c, n] = sweep_argv(SWEEP_AGE);
+        assert_eq!(
+            c,
+            [
+                "container",
+                "prune",
+                "--force",
+                "--filter",
+                "label=wicked.seat=1",
+                "--filter",
+                "until=24h"
+            ]
+        );
+        assert_eq!(n[..2], ["network", "prune"]);
+        assert!(n.contains(&"label=wicked.seat=1".to_string()));
     }
 
     #[test]
@@ -1165,7 +1407,10 @@ mod tests {
             workdir: &tree,
             user: "1:1",
             mounts: &mounts,
+            memory: "3g",
+            gateway_ports: GATEWAY_PORTS,
         });
+        // spawn-audit: test-only — renders the wrapper argv; spawned only by the gated live test.
         let mut cmd = Command::new(&w[0]);
         cmd.args(&w[1..]);
         cmd.args([
@@ -1177,6 +1422,10 @@ mod tests {
         ]);
         cmd.env("SECRET_TOKEN", "value-never-on-argv");
         cmd.env("PATH", "/host/bin");
+        cmd.env("HOME", "/host/home");
+        cmd.env("TMPDIR", "/host/tmp");
+        cmd.env("LANG", "en_US.UTF-8");
+        cmd.env_remove("REMOVED_TOKEN");
         cmd.env(crate::gate_hook::READ_ROOTS_ENV, &skills);
         cmd.env(
             crate::gate_hook::WRITE_ROOTS_ENV,
@@ -1190,15 +1439,70 @@ mod tests {
         let has = |pair: &[&str]| args.windows(2).any(|x| x == pair);
         assert!(has(&["--env", "SECRET_TOKEN"]));
         assert!(!args.iter().any(|a| a.contains("value-never-on-argv")));
-        assert!(!has(&["--env", "PATH"]), "the image keeps its own PATH");
+        assert!(!args
+            .iter()
+            .any(|a| a == "/host/home" || a == "/host/tmp" || a == "en_US.UTF-8"));
+        assert!(!has(&["--env", "REMOVED_TOKEN"]));
+        let img = image_index(&args).unwrap();
+        let land_end = landrun_end(&args, img).unwrap();
+        let has_in = |part: &[String], pair: &[&str]| part.windows(2).any(|w| w == pair);
+        for key in [
+            "SECRET_TOKEN",
+            crate::gate_hook::READ_ROOTS_ENV,
+            crate::gate_hook::WRITE_ROOTS_ENV,
+        ] {
+            assert!(
+                has_in(&args[..img], &["--env", key]),
+                "runtime receives {key}"
+            );
+            assert!(
+                has_in(&args[img + 4..land_end], &["--env", key]),
+                "landrun receives {key}"
+            );
+        }
+        assert!(
+            !has_in(&args[..img], &["--env", "PATH"]),
+            "the image keeps its own PATH"
+        );
+        assert!(
+            has_in(&args[img + 4..land_end], &["--env", "PATH"]),
+            "landrun forwards the IMAGE path"
+        );
+        for key in ["HOME", "TMPDIR", "LANG"] {
+            assert_eq!(
+                args[img + 4..land_end]
+                    .windows(2)
+                    .filter(|w| *w == ["--env", key])
+                    .count(),
+                1
+            );
+        }
+        assert!(has_in(&args[..img], &["--env", "LANG"]));
+        assert!(!has_in(&args[..img], &["--env", "HOME"]));
+        assert!(!has_in(&args[..img], &["--env", "TMPDIR"]));
+        assert_eq!(
+            &args[land_end + 5..],
+            &[
+                "claude",
+                "-p",
+                "/etc/passwd",
+                "--settings",
+                settings.to_str().unwrap()
+            ]
+        );
         let ro = |p: &Path| format!("type=bind,src={p},dst={p},readonly", p = p.display());
         assert!(has(&["--mount", &ro(&skills)]), "{args:?}");
         assert!(has(&["--mount", &ro(&settings)]), "{args:?}");
         // A prompt word that happens to be a path is not a mount.
         assert!(!args.iter().any(|a| a.contains("dst=/etc/passwd")));
-        // The CLI argv still follows the image, untouched.
-        let img = args.iter().position(|a| a == "img:1").unwrap();
-        assert_eq!(args[img + 1], "claude");
+        assert!(has_in(
+            &args[img + 4..land_end],
+            &["--rox", skills.to_str().unwrap()]
+        ));
+        assert!(has_in(
+            &args[img + 4..land_end],
+            &["--rox", settings.to_str().unwrap()]
+        ));
         assert_eq!(
             seat_container(&fin),
             Some(SeatContainer {
@@ -1207,6 +1511,7 @@ mod tests {
             })
         );
         // Not one of ours: unchanged.
+        // spawn-audit: test-only — never spawned; checks a non-seat command is left unchanged.
         let mut plain = Command::new("claude");
         plain.args(["run", "--name", "x"]);
         assert!(seat_container(&plain).is_none());
@@ -1300,6 +1605,8 @@ mod tests {
             workdir: &tree,
             user: &user,
             mounts: &mounts,
+            memory: "3g",
+            gateway_ports: GATEWAY_PORTS,
         });
         let script = format!(
             "id -u; id -g; grep -E '^(CapEff|NoNewPrivs)' /proc/self/status; \
@@ -1309,7 +1616,8 @@ mod tests {
              echo SECRET=[$(cat {k}/id_ed25519 2>/dev/null)] TOKEN=[$(cat {tok} 2>/dev/null)]; \
              test -e {s}/other && echo SIBLING_VISIBLE || echo SIBLING_ABSENT; \
              (curl -sS --max-time 4 -o /dev/null https://example.com 2>/dev/null) && echo NET_OUT || echo NET_BLOCKED; \
-             echo hello > /tmp/scratch && echo TMP_OK",
+             echo hello > /tmp/scratch && echo TMP_OK; \
+             (echo x > /wicked-canary/outside) 2>/dev/null && echo LANDLOCK_ESCAPED || echo LANDLOCK_DENIED",
             t = tree.display(),
             c = clone.display(),
             k = ssh.display(),
@@ -1317,6 +1625,7 @@ mod tests {
             s = sibling.display(),
         );
         w.extend(["sh".into(), "-c".into(), script]);
+        // spawn-audit: test-only — renders the wrapper argv; spawned only by the gated live test.
         let mut cmd = Command::new(&w[0]);
         cmd.args(&w[1..]);
         let out = output_within(cmd, Duration::from_secs(60)).expect("the seat ran");
@@ -1327,6 +1636,11 @@ mod tests {
         let so = String::from_utf8_lossy(&out.stdout).to_string();
         let se = String::from_utf8_lossy(&out.stderr).to_string();
         eprintln!("--- seat stdout ---\n{so}--- seat stderr ---\n{se}");
+        assert!(out.status.success(), "{so}\n{se}");
+        assert!(
+            se.contains("wicked-seat-entry: Landlock canary passed"),
+            "{se}"
+        );
         let (uid, gid) = user.split_once(':').unwrap();
         let lines: Vec<&str> = so.lines().collect();
         assert_eq!(lines.first().copied(), Some(uid), "{so}");
@@ -1341,6 +1655,7 @@ mod tests {
             "SIBLING_ABSENT",
             "NET_BLOCKED",
             "TMP_OK",
+            "LANDLOCK_DENIED",
         ] {
             assert!(so.contains(want), "{want} missing:\n{so}");
         }
