@@ -182,6 +182,12 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          read-only-then-append discipline; exits with the gate's code (2 = deny).",
     ),
     (
+        "seat-image",
+        "wicked-core seat-image build [<cli>...|all] | seat-image status\n  \
+         Build (or report) the container images governed seats run in under the container floor \
+         (WICKED_SEAT_FLOOR=container). Needs a container runtime (docker, podman, nerdctl).",
+    ),
+    (
         "gate-hook",
         "wicked-core gate-hook [--protocol-version]\n  \
          The PreToolUse hook. Arguments travel by environment variable; `--protocol-version` prints \
@@ -311,6 +317,14 @@ fn main() {
     // gate-hook runs as a SUBPROCESS that claude spawns per tool-call. It must NOT spawn the actor
     // (it never writes the store — it only reads policies and appends decisions.ndjson), so handle
     // it before `Core::spawn` and exit with the gate's code (2 = deny ⇒ claude aborts the call).
+    // seat-image talks only to the container runtime: no store, no actor.
+    if args.get(1).map(String::as_str) == Some("seat-image") {
+        if handled_help("seat-image", &args) {
+            return;
+        }
+        std::process::exit(wicked_core::seat_image_main(&args[2..]));
+    }
+
     if args.get(1).map(String::as_str) == Some("gate-hook") {
         // `--help` must DOCUMENT, never execute: this hook opens a store and appends a decision.
         // It is dispatched ahead of the general chokepoint below (it must never spawn the actor),

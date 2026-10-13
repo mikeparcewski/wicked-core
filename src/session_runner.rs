@@ -315,6 +315,16 @@ impl PersistentStepRunner {
         // template names, and a launch the posture guard refuses must not be disclosed as having
         // run unchecked (codex round 1 on #763).
         let governed = input.governance.is_some();
+        // Container floor: this carrier opens the CLI in a host PTY, outside any seat container,
+        // so no governed unit runs here (codex review r2): refused, the failover ladder moves it.
+        if governed && crate::container_floor::container_mode() {
+            let cli = input.unit.assigned_cli.as_deref().unwrap_or("claude");
+            return crate::execute_wrapped::floor_refused(
+                input,
+                cli,
+                crate::worker_sandbox::FloorUnarmed::HostOnlyCarrier,
+            );
+        }
         if governed {
             let own = build_argv(&invocation, "", &input.unit.allowed_skills)
                 .into_iter()
@@ -1412,6 +1422,42 @@ mod tests {
     /// other binary runs and the engine discloses it with `GovernanceUnenforced` (unit-shaped:
     /// run, ord, attempt, argv[0]), exactly like the wrapped carrier's non-claude arm. Control:
     /// the same unit without governance runs with no disclosure at all.
+    #[test]
+    fn under_the_container_floor_no_governed_unit_opens_a_host_pty() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
+        let prev = std::env::var_os(crate::container_floor::SEAT_FLOOR_ENV);
+        std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, "container");
+        let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
+        let events = core.subscribe();
+        let mut unit = make_unit("verify the work", &fake_cli_invocation());
+        unit.ord = 1;
+        unit.assigned_cli = Some("pi".into());
+        let mut input = make_input("run-pty-cf", 0, unit);
+        input.governance = Some(crate::workflow::GovernanceContext {
+            human_confirm: Default::default(),
+            db_path: "/never/opened/estate.db".to_string(),
+            code_graph_db: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_id: None,
+        });
+        let out = runner.run_unit(&input);
+        match prev {
+            Some(v) => std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, v),
+            None => std::env::remove_var(crate::container_floor::SEAT_FLOOR_ENV),
+        }
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(out.output.contains("host_only_carrier"), "{}", out.output);
+        assert!(
+            !std::iter::from_fn(|| events.try_recv().ok())
+                .any(|ev| matches!(ev, CoreEvent::TerminalOpened { .. })),
+            "no host PTY opened"
+        );
+    }
+
     #[test]
     fn a_governed_unit_on_the_pty_carrier_is_refused_for_claude_and_disclosed_for_other_binaries() {
         let _env = crate::test_env::ENV_LOCK

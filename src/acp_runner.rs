@@ -6564,7 +6564,14 @@ impl AcpStepRunner {
 
         // DES-TEAMING-002: the worker's `ADVICE` / `HELP:` / `STEP` lines are read by the worker
         // thread's seam (`team::runner::complete`), on every carrier, after this returns.
-        let output = self.exec_turn_inner(input, emit);
+        // Container floor: no seat runs over ACP (the ACP bridges run on the host, outside any
+        // seat container). Every unit — governed or not, chats included — runs its CLI's
+        // headless mode on the wrapped carrier, which puts governed units in a seat container.
+        let output = if crate::container_floor::container_mode() {
+            self.fallback.run_unit_streaming(input, emit)
+        } else {
+            self.exec_turn_inner(input, emit)
+        };
 
         // On a normal bus-worker return, publication owns the in-flight marker until
         // `task.completed` is durable. A panic never reaches this assignment, so Drop
@@ -8075,6 +8082,14 @@ impl AcpStepRunner {
         seat: &str,
         scope: &crate::team::MonitorScope,
     ) -> Result<Arc<Mutex<AcpProcess>>, String> {
+        // Container floor: a monitor is an ACP session on the host; refused rather than run
+        // outside the floor.
+        if crate::container_floor::container_mode() {
+            return Err(format!(
+                "monitor '{pool_key}' on '{seat}': the container floor runs no ACP sessions; \
+                 team monitors are not available under WICKED_SEAT_FLOOR=container yet"
+            ));
+        }
         if let Some(p) = self
             .monitors
             .lock()

@@ -14,6 +14,20 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Container seat floor (opt-in: `WICKED_SEAT_FLOOR=container`).** A governed unit's CLI runs in a
+  hardened OCI container rendered for the runtime's own CLI (`docker`, `podman` or `nerdctl`; the
+  operator's `WICKED_CONTAINER_RUNTIME`, else the first found): the operator's uid, a read-only root
+  with exec tmpfs `/tmp` and `HOME`, every capability dropped, `no-new-privileges`, pids and memory
+  limits, and Landlock (landrun) inside with a fail-closed canary. Only the unit's floor is mounted,
+  at the same paths: its tree and admitted roots (read-only under a fenced posture), its git state,
+  its seat home, its read roots and skills delivery, the engine's launch files read-only, every
+  secret mask covered. Env passes by name only. One image per CLI from in-repo Dockerfiles on an
+  OSS base (`wicked-core seat-image build|status`). No runtime, a stopped runtime, native Windows,
+  no image, a claude unit whose gate hook is a host binary, or any online seat (the model gateway
+  is not part of this change) **refuses the unit** — it never runs on the host. In this mode no
+  unit runs over ACP or a host PTY; team monitors are refused. Off by default: nothing changes
+  unless the variable is set.
+
 - **The Bash write check judges the path the shell writes (#922).** It used to judge each target
   word as spelled, quotes included. A quoted absolute path was joined onto the worktree, so
   `echo x > "/outside/f"` (and the same with `'…'`, `>>`, `2>`, `tee`, `mkdir`, `touch`, `cp`, `mv`,

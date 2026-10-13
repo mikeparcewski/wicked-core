@@ -296,6 +296,25 @@ pub(crate) enum FloorUnarmed {
     /// A launcher is present but its probe failed here (a kernel refusing unprivileged user
     /// namespaces, a daemon already running inside a sandbox).
     CannotArm,
+    /// The unit's working directory could not be resolved, so no floor can be rendered for it.
+    RootUnresolvable,
+    /// Container floor: no container runtime CLI (`docker`, `podman`, `nerdctl`) on this host.
+    NoContainerRuntime,
+    /// Container floor: a runtime CLI is present but its engine did not answer.
+    ContainerRuntimeDown,
+    /// Container floor: the seat's image is not defined for this CLI or could not be built.
+    NoSeatImage,
+    /// Container floor: native Windows (seat containers mount host paths at the same path).
+    ContainerUnsupportedHost,
+    /// Container floor: the unit's gate hook is a host command the seat container cannot run, and
+    /// no hook route from the seat to the engine exists.
+    GateHookUnreachable,
+    /// Container floor: the carrier the unit reached runs CLIs on the host (the PTY session
+    /// carrier), never in a seat container.
+    HostOnlyCarrier,
+    /// Container floor: the daemon's model gateway (the seat's only egress) could not be started
+    /// or attached.
+    GatewayUnavailable,
 }
 
 impl FloorUnarmed {
@@ -316,6 +335,42 @@ impl FloorUnarmed {
             FloorUnarmed::CannotArm => {
                 "cannot_arm: the host's sandbox launcher is present but its probe failed here"
             }
+            FloorUnarmed::RootUnresolvable => {
+                "root_unresolvable: the unit's working directory could not be resolved"
+            }
+            FloorUnarmed::NoContainerRuntime => {
+                "no_container_runtime: a container runtime is required for governed runs and none \
+                 was found — install Docker, Rancher Desktop, Podman, Colima or OrbStack (or set \
+                 WICKED_CONTAINER_RUNTIME to its CLI)"
+            }
+            FloorUnarmed::ContainerRuntimeDown => {
+                "container_runtime_down: a container runtime CLI is installed but its engine did not \
+                 answer (`<runtime> version` failed) — start it (Docker Desktop, Rancher Desktop, \
+                 `podman machine start`, `colima start`) and retry"
+            }
+            FloorUnarmed::NoSeatImage => {
+                "no_seat_image: the seat's container image is not defined for this CLI or could not \
+                 be built (`wicked-core seat-image build <cli>` shows why)"
+            }
+            FloorUnarmed::ContainerUnsupportedHost => {
+                "container_unsupported_host: the container floor mounts host paths at the same path, \
+                 which native Windows paths cannot be — run the daemon inside WSL2 with a container \
+                 runtime"
+            }
+            FloorUnarmed::GateHookUnreachable => {
+                "gate_hook_unreachable: the unit's PreToolUse gate hook is a host command the seat \
+                 container cannot run, and no hook route from the seat to the engine is configured \
+                 — refusing rather than running its tool calls unchecked"
+            }
+            FloorUnarmed::HostOnlyCarrier => {
+                "host_only_carrier: this carrier runs the CLI on the host, outside any seat \
+                 container; under the container floor a governed unit runs only on the headless \
+                 carrier"
+            }
+            FloorUnarmed::GatewayUnavailable => {
+                "gateway_unavailable: the daemon's model gateway (agentgateway, the seat's only \
+                 egress) could not be started or attached to the seat's network"
+            }
         }
     }
 
@@ -326,6 +381,14 @@ impl FloorUnarmed {
             FloorUnarmed::SeatArmsItsOwn => "seat_arms_its_own",
             FloorUnarmed::NoLauncher => "no_launcher",
             FloorUnarmed::CannotArm => "cannot_arm",
+            FloorUnarmed::RootUnresolvable => "root_unresolvable",
+            FloorUnarmed::NoContainerRuntime => "no_container_runtime",
+            FloorUnarmed::ContainerRuntimeDown => "container_runtime_down",
+            FloorUnarmed::NoSeatImage => "no_seat_image",
+            FloorUnarmed::ContainerUnsupportedHost => "container_unsupported_host",
+            FloorUnarmed::GateHookUnreachable => "gate_hook_unreachable",
+            FloorUnarmed::HostOnlyCarrier => "host_only_carrier",
+            FloorUnarmed::GatewayUnavailable => "gateway_unavailable",
         }
     }
 }
@@ -500,6 +563,548 @@ pub(crate) fn default_worker_sandbox(
         },
         tool: launcher_name(tool),
     })
+}
+
+/// The text of a governed unit refused because its seat container did not arm. Says `could not
+/// run`, which the runner reads as a seat failure, so the actor fails the unit over.
+pub(crate) fn floor_refusal_text(cli: &str, why: FloorUnarmed) -> String {
+    format!(
+        "(seat '{cli}' could not run this governed unit: its seat container did not arm — {}; \
+         the unit is refused rather than run outside the floor (fail closed) — fix it, or let \
+         the run fail over to an eligible seat)",
+        why.describe()
+    )
+}
+
+// ── The seat floor's root computation (rendered by the container floor) ──────────────────────
+
+/// One outbound network grant on the seat floor (macOS; Linux leaves the network open).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub(crate) enum NetGrant {
+    /// `localhost:<port>`: a pinned loopback endpoint (the crew MCP broker, a model gateway, the
+    /// seat's own opencode server). Every other local daemon stays unreachable.
+    Loopback { port: u16 },
+    /// `*:<port>`: any host on this TCP port (443 for the model APIs; a configured proxy's port).
+    AnyHost { port: u16 },
+}
+
+/// What one governed seat spawn asks of the floor. The caller decides the roots; the floor
+/// resolves, renders and records them.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FloorInputs {
+    /// The unit's working directory (its worktree, a package dir below it, or a run sandbox).
+    pub(crate) cwd: PathBuf,
+    /// The write roots the unit was handed. Under the full posture: the armed write set (cwd
+    /// first, the launch extras, the graph key dir). Under a fenced posture: only the posture's
+    /// admitted roots (the notes root, the QE ledger root, a creator's deliverable roots).
+    pub(crate) write_roots: Vec<PathBuf>,
+    /// The READ-ONLY profile (a fenced posture): no write grant on the tree, and none on the
+    /// repository metadata either (gitdir, `objects`, `refs`, `logs`, `packed-refs`) — otherwise a
+    /// "read-only" seat could `git update-ref` another branch.
+    pub(crate) read_only: bool,
+    /// The seat's own directories: its configuration home(s), its cache and temp dirs, a check
+    /// scratch, and the run's governance-log dir (the gate hook writes its decisions there).
+    pub(crate) seat_dirs: Vec<PathBuf>,
+    /// Paths no secret mask may cover: the seat's own configuration when it inherits the
+    /// operator's (the `WICKED_INHERIT_OPERATOR_CONFIG` hatch).
+    pub(crate) unmask: Vec<PathBuf>,
+    /// Files inside the writable dirs that stay read-only ([`SeatFloor::pinned`]).
+    pub(crate) pinned: Vec<PathBuf>,
+    /// The loopback ports the seat serves itself (its own server; the gateway is its egress).
+    pub(crate) net: Vec<NetGrant>,
+    /// The operator's home the secret masks resolve under (the process `HOME`).
+    pub(crate) home: Option<PathBuf>,
+}
+
+/// The seat floor as resolved for one spawn: what the profile renders and what shadow mode
+/// judges each tool call against ([`crate::floor_shadow`]). Every path is canonical.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SeatFloor {
+    /// `"governed"` or `"read-only"`.
+    pub(crate) profile: String,
+    /// The unit's tree (its linked worktree root, else its cwd).
+    pub(crate) tree: PathBuf,
+    /// Allowed back after the blanket write deny.
+    pub(crate) writable: Vec<PathBuf>,
+    /// Then denied again: the clone and the worktrees' parent (the repository boundary).
+    pub(crate) protected: Vec<PathBuf>,
+    /// Then allowed back inside `protected`: the unit's own tree and git state (full posture) or
+    /// only the handed write roots that lie there (read-only).
+    pub(crate) readmitted: Vec<PathBuf>,
+    /// Single files allowed back inside `protected` (`FETCH_HEAD`, `packed-refs`; full posture).
+    pub(crate) readmitted_files: Vec<PathBuf>,
+    /// Read AND write denied, last: secret paths.
+    pub(crate) masks: Vec<PathBuf>,
+    /// Single files kept READ-ONLY inside a writable dir: the engine's own launch files in the
+    /// governance-log dir (the claude hook settings, the floor spec), which a worker that rewrote
+    /// them would use to switch its own gate off.
+    #[serde(default)]
+    pub(crate) pinned: Vec<PathBuf>,
+    /// Outbound grants (macOS).
+    pub(crate) net: Vec<NetGrant>,
+}
+
+/// `p` made canonical even when its leaf does not exist yet: the nearest existing ancestor is
+/// canonicalized and the rest re-appended (SBPL matches resolved paths: `/var` is `/private/var`
+/// on macOS). `None` when nothing of it resolves.
+pub(crate) fn canon_lenient(p: &Path) -> Option<PathBuf> {
+    if let Ok(c) = p.canonicalize() {
+        return Some(c);
+    }
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cur = p;
+    loop {
+        let name = cur.file_name()?;
+        rest.push(name);
+        cur = cur.parent()?;
+        if let Ok(c) = cur.canonicalize() {
+            let mut out = c;
+            for n in rest.iter().rev() {
+                out.push(n);
+            }
+            return Some(out);
+        }
+    }
+}
+
+/// The secret paths the floor masks (read and write denied) under `home`: the validator jail's
+/// credential list ([`crate::validator::secret_read_block_dirs_under`]) plus the other agent CLIs'
+/// own homes and the plain-text credential files. A seat's own home is never under `home` unless
+/// it inherits the operator's, and then the caller unmasks it.
+pub(crate) fn floor_mask_dirs_under(home: Option<&Path>) -> Vec<PathBuf> {
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    let mut out = crate::validator::secret_read_block_dirs_under(Some(home));
+    const MORE: &[&[&str]] = &[
+        &[".claude.json"],
+        &[".codex"],
+        &[".pi"],
+        &[".copilot"],
+        &[".gemini"],
+        &[".config", "opencode"],
+        &[".local", "share", "opencode"],
+        &[".netrc"],
+        &[".git-credentials"],
+        &[".docker"],
+        &[".kube"],
+    ];
+    for segs in MORE {
+        let mut p = home.to_path_buf();
+        for s in *segs {
+            p.push(s);
+        }
+        out.push(p);
+    }
+    out
+}
+
+/// Resolve `inp` into the floor one spawn runs under. `Err(RootUnresolvable)` when the unit's
+/// working directory does not resolve; every other root that does not resolve is left out (it
+/// cannot be written through a path that does not exist).
+pub(crate) fn resolve_seat_floor(inp: &FloorInputs) -> Result<SeatFloor, FloorUnarmed> {
+    let cwd = inp
+        .cwd
+        .canonicalize()
+        .map_err(|_| FloorUnarmed::RootUnresolvable)?;
+    // A write root whose LEAF is a symbolic link is never admitted (codex r3 on core#878): the
+    // engine mints its roots as plain directories, so a link in one's place was planted.
+    let roots: Vec<PathBuf> = inp
+        .write_roots
+        .iter()
+        .filter(|r| {
+            !r.symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+        })
+        .filter_map(|r| canon_lenient(r))
+        .collect();
+    let mut seat_dirs: Vec<PathBuf> = Vec::new();
+    for d in &inp.seat_dirs {
+        let _ = std::fs::create_dir_all(d);
+        if let Some(c) = canon_lenient(d) {
+            if !seat_dirs.contains(&c) {
+                seat_dirs.push(c);
+            }
+        }
+    }
+    let repo = repo_boundary(&cwd, &roots);
+    let tree = repo
+        .as_ref()
+        .and_then(|b| b.admitted.first().cloned())
+        .unwrap_or_else(|| cwd.clone());
+    let in_protected = |p: &Path| {
+        repo.as_ref()
+            .is_some_and(|b| b.protected.iter().any(|g| p.starts_with(g)))
+    };
+    let mut writable = seat_dirs.clone();
+    let mut readmitted: Vec<PathBuf> = Vec::new();
+    let mut readmitted_files: Vec<PathBuf> = Vec::new();
+    let mut protected: Vec<PathBuf> = Vec::new();
+    match (&repo, inp.read_only) {
+        (Some(b), false) => {
+            protected = b.protected.clone();
+            readmitted = b.admitted.clone();
+            readmitted_files = b.admitted_files.clone();
+            for r in &roots {
+                if !in_protected(r) && !writable.contains(r) {
+                    writable.push(r.clone());
+                }
+            }
+        }
+        (Some(b), true) => {
+            protected = b.protected.clone();
+            // The tree's own git state (gitdir, objects, refs, logs), without any handed root.
+            let git_state: Vec<PathBuf> = repo_boundary(&cwd, &[])
+                .map(|base| base.admitted.into_iter().skip(1).collect())
+                .unwrap_or_default();
+            for r in &roots {
+                // Never the tree or its git state, whatever a root list says.
+                if r.starts_with(&tree)
+                    || tree.starts_with(r)
+                    || git_state
+                        .iter()
+                        .any(|g| r.starts_with(g) || g.starts_with(r))
+                {
+                    continue;
+                }
+                let list = if in_protected(r) {
+                    &mut readmitted
+                } else {
+                    &mut writable
+                };
+                if !list.contains(r) {
+                    list.push(r.clone());
+                }
+            }
+        }
+        (None, read_only) => {
+            if !read_only {
+                writable.push(tree.clone());
+            }
+            for r in &roots {
+                if read_only && (r.starts_with(&tree) || tree.starts_with(r)) {
+                    continue;
+                }
+                if !writable.contains(r) {
+                    writable.push(r.clone());
+                }
+            }
+        }
+    }
+    let home = inp.home.clone();
+    let unmask: Vec<PathBuf> = inp
+        .unmask
+        .iter()
+        .map(|u| canon_lenient(u).unwrap_or_else(|| u.clone()))
+        .collect();
+    let mut masks: Vec<PathBuf> = Vec::new();
+    for m in floor_mask_dirs_under(home.as_deref()) {
+        let m = canon_lenient(&m).unwrap_or(m);
+        // A mask never covers what the seat must use: its own inherited home, or a dir it writes.
+        let clashes = unmask
+            .iter()
+            .chain(writable.iter())
+            .chain(std::iter::once(&tree))
+            .any(|u| u.starts_with(&m) || m.starts_with(u));
+        if !clashes && !masks.contains(&m) {
+            masks.push(m);
+        }
+    }
+    Ok(SeatFloor {
+        profile: if inp.read_only {
+            "read-only".into()
+        } else {
+            "governed".into()
+        },
+        tree,
+        writable,
+        protected,
+        readmitted,
+        readmitted_files,
+        masks,
+        pinned: inp.pinned.iter().filter_map(|p| canon_lenient(p)).collect(),
+        net: inp.net.clone(),
+    })
+}
+
+/// The program stem of `argv[0]` (`/opt/bin/codex` → `codex`).
+fn program_stem(argv: &[String]) -> Option<&str> {
+    argv.first()
+        .and_then(|b| Path::new(b).file_stem())
+        .and_then(|s| s.to_str())
+}
+
+/// codex's own sandbox OFF, because ours is on: every `--sandbox <mode>` / `-s <mode>` /
+/// `--sandbox=<mode>` becomes `danger-full-access`, `--full-auto` (which implies
+/// `workspace-write`) and any `-c sandbox_mode=…` are dropped, and the mode is added when the
+/// argv names none (codex's default is read-only, which also nests). A nested Seatbelt apply is
+/// refused under any outer profile, so codex's own sandbox would fail every command with exit 71.
+/// Only for a launch the floor wraps; `false` (nothing changed) when `argv` is not codex.
+pub(crate) fn codex_sandbox_off_under_floor(argv: &mut Vec<String>) -> bool {
+    if program_stem(argv) != Some("codex") {
+        return false;
+    }
+    const OFF: &str = "danger-full-access";
+    let mut out: Vec<String> = Vec::with_capacity(argv.len() + 2);
+    let mut named = false;
+    let mut i = 0;
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        if a == "--" {
+            out.extend(argv[i..].iter().cloned());
+            break;
+        }
+        if (a == "--sandbox" || a == "-s") && i + 1 < argv.len() {
+            out.push(a.to_string());
+            out.push(OFF.to_string());
+            named = true;
+            i += 2;
+            continue;
+        }
+        if a.starts_with("--sandbox=") {
+            out.push(format!("--sandbox={OFF}"));
+            named = true;
+            i += 1;
+            continue;
+        }
+        if a == "--full-auto" {
+            i += 1;
+            continue;
+        }
+        if (a == "-c" || a == "--config")
+            && argv
+                .get(i + 1)
+                .is_some_and(|v| v.trim_start().starts_with("sandbox_mode"))
+        {
+            i += 2;
+            continue;
+        }
+        out.push(a.to_string());
+        i += 1;
+    }
+    if !named {
+        let at = if out.get(1).is_some_and(|s| s == "exec") {
+            2
+        } else {
+            1
+        };
+        out.insert(at.min(out.len()), OFF.to_string());
+        out.insert(at.min(out.len()), "--sandbox".to_string());
+    }
+    *argv = out;
+    true
+}
+
+/// The opencode server-pinning launch under the floor: `opencode run …` with no `--server`
+/// becomes a small `/bin/sh` program that starts `opencode serve` on `port` INSIDE the same
+/// floor, waits for it, and runs `opencode run --server http://127.0.0.1:<port> …` against it.
+/// Without this, `opencode run` connects to the shared background service (which runs outside the
+/// floor) or, with `--standalone`, to a private server on a random port the floor's port pin
+/// refuses. `None` when `argv` is not such an opencode launch. The caller admits
+/// `localhost:<port>` and sets the password env ([`OPENCODE_PASSWORD_ENVS`]) to a per-spawn nonce.
+pub(crate) fn opencode_pinned_server_argv(argv: &[String], port: u16) -> Option<Vec<String>> {
+    if program_stem(argv) != Some("opencode") || argv.get(1).map(String::as_str) != Some("run") {
+        return None;
+    }
+    if argv
+        .iter()
+        .any(|a| a == "--server" || a.starts_with("--server="))
+    {
+        return None;
+    }
+    const SCRIPT: &str = r#"oc="$1"; port="$2"; shift 2
+"$oc" serve --hostname 127.0.0.1 --port "$port" >"${TMPDIR:-.}/opencode-serve-$port.log" 2>&1 &
+srv=$!
+trap 'kill "$srv" 2>/dev/null' EXIT INT TERM
+i=0
+while [ "$i" -lt 150 ]; do
+  if curl -s -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null; then break; fi
+  i=$((i + 1)); sleep 0.1
+done
+"$oc" run --server "http://127.0.0.1:$port" "$@"
+"#;
+    let mut out = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        SCRIPT.to_string(),
+        "wicked-opencode-floor".to_string(),
+        argv[0].clone(),
+        port.to_string(),
+    ];
+    out.extend(
+        argv[2..]
+            .iter()
+            .filter(|a| a.as_str() != "--standalone")
+            .cloned(),
+    );
+    Some(out)
+}
+
+/// The variables opencode's server and client read their shared password from.
+pub(crate) const OPENCODE_PASSWORD_ENVS: [&str; 2] =
+    ["OPENCODE_SERVER_PASSWORD", "OPENCODE_PASSWORD"];
+
+/// A free loopback port for a seat's own server (bound and released; the seat binds it next).
+pub(crate) fn free_loopback_port() -> Option<u16> {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+}
+
+/// The conventional configuration dirs a CLI reads under the operator's own home — what a seat
+/// running under the inherit hatch must keep writable (and unmasked).
+pub(crate) fn inherited_cli_dirs(
+    cli: wicked_apps_core::spawn::SeatCli,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    use wicked_apps_core::spawn::SeatCli;
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    let rel: &[&[&str]] = match cli {
+        SeatCli::Claude => &[&[".claude"], &[".claude.json"], &[".config", "claude"]],
+        SeatCli::Codex => &[&[".codex"]],
+        SeatCli::Pi => &[&[".pi"]],
+        SeatCli::Copilot => &[&[".copilot"]],
+        SeatCli::Opencode => &[
+            &[".config", "opencode"],
+            &[".local", "share", "opencode"],
+            &[".local", "state", "opencode"],
+            &[".cache", "opencode"],
+        ],
+        SeatCli::Agy => &[&[".gemini"]],
+        SeatCli::Other => &[],
+    };
+    rel.iter()
+        .map(|segs| {
+            let mut p = home.to_path_buf();
+            for s in *segs {
+                p.push(s);
+            }
+            p
+        })
+        .collect()
+}
+
+/// The per-seat cache dir every governed seat's package caches are pointed into
+/// ([`floor_cache_env`]): `<worker home>/cache/<seat root name>`. Writes to the operator's own
+/// `~/.cargo`, `~/.npm` or `~/.cache` are denied by the floor, and admitting them would let a
+/// worker poison the operator's next build (cargo does not re-verify extracted sources).
+pub(crate) fn seat_cache_dir(cli: wicked_apps_core::spawn::SeatCli) -> Option<PathBuf> {
+    let base = wicked_apps_core::spawn::worker_home_base().ok()?;
+    Some(base.join("cache").join(cli.root_name().unwrap_or("other")))
+}
+
+/// The cache variables a governed seat gets under the floor, all inside `cache`: cargo's home,
+/// npm / yarn / pnpm / pip / uv / go caches and the XDG cache base (opencode, many tools).
+pub(crate) fn floor_cache_env(cache: &Path) -> Vec<(&'static str, PathBuf)> {
+    vec![
+        ("CARGO_HOME", cache.join("cargo")),
+        ("npm_config_cache", cache.join("npm")),
+        ("YARN_CACHE_FOLDER", cache.join("yarn")),
+        ("npm_config_store_dir", cache.join("pnpm-store")),
+        ("PIP_CACHE_DIR", cache.join("pip")),
+        ("UV_CACHE_DIR", cache.join("uv")),
+        ("GOCACHE", cache.join("go-build")),
+        ("GOMODCACHE", cache.join("go-mod")),
+        ("XDG_CACHE_HOME", cache.join("xdg")),
+    ]
+}
+
+/// One governed seat spawn's floor, planned from the carrier's launch facts: the inputs the floor
+/// arms from, and the environment the seat must run with under it (its caches and temp redirected
+/// into dirs the floor admits).
+#[derive(Debug, Clone)]
+pub(crate) struct SeatFloorPlan {
+    pub(crate) inputs: FloorInputs,
+    /// Set on the worker command AFTER every other temp redirect, so these win.
+    pub(crate) env: Vec<(&'static str, PathBuf)>,
+}
+
+/// The launch facts a carrier hands [`plan_seat_floor`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SeatLaunch<'a> {
+    /// The unit's working directory.
+    pub(crate) cwd: &'a Path,
+    /// The CLI the seat runs (its configuration-home layout).
+    pub(crate) cli: wicked_apps_core::spawn::SeatCli,
+    /// The seat's configuration decision (isolated roots, or the operator's inherited home).
+    pub(crate) config: &'a wicked_apps_core::spawn::SeatConfig,
+    /// A fenced posture (read-only / deliverable-roots): the read-only profile.
+    pub(crate) read_only: bool,
+    /// Where a fenced unit's temp, build output and caches go instead of the tree (its check
+    /// scratch); `None` under the full posture, whose temp is `<cwd>/tmp`.
+    pub(crate) scratch: Option<&'a Path>,
+    /// The dir the unit's gate hook writes its decisions log in (the wrapped claude carrier); the
+    /// in-process ACP gate writes from the daemon, outside the floor, so it passes `None`.
+    pub(crate) gov_log_dir: Option<&'a Path>,
+    /// Loopback ports the seat's own processes listen on (opencode's pinned server).
+    pub(crate) own_ports: &'a [u16],
+}
+
+/// Plan the floor for one governed seat spawn whose write roots are `write_roots`.
+pub(crate) fn plan_seat_floor(launch: SeatLaunch<'_>, write_roots: Vec<PathBuf>) -> SeatFloorPlan {
+    use wicked_apps_core::spawn::{SeatCli, SeatConfig};
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut seat_dirs: Vec<PathBuf> = Vec::new();
+    let mut unmask: Vec<PathBuf> = Vec::new();
+    match launch.config {
+        SeatConfig::Isolated { .. } => seat_dirs.extend(launch.config.owned_dirs()),
+        // The hatch: the seat runs under the operator's own configuration, so that is its home.
+        SeatConfig::Inherit => {
+            let dirs = inherited_cli_dirs(launch.cli, home.as_deref());
+            unmask.extend(dirs.iter().cloned());
+            seat_dirs.extend(dirs);
+        }
+    }
+    let cache = seat_cache_dir(launch.cli);
+    seat_dirs.extend(cache.iter().cloned());
+    seat_dirs.extend(launch.scratch.map(Path::to_path_buf));
+    seat_dirs.extend(launch.gov_log_dir.map(Path::to_path_buf));
+    let mut env: Vec<(&'static str, PathBuf)> =
+        cache.as_deref().map(floor_cache_env).unwrap_or_default();
+    let tmp = match (launch.read_only, launch.scratch) {
+        (true, Some(scratch)) => {
+            let tmp = scratch.join("tmp");
+            let _ = std::fs::create_dir_all(&tmp);
+            for k in ["TMPDIR", "TMP", "TEMP"] {
+                env.push((k, tmp.clone()));
+            }
+            env.push(("CARGO_TARGET_DIR", scratch.join("target")));
+            tmp
+        }
+        _ => launch.cwd.join("tmp"),
+    };
+    // claude ignores `TMPDIR` for its Bash tool's temp dir (`/private/tmp/claude-<uid>`), which
+    // the floor denies: every Bash call failed EPERM without this (DES-PROC-GOVERNANCE §3.1).
+    if launch.cli == SeatCli::Claude {
+        env.push(("CLAUDE_CODE_TMPDIR", tmp));
+    }
+    // A seat container's only route out is the gateway; the floor records just the loopback
+    // ports the seat serves itself (opencode's pinned server).
+    let mut net: Vec<NetGrant> = Vec::new();
+    for p in launch.own_ports.iter().filter(|p| **p != 0) {
+        let g = NetGrant::Loopback { port: *p };
+        if !net.contains(&g) {
+            net.push(g);
+        }
+    }
+    SeatFloorPlan {
+        inputs: FloorInputs {
+            cwd: launch.cwd.to_path_buf(),
+            write_roots,
+            read_only: launch.read_only,
+            seat_dirs,
+            unmask,
+            pinned: Vec::new(),
+            net,
+            home,
+        },
+        env,
+    }
 }
 
 #[cfg(test)]
