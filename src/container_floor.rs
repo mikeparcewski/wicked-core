@@ -74,8 +74,8 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const REAP_TIMEOUT: Duration = Duration::from_secs(20);
 const SWEEP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// The gateway's listeners a seat may connect to: CONNECT 3000, Anthropic 4000, OpenAI 4001,
-/// MCP 6000 ([`crate::seat_gateway`]).
-const GATEWAY_PORTS: &[u16] = &[3000, 4000, 4001, 6000];
+/// the ask MCP 8700 and the gate hook 8711 ([`crate::seat_gateway`], [`crate::hook_relay`]).
+const GATEWAY_PORTS: &[u16] = &[3000, 4000, 4001, 8700, crate::hook_relay::HOOK_PORT];
 const SEAT_ENTRY: &str = "/usr/local/bin/wicked-seat-entry";
 const CANARY_FILE: &str = "/wicked-canary/probe";
 

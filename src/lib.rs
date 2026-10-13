@@ -44,6 +44,7 @@ mod execute_wrapped;
 mod floor_shadow;
 mod gate_hook;
 mod graph_browser;
+mod hook_relay;
 mod install_fence;
 mod interaction;
 mod knowledge;
