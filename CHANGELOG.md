@@ -359,6 +359,25 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.9.10** — 2026-10-13 — patch release on main bf5692d, carrying #920, #921, #923, #924, #925.
+  **Security (#924, fixes #922): outside-worktree write bypass closed.** The Bash write-target scan judged each
+  target word as spelled, quotes included, so a quoted, escaped or `$HOME`/`${HOME}` write target outside the
+  worktree (`echo x > "/outside/f"`, `tee "…"`, `mkdir -p "…"`, `cp`/`mv`/`dd of="…"`, `sh -c '… > "…"'`,
+  `cd "<out>" && …`, `\/abs`, `"../outside/f"`) resolved to a path inside the worktree and was admitted by the
+  boundary. Targets are now judged as the shell resolves them, and those writes are denied. **Behaviour change:**
+  a write target the gate cannot resolve without running the shell (`$VAR`, `$(…)`, backticks, globs, brace
+  lists, `~user`, `sh -c` with outer expansion) is now refused on every posture instead of admitted (an advisory
+  deny: the call is blocked and audited, and the seat is asked to spell the path literally). The same fix
+  ends a false deny of quoted in-scope targets (`mkdir -p "<qe-ledger>/evidence/x"`).
+  #921: governed claude seats load the worktree's `CLAUDE.md` again (the tree is passed as an additional
+  directory with `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1`; repository hooks, settings and MCP servers stay
+  off, per #916). #920 `Core.worktreeBenched` and #923 `Core.qeReviewerAdmitted`: pure predicates for crew's
+  roster (A5 work admission, A4 QE reviewer), additive and feature-detected.
+  #925 (crew#998): a governed unit on a seat admitted to ACP input governance (any seat but claude) whose ACP
+  session cannot start, or drops mid-turn, now fails with the cause (`acpFallback` kind `governed_requires_acp`)
+  instead of falling back to the wrapped carrier, which ran it unchecked. Pair with agent-acp-bridges 1.3.0
+  (published; ships the `pi-governance` gate), otherwise pi units on an install without the
+  gate stop running on pi (they fail over to another seat) instead of running unchecked.
 - **core-ts 0.9.9** — 2026-10-12 — patch release on main 3978a78, carrying #917 (QE acceptance on every seat): the
   engine runs the QE reviewer itself as a fresh, isolated worker session inside the QE unit's attempt (directive
   `accept --phase evidence`, then a reviewer turn handed only the evidence path, its verdict bound to a per-turn
