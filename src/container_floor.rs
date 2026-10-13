@@ -1549,7 +1549,9 @@ pub fn seat_image_main(args: &[String]) -> i32 {
     }
 }
 
-#[cfg(test)]
+// The container floor runs on Unix hosts only (native Windows is refused, tested in
+// `execute_wrapped`); its tests use Unix paths, links and tools throughout.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
