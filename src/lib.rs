@@ -91,6 +91,7 @@ mod review_context;
 #[allow(dead_code)]
 mod review_scale;
 mod scope;
+mod seat_gateway;
 mod session_runner;
 mod skills_snapshot;
 mod sources;

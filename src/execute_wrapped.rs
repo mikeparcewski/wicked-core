@@ -2219,6 +2219,9 @@ impl WrappedCliStepRunner {
             // Container floor: the armed seat's container + network, removed however the unit
             // ends (held to the end of this scope).
             let mut seat_cleanup: Option<crate::container_floor::ReapOnDrop> = None;
+            // Container floor: the seat's gateway env and registration (C3).
+            let mut seat_gateway_env: Vec<(String, String)> = Vec::new();
+            let mut gateway_lease: Option<crate::container_floor::GatewayLease> = None;
             let mut opencode_password: Option<String> = None;
             // A1: a requested kernel floor that cannot arm DISCLOSES AND CONTINUES rather than
             // failing the unit — `detect_worker_sandbox` returns a best-effort (empty-wrapper)
@@ -2330,15 +2333,19 @@ impl WrappedCliStepRunner {
                         .flat_map(|g| g.extra_read_roots.iter().map(PathBuf::from))
                         .chain(handed.map(|s| s.root.clone()))
                         .collect();
+                    let gateway_dir = self.operational_home.as_deref().map(|h| h.join("gateway"));
                     match crate::container_floor::arm(
                         &plan.inputs,
                         &argv,
                         &input.run_id,
                         input.unit.ord,
                         &read_roots,
+                        gateway_dir.as_deref(),
                     ) {
                         Ok(c) => {
                             seat_cleanup = Some(c.cleanup);
+                            seat_gateway_env = c.env;
+                            gateway_lease = c.lease;
                             argv = c.argv;
                             crate::worker_sandbox::GovernedFloor::Armed(Box::new(
                                 crate::worker_sandbox::ArmedFloor {
@@ -2602,6 +2609,9 @@ impl WrappedCliStepRunner {
             for (k, v) in &floor_env {
                 cmd.env(k, v);
             }
+            for (k, v) in &seat_gateway_env {
+                cmd.env(k, v);
+            }
             if let Some(pw) = &opencode_password {
                 for k in crate::worker_sandbox::OPENCODE_PASSWORD_ENVS {
                     cmd.env(k, pw);
@@ -2804,6 +2814,15 @@ impl WrappedCliStepRunner {
             // decisions, appended to the governance log once the unit ends.
             if governed {
                 crate::floor_shadow::summarize(&decisions_path, &shadow_phase);
+            }
+            // C3: revoke the seat's gateway key and keep what the gateway recorded for it (each
+            // model request's status, model, tool calls, text and usage) as the unit's evidence.
+            if let Some(lease) = gateway_lease.take() {
+                let records = lease.release();
+                crate::seat_gateway::write_records(
+                    &decisions_path.with_file_name(format!("gateway-{shadow_phase}.ndjson")),
+                    &records,
+                );
             }
             drop(mcp_channel);
             match bounded {
