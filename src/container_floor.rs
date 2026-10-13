@@ -1102,6 +1102,83 @@ fn operator_user() -> String {
     }
 }
 
+/// One seat's gateway identity: its unit key, its env, and its placeholder credential files.
+type SeatCredential = (
+    crate::seat_gateway::UnitKey,
+    Vec<(String, String)>,
+    Vec<(PathBuf, String)>,
+);
+
+/// The env variable naming `cli`'s configuration home, where its placeholder files go.
+fn config_home_env(cli: &str) -> Option<&'static str> {
+    match cli {
+        "claude" => Some("CLAUDE_CONFIG_DIR"),
+        "codex" => Some("CODEX_HOME"),
+        "pi" => Some("PI_CODING_AGENT_DIR"),
+        _ => None,
+    }
+}
+
+/// Write a seat's placeholder credential `files` into its configuration home as `cmd` names it,
+/// private (0600). Refused unless that home is inside the engine's worker home: a placeholder
+/// never lands in (or overwrites a real credential in) an operator's own configuration.
+#[cfg(unix)]
+pub(crate) fn write_seat_files(
+    cmd: &Command,
+    cli: &str,
+    files: &[(PathBuf, String)],
+) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if files.is_empty() {
+        return Ok(());
+    }
+    let var = config_home_env(cli)
+        .ok_or_else(|| format!("no placeholder credential path is defined for `{cli}`"))?;
+    let home = cmd
+        .get_envs()
+        .find(|(k, _)| *k == var)
+        .and_then(|(_, v)| v)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("the seat's {var} is not set"))?;
+    let base = wicked_apps_core::spawn::worker_home_base().map_err(|e| e.to_string())?;
+    let home_c = crate::worker_sandbox::canon_lenient(&home).unwrap_or(home.clone());
+    let base_c = crate::worker_sandbox::canon_lenient(&base).unwrap_or(base);
+    if !home_c.starts_with(&base_c) {
+        return Err(format!(
+            "the seat's {var} ({}) is not an engine worker home; its placeholder credential is \
+             never written there",
+            home.display()
+        ));
+    }
+    for (rel, body) in files {
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "placeholder path {} escapes the config home",
+                rel.display()
+            ));
+        }
+        let path = home.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let tmp = path.with_extension("wicked-new");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, body.as_bytes()))
+            .and_then(|_| std::fs::rename(&tmp, &path))
+            .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// A seat armed in the container floor: the wrapper, the argv to run after it, the runtime that
 /// armed it (by file name: `docker`, `podman`, `nerdctl`) and the floor it renders.
 #[derive(Debug)]
@@ -1171,11 +1248,7 @@ fn placeholder_handoff(
     kind: crate::seat_credentials::CredentialKind,
     run: &str,
     unit: &str,
-) -> (
-    crate::seat_gateway::UnitKey,
-    Vec<(String, String)>,
-    Vec<(PathBuf, String)>,
-) {
+) -> SeatCredential {
     let mut key = crate::seat_gateway::UnitKey::new(run, unit, cli);
     let files = crate::seat_credentials::placeholder_files(
         cli,

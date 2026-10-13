@@ -2218,6 +2218,8 @@ impl WrappedCliStepRunner {
             let mut floor_env: Vec<(&'static str, PathBuf)> = Vec::new();
             // Container floor: the seat's gateway env and registration (C3).
             let mut seat_gateway_env: Vec<(String, String)> = Vec::new();
+            // Its placeholder credential files (C4), written once the seat's env names its home.
+            let mut seat_files: Vec<(PathBuf, String)> = Vec::new();
             let mut gateway_lease: Option<crate::container_floor::GatewayLease> = None;
             let mut opencode_password: Option<String> = None;
             // A1: a requested kernel floor that cannot arm DISCLOSES AND CONTINUES rather than
@@ -2345,10 +2347,7 @@ impl WrappedCliStepRunner {
                         }
                         Ok(c) => {
                             seat_gateway_env = c.env;
-                            // lane: write files into the seat config home
-                            // c.files paths are relative to the isolated home for this CLI;
-                            // write them before spawn, with private permissions. They contain
-                            // only this unit's placeholder, whose exact bearer is registered.
+                            seat_files = c.files;
                             gateway_lease = c.lease;
                             argv = c.argv;
                             crate::worker_sandbox::GovernedFloor::Armed(Box::new(
@@ -2615,6 +2614,22 @@ impl WrappedCliStepRunner {
             }
             for (k, v) in &seat_gateway_env {
                 cmd.env(k, v);
+            }
+            #[cfg(unix)]
+            if let Err(why) = crate::container_floor::write_seat_files(
+                &cmd,
+                seat_cli.root_name().unwrap_or_default(),
+                &seat_files,
+            ) {
+                eprintln!("wicked-core: unit {}: {why}", input.unit.ord);
+                if let Some(lease) = gateway_lease.take() {
+                    let _ = lease.release();
+                }
+                return floor_refused(
+                    input,
+                    &cli_key,
+                    crate::worker_sandbox::FloorUnarmed::GatewayUnavailable,
+                );
             }
             if let Some(pw) = &opencode_password {
                 for k in crate::worker_sandbox::OPENCODE_PASSWORD_ENVS {
