@@ -393,6 +393,20 @@ pub fn worktree_benched(clis: &[AgenticCli], bound: bool) -> Vec<BenchedSeat> {
     crate::distribute::worktree_benched(clis, bound)
 }
 
+/// (crew Agents page A4) Whether this host's skill routing admits `key` (with its roster
+/// `invocation` template) to the engine's isolated QE reviewer turn (wicked-core#917): the reviewer
+/// unit runs the QE skill, and a seat the routing snapshot does not admit for it (a Claude-only
+/// skills root, or a non-portable QE skill, on a non-claude seat) is never a reviewer candidate
+/// (`qe_acceptance::review::candidates`). Run-specific exclusions (authors, the launch exclusion,
+/// the run's benches) are not judged here. Reads the skills root at call time, as a launch does.
+pub fn qe_reviewer_admitted(key: &str, invocation: Option<String>) -> bool {
+    crate::distribute::qe_reviewer_admitted_against(
+        crate::skills_snapshot::routing_snapshot().as_ref(),
+        key,
+        invocation,
+    )
+}
+
 /// Resolve the council roster from the registry (built-ins merged with the user's
 /// `~/.config/wicked-council/clis.toml`), keeping every seat that may vote OR work (core#572:
 /// routing reads `seat_eligible_for_work`, a decision's ballots `enabled_for_council`). This is

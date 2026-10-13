@@ -939,6 +939,16 @@ impl Core {
         serde_json::to_string(&wicked_core::worktree_benched(&clis, bound)).map_err(err)
     }
 
+    /// (crew Agents page A4) Whether this host's skill routing admits the seat `key` (run with its
+    /// roster `invocation` template, when given) to the engine's isolated QE reviewer turn
+    /// (wicked-core#917) — the reviewer runs the QE skill, and a skills root that makes it
+    /// Claude-only admits claude seats only. Run-specific exclusions are not judged. An addon
+    /// without this static predates it; crew keys on its presence.
+    #[napi]
+    pub fn qe_reviewer_admitted(key: String, invocation: Option<String>) -> bool {
+        wicked_core::qe_reviewer_admitted(&key, invocation)
+    }
+
     /// Whether this addon carries DES-TEAMING-002 T3's plan launch: `LaunchOptions.planJson` /
     /// `deliverStepJson` and `confirmGate(…, planJson)`. napi IGNORES an undeclared object field,
     /// so a launcher keys on this static's presence before it sends a plan — an older addon would

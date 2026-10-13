@@ -911,13 +911,61 @@ fn seat_candidates(
 /// exactly as routing treats it. `invocation` is the template the unit WILL carry on that seat, so
 /// the wrapped carrier's identity is judged on what will actually run (the [`seat_is_claude`] rule).
 pub(crate) fn seat_admits_unit(unit: &WorkUnit, key: &str, invocation: Option<String>) -> bool {
-    if unit.tool_cmd.is_some() || unit.skill_ref.as_deref().is_none_or(str::is_empty) {
+    if unit.tool_cmd.is_some() {
         return true;
     }
-    let Some(snapshot) = crate::skills_snapshot::routing_snapshot() else {
+    seat_admits_skill(unit.skill_ref.as_deref(), key, invocation)
+}
+
+/// [`seat_admits_unit`] for a skill-bearing unit, by its skill alone: no skill, no routing
+/// snapshot, or a skill every seat may run admits the seat; a Claude-only skill admits a claude
+/// seat only.
+pub(crate) fn seat_admits_skill(
+    skill_ref: Option<&str>,
+    key: &str,
+    invocation: Option<String>,
+) -> bool {
+    if skill_ref.is_none_or(str::is_empty) {
+        return true;
+    }
+    seat_admits_skill_against(
+        crate::skills_snapshot::routing_snapshot().as_ref(),
+        skill_ref,
+        key,
+        invocation,
+    )
+}
+
+/// (crew Agents page A4) The QE reviewer's admission for a ROSTER seat, against a resolved routing
+/// snapshot. The roster's template is read the way the reviewer candidates read a run's
+/// ([`invocation_of`]): a blank template is no template. Only this outside entry normalizes — the
+/// engine's own callers keep their exact values (a mid-run reseat judges the raw registry template).
+pub(crate) fn qe_reviewer_admitted_against(
+    snapshot: Option<&crate::skills_snapshot::SkillsSnapshot>,
+    key: &str,
+    invocation: Option<String>,
+) -> bool {
+    let invocation = invocation.filter(|s| !s.trim().is_empty());
+    seat_admits_skill_against(
+        snapshot,
+        Some(crate::execute_wrapped::QE_SKILL),
+        key,
+        invocation,
+    )
+}
+
+/// [`seat_admits_skill`] against an already-resolved routing snapshot (`None`: no root, so the
+/// seat is unconstrained).
+pub(crate) fn seat_admits_skill_against(
+    snapshot: Option<&crate::skills_snapshot::SkillsSnapshot>,
+    skill_ref: Option<&str>,
+    key: &str,
+    invocation: Option<String>,
+) -> bool {
+    let Some(snapshot) = snapshot else {
         return true;
     };
-    match crate::skills_snapshot::seat_requirement(&snapshot, unit.skill_ref.as_deref()) {
+    match crate::skills_snapshot::seat_requirement(snapshot, skill_ref) {
         SeatRequirement::Any => true,
         SeatRequirement::ClaudeOnly { .. } => seat_runs_claude(key, invocation),
     }
@@ -1473,6 +1521,54 @@ mod tests {
                     .contains("holds no seat that resolves to claude"),
             "{err}"
         );
+    }
+
+    /// (crew Agents page A4) The QE reviewer's admission by skill alone: the live-cache fallback
+    /// admits only a claude seat to the QE skill, a published PORTABLE QE skill admits every seat,
+    /// and no root admits every seat — the same verdicts the reviewer candidates read.
+    #[test]
+    fn the_qe_reviewer_admission_follows_the_routing_snapshot() {
+        // Held whole: the tuple drops in order, so HOME is restored before the env lock releases.
+        let _home_env = hermetic_home("qe-admit-home");
+        let qe = Some(crate::execute_wrapped::QE_SKILL);
+        let config = scratch("qe-admit-live").join("claude-config");
+        live_root(
+            &config
+                .join("plugins")
+                .join("cache")
+                .join("wicked-garden")
+                .join("wicked-garden")
+                .join("1.0.0"),
+            "1.0.0",
+            &[("qe", crate::execute_wrapped::QE_SKILL)],
+        );
+        let live = crate::skills_snapshot::resolve_in(None, Some(config), None, &mut |_| {})
+            .unwrap()
+            .expect("the live cache is a root");
+        assert!(!seat_admits_skill_against(Some(&live), qe, "pi", None));
+        assert!(seat_admits_skill_against(Some(&live), qe, "claude", None));
+        let root = snapshot_root_with(
+            &gen_dir(&scratch("qe-admit-pub"), "7"),
+            "7",
+            &[("qe", crate::execute_wrapped::QE_SKILL, true, &[])],
+        );
+        let published = load(&root);
+        assert!(seat_admits_skill_against(Some(&published), qe, "pi", None));
+        assert!(seat_admits_skill_against(None, qe, "pi", None));
+        // The roster entry reads a blank template as none (the engine's rule), not as an empty
+        // binary; the shared judgement keeps the raw value for the engine's own callers.
+        assert!(qe_reviewer_admitted_against(
+            Some(&live),
+            "claude",
+            Some("  ".into())
+        ));
+        assert!(!qe_reviewer_admitted_against(Some(&live), "pi", None));
+        assert!(!seat_admits_skill_against(
+            Some(&live),
+            qe,
+            "claude",
+            Some("  ".into())
+        ));
     }
 
     /// No root to judge against (`None`: the ladder was absent, failed or misconfigured) ⇒ no
