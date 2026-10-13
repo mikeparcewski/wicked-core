@@ -547,10 +547,12 @@ pub(crate) fn run_argv(l: &ContainerLaunch<'_>) -> Vec<String> {
         "--user".into(),
         l.user.into(),
         "--read-only".into(),
+        // `exec`: the runtime's tmpfs default is noexec, and CLIs run code from both (copilot
+        // unpacks its native addon into `$HOME/.cache`; test runners exec from `$TMPDIR`).
         "--tmpfs".into(),
-        "/tmp:rw,mode=1777,size=2g".into(),
+        "/tmp:rw,exec,mode=1777,size=2g".into(),
         "--tmpfs".into(),
-        "/home/seat:rw,mode=1777,size=512m".into(),
+        "/home/seat:rw,exec,mode=1777,size=512m".into(),
         "--cap-drop".into(),
         "ALL".into(),
         "--security-opt".into(),
@@ -1038,6 +1040,7 @@ mod tests {
         assert!(has(&["--network", "wicked-seat-claude-r-1-n"]));
         assert!(has(&["--mount", "type=bind,src=/w/tree,dst=/w/tree"]));
         assert!(w.contains(&"--read-only".to_string()));
+        assert!(has(&["--tmpfs", "/home/seat:rw,exec,mode=1777,size=512m"]));
         assert!(!w
             .iter()
             .any(|a| a == "--privileged" || a.starts_with("--cap-add")));
