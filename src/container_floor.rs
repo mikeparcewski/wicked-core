@@ -195,22 +195,52 @@ pub(crate) fn runtime_candidates(
 }
 
 /// Run `cmd` to completion within `limit`, killing it past the deadline. `None` when it could not
-/// start or ran out of time.
-fn output_within(mut cmd: Command, limit: Duration) -> Option<std::process::Output> {
+/// start or ran out of time. Both pipes are drained while waiting, so a large output cannot fill
+/// a pipe and stall the child.
+pub(crate) fn output_within(mut cmd: Command, limit: Duration) -> Option<std::process::Output> {
+    use std::io::Read;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().ok()?;
+    let drain = |p: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = p {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
     let start = Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(Some(s)) => break Some(s),
             Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(50)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                break None;
             }
         }
-    }
+    };
+    let stdout = out.join().unwrap_or_default();
+    let stderr = err.join().unwrap_or_default();
+    status.map(|status| std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// The runtime this host runs seats with, probed (`<cli> version` must reach the engine). A
@@ -330,6 +360,22 @@ pub(crate) fn build_seat_image(rt: &Runtime, cli: &str) -> Result<String, String
         use std::io::Write;
         let _ = stdin.write_all(df.as_bytes());
     }
+    // Stream the build's progress as it comes (a full pipe would stall the build), keeping
+    // the last lines for the error.
+    let progress = child.stderr.take().map(|se| {
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+            for line in std::io::BufReader::new(se).lines().map_while(Result::ok) {
+                eprintln!("{line}");
+                if tail.len() == 6 {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+            tail.into_iter().collect::<Vec<_>>()
+        })
+    });
     let start = Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -344,19 +390,13 @@ pub(crate) fn build_seat_image(rt: &Runtime, cli: &str) -> Result<String, String
             }
         }
     };
-    let mut err = String::new();
-    if let Some(mut se) = child.stderr.take() {
-        use std::io::Read;
-        let _ = se.read_to_string(&mut err);
-    }
-    eprint!("{err}");
+    let tail = progress.and_then(|h| h.join().ok()).unwrap_or_default();
     if status.success() {
         Ok(tag)
     } else {
-        let tail: Vec<&str> = err.lines().rev().take(6).collect();
         Err(format!(
             "building {tag} failed ({status}): {}",
-            tail.into_iter().rev().collect::<Vec<_>>().join(" | ")
+            tail.join(" | ")
         ))
     }
 }
@@ -492,13 +532,17 @@ pub(crate) fn mount_plan(f: &SeatFloor) -> Result<Vec<Mount>, String> {
     for p in f.pinned.iter().filter(|p| p.is_file()) {
         put(&mut out, bind(p, false))?;
     }
+    // The tree itself, read-only, when nothing above exposes it (a read-only unit outside a
+    // linked worktree: the host floor left it visible, a container only shows what is mounted).
+    if f.tree.is_dir() && !out.iter().any(|o| f.tree.starts_with(o.dst())) {
+        put(&mut out, bind(&f.tree, false))?;
+    }
+    // EVERY existing mask, not only those under a mount yet: a read path [`finalize`] mounts
+    // later (a read root, an argv path) may be an ancestor, and the runtime mounts the deeper
+    // mask over it (mounts apply in destination-depth order).
     let masks: Vec<Mount> = f
         .masks
         .iter()
-        .filter(|m| {
-            out.iter()
-                .any(|o| matches!(o, Mount::Bind { .. }) && m.starts_with(o.dst()))
-        })
         .filter_map(|m| {
             if m.is_dir() {
                 Some(Mount::Tmpfs { path: m.clone() })
@@ -529,6 +573,8 @@ pub(crate) struct ContainerLaunch<'a> {
     pub(crate) memory: &'a str,
     /// The only TCP destination ports the CLI may connect to.
     pub(crate) gateway_ports: &'a [u16],
+    /// Loopback ports the seat serves itself (opencode's pinned server): bind AND connect.
+    pub(crate) own_ports: &'a [u16],
 }
 
 /// The options of ours that take a value, and those that do not: [`finalize`] walks the wrapper
@@ -560,7 +606,7 @@ fn memory_from(choice: Option<&str>) -> &str {
 /// The Landlock policy from the same mounts as the runtime: writable trees are executable too
 /// (test runners exec from them), and read mounts admit executable skills and toolchains. The
 /// entry's second invocation checks enforcement inside this domain before executing the CLI.
-fn landrun_prefix(mounts: &[Mount], gateway_ports: &[u16]) -> Vec<String> {
+fn landrun_prefix(mounts: &[Mount], gateway_ports: &[u16], own_ports: &[u16]) -> Vec<String> {
     let mut out = vec![
         "landrun".into(),
         "--best-effort".into(),
@@ -587,6 +633,10 @@ fn landrun_prefix(mounts: &[Mount], gateway_ports: &[u16]) -> Vec<String> {
         out.extend([access.into(), m.dst().to_string_lossy().into_owned()]);
     }
     for port in gateway_ports {
+        out.extend(["--connect-tcp".into(), port.to_string()]);
+    }
+    for port in own_ports.iter().filter(|p| **p != 0) {
+        out.extend(["--bind-tcp".into(), port.to_string()]);
         out.extend(["--connect-tcp".into(), port.to_string()]);
     }
     for name in ["PATH", "HOME", "TMPDIR", "LANG"] {
@@ -652,7 +702,7 @@ pub(crate) fn run_argv(l: &ContainerLaunch<'_>) -> Vec<String> {
     }
     w.push(l.image.into());
     w.extend([SEAT_ENTRY.into(), CANARY_FILE.into(), "--".into()]);
-    w.extend(landrun_prefix(l.mounts, l.gateway_ports));
+    w.extend(landrun_prefix(l.mounts, l.gateway_ports, l.own_ports));
     w
 }
 
@@ -693,7 +743,7 @@ fn landrun_end(args: &[String], img: usize) -> Option<usize> {
     while let Some(a) = args.get(i) {
         match a.as_str() {
             "--best-effort" | "--ignore-missing" => i += 1,
-            "--ro" | "--rox" | "--rw" | "--rwx" | "--connect-tcp" | "--env" => {
+            "--ro" | "--rox" | "--rw" | "--rwx" | "--connect-tcp" | "--bind-tcp" | "--env" => {
                 args.get(i + 1)?;
                 i += 2;
             }
@@ -705,6 +755,17 @@ fn landrun_end(args: &[String], img: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Reaps a seat container when dropped (the end of the run, however it ends).
+pub(crate) struct ReapOnDrop(pub(crate) Option<SeatContainer>);
+
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        if let Some(seat) = self.0.take() {
+            reap(&seat);
+        }
+    }
 }
 
 /// A seat container to reap: the runtime CLI that launched it and its name.
@@ -761,10 +822,16 @@ pub(crate) fn finalize(cmd: Command) -> Command {
         return cmd;
     };
     let mut existing: Vec<PathBuf> = Vec::new();
+    // The floor's masks as rendered (a tmpfs, or /dev/null over a file): nothing at or under one
+    // is ever mounted from the host.
+    let mut masks: Vec<PathBuf> = Vec::new();
     for w in args[..img].windows(2) {
         if w[0] == "--mount" {
             if let Some(dst) = w[1].split(',').find_map(|kv| kv.strip_prefix("dst=")) {
                 existing.push(PathBuf::from(dst));
+                if w[1].starts_with("type=tmpfs,") || w[1].starts_with("type=bind,src=/dev/null,") {
+                    masks.push(PathBuf::from(dst));
+                }
             }
         }
     }
@@ -791,34 +858,20 @@ pub(crate) fn finalize(cmd: Command) -> Command {
             }
         }
     }
-    // Absolute paths the CLI argv names (`--settings <file>`, `--plugin-dir <dir>`,
-    // `--mcp-config=<file>`): an option's value, never a free-standing word (a prompt).
-    let tail = &args[land_end + 5..];
-    for (i, a) in tail.iter().enumerate() {
-        // A prompt is text even when it spells an existing absolute path.
-        if (i > 0 && matches!(tail[i - 1].as_str(), "-p" | "--prompt"))
-            || a.starts_with("--prompt=")
-        {
-            continue;
-        }
-        let after_flag = i > 0 && tail[i - 1].starts_with('-');
-        let value = match a.split_once('=') {
-            Some((flag, v)) if flag.starts_with("--") => Some(v),
-            _ if after_flag => Some(a.as_str()),
-            _ => None,
-        };
-        if let Some(v) = value {
-            let p = Path::new(v);
-            if p.is_absolute() && p.exists() {
-                ro.push(p.to_path_buf());
-            }
-        }
-    }
+    // Absolute paths the CLI argv names as the value of an option that takes a path (the
+    // engine's own `--settings <file>`, `--plugin-dir <dir>`, `--mcp-config=<file>`, ...). Only
+    // those options, and only before the CLI's `--`: a prompt is text even when it spells an
+    // existing path or looks like an option.
+    ro.extend(argv_paths(&args[land_end + 5..]));
     for p in ro {
         let Some(p) = crate::worker_sandbox::canon_lenient(&p) else {
             continue;
         };
-        if !p.exists() || covered(&p, &existing) || !mountable(&p) {
+        if !p.exists()
+            || covered(&p, &existing)
+            || !mountable(&p)
+            || masks.iter().any(|m| p.starts_with(m))
+        {
             continue;
         }
         extra.push("--mount".into());
@@ -852,6 +905,48 @@ pub(crate) fn finalize(cmd: Command) -> Command {
                 out.env_remove(k);
             }
         }
+    }
+    out
+}
+
+/// The options whose value is a host path the seat must read (claude's `--settings`,
+/// `--plugin-dir`, `--mcp-config`, `--add-dir`, the system-prompt files; codex's `-C`/`--cd`).
+const PATH_OPTS: &[&str] = &[
+    "--settings",
+    "--plugin-dir",
+    "--mcp-config",
+    "--add-dir",
+    "--system-prompt-file",
+    "--append-system-prompt-file",
+    "--cd",
+    "-C",
+];
+
+/// The existing absolute paths `tail` (the CLI argv) names as a [`PATH_OPTS`] value, before
+/// any `--`.
+fn argv_paths(tail: &[String]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tail.len() {
+        let a = tail[i].as_str();
+        if a == "--" {
+            break;
+        }
+        let value = if PATH_OPTS.contains(&a) {
+            i += 1;
+            tail.get(i).map(String::as_str)
+        } else {
+            a.split_once('=')
+                .filter(|(f, _)| PATH_OPTS.contains(f))
+                .map(|(_, v)| v)
+        };
+        if let Some(v) = value {
+            let p = Path::new(v);
+            if p.is_absolute() && p.exists() {
+                out.push(p.to_path_buf());
+            }
+        }
+        i += 1;
     }
     out
 }
@@ -1050,6 +1145,14 @@ pub(crate) fn arm(
     let user = operator_user();
     let workdir = inp.cwd.canonicalize().unwrap_or_else(|_| inp.cwd.clone());
     let memory = std::env::var(MEMORY_ENV).ok();
+    let own_ports: Vec<u16> = spec
+        .net
+        .iter()
+        .filter_map(|g| match g {
+            crate::worker_sandbox::NetGrant::Loopback { port } => Some(*port),
+            crate::worker_sandbox::NetGrant::AnyHost { .. } => None,
+        })
+        .collect();
     let wrapper = run_argv(&ContainerLaunch {
         runtime: &rt.cli,
         image: &image,
@@ -1060,6 +1163,7 @@ pub(crate) fn arm(
         mounts: &mounts,
         memory: memory_from(memory.as_deref()),
         gateway_ports: GATEWAY_PORTS,
+        own_ports: &own_ports,
     });
     Ok(ArmedContainer {
         wrapper,
@@ -1201,6 +1305,7 @@ mod tests {
             mounts: &mounts,
             memory: "3g",
             gateway_ports: GATEWAY_PORTS,
+            own_ports: &[],
         });
         let has = |pair: &[&str]| w.windows(pair.len()).any(|x| x == pair);
         assert_eq!(w[0], "/usr/bin/docker");
@@ -1272,7 +1377,7 @@ mod tests {
                 },
             ]
         );
-        let land = landrun_prefix(&plan, &[3100, 4100]);
+        let land = landrun_prefix(&plan, &[3100, 4100], &[]);
         let has = |flag: &str, path: &Path| {
             land.windows(2)
                 .any(|w| w[0] == flag && Path::new(&w[1]) == path)
@@ -1299,7 +1404,7 @@ mod tests {
             .collect();
         assert_eq!(ports, ["3100", "4100"]);
         assert!(!land.iter().any(|a| a.starts_with("--unrestricted")));
-        assert!(!landrun_prefix(&plan, &[]).contains(&"--connect-tcp".to_string()));
+        assert!(!landrun_prefix(&plan, &[], &[]).contains(&"--connect-tcp".to_string()));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1317,6 +1422,7 @@ mod tests {
             mounts: &[],
             memory: memory_from(Some(" 6g ")),
             gateway_ports: &[],
+            own_ports: &[],
         });
         assert!(w.windows(2).any(|w| w == ["--memory", "6g"]));
         assert_eq!(w[image_index(&w[1..]).unwrap() + 1], "img");
@@ -1409,6 +1515,7 @@ mod tests {
             mounts: &mounts,
             memory: "3g",
             gateway_ports: GATEWAY_PORTS,
+            own_ports: &[],
         });
         // spawn-audit: test-only — renders the wrapper argv; spawned only by the gated live test.
         let mut cmd = Command::new(&w[0]);
@@ -1580,6 +1687,9 @@ mod tests {
         std::fs::write(clone.join("README"), "clone").unwrap();
         std::fs::write(sibling.join("other"), "sibling").unwrap();
         std::fs::write(ssh.join("id_ed25519"), "FAKE-SECRET-CANARY").unwrap();
+        // A mask outside every mount: rendered anyway (a late read path could be its ancestor).
+        let outside_mask = base.join("elsewhere").join(".aws");
+        std::fs::create_dir_all(&outside_mask).unwrap();
         let token = home.join(".token");
         std::fs::write(&token, "FAKE-TOKEN-CANARY").unwrap();
         let spec = SeatFloor {
@@ -1589,7 +1699,7 @@ mod tests {
             protected: vec![clone.clone()],
             readmitted: vec![],
             readmitted_files: vec![],
-            masks: vec![ssh.clone(), token.clone()],
+            masks: vec![ssh.clone(), token.clone(), outside_mask.clone()],
             pinned: vec![],
             net: vec![],
         };
@@ -1607,6 +1717,7 @@ mod tests {
             mounts: &mounts,
             memory: "3g",
             gateway_ports: GATEWAY_PORTS,
+            own_ports: &[],
         });
         let script = format!(
             "id -u; id -g; grep -E '^(CapEff|NoNewPrivs)' /proc/self/status; \
@@ -1681,6 +1792,124 @@ mod tests {
         ni.args(["network", "inspect", &name]);
         assert!(!output_within(ni, PROBE_TIMEOUT).unwrap().status.success());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Codex review r1 (P1): only a known path option's value before `--` is a mount; prompt
+    /// text that spells a path or an option never is.
+    #[test]
+    fn only_path_options_before_the_guard_name_mounts() {
+        let base = tmp("argvp");
+        let p = base.to_string_lossy().into_owned();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            argv_paths(&s(&["claude", "--settings", &p])),
+            vec![base.clone()]
+        );
+        assert_eq!(
+            argv_paths(&s(&["claude", &format!("--mcp-config={p}")])),
+            vec![base.clone()]
+        );
+        assert!(argv_paths(&s(&["codex", "exec", "--", &p])).is_empty());
+        assert!(argv_paths(&s(&["codex", "exec", "--", &format!("--settings={p}")])).is_empty());
+        assert!(argv_paths(&s(&["claude", "-p", &p])).is_empty());
+        assert!(argv_paths(&s(&["claude", "--model", &p])).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Codex review r1 (P1): a read path mounted late never uncovers a mask — every mask is
+    /// rendered up front, and a late path inside one is refused.
+    #[test]
+    fn a_late_read_path_never_uncovers_a_mask() {
+        let base = tmp("mask");
+        let tree = base.join("wt");
+        let home = base.join("home");
+        let ssh = home.join(".ssh");
+        for d in [&tree, &ssh] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let spec = SeatFloor {
+            profile: "governed".into(),
+            tree: tree.clone(),
+            writable: vec![tree.clone()],
+            protected: vec![],
+            readmitted: vec![],
+            readmitted_files: vec![],
+            masks: vec![ssh.clone()],
+            pinned: vec![],
+            net: vec![],
+        };
+        let mounts = mount_plan(&spec).unwrap();
+        assert!(
+            mounts.contains(&Mount::Tmpfs { path: ssh.clone() }),
+            "{mounts:?}"
+        );
+        let w = run_argv(&ContainerLaunch {
+            runtime: Path::new("docker"),
+            image: "img:1",
+            name: "wicked-seat-m",
+            network: "none",
+            workdir: &tree,
+            user: "1:1",
+            mounts: &mounts,
+            memory: "1g",
+            gateway_ports: &[],
+            own_ports: &[],
+        });
+        // spawn-audit: test-only — never spawned; inspects the finalized argv.
+        let mut cmd = Command::new(&w[0]);
+        cmd.args(&w[1..])
+            .args(["claude", "--add-dir", ssh.to_str().unwrap()]);
+        cmd.env(crate::gate_hook::READ_ROOTS_ENV, &home);
+        let fin = finalize(cmd);
+        let args: Vec<String> = fin
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let bind = |p: &Path| format!("type=bind,src={p},dst={p},readonly", p = p.display());
+        assert!(
+            !args.contains(&bind(&ssh)),
+            "a masked dir is never bound: {args:?}"
+        );
+        // The ancestor may be mounted; the mask over its .ssh stays.
+        assert!(args.contains(&bind(&home)), "{args:?}");
+        assert!(args
+            .iter()
+            .any(|a| a == &format!("type=tmpfs,dst={},tmpfs-size=1m", ssh.display())));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Codex review r1 (P2): a read-only unit outside a linked worktree still sees its tree.
+    #[test]
+    fn a_tree_no_list_exposes_is_mounted_read_only() {
+        let base = tmp("rotree");
+        let spec = SeatFloor {
+            profile: "governed".into(),
+            tree: base.clone(),
+            writable: vec![],
+            protected: vec![],
+            readmitted: vec![],
+            readmitted_files: vec![],
+            masks: vec![],
+            pinned: vec![],
+            net: vec![],
+        };
+        assert_eq!(
+            mount_plan(&spec).unwrap(),
+            vec![Mount::Bind {
+                path: base.clone(),
+                rw: false
+            }]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Codex review r1 (P2): the seat's own loopback server (opencode) may bind and connect.
+    #[test]
+    fn own_ports_get_bind_and_connect_grants() {
+        let land = landrun_prefix(&[], &[3000], &[4567]);
+        let has = |pair: &[&str]| land.windows(2).any(|w| w == pair);
+        assert!(has(&["--bind-tcp", "4567"]) && has(&["--connect-tcp", "4567"]));
+        assert!(!has(&["--bind-tcp", "3000"]));
     }
 
     #[test]

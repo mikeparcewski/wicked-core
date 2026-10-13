@@ -2227,7 +2227,7 @@ impl WrappedCliStepRunner {
             // (IG1-core-2) What armed the write boundary (`Ok(launcher)`), or why none did and
             // whether that was already disclosed — read by the `os_sandbox`-class arm below.
             let floor: Result<&'static str, (String, bool)>;
-            let sandbox = if os_sandbox {
+            let sandbox = if os_sandbox && !(governed && crate::container_floor::container_mode()) {
                 let ws = crate::validator::detect_worker_sandbox(&worker_write_roots);
                 if let Some(reason) = &ws.downgrade_reason {
                     if governed && !cfg!(windows) {
@@ -4789,7 +4789,7 @@ pub(crate) fn wrapped_exit_code(output: &str) -> Option<i32> {
 }
 
 fn run_bounded(
-    mut cmd: Command,
+    cmd: Command,
     timeout: Duration,
     emit: &DeltaSink,
     mut adapter: Box<dyn OutputAdapter>,
@@ -4813,6 +4813,13 @@ fn run_bounded(
             Vec::new(),
         ));
     }
+    // A seat container (the container floor): pass the carrier's env in by name and mount its
+    // read roots. FIRST: it rebuilds the command, so stdio and the process group are set on the
+    // rebuilt one below. The guard removes the container however this function ends (a panic
+    // included): a killed client leaves its container running.
+    let mut cmd = crate::container_floor::finalize(cmd);
+    let seat_container = crate::container_floor::seat_container(&cmd);
+    let _reap = crate::container_floor::ReapOnDrop(seat_container.clone());
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -4826,22 +4833,7 @@ fn run_bounded(
         // guard's comparison and still fold as clean).
         cmd.process_group(0);
     }
-    // A seat container (the container floor): pass the carrier's env in by name and mount its
-    // read roots; remembered so the container is removed however the client ends.
-    let mut cmd = crate::container_floor::finalize(cmd);
-    let seat_container = crate::container_floor::seat_container(&cmd);
-    let reap_seat = |_: ()| {
-        if let Some(seat) = &seat_container {
-            crate::container_floor::reap(seat);
-        }
-    };
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            reap_seat(());
-            return Err(e);
-        }
-    };
+    let mut child = cmd.spawn()?;
     let so = child.stdout.take().expect("piped stdout");
     let se = child.stderr.take().expect("piped stderr");
     let child_ref = &mut child;
@@ -4945,8 +4937,6 @@ fn run_bounded(
         let err = err_h.join().unwrap_or_default();
         (code, killed_by, out, usage, files, tools, err)
     });
-    // A killed client (cancel, deadline) leaves its container running: remove it by name.
-    reap_seat(());
 
     if let Some(sentinel) = killed_by {
         // Preserve what the CLI produced before the kill (debugging context on a hang).
@@ -6336,6 +6326,61 @@ mod tests {
             assert!(!out.governed);
         }
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir("run-unenf"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Container floor (codex review r1, P1): a seat wrapper goes through `run_bounded` — the
+    /// command `finalize` rebuilds keeps its piped stdio and process group (the rebuilt one used
+    /// to lose them and panic on `piped stdout`), its output streams, and the reap runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_seat_wrapper_runs_through_run_bounded_with_its_pipes_and_is_reaped() {
+        let dir = std::env::temp_dir().join(format!("wicked-cf-rb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        // A fake runtime: `run ...` prints its last argument; any other call (the reap) is logged.
+        let rt = dir.join("docker");
+        std::fs::write(
+            &rt,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = run ]; then for a; do last=$a; done; echo \"seat-said:$last\"; exit 0; fi\necho \"$@\" >> {}/reaped\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let w = crate::container_floor::run_argv(&crate::container_floor::ContainerLaunch {
+            runtime: &rt,
+            image: "img:1",
+            name: "wicked-seat-rb",
+            network: "none",
+            workdir: &dir,
+            user: "1:1",
+            mounts: &[],
+            memory: "1g",
+            gateway_ports: &[],
+            own_ports: &[],
+        });
+        // spawn-audit: test-only — a fake runtime script; proves the finalized wrapper's pipes.
+        let mut cmd = Command::new(&w[0]);
+        cmd.args(&w[1..]).args(["claude", "-p", "hello"]);
+        let emit = |_: &str| {};
+        let (code, out, _err, ..) = run_bounded(
+            cmd,
+            Duration::from_secs(20),
+            &emit,
+            Box::new(Passthrough),
+            None,
+        )
+        .expect("ran");
+        assert_eq!(code, 0);
+        assert!(out.contains("seat-said:hello"), "{out}");
+        let reaped = std::fs::read_to_string(dir.join("reaped")).unwrap_or_default();
+        assert!(reaped.contains("rm --force wicked-seat-rb"), "{reaped}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
