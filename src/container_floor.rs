@@ -1549,8 +1549,21 @@ pub fn seat_image_main(args: &[String]) -> i32 {
     }
 }
 
-// The container floor runs on Unix hosts only (native Windows is refused, tested in
-// `execute_wrapped`); its tests use Unix paths, links and tools throughout.
+/// Native Windows is refused (the floor mounts host paths at the same path, which a Linux
+/// container cannot do with Windows paths): no runtime is ever resolved there.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    #[test]
+    fn native_windows_never_resolves_a_runtime() {
+        assert!(matches!(
+            super::runtime(),
+            Err(crate::worker_sandbox::FloorUnarmed::ContainerUnsupportedHost)
+        ));
+    }
+}
+
+// The container floor runs on Unix hosts only (native Windows is refused: `windows_tests`); its
+// tests use Unix paths, links and tools throughout.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
