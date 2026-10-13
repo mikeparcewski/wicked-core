@@ -990,20 +990,6 @@ pub(crate) fn boundary_denial_tracked(
                     return Some((format!("Bash `cd` leaves the unit boundary: {d}"), fatal));
                 }
             }
-            // (core#922) FAIL CLOSED on a write target or `cd` destination the text cannot
-            // resolve — judged AFTER the literal ones, so a resolvable escape in the same command
-            // keeps its unit-fatal verdict. ADVISORY: nothing is known to have left the boundary,
-            // so the call is blocked and audited and the seat is told to spell the path.
-            if let Some(ShellTarget::Unresolved(word)) = writes
-                .iter()
-                .chain(&cds)
-                .find(|t| matches!(t, ShellTarget::Unresolved(_)))
-            {
-                return Some((
-                    format!("{UNRESOLVED_TARGET_REASON}: `{word}` — {UNRESOLVED_TARGET_REMEDY}"),
-                    false,
-                ));
-            }
             // ESTATE COMMAND FENCE (DES-GROUNDING-001 §7, issue #463): guard write-path access to
             // the SHARED project graph from a governed unit's Bash. Read-only `wicked-estate`
             // subcommands, and the estate stdio shim / `wicked-estate-mcp` run with `--readonly`
@@ -1029,6 +1015,21 @@ pub(crate) fn boundary_denial_tracked(
                         hit.segment, hit.why
                     ),
                     false, // placeholder — posture-based advisory/fatal decided in evaluate_tool_call
+                ));
+            }
+            // (core#922) FAIL CLOSED on a write target or `cd` destination the text cannot
+            // resolve — judged LAST, after every fence that knows a verdict (a resolvable escape
+            // stays unit-fatal, an estate write keeps its posture verdict). ADVISORY: nothing is
+            // known to have left the boundary, so the call is blocked and audited and the seat is
+            // told to spell the path.
+            if let Some(ShellTarget::Unresolved(word)) = writes
+                .iter()
+                .chain(&cds)
+                .find(|t| matches!(t, ShellTarget::Unresolved(_)))
+            {
+                return Some((
+                    format!("{UNRESOLVED_TARGET_REASON}: `{word}` — {UNRESOLVED_TARGET_REMEDY}"),
+                    false,
                 ));
             }
         }
@@ -1396,7 +1397,7 @@ pub(crate) fn bash_write_phase_scope(
 fn shell_tokens(command: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
-    let mut chars = command.chars();
+    let mut chars = command.chars().peekable();
     let mut in_single = false;
     let mut in_double = false;
     let flush = |cur: &mut String, out: &mut Vec<String>| {
@@ -1414,6 +1415,12 @@ fn shell_tokens(command: &str) -> Vec<String> {
             continue;
         }
         if ch == '\\' {
+            // (core#922 review) A backslash-newline is a LINE CONTINUATION, removed before the
+            // shell splits words (outside single quotes): it is no character of any word.
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+                continue;
+            }
             // Backslash escapes the next char: keep BOTH verbatim so an escaped `;`/`(`/`)` stays a
             // literal path byte, exactly as the pre-split whole-token tokenizer delivered it.
             cur.push(ch);
@@ -1559,7 +1566,7 @@ fn quoted_heredoc_on(line: &str) -> Option<(String, bool)> {
 /// [`classify_estate_command`]'s doc for the complete list of shapes a literal scan does not model.
 pub(crate) fn bash_write_targets(command: &str) -> Vec<String> {
     let mut targets: Vec<String> = Vec::new();
-    collect_bash_write_targets(command, true, &mut targets);
+    collect_bash_write_targets(command, true, None, &mut targets);
     // Drop standard shell write SINKS — writing to them discards or streams bytes, it does not place
     // a file outside the worktree, so they are not escapes. `> /dev/null` is in ~every real command
     // (the governed PageIndex pass failed on an `analyze` unit's `… > /dev/null` before this — a false
@@ -1595,19 +1602,25 @@ pub(crate) const UNRESOLVED_TARGET_REMEDY: &str = "the shell expands it at run t
     quote), so where it lands cannot be judged and the call is refused; spell the target as a \
     literal path (quote it if it holds spaces or glob characters)";
 
+/// Stands in, inside a `sh -c` string unquoted by [`lex_shell_word`]'s `keep` mode, for an
+/// expansion the OUTER shell performs (`$X`, `$(…)`, a backtick) whose value the text cannot give.
+/// A private-use character no command spells; a word holding it is unresolvable however the inner
+/// shell quotes it (`sh -c "echo x > '$X/f'"` writes wherever `$X` points).
+const OPAQUE_EXPANSION: char = '\u{E000}';
+
 /// Resolve ONE shell word to the path the shell writes, or `None` when the text cannot say
 /// ([`ShellTarget::Unresolved`]). POSIX-shell rules: `'…'` is fully literal; inside `"…"` a `\`
 /// escapes only `$`, `` ` ``, `"`, `\` and newline; a bare `\` escapes the next character; only an
 /// UNQUOTED leading `~` (alone or before `/`) is the home dir. On Windows a `\` is a path
 /// separator (the native and PowerShell reading, and how the scan always read it) — unless the
-/// Git Bash reading, where it is an escape, reaches a `..` segment the native one does not
-/// (`.\./x` is `../x` there): that word is refused rather than judged one way.
+/// Git Bash reading, where it is an escape, differs AND has a `..` segment: removing a `\` merges
+/// two segments (`a\b/../..` is `ab/../..` there), so the climb lands elsewhere and the word is
+/// refused rather than judged one way.
 pub(crate) fn resolve_shell_word(raw: &str, home: Option<&Path>) -> Option<String> {
-    let native = lex_shell_word(raw, home, false, !cfg!(windows))?;
+    let native = lex_shell_word(raw, home, false, !cfg!(windows))?.0;
     if cfg!(windows) && raw.contains('\\') {
-        let dot_dots = |s: &str| s.split(['/', '\\']).filter(|seg| *seg == "..").count();
-        if let Some(posix) = lex_shell_word(raw, home, false, true) {
-            if dot_dots(&posix) > dot_dots(&native) {
+        if let Some((posix, _)) = lex_shell_word(raw, home, false, true) {
+            if posix != native && posix.split(['/', '\\']).any(|seg| seg == "..") {
                 return None;
             }
         }
@@ -1615,14 +1628,22 @@ pub(crate) fn resolve_shell_word(raw: &str, home: Option<&Path>) -> Option<Strin
     Some(native)
 }
 
-/// The lexer behind [`resolve_shell_word`]. `keep` is quote removal ONLY — the string a `sh -c`
-/// wrapper hands its inner shell, which lexes it again: expansions stay verbatim (`$X`, `$(…)`,
-/// backticks, globs, braces, `~`) for that second pass to judge. Without `keep`, `$HOME` /
-/// `${HOME}` / a leading `~` are expanded through `home` (`None` home ⇒ unresolvable) and every
-/// other expansion makes the word unresolvable. `escapes` is whether `\` is an escape character.
-fn lex_shell_word(raw: &str, home: Option<&Path>, keep: bool, escapes: bool) -> Option<String> {
+/// The lexer behind [`resolve_shell_word`]; returns the word and whether it held an expansion the
+/// outer shell performs. `keep` is the string a `sh -c` wrapper hands its inner shell, which lexes
+/// it again: quotes removed and escapes applied, `$HOME`/`${HOME}` expanded through `home`, every
+/// other ACTIVE expansion replaced by [`OPAQUE_EXPANSION`], and globs, braces and `~` left for the
+/// inner pass. Without `keep`, `$HOME` / `${HOME}` / a leading `~` are expanded through `home`
+/// (`None` home ⇒ unresolvable) and every other expansion makes the word unresolvable. `escapes`
+/// is whether `\` is an escape character.
+fn lex_shell_word(
+    raw: &str,
+    home: Option<&Path>,
+    keep: bool,
+    escapes: bool,
+) -> Option<(String, bool)> {
     let chars: Vec<char> = raw.chars().collect();
     let mut out = String::new();
+    let mut expanded = false;
     let mut i = 0;
     if !keep && chars.first() == Some(&'~') {
         // `~` alone or `~/…` is the home dir; `~user`, `~+`, `~-` name other directories.
@@ -1634,47 +1655,66 @@ fn lex_shell_word(raw: &str, home: Option<&Path>, keep: bool, escapes: bool) -> 
         out.push_str(&home?.to_string_lossy());
         i = 1;
     }
+    let name_char = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
     // `$HOME` (not followed by a name character) or `${HOME}` at `chars[at]`: its length.
     let home_var = |at: usize| -> Option<usize> {
         let rest: String = chars[at..].iter().take(7).collect();
         if rest.starts_with("${HOME}") {
             return Some(7);
         }
-        let name_char = |c: &char| c.is_ascii_alphanumeric() || *c == '_';
         (rest.starts_with("$HOME") && !chars.get(at + 5).is_some_and(name_char)).then_some(5)
     };
-    // A `$(…)` / backtick span kept verbatim in `keep` mode: the index just past its end, or
-    // `None` when it does not close.
-    let span_end = |at: usize| -> Option<usize> {
-        if chars[at] == '`' {
-            let mut j = at + 1;
+    // The index just past the expansion that starts at `chars[at]` (`$`/`` ` ``): `$(…)` to its
+    // matching paren, `${…}` to its brace, a backtick to the next unescaped one, `$NAME`, or a
+    // one-character special (`$1`, `$?`). `None` when it does not close.
+    let expansion_end = |at: usize| -> Option<usize> {
+        let closing = |open: char, close: char, from: usize| -> Option<usize> {
+            let mut depth = 1usize;
+            let mut j = from;
             while j < chars.len() {
-                match chars[j] {
-                    '\\' => j += 2,
-                    '`' => return Some(j + 1),
-                    _ => j += 1,
+                let c = chars[j];
+                if c == '\\' {
+                    j += 2;
+                    continue;
                 }
-            }
-            return None;
-        }
-        let mut depth = 1usize;
-        for (j, c) in chars.iter().enumerate().skip(at + 1) {
-            match c {
-                '(' => depth += 1,
-                ')' => {
+                if c == close && open != close {
                     depth -= 1;
                     if depth == 0 {
                         return Some(j + 1);
                     }
+                } else if c == close {
+                    return Some(j + 1);
+                } else if c == open {
+                    depth += 1;
                 }
-                _ => {}
+                j += 1;
             }
+            None
+        };
+        if chars[at] == '`' {
+            return closing('`', '`', at + 1);
         }
-        None
+        match chars.get(at + 1) {
+            Some('(') => closing('(', ')', at + 2),
+            Some('{') => closing('{', '}', at + 2),
+            Some(c) if name_char(c) && !c.is_ascii_digit() => {
+                let mut j = at + 1;
+                while chars.get(j).is_some_and(name_char) {
+                    j += 1;
+                }
+                Some(j)
+            }
+            Some(_) => Some(at + 2),
+            None => Some(at + 1),
+        }
     };
     let (mut single, mut double) = (false, false);
     while i < chars.len() {
         let c = chars[i];
+        if c == OPAQUE_EXPANSION {
+            // An outer expansion the `-c` unquoting could not compute — never a literal path.
+            return None;
+        }
         if single {
             if c == '\'' {
                 single = false;
@@ -1709,22 +1749,21 @@ fn lex_shell_word(raw: &str, home: Option<&Path>, keep: bool, escapes: bool) -> 
                 i += 1;
             }
             '$' | '`' => {
-                if keep {
-                    // `$'…'` / `$"…"` are decoded by THIS shell — not modelled, so unresolvable.
-                    if c == '$' && !double && matches!(chars.get(i + 1), Some('\'' | '"')) {
-                        return None;
-                    }
-                    let end = if c == '`' || chars.get(i + 1) == Some(&'(') {
-                        span_end(if c == '`' { i } else { i + 1 })?
-                    } else {
-                        i + 1
-                    };
-                    out.extend(&chars[i..end]);
-                    i = end;
-                } else {
-                    let len = if c == '$' { home_var(i)? } else { return None };
-                    out.push_str(&home?.to_string_lossy());
+                // `$'…'` / `$"…"` are decoded by THIS shell — not modelled, so unresolvable.
+                if c == '$' && !double && matches!(chars.get(i + 1), Some('\'' | '"')) {
+                    return None;
+                }
+                // (A trailing `$` is literal to the shell, but `shell_tokens` splits `$(…)` at
+                // its bare `(`, leaving `$` as the whole target word: it stays unresolvable.)
+                expanded = true;
+                if let (Some(len), Some(h)) = (home_var(i).filter(|_| c == '$'), home) {
+                    out.push_str(&h.to_string_lossy());
                     i += len;
+                } else if keep {
+                    out.push(OPAQUE_EXPANSION);
+                    i = expansion_end(i)?;
+                } else {
+                    return None;
                 }
             }
             '*' | '?' | '[' | '{' if !double && !keep => return None,
@@ -1738,7 +1777,7 @@ fn lex_shell_word(raw: &str, home: Option<&Path>, keep: bool, escapes: bool) -> 
         return None;
     }
     if keep {
-        return Some(out);
+        return Some((out, expanded));
     }
     if out.is_empty() {
         return None;
@@ -1748,33 +1787,107 @@ fn lex_shell_word(raw: &str, home: Option<&Path>, keep: bool, escapes: bool) -> 
     if out.starts_with('~') {
         out.insert_str(0, "./");
     }
-    Some(out)
+    Some((out, expanded))
+}
+
+/// Does `command` name `HOME` as a variable it may SET (`HOME=…`, `export HOME`, `read HOME`,
+/// `unset HOME`, …)? Any `HOME` identifier not spelled as an expansion (`$HOME`, `${HOME}`)
+/// counts. When it does, the captured home is not the value `~` and `$HOME` will have, so both
+/// are unresolvable for that command (codex review of core#922: `HOME=../..; mkdir "src/$HOME"`).
+fn command_may_set_home(command: &str) -> bool {
+    let b = command.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    command.match_indices("HOME").any(|(at, _)| {
+        let before = at.checked_sub(1).map(|j| b[j]);
+        let after = b.get(at + 4).copied();
+        let expansion = matches!(before, Some(b'$'))
+            || (matches!(before, Some(b'{')) && at >= 2 && b[at - 2] == b'$');
+        !before.is_some_and(ident) && !after.is_some_and(ident) && !expansion
+    })
 }
 
 /// [`bash_write_targets`] as the shell will see them ([`ShellTarget`], core#922): each word
 /// resolved through [`resolve_shell_word`], standard sinks dropped AFTER resolution (so a quoted
 /// `"/dev/null"` is the sink it names). The boundary and the phase-scope fence judge these.
 pub(crate) fn resolved_bash_write_targets(command: &str, home: Option<&Path>) -> Vec<ShellTarget> {
+    let home = home.filter(|_| !command_may_set_home(command));
     let mut words: Vec<String> = Vec::new();
-    collect_bash_write_targets(command, true, &mut words);
-    resolve_targets(words, home)
+    collect_bash_write_targets(command, true, home, &mut words);
+    resolve_targets(command, words, home, true)
 }
 
-fn resolve_targets(words: Vec<String>, home: Option<&Path>) -> Vec<ShellTarget> {
+/// Resolve each word of `command`; `drop_sinks` drops the standard write sinks — for WRITE
+/// targets only, never for a `cd` destination. A `/dev/fd/N` path is whatever descriptor N holds
+/// at run time, so it is unresolvable; so are `/dev/stdout`/`/dev/stderr` when the command
+/// read-opens fd 1 or 2 (`exec 1</outside/f; echo x > /dev/stdout` writes `/outside/f`).
+fn resolve_targets(
+    command: &str,
+    words: Vec<String>,
+    home: Option<&Path>,
+    drop_sinks: bool,
+) -> Vec<ShellTarget> {
+    let std_reopened = command.contains("1<") || command.contains("2<");
     words
         .into_iter()
         .filter_map(|w| match resolve_shell_word(&w, home) {
-            Some(p) if is_safe_write_sink(&p) => None,
+            Some(p) if p.starts_with("/dev/fd/") => Some(ShellTarget::Unresolved(w)),
+            Some(p) if std_reopened && matches!(p.as_str(), "/dev/stdout" | "/dev/stderr") => {
+                Some(ShellTarget::Unresolved(w))
+            }
+            Some(p) if drop_sinks && is_safe_write_sink(&p) => None,
             Some(p) => Some(ShellTarget::Path(p)),
             None => Some(ShellTarget::Unresolved(w)),
         })
         .collect()
 }
 
+/// `word` with the literal operand prefix `prefix` (`of=`) removed as the SHELL reads it — after
+/// quote removal, so `"of=/x"`, `of="/x"` and `"of"="/x"` all name the operand `/x` — and the rest
+/// of the word kept as spelled, re-opening the quote the prefix ended inside. `None` when the word
+/// does not start with `prefix`.
+fn strip_shell_prefix(word: &str, prefix: &str) -> Option<String> {
+    let want: Vec<char> = prefix.chars().collect();
+    let (mut single, mut double, mut got) = (false, false, 0usize);
+    let mut it = word.char_indices().peekable();
+    while got < want.len() {
+        let (_, c) = it.next()?;
+        let lit = match c {
+            '\'' if !double => {
+                single = !single;
+                continue;
+            }
+            '"' if !single => {
+                double = !double;
+                continue;
+            }
+            '\\' if !single => it.next()?.1,
+            _ => c,
+        };
+        if lit != want[got] {
+            return None;
+        }
+        got += 1;
+    }
+    let rest = it.peek().map_or("", |(at, _)| &word[*at..]);
+    let reopen = if single {
+        "'"
+    } else if double {
+        "\""
+    } else {
+        ""
+    };
+    Some(format!("{reopen}{rest}"))
+}
+
 /// The scan behind [`bash_write_targets`]. `unwrap_inline` is true for the command line the worker
 /// issued and false for the ONE inner rescan of a shell `-c` string — a `-c` wrapper found INSIDE
 /// that string is the documented two-level pass, not unwrapped again.
-fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut Vec<String>) {
+fn collect_bash_write_targets(
+    command: &str,
+    unwrap_inline: bool,
+    home: Option<&Path>,
+    targets: &mut Vec<String>,
+) {
     // (core#552) The body of a QUOTED-delimiter heredoc is data the shell never expands, so its
     // words are no command's arguments: `tee docs/x.md <<'EOF'` naming `/var/log/app.log` in its
     // body writes only `docs/x.md`. An unquoted heredoc's body still expands `$(…)`, so it stays.
@@ -1832,11 +1945,23 @@ fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut 
                     // `echo x > "/abs"`), not the word with one quote pair peeled. A word that
                     // cannot be unquoted (`$'…'`, an unterminated quote) is itself an unresolved
                     // target: what the inner shell runs cannot be read, so it fails closed.
-                    match lex_shell_word(word, None, true, !cfg!(windows)) {
-                        Some(exact) => collect_bash_write_targets(&exact, false, targets),
+                    //
+                    // An expansion the OUTER shell performs (`sh -c "… $X …"`) has a value the
+                    // text cannot give, and that value is lexed again by the inner shell — it may
+                    // BE a target, or a redirect. A word naming it is unresolvable (it carries
+                    // [`OPAQUE_EXPANSION`]); and when the inner command writes anything at all, the
+                    // `-c` word itself is too, since the value can steer where.
+                    match lex_shell_word(word, home, true, !cfg!(windows)) {
+                        Some((exact, expanded)) => {
+                            let before = targets.len();
+                            collect_bash_write_targets(&exact, false, home, targets);
+                            if expanded && targets.len() > before {
+                                targets.push(word.to_string());
+                            }
+                        }
                         None => {
                             targets.push(word.to_string());
-                            collect_bash_write_targets(inner, false, targets);
+                            collect_bash_write_targets(inner, false, home, targets);
                         }
                     }
                 }
@@ -1859,11 +1984,10 @@ fn collect_bash_write_targets(command: &str, unwrap_inline: bool, targets: &mut 
             }
             "dd" => {
                 for w in &words[idx + 1..] {
-                    // (core#922) `"of=/abs"` is the operand `of=/abs` too: drop the `of=` after
-                    // any leading quote characters, keeping the quoting around the path intact.
-                    let lead = w.len() - w.trim_start_matches(['"', '\'']).len();
-                    if w[lead..].starts_with("of=") {
-                        targets.push(format!("{}{}", &w[..lead], &w[lead + 3..]));
+                    // (core#922) `"of=/abs"` and `"of"="/abs"` are the operand `of=/abs` too: the
+                    // prefix is matched after quote removal, the path keeps its own quoting.
+                    if let Some(f) = strip_shell_prefix(w, "of=") {
+                        targets.push(f);
                     }
                 }
             }
@@ -2107,8 +2231,10 @@ fn bash_cd_escape_targets(command: &str, home: Option<&Path>) -> Vec<ShellTarget
     if bash_write_targets(command).is_empty() && !command_contains_write_capable_program(command) {
         return Vec::new();
     }
-    // (core#922) Judged as the shell resolves the destination, like the write targets are.
-    resolve_targets(bash_cd_targets_inner(command, true), home)
+    // (core#922) Judged as the shell resolves the destination, like the write targets are — and
+    // never dropped as a write SINK (`cd /dev/fd/3` enters whatever directory fd 3 holds).
+    let home = home.filter(|_| !command_may_set_home(command));
+    resolve_targets(command, bash_cd_targets_inner(command, true), home, false)
 }
 
 fn bash_cd_targets_inner(command: &str, unwrap_inline: bool) -> Vec<String> {
@@ -2135,7 +2261,7 @@ fn bash_cd_targets_inner(command: &str, unwrap_inline: bool) -> Vec<String> {
             Unwrapped::Inline { inner, word } => {
                 if unwrap_inline {
                     // (core#922) The inner shell's text, exactly unquoted — as the write scan.
-                    let exact = lex_shell_word(word, None, true, !cfg!(windows));
+                    let exact = lex_shell_word(word, None, true, !cfg!(windows)).map(|(s, _)| s);
                     targets.extend(bash_cd_targets_inner(
                         exact.as_deref().unwrap_or(inner),
                         false,
@@ -3226,12 +3352,17 @@ fn classify_estate_command_in(
 }
 
 /// A standard character-device write sink (not a filesystem location that can hold an escaped file).
-/// `> /dev/null` / `2>/dev/stderr` / `>/dev/fd/3` are ordinary output plumbing, never an escape.
+/// `> /dev/null` / `2>/dev/stderr` are ordinary output plumbing, never an escape.
+///
+/// `/dev/fd/N` is NOT one (core#922 review): it reopens whatever descriptor N holds, so
+/// `exec 3</outside/f; echo x > /dev/fd/3` writes `/outside/f` on Linux. [`resolve_targets`]
+/// makes it unresolvable, and `/dev/stdout`/`/dev/stderr` too when the command read-opens fd 1
+/// or 2 (`exec 1</outside/f`).
 fn is_safe_write_sink(target: &str) -> bool {
     matches!(
         target,
         "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/tty" | "/dev/zero"
-    ) || target.starts_with("/dev/fd/")
+    )
 }
 
 /// Returns `true` for fd-dup redirect operators (`2>&1`, `>&2`, `1>&2`) that appear in the
@@ -11567,11 +11698,54 @@ mod core922_quoted_target_tests {
             "no home: `$HOME` is unresolvable"
         );
         // The `sh -c` string as the inner shell receives it: quotes off, expansions kept.
+        // The OUTER shell's expansions are opaque, except `$HOME`, which it knows.
+        let m = OPAQUE_EXPANSION;
         assert_eq!(
-            lex_shell_word("\"echo $X > \\\"/a\\\" $(date \"+%s\")\"", None, true, true).as_deref(),
-            Some("echo $X > \"/a\" $(date \"+%s\")")
+            lex_shell_word(
+                "\"echo $X > \\\"/a\\\" $(date \"+%s\") `id`\"",
+                None,
+                true,
+                true
+            ),
+            Some((format!("echo {m} > \"/a\" {m} {m}"), true))
+        );
+        assert_eq!(
+            lex_shell_word("\"echo x > '$HOME/e' '${HOME}'\"", Some(h), true, true),
+            Some(("echo x > '/h/e' '/h'".to_string(), true))
+        );
+        assert_eq!(
+            lex_shell_word("'echo $X > \"$(id)\"'", None, true, true),
+            Some(("echo $X > \"$(id)\"".to_string(), false)),
+            "single-quoted: nothing is expanded by the outer shell"
         );
         assert_eq!(lex_shell_word("$'echo x'", None, true, true), None);
+        assert_eq!(
+            resolve_shell_word(&format!("'{m}'"), Some(h)),
+            None,
+            "opaque even when quoted"
+        );
+        // `dd`'s operand prefix is matched after quote removal.
+        for (w, rest) in [
+            ("of=/x", "/x"),
+            ("\"of=/x\"", "\"/x\""),
+            ("\"of\"=\"/x\"", "\"/x\""),
+            ("'of'=~/x", "~/x"),
+            ("o\\f=/x", "/x"),
+        ] {
+            assert_eq!(strip_shell_prefix(w, "of=").as_deref(), Some(rest), "{w}");
+        }
+        assert_eq!(strip_shell_prefix("if=/x", "of="), None);
+        assert_eq!(strip_shell_prefix("\"of", "of="), None);
+        // `HOME` as a variable the command may set — not `$HOME`, `${HOME}`, or `WICKED_HOME`.
+        for (cmd, sets) in [
+            ("HOME=../..; mkdir \"src/$HOME\"", true),
+            ("export HOME; touch ~/f", true),
+            ("unset HOME", true),
+            ("echo $HOME ${HOME} > f", false),
+            ("echo $WICKED_HOME > f; WICKED_HOME=x true", false),
+        ] {
+            assert_eq!(command_may_set_home(cmd), sets, "{cmd}");
+        }
     }
 
     /// FAIL CLOSED: a target the command text cannot resolve is refused (advisory — the seat is
@@ -11604,6 +11778,73 @@ mod core922_quoted_target_tests {
         assert!(
             wrong.is_empty(),
             "unresolvable targets not refused (advisory): {wrong:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&f.base);
+    }
+
+    /// codex review round 1 of core#922: each shape it showed admitted, now refused — or, for the
+    /// line continuation and the estate verdict, judged as it must be.
+    #[test]
+    fn review_round_1_shapes() {
+        let f = fx("r1");
+        let o = w(&f.outside.join("evil"));
+        let outside = w(&f.outside);
+        let mut admitted: Vec<String> = Vec::new();
+        for cmd in [
+            // An outer `$HOME` inside inner single quotes: the OUTER shell expands it.
+            "sh -c \"echo x > '$HOME/evil'\"".to_string(),
+            // Any other outer expansion is opaque, however the inner shell quotes it.
+            "sh -c \"echo x > '$X/evil'\"".to_string(),
+            "sh -c \"touch $(pwd)/f\"".to_string(),
+            "sh -c \"echo $R > f\"".to_string(),
+            // A descriptor path is whatever the descriptor holds.
+            format!("exec 3<{outside}; cd /dev/fd/3 && touch f"),
+            format!("exec 3<{o}; echo x > /dev/fd/3"),
+            format!("exec 1<{o}; echo x > /dev/stdout"),
+            // `dd`'s operand prefix after quote removal.
+            format!("dd if=/dev/zero \"of\"=\"{o}\" bs=1 count=1"),
+            format!("dd if=/dev/zero 'of='{o}"),
+            // HOME the command sets is not the captured home.
+            "HOME=../../outside; mkdir -p \"src/$HOME\"".to_string(),
+            "export HOME=/; touch ~/f".to_string(),
+        ] {
+            if boundary(&f, &cmd).is_none() {
+                admitted.push(cmd);
+            }
+        }
+        assert!(admitted.is_empty(), "review shapes admitted: {admitted:#?}");
+        // An unresolved target must not mask the estate fence's verdict.
+        let (reason, _) = boundary(&f, "touch \"$OUT/f\"; wicked-estate index .").expect("refused");
+        assert!(reason.starts_with(ESTATE_DENY_REASON_PREFIX), "{reason}");
+        // A line continuation is no word: an ordinary in-tree `mkdir` is admitted.
+        assert_eq!(boundary(&f, "mkdir -p \\\n  src/a src/b"), None);
+        assert_eq!(
+            boundary(&f, "echo x >/dev/stderr; echo y 2>/dev/null"),
+            None
+        );
+        assert_eq!(
+            boundary(&f, "sh -c 'echo $X'"),
+            None,
+            "no write, nothing to judge"
+        );
+        assert_eq!(
+            boundary(&f, "sh -c \"echo $X\""),
+            None,
+            "no write, nothing to judge"
+        );
+        let _ = std::fs::remove_dir_all(&f.base);
+    }
+
+    /// Windows: `\` is a separator to the scan, an escape to Git Bash. A word whose Git Bash reading
+    /// differs and climbs with `..` is refused (`a\b/../..` is `ab/../..` there).
+    #[cfg(windows)]
+    #[test]
+    fn windows_backslash_reading_that_climbs_is_refused() {
+        let f = fx("win");
+        assert!(boundary(&f, "echo x > a\\b/../../outside/f").is_some());
+        assert_eq!(
+            boundary(&f, &format!("echo x > {}", w(&f.wt.join("src").join("x")))),
+            None
         );
         let _ = std::fs::remove_dir_all(&f.base);
     }
