@@ -14,6 +14,55 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **One OS floor for every governed seat, codex included (step 0 of process-boundary
+  governance).** A governed unit now runs inside a kernel floor on both carriers (the wrapped CLI
+  spawn and the ACP bridge spawn), whatever its seat, governance class or tree. Writes are denied
+  by default; the unit's tree and the repository metadata a commit on the run branch writes, the
+  handed write roots, the seat's own home, its cache and temp dirs and the run's governance-log
+  dir are allowed back, so the operator's home is write-denied. Reads of credential paths are
+  masked (`~/.ssh`, `~/.aws`, `~/.gnupg`, the gh/git/forge logins, `~/.claude`, `~/.codex`,
+  `~/.pi`, `~/.copilot`, `~/.gemini`, opencode's config and auth, `~/.netrc`,
+  `~/.git-credentials`, `~/.docker`, `~/.kube`), except a seat's own home under the inherit hatch.
+  A fenced unit (read-only, deliverable-roots) gets a separate **read-only profile**: no write on
+  the tree and none on its git metadata either (gitdir, `objects`, `refs`, `logs`,
+  `packed-refs`), so a "read-only" seat cannot `git update-ref` another branch; its temp and build
+  output go to a per-attempt check scratch. Package caches (`CARGO_HOME`, npm, yarn, pnpm, pip,
+  uv, go, `XDG_CACHE_HOME`) are pointed into a per-seat cache under the worker home: writing the
+  operator's own caches is denied, because a worker could poison the operator's next build.
+  - **Network.** On macOS (Seatbelt) outbound traffic is limited to TCP 443 on any host (the model
+    APIs), the system DNS socket, the seat's pinned loopback ports (the crew MCP broker, a
+    loopback `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`, opencode's own server) and a configured
+    proxy's port; `WICKED_WORKER_NET` adds `localhost:<port>` / `*:<port>` grants. SBPL cannot
+    filter by host name, so "only the model hosts" is not expressible: a loopback gateway is the
+    follow-up. Every other local daemon is unreachable. On Linux (`bwrap`) the network stays open;
+    pinning it needs a network namespace plus an egress proxy.
+  - **Each CLI's own sandbox is off under ours.** macOS refuses a nested sandbox apply under any
+    outer profile (`sandbox_apply: Operation not permitted`, exit 71), so codex runs
+    `--sandbox danger-full-access` under the floor (the codex exception, `SeatArmsItsOwn` /
+    `seat:codex`, is removed); claude's own sandbox is never enabled and `CLAUDE_CODE_TMPDIR` is
+    set (claude ignores `TMPDIR` for its Bash tool); a wrapped `opencode run` starts
+    `opencode serve` on a pinned loopback port inside the same floor, with a per-spawn password,
+    instead of the shared background service; pi keeps its own agent dir. The ungoverned
+    repository boundary still never wraps `codex-acp`, whose sandbox has no off switch; a governed
+    codex unit never rides it (codex is not admitted to ACP input governance, so it runs wrapped).
+  - **Fail closed.** On macOS and Linux a governed unit whose floor cannot arm is refused with
+    `could not run this governed unit: its OS floor did not arm — <why>`, which fails it over to
+    the next eligible seat (as crew#998's refusal does); it never runs unconfined. **Windows has no
+    floor yet:** a governed unit keeps today's behaviour (the text fences and the worktree guard),
+    and the record labels it `no OS floor` (`sandboxUnenforced`, and the shadow log). Refusing
+    would block every Windows run.
+  - **macOS interim floor.** The Seatbelt profile is labelled `macOS interim floor` in the record:
+    it is the interim fallback until the container floor (a required container runtime for
+    governed runs) replaces it. Its logic is isolated in `worker_sandbox::sbpl_seat_profile`.
+  - **Shadow mode.** The text fences stay authoritative and none is deleted. Beside each governed
+    unit's decisions log, `floor-shadow.ndjson` records an `arm` line (launcher, profile, roots,
+    masks, network, label), a `call` line per judged tool call (the carrier, the old verdict, the
+    floor's verdict for the same call and its basis, and the agreement class, notably
+    `old_denies_floor_allows`) and a `unit_summary` with the counts. This is the evidence the later
+    deletion steps need.
+  - `sandboxPosture` now predicts the host's launcher for every governed unit (the class and
+    worktree preconditions are gone with the floor's universality).
+
 - **The Bash write check judges the path the shell writes (#922).** It used to judge each target
   word as spelled, quotes included. A quoted absolute path was joined onto the worktree, so
   `echo x > "/outside/f"` (and the same with `'…'`, `>>`, `2>`, `tee`, `mkdir`, `touch`, `cp`, `mv`,

@@ -6184,16 +6184,15 @@ mod tests {
         );
     }
 
-    /// FINDING-063. A governed unit routed to a non-claude CLI cannot be armed — gate-hook
-    /// injection rides `--settings`, which only claude reads — so it runs with its tool calls
-    /// unchecked. That is a deliberate trade (failing it would take out every `evaluator_distinct`
-    /// unit), but it must not be SILENT: `governed: false` is also what an ungoverned-by-design
-    /// unit reports, and the actor keys the ARMED-marker fail-closed fold off exactly that flag
-    /// (actor.rs), so an unenforced unit slips past the erasure check too. The event is the only
-    /// thing that distinguishes "not asked for" from "asked for and not applied".
+    /// FINDING-063, step 0. A governed unit routed to a non-claude CLI has no gate-hook adapter
+    /// (`--settings` is claude's), so before step 0 a floor-class seat outside a run worktree ran
+    /// with its tool calls unchecked and said so. Now the seat floor arms for every governed unit,
+    /// worktree or not: where the launcher arms, the unit is governed by the floor (its ARMED
+    /// marker written, no `governanceUnenforced`); where it cannot (macOS / Linux), the unit is
+    /// REFUSED — never run unconfined, and never quietly.
     #[cfg(unix)]
     #[test]
-    fn a_governed_unit_on_a_cli_that_cannot_be_armed_says_so_instead_of_going_quiet() {
+    fn a_governed_unit_outside_a_worktree_is_floored_or_refused_never_quiet() {
         // Wrapped exec path ⇒ env write lock + "no snapshot" pinned (#402 pass 3; see
         // `scratch_redirect_applies_to_a_nonclaude_seat`).
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
@@ -6235,41 +6234,40 @@ mod tests {
             required_skills: Vec::new(),
         };
 
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir("run-unenf"));
         let out = runner.run_unit(&input);
-
-        let unenforced = rx
+        let unenforced: Vec<_> = rx
             .try_iter()
-            .filter_map(|c| match c {
-                crate::command::Command::EmitEvent(
-                    crate::event::CoreEvent::GovernanceUnenforced {
-                        cli, reason, ord, ..
-                    },
-                ) => Some((cli, reason, ord)),
-                _ => None,
+            .filter(|c| {
+                matches!(
+                    c,
+                    crate::command::Command::EmitEvent(
+                        crate::event::CoreEvent::GovernanceUnenforced { .. }
+                    )
+                )
             })
-            .next()
-            .expect("a governed unit that could not be armed must announce it");
-        assert_eq!(
-            unenforced.0, "/bin/echo",
-            "names the binary, not the seat key"
-        );
-        assert_eq!(unenforced.2, 4);
-        // IG1-core-2: agy is of class `os_sandbox`; a scratch dir is not a run worktree, so the
-        // floor did not arm — the disclosure names that cause, and `sandboxUnenforced` rides it.
-        assert!(
-            unenforced
-                .1
-                .contains("its OS-sandbox governance floor did not arm (not_a_worktree"),
-            "the reason must say WHY it could not be armed: {}",
-            unenforced.1
-        );
-        // The unit still runs — this is a disclosure, not a fallback or a failure.
-        assert_eq!(out.status, StepStatus::Ok);
-        assert!(!out.governed, "and it is honestly reported as ungoverned");
-        assert!(
-            !crate::gate_hook::decisions_path_for("run-unenf", 0).exists(),
-            "no marker is written when the floor did not arm"
-        );
+            .collect();
+        if crate::worker_sandbox::boundary_tool().is_ok() {
+            assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+            assert!(out.governed, "the floor governs it: {}", out.output);
+            assert!(unenforced.is_empty(), "nothing ran unchecked");
+            let shadow = crate::floor_shadow::shadow_path(&crate::gate_hook::decisions_path_for(
+                "run-unenf",
+                0,
+            ));
+            let log = std::fs::read_to_string(&shadow).expect("the shadow log has the arm line");
+            assert!(log.contains("\"kind\":\"arm\""), "{log}");
+            assert!(log.contains("\"kind\":\"unit_summary\""), "{log}");
+        } else {
+            assert_eq!(out.status, StepStatus::Failed);
+            assert!(
+                out.output.contains("could not run this governed unit"),
+                "{}",
+                out.output
+            );
+            assert!(!out.governed);
+        }
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir("run-unenf"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

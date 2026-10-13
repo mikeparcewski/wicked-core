@@ -3662,6 +3662,11 @@ pub(crate) fn evaluate_tool_call(
     crate::floor_shadow::record_call(
         Path::new(decisions_path),
         phase,
+        if boundary.is_some() {
+            CARRIER_ACP
+        } else {
+            CARRIER_WRAPPED_CLI
+        },
         tool,
         input,
         &cwd,
@@ -11553,10 +11558,10 @@ mod phase_scope_tests {
     fn both_carriers_actually_consult_the_phase_scope() {
         let src = include_str!("gate_hook.rs");
         let body = src
-            .split("pub(crate) fn evaluate_tool_call")
+            .split("fn evaluate_tool_call_judged(")
             .nth(1)
             .and_then(|b| b.split("\n/// ").next())
-            .expect("evaluate_tool_call is still a top-level fn");
+            .expect("evaluate_tool_call_judged is still a top-level fn");
         assert!(
             body.contains("phase_scope_denial("),
             "evaluate_tool_call no longer consults the phase scope — the helper is live and \
