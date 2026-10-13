@@ -953,10 +953,14 @@ pub(crate) const OPENCODE_PASSWORD_ENVS: [&str; 2] =
 
 /// A free loopback port for a seat's own server (bound and released; the seat binds it next).
 pub(crate) fn free_loopback_port() -> Option<u16> {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map(|a| a.port())
+    // Never the container floor's canary port: the seat launcher refuses a policy granting it.
+    (0..4).find_map(|_| {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .ok()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.port())
+            .filter(|p| *p != crate::container_floor::CANARY_PORT)
+    })
 }
 
 /// The conventional configuration dirs a CLI reads under the operator's own home — what a seat
