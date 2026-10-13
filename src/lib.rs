@@ -28,6 +28,7 @@ mod code_graph;
 mod codex_skills;
 mod command;
 mod consent_plan;
+mod container_floor;
 mod decision;
 mod deliver_lift;
 mod diagnostic;
@@ -143,6 +144,7 @@ pub use code_graph::{
     index_repo, rank_symbols, recon_repo, repo_graph_root_for_store, RankedSymbol,
 };
 pub use command::InjectTarget;
+pub use container_floor::seat_image_main;
 pub use decision::{DecisionRequest, DecisionVerdict};
 pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
 pub use domain::{

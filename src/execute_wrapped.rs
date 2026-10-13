@@ -2142,9 +2142,12 @@ impl WrappedCliStepRunner {
             // (IG1-core-2) A seat of governance class `os_sandbox` is governed by the OS write
             // boundary instead: whether that floor arms is only known at spawn (below), so its
             // disclosure — or its ARMED marker — is decided there.
+            // The container floor governs every seat it runs, whatever its class: the same
+            // spawn-time decision.
             (Some(_), false)
-                if seat_governance_class(&cli_key)
-                    == wicked_council::GovernanceClass::OsSandboxFloor =>
+                if crate::container_floor::container_mode()
+                    || seat_governance_class(&cli_key)
+                        == wicked_council::GovernanceClass::OsSandboxFloor =>
             {
                 floor_pending = true;
                 None
@@ -2205,6 +2208,14 @@ impl WrappedCliStepRunner {
                 |g| armed_write_root_paths(&cwd, &g.extra_write_roots, graph_write.as_deref()),
             );
             let os_sandbox = worker_os_sandbox_enabled(&cli_key);
+            let governed = input.governance.is_some();
+            // Container floor: the seat's env under it (temp/caches inside dirs it admits, the
+            // opencode server password) and its container + network, removed however the unit
+            // ends (held to the end of this scope).
+            let mut floor_env: Vec<(&'static str, PathBuf)> = Vec::new();
+            let mut opencode_password: Option<String> = None;
+            let mut seat_cleanup: Option<crate::container_floor::ReapOnDrop> = None;
+            let mut scratch_guard: Option<crate::container_floor::RemoveOnDrop> = None;
             // A1: a requested kernel floor that cannot arm DISCLOSES AND CONTINUES rather than
             // failing the unit — `detect_worker_sandbox` returns a best-effort (empty-wrapper)
             // sandbox with a downgrade reason, and we emit a `SandboxUnenforced` disclosure (the
@@ -2214,7 +2225,133 @@ impl WrappedCliStepRunner {
             // (IG1-core-2) What armed the write boundary (`Ok(launcher)`), or why none did and
             // whether that was already disclosed — read by the `os_sandbox`-class arm below.
             let floor: Result<&'static str, (String, bool)>;
-            let sandbox = if os_sandbox {
+            let sandbox = if governed && crate::container_floor::container_mode() {
+                // The container floor (opt-in, WICKED_SEAT_FLOOR=container): the unit's floor —
+                // writes only to its tree and admitted roots (none of the tree under a fenced
+                // posture), git state, its seat home, secrets masked — rendered as a hardened
+                // seat container. Not armed = refused (fail closed), never run on the host.
+                let fenced = write_posture.fences_writes();
+                let scratch: Option<PathBuf> = match (&codex_checks, fenced) {
+                    (Some(ctx), _) => Some(ctx.check_scratch.clone()),
+                    // A fresh scratch for this unit alone: removed however the unit ends.
+                    (None, true) => match codex_check_scratch(input) {
+                        Ok(dir) => {
+                            scratch_guard = Some(crate::container_floor::RemoveOnDrop(dir.clone()));
+                            Some(dir)
+                        }
+                        Err(why) => return posture_refusal(input, &why),
+                    },
+                    _ => None,
+                };
+                let floor_roots: Vec<PathBuf> = if fenced {
+                    let mut r = crate::write_posture::unit_admitted_roots(
+                        write_posture,
+                        &input.unit,
+                        &input
+                            .governance
+                            .as_ref()
+                            .map(|g| g.extra_write_roots.clone())
+                            .unwrap_or_default(),
+                    );
+                    r.extend(graph_write.iter().cloned());
+                    r
+                } else {
+                    worker_write_roots.clone()
+                };
+                let opencode_port = crate::worker_sandbox::opencode_pinned_server_argv(&argv, 0)
+                    .and(crate::worker_sandbox::free_loopback_port());
+                let own_ports: Vec<u16> = opencode_port.into_iter().collect();
+                let decisions_path = crate::gate_hook::decisions_path_for_input(input);
+                let phase = gov_env
+                    .as_ref()
+                    .map(|g| g.phase.clone())
+                    .unwrap_or_else(|| crate::scope::unit_phase(input.unit.ord));
+                let gov_dir = decisions_path.parent().map(Path::to_path_buf);
+                let mut plan = crate::worker_sandbox::plan_seat_floor(
+                    crate::worker_sandbox::SeatLaunch {
+                        cwd: &cwd,
+                        cli: seat_cli,
+                        config: &seat_config,
+                        read_only: fenced,
+                        scratch: scratch.as_deref(),
+                        gov_log_dir: gov_dir.as_deref(),
+                        own_ports: &own_ports,
+                    },
+                    floor_roots,
+                );
+                // The engine's own launch file (claude's settings) stays read-only to the seat.
+                plan.inputs.pinned =
+                    vec![decisions_path.with_file_name(format!("settings-{phase}.json"))];
+                // The git anchor: the dir the actor pinned from the registered repository.
+                plan.inputs.trusted_git_dir = input
+                    .unit
+                    .worktree_baseline
+                    .as_ref()
+                    .and_then(|b| b.git_dir.as_deref())
+                    .map(PathBuf::from);
+                // What the unit may read beyond its tree: the launch's read roots and its
+                // skills delivery (only mounted paths exist in a container).
+                let read_roots: Vec<PathBuf> = input
+                    .governance
+                    .iter()
+                    .flat_map(|g| g.extra_read_roots.iter().map(PathBuf::from))
+                    .chain(handed.map(|s| s.root.clone()))
+                    .collect();
+                if gov_env.is_some() {
+                    // A claude unit's gate hook is `<host wicked-core> gate-hook`: inside the
+                    // seat that command does not exist, so its tool calls would run unjudged.
+                    return floor_refused(
+                        input,
+                        &cli_key,
+                        crate::worker_sandbox::FloorUnarmed::GateHookUnreachable,
+                    );
+                }
+                match crate::container_floor::arm(
+                    &plan.inputs,
+                    &argv,
+                    &input.run_id,
+                    input.unit.ord,
+                    &read_roots,
+                    Some(prompt.as_str()),
+                ) {
+                    Ok(c) => {
+                        seat_cleanup = Some(c.cleanup);
+                        argv = c.argv;
+                        // Each CLI's own sandbox off inside ours (codex's cannot run in a
+                        // container: it needs user namespaces).
+                        crate::worker_sandbox::codex_sandbox_off_under_floor(&mut argv);
+                        if let Some(port) = opencode_port {
+                            if let Some(pinned) =
+                                crate::worker_sandbox::opencode_pinned_server_argv(&argv, port)
+                            {
+                                argv = pinned;
+                                opencode_password = Some(uuid::Uuid::new_v4().simple().to_string());
+                            }
+                        }
+                        floor_env = plan.env;
+                        floor = Ok(c.tool);
+                        Some(crate::validator::WorkerSandbox {
+                            wrapper: c.wrapper,
+                            level: crate::validator::SandboxLevel::Sandboxed,
+                            downgrade_reason: None,
+                        })
+                    }
+                    Err((why, detail)) => {
+                        eprintln!(
+                            "wicked-core: unit {}: the container floor did not arm ({}){}; \
+                             refusing the governed unit (fail closed)",
+                            input.unit.ord,
+                            why.describe(),
+                            if detail.is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {detail}")
+                            }
+                        );
+                        return floor_refused(input, &cli_key, why);
+                    }
+                }
+            } else if os_sandbox {
                 let ws = crate::validator::detect_worker_sandbox(&worker_write_roots);
                 if let Some(reason) = &ws.downgrade_reason {
                     if let Some(cli) = argv.first() {
@@ -2411,6 +2548,16 @@ impl WrappedCliStepRunner {
             if let Some(ctx) = &codex_checks {
                 ctx.apply_env(&mut cmd);
             }
+            // Container floor: the seat's caches and (fenced) temp inside dirs its floor admits,
+            // and the per-spawn password of opencode's pinned server.
+            for (k, v) in &floor_env {
+                cmd.env(k, v);
+            }
+            if let Some(pw) = &opencode_password {
+                for k in crate::worker_sandbox::OPENCODE_PASSWORD_ENVS {
+                    cmd.env(k, pw);
+                }
+            }
             // Even seats without a hook receive the exact root set the kernel launcher got. This
             // does not turn the env into a boundary; it keeps descendant tools and diagnostics
             // aligned with Boundary 1's source of truth.
@@ -2602,6 +2749,9 @@ impl WrappedCliStepRunner {
             let timeout = crate::workflow::effective_timeout(self.timeout, input.unit.budget_secs);
             let bounded = run_bounded(cmd, timeout, emit, adapter, Some(cancel_token.clone()));
             self.unregister_token(input, &cancel_token);
+            // The seat ran (and `run_bounded` reaped it); release the arm-time guards now.
+            drop(seat_cleanup.take());
+            drop(scratch_guard.take());
             drop(mcp_channel);
             match bounded {
                 // FINDING-100. A unit may background work and return — domain-extraction's extract
@@ -4512,6 +4662,26 @@ pub(crate) fn governance_refusal(input: &StepInput, why: &str) -> StepOutput {
     }
 }
 
+/// The [`StepOutput`] for a governed unit whose seat container did not arm: nothing ran. The
+/// text says `could not run`, read as a seat failure, so the run fails over.
+pub(crate) fn floor_refused(
+    input: &StepInput,
+    cli_key: &str,
+    why: crate::worker_sandbox::FloorUnarmed,
+) -> StepOutput {
+    StepOutput {
+        run_id: input.run_id.clone(),
+        unit_ix: input.unit_ix,
+        attempt: input.attempt,
+        output: crate::worker_sandbox::floor_refusal_text(cli_key, why),
+        status: StepStatus::Failed,
+        usage: None,
+        files: Vec::new(),
+        tools: Vec::new(),
+        governed: false,
+    }
+}
+
 pub(crate) fn posture_refusal(input: &StepInput, why: &str) -> StepOutput {
     StepOutput {
         run_id: input.run_id.clone(),
@@ -4589,7 +4759,7 @@ pub(crate) fn wrapped_exit_code(output: &str) -> Option<i32> {
 }
 
 fn run_bounded(
-    mut cmd: Command,
+    cmd: Command,
     timeout: Duration,
     emit: &DeltaSink,
     mut adapter: Box<dyn OutputAdapter>,
@@ -4613,6 +4783,13 @@ fn run_bounded(
             Vec::new(),
         ));
     }
+    // A seat container (the container floor): pass the carrier's env in by name and mount its
+    // read roots. FIRST: it rebuilds the command, so stdio and the process group are set on the
+    // rebuilt one below. The guard removes the container however this function ends (a panic
+    // included): a killed client leaves its container running.
+    let mut cmd = crate::container_floor::finalize(cmd);
+    let seat_container = crate::container_floor::seat_container(&cmd);
+    let _reap = crate::container_floor::ReapOnDrop(seat_container.clone());
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -4735,6 +4912,10 @@ fn run_bounded(
         // Preserve what the CLI produced before the kill (debugging context on a hang).
         Ok((-1, out, sentinel.to_string(), usage, files, tools))
     } else {
+        let err = match &seat_container {
+            Some(seat) => crate::container_floor::explain_start_failure(&seat.name, code, err),
+            None => err,
+        };
         Ok((code, out, err, usage, files, tools))
     }
 }
@@ -6117,6 +6298,138 @@ mod tests {
             !crate::gate_hook::decisions_path_for("run-unenf", 0).exists(),
             "no marker is written when the floor did not arm"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Container floor (codex review r1, P1): a seat wrapper goes through `run_bounded` — the
+    /// command `finalize` rebuilds keeps its piped stdio and process group (the rebuilt one used
+    /// to lose them and panic on `piped stdout`), its output streams, and the reap runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_seat_wrapper_runs_through_run_bounded_with_its_pipes_and_is_reaped() {
+        let dir = std::env::temp_dir().join(format!("wicked-cf-rb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        // A fake runtime: `run ...` prints its last argument; any other call (the reap) is logged.
+        let rt = dir.join("docker");
+        std::fs::write(
+            &rt,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = run ]; then for a; do last=$a; done; echo \"seat-said:$last\"; exit 0; fi\necho \"$@\" >> {}/reaped\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let w = crate::container_floor::run_argv(&crate::container_floor::ContainerLaunch {
+            runtime: &rt,
+            image: "img:1",
+            name: "wicked-seat-rb",
+            network: "none",
+            workdir: &dir,
+            user: "1:1",
+            mounts: &[],
+            memory: "1g",
+            gateway_ports: &[],
+            own_ports: &[],
+        });
+        // spawn-audit: test-only — a fake runtime script; proves the finalized wrapper's pipes.
+        let mut cmd = Command::new(&w[0]);
+        cmd.args(&w[1..]).args(["claude", "-p", "hello"]);
+        let emit = |_: &str| {};
+        let (code, out, _err, ..) = run_bounded(
+            cmd,
+            Duration::from_secs(20),
+            &emit,
+            Box::new(Passthrough),
+            None,
+        )
+        .expect("ran");
+        assert_eq!(code, 0);
+        assert!(out.contains("seat-said:hello"), "{out}");
+        let reaped = std::fs::read_to_string(dir.join("reaped")).unwrap_or_default();
+        assert!(reaped.contains("rm --force wicked-seat-rb"), "{reaped}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Container floor (C1): with `WICKED_SEAT_FLOOR=container` and no container runtime, a
+    /// governed unit is REFUSED with the reason (a runtime is required) — never run on the host.
+    #[cfg(unix)]
+    #[test]
+    fn container_mode_without_a_runtime_refuses_the_governed_unit_with_the_reason() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-cf-noruntime-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        // A stub named `pi` (a seat with an image), so the refusal is the runtime's, not the image's.
+        let stub = dir.join("pi");
+        std::fs::write(&stub, "#!/bin/sh\necho ran-on-host\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _mode = VarGuard::set(
+            crate::container_floor::SEAT_FLOOR_ENV,
+            std::path::Path::new("container"),
+        );
+        let _rt = VarGuard::set(
+            crate::container_floor::RUNTIME_ENV,
+            &dir.join("no-such-runtime"),
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner = WrappedCliStepRunner::with_tx(tx);
+        let mut u = WorkUnit::pending("s:u7", "s", 7, "verify the work");
+        u.assigned_cli = Some("pi".to_string());
+        u.assigned_invocation = Some(format!("{} {{PROMPT}}", stub.display()));
+        let input = StepInput {
+            run_id: "run-cf-noruntime".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: Some(crate::workflow::GovernanceContext {
+                human_confirm: Default::default(),
+                db_path: dir.join("estate.db").to_string_lossy().to_string(),
+                code_graph_db: None,
+                extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
+                project_id: None,
+            }),
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir("run-cf-noruntime"));
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(!out.governed);
+        assert!(
+            out.output.contains("could not run this governed unit")
+                && out.output.contains("no_container_runtime")
+                && out.output.contains("a container runtime is required"),
+            "{}",
+            out.output
+        );
+        assert!(
+            !out.output.contains("ran-on-host"),
+            "never run on the host: {}",
+            out.output
+        );
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir("run-cf-noruntime"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
