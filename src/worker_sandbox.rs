@@ -1010,7 +1010,7 @@ pub(crate) fn seat_floor(inp: &FloorInputs) -> Result<ArmedFloor, FloorUnarmed> 
 #[derive(Debug)]
 pub(crate) enum GovernedFloor {
     /// The floor armed: wrap the worker in it.
-    Armed(ArmedFloor),
+    Armed(Box<ArmedFloor>),
     /// Windows, step 0: there is no floor yet. The unit keeps today's behaviour (the text fences,
     /// the worktree guard) and the record says [`NO_OS_FLOOR`] — refusing would block every
     /// Windows run.
@@ -1035,7 +1035,7 @@ pub(crate) fn governed_floor_on(
         return GovernedFloor::NoOsFloor;
     }
     match arm() {
-        Ok(a) => GovernedFloor::Armed(a),
+        Ok(a) => GovernedFloor::Armed(Box::new(a)),
         Err(why) => GovernedFloor::Refused(why),
     }
 }
@@ -2126,5 +2126,78 @@ t scratch_tmp 'echo x > "$TMPDIR/t"'
         );
         assert!(opencode_pinned_server_argv(&v(&["opencode", "acp"]), 1).is_none());
         assert!(opencode_pinned_server_argv(&v(&["claude", "run"]), 1).is_none());
+    }
+
+    /// Lane tool, not a CI check (`#[ignore]`): render the PRODUCTION seat floor for a live check
+    /// of a real CLI against an offline model stub. Reads `WICKED_FLOOR_DUMP` (output prefix),
+    /// `WICKED_FLOOR_CWD`, `WICKED_FLOOR_CLI` (claude | codex | pi | opencode | copilot),
+    /// `WICKED_FLOOR_SEAT_ROOT`, `WICKED_FLOOR_HOME` (the operator home the masks resolve under),
+    /// `WICKED_FLOOR_PORTS` (loopback ports, comma separated) and `WICKED_FLOOR_READ_ONLY=1`;
+    /// writes `<prefix>.sb` (the profile) and `<prefix>.env` (`KEY=value` the seat runs with).
+    #[test]
+    #[ignore]
+    fn dump_seat_floor_profile_for_a_live_check() {
+        let Ok(prefix) = std::env::var("WICKED_FLOOR_DUMP") else {
+            return;
+        };
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        let cli = match var("WICKED_FLOOR_CLI").as_str() {
+            "claude" => SeatCli::Claude,
+            "codex" => SeatCli::Codex,
+            "pi" => SeatCli::Pi,
+            "opencode" => SeatCli::Opencode,
+            "copilot" => SeatCli::Copilot,
+            other => panic!("unknown cli {other}"),
+        };
+        let cwd = PathBuf::from(var("WICKED_FLOOR_CWD"));
+        let root = PathBuf::from(var("WICKED_FLOOR_SEAT_ROOT"));
+        let read_only = var("WICKED_FLOOR_READ_ONLY") == "1";
+        let ports: Vec<u16> = var("WICKED_FLOOR_PORTS")
+            .split(',')
+            .filter_map(|p| p.trim().parse().ok())
+            .collect();
+        let cfg = seat_config(cli, &root);
+        let scratch = root.join("scratch");
+        let mut plan = plan_seat_floor(
+            SeatLaunch {
+                cwd: &cwd,
+                cli,
+                config: &cfg,
+                read_only,
+                scratch: read_only.then_some(scratch.as_path()),
+                gov_log_dir: None,
+                own_ports: &ports,
+            },
+            if read_only {
+                Vec::new()
+            } else {
+                vec![cwd.clone()]
+            },
+        );
+        plan.inputs.home = Some(PathBuf::from(var("WICKED_FLOOR_HOME")));
+        let spec = resolve_seat_floor(&plan.inputs).expect("resolves");
+        std::fs::write(format!("{prefix}.sb"), sbpl_seat_profile(&spec)).unwrap();
+        let mut env = String::new();
+        if let SeatConfig::Isolated { set, .. } = &cfg {
+            for (k, v) in set {
+                env.push_str(&format!("{k}={}\n", v.display()));
+            }
+        }
+        for (k, v) in &plan.env {
+            env.push_str(&format!("{k}={}\n", v.display()));
+        }
+        std::fs::write(format!("{prefix}.env"), env).unwrap();
+        // The argv the engine launches, through the production rewrites (`WICKED_FLOOR_ARGV`,
+        // unit-separator (0x1f) joined in, NUL-separated out): codex's own sandbox off, opencode's pinned server.
+        if let Ok(raw) = std::env::var("WICKED_FLOOR_ARGV") {
+            let mut argv: Vec<String> = raw.split('\u{1f}').map(str::to_string).collect();
+            codex_sandbox_off_under_floor(&mut argv);
+            if let Some(p) = ports.first() {
+                if let Some(pinned) = opencode_pinned_server_argv(&argv, *p) {
+                    argv = pinned;
+                }
+            }
+            std::fs::write(format!("{prefix}.argv"), argv.join("\0")).unwrap();
+        }
     }
 }
