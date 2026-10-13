@@ -74,8 +74,19 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const REAP_TIMEOUT: Duration = Duration::from_secs(20);
 const SWEEP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// The gateway's listeners a seat may connect to: CONNECT 3000, Anthropic 4000, OpenAI 4001,
-/// the ask MCP 8700 and the gate hook 8711 ([`crate::seat_gateway`], [`crate::hook_relay`]).
-const GATEWAY_PORTS: &[u16] = &[3000, 4000, 4001, 8700, crate::hook_relay::HOOK_PORT];
+/// ChatGPT 4002, pi 4003, opencode 4004, Claude OAuth 4005, the ask MCP 8700 and the gate hook
+/// 8711 ([`crate::seat_gateway`], [`crate::hook_relay`]).
+const GATEWAY_PORTS: &[u16] = &[
+    3000,
+    4000,
+    4001,
+    4002,
+    4003,
+    4004,
+    4005,
+    8700,
+    crate::hook_relay::HOOK_PORT,
+];
 const SEAT_ENTRY: &str = "/usr/local/bin/wicked-seat-entry";
 const CANARY_FILE: &str = "/wicked-canary/probe";
 
@@ -1102,6 +1113,9 @@ pub(crate) struct ArmedContainer {
     /// The env the seat reaches the gateway with (its placeholder key, the model base URLs,
     /// the CONNECT proxy); empty for an offline seat.
     pub(crate) env: Vec<(String, String)>,
+    /// Placeholder files, relative to this seat's isolated CLI config home. The runner writes
+    /// them; arming never touches a CLI home or a provider credential.
+    pub(crate) files: Vec<(PathBuf, String)>,
     /// The seat's gateway registration, released after the unit ([`GatewayLease::release`]).
     pub(crate) lease: Option<GatewayLease>,
 }
@@ -1123,22 +1137,56 @@ impl GatewayLease {
     /// Revoke the seat's key and return what the gateway recorded for it (model requests:
     /// status, model, tool calls, text, usage — never a credential).
     pub(crate) fn release(self) -> Vec<crate::seat_gateway::GatewayRecord> {
-        let records = crate::seat_gateway::collect_unit_records(
-            &self.runtime,
-            &self.gateway,
-            &self.since,
-            &self.unit,
-        );
-        if let Err(e) =
-            crate::seat_gateway::deregister_live(&self.runtime, &self.gateway, &self.dir, &self.key)
+        #[cfg(unix)]
         {
-            eprintln!(
-                "wicked-core: gateway key for {} not revoked: {e}",
-                self.unit
+            let records = crate::seat_gateway::collect_unit_records(
+                &self.runtime,
+                &self.gateway,
+                &self.since,
+                &self.unit,
             );
+            if let Err(e) = crate::seat_gateway::deregister_live(
+                &self.runtime,
+                &self.gateway,
+                &self.dir,
+                &self.key,
+            ) {
+                eprintln!(
+                    "wicked-core: gateway key for {} not revoked: {e}",
+                    self.unit
+                );
+            }
+            records
         }
-        records
+        #[cfg(not(unix))]
+        Vec::new()
     }
+}
+
+/// Pure handoff used by arm: mint the unit placeholder, render its files, and register exactly
+/// what the CLI will send. Keeping the raw key local avoids accidentally registering just the
+/// signature segment of a Codex JWT.
+fn placeholder_handoff(
+    cli: &str,
+    kind: crate::seat_credentials::CredentialKind,
+    run: &str,
+    unit: &str,
+) -> (
+    crate::seat_gateway::UnitKey,
+    Vec<(String, String)>,
+    Vec<(PathBuf, String)>,
+) {
+    let mut key = crate::seat_gateway::UnitKey::new(run, unit, cli);
+    let files = crate::seat_credentials::placeholder_files(
+        cli,
+        kind,
+        &key.key,
+        &crate::seat_gateway::credential_gateway_url(cli, kind),
+    );
+    key.bearer = crate::seat_credentials::sent_bearer(cli, kind, &key.key);
+    key.key = key.bearer.clone();
+    let env = crate::seat_gateway::seat_env_for(cli, kind, &key.bearer);
+    (key, env, files)
 }
 
 fn tool_name(cli: &Path) -> &'static str {
@@ -1171,6 +1219,7 @@ pub(crate) fn container_name(cli: &str, run_id: &str, ord: u32) -> String {
 /// Arm the container floor for one governed seat spawn: resolve the floor (the step-0
 /// computation), find the runtime, the seat image and the network, and render the wrapper. `Err`
 /// names why the unit cannot run in a container; the caller refuses it (fail closed).
+#[cfg(unix)]
 pub(crate) fn arm(
     inp: &crate::worker_sandbox::FloorInputs,
     argv: &[String],
@@ -1192,6 +1241,10 @@ pub(crate) fn arm(
                 ),
             )
         })?;
+    let credential_env = format!("WICKED_SEAT_CREDENTIAL_{}", cli.to_ascii_uppercase());
+    let credential_value = std::env::var(&credential_env).ok();
+    let kind = crate::seat_credentials::CredentialKind::for_cli(cli, credential_value.as_deref())
+        .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
     let spec = crate::worker_sandbox::resolve_seat_floor(inp).map_err(|w| (w, String::new()))?;
     let rt = runtime().map_err(|w| (w, String::new()))?;
     static SWEEP: Once = Once::new();
@@ -1203,20 +1256,21 @@ pub(crate) fn arm(
         ensure_seat_network(&rt, &name).map_err(|e| (FloorUnarmed::ContainerRuntimeDown, e))?;
     // The seat's only egress: the daemon's gateway, attached to its network as `agw`, with a
     // fresh placeholder key. No gateway dir (an engine with no state home) = no egress at all.
-    let (env, lease) = match gateway_dir.filter(|_| network != "none") {
+    let (env, files, lease) = match gateway_dir.filter(|_| network != "none") {
         Some(dir) => {
             let down = |e: String| (FloorUnarmed::GatewayUnavailable, e);
             let gw = crate::seat_gateway::ensure_gateway(&rt, dir).map_err(down)?;
             crate::seat_gateway::attach(&rt, &gw, &network).map_err(down)?;
             let unit = format!("{run_id}#{ord}");
-            let key = crate::seat_gateway::UnitKey::new(run_id, &unit, cli);
+            let (key, env, files) = placeholder_handoff(cli, kind, run_id, &unit);
             let since = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs().saturating_sub(1).to_string())
                 .unwrap_or_default();
             crate::seat_gateway::register_live(&rt, &gw, dir, key.clone()).map_err(down)?;
             (
-                crate::seat_gateway::seat_env_all(&key.key),
+                env,
+                files,
                 Some(GatewayLease {
                     runtime: rt.clone(),
                     dir: dir.to_path_buf(),
@@ -1227,7 +1281,7 @@ pub(crate) fn arm(
                 }),
             )
         }
-        None => (Vec::new(), None),
+        None => (Vec::new(), Vec::new(), None),
     };
     let user = operator_user();
     let workdir = inp.cwd.canonicalize().unwrap_or_else(|_| inp.cwd.clone());
@@ -1258,8 +1312,24 @@ pub(crate) fn arm(
         tool: tool_name(&rt.cli),
         spec,
         env,
+        files,
         lease,
     })
+}
+
+/// The container floor is unsupported on native Windows; never reference Unix gateway calls.
+#[cfg(not(unix))]
+pub(crate) fn arm(
+    _inp: &crate::worker_sandbox::FloorInputs,
+    _argv: &[String],
+    _run_id: &str,
+    _ord: u32,
+    _gateway_dir: Option<&Path>,
+) -> Result<ArmedContainer, (FloorUnarmed, String)> {
+    Err((
+        FloorUnarmed::ContainerRuntimeDown,
+        "the container floor requires Unix".into(),
+    ))
 }
 
 /// `wicked-core seat-image build [<cli>…|all]` / `seat-image status`: build the seat images
@@ -1314,6 +1384,78 @@ pub fn seat_image_main(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placeholder_handoff_registers_exact_file_credentials_and_separate_units() {
+        use crate::seat_credentials::CredentialKind;
+        for (cli, kind, pointer) in [
+            (
+                "claude",
+                CredentialKind::ClaudeOauth,
+                "/claudeAiOauth/accessToken",
+            ),
+            (
+                "codex",
+                CredentialKind::CodexChatgpt,
+                "/tokens/access_token",
+            ),
+            ("codex", CredentialKind::CodexApiKey, "/OPENAI_API_KEY"),
+            (
+                "pi",
+                CredentialKind::ProviderKey,
+                "/providers/openai/apiKey",
+            ),
+            (
+                "opencode",
+                CredentialKind::ProviderKey,
+                "/provider/openai/options/apiKey",
+            ),
+        ] {
+            let (key, env, files) = placeholder_handoff(cli, kind, "test-run", "test-unit-1");
+            let (other, _, _) = placeholder_handoff(cli, kind, "test-run", "test-unit-2");
+            let credential: serde_json::Value = serde_json::from_str(&files[0].1).unwrap();
+            assert_eq!(
+                credential.pointer(pointer).unwrap().as_str().unwrap(),
+                key.key
+            );
+            assert_eq!(key.key, key.bearer);
+            assert_ne!(key.key, other.key);
+            assert!(!format!("{key:?}").contains(&key.bearer));
+            let config = crate::seat_gateway::GatewayConfig {
+                units: vec![key.clone()],
+                ..Default::default()
+            };
+            let rendered = crate::seat_gateway::render(&config);
+            for bind in rendered["binds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .take(config.providers.len())
+            {
+                let auth = &bind["listeners"][0]["routes"][0]["policies"]["apiKey"];
+                assert_eq!(auth["keys"][0]["key"], key.bearer);
+                assert_eq!(auth["keys"][0]["metadata"]["unit"], "test-unit-1");
+            }
+            if matches!(
+                kind,
+                CredentialKind::ClaudeOauth | CredentialKind::CodexChatgpt
+            ) {
+                assert!(!env
+                    .iter()
+                    .any(|(k, _)| k == "OPENAI_API_KEY" || k == "ANTHROPIC_API_KEY"));
+            }
+        }
+        let (key, env, files) = placeholder_handoff(
+            "claude",
+            CredentialKind::ClaudeApiKey,
+            "test-run",
+            "test-unit",
+        );
+        assert!(files.is_empty());
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == &key.key));
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("wicked-cf-{tag}-{}", std::process::id()));

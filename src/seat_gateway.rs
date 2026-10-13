@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::seat_credentials::CredentialKind;
+
 #[cfg(unix)]
 use crate::container_floor::{output_within, Runtime};
 #[cfg(unix)]
@@ -55,7 +57,11 @@ pub(crate) struct GatewayConfig {
 /// Its `Debug` implementation redacts the key so diagnostics cannot print it.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct UnitKey {
+    /// The apiKey policy's exact match value (the whole JWT for Codex ChatGPT).
     pub(crate) key: String,
+    /// The credential the CLI sends; retained explicitly for the runner's credential handoff.
+    #[serde(default)]
+    pub(crate) bearer: String,
     pub(crate) run: String,
     pub(crate) unit: String,
     pub(crate) seat: String,
@@ -65,6 +71,7 @@ impl std::fmt::Debug for UnitKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnitKey")
             .field("key", &"[redacted]")
+            .field("bearer", &"[redacted]")
             .field("run", &self.run)
             .field("unit", &self.unit)
             .field("seat", &self.seat)
@@ -75,8 +82,10 @@ impl std::fmt::Debug for UnitKey {
 impl UnitKey {
     /// Mint a fresh `wk-` + 32 hex key for one governed unit.
     pub(crate) fn new(run: &str, unit: &str, seat: &str) -> Self {
+        let key = format!("wk-{}", uuid::Uuid::new_v4().simple());
         Self {
-            key: format!("wk-{}", uuid::Uuid::new_v4().simple()),
+            bearer: key.clone(),
+            key,
             run: run.into(),
             unit: unit.into(),
             seat: seat.into(),
@@ -96,6 +105,28 @@ pub(crate) struct ModelRoute {
     /// examples/traffic-cross-app-access/okta-auth0/gateway.yaml:31-35).
     pub(crate) tls: bool,
     pub(crate) credential_file: PathBuf,
+    /// Absent on older configs: preserve their native API-key policy.
+    #[serde(default)]
+    pub(crate) kind: Option<CredentialKind>,
+    /// ChatGPT's account identity stays in the broker, alongside its access token.
+    #[serde(default)]
+    pub(crate) account_id_file: Option<PathBuf>,
+}
+
+impl ModelRoute {
+    fn credential_kind(&self) -> CredentialKind {
+        self.kind.unwrap_or(match self.provider {
+            Provider::Anthropic => CredentialKind::ClaudeApiKey,
+            Provider::OpenAI => CredentialKind::CodexApiKey,
+            Provider::ChatGpt => CredentialKind::CodexChatgpt,
+        })
+    }
+
+    fn account_file(&self) -> PathBuf {
+        self.account_id_file
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/broker/chatgpt.account-id"))
+    }
 }
 
 /// The native API each model listener preserves. The seat-env helper uses the standard ports.
@@ -103,6 +134,7 @@ pub(crate) struct ModelRoute {
 pub(crate) enum Provider {
     Anthropic,
     OpenAI,
+    ChatGpt,
 }
 
 impl Provider {
@@ -110,6 +142,7 @@ impl Provider {
         match self {
             Self::Anthropic => 4000,
             Self::OpenAI => 4001,
+            Self::ChatGpt => 4002,
         }
     }
 
@@ -117,6 +150,7 @@ impl Provider {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenAI => "openai",
+            Self::ChatGpt => "chatgpt",
         }
     }
 }
@@ -125,16 +159,55 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             units: Vec::new(),
-            providers: [Provider::Anthropic, Provider::OpenAI]
-                .into_iter()
-                .map(|provider| ModelRoute {
-                    port: provider.port(),
-                    provider,
-                    upstream_host: String::new(),
-                    tls: true,
-                    credential_file: PathBuf::from(format!("/broker/{}.key", provider.name())),
-                })
-                .collect(),
+            providers: [
+                (
+                    Provider::Anthropic,
+                    4000,
+                    CredentialKind::ClaudeApiKey,
+                    "anthropic.key",
+                ),
+                (
+                    Provider::OpenAI,
+                    4001,
+                    CredentialKind::CodexApiKey,
+                    "openai.key",
+                ),
+                (
+                    Provider::ChatGpt,
+                    4002,
+                    CredentialKind::CodexChatgpt,
+                    "openai.token",
+                ),
+                (
+                    Provider::OpenAI,
+                    4003,
+                    CredentialKind::ProviderKey,
+                    "pi.token",
+                ),
+                (
+                    Provider::OpenAI,
+                    4004,
+                    CredentialKind::ProviderKey,
+                    "opencode.token",
+                ),
+                (
+                    Provider::Anthropic,
+                    4005,
+                    CredentialKind::ClaudeOauth,
+                    "anthropic.token",
+                ),
+            ]
+            .into_iter()
+            .map(|(provider, port, kind, file)| ModelRoute {
+                port,
+                provider,
+                upstream_host: String::new(),
+                tls: true,
+                credential_file: PathBuf::from(format!("/broker/{file}")),
+                kind: Some(kind),
+                account_id_file: None,
+            })
+            .collect(),
             // `WICKED_SEAT_EGRESS_HOSTS`: the hostnames (comma-separated) seats may reach
             // through CONNECT, e.g. package registries. None by default.
             egress_hosts: std::env::var("WICKED_SEAT_EGRESS_HOSTS")
@@ -179,14 +252,16 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
                     "/v1/responses": "responses",
                     "*": "passthrough"
                 }),
+                Provider::ChatGpt => json!({"*": "passthrough"}),
             };
             let mut provider = serde_json::Map::new();
             provider.insert(route.provider.name().into(), json!({}));
-            let location = match route.provider {
-                Provider::Anthropic => json!({"header": {"name": "x-api-key"}}),
+            let kind = route.credential_kind();
+            let location = match kind {
+                CredentialKind::ClaudeApiKey => json!({"header": {"name": "x-api-key"}}),
                 // v1.6.0 schema/config.json: LocalAPIKeys.location / AuthorizationLocation.
                 // Native OpenAI clients send Authorization: Bearer <placeholder>.
-                Provider::OpenAI => {
+                _ => {
                     json!({"header": {"name": "authorization", "prefix": "Bearer "}})
                 }
             };
@@ -202,17 +277,61 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
             // signed in it is empty, and the provider answers with its own 401.
             policies["backendAuth"] = json!({"key": {"file": route.credential_file}});
             let mut backend = json!({"name": route.provider.name(), "provider": provider});
+            let broker_bearer = matches!(
+                kind,
+                CredentialKind::ClaudeOauth
+                    | CredentialKind::CodexChatgpt
+                    | CredentialKind::ProviderKey
+            );
+            if broker_bearer {
+                // Preserve Authorization as proved by the broker spike. Native Anthropic ai
+                // backends inject x-api-key; OAuth needs a plain host backend instead.
+                policies["backendAuth"] =
+                    json!({"key": {"value": {"file": route.credential_file}}});
+            }
+            if kind == CredentialKind::ClaudeOauth {
+                policies["requestHeaderModifier"] = json!({"remove": ["x-api-key"]});
+            }
+            if route.provider == Provider::ChatGpt {
+                // v1.6.0 HeaderModifier.set accepts literal strings only. Use its native
+                // watched-file credential locations to replace BOTH seat-supplied headers,
+                // without reading the broker in this pure renderer or caching an account id
+                // outside the broker volume. The account file contains the bare header value.
+                policies["backendAuth"] = json!({"credentials": [
+                    {"key": {"value": {"file": route.credential_file},
+                        "location": {"header": {"name": "authorization", "prefix": "Bearer "}}}},
+                    {"key": {"value": {"file": route.account_file()},
+                        "location": {"header": {"name": "chatgpt-account-id"}}}}
+                ]});
+            }
             if !route.upstream_host.is_empty() {
                 backend["hostOverride"] = json!(route.upstream_host);
                 if route.tls {
                     policies["backendTLS"] = json!({});
                 }
             }
+            let backends =
+                if route.provider == Provider::ChatGpt || kind == CredentialKind::ClaudeOauth {
+                    let host = if route.upstream_host.is_empty() {
+                        match route.provider {
+                            Provider::ChatGpt => "chatgpt.com:443",
+                            _ => "api.anthropic.com:443",
+                        }
+                    } else {
+                        &route.upstream_host
+                    };
+                    if route.upstream_host.is_empty() || route.tls {
+                        policies["backendTLS"] = json!({});
+                    }
+                    json!([{"host": host}])
+                } else {
+                    json!([{"ai": backend}])
+                };
             json!({
                 "port": route.port,
                 "listeners": [{ "routes": [{
                     "policies": policies,
-                    "backends": [{"ai": backend}]
+                    "backends": backends
                 }]}]
             })
         })
@@ -343,6 +462,11 @@ fn env_at_port(provider: Provider, port: u16, key: &str) -> Vec<(String, String)
             "OPENAI_BASE_URL",
             "OPENAI_API_KEY",
             format!("http://agw:{port}/v1"),
+        ),
+        Provider::ChatGpt => (
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY",
+            format!("http://agw:{port}/backend-api/codex"),
         ),
     };
     vec![
@@ -502,6 +626,48 @@ pub(crate) fn seat_env_all(key: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// The per-CLI listener origin, shared by environment and credential-file renderers.
+pub(crate) fn credential_gateway_url(cli: &str, kind: CredentialKind) -> String {
+    let port = match (cli, kind) {
+        (_, CredentialKind::ClaudeApiKey) => 4000,
+        (_, CredentialKind::CodexApiKey) => 4001,
+        (_, CredentialKind::CodexChatgpt) => 4002,
+        ("pi", CredentialKind::ProviderKey) => 4003,
+        ("opencode", CredentialKind::ProviderKey) => 4004,
+        (_, CredentialKind::ClaudeOauth) => 4005,
+        _ => 4001,
+    };
+    format!("http://agw:{port}")
+}
+
+/// OAuth/ChatGPT files select account auth; an API-key env override would change the CLI's
+/// auth mode. Keep those overrides out of the seat while still routing its model requests.
+pub(crate) fn seat_env_for(cli: &str, kind: CredentialKind, bearer: &str) -> Vec<(String, String)> {
+    let mut env = seat_env_all(bearer);
+    let url = credential_gateway_url(cli, kind);
+    for (name, value) in &mut env {
+        match (name.as_str(), kind) {
+            ("ANTHROPIC_BASE_URL", CredentialKind::ClaudeOauth | CredentialKind::ClaudeApiKey) => {
+                *value = url.clone()
+            }
+            ("OPENAI_BASE_URL", CredentialKind::CodexChatgpt) => {
+                *value = format!("{url}/backend-api/codex")
+            }
+            ("OPENAI_BASE_URL", CredentialKind::CodexApiKey | CredentialKind::ProviderKey) => {
+                *value = format!("{url}/v1")
+            }
+            _ => {}
+        }
+    }
+    if matches!(
+        kind,
+        CredentialKind::ClaudeOauth | CredentialKind::CodexChatgpt
+    ) {
+        env.retain(|(name, _)| name != "ANTHROPIC_API_KEY" && name != "OPENAI_API_KEY");
+    }
+    env
 }
 
 /// (tests) Provision routes and allowlisted hosts without losing live registrations. Only the routes
@@ -684,13 +850,19 @@ fn init_volumes(rt: &Runtime, gw: &Gateway, config: &GatewayConfig) -> Result<()
     }
     let mut script = String::from("set -e; chown 10001 /cfg /broker;");
     for r in &config.providers {
-        if let Some(f) = r.credential_file.file_name().and_then(|f| f.to_str()) {
-            if f.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-            {
-                script.push_str(&format!(
+        let mut files = vec![r.credential_file.clone()];
+        if r.provider == Provider::ChatGpt {
+            files.push(r.account_file());
+        }
+        for file in files {
+            if let Some(f) = file.file_name().and_then(|f| f.to_str()) {
+                if f.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+                {
+                    script.push_str(&format!(
                     " [ -e /broker/{f} ] || : > /broker/{f}; chown 10001 /broker/{f}; chmod 600 /broker/{f};"
                 ));
+                }
             }
         }
     }
@@ -1024,6 +1196,7 @@ mod tests {
         GatewayConfig {
             units: vec![UnitKey {
                 key: "wk-unit-PLACEHOLDER-1".into(),
+                bearer: "wk-unit-PLACEHOLDER-1".into(),
                 run: "run-a".into(),
                 unit: "1".into(),
                 seat: "claude".into(),
@@ -1034,6 +1207,8 @@ mod tests {
                 upstream_host: "gw1-stub:8080".into(),
                 tls: false,
                 credential_file: PathBuf::from("/broker/anthropic.key"),
+                kind: Some(CredentialKind::ClaudeApiKey),
+                account_id_file: None,
             }],
             egress_hosts: vec!["registry.npmjs.org".into()],
             hook_upstream: None,
@@ -1092,6 +1267,8 @@ mod tests {
                     upstream_host: format!("{stub}:8080"),
                     tls: false,
                     credential_file: PathBuf::from("/broker/anthropic.key"),
+                    kind: Some(CredentialKind::ClaudeApiKey),
+                    account_id_file: None,
                 }],
                 egress_hosts: vec![],
                 hook_upstream: None,
@@ -1240,6 +1417,156 @@ mod tests {
     }
 
     #[test]
+    fn every_credential_kind_has_the_correct_strict_api_key_location() {
+        let config = GatewayConfig {
+            units: vec![unit("test-unit")],
+            ..Default::default()
+        };
+        let rendered = render(&config);
+        for (index, route) in config.providers.iter().enumerate() {
+            let auth = &rendered["binds"][index]["listeners"][0]["routes"][0]["policies"]["apiKey"];
+            let location = if route.credential_kind() == CredentialKind::ClaudeApiKey {
+                json!({"header": {"name": "x-api-key"}})
+            } else {
+                json!({"header": {"name": "authorization", "prefix": "Bearer "}})
+            };
+            assert_eq!(auth["location"], location);
+            assert_eq!(auth["mode"], "strict");
+            assert_eq!(auth["keys"][0]["key"], config.units[0].key);
+        }
+    }
+
+    #[test]
+    fn oauth_route_preserves_spike_broker_auth_and_strips_x_api_key() {
+        let fixture: Value = serde_yaml::from_str(include_str!(
+            "../tests/fixtures/broker/spike-broker-config.yaml"
+        ))
+        .unwrap();
+        let config = GatewayConfig::default();
+        let rendered = render(&config);
+        let index = config
+            .providers
+            .iter()
+            .position(|r| r.kind == Some(CredentialKind::ClaudeOauth))
+            .unwrap();
+        let policies = &rendered["binds"][index]["listeners"][0]["routes"][0]["policies"];
+        let spike = &fixture["binds"][1]["listeners"][0]["routes"][0]["policies"];
+        assert_eq!(policies["backendAuth"], spike["backendAuth"]);
+        assert_eq!(
+            policies["requestHeaderModifier"],
+            spike["requestHeaderModifier"]
+        );
+        assert_eq!(
+            rendered["binds"][index]["listeners"][0]["routes"][0]["backends"],
+            json!([{"host": "api.anthropic.com:443"}])
+        );
+    }
+
+    #[test]
+    fn chatgpt_route_replaces_both_headers_from_watched_broker_files() {
+        let mut config = GatewayConfig::default();
+        let index = config
+            .providers
+            .iter()
+            .position(|r| r.provider == Provider::ChatGpt)
+            .unwrap();
+        // A nonexistent path is deliberately sufficient: render must never read broker files.
+        config.providers[index].account_id_file = Some(PathBuf::from("/broker/test-account-id"));
+        let rendered = render(&config);
+        let route = &rendered["binds"][index]["listeners"][0]["routes"][0];
+        assert_eq!(
+            route["policies"]["backendAuth"],
+            json!({"credentials": [
+                {"key": {"value": {"file": "/broker/openai.token"},
+                    "location": {"header": {"name": "authorization", "prefix": "Bearer "}}}},
+                {"key": {"value": {"file": "/broker/test-account-id"},
+                    "location": {"header": {"name": "chatgpt-account-id"}}}}
+            ]})
+        );
+        assert_eq!(route["backends"], json!([{"host": "chatgpt.com:443"}]));
+        assert_eq!(route["policies"]["backendTLS"], json!({}));
+        assert_eq!(
+            route["policies"]["ai"]["routes"],
+            json!({"*": "passthrough"})
+        );
+        assert!(!rendered.to_string().contains("acct-PLACEHOLDER"));
+    }
+
+    #[test]
+    fn each_cli_env_and_file_url_selects_its_matching_listener() {
+        let config = GatewayConfig::default();
+        for (cli, kind, port, base, suffix) in [
+            (
+                "claude",
+                CredentialKind::ClaudeApiKey,
+                4000,
+                "ANTHROPIC_BASE_URL",
+                "",
+            ),
+            (
+                "codex",
+                CredentialKind::CodexApiKey,
+                4001,
+                "OPENAI_BASE_URL",
+                "/v1",
+            ),
+            (
+                "codex",
+                CredentialKind::CodexChatgpt,
+                4002,
+                "OPENAI_BASE_URL",
+                "/backend-api/codex",
+            ),
+            (
+                "pi",
+                CredentialKind::ProviderKey,
+                4003,
+                "OPENAI_BASE_URL",
+                "/v1",
+            ),
+            (
+                "opencode",
+                CredentialKind::ProviderKey,
+                4004,
+                "OPENAI_BASE_URL",
+                "/v1",
+            ),
+            (
+                "claude",
+                CredentialKind::ClaudeOauth,
+                4005,
+                "ANTHROPIC_BASE_URL",
+                "",
+            ),
+        ] {
+            let origin = credential_gateway_url(cli, kind);
+            assert_eq!(origin, format!("http://agw:{port}"));
+            assert!(config
+                .providers
+                .iter()
+                .any(|r| r.port == port && r.kind == Some(kind)));
+            let env = seat_env_for(cli, kind, "wk-test-PLACEHOLDER");
+            assert!(env
+                .iter()
+                .any(|(k, v)| k == base && v == &format!("{origin}{suffix}")));
+            assert!(env
+                .iter()
+                .any(|(k, v)| k == "HTTPS_PROXY" && v == "http://agw:3000"));
+        }
+    }
+
+    #[test]
+    fn older_route_configs_keep_the_proven_api_key_policy() {
+        let mut legacy = serde_json::to_value(plain_config()).unwrap();
+        let route = legacy["providers"][0].as_object_mut().unwrap();
+        route.remove("kind");
+        route.remove("account_id_file");
+        legacy["units"][0].as_object_mut().unwrap().remove("bearer");
+        let config: GatewayConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(render(&config), render(&plain_config()));
+    }
+
+    #[test]
     fn openai_routes_and_every_units_metadata_are_rendered_per_bind() {
         let config = GatewayConfig {
             units: vec![unit("1"), unit("2")],
@@ -1266,7 +1593,7 @@ mod tests {
             openai["policies"]["apiKey"]["location"],
             json!({"header": {"name": "authorization", "prefix": "Bearer "}})
         );
-        for bind in &rendered["binds"].as_array().unwrap()[..2] {
+        for bind in &rendered["binds"].as_array().unwrap()[..config.providers.len()] {
             let auth = &bind["listeners"][0]["routes"][0]["policies"]["apiKey"];
             assert_eq!(auth["mode"], "strict");
             assert_eq!(auth["keys"].as_array().unwrap().len(), 2);
@@ -1285,8 +1612,12 @@ mod tests {
 
     #[test]
     fn zero_units_stays_strict_and_empty_egress_has_no_route() {
-        let rendered = render(&GatewayConfig::default());
-        for bind in &rendered["binds"].as_array().unwrap()[..2] {
+        let config = GatewayConfig {
+            egress_hosts: vec![],
+            ..GatewayConfig::default()
+        };
+        let rendered = render(&config);
+        for bind in &rendered["binds"].as_array().unwrap()[..config.providers.len()] {
             let auth = &bind["listeners"][0]["routes"][0]["policies"]["apiKey"];
             assert_eq!(auth["mode"], "strict");
             assert_eq!(auth["keys"], json!([]));

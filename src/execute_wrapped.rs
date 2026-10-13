@@ -2345,6 +2345,10 @@ impl WrappedCliStepRunner {
                         }
                         Ok(c) => {
                             seat_gateway_env = c.env;
+                            // lane: write files into the seat config home
+                            // c.files paths are relative to the isolated home for this CLI;
+                            // write them before spawn, with private permissions. They contain
+                            // only this unit's placeholder, whose exact bearer is registered.
                             gateway_lease = c.lease;
                             argv = c.argv;
                             crate::worker_sandbox::GovernedFloor::Armed(Box::new(
