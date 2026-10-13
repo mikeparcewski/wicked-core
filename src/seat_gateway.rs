@@ -752,7 +752,7 @@ pub(crate) fn publish(rt: &Runtime, gw: &Gateway, dir: &Path) -> Result<(), Stri
 
 /// Store a provider credential in the broker (`/broker/<file>`), the only place it lives: the
 /// gateway reads it to authenticate upstream; no seat ever mounts the broker.
-#[cfg_attr(not(test), allow(dead_code))] // the C4 sign-in flow is its production caller
+#[cfg_attr(any(not(test), not(unix)), allow(dead_code))] // the C4 sign-in flow is its production caller; its tests are unix-only
 pub(crate) fn set_broker_credential(
     rt: &Runtime,
     gw: &Gateway,
