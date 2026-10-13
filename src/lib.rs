@@ -28,6 +28,7 @@ mod code_graph;
 mod codex_skills;
 mod command;
 mod consent_plan;
+mod container_floor;
 mod decision;
 mod deliver_lift;
 mod diagnostic;
@@ -140,6 +141,7 @@ pub use campaign::{
     RunSpec,
 };
 pub use cli_runner::{TASK_COMPLETED, TASK_DISPATCHED};
+pub use container_floor::seat_image_main;
 pub use code_graph::{
     index_repo, rank_symbols, recon_repo, repo_graph_root_for_store, RankedSymbol,
 };

@@ -294,6 +294,14 @@ pub(crate) enum FloorUnarmed {
     CannotArm,
     /// The unit's working directory could not be resolved, so no floor can be rendered for it.
     RootUnresolvable,
+    /// Container floor: no container runtime CLI (`docker`, `podman`, `nerdctl`) on this host.
+    NoContainerRuntime,
+    /// Container floor: a runtime CLI is present but its engine did not answer.
+    ContainerRuntimeDown,
+    /// Container floor: the seat's image is not defined for this CLI or could not be built.
+    NoSeatImage,
+    /// Container floor: native Windows (seat containers mount host paths at the same path).
+    ContainerUnsupportedHost,
 }
 
 impl FloorUnarmed {
@@ -313,6 +321,25 @@ impl FloorUnarmed {
             FloorUnarmed::RootUnresolvable => {
                 "root_unresolvable: the unit's working directory could not be resolved"
             }
+            FloorUnarmed::NoContainerRuntime => {
+                "no_container_runtime: a container runtime is required for governed runs and none \
+                 was found — install Docker, Rancher Desktop, Podman, Colima or OrbStack (or set \
+                 WICKED_CONTAINER_RUNTIME to its CLI)"
+            }
+            FloorUnarmed::ContainerRuntimeDown => {
+                "container_runtime_down: a container runtime CLI is installed but its engine did not \
+                 answer (`<runtime> version` failed) — start it (Docker Desktop, Rancher Desktop, \
+                 `podman machine start`, `colima start`) and retry"
+            }
+            FloorUnarmed::NoSeatImage => {
+                "no_seat_image: the seat's container image is not defined for this CLI or could not \
+                 be built (`wicked-core seat-image build <cli>` shows why)"
+            }
+            FloorUnarmed::ContainerUnsupportedHost => {
+                "container_unsupported_host: the container floor mounts host paths at the same path, \
+                 which native Windows paths cannot be — run the daemon inside WSL2 with a container \
+                 runtime"
+            }
         }
     }
 
@@ -323,6 +350,10 @@ impl FloorUnarmed {
             FloorUnarmed::NoLauncher => "no_launcher",
             FloorUnarmed::CannotArm => "cannot_arm",
             FloorUnarmed::RootUnresolvable => "root_unresolvable",
+            FloorUnarmed::NoContainerRuntime => "no_container_runtime",
+            FloorUnarmed::ContainerRuntimeDown => "container_runtime_down",
+            FloorUnarmed::NoSeatImage => "no_seat_image",
+            FloorUnarmed::ContainerUnsupportedHost => "container_unsupported_host",
         }
     }
 }
@@ -597,7 +628,7 @@ impl SeatFloor {
 /// `p` made canonical even when its leaf does not exist yet: the nearest existing ancestor is
 /// canonicalized and the rest re-appended (SBPL matches resolved paths: `/var` is `/private/var`
 /// on macOS). `None` when nothing of it resolves.
-fn canon_lenient(p: &Path) -> Option<PathBuf> {
+pub(crate) fn canon_lenient(p: &Path) -> Option<PathBuf> {
     if let Ok(c) = p.canonicalize() {
         return Some(c);
     }

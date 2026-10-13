@@ -128,7 +128,11 @@ pub(crate) fn record_arm(
             serde_json::json!({
                 "v": SHADOW_VERSION, "kind": "arm", "phase": phase, "carrier": carrier,
                 "cli": cli, "floor": tool,
-                "label": (*tool == "sandbox-exec").then_some(crate::worker_sandbox::MACOS_INTERIM_FLOOR),
+                "label": match *tool {
+                    "sandbox-exec" => Some(crate::worker_sandbox::MACOS_INTERIM_FLOOR),
+                    "docker" | "podman" | "nerdctl" => Some(crate::container_floor::CONTAINER_FLOOR),
+                    _ => None,
+                },
                 "profile": spec.profile,
                 "tree": spec.tree, "writable": spec.writable, "protected": spec.protected,
                 "readmitted": spec.readmitted, "masks": spec.masks, "net": spec.net,

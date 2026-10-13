@@ -2310,7 +2310,44 @@ impl WrappedCliStepRunner {
                     crate::floor_shadow::spec_path(&decisions_path, &shadow_phase),
                     decisions_path.with_file_name(format!("settings-{shadow_phase}.json")),
                 ];
-                match crate::worker_sandbox::governed_floor(&plan.inputs) {
+                // The container floor (opt-in until the C5 shadow proof): the same resolved
+                // floor rendered as a hardened seat container instead of a host profile.
+                let chosen = if crate::container_floor::container_mode() {
+                    match crate::container_floor::arm(
+                        &plan.inputs,
+                        &argv,
+                        &input.run_id,
+                        input.unit.ord,
+                    ) {
+                        Ok(c) => {
+                            argv = c.argv;
+                            crate::worker_sandbox::GovernedFloor::Armed(
+                                crate::worker_sandbox::ArmedFloor {
+                                    sandbox: crate::validator::WorkerSandbox {
+                                        wrapper: c.wrapper,
+                                        level: crate::validator::SandboxLevel::Sandboxed,
+                                        downgrade_reason: None,
+                                    },
+                                    tool: c.tool,
+                                    spec: Some(c.spec),
+                                },
+                            )
+                        }
+                        Err((why, detail)) => {
+                            if !detail.is_empty() {
+                                eprintln!(
+                                    "wicked-core: unit {}: the container floor did not arm: \
+                                     {detail}",
+                                    input.unit.ord
+                                );
+                            }
+                            crate::worker_sandbox::GovernedFloor::Refused(why)
+                        }
+                    }
+                } else {
+                    crate::worker_sandbox::governed_floor(&plan.inputs)
+                };
+                match chosen {
                     crate::worker_sandbox::GovernedFloor::Armed(armed) => {
                         if let Some(spec) = &armed.spec {
                             crate::floor_shadow::record_arm(
@@ -4783,7 +4820,22 @@ fn run_bounded(
         // guard's comparison and still fold as clean).
         cmd.process_group(0);
     }
-    let mut child = cmd.spawn()?;
+    // A seat container (the container floor): pass the carrier's env in by name and mount its
+    // read roots; remembered so the container is removed however the client ends.
+    let mut cmd = crate::container_floor::finalize(cmd);
+    let seat_container = crate::container_floor::seat_container_name(&cmd);
+    let reap_seat = |_: ()| {
+        if let Some(name) = &seat_container {
+            crate::container_floor::reap(name);
+        }
+    };
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            reap_seat(());
+            return Err(e);
+        }
+    };
     let so = child.stdout.take().expect("piped stdout");
     let se = child.stderr.take().expect("piped stderr");
     let child_ref = &mut child;
@@ -4887,6 +4939,8 @@ fn run_bounded(
         let err = err_h.join().unwrap_or_default();
         (code, killed_by, out, usage, files, tools, err)
     });
+    // A killed client (cancel, deadline) leaves its container running: remove it by name.
+    reap_seat(());
 
     if let Some(sentinel) = killed_by {
         // Preserve what the CLI produced before the kill (debugging context on a hang).
