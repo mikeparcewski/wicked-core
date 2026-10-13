@@ -5785,6 +5785,49 @@ fn should_retry_worker(
         && is_transient_cli_failure(output)
 }
 
+/// (crew#998) Whether falling back to the single-shot wrapped carrier would run THIS unit with its
+/// tool calls unchecked while its seat is reported as governed. True when the unit is governed, the
+/// seat is admitted to ACP input governance (the roster and `/health` then call it governed, and its
+/// ACP session is the carrier that governs it), and the seat is not claude — the wrapped carrier's
+/// gate-hook adapter is claude-only, so on any other seat it discloses `governanceUnenforced` and
+/// runs the unit anyway. A unit for which this holds is refused instead of fallen back: the unit
+/// fails, and the actor's failover ladder moves the work to a seat that can run it governed.
+///
+/// Field case: pi's gate extension was missing, so `wicked-pi` refused to start pi (exit 126),
+/// pi-acp's `session/new` failed, and every pi turn on the rig ran on the wrapped carrier
+/// `governanceUnenforced` while `/roster` reported pi admitted.
+pub(crate) fn governed_fallback_runs_unchecked(
+    governed: bool,
+    acp_admitted: bool,
+    seat_cli: wicked_apps_core::spawn::SeatCli,
+) -> bool {
+    governed && acp_admitted && seat_cli != wicked_apps_core::spawn::SeatCli::Claude
+}
+
+/// (crew#998) The [`StepOutput`] for a governed unit whose admitted seat could not carry it on its
+/// ACP carrier: nothing ran on the wrapped carrier, so `governed` is false and no tools are listed.
+/// The text says `could not run`, which [`is_worker_originated_failure`] reads as a seat failure,
+/// so the actor fails the unit over to the next eligible seat rather than burning the run.
+fn ungoverned_fallback_refusal(input: &StepInput, cli_key: &str, cause: &str) -> StepOutput {
+    let governed = false;
+    StepOutput {
+        run_id: input.run_id.clone(),
+        unit_ix: input.unit_ix,
+        attempt: input.attempt,
+        output: format!(
+            "(seat '{cli_key}' could not run this governed unit on its ACP carrier — {cause}; no \
+             single-shot fallback was attempted, because that carrier arms no input governance \
+             for '{cli_key}' and the seat is reported as governed (crew#998) — fix the seat, or \
+             let the run fail over to an eligible seat)"
+        ),
+        status: StepStatus::Failed,
+        usage: None,
+        files: Vec::new(),
+        tools: Vec::new(),
+        governed,
+    }
+}
+
 /// Run the single-shot fallback, prepending `warning` to the output so it appears in
 /// both the streaming view and the persisted `StepOutput.output` (visible in studio). Retries a
 /// TRANSIENT worker failure up to [`MAX_TRANSIENT_RETRIES`] times (FINDING #5) so a single API blip
@@ -5922,6 +5965,12 @@ pub(crate) mod fallback_kind {
     /// lever is an argv fact (`--exclude-tools edit,write`, `--sandbox read-only`; a lever-less
     /// seat with a write grant is refused there — F-036). Not a failure; a disclosed route.
     pub const READ_ONLY_REQUIRES_WRAPPED: &str = "read_only_requires_wrapped";
+    /// (crew#998) NO fallback: the unit is governed, its seat is admitted to ACP input governance,
+    /// and its ACP carrier could not carry it (the cause is in the reason: a startup failure, a
+    /// session death, an unproven pin, …). The wrapped carrier arms no input governance for the
+    /// seat, so the unit is refused rather than run there unchecked; it fails, and the actor
+    /// fails it over. A seat-health failure signal, unlike the two `*_requires_wrapped` routes.
+    pub const GOVERNED_REQUIRES_ACP: &str = "governed_requires_acp";
     // RETIRED: `handshake_failed`. Its only emitter was the governed-ACP branch removed with
     // FINDING-060. The shared session path reports every startup failure — spawn or handshake — as
     // `binary_unavailable`, so the slug is no longer produced; a consumer still switching on it is
@@ -6262,6 +6311,57 @@ impl AcpStepRunner {
 
     fn emit_event(&self, ev: CoreEvent) {
         let _ = self.tx.send(Command::EmitEvent(ev));
+    }
+
+    /// The ONE exit for a turn this carrier cannot run over ACP: the single-shot wrapped fallback,
+    /// or — when that fallback would run a governed unit unchecked on a seat reported as governed
+    /// (`refuse`, [`governed_fallback_runs_unchecked`]) — a refusal with no fallback (crew#998).
+    /// `cause` names what went wrong, `detail` is appended after the route (a bridge stderr tail);
+    /// `kind`, when set, is the [`CoreEvent::AcpFallback`] slug a FALLBACK is emitted with. A
+    /// refusal is always emitted, as [`fallback_kind::GOVERNED_REQUIRES_ACP`].
+    #[allow(clippy::too_many_arguments)]
+    fn fall_back_or_refuse(
+        &self,
+        run_id: &str,
+        cli_key: &str,
+        kind: Option<&'static str>,
+        cause: &str,
+        detail: &str,
+        refuse: bool,
+        input: &StepInput,
+        emit: &DeltaSink,
+    ) -> StepOutput {
+        let reason = if refuse {
+            format!(
+                "{cause}; NOT falling back to the single-shot wrapped carrier: the unit is \
+                 governed, and '{cli_key}' is governed only on its ACP carrier (the wrapped one \
+                 arms no input governance for it), so the fallback would run its tool calls \
+                 unchecked (crew#998){detail}"
+            )
+        } else {
+            format!("{cause}; using single-shot fallback{detail}")
+        };
+        eprintln!("{reason}");
+        // A refusal is named by its own kind (one meaning: nothing fell back), whatever the cause;
+        // the cause's kind would tell a consumer the unit continued single-shot.
+        let kind = if refuse {
+            Some(fallback_kind::GOVERNED_REQUIRES_ACP)
+        } else {
+            kind
+        };
+        if let Some(kind) = kind {
+            self.emit_event(CoreEvent::AcpFallback {
+                session: run_id.to_string(),
+                cli_key: cli_key.to_string(),
+                reason: reason.clone(),
+                fallback_kind: kind.to_string(),
+            });
+        }
+        if refuse {
+            emit(&format!("{reason}\n"));
+            return ungoverned_fallback_refusal(input, cli_key, &format!("{cause}{detail}"));
+        }
+        fallback_with_warning(reason, input, emit, &self.fallback)
     }
 
     /// Close all ACP sessions for `run_id` and kill their child processes. Idempotent.
@@ -6683,6 +6783,11 @@ impl AcpStepRunner {
         let acp_admitted = acp_cfg_probe
             .as_ref()
             .is_some_and(|c| c.acp_input_governance);
+        // crew#998: past this point every way this turn can leave the ACP carrier for the wrapped
+        // one goes through `fall_back_or_refuse`, which refuses instead when the wrapped carrier
+        // would run this governed unit unchecked on a seat reported as governed.
+        let refuse_fallback =
+            governed_fallback_runs_unchecked(input.governance.is_some(), acp_admitted, seat_cli);
         // core#431 (F-3R2-009), Copilot on #433: a READ-ONLY (executes_code:false) unit may run
         // on this carrier only when the seat's adapter provably asks permission per tool call —
         // which is exactly what `acp_input_governance` admission certifies. An unadmitted seat
@@ -6735,17 +6840,20 @@ impl AcpStepRunner {
                     Some(crate::gate_hook::CARRIER_ACP),
                 ) {
                     // Fail CLOSED: unable to arm means unable to prove the gate ran.
-                    let reason = crate::diagnostic::with_cause(
+                    let cause = crate::diagnostic::with_cause(
                         "[wicked-core] could not arm governance for this ACP unit",
                         &e,
                     );
-                    self.emit_event(CoreEvent::AcpFallback {
-                        session: run_id.clone(),
-                        cli_key: cli_key.clone(),
-                        reason: reason.clone(),
-                        fallback_kind: fallback_kind::GOVERNANCE_REQUIRES_WRAPPED.to_string(),
-                    });
-                    return fallback_with_warning(reason, input, emit, &self.fallback);
+                    return self.fall_back_or_refuse(
+                        &run_id,
+                        &cli_key,
+                        Some(fallback_kind::GOVERNANCE_REQUIRES_WRAPPED),
+                        &cause,
+                        "",
+                        refuse_fallback,
+                        input,
+                        emit,
+                    );
                 }
                 // The unit's filesystem boundary, mirroring what the wrapped launcher arms by
                 // env (core#260): WRITE = unit cwd + the launch-validated extra roots; READ =
@@ -6934,17 +7042,16 @@ impl AcpStepRunner {
         }
 
         if acp_config.transport == AcpTransport::Http {
-            let reason = format!(
-                "[wicked-core] ACP HTTP transport not yet implemented for '{cli_key}'; \
-                 using single-shot fallback"
+            return self.fall_back_or_refuse(
+                &run_id,
+                &cli_key,
+                Some(fallback_kind::HTTP_UNIMPLEMENTED),
+                &format!("[wicked-core] ACP HTTP transport not yet implemented for '{cli_key}'"),
+                "",
+                refuse_fallback,
+                input,
+                emit,
             );
-            self.emit_event(CoreEvent::AcpFallback {
-                session: run_id.clone(),
-                cli_key: cli_key.clone(),
-                reason: reason.clone(),
-                fallback_kind: fallback_kind::HTTP_UNIMPLEMENTED.to_string(),
-            });
-            return fallback_with_warning(reason, input, emit, &self.fallback);
         }
 
         // Lazily open a session for (run_id, cli_key). The global map lock is held only
@@ -6978,6 +7085,23 @@ impl AcpStepRunner {
                         "the session's startup was refused as unauthenticated earlier in this run",
                     );
                 }
+                // crew#998: the startup that failed earlier in this run is not retried, and its
+                // refusal holds for every later turn on the key, exactly as the first one's did.
+                if refuse_fallback {
+                    return self.fall_back_or_refuse(
+                        &run_id,
+                        &cli_key,
+                        None,
+                        &format!(
+                            "[wicked-core] ACP unavailable for '{cli_key}' (its session failed to \
+                             start earlier in this run)"
+                        ),
+                        "",
+                        true,
+                        input,
+                        emit,
+                    );
+                }
                 return self.fallback.run_unit_streaming(input, emit);
             }
             SessionProbe::Live(arc) => (arc, true),
@@ -6991,22 +7115,24 @@ impl AcpStepRunner {
                 // specific error, without marking this session slot failed (Copilot). The
                 // single-shot fallback resolves the same cwd and reports its own spawn error.
                 if let Err(e) = std::fs::create_dir_all(&cwd) {
-                    let reason = format!(
-                        "[wicked-core] cannot create unit workdir {} ({e}); \
-                         using single-shot fallback",
+                    let cause = format!(
+                        "[wicked-core] cannot create unit workdir {} ({e})",
                         cwd.display()
                     );
                     {
                         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
                         guard.entry(session_key.clone()).or_insert(None);
                     }
-                    self.emit_event(CoreEvent::AcpFallback {
-                        session: run_id.clone(),
-                        cli_key: cli_key.clone(),
-                        reason: reason.clone(),
-                        fallback_kind: fallback_kind::BINARY_UNAVAILABLE.to_string(),
-                    });
-                    return fallback_with_warning(reason, input, emit, &self.fallback);
+                    return self.fall_back_or_refuse(
+                        &run_id,
+                        &cli_key,
+                        Some(fallback_kind::BINARY_UNAVAILABLE),
+                        &cause,
+                        "",
+                        refuse_fallback,
+                        input,
+                        emit,
+                    );
                 }
                 // Scope the worker's estate MCP server to THIS run's repo graph (FINDING-122). The
                 // session is cached per (run_id, cli_key), so the repo is stable for its lifetime.
@@ -7182,17 +7308,16 @@ impl AcpStepRunner {
                             emit(&format!("{reason}\n"));
                             return auth_refusal(input, &cli_key, kind, &startup_error);
                         }
-                        let reason = format!(
-                            "[wicked-core] ACP unavailable for '{cli_key}' ({e}); \
-                             using single-shot fallback"
+                        return self.fall_back_or_refuse(
+                            &run_id,
+                            &cli_key,
+                            Some(fallback_kind::BINARY_UNAVAILABLE),
+                            &format!("[wicked-core] ACP unavailable for '{cli_key}' ({e})"),
+                            "",
+                            refuse_fallback,
+                            input,
+                            emit,
                         );
-                        self.emit_event(CoreEvent::AcpFallback {
-                            session: run_id.clone(),
-                            cli_key: cli_key.clone(),
-                            reason: reason.clone(),
-                            fallback_kind: fallback_kind::BINARY_UNAVAILABLE.to_string(),
-                        });
-                        return fallback_with_warning(reason, input, emit, &self.fallback);
                     }
                 }
             }
@@ -7274,23 +7399,27 @@ impl AcpStepRunner {
             &input.unit,
             input.workdir.is_some(),
         ) {
-            let reason = format!(
+            // crew#998 (codex r1): the wrapped carrier's read-only lever is not input governance —
+            // a GOVERNED unit on an admitted non-claude seat is refused here too, never run there.
+            let cause = format!(
                 "[wicked-core] unit {} (phase `{}`) declares executes_code:false, and seat \
                  '{cli_key}' is admitted to input governance but the resolved ACP binary did not \
                  match its pinned verified_version at spawn time — its permission behaviour is \
-                 unproven for this build, so the ACP read-only posture cannot be relied on; \
-                 running it single-shot on the wrapped carrier with the seat's read-only lever \
+                 unproven for this build, so the ACP read-only posture cannot be relied on \
                  (F-036 / core#431)",
                 input.unit.ord,
                 input.unit.phase_id().unwrap_or("?"),
             );
-            self.emit_event(CoreEvent::AcpFallback {
-                session: run_id.clone(),
-                cli_key: cli_key.clone(),
-                reason: reason.clone(),
-                fallback_kind: fallback_kind::READ_ONLY_REQUIRES_WRAPPED.to_string(),
-            });
-            return fallback_with_warning(reason, input, emit, &self.fallback);
+            return self.fall_back_or_refuse(
+                &run_id,
+                &cli_key,
+                Some(fallback_kind::READ_ONLY_REQUIRES_WRAPPED),
+                &cause,
+                "",
+                refuse_fallback,
+                input,
+                emit,
+            );
         }
         // core#581: the version-pin disclosure, emitted from ONE place and only for a unit that
         // actually starts a turn on the drifted bridge.
@@ -7710,18 +7839,16 @@ impl AcpStepRunner {
                 let stderr_note = death_context(&proc);
                 drop(proc);
                 self.drop_session(&run_id);
-                let reason = format!(
-                    "[wicked-core] ACP session exited for '{cli_key}'; \
-                     using single-shot fallback{stderr_note}"
-                );
-                eprintln!("{reason}");
-                self.emit_event(CoreEvent::AcpFallback {
-                    session: run_id.clone(),
-                    cli_key: cli_key.clone(),
-                    reason: reason.clone(),
-                    fallback_kind: fallback_kind::SESSION_DIED.to_string(),
-                });
-                fallback_with_warning(reason, input, emit, &self.fallback)
+                self.fall_back_or_refuse(
+                    &run_id,
+                    &cli_key,
+                    Some(fallback_kind::SESSION_DIED),
+                    &format!("[wicked-core] ACP session exited for '{cli_key}'"),
+                    &stderr_note,
+                    refuse_fallback,
+                    input,
+                    emit,
+                )
             }
             Err(e) => {
                 let stderr_note = death_context(&proc);
@@ -7814,23 +7941,16 @@ impl AcpStepRunner {
                         governed,
                     };
                 }
-                let (reason, kind) = {
-                    (
-                        format!(
-                            "[wicked-core] ACP error for '{cli_key}' ({e}); \
-                             using single-shot fallback{stderr_note}"
-                        ),
-                        fallback_kind::SESSION_DIED,
-                    )
-                };
-                eprintln!("{reason}");
-                self.emit_event(CoreEvent::AcpFallback {
-                    session: run_id.clone(),
-                    cli_key: cli_key.clone(),
-                    reason: reason.clone(),
-                    fallback_kind: kind.to_string(),
-                });
-                fallback_with_warning(reason, input, emit, &self.fallback)
+                self.fall_back_or_refuse(
+                    &run_id,
+                    &cli_key,
+                    Some(fallback_kind::SESSION_DIED),
+                    &format!("[wicked-core] ACP error for '{cli_key}' ({e})"),
+                    &stderr_note,
+                    refuse_fallback,
+                    input,
+                    emit,
+                )
             }
         }
     }
@@ -14265,7 +14385,7 @@ transport = "stdio"
     fn session_death_surfaces_stderr_and_logs() {
         let src = include_str!("acp_runner.rs");
         assert!(
-            src.contains("using single-shot fallback{stderr_note}"),
+            src.contains("using single-shot fallback{detail}") && src.contains("&stderr_note,"),
             "the fallback reason no longer carries the bridge stderr tail"
         );
         assert!(
@@ -21136,6 +21256,397 @@ acp_input_governance = true
         );
         runner.drop_session(&run_id);
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── crew#998: a governed unit on an admitted seat never falls back to an unchecked carrier ──
+
+    /// The predicate, over every seat: only claude's wrapped carrier arms input governance, so only
+    /// a governed unit on an ADMITTED non-claude seat is refused rather than fallen back. An
+    /// ungoverned unit, and an unadmitted (floor-class, disclosed) seat, keep the fallback.
+    #[test]
+    fn a_governed_fallback_is_unchecked_only_on_an_admitted_seat_that_is_not_claude() {
+        use wicked_apps_core::spawn::SeatCli;
+        for seat in [
+            SeatCli::Pi,
+            SeatCli::Opencode,
+            SeatCli::Codex,
+            SeatCli::Copilot,
+            SeatCli::Agy,
+            SeatCli::Other,
+        ] {
+            assert!(
+                governed_fallback_runs_unchecked(true, true, seat),
+                "{seat:?}"
+            );
+            assert!(
+                !governed_fallback_runs_unchecked(false, true, seat),
+                "{seat:?}"
+            );
+            assert!(
+                !governed_fallback_runs_unchecked(true, false, seat),
+                "{seat:?}"
+            );
+        }
+        assert!(!governed_fallback_runs_unchecked(
+            true,
+            true,
+            SeatCli::Claude
+        ));
+    }
+
+    /// A pi-acp stand-in. `fail_new`: answers `initialize`, then fails `session/new` the way
+    /// pi-acp 0.0.32 did on the rig when its pi child (`wicked-pi`, gate missing) had exited 126.
+    /// `die_prompt`: opens the session, then exits on the first `session/prompt` (a mid-turn death).
+    #[cfg(unix)]
+    fn write_pi_acp_standin(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("pi-acp-standin");
+        std::fs::write(
+            &path,
+            r#"#!/usr/bin/env python3
+import sys, json
+mode, ledger = sys.argv[1], sys.argv[2]
+
+def w(obj):
+    print(json.dumps(obj), flush=True)
+
+def record(entry):
+    with open(ledger, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    try:
+        req = json.loads(line)
+    except Exception:
+        continue
+    method = req.get("method")
+    if method == "initialize":
+        w({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "protocolVersion": 1, "agentCapabilities": {}, "authMethods": []}})
+    elif method == "session/new":
+        record({"new": True})
+        if mode == "fail_new":
+            print("[wicked-pi] refusing to start pi: WICKED_PI_GOVERNANCE is set but the "
+                  "pi-governance extension was not found", file=sys.stderr, flush=True)
+            w({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32603, "data": {},
+               "message": "Internal error: Cannot call write after a stream was destroyed"}})
+        else:
+            w({"jsonrpc": "2.0", "id": req["id"], "result": {"sessionId": "pi-standin"}})
+    elif method == "session/prompt":
+        record({"prompt": True})
+        sys.exit(1)
+    elif "id" in req and method:
+        w({"jsonrpc": "2.0", "id": req["id"], "result": {}})
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// An admitted pi seat (`acp_input_governance = true`, as the registry ships it since core#563)
+    /// whose ACP carrier is the stand-in in `mode`, and whose wrapped carrier is a fake `pi` that
+    /// records that it ran. Returns `(home, ran-marker, input)`; `governed` picks the unit's kind.
+    #[cfg(unix)]
+    fn admitted_pi_seat(
+        tag: &str,
+        mode: &str,
+        governed: bool,
+        extra_acp: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, StepInput) {
+        use std::os::unix::fs::PermissionsExt;
+        let home = crate::skills_snapshot::test_support::scratch(tag);
+        std::fs::create_dir_all(home.join("worker")).unwrap();
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let ran = home.join("wrapped-ran.txt");
+        let pi = bin.join("pi");
+        std::fs::write(
+            &pi,
+            format!("#!/bin/sh\necho ran >> \"{}\"\nexit 0\n", ran.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bridge = write_pi_acp_standin(&home);
+        let ledger = home.join("ledger.ndjson");
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                r#"
+[[cli]]
+key = "pi"
+display_name = "pi"
+binary = "pi"
+headless_invocation = "pi -p {{PROMPT}}"
+
+[cli.acp]
+binary = "{bridge}"
+start_args = ["{mode}", "{ledger}"]
+transport = "stdio"
+acp_input_governance = true
+{extra_acp}
+"#,
+                bridge = bridge.display(),
+                ledger = ledger.display(),
+            ),
+        )
+        .unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let run_id = format!("run-998-{tag}-{}", std::process::id());
+        let mut u = crate::domain::WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "build");
+        u.assigned_cli = Some("pi".to_string());
+        u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", pi.display()));
+        u.executes_code = true;
+        let governance = governed.then(|| crate::workflow::GovernanceContext {
+            human_confirm: Default::default(),
+            db_path: home.join("estate.db").to_string_lossy().to_string(),
+            code_graph_db: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_id: None,
+        });
+        let input = StepInput {
+            run_id,
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-998".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: Some(wt),
+            governance,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        (home, ran, input)
+    }
+
+    /// Run `input` on a fresh runner under `home`; returns the output and every event emitted.
+    #[cfg(unix)]
+    fn run_on_admitted_pi(
+        home: &std::path::Path,
+        inputs: &[&StepInput],
+    ) -> (Vec<StepOutput>, Vec<CoreEvent>) {
+        use crate::workflow::StepRunner;
+        let _home = EnvPin::set("HOME", home);
+        let _worker = EnvPin::set(
+            wicked_apps_core::spawn::WORKER_HOME_ENV,
+            &home.join("worker"),
+        );
+        let _nosnap = EnvPin::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        // The isolated fixture, whatever the host's environment (codex r1 on #925): with the
+        // operator-config hatch present the seat would read the operator's own homes.
+        let _isolated = EnvPin::unset(wicked_apps_core::spawn::INHERIT_OPERATOR_CONFIG_ENV);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runner = AcpStepRunner::new(tx);
+        let outs: Vec<StepOutput> = inputs.iter().map(|i| runner.run_unit(i)).collect();
+        for i in inputs {
+            runner.drop_session(&i.run_id);
+        }
+        let events = rx
+            .try_iter()
+            .filter_map(|c| match c {
+                Command::EmitEvent(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        (outs, events)
+    }
+
+    /// crew#998, the rig's failure: pi's ACP `session/new` fails, and the governed unit used to run
+    /// on the wrapped carrier with `governanceUnenforced` while the roster called pi admitted. Now
+    /// the unit is REFUSED — the wrapped `pi` never runs, nothing is disclosed as having run
+    /// unchecked, and the refusal reads as a seat failure so the actor fails it over. A second turn
+    /// on the same run (the failed-startup tombstone) is refused the same way, not fallen back.
+    #[test]
+    #[cfg(unix)]
+    fn a_governed_unit_on_an_admitted_pi_seat_whose_acp_start_fails_is_refused_not_run_unchecked() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let (home, ran, input) = admitted_pi_seat("998-start", "fail_new", true, "");
+        let mut second = input.clone();
+        second.unit_ix = 1;
+        second.unit.ord = 2;
+        let (outs, events) = run_on_admitted_pi(&home, &[&input, &second]);
+        for out in &outs {
+            assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+            assert!(!out.governed, "{}", out.output);
+            assert!(
+                out.output.contains("could not run this governed unit")
+                    && out.output.contains("no single-shot fallback was attempted"),
+                "{}",
+                out.output
+            );
+            assert!(
+                is_worker_originated_failure(&out.output),
+                "the refusal must read as a seat failure, so the actor fails the unit over: {}",
+                out.output
+            );
+        }
+        assert!(
+            outs[0]
+                .output
+                .contains("Cannot call write after a stream was destroyed"),
+            "the refusal carries the startup error: {}",
+            outs[0].output
+        );
+        assert!(
+            !ran.exists(),
+            "the wrapped pi carrier must not run a governed unit"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::GovernanceUnenforced { .. })),
+            "nothing ran unchecked, so nothing is disclosed as unchecked: {events:?}"
+        );
+        let kinds: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                CoreEvent::AcpFallback {
+                    fallback_kind: kind,
+                    ..
+                } => Some(kind.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![fallback_kind::GOVERNED_REQUIRES_ACP; 2],
+            "one refusal event per refused turn, never a kind that reads as a fallback: {events:?}"
+        );
+        for e in &events {
+            if let CoreEvent::AcpFallback { reason, .. } = e {
+                assert!(
+                    reason.contains("NOT falling back") && !reason.contains("using single-shot"),
+                    "{reason}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&input.run_id));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// crew#998, mid-turn: the admitted pi session dies during the governed turn. The unit is
+    /// refused, never re-run on the wrapped carrier unchecked.
+    #[test]
+    #[cfg(unix)]
+    fn a_governed_unit_on_an_admitted_pi_seat_whose_acp_session_dies_is_refused_not_rerun_unchecked(
+    ) {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let (home, ran, input) = admitted_pi_seat("998-death", "die_prompt", true, "");
+        let (outs, events) = run_on_admitted_pi(&home, &[&input]);
+        assert_eq!(outs[0].status, StepStatus::Failed, "{}", outs[0].output);
+        assert!(
+            outs[0]
+                .output
+                .contains("no single-shot fallback was attempted"),
+            "{}",
+            outs[0].output
+        );
+        assert!(
+            !ran.exists(),
+            "the wrapped pi carrier must not re-run a governed unit"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::GovernanceUnenforced { .. })),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CoreEvent::AcpFallback { fallback_kind: kind, reason, .. }
+                    if kind == fallback_kind::GOVERNED_REQUIRES_ACP
+                        && reason.contains("NOT falling back")
+                        && (reason.contains("ACP session exited") || reason.contains("ACP error"))
+            )),
+            "{events:?}"
+        );
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&input.run_id));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// crew#998 (codex r1 on #925): EVERY route from the ACP carrier to the wrapped one in
+    /// `exec_turn_inner` goes through `fall_back_or_refuse`, so a governed unit on an admitted
+    /// non-claude seat can never reach the wrapped carrier. Two direct routes remain, and both are
+    /// legitimate: the STATIC read-only reroute (only for an UNADMITTED adapter,
+    /// `acp_read_only_requires_wrapped`) and the seat with no `[cli.acp]` at all (never admitted).
+    /// The process-level pin reroute (`acp_read_only_unproven_at_spawn`, which needs the registry's
+    /// built-in pin a test cannot set) is covered by this guard: a new direct call fails it.
+    #[test]
+    fn every_acp_to_wrapped_route_after_admission_can_refuse() {
+        // A Windows checkout can carry CRLF line endings (git autocrlf); the scan is over `\n`.
+        let src = include_str!("acp_runner.rs").replace("\r\n", "\n");
+        let body = &src[src
+            .find("    fn exec_turn_inner(")
+            .expect("exec_turn_inner")..];
+        let body = &body[..body.find("\n    }\n").expect("end of exec_turn_inner")];
+        let direct = body.matches("fallback_with_warning(").count();
+        assert_eq!(
+            direct, 1,
+            "only the static unadmitted read-only reroute may call fallback_with_warning directly"
+        );
+        let static_reroute = body.find("acp_read_only_requires_wrapped(").unwrap();
+        let admission = body.find("let refuse_fallback =").unwrap();
+        assert!(
+            body.find("fallback_with_warning(").unwrap() > static_reroute
+                && body.find("fallback_with_warning(").unwrap() > admission,
+            "the one direct call is the static reroute"
+        );
+        let bare: Vec<usize> = body
+            .match_indices("self.fallback.run_unit_streaming(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            bare.len(),
+            2,
+            "no-ACP-config route + the tombstone after its refusal"
+        );
+        let tombstone_refusal = body.find("if refuse_fallback {").unwrap();
+        assert!(
+            body[..bare[0]].trim_end().ends_with("None => return"),
+            "the first is the no-`[cli.acp]` route, whose seat is never admitted"
+        );
+        assert!(
+            bare[1] > tombstone_refusal,
+            "the tombstone's fallback runs only after its refusal check"
+        );
+        assert!(
+            body.matches("self.fall_back_or_refuse(").count() >= 8,
+            "the routes through the one exit"
+        );
+    }
+
+    /// crew#998, the control: an UNGOVERNED unit on the same seat keeps the single-shot fallback —
+    /// nothing is claimed for it, so the wrapped carrier runs it.
+    #[test]
+    #[cfg(unix)]
+    fn an_ungoverned_unit_on_an_admitted_pi_seat_whose_acp_start_fails_still_falls_back() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let (home, ran, input) = admitted_pi_seat("998-ungov", "fail_new", false, "");
+        let (outs, events) = run_on_admitted_pi(&home, &[&input]);
+        assert_eq!(outs[0].status, StepStatus::Ok, "{}", outs[0].output);
+        assert!(ran.exists(), "the wrapped carrier ran the ungoverned unit");
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CoreEvent::AcpFallback { reason, .. } if reason.contains("using single-shot fallback")
+            )),
+            "{events:?}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 }

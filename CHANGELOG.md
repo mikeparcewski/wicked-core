@@ -28,6 +28,26 @@ Two release tracks share this file, newest entry first regardless of track:
   count as writes. On Windows, an unquoted `\` word is judged under both the native and the Git
   Bash reading.
 
+- **A governed unit on an admitted seat is refused, not run unchecked, when its ACP session cannot
+  carry it (crew#998).** On the rig every pi run since 2026-10-11 failed `session/new`: core#563
+  set `WICKED_PI_GOVERNANCE=1`, the `pi-governance` gate was not installed, so `wicked-pi` exited
+  126 and pi-acp answered `Cannot call write after a stream was destroyed`. The runner then fell
+  back to the single-shot wrapped carrier, which arms no input governance for pi, so every pi turn
+  (build units included) ran `governanceUnenforced` while `/roster` and `/health` reported pi as
+  admitted. Now every route from the ACP carrier to the wrapped one (startup failure and its
+  per-run tombstone, workdir creation, arming, HTTP transport, the read-only reroute of a binary
+  that missed its version pin, a session that dies or errors mid-turn) goes through one exit,
+  `fall_back_or_refuse`. When the unit is governed, the seat is admitted to ACP input governance
+  and is not claude (whose wrapped carrier arms the gate-hook), the unit fails with the cause and
+  no fallback runs. The `acpFallback` event carries a new kind, `governed_requires_acp`, with the
+  cause in its reason ("… NOT falling back …"), so no consumer reads it as a single-shot
+  continuation. The refusal reads as a seat failure, so the actor's failover ladder moves the work
+  to the next eligible seat. Ungoverned units and unadmitted (floor-class, disclosed) seats keep
+  the fallback. Tests: `a_governed_unit_on_an_admitted_pi_seat_whose_acp_start_fails_is_refused_not_run_unchecked`,
+  `…_whose_acp_session_dies_is_refused_not_rerun_unchecked` (both fail on the previous main), the
+  ungoverned control, the predicate over every seat, and a source guard that every route after
+  admission can refuse.
+
 - **Governed claude seats load the worktree's `CLAUDE.md` again.** Since #914 they ran with no
   filesystem setting scope, which also dropped the repository's instructions. A claude unit now
   passes its tree as an additional directory and sets `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1`,
