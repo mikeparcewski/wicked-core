@@ -104,8 +104,24 @@ impl Runtime {
     fn cmd(&self) -> Command {
         let mut c = Command::new(&self.cli);
         c.stdin(Stdio::null());
+        if let Some(path) = client_path(&self.cli, std::env::var_os("PATH").as_deref()) {
+            c.env("PATH", path);
+        }
         c
     }
+}
+
+/// `PATH` for the runtime CLI: its own directory first. The desktops ship the client's helpers
+/// beside it (`docker-credential-osxkeychain`, `docker-buildx` in `~/.rd/bin`, Docker.app's
+/// `bin`), and a daemon's `PATH` often lacks that directory: without it a build's base-image pull
+/// fails on "error getting credentials".
+fn client_path(cli: &Path, path: Option<&std::ffi::OsStr>) -> Option<std::ffi::OsString> {
+    let dir = cli.parent().filter(|d| d.is_absolute())?;
+    let mut dirs: Vec<PathBuf> = vec![dir.to_path_buf()];
+    if let Some(p) = path {
+        dirs.extend(std::env::split_paths(p).filter(|d| d != dir));
+    }
+    std::env::join_paths(dirs).ok()
 }
 
 /// The runtime CLIs to try, in order: the operator's choice, then `docker`, `podman`, `nerdctl`
@@ -1192,6 +1208,18 @@ mod tests {
         plain.args(["run", "--name", "x"]);
         assert!(seat_container(&plain).is_none());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_runtime_cli_runs_with_its_own_dir_first_on_path() {
+        let p = client_path(
+            Path::new("/u/.rd/bin/docker"),
+            Some(std::ffi::OsStr::new("/usr/bin:/u/.rd/bin:/bin")),
+        )
+        .unwrap();
+        assert_eq!(p, std::ffi::OsString::from("/u/.rd/bin:/usr/bin:/bin"));
+        assert!(client_path(Path::new("docker"), None).is_none());
     }
 
     #[test]
