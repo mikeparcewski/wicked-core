@@ -368,6 +368,11 @@ pub(crate) fn build_seat_image(rt: &Runtime, cli: &str) -> Result<String, String
     c.stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        c.process_group(0);
+    }
     let mut child = c
         .spawn()
         .map_err(|e| format!("could not start `{} build`: {e}", rt.cli.display()))?;
@@ -378,6 +383,7 @@ pub(crate) fn build_seat_image(rt: &Runtime, cli: &str) -> Result<String, String
     // Stream the build's progress as it comes (a full pipe would stall the build), keeping
     // the last lines for the error.
     let progress = child.stderr.take().map(|se| {
+        let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             use std::io::BufRead;
             let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
@@ -388,8 +394,9 @@ pub(crate) fn build_seat_image(rt: &Runtime, cli: &str) -> Result<String, String
                 }
                 tail.push_back(line);
             }
-            tail.into_iter().collect::<Vec<_>>()
-        })
+            let _ = tx.send(tail.into_iter().collect::<Vec<_>>());
+        });
+        rx
     });
     let start = Instant::now();
     let status = loop {
@@ -399,13 +406,21 @@ pub(crate) fn build_seat_image(rt: &Runtime, cli: &str) -> Result<String, String
                 std::thread::sleep(Duration::from_millis(200))
             }
             _ => {
+                #[cfg(unix)]
+                // SAFETY: killpg on the build's own process group (pgid == its pid).
+                unsafe {
+                    libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(format!("building {tag} ran past {BUILD_TIMEOUT:?}"));
             }
         }
     };
-    let tail = progress.and_then(|h| h.join().ok()).unwrap_or_default();
+    // Bounded: a descendant still holding stderr cannot hold the build past its exit.
+    let tail = progress
+        .and_then(|rx| rx.recv_timeout(Duration::from_secs(5)).ok())
+        .unwrap_or_default();
     if status.success() {
         Ok(tag)
     } else {
@@ -856,6 +871,7 @@ pub(crate) fn finalize(cmd: Command) -> Command {
     let mut land_extra: Vec<String> = Vec::new();
     let mut envs: Vec<(String, Option<std::ffi::OsString>)> = Vec::new();
     let mut ro: Vec<PathBuf> = Vec::new();
+    let mut carrier_path: Option<std::ffi::OsString> = None;
     // Only the variables the carrier set EXPLICITLY reach the seat. Nothing the daemon merely
     // inherited does — by design: a seat's model credentials come from the gateway's broker,
     // never from the daemon's environment (an inherited OPENAI_API_KEY stays on the host).
@@ -863,6 +879,9 @@ pub(crate) fn finalize(cmd: Command) -> Command {
         let key = k.to_string_lossy().into_owned();
         envs.push((key.clone(), v.map(|v| v.to_os_string())));
         let Some(v) = v else { continue };
+        if key == "PATH" {
+            carrier_path = Some(v.to_os_string());
+        }
         if key == crate::gate_hook::READ_ROOTS_ENV {
             ro.extend(std::env::split_paths(v));
         }
@@ -904,6 +923,12 @@ pub(crate) fn finalize(cmd: Command) -> Command {
         land_extra.extend(["--rox".into(), p.to_string_lossy().into_owned()]);
         existing.push(p);
     }
+    // The seat's PATH: the carrier's entries that exist inside (a mounted skills snapshot's
+    // `scripts`, where garden's launcher lives), then the image's own. Host-only entries go.
+    if let Some(p) = &carrier_path {
+        extra.push("--env".into());
+        extra.push(format!("PATH={}", container_path(p, &existing)));
+    }
     // The seat command was hardened where the carrier built it; re-harden the rebuilt one too.
     let mut out = Command::new(cmd.get_program());
     out.hardened();
@@ -926,6 +951,20 @@ pub(crate) fn finalize(cmd: Command) -> Command {
         }
     }
     out
+}
+
+/// The image's own `PATH` (Debian's default), after which a seat's PATH ends.
+const IMAGE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// A seat's PATH: the entries of `carrier` (the carrier's PATH) under a mount, then the image's.
+fn container_path(carrier: &std::ffi::OsStr, mounts: &[PathBuf]) -> String {
+    let mut out: Vec<String> = std::env::split_paths(carrier)
+        .filter(|d| mounts.iter().any(|m| d.starts_with(m)))
+        .filter_map(|d| d.to_str().map(str::to_string))
+        .filter(|d| !d.contains(':'))
+        .collect();
+    out.push(IMAGE_PATH.to_string());
+    out.join(":")
 }
 
 /// The options whose value is a host path the seat must read (claude's `--settings`,
@@ -1166,7 +1205,22 @@ pub(crate) fn arm(
                 ),
             )
         })?;
-    let spec = crate::worker_sandbox::resolve_seat_floor(inp).map_err(|w| (w, String::new()))?;
+    // The engine's launch files, checked at their TRUSTED spelling before anything resolves
+    // them: never a symlink (a worker could plant one to bind a host file in, or to make the
+    // engine create one), and created exclusively when absent.
+    for p in &inp.pinned {
+        trust_pin(p).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
+    }
+    let mut spec =
+        crate::worker_sandbox::resolve_seat_floor(inp).map_err(|w| (w, String::new()))?;
+    // The directory holding the launch files is not writable inside a container: the gate
+    // hook runs on the host, so the seat has nothing to write there (and nothing to plant).
+    let pin_dirs: Vec<PathBuf> = spec
+        .pinned
+        .iter()
+        .filter_map(|p| p.parent().map(Path::to_path_buf))
+        .collect();
+    spec.writable.retain(|w| !pin_dirs.contains(w));
     let rt = runtime().map_err(|w| (w, String::new()))?;
     static SWEEP: Once = Once::new();
     SWEEP.call_once(|| sweep(&rt, SWEEP_AGE));
@@ -1181,20 +1235,6 @@ pub(crate) fn arm(
     }
     // The engine's launch files are bound read-only: each must exist before the mounts are
     // rendered (a fresh phase's floor spec is written after arming).
-    for p in &spec.pinned {
-        if !p.exists() {
-            let made = p
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|_| std::fs::File::create(p).map(|_| ()));
-            if let Err(e) = made {
-                return Err((
-                    FloorUnarmed::RootUnresolvable,
-                    format!("pinned launch file {}: {e}", p.display()),
-                ));
-            }
-        }
-    }
     let mut mounts = mount_plan(&spec).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     add_read_roots(&mut mounts, read_roots);
     let name = container_name(cli, run_id, ord);
@@ -1235,6 +1275,31 @@ pub(crate) fn arm(
         spec,
         cleanup,
     })
+}
+
+/// A launch file the seat gets read-only: refused when it is a symlink; created exclusively
+/// (`O_EXCL`: a dangling symlink planted at its path makes the creation fail, never follow)
+/// when absent.
+pub(crate) fn trust_pin(p: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.file_type().is_symlink() => Err(format!(
+            "pinned launch file {} is a symlink; refusing it",
+            p.display()
+        )),
+        Ok(m) if m.is_file() => Ok(()),
+        Ok(_) => Err(format!("pinned launch file {} is not a file", p.display())),
+        Err(_) => {
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(p)
+                .map(|_| ())
+                .map_err(|e| format!("pinned launch file {}: {e}", p.display()))
+        }
+    }
 }
 
 /// Mount the unit's read roots (its governance read roots, its skills delivery) read-only when
@@ -1653,7 +1718,13 @@ mod tests {
         }
         assert!(
             !has_in(&args[..img], &["--env", "PATH"]),
-            "the image keeps its own PATH"
+            "the PATH is never passed by name (its host value)"
+        );
+        assert!(
+            args[..img]
+                .iter()
+                .any(|a| a == &format!("PATH={IMAGE_PATH}")),
+            "the seat's PATH = mounted carrier entries + the image's: {args:?}"
         );
         assert!(
             has_in(&args[img + 4..land_end], &["--env", "PATH"]),
@@ -2063,6 +2134,39 @@ mod tests {
         let t = Instant::now();
         assert!(output_within(c, Duration::from_millis(300)).is_none());
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
+    /// Codex review r3 (P2): a mounted snapshot's scripts dir stays on the seat's PATH.
+    #[test]
+    fn the_seat_path_keeps_mounted_entries_and_the_images() {
+        let p = std::ffi::OsString::from("/snap/gen1/scripts:/opt/homebrew/bin:/usr/bin");
+        assert_eq!(
+            container_path(&p, &[PathBuf::from("/snap/gen1")]),
+            format!("/snap/gen1/scripts:{IMAGE_PATH}")
+        );
+    }
+
+    /// Codex review r3 (P1): a planted symlink at a launch file's path is refused, and a
+    /// dangling one is never followed to create a host file.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_pin_symlink_is_refused_and_never_followed() {
+        let base = tmp("pin");
+        let target = base.join("operator-private.txt");
+        std::fs::write(&target, "private").unwrap();
+        let pin = base.join("settings-unit-2.json");
+        std::os::unix::fs::symlink(&target, &pin).unwrap();
+        assert!(trust_pin(&pin).unwrap_err().contains("symlink"));
+        let dangling = base.join("floor-spec-unit-3.json");
+        let elsewhere = base.join("created-by-follow");
+        std::os::unix::fs::symlink(&elsewhere, &dangling).unwrap();
+        assert!(trust_pin(&dangling).is_err());
+        assert!(!elsewhere.exists(), "never created through the link");
+        let fresh = base.join("gov/floor-spec-unit-4.json");
+        trust_pin(&fresh).unwrap();
+        assert!(fresh.is_file());
+        trust_pin(&fresh).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
