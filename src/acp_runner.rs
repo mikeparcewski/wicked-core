@@ -21587,7 +21587,8 @@ acp_input_governance = true
     /// built-in pin a test cannot set) is covered by this guard: a new direct call fails it.
     #[test]
     fn every_acp_to_wrapped_route_after_admission_can_refuse() {
-        let src = include_str!("acp_runner.rs");
+        // A Windows checkout can carry CRLF line endings (git autocrlf); the scan is over `\n`.
+        let src = include_str!("acp_runner.rs").replace("\r\n", "\n");
         let body = &src[src
             .find("    fn exec_turn_inner(")
             .expect("exec_turn_inner")..];
