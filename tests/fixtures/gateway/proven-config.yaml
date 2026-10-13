@@ -1,0 +1,38 @@
+config:
+  adminAddr: "off"
+  sensitiveHeaders: [x-api-key, authorization]
+  logging: {level: info, format: json}
+frontendPolicies:
+  accessLog:
+    add:
+      wicked_unit: 'default(apiKey.unit, "none")'
+      wicked_run: 'default(apiKey.run, "none")'
+      llm_model: 'llm.requestModel'
+      llm_tools: 'llm.toolCalls'
+      llm_text: 'llm.completion'
+      llm_in: 'llm.inputTokens'
+      llm_out: 'llm.outputTokens'
+binds:
+- port: 4000
+  listeners:
+  - routes:
+    - policies:
+        apiKey:
+          mode: strict
+          location: {header: {name: x-api-key}}
+          keys:
+          - key: wk-unit-PLACEHOLDER-1
+            metadata: {name: unit-1, run: run-a, unit: "1"}
+        backendAuth:
+          key: {file: /broker/anthropic.key}
+        ai:
+          routes:
+            /v1/messages: messages
+            /v1/messages/count_tokens: anthropicTokenCount
+            '*': passthrough
+      backends:
+      - ai:
+          name: anthropic
+          hostOverride: "gw1-stub:8080"
+          provider:
+            anthropic: {}

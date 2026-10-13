@@ -70,6 +70,13 @@
       "worker_read": "none (a governed worker reaches its OWN graph through the estate MCP / $WICKED_ESTATE_DB, and the boundary grants exactly its <key>/ dir for WAL siblings; the file tools are denied the whole subtree — every other repo's graph is one sibling over)"
     },
     {
+      "name": "gateway",
+      "kind": "dir",
+      "owner": "engine",
+      "source": "wicked-core src/seat_gateway.rs — <state home>/gateway, the container seats' agentgateway state (WICKED_SEAT_FLOOR=container): config/gateway.json (routes), config/units.json (live unit keys, 0600), config/config.json (the rendered gateway config); the served copy and the broker credentials live in runtime-named volumes, never here",
+      "worker_read": "none (a container seat reaches the gateway only over its network; the container floor covers this directory even inside a mounted checkout)"
+    },
+    {
       "name": "learn-schedules.json",
       "kind": "file",
       "owner": "crew",
