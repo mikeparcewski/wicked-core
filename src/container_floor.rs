@@ -785,6 +785,17 @@ fn landrun_end(args: &[String], img: usize) -> Option<usize> {
     None
 }
 
+/// Removes a directory the container floor allocated for one unit (its fenced scratch) when
+/// dropped, however the unit ends.
+#[derive(Debug)]
+pub(crate) struct RemoveOnDrop(pub(crate) PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Reaps a seat container when dropped (the end of the run, however it ends).
 #[derive(Debug)]
 pub(crate) struct ReapOnDrop(pub(crate) Option<SeatContainer>);
@@ -812,6 +823,9 @@ pub(crate) fn seat_container(cmd: &Command) -> Option<SeatContainer> {
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     let img = image_index(&args)?;
+    // Only the complete wrapper `run_argv` renders (the seat entry + landrun after the image):
+    // a label alone never makes a command ours to reap.
+    landrun_end(&args, img)?;
     args[..img]
         .windows(2)
         .find(|w| w[0] == "--name")
@@ -934,14 +948,31 @@ pub(crate) fn finalize(cmd: Command) -> Command {
     out.args(&extra);
     out.args(&args[img..land_end]);
     out.args(&land_extra);
-    out.args(&args[land_end..]);
+    // Mounts sit at canonical paths; a host alias the launch spelled (`/tmp` for `/private/tmp`
+    // on macOS) does not exist inside, so path option values and env values are re-spelled.
+    let mut tail: Vec<String> = args[land_end..].to_vec();
+    let mut i = 5; // past `-- <entry> --check <canary> --`
+    while i < tail.len() {
+        if tail[i] == "--" {
+            break;
+        }
+        if PATH_OPTS.contains(&tail[i].as_str()) && i + 1 < tail.len() {
+            tail[i + 1] = canonical_spelling(std::ffi::OsStr::new(&tail[i + 1]), &existing)
+                .to_string_lossy()
+                .into_owned();
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    out.args(&tail);
     if let Some(dir) = cmd.get_current_dir() {
         out.current_dir(dir);
     }
     for (k, v) in envs {
         match v {
             Some(v) => {
-                out.env(k, v);
+                out.env(k, canonical_spelling(&v, &existing));
             }
             None => {
                 out.env_remove(k);
@@ -951,12 +982,30 @@ pub(crate) fn finalize(cmd: Command) -> Command {
     out
 }
 
+/// `v` (a path or a path list) with each absolute entry whose canonical form is mounted
+/// re-spelled canonically; anything else (not a path, not mounted) is returned unchanged.
+fn canonical_spelling(v: &std::ffi::OsStr, mounts: &[PathBuf]) -> std::ffi::OsString {
+    let parts: Vec<PathBuf> = std::env::split_paths(v).collect();
+    if parts.is_empty() || !parts.iter().all(|p| p.is_absolute()) {
+        return v.to_os_string();
+    }
+    let mapped: Vec<PathBuf> = parts
+        .into_iter()
+        .map(|p| match crate::worker_sandbox::canon_lenient(&p) {
+            Some(c) if c != p && mounts.iter().any(|m| c.starts_with(m)) => c,
+            _ => p,
+        })
+        .collect();
+    std::env::join_paths(mapped).unwrap_or_else(|_| v.to_os_string())
+}
+
 /// The image's own `PATH` (Debian's default), after which a seat's PATH ends.
 const IMAGE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// A seat's PATH: the entries of `carrier` (the carrier's PATH) under a mount, then the image's.
 fn container_path(carrier: &std::ffi::OsStr, mounts: &[PathBuf]) -> String {
     let mut out: Vec<String> = std::env::split_paths(carrier)
+        .map(|d| crate::worker_sandbox::canon_lenient(&d).unwrap_or(d))
         .filter(|d| mounts.iter().any(|m| d.starts_with(m)))
         .filter_map(|d| d.to_str().map(str::to_string))
         .filter(|d| !d.contains(':'))
@@ -1202,6 +1251,9 @@ pub(crate) fn arm(
                 ),
             )
         })?;
+    // The worktree's git pointer is seat-writable: verify it against git's own back-pointer
+    // before anything resolves (or creates) the git dirs it names.
+    verify_linked_worktree(&inp.cwd).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     // The engine's launch files, checked at their TRUSTED spelling before anything resolves
     // them: never a symlink (a worker could plant one to bind a host file in, or to make the
     // engine create one), and created exclusively when absent.
@@ -1271,6 +1323,68 @@ pub(crate) fn arm(
         tool: tool_name(&rt.cli),
         cleanup,
     })
+}
+
+/// A linked worktree's `.git` file (which a full-posture seat can rewrite) is trusted only
+/// when it names a `<common>/.git/worktrees/<n>` dir whose `commondir` leads back to that
+/// common dir and whose `gitdir` back-pointer names THIS worktree's `.git` — git's own
+/// bookkeeping, which the seat cannot write. A redirected pointer is refused. Not a linked
+/// worktree (a main checkout, a scratch dir): nothing to verify.
+pub(crate) fn verify_linked_worktree(cwd: &Path) -> Result<(), String> {
+    let Some(root) = cwd.ancestors().find(|a| a.join(".git").exists()) else {
+        return Ok(());
+    };
+    let dot_git = root.join(".git");
+    if std::fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_dir()) {
+        return Ok(());
+    }
+    let bad = |why: &str| {
+        format!(
+            "the worktree's git pointer {} {why}; refusing it",
+            dot_git.display()
+        )
+    };
+    let text = std::fs::read_to_string(&dot_git).map_err(|_| bad("is unreadable"))?;
+    let raw = text
+        .lines()
+        .find_map(|l| l.strip_prefix("gitdir:"))
+        .map(str::trim)
+        .ok_or_else(|| bad("names no gitdir"))?;
+    let gitdir = if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        root.join(raw)
+    };
+    let gitdir = gitdir
+        .canonicalize()
+        .map_err(|_| bad("names a missing gitdir"))?;
+    if gitdir.parent().and_then(Path::file_name) != Some(std::ffi::OsStr::new("worktrees")) {
+        return Err(bad("does not name a <repo>/.git/worktrees/<name> dir"));
+    }
+    let common_expected = gitdir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| bad("has no common dir"))?
+        .to_path_buf();
+    let common = std::fs::read_to_string(gitdir.join("commondir"))
+        .map_err(|_| bad("names a gitdir without commondir"))?;
+    let common = gitdir
+        .join(common.trim())
+        .canonicalize()
+        .map_err(|_| bad("names a gitdir whose commondir is missing"))?;
+    if common != common_expected {
+        return Err(bad("names a gitdir whose commondir leads elsewhere"));
+    }
+    let back = std::fs::read_to_string(gitdir.join("gitdir"))
+        .map_err(|_| bad("names a gitdir without a back-pointer"))?;
+    let back = Path::new(back.trim())
+        .canonicalize()
+        .map_err(|_| bad("names a gitdir whose back-pointer is missing"))?;
+    let ours = dot_git.canonicalize().map_err(|_| bad("is unresolvable"))?;
+    if back != ours {
+        return Err(bad("names another worktree's gitdir"));
+    }
+    Ok(())
 }
 
 /// A launch file the seat gets read-only: refused when it is a symlink; created exclusively
@@ -2162,6 +2276,112 @@ mod tests {
         trust_pin(&fresh).unwrap();
         assert!(fresh.is_file());
         trust_pin(&fresh).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Codex review r4 (P1): a rewritten `.git` pointer never names the dirs a seat is granted.
+    #[test]
+    fn a_redirected_git_pointer_is_refused() {
+        let base = tmp("gitptr");
+        let common = base.join("clone/.git");
+        let wtgit = common.join("worktrees/wt1");
+        let wt = base.join("wt1");
+        let other = base.join("private-project");
+        for d in [&wtgit, &wt, &other] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(wtgit.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            wtgit.join("gitdir"),
+            format!("{}\n", wt.join(".git").display()),
+        )
+        .unwrap();
+        let point = |to: &Path| {
+            std::fs::write(wt.join(".git"), format!("gitdir: {}\n", to.display())).unwrap()
+        };
+        point(&wtgit);
+        assert!(verify_linked_worktree(&wt).is_ok());
+        assert!(
+            verify_linked_worktree(&wt.join("sub")).is_ok(),
+            "a subdir resolves its worktree"
+        );
+        point(&other);
+        assert!(verify_linked_worktree(&wt)
+            .unwrap_err()
+            .contains("worktrees"));
+        // Another worktree's gitdir: its back-pointer names that worktree, not this one.
+        let wt2git = common.join("worktrees/wt2");
+        std::fs::create_dir_all(&wt2git).unwrap();
+        std::fs::write(wt2git.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            wt2git.join("gitdir"),
+            format!("{}\n", base.join("wt2/.git").display()),
+        )
+        .unwrap();
+        std::fs::create_dir_all(base.join("wt2")).unwrap();
+        std::fs::write(base.join("wt2/.git"), "x").unwrap();
+        point(&wt2git);
+        assert!(verify_linked_worktree(&wt)
+            .unwrap_err()
+            .contains("another worktree"));
+        // A main checkout has no pointer to verify.
+        assert!(verify_linked_worktree(&base.join("clone")).is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Codex review r4 (P2): a command that merely carries the seat label is not ours to reap.
+    #[test]
+    fn only_the_complete_wrapper_is_reaped() {
+        // spawn-audit: test-only — never spawned.
+        let mut c = Command::new("docker");
+        c.args([
+            "run",
+            "--label",
+            "wicked.seat=1",
+            "--name",
+            "keep",
+            "-d",
+            "alpine",
+            "sleep",
+            "9",
+        ]);
+        assert!(seat_container(&c).is_none());
+    }
+
+    /// Codex review r4 (P2): a host alias in an env value or a path option is re-spelled to the
+    /// canonical path the mount sits at.
+    #[cfg(unix)]
+    #[test]
+    fn aliases_are_respelled_to_the_mounted_canonical_path() {
+        let base = tmp("alias");
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("home")).unwrap();
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let mounts = vec![real.clone()];
+        assert_eq!(
+            canonical_spelling(alias.join("home").as_os_str(), &mounts),
+            real.join("home").into_os_string()
+        );
+        assert_eq!(
+            canonical_spelling(std::ffi::OsStr::new("value"), &mounts),
+            "value"
+        );
+        let unmounted = base.join("elsewhere");
+        assert_eq!(
+            canonical_spelling(unmounted.as_os_str(), &mounts),
+            unmounted.into_os_string()
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_unit_scratch_is_removed_when_its_guard_drops() {
+        let base = tmp("scratch");
+        let d = base.join("checks/run/unit");
+        std::fs::create_dir_all(&d).unwrap();
+        drop(RemoveOnDrop(d.clone()));
+        assert!(!d.exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -2215,6 +2215,7 @@ impl WrappedCliStepRunner {
             let mut floor_env: Vec<(&'static str, PathBuf)> = Vec::new();
             let mut opencode_password: Option<String> = None;
             let mut seat_cleanup: Option<crate::container_floor::ReapOnDrop> = None;
+            let mut scratch_guard: Option<crate::container_floor::RemoveOnDrop> = None;
             // A1: a requested kernel floor that cannot arm DISCLOSES AND CONTINUES rather than
             // failing the unit — `detect_worker_sandbox` returns a best-effort (empty-wrapper)
             // sandbox with a downgrade reason, and we emit a `SandboxUnenforced` disclosure (the
@@ -2232,8 +2233,12 @@ impl WrappedCliStepRunner {
                 let fenced = write_posture.fences_writes();
                 let scratch: Option<PathBuf> = match (&codex_checks, fenced) {
                     (Some(ctx), _) => Some(ctx.check_scratch.clone()),
+                    // A fresh scratch for this unit alone: removed however the unit ends.
                     (None, true) => match codex_check_scratch(input) {
-                        Ok(dir) => Some(dir),
+                        Ok(dir) => {
+                            scratch_guard = Some(crate::container_floor::RemoveOnDrop(dir.clone()));
+                            Some(dir)
+                        }
                         Err(why) => return posture_refusal(input, &why),
                     },
                     _ => None,
@@ -2736,8 +2741,9 @@ impl WrappedCliStepRunner {
             let timeout = crate::workflow::effective_timeout(self.timeout, input.unit.budget_secs);
             let bounded = run_bounded(cmd, timeout, emit, adapter, Some(cancel_token.clone()));
             self.unregister_token(input, &cancel_token);
-            // The seat ran (and `run_bounded` reaped it); release the arm-time guard now.
+            // The seat ran (and `run_bounded` reaped it); release the arm-time guards now.
             drop(seat_cleanup.take());
+            drop(scratch_guard.take());
             drop(mcp_channel);
             match bounded {
                 // FINDING-100. A unit may background work and return — domain-extraction's extract

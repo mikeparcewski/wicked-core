@@ -578,7 +578,8 @@ pub(crate) fn floor_refusal_text(cli: &str, why: FloorUnarmed) -> String {
 
 // ── The seat floor's root computation (rendered by the container floor) ──────────────────────
 
-/// One outbound network grant on the seat floor (macOS; Linux leaves the network open).
+/// One network grant on the seat floor: a loopback port the seat serves itself (its egress is
+/// the gateway, not a grant).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub(crate) enum NetGrant {
@@ -617,8 +618,8 @@ pub(crate) struct FloorInputs {
     pub(crate) home: Option<PathBuf>,
 }
 
-/// The seat floor as resolved for one spawn: what the profile renders and what shadow mode
-/// judges each tool call against ([`crate::floor_shadow`]). Every path is canonical.
+/// The seat floor as resolved for one spawn: what the container floor renders as mounts and
+/// Landlock grants ([`crate::container_floor::mount_plan`]). Every path is canonical.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SeatFloor {
@@ -642,13 +643,13 @@ pub(crate) struct SeatFloor {
     /// them would use to switch its own gate off.
     #[serde(default)]
     pub(crate) pinned: Vec<PathBuf>,
-    /// Outbound grants (macOS).
+    /// The seat's own loopback ports.
     pub(crate) net: Vec<NetGrant>,
 }
 
 /// `p` made canonical even when its leaf does not exist yet: the nearest existing ancestor is
-/// canonicalized and the rest re-appended (SBPL matches resolved paths: `/var` is `/private/var`
-/// on macOS). `None` when nothing of it resolves.
+/// canonicalized and the rest re-appended (mounts sit at resolved paths: `/var` is
+/// `/private/var` on macOS). `None` when nothing of it resolves.
 pub(crate) fn canon_lenient(p: &Path) -> Option<PathBuf> {
     if let Ok(c) = p.canonicalize() {
         return Some(c);
@@ -839,8 +840,8 @@ fn program_stem(argv: &[String]) -> Option<&str> {
 /// codex's own sandbox OFF, because ours is on: every `--sandbox <mode>` / `-s <mode>` /
 /// `--sandbox=<mode>` becomes `danger-full-access`, `--full-auto` (which implies
 /// `workspace-write`) and any `-c sandbox_mode=…` are dropped, and the mode is added when the
-/// argv names none (codex's default is read-only, which also nests). A nested Seatbelt apply is
-/// refused under any outer profile, so codex's own sandbox would fail every command with exit 71.
+/// argv names none (codex's default is read-only, which also nests). Inside a seat container
+/// codex's own sandbox cannot run (bwrap needs user namespaces) and fails every command closed.
 /// Only for a launch the floor wraps; `false` (nothing changed) when `argv` is not codex.
 pub(crate) fn codex_sandbox_off_under_floor(argv: &mut Vec<String>) -> bool {
     if program_stem(argv) != Some("codex") {
