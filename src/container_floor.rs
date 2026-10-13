@@ -2340,6 +2340,7 @@ mod tests {
     /// Codex review r4 + r5 (P1): a rewritten `.git` pointer, or a forged gitdir triple that
     /// agrees with itself, never names the dirs a seat is granted: the anchor is the git dir the
     /// engine pinned from the registered repository.
+    #[cfg(unix)]
     #[test]
     fn a_redirected_git_pointer_is_refused() {
         let base = tmp("gitptr");
