@@ -14,6 +14,16 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The `artifact.theme` editor permission.** Protocol 2's `theme.set` (DES-EDITOR-PLUGIN-CONTRACT-001
+  §7.2) changes the theme of the artifact an editor opens, as a new version the user can undo. Crew
+  admits it since wicked-crew#1008 and garden's pack schema since wicked-garden#1303, but the engine's
+  vocabulary refused it, so `evaluateEditorGrants` answered `bad_request: unknown permission
+  "artifact.theme"` for every protocol-2 first-party editor (wicked-page, wicked-deck, wicked-doc,
+  wicked-video) and their cards never started. It is now known: a first-party editor is allowed it
+  by default through the new `EDITOR-BUILTIN-THEME` posture rule, and a pack editor asks, as for
+  `artifact.write`. The rule is separate from `EDITOR-BUILTIN` so the insert-only boot seed adds it to
+  a store seeded before. An unknown permission is still a bad request.
+
 - **Container seats start through the engine's trusted launcher.** Every seat's entrypoint is
   `/floor/launch` from the engine's floor image, mounted read-only (`--mount type=image`): static
   busybox, landrun built static from source, and the launcher. So no code from the seat image runs

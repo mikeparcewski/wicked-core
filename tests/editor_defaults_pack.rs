@@ -86,6 +86,11 @@ fn the_editor_defaults_pack_ingests_and_recalls_its_rules() {
         ("allow".into(), serde_json::json!(["EDITOR-OPEN-DEFAULTS"]))
     );
     assert_eq!(ask("acme-notes", "artifact.write", false).0, "ask");
+    assert_eq!(
+        ask("wicked-deck", "artifact.theme", true),
+        ("allow".into(), serde_json::json!(["EDITOR-BUILTIN-THEME"]))
+    );
+    assert_eq!(ask("acme-slides", "artifact.theme", false).0, "ask");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -43,8 +43,9 @@ operator retired.
 | Rule | Effect |
 |---|---|
 | `EDITOR-GRANTS` | The approvals ledger, not a decide-lane rule. Allowing a permission adds `editor:<id>@<version>#<sha256>/<permission>` to its `excludes`, using the full 64-hex sha256 of the entry file and the version. A new version or a changed hash is a different token and asks again. The engine reads it whether the rule is active or retired. |
-| `EDITOR-BUILTIN` | Allows a first-party editor its default set (every permission but `network.media`). |
+| `EDITOR-BUILTIN` | Allows a first-party editor its default set (every permission but `network.media`, `mcp.session` and `artifact.theme`). |
 | `EDITOR-BUILTIN-PAGE-MEDIA` | Allows `network.media` for the first-party page editor only. |
+| `EDITOR-BUILTIN-THEME` | Allows a first-party editor `artifact.theme`. A pack editor asks. |
 | `EDITOR-OPEN-DEFAULTS` | Allows every editor `artifact.read`, `selection.chip`, `checks.contribute` and `ui.fullscreen`. |
 
 `mcp.session` (DES-MCP-INSPECTOR-001) is in no posture rule. It lets an editor talk, through
@@ -56,10 +57,18 @@ declare it never has it, a new version or hash asks again, and revoking it is re
 in Steering. No `allow` rule grants it, however broad: only that token does. A `deny` on
 `editor-perm:mcp.session` dominates the grant.
 
+`artifact.theme` (DES-EDITOR-PLUGIN-CONTRACT-001 §7.2) is protocol 2's `theme.set`: the editor
+changes the theme of the artifact it opens, and the change lands as a new version the user can
+undo. It is a write, so it follows `artifact.write`: allowed by default for a first-party editor,
+asked for a pack editor. Its default is its own rule, `EDITOR-BUILTIN-THEME`, rather than a wider
+`EDITOR-BUILTIN`, because the seed is insert-only: a store seeded before the permission existed
+keeps its `EDITOR-BUILTIN` and gains the new rule at the next boot.
+
 ## Rules
 
-- `ED-1` (critical): An editor without `artifact.write` changes nothing. It can still point
-  (chips) and note (advisory checks). Enforced by studio's host, from the grants this gate decides.
+- `ED-1` (critical): An editor without `artifact.write` or `artifact.theme` changes nothing. It can
+  still point (chips) and note (advisory checks). `artifact.theme` alone changes only the theme, as
+  a new version. Enforced by studio's host, from the grants this gate decides.
 - `ED-2` (critical): With or without grants, an editor never sends, launches, approves, decides,
   delivers or remembers, and never reaches the network by fetch, XHR, WebSocket, EventSource,
   beacon, form or navigation. No message exists for these, and the editor's own policy carries

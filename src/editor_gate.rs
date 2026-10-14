@@ -53,7 +53,13 @@ pub(crate) const GRANTS_LEDGER: &str = "EDITOR-GRANTS";
 /// `mcp.session` (DES-MCP-INSPECTOR-001 §4) lets an editor talk, through the host, to an MCP server
 /// the operator connected. It starts and drives processes, so no posture rule allows it: it asks
 /// until the operator's install consent for THAT editor build writes its token into the ledger.
-pub const EDITOR_PERMISSIONS: [&str; 12] = [
+///
+/// `artifact.theme` (DES-EDITOR-PLUGIN-CONTRACT-001 §7.2, protocol 2 `theme.set`) changes the theme
+/// of the artifact the editor opens, as a new version the user can undo. It is a write: a
+/// first-party editor is allowed it by default (`EDITOR-BUILTIN-THEME`) and a pack editor asks,
+/// as with `artifact.write`. Crew's `EDITOR_PERMISSIONS` and garden's pack schema carry the same
+/// list; a permission crew admits and this list lacks refuses the whole grants read.
+pub const EDITOR_PERMISSIONS: [&str; 13] = [
     "artifact.read",
     "artifact.write",
     "selection.chip",
@@ -66,6 +72,7 @@ pub const EDITOR_PERMISSIONS: [&str; 12] = [
     "ui.fullscreen",
     "network.media",
     "mcp.session",
+    "artifact.theme",
 ];
 
 /// Permissions only the approvals ledger can allow: an `allow` rule never grants them, so the one
@@ -395,7 +402,7 @@ mod tests {
 
     fn seeded() -> wicked_apps_core::SqliteStore {
         let mut store = open_store(Some(":memory:")).unwrap();
-        assert_eq!(seed_editor_defaults(&mut store).unwrap(), 4);
+        assert_eq!(seed_editor_defaults(&mut store).unwrap(), 5);
         store
     }
 
@@ -671,6 +678,92 @@ mod tests {
             evaluate_editor_grants(&empty, &req("acme-notes", &["checks.read"], false), 1),
             Err(EditorGrantError::GuardError(m)) if m.contains("not in the store")
         ));
+    }
+
+    #[test]
+    fn artifact_theme_is_a_first_party_default_and_asks_for_a_pack_editor() {
+        let mut store = seeded();
+        let first =
+            evaluate_editor_grants(&store, &req("wicked-deck", &["artifact.theme"], true), 1)
+                .unwrap();
+        assert_eq!(decisions(&first), vec![("artifact.theme", "allow")]);
+        assert_eq!(
+            first.grants[0].rule_ids,
+            vec!["EDITOR-BUILTIN-THEME".to_string()]
+        );
+        // A pack editor, and a forged wicked- id the caller does not vouch for, ask.
+        for (id, fp) in [("acme-slides", false), ("wicked-deck", false)] {
+            let got = evaluate_editor_grants(&store, &req(id, &["artifact.theme"], fp), 1).unwrap();
+            assert_eq!(decisions(&got), vec![("artifact.theme", "ask")], "{id}");
+            assert!(got.grants[0].rule_ids.is_empty(), "{id}: no rule fired");
+        }
+        // The operator's allow is the per-build token, like every other ask.
+        approve(
+            &mut store,
+            &grant_token("acme-slides", "1.0.0", SHA, "artifact.theme"),
+        );
+        let granted =
+            evaluate_editor_grants(&store, &req("acme-slides", &["artifact.theme"], false), 1)
+                .unwrap();
+        assert_eq!(decisions(&granted), vec![("artifact.theme", "allow")]);
+        assert_eq!(granted.grants[0].rule_ids, vec![GRANTS_LEDGER.to_string()]);
+    }
+
+    #[test]
+    fn a_protocol_2_first_party_manifest_is_decided_whole() {
+        // The permission list of studio's first-party protocol-2 deck editor (its
+        // `scripts/build-editors.mjs` entry), as crew sends it (`record.manifest.permissions`).
+        // Before artifact.theme was known the whole read was a bad request, so the card never
+        // started. Crew passes only the ids: the manifest's `surfaces` never reach the engine.
+        let store = seeded();
+        let deck = [
+            "artifact.read",
+            "artifact.write",
+            "selection.chip",
+            "ui.fullscreen",
+            "artifact.export",
+            "artifact.theme",
+        ];
+        let got = evaluate_editor_grants(&store, &req("wicked-deck", &deck, true), 1).unwrap();
+        assert!(
+            got.grants.iter().all(|g| g.decision == "allow"),
+            "{:?}",
+            decisions(&got)
+        );
+        // An unknown permission still refuses the whole read.
+        let mut typo = deck.to_vec();
+        typo.push("artifact.restyle");
+        assert!(matches!(
+            evaluate_editor_grants(&store, &req("wicked-deck", &typo, true), 1),
+            Err(EditorGrantError::BadRequest(m)) if m.contains("unknown permission \"artifact.restyle\"")
+        ));
+    }
+
+    #[test]
+    fn a_store_seeded_before_artifact_theme_gains_its_rule_at_the_next_boot() {
+        // A store an older engine seeded holds the other four pack rules only.
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let older: Vec<_> = editor_default_rules()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.id != "EDITOR-BUILTIN-THEME")
+            .map(|r| r.to_node())
+            .collect();
+        assert_eq!(older.len(), 4);
+        let dynstore: &mut dyn GraphStore = &mut store;
+        dynstore.upsert_nodes(&older).unwrap();
+        assert!(matches!(
+            evaluate_editor_grants(&store, &req("wicked-deck", &["artifact.theme"], true), 1),
+            Err(EditorGrantError::GuardError(m)) if m.contains("EDITOR-BUILTIN-THEME")
+        ));
+        assert_eq!(
+            seed_editor_defaults(&mut store).unwrap(),
+            1,
+            "only the new rule"
+        );
+        let got = evaluate_editor_grants(&store, &req("wicked-deck", &["artifact.theme"], true), 1)
+            .unwrap();
+        assert_eq!(decisions(&got), vec![("artifact.theme", "allow")]);
     }
 
     #[test]
