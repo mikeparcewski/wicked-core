@@ -102,6 +102,15 @@ impl KillHandle {
         }
     }
 
+    /// Whether this handle still holds its infrastructure registration.
+    #[cfg(all(test, unix))]
+    fn is_infra(&self) -> bool {
+        self.infra
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
     fn release_infra(&self) {
         self.infra.lock().unwrap_or_else(|p| p.into_inner()).take();
     }
@@ -11773,21 +11782,15 @@ sleep 30
         let quick = std::process::Command::new("true")
             .spawn()
             .expect("true runs");
-        let pid = quick.id();
         let handle = KillHandle::new_bridge(quick, 1);
-        assert!(crate::outstanding_work::infra_pids()
-            .iter()
-            .any(|(p, _)| *p == pid));
+        assert!(handle.is_infra());
         let deadline = Instant::now() + Duration::from_secs(10);
         while handle.try_exit_status().is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(
-            !crate::outstanding_work::infra_pids()
-                .iter()
-                .any(|(p, _)| *p == pid),
-            "a reaped bridge pid is released"
-        );
+        // By the handle's own registration, not the pid: a parallel test may already have been
+        // handed the reused pid for its own bridge.
+        assert!(!handle.is_infra(), "a reaped bridge pid is released");
         assert!(
             handle.try_exit_status().is_some(),
             "a reaped bridge keeps answering its exit status (codex r6)"
@@ -11797,15 +11800,10 @@ sleep 30
             .arg("30")
             .spawn()
             .expect("sleep runs");
-        let pid = slow.id();
         let handle = KillHandle::new_bridge(slow, 1);
-        assert!(crate::outstanding_work::infra_pids()
-            .iter()
-            .any(|(p, _)| *p == pid));
+        assert!(handle.is_infra());
         handle.signal();
-        assert!(!crate::outstanding_work::infra_pids()
-            .iter()
-            .any(|(p, _)| *p == pid));
+        assert!(!handle.is_infra());
     }
 
     /// core#396, the ACP lever, pinned on the pure frame builder: the snapshot rides `session/new`
