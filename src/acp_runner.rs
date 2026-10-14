@@ -45,7 +45,7 @@ use serde_json::json;
 // The in-file tests reach these through `use super::*`.
 #[cfg(test)]
 use serde_json::Value;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::time::Instant;
 
 use crate::command::Command;
@@ -1731,20 +1731,15 @@ fn host_floor_needs_acp(input: &StepInput) -> Option<String> {
     let cli = input.unit.assigned_cli.as_deref().unwrap_or("claude");
     // The binary that will actually run (codex c5-r2): the unit's own invocation when it carries
     // one (an ad-hoc roster can put `pi -p {PROMPT}` on a `claude` seat), else the seat's.
-    let run_root = input
-        .unit
-        .assigned_invocation
-        .as_deref()
-        .and_then(|inv| inv.split_whitespace().next())
-        .and_then(|bin| wicked_apps_core::spawn::SeatCli::from_binary(bin).root_name())
+    // The launcher's own resolution (codex c5-r3): the unit's invocation or the seat's, its binary
+    // read quote-aware exactly as the wrapped carrier will spawn it.
+    let invocation =
+        crate::execute_wrapped::launch_invocation(cli, input.unit.assigned_invocation.clone());
+    let binary = crate::execute_wrapped::template_binary(&invocation);
+    let run_root = wicked_apps_core::spawn::SeatCli::from_binary(&binary)
+        .root_name()
         .map(str::to_string);
-    let is_claude = match &run_root {
-        Some(root) => root == "claude",
-        None => matches!(
-            acp_seat_identity(cli),
-            crate::skills_snapshot::WorkerCli::Claude
-        ),
-    };
+    let is_claude = run_root.as_deref() == Some("claude");
     let acp_class = |key: &str| {
         seat_governance_class(key) == wicked_council::GovernanceClass::AcpInputGovernance
     };
@@ -2060,6 +2055,12 @@ mod tests {
         let mut disguised = unit("claude", true);
         disguised.unit.assigned_invocation = Some("pi -p {PROMPT}".into());
         assert_eq!(host_floor_needs_acp(&disguised).as_deref(), Some("claude"));
+        // ...quoted, as the launcher tokenizes it (codex c5-r3).
+        disguised.unit.assigned_invocation = Some("\"pi\" -p {PROMPT}".into());
+        assert_eq!(host_floor_needs_acp(&disguised).as_deref(), Some("claude"));
+        let mut real = unit("claude", true);
+        real.unit.assigned_invocation = Some("\"/usr/local/bin/claude\" -p {PROMPT}".into());
+        assert_eq!(host_floor_needs_acp(&real), None);
         std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, "container");
         assert_eq!(host_floor_needs_acp(&unit("pi", true)), None);
         match saved {
