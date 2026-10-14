@@ -2809,6 +2809,16 @@ impl WrappedCliStepRunner {
                     // record is not the process: the boundary counts only when the LAUNCHED argv
                     // runs codex itself with that bounded mode and no bypass flag.
                     Err(crate::worker_sandbox::FloorUnarmed::SeatArmsItsOwn) => {
+                        // C5 (codex c5-r5): with ACP gone a governed host-floor codex unit is held
+                        // only by its own bounded sandbox, so an unbounded launch (`--yolo`, no
+                        // mode) is refused, never run with only a disclosure.
+                        if governed && !launches_bounded_codex(&argv) {
+                            return floor_refused(
+                                input,
+                                &cli_key,
+                                crate::worker_sandbox::FloorUnarmed::NeedsContainerFloor,
+                            );
+                        }
                         floor = if launches_bounded_codex(&argv) {
                             Ok(crate::worker_sandbox::SEAT_CODEX_BOUNDARY)
                         } else {
@@ -7343,7 +7353,7 @@ mod tests {
     }
 
     /// IG1-core-2 (review): a governed unit on the `codex` seat whose invocation does not launch
-    /// codex is NOT governed by codex's sandbox — no marker, `governed: false`, both disclosures.
+    /// codex is NOT governed by codex's sandbox — and (C5) on the interim host floor it is refused.
     #[cfg(unix)]
     #[test]
     fn a_codex_seat_launching_another_binary_is_not_governed_by_codex_sandbox() {
@@ -7389,26 +7399,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!out.governed, "an echo is not codex's sandbox");
+        // C5 (codex c5-r5): with ACP gone nothing else would hold it, so the unit is REFUSED
+        // (fail closed) — before C5 it ran with only a disclosure.
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
         assert!(
-            events.iter().any(|c| matches!(
-                c,
-                crate::command::Command::EmitEvent(
-                    crate::event::CoreEvent::GovernanceUnenforced { reason, .. }
-                ) if reason.contains("does not run codex with its own bounded")
-            )),
-            "{} events, none matched",
-            events.len()
+            out.output.contains("needs_container_floor"),
+            "{}",
+            out.output
         );
-        assert!(
-            events.iter().any(|c| matches!(
-                c,
-                crate::command::Command::EmitEvent(
-                    crate::event::CoreEvent::SandboxUnenforced { .. }
-                )
-            )),
-            "{} events, none matched",
-            events.len()
-        );
+        let _ = events;
     }
 
     /// The converse, so the event cannot degrade into noise on every ungoverned internal call:
