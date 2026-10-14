@@ -1680,6 +1680,10 @@ impl AcpStepRunner {
             ),
             None => self.fallback.run_unit_streaming(input, emit),
         };
+        let mut output = output;
+        if ok_turn_is_a_seat_refusal(&output) {
+            output.status = crate::workflow::StepStatus::Failed;
+        }
 
         // On a normal bus-worker return, publication owns the in-flight marker until
         // `task.completed` is durable. A panic never reaches this assignment, so Drop
@@ -1725,13 +1729,39 @@ fn host_floor_needs_acp(input: &StepInput) -> Option<String> {
         return None;
     }
     let cli = input.unit.assigned_cli.as_deref().unwrap_or("claude");
-    let acp_only = seat_governance_class(cli)
-        == wicked_council::GovernanceClass::AcpInputGovernance
-        && !matches!(
+    // The binary that will actually run (codex c5-r2): the unit's own invocation when it carries
+    // one (an ad-hoc roster can put `pi -p {PROMPT}` on a `claude` seat), else the seat's.
+    let run_root = input
+        .unit
+        .assigned_invocation
+        .as_deref()
+        .and_then(|inv| inv.split_whitespace().next())
+        .and_then(|bin| wicked_apps_core::spawn::SeatCli::from_binary(bin).root_name())
+        .map(str::to_string);
+    let is_claude = match &run_root {
+        Some(root) => root == "claude",
+        None => matches!(
             acp_seat_identity(cli),
             crate::skills_snapshot::WorkerCli::Claude
-        );
+        ),
+    };
+    let acp_class = |key: &str| {
+        seat_governance_class(key) == wicked_council::GovernanceClass::AcpInputGovernance
+    };
+    let acp_only = !is_claude && (acp_class(cli) || run_root.as_deref().is_some_and(acp_class));
     acp_only.then(|| cli.to_string())
+}
+
+/// (C5, codex c5-r2; core#755) Whether an `ok` turn is really a provider's refusal: no tool call,
+/// a SHORT output (a refusal is one error message; a long answer that merely quotes the phrase is
+/// work), and the council's own quota / sign-in / approval classifier says so with no exit
+/// evidence. Such a turn fails, so the seat is benched and the unit fails over.
+fn ok_turn_is_a_seat_refusal(output: &StepOutput) -> bool {
+    output.status == crate::workflow::StepStatus::Ok
+        && output.tools.is_empty()
+        && output.output.trim().len() <= 2000
+        && wicked_council::types::SeatFailureReason::classify_refusal(&output.output, false)
+            .is_some()
 }
 
 /// The supervisor's view of the runner — WEAK, so the supervisor thread never keeps the runner
@@ -1801,6 +1831,10 @@ impl StepRunner for AcpStepRunner {
     /// the entire actor while waiting for the subprocess to exit.
     fn on_run_resumed(&self, run_id: &str, min_launch_seq: u64) {
         self.fallback.reopen_run_sessions(run_id, min_launch_seq);
+    }
+
+    fn on_shutdown(&self) {
+        self.fallback.on_shutdown();
     }
 
     fn on_run_complete(&self, run_id: &str) {
@@ -1934,7 +1968,47 @@ pub(crate) fn seat_identity_of(
 #[cfg(test)]
 mod tests {
 
-    use super::{host_floor_needs_acp, is_transient_cli_failure, is_worker_originated_failure};
+    use super::{
+        host_floor_needs_acp, is_transient_cli_failure, is_worker_originated_failure,
+        ok_turn_is_a_seat_refusal,
+    };
+
+    /// (C5) An exit-0, tool-free, short provider refusal is a failed turn; real work is not.
+    #[test]
+    fn an_ok_turn_that_is_only_a_provider_refusal_fails() {
+        let out = |text: &str, tools: Vec<String>| crate::workflow::StepOutput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            output: text.into(),
+            status: crate::workflow::StepStatus::Ok,
+            usage: None,
+            files: vec![],
+            tools,
+            governed: false,
+        };
+        assert!(ok_turn_is_a_seat_refusal(&out(
+            "Error: You have exceeded your monthly quota",
+            vec![]
+        )));
+        assert!(ok_turn_is_a_seat_refusal(&out(
+            "Not logged in. Please run /login",
+            vec![]
+        )));
+        assert!(!ok_turn_is_a_seat_refusal(&out(
+            "Not logged in. Please run /login",
+            vec!["Bash".into()]
+        )));
+        let long = format!(
+            "Implemented the auth guard: a user who is not signed in is redirected. {}",
+            "x".repeat(3000)
+        );
+        assert!(!ok_turn_is_a_seat_refusal(&out(&long, vec![])));
+        assert!(!ok_turn_is_a_seat_refusal(&out(
+            "Done: tests pass.",
+            vec![]
+        )));
+    }
 
     /// (C5, codex c5-r1) On the interim host floor a governed unit on a seat governed only over
     /// ACP (pi, opencode) is refused; claude (its gate hook rides the wrapped carrier), an
@@ -1982,6 +2056,10 @@ mod tests {
         );
         assert_eq!(host_floor_needs_acp(&unit("claude", true)), None);
         assert_eq!(host_floor_needs_acp(&unit("pi", false)), None);
+        // The binary that RUNS decides (codex c5-r2): pi on a claude seat is refused.
+        let mut disguised = unit("claude", true);
+        disguised.unit.assigned_invocation = Some("pi -p {PROMPT}".into());
+        assert_eq!(host_floor_needs_acp(&disguised).as_deref(), Some("claude"));
         std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, "container");
         assert_eq!(host_floor_needs_acp(&unit("pi", true)), None);
         match saved {

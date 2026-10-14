@@ -529,6 +529,11 @@ pub trait StepRunner: Send + Sync {
     /// or below it is obsolete (codex hl-r5). The default is a no-op. Must not block the actor.
     fn on_run_resumed(&self, _run_id: &str, _min_launch_seq: u64) {}
 
+    /// Called once by the actor on `Shutdown`, after every run's `on_run_complete`: a runner
+    /// cancels whatever it still runs that no run lifecycle names (internal judge calls) and
+    /// refuses later launches. The default is a no-op. Must not block the actor.
+    fn on_shutdown(&self) {}
+
     /// Stop the single wrapped child superseded by `ReassignUnit`. `epoch` and `launch_seq` are
     /// the actor-minted identity of the old attempt; implementations must not cancel a newer
     /// launch for the same run. Stateless and persistent-only runners have nothing to do.

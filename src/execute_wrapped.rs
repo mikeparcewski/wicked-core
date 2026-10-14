@@ -1832,6 +1832,8 @@ struct WrappedCancelRegistry {
     /// floor) registers later and must be born cancelled, never start a CLI after the run is
     /// terminal. A resume admits launches from its `min_launch_seq` on again.
     ended: std::collections::HashMap<String, u64>,
+    /// (C5) The engine is shutting down: every registration from here on is born cancelled.
+    shutdown: bool,
 }
 
 /// Per-unit wall-clock timeout. Default 2 h — agentic CLIs doing real multi-file extraction
@@ -1898,7 +1900,7 @@ impl WrappedCliStepRunner {
             .ended
             .get(&key.run_id)
             .is_some_and(|&bound| key.launch_seq <= bound);
-        if ended || guard.reassigned.contains(&key) {
+        if ended || guard.shutdown || guard.reassigned.contains(&key) {
             token.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         guard.tokens.entry(key).or_default().push(token.clone());
@@ -1920,12 +1922,11 @@ impl WrappedCliStepRunner {
     /// again; a superseded launch of the old lifecycle stays fenced by its `launch_seq`).
     pub(crate) fn reopen_run_sessions(&self, run_id: &str, min_launch_seq: u64) {
         self.sessions.reopen_run(run_id, min_launch_seq);
-        // A launch of the resumed lifecycle runs; one of the ended lifecycle stays fenced.
+        // A launch of the resumed lifecycle runs; one of the ended lifecycle stays fenced:
+        // `min_launch_seq` is the HIGHEST sequence the ended lifecycle minted (codex c5-r2).
         let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
         if guard.ended.contains_key(run_id) {
-            guard
-                .ended
-                .insert(run_id.to_string(), min_launch_seq.saturating_sub(1));
+            guard.ended.insert(run_id.to_string(), min_launch_seq);
         }
     }
 
@@ -1937,6 +1938,20 @@ impl WrappedCliStepRunner {
     /// Kill every in-flight wrapped worker of `run_id` (crew#277). Called from the runner's
     /// `on_run_complete`, which the actor invokes on every run-terminal transition — cancel
     /// included. Idempotent; a token with no live child is a no-op.
+    /// (C5, codex c5-r2) Engine shutdown: cancel EVERY wrapped worker — internal judge calls
+    /// (`validator-*` / `triage-*`, epoch 0) included, which no run lifecycle names — and make any
+    /// later registration born cancelled.
+    pub(crate) fn cancel_all_workers(&self) {
+        let tokens: Vec<CancelToken> = {
+            let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
+            guard.shutdown = true;
+            guard.tokens.drain().flat_map(|(_, v)| v).collect()
+        };
+        for t in tokens {
+            t.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn cancel_run_workers(&self, run_id: &str) {
         self.sessions.forget_run(run_id);
         let tokens = {
@@ -2004,6 +2019,10 @@ impl StepRunner for WrappedCliStepRunner {
 
     fn on_run_complete(&self, run_id: &str) {
         self.cancel_run_workers(run_id);
+    }
+
+    fn on_shutdown(&self) {
+        self.cancel_all_workers();
     }
 
     fn cancel_reassigned_worker(&self, run_id: &str, epoch: u64, launch_seq: u64) {
@@ -6837,7 +6856,7 @@ mod tests {
         assert!(late_token.load(std::sync::atomic::Ordering::Relaxed));
         let other_token = runner.register_token(&other);
         assert!(!other_token.load(std::sync::atomic::Ordering::Relaxed));
-        runner.reopen_run_sessions("ended-run", 4);
+        runner.reopen_run_sessions("ended-run", 3);
         let stale = make(3);
         let stale_token = runner.register_token(&stale);
         assert!(
@@ -6855,6 +6874,34 @@ mod tests {
         ] {
             runner.unregister_token(i, t);
         }
+    }
+
+    /// (C5, codex c5-r2) Shutdown cancels every wrapped worker — an internal judge call no run
+    /// lifecycle names included — and a later registration is born cancelled.
+    #[test]
+    fn shutdown_cancels_every_wrapped_worker_and_later_registrations() {
+        let runner = WrappedCliStepRunner::default();
+        let judge = StepInput {
+            run_id: "validator-abc".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: WorkUnit::pending("validator-abc:u1", "validator-abc", 1, "judge"),
+            workflow_id: "wf".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: None,
+            governance: None,
+            prior_outputs: Vec::new(),
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let token = runner.register_token(&judge);
+        assert!(!token.load(std::sync::atomic::Ordering::Relaxed));
+        crate::workflow::StepRunner::on_shutdown(&runner);
+        assert!(token.load(std::sync::atomic::Ordering::Relaxed));
+        let late = runner.register_token(&judge);
+        assert!(late.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     /// The design's pre-spawn guard: a token born cancelled (reassign won the

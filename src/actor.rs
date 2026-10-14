@@ -3909,6 +3909,7 @@ pub(crate) fn run(
                     shared_run_terminal(&run_id, &lifecycle_maps, &write_reg);
                     runner.on_run_complete(&run_id);
                 }
+                runner.on_shutdown();
                 // Reap every live PTY: kill children + join reader threads so no process/thread is
                 // leaked when the last `Core` drops (DES §5, R1).
                 let ids: Vec<String> = terminals.keys().cloned().collect();
