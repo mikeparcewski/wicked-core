@@ -1819,9 +1819,11 @@ esac
     fn sign_out_refuses_unsettled_writer_before_emptying_any_credentials() {
         let fake = FakeRuntime::new();
         std::fs::create_dir_all(fake.dir.join("refresh")).unwrap();
+        // Unique: cleanup `pkill -f`s / `pgrep -f`s the name host-wide, so a fixed one would hit
+        // (or wait on) a parallel test's runtime calls carrying a name it prefixes.
         std::fs::write(
             crate::seat_gateway::unsettled_path(&fake.dir, "claude"),
-            "wicked-mutation-FAKE",
+            format!("wicked-mutation-FAKE{}", uuid::Uuid::new_v4().simple()),
         )
         .unwrap();
         std::fs::write(fake.dir.join("fail_cleanup"), "").unwrap();

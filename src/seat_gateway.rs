@@ -2143,11 +2143,17 @@ cat > "$base/written"
         );
         let rt = Runtime { cli: rt_path };
         let _lock = crate::seat_refresh::mutation_lock(&temp.0).unwrap();
-        // Model a dead process: its runtime-owned writer and pre-spawn marker survive it.
+        // Model a dead process: its runtime-owned writer and pre-spawn marker survive it. The
+        // name is unique: cleanup `pkill -f`s and `pgrep -f`s it across the whole host, so a name
+        // shared with a parallel test would kill (or wait on) that test's runtime calls.
+        let dead = format!(
+            "wicked-mutation-FAKE-dead-{}",
+            uuid::Uuid::new_v4().simple()
+        );
         fs::write(temp.0.join("live"), "FAKE-late-writer").unwrap();
         crate::seat_refresh::create_private_file(
             &unsettled_path(&temp.0, "claude"),
-            b"wicked-mutation-FAKE-dead",
+            dead.as_bytes(),
         )
         .unwrap();
         cleanup_mutations(&rt, &temp.0).unwrap();
@@ -2163,18 +2169,9 @@ cat > "$base/written"
         assert!(!unsettled_path(&temp.0, "claude").exists());
         assert_eq!(fs::read(temp.0.join("written")).unwrap(), b"FAKE-new");
         let calls = fs::read_to_string(temp.0.join("calls")).unwrap();
-        assert!(
-            calls.find("rm --force wicked-mutation-FAKE-dead").unwrap()
-                < calls
-                    .find("container inspect wicked-mutation-FAKE-dead")
-                    .unwrap()
-        );
-        assert!(
-            calls
-                .find("container inspect wicked-mutation-FAKE-dead")
-                .unwrap()
-                < calls.find("run --name").unwrap()
-        );
+        let inspect = calls.find(&format!("container inspect {dead}")).unwrap();
+        assert!(calls.find(&format!("rm --force {dead}")).unwrap() < inspect);
+        assert!(inspect < calls.find("run --name").unwrap());
     }
 
     #[cfg(unix)]
@@ -2252,6 +2249,9 @@ cat > "$base/written"
         let mut config = load_config(&temp.0).unwrap();
         config.units.clear();
         persist_units(&temp.0, &config).unwrap();
+        // Unlock, not only close: a child another test thread forked meanwhile shares the
+        // description until its exec and would keep the lock (ConfigTransaction does the same).
+        lock.unlock().unwrap();
         drop(lock);
         let status = child.wait().unwrap();
         assert!(started && blocked && status.success());
