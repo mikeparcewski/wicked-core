@@ -150,6 +150,7 @@ impl Drop for InfraGuard {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn infra_pids() -> Vec<(u32, u8)> {
     INFRA.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
