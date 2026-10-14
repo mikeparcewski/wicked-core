@@ -14,6 +14,13 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The editor-plugin workflow builds protocol 2.** The built-in `editor-plugin` preset's design, build and test
+  steps still asked for a `protocol [1]` editor on the `wicked.editor/1` plumbing and judged conformance cases
+  0-6 and 8-12 only. They now name `protocol [1, 2]` and the surfaces declaration the host renders (card, options
+  tabs, full screen with Simple/Advanced, the label rules), the protocol-2 messages (`host.surface`, `host.mode`,
+  `host.action`, `host.tab`, `host.selection`, `options.changed`), the scaffold's `--surfaces`, and cases 13-16
+  (DES-EDITOR-PLUGIN-CONTRACT-001 §5, §6, §8.3). Pinned by `tests/presets.rs`
+  `editor_plugin_preset_builds_protocol_2`.
 - **The `artifact.theme` editor permission.** Protocol 2's `theme.set` (DES-EDITOR-PLUGIN-CONTRACT-001
   §7.2) changes the theme of the artifact an editor opens, as a new version the user can undo. Crew
   admits it since wicked-crew#1008 and garden's pack schema since wicked-garden#1303, but the engine's
