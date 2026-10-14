@@ -63,6 +63,12 @@ use wicked_council::types::{AcpConfig, AcpTransport};
 /// PID-reuse races. After the first `signal()` takes the child, subsequent calls are no-ops.
 pub struct KillHandle {
     inner: Mutex<Option<std::process::Child>>,
+    /// (core#936) The bridge's registration as engine infrastructure (`outstanding_work`): held
+    /// exactly while this handle owns the unreaped child, released BEFORE the pid is (codex r4 —
+    /// a reaped pid the OS reuses must never be excused).
+    infra: Mutex<Option<crate::outstanding_work::InfraGuard>>,
+    /// (codex r6) The exit status, once observed: a reaped child answers every later probe with it.
+    exited: Mutex<Option<std::process::ExitStatus>>,
 }
 
 impl KillHandle {
@@ -70,14 +76,34 @@ impl KillHandle {
     pub fn noop() -> Self {
         Self {
             inner: Mutex::new(None),
+            infra: Mutex::new(None),
+            exited: Mutex::new(None),
         }
     }
 
-    /// Construct a handle that will kill `child` on `signal()`.
+    /// Construct a handle that will kill `child` on `signal()`. Not infrastructure.
     pub fn new(child: std::process::Child) -> Self {
         Self {
             inner: Mutex::new(Some(child)),
+            infra: Mutex::new(None),
+            exited: Mutex::new(None),
         }
+    }
+
+    /// (core#936) A handle for an ACP bridge: the child — and the `levels` of descendants that
+    /// are the bridge's own machinery (a resident launcher's bridge, an adapter's CLI runtime) —
+    /// is registered as engine infrastructure for as long as this handle owns it unreaped.
+    pub fn new_bridge(child: std::process::Child, levels: u8) -> Self {
+        let infra = crate::outstanding_work::InfraGuard::register(child.id(), levels);
+        Self {
+            inner: Mutex::new(Some(child)),
+            infra: Mutex::new(Some(infra)),
+            exited: Mutex::new(None),
+        }
+    }
+
+    fn release_infra(&self) {
+        self.infra.lock().unwrap_or_else(|p| p.into_inner()).take();
     }
 
     /// Report the child's exit status if it has ALREADY exited — non-blocking, never killing
@@ -88,7 +114,19 @@ impl KillHandle {
     /// answering.
     pub fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
         let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        guard.as_mut().and_then(|c| c.try_wait().ok().flatten())
+        let mut exited = self.exited.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(status) = *exited {
+            return Some(status);
+        }
+        let child = guard.as_mut()?;
+        // (codex r5) Observe the exit WITHOUT reaping, release the registration while the zombie
+        // still reserves the pid, and only then reap: a reused pid is never registered.
+        if !matches!(crate::validator::has_exited_unreaped(child), Ok(true)) {
+            return None;
+        }
+        self.release_infra();
+        *exited = child.try_wait().ok().flatten();
+        *exited
     }
 
     /// Kill and reap the child process. Idempotent: the first call kills; subsequent calls
@@ -99,6 +137,7 @@ impl KillHandle {
             let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             guard.take()
         };
+        self.release_infra();
         if let Some(mut child) = taken {
             // The bridge was spawned in its OWN process group (`process_group(0)` at spawn), so
             // kill the GROUP — the bridge, the CLI it wraps and anything either backgrounded — and
@@ -107,6 +146,33 @@ impl KillHandle {
             crate::validator::kill_child_tree(&mut child);
             crate::validator::reap_bounded(&mut child);
         }
+    }
+}
+
+/// (core#936) Whether an ACP binary is a VERIFIED adapter that runs the seat's CLI as its direct
+/// child and does no tool work itself: claude-agent-acp (the bridge spawns `claude`) and pi-acp
+/// (it spawns `pi`). Anything else — a native server (`copilot --acp`, `opencode acp`), or an
+/// adapter whose topology varies by implementation (`codex-acp`: the Rust one runs codex in
+/// process, codex r8) — excuses only its own pid.
+fn runs_cli_runtime(binary: &str) -> bool {
+    std::path::Path::new(binary)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| matches!(s, "claude-agent-acp" | "pi-acp"))
+}
+
+#[cfg(test)]
+mod runtime_adapter_tests {
+    #[test]
+    fn core_936_only_verified_adapters_excuse_their_runtime_child() {
+        assert!(super::runs_cli_runtime("claude-agent-acp"));
+        assert!(super::runs_cli_runtime("/opt/bin/pi-acp"));
+        assert!(
+            !super::runs_cli_runtime("codex-acp"),
+            "topology varies by implementation"
+        );
+        assert!(!super::runs_cli_runtime("copilot"));
+        assert!(!super::runs_cli_runtime("opencode"));
     }
 }
 
@@ -2983,7 +3049,14 @@ fn start_acp_process_with_write_roots(
     }
 
     Ok(AcpProcess {
-        kill_handle: Arc::new(KillHandle::new(child)),
+        // (codex r7) A Linux bwrap worker sandbox keeps its own monitor (and, under
+        // --unshare-pid, a namespace init) above the bridge: only the spawned pid and one level
+        // are excused there, so such a runtime may still be waited on (the pre-#936 behaviour),
+        // never an orphan the namespace init adopted.
+        kill_handle: Arc::new(KillHandle::new_bridge(
+            child,
+            u8::from(runs_cli_runtime(&config.binary)),
+        )),
         no_code: false,
         settle_after: acp_settle_after(),
         mcp_token: mcp_token.map(|(token, _)| token),
@@ -11688,6 +11761,51 @@ sleep 30
             json!({"type": "local", "path": snap.to_string_lossy()})
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#936 (codex r4): a bridge is registered infrastructure exactly while its handle owns
+    /// the unreaped child. Reaped by an exit probe or killed by `signal()`, its pid (free for the
+    /// OS to reuse) is no longer excused from a unit's outstanding-work wait.
+    #[cfg(unix)]
+    #[test]
+    fn core_936_a_bridge_pid_is_infrastructure_only_until_it_is_reaped() {
+        // spawn-audit: test-only — short-lived children standing in for a bridge.
+        let quick = std::process::Command::new("true")
+            .spawn()
+            .expect("true runs");
+        let pid = quick.id();
+        let handle = KillHandle::new_bridge(quick, 1);
+        assert!(crate::outstanding_work::infra_pids()
+            .iter()
+            .any(|(p, _)| *p == pid));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handle.try_exit_status().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !crate::outstanding_work::infra_pids()
+                .iter()
+                .any(|(p, _)| *p == pid),
+            "a reaped bridge pid is released"
+        );
+        assert!(
+            handle.try_exit_status().is_some(),
+            "a reaped bridge keeps answering its exit status (codex r6)"
+        );
+        // spawn-audit: test-only — a long-lived stand-in killed through the handle.
+        let slow = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep runs");
+        let pid = slow.id();
+        let handle = KillHandle::new_bridge(slow, 1);
+        assert!(crate::outstanding_work::infra_pids()
+            .iter()
+            .any(|(p, _)| *p == pid));
+        handle.signal();
+        assert!(!crate::outstanding_work::infra_pids()
+            .iter()
+            .any(|(p, _)| *p == pid));
     }
 
     /// core#396, the ACP lever, pinned on the pure frame builder: the snapshot rides `session/new`
