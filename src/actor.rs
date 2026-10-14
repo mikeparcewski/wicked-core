@@ -3157,6 +3157,14 @@ pub(crate) fn run(
                     )));
                     continue;
                 }
+                // (core#933) Refused BEFORE anything is cancelled: a reassign the engine could not
+                // honour (an author's seat for a review) is said so, never silently replaced.
+                if let Some(cli) = new_cli.as_deref() {
+                    if let Err(e) = refuse_author_reassign(&session, &units, session.unit_ix, cli) {
+                        let _ = reply.send(Err(e));
+                        continue;
+                    }
+                }
                 let previous_cli = cursor_unit
                     .assigned_cli
                     .clone()
@@ -5172,9 +5180,22 @@ fn reassign_candidates(
                 .unwrap_or_else(|| "claude".to_string())
         })
         .collect();
+    // (core#933) A Review/Test agent unit is never handed to ANY seat that authored the work it
+    // checks — the same author set `dispatch_unit`'s re-seat and the gate's `same_seat_evaluator`
+    // check read, not only the current seat of a unit it depends on. Otherwise the ladder picked an
+    // earlier author, the dispatch re-seat moved it back onto the failed seat, and it looped.
+    let authors: Vec<String> = if seats_off_authors(unit) {
+        crate::pipeline::work_authors(units, unit.ord)
+    } else {
+        Vec::new()
+    };
     roster
         .iter()
-        .filter(|c| !unit.worker_failed_clis.contains(c) && !creator_seats.contains(*c))
+        .filter(|c| {
+            !unit.worker_failed_clis.contains(c)
+                && !creator_seats.contains(*c)
+                && !authors.contains(c)
+        })
         .cloned()
         .collect()
 }
@@ -6430,7 +6451,11 @@ fn apply_step_result(
             // operator can sign a seat in or reassign the unit and approve the retry (run
             // 390b273e died here with `sessionFailed` and no lever). Autonomous runs
             // (`HumanConfirm::None`) keep the standard fail contract below.
-            if let (true, Some(reason)) = (human_present, seat_refusal) {
+            // (core#933) …and on ANY worker failure once the ladder is exhausted, classified or
+            // not: every eligible seat has now failed this unit, so with an operator present the
+            // run asks them (reassign, sign a seat in, or stop) instead of failing — the ladder is
+            // bounded by the eligible roster, and its end is a needs-you, never a dead run.
+            if human_present {
                 let unit = units
                     .get_mut(unit_ix)
                     .ok_or_else(|| anyhow::anyhow!("unit ix {unit_ix} vanished mid-failover"))?;
@@ -6439,12 +6464,19 @@ fn apply_step_result(
                 let bench =
                     crate::domain::benched_summary(&session.benched_seats, session.clis.len())
                         .unwrap_or_else(|| "no other seat is configured".to_string());
-                let why = format!(
-                    "dead seat: '{failed_cli}' {} on unit {ord} ({}) and no eligible seat remains \
-                     — {bench}",
-                    reason.verb(),
-                    reason.as_str()
-                );
+                let why = match seat_refusal {
+                    Some(reason) => format!(
+                        "dead seat: '{failed_cli}' {} on unit {ord} ({}) and no eligible seat \
+                         remains — {bench}",
+                        reason.verb(),
+                        reason.as_str()
+                    ),
+                    None => format!(
+                        "dead seat: '{failed_cli}' failed unit {ord} (worker error) and every \
+                         eligible seat has now failed it (tried: {}) — {bench}",
+                        unit.worker_failed_clis.join(", ")
+                    ),
+                };
                 unit.status = crate::domain::UnitStatus::Rejected;
                 // (core#466) The seat's own words ride the gate's `verdictSummary` — with the
                 // operator's home / worker-home / temp prefixes redacted first.
@@ -7579,25 +7611,40 @@ pub(crate) fn worktree_retained(session: &crate::domain::AgentSession, now_ms: i
     now_ms.saturating_sub(finished) < window_ms
 }
 
-/// (F-7R2-006) The run's roster keys a failover may move work to: the configured `clis` minus
-/// every benched seat. One rule with `distribute::eligible_seats`.
+/// (crew#972) Whether `unit` is a Review/Test AGENT unit the engine seats away from the work's
+/// authors ([`crate::pipeline::work_authors`]). A team member's step (and the PA's review of it)
+/// is seated by the team gate, which owns its own exclusions (codex r1 on #898): never here.
+fn seats_off_authors(unit: &crate::domain::WorkUnit) -> bool {
+    use crate::domain::StageKind;
+    unit.tool_cmd.is_none()
+        && matches!(unit.stage, StageKind::Review | StageKind::Test)
+        && unit.member_step.is_none()
+        && unit.owner != crate::workflow::StepOwner::Team
+}
+
 /// (crew#972) The seat a Review/Test agent unit should run on instead of its assigned one, when its
 /// assigned seat AUTHORED the work it checks ([`crate::pipeline::work_authors`]): the first run
-/// seat, unbenched and in roster order, that authored nothing. `None` when the unit is not a
-/// Review/Test agent unit, is not on an author's seat, or no distinct seat is left (the gate's
-/// `same_seat_evaluator` denial then escalates).
+/// seat, unbenched and in roster order, that authored nothing AND has not already worker-failed
+/// this unit. `None` when the unit is not a Review/Test agent unit, is not on an author's seat, or
+/// no such seat is left (the gate's `same_seat_evaluator` denial then escalates).
+///
+/// (core#933) The worker-failed exclusion is what keeps the failover ladder bounded: without it a
+/// failover onto an EARLIER author (a seat the ladder's own creator check did not see) was moved
+/// straight back here onto the seat that had just failed, so `worker_failed_clis` never grew and
+/// the ladder looped on one seat (29 copilot attempts on run 872a964f).
 fn distinct_evaluator_seat(
     session: &crate::domain::AgentSession,
     units: &[crate::domain::WorkUnit],
     unit: &crate::domain::WorkUnit,
 ) -> Option<String> {
-    use crate::domain::StageKind;
-    if unit.tool_cmd.is_some() || !matches!(unit.stage, StageKind::Review | StageKind::Test) {
-        return None;
-    }
-    // A team member's step (and the PA's review of it) is seated by the team gate, which owns its
-    // own exclusions (codex r1 on #898): never reseated here.
-    if unit.member_step.is_some() || unit.owner == crate::workflow::StepOwner::Team {
+    // (core#933, codex r1) Only under a contract that enforces a distinct evaluator: a reduced-
+    // assurance run may put a review where the operator reassigned it, and this re-seat must not
+    // silently override that (`refuse_author_reassign` admits it on such a run).
+    if !seats_off_authors(unit)
+        || !session
+            .assurance
+            .enforces(crate::assurance::DISTINCT_EVALUATOR)
+    {
         return None;
     }
     let seat = unit.assigned_cli.as_ref()?;
@@ -7607,11 +7654,60 @@ fn distinct_evaluator_seat(
     }
     // Only a seat whose skills admit the unit (the rule distribution used); with none, the unit
     // stays and the gate decides (codex r1 on #898).
-    eligible_roster_keys(session)
-        .into_iter()
-        .find(|k| !authors.contains(k) && crate::distribute::seat_admits_unit(unit, k, None))
+    eligible_roster_keys(session).into_iter().find(|k| {
+        !authors.contains(k)
+            && !unit.worker_failed_clis.contains(k)
+            && crate::distribute::seat_admits_unit(unit, k, None)
+    })
 }
 
+/// (core#933) An operator's reassign of a Review/Test agent unit onto a seat that AUTHORED the work
+/// it checks, on a run whose contract enforces a distinct evaluator, is REFUSED with the seats that
+/// could take it. Before this the reassign was accepted and `dispatch_unit` silently re-seated the
+/// unit elsewhere (only an `eprintln!` said so), so the operator's choice was overridden (run
+/// 872a964f: reassigned to codex, copilot dispatched). Any other target is honoured as given: the
+/// dispatch re-seat only ever moves a unit that sits on an author's seat.
+fn refuse_author_reassign(
+    session: &crate::domain::AgentSession,
+    units: &[crate::domain::WorkUnit],
+    unit_ix: usize,
+    cli: &str,
+) -> anyhow::Result<()> {
+    let Some(unit) = units.get(unit_ix) else {
+        return Ok(());
+    };
+    if !seats_off_authors(unit)
+        || !session
+            .assurance
+            .enforces(crate::assurance::DISTINCT_EVALUATOR)
+    {
+        return Ok(());
+    }
+    let authors = crate::pipeline::work_authors(units, unit.ord);
+    if !authors.iter().any(|a| a == cli) {
+        return Ok(());
+    }
+    let open: Vec<String> = eligible_roster_keys(session)
+        .into_iter()
+        .filter(|k| !authors.contains(k) && crate::distribute::seat_admits_unit(unit, k, None))
+        .collect();
+    anyhow::bail!(
+        "cannot reassign unit {} to '{cli}': that seat authored the work this review checks \
+         (authors: {}), and this run requires a distinct evaluator — {}",
+        unit.ord,
+        authors.join(", "),
+        if open.is_empty() {
+            "no other seat of this run can review it; stop the run, or relaunch it with another \
+             helper or in reduced assurance"
+                .to_string()
+        } else {
+            format!("reassign it to one of: {}", open.join(", "))
+        }
+    )
+}
+
+/// (F-7R2-006) The run's roster keys a failover may move work to: the configured `clis` minus
+/// every benched seat. One rule with `distribute::eligible_seats`.
 fn eligible_roster_keys(session: &crate::domain::AgentSession) -> Vec<String> {
     session
         .clis
@@ -7984,6 +8080,7 @@ fn reseat_parked_unit(
              so there is nothing to reassign"
         );
     }
+    refuse_author_reassign(session, &units, session.unit_ix, cli)?;
     let previous_cli = unit
         .assigned_cli
         .clone()
@@ -12001,12 +12098,15 @@ pub(crate) fn confirm_gate_as(
                             == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE
                 })
         });
-    // A team run's steps owe their team accounting (PA review, member step, dispute ledger): they
-    // keep today's answer here (codex r1 on #907).
-    let team_unit = session.team.is_some()
-        || crate::domain::session_units(store, run_id)?
-            .get(session.unit_ix)
-            .is_some_and(|u| u.member_step.is_some());
+    // A team member's step and the PA's own steps owe their team accounting (the PA's review of a
+    // member step, the member's record): they keep today's answer here (codex r1 on #907).
+    // (core#937) An ORDINARY step of a teamed run does not: its gate's `gate.decided` was published
+    // when it was denied, and re-running it only walked back into the same judge-less gate (run
+    // 0d2b9fa4: every approve re-ran `verify`, and the run could not pass it). The operator's
+    // approve there is the judgment, exactly as on an un-teamed run.
+    let team_unit = crate::domain::session_units(store, run_id)?
+        .get(session.unit_ix)
+        .is_some_and(|u| u.member_step.is_some() || team_gate::is_pa_step(u));
     if judge_unavailable_gate && !adjudication_open && !team_unit {
         if let crate::workflow::HumanDecision::Approve { amend, .. } = &decision {
             return judge_by_operator(
@@ -12776,6 +12876,45 @@ fn judge_by_operator(
         .filter(|_| s.assurance.qe.as_ref().is_some_and(|q| q.required()));
     if let Some(d) = qe_judged.clone() {
         s.assurance.qe = Some(d);
+    }
+    // (core#937, codex r1) A teamed unit's own record still decides whether the run continues
+    // unattended: when it pauses an approve, the unit is judged (Done, the operator's receipt) and
+    // the run pauses `team_dispute` on it — the dispute's answer counts it and advances.
+    if s.team.is_some() {
+        if let Some(d) = team_gate::operator_judgment_dispute(&u) {
+            put_node(store, u.to_node())?;
+            if let Some(qe) = qe_judged {
+                emit(
+                    subscribers,
+                    CoreEvent::QeAcceptanceDecided {
+                        session: run_id.to_string(),
+                        ord,
+                        qe: Box::new(qe),
+                    },
+                );
+            }
+            let mut act = team_gate::Act {
+                store,
+                subscribers,
+                runner,
+                self_tx,
+                lifecycle_maps,
+                actor_maps,
+                process_gen,
+                is_acp,
+            };
+            team_gate::open_dispute(
+                &mut act,
+                &mut s,
+                ord,
+                attempt,
+                crate::domain::DisputeKind::Finding,
+                d.prompt,
+                d.finding_ids,
+            )?;
+            in_flight.remove(run_id);
+            return Ok(SessionStatus::AwaitingHuman);
+        }
     }
     s.unit_ix = ix + 1;
     s.attempt = units.get(ix + 1).map(next_attempt).unwrap_or(0);
@@ -18547,6 +18686,122 @@ mod request_changes_tests {
                 ..
             }
         )));
+    }
+
+    /// core#937, run 0d2b9fa4: a TEAMED run's ordinary step (`verify`, not a member step or a PA
+    /// step) escalated `judge_unavailable`, and every approve re-ran it into the same judge-less
+    /// gate — the operator-as-judge arm skipped any run with a team. The approve is the judgment
+    /// there too: the unit counts and the run moves on, labelled.
+    #[test]
+    fn core_937_approve_at_judge_unavailable_on_a_teamed_run_is_the_operators_judgment() {
+        let run_id = format!("op-judge-team-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_judge_unavailable_verify(&mut store, &run_id);
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        session.team = Some(crate::domain::RunTeamState::default());
+        put_node(&mut store, session.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        confirm_gate_as(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            &run_id,
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: crate::workflow::AmendScope::Cursor,
+            },
+            Some("operator".into()),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.unit_ix, 4,
+            "the teamed run moved on, not back into the judge-less review"
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(units[3].status, UnitStatus::Done);
+        let r = units[3].assurance.as_ref().expect("a receipt");
+        assert!(
+            r.ran.iter().any(|i| i == crate::assurance::OPERATOR_JUDGE),
+            "{r:?}"
+        );
+    }
+
+    /// core#937 (codex r1): the operator's approve stands in for the judge, never for the team. A
+    /// teamed unit whose bus team record pauses an approve (here: no folded ledger, an incomplete
+    /// record) is judged — Done, the operator's receipt — and the run pauses `team_dispute` on it
+    /// instead of advancing unattended.
+    #[test]
+    fn core_937_an_operator_judgment_still_owes_the_teamed_units_dispute() {
+        let run_id = format!("op-judge-team-dispute-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_judge_unavailable_verify(&mut store, &run_id);
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        session.team = Some(crate::domain::RunTeamState {
+            transport: Some(crate::team::events::Transport::Bus),
+            ..Default::default()
+        });
+        put_node(&mut store, session.to_node()).unwrap();
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        units[3].team = Some(crate::domain::UnitTeamSnapshot::stamped(
+            crate::team::events::Transport::Bus,
+            None,
+            None,
+        ));
+        put_node(&mut store, units[3].to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        let status = confirm_gate_as(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            &run_id,
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: crate::workflow::AmendScope::Cursor,
+            },
+            Some("operator".into()),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(status, SessionStatus::AwaitingHuman);
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.unit_ix, 3, "the cursor stays on the judged unit");
+        assert!(
+            session.team.as_ref().is_some_and(|t| t.dispute.is_some()),
+            "the team dispute is open: {:?}",
+            session.team
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(units[3].status, UnitStatus::Done);
+        assert!(units[3]
+            .assurance
+            .as_ref()
+            .is_some_and(|r| r.ran.iter().any(|i| i == crate::assurance::OPERATOR_JUDGE)));
     }
 
     /// (DES-QE-EVERY-SEAT §3.4.1) No run seat could review the QE evidence in isolation: the
@@ -26015,5 +26270,116 @@ mod work_author_tests {
             crate::pipeline::work_authors(&[build, test.clone()], 5).contains(&"codex".to_string()),
             "the gate counts the failed-over creator as a builder"
         );
+    }
+
+    /// core#933, run 872a964f's exact shape: the edit was authored by codex, then pi (reassigned);
+    /// the critique sat on copilot and copilot kept failing. The ladder picked codex (an earlier
+    /// author its creator check did not see), the dispatch re-seat moved it straight back onto
+    /// copilot, `worker_failed_clis` stayed `[copilot]`, and it looped 29 times. Now the ladder
+    /// walks the eligible roster ONCE: every pick is a seat that is neither an author nor one
+    /// that already failed the unit, the dispatch re-seat never undoes it, and it ends.
+    #[test]
+    fn core_933_the_evaluator_failover_ladder_never_returns_to_a_failed_seat_and_ends() {
+        let s = session(&["opencode", "copilot", "codex", "claude", "pi"], &[]);
+        let edit = unit(2, StageKind::Build, "pi", &["codex", "pi"]);
+        let mut critique = unit(3, StageKind::Review, "copilot", &[]);
+        critique.depends_on = vec!["2".into()];
+        let mut units = vec![edit, critique];
+        let roster = eligible_roster_keys(&s);
+        let mut seated: Vec<String> = Vec::new();
+        for _ in 0..(roster.len() + 2) {
+            // The worker on the current seat fails: record it, take the ladder's next seat, then
+            // let the dispatch re-seat do what `dispatch_unit` does.
+            let failed = units[1].assigned_cli.clone().unwrap();
+            if !units[1].worker_failed_clis.contains(&failed) {
+                units[1].worker_failed_clis.push(failed);
+            }
+            let Some(next) = next_failover_seat(&units, 1, &roster) else {
+                break;
+            };
+            assert!(
+                !crate::pipeline::work_authors(&units, 3).contains(&next),
+                "the ladder never picks an author of the work under review: {next}"
+            );
+            units[1].assigned_cli = Some(next);
+            if let Some(alt) = distinct_evaluator_seat(&s, &units, &units[1].clone()) {
+                units[1].assigned_cli = Some(alt);
+            }
+            let now = units[1].assigned_cli.clone().unwrap();
+            assert!(
+                !units[1].worker_failed_clis.contains(&now),
+                "dispatch never lands on a seat that already failed this unit: {now} ({:?})",
+                units[1].worker_failed_clis
+            );
+            seated.push(now);
+        }
+        assert_eq!(
+            seated,
+            vec!["opencode".to_string(), "claude".to_string()],
+            "each non-author seat once, in roster order — never codex, never copilot again"
+        );
+        assert_eq!(
+            next_failover_seat(&units, 1, &roster),
+            None,
+            "exhausted: the run escalates instead of looping"
+        );
+    }
+
+    /// core#933: the dispatch re-seat of a review sitting on an author's seat never picks a seat
+    /// that already worker-failed the unit (the half of the loop that overrode the ladder).
+    #[test]
+    fn core_933_the_dispatch_reseat_skips_seats_that_failed_the_unit() {
+        let s = session(&["copilot", "codex", "claude", "pi"], &[]);
+        let edit = unit(2, StageKind::Build, "pi", &["codex", "pi"]);
+        let mut on_codex = unit(3, StageKind::Review, "codex", &[]);
+        on_codex.worker_failed_clis = vec!["copilot".into()];
+        assert_eq!(
+            distinct_evaluator_seat(&s, &[edit.clone(), on_codex.clone()], &on_codex).as_deref(),
+            Some("claude")
+        );
+        on_codex.worker_failed_clis.push("claude".into());
+        assert_eq!(
+            distinct_evaluator_seat(&s, &[edit, on_codex.clone()], &on_codex),
+            None,
+            "no seat left: the unit stays for the gate's same_seat_evaluator escalation"
+        );
+    }
+
+    /// core#933: an operator reassign of a review onto a seat that authored its work is REFUSED
+    /// (naming the seats that could take it) on a run that requires a distinct evaluator — it was
+    /// accepted and then silently overridden by the dispatch re-seat. Any other target is honoured;
+    /// a reduced-assurance run may put the review where the operator says.
+    #[test]
+    fn core_933_an_operator_reassign_onto_an_author_seat_is_refused_and_any_other_is_honoured() {
+        let s = session(&["copilot", "codex", "claude", "pi"], &[]);
+        let edit = unit(2, StageKind::Build, "pi", &["codex", "pi"]);
+        let critique = unit(3, StageKind::Review, "copilot", &[]);
+        let units = vec![edit, critique];
+        let e = refuse_author_reassign(&s, &units, 1, "codex").unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("authored the work") && msg.contains("copilot, claude"),
+            "{msg}"
+        );
+        assert!(refuse_author_reassign(&s, &units, 1, "claude").is_ok());
+        let mut reduced = s.clone();
+        reduced.assurance = crate::assurance::RunAssurance::new(None, true);
+        assert!(refuse_author_reassign(&reduced, &units, 1, "codex").is_ok());
+        // (codex r1) …and the dispatch re-seat honours it there: the review stays on codex.
+        let mut on_codex = units[1].clone();
+        on_codex.assigned_cli = Some("codex".into());
+        assert_eq!(
+            distinct_evaluator_seat(&reduced, &[units[0].clone(), on_codex.clone()], &on_codex),
+            None,
+            "an accepted reassign is never silently replaced at dispatch"
+        );
+        assert_eq!(
+            distinct_evaluator_seat(&s, &[units[0].clone(), on_codex.clone()], &on_codex)
+                .as_deref(),
+            Some("copilot"),
+            "under a full contract the author seat is never dispatched (the reassign was refused)"
+        );
+        // A creator unit is never refused here: it has no work to be distinct from.
+        assert!(refuse_author_reassign(&s, &units, 0, "codex").is_ok());
     }
 }

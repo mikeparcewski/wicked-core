@@ -2336,7 +2336,9 @@ fn agent_verdict_denial(
                 crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE,
                 format!(
                     "agent judge could not run — every eligible judge seat failed: {failures}. \
-                     The failed seat(s) are benched for this run; a retry draws another judge"
+                     A seat that refused (signed out, out of quota, not installed) is benched for \
+                     this run, and a retry draws another of the run's seats if one is left; \
+                     otherwise approve to judge the work yourself"
                 ),
             ),
             None => (
