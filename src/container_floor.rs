@@ -2687,11 +2687,9 @@ mod tests {
 
     #[test]
     fn image_build_stdout_is_null_so_login_argv_stays_json_only() {
-        use std::os::unix::fs::PermissionsExt;
         let home = c4_temp();
         let runtime = home.join("runtime");
-        std::fs::write(&runtime, "#!/bin/sh\ncat > /dev/null\n[ /dev/stdout -ef /dev/null ] || exit 77\nprintf 'FAKE-build-progress\n'\n").unwrap();
-        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_env::install_stub(&runtime, "#!/bin/sh\ncat > /dev/null\n[ /dev/stdout -ef /dev/null ] || exit 77\nprintf 'FAKE-build-progress\n'\n");
         assert_eq!(
             build_image(
                 &Runtime { cli: runtime },
