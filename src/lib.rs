@@ -92,7 +92,10 @@ mod review_context;
 #[allow(dead_code)]
 mod review_scale;
 mod scope;
+mod seat_credentials;
 mod seat_gateway;
+mod seat_login;
+mod seat_refresh;
 mod session_runner;
 mod skills_snapshot;
 mod sources;
@@ -173,6 +176,7 @@ pub use mcp_gate::{
     APPROVAL_OBLIGATION as MCP_APPROVAL_OBLIGATION, CREW_URL_ENV as MCP_CREW_URL_ENV,
     MCP_REST_BOUNDARY_RULE, TOKEN_ENV as MCP_TOKEN_ENV,
 };
+pub use seat_login::seat_login_main;
 /// The team wire contract (DES-TEAMING-002 T1): `wicked.team.*` types, payloads, keys, `fold`.
 pub use team::events as team_events;
 pub use team::publish::{

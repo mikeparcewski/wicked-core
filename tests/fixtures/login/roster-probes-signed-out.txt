@@ -1,0 +1,19 @@
+== claude auth status --json
+{
+  "loggedIn": false,
+  "authMethod": "none",
+  "apiProvider": "firstParty",
+  "analyticsDisabled": false,
+  "projectsDirectory": "/home/agent/claude/projects",
+  "configDirectory": "/home/agent/claude"
+}
+rc=1
+== codex login status
+Not logged in
+rc=0
+== opencode auth list
+No authenticated integrations
+rc=0
+== pi auth check --json
+{"status":"not_ready","provider":"anthropic","reason":"credentials_not_configured"}
+rc=0

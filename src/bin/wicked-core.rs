@@ -188,6 +188,13 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          (WICKED_SEAT_FLOOR=container). Needs a container runtime (docker, podman, nerdctl).",
     ),
     (
+        "seat-login",
+        "wicked-core seat-login <argv|ingest|status|sign-out|refresh> <cli>\n  \
+         Open a throwaway container login via crew's PTY, ingest credentials into the broker, \
+         report broker status as JSON, or sign out. Set WICKED_SEAT_GATEWAY_DIR to the daemon's \
+         absolute gateway directory. Needs a container runtime (Unix host).",
+    ),
+    (
         "gate-hook",
         "wicked-core gate-hook [--protocol-version]\n  \
          The PreToolUse hook. Arguments travel by environment variable; `--protocol-version` prints \
@@ -323,6 +330,14 @@ fn main() {
             return;
         }
         std::process::exit(wicked_core::seat_image_main(&args[2..]));
+    }
+
+    // Login handoff addresses runtime volumes only: no store, no actor.
+    if args.get(1).map(String::as_str) == Some("seat-login") {
+        if handled_help("seat-login", &args) {
+            return;
+        }
+        std::process::exit(wicked_core::seat_login_main(&args[2..]));
     }
 
     if args.get(1).map(String::as_str) == Some("gate-hook") {
@@ -2854,5 +2869,18 @@ fn rules_retire_cmd(args: &[String]) {
              still be recallable somewhere a governed run reads; re-run after fixing the named \
              lane, and treat the estate as UNGOVERNED for this rule until the receipt verifies",
         );
+    }
+}
+
+#[cfg(test)]
+mod seat_login_usage_tests {
+    #[test]
+    fn seat_login_usage_lists_refresh() {
+        let usage = super::SUBCOMMAND_USAGE
+            .iter()
+            .find(|(name, _)| *name == "seat-login")
+            .unwrap()
+            .1;
+        assert!(usage.contains("|refresh>"));
     }
 }

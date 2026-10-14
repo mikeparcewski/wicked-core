@@ -2054,28 +2054,69 @@ impl WrappedCliStepRunner {
         // variable, every foreign seat variable STRIPPED, the inherit hatch keeps the operator's
         // own. Fail CLOSED on a resolver error — the launch is refused, never run under the
         // daemon's configuration.
-        let seat_config =
-            match wicked_apps_core::spawn::seat_config_for_carrier_seat(&binary, &cli_key)
-                .and_then(|c| c.ensure_dirs().map(|()| c))
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    return StepOutput {
-                        run_id: input.run_id.clone(),
-                        unit_ix: input.unit_ix,
-                        attempt: input.attempt,
-                        output: format!(
+        let seat_config = match wicked_apps_core::spawn::seat_config_for_carrier_seat(
+            &binary, &cli_key,
+        )
+        .and_then(|c| {
+            let posture =
+                crate::write_posture::WritePosture::of(&input.unit, input.workdir.is_some());
+            let c = config_for_container_launch(
+                c,
+                input.governance.is_some(),
+                crate::container_floor::container_mode(),
+                &input.run_id,
+                posture.label(),
+            )?;
+            c.ensure_dirs().map(|()| c)
+        }) {
+            Ok(c) => c,
+            Err(e) => {
+                return StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: format!(
                         "(worker config dir refused the launch of `{cli_key}`: {e}; refusing to \
                          run the worker under the daemon's own CLI configuration)"
                     ),
-                        status: StepStatus::Failed,
-                        usage: None,
-                        files: Vec::new(),
-                        tools: Vec::new(),
-                        governed: false,
-                    };
+                    status: StepStatus::Failed,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                };
+            }
+        };
+        // agy lg-r1 A1: hold until the unit exits, including every early refusal/panic.
+        let _config_home_guard = if uses_container_seat(
+            input.governance.is_some(),
+            crate::container_floor::container_mode(),
+        ) {
+            match seat_config.root().map(|home| {
+                crate::container_floor::claim_config_home(
+                    wicked_apps_core::spawn::SeatCli::from_binary(&binary)
+                        .root_name()
+                        .unwrap_or_default(),
+                    home,
+                )
+            }) {
+                Some(Ok(guard)) => guard,
+                Some(Err(why)) => {
+                    eprintln!("wicked-core: {why}");
+                    let mut out = floor_refused(
+                        input,
+                        &cli_key,
+                        crate::worker_sandbox::FloorUnarmed::GatewayUnavailable,
+                    );
+                    out.output.push_str(&format!("\n{why}"));
+                    return out;
                 }
-            };
+                None => None,
+            }
+        } else {
+            None
+        };
+
         // F-079 (core#441), the codex lever: populate the seat's ENGINE-MINTED `CODEX_HOME/skills`
         // from the pinned snapshot BEFORE the handoff is reported or the command is built — a
         // population failure refuses the launch naming the seat; a relaunch on an unchanged
@@ -2504,6 +2545,8 @@ impl WrappedCliStepRunner {
             let mut floor_env: Vec<(&'static str, PathBuf)> = Vec::new();
             // Container floor: the seat's gateway env and registration.
             let mut seat_gateway_env: Vec<(String, String)> = Vec::new();
+            // Its placeholder credential files (C4), written once the seat's env names its home.
+            let mut seat_files: Vec<(PathBuf, String)> = Vec::new();
             let mut gateway_lease: Option<crate::container_floor::GatewayLease> = None;
             let mut opencode_password: Option<String> = None;
             let mut seat_cleanup: Option<crate::container_floor::ReapOnDrop> = None;
@@ -2517,7 +2560,8 @@ impl WrappedCliStepRunner {
             // (IG1-core-2) What armed the write boundary (`Ok(launcher)`), or why none did and
             // whether that was already disclosed — read by the `os_sandbox`-class arm below.
             let floor: Result<&'static str, (String, bool)>;
-            let sandbox = if governed && crate::container_floor::container_mode() {
+            let sandbox = if uses_container_seat(governed, crate::container_floor::container_mode())
+            {
                 // The container floor (opt-in, WICKED_SEAT_FLOOR=container): the unit's floor —
                 // writes only to its tree and admitted roots (none of the tree under a fenced
                 // posture), git state, its seat home, secrets masked — rendered as a hardened
@@ -2638,6 +2682,7 @@ impl WrappedCliStepRunner {
                     Ok(c) => {
                         seat_cleanup = Some(c.cleanup);
                         seat_gateway_env = c.env;
+                        seat_files = c.files;
                         gateway_lease = c.lease;
                         argv = c.argv;
                         // Each CLI's own sandbox off inside ours (codex's cannot run in a
@@ -2842,25 +2887,13 @@ impl WrappedCliStepRunner {
             // bare document. A value the deny cannot be composed into refuses the launch.
             let is_opencode = wicked_apps_core::spawn::SeatCli::from_binary(&binary)
                 == wicked_apps_core::spawn::SeatCli::Opencode;
-            let composed = delivery
-                .opencode_config(
-                    std::env::var(crate::skills_snapshot::OPENCODE_CONFIG_ENV)
-                        .ok()
-                        .as_deref(),
-                )
-                .and_then(|skills| {
-                    if !is_opencode {
-                        return Ok(skills);
-                    }
-                    let base = skills.or_else(|| {
-                        inherits_operator_config()
-                            .then(|| {
-                                std::env::var(crate::skills_snapshot::OPENCODE_CONFIG_ENV).ok()
-                            })
-                            .flatten()
-                    });
-                    crate::mcp_isolation::opencode_config(base.as_deref()).map(Some)
-                });
+            let composed = compose_seat_opencode_config(
+                &delivery,
+                is_opencode,
+                uses_container_seat(governed, crate::container_floor::container_mode()),
+                || std::env::var(crate::skills_snapshot::OPENCODE_CONFIG_ENV).ok(),
+                inherits_operator_config,
+            );
             match composed {
                 Ok(Some(content)) => {
                     cmd.env(crate::skills_snapshot::OPENCODE_CONFIG_ENV, content);
@@ -2910,6 +2943,21 @@ impl WrappedCliStepRunner {
             }
             for (k, v) in &seat_gateway_env {
                 cmd.env(k, v);
+            }
+            if let Err(why) = crate::container_floor::write_unit_seat_files(
+                &mut cmd,
+                seat_cli.root_name().unwrap_or_default(),
+                &seat_files,
+            ) {
+                eprintln!("wicked-core: unit {}: {why}", input.unit.ord);
+                if let Some(lease) = gateway_lease.take() {
+                    let _ = lease.release();
+                }
+                return floor_refused(
+                    input,
+                    &cli_key,
+                    crate::worker_sandbox::FloorUnarmed::GatewayUnavailable,
+                );
             }
             if let Some(pw) = &opencode_password {
                 for k in crate::worker_sandbox::OPENCODE_PASSWORD_ENVS {
@@ -5097,6 +5145,48 @@ pub(crate) fn governance_refusal(input: &StepInput, why: &str) -> StepOutput {
     }
 }
 
+// codex lg-r2 C5 / agy lg-r1 A6: config selection and arming share one predicate.
+fn uses_container_seat(governed: bool, container_mode: bool) -> bool {
+    governed && container_mode
+}
+
+fn config_for_container_launch(
+    config: wicked_apps_core::spawn::SeatConfig,
+    governed: bool,
+    container_mode: bool,
+    run: &str,
+    posture: &str,
+) -> anyhow::Result<wicked_apps_core::spawn::SeatConfig> {
+    if uses_container_seat(governed, container_mode) {
+        crate::container_floor::container_seat_config(config, run, posture)
+    } else {
+        Ok(config)
+    }
+}
+
+fn compose_seat_opencode_config(
+    delivery: &crate::skills_snapshot::SkillsDelivery,
+    is_opencode: bool,
+    container_seat: bool,
+    mut host_config: impl FnMut() -> Option<String>,
+    inherit: impl FnOnce() -> bool,
+) -> Result<Option<String>, String> {
+    // agy lg-r1 A2: do not even read host inline keys or the inherit hatch for a container.
+    let host = if container_seat { None } else { host_config() };
+    let skills = delivery.opencode_config(host.as_deref())?;
+    if !is_opencode {
+        return Ok(skills);
+    }
+    let base = skills.or_else(|| {
+        if !container_seat && inherit() {
+            host_config()
+        } else {
+            None
+        }
+    });
+    crate::mcp_isolation::opencode_config(base.as_deref()).map(Some)
+}
+
 /// The [`StepOutput`] for a governed unit whose seat container did not arm: nothing ran. The
 /// text says `could not run`, read as a seat failure, so the run fails over.
 pub(crate) fn floor_refused(
@@ -5885,6 +5975,67 @@ pub(crate) fn build_argv(invocation: &str, prompt: &str, skills: &[String]) -> V
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn container_config_selection_matches_arming_and_preserves_ungoverned_host_home() {
+        for (governed, mode, expected) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            assert_eq!(uses_container_seat(governed, mode), expected);
+        }
+        use wicked_apps_core::spawn::{SeatCli, SeatConfig};
+        for config in [
+            SeatConfig::Inherit,
+            SeatConfig::Isolated {
+                cli: SeatCli::Codex,
+                root: Some("/FAKE-host-home".into()),
+                set: vec![("CODEX_HOME", "/FAKE-host-home".into())],
+                strip: vec![],
+            },
+        ] {
+            assert_eq!(
+                config_for_container_launch(config.clone(), false, true, "FAKE-run", "read-only")
+                    .unwrap(),
+                config
+            );
+        }
+        assert!(config_for_container_launch(
+            SeatConfig::Inherit,
+            true,
+            true,
+            "FAKE-run",
+            "read-only"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn container_opencode_composition_never_reads_host_credentials_or_inherit_hatch() {
+        let composed = compose_seat_opencode_config(
+            &crate::skills_snapshot::SkillsDelivery::None,
+            true,
+            true,
+            || panic!("host OPENCODE_CONFIG_CONTENT must not be read"),
+            || panic!("inherit hatch must not be read"),
+        )
+        .unwrap()
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&composed).unwrap();
+        assert!(value.get("provider").is_none());
+        let host = compose_seat_opencode_config(
+            &crate::skills_snapshot::SkillsDelivery::None,
+            true,
+            false,
+            || Some(r#"{"provider":{"openai":{"options":{"apiKey":"FAKE-host-key"}}}}"#.into()),
+            || true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(host.contains("FAKE-host-key"));
+    }
+
     /// wicked-crew#663: the two path layers cover the SAME providers as the command fence. A
     /// credential store the file-tool fence denies while the OS sandbox leaves it readable (or
     /// the other way round) is exactly the seam that issue is about — a desktop logged into

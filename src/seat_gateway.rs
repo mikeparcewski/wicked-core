@@ -12,6 +12,8 @@
 //! serializes provisioning, startup and key changes. The daemon must pass the same directory
 //! throughout its lifetime (the directory is also the input to [`gateway_name`]).
 
+#![cfg_attr(not(unix), allow(dead_code))] // agy lg-r1 A7: callers remain available.
+
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -21,9 +23,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::seat_credentials::CredentialKind;
+
 use crate::container_floor::{output_within, Runtime};
 use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use wicked_apps_core::HardenedCommand;
 
 /// The OSS gateway image whose config shape the fixture proves.
 pub(crate) const GATEWAY_IMAGE: &str = "ghcr.io/agentgateway/agentgateway:v1.6.0";
@@ -50,13 +56,22 @@ pub(crate) struct GatewayConfig {
     /// `host:port` of crew's MCP broker as the gateway reaches it; `None` = no MCP route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) mcp_upstream: Option<String>,
+    /// The signed-in ChatGPT account (an identifier, not a credential: the broker holds the
+    /// token). agentgateway v1.6.0 sets request headers from literals only, so the ChatGPT route
+    /// carries it here; `None` = signed out (the header is removed and the upstream refuses).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) chatgpt_account: Option<String>,
 }
 
 /// A seat's revocable placeholder key and the identity authenticated requests carry.
 /// Its `Debug` implementation redacts the key so diagnostics cannot print it.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct UnitKey {
+    /// The apiKey policy's exact match value (the whole JWT for Codex ChatGPT).
     pub(crate) key: String,
+    /// The credential the CLI sends; retained explicitly for the runner's credential handoff.
+    #[serde(default)]
+    pub(crate) bearer: String,
     pub(crate) run: String,
     pub(crate) unit: String,
     pub(crate) seat: String,
@@ -66,6 +81,7 @@ impl std::fmt::Debug for UnitKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnitKey")
             .field("key", &"[redacted]")
+            .field("bearer", &"[redacted]")
             .field("run", &self.run)
             .field("unit", &self.unit)
             .field("seat", &self.seat)
@@ -76,8 +92,10 @@ impl std::fmt::Debug for UnitKey {
 impl UnitKey {
     /// Mint a fresh `wk-` + 32 hex key for one governed unit.
     pub(crate) fn new(run: &str, unit: &str, seat: &str) -> Self {
+        let key = format!("wk-{}", uuid::Uuid::new_v4().simple());
         Self {
-            key: format!("wk-{}", uuid::Uuid::new_v4().simple()),
+            bearer: key.clone(),
+            key,
             run: run.into(),
             unit: unit.into(),
             seat: seat.into(),
@@ -97,6 +115,19 @@ pub(crate) struct ModelRoute {
     /// examples/traffic-cross-app-access/okta-auth0/gateway.yaml:31-35).
     pub(crate) tls: bool,
     pub(crate) credential_file: PathBuf,
+    /// Absent on older configs: preserve their native API-key policy.
+    #[serde(default)]
+    pub(crate) kind: Option<CredentialKind>,
+}
+
+impl ModelRoute {
+    fn credential_kind(&self) -> CredentialKind {
+        self.kind.unwrap_or(match self.provider {
+            Provider::Anthropic => CredentialKind::ClaudeApiKey,
+            Provider::OpenAI => CredentialKind::CodexApiKey,
+            Provider::ChatGpt => CredentialKind::CodexChatgpt,
+        })
+    }
 }
 
 /// The native API each model listener preserves. The seat-env helper uses the standard ports.
@@ -104,6 +135,7 @@ pub(crate) struct ModelRoute {
 pub(crate) enum Provider {
     Anthropic,
     OpenAI,
+    ChatGpt,
 }
 
 impl Provider {
@@ -111,6 +143,7 @@ impl Provider {
         match self {
             Self::Anthropic => 4000,
             Self::OpenAI => 4001,
+            Self::ChatGpt => 4002,
         }
     }
 
@@ -118,7 +151,8 @@ impl Provider {
     fn config_key(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",
-            Self::OpenAI => "openAI",
+            // ChatGPT's backend speaks the OpenAI wire.
+            Self::OpenAI | Self::ChatGpt => "openAI",
         }
     }
 
@@ -126,6 +160,7 @@ impl Provider {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenAI => "openai",
+            Self::ChatGpt => "chatgpt",
         }
     }
 }
@@ -134,16 +169,54 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             units: Vec::new(),
-            providers: [Provider::Anthropic, Provider::OpenAI]
-                .into_iter()
-                .map(|provider| ModelRoute {
-                    port: provider.port(),
-                    provider,
-                    upstream_host: String::new(),
-                    tls: true,
-                    credential_file: PathBuf::from(format!("/broker/{}.key", provider.name())),
-                })
-                .collect(),
+            providers: [
+                (
+                    Provider::Anthropic,
+                    4000,
+                    CredentialKind::ClaudeApiKey,
+                    "anthropic.key",
+                ),
+                (
+                    Provider::OpenAI,
+                    4001,
+                    CredentialKind::CodexApiKey,
+                    "openai.key",
+                ),
+                (
+                    Provider::ChatGpt,
+                    4002,
+                    CredentialKind::CodexChatgpt,
+                    "openai.token",
+                ),
+                (
+                    Provider::OpenAI,
+                    4003,
+                    CredentialKind::ProviderKey,
+                    "pi.token",
+                ),
+                (
+                    Provider::OpenAI,
+                    4004,
+                    CredentialKind::ProviderKey,
+                    "opencode.token",
+                ),
+                (
+                    Provider::Anthropic,
+                    4005,
+                    CredentialKind::ClaudeOauth,
+                    "anthropic.token",
+                ),
+            ]
+            .into_iter()
+            .map(|(provider, port, kind, file)| ModelRoute {
+                port,
+                provider,
+                upstream_host: String::new(),
+                tls: true,
+                credential_file: PathBuf::from(format!("/broker/{file}")),
+                kind: Some(kind),
+            })
+            .collect(),
             // `WICKED_SEAT_EGRESS_HOSTS`: the hostnames (comma-separated) seats may reach
             // through CONNECT, e.g. package registries. None by default.
             egress_hosts: std::env::var("WICKED_SEAT_EGRESS_HOSTS")
@@ -154,6 +227,7 @@ impl Default for GatewayConfig {
                 .collect(),
             hook_upstream: None,
             mcp_upstream: None,
+            chatgpt_account: None,
         }
     }
 }
@@ -189,14 +263,16 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
                     "/v1/responses": "responses",
                     "*": "passthrough"
                 }),
+                Provider::ChatGpt => json!({"*": "passthrough"}),
             };
             let mut provider = serde_json::Map::new();
             provider.insert(route.provider.config_key().into(), json!({}));
-            let location = match route.provider {
-                Provider::Anthropic => json!({"header": {"name": "x-api-key"}}),
+            let kind = route.credential_kind();
+            let location = match kind {
+                CredentialKind::ClaudeApiKey => json!({"header": {"name": "x-api-key"}}),
                 // v1.6.0 schema/config.json: LocalAPIKeys.location / AuthorizationLocation.
                 // Native OpenAI clients send Authorization: Bearer <placeholder>.
-                Provider::OpenAI => {
+                _ => {
                     json!({"header": {"name": "authorization", "prefix": "Bearer "}})
                 }
             };
@@ -212,17 +288,60 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
             // signed in it is empty, and the provider answers with its own 401.
             policies["backendAuth"] = json!({"key": {"file": route.credential_file}});
             let mut backend = json!({"name": route.provider.name(), "provider": provider});
+            let broker_bearer = matches!(
+                kind,
+                CredentialKind::ClaudeOauth
+                    | CredentialKind::CodexChatgpt
+                    | CredentialKind::ProviderKey
+            );
+            if broker_bearer {
+                // Preserve Authorization as proved by the broker spike. Native Anthropic ai
+                // backends inject x-api-key; OAuth needs a plain host backend instead.
+                policies["backendAuth"] =
+                    json!({"key": {"value": {"file": route.credential_file}}});
+            }
+            if kind == CredentialKind::ClaudeOauth {
+                policies["requestHeaderModifier"] = json!({"remove": ["x-api-key"]});
+            }
+            if route.provider == Provider::ChatGpt {
+                // The broker's access token replaces the seat's placeholder bearer (watched
+                // file); the account header is a literal (v1.6.0 HeaderModifier.set takes
+                // literals only), as the broker spike proved (`linux/broker/config.yaml`).
+                policies["backendAuth"] =
+                    json!({"key": {"value": {"file": route.credential_file}}});
+                policies["requestHeaderModifier"] = match config.chatgpt_account.as_deref() {
+                    Some(acct) => json!({"set": {"chatgpt-account-id": acct}}),
+                    None => json!({"remove": ["chatgpt-account-id"]}),
+                };
+            }
             if !route.upstream_host.is_empty() {
                 backend["hostOverride"] = json!(route.upstream_host);
                 if route.tls {
                     policies["backendTLS"] = json!({});
                 }
             }
+            let backends =
+                if route.provider == Provider::ChatGpt || kind == CredentialKind::ClaudeOauth {
+                    let host = if route.upstream_host.is_empty() {
+                        match route.provider {
+                            Provider::ChatGpt => "chatgpt.com:443",
+                            _ => "api.anthropic.com:443",
+                        }
+                    } else {
+                        &route.upstream_host
+                    };
+                    if route.upstream_host.is_empty() || route.tls {
+                        policies["backendTLS"] = json!({});
+                    }
+                    json!([{"host": host}])
+                } else {
+                    json!([{"ai": backend}])
+                };
             json!({
                 "port": route.port,
                 "listeners": [{ "routes": [{
                     "policies": policies,
-                    "backends": [{"ai": backend}]
+                    "backends": backends
                 }]}]
             })
         })
@@ -317,7 +436,7 @@ pub(crate) struct Gateway {
 }
 
 impl Gateway {
-    fn for_dir(dir: &Path) -> Self {
+    pub(crate) fn for_dir(dir: &Path) -> Self {
         let name = gateway_name(dir);
         Self {
             external_network: format!("{name}-ext"),
@@ -385,6 +504,11 @@ fn env_at_port(provider: Provider, port: u16, key: &str) -> Vec<(String, String)
             "OPENAI_BASE_URL",
             "OPENAI_API_KEY",
             format!("http://agw:{port}/v1"),
+        ),
+        Provider::ChatGpt => (
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY",
+            format!("http://agw:{port}/backend-api/codex"),
         ),
     };
     vec![
@@ -621,13 +745,83 @@ pub(crate) fn seat_env_all(key: &str) -> Vec<(String, String)> {
     out
 }
 
+/// The per-CLI listener origin, shared by environment and credential-file renderers.
+pub(crate) fn credential_gateway_url(cli: &str, kind: CredentialKind) -> String {
+    let port = match (cli, kind) {
+        (_, CredentialKind::ClaudeApiKey) => 4000,
+        (_, CredentialKind::CodexApiKey) => 4001,
+        (_, CredentialKind::CodexChatgpt) => 4002,
+        ("pi", CredentialKind::ProviderKey) => 4003,
+        ("opencode", CredentialKind::ProviderKey) => 4004,
+        (_, CredentialKind::ClaudeOauth) => 4005,
+        _ => 4001,
+    };
+    format!("http://agw:{port}")
+}
+
+/// OAuth/ChatGPT files select account auth; an API-key env override would change the CLI's
+/// auth mode. Keep those overrides out of the seat while still routing its model requests.
+pub(crate) fn seat_env_for(cli: &str, kind: CredentialKind, bearer: &str) -> Vec<(String, String)> {
+    let mut env = seat_env_all(bearer);
+    let url = credential_gateway_url(cli, kind);
+    for (name, value) in &mut env {
+        match (name.as_str(), kind) {
+            ("ANTHROPIC_BASE_URL", CredentialKind::ClaudeOauth | CredentialKind::ClaudeApiKey) => {
+                *value = url.clone()
+            }
+            ("OPENAI_BASE_URL", CredentialKind::CodexChatgpt) => {
+                *value = format!("{url}/backend-api/codex")
+            }
+            ("OPENAI_BASE_URL", CredentialKind::CodexApiKey | CredentialKind::ProviderKey) => {
+                *value = format!("{url}/v1")
+            }
+            _ => {}
+        }
+    }
+    if matches!(
+        kind,
+        CredentialKind::ClaudeOauth | CredentialKind::CodexChatgpt
+    ) {
+        env.retain(|(name, _)| name != "ANTHROPIC_API_KEY" && name != "OPENAI_API_KEY");
+    }
+    env
+}
+
+// codex lg-r1 #3: seat-login is a separate process; keep publication inside this
+// transaction too. All callers acquire PUBLISH_LOCK -> CONFIG_LOCK -> config/.lock.
+struct ConfigTransaction {
+    _publish: std::sync::MutexGuard<'static, ()>,
+    _config: std::sync::MutexGuard<'static, ()>,
+    _file: fs::File,
+}
+
+fn config_transaction(dir: &Path) -> Result<ConfigTransaction, String> {
+    let publishing = PUBLISH_LOCK
+        .lock()
+        .map_err(|_| "gateway publish lock poisoned")?;
+    let config = CONFIG_LOCK
+        .lock()
+        .map_err(|_| "gateway config lock poisoned")?;
+    fs::create_dir_all(dir.join("config")).map_err(|e| e.to_string())?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("config/.lock"))
+        .map_err(|e| e.to_string())?;
+    file.lock().map_err(|e| e.to_string())?;
+    Ok(ConfigTransaction {
+        _publish: publishing,
+        _config: config,
+        _file: file,
+    })
+}
+
 /// (tests) Provision routes and allowlisted hosts without losing live registrations. Only the routes
 /// and hosts from `config` are used; keys are owned by register/deregister, never provisioning.
 #[cfg(test)]
 pub(crate) fn configure_gateway(dir: &Path, config: &GatewayConfig) -> Result<(), String> {
-    let _one = CONFIG_LOCK
-        .lock()
-        .map_err(|_| "gateway config lock poisoned")?;
+    let _transaction = config_transaction(dir)?;
     let units = read_json(&dir.join("config/units.json"))?.unwrap_or_default();
     let mut settings = config.clone();
     settings.units.clear();
@@ -637,14 +831,126 @@ pub(crate) fn configure_gateway(dir: &Path, config: &GatewayConfig) -> Result<()
 }
 
 /// Add (or replace) one unit key and atomically publish the new strict auth policy.
+#[cfg(test)]
 pub(crate) fn register_unit(dir: &Path, unit: UnitKey) -> Result<(), String> {
-    let _one = CONFIG_LOCK
-        .lock()
-        .map_err(|_| "gateway config lock poisoned")?;
+    let _transaction = config_transaction(dir)?;
+    register_unit_locked(dir, unit)
+}
+
+fn register_unit_locked(dir: &Path, unit: UnitKey) -> Result<(), String> {
     let mut config = load_config(dir)?;
     config.units.retain(|u| u.key != unit.key);
     config.units.push(unit);
     persist_units(dir, &config)
+}
+
+/// Accept only a plain identifier before it becomes a literal HTTP header value.
+pub(crate) fn validate_chatgpt_account(account: Option<&str>) -> Result<(), String> {
+    if account.is_some_and(|a| {
+        a.is_empty()
+            || a.len() > 128
+            || !a
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    }) {
+        return Err("the ChatGPT account id is not a plain identifier".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn set_chatgpt_account(dir: &Path, account: Option<&str>) -> Result<(), String> {
+    validate_chatgpt_account(account)?;
+    let _transaction = config_transaction(dir)?;
+    set_chatgpt_account_locked(dir, account)
+}
+
+fn set_chatgpt_account_locked(dir: &Path, account: Option<&str>) -> Result<(), String> {
+    validate_chatgpt_account(account)?;
+    let mut config = load_config(dir)?;
+    config.chatgpt_account = account.map(str::to_string);
+    let mut settings = config.clone();
+    settings.units.clear();
+    atomic_json(&dir.join("config/gateway.json"), &settings)?;
+    persist_units(dir, &config)
+}
+
+pub(crate) fn route_sign_in(
+    rt: &Runtime,
+    gw: &Gateway,
+    dir: &Path,
+    cli: &str,
+    account: Option<&str>,
+) -> Result<(), String> {
+    let _transaction = config_transaction(dir)?;
+    if cli == "codex" {
+        set_chatgpt_account_locked(dir, account)?;
+    }
+    rerender_without_pending(dir)?; // agy lg-r1 A8: never resurrect pending revocations.
+    let config = load_config(dir)?;
+    persist_units(dir, &config)?;
+    publish_for_cli(rt, gw, dir, cli)
+}
+
+// codex lg-r1 #9: a temporary readiness key proves this reload generation was applied.
+// This confirms config application, not a provider request or upstream token-cache eviction.
+pub(crate) fn confirm_sign_out(
+    rt: &Runtime,
+    gw: &Gateway,
+    dir: &Path,
+    cli: &str,
+) -> Result<(), String> {
+    let _transaction = config_transaction(dir)?;
+    if cli == "codex" {
+        set_chatgpt_account_locked(dir, None)?;
+    }
+    rerender_without_pending(dir)?;
+    // agy lg-r1 A3: only a running gateway can acknowledge a generation.
+    match gw_state(rt, gw, CLI_TIMEOUT) {
+        GwState::Running => {}
+        GwState::Stopped | GwState::Absent => {
+            let mut cmd = rt.cmd();
+            cmd.args(["volume", "ls", "--format", "{{.Name}}"]);
+            let out = output_within(cmd, CLI_TIMEOUT).ok_or("could not inspect config volumes")?;
+            if !out.status.success() {
+                return Err("could not inspect config volumes".into());
+            }
+            if String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|v| v == volumes(gw).0)
+            {
+                publish_for_cli(rt, gw, dir, cli)?;
+            }
+            // agy lg-r1 A3: no stopped/absent process can still serve a pending probe key.
+            atomic_json(&revoking_path(dir), &Vec::<String>::new())?;
+            return Ok(());
+        }
+        GwState::Unknown => return Err("sign-out could not confirm gateway state".into()),
+    }
+    confirm_generation(
+        dir,
+        || publish_for_cli(rt, gw, dir, cli),
+        |key, accepted| confirm_key(rt, gw, key, accepted),
+    )
+    .map_err(|e| format!("sign-out could not confirm gateway config application: {e}"))
+}
+
+fn confirm_generation(
+    dir: &Path,
+    mut publish: impl FnMut() -> Result<(), String>,
+    mut confirm: impl FnMut(&str, bool) -> Result<(), String>,
+) -> Result<(), String> {
+    let probe = UnitKey::new("readiness", "sign-out", "broker");
+    register_unit_locked(dir, probe.clone())?;
+    let applied = publish().and_then(|()| confirm(&probe.key, true));
+    // Remove even on failure; pending revocation preserves a failed acknowledgement.
+    deregister_unit_locked(dir, &probe.key)?;
+    publish()?;
+    confirm(&probe.key, false)?;
+    let mut pending = load_revoking(dir)?;
+    pending.retain(|k| k != &probe.key);
+    atomic_json(&revoking_path(dir), &pending)?;
+    applied
 }
 
 /// Revoke one key. Repeating a revocation is harmless; all other keys and routes survive. The key
@@ -652,10 +958,13 @@ pub(crate) fn register_unit(dir: &Path, unit: UnitKey) -> Result<(), String> {
 /// and stays there until the gateway is seen refusing it ([`settle_revoking`]) or the gateway
 /// container is gone (codex gw-r4 P2: a failed publish, a crash or a failed quarantine must not
 /// lose the one record of a key the gateway may still accept).
+#[cfg(test)]
 pub(crate) fn deregister_unit(dir: &Path, key: &str) -> Result<(), String> {
-    let _one = CONFIG_LOCK
-        .lock()
-        .map_err(|_| "gateway config lock poisoned")?;
+    let _transaction = config_transaction(dir)?;
+    deregister_unit_locked(dir, key)
+}
+
+fn deregister_unit_locked(dir: &Path, key: &str) -> Result<(), String> {
     let mut config = load_config(dir)?;
     mark_revoking(dir, [key.to_string()])?;
     config.units.retain(|u| u.key != key);
@@ -699,37 +1008,16 @@ fn rerender_without_pending(dir: &Path) -> Result<Vec<String>, String> {
 /// Publish the served config and confirm the gateway refuses every pending revocation; only
 /// then are they cleared. `config_locked`: the caller already holds `CONFIG_LOCK`. Callers hold
 /// `PUBLISH_LOCK`.
-fn settle_revoking(
-    rt: &Runtime,
-    gw: &Gateway,
-    dir: &Path,
-    config_locked: bool,
-) -> Result<(), String> {
-    let lock = || -> Result<Option<std::sync::MutexGuard<'static, ()>>, String> {
-        if config_locked {
-            Ok(None)
-        } else {
-            CONFIG_LOCK
-                .lock()
-                .map(Some)
-                .map_err(|_| "gateway config lock poisoned".to_string())
-        }
-    };
-    let pending = {
-        let _one = lock()?;
-        rerender_without_pending(dir)?
-    };
+fn settle_revoking(rt: &Runtime, gw: &Gateway, dir: &Path) -> Result<(), String> {
+    let pending = rerender_without_pending(dir)?;
     if pending.is_empty() {
         return Ok(());
     }
-    publish(rt, gw, dir)?;
+    publish_locked(rt, gw, dir)?;
     for key in &pending {
         confirm_key(rt, gw, key, false)?;
     }
-    let _one = lock()?;
-    let mut now = load_revoking(dir)?;
-    now.retain(|k| !pending.contains(k));
-    atomic_json(&revoking_path(dir), &now)
+    atomic_json(&revoking_path(dir), &Vec::<String>::new())
 }
 
 /// The pinned OSS helper image that writes into the gateway's volumes from inside the runtime's
@@ -744,10 +1032,15 @@ pub(crate) fn volumes(gw: &Gateway) -> (String, String) {
 
 /// Publish `dir/config/config.json` (the rendered config) into the gateway's config volume by
 /// an atomic rename inside the VM, which the gateway's watcher sees and reloads.
-pub(crate) fn publish(rt: &Runtime, gw: &Gateway, dir: &Path) -> Result<(), String> {
+fn publish_locked(rt: &Runtime, gw: &Gateway, dir: &Path) -> Result<(), String> {
+    publish_for_cli(rt, gw, dir, "config")
+}
+
+fn publish_for_cli(rt: &Runtime, gw: &Gateway, dir: &Path, cli: &str) -> Result<(), String> {
     let body = fs::read(dir.join("config/config.json"))
         .map_err(|e| format!("could not read the rendered gateway config: {e}"))?;
-    write_into_volume(rt, &volumes(gw).0, "config.json", &body)
+    // codex lg-r2 C1: sign-in/out config writers share that agent's cleanup marker.
+    write_into_volume(rt, dir, cli, &volumes(gw).0, "config.json", &body)
 }
 
 /// Store a provider credential in the broker (`/broker/<file>`), the only place it lives: the
@@ -756,6 +1049,8 @@ pub(crate) fn publish(rt: &Runtime, gw: &Gateway, dir: &Path) -> Result<(), Stri
 pub(crate) fn set_broker_credential(
     rt: &Runtime,
     gw: &Gateway,
+    dir: &Path,
+    cli: &str,
     file: &str,
     secret: &[u8],
 ) -> Result<(), String> {
@@ -766,17 +1061,211 @@ pub(crate) fn set_broker_credential(
     {
         return Err(format!("`{file}` is not a broker file name"));
     }
-    write_into_volume(rt, &volumes(gw).1, file, secret)
+    write_into_volume(rt, dir, cli, &volumes(gw).1, file, secret)
+}
+
+// codex lg-r3 R5: a runtime client dying does not stop its daemon-owned container.
+// Journal before spawn; the next lock owner must settle abandoned helpers before mutating.
+pub(crate) fn unsettled_path(dir: &Path, scope: &str) -> PathBuf {
+    dir.join("refresh").join(format!("{scope}.unsettled"))
+}
+
+/// Stop every host process whose argv carries the unique helper `name` (a dead owner's runtime
+/// client), and CONFIRM none remains; fail closed when that cannot be established (codex lg-r5:
+/// an unchecked `pkill` from the daemon's PATH could silently not run).
+#[cfg(unix)]
+fn stop_orphan_clients(name: &str) -> Result<(), String> {
+    let tool = |t: &str| {
+        ["/usr/bin", "/bin"]
+            .iter()
+            .map(|d| Path::new(d).join(t))
+            .find(|p| p.is_file())
+    };
+    let (Some(pkill), Some(pgrep)) = (tool("pkill"), tool("pgrep")) else {
+        return Err("cannot confirm the helper's runtime client is gone (no pkill/pgrep)".into());
+    };
+    let mut kill = std::process::Command::new(&pkill);
+    kill.hardened().args(["-KILL", "-f", name]);
+    // 0 = killed, 1 = none matched; anything else (or no answer) fails closed.
+    match output_within(kill, CLI_TIMEOUT).and_then(|o| o.status.code()) {
+        Some(0 | 1) => {}
+        _ => return Err("could not stop the helper's runtime client".into()),
+    }
+    let start = Instant::now();
+    loop {
+        let mut look = std::process::Command::new(&pgrep);
+        look.hardened().args(["-f", name]);
+        match output_within(look, CLI_TIMEOUT).and_then(|o| o.status.code()) {
+            Some(1) => return Ok(()),
+            Some(0) if start.elapsed() < Duration::from_secs(5) => {
+                std::thread::sleep(Duration::from_millis(100))
+            }
+            _ => return Err("the helper's runtime client could not be confirmed gone".into()),
+        }
+    }
+}
+
+fn remove_helper(rt: &Runtime, name: &str) -> Result<(), String> {
+    // codex lg-r4: an owner that died can leave its runtime CLIENT alive, still able to create
+    // the container after we saw it absent. The journaled name is unique, so any host process
+    // carrying it is that client: stop it first, then remove and confirm absence twice.
+    #[cfg(unix)]
+    stop_orphan_clients(name)?;
+    let absent = || {
+        let mut rm = rt.cmd();
+        rm.args(["rm", "--force", name]);
+        let _ = output_within(rm, CLI_TIMEOUT);
+        let mut inspect = rt.cmd();
+        inspect.args(["container", "inspect", name]);
+        output_within(inspect, CLI_TIMEOUT).is_some_and(|out| {
+            !out.status.success()
+                && String::from_utf8_lossy(&out.stderr)
+                    .to_ascii_lowercase()
+                    .contains("no such container")
+        })
+    };
+    if absent() && {
+        std::thread::sleep(Duration::from_millis(500));
+        absent()
+    } {
+        return Ok(());
+    }
+    Err("mutation helper removal could not be confirmed".into())
+}
+
+pub(crate) fn cleanup_unsettled(rt: &Runtime, dir: &Path, scope: &str) -> Result<(), String> {
+    let path = unsettled_path(dir, scope);
+    let name = match fs::read_to_string(&path) {
+        Ok(name) => name,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !name.starts_with("wicked-mutation-")
+        || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+    {
+        return Err("invalid unsettled mutation helper identity".into());
+    }
+    remove_helper(rt, &name)?;
+    crate::seat_refresh::remove_private_file(&path)
+}
+
+pub(crate) fn cleanup_mutations(rt: &Runtime, dir: &Path) -> Result<(), String> {
+    // codex lg-r3 R5: callers hold the exclusive mutation lock, so markers have dead owners.
+    for scope in [
+        "claude", "codex", "pi", "opencode", "copilot", "broker", "config",
+    ] {
+        cleanup_unsettled(rt, dir, scope)?;
+    }
+    Ok(())
+}
+
+/// Stdin and stdout run concurrently; the deadline includes both (codex lg-r2 C6).
+/// Error paths settle the named container before returning to a caller holding a lock.
+pub(crate) fn mutation_helper(
+    rt: &Runtime,
+    dir: &Path,
+    scope: &str,
+    argv: &[String],
+    body: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    cleanup_unsettled(rt, dir, scope)?;
+    let name = format!("wicked-mutation-{}", uuid::Uuid::new_v4().simple());
+    // codex lg-r3 R5: the lock's next owner must find even a helper whose owner died at spawn.
+    fs::create_dir_all(dir.join("refresh")).map_err(|e| e.to_string())?;
+    crate::seat_refresh::create_private_file(&unsettled_path(dir, scope), name.as_bytes())?;
+    let mut args = argv.to_vec();
+    args.splice(1..1, ["--name".into(), name.clone()]);
+    // codex lg-r3 R1: attached pipes do not disable the runtime's persistent logging.
+    if !args.windows(2).any(|w| w == ["--log-driver", "none"]) {
+        args.splice(3..3, ["--log-driver".into(), "none".into()]);
+    }
+    let mut cmd = rt.cmd();
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let start = Instant::now();
+    let result = (|| {
+        let mut child = cmd.spawn().map_err(|_| "could not start mutation helper")?;
+        let stdin = child.stdin.take().ok_or("no helper stdin")?;
+        let stdout = child.stdout.take().ok_or("no helper stdout")?;
+        let bytes = body.to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut stdin = stdin;
+            let result = stdin
+                .write_all(&bytes)
+                .map_err(|_| "could not stream helper input");
+            drop(stdin);
+            let _ = tx.send(result);
+        });
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stdout
+                .take(256 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes);
+            let _ = out_tx.send(result);
+        });
+        let result = (|| {
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) if start.elapsed() < timeout => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    _ => return Err("mutation helper timed out".to_string()),
+                }
+            };
+            if !status.success() {
+                return Err(format!("mutation helper failed ({status})"));
+            }
+            let remaining = || timeout.saturating_sub(start.elapsed());
+            rx.recv_timeout(remaining())
+                .map_err(|_| "helper input timed out")?
+                .map_err(str::to_string)?;
+            let bytes = out_rx
+                .recv_timeout(remaining())
+                .map_err(|_| "helper output timed out")?
+                .map_err(|_| "could not read helper output")?;
+            if bytes.len() > 256 * 1024 {
+                return Err("helper output exceeds size limit".into());
+            }
+            Ok(bytes)
+        })();
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        result
+    })();
+    if result.is_err() {
+        cleanup_unsettled(rt, dir, scope)?;
+    } else {
+        // A successful attached `run` confirms exit; failures require confirmed removal.
+        crate::seat_refresh::remove_private_file(&unsettled_path(dir, scope))?;
+    }
+    result
 }
 
 /// Write `body` to `<volume>/<file>` from inside the runtime's VM (stdin, never argv), by an
 /// atomic rename the gateway's watcher sees. `file` is a plain name (checked by the callers).
-fn write_into_volume(rt: &Runtime, volume: &str, file: &str, body: &[u8]) -> Result<(), String> {
-    use std::io::Write as _;
-    let mut cmd = rt.cmd();
-    cmd.args([
+fn write_into_volume(
+    rt: &Runtime,
+    dir: &Path,
+    scope: &str,
+    volume: &str,
+    file: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    let argv = [
         "run",
         "--rm",
+        "--log-driver",
+        "none",
         "-i",
         "--network",
         "none",
@@ -790,33 +1279,45 @@ fn write_into_volume(rt: &Runtime, volume: &str, file: &str, body: &[u8]) -> Res
         "sh",
         "-c",
         &format!("umask 077; cat > /v/.{file}.new && mv /v/.{file}.new /v/{file}"),
-    ]);
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("could not start the config publisher: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(body)
-            .map_err(|e| format!("could not stream into the gateway volume: {e}"))?;
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    mutation_helper(rt, dir, scope, &argv, body, START_TIMEOUT).map(|_| ())
+}
+
+pub(crate) fn remove_broker_file(
+    rt: &Runtime,
+    gw: &Gateway,
+    dir: &Path,
+    cli: &str,
+    file: &str,
+) -> Result<(), String> {
+    if !file
+        .bytes()
+        .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+        || file.is_empty()
+    {
+        return Err("invalid broker file name".into());
     }
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(st)) if st.success() => return Ok(()),
-            Ok(Some(st)) => return Err(format!("writing {file} into {volume} failed ({st})")),
-            Ok(None) if start.elapsed() < START_TIMEOUT => {
-                std::thread::sleep(Duration::from_millis(50))
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("writing {file} into {volume} timed out"));
-            }
-        }
-    }
+    let argv = [
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--user",
+        "10001",
+        "-v",
+        &format!("{}:/v", volumes(gw).1),
+        HELPER_IMAGE,
+        "sh",
+        "-c",
+        &format!("rm -f /v/{file}"),
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    mutation_helper(rt, dir, cli, &argv, &[], START_TIMEOUT).map(|_| ())
 }
 
 /// Serializes register/deregister WITH their publish, so the served config is never older than
@@ -830,12 +1331,13 @@ pub(crate) fn register_live(
     dir: &Path,
     unit: UnitKey,
 ) -> Result<(), String> {
-    let _one = PUBLISH_LOCK
-        .lock()
-        .map_err(|_| "gateway publish lock poisoned")?;
+    // codex lg-r3 R5: config publishers share the lock with credential mutation helpers.
+    let _broker = crate::seat_refresh::mutation_lock(dir)?;
+    let _transaction = config_transaction(dir)?;
+    cleanup_mutations(rt, dir)?;
     let key = unit.key.clone();
-    register_unit(dir, unit)?;
-    publish(rt, gw, dir)?;
+    register_unit_locked(dir, unit)?;
+    publish_locked(rt, gw, dir)?;
     // The seat starts only once the gateway SERVES its key (the reload is asynchronous).
     confirm_key(rt, gw, &key, true)
 }
@@ -847,12 +1349,12 @@ pub(crate) fn deregister_live(
     dir: &Path,
     key: &str,
 ) -> Result<(), String> {
-    let _one = PUBLISH_LOCK
-        .lock()
-        .map_err(|_| "gateway publish lock poisoned")?;
-    deregister_unit(dir, key)?;
+    let _broker = crate::seat_refresh::mutation_lock(dir)?;
+    let _transaction = config_transaction(dir)?;
+    cleanup_mutations(rt, dir)?;
+    deregister_unit_locked(dir, key)?;
     // Revocation is complete only when the gateway refuses the key (and any key still pending).
-    settle_revoking(rt, gw, dir, false)
+    settle_revoking(rt, gw, dir)
 }
 
 /// Wait (bounded) until the running gateway accepts (`accepted`) or refuses `key` on its
@@ -874,6 +1376,8 @@ pub(crate) fn confirm_key(
     cmd.args([
         "run",
         "--rm",
+        "--log-driver",
+        "none",
         "-i",
         "--network",
         &format!("container:{}", gw.name),
@@ -921,7 +1425,20 @@ pub(crate) fn confirm_key(
 
 /// Create the gateway's volumes owned by its user, with an (empty) credential file per route
 /// so the served config never names a missing file. Existing credentials are kept.
-fn init_volumes(rt: &Runtime, gw: &Gateway, config: &GatewayConfig) -> Result<(), String> {
+pub(crate) fn init_gateway_volumes(rt: &Runtime, gw: &Gateway, dir: &Path) -> Result<(), String> {
+    // codex lg-r3 R3: caller holds the mutation lock; preserve live keys and daemon ownership.
+    let _transaction = config_transaction(dir)?;
+    let mut config = load_config(dir)?;
+    reconcile_routes(&mut config);
+    init_volumes(rt, gw, dir, &config)
+}
+
+fn init_volumes(
+    rt: &Runtime,
+    gw: &Gateway,
+    dir: &Path,
+    config: &GatewayConfig,
+) -> Result<(), String> {
     let (cfg, broker) = volumes(gw);
     for v in [&cfg, &broker] {
         checked(
@@ -948,8 +1465,10 @@ fn init_volumes(rt: &Runtime, gw: &Gateway, config: &GatewayConfig) -> Result<()
         }
     }
     // One-off, offline, root only for chown (a fresh volume is root-owned).
-    checked(
+    mutation_helper(
         rt,
+        dir,
+        "broker",
         &[
             "run".into(),
             "--rm".into(),
@@ -966,7 +1485,10 @@ fn init_volumes(rt: &Runtime, gw: &Gateway, config: &GatewayConfig) -> Result<()
             "-c".into(),
             script,
         ],
+        &[],
+        START_TIMEOUT,
     )
+    .map(|_| ())
 }
 
 fn cli(rt: &Runtime, argv: &[String], limit: Duration) -> Option<Output> {
@@ -1061,16 +1583,49 @@ fn external_network_argv(gw: &Gateway) -> Vec<String> {
 /// the hardened container. `dir` is the daemon's explicit gateway state directory. Provision
 /// routes from `config/gateway.json` when present, else the defaults (provider endpoints, broker
 /// credentials used only when present).
+// codex lg-r1 #11: preserve overrides on existing routes, fill the missing C4 routes.
+fn reconcile_routes(config: &mut GatewayConfig) {
+    for mut route in GatewayConfig::default().providers {
+        if !config.providers.iter().any(|r| r.port == route.port) {
+            if let Some(old) = config
+                .providers
+                .iter()
+                .find(|r| r.provider == route.provider)
+            {
+                route.upstream_host = old.upstream_host.clone();
+                route.tls = old.tls;
+            }
+            config.providers.push(route);
+        }
+    }
+}
+
+// codex lg-r3 R3: login provisioning never starts or takes over a daemon gateway.
+pub(crate) fn ensure_external_bridge(rt: &Runtime, gw: &Gateway) -> Result<(), String> {
+    if checked(rt, &external_network_argv(gw)).is_ok() {
+        return Ok(());
+    }
+    let argv = [
+        "network",
+        "inspect",
+        "--format",
+        "{{.Driver}} {{.Internal}}",
+        &gw.external_network,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    if cli(rt, &argv, CLI_TIMEOUT).is_some_and(|o| {
+        o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "bridge false"
+    }) {
+        Ok(())
+    } else {
+        Err("could not create or reuse the gateway's external bridge".into())
+    }
+}
+
 pub(crate) fn ensure_gateway(rt: &Runtime, dir: &Path) -> Result<Gateway, String> {
-    // A reset clears and republishes the keys: serialized with every register/deregister and
-    // its publish (lock order PUBLISH_LOCK -> CONFIG_LOCK, as in `register_live`).
-    let _publishing = PUBLISH_LOCK
-        .lock()
-        .map_err(|_| "gateway publish lock poisoned")?;
-    let _one = CONFIG_LOCK
-        .lock()
-        .map_err(|_| "gateway config lock poisoned")?;
-    // Validate before rendering comma-separated --mount values, as the seat floor does.
+    // Validate before creating locks or rendering comma-separated mount values.
     if !dir.is_absolute()
         || !dir
             .to_str()
@@ -1078,7 +1633,12 @@ pub(crate) fn ensure_gateway(rt: &Runtime, dir: &Path) -> Result<Gateway, String
     {
         return Err("gateway directory must be an absolute UTF-8 mountable path".into());
     }
+    // codex lg-r1 #2/#11: missing-file initialization also mutates the broker.
+    // Broker first, then PUBLISH_LOCK -> CONFIG_LOCK -> config/.lock, as in sign-in/out.
+    let _broker = crate::seat_refresh::mutation_lock(dir)?;
+    let _transaction = config_transaction(dir)?;
     let gw = Gateway::for_dir(dir);
+    cleanup_mutations(rt, dir)?;
     // Whose keys the served config holds: this process takes the gateway over once, and keys an
     // earlier engine left (it crashed with units live) are revoked before any new unit runs.
     // Ownership is recorded only once a takeover or a fresh start has SUCCEEDED (codex gw-r3
@@ -1127,19 +1687,25 @@ pub(crate) fn ensure_gateway(rt: &Runtime, dir: &Path) -> Result<Gateway, String
         // probe it now; the next publish (the first unit's key) carries the fresh route.
         let _ = probe_hook(rt, &gw);
         let _ = probe_mcp(rt, &gw);
-        if !owned() {
-            let mut config = load_config(dir)?;
-            if !config.units.is_empty() {
-                // Pending first: if the publish or a confirmation below fails, the next attempt
-                // (or the next daemon) still knows which keys must be seen refused.
-                mark_revoking(dir, config.units.iter().map(|u| u.key.clone()))?;
-                config.units.clear();
-                persist_units(dir, &config)?;
-            }
+        let mut config = load_config(dir)?;
+        reconcile_routes(&mut config);
+        let mut settings = config.clone();
+        settings.units.clear();
+        atomic_json(&dir.join("config/gateway.json"), &settings)?;
+        // Missing files only, before any publish (codex lg-r1 #11).
+        init_volumes(rt, &gw, dir, &config)?;
+        if !owned() && !config.units.is_empty() {
+            // Pending first: if the publish or a confirmation below fails, the next attempt
+            // (or the next daemon) still knows which keys must be seen refused.
+            mark_revoking(dir, config.units.iter().map(|u| u.key.clone()))?;
+            config.units.clear();
+            persist_units(dir, &config)?;
         }
         // Every pending revocation (a takeover's stale keys, a revocation an earlier attempt or
         // daemon never confirmed) is confirmed before this gateway serves another seat.
-        settle_revoking(rt, &gw, dir, true)?;
+        persist_units(dir, &config)?;
+        publish_locked(rt, &gw, dir)?;
+        settle_revoking(rt, &gw, dir)?;
         own();
         return Ok(gw);
     }
@@ -1150,35 +1716,21 @@ pub(crate) fn ensure_gateway(rt: &Runtime, dir: &Path) -> Result<Gateway, String
     if state == GwState::Stopped {
         checked(rt, &["rm".into(), gw.name.clone()])?;
     }
-    if checked(rt, &external_network_argv(&gw)).is_err() {
-        // An existing normal bridge is reusable, but an internal network must be refused.
-        let argv = [
-            "network",
-            "inspect",
-            "--format",
-            "{{.Driver}} {{.Internal}}",
-            &gw.external_network,
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-        let normal = cli(rt, &argv, CLI_TIMEOUT).is_some_and(|o| {
-            o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "bridge false"
-        });
-        if !normal {
-            return Err("could not create or reuse the gateway's external bridge".into());
-        }
-    }
+    ensure_external_bridge(rt, &gw)?;
     let _ = probe_hook(rt, &gw);
     let _ = probe_mcp(rt, &gw);
     let mut config = load_config(dir)?;
+    reconcile_routes(&mut config);
+    let mut settings = config.clone();
+    settings.units.clear();
+    atomic_json(&dir.join("config/gateway.json"), &settings)?;
     config.units.clear();
     persist_units(dir, &config)?;
     // The container that served the pending keys is gone (absent, or removed above): a fresh
     // gateway never accepted them.
     atomic_json(&revoking_path(dir), &Vec::<String>::new())?;
-    init_volumes(rt, &gw, &config)?;
-    publish(rt, &gw, dir)?;
+    init_volumes(rt, &gw, dir, &config)?;
+    publish_locked(rt, &gw, dir)?;
     let argv = run_argv(&rt.cli, &gw);
     match cli(rt, &argv[1..], START_TIMEOUT) {
         Some(o) if o.status.success() => {}
@@ -1426,6 +1978,403 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_writer_cleanup_is_confirmed_or_blocks_next_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!(".c4-helper-test-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let runtime = dir.join("runtime");
+        fs::write(
+            &runtime,
+            r#"#!/bin/sh
+base=${0%/*}
+printf '%s\n' "$*" >> "$base/calls"
+if [ "$1 $2" = 'rm --force' ]; then
+  [ -e "$base/fail_cleanup" ] || rm -f "$base/live"
+  exit 0
+fi
+if [ "$1 $2" = 'container inspect' ]; then
+  [ ! -e "$base/fail_cleanup" ] || { printf live; exit 0; }
+  [ ! -e "$base/live" ] || { printf 'live'; exit 0; }
+  printf 'No such container\n' >&2; exit 1
+fi
+[ "$1" = run ] || exit 1
+shift
+[ "$1" = --name ] || exit 1
+[ "$(cat "$base/refresh/claude.unsettled")" = "$2" ] || exit 91
+printf '%s\n' "$2" >> "$base/marker-seen-before-spawn"
+printf '%s' "$2" > "$base/live"
+for arg do last=$arg; done
+if [ "$last" = stall ]; then exec sleep 5; fi
+cat > /dev/null
+rm -f "$base/live"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let rt = Runtime { cli: runtime };
+        let _lock = crate::seat_refresh::mutation_lock(&dir).unwrap();
+        fs::write(dir.join("fail_cleanup"), "").unwrap();
+        // Larger than a pipe: this exercises the stdin deadline too (codex lg-r2 C6).
+        let result = mutation_helper(
+            &rt,
+            &dir,
+            "claude",
+            &["run".into(), "stall".into()],
+            &vec![b'F'; 128 * 1024],
+            // Below the stalled helper's 5 s, above a loaded host's shell start-up.
+            Duration::from_secs(3),
+        );
+        assert!(result
+            .unwrap_err()
+            .contains("removal could not be confirmed"));
+        let marker = fs::read_to_string(unsettled_path(&dir, "claude")).unwrap();
+        assert!(marker.starts_with("wicked-mutation-"));
+        assert_eq!(
+            fs::read_to_string(dir.join("marker-seen-before-spawn"))
+                .unwrap()
+                .trim(),
+            marker
+        );
+        assert!(mutation_helper(
+            &rt,
+            &dir,
+            "claude",
+            &["run".into(), "ok".into()],
+            b"FAKE",
+            Duration::from_secs(10)
+        )
+        .is_err());
+        let calls = fs::read_to_string(dir.join("calls")).unwrap();
+        assert_eq!(calls.lines().filter(|l| l.starts_with("run ")).count(), 1);
+        assert!(calls.contains(&format!("rm --force {marker}")));
+        assert!(calls.contains(&format!("container inspect {marker}")));
+        fs::remove_file(dir.join("fail_cleanup")).unwrap();
+        mutation_helper(
+            &rt,
+            &dir,
+            "claude",
+            &["run".into(), "ok".into()],
+            b"FAKE",
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(!unsettled_path(&dir, "claude").exists());
+        let calls = fs::read_to_string(dir.join("calls")).unwrap();
+        let names = calls
+            .lines()
+            .filter(|l| l.starts_with("run "))
+            .map(|l| l.split_whitespace().nth(2).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 2);
+        assert_ne!(names[0], names[1]);
+        assert!(
+            calls
+                .rfind(&format!("container inspect {}", names[0]))
+                .unwrap()
+                < calls.rfind(&format!("run --name {}", names[1])).unwrap()
+        );
+        drop(_lock);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// codex lg-r4: an owner that died can leave its runtime client alive, still able to create
+    /// the journaled container after it was seen absent; cleanup stops any host process that
+    /// carries the unique name before confirming the container is gone.
+    #[cfg(unix)]
+    #[test]
+    fn an_orphaned_runtime_client_is_stopped_before_removal_is_confirmed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("c4-orphan-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let runtime = dir.join("runtime");
+        fs::write(
+            &runtime,
+            "#!/bin/sh\nprintf 'No such container\\n' >&2; exit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let rt = Runtime { cli: runtime };
+        let name = format!("wicked-mutation-{}", uuid::Uuid::new_v4().simple());
+        // A stand-in for the dead owner's client: a live host process whose argv names it.
+        // spawn-audit: test-only — a stand-in orphan client for the cleanup test; never a production spawn.
+        let mut orphan = std::process::Command::new("/bin/sh")
+            // A loop, not a lone command: sh would exec that, dropping the name from argv
+            // (a real runtime client keeps `--name <name>` in its argv).
+            .args(["-c", "while :; do sleep 1; done", &name])
+            .spawn()
+            .unwrap();
+        remove_helper(&rt, &name).unwrap();
+        let start = Instant::now();
+        while orphan.try_wait().unwrap().is_none() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let stopped = orphan.try_wait().unwrap().is_some();
+        let _ = orphan.kill();
+        let _ = orphan.wait();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(stopped, "the orphaned client was left running");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abandoned_helper_is_removed_before_a_new_writer_can_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new();
+        let rt_path = temp.0.join("runtime");
+        fs::write(
+            &rt_path,
+            r#"#!/bin/sh
+base=${0%/*}
+printf '%s\n' "$*" >> "$base/calls"
+if [ "$1 $2" = 'rm --force' ]; then rm -f "$base/live"; exit 0; fi
+if [ "$1 $2" = 'container inspect' ]; then
+  [ ! -e "$base/live" ] || exit 0
+  printf 'No such container\n' >&2; exit 1
+fi
+[ "$1 $2" = 'run --name' ] || exit 1
+[ "$(cat "$base/refresh/claude.unsettled")" = "$3" ] || exit 91
+[ ! -e "$base/live" ] || exit 92
+cat > "$base/written"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&rt_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let rt = Runtime { cli: rt_path };
+        let _lock = crate::seat_refresh::mutation_lock(&temp.0).unwrap();
+        // Model a dead process: its runtime-owned writer and pre-spawn marker survive it.
+        fs::write(temp.0.join("live"), "FAKE-late-writer").unwrap();
+        crate::seat_refresh::create_private_file(
+            &unsettled_path(&temp.0, "claude"),
+            b"wicked-mutation-FAKE-dead",
+        )
+        .unwrap();
+        cleanup_mutations(&rt, &temp.0).unwrap();
+        mutation_helper(
+            &rt,
+            &temp.0,
+            "claude",
+            &["run".into(), "FAKE-helper".into()],
+            b"FAKE-new",
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(!unsettled_path(&temp.0, "claude").exists());
+        assert_eq!(fs::read(temp.0.join("written")).unwrap(), b"FAKE-new");
+        let calls = fs::read_to_string(temp.0.join("calls")).unwrap();
+        assert!(
+            calls.find("rm --force wicked-mutation-FAKE-dead").unwrap()
+                < calls
+                    .find("container inspect wicked-mutation-FAKE-dead")
+                    .unwrap()
+        );
+        assert!(
+            calls
+                .find("container inspect wicked-mutation-FAKE-dead")
+                .unwrap()
+                < calls.find("run --name").unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sign_in_rerender_excludes_pending_revocations() {
+        let temp = TempDir::new();
+        let revoked = UnitKey::new("FAKE-run", "FAKE-unit", "codex");
+        configure_gateway(
+            &temp.0,
+            &GatewayConfig {
+                units: vec![revoked.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        register_unit(&temp.0, revoked.clone()).unwrap();
+        mark_revoking(&temp.0, [revoked.key.clone()]).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let runtime = temp.0.join("runtime");
+        fs::write(&runtime, "#!/bin/sh\ncat > /dev/null\n").unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        route_sign_in(
+            &Runtime { cli: runtime },
+            &Gateway::for_dir(&temp.0),
+            &temp.0,
+            "codex",
+            None,
+        )
+        .unwrap();
+        assert!(load_config(&temp.0).unwrap().units.is_empty());
+        assert!(!fs::read_to_string(temp.0.join("config/config.json"))
+            .unwrap()
+            .contains(&revoked.key));
+    }
+
+    #[test]
+    fn config_lock_account_child() {
+        let Some(dir) = std::env::var_os("WICKED_C4_CONFIG_LOCK_TEST") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        fs::write(dir.join("child-started"), "").unwrap();
+        set_chatgpt_account(&dir, Some("FAKE-new-account")).unwrap();
+        fs::write(dir.join("child-finished"), "").unwrap();
+    }
+
+    #[test]
+    fn account_update_reads_fresh_units_after_a_separate_process_revokes_a_key() {
+        let temp = TempDir::new();
+        configure_gateway(&temp.0, &plain_config()).unwrap();
+        let key = unit("FAKE-revoked");
+        register_unit(&temp.0, key.clone()).unwrap();
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .open(temp.0.join("config/.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        // spawn-audit: test-only — re-runs this test binary as a fake owner process; never a production spawn.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "seat_gateway::tests::config_lock_account_child",
+                "--nocapture",
+            ])
+            .env("WICKED_C4_CONFIG_LOCK_TEST", &temp.0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        while !temp.0.join("child-started").exists() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let started = temp.0.join("child-started").exists();
+        let blocked = !temp.0.join("child-finished").exists();
+        // Simulate the daemon's revoke while holding the actual advisory lock.
+        let mut config = load_config(&temp.0).unwrap();
+        config.units.clear();
+        persist_units(&temp.0, &config).unwrap();
+        drop(lock);
+        let status = child.wait().unwrap();
+        assert!(started && blocked && status.success());
+        let fresh = load_config(&temp.0).unwrap();
+        assert!(
+            fresh.units.is_empty(),
+            "the child must not restore its old snapshot"
+        );
+        assert_eq!(fresh.chatgpt_account.as_deref(), Some("FAKE-new-account"));
+        assert!(!fs::read_to_string(temp.0.join("config/config.json"))
+            .unwrap()
+            .contains(&key.key));
+    }
+
+    #[test]
+    fn sign_out_generation_requires_both_apply_and_cleanup_acknowledgements() {
+        let temp = TempDir::new();
+        configure_gateway(&temp.0, &plain_config()).unwrap();
+        let live = unit("FAKE-live");
+        register_unit(&temp.0, live.clone()).unwrap();
+        let _transaction = config_transaction(&temp.0).unwrap();
+        let events = std::cell::RefCell::new(Vec::new());
+        confirm_generation(
+            &temp.0,
+            || {
+                events.borrow_mut().push("publish");
+                Ok(())
+            },
+            |key, accepted| {
+                let rendered = fs::read_to_string(temp.0.join("config/config.json")).unwrap();
+                assert_eq!(rendered.contains(key), accepted);
+                events
+                    .borrow_mut()
+                    .push(if accepted { "accept" } else { "refuse" });
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*events.borrow(), ["publish", "accept", "publish", "refuse"]);
+        assert_eq!(load_config(&temp.0).unwrap().units, vec![live]);
+        assert!(confirm_generation(
+            &temp.0,
+            || Ok(()),
+            |_, accepted| {
+                if accepted {
+                    Err("injected unapplied generation".into())
+                } else {
+                    Ok(())
+                }
+            }
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopting_running_gateway_initializes_missing_files_before_first_publish() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let temp = TempDir::new();
+        let mut old = GatewayConfig::default();
+        old.providers.truncate(2);
+        old.providers[0].upstream_host = "FAKE-upstream:8080".into();
+        old.providers[0].tls = false;
+        configure_gateway(&temp.0, &old).unwrap();
+        fs::create_dir(temp.0.join("served-broker")).unwrap();
+        fs::write(temp.0.join("served-broker/openai.token"), "FAKE-preserved").unwrap();
+        let rt_path = temp.0.join("runtime");
+        fs::write(
+            &rt_path,
+            r#"#!/bin/sh
+base=${0%/*}
+printf '%s\n' "$*" >> "$base/calls"
+if [ "$1 $2" = 'image inspect' ]; then exit 0; fi
+if [ "$1 $2" = 'container inspect' ]; then printf 'true\n'; exit 0; fi
+if [ "$1 $2" = 'volume create' ]; then exit 0; fi
+for arg do last=$arg; done
+case "$last" in
+  *'chown 10001 /cfg /broker;'*)
+    # Apply only the missing-file clauses in the engine's real initialization script.
+    for word in $last; do
+      case "$word" in /broker/*) name=${word#/broker/}; name=${name%;};
+        [ -e "$base/served-broker/$name" ] || : > "$base/served-broker/$name";; esac
+    done;;
+  *'cat > /v/.config.json.new'*)
+    for name in anthropic.key openai.key openai.token pi.token opencode.token anthropic.token; do
+      [ -f "$base/served-broker/$name" ] || exit 77
+    done
+    cat > "$base/published";;
+  *'read K;'*) cat > /dev/null;;
+  *) exit 1;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&rt_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let rt = Runtime { cli: rt_path };
+        ensure_gateway(&rt, &temp.0).unwrap();
+        let calls = fs::read_to_string(temp.0.join("calls")).unwrap();
+        assert!(
+            calls.find("chown 10001 /cfg /broker;").unwrap()
+                < calls.find("cat > /v/.config.json.new").unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(temp.0.join("served-broker/openai.token")).unwrap(),
+            "FAKE-preserved"
+        );
+        let adopted = load_config(&temp.0).unwrap();
+        assert_eq!(adopted.providers.len(), 6);
+        assert_eq!(adopted.providers[0], old.providers[0]);
+        let oauth = adopted.providers.iter().find(|r| r.port == 4005).unwrap();
+        assert_eq!(oauth.upstream_host, "FAKE-upstream:8080");
+        assert!(!oauth.tls);
+        let published: Value =
+            serde_json::from_slice(&fs::read(temp.0.join("published")).unwrap()).unwrap();
+        assert_eq!(published, render(&effective(&adopted)));
+    }
+
     /// Codex gw-r2 (P2): only a runtime's own answer counts as stopped or absent; a failed or
     /// garbled inspection is unknown, and a reset (which clears every live key) never follows it.
     #[test]
@@ -1453,6 +2402,7 @@ mod tests {
         GatewayConfig {
             units: vec![UnitKey {
                 key: "wk-unit-PLACEHOLDER-1".into(),
+                bearer: "wk-unit-PLACEHOLDER-1".into(),
                 run: "run-a".into(),
                 unit: "1".into(),
                 seat: "claude".into(),
@@ -1463,10 +2413,12 @@ mod tests {
                 upstream_host: "gw1-stub:8080".into(),
                 tls: false,
                 credential_file: PathBuf::from("/broker/anthropic.key"),
+                kind: Some(CredentialKind::ClaudeApiKey),
             }],
             egress_hosts: vec!["registry.npmjs.org".into()],
             hook_upstream: None,
             mcp_upstream: None,
+            chatgpt_account: None,
         }
     }
 
@@ -1522,15 +2474,17 @@ mod tests {
                     upstream_host: format!("{stub}:8080"),
                     tls: false,
                     credential_file: PathBuf::from("/broker/anthropic.key"),
+                    kind: Some(CredentialKind::ClaudeApiKey),
                 }],
                 egress_hosts: vec![],
                 hook_upstream: None,
                 mcp_upstream: None,
+                chatgpt_account: None,
             },
         )
         .unwrap();
         let gw = ensure_gateway(&rt, &dir).expect("the gateway starts");
-        set_broker_credential(&rt, &gw, "anthropic.key", b"broker-secret").unwrap();
+        set_broker_credential(&rt, &gw, &dir, "claude", "anthropic.key", b"broker-secret").unwrap();
         let stub_dir = format!(
             "type=bind,src={},dst=/s,readonly",
             dir.join("stub").display()
@@ -1840,6 +2794,176 @@ mod tests {
     }
 
     #[test]
+    fn every_credential_kind_has_the_correct_strict_api_key_location() {
+        let config = GatewayConfig {
+            units: vec![unit("test-unit")],
+            ..Default::default()
+        };
+        let rendered = render(&config);
+        for (index, route) in config.providers.iter().enumerate() {
+            let auth = &rendered["binds"][index]["listeners"][0]["routes"][0]["policies"]["apiKey"];
+            let location = if route.credential_kind() == CredentialKind::ClaudeApiKey {
+                json!({"header": {"name": "x-api-key"}})
+            } else {
+                json!({"header": {"name": "authorization", "prefix": "Bearer "}})
+            };
+            assert_eq!(auth["location"], location);
+            assert_eq!(auth["mode"], "strict");
+            assert_eq!(auth["keys"][0]["key"], config.units[0].key);
+        }
+    }
+
+    #[test]
+    fn oauth_route_preserves_spike_broker_auth_and_strips_x_api_key() {
+        let fixture: Value = serde_yaml::from_str(include_str!(
+            "../tests/fixtures/broker/spike-broker-config.yaml"
+        ))
+        .unwrap();
+        let config = GatewayConfig::default();
+        let rendered = render(&config);
+        let index = config
+            .providers
+            .iter()
+            .position(|r| r.kind == Some(CredentialKind::ClaudeOauth))
+            .unwrap();
+        let policies = &rendered["binds"][index]["listeners"][0]["routes"][0]["policies"];
+        let spike = &fixture["binds"][1]["listeners"][0]["routes"][0]["policies"];
+        assert_eq!(policies["backendAuth"], spike["backendAuth"]);
+        assert_eq!(
+            policies["requestHeaderModifier"],
+            spike["requestHeaderModifier"]
+        );
+        assert_eq!(
+            rendered["binds"][index]["listeners"][0]["routes"][0]["backends"],
+            json!([{"host": "api.anthropic.com:443"}])
+        );
+    }
+
+    #[test]
+    fn chatgpt_route_injects_the_broker_token_and_the_signed_in_account_literal() {
+        let mut config = GatewayConfig::default();
+        let index = config
+            .providers
+            .iter()
+            .position(|r| r.provider == Provider::ChatGpt)
+            .unwrap();
+        // Signed out: no account header reaches the upstream (the seat's own is removed).
+        let rendered = render(&config);
+        let route = &rendered["binds"][index]["listeners"][0]["routes"][0];
+        assert_eq!(
+            route["policies"]["backendAuth"],
+            json!({"key": {"value": {"file": "/broker/openai.token"}}})
+        );
+        assert_eq!(
+            route["policies"]["requestHeaderModifier"],
+            json!({"remove": ["chatgpt-account-id"]})
+        );
+        assert_eq!(route["backends"], json!([{"host": "chatgpt.com:443"}]));
+        assert_eq!(route["policies"]["backendTLS"], json!({}));
+        assert_eq!(
+            route["policies"]["ai"]["routes"],
+            json!({"*": "passthrough"})
+        );
+        // Signed in: the spike's proven form (linux/broker/config.yaml, port 4002).
+        config.chatgpt_account = Some("acct-FAKE-0001".into());
+        let rendered = render(&config);
+        let route = &rendered["binds"][index]["listeners"][0]["routes"][0];
+        assert_eq!(
+            route["policies"]["requestHeaderModifier"],
+            json!({"set": {"chatgpt-account-id": "acct-FAKE-0001"}})
+        );
+        assert!(!rendered.to_string().contains("acct-PLACEHOLDER"));
+    }
+
+    #[test]
+    fn the_chatgpt_account_is_set_and_cleared_and_only_a_plain_identifier_is_accepted() {
+        let temp = TempDir::new();
+        set_chatgpt_account(&temp.0, Some("acct-FAKE_1.x")).unwrap();
+        assert_eq!(
+            load_config(&temp.0).unwrap().chatgpt_account.as_deref(),
+            Some("acct-FAKE_1.x")
+        );
+        for bad in ["", "a b", "a\r\nx-evil: 1", "a\"b", &"x".repeat(129)] {
+            assert!(set_chatgpt_account(&temp.0, Some(bad)).is_err(), "{bad:?}");
+        }
+        set_chatgpt_account(&temp.0, None).unwrap();
+        assert_eq!(load_config(&temp.0).unwrap().chatgpt_account, None);
+    }
+
+    #[test]
+    fn each_cli_env_and_file_url_selects_its_matching_listener() {
+        let config = GatewayConfig::default();
+        for (cli, kind, port, base, suffix) in [
+            (
+                "claude",
+                CredentialKind::ClaudeApiKey,
+                4000,
+                "ANTHROPIC_BASE_URL",
+                "",
+            ),
+            (
+                "codex",
+                CredentialKind::CodexApiKey,
+                4001,
+                "OPENAI_BASE_URL",
+                "/v1",
+            ),
+            (
+                "codex",
+                CredentialKind::CodexChatgpt,
+                4002,
+                "OPENAI_BASE_URL",
+                "/backend-api/codex",
+            ),
+            (
+                "pi",
+                CredentialKind::ProviderKey,
+                4003,
+                "OPENAI_BASE_URL",
+                "/v1",
+            ),
+            (
+                "opencode",
+                CredentialKind::ProviderKey,
+                4004,
+                "OPENAI_BASE_URL",
+                "/v1",
+            ),
+            (
+                "claude",
+                CredentialKind::ClaudeOauth,
+                4005,
+                "ANTHROPIC_BASE_URL",
+                "",
+            ),
+        ] {
+            let origin = credential_gateway_url(cli, kind);
+            assert_eq!(origin, format!("http://agw:{port}"));
+            assert!(config
+                .providers
+                .iter()
+                .any(|r| r.port == port && r.kind == Some(kind)));
+            let env = seat_env_for(cli, kind, "wk-test-PLACEHOLDER");
+            assert!(env
+                .iter()
+                .any(|(k, v)| k == base && v == &format!("{origin}{suffix}")));
+            assert!(env
+                .iter()
+                .any(|(k, v)| k == "HTTPS_PROXY" && v == "http://agw:3000"));
+        }
+    }
+
+    #[test]
+    fn older_route_configs_keep_the_proven_api_key_policy() {
+        let mut legacy = serde_json::to_value(plain_config()).unwrap();
+        let route = legacy["providers"][0].as_object_mut().unwrap();
+        route.remove("kind");
+        legacy["units"][0].as_object_mut().unwrap().remove("bearer");
+        let config: GatewayConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(render(&config), render(&plain_config()));
+    }
+
+    #[test]
     fn openai_routes_and_every_units_metadata_are_rendered_per_bind() {
         let config = GatewayConfig {
             units: vec![unit("1"), unit("2")],
@@ -1866,7 +2990,7 @@ mod tests {
             openai["policies"]["apiKey"]["location"],
             json!({"header": {"name": "authorization", "prefix": "Bearer "}})
         );
-        for bind in &rendered["binds"].as_array().unwrap()[..2] {
+        for bind in &rendered["binds"].as_array().unwrap()[..config.providers.len()] {
             let auth = &bind["listeners"][0]["routes"][0]["policies"]["apiKey"];
             assert_eq!(auth["mode"], "strict");
             assert_eq!(auth["keys"].as_array().unwrap().len(), 2);
@@ -1885,8 +3009,12 @@ mod tests {
 
     #[test]
     fn zero_units_stays_strict_and_empty_egress_has_no_route() {
-        let rendered = render(&GatewayConfig::default());
-        for bind in &rendered["binds"].as_array().unwrap()[..2] {
+        let config = GatewayConfig {
+            egress_hosts: vec![],
+            ..GatewayConfig::default()
+        };
+        let rendered = render(&config);
+        for bind in &rendered["binds"].as_array().unwrap()[..config.providers.len()] {
             let auth = &bind["listeners"][0]["routes"][0]["policies"]["apiKey"];
             assert_eq!(auth["mode"], "strict");
             assert_eq!(auth["keys"], json!([]));
