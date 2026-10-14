@@ -141,6 +141,13 @@ pub struct TeamPlanState {
     /// (WT-C3) Every advisory (recall-only) testing rule that applied to one of the run's plans.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recalled: Vec<String>,
+    /// (core#934) The run's assurance contract enforces a distinct evaluator, stamped at launch
+    /// from the same declaration and opt-in the run's contract is built from: every plan this run
+    /// decides (the launch plan, the PA-scoped plan, a revision) owes an evaluator step whatever
+    /// its band ([`crate::plan::FloorInput::requires_evaluator`]). A state persisted before this
+    /// reads `false` (that run's plans are decided as they were).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requires_evaluator: bool,
 }
 
 /// (WT-C3, DES-walkthrough-proof §4.12) The testing rules the engine read for one proposal at
@@ -996,6 +1003,7 @@ pub(crate) fn decide(
             deliver: deliver.as_deref(),
             obligations: &obligations,
             ran: &[],
+            requires_evaluator: prior.requires_evaluator,
         },
     ) {
         Ok(f) => f,

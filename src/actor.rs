@@ -4118,16 +4118,6 @@ fn team_plan_at_launch(
         }
         return Ok(None);
     };
-    let prior = crate::plan_gate::TeamPlanState {
-        roster: spec
-            .clis
-            .iter()
-            .filter_map(|c| serde_json::to_value(c).ok())
-            .collect(),
-        deliver_step: spec.deliver_step.clone(),
-        deliverables: spec.deliverables.clone(),
-        ..Default::default()
-    };
     // (QE acceptance) A built-in preset that makes application changes requires QE acceptance:
     // the per-run def carries its declaration, so every path that reads the def's contract (the
     // campaign launch builds the session from it) sees the same requirement.
@@ -4136,6 +4126,36 @@ fn team_plan_at_launch(
             crate::preset::required_instruments(&*store, spec.project_id.as_deref(), name)?
         }
         None => None,
+    };
+    let prior = crate::plan_gate::TeamPlanState {
+        roster: spec
+            .clis
+            .iter()
+            .filter_map(|c| serde_json::to_value(c).ok())
+            .collect(),
+        deliver_step: spec.deliver_step.clone(),
+        deliverables: spec.deliverables.clone(),
+        // (core#934) The contract the run's session is built from: when it enforces a distinct
+        // evaluator, every plan owes one. A launch stub already carries the persisted contract
+        // (codex r1: read it, never a re-resolution that could have changed since); the campaign
+        // path builds its session from the def below, with the same declaration and opt-in.
+        requires_evaluator: match crate::domain::get_session(&*store, run_id)? {
+            // Only THIS launch's stub (codex r2): a terminal session under a reused run id (a
+            // campaign relaunch) gets a fresh contract built from the declaration, as its session.
+            Some(stub)
+                if !matches!(
+                    stub.status,
+                    SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                ) =>
+            {
+                stub.assurance
+            }
+            _ => {
+                crate::assurance::RunAssurance::new(instruments.as_deref(), spec.reduced_assurance)
+            }
+        }
+        .enforces(crate::assurance::DISTINCT_EVALUATOR),
+        ..Default::default()
     };
     // (X1) A plan with a creator step and no declared touch set is scored by the PA: rev 1 is its
     // read-only scope step alone, and the launch plan is decided at that step's boundary
@@ -4246,8 +4266,18 @@ fn preview_launch_plan(
     human_confirm: &crate::domain::HumanConfirm,
 ) -> anyhow::Result<crate::plan_gate::PlanPreview> {
     // The plan as the launch resolves it (a preset name resolves per project; a plan is itself).
-    let (plan, _) = crate::plan_gate::launch_plan(&*store, Some(&plan), None, project_id, &[])?
-        .ok_or_else(|| anyhow::anyhow!("the preview carries no plan"))?;
+    let (plan, preset) =
+        crate::plan_gate::launch_plan(&*store, Some(&plan), None, project_id, &[])?
+            .ok_or_else(|| anyhow::anyhow!("the preview carries no plan"))?;
+    // (core#934, codex r1) The contract the launch would run under (a preset's declaration, else
+    // the default), so the preview floors the same evaluator the launch would add. A preview has
+    // no reduced-assurance opt-in: it shows the full contract.
+    let instruments = match preset.as_deref() {
+        Some(name) => crate::preset::required_instruments(&*store, project_id, name)?,
+        None => None,
+    };
+    let requires_evaluator = crate::assurance::RunAssurance::new(instruments.as_deref(), false)
+        .enforces(crate::assurance::DISTINCT_EVALUATOR);
     // (WT-C3) The testing rules a launch filed in `project_id` would compose under; a preview
     // is not teamed (no run exists), so its kinds fail closed exactly as the launch's do.
     let rules = crate::plan_gate::StoreRules {
@@ -4262,6 +4292,7 @@ fn preview_launch_plan(
         base_commit,
         deliver_step.as_ref(),
         &rules,
+        requires_evaluator,
     )?;
     // The launch's planning checks on the exact def it would run (tool preflight, base skill,
     // repo binding, unit limit, validator attach): a plan the launch would refuse is refused here.
@@ -23389,6 +23420,7 @@ mod prior_context_tests {
                 deliver: None,
                 obligations: &[],
                 ran: &[],
+                requires_evaluator: false,
             },
         )
         .unwrap();

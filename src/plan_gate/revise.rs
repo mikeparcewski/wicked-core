@@ -585,6 +585,7 @@ pub(crate) fn revise(
             deliver: deliver.as_deref(),
             obligations: &obligations,
             ran: done,
+            requires_evaluator: prior.requires_evaluator,
         },
     ) {
         Ok(f) => f,
