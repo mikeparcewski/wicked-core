@@ -1827,6 +1827,11 @@ struct WrappedCancelRegistry {
     /// this tombstone until terminal cleanup so that late registration is born cancelled instead
     /// of starting a stale child in the newly reassigned worktree.
     reassigned: std::collections::HashSet<WrappedWorkerKey>,
+    /// (C5) A run whose end (cancel / completion) this carrier saw, with the last launch sequence
+    /// that end covers: a launch of the run still preparing when it ended (skills, config, the
+    /// floor) registers later and must be born cancelled, never start a CLI after the run is
+    /// terminal. A resume admits launches from its `min_launch_seq` on again.
+    ended: std::collections::HashMap<String, u64>,
 }
 
 /// Per-unit wall-clock timeout. Default 2 h — agentic CLIs doing real multi-file extraction
@@ -1889,7 +1894,11 @@ impl WrappedCliStepRunner {
         let key = Self::worker_key(input);
         let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
-        if guard.reassigned.contains(&key) {
+        let ended = guard
+            .ended
+            .get(&key.run_id)
+            .is_some_and(|&bound| key.launch_seq <= bound);
+        if ended || guard.reassigned.contains(&key) {
             token.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         guard.tokens.entry(key).or_default().push(token.clone());
@@ -1911,6 +1920,13 @@ impl WrappedCliStepRunner {
     /// again; a superseded launch of the old lifecycle stays fenced by its `launch_seq`).
     pub(crate) fn reopen_run_sessions(&self, run_id: &str, min_launch_seq: u64) {
         self.sessions.reopen_run(run_id, min_launch_seq);
+        // A launch of the resumed lifecycle runs; one of the ended lifecycle stays fenced.
+        let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.ended.contains_key(run_id) {
+            guard
+                .ended
+                .insert(run_id.to_string(), min_launch_seq.saturating_sub(1));
+        }
     }
 
     /// Forget the container carrier's sessions of `run_id` on seat `cli_key`.
@@ -1936,6 +1952,7 @@ impl WrappedCliStepRunner {
                 .flat_map(|key| guard.tokens.remove(&key).unwrap_or_default())
                 .collect();
             guard.reassigned.retain(|key| key.run_id != run_id);
+            guard.ended.insert(run_id.to_string(), u64::MAX);
             tokens
         };
         for t in tokens {
@@ -6787,6 +6804,57 @@ mod tests {
         runner.unregister_token(&old, &old_token);
         runner.unregister_token(&replacement, &replacement_token);
         runner.unregister_token(&late, &late_token);
+    }
+
+    /// (C5, codex c5-r1) A launch of a run that ENDED while it was still preparing registers late
+    /// and is born cancelled (the pre-spawn guard then never starts it); a resume admits the new
+    /// lifecycle's launches again while the old one stays fenced.
+    #[test]
+    fn a_launch_registering_after_its_run_ended_is_born_cancelled_until_a_resume() {
+        let runner = WrappedCliStepRunner::default();
+        let make = |launch_seq| StepInput {
+            run_id: "ended-run".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: WorkUnit::pending("ended-run:u1", "ended-run", 1, "work"),
+            workflow_id: "wf".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: None,
+            governance: None,
+            prior_outputs: Vec::new(),
+            elicitation_epoch: 1,
+            process_gen: None,
+            launch_seq,
+            required_skills: Vec::new(),
+        };
+        let other = StepInput {
+            run_id: "other-run".to_string(),
+            ..make(3)
+        };
+        runner.cancel_run_workers("ended-run");
+        let late = make(3);
+        let late_token = runner.register_token(&late);
+        assert!(late_token.load(std::sync::atomic::Ordering::Relaxed));
+        let other_token = runner.register_token(&other);
+        assert!(!other_token.load(std::sync::atomic::Ordering::Relaxed));
+        runner.reopen_run_sessions("ended-run", 4);
+        let stale = make(3);
+        let stale_token = runner.register_token(&stale);
+        assert!(
+            stale_token.load(std::sync::atomic::Ordering::Relaxed),
+            "the old lifecycle stays fenced"
+        );
+        let resumed = make(4);
+        let resumed_token = runner.register_token(&resumed);
+        assert!(!resumed_token.load(std::sync::atomic::Ordering::Relaxed));
+        for (i, t) in [
+            (&late, &late_token),
+            (&other, &other_token),
+            (&stale, &stale_token),
+            (&resumed, &resumed_token),
+        ] {
+            runner.unregister_token(i, t);
+        }
     }
 
     /// The design's pre-spawn guard: a token born cancelled (reassign won the

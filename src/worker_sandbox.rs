@@ -321,6 +321,8 @@ pub(crate) enum FloorUnarmed {
     /// Container floor: the agent has no usable sign-in in its broker (signed out, expired, or a
     /// sign-in still being published), so its seat would only be refused upstream.
     AgentSignedOut,
+    /// (C5) A governed unit on the interim host floor whose seat was governed only over ACP.
+    NeedsContainerFloor,
 }
 
 impl FloorUnarmed {
@@ -387,6 +389,11 @@ impl FloorUnarmed {
                  expired, or a sign-in still finishing) — sign in from Agents → Sign in, which \
                  opens the agent's login container, then retry"
             }
+            FloorUnarmed::NeedsContainerFloor => {
+                "needs_container_floor: this seat's tool calls were checked over ACP, which is \
+                 removed; on the interim host floor (WICKED_SEAT_FLOOR=host) nothing would check \
+                 them — run with the container floor (the default), or use a claude seat"
+            }
         }
     }
 
@@ -407,6 +414,7 @@ impl FloorUnarmed {
             FloorUnarmed::GatewayUnavailable => "gateway_unavailable",
             FloorUnarmed::UnverifiedHookImage => "unverified_hook_image",
             FloorUnarmed::AgentSignedOut => "agent_signed_out",
+            FloorUnarmed::NeedsContainerFloor => "needs_container_floor",
         }
     }
 }

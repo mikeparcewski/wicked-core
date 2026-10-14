@@ -1208,11 +1208,6 @@ fn sweep_own_settings_temps(dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn private_dir_builder() -> std::fs::DirBuilder {
-    std::fs::DirBuilder::new()
-}
-
 /// Write `bytes` to `path` atomically: an exclusively-created private temp file in the same
 /// directory (`<name>.<pid>.<seq>.tmp`, [`settings_temp_name`]), then `rename` over `path` — a
 /// reader sees the old file or the new one, never a torn one, and a planted link at `path` is
@@ -1677,7 +1672,14 @@ impl AcpStepRunner {
         // C5: ACP is removed from the seats. Every unit runs its CLI's headless mode on the wrapped
         // carrier: in a seat container under the container floor, else on the labelled interim
         // host floor (WICKED_SEAT_FLOOR=host).
-        let output = self.fallback.run_unit_streaming(input, emit);
+        let output = match host_floor_needs_acp(input) {
+            Some(cli) => crate::execute_wrapped::floor_refused(
+                input,
+                &cli,
+                crate::worker_sandbox::FloorUnarmed::NeedsContainerFloor,
+            ),
+            None => self.fallback.run_unit_streaming(input, emit),
+        };
 
         // On a normal bus-worker return, publication owns the in-flight marker until
         // `task.completed` is durable. A panic never reaches this assignment, so Drop
@@ -1713,6 +1715,24 @@ impl AcpStepRunner {
 /// already refused them.
 const NO_MONITORS: &str = "team monitors ran over ACP, which is removed from the seats (C5); \
      they are not available until the headless carrier hosts them";
+
+/// (C5, codex c5-r1) A governed unit whose seat's tool calls were governed ONLY over ACP (pi,
+/// opencode: `acp_input_governance`, not claude, whose gate hook rides the wrapped carrier) has
+/// nothing checking its tool calls on the interim host floor once ACP is gone: refused (fail
+/// closed), never run unchecked. Under the container floor the seat container is its floor.
+fn host_floor_needs_acp(input: &StepInput) -> Option<String> {
+    if input.governance.is_none() || crate::container_floor::container_mode() {
+        return None;
+    }
+    let cli = input.unit.assigned_cli.as_deref().unwrap_or("claude");
+    let acp_only = seat_governance_class(cli)
+        == wicked_council::GovernanceClass::AcpInputGovernance
+        && !matches!(
+            acp_seat_identity(cli),
+            crate::skills_snapshot::WorkerCli::Claude
+        );
+    acp_only.then(|| cli.to_string())
+}
 
 /// The supervisor's view of the runner — WEAK, so the supervisor thread never keeps the runner
 /// (and through it the actor channel) alive.
@@ -1914,7 +1934,61 @@ pub(crate) fn seat_identity_of(
 #[cfg(test)]
 mod tests {
 
-    use super::{is_transient_cli_failure, is_worker_originated_failure};
+    use super::{host_floor_needs_acp, is_transient_cli_failure, is_worker_originated_failure};
+
+    /// (C5, codex c5-r1) On the interim host floor a governed unit on a seat governed only over
+    /// ACP (pi, opencode) is refused; claude (its gate hook rides the wrapped carrier), an
+    /// ungoverned unit, and any unit under the container floor are not.
+    #[test]
+    fn the_host_floor_refuses_a_governed_unit_on_an_acp_governed_seat() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var_os(crate::container_floor::SEAT_FLOOR_ENV);
+        let unit = |cli: &str, governed: bool| {
+            let mut u = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do");
+            u.assigned_cli = Some(cli.to_string());
+            crate::workflow::StepInput {
+                run_id: "r".into(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf".into(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: None,
+                governance: governed.then(|| crate::workflow::GovernanceContext {
+                    db_path: String::new(),
+                    code_graph_db: None,
+                    extra_write_roots: vec![],
+                    extra_read_roots: vec![],
+                    project_id: None,
+                    human_confirm: Default::default(),
+                }),
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            }
+        };
+        std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, "host");
+        assert_eq!(
+            host_floor_needs_acp(&unit("pi", true)).as_deref(),
+            Some("pi")
+        );
+        assert_eq!(
+            host_floor_needs_acp(&unit("opencode", true)).as_deref(),
+            Some("opencode")
+        );
+        assert_eq!(host_floor_needs_acp(&unit("claude", true)), None);
+        assert_eq!(host_floor_needs_acp(&unit("pi", false)), None);
+        std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, "container");
+        assert_eq!(host_floor_needs_acp(&unit("pi", true)), None);
+        match saved {
+            Some(v) => std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, v),
+            None => std::env::remove_var(crate::container_floor::SEAT_FLOOR_ENV),
+        }
+    }
     use crate::workflow::StepStatus;
 
     // Guards process-global env (WICKED_WORKER_HOME, HOME, WICKED_SKILLS_SNAPSHOT) — cargo runs
