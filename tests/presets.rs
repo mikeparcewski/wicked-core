@@ -1222,6 +1222,39 @@ fn x3_editor_plugin_launches_the_preset_with_its_skills_gates_and_consent() {
     assert_eq!(install.depends_on, vec!["install-plan".to_string()]);
 }
 
+/// DES-EDITOR-PLUGIN-CONTRACT-001: the editor-plugin builder builds protocol 2 — the design names `protocol [1, 2]`
+/// and the surfaces declaration, the build scaffolds on the template's protocol-2 plumbing, and the test judges the
+/// protocol-2 conformance cases (13-16) too. Nothing in it still asks for a protocol-1-only editor.
+#[test]
+fn editor_plugin_preset_builds_protocol_2() {
+    let preset: serde_json::Value =
+        serde_json::from_str(include_str!("../src/presets/editor-plugin.json")).unwrap();
+    let step = |id: &str| {
+        preset["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .and_then(|s| s["instructions"].as_str())
+            .unwrap_or_else(|| panic!("no `{id}` step"))
+            .to_string()
+    };
+    let (design, build, test) = (step("design"), step("build"), step("test"));
+    assert!(
+        design.contains("protocol [1, 2]") && design.contains("surfaces declaration"),
+        "{design}"
+    );
+    assert!(!design.contains("protocol [1],"), "{design}");
+    assert!(
+        build.contains("protocol-2 plumbing") && !build.contains("wicked.editor/1"),
+        "{build}"
+    );
+    assert!(
+        test.contains("0-6 and 8-16") && !test.contains("8-12"),
+        "{test}"
+    );
+}
+
 /// M9b (studio#373): a launch naming `demo` runs the built-in preset — the wicked-garden demo
 /// skill's plan → record → review, meant for the launch's one declared write root. `plan` and `review`
 /// are the plan gate and the review gate (`human_confirm`); `plan` and `record` are creators and
