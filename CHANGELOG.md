@@ -423,6 +423,16 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.11.0** — 2026-10-14 — minor release on main e11232c, carrying #946, #947, #948 (C6).
+  A **minor** bump on purpose: C6 changes the container floor's operator surface. A container seat
+  now runs on the credential the user signed in with in the agent's login container, the
+  `WICKED_SEAT_CREDENTIAL_<CLI>` override is removed, and an agent with no usable sign-in is refused
+  before its seat starts with the new `agent_signed_out` reason (read as a "not signed in" seat
+  refusal: benched and failed over). A closed sign-in tab no longer blocks later sign-ins (login
+  containers are named after their session and stopped before the volume is read or removed), and
+  `seat-login argv copilot` refuses up front (#948). The engine knows the `artifact.theme` editor
+  permission, so protocol-2 first-party editor cards start again (#946), and the built-in
+  `editor-plugin` workflow builds protocol 2 (#947).
 - **core-ts 0.10.0** — 2026-10-14 — minor release on main ce6ada4, carrying #927, #930, #931, #932, #938
   (the container seat floor, opt-in), #939 (#933 + #937), #940 (#934), #941 + #943 (#936), #942 (#935), #945 (seat-login test isolation; the broker lock unlocks before close).
   A **minor** bump on purpose: the container seat floor lands (opt-in `WICKED_SEAT_FLOOR=container`;
