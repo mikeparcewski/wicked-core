@@ -11171,13 +11171,7 @@ mod tests {
             production.contains("prior_context_prefix(&input.prior_outputs)"),
             "the wrapped exec no longer prepends the run's prior context (core #470)"
         );
-        // And the ACP carrier reads the SAME const (no second wording).
-        let acp = include_str!("acp_runner.rs");
-        assert!(
-            acp.contains("crate::execute_wrapped::PRIOR_CONTEXT_PREAMBLE")
-                && !acp.contains("\"CONTEXT (prior phases of this run)"),
-            "the ACP carrier must read the shared preamble const, not its own literal"
-        );
+        // (C5) The ACP carrier, the only other reader, is gone with ACP.
     }
 
     /// A pty turn is submitted as one line, and a canonical-mode terminal DISCARDS any line that

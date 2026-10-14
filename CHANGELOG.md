@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **BREAKING (C5): governed seats default to the container carrier, and ACP is removed from the seats.**
+  The `wicked-core` CLI (and crew's daemon) set `WICKED_SEAT_FLOOR=container` unless the operator chose
+  a floor; `WICKED_SEAT_FLOOR=host` keeps the labelled interim host floor. Every unit runs its CLI's
+  headless mode on the wrapped carrier; the ACP turn path, sessions, permission bridge, team monitors
+  (now refused with the reason), in-session steering and per-tool checkpoints are deleted (~22k lines).
+  In-turn questions and per-tool permission asks return with DES-CONTAINER-FLOOR step 5 (the MCP `ask`
+  tool through agentgateway, seccomp notify); until then they are not available.
+
 - **The editor-plugin workflow builds protocol 2.** The built-in `editor-plugin` preset's design, build and test
   steps still asked for a `protocol [1]` editor on the `wicked.editor/1` plumbing and judged conformance cases
   0-6 and 8-12 only. They now name `protocol [1, 2]` and the surfaces declaration the host renders (card, options

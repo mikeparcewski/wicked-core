@@ -413,19 +413,6 @@ pub(crate) const OPENCODE_CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 /// running seat (the `WICKED_SKILLS_SNAPSHOT` rule).
 pub(crate) const GARDEN_ROOT_ENV: &str = "WICKED_GARDEN_ROOT";
 
-/// The env var pi's delivery rides when the ACP carrier is a separate bridge program
-/// (`pi-acp`): the deliverable portable skill directories as ONE OS path-list (`:` on unix, `;`
-/// on Windows), in the order [`SkillsDelivery::argv_flags`] would spell them. The crew-side
-/// bridge (wicked-crew#531) turns it into `--no-skills --skill <dir> …` on the pi it spawns.
-///
-/// Contract, spelled for the bridge: the variable being SET is the delivery — the bridge passes
-/// `--no-skills` (discovery OFF, so the seat's own skills directory is never a side channel,
-/// v3.2 §2), then one `--skill <dir>` per non-empty entry. An EMPTY value is a delivery of ZERO
-/// portable skills: `--no-skills` alone — exactly what the wrapped carrier spells for the same
-/// snapshot ([`SkillsDelivery::argv_flags`]), so the two carriers agree. UNSET means no delivery
-/// at all (a lever-less launch, a chat session): the bridge adds no skills flags.
-pub(crate) const PI_SKILL_DIRS_ENV: &str = "WICKED_PI_SKILL_DIRS";
-
 /// Where garden ships the `wicked-garden` / `wicked-garden.cmd` shim inside the bundle closure
 /// (`scripts/**` rides every snapshot, `crew/skills/bundle.ts`); prepended to a delivered seat's
 /// `PATH` so `wicked-garden run …` in a skill's text resolves to THIS generation's launcher.
@@ -453,28 +440,6 @@ pub(crate) fn prepend_path_entry(
         out.push(rest);
     }
     out
-}
-
-/// `entries` joined with `sep` into one `PATH`-shaped list, in order. An entry that itself
-/// contains `sep` cannot be spelled in such a list — the consumer would split it in two — so it
-/// is an `Err` naming the entry (fail closed: never a silently truncated skill path). Pure, like
-/// [`prepend_path_entry`].
-pub(crate) fn join_path_list(entries: &[PathBuf], sep: &str) -> Result<std::ffi::OsString, String> {
-    let mut out = std::ffi::OsString::new();
-    for (i, entry) in entries.iter().enumerate() {
-        if entry.to_string_lossy().contains(sep) {
-            return Err(format!(
-                "skill directory {} contains the path-list separator `{sep}` and cannot be \
-                 spelled in a {sep}-separated list",
-                entry.display()
-            ));
-        }
-        if i > 0 {
-            out.push(sep);
-        }
-        out.push(entry.as_os_str());
-    }
-    Ok(out)
 }
 
 /// The codex lever's side effect (F-079, core#441), performed by BOTH runners before the seat
@@ -559,32 +524,6 @@ impl SkillsDelivery {
                 prepend_path_entry(&root.join(SCRIPTS_DIR), inherited_path, PATH_LIST_SEPARATOR),
             ),
         ]
-    }
-
-    /// How this delivery rides the ACP carrier `carrier_binary` — `(argv flags, env)`: on the
-    /// carrier's own argv when the carrier IS the CLI the flags belong to (`copilot --acp`; pi
-    /// registered as its own carrier), and through the environment the bridge forwards when it is
-    /// a separate program — pi's [`PI_SKILL_DIRS_ENV`] behind `pi-acp` (the bridge spawns pi with
-    /// its own args, so flags on ITS argv would reach nothing). A delivery of ZERO portable skills
-    /// is still a delivery on both carriers — `--no-skills` alone on the argv, the variable SET
-    /// and EMPTY behind a bridge (see [`PI_SKILL_DIRS_ENV`]) — discovery is off either way.
-    /// Claude's plugin rides `session/new` and opencode's config its own composed variable, so
-    /// both are `(∅, ∅)` here. `Err` when a skill directory cannot be spelled in a path-list
-    /// ([`join_path_list`]) — surfaced as a launch refusal ([`SkillsError::LeverConfig`]), never
-    /// a truncated delivery.
-    pub(crate) fn acp_transport(
-        &self,
-        carrier_binary: &str,
-    ) -> Result<(Vec<String>, EnvPairs), String> {
-        match self {
-            SkillsDelivery::PiSkillFlags { dirs, .. }
-                if SkillsLever::for_binary(carrier_binary) != SkillsLever::PiSkillFlags =>
-            {
-                let list = join_path_list(dirs, PATH_LIST_SEPARATOR)?;
-                Ok((Vec::new(), vec![(PI_SKILL_DIRS_ENV, list)]))
-            }
-            _ => Ok((self.argv_flags(), Vec::new())),
-        }
     }
 
     /// The argv flags this delivery rides, for the levers that are flags: pi's
@@ -1564,13 +1503,6 @@ pub(crate) enum SkillsError {
     /// without the skills its directive names; nothing else under the home, and never the
     /// operator's own `~/.codex`, is touched.
     SeatHome { cli: String, why: String },
-    /// A CACHED ACP session that was opened WITHOUT a snapshot (nothing pinned — no root on the
-    /// ladder at the time) was asked, on a later turn, for skills. The plugin is handed at
-    /// `session/new` and never afterwards, so the session cannot be given what a NOW-available
-    /// root holds; the turn is refused naming the skills, and the fix is a fresh session (codex
-    /// round 5 — resolving the ambient configuration here would admit a session against a plugin
-    /// it never loaded and generate a directive for a skill it cannot invoke).
-    NotDelivered { cli: String, skills: Vec<String> },
     /// The live-cache FALLBACK root (no snapshot published) is Claude-only (codex round 7): its
     /// index carries no publish-time portability verdict — cwd-relative script detection is crew's
     /// publish analyzer and is not re-implemented here — so no non-Claude seat is handed anything
@@ -1745,15 +1677,6 @@ impl std::fmt::Display for SkillsError {
                  first unit); run skill-bearing units on the wrapped or ACP carrier (which \
                  resolve, admit and hand the snapshot) — no invocation directive is emitted on a \
                  carrier that cannot load the skill",
-                skills.join(", ")
-            ),
-            SkillsError::NotDelivered { cli, skills } => write!(
-                f,
-                "the cached ACP session for '{cli}' was opened without a skills snapshot (none was \
-                 available when it started), so no plugin was ever handed to it, but this unit \
-                 requires {}; a snapshot reaches a session only at session/new, never mid-run — \
-                 start a fresh session (a new run, or restart this one) now that a root is \
-                 available, rather than invoking a skill the session never loaded",
                 skills.join(", ")
             ),
             SkillsError::FallbackClaudeOnly { root, cli, skills } => write!(
@@ -3469,9 +3392,6 @@ pub(crate) fn routing_root(
 pub(crate) enum Turn {
     /// A launch that will open a new process: nothing pinned yet; the ladder decides.
     Fresh,
-    /// A turn on a cached ACP session, carrying the snapshot the session was opened with
-    /// (`proc.skills`) — `None` when it was opened WITHOUT one (no root on the ladder then).
-    Cached(Option<SkillsSnapshot>),
 }
 
 /// ONE admission policy for every turn on either carrier — a fresh launch and a cached ACP session
@@ -3521,24 +3441,6 @@ pub(crate) fn admit_turn(
                 None
             }
         },
-        Turn::Cached(Some(pinned)) => Some(pinned),
-        Turn::Cached(None) => {
-            let mut skills: Vec<String> = refs
-                .plan
-                .iter()
-                .filter(|r| !r.is_empty())
-                .map(|r| r.to_string())
-                .collect();
-            skills.sort();
-            skills.dedup();
-            if skills.is_empty() {
-                return Ok(None);
-            }
-            return Err(SkillsError::NotDelivered {
-                cli: cli.to_string(),
-                skills,
-            });
-        }
     };
     admit_refs(snapshot, &refs, cli)
 }
@@ -6105,15 +6007,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// codex round 4: ONE admission policy for a fresh launch and a cached session (`admit_turn`);
-    /// codex round 5: the two kinds of turn are told apart. The inherit-config escape hatch
-    /// bypasses admission whatever the turn; a FRESH launch resolves the ambient root through the
-    /// ladder and the fence; a cached session PINNED to a generation is judged against it and never
-    /// the ambient one; a cached session opened with NO snapshot is admitted for a skill-free turn
-    /// and REFUSED for a skill-bearing one naming the skills — the ambient root, whatever it now
-    /// holds, is never resolved for it (the session never received a plugin).
+    /// C5 (fresh-only survivor of the fresh/cached policy test; cached ACP sessions are gone): a
+    /// fresh launch resolves the ambient generation, fences it and hands it; a missing required
+    /// skill is refused by name against it; under the inherit hatch the same holds, and an
+    /// explicit path that is not a snapshot is a launch error naming it.
     #[test]
-    fn admit_turn_applies_one_policy_to_fresh_and_cached_sessions() {
+    fn admit_turn_resolves_fences_and_hands_the_ambient_generation_to_a_fresh_launch() {
         let _env = crate::test_env::ENV_LOCK
             .write()
             .unwrap_or_else(|p| p.into_inner());
@@ -6148,12 +6047,6 @@ mod tests {
                 ("search", "wicked-garden-search"),
             ],
         );
-        let pinned_root = snapshot_root(
-            &gen_dir(&base, "1"),
-            "1",
-            &[("domain", "wicked-garden-domain")],
-        );
-        let pinned = load(&pinned_root);
         let _snap = Pin::set(SKILLS_SNAPSHOT_ENV, Some(ambient.as_os_str()));
         let input = |skill: &str| {
             let mut u = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do");
@@ -6175,74 +6068,19 @@ mod tests {
             }
         };
         let claude = WorkerCli::Claude;
-        // Fresh: the ambient generation is resolved, fenced and handed.
         let fresh = admit_turn(Turn::Fresh, &input("wicked-garden-search"), &claude)
             .unwrap()
             .expect("handed");
         assert_eq!(fresh.root, ambient);
-        // Pinned: judged against the pinned generation ONLY — `search` lives in the ambient one
-        // and is refused naming the PINNED root; `domain` is admitted from it.
-        let err = admit_turn(
-            Turn::Cached(Some(pinned.clone())),
-            &input("wicked-garden-search"),
-            &claude,
-        )
-        .expect_err("the pinned generation wins over the ambient one");
-        assert!(
-            matches!(&err, SkillsError::Missing { root: Some(r), .. } if r == &pinned_root),
-            "{err:?}"
-        );
-        assert_eq!(
-            admit_turn(
-                Turn::Cached(Some(pinned.clone())),
-                &input("wicked-garden-domain"),
-                &claude
-            )
-            .unwrap()
-            .unwrap()
-            .root,
-            pinned_root
-        );
-        // Cached with NOTHING pinned (codex round 5): the ambient generation — which holds
-        // `search` and would admit a fresh launch — is NOT resolved for it. A skill-bearing turn
-        // is refused naming the skill and the seat, advising a fresh session; a skill-free turn is
-        // admitted with nothing handed; the plan-wide set counts (a skill another unit names,
-        // this one invoking nothing, still refuses — the session cannot serve that run).
-        let err = admit_turn(Turn::Cached(None), &input("wicked-garden-search"), &claude)
-            .expect_err("a session that never received a plugin cannot be given one mid-run");
+        let err = admit_turn(Turn::Fresh, &input("wicked-garden-absent"), &claude)
+            .expect_err("a missing skill is refused");
         assert_eq!(
             err,
-            SkillsError::NotDelivered {
-                cli: "claude".to_string(),
-                skills: vec!["wicked-garden-search".to_string()],
+            SkillsError::Missing {
+                root: Some(ambient.clone()),
+                missing: vec!["wicked-garden-absent".to_string()],
             }
         );
-        let text = err.to_string();
-        assert!(
-            text.contains("wicked-garden-search")
-                && text.contains("opened without a skills snapshot")
-                && text.contains("fresh session")
-                && !text.contains(&ambient.display().to_string()),
-            "names the skill, advises a fresh session, never mentions the ambient root: {text}"
-        );
-        let mut none = input("");
-        none.unit.skill_ref = None;
-        assert_eq!(admit_turn(Turn::Cached(None), &none, &claude), Ok(None));
-        let mut plan_wide = none.clone();
-        plan_wide.required_skills = vec!["wicked-garden-domain".to_string()];
-        assert_eq!(
-            admit_turn(Turn::Cached(None), &plan_wide, &claude),
-            Err(SkillsError::NotDelivered {
-                cli: "claude".to_string(),
-                skills: vec!["wicked-garden-domain".to_string()],
-            })
-        );
-        // The inherit-config escape hatch bypasses NOTHING (codex round 6): under it a fresh
-        // launch still resolves, fences and is handed the ambient generation; a missing required
-        // skill is still refused by name against it; a pinned session is still judged against its
-        // generation; a session that never received a plugin still refuses a skill turn; and an
-        // explicit path that is not a snapshot is still a launch error naming it. Rounds 2–5
-        // returned `Ok(None)` for every one of these.
         {
             let _hatch = Pin::set(
                 crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV,
@@ -6252,32 +6090,8 @@ mod tests {
                 .unwrap()
                 .expect("the snapshot is handed under the hatch too");
             assert_eq!(handed.root, ambient);
-            let err = admit_turn(Turn::Fresh, &input("wicked-garden-absent"), &claude)
-                .expect_err("a missing skill is refused under the hatch");
-            assert_eq!(
-                err,
-                SkillsError::Missing {
-                    root: Some(ambient.clone()),
-                    missing: vec!["wicked-garden-absent".to_string()],
-                }
-            );
-            let err = admit_turn(
-                Turn::Cached(Some(pinned.clone())),
-                &input("wicked-garden-search"),
-                &claude,
-            )
-            .expect_err("the pinned generation is still the judge");
-            assert!(
-                matches!(&err, SkillsError::Missing { root: Some(r), .. } if r == &pinned_root),
-                "{err:?}"
-            );
-            assert_eq!(
-                admit_turn(Turn::Cached(None), &input("wicked-garden-search"), &claude),
-                Err(SkillsError::NotDelivered {
-                    cli: "claude".to_string(),
-                    skills: vec!["wicked-garden-search".to_string()],
-                })
-            );
+            let mut none = input("wicked-garden-search");
+            none.unit.skill_ref = None;
             let bad = base.join("no-such-snapshot");
             let _bad = Pin::set(SKILLS_SNAPSHOT_ENV, Some(bad.as_os_str()));
             let err = admit_turn(Turn::Fresh, &none, &claude)
@@ -7207,111 +7021,5 @@ mod tests {
             if cfg!(windows) { ";" } else { ":" },
             "the platform constant is the one `std::env::split_paths` splits on"
         );
-    }
-
-    /// F-079 (core#441): pi's delivery rides `WICKED_PI_SKILL_DIRS` when the ACP carrier is a
-    /// separate bridge program (`pi-acp`) — the deliverable dirs as ONE path-list in `argv_flags`
-    /// order, and NO flag on the bridge's own argv — and the argv flags when the carrier IS pi.
-    /// Copilot's stays argv; claude's, opencode's and an empty delivery carry nothing here. An
-    /// entry that cannot be spelled in a path-list is an error, never a silently truncated list.
-    #[test]
-    fn pi_over_a_separate_bridge_is_handed_its_skill_dirs_as_one_path_list() {
-        use std::ffi::OsString;
-        let root = PathBuf::from("/snap/000007");
-        let a = root.join("skills").join("a");
-        let b = root.join("skills").join("q").join("b");
-        let pi = SkillsDelivery::PiSkillFlags {
-            root: root.clone(),
-            dirs: vec![a.clone(), b.clone()],
-        };
-        let (flags, env) = pi.acp_transport("pi-acp").unwrap();
-        assert!(flags.is_empty(), "{flags:?}");
-        let mut list = OsString::from(&a);
-        list.push(PATH_LIST_SEPARATOR);
-        list.push(&b);
-        assert_eq!(env, vec![(PI_SKILL_DIRS_ENV, list.clone())]);
-        // The same order the flags spell, and the consumer's split recovers the dirs.
-        let flag_dirs: Vec<String> = pi
-            .argv_flags()
-            .windows(2)
-            .filter(|w| w[0] == "--skill")
-            .map(|w| w[1].clone())
-            .collect();
-        assert_eq!(
-            flag_dirs,
-            vec![
-                a.to_string_lossy().into_owned(),
-                b.to_string_lossy().into_owned()
-            ]
-        );
-        assert_eq!(
-            std::env::split_paths(&list).collect::<Vec<_>>(),
-            vec![a.clone(), b.clone()]
-        );
-        // A bridge under any path spelling; the carrier that IS pi gets the flags instead.
-        let (flags, env) = pi.acp_transport("/opt/bridges/pi-acp").unwrap();
-        assert!(flags.is_empty() && env.len() == 1);
-        let (flags, env) = pi.acp_transport("/usr/local/bin/pi").unwrap();
-        assert_eq!(flags, pi.argv_flags());
-        assert!(env.is_empty());
-        // The other levers: argv for copilot, nothing for the rest.
-        let copilot = SkillsDelivery::CopilotAddDir {
-            root: root.clone(),
-            view: root.join("views").join("copilot"),
-        };
-        assert_eq!(
-            copilot.acp_transport("copilot").unwrap(),
-            (copilot.argv_flags(), Vec::new())
-        );
-        for other in [
-            SkillsDelivery::ClaudePlugin(root.clone()),
-            SkillsDelivery::OpencodeConfig {
-                root: root.clone(),
-                dirs: vec![a.clone()],
-            },
-            SkillsDelivery::LauncherOnly(root.clone()),
-            SkillsDelivery::None,
-        ] {
-            assert_eq!(
-                other.acp_transport("whatever").unwrap(),
-                (Vec::new(), Vec::new()),
-                "{other:?}"
-            );
-        }
-        // Fail closed on an unspellable entry — both separators, pure.
-        let err = join_path_list(&[PathBuf::from("/a;b"), PathBuf::from("/c")], ";").unwrap_err();
-        assert!(err.contains("/a;b") && err.contains("`;`"), "{err}");
-        assert_eq!(
-            join_path_list(&[PathBuf::from(r"C:\x"), PathBuf::from(r"D:\y")], ";").unwrap(),
-            OsString::from(r"C:\x;D:\y")
-        );
-        assert_eq!(join_path_list(&[], ":").unwrap(), OsString::new());
-        let bad = SkillsDelivery::PiSkillFlags {
-            root: root.clone(),
-            dirs: vec![PathBuf::from(format!("/snap/a{PATH_LIST_SEPARATOR}b"))],
-        };
-        assert!(bad
-            .acp_transport("pi-acp")
-            .unwrap_err()
-            .contains("path-list separator"));
-        assert!(
-            bad.acp_transport("pi").is_ok(),
-            "the flags carrier spells each dir on its own"
-        );
-        // A delivery of ZERO portable skills is still a delivery, and the two carriers agree on
-        // it: `--no-skills` alone on the argv (discovery OFF, nothing added), the variable SET
-        // and EMPTY behind a bridge — never unset, which would read as "no delivery" and leave
-        // discovery ON where the wrapped carrier turns it off.
-        let empty = SkillsDelivery::PiSkillFlags {
-            root: root.clone(),
-            dirs: Vec::new(),
-        };
-        assert_eq!(empty.argv_flags(), vec!["--no-skills".to_string()]);
-        let (flags, env) = empty.acp_transport("pi-acp").unwrap();
-        assert!(flags.is_empty());
-        assert_eq!(env, vec![(PI_SKILL_DIRS_ENV, OsString::new())]);
-        let (flags, env) = empty.acp_transport("pi").unwrap();
-        assert_eq!(flags, vec!["--no-skills".to_string()]);
-        assert!(env.is_empty());
     }
 }

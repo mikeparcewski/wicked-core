@@ -114,17 +114,6 @@ fn estate_store_pinned_from_env() -> bool {
         .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
 }
 
-/// The store-pin fact for the IN-PROCESS carrier (the ACP permission bridge): what the AGENT child
-/// inherits is the daemon's environment minus `hardened()`'s strip list — so a pin the daemon holds
-/// under a stripped name ([`ESTATE_DB_ENV`]) never reaches the child and must not count. Evaluated on
-/// the runner at boundary construction, where the daemon env IS the child's parent environment.
-pub(crate) fn estate_store_pinned_for_child() -> bool {
-    ESTATE_STORE_PIN_ENV
-        .iter()
-        .filter(|k| !wicked_apps_core::spawn::ENGINE_INTERNAL_ENV.contains(k))
-        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
-}
-
 /// The store a VALIDATOR script may reach, carried under its own name.
 ///
 /// Validator scripts used to be handed `WICKED_ESTATE_DB` — the OPERATIONAL store — so that
@@ -4665,23 +4654,6 @@ fn write_hook_fired_sentinel(decisions_path: &str, phase: &str) -> Result<(), St
         f.write_all(sentinel_line.as_bytes())
     })
     .map_err(|e| format!("could not write hook-fired sentinel: {e}"))
-}
-
-/// (core#657) Record an MCP refusal the in-process ACP permission bridge made BEFORE reaching
-/// [`evaluate_tool_call`]: the hook-fired sentinel for `phase` first (a claim without it reads as
-/// a suppressed gate to the fold), then the advisory [`append_mcp_deny`] claim. Best-effort like
-/// the other recorders: the call is refused either way.
-pub(crate) fn record_mcp_denial(
-    decisions_path: &str,
-    scope: &str,
-    phase: &str,
-    tool: &str,
-    reason: &str,
-) {
-    if let Err(why) = write_hook_fired_sentinel(decisions_path, phase) {
-        eprintln!("wicked-governance: mcp refusal not fully recorded ({why})");
-    }
-    append_mcp_deny(decisions_path, scope, phase, tool, reason);
 }
 
 /// Record an MCP refusal (core#657) under [`MCP_DENY_PREFIX`] — advisory by the allowlist,
@@ -11165,15 +11137,7 @@ mod boundary_tests {
             "the wrapped launcher no longer joins the launch-declared extra_read_roots (and the \
              skills snapshot) into WICKED_READ_ROOTS (core#294, core#396)"
         );
-        // The ACP carrier builds its BoundaryCtx from the same assembly (core#260's one-assembly
-        // rule): dropping the extras there would make the read grant depend on which seat the run
-        // resolved to — the exact per-seat divergence core#297 §1 closed for deliverables.
-        let acp = include_str!("acp_runner.rs");
-        assert!(
-            acp.contains("&g.extra_read_roots,"),
-            "the ACP carrier no longer hands the launch-declared extra_read_roots to the shared \
-             read-root assembly (core#294)"
-        );
+        // (C5) The ACP carrier, the second assembly site, is gone with ACP: one carrier, one site.
         // The launch side must actually judge the extras — same rules as the write roots, or the
         // widening becomes an unvetted grant.
         let launch = include_str!("actor.rs");
@@ -11535,12 +11499,7 @@ mod phase_scope_tests {
             "the flag must come from the UNIT (def-derived at plan time), not from a workflow id, \
              an env var, or anything the worker controls"
         );
-        // The ACP half — the carrier the reported run actually used.
-        let acp = include_str!("acp_runner.rs");
-        assert!(
-            acp.contains("pre_build_scope: input.unit.pre_build_scope"),
-            "the ACP runner no longer carries the unit's phase scope into its BoundaryCtx"
-        );
+        // (C5) The ACP half went with the ACP carrier.
     }
 
     /// F-7R2-012 (wave 6): a worker seat's `git push` / `gh pr create` is refused by the Bash

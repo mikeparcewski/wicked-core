@@ -472,6 +472,15 @@ fn main() {
         _ => {}
     }
 
+    // C5: governed units run in seat containers unless the operator chose a floor (`host` = the
+    // labelled interim host floor), set before the engine exists.
+    let floor = wicked_core::default_seat_floor();
+    if !floor.trim().eq_ignore_ascii_case("container") {
+        eprintln!(
+            "wicked-core: WICKED_SEAT_FLOOR={floor} — governed seats run on the interim HOST floor, \
+             not in containers"
+        );
+    }
     let core = Core::spawn(store_path(&args));
 
     match args.get(1).map(String::as_str) {

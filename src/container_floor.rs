@@ -113,6 +113,21 @@ const SEAT_PACKAGES: &[(&str, &str)] = &[
     ("copilot", "@github/copilot@1.0.96"),
 ];
 
+/// The seat floor a PRODUCT process (the `wicked-core` CLI; crew's daemon does the same) runs
+/// governed units on (C5): `WICKED_SEAT_FLOOR=container` unless the operator chose a floor —
+/// `host` keeps the labelled interim host floor. Set once at process start, before any engine
+/// exists; the library itself never defaults the variable (embedders and tests say what they run).
+/// Returns the floor in force.
+pub fn default_seat_floor() -> String {
+    match std::env::var(SEAT_FLOOR_ENV) {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => {
+            std::env::set_var(SEAT_FLOOR_ENV, "container");
+            "container".into()
+        }
+    }
+}
+
 /// Whether governed units run in the container floor on this host ([`SEAT_FLOOR_ENV`]).
 pub(crate) fn container_mode() -> bool {
     container_mode_from(std::env::var(SEAT_FLOOR_ENV).ok().as_deref())
@@ -2902,6 +2917,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d.canonicalize().unwrap()
+    }
+
+    /// C5: a product process (the CLI, crew's daemon) runs governed units in containers unless
+    /// the operator chose a floor; `host` is kept as the labelled interim floor.
+    #[test]
+    fn products_default_the_seat_floor_to_container_and_keep_an_explicit_choice() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var_os(SEAT_FLOOR_ENV);
+        for unset in [None, Some(""), Some("  ")] {
+            match unset {
+                None => std::env::remove_var(SEAT_FLOOR_ENV),
+                Some(v) => std::env::set_var(SEAT_FLOOR_ENV, v),
+            }
+            assert_eq!(default_seat_floor(), "container");
+            assert!(container_mode());
+        }
+        for chosen in ["host", "container"] {
+            std::env::set_var(SEAT_FLOOR_ENV, chosen);
+            assert_eq!(default_seat_floor(), chosen);
+            assert_eq!(container_mode(), chosen == "container");
+        }
+        match saved {
+            Some(v) => std::env::set_var(SEAT_FLOOR_ENV, v),
+            None => std::env::remove_var(SEAT_FLOOR_ENV),
+        }
     }
 
     #[test]

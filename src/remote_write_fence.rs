@@ -182,17 +182,6 @@ pub(crate) struct RemoteWriteHit {
 }
 
 impl RemoteWriteHit {
-    /// The remedy this refusal's class carries — the `remedy` field of `workerToolCallDenied`,
-    /// which must be the SAME remedy the reason embeds (review of #671: the ACP carrier sent the
-    /// deliver-phase remedy with a provider-read reason, so the structured event told a worker to
-    /// commit and let the deliver phase open the PR when what it had asked for was a read).
-    pub(crate) fn remedy(&self) -> &'static str {
-        match self.class {
-            HitClass::RemoteWrite => REMEDY,
-            HitClass::ProviderFenced => PROVIDER_REMEDY,
-        }
-    }
-
     /// The operator- and seat-facing reason for the refusal (the `reason` on the wire).
     pub(crate) fn reason(&self) -> String {
         match self.class {
