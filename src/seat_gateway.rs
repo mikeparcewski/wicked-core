@@ -28,6 +28,7 @@ use crate::seat_credentials::CredentialKind;
 use crate::container_floor::{output_within, Runtime};
 use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
+#[cfg(unix)]
 use wicked_apps_core::HardenedCommand;
 
 /// The OSS gateway image whose config shape the fixture proves.
