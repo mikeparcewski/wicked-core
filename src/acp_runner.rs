@@ -103,7 +103,7 @@ impl KillHandle {
     }
 
     /// Whether this handle still holds its infrastructure registration.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn is_infra(&self) -> bool {
         self.infra
             .lock()
