@@ -2341,6 +2341,22 @@ impl WrappedCliStepRunner {
                     no_lever_note = Some(note);
                 }
                 apply_seat_posture(&mut argv, &posture);
+                // (core#935) Only on this path: the read-only lever above configures its own roots
+                // (agy r1: a QE unit's notes + ledger roots would otherwise ride twice).
+                if seat_cli == wicked_apps_core::spawn::SeatCli::Codex {
+                    let extra_write_roots = input
+                        .governance
+                        .as_ref()
+                        .map_or(&[][..], |g| g.extra_write_roots.as_slice());
+                    inject_codex_write_roots(
+                        &mut argv,
+                        &invocation,
+                        &posture,
+                        write_posture,
+                        &input.unit,
+                        extra_write_roots,
+                    );
+                }
             }
             // v3.2 §2: the seat's PER-LAUNCH skills delivery — pi's `--no-skills --skill <dir>…`,
             // copilot's `--add-dir <view>` — rides the argv exactly like its posture (before any
@@ -4404,6 +4420,67 @@ pub(crate) fn apply_seat_posture(argv: &mut Vec<String>, posture: &[String]) {
         }
         None => argv.extend(posture.iter().cloned()),
     }
+}
+
+/// core#935: codex's workspace-write sandbox must admit the same out-of-tree roots as the
+/// engine's posture. A read-only unit keeps its existing notes/check-scratch lever unchanged.
+///
+/// Nothing here is read from the argv's own tokens, which hold the untrusted prompt (codex r1, agy
+/// r1: `build_argv` adds no `--` guard after a bare flag, so a prompt can sit among the options and
+/// spell `--sandbox=…` or `exec`). The sandbox mode is the ENGINE's posture flags (`posture`, what
+/// [`apply_seat_posture`] just applied), and the roots go right after the `exec` subcommand as the
+/// TRUSTED template (`invocation`, before the prompt is substituted) places it — after any global
+/// options (codex r3), where no option can own them as its value. Only template tokens before the
+/// first `{PROMPT}` / `{SKILLS}` placeholder count (codex r4: a literal brace in a `-c` inline table
+/// is no placeholder), and the argv token at that index must be `exec` too. Anything else gets
+/// nothing (fail closed: the floor then says the deliverable is missing, as before).
+fn inject_codex_write_roots(
+    argv: &mut Vec<String>,
+    invocation: &str,
+    posture: &[String],
+    write_posture: crate::write_posture::WritePosture,
+    unit: &WorkUnit,
+    extra_write_roots: &[String],
+) {
+    use crate::write_posture::{deliverable_roots_from, unit_admitted_roots, WritePosture};
+    if write_posture == WritePosture::ReadOnly {
+        return;
+    }
+    let sandbox = posture
+        .iter()
+        .enumerate()
+        .filter_map(|(i, arg)| {
+            if arg == "--sandbox" || arg == "-s" {
+                posture.get(i + 1).map(String::as_str)
+            } else {
+                arg.strip_prefix("--sandbox=")
+                    .or_else(|| arg.strip_prefix("-s="))
+                    .or_else(|| arg.strip_prefix("-s").filter(|m| !m.is_empty()))
+            }
+        })
+        .next_back();
+    if sandbox != Some("workspace-write") {
+        return;
+    }
+    let template = tokenize(invocation);
+    let Some(exec) = template
+        .iter()
+        .take_while(|t| !t.contains("{PROMPT}") && !t.contains("{SKILLS}"))
+        .position(|t| t == "exec")
+        .filter(|&i| i > 0 && argv.get(i).map(String::as_str) == Some("exec"))
+    else {
+        return;
+    };
+    let roots = if write_posture == WritePosture::Full {
+        deliverable_roots_from(extra_write_roots)
+    } else {
+        unit_admitted_roots(write_posture, unit, extra_write_roots)
+    };
+    let flags: Vec<String> = roots
+        .into_iter()
+        .flat_map(|root| ["--add-dir".to_string(), root.to_string_lossy().into_owned()])
+        .collect();
+    argv.splice(exec + 1..exec + 1, flags);
 }
 
 /// (F-433-009, core#431) The read-only instruction a GUARD-ONLY seat carries in its prompt — a
@@ -8551,6 +8628,112 @@ mod tests {
             &["--sandbox".to_string(), "workspace-write".to_string()],
             "the exact posture flags must appear, in order, on the argv"
         );
+    }
+
+    /// core#935: both bound deliverable creators and repo-less interactive creators need their
+    /// admitted roots in codex's own sandbox. (codex r1) The flags go right after `exec`, so no
+    /// option is split from its value and a prompt that equals an option changes nothing.
+    #[test]
+    fn codex_argv_adds_admitted_write_roots_only_when_writable() {
+        use crate::write_posture::WritePosture;
+
+        let mut unit = WorkUnit::pending("r:create", "r", 1, "write the document");
+        unit.role = crate::workflow::PhaseRole::Creator;
+        unit.executes_code = false;
+        unit.worktree_guarded = true;
+        let roots = vec!["/crew/interactive-drafts/doc".to_string()];
+        for bound in [true, false] {
+            let posture = WritePosture::of(&unit, bound);
+            assert_eq!(
+                posture,
+                if bound {
+                    WritePosture::DeliverableRoots
+                } else {
+                    WritePosture::Full
+                }
+            );
+            for (invocation, prompt) in [
+                (
+                    "codex exec --skip-git-repo-check {PROMPT}",
+                    "write the document",
+                ),
+                ("codex exec {PROMPT}", "write the document"),
+                // An operator template that binds the prompt to a flag keeps the binding.
+                ("codex exec --prompt {PROMPT}", "write the document"),
+                // …and one whose prompt follows another option's value keeps that binding.
+                (
+                    "codex exec --output-last-message - {PROMPT}",
+                    "write the document",
+                ),
+                // A prompt that equals an option is never mistaken for it, guarded or not.
+                ("codex exec {PROMPT}", "--sandbox"),
+                ("codex exec {PROMPT}", "-s=read-only"),
+                ("codex exec --skip-git-repo-check {PROMPT}", "-s=read-only"),
+                ("codex exec --prompt {PROMPT}", "exec"),
+                // Global options before the subcommand (codex r3).
+                (
+                    "codex --model=my-model exec --skip-git-repo-check {PROMPT}",
+                    "write it",
+                ),
+                ("codex -c k=v exec {PROMPT}", "exec"),
+                // A literal brace in a global option is no placeholder (codex r4).
+                (
+                    "codex -c sandbox_workspace_write={network_access=true} exec {PROMPT}",
+                    "write it",
+                ),
+            ] {
+                let flags: Vec<String> = vec!["--sandbox".into(), "workspace-write".into()];
+                let mut argv = build_argv(invocation, prompt, &[]);
+                apply_seat_posture(&mut argv, &flags);
+                let before = argv.clone();
+                inject_codex_write_roots(&mut argv, invocation, &flags, posture, &unit, &roots);
+                let exec = argv.iter().position(|a| a == "exec").unwrap();
+                assert_eq!(
+                    &argv[exec + 1..exec + 3],
+                    &["--add-dir".to_string(), roots[0].clone()],
+                    "core#935: the admitted root rides right after exec: {argv:?}"
+                );
+                let mut without = argv.clone();
+                without.drain(exec + 1..exec + 3);
+                assert_eq!(without, before, "nothing else moves: {argv:?}");
+            }
+        }
+
+        // Neither a read-only unit nor a read-only posture gains the run's write roots, whatever
+        // the prompt spells (agy r1: a prompt `--sandbox=workspace-write` after a bare flag).
+        let ro: Vec<String> = vec!["--sandbox".into(), "read-only".into()];
+        for posture in [WritePosture::ReadOnly, WritePosture::DeliverableRoots] {
+            let mut argv = build_argv(
+                "codex exec --skip-git-repo-check {PROMPT}",
+                "--sandbox=workspace-write",
+                &[],
+            );
+            apply_seat_posture(&mut argv, &ro);
+            let before = argv.clone();
+            inject_codex_write_roots(
+                &mut argv,
+                "codex exec --skip-git-repo-check {PROMPT}",
+                &ro,
+                posture,
+                &unit,
+                &roots,
+            );
+            assert_eq!(argv, before, "{posture:?}: {argv:?}");
+        }
+        // A template with no leading `exec` subcommand gets nothing, even when the prompt is `exec`.
+        let ww: Vec<String> = vec!["--sandbox".into(), "workspace-write".into()];
+        let mut argv = build_argv("codex {PROMPT}", "exec", &[]);
+        apply_seat_posture(&mut argv, &ww);
+        let before = argv.clone();
+        inject_codex_write_roots(
+            &mut argv,
+            "codex {PROMPT}",
+            &ww,
+            WritePosture::Full,
+            &unit,
+            &roots,
+        );
+        assert_eq!(argv, before, "{argv:?}");
     }
 
     /// crew#427 SECURITY CAP: `bound_ungated_posture` must guarantee the governed-worker path can

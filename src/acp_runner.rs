@@ -1066,6 +1066,10 @@ struct AcpProcess {
     /// (it could background a writer past the guard's final snapshot), and a no-code phase's
     /// process is killed, group and all, the moment its unit ends.
     no_code: bool,
+    /// (core#935, agy r1) The write roots this process's `session/new` handed codex-acp as
+    /// `additionalDirectories`. They are fixed for the process's life, so a unit whose admitted
+    /// roots differ never reuses it (the cache would otherwise widen a later unit).
+    write_roots: Vec<std::path::PathBuf>,
     /// A CHAT session's filesystem boundary (core#410, review): the scratch root writable, the
     /// scoped repository roots read-only. Judged on every `session/request_permission` of a turn
     /// that carries no governance gate (`acp_permission::chat_boundary_result`); `None` for unit
@@ -2081,6 +2085,7 @@ fn start_acp_process(
         &[],
         &[],
         &[],
+        &[],
         &crate::skills_snapshot::SkillsDelivery::None,
         seat_cli,
         "",
@@ -2240,7 +2245,8 @@ impl SessionOptions<'_> {
     };
 }
 
-/// The `session/new` params: the spec fields every ACP agent reads (`cwd`, `mcpServers`) plus
+/// The `session/new` params: the spec fields (`cwd`, `mcpServers`, and codex's admitted
+/// `additionalDirectories`, core#935) plus
 /// the Claude bridge's `_meta.claudeCode.options` extension carrying this session's
 /// [`SessionOptions`]. Pure, so the frame the bridge receives is pinned by a test rather than
 /// inferred from a live handshake.
@@ -2248,12 +2254,19 @@ fn session_new_params(
     cwd: &std::path::Path,
     mcp_servers: Value,
     options: &SessionOptions<'_>,
+    seat_cli: wicked_apps_core::spawn::SeatCli,
+    admitted_write_roots: &[std::path::PathBuf],
 ) -> Value {
     let mut params = json!({
         "cwd": cwd.to_string_lossy().as_ref(),
         "mcpServers": mcp_servers
     });
     attach_session_options(&mut params, options);
+    // core#935: codex-acp adds these spec-level directories to its workspace-write sandbox.
+    // Claude's SDK extension above is a different channel; every other seat's frame stays put.
+    if seat_cli == wicked_apps_core::spawn::SeatCli::Codex && !admitted_write_roots.is_empty() {
+        params["additionalDirectories"] = json!(admitted_write_roots);
+    }
     params
 }
 
@@ -2392,6 +2405,8 @@ fn start_acp_process_with_write_roots(
     code_graph_db: Option<&str>,
     scratch_tmp: Option<&std::path::Path>,
     extra_write_roots: &[String],
+    // core#935: the unit's posture-admitted roots, distinct from the run's boundary roots above.
+    admitted_write_roots: &[std::path::PathBuf],
     // core#410 / crew#502: a CHAT's scoped repository roots, advertised to a claude seat as the
     // SDK's `additionalDirectories` (`SessionOptions`). Empty for unit sessions, whose read roots
     // are the in-process boundary's (`assemble_read_roots`), never the SDK's.
@@ -3012,7 +3027,13 @@ fn start_acp_process_with_write_roots(
     // default its `WICKED_ESTATE_READONLY=1` (`build_cmd`); grounding is the estate shim garden's
     // skills run, audited by the estate fence on every call.
     let mcp_servers = json!([]);
-    let session_new = session_new_params(cwd, mcp_servers, &session_options);
+    let session_new = session_new_params(
+        cwd,
+        mcp_servers,
+        &session_options,
+        seat_cli,
+        admitted_write_roots,
+    );
     let session_new_id = next_id;
     next_id += 1;
     if let Err(e) = rpc_send(&mut stdin, session_new_id, "session/new", session_new) {
@@ -3067,6 +3088,7 @@ fn start_acp_process_with_write_roots(
             u8::from(runs_cli_runtime(&config.binary)),
         )),
         no_code: false,
+        write_roots: Vec::new(),
         settle_after: acp_settle_after(),
         mcp_token: mcp_token.map(|(token, _)| token),
         write_lock: Arc::new(Mutex::new(())),
@@ -6720,8 +6742,36 @@ impl AcpStepRunner {
         let write_posture =
             crate::write_posture::WritePosture::of(&input.unit, input.workdir.is_some());
         let wants_no_code = write_posture.fences_writes();
+        // (core#935) The write roots codex's own sandbox gets at `session/new` — the unit's
+        // posture-admitted roots (computed here so a cached process opened with others is closed).
+        let extra_write_roots = input
+            .governance
+            .as_ref()
+            .map_or(&[][..], |g| g.extra_write_roots.as_slice());
+        let admitted_write_roots = if seat_cli != wicked_apps_core::spawn::SeatCli::Codex {
+            Vec::new()
+        } else if write_posture == crate::write_posture::WritePosture::Full {
+            crate::write_posture::deliverable_roots_from(extra_write_roots)
+        } else {
+            crate::write_posture::unit_admitted_roots(write_posture, &input.unit, extra_write_roots)
+        };
         let probe =
             match probe {
+                SessionProbe::Live(arc)
+                    if arc.lock().unwrap_or_else(|p| p.into_inner()).write_roots
+                        != admitted_write_roots =>
+                {
+                    eprintln!(
+                        "wicked-core: run {run_id} unit {} needs a `{cli_key}` ACP process whose \
+                         sandbox admits other write roots than the cached one — closing it and \
+                         starting fresh (core#935)",
+                        input.unit.ord
+                    );
+                    drop(arc);
+                    self.drop_session_key(&session_key);
+                    self.mark_restart(&session_key, "write_roots_switch", Some(Instant::now()));
+                    SessionProbe::Vacant
+                }
                 SessionProbe::Live(arc)
                     if arc.lock().unwrap_or_else(|p| p.into_inner()).no_code != wants_no_code =>
                 {
@@ -7230,10 +7280,6 @@ impl AcpStepRunner {
                     .governance
                     .as_ref()
                     .and_then(|g| g.code_graph_db.as_deref());
-                let extra_write_roots = input
-                    .governance
-                    .as_ref()
-                    .map_or(&[][..], |g| g.extra_write_roots.as_slice());
                 // Provenance for the estate MCP's `proposal.submit`, stamped from the run/unit/agent
                 // that owns this session (DES-MEM-FACETED-001 follow-on) — same source fields and helper
                 // as the wrapped carrier, formatted into the ACP `env` array by the spawn.
@@ -7258,6 +7304,7 @@ impl AcpStepRunner {
                     code_graph_db,
                     Some(&cwd.join("tmp")),
                     extra_write_roots,
+                    &admitted_write_roots,
                     &[],
                     &estate_provenance,
                     &delivery,
@@ -7272,6 +7319,7 @@ impl AcpStepRunner {
                         // whatever `current` resolves to later.
                         proc.skills = handed.cloned();
                         proc.no_code = wants_no_code;
+                        proc.write_roots = admitted_write_roots.clone();
                         let acp_session_id = proc.session_id.clone();
                         // A1: captured before `proc` moves into the Arc so the once-per-spawn
                         // `SandboxUnenforced` disclosure can be emitted in the `did_insert` arm.
@@ -7362,6 +7410,38 @@ impl AcpStepRunner {
                         }
                         // A racing turn may have inserted its own process first (`did_insert`
                         // false): that session is the one reused, with ITS bound snapshot.
+                        // (core#935, codex r3) …only when it was opened for this unit's posture and
+                        // write roots: codex's own sandbox is fixed at `session/new`, so adopting
+                        // a racer's process could widen (or narrow) this unit's writes. Ours is
+                        // dropped (killed) and this turn fails as a seat failure, closed.
+                        if !did_insert {
+                            let (theirs_no_code, theirs_roots) = {
+                                let p = result.lock().unwrap_or_else(|p| p.into_inner());
+                                (p.no_code, p.write_roots.clone())
+                            };
+                            if theirs_no_code != wants_no_code
+                                || theirs_roots != admitted_write_roots
+                            {
+                                drop(arc);
+                                let why = format!(
+                                    "[wicked-core] a concurrent `{cli_key}` ACP process for run \
+                                     {run_id} was opened for another posture or other write roots; \
+                                     this turn does not adopt it (core#935)"
+                                );
+                                eprintln!("{why}");
+                                return StepOutput {
+                                    run_id: input.run_id.clone(),
+                                    unit_ix: input.unit_ix,
+                                    attempt: input.attempt,
+                                    output: why,
+                                    status: StepStatus::Failed,
+                                    usage: None,
+                                    files: Vec::new(),
+                                    tools: Vec::new(),
+                                    governed: false,
+                                };
+                            }
+                        }
                         (result, !did_insert)
                     }
                     Err(e) => {
@@ -7772,7 +7852,9 @@ impl AcpStepRunner {
                 ),
             };
             drop(proc);
-            if settled {
+            // (agy r1 on #935) A superseded fenced or QE turn's process goes as on completion:
+            // its posture and roots belong to that unit only.
+            if settled || wants_no_code || input.unit.qe_ledger_root.is_some() {
                 self.drop_session_key(&session_key);
                 drop(proc_arc);
                 self.mark_restart(&session_key, "turn_settled", None);
@@ -8209,6 +8291,7 @@ impl AcpStepRunner {
             &scope.cwd,
             scope.code_graph_db.as_deref(),
             None,
+            &[],
             &[],
             &scope.read_roots,
             &[],
@@ -8746,6 +8829,7 @@ mod tests {
             code_graph_db,
             scratch_tmp,
             extra_write_roots,
+            &[],
             &[],
             estate_provenance,
             delivery,
@@ -11255,6 +11339,7 @@ sleep 30
                 &[],
                 &[],
                 &[],
+                &[],
                 &crate::skills_snapshot::SkillsDelivery::None,
                 wicked_apps_core::spawn::SeatCli::Claude,
                 seat_key,
@@ -11806,6 +11891,45 @@ sleep 30
         assert!(!handle.is_infra());
     }
 
+    /// core#935: only codex-acp receives the posture-admitted roots as a spec field.
+    #[test]
+    fn codex_session_new_carries_admitted_write_roots_only_at_the_top_level() {
+        use wicked_apps_core::spawn::SeatCli;
+
+        let cwd = std::path::Path::new("/sandbox");
+        let roots = crate::write_posture::deliverable_roots_from(&[
+            "/crew/interactive-drafts/doc".to_string()
+        ]);
+        let frame = |seat| session_new_params(cwd, json!([]), &SessionOptions::NONE, seat, &roots);
+        let codex = frame(SeatCli::Codex);
+        assert_eq!(
+            codex["additionalDirectories"],
+            json!(["/crew/interactive-drafts/doc"]),
+            "core#935: codex-acp reads the spec field, not Claude's SDK options: {codex}"
+        );
+        assert!(codex["_meta"]["claudeCode"]["options"]
+            .get("additionalDirectories")
+            .is_none());
+        let unchanged = json!({
+            "cwd": "/sandbox",
+            "mcpServers": [],
+            "_meta": {"claudeCode": {"options": {"strictMcpConfig": true}}}
+        });
+        for seat in [
+            SeatCli::Claude,
+            SeatCli::Pi,
+            SeatCli::Opencode,
+            SeatCli::Copilot,
+        ] {
+            let params = frame(seat);
+            assert!(
+                params.get("additionalDirectories").is_none(),
+                "{seat:?}: {params}"
+            );
+            assert_eq!(params, unchanged, "{seat:?}: the frame is unchanged");
+        }
+    }
+
     /// core#396, the ACP lever, pinned on the pure frame builder: the snapshot rides `session/new`
     /// as `_meta.claudeCode.options.plugins = [{type: "local", path}]` — the SDK's own plugin shape
     /// under the extension the bridge spreads into its session options — MERGED into whatever
@@ -11823,7 +11947,13 @@ sleep 30
     #[test]
     fn every_session_new_pins_strict_mcp_config() {
         let cwd = std::path::Path::new("/wt");
-        let bare = session_new_params(cwd, serde_json::json!([]), &SessionOptions::NONE);
+        let bare = session_new_params(
+            cwd,
+            serde_json::json!([]),
+            &SessionOptions::NONE,
+            wicked_apps_core::spawn::SeatCli::Claude,
+            &[],
+        );
         assert_eq!(bare["mcpServers"], serde_json::json!([]));
         assert_eq!(
             bare["_meta"]["claudeCode"]["options"]["strictMcpConfig"],
@@ -11853,7 +11983,13 @@ sleep 30
         let cwd = std::path::Path::new("/wt");
         let servers = serde_json::json!([{"name": "wicked-estate"}]);
 
-        let bare = session_new_params(cwd, servers.clone(), &SessionOptions::NONE);
+        let bare = session_new_params(
+            cwd,
+            servers.clone(),
+            &SessionOptions::NONE,
+            wicked_apps_core::spawn::SeatCli::Claude,
+            &[],
+        );
         assert_eq!(bare["cwd"], "/wt");
         assert_eq!(bare["mcpServers"], servers);
         // core#657: the one option every frame carries is the MCP pin; nothing else is attached
@@ -11872,7 +12008,13 @@ sleep 30
             additional_directories: &[],
             setting_sources: None,
         };
-        let handed = session_new_params(cwd, servers.clone(), &with_plugin(gen7));
+        let handed = session_new_params(
+            cwd,
+            servers.clone(),
+            &with_plugin(gen7),
+            wicked_apps_core::spawn::SeatCli::Claude,
+            &[],
+        );
         assert_eq!(
             handed["cwd"], "/wt",
             "the spec params are beside the extension, not under it"
@@ -11889,6 +12031,8 @@ sleep 30
             cwd,
             servers.clone(),
             &with_plugin(std::path::Path::new("/snapshots/8")),
+            wicked_apps_core::spawn::SeatCli::Claude,
+            &[],
         );
         assert_eq!(
             gen8["_meta"]["claudeCode"]["options"]["plugins"][0]["path"],
@@ -11913,6 +12057,8 @@ sleep 30
                 additional_directories: &[],
                 setting_sources: Some(ENGINE_SETTING_SOURCES),
             },
+            wicked_apps_core::spawn::SeatCli::Claude,
+            &[],
         );
         let options = &fenced["_meta"]["claudeCode"]["options"];
         assert_eq!(options["disallowedTools"], serde_json::json!(deny));
@@ -12595,6 +12741,7 @@ cat >/dev/null
                 &dir,
                 None,
                 None,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -19755,6 +19902,7 @@ transport = "stdio"
                 &dir,
                 None,
                 None,
+                &[],
                 &[],
                 &[],
                 &[],
