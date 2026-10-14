@@ -385,6 +385,21 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.10.0** — 2026-10-14 — minor release on main ce6ada4, carrying #927, #930, #931, #932, #938
+  (the container seat floor, opt-in), #939 (#933 + #937), #940 (#934), #941 + #943 (#936), #942 (#935), #945 (seat-login test isolation; the broker lock unlocks before close).
+  A **minor** bump on purpose: the container seat floor lands (opt-in `WICKED_SEAT_FLOOR=container`;
+  the host floor is unchanged by default): governed seats run in a hardened OCI container started
+  through the engine's trusted launcher from a read-only floor image (#927, #930); agentgateway is
+  every container seat's only egress, with per-unit keys and broker-held credentials (#931);
+  container units run each CLI's own headless JSON mode and resume the run's session per seat and
+  posture (#932); and a seat signs in once per agent through a login container whose credential the
+  broker holds (`wicked-core seat-login argv|ingest|status|sign-out|refresh`, #938; crew's routes in
+  wicked-crew#1006). Run-blocker fixes: evaluator failover never re-picks a failed or author seat, a
+  reassign is honoured or refused, and the judge comes from the run's seats (#939); a run whose
+  contract requires a distinct evaluator always plans one (#940); an ACP bridge the engine keeps
+  alive is never a unit's background work, so a wrapped unit closes when its CLI exits (#941, #943);
+  and codex's own sandbox admits the unit's declared write roots, on ACP (`additionalDirectories`)
+  and wrapped (#942).
 - **core-ts 0.9.10** — 2026-10-13 — patch release on main bf5692d, carrying #920, #921, #923, #924, #925.
   **Security (#924, fixes #922): outside-worktree write bypass closed.** The Bash write-target scan judged each
   target word as spelled, quotes included, so a quoted, escaped or `$HOME`/`${HOME}` write target outside the
