@@ -1992,9 +1992,13 @@ pub(crate) fn seat_identity(c: &AgenticCli) -> String {
 /// identity; otherwise the normalized key itself. So excluding the deterministic author `claude` also
 /// excludes a `claude-sonnet` seat that invokes `claude` (C2), whether or not `claude` is itself listed.
 pub(crate) fn excluded_identity(key: &str, roster: &[AgenticCli]) -> String {
+    // (core#937, codex r2) An instance key (`pi#2`) is its CLI's seat: the judge pool maps it to
+    // that seat, so the exclusion must resolve it the same way or `pi` would judge `pi#2`'s work.
+    let cli = wicked_apps_core::spawn::seat_cli_key(key);
     roster
         .iter()
         .find(|c| c.key == key)
+        .or_else(|| roster.iter().find(|c| c.key == cli))
         .map(seat_identity)
         .unwrap_or_else(|| normalize_identity(key))
 }

@@ -1047,6 +1047,54 @@ pub(super) fn open_unit_review(
     Some(gid)
 }
 
+/// (core#937, codex r1) The `team_dispute` an operator's judgment of a teamed unit still owes. The
+/// approve at a `judge_unavailable` gate stands in for the judge, never for the team: a unit whose
+/// bus team record pauses an approve — unresolved HIGH findings without a council YES, or an
+/// incomplete record — pauses there too, exactly as the fold's approve does
+/// ([`decide_unit_review`]). `None` for a unit with no bus team record (nothing to account for).
+pub(super) fn operator_judgment_dispute(unit: &WorkUnit) -> Option<DisputeOpen> {
+    let snap = unit.team.as_ref()?;
+    if snap.transport != Transport::Bus {
+        return None;
+    }
+    let owned;
+    let ledger = match snap.ledger.as_ref() {
+        Some(l) => l,
+        None => {
+            owned = crate::team::TeamLedger::new(
+                crate::team::FinalPass::StreamGap,
+                Vec::new(),
+                Vec::new(),
+                Default::default(),
+            );
+            &owned
+        }
+    };
+    if !tev::gate_pauses(true, ledger) {
+        return None;
+    }
+    let unresolved: Vec<String> = tev::unresolved_highs(ledger)
+        .iter()
+        .map(|f| f.finding.finding_id.clone())
+        .collect();
+    let why = if unresolved.is_empty() {
+        "the team's record of this step is incomplete".to_string()
+    } else {
+        format!(
+            "unresolved HIGH finding(s) without a council YES: {}",
+            unresolved.join(", ")
+        )
+    };
+    Some(DisputeOpen {
+        prompt: format!(
+            "Team dispute on unit {} ({}): you judged the work at its judge_unavailable gate, but \
+             {why}. Approve to continue, request changes to rework, or reject to cancel.",
+            unit.ord, unit.description
+        ),
+        finding_ids: unresolved,
+    })
+}
+
 /// A `team_dispute` the fold decided the unit opens: the prompt and the unresolved HIGHs it names.
 #[derive(Debug, Clone)]
 pub(super) struct DisputeOpen {
