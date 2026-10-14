@@ -318,6 +318,9 @@ pub(crate) enum FloorUnarmed {
     /// Container floor: a governed claude seat on an operator-supplied image, whose claude the
     /// engine cannot verify honours the blocking HTTP gate hook.
     UnverifiedHookImage,
+    /// Container floor: the agent has no usable sign-in in its broker (signed out, expired, or a
+    /// sign-in still being published), so its seat would only be refused upstream.
+    AgentSignedOut,
 }
 
 impl FloorUnarmed {
@@ -379,6 +382,11 @@ impl FloorUnarmed {
                  image (2.1.295 or later fails its HTTP gate hook closed); unset \
                  WICKED_SEAT_IMAGE_CLAUDE for governed runs"
             }
+            FloorUnarmed::AgentSignedOut => {
+                "agent_signed_out: this agent is not signed in for container seats (signed out, \
+                 expired, or a sign-in still finishing) — sign in from Agents → Sign in, which \
+                 opens the agent's login container, then retry"
+            }
         }
     }
 
@@ -398,6 +406,7 @@ impl FloorUnarmed {
             FloorUnarmed::HostOnlyCarrier => "host_only_carrier",
             FloorUnarmed::GatewayUnavailable => "gateway_unavailable",
             FloorUnarmed::UnverifiedHookImage => "unverified_hook_image",
+            FloorUnarmed::AgentSignedOut => "agent_signed_out",
         }
     }
 }
@@ -1130,6 +1139,19 @@ pub(crate) fn plan_seat_floor(launch: SeatLaunch<'_>, write_roots: Vec<PathBuf>)
 pub(crate) mod tests {
     use super::*;
     use std::process::Command;
+
+    /// agy c6-r1: a signed-out agent's refusal is read as the SEAT's sign-in refusal, so the
+    /// actor benches that seat and fails the unit over, as for any other "not signed in" seat.
+    #[test]
+    fn an_agent_signed_out_refusal_is_a_not_logged_in_seat_refusal() {
+        let text = floor_refusal_text("claude", FloorUnarmed::AgentSignedOut);
+        assert_eq!(
+            wicked_council::types::SeatFailureReason::classify_refusal(&text, false),
+            Some(wicked_council::types::SeatFailureReason::NotLoggedIn),
+            "{text}"
+        );
+        assert!(text.contains("agent_signed_out") && text.contains("Agents"));
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let out = Command::new("git")

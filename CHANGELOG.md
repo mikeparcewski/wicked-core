@@ -21,6 +21,27 @@ Two release tracks share this file, newest entry first regardless of track:
   `host.action`, `host.tab`, `host.selection`, `options.changed`), the scaffold's `--surfaces`, and cases 13-16
   (DES-EDITOR-PLUGIN-CONTRACT-001 §5, §6, §8.3). Pinned by `tests/presets.rs`
   `editor_plugin_preset_builds_protocol_2`.
+- **Container seats run on the agent's own sign-in (C6).** Under the container floor
+  (`WICKED_SEAT_FLOOR=container`) a governed seat now presents the credential the user signed in with
+  in the agent's login container: arm reads the broker (under its mutation lock) and the seat's
+  placeholder takes that credential's shape and gateway route (Claude subscription or API key, Codex
+  ChatGPT or API key, a pi/opencode provider key). The `WICKED_SEAT_CREDENTIAL_<CLI>` override that
+  guessed it is gone. An agent with no usable sign-in (signed out, expired, a sign-in still being
+  published, or an unreadable broker) is refused before its seat starts with the new
+  `agent_signed_out` reason, which tells the user to sign in from Agents and reads as a "not signed
+  in" seat refusal (the seat is benched and the unit fails over), instead of launching a seat that the
+  provider then refuses. Arm first settles a broker mutation a crash interrupted, in ingest's order,
+  including a published sign-in's leftover login volume. Claude API-key mode writes an empty
+  `.credentials.json` over a stale OAuth placeholder.
+- **A closed sign-in tab no longer blocks every later sign-in.** Killing a login terminal's client
+  (a closed tab, a dropped socket) left `docker run -it` running on the login volume, so every later
+  `seat-login argv` failed on `volume rm`. Login containers are now named after their session, and the
+  session's login containers (including ones an earlier engine named `wicked-login-<cli>-<id>`) are
+  stopped, and polled until gone, before ingest reads the volume and before any login volume is
+  removed.
+- **`seat-login argv copilot` refuses up front.** The broker cannot hold a Copilot credential yet, so the
+  login is not opened (the user would finish a real sign-in only for ingest to discard it).
+
 - **The `artifact.theme` editor permission.** Protocol 2's `theme.set` (DES-EDITOR-PLUGIN-CONTRACT-001
   §7.2) changes the theme of the artifact an editor opens, as a new version the user can undo. Crew
   admits it since wicked-crew#1008 and garden's pack schema since wicked-garden#1303, but the engine's

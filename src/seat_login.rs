@@ -37,8 +37,14 @@ fn login_volume(gateway: &str, cli: &str) -> String {
     )
 }
 
-/// Pure argv rendering: no host environment or credentials are forwarded. The nonce is only
-/// a container identifier. Callers validate CLI names before using the returned argv.
+/// The login container of the session whose volume is `login_volume`: the same name (containers
+/// and volumes are separate namespaces), so the session marker records both.
+fn login_container(login_volume: &str) -> String {
+    login_volume.to_string()
+}
+
+/// Pure argv rendering: no host environment or credentials are forwarded. Callers validate CLI
+/// names before using the returned argv.
 pub(crate) fn login_argv(
     rt: &Path,
     cli: &str,
@@ -54,8 +60,11 @@ pub(crate) fn login_argv(
         // codex lg-r3 R1: PTY output can include credentials; keep it out of runtime logs.
         "--log-driver".into(),
         "none".into(),
+        // Named after its session's volume (C6): a terminal whose client died (a closed tab, a
+        // dropped socket) leaves this container running on the volume, and only a known name lets
+        // ingest, the next sign-in and sign-out stop it.
         "--name".into(),
-        format!("wicked-login-{cli}-{}", uuid::Uuid::new_v4().simple()),
+        login_container(login_volume),
         "--user".into(),
         "10001".into(),
         "--read-only".into(),
@@ -760,25 +769,147 @@ fn publication_status(dir: &Path, cli: &str, status: BrokerStatus) -> BrokerStat
 
 #[cfg(unix)]
 pub(crate) fn broker_status(rt: &Runtime, gw: &Gateway, cli: &str) -> BrokerStatus {
+    broker_reading(rt, gw, cli).0
+}
+
+/// The broker's status for `cli` and the route files it was read from (presence markers, plus
+/// the retained OAuth record) — one read for both the status and the seat's credential kind.
+#[cfg(unix)]
+fn broker_reading(rt: &Runtime, gw: &Gateway, cli: &str) -> (BrokerStatus, Vec<(String, Vec<u8>)>) {
     let paths = match broker_files(cli) {
         Ok(paths) => paths,
-        Err(e) => return BrokerStatus::Unknown(e),
+        Err(e) => return (BrokerStatus::Unknown(e), Vec::new()),
     };
     let volume = volumes(gw).1;
     match volume_exists(rt, &volume) {
-        Ok(false) => return BrokerStatus::SignedOut,
-        Err(e) => return BrokerStatus::Unknown(e),
+        Ok(false) => return (BrokerStatus::SignedOut, Vec::new()),
+        Err(e) => return (BrokerStatus::Unknown(e), Vec::new()),
         Ok(true) => {}
     }
     let files = match read_volume(rt, &volume, paths, true) {
         Ok(files) => files,
-        Err(e) => return BrokerStatus::Unknown(e),
+        Err(e) => return (BrokerStatus::Unknown(e), Vec::new()),
     };
     let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(now) => now.as_secs(),
-        Err(_) => return BrokerStatus::Unknown("system clock precedes Unix epoch".into()),
+        Err(_) => {
+            return (
+                BrokerStatus::Unknown("system clock precedes Unix epoch".into()),
+                files,
+            )
+        }
     };
-    status_from_files(cli, &files, now)
+    (status_from_files(cli, &files, now), files)
+}
+
+/// The credential a signed-in agent's broker holds, as the kind its seats must present: the
+/// seat's placeholder takes that shape and its requests ride that credential's gateway route.
+/// Pure over the broker's route files (nonempty = present, as [`status_from_files`] reads them);
+/// `None` when no usable credential is present.
+pub(crate) fn kind_from_files(
+    cli: &str,
+    files: &[(String, Vec<u8>)],
+) -> Option<crate::seat_credentials::CredentialKind> {
+    use crate::seat_credentials::CredentialKind;
+    let present = |name: &str| files.iter().any(|(p, b)| p == name && !b.is_empty());
+    match cli {
+        // An OAuth sign-in wins, as the status's expiry reading does.
+        "claude" if present("anthropic.token") => Some(CredentialKind::ClaudeOauth),
+        "claude" if present("anthropic.key") => Some(CredentialKind::ClaudeApiKey),
+        "codex" => {
+            let mode = files
+                .iter()
+                .find(|(p, b)| p == "codex.auth.json" && !b.is_empty())
+                .and_then(|(_, b)| serde_json::from_slice::<Value>(b).ok())
+                .and_then(|v| {
+                    v.get("auth_mode")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+            let chatgpt = present("openai.token") && present("openai.account");
+            match mode.as_deref() {
+                Some("apikey") if present("openai.key") => Some(CredentialKind::CodexApiKey),
+                Some("chatgpt") if chatgpt => Some(CredentialKind::CodexChatgpt),
+                None if present("openai.key") => Some(CredentialKind::CodexApiKey),
+                None if chatgpt => Some(CredentialKind::CodexChatgpt),
+                _ => None,
+            }
+        }
+        "pi" if present("pi.token") => Some(CredentialKind::ProviderKey),
+        "opencode" if present("opencode.token") => Some(CredentialKind::ProviderKey),
+        _ => None,
+    }
+}
+
+/// The sign-in a governed seat of `cli` runs on (DES-CONTAINER-FLOOR §6): the kind of the
+/// credential the user signed in with in the agent's login container, read from the broker of
+/// the daemon whose gateway dir is `dir`. Signed out, expired, mid-publication or unreadable =
+/// the reason, and the unit is refused before its seat starts (never launched to fail upstream).
+/// A failed refresh of a still-valid credential still runs (the status says so on the tab).
+#[cfg(unix)]
+pub(crate) fn seat_credential_kind(
+    rt: &Runtime,
+    gw: &Gateway,
+    dir: &Path,
+    cli: &str,
+) -> Result<crate::seat_credentials::CredentialKind, String> {
+    // codex c6-r1: the broker's files are read one helper at a time; holding the mutation lock that
+    // ingest, sign-out and refresh hold means the snapshot is never torn by one of them.
+    let _lock = crate::seat_refresh::mutation_lock(dir)?;
+    // agy c6-r1: an interrupted sign-in, sign-out or refresh is finished first, as ingest does,
+    // so a crash mid-publication heals on the next unit instead of refusing every one after it.
+    settle_broker(rt, gw, dir, cli)
+        .map_err(|e| format!("{cli}'s sign-in could not be settled: {e}"))?;
+    let (status, files) = broker_reading(rt, gw, cli);
+    let status = publication_status(
+        dir,
+        cli,
+        with_last_refresh(status, crate::seat_refresh::last_refresh(dir, cli)),
+    );
+    match status {
+        BrokerStatus::SignedIn { .. } | BrokerStatus::RefreshFailing { .. } => {
+            kind_from_files(cli, &files)
+                .ok_or_else(|| format!("{cli}: the broker holds no usable sign-in"))
+        }
+        BrokerStatus::SignedOut => Err(format!("{cli} is not signed in")),
+        BrokerStatus::Expired => Err(format!("{cli}'s sign-in has expired")),
+        BrokerStatus::Unknown(why) => Err(format!("{cli}'s sign-in could not be read: {why}")),
+    }
+}
+
+/// Finish whatever broker mutation of `cli` a crash interrupted (caller holds the mutation lock):
+/// a helper's cleanup, a sign-out tombstone, an ingest journal, a refresh's staged record. The
+/// same order `ingest_and_route` repairs in.
+#[cfg(unix)]
+fn settle_broker(rt: &Runtime, gw: &Gateway, dir: &Path, cli: &str) -> Result<(), String> {
+    crate::seat_gateway::cleanup_mutations(rt, dir)?;
+    complete_sign_out(rt, gw, dir, cli)?;
+    if signin_pending(dir, cli) {
+        repair_ingest(rt, gw, dir, cli)?;
+    } else {
+        crate::seat_refresh::repair_refresh(rt, gw, dir, cli)?;
+    }
+    // codex c6-r3: a published sign-in whose cleanup a crash interrupted still has its login
+    // volume (a copy of the credential) and session marker; finish them as ingest_and_route does.
+    // An uncommitted session is a login that may still be open: it is never touched here.
+    if let Some(volume) = read_session(dir, gw, cli)? {
+        if session_committed(dir, cli)? {
+            remove_login_volume(rt, &volume)?;
+            crate::seat_refresh::remove_private_file(&session_path(dir, cli))?;
+        }
+    }
+    Ok(())
+}
+
+/// Native Windows has no seat sign-ins (the container floor needs a Unix host).
+#[cfg(not(unix))]
+pub(crate) fn seat_credential_kind(
+    _rt: &crate::container_floor::Runtime,
+    _gw: &crate::seat_gateway::Gateway,
+    _dir: &Path,
+    _cli: &str,
+) -> Result<crate::seat_credentials::CredentialKind, String> {
+    Err("seat sign-ins need a Unix host".into())
 }
 
 /// Ingest, then point the gateway's routes at the new sign-in: codex's ChatGPT route carries the
@@ -795,6 +926,9 @@ pub(crate) fn ingest_and_route(
     crate::seat_gateway::cleanup_mutations(rt, dir)?;
     complete_sign_out(rt, gw, dir, cli)?;
     let volume = read_session(dir, gw, cli)?.ok_or_else(|| missing(cli, "login session"))?;
+    // The terminal has ended: its container is stopped before the volume is read, so whatever the
+    // CLI wrote is final and nothing still holds the volume when it is removed.
+    stop_login_container(rt, &volume)?;
     repair_ingest(rt, gw, dir, cli)?;
     // codex lg-r3 R2: rescue or staging can survive even a failed pending-marker write.
     if !signin_pending(dir, cli) {
@@ -880,7 +1014,9 @@ pub(crate) fn complete_sign_out(
     if let Some(volume) = read_session(dir, gw, cli)? {
         // codex lg-r3 R4: retry a crash between removal of the volume and its session marker.
         if volume_exists(rt, &volume)? {
-            checked(rt, &["volume".into(), "rm".into(), volume])?;
+            remove_login_volume(rt, &volume)?;
+        } else {
+            stop_login_container(rt, &volume)?;
         }
         crate::seat_refresh::remove_private_file(&session_path(dir, cli))?;
     }
@@ -957,10 +1093,76 @@ fn new_session(rt: &Runtime, gw: &Gateway, dir: &Path, cli: &str) -> Result<Stri
     Ok(volume)
 }
 
-/// Remove a login volume, treating one that is already gone as removed (a crash after the
-/// removal and before its marker was unlinked).
+/// Stop and remove the login container of session `volume`, if it still runs. Its terminal is
+/// over whenever this is called (ingest runs on the terminal's exit), but a terminal whose client
+/// was killed leaves `docker run -it` behind, still holding the volume: every later volume
+/// removal, and so every later sign-in, would fail (found on the proof daemon, C6).
+#[cfg(unix)]
+fn stop_login_container(rt: &Runtime, volume: &str) -> Result<(), String> {
+    // agy c6-r1: a login that just exited is still being removed by its own `--rm` (`rm -f` then
+    // answers "removal already in progress" and `ps -a` still lists it), so poll until it is gone.
+    let deadline = std::time::Instant::now() + LOGIN_STOP_WAIT;
+    loop {
+        let names = login_containers_on(rt, volume)?;
+        if names.is_empty() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("could not stop the login container".into());
+        }
+        for name in names {
+            // Judged by the next listing: one that removed itself meanwhile makes `rm -f` fail.
+            let _ = checked(rt, &["rm".into(), "-f".into(), name]);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// How long a login container's removal may take before stopping it counts as failed.
+#[cfg(unix)]
+const LOGIN_STOP_WAIT: Duration = Duration::from_secs(10);
+
+/// The login containers that mount session `volume`: the one named after the session, and one an
+/// earlier engine named `wicked-login-<cli>-<32 hex>` (codex c6-r1: an abandoned login from before
+/// the upgrade still holds its volume). Nothing else that mounts the volume is ours to stop.
+#[cfg(unix)]
+fn login_containers_on(rt: &Runtime, volume: &str) -> Result<Vec<String>, String> {
+    let out = execute(
+        rt,
+        &[
+            "ps".into(),
+            "-a".into(),
+            "--filter".into(),
+            format!("volume={volume}"),
+            "--format".into(),
+            "{{.Names}}".into(),
+        ],
+    )?;
+    if !out.status.success() {
+        return Err("could not list the login containers".into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|name| ours_on(volume, name))
+        .map(str::to_string)
+        .collect())
+}
+
+fn ours_on(volume: &str, name: &str) -> bool {
+    name == login_container(volume)
+        || name.strip_prefix("wicked-login-").is_some_and(|rest| {
+            rest.rsplit_once('-').is_some_and(|(cli, id)| {
+                supported_cli(cli) && id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+        })
+}
+
+/// Remove a login volume (stopping its login container first), treating one that is already
+/// gone as removed (a crash after the removal and before its marker was unlinked).
 #[cfg(unix)]
 fn remove_login_volume(rt: &Runtime, volume: &str) -> Result<(), String> {
+    stop_login_container(rt, volume)?;
     match checked(rt, &["volume".into(), "rm".into(), volume.into()]) {
         Ok(()) => Ok(()),
         Err(e) if !volume_exists(rt, volume)? => {
@@ -1044,6 +1246,9 @@ fn prepare_login_argv(
     cli: &str,
     image: &str,
 ) -> Result<Vec<String>, String> {
+    // C6: an agent whose credential the broker cannot hold never opens a login (the user would
+    // complete a real sign-in only for ingest to discard it).
+    broker_files(cli).map_err(|e| format!("{cli} cannot sign in for container seats yet: {e}"))?;
     // codex lg-r3 R3: only the daemon may take ownership and revoke stale unit keys.
     crate::seat_gateway::ensure_external_bridge(rt, gw)?;
     let volume = new_session(rt, gw, dir, cli)?;
@@ -1673,6 +1878,29 @@ esac
         sign_out_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
     }
 
+    /// codex c6-r3: arm finishes a published sign-in's interrupted cleanup (its login volume holds
+    /// a copy of the credential), and never touches a session that may be a login still open.
+    #[cfg(unix)]
+    #[test]
+    fn arm_finishes_a_committed_sign_ins_cleanup_and_leaves_an_open_login_alone() {
+        let fake = FakeRuntime::new();
+        std::fs::write(fake.dir.join("broker/pi.token"), "FAKE-key").unwrap();
+        let open = new_session(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap();
+        assert_eq!(
+            seat_credential_kind(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap(),
+            crate::seat_credentials::CredentialKind::ProviderKey
+        );
+        assert_eq!(
+            read_session(&fake.dir, &fake.gw, "pi").unwrap(),
+            Some(open.clone())
+        );
+        assert!(!fake.calls().contains(&format!("volume rm {open}")));
+        write_session_state(&fake.dir, "pi", &open, true).unwrap();
+        assert!(seat_credential_kind(&fake.rt, &fake.gw, &fake.dir, "pi").is_ok());
+        assert_eq!(read_session(&fake.dir, &fake.gw, "pi").unwrap(), None);
+        assert!(fake.calls().contains(&format!("volume rm {open}")));
+    }
+
     #[cfg(unix)]
     #[test]
     fn committed_ingest_retry_preserves_since_rotated_record() {
@@ -1987,7 +2215,7 @@ esac
             assert!(argv.iter().any(|a| a == "--read-only"));
             assert!(pair("-v", &format!("{volume}:/home/login")));
             let name = &argv[argv.iter().position(|a| a == "--name").unwrap() + 1];
-            assert!(name.starts_with(&format!("wicked-login-{cli}-")));
+            assert_eq!(name, &volume, "the container is named after its session");
             assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
             for env in config_env {
                 assert!(pair("-e", env), "{cli}: {env}");
@@ -2294,6 +2522,99 @@ esac
         }
     }
 
+    /// C6: a governed seat presents what the user signed in with, never a configured guess. Each
+    /// sign-in the broker can hold maps to the one kind whose route serves that credential, and
+    /// a broker the status would call signed out yields no kind (the seat is refused).
+    #[test]
+    fn the_seat_presents_the_kind_the_user_signed_in_with() {
+        use crate::seat_credentials::CredentialKind as K;
+        let f = |name: &str, v: &str| token_file(name, v);
+        let codex_mode = |mode: &str| file("codex.auth.json", json!({"auth_mode": mode}));
+        for (cli, files, want) in [
+            (
+                "claude",
+                vec![
+                    f("anthropic.token", "FAKE-access"),
+                    file("claude.credentials.json", oauth(4102444800000)),
+                ],
+                Some(K::ClaudeOauth),
+            ),
+            (
+                "claude",
+                vec![f("anthropic.key", "FAKE-key")],
+                Some(K::ClaudeApiKey),
+            ),
+            // OAuth wins, as the status's expiry reading does.
+            (
+                "claude",
+                vec![
+                    f("anthropic.key", "FAKE-key"),
+                    f("anthropic.token", "FAKE-a"),
+                ],
+                Some(K::ClaudeOauth),
+            ),
+            (
+                "codex",
+                vec![
+                    codex_mode("chatgpt"),
+                    f("openai.token", "FAKE-a"),
+                    f("openai.account", "FAKE-acct"),
+                ],
+                Some(K::CodexChatgpt),
+            ),
+            (
+                "codex",
+                vec![codex_mode("apikey"), f("openai.key", "FAKE-key")],
+                Some(K::CodexApiKey),
+            ),
+            (
+                "codex",
+                vec![f("openai.key", "FAKE-key")],
+                Some(K::CodexApiKey),
+            ),
+            // A ChatGPT sign-in without its account header cannot authenticate: no kind.
+            (
+                "codex",
+                vec![codex_mode("chatgpt"), f("openai.token", "FAKE-a")],
+                None,
+            ),
+            // A mode whose route file is empty (revoked) is signed out.
+            (
+                "codex",
+                vec![codex_mode("apikey"), f("openai.key", "")],
+                None,
+            ),
+            ("pi", vec![f("pi.token", "FAKE-key")], Some(K::ProviderKey)),
+            (
+                "opencode",
+                vec![f("opencode.token", "FAKE-key")],
+                Some(K::ProviderKey),
+            ),
+            ("copilot", vec![f("pi.token", "FAKE-key")], None),
+        ] {
+            assert_eq!(kind_from_files(cli, &files), want, "{cli} {files:?}");
+            // Whenever there is a kind, the status agrees the agent is signed in.
+            if want.is_some() {
+                assert!(
+                    matches!(
+                        status_from_files(cli, &files, 100),
+                        BrokerStatus::SignedIn { .. }
+                    ),
+                    "{cli}"
+                );
+            }
+        }
+        for cli in ["claude", "codex", "pi", "opencode"] {
+            let empty: Vec<_> = broker_files(cli)
+                .unwrap()
+                .iter()
+                .map(|p| ((*p).into(), vec![]))
+                .collect();
+            assert_eq!(kind_from_files(cli, &[]), None, "{cli}");
+            assert_eq!(kind_from_files(cli, &empty), None, "{cli}");
+        }
+    }
+
     #[test]
     fn codex_status_requires_route_account_and_uses_access_jwt_expiry() {
         let mut auth = chatgpt();
@@ -2397,6 +2718,32 @@ esac
                         .any(|p| p == format!("/in/{filename}")));
                 }
             }
+        }
+    }
+
+    /// codex c6-r1: only the session's own login container, or one an earlier engine named
+    /// `wicked-login-<cli>-<32 hex>`, is stopped on its volume's behalf.
+    #[test]
+    fn only_login_containers_are_stopped_for_a_session_volume() {
+        let v = "wicked-agw-0123456789ab-login-claude-0a1b2c3d";
+        assert!(ours_on(v, v));
+        assert!(ours_on(
+            v,
+            &format!("wicked-login-claude-{}", "a".repeat(32))
+        ));
+        assert!(ours_on(
+            v,
+            &format!("wicked-login-opencode-{}", "0".repeat(32))
+        ));
+        for other in [
+            "wicked-seat-claude-run-1",
+            "wicked-login-claude-short",
+            &format!("wicked-login-bogus-{}", "a".repeat(32)),
+            &format!("wicked-login-claude-{}", "g".repeat(32)),
+            "wicked-agw-0123456789ab-login-claude-0a1b2c3e",
+            "some-user-container",
+        ] {
+            assert!(!ours_on(v, other), "{other}");
         }
     }
 
@@ -2688,5 +3035,377 @@ esac
         );
         assert!(!all_logs.contains("FAKE-codex-access-v2"));
         assert!(!all_logs.contains("FAKE-codex-access") && !all_logs.contains(&key.bearer));
+    }
+
+    /// The FAKE claude the C6 live test builds into a seat image: no account, no network auth.
+    /// `claude auth login` shows what the real subscription login shows in a terminal with no
+    /// browser (a link, then a code to paste) and writes a FAKE OAuth record; a headless turn sends
+    /// one model request with whatever credential its seat holds and prints what came back.
+    #[cfg(unix)]
+    const FAKE_CLAUDE: &str = r#"#!/bin/sh
+cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+if [ "$1 $2" = "auth login" ]; then
+  echo "Browser didn't open? Use the url below to sign in:"
+  echo "https://claude.example.invalid/oauth/authorize?code=true"
+  printf 'Paste code here if prompted > '
+  read code
+  [ "$code" = "FAKE-CODE-1234" ] || { echo "Invalid code"; exit 1; }
+  mkdir -p "$cfg" && umask 077
+  printf '%s' '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-FAKE-c6-access","refreshToken":"sk-ant-ort01-FAKE-c6-refresh","expiresAt":4102444800000,"scopes":["user:inference"]}}' > "$cfg/.credentials.json"
+  echo "Login successful."
+  exit 0
+fi
+tok=$(jq -r '.claudeAiOauth.accessToken // empty' "$cfg/.credentials.json" 2>/dev/null)
+curl -s --max-time 8 -H "authorization: Bearer $tok" -H 'content-type: application/json' \
+  -d '{"model":"x","max_tokens":1,"messages":[]}' "$ANTHROPIC_BASE_URL/v1/messages" || echo CURL_FAILED
+"#;
+
+    /// Run a login argv in the engine's own PTY (`terminal::spawn_pty`, the one behind crew's
+    /// `/terminals`) and, at the CLI's code prompt, type `answer` — or, with `None`, kill the
+    /// terminal there, as crew does when its socket drops. Returns the transcript and exit code.
+    #[cfg(unix)]
+    fn login_terminal(argv: &[String], answer: Option<&str>) -> (String, Option<i32>) {
+        let map = crate::terminal::new_map();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = crate::terminal::spawn_pty(
+            "c6-login",
+            &std::env::temp_dir(),
+            Some(argv.to_vec()),
+            100,
+            30,
+            &map,
+            tx,
+        )
+        .expect("the login terminal opens");
+        let mut transcript = String::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        let mut typed = false;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(crate::command::Command::TerminalChunk { bytes, .. }) => {
+                    spawned
+                        .in_flight
+                        .fetch_sub(bytes.len(), std::sync::atomic::Ordering::AcqRel);
+                    transcript.push_str(&String::from_utf8_lossy(&bytes));
+                    if !typed && transcript.contains("Paste code") {
+                        typed = true;
+                        let Some(answer) = answer else { break };
+                        use std::io::Write;
+                        let terminals = crate::terminal::lock(&map);
+                        let mut w = terminals["c6-login"].writer.lock().unwrap();
+                        w.write_all(format!("{answer}\r").as_bytes()).unwrap();
+                    }
+                }
+                Ok(crate::command::Command::TerminalReaderDone { .. }) => break,
+                Ok(_) => {}
+                Err(e) => panic!("the login terminal did not finish ({e}): {transcript}"),
+            }
+        }
+        let mut session = crate::terminal::lock(&map).remove("c6-login").unwrap();
+        let exit = crate::terminal::reap_session(&mut session, answer.is_none());
+        (transcript, exit)
+    }
+
+    /// LIVE (`WICKED_CONTAINER_LIVE=1` + a runtime; skipped otherwise) — C6, the sign-in journey
+    /// end to end with a FAKE claude (no account, no real credential anywhere):
+    /// 1. before any sign-in, the agent's governed seat is refused (`agent_signed_out`);
+    /// 2. a sign-in abandoned mid-login (the terminal killed, as a closed tab does) leaves no
+    ///    container behind once ingested and does not block the next one; then
+    ///    the login argv crew runs for Agents → Sign in, run in the engine's own PTY (the one
+    ///    behind crew's `/terminals`): the user sees the link, types the code, the CLI writes its
+    ///    credential into the throwaway login volume;
+    /// 3. ingest moves it into the broker and removes the login volume;
+    /// 4. a governed seat of that agent, armed by the container floor, holds only a placeholder,
+    ///    yet its model request reaches the (stub) upstream carrying the user's credential, through
+    ///    the route of the kind the user signed in with;
+    /// 5. after sign-out the seat is refused again.
+    #[cfg(unix)]
+    #[test]
+    fn live_a_login_container_sign_in_carries_to_the_agents_governed_seat() {
+        use crate::container_floor::{arm, build_image, ensure_seat_image, finalize};
+        use crate::seat_gateway::{configure_gateway, ensure_gateway, GatewayConfig};
+        use crate::worker_sandbox::{FloorInputs, FloorUnarmed};
+        use base64::engine::general_purpose::STANDARD;
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        const IMAGE_ENV: &str = "WICKED_SEAT_IMAGE_CLAUDE";
+        // Restored however the test ends (agy c6-r2 P3): later tests in this binary read them.
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (k, v) in self.0.drain(..) {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            [IMAGE_ENV, "WICKED_WORKER_HOME"]
+                .into_iter()
+                .map(|k| (k, std::env::var_os(k)))
+                .collect(),
+        );
+        std::env::remove_var(IMAGE_ENV);
+        let rt = crate::container_floor::runtime().expect("a container runtime answers");
+        let pinned = ensure_seat_image(&rt, "claude").expect("the claude seat image");
+        let fake = format!("wicked-c6-fake-claude:{}", uuid::Uuid::new_v4().simple());
+        build_image(
+            &rt,
+            &format!(
+                "FROM {pinned}\nRUN rm -f /usr/local/bin/claude && echo {} | base64 -d > \
+                 /usr/local/bin/claude && chmod 755 /usr/local/bin/claude\n",
+                STANDARD.encode(FAKE_CLAUDE)
+            ),
+            &fake,
+            &[],
+        )
+        .expect("the fake claude image");
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("wicked-c6-live-{}", uuid::Uuid::new_v4().simple()));
+        let dir = base.join("state/gateway");
+        let worker = base.join("worker");
+        let seat_home = worker.join("seat-claude");
+        for d in [&dir, &seat_home, &base.join("stub")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::env::set_var(IMAGE_ENV, &fake);
+        std::env::set_var("WICKED_WORKER_HOME", &worker);
+        let run = |argv: &[&str]| {
+            let mut c = rt.cmd();
+            c.args(argv);
+            output_within(c, Duration::from_secs(60)).unwrap()
+        };
+        let gw = Gateway::for_dir(&dir);
+        let stub = format!("{}-stub", gw.name);
+        // The stub upstream answers with what authenticated the request.
+        std::fs::write(
+            base.join("stub/stub.js"),
+            "require('http').createServer((q,r)=>{q.resume();q.on('end',()=>{\
+             r.setHeader('content-type','application/json');\
+             r.end(JSON.stringify({path:q.url,auth:q.headers['authorization']||'',\
+             key:q.headers['x-api-key']||''}))})}).listen(8080)",
+        )
+        .unwrap();
+        let mut config = GatewayConfig::default();
+        for route in &mut config.providers {
+            route.upstream_host = format!("{stub}:8080");
+            route.tls = false;
+        }
+        configure_gateway(&dir, &config).unwrap();
+        let gw = ensure_gateway(&rt, &dir).expect("the gateway starts");
+        let stub_mount = format!(
+            "type=bind,src={},dst=/s,readonly",
+            base.join("stub").display()
+        );
+        let o = run(&[
+            "run",
+            "-d",
+            "--name",
+            &stub,
+            "--network",
+            &gw.external_network,
+            "--mount",
+            &stub_mount,
+            &pinned,
+            "node",
+            "/s/stub.js",
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        // A real linked run worktree with the engine's pin, as a governed unit has.
+        let repo = base.join("repo");
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            // spawn-audit: test-only — local git over a temp repo.
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        };
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "i"]);
+        git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let pin = crate::worktree_guard::pinned_git_dir(&wt, &repo).unwrap();
+        let inputs = FloorInputs {
+            cwd: wt.clone(),
+            write_roots: vec![wt.clone()],
+            read_only: false,
+            seat_dirs: vec![seat_home.clone()],
+            unmask: vec![],
+            pinned: vec![],
+            net: vec![],
+            home: None,
+            trusted_git_dir: Some(pin),
+        };
+        let argv: Vec<String> = ["claude", "-p", "hello"].map(String::from).to_vec();
+        let seat = |ord: u32| {
+            arm(
+                &inputs,
+                &argv,
+                "run-c6",
+                ord,
+                &[],
+                Some("hello"),
+                Some(&dir),
+            )
+        };
+        // 1. Signed out: refused before any seat container starts.
+        let before = seat(1).map(|_| ()).unwrap_err();
+        let running = |name: &str| {
+            run(&[
+                "container",
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                name,
+            ])
+            .stdout
+            .starts_with(b"true")
+        };
+        // 2a. A sign-in whose tab closed mid-login: crew kills the terminal's client, which leaves
+        // `docker run -it` running on the login volume. Ingest (crew runs it on the terminal's
+        // exit) stops it; nothing was signed in; the next sign-in opens normally.
+        let abandoned = prepare_login_argv(&rt, &gw, &dir, "claude", &fake).expect("login argv");
+        let abandoned_volume = read_session(&dir, &gw, "claude").unwrap().unwrap();
+        let _ = login_terminal(&abandoned, None);
+        let lingered = running(&abandoned_volume);
+        let abandoned_ingest = ingest_and_route(&rt, &gw, &dir, "claude").map(|r| r.files);
+        let stopped = !running(&abandoned_volume);
+        // 2a'. One an earlier engine left (named `wicked-login-<cli>-<hex>`, not after its session).
+        prepare_login_argv(&rt, &gw, &dir, "claude", &fake).expect("argv");
+        let legacy_volume = read_session(&dir, &gw, "claude").unwrap().unwrap();
+        let legacy = format!("wicked-login-claude-{}", uuid::Uuid::new_v4().simple());
+        let mount = format!("{legacy_volume}:/home/login");
+        let o = run(&[
+            "run", "-d", "--name", &legacy, "-v", &mount, &fake, "sleep", "300",
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let legacy_ingest = ingest_and_route(&rt, &gw, &dir, "claude").map(|r| r.files);
+        let legacy_stopped = !running(&legacy);
+        // 2b. Agents -> Sign in: the login argv crew runs, in the engine's PTY.
+        let login = prepare_login_argv(&rt, &gw, &dir, "claude", &fake).expect("the login argv");
+        let volume = read_session(&dir, &gw, "claude")
+            .unwrap()
+            .expect("a login session");
+        let abandoned_gone = !volume_exists(&rt, &abandoned_volume).unwrap()
+            && !volume_exists(&rt, &legacy_volume).unwrap();
+        let (transcript, exit) = login_terminal(&login, Some("FAKE-CODE-1234"));
+        // 3. Crew's ingest on the terminal's exit.
+        let report = ingest_and_route(&rt, &gw, &dir, "claude").expect("ingested");
+        let login_gone = !volume_exists(&rt, &volume).unwrap();
+        // 4. The agent's governed seat.
+        let armed = seat(2).expect("a signed-in agent's seat arms");
+        let base_url = armed
+            .env
+            .iter()
+            .find(|(k, _)| k == "ANTHROPIC_BASE_URL")
+            .map(|(_, v)| v.clone());
+        // The command execute_wrapped builds: the floor's wrapper, then the seat's argv.
+        let full: Vec<String> = armed.wrapper.iter().chain(&armed.argv).cloned().collect();
+        let mut cmd = crate::execute_wrapped::build_worker_command(&full, None);
+        cmd.env("CLAUDE_CONFIG_DIR", &seat_home);
+        for (k, v) in &armed.env {
+            cmd.env(k, v);
+        }
+        crate::container_floor::write_unit_seat_files(&mut cmd, "claude", &armed.files)
+            .expect("placeholder files");
+        let placeholder =
+            std::fs::read_to_string(seat_home.join(".credentials.json")).unwrap_or_default();
+        let out = output_within(finalize(cmd), Duration::from_secs(90)).expect("the seat ran");
+        let seat_out = String::from_utf8_lossy(&out.stdout).to_string();
+        let seat_err = String::from_utf8_lossy(&out.stderr).to_string();
+        if let Some(lease) = armed.lease {
+            let _ = lease.release();
+        }
+        drop(armed.cleanup);
+        // 5. Sign out: refused again.
+        sign_out_and_route(&rt, &gw, &dir, "claude").expect("signed out");
+        let after = seat(3).map(|_| ()).unwrap_err();
+        let logs = run(&["logs", &gw.name]);
+        let gw_logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&logs.stdout),
+            String::from_utf8_lossy(&logs.stderr)
+        );
+        run(&["rm", "-f", &stub, &gw.name]);
+        run(&["network", "rm", &gw.external_network]);
+        let (cfg, broker) = crate::seat_gateway::volumes(&gw);
+        run(&["volume", "rm", &cfg, &broker, &volume]);
+        run(&["rm", "-f", &abandoned_volume, &volume, &legacy]);
+        run(&["volume", "rm", &abandoned_volume, &legacy_volume]);
+        run(&["image", "rm", &fake]);
+        let _ = std::fs::remove_dir_all(&base);
+        eprintln!(
+            "before={before:?}\ntranscript={transcript}\nexit={exit:?}\nreport={report:?}\n\
+             base_url={base_url:?}\nseat_out={seat_out}\nseat_err={seat_err}\nafter={after:?}"
+        );
+        assert!(
+            lingered,
+            "a killed terminal client leaves its login container running"
+        );
+        assert!(
+            abandoned_ingest.is_err(),
+            "nothing was signed in: {abandoned_ingest:?}"
+        );
+        assert!(stopped, "ingest stops the abandoned login container");
+        assert!(legacy_ingest.is_err(), "{legacy_ingest:?}");
+        assert!(
+            legacy_stopped,
+            "an earlier engine's login container is stopped too"
+        );
+        assert!(
+            abandoned_gone,
+            "the next sign-in removes the abandoned session's volume"
+        );
+        assert_eq!(before.0, FloorUnarmed::AgentSignedOut, "{before:?}");
+        assert!(before.1.contains("claude is not signed in"), "{before:?}");
+        assert!(
+            transcript.contains("https://claude.example.invalid/oauth/authorize")
+                && transcript.contains("Login successful."),
+            "the user sees the link and the result: {transcript}"
+        );
+        assert_eq!(exit, Some(0), "{transcript}");
+        assert!(
+            login_gone,
+            "the throwaway login volume is removed after ingest"
+        );
+        assert_eq!(
+            report.files,
+            vec![
+                "anthropic.token".to_string(),
+                "claude.credentials.json".into()
+            ]
+        );
+        // The OAuth sign-in's route, and only a placeholder in the seat.
+        assert_eq!(base_url.as_deref(), Some("http://agw:4005"));
+        assert!(placeholder.contains("claudeAiOauth"), "{placeholder}");
+        assert!(!placeholder.contains("FAKE-c6-access"), "{placeholder}");
+        assert!(out.status.success(), "{seat_out}\n{seat_err}");
+        assert!(
+            seat_out.contains("\"auth\":\"Bearer sk-ant-oat01-FAKE-c6-access\""),
+            "the upstream receives the user's credential: {seat_out}\n{seat_err}"
+        );
+        assert!(seat_out.contains("\"path\":\"/v1/messages\""), "{seat_out}");
+        assert_eq!(after.0, FloorUnarmed::AgentSignedOut, "{after:?}");
+        assert!(
+            !gw_logs.contains("FAKE-c6-access"),
+            "no credential in the gateway log"
+        );
     }
 }
