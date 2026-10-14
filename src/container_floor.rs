@@ -2655,6 +2655,7 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner());
         let home = c4_temp();
         let make = |key: &str| {
+            // spawn-audit: test-only — never spawned; the command only carries env for the placeholder-write test.
             let mut cmd = Command::new("opencode");
             cmd.env("XDG_CONFIG_HOME", &home);
             write_unit_seat_files(
@@ -2770,6 +2771,7 @@ mod tests {
         assert!(seeded.contains("FAKE-model"));
         assert!(!seeded.contains("api_key"));
         assert!(!seeded.contains("FAKE-host-key"));
+        // spawn-audit: test-only — never spawned; the command only carries env for the placeholder-write test.
         let mut cmd = Command::new("unused");
         first.apply(&mut cmd);
         write_seat_files(&cmd, "codex", &[("auth.json".into(), "PLACEHOLDER".into())]).unwrap();
@@ -2787,6 +2789,7 @@ mod tests {
             .read()
             .unwrap_or_else(|p| p.into_inner());
         let dir = c4_temp();
+        // spawn-audit: test-only — never spawned; the command only carries env for the placeholder-write test.
         let mut cmd = Command::new("unused");
         cmd.env("XDG_CONFIG_HOME", &dir);
         write_seat_files(

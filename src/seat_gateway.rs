@@ -28,6 +28,7 @@ use crate::seat_credentials::CredentialKind;
 use crate::container_floor::{output_within, Runtime};
 use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
+use wicked_apps_core::HardenedCommand;
 
 /// The OSS gateway image whose config shape the fixture proves.
 pub(crate) const GATEWAY_IMAGE: &str = "ghcr.io/agentgateway/agentgateway:v1.6.0";
@@ -1083,7 +1084,7 @@ fn stop_orphan_clients(name: &str) -> Result<(), String> {
         return Err("cannot confirm the helper's runtime client is gone (no pkill/pgrep)".into());
     };
     let mut kill = std::process::Command::new(&pkill);
-    kill.args(["-KILL", "-f", name]);
+    kill.hardened().args(["-KILL", "-f", name]);
     // 0 = killed, 1 = none matched; anything else (or no answer) fails closed.
     match output_within(kill, CLI_TIMEOUT).and_then(|o| o.status.code()) {
         Some(0 | 1) => {}
@@ -1092,7 +1093,7 @@ fn stop_orphan_clients(name: &str) -> Result<(), String> {
     let start = Instant::now();
     loop {
         let mut look = std::process::Command::new(&pgrep);
-        look.args(["-f", name]);
+        look.hardened().args(["-f", name]);
         match output_within(look, CLI_TIMEOUT).and_then(|o| o.status.code()) {
             Some(1) => return Ok(()),
             Some(0) if start.elapsed() < Duration::from_secs(5) => {
@@ -2097,8 +2098,11 @@ rm -f "$base/live"
         let rt = Runtime { cli: runtime };
         let name = format!("wicked-mutation-{}", uuid::Uuid::new_v4().simple());
         // A stand-in for the dead owner's client: a live host process whose argv names it.
+        // spawn-audit: test-only — a stand-in orphan client for the cleanup test; never a production spawn.
         let mut orphan = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 30", &name])
+            // A loop, not a lone command: sh would exec that, dropping the name from argv
+            // (a real runtime client keeps `--name <name>` in its argv).
+            .args(["-c", "while :; do sleep 1; done", &name])
             .spawn()
             .unwrap();
         remove_helper(&rt, &name).unwrap();
@@ -2228,6 +2232,7 @@ cat > "$base/written"
             .open(temp.0.join("config/.lock"))
             .unwrap();
         lock.lock().unwrap();
+        // spawn-audit: test-only — re-runs this test binary as a fake owner process; never a production spawn.
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
