@@ -2420,7 +2420,9 @@ esac
     fn gateway_identity_requires_explicit_absolute_directory_without_host_io() {
         assert!(gateway_for_dir(None).is_err());
         assert!(gateway_for_dir(Some(Path::new("relative/gateway"))).is_err());
-        let dir = Path::new("/FAKE-never-opened-state/gateway");
+        // Absolute on every platform (a bare `/x` has no drive on Windows); never opened.
+        let dir = std::env::temp_dir().join("FAKE-never-opened-state/gateway");
+        let dir = dir.as_path();
         let gw = gateway_for_dir(Some(dir)).unwrap();
         assert_eq!(gw.name, crate::seat_gateway::gateway_name(dir));
         assert_eq!(gw.external_network, format!("{}-ext", gw.name));
