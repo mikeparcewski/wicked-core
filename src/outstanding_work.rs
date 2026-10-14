@@ -32,8 +32,11 @@
 //!
 //! # What counts as outstanding
 //!
-//! A live process with this unit's worktree path on its command line. That is deliberately narrow:
-//! it is the unit's OWN work, not "the machine is busy". A worker the unit backgrounds is launched
+//! A live process with this unit's worktree path on its command line — except the engine's own
+//! infrastructure ([`InfraGuard`], core#936: an ACP bridge the engine keeps alive for the run, and
+//! anything under it, is never this seat's leftover work). Anything else counts, including a
+//! seat's orphan the engine adopted (an engine running as PID 1 or a subreaper). That is
+//! deliberately narrow: it is the unit's OWN work, not "the machine is busy". A worker the unit backgrounds is launched
 //! with paths into the worktree it was pointed at — that path is how it finds its database and its
 //! scripts — so the command line is the honest signal that the process belongs to this unit. We do
 //! NOT inspect working directories: reading another process's cwd is not portable across macOS and
@@ -115,11 +118,48 @@ impl WaitOutcome {
     }
 }
 
+/// (core#936) The pids of the engine's long-lived infrastructure processes (ACP bridges),
+/// registered for exactly their lifetime by [`InfraGuard`].
+static INFRA: std::sync::Mutex<Vec<(u32, u8)>> = std::sync::Mutex::new(Vec::new());
+
+/// (core#936) Registers an infrastructure process (an ACP bridge) for as long as the guard lives:
+/// neither it nor anything under it is ever a unit's outstanding work. Named explicitly by its
+/// owner, never inferred from ancestry or age (codex r1-r3: an engine running as PID 1 adopts a
+/// seat's orphans, and a worker can predate a retry).
+#[derive(Debug)]
+pub struct InfraGuard(u32);
+
+impl InfraGuard {
+    /// Register `pid` and `levels` of its descendants as the bridge's own machinery (a resident
+    /// launcher's bridge, an adapter's CLI runtime).
+    pub fn register(pid: u32, levels: u8) -> Self {
+        INFRA
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((pid, levels));
+        Self(pid)
+    }
+}
+
+impl Drop for InfraGuard {
+    fn drop(&mut self) {
+        let mut v = INFRA.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(i) = v.iter().position(|(p, _)| *p == self.0) {
+            v.swap_remove(i);
+        }
+    }
+}
+
+pub(crate) fn infra_pids() -> Vec<(u32, u8)> {
+    INFRA.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
 /// Count live processes working inside `worktree`.
 ///
 /// Matches on the COMMAND LINE containing the worktree path. A worker a unit backgrounds is
 /// launched with paths into its own worktree — that is how it finds its database and its scripts —
-/// so the path is the honest signal that the process belongs to this unit.
+/// so the path is the honest signal that the process belongs to this unit. The engine's registered
+/// infrastructure and everything under it is never the unit's (core#936).
 ///
 /// Returns `None` when the process table cannot be read at all, which is distinct from zero: an
 /// unreadable table means "unknown", and a caller must not turn that into "nothing outstanding".
@@ -159,37 +199,102 @@ pub fn outstanding_in(worktree: &Path) -> Option<usize> {
         use wicked_apps_core::spawn::HardenedCommand;
         let mut cmd = std::process::Command::new("ps");
         cmd.hardened();
-        let out = cmd.args(["-Ao", "pid=,args="]).output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let table = String::from_utf8_lossy(&out.stdout);
+        let table = ps_table(cmd)?;
         Some(count_worktree_procs(
             &table,
             needle.as_ref(),
             std::process::id(),
+            &infra_pids(),
         ))
     }
 }
 
-/// Count lines of a `ps -Ao pid=,args=` table whose argv contains `needle`, excluding pid `me`.
-///
-/// Pure so the pid self-exclusion is falsifiable without a process whose command line we control:
-/// a synthetic table can put `needle` on a line whose pid IS `me`, which no real child of a test
-/// could reproduce. Split off the leading pid, keep the rest as argv, drop our own line by identity
-/// — a string filter (the pre-review bug) could never tell the engine's own process from a worker.
+/// `ps -Aww -o pid=,ppid=,args=` (`-ww`: unlimited width, so a long argv is never cut before the
+/// worktree path — Linux `ps` honours COLUMNS on redirected output, codex r1 on #936).
 #[cfg(unix)]
-fn count_worktree_procs(table: &str, needle: &str, me: u32) -> usize {
+fn ps_table(mut cmd: std::process::Command) -> Option<String> {
+    let out = cmd.args(["-Aww", "-o", "pid=,ppid=,args="]).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// One row of a [`ps_table`].
+#[cfg(unix)]
+struct Row<'a> {
+    pid: u32,
+    ppid: u32,
+    argv: &'a str,
+}
+
+/// Parse a [`ps_table`]: pid, ppid, then the argv as written.
+#[cfg(unix)]
+fn parse_rows(table: &str) -> Vec<Row<'_>> {
     table
         .lines()
         .filter_map(|l| {
-            let t = l.trim_start();
-            let sp = t.find(char::is_whitespace)?;
-            let pid: u32 = t[..sp].parse().ok()?;
-            Some((pid, &t[sp + 1..]))
+            let mut rest = l.trim_start();
+            let mut field = || {
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                let (f, r) = rest.split_at(end);
+                rest = r.trim_start();
+                f
+            };
+            let pid: u32 = field().parse().ok()?;
+            let ppid: u32 = field().parse().ok()?;
+            Some(Row {
+                pid,
+                ppid,
+                argv: rest,
+            })
         })
-        .filter(|(pid, _)| *pid != me)
-        .filter(|(_, argv)| argv.contains(needle))
+        .collect()
+}
+
+/// Whether `pid` is a registered infrastructure process or within the registered number of levels
+/// below it (a resident launcher's bridge, an adapter's CLI runtime). NOT anything deeper (codex
+/// r4): a worker an agent backgrounded sits below its runtime and is outstanding work like any
+/// other, as is a direct child of a native ACP server, which runs its tools itself (codex r5).
+#[cfg(unix)]
+fn is_infra(rows: &[Row<'_>], pid: u32, infra: &[(u32, u8)]) -> bool {
+    let parent = |p: u32| rows.iter().find(|r| r.pid == p).map(|r| r.ppid);
+    let mut at = pid;
+    let mut depth: u8 = 0;
+    loop {
+        if infra.iter().any(|(p, levels)| *p == at && depth <= *levels) {
+            return true;
+        }
+        if depth >= 2 {
+            return false;
+        }
+        match parent(at) {
+            Some(up) if up != at && up != 0 => at = up,
+            _ => return false,
+        }
+        depth += 1;
+    }
+}
+
+/// Count rows of a [`ps_table`] whose argv contains `needle`, excluding pid `me`, every registered
+/// infrastructure process (`infra`) and the agent runtime directly under each.
+///
+/// Pure so the exclusion is falsifiable without processes whose command lines we control: a
+/// synthetic table can put `needle` on lines whose pid IS `me` or that run under an infrastructure
+/// pid. Drop our own line by identity — a string filter (the pre-review bug) could never tell the
+/// engine's own process from a worker.
+///
+/// (core#936) An unbound run's seats share ONE sandbox cwd, so the claude ACP bridge the engine
+/// keeps alive for the run carries that path on its command line; a wrapped codex review that
+/// exited then waited on the bridge — "its own background work" — for the 4-hour budget, and the
+/// unit never closed (run ae4bf4ea: PASS printed, no `unitDone`, reassigned by the stall watchdog
+/// at 30 min, PASS discarded). The bridge is registered infrastructure now; every other process
+/// with the path counts, an orphan the engine adopted and a bridge agent's own background worker
+/// included.
+#[cfg(unix)]
+fn count_worktree_procs(table: &str, needle: &str, me: u32, infra: &[(u32, u8)]) -> usize {
+    let rows = parse_rows(table);
+    rows.iter()
+        .filter(|r| r.argv.contains(needle) && r.pid != me && !is_infra(&rows, r.pid, infra))
         .count()
 }
 
@@ -427,25 +532,86 @@ mod tests {
         let me = 4242;
         let table = format!(
             // engine's own line: our pid, worktree on argv → must be dropped
-            "  {me} /usr/bin/wicked-core run {needle}/plan.json\n\
+            "  {me}     1 /usr/bin/wicked-core run {needle}/plan.json\n\
              // a real worker: different pid, worktree on argv → must be counted\n\
-             {other} /bin/sh {needle}/run_worker.sh\n\
+             {other}     1 /bin/sh {needle}/run_worker.sh\n\
              // unrelated process, no worktree → ignored\n\
-             {noise} /usr/bin/some-daemon --serve\n",
+             {noise}     1 /usr/bin/some-daemon --serve\n",
             other = me + 1,
             noise = me + 2,
         );
         assert_eq!(
-            count_worktree_procs(&table, needle, me),
+            count_worktree_procs(&table, needle, me, &[]),
             1,
             "our own pid ({me}) must be excluded and the one real worker counted"
         );
         // And with a DIFFERENT `me`, our former line is now a real worker: the count rises to 2.
         // This proves the exclusion is by pid identity, not by matching the argv text.
         assert_eq!(
-            count_worktree_procs(&table, needle, 9999),
+            count_worktree_procs(&table, needle, 9999, &[]),
             2,
             "when neither pid is ours, both worktree lines count"
         );
+    }
+
+    /// core#936, run ae4bf4ea: the engine's registered infrastructure (the claude ACP bridge it
+    /// kept for the run, and the claude under it) is never a unit's outstanding work, though the
+    /// unbound run's sandbox cwd is on their command lines. Every other process with the path
+    /// counts: an orphaned worker and its child, and (codex r1/r3) a worker the engine adopted as
+    /// PID 1 / a subreaper, whenever it started.
+    #[cfg(unix)]
+    #[test]
+    fn core_936_registered_engine_infrastructure_is_not_a_units_outstanding_work() {
+        let needle = "/var/folders/x/T/wicked-core-sandbox/ae4bf4ea";
+        let me = 64315;
+        let table = format!(
+            "{me}     1 node wicked-crew serve --port 7801\n\
+             80258 {me} node claude-agent-acp --cwd {needle}\n\
+             80374 80258 /usr/local/bin/claude --add-dir {needle}\n\
+             90001     1 /bin/sh {needle}/run_worker.sh\n\
+             90002 90001 python3 {needle}/worker.py\n\
+             90003 {me} /bin/sh {needle}/adopted_worker.sh\n\
+             90005 80374 /bin/sh -c {needle}/bg.sh\n\
+             90006 90005 python3 {needle}/bg_worker.py\n"
+        );
+        // (codex r4) The worker claude backgrounded under the bridge counts too.
+        assert_eq!(count_worktree_procs(&table, needle, me, &[(80258, 1)]), 5);
+        // (codex r5) A native ACP server runs its tools itself: its direct child counts.
+        assert_eq!(count_worktree_procs(&table, needle, me, &[(80258, 0)]), 6);
+        assert_eq!(
+            count_worktree_procs(&table, needle, me, &[]),
+            7,
+            "nothing registered: nothing is excused"
+        );
+    }
+
+    /// core#936, end to end on the real process table and the real registry: a child of THIS
+    /// process with the worktree on its argv is not counted while an [`InfraGuard`] holds it, and
+    /// counts again once the guard is dropped.
+    #[cfg(unix)]
+    #[test]
+    fn core_936_a_registered_bridge_is_not_counted_while_registered() {
+        let dir = std::env::temp_dir().join(format!("wicked-936-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // `read` is a shell builtin, so the shell is the only process (no grandchild to leak); it
+        // blocks on the piped stdin until the test closes it (codex r1).
+        // spawn-audit: test-only — a long-lived child whose argv names the worktree.
+        let mut bridge = std::process::Command::new("sh")
+            .args(["-c", "read x", "bridge"])
+            .arg(&dir)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh runs");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let guard = InfraGuard::register(bridge.id(), 0);
+        let registered = outstanding_in(&dir).expect("the process table is readable");
+        drop(guard);
+        let unregistered = outstanding_in(&dir).expect("the process table is readable");
+        drop(bridge.stdin.take());
+        let _ = bridge.kill();
+        let _ = bridge.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(registered, 0, "registered infrastructure is the engine's");
+        assert_eq!(unregistered, 1, "unregistered, it counts");
     }
 }
