@@ -7429,6 +7429,8 @@ impl AcpStepRunner {
                                      this turn does not adopt it (core#935)"
                                 );
                                 eprintln!("{why}");
+                                // Nothing ran on this turn, so no gate was armed for it.
+                                let governed = false;
                                 return StepOutput {
                                     run_id: input.run_id.clone(),
                                     unit_ix: input.unit_ix,
@@ -7438,7 +7440,7 @@ impl AcpStepRunner {
                                     usage: None,
                                     files: Vec::new(),
                                     tools: Vec::new(),
-                                    governed: false,
+                                    governed,
                                 };
                             }
                         }
