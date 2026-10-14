@@ -878,9 +878,7 @@ fn launch_preset_into(e: &Engine, run: &str, workflow: &str, inbox: &std::path::
             base_ref: None,
             project_id: None,
             problem: "x3 preset launch".into(),
-            // (core#934) A third seat for the contract's critique: the PA (`a`) authored the
-            // outline and the draft sits on another seat, so the reviewer must be neither.
-            clis: vec![cli("a"), cli("b"), cli("c")],
+            clis: vec![cli("a"), cli("b")],
             entity_mode: crate::EntityMode::Shared,
             session_id: run.into(),
             human_confirm: HumanConfirm::None,
@@ -937,7 +935,7 @@ fn x3_a_preset_steps_declared_deliverable_is_the_engines_floor() {
                 turn(&pa_output("drafted"), None)
             }
             // (core#934) The contract's critique, added to the draft plan by the floor.
-            "critique" => turn(&pa_output("PASS the draft reads well"), None),
+            "critique" => turn(&pa_output("the draft reads well\nVERDICT: PASS"), None),
             _ => hold(),
         }
     });
