@@ -392,7 +392,7 @@ impl FloorUnarmed {
             FloorUnarmed::NeedsContainerFloor => {
                 "needs_container_floor: this seat's tool calls were checked over ACP, which is \
                  removed; on the interim host floor (WICKED_SEAT_FLOOR=host) nothing would check \
-                 them — run with the container floor (the default), or use a claude seat"
+                 them — run with the container floor (the default), or use a claude or codex seat"
             }
         }
     }

@@ -1720,10 +1720,10 @@ impl AcpStepRunner {
 const NO_MONITORS: &str = "team monitors ran over ACP, which is removed from the seats (C5); \
      they are not available until the headless carrier hosts them";
 
-/// (C5, codex c5-r1) A governed unit whose seat's tool calls were governed ONLY over ACP (pi,
-/// opencode: `acp_input_governance`, not claude, whose gate hook rides the wrapped carrier) has
-/// nothing checking its tool calls on the interim host floor once ACP is gone: refused (fail
-/// closed), never run unchecked. Under the container floor the seat container is its floor.
+/// (C5, codex c5-r1..r4) On the interim host floor, a governed unit whose seat's tool calls were
+/// checked over ACP (pi, opencode, copilot, agy, …: everything but claude's gate hook and codex's
+/// own bounded sandbox) has nothing checking them once ACP is gone: refused (fail closed), never
+/// run unchecked. Under the container floor the seat container is its floor.
 fn host_floor_needs_acp(input: &StepInput) -> Option<String> {
     if input.governance.is_none() || crate::container_floor::container_mode() {
         return None;
@@ -1739,12 +1739,11 @@ fn host_floor_needs_acp(input: &StepInput) -> Option<String> {
     let run_root = wicked_apps_core::spawn::SeatCli::from_binary(&binary)
         .root_name()
         .map(str::to_string);
-    let is_claude = run_root.as_deref() == Some("claude");
-    let acp_class = |key: &str| {
-        seat_governance_class(key) == wicked_council::GovernanceClass::AcpInputGovernance
-    };
-    let acp_only = !is_claude && (acp_class(cli) || run_root.as_deref().is_some_and(acp_class));
-    acp_only.then(|| cli.to_string())
+    // Fail closed (codex c5-r4): on the interim host floor only claude (its gate hook) and codex
+    // (its own bounded sandbox, judged by the wrapped carrier) keep a per-call check without ACP;
+    // every other seat lost its command fences with the ACP permission handler.
+    let keeps_a_check = matches!(run_root.as_deref(), Some("claude") | Some("codex"));
+    (!keeps_a_check).then(|| cli.to_string())
 }
 
 /// (C5, codex c5-r2; core#755) Whether an `ok` turn is really a provider's refusal: no tool call,
@@ -2050,6 +2049,11 @@ mod tests {
             Some("opencode")
         );
         assert_eq!(host_floor_needs_acp(&unit("claude", true)), None);
+        assert_eq!(host_floor_needs_acp(&unit("codex", true)), None);
+        assert_eq!(
+            host_floor_needs_acp(&unit("copilot", true)).as_deref(),
+            Some("copilot")
+        );
         assert_eq!(host_floor_needs_acp(&unit("pi", false)), None);
         // The binary that RUNS decides (codex c5-r2): pi on a claude seat is refused.
         let mut disguised = unit("claude", true);
