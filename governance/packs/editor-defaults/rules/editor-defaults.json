@@ -49,6 +49,23 @@
       }
     },
     {
+      "id": "EDITOR-BUILTIN-THEME",
+      "rule_type": "policy",
+      "statement": "A first-party editor (a wicked-* id whose entry hash is the one shipped in studio's bundle) may change the theme of the artifact it opens (protocol 2 theme.set), as a new version the user can undo. A pack editor asks. This is its own rule, not a widening of EDITOR-BUILTIN, because the boot seed is insert-only: a store seeded before artifact.theme existed keeps its EDITOR-BUILTIN and gains this rule at the next boot.",
+      "severity": "info",
+      "confidence": 1.0,
+      "steering_type": "security",
+      "applies_to": ["editor-origin:first-party"],
+      "effect": "allow",
+      "trigger": { "contains": "\"permission\":\"artifact\\.theme\"" },
+      "criteria": "first-party editors may change an artifact's theme as a new version",
+      "provenance": {
+        "source": "filesystem",
+        "ref": "governance/packs/editor-defaults/rules/editor-defaults.json#EDITOR-BUILTIN-THEME",
+        "source_kinds": ["doc"]
+      }
+    },
+    {
       "id": "EDITOR-OPEN-DEFAULTS",
       "rule_type": "policy",
       "statement": "Every editor, third-party included, may read the artifact it opens, point at parts of it, contribute notes marked as its own, and go full screen without being asked. Everything else asks until the operator allows it.",

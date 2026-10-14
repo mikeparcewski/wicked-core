@@ -4589,6 +4589,7 @@ mod tests {
             [
                 "EDITOR-BUILTIN",
                 "EDITOR-BUILTIN-PAGE-MEDIA",
+                "EDITOR-BUILTIN-THEME",
                 "EDITOR-GRANTS",
                 "EDITOR-OPEN-DEFAULTS",
                 "MCP-FIRST-USE",
