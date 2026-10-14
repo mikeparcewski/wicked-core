@@ -599,7 +599,12 @@ pub(crate) fn ensure_netns_image(rt: &Runtime) -> Result<String, String> {
 
 /// Build `df` alone (no build context) as `tag`, streaming the runtime's progress to the engine's
 /// stderr. `Err` carries the runtime's last words.
-fn build_image(rt: &Runtime, df: &str, tag: &str, build_args: &[String]) -> Result<String, String> {
+pub(crate) fn build_image(
+    rt: &Runtime,
+    df: &str,
+    tag: &str,
+    build_args: &[String],
+) -> Result<String, String> {
     let tag = tag.to_string();
     let mut c = rt.cmd();
     c.args(["build", "--label", &format!("{SEAT_LABEL}=1")]);
@@ -2001,16 +2006,15 @@ impl Drop for GatewayLease {
 /// Pure handoff used by arm: mint the unit placeholder, render its files, and register exactly
 /// what the CLI will send. Keeping the raw key local avoids accidentally registering just the
 /// signature segment of a Codex JWT.
-fn credential_kind_for_network(
-    cli: &str,
-    online: bool,
-) -> Result<Option<crate::seat_credentials::CredentialKind>, String> {
-    if !online {
-        return Ok(None);
+/// Whether an online seat of `cli` has a gateway credential route at all (offline seats need
+/// none). Which credential it presents is the agent's sign-in, read from the broker at arm time.
+fn gateway_route_defined(cli: &str, online: bool) -> Result<(), String> {
+    if online && !matches!(cli, "claude" | "codex" | "pi" | "opencode") {
+        return Err(format!(
+            "no gateway credential route is defined for seat {cli}"
+        ));
     }
-    let credential_env = format!("WICKED_SEAT_CREDENTIAL_{}", cli.to_ascii_uppercase());
-    let value = std::env::var(&credential_env).ok();
-    crate::seat_credentials::CredentialKind::for_cli(cli, value.as_deref()).map(Some)
+    Ok(())
 }
 
 fn placeholder_handoff(
@@ -2151,7 +2155,7 @@ pub(crate) fn arm(
     }));
     // The seat's only egress: the daemon's gateway, attached to its network as `agw`, with a
     // fresh placeholder key. No gateway dir (an engine with no state home) = no egress at all.
-    let kind = credential_kind_for_network(cli, gateway_dir.is_some() && network != "none")
+    gateway_route_defined(cli, gateway_dir.is_some() && network != "none")
         .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
     let (env, files, lease) = match gateway_dir.filter(|_| network != "none") {
         Some(dir) => {
@@ -2161,6 +2165,11 @@ pub(crate) fn arm(
             // expired between runs is refreshed before the seat starts).
             #[cfg(unix)]
             crate::seat_refresh::start(&rt, &gw, dir);
+            // The agent's sign-in (DES §6): the user signed in once in its login container, and
+            // the broker holds that credential. The seat's placeholder takes its shape and its
+            // requests ride its route; signed out (or expired) = refused before the seat starts.
+            let kind = crate::seat_login::seat_credential_kind(&rt, &gw, dir, cli)
+                .map_err(|e| (FloorUnarmed::AgentSignedOut, e))?;
             crate::seat_gateway::attach(&rt, &gw, &network).map_err(down)?;
             // The seat's namespace: a sidecar allows output only to the gateway's own address on
             // its ports (an internal network alone still reaches the VM host's services).
@@ -2172,8 +2181,6 @@ pub(crate) fn arm(
                 "{run_id}#{ord}@{}",
                 &uuid::Uuid::new_v4().simple().to_string()[..8]
             );
-            // codex lg-r1 #6: offline supported images need no gateway credential kind.
-            let kind = kind.expect("online credential selection");
             let (key, env, files) = placeholder_handoff(cli, kind, run_id, &unit);
             let since = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2807,8 +2814,11 @@ mod tests {
     #[test]
     fn offline_copilot_image_needs_no_credential_kind() {
         assert!(seat_package("copilot").is_some());
-        assert_eq!(credential_kind_for_network("copilot", false).unwrap(), None);
-        assert!(credential_kind_for_network("copilot", true).is_err());
+        assert!(gateway_route_defined("copilot", false).is_ok());
+        assert!(gateway_route_defined("copilot", true).is_err());
+        for cli in ["claude", "codex", "pi", "opencode"] {
+            assert!(gateway_route_defined(cli, true).is_ok(), "{cli}");
+        }
     }
 
     #[test]
@@ -2877,7 +2887,11 @@ mod tests {
             "test-run",
             "test-unit",
         );
-        assert!(files.is_empty());
+        // An empty record over a stale OAuth placeholder; the key rides the env only.
+        assert_eq!(
+            files,
+            vec![(PathBuf::from(".credentials.json"), "{}".to_string())]
+        );
         assert!(env
             .iter()
             .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == &key.key));

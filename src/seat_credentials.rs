@@ -16,21 +16,6 @@ pub(crate) enum CredentialKind {
     ProviderKey,
 }
 
-impl CredentialKind {
-    /// Parse the value of WICKED_SEAT_CREDENTIAL_<CLI>, without reading any config home.
-    pub(crate) fn for_cli(cli: &str, value: Option<&str>) -> Result<Self, String> {
-        match (cli, value) {
-            ("claude", None | Some("oauth")) => Ok(Self::ClaudeOauth),
-            ("claude", Some("apikey")) => Ok(Self::ClaudeApiKey),
-            ("codex", None | Some("chatgpt")) => Ok(Self::CodexChatgpt),
-            ("codex", Some("apikey")) => Ok(Self::CodexApiKey),
-            ("pi" | "opencode", None | Some("key") | Some("apikey")) => Ok(Self::ProviderKey),
-            // Do not echo an invalid environment value: it could be a misplaced credential.
-            _ => Err(format!("unsupported credential kind for seat {cli}")),
-        }
-    }
-}
-
 const ACCOUNT_ID: &str = "acct-PLACEHOLDER";
 
 /// The exact apiKey value to register, excluding the HTTP `Bearer ` prefix. Codex sends the
@@ -72,8 +57,10 @@ pub(crate) fn placeholder_files(
                 "subscriptionType": "max"
             }}),
         ),
-        // Claude API-key mode is selected by ANTHROPIC_API_KEY, not an OAuth file.
-        ("claude", CredentialKind::ClaudeApiKey) => return Vec::new(),
+        // Claude API-key mode is selected by ANTHROPIC_API_KEY, not an OAuth file. The file is
+        // still written, with no OAuth record, so a seat home an earlier unit of the run used
+        // under an OAuth sign-in keeps no stale placeholder there (agy c6-r1).
+        ("claude", CredentialKind::ClaudeApiKey) => (".credentials.json", json!({})),
         ("codex", CredentialKind::CodexChatgpt) => {
             let jwt = sent_bearer(cli, kind, unit_key);
             (
@@ -215,7 +202,10 @@ mod tests {
 
     #[test]
     fn api_key_modes_use_the_unit_key_without_oauth_tokens() {
-        assert!(placeholder_files("claude", CredentialKind::ClaudeApiKey, KEY, URL).is_empty());
+        let claude = placeholder_files("claude", CredentialKind::ClaudeApiKey, KEY, URL);
+        assert_eq!(claude.len(), 1);
+        assert_eq!(claude[0].0, PathBuf::from(".credentials.json"));
+        assert_eq!(claude[0].1, "{}", "no OAuth record, no key in the file");
         assert_eq!(
             sent_bearer("claude", CredentialKind::ClaudeApiKey, KEY),
             KEY
@@ -244,41 +234,6 @@ mod tests {
                 sent_bearer(cli, kind, "wk-test-PLACEHOLDER-unit-2")
             );
         }
-    }
-
-    #[test]
-    fn credential_selection_defaults_overrides_and_invalid_values() {
-        for (cli, default, alternate) in [
-            (
-                "claude",
-                CredentialKind::ClaudeOauth,
-                CredentialKind::ClaudeApiKey,
-            ),
-            (
-                "codex",
-                CredentialKind::CodexChatgpt,
-                CredentialKind::CodexApiKey,
-            ),
-            (
-                "pi",
-                CredentialKind::ProviderKey,
-                CredentialKind::ProviderKey,
-            ),
-            (
-                "opencode",
-                CredentialKind::ProviderKey,
-                CredentialKind::ProviderKey,
-            ),
-        ] {
-            assert_eq!(CredentialKind::for_cli(cli, None).unwrap(), default);
-            assert_eq!(
-                CredentialKind::for_cli(cli, Some("apikey")).unwrap(),
-                alternate
-            );
-            assert!(CredentialKind::for_cli(cli, Some("PLACEHOLDER-invalid")).is_err());
-        }
-        assert!(CredentialKind::for_cli("pi", Some("oauth")).is_err());
-        assert!(CredentialKind::for_cli("claude", Some("chatgpt")).is_err());
     }
 
     #[test]
