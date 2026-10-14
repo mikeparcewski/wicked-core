@@ -1,0 +1,73 @@
+# yaml-language-server: $schema=https://agentgateway.dev/schema/config
+# spike-container-floor: agentgateway as the CREDENTIAL BROKER (operator decision 2026-10-13).
+# The real credentials (FAKE here) live on the broker volume, mounted ONLY into this gateway at /broker.
+# Seats hold a PLACEHOLDER; each model route strips whatever the seat sent and injects the broker's value.
+# backendAuth file references are watched: the broker's refresher rewrites the file, no restart, no seat change.
+#   :4001 Anthropic (claude, OAuth bearer)   :4002 OpenAI/ChatGPT (codex: access token + account header)
+#   :4003 pi provider key                    :4004 opencode provider key        :3000 CONNECT allowlist
+config:
+  logging:
+    format: json
+binds:
+- port: 3000
+  tunnelProtocol: connect
+  listeners: []
+- port: 4001
+  listeners:
+  - routes:
+    - name: anthropic-broker
+      policies:
+        requestHeaderModifier:
+          remove: [x-api-key]
+        backendAuth:
+          key:
+            value: {file: /broker/anthropic.token}
+      backends:
+      - host: scf-upstream:47413
+- port: 4002
+  listeners:
+  - routes:
+    - name: openai-broker
+      policies:
+        requestHeaderModifier:
+          set:
+            chatgpt-account-id: acct-FAKE-REAL-0001
+        backendAuth:
+          key:
+            value: {file: /broker/openai.token}
+      backends:
+      - host: scf-upstream:47413
+- port: 4003
+  listeners:
+  - routes:
+    - name: pi-broker
+      policies:
+        backendAuth:
+          key:
+            value: {file: /broker/pi.token}
+      backends:
+      - host: scf-upstream:47413
+- port: 4004
+  listeners:
+  - routes:
+    - name: opencode-broker
+      policies:
+        backendAuth:
+          key:
+            value: {file: /broker/opencode.token}
+      backends:
+      - host: scf-upstream:47413
+gateways:
+  secure:
+    port: 443
+    listeners:
+    - name: public-egress
+      hostname: "*"
+      protocol: TLS
+tcpRoutes:
+- name: egress-allowlist
+  gateways: secure/public-egress
+  hostnames:
+  - registry.npmjs.org
+  backends:
+  - dynamic: {}

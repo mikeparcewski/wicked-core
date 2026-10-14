@@ -72,8 +72,19 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const REAP_TIMEOUT: Duration = Duration::from_secs(20);
 const SWEEP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// The gateway's listeners a seat may connect to: CONNECT 3000, Anthropic 4000, OpenAI 4001,
-/// the ask MCP 8700 and the gate hook 8711 ([`crate::seat_gateway`], [`crate::hook_relay`]).
-pub(crate) const GATEWAY_PORTS: &[u16] = &[3000, 4000, 4001, 8700, crate::hook_relay::HOOK_PORT];
+/// ChatGPT 4002, pi 4003, opencode 4004, Claude OAuth 4005, the ask MCP 8700 and the gate hook
+/// 8711 ([`crate::seat_gateway`], [`crate::hook_relay`]).
+pub(crate) const GATEWAY_PORTS: &[u16] = &[
+    3000,
+    4000,
+    4001,
+    4002,
+    4003,
+    4004,
+    4005,
+    8700,
+    crate::hook_relay::HOOK_PORT,
+];
 /// The engine's trusted launcher, from the floor image mounted read-only at [`FLOOR_DIR`]: the
 /// seat's entrypoint, so no code from the seat image runs before the floor holds.
 const SEAT_ENTRY: &str = "/floor/launch";
@@ -597,7 +608,7 @@ fn build_image(rt: &Runtime, df: &str, tag: &str, build_args: &[String]) -> Resu
     }
     c.args(["-t", &tag, "-"]);
     c.stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
+        .stdout(Stdio::null()) // crew E1: stdout is seat-login argv JSON only.
         .stderr(Stdio::piped());
     #[cfg(unix)]
     {
@@ -1473,6 +1484,427 @@ fn operator_user() -> String {
     }
 }
 
+/// One seat's gateway identity: its unit key, its env, and its placeholder credential files.
+type SeatCredential = (
+    crate::seat_gateway::UnitKey,
+    Vec<(String, String)>,
+    Vec<(PathBuf, String)>,
+);
+
+/// The env variable naming `cli`'s configuration home, where its placeholder files go.
+fn config_home_env(cli: &str) -> Option<&'static str> {
+    match cli {
+        "claude" => Some("CLAUDE_CONFIG_DIR"),
+        "codex" => Some("CODEX_HOME"),
+        "pi" => Some("PI_CODING_AGENT_DIR"),
+        "opencode" => Some("XDG_CONFIG_HOME"),
+        "copilot" => Some("COPILOT_HOME"),
+        _ => None,
+    }
+}
+
+// codex lg-r1 #1: anchor every operation to a directory opened without following
+// links. A seat renaming a parent cannot redirect an engine write to a host file.
+#[cfg(unix)]
+fn private_dir(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    if !path.is_absolute() {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    let mut dir = std::fs::File::open("/")?;
+    for part in path.components() {
+        let std::path::Component::Normal(name) = part else {
+            if matches!(part, std::path::Component::RootDir) {
+                continue;
+            }
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        };
+        let name = std::ffi::CString::new(name.as_bytes())?;
+        // SAFETY: the live directory fd and NUL-terminated component remain valid.
+        let fd = unsafe {
+            libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o700);
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a new owned fd.
+        dir = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    Ok(dir)
+}
+
+#[cfg(unix)]
+fn write_private_file(path: &Path, body: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let dir =
+        private_dir(path.parent().ok_or("no credential parent")?).map_err(|e| e.to_string())?;
+    let name = std::ffi::CString::new(path.file_name().ok_or("no credential name")?.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let tmp =
+        std::ffi::CString::new(format!(".wicked-{}.tmp", uuid::Uuid::new_v4().simple())).unwrap();
+    // symlink_metadata refuses the supplied destination; fstatat repeats that check
+    // against the pinned directory so parent renames cannot redirect the operation.
+    let check = || -> Result<(), String> {
+        match std::fs::symlink_metadata(path) {
+            Ok(m) if m.file_type().is_file() => {}
+            Ok(_) => return Err("credential destination is not a regular file".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the live directory fd, name and output buffer remain valid.
+        let result = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result == 0 {
+            // SAFETY: successful fstatat initialized the buffer.
+            let metadata = unsafe { metadata.assume_init() };
+            if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
+                return Err("credential destination is not a regular file".into());
+            }
+        } else if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(())
+    };
+    check()?;
+    // O_CREAT | O_EXCL implements create_new(true) relative to the pinned directory;
+    // std OpenOptions has no directory-relative open, and macOS /dev/fd cannot do this.
+    // SAFETY: the directory fd and unique name remain valid.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            tmp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: openat returned a new owned fd.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let result = (|| {
+        file.write_all(body).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        check()?;
+        // SAFETY: both names and the pinned directory fd are live.
+        if unsafe {
+            libc::renameat(
+                dir.as_raw_fd(),
+                tmp.as_ptr(),
+                dir.as_raw_fd(),
+                name.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        // SAFETY: this is our exclusively created temporary entry.
+        unsafe {
+            libc::unlinkat(dir.as_raw_fd(), tmp.as_ptr(), 0);
+        }
+    }
+    result
+}
+
+#[cfg(not(unix))]
+fn write_private_file(_path: &Path, _body: &[u8]) -> Result<(), String> {
+    Err("container credential homes require Unix".into())
+}
+
+#[cfg(unix)]
+fn read_seed(source: &Path, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let path = source.join(name);
+    if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
+        return Ok(None);
+    }
+    let dir = private_dir(source)?;
+    let name = std::ffi::CString::new(name)?;
+    // codex lg-r1 #4: a seed swapped for an auth-file link is never followed.
+    // SAFETY: the directory fd and NUL-terminated name remain valid.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: openat returned a new owned fd.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "config seed is not a regular file"
+    );
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= 1024 * 1024, "config seed exceeds size limit");
+    Ok(Some(bytes))
+}
+
+#[cfg(not(unix))]
+fn read_seed(_source: &Path, _name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    anyhow::bail!("container config seeds require Unix")
+}
+
+fn seed_container_settings(
+    cli: wicked_apps_core::spawn::SeatCli,
+    source: &Path,
+    target: &Path,
+) -> anyhow::Result<()> {
+    use wicked_apps_core::spawn::SeatCli;
+    // codex lg-r1 #4: copy permitted preferences, never an auth file or credential
+    // property. CLI configuration can embed keys, so its whole document is not a seed.
+    let (name, fields): (&str, &[&str]) = match cli {
+        SeatCli::Codex => (
+            "config.toml",
+            &[
+                "model",
+                "model_reasoning_effort",
+                "model_reasoning_summary",
+                "model_verbosity",
+                "personality",
+            ],
+        ),
+        SeatCli::Claude => (
+            "settings.json",
+            &["model", "alwaysThinkingEnabled", "effortLevel"],
+        ),
+        SeatCli::Pi => (
+            "settings.json",
+            &[
+                "defaultProvider",
+                "defaultModel",
+                "defaultThinkingLevel",
+                "theme",
+            ],
+        ),
+        _ => return Ok(()),
+    };
+    if target.join(name).exists() {
+        return Ok(());
+    }
+    let Some(bytes) = read_seed(source, name)? else {
+        return Ok(());
+    };
+    let input = std::str::from_utf8(&bytes)?;
+    let bytes = if cli == SeatCli::Codex {
+        let parsed: toml::Table =
+            toml::from_str(input).map_err(|_| anyhow::anyhow!("invalid TOML config seed"))?;
+        let selected: toml::Table = parsed
+            .into_iter()
+            .filter(|(k, v)| {
+                fields.contains(&k.as_str()) && (v.is_str() || v.is_bool() || v.is_integer())
+            })
+            .collect();
+        toml::to_string(&selected)?.into_bytes()
+    } else {
+        let parsed: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(input).map_err(|_| anyhow::anyhow!("invalid JSON config seed"))?;
+        let selected: serde_json::Map<String, serde_json::Value> = parsed
+            .into_iter()
+            .filter(|(k, v)| {
+                fields.contains(&k.as_str()) && (v.is_string() || v.is_boolean() || v.is_number())
+            })
+            .collect();
+        serde_json::to_vec(&selected)?
+    };
+    write_private_file(&target.join(name), &bytes).map_err(anyhow::Error::msg)
+}
+
+// codex lg-r1 #4: shared only within one run/seat/posture; never seed credentials.
+// This per-unit launcher has no run-end hook. Run homes remain for session resume until
+// the worker home is cleaned; unit cleanup must not delete another live unit's home.
+pub(crate) fn container_seat_config(
+    config: wicked_apps_core::spawn::SeatConfig,
+    run: &str,
+    posture: &str,
+) -> anyhow::Result<wicked_apps_core::spawn::SeatConfig> {
+    use wicked_apps_core::spawn::SeatConfig;
+    let SeatConfig::Isolated {
+        cli,
+        root: Some(root),
+        set,
+        strip,
+    } = config
+    else {
+        anyhow::bail!("container seats require an isolated config home");
+    };
+    let run_name: String = run
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-_".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // The digest avoids sanitized-name collisions across runs.
+    use sha2::{Digest, Sha256};
+    let suffix = format!("{:x}", Sha256::digest(run.as_bytes()));
+    // The seat root is the engine's own worker-home path: resolve its existing ancestors (macOS
+    // `/var` -> `/private/var`) so the no-follow walk below only refuses links the seat could
+    // plant under it.
+    let base = crate::worker_sandbox::canon_lenient(&root).unwrap_or_else(|| root.clone());
+    let target = base
+        .join(".wicked-container")
+        .join(format!("{run_name}-{}", &suffix[..12]))
+        .join(posture);
+    #[cfg(unix)]
+    private_dir(&target)?;
+    // Explicit non-credential documents supplied by seat homes. Config/auth JSON and TOML
+    // can embed keys; they are deliberately not copied wholesale.
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        if !target.join(name).exists() {
+            if let Some(bytes) = read_seed(&root, name)? {
+                write_private_file(&target.join(name), &bytes).map_err(anyhow::Error::msg)?;
+            }
+        }
+    }
+    seed_container_settings(cli, &root, &target)?;
+    let set = set
+        .into_iter()
+        .map(|(env, p)| {
+            let rel = p.strip_prefix(&root).expect("seat config paths are rooted");
+            (env, target.join(rel))
+        })
+        .collect();
+    Ok(SeatConfig::Isolated {
+        cli,
+        root: Some(target),
+        set,
+        strip,
+    })
+}
+
+// agy lg-r1 A1: Claude/Codex auth and Pi models.json have fixed paths under
+// their session home. OpenCode accepts OPENCODE_CONFIG, so only it uses per-unit files.
+static CONFIG_IN_USE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+#[derive(Debug)]
+pub(crate) struct ConfigHomeGuard(PathBuf);
+
+impl Drop for ConfigHomeGuard {
+    fn drop(&mut self) {
+        CONFIG_IN_USE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|p| p != &self.0);
+    }
+}
+
+pub(crate) fn claim_config_home(cli: &str, home: &Path) -> Result<Option<ConfigHomeGuard>, String> {
+    if cli == "opencode" {
+        return Ok(None);
+    }
+    let mut live = CONFIG_IN_USE.lock().unwrap_or_else(|p| p.into_inner());
+    if live.iter().any(|p| p == home) {
+        return Err(format!("concurrent {cli} unit refused: shared run config home is already in use (fixed credential path)"));
+    }
+    live.push(home.to_path_buf());
+    Ok(Some(ConfigHomeGuard(home.to_path_buf())))
+}
+
+pub(crate) fn write_unit_seat_files(
+    cmd: &mut Command,
+    cli: &str,
+    files: &[(PathBuf, String)],
+) -> Result<(), String> {
+    if cli != "opencode" || files.is_empty() {
+        return write_seat_files(cmd, cli, files);
+    }
+    let env = config_home_env(cli).ok_or("no credential home")?;
+    let home = cmd
+        .get_envs()
+        .find(|(k, _)| *k == env)
+        .and_then(|(_, v)| v)
+        .map(PathBuf::from)
+        .ok_or("no credential home")?;
+    let unit = format!(".wicked-units/{}", uuid::Uuid::new_v4().simple());
+    let scoped = files
+        .iter()
+        .map(|(p, b)| (PathBuf::from(&unit).join(p), b.clone()))
+        .collect::<Vec<_>>();
+    write_seat_files(cmd, cli, &scoped)?;
+    let file = home.join("opencode").join(&scoped[0].0);
+    cmd.env("OPENCODE_CONFIG", file);
+    Ok(())
+}
+
+/// Write a seat's placeholder credential `files` into its configuration home as `cmd` names it,
+/// private (0600). Refused unless that home is inside the engine's worker home: a placeholder
+/// never lands in (or overwrites a real credential in) an operator's own configuration.
+pub(crate) fn write_seat_files(
+    cmd: &Command,
+    cli: &str,
+    files: &[(PathBuf, String)],
+) -> Result<(), String> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let var = config_home_env(cli)
+        .ok_or_else(|| format!("no placeholder credential path is defined for `{cli}`"))?;
+    let home = cmd
+        .get_envs()
+        .find(|(k, _)| *k == var)
+        .and_then(|(_, v)| v)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("the seat's {var} is not set"))?;
+    let base = wicked_apps_core::spawn::worker_home_base().map_err(|e| e.to_string())?;
+    let home_c = crate::worker_sandbox::canon_lenient(&home).unwrap_or(home.clone());
+    let base_c = crate::worker_sandbox::canon_lenient(&base).unwrap_or(base);
+    if !home_c.starts_with(&base_c) {
+        return Err(format!(
+            "the seat's {var} ({}) is not an engine worker home; its placeholder credential is \
+             never written there",
+            home.display()
+        ));
+    }
+    for (rel, body) in files {
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "placeholder path {} escapes the config home",
+                rel.display()
+            ));
+        }
+        // codex lg-r1 #5: XDG names the parent of opencode's config directory.
+        let home = if cli == "opencode" {
+            home.join("opencode")
+        } else {
+            home.clone()
+        };
+        let path = home.join(rel);
+        write_private_file(&path, body.as_bytes())?;
+    }
+    Ok(())
+}
+
 /// A seat armed in the container floor: the wrapper, the argv to run after it, the runtime that
 /// armed it (by file name: `docker`, `podman`, `nerdctl`).
 #[derive(Debug)]
@@ -1486,6 +1918,9 @@ pub(crate) struct ArmedContainer {
     /// The env the seat reaches the gateway with (its placeholder key, the model base URLs,
     /// the CONNECT proxy); empty for an offline seat.
     pub(crate) env: Vec<(String, String)>,
+    /// Placeholder files, relative to this seat's isolated CLI config home. The runner writes
+    /// them; arming never touches a CLI home or a provider credential.
+    pub(crate) files: Vec<(PathBuf, String)>,
     /// The seat's gateway registration, released after the unit ([`GatewayLease::release`]).
     pub(crate) lease: Option<GatewayLease>,
 }
@@ -1561,6 +1996,40 @@ impl Drop for GatewayLease {
     fn drop(&mut self) {
         self.revoke();
     }
+}
+
+/// Pure handoff used by arm: mint the unit placeholder, render its files, and register exactly
+/// what the CLI will send. Keeping the raw key local avoids accidentally registering just the
+/// signature segment of a Codex JWT.
+fn credential_kind_for_network(
+    cli: &str,
+    online: bool,
+) -> Result<Option<crate::seat_credentials::CredentialKind>, String> {
+    if !online {
+        return Ok(None);
+    }
+    let credential_env = format!("WICKED_SEAT_CREDENTIAL_{}", cli.to_ascii_uppercase());
+    let value = std::env::var(&credential_env).ok();
+    crate::seat_credentials::CredentialKind::for_cli(cli, value.as_deref()).map(Some)
+}
+
+fn placeholder_handoff(
+    cli: &str,
+    kind: crate::seat_credentials::CredentialKind,
+    run: &str,
+    unit: &str,
+) -> SeatCredential {
+    let mut key = crate::seat_gateway::UnitKey::new(run, unit, cli);
+    let files = crate::seat_credentials::placeholder_files(
+        cli,
+        kind,
+        &key.key,
+        &crate::seat_gateway::credential_gateway_url(cli, kind),
+    );
+    key.bearer = crate::seat_credentials::sent_bearer(cli, kind, &key.key);
+    key.key = key.bearer.clone();
+    let env = crate::seat_gateway::seat_env_for(cli, kind, &key.bearer);
+    (key, env, files)
 }
 
 fn tool_name(cli: &Path) -> &'static str {
@@ -1682,10 +2151,16 @@ pub(crate) fn arm(
     }));
     // The seat's only egress: the daemon's gateway, attached to its network as `agw`, with a
     // fresh placeholder key. No gateway dir (an engine with no state home) = no egress at all.
-    let (env, lease) = match gateway_dir.filter(|_| network != "none") {
+    let kind = credential_kind_for_network(cli, gateway_dir.is_some() && network != "none")
+        .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
+    let (env, files, lease) = match gateway_dir.filter(|_| network != "none") {
         Some(dir) => {
             let down = |e: String| (FloorUnarmed::GatewayUnavailable, e);
             let gw = crate::seat_gateway::ensure_gateway(&rt, dir).map_err(down)?;
+            // The broker's one refresher runs beside this daemon's gateway (a credential that
+            // expired between runs is refreshed before the seat starts).
+            #[cfg(unix)]
+            crate::seat_refresh::start(&rt, &gw, dir);
             crate::seat_gateway::attach(&rt, &gw, &network).map_err(down)?;
             // The seat's namespace: a sidecar allows output only to the gateway's own address on
             // its ports (an internal network alone still reaches the VM host's services).
@@ -1697,7 +2172,9 @@ pub(crate) fn arm(
                 "{run_id}#{ord}@{}",
                 &uuid::Uuid::new_v4().simple().to_string()[..8]
             );
-            let key = crate::seat_gateway::UnitKey::new(run_id, &unit, cli);
+            // codex lg-r1 #6: offline supported images need no gateway credential kind.
+            let kind = kind.expect("online credential selection");
+            let (key, env, files) = placeholder_handoff(cli, kind, run_id, &unit);
             let since = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs().saturating_sub(1).to_string())
@@ -1713,9 +2190,9 @@ pub(crate) fn arm(
                 since,
             };
             crate::seat_gateway::register_live(&rt, &gw, dir, key.clone()).map_err(down)?;
-            (crate::seat_gateway::seat_env_all(&key.key), Some(lease))
+            (env, files, Some(lease))
         }
-        None => (Vec::new(), None),
+        None => (Vec::new(), Vec::new(), None),
     };
     let user = operator_user();
     let workdir = inp.cwd.canonicalize().unwrap_or_else(|_| inp.cwd.clone());
@@ -1753,6 +2230,7 @@ pub(crate) fn arm(
         tool: tool_name(&rt.cli),
         cleanup,
         env,
+        files,
         lease,
     })
 }
@@ -2138,6 +2616,271 @@ mod windows_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    fn c4_temp() -> PathBuf {
+        let base = wicked_apps_core::spawn::hermetic_test_worker_home();
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = base
+            .canonicalize()
+            .unwrap()
+            .join(format!("c4-{}", uuid::Uuid::new_v4().simple()));
+        private_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn fixed_auth_homes_refuse_concurrency_and_guard_releases_on_every_exit() {
+        let home = c4_temp();
+        for cli in ["claude", "codex", "pi"] {
+            let guard = claim_config_home(cli, &home).unwrap();
+            assert!(claim_config_home(cli, &home)
+                .unwrap_err()
+                .contains("already in use"));
+            assert!(claim_config_home(cli, &home.join("other-posture")).is_ok());
+            drop(guard);
+            assert!(claim_config_home(cli, &home).is_ok());
+            let _ = std::panic::catch_unwind(|| {
+                let _held = claim_config_home(cli, &home).unwrap();
+                panic!("injected early exit");
+            });
+            assert!(claim_config_home(cli, &home).is_ok());
+        }
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn opencode_units_keep_separate_placeholders_in_shared_session_home() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let home = c4_temp();
+        let make = |key: &str| {
+            let mut cmd = Command::new("opencode");
+            cmd.env("XDG_CONFIG_HOME", &home);
+            write_unit_seat_files(
+                &mut cmd,
+                "opencode",
+                &[("opencode.json".into(), key.to_string())],
+            )
+            .unwrap();
+            cmd.get_envs()
+                .find(|(k, _)| *k == "OPENCODE_CONFIG")
+                .and_then(|(_, v)| v)
+                .map(PathBuf::from)
+                .unwrap()
+        };
+        let first = make("PLACEHOLDER-first");
+        let second = make("PLACEHOLDER-second");
+        assert_ne!(first, second);
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            "PLACEHOLDER-first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "PLACEHOLDER-second"
+        );
+        assert!(claim_config_home("opencode", &home).unwrap().is_none());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn image_build_stdout_is_null_so_login_argv_stays_json_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = c4_temp();
+        let runtime = home.join("runtime");
+        std::fs::write(&runtime, "#!/bin/sh\ncat > /dev/null\n[ /dev/stdout -ef /dev/null ] || exit 77\nprintf 'FAKE-build-progress\n'\n").unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            build_image(
+                &Runtime { cli: runtime },
+                "FAKE-dockerfile",
+                "FAKE-tag",
+                &[]
+            )
+            .unwrap(),
+            "FAKE-tag"
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn planted_temp_destination_and_parent_links_cannot_redirect_placeholder_writes() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = c4_temp();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "FAKE-untouched").unwrap();
+        symlink(&victim, dir.join("auth.wicked-new")).unwrap();
+        write_private_file(&dir.join("auth.json"), b"PLACEHOLDER").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "FAKE-untouched");
+        assert_eq!(
+            std::fs::metadata(dir.join("auth.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        std::fs::remove_file(dir.join("auth.json")).unwrap();
+        symlink(&victim, dir.join("auth.json")).unwrap();
+        assert!(write_private_file(&dir.join("auth.json"), b"bad").is_err());
+        symlink(&dir, dir.join("parent-link")).unwrap();
+        assert!(write_private_file(&dir.join("parent-link/other.json"), b"bad").is_err());
+        std::fs::create_dir(dir.join("directory.json")).unwrap();
+        assert!(write_private_file(&dir.join("directory.json"), b"bad").is_err());
+        assert!(!dir.join("other.json").exists());
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "FAKE-untouched");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn container_homes_share_within_run_posture_and_preserve_host_credentials() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        use wicked_apps_core::spawn::{SeatCli, SeatConfig};
+        let dir = c4_temp();
+        std::fs::write(dir.join("auth.json"), "FAKE-host-credential").unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "permitted instructions").unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "model = 'FAKE-model'\napi_key = 'FAKE-host-key'",
+        )
+        .unwrap();
+        let config = SeatConfig::Isolated {
+            cli: SeatCli::Codex,
+            root: Some(dir.clone()),
+            set: vec![("CODEX_HOME", dir.clone())],
+            strip: vec![],
+        };
+        let first = container_seat_config(config.clone(), "run/one", "full").unwrap();
+        let same = container_seat_config(config.clone(), "run/one", "full").unwrap();
+        let other = container_seat_config(config.clone(), "run/one", "read-only").unwrap();
+        let collision = container_seat_config(config, "run_one", "full").unwrap();
+        assert_eq!(first.root(), same.root());
+        assert_ne!(first.root(), other.root());
+        assert_ne!(first.root(), collision.root());
+        let private = first.root().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(private.join("AGENTS.md")).unwrap(),
+            "permitted instructions"
+        );
+        assert!(!private.join("auth.json").exists());
+        let seeded = std::fs::read_to_string(private.join("config.toml")).unwrap();
+        assert!(seeded.contains("FAKE-model"));
+        assert!(!seeded.contains("api_key"));
+        assert!(!seeded.contains("FAKE-host-key"));
+        let mut cmd = Command::new("unused");
+        first.apply(&mut cmd);
+        write_seat_files(&cmd, "codex", &[("auth.json".into(), "PLACEHOLDER".into())]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("auth.json")).unwrap(),
+            "FAKE-host-credential"
+        );
+        assert!(!other.root().unwrap().join("auth.json").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn opencode_placeholder_uses_the_xdg_app_subdirectory() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = c4_temp();
+        let mut cmd = Command::new("unused");
+        cmd.env("XDG_CONFIG_HOME", &dir);
+        write_seat_files(
+            &cmd,
+            "opencode",
+            &[("opencode.json".into(), "PLACEHOLDER".into())],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("opencode/opencode.json")).unwrap(),
+            "PLACEHOLDER"
+        );
+        assert!(!dir.join("opencode.json").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn offline_copilot_image_needs_no_credential_kind() {
+        assert!(seat_package("copilot").is_some());
+        assert_eq!(credential_kind_for_network("copilot", false).unwrap(), None);
+        assert!(credential_kind_for_network("copilot", true).is_err());
+    }
+
+    #[test]
+    fn placeholder_handoff_registers_exact_file_credentials_and_separate_units() {
+        use crate::seat_credentials::CredentialKind;
+        for (cli, kind, pointer) in [
+            (
+                "claude",
+                CredentialKind::ClaudeOauth,
+                "/claudeAiOauth/accessToken",
+            ),
+            (
+                "codex",
+                CredentialKind::CodexChatgpt,
+                "/tokens/access_token",
+            ),
+            ("codex", CredentialKind::CodexApiKey, "/OPENAI_API_KEY"),
+            (
+                "pi",
+                CredentialKind::ProviderKey,
+                "/providers/openai/apiKey",
+            ),
+            (
+                "opencode",
+                CredentialKind::ProviderKey,
+                "/provider/openai/options/apiKey",
+            ),
+        ] {
+            let (key, env, files) = placeholder_handoff(cli, kind, "test-run", "test-unit-1");
+            let (other, _, _) = placeholder_handoff(cli, kind, "test-run", "test-unit-2");
+            let credential: serde_json::Value = serde_json::from_str(&files[0].1).unwrap();
+            assert_eq!(
+                credential.pointer(pointer).unwrap().as_str().unwrap(),
+                key.key
+            );
+            assert_eq!(key.key, key.bearer);
+            assert_ne!(key.key, other.key);
+            assert!(!format!("{key:?}").contains(&key.bearer));
+            let config = crate::seat_gateway::GatewayConfig {
+                units: vec![key.clone()],
+                ..Default::default()
+            };
+            let rendered = crate::seat_gateway::render(&config);
+            for bind in rendered["binds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .take(config.providers.len())
+            {
+                let auth = &bind["listeners"][0]["routes"][0]["policies"]["apiKey"];
+                assert_eq!(auth["keys"][0]["key"], key.bearer);
+                assert_eq!(auth["keys"][0]["metadata"]["unit"], "test-unit-1");
+            }
+            if matches!(
+                kind,
+                CredentialKind::ClaudeOauth | CredentialKind::CodexChatgpt
+            ) {
+                assert!(!env
+                    .iter()
+                    .any(|(k, _)| k == "OPENAI_API_KEY" || k == "ANTHROPIC_API_KEY"));
+            }
+        }
+        let (key, env, files) = placeholder_handoff(
+            "claude",
+            CredentialKind::ClaudeApiKey,
+            "test-run",
+            "test-unit",
+        );
+        assert!(files.is_empty());
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == &key.key));
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("wicked-cf-{tag}-{}", std::process::id()));
