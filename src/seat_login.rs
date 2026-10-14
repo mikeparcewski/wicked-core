@@ -1165,14 +1165,13 @@ mod tests {
     #[cfg(unix)]
     impl FakeRuntime {
         fn new() -> Self {
-            use std::os::unix::fs::PermissionsExt;
             let dir = std::env::temp_dir()
                 .join(format!(".c4-login-test-{}", uuid::Uuid::new_v4().simple()));
             std::fs::create_dir_all(&dir).unwrap();
             let gw = Gateway::for_dir(&dir);
             let path = dir.join("runtime");
             // Offline stand-in: it records argv and stdin; it never invokes a container runtime.
-            std::fs::write(
+            crate::test_env::install_stub(
                 &path,
                 r#"#!/bin/sh
 base=${0%/*}
@@ -1227,9 +1226,7 @@ case "$last" in
   *) exit 0;;
 esac
 "#,
-            )
-            .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            );
             std::fs::create_dir(dir.join("broker")).unwrap();
             std::fs::write(dir.join("volumes"), format!("{}\n", volumes(&gw).1)).unwrap();
             Self {
@@ -1822,9 +1819,11 @@ esac
     fn sign_out_refuses_unsettled_writer_before_emptying_any_credentials() {
         let fake = FakeRuntime::new();
         std::fs::create_dir_all(fake.dir.join("refresh")).unwrap();
+        // Unique: cleanup `pkill -f`s / `pgrep -f`s the name host-wide, so a fixed one would hit
+        // (or wait on) a parallel test's runtime calls carrying a name it prefixes.
         std::fs::write(
             crate::seat_gateway::unsettled_path(&fake.dir, "claude"),
-            "wicked-mutation-FAKE",
+            format!("wicked-mutation-FAKE{}", uuid::Uuid::new_v4().simple()),
         )
         .unwrap();
         std::fs::write(fake.dir.join("fail_cleanup"), "").unwrap();

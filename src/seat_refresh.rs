@@ -292,10 +292,29 @@ pub(crate) fn open_mutation_lock(dir: &Path) -> Result<std::fs::File, String> {
         .map_err(|e| e.to_string())
 }
 
-pub(crate) fn mutation_lock(dir: &Path) -> Result<std::fs::File, String> {
+/// The held broker mutation lock. Dropping it UNLOCKS before it closes: an `flock` belongs to the
+/// open file description, and a child that another thread forks while the lock is held shares
+/// that description until its exec, so a bare close could leave the lock held after its owner
+/// is done (a concurrent refresher then saw `Busy` for a free broker). An explicit unlock
+/// releases it for every descriptor sharing the description.
+pub(crate) struct MutationLock(std::fs::File);
+
+impl Drop for MutationLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+pub(crate) fn mutation_lock(dir: &Path) -> Result<MutationLock, String> {
     let file = open_mutation_lock(dir)?;
     file.lock().map_err(|e| e.to_string())?;
-    Ok(file)
+    Ok(MutationLock(file))
+}
+
+/// [`mutation_lock`] without waiting: `None` when it cannot be taken now (another owner holds it).
+pub(crate) fn try_mutation_lock(dir: &Path) -> Result<Option<MutationLock>, String> {
+    let file = open_mutation_lock(dir)?;
+    Ok(file.try_lock().ok().map(|()| MutationLock(file)))
 }
 
 pub(crate) fn pending_path(dir: &Path, cli: &str) -> PathBuf {
@@ -635,10 +654,9 @@ mod live {
         cli: &str,
         force: bool,
     ) -> Result<Outcome, String> {
-        let lock = open_mutation_lock(dir)?;
-        if lock.try_lock().is_err() {
+        let Some(_lock) = try_mutation_lock(dir)? else {
             return Ok(Outcome::Busy);
-        }
+        };
         crate::seat_gateway::cleanup_mutations(rt, dir)?;
         if crate::seat_login::complete_sign_out(rt, gw, dir, cli)? {
             return Ok(Outcome::NotRefreshable);
@@ -810,11 +828,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn token_answer_uses_attached_stdio_without_runtime_logging() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("c4-post-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let runtime = dir.join("runtime");
-        std::fs::write(
+        crate::test_env::install_stub(
             &runtime,
             r#"#!/bin/sh
 base=${0%/*}
@@ -824,9 +841,7 @@ printf '%s\n' "$*" > "$base/argv"
 cat > "$base/request"
 printf '{"access_token":"FAKE-answer","refresh_token":"FAKE-R2"}'
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let rt = crate::container_floor::Runtime { cli: runtime };
         let _lock = mutation_lock(&dir).unwrap();
         let answer = live::post_json(
@@ -939,6 +954,24 @@ printf '{"access_token":"FAKE-answer","refresh_token":"FAKE-R2"}'
             Outcome::Busy
         );
         drop(lock);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// core-ci-red: a child forked by another thread while the lock is held shares its open file
+    /// description until its exec. The owner's drop must free the broker anyway; a bare close
+    /// left the `flock` held, and a concurrent refresh read `Busy` (an `Ok`) for a free broker.
+    #[cfg(unix)]
+    #[test]
+    fn a_dropped_mutation_lock_is_free_while_a_forked_child_shares_its_descriptor() {
+        let dir =
+            std::env::temp_dir().join(format!("c4-lock-share-{}", uuid::Uuid::new_v4().simple()));
+        let lock = mutation_lock(&dir).unwrap();
+        // What the forked child holds: a duplicate of the same open file description.
+        let inherited = lock.0.try_clone().unwrap();
+        assert!(try_mutation_lock(&dir).unwrap().is_none());
+        drop(lock);
+        assert!(try_mutation_lock(&dir).unwrap().is_some());
+        drop(inherited);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -795,6 +795,14 @@ struct ConfigTransaction {
     _file: fs::File,
 }
 
+impl Drop for ConfigTransaction {
+    // Unlock before the close, as `seat_refresh::MutationLock` does: a child forked meanwhile
+    // shares the `flock`'d description until its exec, and would keep the lock past this owner.
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+    }
+}
+
 fn config_transaction(dir: &Path) -> Result<ConfigTransaction, String> {
     let publishing = PUBLISH_LOCK
         .lock()
@@ -1981,12 +1989,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn timed_out_writer_cleanup_is_confirmed_or_blocks_next_mutation() {
-        use std::os::unix::fs::PermissionsExt;
         let dir =
             std::env::temp_dir().join(format!(".c4-helper-test-{}", uuid::Uuid::new_v4().simple()));
         fs::create_dir_all(&dir).unwrap();
         let runtime = dir.join("runtime");
-        fs::write(
+        crate::test_env::install_stub(
             &runtime,
             r#"#!/bin/sh
 base=${0%/*}
@@ -2011,9 +2018,7 @@ if [ "$last" = stall ]; then exec sleep 5; fi
 cat > /dev/null
 rm -f "$base/live"
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let rt = Runtime { cli: runtime };
         let _lock = crate::seat_refresh::mutation_lock(&dir).unwrap();
         fs::write(dir.join("fail_cleanup"), "").unwrap();
@@ -2086,16 +2091,13 @@ rm -f "$base/live"
     #[cfg(unix)]
     #[test]
     fn an_orphaned_runtime_client_is_stopped_before_removal_is_confirmed() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("c4-orphan-{}", uuid::Uuid::new_v4().simple()));
         fs::create_dir_all(&dir).unwrap();
         let runtime = dir.join("runtime");
-        fs::write(
+        crate::test_env::install_stub(
             &runtime,
             "#!/bin/sh\nprintf 'No such container\\n' >&2; exit 1\n",
-        )
-        .unwrap();
-        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let rt = Runtime { cli: runtime };
         let name = format!("wicked-mutation-{}", uuid::Uuid::new_v4().simple());
         // A stand-in for the dead owner's client: a live host process whose argv names it.
@@ -2121,10 +2123,9 @@ rm -f "$base/live"
     #[cfg(unix)]
     #[test]
     fn abandoned_helper_is_removed_before_a_new_writer_can_start() {
-        use std::os::unix::fs::PermissionsExt;
         let temp = TempDir::new();
         let rt_path = temp.0.join("runtime");
-        fs::write(
+        crate::test_env::install_stub(
             &rt_path,
             r#"#!/bin/sh
 base=${0%/*}
@@ -2139,16 +2140,20 @@ fi
 [ ! -e "$base/live" ] || exit 92
 cat > "$base/written"
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(&rt_path, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let rt = Runtime { cli: rt_path };
         let _lock = crate::seat_refresh::mutation_lock(&temp.0).unwrap();
-        // Model a dead process: its runtime-owned writer and pre-spawn marker survive it.
+        // Model a dead process: its runtime-owned writer and pre-spawn marker survive it. The
+        // name is unique: cleanup `pkill -f`s and `pgrep -f`s it across the whole host, so a name
+        // shared with a parallel test would kill (or wait on) that test's runtime calls.
+        let dead = format!(
+            "wicked-mutation-FAKE-dead-{}",
+            uuid::Uuid::new_v4().simple()
+        );
         fs::write(temp.0.join("live"), "FAKE-late-writer").unwrap();
         crate::seat_refresh::create_private_file(
             &unsettled_path(&temp.0, "claude"),
-            b"wicked-mutation-FAKE-dead",
+            dead.as_bytes(),
         )
         .unwrap();
         cleanup_mutations(&rt, &temp.0).unwrap();
@@ -2164,18 +2169,9 @@ cat > "$base/written"
         assert!(!unsettled_path(&temp.0, "claude").exists());
         assert_eq!(fs::read(temp.0.join("written")).unwrap(), b"FAKE-new");
         let calls = fs::read_to_string(temp.0.join("calls")).unwrap();
-        assert!(
-            calls.find("rm --force wicked-mutation-FAKE-dead").unwrap()
-                < calls
-                    .find("container inspect wicked-mutation-FAKE-dead")
-                    .unwrap()
-        );
-        assert!(
-            calls
-                .find("container inspect wicked-mutation-FAKE-dead")
-                .unwrap()
-                < calls.find("run --name").unwrap()
-        );
+        let inspect = calls.find(&format!("container inspect {dead}")).unwrap();
+        assert!(calls.find(&format!("rm --force {dead}")).unwrap() < inspect);
+        assert!(inspect < calls.find("run --name").unwrap());
     }
 
     #[cfg(unix)]
@@ -2193,10 +2189,8 @@ cat > "$base/written"
         .unwrap();
         register_unit(&temp.0, revoked.clone()).unwrap();
         mark_revoking(&temp.0, [revoked.key.clone()]).unwrap();
-        use std::os::unix::fs::PermissionsExt;
         let runtime = temp.0.join("runtime");
-        fs::write(&runtime, "#!/bin/sh\ncat > /dev/null\n").unwrap();
-        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_env::install_stub(&runtime, "#!/bin/sh\ncat > /dev/null\n");
         route_sign_in(
             &Runtime { cli: runtime },
             &Gateway::for_dir(&temp.0),
@@ -2255,6 +2249,9 @@ cat > "$base/written"
         let mut config = load_config(&temp.0).unwrap();
         config.units.clear();
         persist_units(&temp.0, &config).unwrap();
+        // Unlock, not only close: a child another test thread forked meanwhile shares the
+        // description until its exec and would keep the lock (ConfigTransaction does the same).
+        lock.unlock().unwrap();
         drop(lock);
         let status = child.wait().unwrap();
         assert!(started && blocked && status.success());
@@ -2312,7 +2309,6 @@ cat > "$base/written"
     #[cfg(unix)]
     #[test]
     fn adopting_running_gateway_initializes_missing_files_before_first_publish() {
-        use std::os::unix::fs::PermissionsExt;
         let _env = crate::test_env::ENV_LOCK
             .read()
             .unwrap_or_else(|p| p.into_inner());
@@ -2325,7 +2321,7 @@ cat > "$base/written"
         fs::create_dir(temp.0.join("served-broker")).unwrap();
         fs::write(temp.0.join("served-broker/openai.token"), "FAKE-preserved").unwrap();
         let rt_path = temp.0.join("runtime");
-        fs::write(
+        crate::test_env::install_stub(
             &rt_path,
             r#"#!/bin/sh
 base=${0%/*}
@@ -2350,9 +2346,7 @@ case "$last" in
   *) exit 1;;
 esac
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(&rt_path, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let rt = Runtime { cli: rt_path };
         ensure_gateway(&rt, &temp.0).unwrap();
         let calls = fs::read_to_string(temp.0.join("calls")).unwrap();

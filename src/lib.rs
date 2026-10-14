@@ -126,6 +126,35 @@ mod write_posture;
 #[cfg(test)]
 pub(crate) mod test_env {
     pub(crate) static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// Install an executable test stub (mode 0700) at `path` WITHOUT this process ever holding a
+    /// writable descriptor to it. A stub written in-process can fail its first exec with
+    /// `ETXTBSY` on Linux: a child that another test thread forks while the write is open keeps
+    /// a writable copy of the descriptor until its own exec. A `/bin/sh` child writes the file
+    /// instead, and every writer has exited once it returns, so every later exec succeeds.
+    #[cfg(unix)]
+    pub(crate) fn install_stub(path: &std::path::Path, body: &str) {
+        use std::io::Write;
+        // spawn-audit: test-only — `/bin/sh` writes the test's own stub file.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 700 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn /bin/sh to write a test stub");
+        child
+            .stdin
+            .take()
+            .expect("stub stdin")
+            .write_all(body.as_bytes())
+            .expect("write the test stub");
+        let status = child.wait().expect("wait for the stub writer");
+        assert!(
+            status.success(),
+            "could not install the stub {}",
+            path.display()
+        );
+    }
 }
 
 pub use acp_runner::AcpStepRunner;
