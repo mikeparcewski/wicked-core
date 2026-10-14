@@ -855,7 +855,9 @@ fn x1_r2_m2_a_restart_after_the_scope_fold_decides_the_plan_not_completes_the_ru
     let tp = v.session.team_plan.unwrap();
     assert_eq!((tp.rev, tp.max_score), (2, 10), "the scoped plan is rev 2");
     let ids: Vec<String> = v.units.iter().map(|u| u.id.clone()).collect();
-    assert_eq!(ids, ["xm2:pa-scope", "xm2:draft"]);
+    // (core#934) The run's default contract requires a distinct evaluator: the scoped draft plan
+    // gains its critique whatever its band.
+    assert_eq!(ids, ["xm2:pa-scope", "xm2:draft", "xm2:critique"]);
     release_all(&w2);
 }
 
@@ -932,6 +934,8 @@ fn x3_a_preset_steps_declared_deliverable_is_the_engines_floor() {
                 }
                 turn(&pa_output("drafted"), None)
             }
+            // (core#934) The contract's critique, added to the draft plan by the floor.
+            "critique" => turn(&pa_output("the draft reads well\nVERDICT: PASS"), None),
             _ => hold(),
         }
     });

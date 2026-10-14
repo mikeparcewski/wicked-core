@@ -717,6 +717,9 @@ pub enum PlanRefusal {
     /// The override removes a floor phase whose entry carries a validator pin, in a high-risk
     /// band (§8.5).
     OverrideRemovesPinned { catalog: String },
+    /// (core#934) The override removes the only evaluator of a creator plan whose run contract
+    /// requires a distinct evaluator.
+    OverrideRemovesRequiredEvaluator { catalog: String },
     /// The override names a catalog id the catalog does not define.
     OverrideUnknownEntry { catalog: String },
     /// The override names a catalog id that is not a phase of the computed floor: there is
@@ -778,6 +781,9 @@ impl PlanRefusal {
             PlanRefusal::InvalidDef(_) => "invalid_def",
             PlanRefusal::OverrideInAutoMode => "override_in_auto_mode",
             PlanRefusal::OverrideRemovesPinned { .. } => "override_removes_pinned",
+            PlanRefusal::OverrideRemovesRequiredEvaluator { .. } => {
+                "override_removes_required_evaluator"
+            }
             PlanRefusal::OverrideUnknownEntry { .. } => "override_unknown_entry",
             PlanRefusal::OverrideNotInFloor { .. } => "override_not_in_floor",
             PlanRefusal::FloorReordered { .. } => "floor_reordered",
@@ -893,6 +899,11 @@ impl std::fmt::Display for PlanRefusal {
             PlanRefusal::OverrideRemovesPinned { catalog } => write!(
                 f,
                 "{r}: the override removes {catalog}, a pinned floor phase, in a high-risk band"
+            ),
+            PlanRefusal::OverrideRemovesRequiredEvaluator { catalog } => write!(
+                f,
+                "{r}: the override removes {catalog}, the plan's only evaluator, and the run's \
+                 assurance contract requires a distinct evaluator"
             ),
             PlanRefusal::OverrideUnknownEntry { catalog } => write!(
                 f,
@@ -1312,7 +1323,16 @@ pub struct FloorInput<'a> {
     /// revision's done prefix; empty at compose). The walkthrough-after-last-creator rule reads
     /// the plan in RUNNING order: the done prefix, then every other step in plan order.
     pub ran: &'a [String],
+    /// (core#934) The run's assurance contract enforces a distinct evaluator
+    /// ([`crate::assurance::RunAssurance::enforces`]`(DISTINCT_EVALUATOR)`): a plan with a creator
+    /// step and no evaluator step owes one whatever its band (`review`, or `critique` on a non-code
+    /// plan) — the contract, not the score, says the work is reviewed.
+    pub requires_evaluator: bool,
 }
+
+/// (core#934) The floor reason of the evaluator step a run's assurance contract adds.
+pub const CONTRACT_EVALUATOR_REASON: &str =
+    "the run's assurance contract requires a distinct evaluator";
 
 /// (WT-C3) One obligation of a held `plan.compose` testing rule that fired for the run: the rule
 /// and the token it requires (`step:walkthrough`). Persisted on the run's plan state (the
@@ -1492,6 +1512,42 @@ pub fn floor_fill(
             exempt.push(c);
         }
     }
+    // (core#934) THE CONTRACT FLOOR. A run that requires a distinct evaluator completed with no
+    // review at all (run be4759e5: its PA planned `pa-scope` + `draft`, the unbound run scored the
+    // lowest band, whose floor has no review, and every gate allowed with `ran: []`). A plan with
+    // a creator step and no evaluator step — authored or in the floor — owes one under such a
+    // contract. Added AFTER the override is validated, so a floor override cannot remove it.
+    let evaluator_type =
+        |c: &str| entry(c).is_some_and(|e| e.role == crate::workflow::PhaseRole::Evaluator);
+    let mut contract_floor: Option<String> = None;
+    if input.requires_evaluator && creator && !plan.steps.iter().any(|s| evaluator_type(&s.catalog))
+    {
+        // (codex r1) An override that exempts the band's own evaluator would leave the plan
+        // unreviewed just the same: refused.
+        // …only when it removes the LAST one (codex r2): an exempted optional evaluator (a
+        // walkthrough pair) beside the band's review leaves the plan reviewed.
+        let kept = floor
+            .iter()
+            .any(|t| evaluator_type(t) && !exempt.contains(&t.as_str()));
+        if let (false, Some(t)) = (
+            kept,
+            floor
+                .iter()
+                .find(|t| evaluator_type(t) && exempt.contains(&t.as_str())),
+        ) {
+            return Err(PlanRefusal::OverrideRemovesRequiredEvaluator { catalog: t.clone() });
+        }
+        if !floor.iter().any(|t| evaluator_type(t)) {
+            if let Some(ty) = floor_types(catalog, plan, &["review"], false)
+                .into_iter()
+                .next()
+            {
+                floor.push(ty.clone());
+                floor.sort_by_key(|t| order(t));
+                contract_floor = Some(ty);
+            }
+        }
+    }
     let mut steps: Vec<PlanStep> = plan.steps.clone();
     for s in &mut steps {
         s.added_by = Some(AddedBy::Plan);
@@ -1538,6 +1594,9 @@ pub fn floor_fill(
         let floor_rule = rule_of(ty);
         let floor_reason = match &floor_rule {
             Some(rule) => format!("rule {rule} requires {ty}"),
+            None if contract_floor.as_deref() == Some(ty.as_str()) => {
+                CONTRACT_EVALUATOR_REASON.to_string()
+            }
             None => format!("band {} requires {ty}", row.band),
         };
         steps.insert(
@@ -2979,6 +3038,7 @@ mod tests {
                     deliver,
                     obligations: &[],
                     ran: &[],
+                    requires_evaluator: false,
                 },
             )
         }
@@ -3015,6 +3075,161 @@ mod tests {
 
         fn phase_ids(f: &FloorFilled) -> Vec<&str> {
             f.def.phases.iter().map(|p| p.id.as_str()).collect()
+        }
+
+        fn fill_contract(
+            p: &PlanSteps,
+            score: u8,
+            hc: &HumanConfirm,
+            requires_evaluator: bool,
+        ) -> Result<FloorFilled, PlanRefusal> {
+            floor_fill(
+                crate::catalog::catalog(),
+                p,
+                FloorInput {
+                    score,
+                    destructive: false,
+                    human_confirm: hc,
+                    deliver: None,
+                    obligations: &[],
+                    ran: &[],
+                    requires_evaluator,
+                },
+            )
+        }
+
+        /// core#934, run be4759e5: an unbound Slides draft whose PA planned `pa-scope` + `draft`
+        /// scored the lowest band (no review in its floor), so the run completed with no review
+        /// although its contract required a distinct evaluator and a judge. Under such a contract
+        /// a plan with a creator and no evaluator owes one at ANY band: `critique` on a non-code
+        /// plan, `review` on a code plan, after the creator, with the contract as its reason.
+        #[test]
+        fn core_934_a_contract_that_requires_an_evaluator_adds_one_to_an_unreviewed_plan() {
+            let draft = plan(json!({"steps": [
+                {"catalog": "understand", "id": "pa-scope"},
+                {"catalog": "produce", "id": "draft"}
+            ]}));
+            let f = fill_contract(&draft, 0, &AUTO, true).unwrap();
+            assert_eq!(
+                rows(&f),
+                vec![
+                    row("understand", "pa-scope", AddedBy::Plan, None),
+                    row("produce", "draft", AddedBy::Plan, None),
+                    row(
+                        "critique",
+                        "critique",
+                        AddedBy::Floor,
+                        Some(CONTRACT_EVALUATOR_REASON)
+                    ),
+                ],
+                "the deck draft is reviewed"
+            );
+            let build = plan(json!({"steps": [{"catalog": "build", "id": "fix"}]}));
+            let f = fill_contract(&build, 0, &AUTO, true).unwrap();
+            assert!(
+                rows(&f).contains(&row(
+                    "review",
+                    "review",
+                    AddedBy::Floor,
+                    Some(CONTRACT_EVALUATOR_REASON)
+                )),
+                "{:?}",
+                rows(&f)
+            );
+            // Control: the same plans without the contract are filled as before.
+            assert_eq!(
+                rows(&fill_contract(&draft, 0, &AUTO, false).unwrap()).len(),
+                2,
+                "no contract, no added review"
+            );
+        }
+
+        /// core#934: the contract floor adds nothing to a plan that already has an evaluator (its
+        /// own, or one the band put in), and a manual floor override cannot remove it.
+        #[test]
+        fn core_934_the_contract_evaluator_is_added_once_and_cannot_be_overridden_away() {
+            let reviewed = plan(json!({"steps": [
+                {"catalog": "produce", "id": "draft"},
+                {"catalog": "critique", "id": "critique"}
+            ]}));
+            let f = fill_contract(&reviewed, 0, &AUTO, true).unwrap();
+            assert_eq!(
+                f.steps
+                    .steps
+                    .iter()
+                    .filter(|s| s.catalog == "critique")
+                    .count(),
+                1
+            );
+            // Band 20+ already floors a review: the contract adds no second one.
+            let build = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+            let banded = fill_contract(&build, 30, &AUTO, true).unwrap();
+            assert_eq!(
+                banded
+                    .steps
+                    .steps
+                    .iter()
+                    .filter(|s| s.catalog == "review")
+                    .count(),
+                1
+            );
+            assert!(banded
+                .steps
+                .steps
+                .iter()
+                .all(|s| s.floor_reason.as_deref() != Some(CONTRACT_EVALUATOR_REASON)));
+            let overridden = plan(json!({
+                "steps": [{"catalog": "produce", "id": "draft"}],
+                "override": {"remove": ["critique"], "reason": "no review wanted"}
+            }));
+            assert!(
+                fill_contract(&overridden, 0, &MANUAL, true).is_err(),
+                "a floor override cannot remove the review the contract requires"
+            );
+            // (codex r2) Removing an OPTIONAL evaluator (a rule's `test`) beside the band's
+            // review stands: the plan stays reviewed.
+            let held = [HeldObligation {
+                rule: "R-test".into(),
+                token: "step:test".into(),
+            }];
+            let optional = plan(json!({
+                "steps": [{"catalog": "build", "id": "build"}],
+                "override": {"remove": ["test"], "reason": "tests run elsewhere"}
+            }));
+            let kept = floor_fill(
+                crate::catalog::catalog(),
+                &optional,
+                FloorInput {
+                    score: 30,
+                    destructive: false,
+                    human_confirm: &MANUAL,
+                    deliver: None,
+                    obligations: &held,
+                    ran: &[],
+                    requires_evaluator: true,
+                },
+            )
+            .expect("the band's review still reviews the plan");
+            assert!(kept.steps.steps.iter().any(|s| s.catalog == "review"));
+            assert!(!kept.steps.steps.iter().any(|s| s.catalog == "test"));
+            // (codex r1) …nor the band's own review at score 30, code or non-code.
+            for (ty, step) in [("review", "build"), ("critique", "produce")] {
+                let banded_override = plan(json!({
+                    "steps": [{"catalog": step, "id": step}],
+                    "override": {"remove": [ty], "reason": "no review wanted"}
+                }));
+                assert!(
+                    matches!(
+                        fill_contract(&banded_override, 30, &MANUAL, true),
+                        Err(PlanRefusal::OverrideRemovesRequiredEvaluator { .. })
+                    ),
+                    "{ty}: the band's evaluator is the contract's too"
+                );
+                assert!(
+                    fill_contract(&banded_override, 30, &MANUAL, false).is_ok(),
+                    "{ty}: without the contract the override stands"
+                );
+            }
         }
 
         /// (core#846) A security_review in a plan where no step executes code is refused when
@@ -3062,6 +3277,7 @@ mod tests {
                     deliver: None,
                     obligations: &held,
                     ran: &[],
+                    requires_evaluator: false,
                 },
             )
             .expect_err("refused");
@@ -3085,6 +3301,7 @@ mod tests {
                     deliver: None,
                     obligations: &held,
                     ran: &[],
+                    requires_evaluator: false,
                 },
             )
             .expect("a code plan keeps its security_review");
@@ -3289,6 +3506,7 @@ mod tests {
                     deliver: None,
                     obligations: &[],
                     ran: &[],
+                    requires_evaluator: false,
                 },
             )
             .unwrap();
@@ -3681,6 +3899,7 @@ mod tests {
                     deliver: None,
                     obligations,
                     ran,
+                    requires_evaluator: false,
                 },
             )
         }

@@ -62,6 +62,7 @@ pub(crate) fn preview_plan(
     base_commit: Option<&str>,
     deliver_step: Option<&PlanStep>,
     rules: &dyn super::RuleSource,
+    requires_evaluator: bool,
 ) -> anyhow::Result<PlanPreview> {
     // The launch's synchronous checks, then its decision — the same calls, in the same order.
     if let Err(r) = super::precheck(plan, deliver_step, human_confirm) {
@@ -102,6 +103,8 @@ pub(crate) fn preview_plan(
         },
         &super::TeamPlanState {
             deliver_step: deliver_step.cloned(),
+            // (core#934, codex r1) The launch's contract floor, so the preview matches it.
+            requires_evaluator,
             ..super::TeamPlanState::default()
         },
         human_confirm,
@@ -156,7 +159,7 @@ mod tests {
     }
 
     fn preview_of(p: &PlanSteps, hc: &HumanConfirm) -> anyhow::Result<PlanPreview> {
-        preview_plan(p, hc, None, None, None, &crate::plan_gate::NoRules)
+        preview_plan(p, hc, None, None, None, &crate::plan_gate::NoRules, false)
     }
 
     fn preview(v: Value, hc: HumanConfirm) -> Value {
@@ -309,6 +312,7 @@ mod tests {
             None,
             None,
             &rules,
+            false,
         )
         .expect("a pending-scope preview is not refused by a rule the launch has not read");
         assert_eq!(p.graph, "pending_pa_scope");
@@ -321,6 +325,7 @@ mod tests {
             None,
             None,
             &rules,
+            false,
         );
         assert!(
             declared.is_err(),
@@ -387,6 +392,7 @@ mod tests {
             None,
             Some(&d),
             &crate::plan_gate::NoRules,
+            false,
         )
         .unwrap();
         assert!(p.floor.contains(&"deliver".to_string()), "{:?}", p.floor);
@@ -401,7 +407,7 @@ mod tests {
             &HumanConfirm::All,
             None,
             None,
-            Some(&d), &crate::plan_gate::NoRules,
+            Some(&d), &crate::plan_gate::NoRules, false,
         )
         .is_err());
     }
