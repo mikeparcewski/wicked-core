@@ -878,7 +878,9 @@ fn launch_preset_into(e: &Engine, run: &str, workflow: &str, inbox: &std::path::
             base_ref: None,
             project_id: None,
             problem: "x3 preset launch".into(),
-            clis: vec![cli("a"), cli("b")],
+            // (core#934) A third seat for the contract's critique: the PA (`a`) authored the
+            // outline and the draft sits on another seat, so the reviewer must be neither.
+            clis: vec![cli("a"), cli("b"), cli("c")],
             entity_mode: crate::EntityMode::Shared,
             session_id: run.into(),
             human_confirm: HumanConfirm::None,
