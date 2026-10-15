@@ -30,6 +30,16 @@ fn hermetic_process() {
         std::env::set_var("USERPROFILE", &home);
         std::env::set_var("CLAUDE_CONFIG_DIR", home.join(".claude"));
         std::env::set_var("WICKED_MEMORY_EMBEDDER", "hash");
+        // A configured host's live bus, exec mediation, skills and telemetry stay out of it.
+        for var in [
+            "WICKED_BUS_DB",
+            "WICKED_BUS_EXEC",
+            "WICKED_SKILLS_SNAPSHOT",
+            "WICKED_OTEL_ENDPOINT",
+            "WICKED_ESTATE_DB",
+        ] {
+            std::env::remove_var(var);
+        }
     }
 }
 
@@ -49,7 +59,8 @@ fn seat(key: &str, script: &std::path::Path) -> AgenticCli {
         key: key.into(),
         display_name: key.into(),
         binary: "/bin/sh".into(),
-        headless_invocation: format!("/bin/sh {} {{PROMPT}}", script.display()),
+        // Quoted: the invocation tokenizer splits on unquoted whitespace (a TMPDIR may hold spaces).
+        headless_invocation: format!("/bin/sh \"{}\" {{PROMPT}}", script.display()),
         category: Category::default(),
         input_mode: InputMode::default(),
         version_probe: vec![],
