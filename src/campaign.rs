@@ -60,12 +60,43 @@ pub struct RunSpec {
     /// `#[serde(default)]` so existing serialised `CampaignDef`s without the field deserialise as `None`.
     #[serde(default)]
     pub workflow_id: Option<String>,
+    /// (QE acceptance) SKIP a required QE acceptance on this node's Run, for this reason (non-empty)
+    /// — the campaign twin of `LaunchOptions.skipQeAcceptanceReason`: persisted on the Run's
+    /// contract (`assurance.qe`, `basis: "operator"`) and labelled on every gate and the delivery.
+    /// Refused beside `force_qe_acceptance` (at define time), and on a node whose workflow does not
+    /// require QE acceptance (when the node launches, like any launch refusal). `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_qe_acceptance_reason: Option<String>,
+    /// (QE acceptance) REQUIRE QE acceptance on this node's Run whatever its impact score says.
+    /// Same refusals as the skip. Absent (`false`) and neither field set: the node launches with no
+    /// word of its own, so the host's standing "QE acceptance off" ([`crate::Core::set_qe_acceptance_off`])
+    /// applies when it is set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force_qe_acceptance: bool,
 }
 
 impl RunSpec {
+    /// This node's own QE word (refused when it gives both a skip and a force).
+    pub(crate) fn qe_word(&self) -> Result<crate::assurance::QeOverride, String> {
+        crate::assurance::QeOverride::from_wire(
+            self.skip_qe_acceptance_reason.clone(),
+            self.force_qe_acceptance,
+        )
+    }
+
     /// Build the [`LaunchSpec`] for this node's Run under the dispatch-derived `run_id` (§2.1).
-    pub(crate) fn to_launch_spec(&self, run_id: String) -> LaunchSpec {
-        LaunchSpec {
+    /// `host` is read NOW, at the node's launch: a node with no QE word of its own runs under the
+    /// host's standing skip when QE acceptance is off at the moment it dispatches.
+    pub(crate) fn to_launch_spec(
+        &self,
+        run_id: String,
+        host: &crate::assurance::HostQeAcceptance,
+    ) -> anyhow::Result<LaunchSpec> {
+        let qe_acceptance = host.word_for(
+            self.qe_word()
+                .map_err(|e| anyhow::Error::new(crate::assurance::QeOverrideRefused(e)))?,
+        );
+        Ok(LaunchSpec {
             base_ref: None,
             problem: self.problem.clone(),
             clis: self.clis.clone(),
@@ -92,8 +123,8 @@ impl RunSpec {
             primary: None,
             reduced_assurance: false,
             deliverables: Vec::new(),
-            qe_acceptance: Default::default(),
-        }
+            qe_acceptance,
+        })
     }
 }
 
@@ -525,6 +556,20 @@ pub fn validate(def: &CampaignDef) -> Result<(), String> {
         if !ids.insert(n.node_id.as_str()) {
             return Err(format!("duplicate node id: {}", n.node_id));
         }
+        // (QE acceptance) The word's own shape is checked here, before anything persists; whether
+        // the node's workflow requires QE acceptance is the launch's to judge (a preset may change
+        // between define time and dispatch).
+        match n.run_spec.qe_word() {
+            Err(e) => return Err(format!("node {}: {e}", n.node_id)),
+            Ok(crate::assurance::QeOverride::Skip(r)) if r.trim().is_empty() => {
+                return Err(format!(
+                    "node {}: skipping QE acceptance needs a reason \
+                     (skip_qe_acceptance_reason is empty)",
+                    n.node_id
+                ))
+            }
+            Ok(_) => {}
+        }
     }
 
     let mut pairs: BTreeSet<(&str, &str)> = BTreeSet::new();
@@ -675,6 +720,8 @@ pub(crate) struct Seams<'a> {
     /// Shared lifecycle maps — passed to `cancel_run` so tool child groups are killed
     /// synchronously BEFORE `RunCancelled` is emitted (core#500 / AC2).
     pub lifecycle_maps: &'a Option<Arc<std::sync::Mutex<crate::acp_runner::ElicitationMaps>>>,
+    /// The host's standing QE word (`Core::set_qe_acceptance_off`), read as each node launches.
+    pub qe_host: &'a crate::assurance::HostQeAcceptance,
 }
 
 /// Record + fan out one event (mirrors the actor's single-emit-point helper). Both helpers now bottom
@@ -811,21 +858,23 @@ fn dispatch(
     persist(store, campaign)?;
 
     let launched = if was_ready {
-        let ls = spec.to_launch_spec(run_id.clone());
-        crate::actor::launch_run_inner(
-            store,
-            subscribers,
-            seams.runner,
-            seams.self_tx,
-            in_flight,
-            ls,
-            seams.registry,
-            seams.lifecycle_maps,
-            &None,
-            seams.process_gen,
-            false,
-        )
-        .map(|_| ())
+        spec.to_launch_spec(run_id.clone(), seams.qe_host)
+            .and_then(|ls| {
+                crate::actor::launch_run_inner(
+                    store,
+                    subscribers,
+                    seams.runner,
+                    seams.self_tx,
+                    in_flight,
+                    ls,
+                    seams.registry,
+                    seams.lifecycle_maps,
+                    &None,
+                    seams.process_gen,
+                    false,
+                )
+            })
+            .map(|_| ())
     } else {
         // ReadyToResume: re-acquire the slot, then resume the paused Run via confirm_gate (§6.5).
         let decision =
@@ -1498,20 +1547,24 @@ pub(crate) fn resume(
                     .find(|n| &n.node_id == node)
                     .map(|n| n.run_spec.clone());
                 let launched = match spec {
-                    Some(spec) => crate::actor::launch_run_inner(
-                        store,
-                        subscribers,
-                        seams.runner,
-                        seams.self_tx,
-                        in_flight,
-                        spec.to_launch_spec(run_id.clone()),
-                        seams.registry,
-                        seams.lifecycle_maps,
-                        &None,
-                        seams.process_gen,
-                        false,
-                    )
-                    .map(|_| ()),
+                    Some(spec) => spec
+                        .to_launch_spec(run_id.clone(), seams.qe_host)
+                        .and_then(|ls| {
+                            crate::actor::launch_run_inner(
+                                store,
+                                subscribers,
+                                seams.runner,
+                                seams.self_tx,
+                                in_flight,
+                                ls,
+                                seams.registry,
+                                seams.lifecycle_maps,
+                                &None,
+                                seams.process_gen,
+                                false,
+                            )
+                        })
+                        .map(|_| ()),
                     None => Err(anyhow::anyhow!("resume: unknown node {node}")),
                 };
                 if let Err(e) = launched {
@@ -1828,6 +1881,8 @@ mod tests {
                 human_confirm: HumanConfirm::None,
                 repo_ref: None,
                 workflow_id: None,
+                skip_qe_acceptance_reason: None,
+                force_qe_acceptance: false,
             },
         }
     }
@@ -2118,8 +2173,12 @@ mod tests {
             human_confirm: HumanConfirm::None,
             repo_ref: None,
             workflow_id: Some("feature".into()),
+            skip_qe_acceptance_reason: None,
+            force_qe_acceptance: false,
         };
-        let ls = spec_with.to_launch_spec("run-abc".into());
+        let ls = spec_with
+            .to_launch_spec("run-abc".into(), &Default::default())
+            .unwrap();
         assert_eq!(
             ls.workflow,
             Some("feature".into()),
@@ -2134,8 +2193,12 @@ mod tests {
             human_confirm: HumanConfirm::None,
             repo_ref: None,
             workflow_id: None,
+            skip_qe_acceptance_reason: None,
+            force_qe_acceptance: false,
         };
-        let ls_none = spec_without.to_launch_spec("run-xyz".into());
+        let ls_none = spec_without
+            .to_launch_spec("run-xyz".into(), &Default::default())
+            .unwrap();
         assert_eq!(
             ls_none.workflow, None,
             "absent workflow_id should yield LaunchSpec.workflow = None"
@@ -2369,6 +2432,7 @@ mod tests {
             registry: &registry,
             process_gen: uuid::Uuid::new_v4(),
             lifecycle_maps: &lifecycle_maps,
+            qe_host: &Default::default(),
         };
 
         let (ev_tx, ev_rx) = channel::<CoreEvent>();
@@ -2572,6 +2636,7 @@ mod tests {
             registry: &registry,
             process_gen: uuid::Uuid::new_v4(),
             lifecycle_maps: &lifecycle_maps,
+            qe_host: &Default::default(),
         };
         let mut subscribers = crate::event_log::EventSink::default();
         subscribers.push(ev_tx);

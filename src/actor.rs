@@ -786,6 +786,7 @@ pub(crate) fn run(
     elicitation_maps: Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     write_reg: WriteReg,
     team_link: crate::team::publish::TeamLink,
+    qe_host: crate::assurance::HostQeAcceptance,
 ) {
     // DES-TEAMING-002 P1: this thread's link to the team publisher. The actor never opens the
     // bus; it sends the publisher requests and waits for acknowledgements as commands.
@@ -1271,10 +1272,12 @@ pub(crate) fn run(
                         "a reduced-assurance launch must use launch_run: the straight-through \
                          path does not record the run's assurance contract"
                     )),
-                    // (QE acceptance) …and so is an explicit QE skip or force.
+                    // (QE acceptance) …and so is a QE word: an explicit skip or force, or the
+                    // host's standing skip (which only `launch_run` resolves against a contract).
                     Ok(None) if qe_acceptance != crate::assurance::QeOverride::Auto => {
                         Err(anyhow::anyhow!(
-                            "a launch that skips or forces QE acceptance must use launch_run: the \
+                            "a launch with a QE acceptance word (a skip, a force, or the host's \
+                             standing skip) must use launch_run: the \
                              straight-through path does not record the run's assurance contract"
                         ))
                     }
@@ -1609,7 +1612,9 @@ pub(crate) fn run(
                         // (QE acceptance) The operator's explicit skip or force, refused before
                         // anything persists when it is malformed or has nothing to apply to.
                         .with_qe_override(&spec.qe_acceptance)
-                        .map_err(|e| anyhow::anyhow!("the launch is refused: {e}"))?,
+                        // Typed, so the bus bridge drops a request that will never launch
+                        // instead of retrying it forever.
+                        .map_err(|e| anyhow::Error::new(crate::assurance::QeOverrideRefused(e)))?,
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
                     // — a crash between "run exists" and "run is in the project" cannot happen.
@@ -2771,8 +2776,14 @@ pub(crate) fn run(
             }
             // ── Campaign DAG scheduler (DES-CAMPAIGN-001) ────────────────────────────────────────
             Command::LaunchCampaign { def, reply } => {
-                let seams =
-                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
+                let seams = campaign_seams(
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                    &qe_host,
+                );
                 let res = crate::campaign::launch(
                     &mut store,
                     &mut subscribers,
@@ -2783,8 +2794,14 @@ pub(crate) fn run(
                 let _ = reply.send(res);
             }
             Command::ResumeCampaign { id, reply } => {
-                let seams =
-                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
+                let seams = campaign_seams(
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                    &qe_host,
+                );
                 let res = crate::campaign::resume(
                     &mut store,
                     &mut subscribers,
@@ -2795,8 +2812,14 @@ pub(crate) fn run(
                 let _ = reply.send(res);
             }
             Command::CancelCampaign { id, reply } => {
-                let seams =
-                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
+                let seams = campaign_seams(
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                    &qe_host,
+                );
                 let res = crate::campaign::cancel(
                     &mut store,
                     &mut subscribers,
@@ -2816,8 +2839,14 @@ pub(crate) fn run(
                 decision,
                 reply,
             } => {
-                let seams =
-                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
+                let seams = campaign_seams(
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                    &qe_host,
+                );
                 let res = crate::campaign::confirm_gate(
                     &mut store,
                     &mut subscribers,
@@ -2840,8 +2869,14 @@ pub(crate) fn run(
             Command::CampaignRunFinished { run_id, outcome } => {
                 // Deferred reconcile of a per-Run terminal signal (sent from the run's terminal emit
                 // points). No-op if the run isn't campaign-owned.
-                let seams =
-                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
+                let seams = campaign_seams(
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                    &qe_host,
+                );
                 if let Err(e) = crate::campaign::on_run_finished(
                     &mut store,
                     &mut subscribers,
@@ -2855,8 +2890,14 @@ pub(crate) fn run(
             }
             Command::CampaignNodeAwaiting { run_id, prompt } => {
                 // Deferred: a node's Run hit a HITL gate → free its slot + let independent work run.
-                let seams =
-                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
+                let seams = campaign_seams(
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                    &qe_host,
+                );
                 if let Err(e) = crate::campaign::on_node_awaiting(
                     &mut store,
                     &mut subscribers,
@@ -4012,6 +4053,7 @@ fn campaign_seams<'a>(
     registry: &'a crate::workflow::WorkflowRegistry,
     process_gen: uuid::Uuid,
     lifecycle_maps: &'a Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    qe_host: &'a crate::assurance::HostQeAcceptance,
 ) -> crate::campaign::Seams<'a> {
     crate::campaign::Seams {
         runner,
@@ -4019,6 +4061,7 @@ fn campaign_seams<'a>(
         registry,
         process_gen,
         lifecycle_maps,
+        qe_host,
     }
 }
 
