@@ -2466,6 +2466,16 @@ impl WrappedCliStepRunner {
                     eprintln!("wicked-core: unit {}: {why}", input.unit.ord);
                     return governance_refusal(input, &why);
                 }
+                // C5 (codex c5-r8): claude keeps the LAST `--settings`, and the engine's goes in
+                // right after the executable — a template's own would replace the gate hook. With
+                // ACP gone the hook is the only per-call check: refuse rather than run unchecked.
+                if template_overrides_settings(&argv) {
+                    let why = "the unit's claude invocation carries its own `--settings`, which \
+                               would replace the engine's gate-hook settings; a governed unit runs \
+                               with the engine's settings only — remove it from the template";
+                    eprintln!("wicked-core: unit {}: {why}", input.unit.ord);
+                    return governance_refusal(input, why);
+                }
                 match arm_input_governance(
                     input,
                     gov,
@@ -3484,6 +3494,14 @@ pub(crate) fn build_worker_command(
 /// (IG1-core-2, review) Whether `argv` — the command a unit actually launches — runs codex itself
 /// (its program's stem is `codex`) with its own sandbox in a bounded mode and no bypass flag. The
 /// seat record's class is a prediction; a wrapper or an invocation that drops the mode is refused.
+/// (C5) Whether a claude template names its own `--settings` (either spelling) — before the engine
+/// inserts its own.
+fn template_overrides_settings(argv: &[String]) -> bool {
+    argv.iter()
+        .skip(1)
+        .any(|a| a == "--settings" || a.starts_with("--settings="))
+}
+
 /// (C5) Whether a governed launch of `argv` keeps a per-call check on the interim host floor:
 /// claude (the gate hook) or codex in its own bounded sandbox (no bypass flag).
 fn host_floor_keeps_a_check(argv: &[String]) -> bool {
@@ -7312,6 +7330,23 @@ mod tests {
             "--dangerously-bypass-approvals-and-sandbox",
         ])));
         assert!(!launches_bounded_codex(&[]));
+        // C5 (codex c5-r8): a template's own `--settings` would replace the gate hook's.
+        assert!(template_overrides_settings(&v(&[
+            "claude",
+            "--settings",
+            "./team.json",
+            "-p",
+            "x"
+        ])));
+        assert!(template_overrides_settings(&v(&[
+            "claude",
+            "--settings=./team.json",
+            "-p",
+            "x"
+        ])));
+        assert!(!template_overrides_settings(&v(&[
+            "claude", "-p", "--model", "m", "x"
+        ])));
         // C5: the host-floor rule over the final argv. The hook-arming predicate decides (codex
         // c5-r7): what it does not call claude is not admitted as claude.
         assert_eq!(
