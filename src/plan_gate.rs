@@ -148,6 +148,12 @@ pub struct TeamPlanState {
     /// reads `false` (that run's plans are decided as they were).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub requires_evaluator: bool,
+    /// (core#960) The run's assurance contract enforces QE acceptance, stamped at launch from
+    /// the persisted contract, including any operator or standing skip. Every code plan this run
+    /// decides owes a test step whatever its band ([`crate::plan::FloorInput::requires_qe`]).
+    /// A state persisted before this reads `false`, preserving its prior planning behavior.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requires_qe: bool,
 }
 
 /// (WT-C3, DES-walkthrough-proof §4.12) The testing rules the engine read for one proposal at
@@ -1004,6 +1010,7 @@ pub(crate) fn decide(
             obligations: &obligations,
             ran: &[],
             requires_evaluator: prior.requires_evaluator,
+            requires_qe: prior.requires_qe,
         },
     ) {
         Ok(f) => f,
@@ -1254,6 +1261,7 @@ pub(crate) fn precheck(
 pub(crate) fn worst_case_floor_additions(
     plan: &PlanSteps,
     deliver_step: Option<&PlanStep>,
+    requires_qe: bool,
 ) -> Vec<String> {
     // A plan the launch refuses for two deliver sources is counted as authored (it never runs).
     let plan = with_default_ids(&with_deliver(plan, deliver_step).unwrap_or_else(|_| plan.clone()));
@@ -1261,6 +1269,7 @@ pub(crate) fn worst_case_floor_additions(
         crate::catalog::catalog(),
         &plan,
         deliver_step.is_some(),
+        requires_qe,
     )
 }
 
@@ -2585,42 +2594,113 @@ mod tests {
     /// §8.5's 70-100 row), with the non-code substitution and `deliver` only for a delivering run.
     #[test]
     fn worst_case_floor_additions_are_the_top_band_types_the_plan_lacks() {
-        let adds =
-            |v: serde_json::Value, d: Option<&PlanStep>| worst_case_floor_additions(&plan(v), d);
-        assert_eq!(
-            adds(json!({"steps": [{"catalog": "build"}]}), None),
-            [
-                "test_plan",
-                "design",
-                "architecture",
-                "review",
-                "security_review"
-            ]
-        );
-        assert_eq!(
-            adds(
-                json!({"steps": [{"catalog": "build"}, {"catalog": "review"}]}),
-                None
-            ),
-            ["test_plan", "design", "architecture", "security_review"]
-        );
-        // No creator step: an empty floor.
-        assert!(adds(json!({"steps": [{"catalog": "understand"}]}), None).is_empty());
-        // A non-code run: `critique` fills the review slot, and no diff-floored
-        // `security_review` (core#649).
-        assert_eq!(
-            adds(json!({"steps": [{"catalog": "produce"}]}), None),
-            ["test_plan", "design", "architecture", "critique"]
-        );
-        // A delivering run carries its deliver step, so `deliver` is never an addition.
-        let d: PlanStep = serde_json::from_value(json!({
-            "catalog": "deliver", "id": "deliver", "executor": {"type": "tool", "cmd": ["true"]}
-        }))
-        .unwrap();
-        assert_eq!(
-            adds(json!({"steps": [{"catalog": "build"}]}), Some(&d)).len(),
-            5
-        );
+        let adds = |v: serde_json::Value, d: Option<&PlanStep>, requires_qe: bool| {
+            worst_case_floor_additions(&plan(v), d, requires_qe)
+        };
+        for requires_qe in [false, true] {
+            let expected = if requires_qe {
+                vec![
+                    "test_plan",
+                    "design",
+                    "architecture",
+                    "test",
+                    "review",
+                    "security_review",
+                ]
+            } else {
+                vec![
+                    "test_plan",
+                    "design",
+                    "architecture",
+                    "review",
+                    "security_review",
+                ]
+            };
+            assert_eq!(
+                adds(json!({"steps": [{"catalog": "build"}]}), None, requires_qe),
+                expected
+            );
+            let expected = if requires_qe {
+                vec![
+                    "test_plan",
+                    "design",
+                    "architecture",
+                    "test",
+                    "security_review",
+                ]
+            } else {
+                vec!["test_plan", "design", "architecture", "security_review"]
+            };
+            assert_eq!(
+                adds(
+                    json!({"steps": [{"catalog": "build"}, {"catalog": "review"}]}),
+                    None,
+                    requires_qe
+                ),
+                expected
+            );
+            // Reserve a contract test even with an authored test: floor fill may add a writer.
+            let expected = if requires_qe {
+                vec![
+                    "test_plan",
+                    "design",
+                    "architecture",
+                    "test",
+                    "review",
+                    "security_review",
+                ]
+            } else {
+                vec![
+                    "test_plan",
+                    "design",
+                    "architecture",
+                    "review",
+                    "security_review",
+                ]
+            };
+            assert_eq!(
+                adds(
+                    json!({"steps": [{"catalog": "build"}, {"catalog": "test"}]}),
+                    None,
+                    requires_qe
+                ),
+                expected
+            );
+            // No creator step: an empty floor, even when a step does code work.
+            for catalog in ["understand", "review"] {
+                assert!(
+                    adds(json!({"steps": [{"catalog": catalog}]}), None, requires_qe).is_empty()
+                );
+            }
+            // A non-code run substitutes critique; the QE upper bound still reserves a test.
+            let expected = if requires_qe {
+                vec!["test_plan", "design", "architecture", "test", "critique"]
+            } else {
+                vec!["test_plan", "design", "architecture", "critique"]
+            };
+            assert_eq!(
+                adds(
+                    json!({"steps": [{"catalog": "produce"}]}),
+                    None,
+                    requires_qe
+                ),
+                expected
+            );
+            // A delivering run carries its deliver step, so deliver is never an addition.
+            let d: PlanStep = serde_json::from_value(json!({
+                "catalog": "deliver", "id": "deliver", "executor": {"type": "tool", "cmd": ["true"]}
+            }))
+            .unwrap();
+            assert_eq!(
+                adds(
+                    json!({"steps": [{"catalog": "build"}]}),
+                    Some(&d),
+                    requires_qe
+                )
+                .len(),
+                if requires_qe { 6 } else { 5 }
+            );
+        }
     }
 
     /// WT-C4 (DES-walkthrough-proof §4.12 S5): the shipped testing starter, read by the engine
