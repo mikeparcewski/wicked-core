@@ -15257,7 +15257,7 @@ No further next steps — both questions fully answered.";
     /// `{PROMPT}` (execute_wrapped.rs:1228), and that prompt carries `|||` and newlines — pipes and
     /// command separators to `cmd`. So Windows names a binary that cannot exist: the spawn fails
     /// fast, without a shell, and every assertion below except the execution proof still holds,
-    /// because `fallback_with_warning` prepends its warning whether or not the child runs.
+    /// because `fallback_with_warning` discloses the fallback whether or not the child runs.
     /// FINDING-060's regression, now asserted the other way round.
     ///
     /// The ACP path once armed governance the bridge never applied, so a governed unit ran with

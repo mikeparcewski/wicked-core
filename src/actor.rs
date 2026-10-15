@@ -6697,8 +6697,12 @@ fn apply_step_result(
     let clean = worktree_is_clean(session.workdir.as_deref());
     let declared_no_change = declares_no_change(&output.output);
     let left_no_change = clean || evidence.tree_changed == Some(false);
+    // The prose arm rejects only over a clean worktree (a diff is substance of its own) — except
+    // under the human-confirm exemption, where `no_prose` already means "no answer at all": an
+    // empty answer is no answer however dirty the worktree is (core#970, codex r5).
+    let prose_rejects = no_prose && (clean || human_reads_every_output);
     if output.governed
-        && ((no_prose && clean) || (code_without_diff && !declared_no_change && left_no_change))
+        && (prose_rejects || (code_without_diff && !declared_no_change && left_no_change))
     {
         const NO_SUBSTANCE: &str = "phase produced no reviewable substance";
         const NO_DIFF: &str = "executes-code phase reported done but left no change in the \
@@ -6709,7 +6713,7 @@ fn apply_step_result(
                                    it on a seat that can write, or reassign";
         // `no_prose` wins the tie so the pre-existing rejection keeps its exact record shape —
         // the new arm only ever rejects folds that previously passed.
-        let why: &'static str = if no_prose && clean {
+        let why: &'static str = if prose_rejects {
             NO_SUBSTANCE
         } else if clean {
             NO_DIFF
@@ -19633,6 +19637,41 @@ mod code_evidence_floor_tests {
         assert_eq!(unit.status, UnitStatus::Rejected);
         let why = unit.denial_reason.clone().unwrap_or_default();
         assert!(why.contains("changed nothing"), "{why}");
+    }
+
+    /// (core#970, codex r5) The human-confirm exemption accepts a SHORT answer, never an empty one —
+    /// and that holds over a dirty worktree too (an earlier phase's change is not this read-only
+    /// step's answer), where the ordinary prose arm would let any output through.
+    #[test]
+    fn an_empty_human_confirmed_answer_over_a_dirty_worktree_is_still_no_substance() {
+        for (i, output) in ["", "  \n\t "].into_iter().enumerate() {
+            let wt = git_worktree(&format!("empty-answer-dirty-{i}"));
+            std::fs::write(wt.join("design-notes.md"), "an earlier phase's change\n").unwrap();
+            let run_id = format!("empty-answer-dirty-{i}");
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed(
+                &mut store,
+                &run_id,
+                PhaseRole::Neutral,
+                false,
+                Some(wt.to_string_lossy().into_owned()),
+            );
+            let mut u = crate::domain::session_units(&store, &run_id)
+                .unwrap()
+                .remove(0);
+            u.gate = crate::workflow::GateSpec::HumanConfirm {
+                unconditional: true,
+            };
+            put_node(&mut store, u.to_node()).unwrap();
+            let mut subs = crate::event_log::EventSink::default();
+            let (_session, unit) = fold(&mut store, &mut subs, &run_id, output, true);
+            assert_eq!(unit.status, UnitStatus::Rejected, "output {output:?}");
+            assert_eq!(
+                unit.denial_reason.as_deref(),
+                Some("phase produced no reviewable substance"),
+                "output {output:?}"
+            );
+        }
     }
 
     /// …and an explicit `NO CHANGE NEEDED` line is the one way such a step passes the floor.
