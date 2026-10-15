@@ -14,6 +14,25 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Approving a `judge_unavailable` gate on a team run's build step judges the work instead of
+  re-running it (core#969).** On a teamed run every non-evaluator step the team does not own is a PA
+  step, the build step included, and the operator-as-judge arm skipped every PA step: Approve (with or
+  without a note) re-dispatched the step, whose tree its first attempt had already changed, so the
+  substance floor failed it as "changed nothing", again and again (verify-e2e r4, run 24590a4b). Now
+  only a team member's step keeps the team gate's re-run. A PA step is judged by the operator, labelled
+  on its receipt, and still pauses on the team dispute its ledger owes. The hold and the judge-required
+  denial now say what Approve does ("Approve to judge it yourself"). An empty fallback-judge answer was
+  already a seat failure (the next fallback seat, else the hold); that is unchanged and pinned.
+- **`NO CHANGE NEEDED` is read when it starts or ends a line, decorated or fused (core#929).**
+  `**NO CHANGE NEEDED** — …` and a carrier-joined `…state:NO CHANGE NEEDED` now declare it; prose
+  that only mentions it mid-sentence does not. The floor's refusal names the form.
+- **Engine notes on a unit's live output stand on their own line (core#969, core#970).** The repo
+  checks floor heartbeat, floor-fix and fallback-judge notes no longer fuse onto the seat's last
+  sentence ("…empirically.agent validator: the run's judge is out …").
+- **The ACP read-only reroute's disclosure is no longer the seat's output (core#970).** It was emitted
+  into the unit's output stream and prepended to `StepOutput.output`, so every chat answer on that
+  carrier began with "[wicked-core] unit N … F-036 / core#431" and the chat's reviewer flagged it. It
+  stays on `acpFallback` (and the daemon log). C5 removes this reroute altogether.
 - **core, core-ts: a diagnostic line no longer kills the thread that writes it (core#957).** Several
   unattended runs at once in a Node host (crew) could hang a unit in `executing`, or stop the actor
   ("core actor stopped") with no panic printed. Node hands the addon a non-blocking stderr pipe; when
