@@ -14,6 +14,31 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The container floor keeps codex on repository runs.** The worktree bench (core#769) benched every codex seat on a
+  run bound to a repository, because the account's signed requirements bundle forbids `approval_policy = "never"`, and
+  on the host codex's own sandbox sends commands for an approval nobody can give (`approval request failed`). In a
+  seat container the engine runs codex with `--sandbox danger-full-access` inside the container's own boundary, and
+  under the bundle's `on-request` fallback its commands run without an approval. So the bench now applies only off the
+  container floor (`WICKED_SEAT_FLOOR=container` keeps codex; `WICKED_CODEX_WORKTREE_OK=1` still opts out
+  anywhere). A bundle that allows only `untrusted` still refuses commands in a container, and the existing
+  `approval_unavailable` seat refusal benches that seat when it happens. `Core.worktreeBenched()` follows the same
+  rule. A decision council's ballots run the host CLIs on every floor, so they keep the bench on a bound run. Stacked
+  on the change that runs agent judges and triage in seat containers (they no longer run host codex).
+
+- **Agent judges, validator authoring and failure triage follow the seat floor.** Under the container floor these
+  engine-internal sessions ran the host CLIs (ungoverned internal calls), outside any seat container: on a host where
+  the agents are signed in only through their seat containers they failed, and they read the operator's own CLI
+  configuration. They now take the same arming path as a worker (`runs_in_seat`): a seat container with the agent's
+  brokered sign-in, the gateway as the only egress, and the floor's mounts. A judge that cannot arm (signed out, no
+  runtime) is a seat failure, so the rotation moves to the next judge, as before. They stay ungoverned (no gate hook,
+  no `ask` tool, no MCP channel, no governance files). The PTY session carrier refuses them under the container floor,
+  as it refuses governed units. Under `WICKED_SEAT_FLOOR=host` nothing changes.
+
+- **An ask question's `elicitationCreated` frame names the seat that asked.** Additive `seat` (the asking unit's
+  roster seat key for that attempt, e.g. `pi` or `codex#2`), beside `source: "ask"`, `ord` and `attempt`; absent for
+  every other producer. Studio's question card read the run's current lead seat, which named the wrong agent when
+  another unit asked (a pi question shown as "Codex · is asking").
+
 - **opencode seats get the MCP `ask` tool.** opencode 2.0.25 connects an MCP server named in its configuration files
   (`initialize`, `tools/list`) but never offers its tools to the model, either directly or in Code Mode, even once
   `GET /api/mcp` reports it `connected`; a server registered through its own serve API is offered. So a governed

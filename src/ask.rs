@@ -163,6 +163,7 @@ fn created(id: &str, p: &Pending) -> CoreEvent {
         source: Some("ask".into()),
         ord: Some(p.ord),
         attempt: Some(p.attempt),
+        seat: Some(p.seat.clone()),
     }
 }
 
@@ -521,6 +522,7 @@ mod tests {
                 assert_eq!(created["source"], "ask");
                 assert_eq!(created["ord"], next.ord);
                 assert_eq!(created["attempt"], next.attempt);
+                assert_eq!(created["seat"], next.seat);
             }
             assert!(events.try_recv().is_err());
         }
@@ -732,6 +734,8 @@ mod tests {
         assert_eq!(created["options"], serde_json::json!(["A", "B"]));
         assert_eq!(created["ord"], 3);
         assert_eq!(created["attempt"], 2);
+        // The frame names the seat that asked, as the ticket does.
+        assert_eq!(created["seat"], "claude");
         assert!(f
             .core
             .resolve_elicitation(

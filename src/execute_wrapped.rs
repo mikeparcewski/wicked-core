@@ -1882,6 +1882,23 @@ impl WrappedCliStepRunner {
         }
     }
 
+    /// The runner for the `wicked-core` CLI's standalone validator authoring on the store at
+    /// `db_path`. Under the container floor the authoring session arms a seat container, whose only
+    /// egress is the gateway under the store's operational state home (its canonical parent, as for
+    /// [`with_tx_for_store`](Self::with_tx_for_store)), so the runner is bound to it. On any other
+    /// floor it is the [`Default`] runner, exactly as before (codex judges-r2: binding a home there
+    /// would change which skills snapshots the launch admits).
+    pub fn for_standalone_authoring(db_path: &str) -> Self {
+        if crate::container_floor::container_mode() {
+            WrappedCliStepRunner {
+                operational_home: crate::state_home::operational_home_of_db(db_path),
+                ..Self::default()
+            }
+        } else {
+            Self::default()
+        }
+    }
+
     fn worker_key(input: &StepInput) -> WrappedWorkerKey {
         WrappedWorkerKey {
             run_id: input.run_id.clone(),
@@ -2098,7 +2115,7 @@ impl WrappedCliStepRunner {
                 crate::write_posture::WritePosture::of(&input.unit, input.workdir.is_some());
             let c = config_for_container_launch(
                 c,
-                input.governance.is_some(),
+                runs_in_seat(input),
                 crate::container_floor::container_mode(),
                 &input.run_id,
                 posture.label(),
@@ -2125,7 +2142,7 @@ impl WrappedCliStepRunner {
         };
         // agy lg-r1 A1: hold until the unit exits, including every early refusal/panic.
         let _config_home_guard = if uses_container_seat(
-            input.governance.is_some(),
+            runs_in_seat(input),
             crate::container_floor::container_mode(),
         ) {
             match seat_config.root().map(|home| {
@@ -2684,8 +2701,10 @@ impl WrappedCliStepRunner {
                     crate::worker_sandbox::FloorUnarmed::NeedsContainerFloor,
                 );
             }
-            let sandbox = if uses_container_seat(governed, crate::container_floor::container_mode())
-            {
+            let sandbox = if uses_container_seat(
+                runs_in_seat(input),
+                crate::container_floor::container_mode(),
+            ) {
                 // The container floor (opt-in, WICKED_SEAT_FLOOR=container): the unit's floor —
                 // writes only to its tree and admitted roots (none of the tree under a fenced
                 // posture), git state, its seat home, secrets masked — rendered as a hardened
@@ -2726,7 +2745,12 @@ impl WrappedCliStepRunner {
                     .as_ref()
                     .map(|g| g.phase.clone())
                     .unwrap_or_else(|| crate::scope::unit_phase(input.unit.ord));
-                let gov_dir = decisions_path.parent().map(Path::to_path_buf);
+                // An engine-internal judge/triage session is ungoverned: no decisions log and no
+                // launch settings file to mount (and none created under the governance root).
+                let gov_dir = decisions_path
+                    .parent()
+                    .filter(|_| governed)
+                    .map(Path::to_path_buf);
                 let mut plan = crate::worker_sandbox::plan_seat_floor(
                     crate::worker_sandbox::SeatLaunch {
                         cwd: &cwd,
@@ -2740,8 +2764,11 @@ impl WrappedCliStepRunner {
                     floor_roots,
                 );
                 // The engine's own launch file (claude's settings) stays read-only to the seat.
-                plan.inputs.pinned =
-                    vec![decisions_path.with_file_name(format!("settings-{phase}.json"))];
+                plan.inputs.pinned = if governed {
+                    vec![decisions_path.with_file_name(format!("settings-{phase}.json"))]
+                } else {
+                    Vec::new()
+                };
                 // The git anchor: the dir the actor pinned from the registered repository.
                 plan.inputs.trusted_git_dir = input
                     .unit
@@ -3015,7 +3042,10 @@ impl WrappedCliStepRunner {
                 &delivery,
                 is_opencode,
                 ask_config.env.iter().any(|(k, _)| k == OPENCODE_ASK_ENV),
-                uses_container_seat(governed, crate::container_floor::container_mode()),
+                uses_container_seat(
+                    runs_in_seat(input),
+                    crate::container_floor::container_mode(),
+                ),
                 || std::env::var(crate::skills_snapshot::OPENCODE_CONFIG_ENV).ok(),
                 inherits_operator_config,
             );
@@ -5506,8 +5536,20 @@ pub(crate) fn governance_refusal(input: &StepInput, why: &str) -> StepOutput {
 }
 
 // codex lg-r2 C5 / agy lg-r1 A6: config selection and arming share one predicate.
-fn uses_container_seat(governed: bool, container_mode: bool) -> bool {
-    governed && container_mode
+// `seated` is [`runs_in_seat`]: a governed unit, or one of the engine's own judge/triage sessions.
+fn uses_container_seat(seated: bool, container_mode: bool) -> bool {
+    seated && container_mode
+}
+
+/// Whether this unit follows the run's seat floor: every governed unit, and the engine's own
+/// judge, validator-authoring and triage sessions ([`is_engine_internal`]). Under the container
+/// floor those run in seat containers through the same arming as a worker (the agent's brokered
+/// sign-in, the gateway as the only egress, the floor's mounts), never as a host CLI: on such a
+/// host the agents are signed in only in their seat containers, and a host judge would read the
+/// operator's own configuration. They stay UNGOVERNED (no gate hook, no ask tool, no MCP channel):
+/// an authored verdict call has no tool calls to judge. Under the host floor nothing changes.
+pub(crate) fn runs_in_seat(input: &StepInput) -> bool {
+    input.governance.is_some() || is_engine_internal(&input.unit)
 }
 
 fn config_for_container_launch(
@@ -7459,6 +7501,143 @@ mod tests {
             out.output
         );
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir("run-cf-noruntime"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// codex judges-r1: the CLI's standalone validator authoring runner is bound to its store's
+    /// state home, so a container-floor authoring session has the gateway dir it needs to arm.
+    #[test]
+    fn a_store_bound_runner_knows_its_operational_home() {
+        let dir = std::env::temp_dir().join(format!("wicked-for-store-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("core.db");
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let runner = |floor: &str| {
+            let _f = VarGuard::set(
+                crate::container_floor::SEAT_FLOOR_ENV,
+                std::path::Path::new(floor),
+            );
+            WrappedCliStepRunner::for_standalone_authoring(db.to_str().unwrap())
+        };
+        let contained = runner("container");
+        assert_eq!(
+            contained.operational_home,
+            crate::state_home::operational_home_of_db(db.to_str().unwrap())
+        );
+        assert!(contained.operational_home.is_some());
+        // The host floor keeps the default runner (no home: the launch rules are unchanged).
+        assert!(runner("host").operational_home.is_none());
+        assert!(WrappedCliStepRunner::default().operational_home.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L15 (C5 follow-up): the engine's own judge and triage sessions follow the seat floor. Under
+    /// the container floor an ungoverned judge/triage unit takes the SAME arming path as a governed
+    /// worker (here: refused for want of a runtime, never run on the host); under the host floor it
+    /// runs on the host exactly as before; and an ordinary ungoverned unit is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn judge_and_triage_sessions_follow_the_seat_floor() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-cf-judge-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        // A stub named `pi` (a seat with an image), so a container refusal is the runtime's.
+        let stub = dir.join("pi");
+        std::fs::write(&stub, "#!/bin/sh\necho ran-on-host\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _rt = VarGuard::set(
+            crate::container_floor::RUNTIME_ENV,
+            &dir.join("no-such-runtime"),
+        );
+        let input = |session: &str, run_id: &str| {
+            let mut u = WorkUnit::pending(format!("{session}-agent"), session, 1, "judge this");
+            u.assigned_cli = Some("pi".to_string());
+            u.assigned_invocation = Some(format!("{} {{PROMPT}}", stub.display()));
+            StepInput {
+                run_id: run_id.to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-validator".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: None,
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            }
+        };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner = WrappedCliStepRunner::with_tx(tx);
+        let run = |i: &StepInput| {
+            let out = runner.run_unit(i);
+            let _ = std::fs::remove_dir_all(sandbox_for(i));
+            out
+        };
+        {
+            let _mode = VarGuard::set(
+                crate::container_floor::SEAT_FLOOR_ENV,
+                std::path::Path::new("container"),
+            );
+            for session in ["validator", "triage"] {
+                let i = input(
+                    session,
+                    &format!("{session}-cf-judge-{}", std::process::id()),
+                );
+                let out = run(&i);
+                assert_eq!(out.status, StepStatus::Failed, "{session}: {}", out.output);
+                assert!(
+                    out.output.contains("no_container_runtime"),
+                    "{session}: {}",
+                    out.output
+                );
+                assert!(
+                    !out.output.contains("ran-on-host"),
+                    "{session}: never a host CLI under the container floor: {}",
+                    out.output
+                );
+                assert!(!out.governed, "a judge stays ungoverned");
+                assert!(
+                    !crate::gate_hook::gov_run_dir(&i.run_id).exists(),
+                    "{session}: no governance files are created for an ungoverned judge"
+                );
+            }
+            // An ordinary ungoverned unit keeps its host launch.
+            let out = run(&input("s", &format!("s-cf-plain-{}", std::process::id())));
+            assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+            assert!(out.output.contains("ran-on-host"), "{}", out.output);
+        }
+        let _mode = VarGuard::set(
+            crate::container_floor::SEAT_FLOOR_ENV,
+            std::path::Path::new("host"),
+        );
+        for session in ["validator", "triage"] {
+            let out = run(&input(
+                session,
+                &format!("{session}-host-judge-{}", std::process::id()),
+            ));
+            assert_eq!(out.status, StepStatus::Ok, "{session}: {}", out.output);
+            assert!(
+                out.output.contains("ran-on-host"),
+                "{session}: {}",
+                out.output
+            );
+        }
+        assert!(runs_in_seat(&input("validator", "x")));
+        assert!(runs_in_seat(&input("triage", "x")));
+        assert!(!runs_in_seat(&input("s", "x")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
