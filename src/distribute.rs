@@ -316,14 +316,58 @@ pub(crate) fn eligible_seats<'a>(
 pub(crate) const CODEX_WORKTREE_BENCH: &str = "codex cannot work in this run's worktree on this \
     host: its commands come back `approval request failed` (the account's approval policy has no \
     approver), so it can neither read nor write the repository — benched for worktree-bound runs \
-    (set WICKED_CODEX_WORKTREE_OK=1 on a host where codex runs commands)";
+    on the host floor (the container floor keeps codex; set WICKED_CODEX_WORKTREE_OK=1 on a host \
+    where codex runs commands)";
 
 /// (F-EDIT-5 / F-LEARN-3) The worktree bench: on a run BOUND to a repository, every codex seat
 /// (any instance) is benched with [`CODEX_WORKTREE_BENCH`], so it is never routed a unit, failed
 /// over to, or seated as a judge — a codex seat that cannot run a command used to pass a build it
-/// never wrote (run 7d8c9c98) and FAIL a review it never read (run 07965bf6). Unbound runs, and
-/// hosts that set `WICKED_CODEX_WORKTREE_OK=1`, keep codex.
-pub(crate) fn worktree_benched(clis: &[AgenticCli], bound: bool) -> Vec<BenchedSeat> {
+/// never wrote (run 7d8c9c98) and FAIL a review it never read (run 07965bf6). Unbound runs, hosts
+/// that set `WICKED_CODEX_WORKTREE_OK=1`, and the container floor keep codex
+/// ([`codex_worktree_ok`]). `contained` is whether this run's work units can run in seat
+/// containers at all: they are armed only with a governance context, which a store the gate hook
+/// cannot open (`:memory:`, `postgres://`; `actor::in_process_governance`) does not give, and then
+/// they run on the host and keep the bench.
+pub(crate) fn worktree_benched(
+    clis: &[AgenticCli],
+    bound: bool,
+    contained: bool,
+) -> Vec<BenchedSeat> {
+    worktree_benched_with(
+        clis,
+        bound,
+        codex_worktree_ok(
+            std::env::var_os("WICKED_CODEX_WORKTREE_OK").is_some(),
+            std::env::var(crate::container_floor::SEAT_FLOOR_ENV)
+                .ok()
+                .as_deref()
+                .filter(|_| contained),
+        ),
+    )
+}
+
+/// Whether a bound run keeps its codex seats: the operator said so (`WICKED_CODEX_WORKTREE_OK`),
+/// or the seat floor is the container floor. The bench's cause is the account's signed
+/// requirements bundle forbidding `approval_policy = "never"` (`allowed_approval_policies =
+/// ["on-request", "untrusted"]`, core#769): `codex exec` falls back to `on-request`, and on the
+/// host its own sandbox sends a command for an approval nobody can give. In a seat container the
+/// engine runs codex with `--sandbox danger-full-access` inside the container's own boundary
+/// ([`crate::worker_sandbox::codex_sandbox_off_under_floor`]), and under `on-request` a command
+/// that needs no escalation runs with no approval asked: the real codex 0.162.1 seat image, with
+/// that requirements bundle, ran the command and returned its output. A bundle that allows only
+/// `untrusted` still refuses commands in a container; that shape is caught when it happens, by
+/// the `approval_unavailable` seat refusal (core#670, core#769), which benches the seat and fails
+/// the unit over.
+pub(crate) fn codex_worktree_ok(operator_ok: bool, seat_floor: Option<&str>) -> bool {
+    operator_ok || crate::container_floor::container_mode_from(seat_floor)
+}
+
+/// The worktree bench for a call that runs the HOST CLI whatever the seat floor: a decision
+/// council's ballots (`wicked_council` dispatch, with codex's registered `--sandbox
+/// workspace-write`). Lifting the bench under the container floor is about seat containers only,
+/// so a ballot on a bound run still leaves codex out unless the operator opted out — else a host
+/// approval refusal there would bench a codex seat that works in its container for the whole run.
+pub(crate) fn host_worktree_benched(clis: &[AgenticCli], bound: bool) -> Vec<BenchedSeat> {
     worktree_benched_with(
         clis,
         bound,
@@ -3280,5 +3324,80 @@ mod worktree_bench_tests {
             worktree_benched_with(&clis, true, true).is_empty(),
             "operator opt-out"
         );
+    }
+
+    /// The container floor keeps codex on a bound run (its seat runs commands there under the
+    /// account's `on-request` fallback); the host floor, an unset floor and a typo keep the bench
+    /// unless the operator opts out.
+    #[test]
+    fn the_container_floor_keeps_codex_on_a_bound_run_and_the_host_floor_benches_it() {
+        assert!(codex_worktree_ok(false, Some("container")));
+        assert!(codex_worktree_ok(false, Some(" Container ")));
+        assert!(!codex_worktree_ok(false, Some("host")));
+        assert!(!codex_worktree_ok(false, Some("contianer")));
+        assert!(!codex_worktree_ok(false, None));
+        assert!(codex_worktree_ok(true, Some("host")));
+        assert!(codex_worktree_ok(true, None));
+        // A run whose units cannot be armed (a store the gate hook cannot open) stays on the host.
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = (
+            std::env::var_os("WICKED_CODEX_WORKTREE_OK"),
+            std::env::var_os(crate::container_floor::SEAT_FLOOR_ENV),
+        );
+        std::env::remove_var("WICKED_CODEX_WORKTREE_OK");
+        std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, "container");
+        let two = [seat("claude"), seat("codex")];
+        assert!(worktree_benched(&two, true, true).is_empty(), "contained");
+        assert_eq!(
+            worktree_benched(&two, true, false).len(),
+            1,
+            "not contained"
+        );
+        for (k, v) in [
+            ("WICKED_CODEX_WORKTREE_OK", prev.0),
+            (crate::container_floor::SEAT_FLOOR_ENV, prev.1),
+        ] {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        drop(_env);
+        let clis = [seat("claude"), seat("codex")];
+        assert!(
+            worktree_benched_with(&clis, true, codex_worktree_ok(false, Some("container")))
+                .is_empty()
+        );
+        assert_eq!(
+            worktree_benched_with(&clis, true, codex_worktree_ok(false, Some("host"))).len(),
+            1
+        );
+        assert!(
+            CODEX_WORKTREE_BENCH.contains("host floor"),
+            "{CODEX_WORKTREE_BENCH}"
+        );
+    }
+
+    /// A host-only call (a decision council's ballots) keeps the bench on a bound run whatever the
+    /// floor, unless the operator opted out.
+    #[test]
+    fn host_only_calls_keep_the_codex_bench_on_a_bound_run() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var_os("WICKED_CODEX_WORKTREE_OK");
+        std::env::remove_var("WICKED_CODEX_WORKTREE_OK");
+        let clis = [seat("claude"), seat("codex")];
+        let keys = |b: Vec<BenchedSeat>| b.into_iter().map(|s| s.cli).collect::<Vec<_>>();
+        assert_eq!(keys(host_worktree_benched(&clis, true)), vec!["codex"]);
+        assert!(host_worktree_benched(&clis, false).is_empty());
+        std::env::set_var("WICKED_CODEX_WORKTREE_OK", "1");
+        assert!(host_worktree_benched(&clis, true).is_empty());
+        match prev {
+            Some(v) => std::env::set_var("WICKED_CODEX_WORKTREE_OK", v),
+            None => std::env::remove_var("WICKED_CODEX_WORKTREE_OK"),
+        }
     }
 }

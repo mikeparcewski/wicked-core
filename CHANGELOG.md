@@ -14,6 +14,53 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The container floor keeps codex on repository runs.** The worktree bench (core#769) benched every codex seat on a
+  run bound to a repository, because the account's signed requirements bundle forbids `approval_policy = "never"`, and
+  on the host codex's own sandbox sends commands for an approval nobody can give (`approval request failed`). In a
+  seat container the engine runs codex with `--sandbox danger-full-access` inside the container's own boundary, and
+  under the bundle's `on-request` fallback its commands run without an approval. So the bench now applies only off the
+  container floor (`WICKED_SEAT_FLOOR=container` keeps codex; `WICKED_CODEX_WORKTREE_OK=1` still opts out
+  anywhere). A bundle that allows only `untrusted` still refuses commands in a container, and the existing
+  `approval_unavailable` seat refusal benches that seat when it happens. `Core.worktreeBenched()` follows the same
+  rule. A decision council's ballots run the host CLIs on every floor, so they keep the bench on a bound run. Stacked
+  on the change that runs agent judges and triage in seat containers (they no longer run host codex).
+
+- **Agent judges, validator authoring and failure triage follow the seat floor.** Under the container floor these
+  engine-internal sessions ran the host CLIs (ungoverned internal calls), outside any seat container: on a host where
+  the agents are signed in only through their seat containers they failed, and they read the operator's own CLI
+  configuration. They now take the same arming path as a worker (`runs_in_seat`): a seat container with the agent's
+  brokered sign-in, the gateway as the only egress, and the floor's mounts. A judge that cannot arm (signed out, no
+  runtime) is a seat failure, so the rotation moves to the next judge, as before. They stay ungoverned (no gate hook,
+  no `ask` tool, no MCP channel, no governance files). The PTY session carrier refuses them under the container floor,
+  as it refuses governed units. Under `WICKED_SEAT_FLOOR=host` nothing changes.
+
+- **An ask question's `elicitationCreated` frame names the seat that asked.** Additive `seat` (the asking unit's
+  roster seat key for that attempt, e.g. `pi` or `codex#2`), beside `source: "ask"`, `ord` and `attempt`; absent for
+  every other producer. Studio's question card read the run's current lead seat, which named the wrong agent when
+  another unit asked (a pi question shown as "Codex · is asking").
+
+- **opencode seats get the MCP `ask` tool.** opencode 2.0.25 connects an MCP server named in its configuration files
+  (`initialize`, `tools/list`) but never offers its tools to the model, either directly or in Code Mode, even once
+  `GET /api/mcp` reports it `connected`; a server registered through its own serve API is offered. So a governed
+  container opencode seat's pinned server script now registers the engine's `wicked` server
+  (`PUT /api/experimental/mcp/wicked`, then `connect`, for the run's directory) before `opencode run`: the gateway
+  route, `codemode: false` (the tool is `wicked_ask`), `timeout.execution` = the ask timeout + 60 s, and the seat's
+  `WICKED_MCP_TOKEN` filled into the body on curl's stdin, never argv (`WICKED_OPENCODE_ASK` carries the body with a
+  slot). The seat's MCP deny (`"*_*": "deny"`) gains an exact `"wicked_ask": "allow"` read after it, at the top level
+  and on the governed agent. A failed registration is logged and the seat runs without the tool. Still not copilot.
+
+- **Governed container seats ask the operator mid-turn with the MCP `ask` tool (DES-CONTAINER-FLOOR step 5).**
+  C5 removed ACP and with it in-turn questions; crew now serves an MCP `ask` route, reached by seat containers only
+  through agentgateway's 8700 route (exact `POST`/`GET /api/v1/mcp/ask` matches). The engine owns the questions
+  (`src/ask.rs`, actor-owned): `openAsk` (bound token, non-terminal run, byte caps, distinct choices) emits the existing
+  `elicitationCreated` frame when the run has no open question and queues the rest; the operator's answer through the
+  existing `resolve_elicitation` emits `elicitationResolved` with `answer` and `heldMs` and promotes the next one;
+  `closeAsk` (timeout/teardown), a run's terminal frame and actor shutdown close them. Additive frame fields (absent when
+  unset): `source`, `ord`, `attempt`; `answer`, `heldMs`. napi: `askUnit`, `openAsk`, `closeAsk`. Seats get static
+  config with the token taken from their own env: claude `--mcp-config` (+ `MCP_TOOL_TIMEOUT`; the gate hook allows
+  exactly `mcp__wicked__ask`), codex `-c mcp_servers.wicked.*`, pi `mcp.json` + `-e builtin:mcp` + `--no-approve`.
+  `WICKED_ASK_TIMEOUT_SECS` (default 600). opencode asks too (see the entry above); not copilot or the host floor.
+
 - **BREAKING (C5): governed seats default to the container carrier, and ACP is removed from the seats.**
   The `wicked-core` CLI (and crew's daemon) set `WICKED_SEAT_FLOOR=container` unless the operator chose
   a floor; `WICKED_SEAT_FLOOR=host` keeps the labelled interim host floor. Every unit runs its CLI's

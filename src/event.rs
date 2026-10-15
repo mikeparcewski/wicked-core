@@ -1338,6 +1338,15 @@ pub enum CoreEvent {
         /// recommends — the field's own JSON Schema `default`, when it names one of the delivered
         /// options. `None` (ABSENT on the wire) ⇒ nothing is preselected.
         recommended: Option<u32>,
+        /// (ask, additive) `"ask"` for a seat's MCP `ask` question; absent for every other producer.
+        source: Option<String>,
+        /// (ask, additive) The asking unit's ordinal and dispatch attempt.
+        ord: Option<u32>,
+        attempt: Option<u32>,
+        /// (ask, additive) The seat key that asked (the roster instance, e.g. `pi` or `codex#2`):
+        /// the unit's seat for that attempt, so a consumer names the asker without reading which
+        /// seat the run is running now. Absent for every other producer.
+        seat: Option<String>,
     },
     /// The elicitation identified by `elicitation_id` reached a terminal state. `session` is the
     /// `run_id`. `action` mirrors the resolved `action` field from the `elicitation/create`
@@ -1348,6 +1357,8 @@ pub enum CoreEvent {
         elicitation_id: String,
         action: String,
         reason: String,
+        answer: Option<String>,
+        held_ms: Option<u64>,
     },
 }
 
@@ -2614,6 +2625,10 @@ impl CoreEvent {
                 options,
                 prop_type,
                 recommended,
+                source,
+                ord,
+                attempt,
+                seat,
             } => {
                 let mut v = json!({
                     "type": "elicitationCreated",
@@ -2628,6 +2643,18 @@ impl CoreEvent {
                 if let Some(i) = recommended {
                     v["recommended"] = json!(i);
                 }
+                if let Some(source) = source {
+                    v["source"] = json!(source);
+                }
+                if let Some(ord) = ord {
+                    v["ord"] = json!(ord);
+                }
+                if let Some(attempt) = attempt {
+                    v["attempt"] = json!(attempt);
+                }
+                if let Some(seat) = seat {
+                    v["seat"] = json!(seat);
+                }
                 v
             }
             CoreEvent::ElicitationResolved {
@@ -2635,13 +2662,24 @@ impl CoreEvent {
                 elicitation_id,
                 action,
                 reason,
-            } => json!({
-                "type": "elicitationResolved",
-                "session": session,
-                "elicitationId": elicitation_id,
-                "action": action,
-                "reason": reason,
-            }),
+                answer,
+                held_ms,
+            } => {
+                let mut v = json!({
+                    "type": "elicitationResolved",
+                    "session": session,
+                    "elicitationId": elicitation_id,
+                    "action": action,
+                    "reason": reason,
+                });
+                if let Some(answer) = answer {
+                    v["answer"] = json!(answer);
+                }
+                if let Some(held_ms) = held_ms {
+                    v["heldMs"] = json!(held_ms);
+                }
+                v
+            }
         }
     }
 }
@@ -2772,12 +2810,51 @@ mod tests {
                 options: Some(vec!["a".into(), "b".into()]),
                 prop_type: Some("string".into()),
                 recommended,
+                source: None,
+                ord: None,
+                attempt: None,
+                seat: None,
             }
             .to_json()
         };
         assert!(frame(None).get("recommended").is_none());
         assert_eq!(frame(Some(1))["recommended"], 1);
         assert_eq!(frame(Some(1))["options"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn ask_legacy_elicitation_json_is_byte_identical_without_additive_fields() {
+        let created = CoreEvent::ElicitationCreated {
+            session: "s".into(),
+            epoch: 1,
+            elicitation_id: "e".into(),
+            message: "pick".into(),
+            options: None,
+            prop_type: None,
+            recommended: None,
+            source: None,
+            ord: None,
+            attempt: None,
+            seat: None,
+        }
+        .to_json();
+        assert_eq!(
+            created.to_string(),
+            r#"{"elicitationId":"e","epoch":1,"message":"pick","options":null,"propType":null,"session":"s","type":"elicitationCreated"}"#
+        );
+        let resolved = CoreEvent::ElicitationResolved {
+            session: "s".into(),
+            elicitation_id: "e".into(),
+            action: "cancel".into(),
+            reason: "teardown".into(),
+            answer: None,
+            held_ms: None,
+        }
+        .to_json();
+        assert_eq!(
+            resolved.to_string(),
+            r#"{"action":"cancel","elicitationId":"e","reason":"teardown","session":"s","type":"elicitationResolved"}"#
+        );
     }
 
     /// The throttled live-output frame: camelCase tag `unitOutputDelta`, and `attempt` MUST ride

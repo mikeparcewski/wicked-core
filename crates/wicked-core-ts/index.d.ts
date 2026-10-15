@@ -200,7 +200,8 @@ export declare class Core {
    * JSON array of `AgenticCli` seats (the engine-shaped roster, as `launchRun`'s `clisJson`) and
    * whether the run is BOUND to one repository, the JSON array of `BenchedSeat` (`{cli, reason,
    * source: "launcher"}`) the launch would bench before routing. Reads
-   * `WICKED_CODEX_WORKTREE_OK` at call time, as the launch does. An addon without this static
+   * `WICKED_CODEX_WORKTREE_OK` and `WICKED_SEAT_FLOOR` at call time, as the launch does (the
+   * container floor keeps codex). An addon without this static
    * predates it; crew keys on its presence.
    */
   static worktreeBenched(clisJson: string, bound: boolean): string
@@ -349,6 +350,12 @@ export declare class Core {
    * token. Safe whether the run is executing or paused.
    */
   cancelRun(runId: string): Promise<string>
+  /** The unit a bound MCP token belongs to: `{runId, ord, attempt, seat, timeoutSecs}` (JSON). */
+  askUnit(token: string): Promise<string>
+  /** Open an operator question with `{token, question, choices?, recommended?}`. */
+  openAsk(requestJson: string): Promise<string>
+  /** Close an unanswered question (`timeout` or `teardown`); false if already resolved. */
+  closeAsk(elicitationId: string, reason: string): Promise<boolean>
   /**
    * Resolve a pending ACP elicitation. `action` must be `"accept"`, `"decline"`, or `"cancel"`;
    * `response` is the human's typed/selected value as a JSON-typed value — pass `null` for

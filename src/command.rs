@@ -298,6 +298,18 @@ pub(crate) enum Command {
         #[allow(dead_code)]
         launch_seq: u64,
     },
+    /// Open on the actor so token liveness, run status and creation precede any later teardown.
+    OpenAsk {
+        /// The unit capability token, re-resolved when the actor handles this command.
+        unit: String,
+        request: crate::AskRequest,
+        reply: Sender<Result<crate::AskTicket, crate::AskError>>,
+    },
+    CloseAsk {
+        id: String,
+        reason: String,
+        reply: Sender<bool>,
+    },
     // ── ACP elicitation (DES-002) ────────────────────────────────────────────────────────────────
     /// Deliver a human's elicitation response to the suspended `exec_turn_acp` worker thread.
     /// The `reply` sender is signalled after the worker acknowledges receipt (success) or if the

@@ -117,6 +117,22 @@ pub(crate) fn seat_mcp_pin_flags(
     }
 }
 
+/// Return isolation flags and whether ask can be handed to this seat. Codex merges per-key
+/// overrides with ambient entries, so any existing `wicked` entry must stay disabled.
+pub(crate) fn seat_mcp_pin_flags_with_ask(
+    cli: SeatCli,
+    seat_root: Option<&std::path::Path>,
+    cwd: Option<&std::path::Path>,
+    ask_enabled: bool,
+) -> Result<(Vec<String>, bool), String> {
+    let flags = seat_mcp_pin_flags(cli, seat_root, cwd)?;
+    let collision = cli == SeatCli::Codex
+        && flags
+            .iter()
+            .any(|flag| flag == "mcp_servers.wicked.enabled=false");
+    Ok((flags, ask_enabled && !collision))
+}
+
 /// The configuration home whose MCP config a seat will actually read: its ENGINE-MINTED root when
 /// it has one, and otherwise — under the operator-inherit hatch, where `SeatConfig::Inherit`
 /// touches no CLI configuration variable — the CLI's OWN home, `$CODEX_HOME` / `$COPILOT_HOME`
@@ -311,7 +327,25 @@ fn pin_governed_agent_selectable(governed: &mut serde_json::Map<String, Value>) 
 /// Fails closed like the skills composition: a value that is not a JSON object, or whose
 /// `permission` / `agent` / `agent.build` / `agent.build.permission` is not an object, is an
 /// `Err`. The seat is then not launched rather than launched with the MCP tools visible.
+/// (Test-only since L15: the launch composes through [`opencode_config_admitting`].)
+#[cfg(test)]
 pub(crate) fn opencode_config(existing: Option<&str>) -> Result<String, String> {
+    opencode_config_admitting(existing, &[])
+}
+
+/// The opencode tool id of the engine's own `ask` server ([`crate::seat_gateway::ASK_URL`]),
+/// registered on a governed container seat by its launch ([`crate::worker_sandbox`]'s pinned
+/// server script), never by a configuration file.
+pub(crate) const OPENCODE_ASK_TOOL: &str = "wicked_ask";
+
+/// [`opencode_config`], then an exact `allow` for each id in `admitted`, at the top level and on
+/// the governed agent, read after the deny (an exact id, so it re-admits that one tool and nothing
+/// else). Used only for [`OPENCODE_ASK_TOOL`] on a seat whose launch registers the engine's own
+/// `wicked` server through opencode's API, which replaces any ambient server of that name.
+pub(crate) fn opencode_config_admitting(
+    existing: Option<&str>,
+    admitted: &[&str],
+) -> Result<String, String> {
     const VAR: &str = crate::skills_snapshot::OPENCODE_CONFIG_ENV;
     let mut doc = match existing {
         None => serde_json::json!({}),
@@ -333,15 +367,35 @@ pub(crate) fn opencode_config(existing: Option<&str>) -> Result<String, String> 
     obj.entry("$schema")
         .or_insert_with(|| Value::String("https://opencode.ai/config.json".to_string()));
     deny_mcp_in(obj, "permission")?;
+    admit_in(obj, admitted)?;
     let agent = object_entry(obj, "agent", VAR)?;
     let governed = object_entry(agent, OPENCODE_GOVERNED_AGENT, VAR)?;
     deny_mcp_in(governed, "permission")?;
+    admit_in(governed, admitted)?;
     pin_governed_agent_selectable(governed);
     obj.insert(
         "default_agent".to_string(),
         Value::String(OPENCODE_GOVERNED_AGENT.to_string()),
     );
     Ok(doc.to_string())
+}
+
+/// `parent.permission[id] = "allow"` for each exact `id`, inserted after the deny: emitted after it
+/// under sorted keys (an id is letter-led, the deny `*`-led) and under insertion order alike.
+fn admit_in(parent: &mut serde_json::Map<String, Value>, admitted: &[&str]) -> Result<(), String> {
+    if admitted.is_empty() {
+        return Ok(());
+    }
+    let rules = object_entry(
+        parent,
+        "permission",
+        crate::skills_snapshot::OPENCODE_CONFIG_ENV,
+    )?;
+    for id in admitted {
+        rules.remove(*id);
+        rules.insert((*id).to_string(), Value::String("allow".to_string()));
+    }
+    Ok(())
 }
 
 /// Set `parent[key][OPENCODE_MCP_TOOL_PATTERN] = "deny"`, creating the object where absent, so
@@ -454,6 +508,26 @@ mod tests {
         // No existing content: a bare document still carries the deny.
         let doc: Value = serde_json::from_str(&opencode_config(None).unwrap()).unwrap();
         assert_eq!(doc["permission"]["*_*"], "deny");
+    }
+
+    /// L15: the ask admission re-admits exactly `wicked_ask`, after the deny, at both levels, over
+    /// an ambient deny of that id; every other MCP id stays denied.
+    #[test]
+    fn the_admitting_document_allows_exactly_the_named_tool_after_the_deny() {
+        let ambient = r#"{"permission":{"wicked_ask":"deny","wicked_*":"allow"},"agent":{"build":{"permission":{"wicked_ask":"deny"}}}}"#;
+        let out = opencode_config_admitting(Some(ambient), &[OPENCODE_ASK_TOOL]).unwrap();
+        let doc: Value = serde_json::from_str(&out).unwrap();
+        for rules in [&doc["permission"], &doc["agent"]["build"]["permission"]] {
+            assert_eq!(rules["*_*"], "deny");
+            assert_eq!(rules["wicked_ask"], "allow");
+            assert!(rules.get("wicked_*").is_none(), "{rules}");
+        }
+        let text_deny = out.find("\"*_*\"").unwrap();
+        assert!(out[text_deny..].contains("\"wicked_ask\":\"allow\""));
+        assert_eq!(
+            opencode_config_admitting(Some(ambient), &[]).unwrap(),
+            opencode_config(Some(ambient)).unwrap()
+        );
     }
 
     /// core#911: the governed agent stays selectable. Content that demotes, hides or disables it
@@ -714,5 +788,63 @@ mod tests {
             let err = opencode_config(Some(bad)).expect_err(bad);
             assert!(err.contains("OPENCODE_CONFIG_CONTENT"), "{bad}: {err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod ask_pin_tests {
+    use super::*;
+    #[test]
+    fn ask_codex_pin_refuses_ambient_wicked_in_either_config_source() {
+        let root =
+            std::env::temp_dir().join(format!("wicked-ask-pin-{}", uuid::Uuid::new_v4().simple()));
+        let home = root.join("seat");
+        let project = root.join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(project.join(".codex")).unwrap();
+        for source in [home.join("config.toml"), project.join(".codex/config.toml")] {
+            for entry in [
+                "[mcp_servers.wicked]\ncommand = 'echo'\n",
+                "[mcp_servers.wicked]\nurl = 'http://old'\nenabled = false\n",
+                "[mcp_servers.wicked]\nurl = 'http://old'\nenabled_tools = ['other']\n",
+                "",
+            ] {
+                std::fs::write(
+                    &source,
+                    format!("{entry}[mcp_servers.ambient]\ncommand = 'echo'\n"),
+                )
+                .unwrap();
+                for requested in [false, true] {
+                    let (flags, enabled) = seat_mcp_pin_flags_with_ask(
+                        SeatCli::Codex,
+                        Some(&home),
+                        Some(&project),
+                        requested,
+                    )
+                    .unwrap();
+                    assert_eq!(enabled, requested && entry.is_empty());
+                    assert!(flags
+                        .iter()
+                        .any(|s| s == "mcp_servers.ambient.enabled=false"));
+                    assert_eq!(
+                        flags
+                            .iter()
+                            .any(|s| s == "mcp_servers.wicked.enabled=false"),
+                        !entry.is_empty()
+                    );
+                    let config =
+                        crate::execute_wrapped::ask_seat_config(SeatCli::Codex, enabled, 600, &[]);
+                    assert_eq!(config.flags.is_empty(), !enabled);
+                    if enabled {
+                        assert!(config
+                            .flags
+                            .iter()
+                            .any(|s| s == "mcp_servers.wicked.enabled=true"));
+                    }
+                }
+            }
+            std::fs::remove_file(source).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

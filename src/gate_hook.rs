@@ -3645,8 +3645,32 @@ pub(crate) fn evaluate_tool_call(
         return 2;
     }
 
+    // Asking the operator writes nothing. This exact engine-owned tool bypasses every write
+    // posture; other MCP names still meet the fence below. Record its allow like other tools.
+    if tool == "mcp__wicked__ask" {
+        let claim = ConformanceClaim {
+            claim_id: format!("ask-allow:{phase}:{}", uuid::Uuid::new_v4().simple()),
+            scope: scope.to_string(),
+            phase: phase.to_string(),
+            policy_ids: vec!["engine:operator-ask".into()],
+            decision: Decision::Allow,
+            obligations: vec![],
+            evaluated_context_ref: "sha256:operator-ask".into(),
+            criteria: "ask the operator".into(),
+            evaluator_identity: "wicked-governance".into(),
+            evaluated_at: crate::clock::eval_now(),
+        };
+        return match append_annotated_claim_checked(decisions_path, phase, tool, &claim) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("wicked-governance: DENY (could not record ask allow: {e})");
+                2
+            }
+        };
+    }
+
     // MCP FENCE (core#657, F-11) — before everything else that needs no store: a governed worker
-    // loads no MCP server (wrapped claude runs `--strict-mcp-config`), so an `mcp__<server>__<tool>`
+    // loads no ambient MCP server (the engine ask exception is above), so an `mcp__<server>__<tool>`
     // call that reaches the hook anyway is from a server nobody registered. Refused on every
     // posture — MCP calls count as writes, and none is registered read-only — and recorded as an
     // ADVISORY claim naming the tool: the call never ran, the seat continues without it. Before
@@ -7527,6 +7551,69 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ask_mcp_exemption_is_exact_on_every_posture_and_records_allow() {
+        use crate::path_policy::AllowedRoots;
+        use crate::write_posture::WritePosture;
+        let base =
+            std::env::temp_dir().join(format!("wicked-ask-hook-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&base).unwrap();
+        for posture in [
+            WritePosture::ReadOnly,
+            WritePosture::DeliverableRoots,
+            WritePosture::Full,
+        ] {
+            let path = base.join(format!("{}.ndjson", posture.label()));
+            let boundary = BoundaryCtx {
+                roots: AllowedRoots {
+                    write: vec![base.clone()],
+                    read: vec![],
+                },
+                cwd: base.clone(),
+                home: None,
+                claude_config_dir: None,
+                pre_build_scope: false,
+                write_posture: posture,
+                deliverable_roots: vec![],
+                estate_store_pinned: false,
+                graph_write_dir: None,
+                graph_store_db: None,
+            };
+            for tool in [
+                "mcp__wicked__ask",
+                "mcp__wicked__other",
+                "mcp__Wicked__ask",
+                "mcp__x__ask",
+            ] {
+                assert_eq!(
+                    evaluate_tool_call(
+                        "scope",
+                        "unit-1",
+                        None,
+                        None,
+                        Some("/no-store"),
+                        path.to_str().unwrap(),
+                        &serde_json::json!({}),
+                        tool,
+                        Some(&boundary)
+                    ),
+                    if tool == "mcp__wicked__ask" { 0 } else { 2 },
+                    "{posture:?}: {tool}"
+                );
+            }
+            let log = std::fs::read_to_string(path).unwrap();
+            let claims: Vec<ConformanceClaim> = log
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+            assert_eq!(claims.len(), 4);
+            assert_eq!(claims[0].decision, Decision::Allow);
+            assert!(claims[1..].iter().all(|c| c.decision == Decision::Deny));
+            assert!(log.contains("mcp__wicked__ask"));
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// core#657 (F-11), the wrapped carrier: the `PreToolUse` hook (matcher `*`) sees an MCP call

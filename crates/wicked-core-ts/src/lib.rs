@@ -538,6 +538,23 @@ impl Task for CoreTask {
     }
 }
 
+/// The ask close binding returns a JS boolean rather than a JSON string.
+pub struct CloseAskTask {
+    core: wicked_core::Core,
+    id: String,
+    reason: String,
+}
+impl Task for CloseAskTask {
+    type Output = bool;
+    type JsValue = bool;
+    fn compute(&mut self) -> napi::Result<bool> {
+        Ok(self.core.close_ask(&self.id, &self.reason))
+    }
+    fn resolve(&mut self, _env: Env, output: bool) -> napi::Result<bool> {
+        Ok(output)
+    }
+}
+
 /// `Core.busRead()`'s JSON `{ next, rows }`.
 fn bus_read_json(
     core: &wicked_core::Core,
@@ -930,7 +947,8 @@ impl Core {
     /// JSON array of `AgenticCli` seats (the engine-shaped roster, as `launchRun`'s `clisJson`) and
     /// whether the run is BOUND to one repository, the JSON array of `BenchedSeat` (`{cli, reason,
     /// source: "launcher"}`) the launch would bench before routing. Reads
-    /// `WICKED_CODEX_WORKTREE_OK` at call time, as the launch does. An addon without this static
+    /// `WICKED_CODEX_WORKTREE_OK` and `WICKED_SEAT_FLOOR` at call time, as the launch does (the
+    /// container floor keeps codex). An addon without this static
     /// predates it; crew keys on its presence.
     #[napi]
     pub fn worktree_benched(clis_json: String, bound: bool) -> napi::Result<String> {
@@ -1352,6 +1370,31 @@ impl Core {
     pub fn cancel_run(&self, run_id: String) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || core.cancel_run(&run_id).map(status_token).map_err(err))
+    }
+
+    /// The unit a bound MCP token belongs to: `{runId, ord, attempt, seat, timeoutSecs}`; rejects
+    /// `invalid_token: …`. Records and emits nothing (crew queues asks per run before opening).
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn ask_unit(&self, token: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || core.ask_unit_json(&token).map_err(err))
+    }
+
+    /// Open an operator question with `{token, question, choices?, recommended?}`.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn open_ask(&self, request_json: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || core.open_ask_json(&request_json).map_err(err))
+    }
+
+    /// Close an unanswered question (`timeout` or `teardown`); false if already resolved.
+    #[napi(ts_return_type = "Promise<boolean>")]
+    pub fn close_ask(&self, elicitation_id: String, reason: String) -> AsyncTask<CloseAskTask> {
+        AsyncTask::new(CloseAskTask {
+            core: self.inner.clone(),
+            id: elicitation_id,
+            reason,
+        })
     }
 
     /// Resolve a pending ACP elicitation. `action` must be `"accept"`, `"decline"`, or `"cancel"`;
@@ -2720,7 +2763,10 @@ mod tests {
                 .unwrap();
         let bound: Vec<serde_json::Value> =
             serde_json::from_str(&Core::worktree_benched(roster.clone(), true).unwrap()).unwrap();
-        if std::env::var_os("WICKED_CODEX_WORKTREE_OK").is_none() {
+        let floor = std::env::var("WICKED_SEAT_FLOOR").unwrap_or_default();
+        if std::env::var_os("WICKED_CODEX_WORKTREE_OK").is_none()
+            && !floor.trim().eq_ignore_ascii_case("container")
+        {
             let keys: Vec<&str> = bound.iter().filter_map(|b| b["cli"].as_str()).collect();
             assert_eq!(keys, vec!["codex", "codex#2"]);
             assert!(bound.iter().all(|b| b["source"] == "launcher"), "{bound:?}");
@@ -2729,8 +2775,8 @@ mod tests {
                 .unwrap()
                 .contains("approval request failed"));
         } else {
-            // The runner's own opt-out: the binding must honour it (both branches of the rule
-            // itself are pinned env-free by `distribute::worktree_bench_tests`).
+            // The runner's own opt-out or the container floor: the binding must honour both (the
+            // rule itself is pinned env-free by `distribute::worktree_bench_tests`).
             assert!(bound.is_empty(), "{bound:?}");
         }
         let unbound = Core::worktree_benched(roster, false).unwrap();

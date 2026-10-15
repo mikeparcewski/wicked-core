@@ -1507,9 +1507,11 @@ pub(crate) fn run(
                     };
                     if needs_seat && !spec.clis.is_empty() {
                         let mut benched = crate::distribute::launcher_benched(&spec.clis);
-                        for seat in
-                            crate::distribute::worktree_benched(&spec.clis, repo_ref.is_some())
-                        {
+                        for seat in crate::distribute::worktree_benched(
+                            &spec.clis,
+                            repo_ref.is_some(),
+                            in_process_governance().is_some(),
+                        ) {
                             crate::domain::bench_seat(&mut benched, seat);
                         }
                         if crate::distribute::eligible_seats(&spec.clis, &benched).is_empty() {
@@ -1592,6 +1594,7 @@ pub(crate) fn run(
                         benched_seats: crate::distribute::worktree_benched(
                             &spec.clis,
                             repo_ref.is_some(),
+                            in_process_governance().is_some(),
                         ),
                         team: None,
                         team_plan: None,
@@ -2514,6 +2517,42 @@ pub(crate) fn run(
                     );
                 }
             }
+            Command::OpenAsk {
+                unit,
+                request,
+                reply,
+            } => {
+                let result = (|| {
+                    let unit =
+                        crate::mcp_gate::resolve(&unit).ok_or(crate::AskError::InvalidToken)?;
+                    let session = crate::domain::get_session(&store, &unit.run_id)
+                        .map_err(|e| crate::AskError::RunEnded(e.to_string()))?
+                        .ok_or_else(|| crate::AskError::RunEnded("run not found".into()))?;
+                    if matches!(
+                        session.status,
+                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                    ) {
+                        return Err(crate::AskError::RunEnded(unit.run_id));
+                    }
+                    let request = request.validate()?;
+                    let (ticket, created) = subscribers.asks.open(unit, request);
+                    if let Some(created) = created {
+                        emit(&mut subscribers, created);
+                    }
+                    Ok(ticket)
+                })();
+                let _ = reply.send(result);
+            }
+            Command::CloseAsk { id, reason, reply } => {
+                let events = subscribers.asks.close(&id, &reason);
+                let closed = events.is_some();
+                if let Some(events) = events {
+                    for event in events {
+                        emit(&mut subscribers, event);
+                    }
+                }
+                let _ = reply.send(closed);
+            }
             Command::ResolveElicitation {
                 run_id,
                 elicitation_id,
@@ -2521,6 +2560,23 @@ pub(crate) fn run(
                 response,
                 reply,
             } => {
+                match subscribers
+                    .asks
+                    .resolve(&run_id, &elicitation_id, &action, response.as_ref())
+                {
+                    Ok(Some(events)) => {
+                        for event in events {
+                            emit(&mut subscribers, event);
+                        }
+                        let _ = reply.send(Ok(()));
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                        continue;
+                    }
+                    Ok(None) => {}
+                }
                 // Deliver the human response to the waiting exec_turn_acp dual-poll loop.
                 // actor_maps is Some only for ACP runners; PTY/injected runners return Err.
                 let res = match &actor_maps {
@@ -2543,7 +2599,11 @@ pub(crate) fn run(
                     ref elicitation_id, ..
                 } = ev
                 {
-                    if let Some(ref maps) = actor_maps {
+                    // Ask frames belong to the ask registry, never ACP's epoch maps.
+                    if let Some(maps) = actor_maps
+                        .as_ref()
+                        .filter(|_| !elicitation_id.starts_with("ask-"))
+                    {
                         let mut maps = maps.lock().unwrap_or_else(|e| e.into_inner());
                         // take_suppressed_creation removes the marker if present.
                         let was_suppressed = maps.take_suppressed_creation(elicitation_id);
@@ -2572,7 +2632,10 @@ pub(crate) fn run(
                     ref elicitation_id, ..
                 } = ev
                 {
-                    if let Some(ref maps) = actor_maps {
+                    if let Some(maps) = actor_maps
+                        .as_ref()
+                        .filter(|_| !elicitation_id.starts_with("ask-"))
+                    {
                         let mut maps = maps.lock().unwrap_or_else(|e| e.into_inner());
                         if maps.take_suppressed_resolution(elicitation_id) {
                             tracing::warn!(
@@ -2879,8 +2942,15 @@ pub(crate) fn run(
                     match crate::domain::get_session(&store, &req.session_id) {
                         Ok(Some(session)) => {
                             let roster = eligible_roster_keys(&session);
+                            // Ballots run the host CLIs on every floor: the host worktree bench
+                            // still applies to them (the container floor lifts it for seats only).
+                            let host_bench = crate::distribute::host_worktree_benched(
+                                &clis,
+                                session.repo_ref.is_some(),
+                            );
                             clis.into_iter()
                                 .filter(|c| !session.benched_seats.iter().any(|b| b.cli == c.key))
+                                .filter(|c| !host_bench.iter().any(|b| b.cli == c.key))
                                 .filter(|c| {
                                     // By CLI key: a run configured `codex#2` keeps the `codex`
                                     // ballot record the registry hands (codex r2).
@@ -3889,6 +3959,7 @@ pub(crate) fn run(
                 );
             }
             Command::Shutdown => {
+                subscribers.close_asks();
                 // Stop ACP workers before dropping the actor channel. Ordinary prompt waits
                 // do not poll the elicitation tombstone, so they must be interrupted through
                 // the registered child kill handles; elicitation waits also observe the flag.
@@ -5349,6 +5420,18 @@ fn apply_step_result(
     // Load units early so both discard guards can gate on tool_cmd.is_some(); fail-open (.ok())
     // so a DB error here still lets the terminal guard return Ok(Stale) rather than Err.
     let units_opt = crate::domain::session_units(store, &run_id).ok();
+
+    // The worker has exited, even if its result is stale after reassignment or cursor advance.
+    // Use the result's unit/attempt, never the live cursor: a replacement's ask must survive.
+    // Do this before every discard guard and before a failure can dispatch another seat.
+    if let Some(unit) = units_opt.as_ref().and_then(|us| us.get(output.unit_ix)) {
+        for event in subscribers
+            .asks
+            .close_attempt(&run_id, unit.ord, output.attempt)
+        {
+            emit(subscribers, event);
+        }
+    }
 
     // Terminal guard: never apply onto an already-terminal run (e.g. a worker orphaned by Cancel).
     if matches!(
@@ -20086,6 +20169,165 @@ mod seat_failover_tests {
         u.depends_on = depends_on.iter().map(|d| d.to_string()).collect();
         u.status = status;
         put_node(store, u.to_node()).unwrap();
+    }
+
+    fn open_ask(
+        subs: &mut crate::event_log::EventSink,
+        run: &str,
+        ord: u32,
+        attempt: u32,
+    ) -> crate::AskTicket {
+        let (ticket, created) = subs.asks.open(
+            crate::mcp_gate::McpUnit {
+                run_id: run.into(),
+                ord,
+                attempt,
+                seat: "agy".into(),
+                scope: "scope".into(),
+                phase: format!("unit-{ord}"),
+                phase_id: "build".into(),
+                catalog: String::new(),
+                role: PhaseRole::Creator,
+                posture: crate::write_posture::WritePosture::Full,
+                mode: crate::mcp_gate::McpMode::Ask,
+                decisions_path: "/unused".into(),
+                db_path: String::new(),
+            },
+            crate::AskRequest {
+                question: "pick one".into(),
+                choices: Some(vec!["A".into(), "B".into()]),
+                recommended: None,
+            },
+        );
+        if let Some(event) = created {
+            emit(subs, event);
+        }
+        ticket
+    }
+
+    #[test]
+    fn ask_step_result_tears_down_only_the_finished_attempt_before_stale_pause_or_failover() {
+        for (case, live_attempt, cursor, status) in [
+            ("reassigned", 1, 0, StepStatus::Cancelled),
+            ("advanced", 0, 1, StepStatus::Ok),
+            ("failover", 0, 0, StepStatus::Failed),
+            ("timeout", 0, 0, StepStatus::TimedOut),
+        ] {
+            for queued_only in [false, true] {
+                let mut store = open_store(Some(":memory:")).unwrap();
+                let run = "ask-attempt";
+                seed_session(
+                    &mut store,
+                    run,
+                    &["agy", "claude"],
+                    SessionStatus::Executing,
+                    cursor,
+                );
+                let mut session = crate::domain::get_session(&store, run).unwrap().unwrap();
+                session.attempt = live_attempt;
+                if case == "timeout" {
+                    session.human_confirm = HumanConfirm::All;
+                }
+                put_node(&mut store, session.to_node()).unwrap();
+                // Ordinals deliberately differ from indices: the result names index 0, ord 7.
+                for (ord, phase) in [(7, "build"), (9, "review")] {
+                    seed_unit(
+                        &mut store,
+                        run,
+                        ord,
+                        phase,
+                        "agy",
+                        PhaseRole::Creator,
+                        &[],
+                        UnitStatus::Distributed,
+                    );
+                }
+                let mut subs = crate::event_log::EventSink::default();
+                let (event_tx, event_rx) = channel();
+                subs.push(event_tx);
+                let other_open = queued_only.then(|| open_ask(&mut subs, run, 9, 0));
+                let finished = open_ask(&mut subs, run, 7, 0);
+                let finished_queued = open_ask(&mut subs, run, 7, 0);
+                let replacement = open_ask(&mut subs, run, 7, 1);
+                let other_queued = open_ask(&mut subs, run, 9, 0);
+                let other_run = open_ask(&mut subs, "other-run", 7, 0);
+                let _ = event_rx.try_iter().collect::<Vec<_>>();
+
+                let (tx, _rx) = channel::<Command>();
+                let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+                let applied = apply_step_result(
+                    &mut store,
+                    &mut subs,
+                    &runner,
+                    &tx,
+                    StepOutput {
+                        run_id: run.into(),
+                        unit_ix: 0,
+                        attempt: 0,
+                        output: "(cli `agy` exited 1) boom".into(),
+                        status,
+                        usage: None,
+                        files: vec![],
+                        tools: vec![],
+                        governed: true,
+                    },
+                    None,
+                    crate::workflow::UnitEvidence::default(),
+                    "",
+                    &None,
+                    &None,
+                    uuid::Uuid::nil(),
+                    false,
+                )
+                .unwrap();
+                assert!(
+                    match case {
+                        "reassigned" | "advanced" => matches!(applied, StepApplied::Stale),
+                        "failover" => matches!(applied, StepApplied::Continuing),
+                        "timeout" => matches!(applied, StepApplied::Paused),
+                        _ => unreachable!(),
+                    },
+                    "unexpected step outcome for {case}"
+                );
+                let asks: Vec<_> = event_rx
+                    .try_iter()
+                    .map(|event| event.to_json())
+                    .filter(|event| {
+                        matches!(
+                            event["type"].as_str(),
+                            Some("elicitationCreated" | "elicitationResolved")
+                        )
+                    })
+                    .collect();
+                if queued_only {
+                    assert!(asks.is_empty(), "{case}: {asks:?}");
+                    assert!(subs.asks.is_open(&other_open.unwrap().elicitation_id));
+                } else {
+                    assert_eq!(asks.len(), 2, "{case}: {asks:?}");
+                    assert_eq!(asks[0]["type"], "elicitationResolved");
+                    assert_eq!(asks[0]["elicitationId"], finished.elicitation_id);
+                    assert_eq!(asks[0]["action"], "cancel");
+                    assert_eq!(asks[0]["reason"], "teardown");
+                    assert_eq!(asks[1]["type"], "elicitationCreated");
+                    assert_eq!(asks[1]["elicitationId"], replacement.elicitation_id);
+                    assert_eq!(asks[1]["ord"], 7);
+                    assert_eq!(asks[1]["attempt"], 1);
+                }
+                assert_eq!(subs.asks.is_open(&replacement.elicitation_id), !queued_only);
+                assert!(subs.asks.is_open(&other_run.elicitation_id));
+                for ticket in [&finished, &finished_queued] {
+                    assert!(subs
+                        .asks
+                        .close(&ticket.elicitation_id, "teardown")
+                        .is_none());
+                }
+                // The other unit's queued ask remains queued and can still be closed silently.
+                assert_eq!(
+                    subs.asks.close(&other_queued.elicitation_id, "teardown"),
+                    Some(vec![])
+                );
+            }
+        }
     }
 
     /// Fold a GOVERNED worker FAILURE for the run's cursor unit at its live attempt.

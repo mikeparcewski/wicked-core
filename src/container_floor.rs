@@ -3473,6 +3473,8 @@ mod tests {
             settings.to_str().unwrap(),
         ]);
         cmd.env("SECRET_TOKEN", "value-never-on-argv");
+        cmd.env(crate::mcp_gate::TOKEN_ENV, "unit-token-never-on-argv");
+        cmd.env("MCP_TOOL_TIMEOUT", "660000");
         cmd.env("PATH", "/host/bin");
         cmd.env("HOME", "/host/home");
         cmd.env("TMPDIR", "/host/tmp");
@@ -3491,6 +3493,7 @@ mod tests {
         let has = |pair: &[&str]| args.windows(2).any(|x| x == pair);
         assert!(has(&["--env", "SECRET_TOKEN"]));
         assert!(!args.iter().any(|a| a.contains("value-never-on-argv")));
+        assert!(!args.iter().any(|a| a.contains("unit-token-never-on-argv")));
         assert!(!args
             .iter()
             .any(|a| a == "/host/home" || a == "/host/tmp" || a == "en_US.UTF-8"));
@@ -3500,6 +3503,8 @@ mod tests {
         let has_in = |part: &[String], pair: &[&str]| part.windows(2).any(|w| w == pair);
         for key in [
             "SECRET_TOKEN",
+            crate::mcp_gate::TOKEN_ENV,
+            "MCP_TOOL_TIMEOUT",
             crate::gate_hook::READ_ROOTS_ENV,
             crate::gate_hook::WRITE_ROOTS_ENV,
         ] {
