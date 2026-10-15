@@ -12978,9 +12978,11 @@ mod boundary_tests {
         let cd_clone = format!("cd {}", shell_read_951_path(&repo));
         assert_eq!(judge(&cd_clone), None);
         track_install_fence_cwd(&cd_clone, &wt, None, &state);
+        // The sidecar holds the resolved directory; on Windows that is the canonical `\\?\` long-name
+        // spelling of the temp dir (`RUNNER~1` vs `runneradmin`), so compare canonical paths.
         assert_eq!(
-            std::fs::read_to_string(&state).unwrap().trim(),
-            repo.to_string_lossy()
+            std::fs::canonicalize(std::fs::read_to_string(&state).unwrap().trim()).unwrap(),
+            std::fs::canonicalize(&repo).unwrap()
         );
         // A benign intermediate call keeps the tracking.
         assert_eq!(judge("git status"), None);
