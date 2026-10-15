@@ -862,6 +862,7 @@ pub(crate) fn boundary_denial_tracked(
     estate_store_pinned: bool,
     graph_store: &[std::path::PathBuf],
 ) -> Option<(String, bool)> {
+    let _scan = ShellScanGuard::session();
     // (crew#634 R7) A search tool with NO `path` searches the shell's cwd; its path pattern can
     // still climb into a sibling run's worktree (`Glob {pattern: "../run-2/**"}`).
     if matches!(tool, "Glob" | "Grep")
@@ -968,12 +969,17 @@ pub(crate) fn boundary_denial_tracked(
                     .find_map(|key| args.get(key).and_then(serde_json::Value::as_str))
             });
             let mut read_bases = bases.clone();
+            let mut read_targets = Vec::new();
+            // Accepted limit: a stateful in-process (ACP) seat can retain a cwd BELOW a
+            // granted root between calls; grant-root candidates do not track that descendant.
+            // C5 removes ACP from the seats: the container floor closes this gap and is the
+            // hermetic layer; this literal scan is defense-in-depth.
             if install_state.is_none() {
                 read_bases.extend(roots.read.iter().chain(&roots.write).cloned());
             }
             if let Some(raw) = call_cwd {
                 bases = shell_cwd_candidates(bases, &[raw.to_string()], home);
-                read_bases = shell_cwd_candidates(read_bases, &[raw.to_string()], home);
+                (read_bases, read_targets) = shell_cwd_walk(read_bases, &[raw.to_string()], home);
                 if let Some(dir) = existing_shell_cwd_paths(raw, Some(&here), home)
                     .into_iter()
                     .find(|p| p.is_dir())
@@ -984,16 +990,24 @@ pub(crate) fn boundary_denial_tracked(
             let mut operands = ShellOperands::default();
             // Keep the real home for reads even when the command may set HOME. Clearing it
             // would silently drop home-relative reads instead of conservatively judging them.
-            collect_shell_operands(command, home, 8, true, &mut operands);
+            collect_shell_operands(command, home, &mut operands);
             let mut write_cwds = bash_cd_targets_inner(command, true);
-            let candidates = shell_cwd_candidates(bases, &write_cwds, home);
+            let mut candidates = shell_cwd_candidates(bases.clone(), &write_cwds, home);
+            for candidate in shell_cwd_candidates(bases, &operands.cwds, home) {
+                if candidates.len() == MAX_SHELL_CWD_CANDIDATES {
+                    break;
+                }
+                if !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
             // ACP/chat roots are possible prior directories for READS only. A read grant
             // must never create a fatal write-resolution base.
-            let read_candidates = shell_cwd_candidates(read_bases, &operands.cwds, home);
+            let (read_candidates, directory_reads) =
+                shell_cwd_walk(read_bases, &operands.cwds, home);
+            read_targets.extend(directory_reads);
             if let Some(raw) = call_cwd {
                 write_cwds.insert(0, raw.to_string());
-                // Also judge the starting directory itself like a cd destination below.
-                operands.cwds.insert(0, raw.to_string());
             }
             // INSTALL FENCE (F-E2E-029): a package-manager install whose effective directory —
             // after `cd`/`pushd` and the manager's own `--prefix`/`-C`/`--cwd` — leaves the unit's
@@ -1041,7 +1055,8 @@ pub(crate) fn boundary_denial_tracked(
             // relative write targets in subsequent segments land in the cd destination, not in the
             // process cwd (the worktree). Check the cd destination against the boundary so the
             // escape is caught before the write segments run.  Unit-fatal like any write escape.
-            let cds = bash_cd_escape_targets(command, &write_cwds, home);
+            let mut cds = bash_cd_escape_targets(command, &write_cwds, home);
+            cds.extend(bash_cd_escape_targets(command, &operands.cwds, home));
             for (target, base) in cds
                 .iter()
                 .flat_map(|t| candidates.iter().map(move |b| (t, b)))
@@ -1086,11 +1101,7 @@ pub(crate) fn boundary_denial_tracked(
             }
             // core#951: a shell read has the SAME roots and sibling-worker fence as Read.
             // Hold it until every fatal write check above has won; a blocked read is advisory.
-            let mut read_targets = Vec::new();
             for base in &read_candidates {
-                for raw in &operands.cwds {
-                    read_targets.extend(existing_shell_cwd_paths(raw, Some(base), home));
-                }
                 for word in &operands.reads {
                     read_targets.extend(existing_shell_read_paths(word, Some(base), home));
                 }
@@ -1631,15 +1642,18 @@ fn strip_quoted_heredoc_bodies(command: &str) -> String {
 /// bodies follow one another (`cat <<EOF <<'DATA'` — the first, unquoted, body is EXPANDED by the
 /// shell), and blanking up to the last delimiter would hide the expanded one, so none is stripped.
 fn quoted_heredoc_on(line: &str) -> Option<(String, bool)> {
-    heredocs_on(line, false).into_iter().next()
+    heredocs_on(line, false)
+        .into_iter()
+        .next()
+        .map(|(delim, dash, _)| (delim, dash))
 }
 
-// Reads treat every heredoc body as data, including multiple bodies on one header line.
+// Shell/interpreter heredocs are scripts; other receivers get data, including multiple bodies.
 fn strip_read_heredoc_bodies(command: &str) -> String {
     let mut out = Vec::new();
     let mut pending = std::collections::VecDeque::new();
     for line in command.split('\n') {
-        if let Some((delim, dash)) = pending.front() {
+        if let Some((delim, dash, executable)) = pending.front() {
             let probe = if *dash {
                 line.trim_start_matches('\t')
             } else {
@@ -1647,8 +1661,10 @@ fn strip_read_heredoc_bodies(command: &str) -> String {
             };
             if probe == delim {
                 pending.pop_front();
+                out.push("");
+            } else {
+                out.push(if *executable { line } else { "" });
             }
-            out.push("");
         } else {
             out.push(line);
             pending.extend(heredocs_on(line, true));
@@ -1657,7 +1673,50 @@ fn strip_read_heredoc_bodies(command: &str) -> String {
     out.join("\n")
 }
 
-fn heredocs_on(line: &str, read_scan: bool) -> Vec<(String, bool)> {
+fn heredoc_runs_script(header: &str) -> bool {
+    let scan = ShellScanGuard::scan(header, true);
+    if !scan.extended {
+        return false;
+    }
+    let owned = shell_tokens_with_operators(header, true);
+    let segment = owned
+        .rsplit(|t| matches!(t.as_str(), ";" | "|" | "||" | "&&" | "&" | "|&" | "(" | ")"))
+        .next()
+        .unwrap_or_default();
+    let mut skip_operand = false;
+    let words: Vec<_> = segment
+        .iter()
+        .filter_map(|token| {
+            if std::mem::take(&mut skip_operand) {
+                None
+            } else if let Some(takes_next) = redirection_operand(token) {
+                skip_operand = takes_next;
+                None
+            } else {
+                Some(token.as_str())
+            }
+        })
+        .collect();
+    match unwrap_program_with_reads(&words, false, |_| {}) {
+        Unwrapped::Program { idx, .. } => words.get(idx).is_some_and(|word| {
+            matches!(
+                program_basename(word),
+                "sh" | "bash"
+                    | "zsh"
+                    | "dash"
+                    | "ksh"
+                    | "python"
+                    | "python3"
+                    | "node"
+                    | "perl"
+                    | "ruby"
+            )
+        }),
+        Unwrapped::Inline { inner, .. } => heredoc_runs_script(&inner),
+    }
+}
+
+fn heredocs_on(line: &str, read_scan: bool) -> Vec<(String, bool, bool)> {
     let b = line.as_bytes();
     let (mut i, mut sq, mut dq) = (0usize, false, false);
     let mut found = Vec::new();
@@ -1735,7 +1794,7 @@ fn heredocs_on(line: &str, read_scan: bool) -> Vec<(String, bool)> {
                     && !piped_on
                     && matches!(program, Some("cat" | "tee")))
             {
-                found.push((delim, dash));
+                found.push((delim, dash, read_scan && heredoc_runs_script(&line[..i])));
             }
             i = j + word.len();
             continue;
@@ -2082,27 +2141,93 @@ pub(crate) fn resolved_bash_write_targets(command: &str, home: Option<&Path>) ->
     resolve_targets(command, words, home, true)
 }
 
+// One budget for the entire synchronous tool-call judgment, shared by read, write, cd and
+// estate callers. Standalone scanners create the same scope; nested callers never reset it.
+// Only the additional literal scan is bounded: on exhaustion reads stop, while non-read
+// callers use main's wrapper grammar and its one inline shell level. The OS/container floor
+// (C5) is the hermetic layer; this scan is defense-in-depth.
+const MAX_SHELL_SCAN_BYTES: usize = 64 * 1024;
+const MAX_SHELL_SCAN_DEPTH: usize = 8;
+
+#[derive(Clone, Copy, Default)]
+struct ShellScanState {
+    bytes: usize,
+    depth: usize,
+    legacy: bool,
+}
+
+thread_local! {
+    static SHELL_SCAN: std::cell::Cell<Option<ShellScanState>> = const { std::cell::Cell::new(None) };
+}
+
+struct ShellScanGuard {
+    previous: Option<ShellScanState>,
+    extended: bool,
+}
+
+impl ShellScanGuard {
+    fn session() -> Self {
+        SHELL_SCAN.with(|slot| {
+            let previous = slot.get();
+            slot.set(Some(previous.unwrap_or_default()));
+            Self {
+                previous,
+                extended: true,
+            }
+        })
+    }
+
+    fn scan(command: &str, read_scan: bool) -> Self {
+        SHELL_SCAN.with(|slot| {
+            let previous = slot.get();
+            let mut state = previous.unwrap_or_default();
+            let extended = !state.legacy
+                // Non-read fallback needs room for main's current + one inline scan.
+                && state.depth <= MAX_SHELL_SCAN_DEPTH - if read_scan { 0 } else { 2 }
+                && command.len() <= MAX_SHELL_SCAN_BYTES.saturating_sub(state.bytes);
+            if extended {
+                state.bytes += command.len();
+            }
+            state.depth += 1;
+            state.legacy |= !extended;
+            slot.set(Some(state));
+            Self { previous, extended }
+        })
+    }
+
+    fn legacy() -> bool {
+        SHELL_SCAN.with(|slot| slot.get().is_some_and(|state| state.legacy))
+    }
+}
+
+impl Drop for ShellScanGuard {
+    fn drop(&mut self) {
+        SHELL_SCAN.with(|slot| {
+            // Restore nesting, but keep bytes charged by every sibling/caller in the session.
+            slot.set(self.previous.map(|mut previous| {
+                previous.bytes = slot.get().map_or(previous.bytes, |state| state.bytes);
+                previous
+            }));
+        });
+    }
+}
+
 /// Literal operands and directory destinations, collected before any path is judged. We do not
-/// simulate shell control flow: a pipeline, failed cd, directory stack, or eval can leave the
-/// shell at an earlier directory. Every operand is checked against every candidate below.
+/// simulate shell control flow: pipelines, directory stacks and eval can leave the shell at
+/// an earlier directory. File operands are checked against every candidate; directory operands
+/// follow only their own running chain.
 #[derive(Default)]
 struct ShellOperands {
     reads: Vec<String>,
     cwds: Vec<String>,
 }
 
-fn collect_shell_operands(
-    command: &str,
-    home: Option<&Path>,
-    inline_depth: usize,
-    read_scan: bool,
-    out: &mut ShellOperands,
-) {
-    let command = if read_scan {
-        strip_read_heredoc_bodies(command)
-    } else {
-        strip_quoted_heredoc_bodies(command)
-    };
+fn collect_shell_operands(command: &str, home: Option<&Path>, out: &mut ShellOperands) {
+    let _scan = ShellScanGuard::scan(command, true);
+    if !_scan.extended {
+        return;
+    }
+    let command = strip_read_heredoc_bodies(command);
     let owned = shell_tokens_with_operators(&command, true);
     for tokens in
         owned.split(|t| matches!(t.as_str(), ";" | "|" | "||" | "&&" | "&" | "|&" | "(" | ")"))
@@ -2138,91 +2263,69 @@ fn collect_shell_operands(
             WrapperRead::File(raw) => out.reads.push(raw.to_string()),
             WrapperRead::Cwd(raw) => out.cwds.push(raw.to_string()),
         });
-        let legacy = unwrap_program_with_reads(&words, true, |_| {});
-        let variants = if !read_scan && unwrapped != legacy {
-            vec![unwrapped, legacy]
-        } else {
-            vec![unwrapped]
-        };
-        for unwrapped in variants {
-            match unwrapped {
-                Unwrapped::Inline {
-                    word,
-                    argv_expansion,
-                    argv_tail,
-                    ..
-                } if inline_depth > 0 || (!read_scan && argv_expansion) => {
-                    // Unknown expansions remain opaque; reads never fail closed on unknown operands.
-                    if let Some((mut inner, _)) = lex_shell_word(&word, home, true, !cfg!(windows))
-                    {
-                        inner.push_str(&argv_tail);
-                        collect_shell_operands(
-                            &inner,
-                            home,
-                            inline_depth - usize::from(read_scan || !argv_expansion),
-                            read_scan,
-                            out,
-                        );
-                    }
+        match unwrapped {
+            Unwrapped::Inline {
+                word, argv_tail, ..
+            } => {
+                // Unknown expansions remain opaque; reads never fail closed on unknown operands.
+                if let Some((mut inner, _)) = lex_shell_word(&word, home, true, !cfg!(windows)) {
+                    inner.push_str(&argv_tail);
+                    collect_shell_operands(&inner, home, out);
                 }
-                Unwrapped::Program { idx, .. } => {
-                    let Some(program) = words.get(idx) else {
+            }
+            Unwrapped::Program { idx, .. } => {
+                let Some(program) = words.get(idx) else {
+                    continue;
+                };
+                let program = program_basename(program);
+                let assignment_builtin = matches!(
+                    program,
+                    "export" | "declare" | "local" | "readonly" | "typeset"
+                );
+                let mut end_options = false;
+                for word in words
+                    .iter()
+                    .skip(idx + 1)
+                    .filter(|_| !matches!(program, "cd" | "pushd"))
+                {
+                    let flag = strip_one_quote_layer(word);
+                    if !end_options && flag == "--" {
+                        end_options = true;
                         continue;
-                    };
-                    let program = program_basename(program);
-                    let assignment_builtin = matches!(
-                        program,
-                        "export" | "declare" | "local" | "readonly" | "typeset"
-                    );
-                    let mut end_options = false;
-                    for word in words.iter().skip(idx + 1) {
-                        let flag = strip_one_quote_layer(word);
-                        if !end_options && flag == "--" {
-                            end_options = true;
-                            continue;
-                        }
-                        if !end_options
-                            && flag.starts_with('-')
-                            && !flag.contains(['/', '\\', '~', '.', '='])
-                        {
-                            continue;
-                        }
-                        if !assignment_builtin
-                            || !is_env_assignment(word)
-                            || sourced_env_assignment(word)
-                        {
-                            out.reads.push((*word).to_string());
-                        }
                     }
-                    if matches!(program, "cd" | "pushd") {
-                        let mut args = words[idx + 1..].iter().copied();
-                        let mut dest = None;
-                        while let Some(raw) = args.next() {
-                            let flag = strip_one_quote_layer(raw);
-                            if flag == "--" {
-                                dest = args.next();
-                                break;
-                            }
-                            if !flag.starts_with('-') {
-                                dest = Some(raw);
-                                break;
-                            }
-                        }
-                        // Preserve the word main's cd scan judged, even if -- gives a different
-                        // operand to the richer scan (e.g. `cd -- -dir /outside`).
-                        if let Some(raw) = words[idx + 1..].iter().find(|w| !w.starts_with('-')) {
-                            if Some(*raw) != dest {
-                                out.cwds.push((*raw).to_string());
-                            }
-                        }
-                        if let Some(raw) = dest
-                            .or_else(|| (program == "cd" && words.len() == idx + 1).then_some("~"))
-                        {
-                            out.cwds.push(raw.to_string());
-                        }
+                    if !end_options
+                        && flag.starts_with('-')
+                        && !flag.contains(['/', '\\', '~', '.', '='])
+                    {
+                        continue;
+                    }
+                    if !assignment_builtin
+                        || !is_env_assignment(word)
+                        || sourced_env_assignment(word)
+                    {
+                        out.reads.push((*word).to_string());
                     }
                 }
-                _ => {}
+                if matches!(program, "cd" | "pushd") {
+                    let mut args = words[idx + 1..].iter().copied();
+                    let mut dest = None;
+                    while let Some(raw) = args.next() {
+                        let flag = strip_one_quote_layer(raw);
+                        if flag == "--" {
+                            dest = args.next();
+                            break;
+                        }
+                        if !flag.starts_with('-') {
+                            dest = Some(raw);
+                            break;
+                        }
+                    }
+                    if let Some(raw) =
+                        dest.or_else(|| (program == "cd" && words.len() == idx + 1).then_some("~"))
+                    {
+                        out.cwds.push(raw.to_string());
+                    }
+                }
             }
         }
     }
@@ -2237,6 +2340,16 @@ fn shell_cwd_candidates(
     destinations: &[String],
     home: Option<&Path>,
 ) -> Vec<PathBuf> {
+    shell_cwd_walk(bases, destinations, home).0
+}
+
+// Each destination belongs to its own running chain. Earlier successful directories remain
+// operand candidates for pipelines/subshells; a failed cd does not advance the running cwd.
+fn shell_cwd_walk(
+    bases: Vec<PathBuf>,
+    destinations: &[String],
+    home: Option<&Path>,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut candidates = Vec::new();
     for base in bases {
         if !candidates.contains(&base) {
@@ -2246,37 +2359,33 @@ fn shell_cwd_candidates(
             break;
         }
     }
-    if candidates.len() == MAX_SHELL_CWD_CANDIDATES {
-        return candidates;
-    }
-    let starting = candidates.clone();
-    let mut running = starting.clone();
+    let mut running = candidates.clone();
+    let mut targets = Vec::new();
     for raw in destinations {
         let readings = resolve_shell_readings(raw, home).unwrap_or_default();
-        for (base, here) in starting.iter().zip(&mut running) {
-            // One left-to-right walk per starting base, plus each destination resolved
-            // against the STARTING bases (a failed cd may leave the shell there).
+        for here in &mut running {
             for p in &readings {
-                let path = crate::path_policy::normalize_for_fence(p, base, home);
-                if !candidates.contains(&path) {
-                    candidates.push(path);
+                let path = crate::path_policy::normalize_for_fence(p, here, home);
+                if path.exists() && !targets.contains(&path) {
+                    targets.push(path.clone());
                 }
-                if candidates.len() == MAX_SHELL_CWD_CANDIDATES {
-                    return candidates;
+                // A nonexistent destination remains a candidate, but cannot change shell cwd.
+                if !candidates.contains(&path) {
+                    if candidates.len() == MAX_SHELL_CWD_CANDIDATES {
+                        return (candidates, targets);
+                    }
+                    candidates.push(path);
                 }
             }
             if let Some(p) = readings.first() {
-                *here = crate::path_policy::normalize_for_fence(p, here, home);
-                if !candidates.contains(here) {
-                    candidates.push(here.clone());
-                }
-                if candidates.len() == MAX_SHELL_CWD_CANDIDATES {
-                    return candidates;
+                let path = crate::path_policy::normalize_for_fence(p, here, home);
+                if path.is_dir() {
+                    *here = path;
                 }
             }
         }
     }
-    candidates
+    (candidates, targets)
 }
 
 /// A cwd argument is a path even when it starts with `-` or contains `=`; it is not an option.
@@ -2492,6 +2601,7 @@ fn collect_bash_write_targets(
     home: Option<&Path>,
     targets: &mut Vec<String>,
 ) {
+    let _scan = ShellScanGuard::scan(command, false);
     // (core#552) The body of a QUOTED-delimiter heredoc is data the shell never expands, so its
     // words are no command's arguments: `tee docs/x.md <<'EOF'` naming `/var/log/app.log` in its
     // body writes only `docs/x.md`. An unquoted heredoc's body still expands `$(…)`, so it stays.
@@ -2794,6 +2904,7 @@ const OPAQUE_WRITER_PROGRAMS: &[&str] = &[
 /// Used by `bash_cd_escape_targets` to judge `cd` destinations even when there is no
 /// statically-resolvable write target.
 fn command_contains_write_capable_program(command: &str) -> bool {
+    let _scan = ShellScanGuard::scan(command, false);
     let owned = shell_tokens(command);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
     const SEPS: [&str; 8] = ["|", "||", "&&", ";", "&", "|&", "(", ")"];
@@ -2871,6 +2982,7 @@ fn bash_cd_escape_targets(
     destinations: &[String],
     home: Option<&Path>,
 ) -> Vec<ShellTarget> {
+    let _scan = ShellScanGuard::session();
     if bash_write_targets(command).is_empty() && !command_contains_write_capable_program(command) {
         return Vec::new();
     }
@@ -2881,16 +2993,53 @@ fn bash_cd_escape_targets(
 }
 
 fn bash_cd_targets_inner(command: &str, unwrap_inline: bool) -> Vec<String> {
-    let mut operands = ShellOperands::default();
-    collect_shell_operands(
-        command,
-        None,
-        usize::from(unwrap_inline),
-        false,
-        &mut operands,
-    );
-    operands.cwds.dedup();
-    operands.cwds
+    let _scan = ShellScanGuard::scan(command, false);
+    let owned = shell_tokens(command);
+    let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
+    const SEPS: [&str; 8] = ["|", "||", "&&", ";", "&", "|&", "(", ")"];
+    let mut segments: Vec<Vec<&str>> = Vec::new();
+    let mut seg: Vec<&str> = Vec::new();
+    for &t in &toks {
+        if SEPS.contains(&t) {
+            if !seg.is_empty() {
+                segments.push(std::mem::take(&mut seg));
+            }
+        } else if redirect_glob(t).is_none() {
+            seg.push(t);
+        }
+    }
+    if !seg.is_empty() {
+        segments.push(seg);
+    }
+    let mut targets: Vec<String> = Vec::new();
+    for words in &segments {
+        match unwrap_program_with_reads(words, true, |_| {}) {
+            Unwrapped::Inline { inner, word, .. } => {
+                if unwrap_inline {
+                    // (core#922) The inner shell's text, exactly unquoted — as the write scan.
+                    let exact = lex_shell_word(&word, None, true, !cfg!(windows)).map(|(s, _)| s);
+                    targets.extend(bash_cd_targets_inner(
+                        exact.as_deref().unwrap_or(&inner),
+                        false,
+                    ));
+                }
+            }
+            Unwrapped::Program { idx, .. } => {
+                let Some(prog) = words.get(idx) else {
+                    continue;
+                };
+                // `pushd` moves the shell exactly as `cd` does — the install fence already
+                // tracks both — so a `pushd <outside> && <write>` escape is the same escape as
+                // issue #540's, and the raw-SQLite fence's cwd walk needs it too (#645).
+                if matches!(program_basename(prog), "cd" | "pushd") {
+                    if let Some(dest) = words[idx + 1..].iter().find(|w| !w.starts_with('-')) {
+                        targets.push((*dest).to_string());
+                    }
+                }
+            }
+        }
+    }
+    targets
 }
 
 /// Under ReadOnly posture, deny interpreter invocations whose write targets cannot be resolved
@@ -2912,6 +3061,7 @@ fn opaque_interpreter_denial(command: &str) -> Option<String> {
 }
 
 fn opaque_interpreter_denial_inner(command: &str, unwrap_inline: bool) -> Option<String> {
+    let _scan = ShellScanGuard::scan(command, false);
     let owned = shell_tokens(command);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
     const SEPS: [&str; 8] = ["|", "||", "&&", ";", "&", "|&", "(", ")"];
@@ -2992,6 +3142,7 @@ fn explicit_write_program_denial(command: &str) -> Option<String> {
 }
 
 fn explicit_write_program_denial_inner(command: &str, unwrap_inline: bool) -> Option<String> {
+    let _scan = ShellScanGuard::scan(command, false);
     let owned = shell_tokens(command);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
     const SEPS: [&str; 8] = ["|", "||", "&&", ";", "&", "|&", "(", ")"];
@@ -3163,7 +3314,8 @@ enum Unwrapped<'a> {
     Inline {
         inner: String,
         word: String,
-        // env -S expands argv at this level; it must not consume the shell rescan budget.
+        // env -S expands argv at this level. It shares the global byte/depth budget,
+        // while preserving main's one-shell-level behavior for non-read callers.
         argv_expansion: bool,
         argv_tail: String,
     },
@@ -3194,7 +3346,7 @@ enum WrapperRead<'a> {
 /// * **shell `-c` family** — `sh`/`bash`/`zsh`/`dash` followed by a short flag cluster containing `c`
 ///   (`-c`, `-lc`, `-ec`, `-xc`, …) then `<string>`: the string is handed back as
 ///   [`Unwrapped::Inline`] for a rescan. Writes and estate scans keep one shell level;
-///   reads have an independent depth limit of eight.
+///   all callers share the command's byte/depth budget (reads stop at eight).
 /// * **`exec` / `builtin` / `command`** — the word and its own flags dropped.
 /// * **`eval words…` / `env -S <string>`** — returned as an inline script.
 /// * **`xargs [flags]`** — the word, flags and their arguments dropped.
@@ -3227,6 +3379,7 @@ fn unwrap_program_with_reads<'a>(
     preserve_legacy: bool,
     mut read: impl FnMut(WrapperRead<'a>),
 ) -> Unwrapped<'a> {
+    let preserve_legacy = preserve_legacy || ShellScanGuard::legacy();
     let assignment = |word: &str| {
         is_env_assignment(word)
             && (!preserve_legacy
@@ -3435,8 +3588,15 @@ fn unwrap_program_with_reads<'a>(
                     return Unwrapped::Program { idx, assignments };
                 }
                 let mut j = idx + 1;
-                while j < words.len() && words[j].starts_with(['-', '+']) {
-                    let flag = words[j];
+                while j < words.len() {
+                    let Some((flag, _)) = lex_shell_word(words[j], None, true, !cfg!(windows))
+                    else {
+                        break;
+                    };
+                    if !flag.starts_with(['-', '+']) {
+                        break;
+                    }
+                    let flag = flag.as_str();
                     j += 1;
                     if flag == "--" {
                         break;
@@ -3979,6 +4139,7 @@ fn classify_estate_command(
     cwd_bases: &[std::path::PathBuf],
     home: Option<&std::path::Path>,
 ) -> Option<EstateDeny> {
+    let _scan = ShellScanGuard::session();
     classify_estate_command_in(
         command,
         store_pinned_by_env,
@@ -3997,6 +4158,11 @@ fn classify_estate_command(
 /// Judged over the WHOLE command line, so a disarm in one segment covers a shim in another, or
 /// one inside a `bash -c` string.
 fn readonly_env_disarmed(command: &str) -> bool {
+    let _scan = ShellScanGuard::scan(command, false);
+    if !_scan.extended {
+        // Do not assume the shim's read-only default survives an opaque/limited command.
+        return true;
+    }
     if command.contains(ESTATE_READONLY_ENV) {
         return true;
     }
@@ -4044,6 +4210,7 @@ fn classify_estate_command_in(
     // missing `--readonly` token is not a refusal.
     readonly_env_disarmed: bool,
 ) -> Option<EstateDeny> {
+    let _scan = ShellScanGuard::scan(command, false);
     let owned = shell_tokens(command);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
 
@@ -4375,6 +4542,7 @@ pub(crate) fn evaluate_tool_call(
     // cwd belong to the DAEMON, not the unit — its boundary must arrive as explicit state.
     boundary: Option<&BoundaryCtx>,
 ) -> i32 {
+    let _scan = ShellScanGuard::session();
     // No clones: this runs once per tool call on both carriers, and `context` carries the tool's
     // whole input — file contents included (review).
     // Write the hook-fired liveness sentinel for `phase` BEFORE any policy evaluation or early-returns
@@ -9914,6 +10082,196 @@ mod boundary_tests {
     }
 
     #[test]
+    fn shell_read_951_r6_quoted_shell_flags_and_executable_heredocs() {
+        let (_, scratch, outside) = shell_read_951_r2_fixture("r6-scripts");
+        let file = shell_read_951_path(&outside.join("tip.mjs"));
+        let script = shell_read_951_word(&format!("cat {file}"));
+        let mut commands = vec![
+            format!("sh '-c' {script}"),
+            format!("bash \"-lc\" {script}"),
+            format!("env sh '-c' {script}"),
+            format!("sh -'c' {script}"),
+            format!("bash -\"l\"c {script}"),
+        ];
+        for receiver in [
+            "sh",
+            "bash",
+            "zsh",
+            "dash",
+            "ksh",
+            "python",
+            "python3",
+            "node",
+            "perl",
+            "ruby",
+            "env sh",
+            "command bash",
+            "env -S sh",
+            "cat /dev/null; env sh",
+            "3</dev/null env sh",
+            "xargs sh",
+        ] {
+            for delimiter in ["EOF", "'EOF'", "\"EOF\""] {
+                commands.push(format!("{receiver} <<{delimiter}\ncat {file}\nEOF"));
+            }
+        }
+        shell_read_951_r2_assert_reads(&scratch, &outside, &commands);
+    }
+
+    #[test]
+    fn shell_read_951_r6_returning_to_start_does_not_read_parent() {
+        let (_, scratch, _) = shell_read_951_r2_fixture("r6-return");
+        std::fs::create_dir_all(scratch.join("src")).unwrap();
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![scratch.clone()],
+            read: vec![],
+        };
+        for command in [
+            "cd src && cd .. && git status",
+            "pushd src && pushd .. && git status",
+            "cd src; cd missing || true; cd ..; git status",
+        ] {
+            assert_eq!(
+                boundary_denial_with(
+                    &roots,
+                    &scratch,
+                    None,
+                    None,
+                    &json!({"command": command}),
+                    "bash"
+                ),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_read_951_r6_failed_cd_keeps_last_existing_directory() {
+        let (_, scratch, outside) = shell_read_951_r2_fixture("r6-failed-cd");
+        std::fs::create_dir_all(scratch.join("a/c")).unwrap();
+        std::os::unix::fs::symlink(outside.join("tip.mjs"), scratch.join("a/c/tip.mjs")).unwrap();
+        shell_read_951_r2_assert_reads(
+            &scratch,
+            &outside,
+            &["cd a; cd missing || true; cd c; cat tip.mjs".into()],
+        );
+        let (candidates, _) = shell_cwd_walk(
+            vec![scratch.clone()],
+            &["a".into(), "missing".into(), "c".into()],
+            None,
+        );
+        assert!(candidates.contains(&scratch.join("a/missing")));
+        assert!(candidates.contains(&scratch.join("a/c")));
+        assert!(!candidates.contains(&scratch.join("a/missing/c")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_read_951_r6_repeated_cd_preserves_main_estate_walk() {
+        let (_, scratch, graph) = shell_read_951_r2_fixture("r6-estate-cd");
+        std::fs::create_dir_all(scratch.join("a")).unwrap();
+        std::fs::write(graph.join("graph.db"), "fixture").unwrap();
+        std::os::unix::fs::symlink(&graph, scratch.join("a/a")).unwrap();
+        let command = "cd a && cd a && sqlite3 graph.db 'UPDATE nodes SET risk = 0'";
+        assert_eq!(bash_cd_targets_inner(command, true), vec!["a", "a"]);
+        assert_eq!(bash_cd_targets_inner("env -C other cd a", true), vec!["a"]);
+        assert_eq!(bash_cd_targets_inner("env -S cd cd a", true), vec!["a"]);
+        let bases = graph_store_cwd_bases(command, &scratch, None);
+        assert!(bases.contains(&scratch.join("a/a")));
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![scratch.clone(), graph.clone()],
+            read: vec![],
+        };
+        let (reason, _) = boundary_denial_tracked(
+            &roots,
+            &scratch,
+            None,
+            None,
+            &json!({"command": command}),
+            "bash",
+            None,
+            true,
+            &[graph],
+        )
+        .expect("main's estate denial must survive repeated cd operands");
+        assert!(reason.starts_with(ESTATE_DENY_REASON_PREFIX), "{reason}");
+    }
+
+    #[test]
+    fn shell_read_951_r6_scan_budget_is_global_and_bounded() {
+        let (_, scratch, outside) = shell_read_951_r2_fixture("r6-budget");
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![scratch.clone()],
+            read: vec![],
+        };
+        for count in [10_000, 100] {
+            let command = format!("{}true", "env -S ".repeat(count));
+            let start = std::time::Instant::now();
+            assert_eq!(
+                boundary_denial_with(
+                    &roots,
+                    &scratch,
+                    None,
+                    None,
+                    &json!({"command": command}),
+                    "bash"
+                ),
+                None
+            );
+            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        }
+        shell_read_951_r2_assert_reads(
+            &scratch,
+            &outside,
+            &[format!(
+                "cat {}",
+                shell_read_951_path(&outside.join("tip.mjs"))
+            )],
+        );
+
+        let _session = ShellScanGuard::session();
+        let command = format!("cat {}", "x".repeat(16_000));
+        let mut operands = ShellOperands::default();
+        collect_shell_operands(&command, None, &mut operands);
+        let after_reads = SHELL_SCAN.with(|slot| slot.get().unwrap().bytes);
+        bash_write_targets(&command);
+        let after_writes = SHELL_SCAN.with(|slot| slot.get().unwrap().bytes);
+        bash_cd_targets_inner(&command, true);
+        let after_cd = SHELL_SCAN.with(|slot| slot.get().unwrap().bytes);
+        super::classify_estate_command(&command, true, &[], &[], None);
+        let after_estate = SHELL_SCAN.with(|slot| slot.get().unwrap().bytes);
+        assert!(after_reads < after_writes && after_writes < after_cd && after_cd < after_estate);
+        assert!(after_estate <= MAX_SHELL_SCAN_BYTES);
+        operands.reads.clear();
+        collect_shell_operands(&command, None, &mut operands);
+        assert!(
+            operands.reads.is_empty(),
+            "later callers must not reset the budget"
+        );
+
+        // Spend the remainder too: no small script can acquire a fresh caller budget.
+        let remainder = " ".repeat(MAX_SHELL_SCAN_BYTES - after_estate);
+        collect_shell_operands(&remainder, None, &mut operands);
+        assert_eq!(
+            SHELL_SCAN.with(|slot| slot.get().unwrap().bytes),
+            MAX_SHELL_SCAN_BYTES
+        );
+        // At exhaustion non-read callers retain main's detections and one inline level.
+        let target = shell_read_951_path(&outside.join("new-951"));
+        let command = format!("sh -c {}", shell_read_951_word(&format!("touch {target}")));
+        assert!(bash_write_targets(&command).contains(&target));
+        assert_eq!(
+            bash_cd_targets_inner("sh -c 'cd a; cd a'", true),
+            vec!["a", "a"]
+        );
+        assert!(classify_estate_command("sh -c 'wicked-estate index .'", true).is_some());
+        assert!(explicit_write_program_denial("sh -c 'rm x'").is_some());
+        assert!(opaque_interpreter_denial("sh -c 'python3 script.py'").is_some());
+    }
+
+    #[test]
     fn shell_read_951_r4_env_split_keeps_tail_for_every_scan() {
         let (_, scratch, outside) = shell_read_951_r2_fixture("r4-env");
         let roots = crate::path_policy::AllowedRoots {
@@ -10033,8 +10391,10 @@ mod boundary_tests {
 
     #[test]
     fn shell_read_951_r4_cwd_candidates_are_linear_and_capped() {
-        let base = std::env::temp_dir().join("shell-read-951-cwd/worktree");
+        let (_, base, _) = shell_read_951_r2_fixture("r6-cwd-cap");
         let destinations: Vec<_> = (0..30).map(|i| format!("d{i}")).collect();
+        let nested = destinations.iter().fold(base.clone(), |p, d| p.join(d));
+        std::fs::create_dir_all(&nested).unwrap();
         // Fail safely on the old exponential implementation before trying all 30.
         assert!(shell_cwd_candidates(vec![base.clone()], &destinations[..10], None).len() <= 21);
         let command = destinations
@@ -10045,7 +10405,8 @@ mod boundary_tests {
         let start = std::time::Instant::now();
         let cwds = bash_cd_targets_inner(&command, true);
         let candidates = shell_cwd_candidates(vec![base.clone()], &cwds, None);
-        assert_eq!(candidates.len(), 60);
+        // r4's 60 included later destinations resolved against unrelated starting bases.
+        assert_eq!(candidates.len(), 31);
         assert!(candidates.contains(&destinations.iter().fold(base.clone(), |p, d| p.join(d))));
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
         let destinations: Vec<_> = (0..100).map(|i| format!("d{i}")).collect();
@@ -10056,7 +10417,7 @@ mod boundary_tests {
     }
 
     #[test]
-    fn shell_read_951_r4_nested_inline_reads_have_their_own_depth_budget() {
+    fn shell_read_951_r4_nested_inline_reads_respect_the_depth_budget() {
         let (_, scratch, outside) = shell_read_951_r2_fixture("r4-depth");
         let file = outside.join("tip.mjs");
         let mut command = format!("cat {}", shell_read_951_path(&file));
@@ -10073,8 +10434,6 @@ mod boundary_tests {
         collect_shell_operands(
             &format!("sh -c {}", shell_read_951_word(&command)),
             None,
-            8,
-            true,
             &mut operands,
         );
         assert!(
@@ -10130,7 +10489,7 @@ mod boundary_tests {
     }
 
     #[test]
-    fn shell_read_951_r4_all_heredoc_bodies_are_read_data() {
+    fn shell_read_951_r4_data_receivers_keep_heredoc_bodies_as_data() {
         let (_, scratch, outside) = shell_read_951_r2_fixture("r4-heredocs");
         let roots = crate::path_policy::AllowedRoots {
             write: vec![scratch.clone()],
