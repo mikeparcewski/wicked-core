@@ -15507,6 +15507,8 @@ mod ask_config_tests {
         std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&input.run_id)).unwrap();
     }
 
+    // Container seat homes are seeded only on Unix (the container floor is Linux-in-a-VM; native Windows refuses it).
+    #[cfg(unix)]
     #[test]
     fn ask_pi_reused_container_home_clears_the_server_on_a_withheld_launch() {
         let _env = crate::test_env::ENV_LOCK
