@@ -1471,11 +1471,19 @@ fn owes_qe_test(
     ran: &[String],
     requires_qe: bool,
 ) -> bool {
+    // A test only counts between the last tree change and the deliver step: one after delivery
+    // decides nothing the delivery was gated on (codex r4).
+    let deliver_at = (0..steps.len())
+        .filter(|&i| steps[i].catalog == DELIVER_ID)
+        .map(|i| run_position(steps, ran, i))
+        .min();
     requires_qe
         && qe_reachable(catalog, steps)
         && last_tree_changing_step(catalog, steps, ran).is_some_and(|c| {
+            let after = run_position(steps, ran, c);
             !steps.iter().enumerate().any(|(i, s)| {
-                s.catalog == "test" && run_position(steps, ran, i) > run_position(steps, ran, c)
+                let at = run_position(steps, ran, i);
+                s.catalog == "test" && at > after && deliver_at.is_none_or(|d| at < d)
             })
         })
 }
@@ -1734,17 +1742,14 @@ pub fn floor_fill(
         }
     }
     // §8.5: no floor phase before a floor phase that precedes it in catalog order.
-    // A required QE test after the last tree change is valid whatever its catalog order or
-    // provenance, including when an accepted plan is filled again on revision.
-    let last_change = last_tree_changing_step(catalog, &steps, input.ran)
-        .map(|i| run_position(&steps, input.ran, i));
+    // Under a QE contract, `test` steps are placed by the QE rule (after the last tree change),
+    // not by catalog order — on the fill that adds one and on every later revision, where an
+    // earlier test may already be done before newer work (codex r3, r4). They are left out of
+    // this check.
     let first = |ty: &String| {
-        steps.iter().enumerate().position(|(i, s)| {
-            &s.catalog == ty
-                && !(input.requires_qe
-                    && s.catalog == "test"
-                    && last_change.is_some_and(|c| run_position(&steps, input.ran, i) > c))
-        })
+        steps
+            .iter()
+            .position(|s| &s.catalog == ty && !(input.requires_qe && s.catalog == "test"))
     };
     for (k, ty) in floor.iter().enumerate() {
         let Some(at) = first(ty) else { continue };
@@ -3430,6 +3435,48 @@ mod tests {
             assert!(units
                 .iter()
                 .any(|u| crate::qe_acceptance::is_qe_unit(u) && u.ord > review.ord));
+        }
+
+        /// (codex r4) A test after the deliver step decides nothing the delivery was gated on: the
+        /// contract still owes one between the last tree change and the deliver step.
+        #[test]
+        fn core_960_a_test_after_deliver_does_not_meet_the_qe_contract() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "review", "id": "review"},
+                {"catalog": "deliver", "id": "deliver", "executes_code": true,
+                 "executor": {"type": "tool", "cmd": ["true"]}},
+                {"catalog": "test", "id": "late"}
+            ]}));
+            let f = fill_qe_contract(&p, true, &[]).unwrap();
+            let ids = phase_ids(&f);
+            let pos = |id: &str| ids.iter().position(|i| *i == id).unwrap();
+            assert!(
+                pos("test") > pos("build") && pos("test") < pos("deliver"),
+                "{ids:?}"
+            );
+        }
+
+        /// (codex r4) On a revision whose done prefix already holds a test, new work after it gets
+        /// its own contract test, and the done test is not a catalog-order violation.
+        #[test]
+        fn core_960_a_done_test_before_new_work_is_not_a_reorder() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "review", "id": "review", "executes_code": true},
+                {"catalog": "test", "id": "verify"},
+                {"catalog": "build", "id": "build-2"}
+            ]}));
+            let held = [HeldObligation {
+                rule: "R-test".into(),
+                token: "step:test".into(),
+            }];
+            let ran: Vec<String> = ["build", "review", "verify"].map(String::from).to_vec();
+            let f = fill_qe_contract_in(&p, true, &held, 45, &ran).expect("a valid revision");
+            let ids = phase_ids(&f);
+            let pos = |id: &str| ids.iter().position(|i| *i == id).unwrap();
+            let last_test = ids.iter().rposition(|i| i.starts_with("test")).unwrap();
+            assert!(last_test > pos("build-2"), "{ids:?}");
         }
 
         #[test]
