@@ -10832,34 +10832,27 @@ fn run_tool_cmd_jailed(
 /// code-evidence floor accepts an unchanged tree only with it.
 pub(crate) const NO_CHANGE_NEEDED: &str = "NO CHANGE NEEDED";
 
-/// (core#929) Whether `output` declares [`NO_CHANGE_NEEDED`]. A line declares it when, with its
-/// markdown emphasis (`*`, `_`, `` ` ``) and surrounding blanks stripped, the marker STARTS it
-/// (`**NO CHANGE NEEDED** — the fix is already in`) or ENDS it (`Verifying current state:NO
-/// CHANGE NEEDED`: a carrier joined two agent messages with no newline), on a word boundary each
-/// way. Case-sensitive: the marker is upper case. Prose that only mentions it mid-sentence
-/// (`reply with the line NO CHANGE NEEDED.`) does not declare it.
+/// (core#929) Whether `output` declares [`NO_CHANGE_NEEDED`]: a line that STARTS with the marker,
+/// its markdown emphasis (`*`, `_`, `` ` ``) and surrounding blanks stripped, followed by nothing or
+/// by its reason after a separator (`**NO CHANGE NEEDED** — the fix is already in the tree`,
+/// `NO CHANGE NEEDED: attempt 0 landed it`). Case-sensitive. A line that only MENTIONS the marker
+/// (`reply with: NO CHANGE NEEDED`, `I cannot declare NO CHANGE NEEDED`) never declares it (codex
+/// r1, r2): only the line's opening is read, so no wording before it can turn prose into the
+/// declaration. A marker a carrier fused onto the previous sentence (`state:NO CHANGE NEEDED`, the
+/// ACP carrier joining two agent messages, run 24590a4b) is not read either; the floor's refusal
+/// names the form.
 pub(crate) fn declares_no_change(output: &str) -> bool {
     let m = NO_CHANGE_NEEDED;
-    // (codex r1) The marker must DECLARE, never be mentioned: after it, nothing or a separator that
-    // starts its reason; before it (the suffix form), nothing or the end of a sentence or clause —
-    // a carrier-fused `state:` included. `I cannot declare NO CHANGE NEEDED` and `reply with NO
-    // CHANGE NEEDED` are prose about the marker, not the declaration.
-    let opens_reason = |rest: &str| {
-        let rest = rest.trim_start();
-        rest.is_empty() || rest.starts_with(['—', '–', '-', ':', '.', ';', ',', '('])
-    };
-    let ends_clause = |head: &str| {
-        let head = head.trim_end();
-        head.is_empty() || head.ends_with(['.', ':', '!', '?', ';', '—', '–', '-', ')'])
-    };
     output.lines().any(|l| {
         let s: String = l
             .chars()
             .filter(|c| !matches!(c, '*' | '_' | '`'))
             .collect();
         let s = s.trim();
-        (s.starts_with(m) && opens_reason(&s[m.len()..]))
-            || (s.ends_with(m) && ends_clause(&s[..s.len() - m.len()]))
+        s.strip_prefix(m).is_some_and(|rest| {
+            let rest = rest.trim_start();
+            rest.is_empty() || rest.starts_with(['—', '–', '-', ':', '.', ';', ',', '('])
+        })
     })
 }
 
@@ -19027,7 +19020,8 @@ mod request_changes_tests {
         assert!(p.contains("approve to re-run the phase"), "{p}");
     }
 
-    /// core#929: the NO CHANGE NEEDED declaration, however a seat or its carrier decorates it.
+    /// core#929: the NO CHANGE NEEDED declaration opens its line, decorated or followed by a reason;
+    /// a mention anywhere else is prose (codex r1, r2).
     #[test]
     fn core_929_no_change_needed_is_read_decorated_or_fused() {
         for yes in [
@@ -19036,15 +19030,15 @@ mod request_changes_tests {
             "**NO CHANGE NEEDED** — the fix is already in the tree",
             "`NO CHANGE NEEDED`",
             "NO CHANGE NEEDED: attempt 0 landed it",
-            "Verifying current state:NO CHANGE NEEDED",
-            "Checked the tree. NO CHANGE NEEDED",
-            "Done — NO CHANGE NEEDED",
         ] {
             assert!(declares_no_change(yes), "{yes:?}");
         }
         for no in [
             "Change nothing; reply with the line NO CHANGE NEEDED.",
             "I cannot declare NO CHANGE NEEDED",
+            "I cannot truthfully declare: NO CHANGE NEEDED",
+            "If no edits are required, reply with: NO CHANGE NEEDED",
+            "Checked the tree. NO CHANGE NEEDED",
             "If no edits are required, reply with NO CHANGE NEEDED",
             "NO CHANGE NEEDED? No: I changed tip.mjs",
             "NO CHANGE NEEDED is what I would say, but I edited tip.mjs",
