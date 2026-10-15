@@ -2639,20 +2639,32 @@ mod tests {
                 ),
                 expected
             );
-            // An authored test already meets the contract; count it only once.
+            // Reserve a contract test even with an authored test: floor fill may add a writer.
+            let expected = if requires_qe {
+                vec![
+                    "test_plan",
+                    "design",
+                    "architecture",
+                    "test",
+                    "review",
+                    "security_review",
+                ]
+            } else {
+                vec![
+                    "test_plan",
+                    "design",
+                    "architecture",
+                    "review",
+                    "security_review",
+                ]
+            };
             assert_eq!(
                 adds(
                     json!({"steps": [{"catalog": "build"}, {"catalog": "test"}]}),
                     None,
                     requires_qe
                 ),
-                [
-                    "test_plan",
-                    "design",
-                    "architecture",
-                    "review",
-                    "security_review"
-                ]
+                expected
             );
             // No creator step: an empty floor, even when a step does code work.
             for catalog in ["understand", "review"] {
@@ -2660,14 +2672,19 @@ mod tests {
                     adds(json!({"steps": [{"catalog": catalog}]}), None, requires_qe).is_empty()
                 );
             }
-            // A non-code run substitutes critique and owes neither security_review nor test.
+            // A non-code run substitutes critique; the QE upper bound still reserves a test.
+            let expected = if requires_qe {
+                vec!["test_plan", "design", "architecture", "test", "critique"]
+            } else {
+                vec!["test_plan", "design", "architecture", "critique"]
+            };
             assert_eq!(
                 adds(
                     json!({"steps": [{"catalog": "produce"}]}),
                     None,
                     requires_qe
                 ),
-                ["test_plan", "design", "architecture", "critique"]
+                expected
             );
             // A delivering run carries its deliver step, so deliver is never an addition.
             let d: PlanStep = serde_json::from_value(json!({

@@ -1430,17 +1430,41 @@ fn run_position(steps: &[PlanStep], ran: &[String], i: usize) -> usize {
         .unwrap_or(ran.len() + i)
 }
 
-fn last_code_creator(
+/// Mirror `qe_acceptance::may_change_the_tree`: creators and code-executing steps, including
+/// Tools, can revoke a waiver; delivery only ships the tree.
+fn may_change_the_tree(catalog: &[crate::workflow::PhaseDef], step: &PlanStep) -> bool {
+    step.catalog != DELIVER_ID
+        && catalog
+            .iter()
+            .find(|e| e.id == step.catalog)
+            .is_some_and(|e| {
+                e.role == crate::workflow::PhaseRole::Creator
+                    || step.executes_code.unwrap_or(e.executes_code)
+            })
+}
+
+fn last_tree_changing_step(
     catalog: &[crate::workflow::PhaseDef],
     steps: &[PlanStep],
     ran: &[String],
 ) -> Option<usize> {
     (0..steps.len())
-        .filter(|&i| is_creator_step(catalog, &steps[i]) && code_work_step(catalog, &steps[i]))
+        .filter(|&i| may_change_the_tree(catalog, &steps[i]))
         .max_by_key(|&i| run_position(steps, ran, i))
 }
 
-/// Whether the QE contract needs a test after the last code-work creator in running order.
+/// Whether a test can become a QE unit: `compose` fixes the role to the catalog entry's, and
+/// `plan_from_def` requires an earlier code-executing Creator for `repo_checks_floor`.
+fn qe_reachable(catalog: &[crate::workflow::PhaseDef], steps: &[PlanStep]) -> bool {
+    steps.iter().any(|s| {
+        catalog.iter().find(|e| e.id == s.catalog).is_some_and(|e| {
+            e.role == crate::workflow::PhaseRole::Creator
+                && s.executes_code.unwrap_or(e.executes_code)
+        })
+    })
+}
+
+/// Whether the reachable QE contract needs a test after the last tree change in running order.
 fn owes_qe_test(
     catalog: &[crate::workflow::PhaseDef],
     steps: &[PlanStep],
@@ -1448,7 +1472,8 @@ fn owes_qe_test(
     requires_qe: bool,
 ) -> bool {
     requires_qe
-        && last_code_creator(catalog, steps, ran).is_some_and(|c| {
+        && qe_reachable(catalog, steps)
+        && last_tree_changing_step(catalog, steps, ran).is_some_and(|c| {
             !steps.iter().enumerate().any(|(i, s)| {
                 s.catalog == "test" && run_position(steps, ran, i) > run_position(steps, ran, c)
             })
@@ -1457,11 +1482,12 @@ fn owes_qe_test(
 
 /// The phase types floor fill could insert into `plan` in the WORST case: the top band's floor
 /// (read from `THRESHOLDS` — the highest score any plan can reach, destructive or not) minus the
-/// types the plan already has, plus the QE contract's test when owed (even if an earlier test
-/// already exists). Floor fill inserts one step per missing band-floor type, plus at most one
-/// contract test, and a ratchet never exceeds the top band, so `plan` units plus this count is
-/// an upper bound on
-/// what the run will plan — what a launch's synchronous unit limit checks (codex round 5 on #622)
+/// types the plan already has, plus one QE contract test whenever the contract requires QE and
+/// the plan has a creator (deduplicated with a missing band-floor test). Reserve it regardless
+/// of authored tests: floor fill can itself introduce a code Creator or a later tree change.
+/// Floor fill inserts one step per missing band-floor type, plus at most one contract test,
+/// and a ratchet never exceeds the top band, so `plan` units plus this count is an upper bound
+/// on what the run will plan — what a launch's synchronous unit limit checks (codex round 5 on #622)
 /// before any score exists.
 pub fn worst_case_floor_additions(
     catalog: &[crate::workflow::PhaseDef],
@@ -1474,9 +1500,7 @@ pub fn worst_case_floor_additions(
         .into_iter()
         .filter(|ty| !plan.steps.iter().any(|s| &s.catalog == ty))
         .collect();
-    if owes_qe_test(catalog, &plan.steps, &[], requires_qe)
-        && !additions.iter().any(|ty| ty == "test")
-    {
+    if requires_qe && plan.has_creator_in(catalog) && !additions.iter().any(|ty| ty == "test") {
         additions.push("test".to_string());
     }
     additions.sort_by_key(|ty| catalog.iter().position(|e| &e.id == ty));
@@ -1487,8 +1511,8 @@ pub fn worst_case_floor_additions(
 /// `plan.steps` is inserted at its catalog-order position, marked `added_by: floor` with its
 /// `floor_reason`, and the result goes through [`compose`]. Never removes or replaces a step.
 /// Every authored step comes out `added_by: plan`; a step that supplies provenance is refused.
-/// The QE contract may additionally insert a `test` after the last code-work creator in running
-/// order, even when an earlier test exists or the creator follows the test's catalog slot.
+/// When QE is reachable, its contract may additionally insert a `test` after the last tree-changing
+/// step in running order, even when an earlier test exists or a writer follows the test's slot.
 ///
 /// (WT-C3, DES-walkthrough-proof §4.12) The computed floor is the band's floor UNION the catalog
 /// types of every held testing-rule obligation ([`FloorInput::obligations`]), for a plan with a
@@ -1676,12 +1700,12 @@ pub fn floor_fill(
             },
         );
     }
-    // (core#960) A band/rule/authored test before a later code creator cannot verify the final
+    // (core#960) A band/rule/authored test before a later tree change cannot verify the final
     // tree. Apply the contract after ordinary floor insertion, reading the revision's done prefix
-    // in running order, and place the test immediately after the last code-work creator.
+    // in running order, and place the test immediately after the last tree-changing step.
     let contract_test_id = if owes_qe_test(catalog, &steps, input.ran, input.requires_qe) {
-        let c =
-            last_code_creator(catalog, &steps, input.ran).expect("QE is owed for a code creator");
+        let c = last_tree_changing_step(catalog, &steps, input.ran)
+            .expect("QE is owed after a tree change");
         let id = fresh_id(&steps, "test");
         steps.insert(
             c + 1,
@@ -1710,13 +1734,17 @@ pub fn floor_fill(
         }
     }
     // §8.5: no floor phase before a floor phase that precedes it in catalog order.
-    // The QE contract test must run after the last code creator whatever the catalog order
-    // (e.g. a review that executes code). Exclude that step from the catalog-order check;
-    // authored and band/rule-added tests still obey the ordinary floor ordering.
+    // A required QE test after the last tree change is valid whatever its catalog order or
+    // provenance, including when an accepted plan is filled again on revision.
+    let last_change = last_tree_changing_step(catalog, &steps, input.ran)
+        .map(|i| run_position(&steps, input.ran, i));
     let first = |ty: &String| {
-        steps
-            .iter()
-            .position(|s| &s.catalog == ty && contract_test_id.as_ref() != Some(&s.id))
+        steps.iter().enumerate().position(|(i, s)| {
+            &s.catalog == ty
+                && !(input.requires_qe
+                    && s.catalog == "test"
+                    && last_change.is_some_and(|c| run_position(&steps, input.ran, i) > c))
+        })
     };
     for (k, ty) in floor.iter().enumerate() {
         let Some(at) = first(ty) else { continue };
@@ -3405,6 +3433,36 @@ mod tests {
         }
 
         #[test]
+        fn core_960_qe_contract_test_runs_after_every_tree_changing_step() {
+            for writer in [
+                json!({"catalog": "produce", "id": "draft"}),
+                json!({"catalog": "run", "id": "cutover", "executes_code": true,
+                    "executor": {"type": "tool", "cmd": ["true"]}}),
+            ] {
+                let p = plan(json!({"steps": [
+                    {"catalog": "build", "id": "build"},
+                    writer,
+                    {"catalog": "review", "id": "review"},
+                    {"catalog": "deliver", "id": "deliver", "executes_code": true,
+                     "executor": {"type": "tool", "cmd": ["true"]}}
+                ]}));
+                let f = fill_qe_contract(&p, true, &[]).unwrap();
+                assert_eq!(
+                    phase_ids(&f),
+                    [
+                        "build",
+                        writer["id"].as_str().unwrap(),
+                        "test",
+                        "review",
+                        "deliver"
+                    ]
+                );
+                let units = plan_from_def(&f.def, "fix the bug", "r-qe-after-writer");
+                assert!(crate::qe_acceptance::is_qe_unit(&units[2]));
+            }
+        }
+
+        #[test]
         fn core_960_qe_after_code_review_does_not_violate_the_band_floor_order() {
             let p = plan(json!({"steps": [
                 {"catalog": "build", "id": "build"},
@@ -3417,6 +3475,37 @@ mod tests {
                 ["test_plan", "design", "build", "review", "test"]
             );
             assert_eq!(f.floor, ["test_plan", "design", "build", "test", "review"]);
+        }
+
+        #[test]
+        fn core_960_an_accepted_contract_test_keeps_its_order_exemption_on_revision() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "review", "id": "review", "executes_code": true}
+            ]}));
+            let accepted = fill_qe_contract(&p, true, &[]).unwrap();
+            assert_eq!(phase_ids(&accepted), ["build", "review", "test"]);
+            let mut revision = accepted.steps;
+            // revise strips provenance before calling floor_fill, then restores it by id.
+            for s in &mut revision.steps {
+                s.added_by = None;
+                s.floor_reason = None;
+                s.floor_rule = None;
+            }
+            let held = [HeldObligation {
+                rule: "R-test".into(),
+                token: "step:test".into(),
+            }];
+            let f = fill_qe_contract_in(&revision, true, &held, 45, &[])
+                .expect("an existing contract test after review is not FloorReordered");
+            assert_eq!(
+                phase_ids(&f),
+                ["test_plan", "design", "build", "review", "test"]
+            );
+            assert_eq!(
+                f.steps.steps.iter().filter(|s| s.catalog == "test").count(),
+                1
+            );
         }
 
         #[test]
@@ -3550,6 +3639,27 @@ mod tests {
         }
 
         #[test]
+        fn core_960_worst_case_reserves_qe_when_floor_fill_introduces_the_code_creator() {
+            let p = plan(json!({"steps": [
+                {"catalog": "produce", "id": "draft"},
+                {"catalog": "run", "id": "cutover", "executes_code": true,
+                 "executor": {"type": "tool", "cmd": ["true"]}},
+                {"catalog": "review", "id": "review"}
+            ]}));
+            let additions = worst_case_floor_additions(crate::catalog::catalog(), &p, false, true);
+            assert_eq!(additions.iter().filter(|ty| *ty == "test").count(), 1);
+            assert!(additions.iter().any(|ty| ty == "build"));
+            let f = fill_qe_contract(&p, true, &[]).unwrap();
+            assert_eq!(
+                phase_ids(&f),
+                ["build", "draft", "cutover", "test", "review"]
+            );
+            assert!(plan_from_def(&f.def, "fix the bug", "r-qe-floor-creator")
+                .iter()
+                .any(crate::qe_acceptance::is_qe_unit));
+        }
+
+        #[test]
         fn core_960_an_early_authored_test_does_not_allow_overriding_required_qe() {
             let p = plan(json!({
                 "steps": [
@@ -3646,6 +3756,24 @@ mod tests {
             let f = fill_qe_contract(&p, true, &[]).unwrap();
             assert_eq!(phase_ids(&f), ["draft", "critique"]);
             assert!(!f.floor.iter().any(|t| t == "test"));
+        }
+
+        #[test]
+        fn core_960_overriding_build_leaves_no_reachable_qe_unit() {
+            let p = plan(json!({
+                "steps": [{"catalog": "review", "id": "review", "executes_code": true}],
+                "override": {"remove": ["build"], "reason": "review performs the work"}
+            }));
+            let f =
+                fill_qe_contract(&p, true, &[]).expect("QE is unreachable without a code Creator");
+            assert_eq!(phase_ids(&f), ["review"]);
+            assert_eq!(f.def.phases[0].role, crate::workflow::PhaseRole::Evaluator);
+            assert!(f.def.phases[0].executes_code);
+            assert!(
+                !plan_from_def(&f.def, "review the change", "r-no-qe-creator")
+                    .iter()
+                    .any(crate::qe_acceptance::is_qe_unit)
+            );
         }
 
         #[test]
