@@ -581,6 +581,59 @@ mod tests {
         ])
     }
 
+    #[test]
+    fn shell_read_951_r7_directory_operands_ignore_speculative_grant_cwds() {
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/shell-read-951-r7/acp/repo");
+        let cwd = repo.join("wt");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let db = repo.join("gov.db");
+        drop(wicked_apps_core::open_store(db.to_str()).unwrap());
+        let decisions = repo.join("decisions.jsonl");
+        let boundary = crate::gate_hook::BoundaryCtx {
+            roots: crate::path_policy::AllowedRoots {
+                write: vec![cwd.clone()],
+                read: vec![repo],
+            },
+            cwd,
+            home: None,
+            claude_config_dir: None,
+            pre_build_scope: false,
+            write_posture: crate::write_posture::WritePosture::Full,
+            deliverable_roots: vec![],
+            estate_store_pinned: false,
+            graph_write_dir: None,
+            graph_store_db: None,
+        };
+        let gate = AcpGate {
+            scope: "unit",
+            phase: "unit-951-r7",
+            phase_alias: None,
+            catalog_alias: None,
+            db: db.to_str(),
+            decisions_path: decisions.to_str().unwrap(),
+            boundary: Some(boundary),
+        };
+        for command in [
+            "cd .. && git status",
+            "pushd .. && git status",
+            "env -C .. git status",
+        ] {
+            let params = json!({
+                "toolName": "bash",
+                "toolCall": {"rawInput": {"command": command}},
+                "options": opts(),
+            });
+            for (result, allowed) in [
+                permission_result(&gate, &params),
+                chat_boundary_result(gate.boundary.as_ref().unwrap(), &params),
+            ] {
+                assert!(allowed, "{command}: {result}");
+                assert_eq!(result["outcome"]["optionId"], "allow");
+            }
+        }
+    }
+
     /// core#951: the actual pi/codex wire spelling must reach the shared read boundary.
     #[test]
     fn shell_read_951_acp_and_chat_reject_and_audit_the_command() {

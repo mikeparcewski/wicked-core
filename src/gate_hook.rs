@@ -945,6 +945,7 @@ pub(crate) fn boundary_denial_tracked(
     // (container / Seatbelt) is the hermetic layer; this scan closes direct, literal escapes only.
     // An existing absolute path used as a SEARCH PATTERN (`rg '/etc/hosts' src/`) is also
     // judged as an operand: a rare advisory false positive accepted by the program-agnostic scan.
+    // A heredoc piped into a shell (`cat <<'EOF' | sh`) is also an accepted literal-scan limit.
     if is_shell_call(context, tool) {
         if let Some(command) = context.get("command").and_then(serde_json::Value::as_str) {
             // REMOTE-WRITE FENCE (F-7R2-012, wave 6): a `git push` / `gh pr create|merge|edit|
@@ -959,8 +960,8 @@ pub(crate) fn boundary_denial_tracked(
             if let Some(hit) = crate::remote_write_fence::remote_write_command(command) {
                 return Some((hit.reason(), false));
             }
-            let mut here =
-                read_install_fence_cwd(install_state).unwrap_or_else(|| cwd.to_path_buf());
+            let here = read_install_fence_cwd(install_state).unwrap_or_else(|| cwd.to_path_buf());
+            // The call cwd adds scan candidates; the existing fences keep main's `here`.
             // Always retain the unit cwd: a stale sidecar must never weaken main's write check.
             let mut bases = vec![cwd.to_path_buf(), here.clone()];
             let call_cwd = context.get("args").and_then(|args| {
@@ -969,7 +970,9 @@ pub(crate) fn boundary_denial_tracked(
                     .find_map(|key| args.get(key).and_then(serde_json::Value::as_str))
             });
             let mut read_bases = bases.clone();
+            let mut directory_bases = bases.clone();
             let mut read_targets = Vec::new();
+            // ACP/chat grant-root speculation applies only to file operands.
             // Accepted limit: a stateful in-process (ACP) seat can retain a cwd BELOW a
             // granted root between calls; grant-root candidates do not track that descendant.
             // C5 removes ACP from the seats: the container floor closes this gap and is the
@@ -979,13 +982,9 @@ pub(crate) fn boundary_denial_tracked(
             }
             if let Some(raw) = call_cwd {
                 bases = shell_cwd_candidates(bases, &[raw.to_string()], home);
-                (read_bases, read_targets) = shell_cwd_walk(read_bases, &[raw.to_string()], home);
-                if let Some(dir) = existing_shell_cwd_paths(raw, Some(&here), home)
-                    .into_iter()
-                    .find(|p| p.is_dir())
-                {
-                    here = dir;
-                }
+                read_bases = shell_cwd_candidates(read_bases, &[raw.to_string()], home);
+                (directory_bases, read_targets) =
+                    shell_cwd_walk(directory_bases, &[raw.to_string()], home);
             }
             let mut operands = ShellOperands::default();
             // Keep the real home for reads even when the command may set HOME. Clearing it
@@ -1001,10 +1000,9 @@ pub(crate) fn boundary_denial_tracked(
                     candidates.push(candidate);
                 }
             }
-            // ACP/chat roots are possible prior directories for READS only. A read grant
-            // must never create a fatal write-resolution base.
-            let (read_candidates, directory_reads) =
-                shell_cwd_walk(read_bases, &operands.cwds, home);
+            let read_candidates = shell_cwd_candidates(read_bases, &operands.cwds, home);
+            // Directory operands follow only the real starting cwd chain.
+            let (_, directory_reads) = shell_cwd_walk(directory_bases, &operands.cwds, home);
             read_targets.extend(directory_reads);
             if let Some(raw) = call_cwd {
                 write_cwds.insert(0, raw.to_string());
@@ -1652,7 +1650,8 @@ fn quoted_heredoc_on(line: &str) -> Option<(String, bool)> {
 fn strip_read_heredoc_bodies(command: &str) -> String {
     let mut out = Vec::new();
     let mut pending = std::collections::VecDeque::new();
-    for line in command.split('\n') {
+    let mut lines = command.split('\n');
+    while let Some(line) = lines.next() {
         if let Some((delim, dash, executable)) = pending.front() {
             let probe = if *dash {
                 line.trim_start_matches('\t')
@@ -1661,27 +1660,41 @@ fn strip_read_heredoc_bodies(command: &str) -> String {
             };
             if probe == delim {
                 pending.pop_front();
-                out.push("");
+                out.push(String::new());
             } else {
-                out.push(if *executable { line } else { "" });
+                out.push(if *executable { line } else { "" }.to_string());
             }
         } else {
-            out.push(line);
-            pending.extend(heredocs_on(line, true));
+            // Join continued headers for receiver classification; quoted data bodies keep
+            // their physical lines, since a backslash there must not swallow the delimiter.
+            let mut header = line.to_string();
+            while header.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1 {
+                let Some(next) = lines.next() else { break };
+                header.push('\n');
+                header.push_str(next);
+            }
+            pending.extend(heredocs_on(&header, true));
+            out.push(header);
         }
     }
     out.join("\n")
 }
 
-fn heredoc_runs_script(header: &str) -> bool {
+fn heredoc_runs_script(header: &str, operator: usize) -> bool {
     let scan = ShellScanGuard::scan(header, true);
     if !scan.extended {
         return false;
     }
     let owned = shell_tokens_with_operators(header, true);
+    let separator =
+        |t: &String| matches!(t.as_str(), ";" | "|" | "||" | "&&" | "&" | "|&" | "(" | ")");
+    let segment_index = shell_tokens_with_operators(&header[..operator], true)
+        .iter()
+        .filter(|t| separator(t))
+        .count();
     let segment = owned
-        .rsplit(|t| matches!(t.as_str(), ";" | "|" | "||" | "&&" | "&" | "|&" | "(" | ")"))
-        .next()
+        .split(separator)
+        .nth(segment_index)
         .unwrap_or_default();
     let mut skip_operand = false;
     let words: Vec<_> = segment
@@ -1712,7 +1725,7 @@ fn heredoc_runs_script(header: &str) -> bool {
                     | "ruby"
             )
         }),
-        Unwrapped::Inline { inner, .. } => heredoc_runs_script(&inner),
+        Unwrapped::Inline { inner, .. } => heredoc_runs_script(&inner, inner.len()),
     }
 }
 
@@ -1794,7 +1807,7 @@ fn heredocs_on(line: &str, read_scan: bool) -> Vec<(String, bool, bool)> {
                     && !piped_on
                     && matches!(program, Some("cat" | "tee")))
             {
-                found.push((delim, dash, read_scan && heredoc_runs_script(&line[..i])));
+                found.push((delim, dash, read_scan && heredoc_runs_script(line, i)));
             }
             i = j + word.len();
             continue;
@@ -2386,23 +2399,6 @@ fn shell_cwd_walk(
         }
     }
     (candidates, targets)
-}
-
-/// A cwd argument is a path even when it starts with `-` or contains `=`; it is not an option.
-fn existing_shell_cwd_paths(raw: &str, cwd: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
-    resolve_shell_readings(raw, home)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|p| {
-            let base = if Path::new(&p).is_absolute() {
-                Path::new("")
-            } else {
-                cwd?
-            };
-            let path = crate::path_policy::normalize_for_fence(&p, base, home);
-            path.exists().then_some(path)
-        })
-        .collect()
 }
 
 fn existing_shell_read_paths(word: &str, cwd: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
@@ -10079,6 +10075,60 @@ mod boundary_tests {
 
     fn ctx(path: &str) -> serde_json::Value {
         json!({ "path": path })
+    }
+
+    #[test]
+    fn shell_read_951_r7_heredoc_receiver_uses_the_whole_logical_segment() {
+        let (_, scratch, outside) = shell_read_951_r2_fixture("r7-heredocs");
+        let file = shell_read_951_path(&outside.join("tip.mjs"));
+        let commands = [
+            "<<'EOF' sh",
+            "sh \\\n<<'EOF'",
+            "true; <<'EOF' env sh; true",
+            "true && <<'EOF' command bash | cat",
+        ]
+        .map(|header| format!("{header}\ncat {file}\nEOF"));
+        shell_read_951_r2_assert_reads(&scratch, &outside, &commands);
+        shell_read_951_r2_assert_reads(
+            &scratch,
+            &outside,
+            &[format!("cat <<'EOF'\ntext \\\nEOF\ncat {file}\nEOF")],
+        );
+    }
+
+    #[test]
+    fn shell_read_951_r7_call_cwd_does_not_downgrade_main_fatal_write() {
+        let (dir, scratch, outside) = shell_read_951_r2_fixture("r7-call-cwd");
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![scratch.clone()],
+            read: vec![],
+        };
+        let command = format!(
+            "npm ci; touch {}",
+            shell_read_951_path(&outside.join("951-new"))
+        );
+        let state = dir.join("cwd");
+        std::fs::write(&state, scratch.to_str().unwrap()).unwrap();
+        for install_state in [None, Some(state.as_path())] {
+            for key in ["workdir", "cwd", "working_directory", "dir"] {
+                let (reason, fatal) = boundary_denial_tracked(
+                    &roots,
+                    &scratch,
+                    None,
+                    None,
+                    &json!({"command": command, "args": {key: outside}}),
+                    "bash",
+                    install_state,
+                    false,
+                    &[],
+                )
+                .expect("the absolute write must remain denied");
+                assert!(
+                    fatal && reason.starts_with("Bash write leaves"),
+                    "{key}: {reason}"
+                );
+            }
+        }
     }
 
     #[test]
