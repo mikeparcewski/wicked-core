@@ -1328,8 +1328,8 @@ pub struct FloorInput<'a> {
     /// has fired so far (ratcheted: never dropped). Each token's phases join the computed floor.
     pub obligations: &'a [HeldObligation],
     /// The ids of the plan's steps already dispatched or done, in running order (a mid-run
-    /// revision's done prefix; empty at compose). The walkthrough-after-last-creator rule reads
-    /// the plan in RUNNING order: the done prefix, then every other step in plan order.
+    /// revision's done prefix; empty at compose). The QE and walkthrough rules read the plan in
+    /// RUNNING order: the done prefix, then every other step in plan order.
     pub ran: &'a [String],
     /// (core#934) The run's assurance contract enforces a distinct evaluator
     /// ([`crate::assurance::RunAssurance::enforces`]`(DISTINCT_EVALUATOR)`): a plan with a creator
@@ -1338,7 +1338,8 @@ pub struct FloorInput<'a> {
     pub requires_evaluator: bool,
     /// (core#960) The run's assurance contract enforces QE acceptance
     /// ([`crate::assurance::RunAssurance::enforces`]`(QE_ACCEPTANCE)`): a code plan with a
-    /// creator owes a `test` step whatever its band, so a QE acceptance unit is reachable.
+    /// creator owes a `test` step after its last code-work creator whatever its band, so a QE
+    /// acceptance unit is reachable after the final code change.
     pub requires_qe: bool,
 }
 
@@ -1423,23 +1424,43 @@ fn floor_types(
         .collect()
 }
 
-/// Whether the QE contract floor would add a test step to this plan.
+fn run_position(steps: &[PlanStep], ran: &[String], i: usize) -> usize {
+    ran.iter()
+        .position(|d| d == &steps[i].id)
+        .unwrap_or(ran.len() + i)
+}
+
+fn last_code_creator(
+    catalog: &[crate::workflow::PhaseDef],
+    steps: &[PlanStep],
+    ran: &[String],
+) -> Option<usize> {
+    (0..steps.len())
+        .filter(|&i| is_creator_step(catalog, &steps[i]) && code_work_step(catalog, &steps[i]))
+        .max_by_key(|&i| run_position(steps, ran, i))
+}
+
+/// Whether the QE contract needs a test after the last code-work creator in running order.
 fn owes_qe_test(
     catalog: &[crate::workflow::PhaseDef],
-    plan: &PlanSteps,
+    steps: &[PlanStep],
+    ran: &[String],
     requires_qe: bool,
 ) -> bool {
     requires_qe
-        && plan.has_creator_in(catalog)
-        && plan.steps.iter().any(|s| code_work_step(catalog, s))
-        && !plan.steps.iter().any(|s| s.catalog == "test")
+        && last_code_creator(catalog, steps, ran).is_some_and(|c| {
+            !steps.iter().enumerate().any(|(i, s)| {
+                s.catalog == "test" && run_position(steps, ran, i) > run_position(steps, ran, c)
+            })
+        })
 }
 
 /// The phase types floor fill could insert into `plan` in the WORST case: the top band's floor
 /// (read from `THRESHOLDS` — the highest score any plan can reach, destructive or not) minus the
-/// types the plan already has, plus the QE contract's test when owed. Floor fill inserts exactly
-/// one step per missing floor type and a ratchet never exceeds the top band, so `plan` units
-/// plus this count is an exact upper bound on
+/// types the plan already has, plus the QE contract's test when owed (even if an earlier test
+/// already exists). Floor fill inserts one step per missing band-floor type, plus at most one
+/// contract test, and a ratchet never exceeds the top band, so `plan` units plus this count is
+/// an upper bound on
 /// what the run will plan — what a launch's synchronous unit limit checks (codex round 5 on #622)
 /// before any score exists.
 pub fn worst_case_floor_additions(
@@ -1453,7 +1474,9 @@ pub fn worst_case_floor_additions(
         .into_iter()
         .filter(|ty| !plan.steps.iter().any(|s| &s.catalog == ty))
         .collect();
-    if owes_qe_test(catalog, plan, requires_qe) && !additions.iter().any(|ty| ty == "test") {
+    if owes_qe_test(catalog, &plan.steps, &[], requires_qe)
+        && !additions.iter().any(|ty| ty == "test")
+    {
         additions.push("test".to_string());
     }
     additions.sort_by_key(|ty| catalog.iter().position(|e| &e.id == ty));
@@ -1464,6 +1487,8 @@ pub fn worst_case_floor_additions(
 /// `plan.steps` is inserted at its catalog-order position, marked `added_by: floor` with its
 /// `floor_reason`, and the result goes through [`compose`]. Never removes or replaces a step.
 /// Every authored step comes out `added_by: plan`; a step that supplies provenance is refused.
+/// The QE contract may additionally insert a `test` after the last code-work creator in running
+/// order, even when an earlier test exists or the creator follows the test's catalog slot.
 ///
 /// (WT-C3, DES-walkthrough-proof §4.12) The computed floor is the band's floor UNION the catalog
 /// types of every held testing-rule obligation ([`FloorInput::obligations`]), for a plan with a
@@ -1527,7 +1552,7 @@ pub fn floor_fill(
     // §8.5 floor override: none in auto mode; in manual mode recorded, and never a pinned BAND
     // floor phase in a high-risk band. It exempts floor types from the fill; it removes no
     // authored step.
-    let owes_qe = owes_qe_test(catalog, plan, input.requires_qe);
+    let owes_qe = owes_qe_test(catalog, &plan.steps, input.ran, input.requires_qe);
     let mut exempt: Vec<&str> = Vec::new();
     if let Some(ov) = &plan.floor_override {
         if matches!(input.human_confirm, crate::domain::HumanConfirm::None) {
@@ -1587,13 +1612,6 @@ pub fn floor_fill(
             }
         }
     }
-    // (core#960) A QE contract needs a verified-evidence phase after code work. Like the
-    // evaluator contract floor, this is applied after override validation and in catalog order.
-    let contract_qe = owes_qe && !floor.iter().any(|t| t == "test");
-    if contract_qe {
-        floor.push("test".to_string());
-        floor.sort_by_key(|t| order(t));
-    }
     let mut steps: Vec<PlanStep> = plan.steps.clone();
     for s in &mut steps {
         s.added_by = Some(AddedBy::Plan);
@@ -1643,7 +1661,6 @@ pub fn floor_fill(
             None if contract_floor.as_deref() == Some(ty.as_str()) => {
                 CONTRACT_EVALUATOR_REASON.to_string()
             }
-            None if contract_qe && ty == "test" => CONTRACT_QE_REASON.to_string(),
             None => format!("band {} requires {ty}", row.band),
         };
         steps.insert(
@@ -1659,6 +1676,27 @@ pub fn floor_fill(
             },
         );
     }
+    // (core#960) A band/rule/authored test before a later code creator cannot verify the final
+    // tree. Apply the contract after ordinary floor insertion, reading the revision's done prefix
+    // in running order, and place the test immediately after the last code-work creator.
+    let contract_test_id = if owes_qe_test(catalog, &steps, input.ran, input.requires_qe) {
+        let c =
+            last_code_creator(catalog, &steps, input.ran).expect("QE is owed for a code creator");
+        let id = fresh_id(&steps, "test");
+        steps.insert(
+            c + 1,
+            PlanStep {
+                catalog: "test".to_string(),
+                id: id.clone(),
+                added_by: Some(AddedBy::Floor),
+                floor_reason: Some(CONTRACT_QE_REASON.to_string()),
+                ..PlanStep::default()
+            },
+        );
+        Some(id)
+    } else {
+        None
+    };
     // (core#846) A security_review in a plan where no step executes code is refused here, the
     // one composition boundary every author passes (the launch, a re-score or ratchet revision,
     // the PA's PLAN+, a human edit): its diff evidence floor cannot pass on a run that writes no
@@ -1672,7 +1710,14 @@ pub fn floor_fill(
         }
     }
     // §8.5: no floor phase before a floor phase that precedes it in catalog order.
-    let first = |ty: &String| steps.iter().position(|s| &s.catalog == ty);
+    // The QE contract test must run after the last code creator whatever the catalog order
+    // (e.g. a review that executes code). Exclude that step from the catalog-order check;
+    // authored and band/rule-added tests still obey the ordinary floor ordering.
+    let first = |ty: &String| {
+        steps
+            .iter()
+            .position(|s| &s.catalog == ty && contract_test_id.as_ref() != Some(&s.id))
+    };
     for (k, ty) in floor.iter().enumerate() {
         let Some(at) = first(ty) else { continue };
         if floor[..k].iter().filter_map(first).any(|pred| pred > at) {
@@ -1691,13 +1736,7 @@ pub fn floor_fill(
     // The pair is keyed on its proof step: a plan with no `walkthrough_review` has no walkthrough
     // to keep current (a lone authored `walkthrough_plan` records nothing).
     if !pair_exempt && steps.iter().any(|s| s.catalog == WALKTHROUGH_REVIEW) {
-        let run_pos = |steps: &[PlanStep], i: usize| {
-            input
-                .ran
-                .iter()
-                .position(|d| d == &steps[i].id)
-                .unwrap_or(input.ran.len() + i)
-        };
+        let run_pos = |steps: &[PlanStep], i: usize| run_position(steps, input.ran, i);
         let last_creator = (0..steps.len())
             .filter(|&i| is_creator_step(catalog, &steps[i]))
             .max_by_key(|&i| run_pos(&steps, i));
@@ -1739,6 +1778,12 @@ pub fn floor_fill(
                 }
             }
         }
+    }
+    // Report the contract obligation without making an authored early test a new catalog-order
+    // constraint when `test` was not already in the band's/rule's floor.
+    if contract_test_id.is_some() && !floor.iter().any(|t| t == "test") {
+        floor.push("test".to_string());
+        floor.sort_by_key(|t| order(t));
     }
     let filled = PlanSteps {
         steps,
@@ -3287,16 +3332,26 @@ mod tests {
             requires_qe: bool,
             obligations: &[HeldObligation],
         ) -> Result<FloorFilled, PlanRefusal> {
+            fill_qe_contract_in(p, requires_qe, obligations, 0, &[])
+        }
+
+        fn fill_qe_contract_in(
+            p: &PlanSteps,
+            requires_qe: bool,
+            obligations: &[HeldObligation],
+            score: u8,
+            ran: &[String],
+        ) -> Result<FloorFilled, PlanRefusal> {
             floor_fill(
                 crate::catalog::catalog(),
                 p,
                 FloorInput {
-                    score: 0,
+                    score,
                     destructive: false,
                     human_confirm: &MANUAL,
                     deliver: None,
                     obligations,
-                    ran: &[],
+                    ran,
                     requires_evaluator: true,
                     requires_qe,
                 },
@@ -3321,6 +3376,217 @@ mod tests {
             assert_eq!(f.floor, ["build", "test"]);
             let units = plan_from_def(&f.def, "fix the bug", "r-qe");
             assert!(units.iter().any(crate::qe_acceptance::is_qe_unit));
+        }
+
+        #[test]
+        fn core_960_qe_contract_test_runs_after_a_review_that_executes_code() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "review", "id": "review", "executes_code": true}
+            ]}));
+            let f = fill_qe_contract(&p, true, &[]).unwrap();
+            assert_eq!(
+                rows(&f),
+                vec![
+                    row("build", "build", AddedBy::Plan, None),
+                    row("review", "review", AddedBy::Plan, None),
+                    row("test", "test", AddedBy::Floor, Some(CONTRACT_QE_REASON)),
+                ]
+            );
+            assert_eq!(f.floor, ["build", "test"]);
+            let units = plan_from_def(&f.def, "fix the bug", "r-qe-after-review");
+            let review = units
+                .iter()
+                .find(|u| u.phase_id() == Some("review"))
+                .unwrap();
+            assert!(units
+                .iter()
+                .any(|u| crate::qe_acceptance::is_qe_unit(u) && u.ord > review.ord));
+        }
+
+        #[test]
+        fn core_960_qe_after_code_review_does_not_violate_the_band_floor_order() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "review", "id": "review", "executes_code": true}
+            ]}));
+            let f = fill_qe_contract_in(&p, true, &[], 45, &[])
+                .expect("the contract test may follow the band's review");
+            assert_eq!(
+                phase_ids(&f),
+                ["test_plan", "design", "build", "review", "test"]
+            );
+            assert_eq!(f.floor, ["test_plan", "design", "build", "test", "review"]);
+        }
+
+        #[test]
+        fn core_960_an_authored_test_before_a_code_creator_does_not_satisfy_qe() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "test", "id": "test"},
+                {"catalog": "review", "id": "review", "executes_code": true}
+            ]}));
+            let f = fill_qe_contract(&p, true, &[]).unwrap();
+            assert_eq!(phase_ids(&f), ["build", "test", "review", "test-floor"]);
+            assert_eq!(
+                rows(&f).last(),
+                Some(&row(
+                    "test",
+                    "test-floor",
+                    AddedBy::Floor,
+                    Some(CONTRACT_QE_REASON)
+                ))
+            );
+            assert!(f.floor.iter().any(|ty| ty == "test"));
+
+            // A contract-only floor test also must not impose catalog ordering on an authored
+            // test that predates even the build (the low band's only floor phase).
+            let mut early = p;
+            early.steps.swap(0, 1);
+            early.steps.insert(
+                0,
+                PlanStep {
+                    catalog: "produce".into(),
+                    id: "draft".into(),
+                    ..Default::default()
+                },
+            );
+            let f = fill_qe_contract(&early, true, &[]).unwrap();
+            assert_eq!(
+                phase_ids(&f),
+                ["draft", "test", "build", "review", "test-floor"]
+            );
+            assert!(f.floor.iter().any(|ty| ty == "test"));
+        }
+
+        #[test]
+        fn core_960_a_rule_test_before_a_code_creator_needs_a_later_contract_test() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "review", "id": "review", "executes_code": true}
+            ]}));
+            let held = [HeldObligation {
+                rule: "R-test".into(),
+                token: "step:test".into(),
+            }];
+            let f = fill_qe_contract_in(&p, true, &held, 45, &[]).unwrap();
+            assert_eq!(
+                phase_ids(&f),
+                [
+                    "test_plan",
+                    "design",
+                    "build",
+                    "test",
+                    "review",
+                    "test-floor"
+                ]
+            );
+            let rule_test = f.steps.steps.iter().find(|s| s.id == "test").unwrap();
+            assert_eq!(rule_test.floor_rule.as_deref(), Some("R-test"));
+            let contract_test = f.steps.steps.last().unwrap();
+            assert_eq!(
+                contract_test.floor_reason.as_deref(),
+                Some(CONTRACT_QE_REASON)
+            );
+            assert_eq!(contract_test.floor_rule, None);
+        }
+
+        #[test]
+        fn core_960_qe_uses_running_order_for_a_revisions_done_prefix() {
+            let ran = ["build".to_string(), "test".to_string()];
+            // The completed test is earlier in running order even if a revision moves its
+            // authored row after the pending code creator.
+            for steps in [
+                json!([
+                    {"catalog": "build", "id": "build"},
+                    {"catalog": "test", "id": "test"},
+                    {"catalog": "review", "id": "review", "executes_code": true}
+                ]),
+                json!([
+                    {"catalog": "build", "id": "build"},
+                    {"catalog": "review", "id": "review", "executes_code": true},
+                    {"catalog": "test", "id": "test"}
+                ]),
+            ] {
+                let p = plan(json!({"steps": steps}));
+                let f = fill_qe_contract_in(&p, true, &[], 0, &ran).unwrap();
+                let review = f.steps.steps.iter().position(|s| s.id == "review").unwrap();
+                assert_eq!(f.steps.steps[review + 1].id, "test-floor");
+                assert_eq!(
+                    f.steps.steps[review + 1].floor_reason.as_deref(),
+                    Some(CONTRACT_QE_REASON)
+                );
+            }
+            // Conversely, a test that actually ran after both creators is sufficient even
+            // when its authored row is before the review.
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "test", "id": "test"},
+                {"catalog": "review", "id": "review", "executes_code": true}
+            ]}));
+            let ran = [
+                "build".to_string(),
+                "review".to_string(),
+                "test".to_string(),
+            ];
+            let f = fill_qe_contract_in(&p, true, &[], 0, &ran).unwrap();
+            assert_eq!(phase_ids(&f), ["build", "test", "review"]);
+        }
+
+        #[test]
+        fn core_960_worst_case_counts_a_test_after_the_last_code_creator() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "test", "id": "test"},
+                {"catalog": "review", "id": "review", "executes_code": true}
+            ]}));
+            let additions = worst_case_floor_additions(crate::catalog::catalog(), &p, false, true);
+            assert_eq!(additions.iter().filter(|ty| *ty == "test").count(), 1);
+            assert!(
+                !worst_case_floor_additions(crate::catalog::catalog(), &p, false, false)
+                    .iter()
+                    .any(|ty| ty == "test")
+            );
+        }
+
+        #[test]
+        fn core_960_an_early_authored_test_does_not_allow_overriding_required_qe() {
+            let p = plan(json!({
+                "steps": [
+                    {"catalog": "build", "id": "build"},
+                    {"catalog": "test", "id": "test"},
+                    {"catalog": "review", "id": "review", "executes_code": true}
+                ],
+                "override": {"remove": ["test"], "reason": "already tested"}
+            }));
+            let r = fill_qe_contract(&p, true, &[]).unwrap_err();
+            assert_eq!(
+                r,
+                PlanRefusal::OverrideRemovesRequiredQe {
+                    catalog: "test".into()
+                }
+            );
+        }
+
+        #[test]
+        fn core_960_a_contract_test_does_not_require_another_walkthrough_pair() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "review", "id": "review", "executes_code": true},
+                {"catalog": "walkthrough_plan", "id": "walkthrough_plan"},
+                {"catalog": "walkthrough_review", "id": "walkthrough_review"}
+            ]}));
+            let f = fill_qe_contract(&p, true, &[]).unwrap();
+            assert_eq!(
+                phase_ids(&f),
+                [
+                    "build",
+                    "review",
+                    "test",
+                    "walkthrough_plan",
+                    "walkthrough_review"
+                ]
+            );
         }
 
         #[test]
