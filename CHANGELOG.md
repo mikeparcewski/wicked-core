@@ -460,6 +460,13 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.11.1** — 2026-10-15 — patch release on main 2835fb2, carrying #952 (QE acceptance on
+  engine-made launches: `LaunchSpec` QE fields, `Core.setQeAcceptanceOff`), #953 (a benched or unavailable
+  judge gets a disclosed fallback judge), #956 (`Core.qeReviewersAdmitted`: a whole roster's QE reviewer
+  admission against one routing snapshot, off the Node thread) and #955 (core#951: a shell read meets the same
+  read boundary as the Read tool on every carrier's shell tool; pi's `bash` and codex's `shell` no longer skip
+  the shell fences). A patch on purpose: every surface change is additive (new methods and optional fields),
+  and a shell read the boundary refuses is advisory, as a refused Read is.
 - **core-ts 0.11.0** — 2026-10-14 — minor release on main e11232c, carrying #946, #947, #948 (C6).
   A **minor** bump on purpose: C6 changes the container floor's operator surface. A container seat
   now runs on the credential the user signed in with in the agent's login container, the
