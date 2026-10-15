@@ -6676,12 +6676,17 @@ fn apply_step_result(
     // a chat's answer step, its turn gate) is judged by that human: a one-line answer is an
     // answer, not "no reviewable substance". The ACP reroute's disclosure, prepended to every
     // codex answer, used to pad such answers past this floor; without it a short, correct chat
-    // answer failed the floor and never reached the chat.
+    // answer failed the floor and never reached the chat. The exemption lowers the floor to "an
+    // answer exists": an empty or whitespace-only output is still no substance.
     let human_reads_every_output =
         !unit.executes_code && matches!(unit.gate, crate::workflow::GateSpec::HumanConfirm { .. });
+    let prose_chars = output.output.trim().chars().count();
     let no_prose = unit.role != crate::workflow::PhaseRole::Evaluator
-        && !human_reads_every_output
-        && output.output.trim().chars().count() < MIN_SUBSTANCE_CHARS;
+        && if human_reads_every_output {
+            prose_chars == 0
+        } else {
+            prose_chars < MIN_SUBSTANCE_CHARS
+        };
     let code_without_diff = unit.role == crate::workflow::PhaseRole::Creator
         && unit.executes_code
         && session.workdir.is_some();
@@ -15622,6 +15627,30 @@ mod substance_gate_tests {
                 rejected,
                 "executes_code {executes_code}: {:?}",
                 unit.denial_reason
+            );
+        }
+    }
+
+    /// (core#970, codex r4) The exemption lowers the floor to "an answer exists", not to nothing:
+    /// an empty or whitespace-only output on the same human-confirmed read-only phase is still
+    /// "no reviewable substance".
+    #[test]
+    fn core_970_an_empty_answer_a_human_confirms_is_still_no_substance() {
+        for (i, output) in ["", "  \n\t "].into_iter().enumerate() {
+            let run_id = format!("substance-ask-empty-{i}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_with(&mut store, &run_id, PhaseRole::Neutral, |u| {
+                u.executes_code = false;
+                u.gate = crate::workflow::GateSpec::HumanConfirm {
+                    unconditional: true,
+                };
+            });
+            let mut subs = crate::event_log::EventSink::default();
+            let (_applied, _session, unit) = fold(&mut store, &mut subs, &run_id, output, true);
+            assert_eq!(
+                unit.denial_reason.as_deref(),
+                Some(NO_SUBSTANCE),
+                "output {output:?}"
             );
         }
     }

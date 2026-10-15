@@ -6031,8 +6031,9 @@ enum SessionProbe {
 /// - the ACP binary is not on PATH
 /// - the handshake fails or the session dies mid-run
 ///
-/// All fallbacks prepend a `[wicked-core] ACP …` warning to `StepOutput.output` so
-/// the degradation is visible in both streaming output and persisted logs.
+/// Every fallback is disclosed on [`CoreEvent::AcpFallback`] and in the daemon log
+/// (core#970); the seat's output is left untouched, so the disclosure never reads as
+/// part of the agent's answer.
 /// Stable `fallback_kind` slugs carried on [`CoreEvent::AcpFallback`] for UI dispatch.
 pub(crate) mod fallback_kind {
     pub const BINARY_UNAVAILABLE: &str = "binary_unavailable";
