@@ -1507,9 +1507,11 @@ pub(crate) fn run(
                     };
                     if needs_seat && !spec.clis.is_empty() {
                         let mut benched = crate::distribute::launcher_benched(&spec.clis);
-                        for seat in
-                            crate::distribute::worktree_benched(&spec.clis, repo_ref.is_some())
-                        {
+                        for seat in crate::distribute::worktree_benched(
+                            &spec.clis,
+                            repo_ref.is_some(),
+                            in_process_governance().is_some(),
+                        ) {
                             crate::domain::bench_seat(&mut benched, seat);
                         }
                         if crate::distribute::eligible_seats(&spec.clis, &benched).is_empty() {
@@ -1592,6 +1594,7 @@ pub(crate) fn run(
                         benched_seats: crate::distribute::worktree_benched(
                             &spec.clis,
                             repo_ref.is_some(),
+                            in_process_governance().is_some(),
                         ),
                         team: None,
                         team_plan: None,
@@ -2939,8 +2942,15 @@ pub(crate) fn run(
                     match crate::domain::get_session(&store, &req.session_id) {
                         Ok(Some(session)) => {
                             let roster = eligible_roster_keys(&session);
+                            // Ballots run the host CLIs on every floor: the host worktree bench
+                            // still applies to them (the container floor lifts it for seats only).
+                            let host_bench = crate::distribute::host_worktree_benched(
+                                &clis,
+                                session.repo_ref.is_some(),
+                            );
                             clis.into_iter()
                                 .filter(|c| !session.benched_seats.iter().any(|b| b.cli == c.key))
+                                .filter(|c| !host_bench.iter().any(|b| b.cli == c.key))
                                 .filter(|c| {
                                     // By CLI key: a run configured `codex#2` keeps the `codex`
                                     // ballot record the registry hands (codex r2).
