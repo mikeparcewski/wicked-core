@@ -12,6 +12,21 @@
 //! semantic-judge and repo-check gates folded on the actor. The stub execute path remains for
 //! tests.
 
+// (core#957) A diagnostic line never kills the thread that writes it. std's `eprintln!` PANICS when
+// the write fails, and a Node host hands this addon a stderr that is a non-blocking pipe: when the
+// reader lags, a write fails with EAGAIN. The panic message is lost the same way, so the thread
+// died with no trace — a worker took its unit's result with it (the run hung in `executing`) and the
+// actor took the engine ("core actor stopped"). This crate-wide shadow of `eprintln!` (textual
+// scope: every module declared below) writes the same line and drops it when stderr refuses it.
+// Unit tests keep std's macro, whose output the test harness captures.
+#[cfg(not(test))]
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod acp_permission;
 mod acp_runner;
 mod actor;
@@ -450,6 +465,26 @@ pub fn qe_reviewer_admitted(key: &str, invocation: Option<String>) -> bool {
     )
 }
 
+/// Judge a whole roster's QE reviewer admission against one routing snapshot, in input order.
+/// Each result is the same as calling [`qe_reviewer_admitted`] for that seat against the same
+/// skills root; the skills ladder is resolved only once for the whole batch.
+pub fn qe_reviewers_admitted(seats: &[(String, Option<String>)]) -> Vec<bool> {
+    if seats.is_empty() {
+        return Vec::new(); // no seat, no skills-root walk (agy on #956)
+    }
+    let snapshot = crate::skills_snapshot::routing_snapshot();
+    seats
+        .iter()
+        .map(|(key, invocation)| {
+            crate::distribute::qe_reviewer_admitted_against(
+                snapshot.as_ref(),
+                key,
+                invocation.clone(),
+            )
+        })
+        .collect()
+}
+
 /// Resolve the council roster from the registry (built-ins merged with the user's
 /// `~/.config/wicked-council/clis.toml`), keeping every seat that may vote OR work (core#572:
 /// routing reads `seat_eligible_for_work`, a decision's ballots `enabled_for_council`). This is
@@ -517,6 +552,9 @@ pub struct Core {
     /// What arming the launch bridge came to at spawn (DES-TEAMING-002 T0) — see
     /// [`Core::bus_bridge_state`].
     bus_bridge_state: crate::bus::BusBridgeState,
+    /// The host's standing QE word for the launches the engine makes on its own (campaign nodes,
+    /// bus requests) — see [`Core::set_qe_acceptance_off`].
+    qe_host: crate::assurance::HostQeAcceptance,
     /// Where this core publishes team facts (DES-TEAMING-002 P1) — read by
     /// [`Core::replay_team_outbox`], which drains on the caller's thread, never the actor's.
     team: crate::team::publish::TeamConfig,
@@ -532,6 +570,7 @@ pub struct Core {
 fn arm_bus_bridge(
     tx: &Sender<Command>,
     slot: &crate::bus::BridgeSlot,
+    qe_host: &crate::assurance::HostQeAcceptance,
 ) -> crate::bus::BusBridgeState {
     match std::env::var("WICKED_BUS_DB")
         .ok()
@@ -546,6 +585,7 @@ fn arm_bus_bridge(
                 crate::scope::EntityMode::Shared,
                 std::time::Duration::from_millis(500),
                 crate::bus::BUS_ARM_TIMEOUT,
+                qe_host.clone(),
             );
             let state = armed.state.clone();
             *slot
@@ -688,6 +728,10 @@ impl Core {
         // the actor's; the actor starts first and joins the bridge from `bus_bridge` at its exit.
         let bus_bridge: crate::bus::BridgeSlot = Default::default();
         let bus_bridge_actor = bus_bridge.clone();
+        // The host's standing QE word (`set_qe_acceptance_off`), shared with the actor (campaign
+        // nodes) and the bus bridge (bus requests).
+        let qe_host = crate::assurance::HostQeAcceptance::from_env();
+        let qe_host_actor = qe_host.clone();
         let team_link = crate::team::publish::TeamLink::spawn(&team_cfg, tx.clone());
         std::thread::spawn(move || {
             actor::run(
@@ -703,16 +747,18 @@ impl Core {
                 Some(lifecycle_arc),
                 empty_write_reg,
                 team_link,
+                qe_host_actor,
             )
         });
         // Arm the launch bridge (bounded handshake) while the actor starts; `spawn` returns only once
         // it polls strictly after the bus tail as of now, or has reported itself not armed.
-        let bus_bridge_state = arm_bus_bridge(&tx, &bus_bridge);
+        let bus_bridge_state = arm_bus_bridge(&tx, &bus_bridge, &qe_host);
         let core = Core {
             tx: tx.clone(),
             pty,
             log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
+            qe_host,
             team: team_cfg,
             _team_supervisor: None,
             _shutdown: Arc::new(ShutdownGuard { tx }),
@@ -761,6 +807,10 @@ impl Core {
         // the actor's; the actor starts first and joins the bridge from `bus_bridge` at its exit.
         let bus_bridge: crate::bus::BridgeSlot = Default::default();
         let bus_bridge_actor = bus_bridge.clone();
+        // The host's standing QE word (`set_qe_acceptance_off`), shared with the actor (campaign
+        // nodes) and the bus bridge (bus requests).
+        let qe_host = crate::assurance::HostQeAcceptance::from_env();
+        let qe_host_actor = qe_host.clone();
         let team_link = crate::team::publish::TeamLink::spawn(&team_cfg, tx.clone());
         let publishes = matches!(team_link, crate::team::publish::TeamLink::Publisher { .. });
         std::thread::spawn(move || {
@@ -777,11 +827,12 @@ impl Core {
                 Some(actor_maps),
                 actor_write_reg,
                 team_link,
+                qe_host_actor,
             )
         });
         // Arm the launch bridge (bounded handshake) while the actor starts; `spawn` returns only once
         // it polls strictly after the bus tail as of now, or has reported itself not armed.
-        let bus_bridge_state = arm_bus_bridge(&tx, &bus_bridge);
+        let bus_bridge_state = arm_bus_bridge(&tx, &bus_bridge, &qe_host);
         // DES-TEAMING-002 T6: the team supervisor on the bus — armed only from the engine's live
         // teamed runs (P1's replay set) and from `path.started` rows. Its members run through a
         // WEAK handle on this runner; its councils go through the engine's one council entry
@@ -812,6 +863,7 @@ impl Core {
             pty,
             log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
+            qe_host,
             team: team_cfg,
             _team_supervisor: supervisor,
             _shutdown: Arc::new(ShutdownGuard { tx }),
@@ -846,6 +898,10 @@ impl Core {
         // the actor's; the actor starts first and joins the bridge from `bus_bridge` at its exit.
         let bus_bridge: crate::bus::BridgeSlot = Default::default();
         let bus_bridge_actor = bus_bridge.clone();
+        // The host's standing QE word (`set_qe_acceptance_off`), shared with the actor (campaign
+        // nodes) and the bus bridge (bus requests).
+        let qe_host = crate::assurance::HostQeAcceptance::from_env();
+        let qe_host_actor = qe_host.clone();
         let team_link = crate::team::publish::TeamLink::spawn(&team_cfg, tx.clone());
         std::thread::spawn(move || {
             actor::run(
@@ -861,16 +917,18 @@ impl Core {
                 Some(spawn_lifecycle_arc),
                 spawn_write_reg,
                 team_link,
+                qe_host_actor,
             )
         });
         // Arm the launch bridge (bounded handshake) while the actor starts; `spawn` returns only once
         // it polls strictly after the bus tail as of now, or has reported itself not armed.
-        let bus_bridge_state = arm_bus_bridge(&tx, &bus_bridge);
+        let bus_bridge_state = arm_bus_bridge(&tx, &bus_bridge, &qe_host);
         Core {
             tx: tx.clone(),
             pty,
             log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
+            qe_host,
             team: team_cfg,
             _team_supervisor: None,
             _shutdown: Arc::new(ShutdownGuard { tx }),
@@ -904,7 +962,28 @@ impl Core {
             roster,
             EntityMode::Shared,
             std::time::Duration::from_millis(200),
+            self.qe_host.clone(),
         )
+    }
+
+    /// (QE acceptance) Turn QE acceptance OFF for the launches the engine makes on its own — campaign
+    /// nodes as they dispatch, and bus `wicked.crew.run.requested` requests — with this reason
+    /// (non-empty), or back on with `None`. A host's own launches (`launch_run`) carry their word in
+    /// [`LaunchSpec::qe_acceptance`] and are not affected. While it is off, such a launch that gives
+    /// no QE word of its own (`skip_qe_acceptance_reason` / `force_qe_acceptance` on its run spec or
+    /// request args) and whose contract requires QE acceptance is skipped with `reason`, persisted
+    /// and labelled exactly like an operator skip ("QE acceptance skipped by operator: <reason>",
+    /// `basis: "operator"`) on the run, every gate and the delivery. A launch whose contract does
+    /// not require it is left as it is: the setting is never a refusal. Read at each launch. A
+    /// `Core` starts with [`crate::assurance::QE_ACCEPTANCE_OFF_ENV`]'s reason when the host set it
+    /// before spawning (so no bus request can launch under the default in between).
+    pub fn set_qe_acceptance_off(&self, reason: Option<String>) -> Result<(), String> {
+        self.qe_host.set(reason)
+    }
+
+    /// The standing reason while QE acceptance is off for engine-originated launches, else `None`.
+    pub fn qe_acceptance_off(&self) -> Option<String> {
+        self.qe_host.get()
     }
 
     /// Liveness probe — emits a `Heartbeat` to subscribers and waits for the actor to ack.

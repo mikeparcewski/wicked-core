@@ -23,6 +23,21 @@
 //! DOMINATES); triggered [`Effect::AllowWithConditions`] ⇒ union obligations; else
 //! [`wicked_apps_core::Decision::Allow`]. Same context ⇒ same claim (re-derivable, attestable — ADR-0003).
 
+// (core#957) A diagnostic line never kills the thread that writes it. std's `eprintln!` PANICS when
+// the write fails, and a Node host hands this addon a stderr that is a non-blocking pipe: when the
+// reader lags, a write fails with EAGAIN. The panic message is lost the same way, so the thread
+// died with no trace — a worker took its unit's result with it (the run hung in `executing`) and the
+// actor took the engine ("core actor stopped"). This crate-wide shadow of `eprintln!` (textual
+// scope: every module declared below) writes the same line and drops it when stderr refuses it.
+// Unit tests keep std's macro, whose output the test harness captures.
+#[cfg(not(test))]
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod conformance;
 mod domain;
 mod domain_model;
@@ -173,13 +188,13 @@ pub use schemas::{
 // from the gate it measures. `governance_evals`/`governance_corpus_import` are the JSON-string
 // entry points the core-ts binding wraps verbatim.
 pub use evals::{
-    default_knowledge_db, governance_corpus_import, governance_evals, import_corpus, load_corpus,
-    open_memory_ro, pretool_context, pretool_event_from_signals, run_evals, run_evals_with_memory,
-    sample_chunk_id, CorpusSource, EvalReport, EvalSample, EvalSummary, Expected, ImportReceipt,
-    MemoryAxis, MemoryCoverage, MemoryResult, NearestRule, RuleCoverage, SampleKind, SampleRef,
-    SampleResult, SampleSignals, TypeCoverage, UnexercisedRule, UnsurfacedMemory, Verdict,
-    DEFAULT_CORPUS_NAME, DEFAULT_EVAL_PHASE, DEGRADED_FACET_ONLY, EVAL_SAMPLE_PREFIX,
-    EVAL_SCOPE_PREFIX,
+    default_knowledge_db, governance_corpus_import, governance_evals, import_corpus, is_shell_tool,
+    load_corpus, open_memory_ro, pretool_context, pretool_event_from_signals, run_evals,
+    run_evals_with_memory, sample_chunk_id, CorpusSource, EvalReport, EvalSample, EvalSummary,
+    Expected, ImportReceipt, MemoryAxis, MemoryCoverage, MemoryResult, NearestRule, RuleCoverage,
+    SampleKind, SampleRef, SampleResult, SampleSignals, TypeCoverage, UnexercisedRule,
+    UnsurfacedMemory, Verdict, DEFAULT_CORPUS_NAME, DEFAULT_EVAL_PHASE, DEGRADED_FACET_ONLY,
+    EVAL_SAMPLE_PREFIX, EVAL_SCOPE_PREFIX,
 };
 
 // Re-export the claim wire type so callers program against one path.

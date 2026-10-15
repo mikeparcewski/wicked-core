@@ -1714,6 +1714,10 @@ pub struct AgentVerdict {
     /// is told the judge could not run, not that the work was rejected. `None` whenever a seat
     /// answered (including an unreadable answer, which IS that seat's verdict).
     pub seat_failure: Option<String>,
+    /// (operator ruling 2026-10-14) `Some` when `judge_cli` is a FALLBACK seat that stood in for
+    /// the run's benched or unavailable preferred judge — the disclosure every receipt carries
+    /// ([`crate::assurance::JudgeFallback`]). `None` for the run's own judge.
+    pub judge_fallback: Option<crate::assurance::JudgeFallback>,
 }
 
 impl AgentVerdict {
@@ -1742,6 +1746,7 @@ impl AgentVerdict {
                 judge_cli: None,
                 judge_distinct: None,
                 seat_failure: Some(format!("{} ({JUDGE_NO_VERDICT})", nv.seat)),
+                judge_fallback: None,
             };
         }
         match e.downcast_ref::<JudgeUnavailable>() {
@@ -1751,6 +1756,7 @@ impl AgentVerdict {
                 judge_cli: None,
                 judge_distinct: None,
                 seat_failure: Some(u.summary()),
+                judge_fallback: None,
             },
             None => AgentVerdict {
                 pass: false,
@@ -1758,6 +1764,7 @@ impl AgentVerdict {
                 judge_cli: None,
                 judge_distinct: None,
                 seat_failure: None,
+                judge_fallback: None,
             },
         }
     }
@@ -1967,7 +1974,7 @@ pub const DETERMINISTIC_VALIDATOR_SEAT: &str = "claude";
 
 /// Normalize an identity token (a registry key or an invocation argv[0]) to a comparable identity: its
 /// basename (last path component), case-folded. So `/usr/local/bin/Claude` and `claude` compare EQUAL.
-fn normalize_identity(tok: &str) -> String {
+pub(crate) fn normalize_identity(tok: &str) -> String {
     tok.rsplit(['/', '\\'])
         .next()
         .unwrap_or(tok)
@@ -2904,6 +2911,7 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
                     judge_cli: None,
                     judge_distinct: None,
                     seat_failure: None,
+                    judge_fallback: None,
                     pass: false,
                     reasoning: format!(
                         "ambiguous or malformed verdict at the decision line (fail-closed): {line}"
@@ -2951,6 +2959,7 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
                 judge_cli: None,
                 judge_distinct: None,
                 seat_failure: None,
+                judge_fallback: None,
                 pass: false,
                 reasoning: format!(
                     "{reasoning} [no closing verdict: the reply opened {first} and never closed \
@@ -2964,6 +2973,7 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
                 judge_cli: None,
                 judge_distinct: None,
                 seat_failure: None,
+                judge_fallback: None,
                 pass: false,
                 reasoning: format!(
                     "{reasoning} [verdict drift: the reply opened {first} and closed {closing} — \
@@ -2992,6 +3002,7 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
                 judge_cli: None,
                 judge_distinct: None,
                 seat_failure: None,
+                judge_fallback: None,
                 pass: false,
                 reasoning: format!(
                     "{reasoning} [verdict drift: the decision line said {first}, a later line said \
@@ -3004,6 +3015,7 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
             judge_cli: None,
             judge_distinct: None,
             seat_failure: None,
+            judge_fallback: None,
             pass: leading,
             reasoning,
         };
@@ -3013,6 +3025,7 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
         judge_cli: None,
         judge_distinct: None,
         seat_failure: None,
+        judge_fallback: None,
         pass: false,
         reasoning: format!(
             "no unambiguous PASS/REJECT contract line (fail-closed): {}",
@@ -3731,6 +3744,7 @@ mod tests {
             judge_cli: None,
             judge_distinct: None,
             seat_failure: None,
+            judge_fallback: None,
             pass: true,
             reasoning: "ok".into(),
         };
@@ -3738,6 +3752,7 @@ mod tests {
             judge_cli: None,
             judge_distinct: None,
             seat_failure: None,
+            judge_fallback: None,
             pass: false,
             reasoning: "no".into(),
         };

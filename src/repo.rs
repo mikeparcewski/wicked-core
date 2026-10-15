@@ -2994,6 +2994,8 @@ mod tests {
                     human_confirm: crate::domain::HumanConfirm::None,
                     repo_ref: Some("r".into()),
                     workflow_id: None,
+                    skip_qe_acceptance_reason: None,
+                    force_qe_acceptance: false,
                 },
             }],
             edges: vec![],

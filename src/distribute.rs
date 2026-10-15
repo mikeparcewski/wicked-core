@@ -1615,6 +1615,62 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn qe_reviewers_admitted_matches_per_seat_calls_for_portable_and_nonportable_qe() {
+        let _home_env = hermetic_home("qe-batch-home");
+        struct SnapshotPin(Option<std::ffi::OsString>);
+        impl Drop for SnapshotPin {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("WICKED_SKILLS_SNAPSHOT", value),
+                    None => std::env::remove_var("WICKED_SKILLS_SNAPSHOT"),
+                }
+            }
+        }
+        let _snapshot = SnapshotPin(std::env::var_os("WICKED_SKILLS_SNAPSHOT"));
+        let seats = vec![
+            ("claude".into(), None),
+            ("pi".into(), None),
+            ("claude#2".into(), Some("claude -p {PROMPT}".into())),
+            ("claude#3".into(), Some("pi {PROMPT}".into())),
+            ("claude#4".into(), Some("  ".into())),
+        ];
+        for portable in [true, false] {
+            let base = scratch("qe-batch-pub");
+            let root = snapshot_root_with(
+                &gen_dir(&base, "7"),
+                "7",
+                &[
+                    ("qe", crate::execute_wrapped::QE_SKILL, portable, &[]),
+                    (
+                        "qe-semantic-reviewer",
+                        "wicked-garden-qe-semantic-reviewer",
+                        !portable,
+                        &[],
+                    ),
+                ],
+            );
+            // Ensure a broken fixture cannot silently exercise the unconstrained fallback.
+            assert_eq!(
+                load(&root)
+                    .skill(crate::execute_wrapped::QE_SKILL)
+                    .unwrap()
+                    .portable,
+                portable
+            );
+            std::env::set_var("WICKED_SKILLS_SNAPSHOT", &root);
+            let batch = crate::qe_reviewers_admitted(&seats);
+            let per_seat: Vec<_> = seats
+                .iter()
+                .map(|(key, invocation)| crate::qe_reviewer_admitted(key, invocation.clone()))
+                .collect();
+            assert_eq!(batch, per_seat);
+            assert_eq!(batch, vec![true, portable, true, portable, true]);
+            assert!(crate::qe_reviewers_admitted(&[]).is_empty());
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
+
     /// No root to judge against (`None`: the ladder was absent, failed or misconfigured) ⇒ no
     /// seat is constrained and nothing is refused here — the launch admission decides at the first
     /// unit, exactly as before this change. A tool unit is never constrained either.

@@ -188,14 +188,6 @@ export declare class Core {
    */
   static registryRoster(): string
   /**
-   * (crew Agents page A4) Whether this host's skill routing admits the seat `key` (run with its
-   * roster `invocation` template, when given) to the engine's isolated QE reviewer turn
-   * (wicked-core#917) — the reviewer runs the QE skill, and a skills root that makes it
-   * Claude-only admits claude seats only. Run-specific exclusions are not judged. An addon
-   * without this static predates it; crew keys on its presence.
-   */
-  static qeReviewerAdmitted(key: string, invocation?: string | undefined | null): boolean
-  /**
    * (core#769, crew Agents page A5) The engine's worktree bench as a pure predicate: given a
    * JSON array of `AgenticCli` seats (the engine-shaped roster, as `launchRun`'s `clisJson`) and
    * whether the run is BOUND to one repository, the JSON array of `BenchedSeat` (`{cli, reason,
@@ -205,6 +197,20 @@ export declare class Core {
    * predates it; crew keys on its presence.
    */
   static worktreeBenched(clisJson: string, bound: boolean): string
+  /**
+   * (crew Agents page A4) Whether this host's skill routing admits the seat `key` (run with its
+   * roster `invocation` template, when given) to the engine's isolated QE reviewer turn
+   * (wicked-core#917) — the reviewer runs the QE skill, and a skills root that makes it
+   * Claude-only admits claude seats only. Run-specific exclusions are not judged. An addon
+   * without this static predates it; crew keys on its presence.
+   */
+  static qeReviewerAdmitted(key: string, invocation?: string | undefined | null): boolean
+  /**
+   * Judge a whole roster's QE reviewer admission against one routing snapshot, off the Node
+   * thread (wicked-crew#1021). `seatsJson` is an array of `{key, invocation?}` (invocation may
+   * be null); resolves to `[{key, admitted}]` in input order. Invalid JSON rejects the promise.
+   */
+  static qeReviewersAdmitted(seatsJson: string): Promise<string>
   /**
    * Whether this addon carries DES-TEAMING-002 T3's plan launch: `LaunchOptions.planJson` /
    * `deliverStepJson` and `confirmGate(…, planJson)`. napi IGNORES an undeclared object field,
@@ -228,6 +234,21 @@ export declare class Core {
    * `/health.warnings` (`bus.unavailable`).
    */
   busBridgeState(): string
+  /**
+   * (QE acceptance) Turn QE acceptance OFF for the launches the engine makes on its own —
+   * campaign nodes as they dispatch and bus `wicked.crew.run.requested` requests — with this
+   * reason (non-empty), or back on with `null`. While off, such a launch that gives no QE word of
+   * its own (`skip_qe_acceptance_reason` / `force_qe_acceptance` on its campaign `run_spec` or bus
+   * `args`) and whose contract requires QE acceptance is skipped with `reason`, labelled like an
+   * operator skip (`assurance.qe {status: "skipped", basis: "operator"}`, "QE acceptance skipped by
+   * operator: <reason>") on the run, every gate and the delivery; any other run is left as it is.
+   * `launchRun` is not affected (it carries its own `skipQeAcceptanceReason`). Throws on a blank
+   * reason. Read at each launch. An addon without this method predates it; crew keys on its
+   * presence.
+   */
+  setQeAcceptanceOff(reason?: string | undefined | null): void
+  /** The standing reason while QE acceptance is off for engine-originated launches, else `null`. */
+  qeAcceptanceOff(): string | null
   /**
    * Publish one event on this engine's bus (`WICKED_BUS_DB`), given as wicked-bus `emit()`
    * takes it: JSON `{ event_type, domain, subdomain?, payload, idempotency_key?, producer_id?,

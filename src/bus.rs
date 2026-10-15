@@ -65,6 +65,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use wicked_council::AgenticCli;
 
+use crate::assurance::{HostQeAcceptance, QeOverride, QeOverrideRefused};
 use crate::command::Command;
 use crate::scope::EntityMode;
 use crate::{HumanConfirm, LaunchSpec};
@@ -1124,6 +1125,16 @@ struct RunArgs {
     repo_ref: Option<String>,
     /// `"all"` pauses before every unit; anything else ⇒ no human gate.
     human_confirm: Option<String>,
+    /// (QE acceptance) Skip a required QE acceptance on this run, for this reason (non-empty) — the
+    /// bus twin of `LaunchOptions.skipQeAcceptanceReason`, labelled on the run, every gate and the
+    /// delivery. Refused (the request is dropped, never retried) beside `force_qe_acceptance`, when
+    /// blank, or when the run's workflow does not require QE acceptance.
+    #[serde(default)]
+    skip_qe_acceptance_reason: Option<String>,
+    /// (QE acceptance) Require QE acceptance whatever the run's impact score says. Same refusals.
+    /// Neither set: the host's standing "QE acceptance off" (`Core::set_qe_acceptance_off`) applies.
+    #[serde(default)]
+    force_qe_acceptance: bool,
 }
 
 /// A running bridge: the poller thread plus its stop flag. Dropping it (or calling [`stop`]) signals
@@ -1163,6 +1174,7 @@ pub fn connect(
     roster: Vec<AgenticCli>,
     entity_mode: EntityMode,
     poll_interval: Duration,
+    qe_host: HostQeAcceptance,
 ) -> BusBridge {
     let stop = Arc::new(AtomicBool::new(false));
     let handle = spawn_run_requested_poller(
@@ -1172,6 +1184,7 @@ pub fn connect(
         entity_mode,
         poll_interval,
         stop.clone(),
+        qe_host,
     );
     BusBridge {
         stop,
@@ -1201,6 +1214,7 @@ pub fn spawn_run_requested_poller(
     entity_mode: EntityMode,
     poll_interval: Duration,
     stop: Arc<AtomicBool>,
+    qe_host: HostQeAcceptance,
 ) -> JoinHandle<()> {
     // Snapshot the tail SYNCHRONOUSLY on the caller's thread (see the doc comment): once this function
     // returns, any subsequently-emitted request has a strictly higher id than the floor. If the
@@ -1223,7 +1237,16 @@ pub fn spawn_run_requested_poller(
         .name(BUS_POLLER_THREAD.into())
         .spawn(move || {
             let _live = LiveBridge::enter();
-            run_requested_poll_loop(db, floor_init, tx, roster, entity_mode, poll_interval, stop)
+            run_requested_poll_loop(
+                db,
+                floor_init,
+                tx,
+                roster,
+                entity_mode,
+                poll_interval,
+                stop,
+                qe_host,
+            )
         })
         .expect("spawn the bus bridge thread")
 }
@@ -1317,6 +1340,7 @@ pub(crate) fn arm_run_requested_bridge(
     entity_mode: EntityMode,
     poll_interval: Duration,
     timeout: Duration,
+    qe_host: HostQeAcceptance,
 ) -> ArmedBridge {
     let stop = Arc::new(AtomicBool::new(false));
     let (floor_tx, floor_rx) = std::sync::mpsc::sync_channel::<Result<i64, String>>(1);
@@ -1342,6 +1366,7 @@ pub(crate) fn arm_run_requested_bridge(
                         entity_mode,
                         poll_interval,
                         thread_stop,
+                        qe_host,
                     )
                 }
                 Err(e) => {
@@ -1388,6 +1413,7 @@ pub(crate) fn arm_run_requested_bridge(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_requested_poll_loop(
     db: BusDb,
     floor_init: i64,
@@ -1396,6 +1422,7 @@ fn run_requested_poll_loop(
     entity_mode: EntityMode,
     poll_interval: Duration,
     stop: Arc<AtomicBool>,
+    qe_host: HostQeAcceptance,
 ) {
     // Start at `floor_init` — an event id read synchronously before the caller returned (the
     // caller's own snapshot, or the arming handshake): only requests after it drive launches, and
@@ -1412,7 +1439,7 @@ fn run_requested_poll_loop(
             }
         };
         for ev in events {
-            match launch_from_event(&tx, &db, &roster, entity_mode, &ev, &stop) {
+            match launch_from_event(&tx, &db, &roster, entity_mode, &ev, &stop, &qe_host) {
                 // Handled (launched OR idempotent redelivery) → advance PAST this request.
                 Ok(()) => {
                     floor = ev.event_id;
@@ -1483,6 +1510,7 @@ fn launch_from_event(
     entity_mode: EntityMode,
     ev: &BusEvent,
     stop: &Arc<AtomicBool>,
+    qe_host: &HostQeAcceptance,
 ) -> Result<(), BridgeError> {
     // A malformed payload is a PERMANENT poison — it will never parse, so retrying it forever would
     // wedge every later request behind it. Advance past it instead.
@@ -1500,6 +1528,15 @@ fn launch_from_event(
     // than fail OPEN into an ungoverned run.
     let human_confirm = HumanConfirm::parse(req.args.human_confirm.as_deref())
         .map_err(|e| BridgeError::Permanent(anyhow::anyhow!(e)))?;
+    // (QE acceptance) The request's own word (both at once is a poison: it will never launch), else
+    // the host's standing word, read NOW so a setting changed after the bridge armed applies.
+    let qe_acceptance = qe_host.word_for(
+        QeOverride::from_wire(
+            req.args.skip_qe_acceptance_reason.clone(),
+            req.args.force_qe_acceptance,
+        )
+        .map_err(|e| BridgeError::Permanent(anyhow::anyhow!(e)))?,
+    );
     let spec = LaunchSpec {
         base_ref: None,
         problem: req.problem.clone(),
@@ -1531,7 +1568,7 @@ fn launch_from_event(
         primary: None,
         reduced_assurance: false,
         deliverables: Vec::new(),
-        qe_acceptance: Default::default(),
+        qe_acceptance,
     };
 
     let (reply, rx) = channel();
@@ -1567,6 +1604,10 @@ fn launch_from_event(
             {
                 emit_run_launched(db, &session_id, req.workflow.as_deref(), &req.problem);
                 Ok(())
+            } else if e.downcast_ref::<QeOverrideRefused>().is_some() {
+                // A QE word that cannot apply (a blank reason, or nothing to skip or force) is
+                // refused the same way on every retry: drop it rather than wedge the bridge.
+                Err(BridgeError::Permanent(e))
             } else {
                 Err(BridgeError::Retriable(e))
             }
@@ -1930,6 +1971,81 @@ mod tests {
         }
     }
 
+    /// A bus request's QE word: its own `args` word, else the host's standing word read at the
+    /// request; both at once is a poison (never sent to the actor); a QE refusal from the actor is
+    /// PERMANENT (dropped), never retried forever.
+    #[test]
+    fn a_bus_request_carries_its_qe_word_or_the_hosts_and_a_qe_refusal_is_dropped() {
+        let db = BusDb::open(&tmp_bus("qeword")).unwrap();
+        let (tx, rx) = channel();
+        let seen = Arc::new(Mutex::new(Vec::<QeOverride>::new()));
+        let seen_actor = seen.clone();
+        let actor = std::thread::spawn(move || {
+            while let Ok(cmd) = rx.recv() {
+                if let Command::LaunchRun { spec, reply } = cmd {
+                    let word = spec.qe_acceptance.clone();
+                    seen_actor.lock().unwrap().push(word.clone());
+                    let res = match word {
+                        QeOverride::Force => Err(anyhow::Error::new(QeOverrideRefused(
+                            "this run's workflow does not require QE acceptance".into(),
+                        ))),
+                        _ => Ok(spec.session_id.clone()),
+                    };
+                    let _ = reply.send(res);
+                }
+            }
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let host = HostQeAcceptance::default();
+        let ev = |id: i64, args: serde_json::Value| BusEvent {
+            event_id: id,
+            event_type: RUN_REQUESTED.to_string(),
+            domain: "d".to_string(),
+            subdomain: "s".to_string(),
+            payload: serde_json::json!({ "problem": "p", "workflow": "bug", "args": args }),
+        };
+        let go = |e: &BusEvent, host: &HostQeAcceptance| {
+            launch_from_event(&tx, &db, &[], EntityMode::Shared, e, &stop, host)
+        };
+
+        // No word, setting on: Auto.
+        assert!(go(&ev(1, serde_json::json!({"session_id": "q1"})), &host).is_ok());
+        // Its own skip.
+        let own = serde_json::json!({"session_id": "q2", "skip_qe_acceptance_reason": "docs only"});
+        assert!(go(&ev(2, own.clone()), &host).is_ok());
+        // Setting off: a request with no word gets the standing skip; its own word still wins.
+        host.set(Some("QE acceptance is off on this daemon".into()))
+            .unwrap();
+        assert!(go(&ev(3, serde_json::json!({"session_id": "q3"})), &host).is_ok());
+        assert!(go(&ev(4, own), &host).is_ok());
+        // Both at once: a poison, never sent to the actor.
+        let both = serde_json::json!({
+            "session_id": "q5", "skip_qe_acceptance_reason": "x", "force_qe_acceptance": true
+        });
+        assert!(matches!(
+            go(&ev(5, both), &host),
+            Err(BridgeError::Permanent(_))
+        ));
+        // The engine refusing the word (nothing to force): dropped, not retried.
+        let force = serde_json::json!({"session_id": "q6", "force_qe_acceptance": true});
+        assert!(matches!(
+            go(&ev(6, force), &host),
+            Err(BridgeError::Permanent(_))
+        ));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                QeOverride::Auto,
+                QeOverride::Skip("docs only".into()),
+                QeOverride::Standing("QE acceptance is off on this daemon".into()),
+                QeOverride::Skip("docs only".into()),
+                QeOverride::Force,
+            ]
+        );
+        drop(tx);
+        actor.join().unwrap();
+    }
+
     /// Finding #2/#9: a TRANSIENT launch fault is surfaced as `Retriable` (which the poller uses to
     /// NOT advance the floor), and a later attempt on the SAME event succeeds — at-least-once, not
     /// at-most-once.
@@ -1947,7 +2063,15 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let ev = requested(1, "run-x");
 
-        let r1 = launch_from_event(&tx, &db, &[], EntityMode::Shared, &ev, &stop);
+        let r1 = launch_from_event(
+            &tx,
+            &db,
+            &[],
+            EntityMode::Shared,
+            &ev,
+            &stop,
+            &Default::default(),
+        );
         assert!(
             matches!(r1, Err(BridgeError::Retriable(_))),
             "a transient fault is retriable (floor must not advance)"
@@ -1955,7 +2079,15 @@ mod tests {
         // No launched signal yet — the run never started.
         assert_eq!(db.poll(RUN_LAUNCHED, 0, 10).unwrap().len(), 0);
 
-        let r2 = launch_from_event(&tx, &db, &[], EntityMode::Shared, &ev, &stop);
+        let r2 = launch_from_event(
+            &tx,
+            &db,
+            &[],
+            EntityMode::Shared,
+            &ev,
+            &stop,
+            &Default::default(),
+        );
         assert!(r2.is_ok(), "the retry succeeds");
         assert_eq!(
             db.poll(RUN_LAUNCHED, 0, 10).unwrap().len(),
@@ -1984,13 +2116,29 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let ev = requested(7, "run-dup");
 
-        let r_busy = launch_from_event(&tx, &db, &[], EntityMode::Shared, &ev, &stop);
+        let r_busy = launch_from_event(
+            &tx,
+            &db,
+            &[],
+            EntityMode::Shared,
+            &ev,
+            &stop,
+            &Default::default(),
+        );
         assert!(
             r_busy.is_ok(),
             "RunBusy is an idempotent redelivery, not a fault"
         );
 
-        let r_exists = launch_from_event(&tx, &db, &[], EntityMode::Shared, &ev, &stop);
+        let r_exists = launch_from_event(
+            &tx,
+            &db,
+            &[],
+            EntityMode::Shared,
+            &ev,
+            &stop,
+            &Default::default(),
+        );
         assert!(
             r_exists.is_ok(),
             "RunExists is an idempotent redelivery, not a fault"
@@ -2040,6 +2188,7 @@ mod tests {
             EntityMode::Shared,
             Duration::from_millis(20),
             stop.clone(),
+            HostQeAcceptance::default(),
         );
         let db = BusDb::open(&path).unwrap();
         db.emit(&BusEmit::new(
@@ -2105,6 +2254,7 @@ mod tests {
             EntityMode::Shared,
             Duration::from_millis(20),
             stop.clone(),
+            HostQeAcceptance::default(),
         );
         let db = BusDb::open(&path).unwrap();
         db.emit(&BusEmit::new(

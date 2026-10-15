@@ -1635,9 +1635,9 @@ pub(crate) fn apply_and_finish_unit(
     // (DES-QE-EVERY-SEAT §3.2, codex r2 F15) A floor fix's seat changed this unit's tree: it is an
     // AUTHOR of that tree from now on, so no later reviewer or judge of it runs there.
     if let Some(seat) = floor_fixer {
-        if !unit.authored_by.contains(&seat) {
-            unit.authored_by.push(seat);
-        }
+        // The floor fix runs with no recorded invocation (`cli_runner::floor_fix_unit`).
+        let binaries = crate::cli_runner::launched_identities(&seat, None);
+        crate::domain::stamp_author(unit, seat, binaries);
     }
     // (DES-QE-EVERY-SEAT §3.5) The isolated QE reviewer's record — evidence on the persisted unit,
     // kept whichever way it went; `None` (no reviewer this attempt) leaves the last one.
@@ -1911,7 +1911,7 @@ pub(crate) fn apply_and_finish_unit(
     emit(CoreEvent::GateEvaluated {
         session: session_id.to_string(),
         ord: unit.ord,
-        assurance: receipt,
+        assurance: Box::new(receipt),
         criterion,
         has_deterministic_floor,
         deterministic_pass,
@@ -2482,6 +2482,75 @@ pub(crate) fn work_authors(units: &[crate::domain::WorkUnit], ord: u32) -> Vec<S
     out
 }
 
+/// (operator ruling 2026-10-14, the fallback judge) The BINARIES every author of the work a unit at
+/// `ord` checks actually ran ([`crate::domain::WorkUnit::authored_binaries`]) for each earlier
+/// [`fallback_author_unit`] (Build/Recon, or Creator-role of any stage). `None` when an author's
+/// binary cannot be established ([`author_binaries_known`]: a history from before the record).
+pub(crate) fn work_author_binaries(
+    units: &[crate::domain::WorkUnit],
+    ord: u32,
+) -> Option<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for u in units.iter().filter(|u| fallback_author_unit(u, ord)) {
+        if !author_binaries_known(u) {
+            return None;
+        }
+        for b in &u.authored_binaries {
+            if !out.contains(b) {
+                out.push(b.clone());
+            }
+        }
+    }
+    Some(out)
+}
+
+/// (codex r5/r7) The units whose seats authored the work an evaluator at `ord` reads, for the
+/// FALLBACK judge: every earlier Build/Recon agent unit ([`work_authors`]'s set), every earlier
+/// Creator-role agent unit whatever its stage (the artifact [`creator_output_for`] selects), and
+/// every earlier unit that recorded an author (a floor fix on a Review/Test unit).
+pub(crate) fn fallback_author_unit(u: &crate::domain::WorkUnit, ord: u32) -> bool {
+    use crate::domain::StageKind;
+    u.ord < ord
+        && u.tool_cmd.is_none()
+        && (matches!(u.stage, StageKind::Build | StageKind::Recon)
+            || u.role == crate::workflow::PhaseRole::Creator
+            // (codex r7) …and any unit that recorded an author, whatever its stage or role: a floor
+            // fix on a Review/Test unit authored the tree.
+            || !u.authored_by.is_empty()
+            || !u.authored_binaries.is_empty())
+}
+
+/// The seat keys of [`fallback_author_unit`]s: [`work_authors`] plus every earlier Creator-role
+/// unit's seat and history.
+pub(crate) fn fallback_work_authors(units: &[crate::domain::WorkUnit], ord: u32) -> Vec<String> {
+    let mut out = work_authors(units, ord);
+    for u in units.iter().filter(|u| fallback_author_unit(u, ord)) {
+        for s in u.assigned_cli.iter().chain(u.authored_by.iter()) {
+            if !out.contains(s) {
+                out.push(s.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Whether every binary that authored `u` is recorded: `authored_by` and `authored_binaries` are
+/// stamped together ([`crate::domain::stamp_author`]); authors with no binary, or the
+/// [`crate::domain::UNKNOWN_AUTHOR_BINARY`] mark, is a history from before the record (a
+/// never-dispatched unit has neither).
+pub(crate) fn author_binaries_known(u: &crate::domain::WorkUnit) -> bool {
+    // A Creator-role unit outside Build/Recon records binaries only (no `authored_by`): one that
+    // was dispatched (`last_attempt`) with none recorded is a history from before the record.
+    let dispatched_unrecorded = u.authored_binaries.is_empty()
+        && (!u.authored_by.is_empty()
+            || (u.role == crate::workflow::PhaseRole::Creator && u.last_attempt.is_some()));
+    !dispatched_unrecorded
+        && !u
+            .authored_binaries
+            .iter()
+            .any(|b| b == crate::domain::UNKNOWN_AUTHOR_BINARY)
+}
+
 /// What the fold observed, for [`gate_receipt`].
 struct GateFacts<'a> {
     /// `None`: no pinned validator; `Some(Ok)`: it reached a verdict; `Some(Err)`: it reached none.
@@ -2575,6 +2644,11 @@ fn gate_receipt(
             Some(why.to_string()),
         ),
         (None, None) => {}
+    }
+    // (operator ruling 2026-10-14) A fallback judge is labelled on the receipt whatever it came
+    // to — a verdict, or an answer without one (codex r1).
+    if let Some(fb) = f.judge.and_then(|v| v.judge_fallback.as_ref()) {
+        r.judge_fallbacks.push(fb.clone());
     }
     if f.eval_ran {
         r.ran(a::EVALUATOR_PASS);
@@ -3035,6 +3109,7 @@ mod resolve_tests {
             judge_cli: None,
             judge_distinct: None,
             seat_failure: None,
+            judge_fallback: None,
         }
     }
 
@@ -3966,7 +4041,7 @@ mod judge_bench_tests {
         let receipt = seen
             .iter()
             .find_map(|e| match e {
-                CoreEvent::GateEvaluated { assurance, .. } => Some(assurance.clone()),
+                CoreEvent::GateEvaluated { assurance, .. } => Some((**assurance).clone()),
                 _ => None,
             })
             .expect("gateEvaluated");

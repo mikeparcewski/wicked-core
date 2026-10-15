@@ -31,6 +31,21 @@
 //! `.cargo/config.toml` here injects the macOS `dynamic_lookup` linker flags — for a napi-CLI-free
 //! dev/IDE loop.
 
+// (core#957) A diagnostic line never kills the thread that writes it. std's `eprintln!` PANICS when
+// the write fails, and a Node host hands this addon a stderr that is a non-blocking pipe: when the
+// reader lags, a write fails with EAGAIN. The panic message is lost the same way, so the thread
+// died with no trace — a worker took its unit's result with it (the run hung in `executing`) and the
+// actor took the engine ("core actor stopped"). This crate-wide shadow of `eprintln!` (textual
+// scope: every module declared below) writes the same line and drops it when stderr refuses it.
+// Unit tests keep std's macro, whose output the test harness captures.
+#[cfg(not(test))]
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
+    }};
+}
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -630,6 +645,33 @@ fn propose_plan_json(
     serde_json::to_string(&proposal).map_err(err)
 }
 
+fn qe_reviewers_admitted_json(seats_json: &str) -> napi::Result<String> {
+    #[derive(serde::Deserialize)]
+    struct Seat {
+        key: String,
+        invocation: Option<String>,
+    }
+    let seats: Vec<Seat> = serde_json::from_str(seats_json).map_err(|e| {
+        err(format!(
+            "seatsJson is not a valid QE reviewer seat array: {e}"
+        ))
+    })?;
+    let seats: Vec<_> = seats.into_iter().map(|s| (s.key, s.invocation)).collect();
+    // The batch runs on a libuv worker thread and the routing snapshot logs with `eprintln!`, which
+    // panics when stderr cannot be written (a full non-blocking pipe). A panic must not cross napi's
+    // C boundary and abort the daemon: it becomes the promise's rejection (codex on #956).
+    let admitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wicked_core::qe_reviewers_admitted(&seats)
+    }))
+    .map_err(|_| err("QE reviewer admission panicked while reading the skills root".to_string()))?;
+    let results: Vec<_> = seats
+        .iter()
+        .zip(admitted)
+        .map(|((key, _), admitted)| serde_json::json!({ "key": key, "admitted": admitted }))
+        .collect();
+    serde_json::to_string(&results).map_err(err)
+}
+
 fn task<F>(f: F) -> AsyncTask<CoreTask>
 where
     F: FnOnce() -> napi::Result<String> + Send + 'static,
@@ -812,19 +854,11 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
     let clis: Vec<AgenticCli> = serde_json::from_str(&o.clis_json)
         .map_err(|e| err(format!("clisJson is not a valid AgenticCli array: {e}")))?;
     let plan = o.plan_json.as_deref().map(parse_plan).transpose()?;
-    let qe_acceptance = match (
+    let qe_acceptance = wicked_core::assurance::QeOverride::from_wire(
         o.skip_qe_acceptance_reason,
         o.force_qe_acceptance.unwrap_or(false),
-    ) {
-        (Some(_), true) => {
-            return Err(err(
-                "skipQeAcceptanceReason and forceQeAcceptance are mutually exclusive",
-            ))
-        }
-        (Some(reason), false) => wicked_core::assurance::QeOverride::Skip(reason),
-        (None, true) => wicked_core::assurance::QeOverride::Force,
-        (None, false) => wicked_core::assurance::QeOverride::Auto,
-    };
+    )
+    .map_err(|_| err("skipQeAcceptanceReason and forceQeAcceptance are mutually exclusive"))?;
     let deliver_step = o
         .deliver_step_json
         .as_deref()
@@ -967,6 +1001,14 @@ impl Core {
         wicked_core::qe_reviewer_admitted(&key, invocation)
     }
 
+    /// Judge a whole roster's QE reviewer admission against one routing snapshot, off the Node
+    /// thread (wicked-crew#1021). `seatsJson` is an array of `{key, invocation?}` (invocation may
+    /// be null); resolves to `[{key, admitted}]` in input order. Invalid JSON rejects the promise.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn qe_reviewers_admitted(seats_json: String) -> AsyncTask<CoreTask> {
+        task(move || qe_reviewers_admitted_json(&seats_json))
+    }
+
     /// Whether this addon carries DES-TEAMING-002 T3's plan launch: `LaunchOptions.planJson` /
     /// `deliverStepJson` and `confirmGate(…, planJson)`. napi IGNORES an undeclared object field,
     /// so a launcher keys on this static's presence before it sends a plan — an older addon would
@@ -1005,6 +1047,27 @@ impl Core {
             }
         }
         .to_string()
+    }
+
+    /// (QE acceptance) Turn QE acceptance OFF for the launches the engine makes on its own —
+    /// campaign nodes as they dispatch and bus `wicked.crew.run.requested` requests — with this
+    /// reason (non-empty), or back on with `null`. While off, such a launch that gives no QE word of
+    /// its own (`skip_qe_acceptance_reason` / `force_qe_acceptance` on its campaign `run_spec` or bus
+    /// `args`) and whose contract requires QE acceptance is skipped with `reason`, labelled like an
+    /// operator skip (`assurance.qe {status: "skipped", basis: "operator"}`, "QE acceptance skipped by
+    /// operator: <reason>") on the run, every gate and the delivery; any other run is left as it is.
+    /// `launchRun` is not affected (it carries its own `skipQeAcceptanceReason`). Throws on a blank
+    /// reason. Read at each launch. An addon without this method predates it; crew keys on its
+    /// presence.
+    #[napi]
+    pub fn set_qe_acceptance_off(&self, reason: Option<String>) -> napi::Result<()> {
+        self.inner.set_qe_acceptance_off(reason).map_err(err)
+    }
+
+    /// The standing reason while QE acceptance is off for engine-originated launches, else `null`.
+    #[napi]
+    pub fn qe_acceptance_off(&self) -> Option<String> {
+        self.inner.qe_acceptance_off()
     }
 
     /// Publish one event on this engine's bus (`WICKED_BUS_DB`), given as wicked-bus `emit()`
@@ -2782,6 +2845,35 @@ mod tests {
         let unbound = Core::worktree_benched(roster, false).unwrap();
         assert_eq!(unbound, "[]");
         assert!(Core::worktree_benched("{}".into(), true).is_err());
+    }
+
+    #[test]
+    fn qe_reviewers_admitted_answers_the_roster_as_json() {
+        let roster = r#"[{"key":"claude"},{"key":"pi","invocation":null},{"key":"claude#2","invocation":"claude -p {PROMPT}"},{"key":"claude","invocation":"pi {PROMPT}"}]"#;
+        let result: serde_json::Value =
+            serde_json::from_str(&qe_reviewers_admitted_json(roster).unwrap()).unwrap();
+        let rows = result.as_array().unwrap();
+        assert_eq!(rows.len(), 4);
+        for (row, key) in rows.iter().zip(["claude", "pi", "claude#2", "claude"]) {
+            assert_eq!(row["key"], key);
+            assert!(row["admitted"].is_boolean(), "{row}");
+            assert_eq!(row.as_object().unwrap().len(), 2);
+        }
+        assert_eq!(qe_reviewers_admitted_json("[]").unwrap(), "[]");
+        for bad in [
+            "not json",
+            "{}",
+            "[{}]",
+            r#"[{"key":"pi","invocation":42}]"#,
+        ] {
+            let error = qe_reviewers_admitted_json(bad).unwrap_err();
+            assert!(
+                error
+                    .reason
+                    .contains("seatsJson is not a valid QE reviewer seat array"),
+                "{error}"
+            );
+        }
     }
 
     /// (DC-S1) `Core.considerRules()`: the binding answers the governance split as JSON — a

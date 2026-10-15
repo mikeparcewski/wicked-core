@@ -829,6 +829,8 @@ fn campaign_cancel_kills_the_live_tool_child_through_cancel_campaign() {
                 human_confirm: HumanConfirm::None,
                 repo_ref: None,
                 workflow_id: Some("campaign-tool".into()),
+                skip_qe_acceptance_reason: None,
+                force_qe_acceptance: false,
             },
         }],
         edges: vec![],

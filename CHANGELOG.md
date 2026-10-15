@@ -69,6 +69,53 @@ Two release tracks share this file, newest entry first regardless of track:
   In-turn questions and per-tool permission asks return with DES-CONTAINER-FLOOR step 5 (the MCP `ask`
   tool through agentgateway, seccomp notify); until then they are not available.
 
+- **core, core-ts: a diagnostic line no longer kills the thread that writes it (core#957).** Several
+  unattended runs at once in a Node host (crew) could hang a unit in `executing`, or stop the actor
+  ("core actor stopped") with no panic printed. Node hands the addon a non-blocking stderr pipe; when
+  its reader lagged, a write failed with EAGAIN, std's `eprintln!` panicked, and the panic message was
+  lost the same way — so a worker died with its unit's result, or the actor died. wicked-core,
+  wicked-council, wicked-apps-core, wicked-governance and wicked-core-ts now shadow `eprintln!` with a
+  write that drops the line when stderr refuses it. `tests/concurrent_engine_runs.rs` runs five
+  concurrent unattended runs on two stub seats (launched, and bus-requested beside campaign nodes),
+  and again in a child process whose stderr is a full non-blocking pipe.
+
+- **core-ts**: `Core.qeReviewersAdmitted(seatsJson)` judges a whole roster's QE
+  reviewer admission against one routing snapshot, off the Node thread (wicked-crew#1021).
+- **core**: `qe_reviewers_admitted` judges every seat's QE reviewer admission against one routing
+  snapshot, returning the same verdicts as per-seat `qe_reviewer_admitted` calls (wicked-crew#1021).
+
+- **A benched or unavailable judge gets a disclosed fallback judge (operator ruling 2026-10-14).** On a host
+  whose codex cannot run commands, codex is benched for every repository-bound run. When every other run seat
+  was a party to the work, every gate escalated `judge_unavailable` and the operator approved each one by hand
+  (crew run 59232ebc). Now, when every preferred judge seat of a unit is benched for the run, or every one it
+  walked failed as a seat while judging (signed out, out of quota, an empty answer), the engine seats a fallback
+  judge: Claude Code, then Antigravity (`cli_runner::JUDGE_FALLBACK_SEATS`). The fallback seat must be distinct
+  from every seat the contract excludes: the creator, every author, the evaluator, the validator author, the
+  team monitors, the launch's judge exclusion, and every seat that authored earlier work in the run (Build/Recon
+  units, Creator-role units of any stage, floor fixes). "Distinct" is checked by key, by instance, and by every
+  binary each author may have run: its invocation, its registry record's `binary` and its ACP adapter. Those
+  binaries are recorded at every dispatch in the new `WorkUnit.authored_binaries`, which a reassign never clears. Work whose author has no
+  recorded binary (a unit persisted before this change) gets no fallback. The fallback seat must also not be
+  ballot-only, benched (any instance), declared unusable by the launcher, or already tried. Antigravity's built-in record is neither council- nor work-enabled, so it
+  is read from the full registry and seated as a judge only (a fenced verdict prompt, not governed work). The
+  fallback is seated only after genuine seat refusals: a judge that wrote a verdict and exited non-zero has
+  answered, and nothing more is asked. It never REJECTs on a seat failure. If every fallback seat refuses or errors, the hold stands and names
+  them too. A verdict-less answer escalates as before. If no distinct fallback seat exists, the behaviour is
+  unchanged. The gate receipt (`gateEvaluated.assurance.judgeFallbacks`) and the delivery receipt carry
+  `{seat, preferred, reason, label}`, and the run's live output gets the line. The label reads, for example,
+  `judge: agy (fallback; codex benched: codex cannot work in this run's worktree on this host)`. The hold now
+  names a launcher bench in its own words (`codex (benched for this run: …)`), not "after a seat failure".
+  `WICKED_JUDGE_FALLBACK` (comma-separated) can narrow or reorder the two seats; empty or `off` disables it. A
+  fallback record must run its key's CLI on every carrier (invocation, `binary`, ACP adapter). The bus
+  evaluator daemon's judge is unchanged. Pinned by `cli_runner::judge_fallback_tests` and
+  `tests/judge_fallback.rs` (the 59232ebc shape through the actor: the hold with the fallback off, then a
+  completed run judged by agy, with a disclosed fallback on every gate).
+- **core** Shell tools on every carrier now apply the filesystem read boundary to existing literal
+  path operands, including input redirects and changes of directory. Blocked reads remain advisory
+  and retain the tool and command in the audit; write escapes keep their fatal verdict. Wrapper
+  options, sourced environment files, attached path flags, file URLs and call-level working
+  directories are covered; failed directory changes preserve the known cwd (core#951).
+
 - **The editor-plugin workflow builds protocol 2.** The built-in `editor-plugin` preset's design, build and test
   steps still asked for a `protocol [1]` editor on the `wicked.editor/1` plumbing and judged conformance cases
   0-6 and 8-12 only. They now name `protocol [1, 2]` and the surfaces declaration the host renders (card, options
@@ -478,6 +525,18 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.11.2** — 2026-10-15 — patch release on main 42b9ddc, carrying #966 (core#957: a diagnostic
+  line no longer kills the thread that writes it). In a Node host the addon's stderr is a non-blocking
+  pipe. When its reader lagged, std's `eprintln!` panicked on EAGAIN and the panic message was lost, so a
+  unit worker died with its result (the run hung in `executing`) or the actor died (`core actor stopped`).
+  Several concurrent unattended runs made it likely. A patch: no surface change.
+- **core-ts 0.11.1** — 2026-10-15 — patch release on main 2835fb2, carrying #952 (QE acceptance on
+  engine-made launches: `LaunchSpec` QE fields, `Core.setQeAcceptanceOff`), #953 (a benched or unavailable
+  judge gets a disclosed fallback judge), #956 (`Core.qeReviewersAdmitted`: a whole roster's QE reviewer
+  admission against one routing snapshot, off the Node thread) and #955 (core#951: a shell read meets the same
+  read boundary as the Read tool on every carrier's shell tool; pi's `bash` and codex's `shell` no longer skip
+  the shell fences). A patch on purpose: every surface change is additive (new methods and optional fields),
+  and a shell read the boundary refuses is advisory, as a refused Read is.
 - **core-ts 0.11.0** — 2026-10-14 — minor release on main e11232c, carrying #946, #947, #948 (C6).
   A **minor** bump on purpose: C6 changes the container floor's operator surface. A container seat
   now runs on the credential the user signed in with in the agent's login container, the

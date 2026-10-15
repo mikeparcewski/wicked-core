@@ -786,6 +786,7 @@ pub(crate) fn run(
     elicitation_maps: Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     write_reg: WriteReg,
     team_link: crate::team::publish::TeamLink,
+    qe_host: crate::assurance::HostQeAcceptance,
 ) {
     // DES-TEAMING-002 P1: this thread's link to the team publisher. The actor never opens the
     // bus; it sends the publisher requests and waits for acknowledgements as commands.
@@ -1271,10 +1272,12 @@ pub(crate) fn run(
                         "a reduced-assurance launch must use launch_run: the straight-through \
                          path does not record the run's assurance contract"
                     )),
-                    // (QE acceptance) …and so is an explicit QE skip or force.
+                    // (QE acceptance) …and so is a QE word: an explicit skip or force, or the
+                    // host's standing skip (which only `launch_run` resolves against a contract).
                     Ok(None) if qe_acceptance != crate::assurance::QeOverride::Auto => {
                         Err(anyhow::anyhow!(
-                            "a launch that skips or forces QE acceptance must use launch_run: the \
+                            "a launch with a QE acceptance word (a skip, a force, or the host's \
+                             standing skip) must use launch_run: the \
                              straight-through path does not record the run's assurance contract"
                         ))
                     }
@@ -1612,7 +1615,9 @@ pub(crate) fn run(
                         // (QE acceptance) The operator's explicit skip or force, refused before
                         // anything persists when it is malformed or has nothing to apply to.
                         .with_qe_override(&spec.qe_acceptance)
-                        .map_err(|e| anyhow::anyhow!("the launch is refused: {e}"))?,
+                        // Typed, so the bus bridge drops a request that will never launch
+                        // instead of retrying it forever.
+                        .map_err(|e| anyhow::Error::new(crate::assurance::QeOverrideRefused(e)))?,
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
                     // — a crash between "run exists" and "run is in the project" cannot happen.
@@ -2834,8 +2839,14 @@ pub(crate) fn run(
             }
             // ── Campaign DAG scheduler (DES-CAMPAIGN-001) ────────────────────────────────────────
             Command::LaunchCampaign { def, reply } => {
-                let seams =
-                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
+                let seams = campaign_seams(
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                    &qe_host,
+                );
                 let res = crate::campaign::launch(
                     &mut store,
                     &mut subscribers,
@@ -2846,8 +2857,14 @@ pub(crate) fn run(
                 let _ = reply.send(res);
             }
             Command::ResumeCampaign { id, reply } => {
-                let seams =
-                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
+                let seams = campaign_seams(
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                    &qe_host,
+                );
                 let res = crate::campaign::resume(
                     &mut store,
                     &mut subscribers,
@@ -2858,8 +2875,14 @@ pub(crate) fn run(
                 let _ = reply.send(res);
             }
             Command::CancelCampaign { id, reply } => {
-                let seams =
-                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
+                let seams = campaign_seams(
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                    &qe_host,
+                );
                 let res = crate::campaign::cancel(
                     &mut store,
                     &mut subscribers,
@@ -2879,8 +2902,14 @@ pub(crate) fn run(
                 decision,
                 reply,
             } => {
-                let seams =
-                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
+                let seams = campaign_seams(
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                    &qe_host,
+                );
                 let res = crate::campaign::confirm_gate(
                     &mut store,
                     &mut subscribers,
@@ -2903,8 +2932,14 @@ pub(crate) fn run(
             Command::CampaignRunFinished { run_id, outcome } => {
                 // Deferred reconcile of a per-Run terminal signal (sent from the run's terminal emit
                 // points). No-op if the run isn't campaign-owned.
-                let seams =
-                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
+                let seams = campaign_seams(
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                    &qe_host,
+                );
                 if let Err(e) = crate::campaign::on_run_finished(
                     &mut store,
                     &mut subscribers,
@@ -2918,8 +2953,14 @@ pub(crate) fn run(
             }
             Command::CampaignNodeAwaiting { run_id, prompt } => {
                 // Deferred: a node's Run hit a HITL gate → free its slot + let independent work run.
-                let seams =
-                    campaign_seams(&runner, &self_tx, &registry, process_gen, &lifecycle_maps);
+                let seams = campaign_seams(
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                    &qe_host,
+                );
                 if let Err(e) = crate::campaign::on_node_awaiting(
                     &mut store,
                     &mut subscribers,
@@ -4084,6 +4125,7 @@ fn campaign_seams<'a>(
     registry: &'a crate::workflow::WorkflowRegistry,
     process_gen: uuid::Uuid,
     lifecycle_maps: &'a Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    qe_host: &'a crate::assurance::HostQeAcceptance,
 ) -> crate::campaign::Seams<'a> {
     crate::campaign::Seams {
         runner,
@@ -4091,6 +4133,7 @@ fn campaign_seams<'a>(
         registry,
         process_gen,
         lifecycle_maps,
+        qe_host,
     }
 }
 
@@ -9289,6 +9332,9 @@ fn dispatch_unit(
     // unit's own dispatch history, so `next_attempt` stays fresh whatever the attempt's outcome
     // (a worker exit never reaches the fold's write) and `None` means exactly "never dispatched"
     // (the dead-seat gate's never-seated clause, des-adjudicated §4.7).
+    // (the fallback judge) Whether this unit was dispatched before THIS dispatch, read before the
+    // stamp below: a Creator unit with no recorded binary then has an unrecorded author.
+    let previously_dispatched = unit.last_attempt.is_some();
     let attempt_changed = unit.last_attempt != Some(session.attempt);
     if attempt_changed {
         unit.last_attempt = Some(session.attempt);
@@ -9311,8 +9357,10 @@ fn dispatch_unit(
         );
     if builds {
         if let Some(seat) = unit.assigned_cli.clone() {
-            if !unit.authored_by.contains(&seat) {
-                unit.authored_by.push(seat);
+            // …and every binary that dispatch may run (the fallback judge never shares one).
+            let binaries =
+                crate::cli_runner::launched_identities(&seat, unit.assigned_invocation.clone());
+            if crate::domain::stamp_author(&mut unit, seat, binaries) {
                 team_changed = true;
             }
         }
@@ -9331,6 +9379,19 @@ fn dispatch_unit(
         unit.assigned_cli = Some(alt);
         unit.assigned_invocation = None;
         team_changed = true;
+    }
+    // (codex r5/r6) A Creator-role unit of another stage authors the artifact an evaluator's judge
+    // reads: the binaries of its FINAL seat for this dispatch (after the reseat above) are recorded
+    // for the fallback judge. Its seat is not added to `authored_by`, which evaluator seating reads
+    // for Build/Recon work only.
+    if !builds && unit.tool_cmd.is_none() && unit.role == crate::workflow::PhaseRole::Creator {
+        if let Some(seat) = unit.assigned_cli.clone() {
+            let binaries =
+                crate::cli_runner::launched_identities(&seat, unit.assigned_invocation.clone());
+            if crate::domain::stamp_author_binaries(&mut unit, previously_dispatched, binaries) {
+                team_changed = true;
+            }
+        }
     }
     // (core#810) The worker pool is re-filled against the run's CURRENT seats at every dispatch:
     // a failover, a bench reseat or an operator reassign moves `assigned_cli` after distribution,
@@ -10155,11 +10216,14 @@ fn dispatch_unit(
     // (F-7R2-006 / review RT-1) The run's roster and bench ride to the worker thread: the agent
     // judge is drawn from the seats this run configured, never a benched one.
     let run_roster_keys: Vec<String> = session.clis.clone();
-    let benched_keys: Vec<String> = session
-        .benched_seats
-        .iter()
-        .map(|b| b.cli.clone())
-        .collect();
+    // (operator ruling 2026-10-14) …with its reasons: a fallback judge's disclosure names why.
+    let bench: Vec<crate::domain::BenchedSeat> = session.benched_seats.clone();
+    // (operator ruling 2026-10-14, codex r1/r8) Every seat that authored the run's work before this
+    // unit — and every binary it may have run — is excluded from this unit's FALLBACK judge,
+    // whether or not the unit's judge reads a creator's cold output (`None`: an author's binary
+    // cannot be established, so no fallback judge).
+    let work_authors: Vec<String> = pipeline::fallback_work_authors(&units, unit.ord);
+    let author_binaries: Option<Vec<String>> = pipeline::work_author_binaries(&units, unit.ord);
     let runner = runner.clone();
     let tx = self_tx.clone();
     // The bus exec mediation is armed over (a publish that fell back in-process): the judge still
@@ -10204,7 +10268,9 @@ fn dispatch_unit(
             agent_review_target.as_deref(),
             &emit,
             &run_roster_keys,
-            &benched_keys,
+            &bench,
+            &work_authors,
+            author_binaries.as_deref(),
             exec_bus.as_deref(),
             team_runner.as_ref(),
         );

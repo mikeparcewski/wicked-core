@@ -410,7 +410,8 @@ pub enum CoreEvent {
         /// (core#850) What assured this decision — the run's contract (`mode`, `required`), the
         /// instruments that `ran` and the ones `skipped` (each with its reason), the `creator` /
         /// `evaluator` / `judge` seats, the `tree` and the `attempt`. Also persisted on the unit.
-        assurance: crate::assurance::AssuranceReceipt,
+        /// Boxed: the receipt is the bulk of the largest variant (clippy `large_enum_variant`).
+        assurance: Box<crate::assurance::AssuranceReceipt>,
     },
     /// (DES-STUDIO-COCKPIT-001 §3 B2) A unit was dispatched to a worker — emitted at EVERY dispatch
     /// (initial + each re-dispatch), so a client sees rework happen. `attempt` increments on re-dispatch;

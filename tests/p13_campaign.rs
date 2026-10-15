@@ -195,6 +195,8 @@ fn cnode(id: &str, hc: HumanConfirm) -> CampaignNode {
             human_confirm: hc,
             repo_ref: None,
             workflow_id: None,
+            skip_qe_acceptance_reason: None,
+            force_qe_acceptance: false,
         },
     }
 }

@@ -119,6 +119,8 @@ fn node(id: &str, hc: HumanConfirm, workflow_id: Option<&str>) -> CampaignNode {
             human_confirm: hc,
             repo_ref: None,
             workflow_id: workflow_id.map(str::to_string),
+            skip_qe_acceptance_reason: None,
+            force_qe_acceptance: false,
         },
     }
 }
