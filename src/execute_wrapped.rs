@@ -3041,6 +3041,7 @@ impl WrappedCliStepRunner {
             let composed = compose_seat_opencode_config(
                 &delivery,
                 is_opencode,
+                ask_config.env.iter().any(|(k, _)| k == OPENCODE_ASK_ENV),
                 uses_container_seat(
                     runs_in_seat(input),
                     crate::container_floor::container_mode(),
@@ -3599,7 +3600,10 @@ fn ask_seat_enabled(
         && container
         && !offline
         && has_operational_home
-        && matches!(cli, SeatCli::Claude | SeatCli::Codex | SeatCli::Pi)
+        && matches!(
+            cli,
+            SeatCli::Claude | SeatCli::Codex | SeatCli::Pi | SeatCli::Opencode
+        )
         && crew_url.and_then(crate::seat_gateway::crew_port).is_some()
         && route_ready
 }
@@ -3612,6 +3616,12 @@ fn pi_ask_refusal(cli: wicked_apps_core::spawn::SeatCli, argv: &[String]) -> Opt
             .any(|a| matches!(a.as_str(), "--approve" | "-a")))
         .then_some("pi --approve/-a trusts project-local MCP servers that can replace the engine's wicked server")
 }
+
+/// The opencode seat's ask registration (`PUT /api/experimental/mcp/wicked` body), read by the
+/// pinned server script.
+pub(crate) const OPENCODE_ASK_ENV: &str = "WICKED_OPENCODE_ASK";
+/// Where that body takes the seat's token (`wmt_<hex>`, JSON-safe), filled in by the script.
+pub(crate) const OPENCODE_ASK_TOKEN_SLOT: &str = "__WICKED_MCP_TOKEN__";
 
 #[derive(Default)]
 pub(crate) struct AskSeatConfig {
@@ -3672,6 +3682,28 @@ pub(crate) fn ask_seat_config(
                 .into_iter()
                 .flat_map(|s| ["-c".into(), s])
                 .collect();
+        }
+        // opencode 2.0.25 connects a server from its configuration files (`initialize`,
+        // `tools/list`) but never offers its tools to the model, directly or in Code Mode; a server
+        // registered through its own serve API is offered (`wicked_ask`) and held to the timeout
+        // (L15 probes). So the launch registers it: this variable is read by the pinned server
+        // script ([`crate::worker_sandbox::opencode_pinned_server_argv`]), which puts the seat's
+        // own `WICKED_MCP_TOKEN` in place of [`OPENCODE_ASK_TOKEN_SLOT`] on its stdin (never argv).
+        // Only a launch that script runs (`opencode run` with no `--server`) is handed it.
+        SeatCli::Opencode => {
+            if crate::worker_sandbox::opencode_pinned_server_argv(argv, 0).is_some() {
+                config.env = vec![(
+                    OPENCODE_ASK_ENV.into(),
+                    serde_json::json!({"config": {
+                        "type": "remote",
+                        "url": url,
+                        "headers": {"Authorization": format!("Bearer {OPENCODE_ASK_TOKEN_SLOT}")},
+                        "codemode": false,
+                        "timeout": {"execution": (timeout + 60) * 1000}
+                    }})
+                    .to_string(),
+                )];
+            }
         }
         SeatCli::Pi => {
             // Pi 1.1.0 ignores project-local configuration with this flag, including .pi/mcp.json.
@@ -5537,6 +5569,8 @@ fn config_for_container_launch(
 fn compose_seat_opencode_config(
     delivery: &crate::skills_snapshot::SkillsDelivery,
     is_opencode: bool,
+    // The launch registers the engine's `wicked` ask server: admit exactly its one tool.
+    admit_ask: bool,
     container_seat: bool,
     mut host_config: impl FnMut() -> Option<String>,
     inherit: impl FnOnce() -> bool,
@@ -5554,7 +5588,12 @@ fn compose_seat_opencode_config(
             None
         }
     });
-    crate::mcp_isolation::opencode_config(base.as_deref()).map(Some)
+    let admitted: &[&str] = if admit_ask {
+        &[crate::mcp_isolation::OPENCODE_ASK_TOOL]
+    } else {
+        &[]
+    };
+    crate::mcp_isolation::opencode_config_admitting(base.as_deref(), admitted).map(Some)
 }
 
 /// The [`StepOutput`] for a governed unit whose seat container did not arm: nothing ran. The
@@ -6386,6 +6425,7 @@ mod tests {
         let composed = compose_seat_opencode_config(
             &crate::skills_snapshot::SkillsDelivery::None,
             true,
+            false,
             true,
             || panic!("host OPENCODE_CONFIG_CONTENT must not be read"),
             || panic!("inherit hatch must not be read"),
@@ -6397,6 +6437,7 @@ mod tests {
         let host = compose_seat_opencode_config(
             &crate::skills_snapshot::SkillsDelivery::None,
             true,
+            false,
             false,
             || Some(r#"{"provider":{"openai":{"options":{"apiKey":"FAKE-host-key"}}}}"#.into()),
             || true,
@@ -15835,9 +15876,78 @@ mod ask_config_tests {
                 "mcp_servers.wicked.startup_timeout_sec=20"
             ]
         );
+        // copilot has no broker route; opencode only on a launch the pinned server script runs.
         for cli in [SeatCli::Opencode, SeatCli::Copilot] {
             let config = ask_seat_config(cli, true, 600, &[]);
             assert!(config.flags.is_empty() && config.files.is_empty() && config.env.is_empty());
+        }
+    }
+
+    /// L15: opencode is handed the ask server as a registration body for its pinned server script
+    /// (its configuration files' MCP tools are never offered): the gateway route, codemode off,
+    /// the timeout with headroom in milliseconds, and the token as a slot the script fills from the
+    /// seat's env. A launch the script does not run (`--server`, not `run`) is handed nothing.
+    #[test]
+    fn ask_opencode_is_a_registration_body_for_the_pinned_server_script() {
+        let argv: Vec<String> = ["opencode", "run", "--format", "json", "do it"]
+            .map(String::from)
+            .to_vec();
+        let config = ask_seat_config(SeatCli::Opencode, true, 600, &argv);
+        assert!(config.flags.is_empty() && config.files.is_empty());
+        assert_eq!(config.env.len(), 1);
+        assert_eq!(config.env[0].0, OPENCODE_ASK_ENV);
+        let body: serde_json::Value = serde_json::from_str(&config.env[0].1).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"config": {
+                "type": "remote",
+                "url": crate::seat_gateway::ASK_URL,
+                "headers": {"Authorization": "Bearer __WICKED_MCP_TOKEN__"},
+                "codemode": false,
+                "timeout": {"execution": 660_000}
+            }})
+        );
+        assert!(!config.env[0].1.contains("wmt_"), "never a token");
+        for other in [
+            vec!["opencode", "run", "--server", "http://127.0.0.1:1", "x"],
+            vec!["opencode", "serve"],
+        ] {
+            let argv: Vec<String> = other.into_iter().map(String::from).collect();
+            let config = ask_seat_config(SeatCli::Opencode, true, 600, &argv);
+            assert!(config.env.is_empty(), "{argv:?}");
+        }
+        assert!(ask_seat_config(SeatCli::Opencode, false, 600, &argv)
+            .env
+            .is_empty());
+    }
+
+    /// The composed opencode document admits exactly the ask tool when the launch registers it,
+    /// and nothing otherwise.
+    #[test]
+    fn ask_opencode_document_admits_only_the_ask_tool_when_handed() {
+        for admit in [false, true] {
+            let doc = compose_seat_opencode_config(
+                &crate::skills_snapshot::SkillsDelivery::None,
+                true,
+                admit,
+                true,
+                || None,
+                || false,
+            )
+            .unwrap()
+            .unwrap();
+            let v: serde_json::Value = serde_json::from_str(&doc).unwrap();
+            for rules in [&v["permission"], &v["agent"]["build"]["permission"]] {
+                assert_eq!(rules["*_*"], "deny");
+                assert_eq!(
+                    rules.get("wicked_ask").and_then(|r| r.as_str()),
+                    admit.then_some("allow")
+                );
+            }
+            let deny = doc.find("\"*_*\"").unwrap();
+            if admit {
+                assert!(doc[deny..].contains("\"wicked_ask\":\"allow\""), "{doc}");
+            }
         }
     }
 
@@ -15873,7 +15983,10 @@ mod ask_config_tests {
                                     && container
                                     && matches!(
                                         cli,
-                                        SeatCli::Claude | SeatCli::Codex | SeatCli::Pi
+                                        SeatCli::Claude
+                                            | SeatCli::Codex
+                                            | SeatCli::Pi
+                                            | SeatCli::Opencode
                                     )
                                     && url == Some("http://127.0.0.1:7871")
                                     && route_ready
@@ -15904,7 +16017,10 @@ mod ask_config_tests {
                             true,
                             true
                         ),
-                        matches!(cli, SeatCli::Claude | SeatCli::Codex | SeatCli::Pi)
+                        matches!(
+                            cli,
+                            SeatCli::Claude | SeatCli::Codex | SeatCli::Pi | SeatCli::Opencode
+                        )
                     );
                 }
             }

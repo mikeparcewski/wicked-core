@@ -39,6 +39,16 @@ Two release tracks share this file, newest entry first regardless of track:
   every other producer. Studio's question card read the run's current lead seat, which named the wrong agent when
   another unit asked (a pi question shown as "Codex · is asking").
 
+- **opencode seats get the MCP `ask` tool.** opencode 2.0.25 connects an MCP server named in its configuration files
+  (`initialize`, `tools/list`) but never offers its tools to the model, either directly or in Code Mode, even once
+  `GET /api/mcp` reports it `connected`; a server registered through its own serve API is offered. So a governed
+  container opencode seat's pinned server script now registers the engine's `wicked` server
+  (`PUT /api/experimental/mcp/wicked`, then `connect`, for the run's directory) before `opencode run`: the gateway
+  route, `codemode: false` (the tool is `wicked_ask`), `timeout.execution` = the ask timeout + 60 s, and the seat's
+  `WICKED_MCP_TOKEN` filled into the body on curl's stdin, never argv (`WICKED_OPENCODE_ASK` carries the body with a
+  slot). The seat's MCP deny (`"*_*": "deny"`) gains an exact `"wicked_ask": "allow"` read after it, at the top level
+  and on the governed agent. A failed registration is logged and the seat runs without the tool. Still not copilot.
+
 - **Governed container seats ask the operator mid-turn with the MCP `ask` tool (DES-CONTAINER-FLOOR step 5).**
   C5 removed ACP and with it in-turn questions; crew now serves an MCP `ask` route, reached by seat containers only
   through agentgateway's 8700 route (exact `POST`/`GET /api/v1/mcp/ask` matches). The engine owns the questions
@@ -49,7 +59,7 @@ Two release tracks share this file, newest entry first regardless of track:
   unset): `source`, `ord`, `attempt`; `answer`, `heldMs`. napi: `askUnit`, `openAsk`, `closeAsk`. Seats get static
   config with the token taken from their own env: claude `--mcp-config` (+ `MCP_TOOL_TIMEOUT`; the gate hook allows
   exactly `mcp__wicked__ask`), codex `-c mcp_servers.wicked.*`, pi `mcp.json` + `-e builtin:mcp` + `--no-approve`.
-  `WICKED_ASK_TIMEOUT_SECS` (default 600). Not opencode, copilot or the host floor.
+  `WICKED_ASK_TIMEOUT_SECS` (default 600). opencode asks too (see the entry above); not copilot or the host floor.
 
 - **BREAKING (C5): governed seats default to the container carrier, and ACP is removed from the seats.**
   The `wicked-core` CLI (and crew's daemon) set `WICKED_SEAT_FLOOR=container` unless the operator chose

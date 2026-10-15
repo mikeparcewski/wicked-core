@@ -327,7 +327,25 @@ fn pin_governed_agent_selectable(governed: &mut serde_json::Map<String, Value>) 
 /// Fails closed like the skills composition: a value that is not a JSON object, or whose
 /// `permission` / `agent` / `agent.build` / `agent.build.permission` is not an object, is an
 /// `Err`. The seat is then not launched rather than launched with the MCP tools visible.
+/// (Test-only since L15: the launch composes through [`opencode_config_admitting`].)
+#[cfg(test)]
 pub(crate) fn opencode_config(existing: Option<&str>) -> Result<String, String> {
+    opencode_config_admitting(existing, &[])
+}
+
+/// The opencode tool id of the engine's own `ask` server ([`crate::seat_gateway::ASK_URL`]),
+/// registered on a governed container seat by its launch ([`crate::worker_sandbox`]'s pinned
+/// server script), never by a configuration file.
+pub(crate) const OPENCODE_ASK_TOOL: &str = "wicked_ask";
+
+/// [`opencode_config`], then an exact `allow` for each id in `admitted`, at the top level and on
+/// the governed agent, read after the deny (an exact id, so it re-admits that one tool and nothing
+/// else). Used only for [`OPENCODE_ASK_TOOL`] on a seat whose launch registers the engine's own
+/// `wicked` server through opencode's API, which replaces any ambient server of that name.
+pub(crate) fn opencode_config_admitting(
+    existing: Option<&str>,
+    admitted: &[&str],
+) -> Result<String, String> {
     const VAR: &str = crate::skills_snapshot::OPENCODE_CONFIG_ENV;
     let mut doc = match existing {
         None => serde_json::json!({}),
@@ -349,15 +367,35 @@ pub(crate) fn opencode_config(existing: Option<&str>) -> Result<String, String> 
     obj.entry("$schema")
         .or_insert_with(|| Value::String("https://opencode.ai/config.json".to_string()));
     deny_mcp_in(obj, "permission")?;
+    admit_in(obj, admitted)?;
     let agent = object_entry(obj, "agent", VAR)?;
     let governed = object_entry(agent, OPENCODE_GOVERNED_AGENT, VAR)?;
     deny_mcp_in(governed, "permission")?;
+    admit_in(governed, admitted)?;
     pin_governed_agent_selectable(governed);
     obj.insert(
         "default_agent".to_string(),
         Value::String(OPENCODE_GOVERNED_AGENT.to_string()),
     );
     Ok(doc.to_string())
+}
+
+/// `parent.permission[id] = "allow"` for each exact `id`, inserted after the deny: emitted after it
+/// under sorted keys (an id is letter-led, the deny `*`-led) and under insertion order alike.
+fn admit_in(parent: &mut serde_json::Map<String, Value>, admitted: &[&str]) -> Result<(), String> {
+    if admitted.is_empty() {
+        return Ok(());
+    }
+    let rules = object_entry(
+        parent,
+        "permission",
+        crate::skills_snapshot::OPENCODE_CONFIG_ENV,
+    )?;
+    for id in admitted {
+        rules.remove(*id);
+        rules.insert((*id).to_string(), Value::String("allow".to_string()));
+    }
+    Ok(())
 }
 
 /// Set `parent[key][OPENCODE_MCP_TOOL_PATTERN] = "deny"`, creating the object where absent, so
@@ -470,6 +508,26 @@ mod tests {
         // No existing content: a bare document still carries the deny.
         let doc: Value = serde_json::from_str(&opencode_config(None).unwrap()).unwrap();
         assert_eq!(doc["permission"]["*_*"], "deny");
+    }
+
+    /// L15: the ask admission re-admits exactly `wicked_ask`, after the deny, at both levels, over
+    /// an ambient deny of that id; every other MCP id stays denied.
+    #[test]
+    fn the_admitting_document_allows_exactly_the_named_tool_after_the_deny() {
+        let ambient = r#"{"permission":{"wicked_ask":"deny","wicked_*":"allow"},"agent":{"build":{"permission":{"wicked_ask":"deny"}}}}"#;
+        let out = opencode_config_admitting(Some(ambient), &[OPENCODE_ASK_TOOL]).unwrap();
+        let doc: Value = serde_json::from_str(&out).unwrap();
+        for rules in [&doc["permission"], &doc["agent"]["build"]["permission"]] {
+            assert_eq!(rules["*_*"], "deny");
+            assert_eq!(rules["wicked_ask"], "allow");
+            assert!(rules.get("wicked_*").is_none(), "{rules}");
+        }
+        let text_deny = out.find("\"*_*\"").unwrap();
+        assert!(out[text_deny..].contains("\"wicked_ask\":\"allow\""));
+        assert_eq!(
+            opencode_config_admitting(Some(ambient), &[]).unwrap(),
+            opencode_config(Some(ambient)).unwrap()
+        );
     }
 
     /// core#911: the governed agent stays selectable. Content that demotes, hides or disables it

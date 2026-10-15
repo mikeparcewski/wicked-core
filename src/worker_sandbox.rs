@@ -935,6 +935,10 @@ pub(crate) fn codex_sandbox_off_under_floor(argv: &mut Vec<String>) -> bool {
 /// floor) or, with `--standalone`, to a private server on a random port the floor's port pin
 /// refuses. `None` when `argv` is not such an opencode launch. The caller admits
 /// `localhost:<port>` and sets the password env ([`OPENCODE_PASSWORD_ENVS`]) to a per-spawn nonce.
+/// When the launch is handed the `ask` tool (`WICKED_OPENCODE_ASK`, see
+/// [`crate::execute_wrapped::ask_seat_config`]), the script registers the `wicked` server through
+/// the server's own API for the run's directory before `run` (opencode 2.0.25 never offers a
+/// configuration file's MCP tools), with the seat's token on curl's stdin, never on a command line.
 pub(crate) fn opencode_pinned_server_argv(argv: &[String], port: u16) -> Option<Vec<String>> {
     if program_stem(argv) != Some("opencode") || argv.get(1).map(String::as_str) != Some("run") {
         return None;
@@ -954,6 +958,15 @@ while [ "$i" -lt 150 ]; do
   if curl -s -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null; then break; fi
   i=$((i + 1)); sleep 0.1
 done
+case "${WICKED_OPENCODE_ASK:-}" in *__WICKED_MCP_TOKEN__*)
+  au="opencode:${OPENCODE_SERVER_PASSWORD:-$OPENCODE_PASSWORD}"
+  slot=__WICKED_MCP_TOKEN__
+  body="${WICKED_OPENCODE_ASK%%"$slot"*}${WICKED_MCP_TOKEN:-}${WICKED_OPENCODE_ASK#*"$slot"}"
+  if printf '%s' "$body" | curl -sS -f -o /dev/null -u "$au" -X PUT -H 'content-type: application/json' --data-binary @- --url-query "location[directory]=$PWD" "http://127.0.0.1:$port/api/experimental/mcp/wicked" \
+    && curl -sS -f -o /dev/null -u "$au" -X POST --url-query "location[directory]=$PWD" "http://127.0.0.1:$port/api/experimental/mcp/wicked/connect"; then :; else
+    echo "wicked-core: the ask MCP server could not be registered with opencode; the seat runs without it" >&2
+  fi ;;
+esac
 "$oc" run --server "http://127.0.0.1:$port" "$@"
 "#;
     let mut out = vec![
@@ -1145,6 +1158,100 @@ pub(crate) fn plan_seat_floor(launch: SeatLaunch<'_>, write_roots: Vec<PathBuf>)
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    /// L15: the pinned opencode script registers the ask server through the server's API for the
+    /// run's directory when handed `WICKED_OPENCODE_ASK`: the token reaches curl on stdin (never
+    /// its argv), the connect follows, and the run goes on; with no registration nothing is sent.
+    #[cfg(unix)]
+    #[test]
+    fn the_pinned_opencode_script_registers_the_ask_server_with_the_token_on_stdin() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("wicked-oc-ask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let bin = bin.canonicalize().unwrap();
+        let write = |name: &str, body: String| {
+            let p = bin.join(name);
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let log = dir.join("log");
+        let oc = write(
+            "opencode",
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = serve ]; then exec sleep 30; fi\necho \"run $*\" >> {}\n",
+                log.display()
+            ),
+        );
+        write(
+            "curl",
+            format!(
+                "#!/bin/sh\necho \"curl $*\" >> {l}\ncase \"$*\" in *--data-binary*) printf 'body ' >> {l}; cat >> {l}; echo >> {l};; esac\nexit 0\n",
+                l = log.display()
+            ),
+        );
+        let argv: Vec<String> = [oc.to_str().unwrap(), "run", "--format", "json", "do it"]
+            .map(String::from)
+            .to_vec();
+        let pinned = opencode_pinned_server_argv(&argv, 4999).unwrap();
+        for handed in [true, false] {
+            let _ = std::fs::remove_file(&log);
+            // spawn-audit: test-only — the engine's pinned script with fake opencode and curl.
+            let mut cmd = std::process::Command::new(&pinned[0]);
+            cmd.args(&pinned[1..])
+                .current_dir(&dir)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("OPENCODE_SERVER_PASSWORD", "nonce-not-a-secret")
+                .env("WICKED_MCP_TOKEN", "wmt_0123abcd");
+            if handed {
+                cmd.env(
+                    "WICKED_OPENCODE_ASK",
+                    r#"{"config":{"headers":{"Authorization":"Bearer __WICKED_MCP_TOKEN__"}}}"#,
+                );
+            } else {
+                cmd.env_remove("WICKED_OPENCODE_ASK");
+            }
+            let out = cmd.output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+            let log = std::fs::read_to_string(&log).unwrap();
+            let lines: Vec<&str> = log.lines().collect();
+            let run = lines
+                .iter()
+                .position(|l| l.starts_with("run "))
+                .expect("ran");
+            assert!(
+                lines[run].contains("--server http://127.0.0.1:4999"),
+                "{log}"
+            );
+            if handed {
+                let put = lines
+                    .iter()
+                    .position(|l| l.contains("-X PUT"))
+                    .expect("registered");
+                assert!(
+                    lines[put].contains("/api/experimental/mcp/wicked")
+                        && lines[put].contains(&format!("location[directory]={}", dir.display()))
+                        && !lines[put].contains("wmt_0123abcd"),
+                    "{log}"
+                );
+                assert_eq!(
+                    lines[put + 1],
+                    r#"body {"config":{"headers":{"Authorization":"Bearer wmt_0123abcd"}}}"#
+                );
+                let connect = lines
+                    .iter()
+                    .position(|l| l.contains("/api/experimental/mcp/wicked/connect"))
+                    .expect("connected");
+                assert!(put < connect && connect < run, "{log}");
+            } else {
+                assert!(!log.contains("/api/experimental/mcp"), "{log}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
     use std::process::Command;
 
