@@ -59,7 +59,7 @@ Two release tracks share this file, newest entry first regardless of track:
   unset): `source`, `ord`, `attempt`; `answer`, `heldMs`. napi: `askUnit`, `openAsk`, `closeAsk`. Seats get static
   config with the token taken from their own env: claude `--mcp-config` (+ `MCP_TOOL_TIMEOUT`; the gate hook allows
   exactly `mcp__wicked__ask`), codex `-c mcp_servers.wicked.*`, pi `mcp.json` + `-e builtin:mcp` + `--no-approve`.
-  `WICKED_ASK_TIMEOUT_SECS` (default 600). Not opencode, copilot or the host floor.
+  `WICKED_ASK_TIMEOUT_SECS` (default 600). opencode asks too (see the entry above); not copilot or the host floor.
 
 - **BREAKING (C5): governed seats default to the container carrier, and ACP is removed from the seats.**
   The `wicked-core` CLI (and crew's daemon) set `WICKED_SEAT_FLOOR=container` unless the operator chose
