@@ -1672,14 +1672,9 @@ impl AcpStepRunner {
         // C5: ACP is removed from the seats. Every unit runs its CLI's headless mode on the wrapped
         // carrier: in a seat container under the container floor, else on the labelled interim
         // host floor (WICKED_SEAT_FLOOR=host).
-        let output = match host_floor_needs_acp(input) {
-            Some(cli) => crate::execute_wrapped::floor_refused(
-                input,
-                &cli,
-                crate::worker_sandbox::FloorUnarmed::NeedsContainerFloor,
-            ),
-            None => self.fallback.run_unit_streaming(input, emit),
-        };
+        // The host-floor rule (needs_container_floor) is judged by the wrapped carrier on the
+        // final argv.
+        let output = self.fallback.run_unit_streaming(input, emit);
         let mut output = output;
         if ok_turn_is_a_seat_refusal(&output) {
             output.status = crate::workflow::StepStatus::Failed;
@@ -1719,32 +1714,6 @@ impl AcpStepRunner {
 /// already refused them.
 const NO_MONITORS: &str = "team monitors ran over ACP, which is removed from the seats (C5); \
      they are not available until the headless carrier hosts them";
-
-/// (C5, codex c5-r1..r4) On the interim host floor, a governed unit whose seat's tool calls were
-/// checked over ACP (pi, opencode, copilot, agy, …: everything but claude's gate hook and codex's
-/// own bounded sandbox) has nothing checking them once ACP is gone: refused (fail closed), never
-/// run unchecked. Under the container floor the seat container is its floor.
-fn host_floor_needs_acp(input: &StepInput) -> Option<String> {
-    if input.governance.is_none() || crate::container_floor::container_mode() {
-        return None;
-    }
-    let cli = input.unit.assigned_cli.as_deref().unwrap_or("claude");
-    // The binary that will actually run (codex c5-r2): the unit's own invocation when it carries
-    // one (an ad-hoc roster can put `pi -p {PROMPT}` on a `claude` seat), else the seat's.
-    // The launcher's own resolution (codex c5-r3): the unit's invocation or the seat's, its binary
-    // read quote-aware exactly as the wrapped carrier will spawn it.
-    let invocation =
-        crate::execute_wrapped::launch_invocation(cli, input.unit.assigned_invocation.clone());
-    let binary = crate::execute_wrapped::template_binary(&invocation);
-    let run_root = wicked_apps_core::spawn::SeatCli::from_binary(&binary)
-        .root_name()
-        .map(str::to_string);
-    // Fail closed (codex c5-r4): on the interim host floor only claude (its gate hook) and codex
-    // (its own bounded sandbox, judged by the wrapped carrier) keep a per-call check without ACP;
-    // every other seat lost its command fences with the ACP permission handler.
-    let keeps_a_check = matches!(run_root.as_deref(), Some("claude") | Some("codex"));
-    (!keeps_a_check).then(|| cli.to_string())
-}
 
 /// (C5, codex c5-r2; core#755) Whether an `ok` turn is really a provider's refusal: no tool call,
 /// a SHORT output (a refusal is one error message; a long answer that merely quotes the phrase is
@@ -1963,8 +1932,7 @@ pub(crate) fn seat_identity_of(
 mod tests {
 
     use super::{
-        host_floor_needs_acp, is_transient_cli_failure, is_worker_originated_failure,
-        ok_turn_is_a_seat_refusal,
+        is_transient_cli_failure, is_worker_originated_failure, ok_turn_is_a_seat_refusal,
     };
 
     /// (C5) An exit-0, tool-free, short provider refusal is a failed turn; real work is not.
@@ -2004,74 +1972,6 @@ mod tests {
         )));
     }
 
-    /// (C5, codex c5-r1) On the interim host floor a governed unit on a seat governed only over
-    /// ACP (pi, opencode) is refused; claude (its gate hook rides the wrapped carrier), an
-    /// ungoverned unit, and any unit under the container floor are not.
-    #[test]
-    fn the_host_floor_refuses_a_governed_unit_on_an_acp_governed_seat() {
-        let _env = crate::test_env::ENV_LOCK
-            .write()
-            .unwrap_or_else(|p| p.into_inner());
-        let saved = std::env::var_os(crate::container_floor::SEAT_FLOOR_ENV);
-        let unit = |cli: &str, governed: bool| {
-            let mut u = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do");
-            u.assigned_cli = Some(cli.to_string());
-            crate::workflow::StepInput {
-                run_id: "r".into(),
-                unit_ix: 0,
-                attempt: 0,
-                unit: u,
-                workflow_id: "wf".into(),
-                entity_mode: crate::scope::EntityMode::Isolated,
-                workdir: None,
-                governance: governed.then(|| crate::workflow::GovernanceContext {
-                    db_path: String::new(),
-                    code_graph_db: None,
-                    extra_write_roots: vec![],
-                    extra_read_roots: vec![],
-                    project_id: None,
-                    human_confirm: Default::default(),
-                }),
-                prior_outputs: vec![],
-                elicitation_epoch: 0,
-                process_gen: None,
-                launch_seq: 0,
-                required_skills: Vec::new(),
-            }
-        };
-        std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, "host");
-        assert_eq!(
-            host_floor_needs_acp(&unit("pi", true)).as_deref(),
-            Some("pi")
-        );
-        assert_eq!(
-            host_floor_needs_acp(&unit("opencode", true)).as_deref(),
-            Some("opencode")
-        );
-        assert_eq!(host_floor_needs_acp(&unit("claude", true)), None);
-        assert_eq!(host_floor_needs_acp(&unit("codex", true)), None);
-        assert_eq!(
-            host_floor_needs_acp(&unit("copilot", true)).as_deref(),
-            Some("copilot")
-        );
-        assert_eq!(host_floor_needs_acp(&unit("pi", false)), None);
-        // The binary that RUNS decides (codex c5-r2): pi on a claude seat is refused.
-        let mut disguised = unit("claude", true);
-        disguised.unit.assigned_invocation = Some("pi -p {PROMPT}".into());
-        assert_eq!(host_floor_needs_acp(&disguised).as_deref(), Some("claude"));
-        // ...quoted, as the launcher tokenizes it (codex c5-r3).
-        disguised.unit.assigned_invocation = Some("\"pi\" -p {PROMPT}".into());
-        assert_eq!(host_floor_needs_acp(&disguised).as_deref(), Some("claude"));
-        let mut real = unit("claude", true);
-        real.unit.assigned_invocation = Some("\"/usr/local/bin/claude\" -p {PROMPT}".into());
-        assert_eq!(host_floor_needs_acp(&real), None);
-        std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, "container");
-        assert_eq!(host_floor_needs_acp(&unit("pi", true)), None);
-        match saved {
-            Some(v) => std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, v),
-            None => std::env::remove_var(crate::container_floor::SEAT_FLOOR_ENV),
-        }
-    }
     // Used only by the unix-gated tests below (Windows clippy: unused import).
     #[cfg(unix)]
     use crate::workflow::StepStatus;

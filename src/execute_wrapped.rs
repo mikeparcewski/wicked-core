@@ -2612,6 +2612,20 @@ impl WrappedCliStepRunner {
             // (IG1-core-2) What armed the write boundary (`Ok(launcher)`), or why none did and
             // whether that was already disclosed — read by the `os_sandbox`-class arm below.
             let floor: Result<&'static str, (String, bool)>;
+            // C5 (codex c5-r1..r6): ACP is gone from the seats, so on the interim host floor a
+            // governed unit runs only when the FINAL argv keeps a per-call check — claude (its gate
+            // hook) or codex in its own bounded sandbox — whatever seat key carries it and whatever
+            // floor resolves below. Anything else is refused, never run with only a disclosure.
+            if governed
+                && !crate::container_floor::container_mode()
+                && !host_floor_keeps_a_check(&argv)
+            {
+                return floor_refused(
+                    input,
+                    &cli_key,
+                    crate::worker_sandbox::FloorUnarmed::NeedsContainerFloor,
+                );
+            }
             let sandbox = if uses_container_seat(governed, crate::container_floor::container_mode())
             {
                 // The container floor (opt-in, WICKED_SEAT_FLOOR=container): the unit's floor —
@@ -2809,16 +2823,6 @@ impl WrappedCliStepRunner {
                     // record is not the process: the boundary counts only when the LAUNCHED argv
                     // runs codex itself with that bounded mode and no bypass flag.
                     Err(crate::worker_sandbox::FloorUnarmed::SeatArmsItsOwn) => {
-                        // C5 (codex c5-r5): with ACP gone a governed host-floor codex unit is held
-                        // only by its own bounded sandbox, so an unbounded launch (`--yolo`, no
-                        // mode) is refused, never run with only a disclosure.
-                        if governed && !launches_bounded_codex(&argv) {
-                            return floor_refused(
-                                input,
-                                &cli_key,
-                                crate::worker_sandbox::FloorUnarmed::NeedsContainerFloor,
-                            );
-                        }
                         floor = if launches_bounded_codex(&argv) {
                             Ok(crate::worker_sandbox::SEAT_CODEX_BOUNDARY)
                         } else {
@@ -3480,6 +3484,17 @@ pub(crate) fn build_worker_command(
 /// (IG1-core-2, review) Whether `argv` — the command a unit actually launches — runs codex itself
 /// (its program's stem is `codex`) with its own sandbox in a bounded mode and no bypass flag. The
 /// seat record's class is a prediction; a wrapper or an invocation that drops the mode is refused.
+/// (C5) Whether a governed launch of `argv` keeps a per-call check on the interim host floor:
+/// claude (the gate hook) or codex in its own bounded sandbox (no bypass flag).
+fn host_floor_keeps_a_check(argv: &[String]) -> bool {
+    let stem = argv
+        .first()
+        .and_then(|b| std::path::Path::new(b).file_stem())
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase);
+    stem.as_deref() == Some("claude") || launches_bounded_codex(argv)
+}
+
 fn launches_bounded_codex(argv: &[String]) -> bool {
     argv.first().is_some_and(|bin| {
         std::path::Path::new(bin)
@@ -7065,41 +7080,17 @@ mod tests {
         };
 
         let out = runner.run_unit(&input);
-
-        let unenforced = rx
-            .try_iter()
-            .filter_map(|c| match c {
-                crate::command::Command::EmitEvent(
-                    crate::event::CoreEvent::GovernanceUnenforced {
-                        cli, reason, ord, ..
-                    },
-                ) => Some((cli, reason, ord)),
-                _ => None,
-            })
-            .next()
-            .expect("a governed unit that could not be armed must announce it");
-        assert_eq!(
-            unenforced.0, "/bin/echo",
-            "names the binary, not the seat key"
-        );
-        assert_eq!(unenforced.2, 4);
-        // IG1-core-2: agy is of class `os_sandbox`; a scratch dir is not a run worktree, so the
-        // floor did not arm — the disclosure names that cause, and `sandboxUnenforced` rides it.
+        // C5 (codex c5-r4..r6): on the interim host floor a governed unit runs only on claude (its
+        // gate hook) or bounded codex; an OS-floor seat whose floor did not arm is refused with the reason, never run with only
+        // a disclosure (before C5 it ran, disclosed or floor-governed).
+        let _ = rx.try_iter().count();
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
         assert!(
-            unenforced
-                .1
-                .contains("its OS-sandbox governance floor did not arm (not_a_worktree"),
-            "the reason must say WHY it could not be armed: {}",
-            unenforced.1
+            out.output.contains("needs_container_floor"),
+            "{}",
+            out.output
         );
-        // The unit still runs — this is a disclosure, not a fallback or a failure.
-        assert_eq!(out.status, StepStatus::Ok);
-        assert!(!out.governed, "and it is honestly reported as ungoverned");
-        assert!(
-            !crate::gate_hook::decisions_path_for("run-unenf", 0).exists(),
-            "no marker is written when the floor did not arm"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!out.governed);
     }
 
     /// Container floor (codex review r1, P1): a seat wrapper goes through `run_bounded` — the
@@ -7281,43 +7272,17 @@ mod tests {
             required_skills: Vec::new(),
         };
         let out = runner.run_unit(&input);
-        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
-        assert!(out.governed, "the armed floor governs the unit");
-        let events: Vec<_> = rx.try_iter().collect();
+        // C5 (codex c5-r4..r6): on the interim host floor a governed unit runs only on claude (its
+        // gate hook) or bounded codex; an OS-floor seat even with its floor armed is refused with the reason, never run with only
+        // a disclosure (before C5 it ran, disclosed or floor-governed).
+        let _ = rx.try_iter().count();
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
         assert!(
-            !events.iter().any(|c| matches!(
-                c,
-                crate::command::Command::EmitEvent(
-                    crate::event::CoreEvent::GovernanceUnenforced { .. }
-                        | crate::event::CoreEvent::SandboxUnenforced { .. }
-                )
-            )),
-            "an armed floor discloses nothing"
+            out.output.contains("needs_container_floor"),
+            "{}",
+            out.output
         );
-        let log = std::fs::read_to_string(crate::gate_hook::decisions_path_for(&run_id, 0))
-            .expect("the os_sandbox marker is written");
-        let marker: serde_json::Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
-        assert_eq!(marker["_wicked_gov_armed"], "unit-2");
-        assert_eq!(marker["_wicked_gov_carrier"], "os_sandbox");
-        assert_eq!(
-            marker["_wicked_gov_roots"],
-            serde_json::json!([own.to_string_lossy()])
-        );
-        assert!(
-            ["sandbox-exec", "bwrap"].contains(&marker["_wicked_gov_boundary"].as_str().unwrap()),
-            "{marker}"
-        );
-        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
-        assert_eq!(
-            crate::gate_hook::fold_input_denial_with_activity(
-                &mut store, &run_id, 0, "unit-2", true, true
-            )
-            .unwrap(),
-            None,
-            "the fold accepts a governed, contained floor attempt"
-        );
-        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
-        let _ = std::fs::remove_dir_all(&base);
+        assert!(!out.governed);
     }
 
     /// IG1-core-2 (review): codex's own sandbox counts as the floor only when the LAUNCHED argv
@@ -7350,6 +7315,25 @@ mod tests {
             "--dangerously-bypass-approvals-and-sandbox",
         ])));
         assert!(!launches_bounded_codex(&[]));
+        // C5: the host-floor rule over the final argv.
+        assert!(host_floor_keeps_a_check(&v(&[
+            "/opt/tools/claude",
+            "-p",
+            "x"
+        ])));
+        assert!(host_floor_keeps_a_check(&v(&[
+            "codex",
+            "exec",
+            "--sandbox",
+            "workspace-write",
+            "p"
+        ])));
+        assert!(!host_floor_keeps_a_check(&v(&[
+            "codex", "--yolo", "exec", "p"
+        ])));
+        assert!(!host_floor_keeps_a_check(&v(&["codex", "exec", "p"])));
+        assert!(!host_floor_keeps_a_check(&v(&["pi", "-p", "x"])));
+        assert!(!host_floor_keeps_a_check(&v(&["copilot", "-p", "x"])));
     }
 
     /// IG1-core-2 (review): a governed unit on the `codex` seat whose invocation does not launch
