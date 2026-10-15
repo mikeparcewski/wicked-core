@@ -128,11 +128,15 @@ pub fn default_seat_floor() -> String {
     }
 }
 
-/// Whether the operator explicitly chose the labelled interim HOST floor (`WICKED_SEAT_FLOOR=host`).
-/// Products always choose a floor ([`default_seat_floor`]); an unset floor is a library embedding or
-/// a test, which keeps the pre-C5 wrapped behaviour.
+/// Whether a floor OTHER than the container floor was chosen (`WICKED_SEAT_FLOOR=host`, or any other
+/// non-empty value, a typo included — codex c5-r10): the labelled interim host floor, with its
+/// fail-closed rule. Products always choose a floor ([`default_seat_floor`]); only an UNSET floor
+/// (a library embedding or a test) keeps the pre-C5 wrapped behaviour.
 pub(crate) fn host_floor_chosen() -> bool {
-    std::env::var(SEAT_FLOOR_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("host"))
+    std::env::var(SEAT_FLOOR_ENV).is_ok_and(|v| {
+        let v = v.trim();
+        !v.is_empty() && !v.eq_ignore_ascii_case("container")
+    })
 }
 
 /// Whether governed units run in the container floor on this host ([`SEAT_FLOOR_ENV`]).
@@ -2946,7 +2950,13 @@ mod tests {
             std::env::set_var(SEAT_FLOOR_ENV, chosen);
             assert_eq!(default_seat_floor(), chosen);
             assert_eq!(container_mode(), chosen == "container");
+            assert_eq!(host_floor_chosen(), chosen == "host");
         }
+        // codex c5-r10: an unknown value (a typo) is the host floor with its rule, never an escape.
+        std::env::set_var(SEAT_FLOOR_ENV, "contaner");
+        assert!(!container_mode() && host_floor_chosen());
+        std::env::remove_var(SEAT_FLOOR_ENV);
+        assert!(!host_floor_chosen(), "only an unset floor is exempt");
         match saved {
             Some(v) => std::env::set_var(SEAT_FLOOR_ENV, v),
             None => std::env::remove_var(SEAT_FLOOR_ENV),
