@@ -502,6 +502,12 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.11.3** — 2026-10-15 — patch release on main e231ba8, carrying #967 (core#960: a run whose
+  contract requires QE acceptance gets a `test` step after its last tree change, whatever its band) and
+  #972 (core#969: Approve at `judge_unavailable` judges a team run's PA step instead of re-running it;
+  core#929: `NO CHANGE NEEDED` declares only when it opens its line; core#970: no engine text in a
+  seat's answer, engine notes on their own line, and a short human-confirmed chat answer passes the
+  substance floor). A patch: no surface change.
 - **core-ts 0.11.2** — 2026-10-15 — patch release on main 42b9ddc, carrying #966 (core#957: a diagnostic
   line no longer kills the thread that writes it). In a Node host the addon's stderr is a non-blocking
   pipe. When its reader lagged, std's `eprintln!` panicked on EAGAIN and the panic message was lost, so a
