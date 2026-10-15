@@ -148,6 +148,12 @@ pub struct TeamPlanState {
     /// reads `false` (that run's plans are decided as they were).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub requires_evaluator: bool,
+    /// (core#960) The run's assurance contract enforces QE acceptance, stamped at launch from
+    /// the persisted contract, including any operator or standing skip. Every code plan this run
+    /// decides owes a test step whatever its band ([`crate::plan::FloorInput::requires_qe`]).
+    /// A state persisted before this reads `false`, preserving its prior planning behavior.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requires_qe: bool,
 }
 
 /// (WT-C3, DES-walkthrough-proof §4.12) The testing rules the engine read for one proposal at
@@ -1004,6 +1010,7 @@ pub(crate) fn decide(
             obligations: &obligations,
             ran: &[],
             requires_evaluator: prior.requires_evaluator,
+            requires_qe: prior.requires_qe,
         },
     ) {
         Ok(f) => f,

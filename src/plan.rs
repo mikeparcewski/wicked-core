@@ -720,6 +720,8 @@ pub enum PlanRefusal {
     /// (core#934) The override removes the only evaluator of a creator plan whose run contract
     /// requires a distinct evaluator.
     OverrideRemovesRequiredEvaluator { catalog: String },
+    /// (core#960) The override removes the test step required by the run's QE contract.
+    OverrideRemovesRequiredQe { catalog: String },
     /// The override names a catalog id the catalog does not define.
     OverrideUnknownEntry { catalog: String },
     /// The override names a catalog id that is not a phase of the computed floor: there is
@@ -784,6 +786,7 @@ impl PlanRefusal {
             PlanRefusal::OverrideRemovesRequiredEvaluator { .. } => {
                 "override_removes_required_evaluator"
             }
+            PlanRefusal::OverrideRemovesRequiredQe { .. } => "override_removes_required_qe",
             PlanRefusal::OverrideUnknownEntry { .. } => "override_unknown_entry",
             PlanRefusal::OverrideNotInFloor { .. } => "override_not_in_floor",
             PlanRefusal::FloorReordered { .. } => "floor_reordered",
@@ -904,6 +907,11 @@ impl std::fmt::Display for PlanRefusal {
                 f,
                 "{r}: the override removes {catalog}, the plan's only evaluator, and the run's \
                  assurance contract requires a distinct evaluator"
+            ),
+            PlanRefusal::OverrideRemovesRequiredQe { catalog } => write!(
+                f,
+                "{r}: the override removes {catalog}, the plan's only QE acceptance step, and the run's \
+                 assurance contract requires QE acceptance"
             ),
             PlanRefusal::OverrideUnknownEntry { catalog } => write!(
                 f,
@@ -1328,11 +1336,18 @@ pub struct FloorInput<'a> {
     /// step and no evaluator step owes one whatever its band (`review`, or `critique` on a non-code
     /// plan) — the contract, not the score, says the work is reviewed.
     pub requires_evaluator: bool,
+    /// (core#960) The run's assurance contract enforces QE acceptance
+    /// ([`crate::assurance::RunAssurance::enforces`]`(QE_ACCEPTANCE)`): a code plan with a
+    /// creator owes a `test` step whatever its band, so a QE acceptance unit is reachable.
+    pub requires_qe: bool,
 }
 
 /// (core#934) The floor reason of the evaluator step a run's assurance contract adds.
 pub const CONTRACT_EVALUATOR_REASON: &str =
     "the run's assurance contract requires a distinct evaluator";
+
+/// (core#960) The floor reason of the test step a run's assurance contract adds.
+pub const CONTRACT_QE_REASON: &str = "the run's assurance contract requires QE acceptance";
 
 /// (WT-C3) One obligation of a held `plan.compose` testing rule that fired for the run: the rule
 /// and the token it requires (`step:walkthrough`). Persisted on the run's plan state (the
@@ -1493,6 +1508,9 @@ pub fn floor_fill(
     // §8.5 floor override: none in auto mode; in manual mode recorded, and never a pinned BAND
     // floor phase in a high-risk band. It exempts floor types from the fill; it removes no
     // authored step.
+    let qe_reachable = creator && plan.steps.iter().any(|s| code_work_step(catalog, s));
+    let owes_qe =
+        input.requires_qe && qe_reachable && !plan.steps.iter().any(|s| s.catalog == "test");
     let mut exempt: Vec<&str> = Vec::new();
     if let Some(ov) = &plan.floor_override {
         if matches!(input.human_confirm, crate::domain::HumanConfirm::None) {
@@ -1502,6 +1520,10 @@ pub fn floor_fill(
             let Some(e) = entry(c) else {
                 return Err(PlanRefusal::OverrideUnknownEntry { catalog: c.clone() });
             };
+            // (core#960) The contract requires test even below the band's test threshold.
+            if owes_qe && c == "test" {
+                return Err(PlanRefusal::OverrideRemovesRequiredQe { catalog: c.clone() });
+            }
             // Validated against the COMPUTED floor first: the pinned rule binds floor phases only.
             if !floor.contains(c) {
                 return Err(PlanRefusal::OverrideNotInFloor { catalog: c.clone() });
@@ -1547,6 +1569,13 @@ pub fn floor_fill(
                 contract_floor = Some(ty);
             }
         }
+    }
+    // (core#960) A QE contract needs a verified-evidence phase after code work. Like the
+    // evaluator contract floor, this is applied after override validation and in catalog order.
+    let contract_qe = owes_qe && !floor.iter().any(|t| t == "test");
+    if contract_qe {
+        floor.push("test".to_string());
+        floor.sort_by_key(|t| order(t));
     }
     let mut steps: Vec<PlanStep> = plan.steps.clone();
     for s in &mut steps {
@@ -1597,6 +1626,7 @@ pub fn floor_fill(
             None if contract_floor.as_deref() == Some(ty.as_str()) => {
                 CONTRACT_EVALUATOR_REASON.to_string()
             }
+            None if contract_qe && ty == "test" => CONTRACT_QE_REASON.to_string(),
             None => format!("band {} requires {ty}", row.band),
         };
         steps.insert(
@@ -3039,6 +3069,7 @@ mod tests {
                     obligations: &[],
                     ran: &[],
                     requires_evaluator: false,
+                    requires_qe: false,
                 },
             )
         }
@@ -3094,6 +3125,7 @@ mod tests {
                     obligations: &[],
                     ran: &[],
                     requires_evaluator,
+                    requires_qe: false,
                 },
             )
         }
@@ -3207,6 +3239,7 @@ mod tests {
                     obligations: &held,
                     ran: &[],
                     requires_evaluator: true,
+                    requires_qe: false,
                 },
             )
             .expect("the band's review still reviews the plan");
@@ -3230,6 +3263,170 @@ mod tests {
                     "{ty}: without the contract the override stands"
                 );
             }
+        }
+
+        fn fill_qe_contract(
+            p: &PlanSteps,
+            requires_qe: bool,
+            obligations: &[HeldObligation],
+        ) -> Result<FloorFilled, PlanRefusal> {
+            floor_fill(
+                crate::catalog::catalog(),
+                p,
+                FloorInput {
+                    score: 0,
+                    destructive: false,
+                    human_confirm: &MANUAL,
+                    deliver: None,
+                    obligations,
+                    ran: &[],
+                    requires_evaluator: true,
+                    requires_qe,
+                },
+            )
+        }
+
+        #[test]
+        fn core_960_qe_contract_adds_a_reachable_test_unit_at_a_low_score() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "review", "id": "review"}
+            ]}));
+            let f = fill_qe_contract(&p, true, &[]).unwrap();
+            assert_eq!(
+                rows(&f),
+                vec![
+                    row("build", "build", AddedBy::Plan, None),
+                    row("test", "test", AddedBy::Floor, Some(CONTRACT_QE_REASON)),
+                    row("review", "review", AddedBy::Plan, None),
+                ]
+            );
+            assert_eq!(f.floor, ["build", "test"]);
+            let units = plan_from_def(&f.def, "fix the bug", "r-qe");
+            assert!(units.iter().any(crate::qe_acceptance::is_qe_unit));
+        }
+
+        #[test]
+        fn core_960_qe_and_evaluator_contract_floors_keep_their_own_reasons() {
+            let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}]}));
+            let f = fill_qe_contract(&p, true, &[]).unwrap();
+            assert_eq!(
+                rows(&f),
+                vec![
+                    row("build", "build", AddedBy::Plan, None),
+                    row("test", "test", AddedBy::Floor, Some(CONTRACT_QE_REASON)),
+                    row(
+                        "review",
+                        "review",
+                        AddedBy::Floor,
+                        Some(CONTRACT_EVALUATOR_REASON)
+                    ),
+                ]
+            );
+        }
+
+        #[test]
+        fn core_960_without_qe_contract_the_low_band_adds_no_test() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "review", "id": "review"}
+            ]}));
+            let f = fill_qe_contract(&p, false, &[]).unwrap();
+            assert_eq!(phase_ids(&f), ["build", "review"]);
+            assert!(!plan_from_def(&f.def, "fix the bug", "r-no-qe")
+                .iter()
+                .any(crate::qe_acceptance::is_qe_unit));
+        }
+
+        #[test]
+        fn core_960_an_authored_test_satisfies_the_qe_contract_once() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "test", "id": "verify"},
+                {"catalog": "review", "id": "review"}
+            ]}));
+            let f = fill_qe_contract(&p, true, &[]).unwrap();
+            assert_eq!(phase_ids(&f), ["build", "verify", "review"]);
+            assert!(f
+                .steps
+                .steps
+                .iter()
+                .all(|s| s.added_by == Some(AddedBy::Plan)));
+        }
+
+        #[test]
+        fn core_960_a_non_code_plan_needs_no_qe_test() {
+            let p = plan(json!({"steps": [
+                {"catalog": "produce", "id": "draft"},
+                {"catalog": "critique", "id": "critique"}
+            ]}));
+            let f = fill_qe_contract(&p, true, &[]).unwrap();
+            assert_eq!(phase_ids(&f), ["draft", "critique"]);
+            assert!(!f.floor.iter().any(|t| t == "test"));
+        }
+
+        #[test]
+        fn core_960_a_manual_override_cannot_remove_required_qe() {
+            let p = plan(json!({
+                "steps": [
+                    {"catalog": "build", "id": "build"},
+                    {"catalog": "review", "id": "review"}
+                ],
+                "override": {"remove": ["test"], "reason": "tests run elsewhere"}
+            }));
+            let held = [HeldObligation {
+                rule: "R-test".into(),
+                token: "step:test".into(),
+            }];
+            // The refusal is typed both below the band's test threshold and when a rule adds it.
+            for obligations in [&[][..], &held[..]] {
+                let r = fill_qe_contract(&p, true, obligations).unwrap_err();
+                assert_eq!(
+                    r,
+                    PlanRefusal::OverrideRemovesRequiredQe {
+                        catalog: "test".into()
+                    }
+                );
+                assert_eq!(r.reason(), "override_removes_required_qe");
+                assert!(r
+                    .to_string()
+                    .contains("assurance contract requires QE acceptance"));
+            }
+            let f = fill_qe_contract(&p, false, &held).unwrap();
+            assert_eq!(phase_ids(&f), ["build", "review"]);
+            // Removing a floor obligation never removes an authored test.
+            let mut authored = p;
+            authored.steps.insert(
+                1,
+                PlanStep {
+                    catalog: "test".into(),
+                    id: "verify".into(),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                phase_ids(&fill_qe_contract(&authored, true, &held).unwrap()),
+                ["build", "verify", "review"]
+            );
+        }
+
+        #[test]
+        fn core_960_a_held_rule_keeps_the_test_floor_provenance() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "review", "id": "review"}
+            ]}));
+            let held = [HeldObligation {
+                rule: "R-test".into(),
+                token: "step:test".into(),
+            }];
+            let f = fill_qe_contract(&p, true, &held).unwrap();
+            let test = f.steps.steps.iter().find(|s| s.catalog == "test").unwrap();
+            assert_eq!(test.floor_rule.as_deref(), Some("R-test"));
+            assert_eq!(
+                test.floor_reason.as_deref(),
+                Some("rule R-test requires test")
+            );
         }
 
         /// (core#846) A security_review in a plan where no step executes code is refused when
@@ -3278,6 +3475,7 @@ mod tests {
                     obligations: &held,
                     ran: &[],
                     requires_evaluator: false,
+                    requires_qe: false,
                 },
             )
             .expect_err("refused");
@@ -3302,6 +3500,7 @@ mod tests {
                     obligations: &held,
                     ran: &[],
                     requires_evaluator: false,
+                    requires_qe: false,
                 },
             )
             .expect("a code plan keeps its security_review");
@@ -3507,6 +3706,7 @@ mod tests {
                     obligations: &[],
                     ran: &[],
                     requires_evaluator: false,
+                    requires_qe: false,
                 },
             )
             .unwrap();
@@ -3900,6 +4100,7 @@ mod tests {
                     obligations,
                     ran,
                     requires_evaluator: false,
+                    requires_qe: false,
                 },
             )
         }

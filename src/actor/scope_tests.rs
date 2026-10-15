@@ -24,6 +24,17 @@ fn put(e: &Engine, name: &str, steps: Value) {
 
 /// Launch the preset `workflow` (no plan, so no `touch`) on `repo_ref`, on seats `a` (the PA), `b`.
 fn launch_preset(e: &Engine, run: &str, workflow: &str, repo_ref: Option<&str>, hc: HumanConfirm) {
+    launch_preset_with_qe(e, run, workflow, repo_ref, hc, Default::default());
+}
+
+fn launch_preset_with_qe(
+    e: &Engine,
+    run: &str,
+    workflow: &str,
+    repo_ref: Option<&str>,
+    hc: HumanConfirm,
+    qe_acceptance: crate::assurance::QeOverride,
+) {
     e.core
         .launch_run(LaunchSpec {
             base_ref: None,
@@ -46,7 +57,7 @@ fn launch_preset(e: &Engine, run: &str, workflow: &str, repo_ref: Option<&str>, 
             primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
             reduced_assurance: false,
             deliverables: Vec::new(),
-            qe_acceptance: Default::default(),
+            qe_acceptance,
         })
         .expect("launch");
 }
@@ -859,6 +870,95 @@ fn x1_r2_m2_a_restart_after_the_scope_fold_decides_the_plan_not_completes_the_ru
     // gains its critique whatever its band.
     assert_eq!(ids, ["xm2:pa-scope", "xm2:draft", "xm2:critique"]);
     release_all(&w2);
+}
+
+/// core#960: a QE-required preset that authors build -> review reaches the lowest band after
+/// PA scope. Its persisted contract adds a QE unit; an operator skip on that same launch does not.
+#[test]
+fn core_960_a_launch_adds_required_qe_unless_the_operator_skips_it() {
+    let rig = rig("core-960");
+    let db = rig.dir.join("core.db").to_string_lossy().into_owned();
+    {
+        // Seed before spawning the sole store writer.
+        let mut store = wicked_apps_core::open_store(Some(&db)).unwrap();
+        crate::preset::put_preset_requiring(
+            &mut store,
+            crate::preset::PresetSpec {
+                name: "qe-contract".into(),
+                project_id: None,
+                steps: serde_json::from_value(json!([
+                    {"catalog": "build", "id": "build"},
+                    {"catalog": "review", "id": "review"}
+                ]))
+                .unwrap(),
+                created_by: "api".into(),
+            },
+            Some(vec![
+                crate::assurance::DISTINCT_EVALUATOR.into(),
+                crate::assurance::JUDGE.into(),
+                crate::assurance::QE_ACCEPTANCE.into(),
+            ]),
+            0,
+        )
+        .unwrap();
+    }
+    let worker = by_unit(|phase| {
+        (phase == "pa-scope").then(|| {
+            turn(
+                &pa_output("RISK {\"score\":0,\"reasons\":[\"small fix\"]}"),
+                None,
+            )
+        })
+    });
+    let cfg = team_cfg(&rig, Duration::from_millis(300));
+    let core = Core::spawn_with_engine_team(db, Arc::new(StubDispatcher), worker.clone(), cfg);
+    let e = wire(core, worker.clone(), rig);
+    for (run, word, requires_qe) in [
+        ("qe-required", crate::assurance::QeOverride::Auto, true),
+        (
+            "qe-skipped",
+            crate::assurance::QeOverride::Skip("tests run elsewhere".into()),
+            false,
+        ),
+    ] {
+        launch_preset_with_qe(&e, run, "qe-contract", None, HumanConfirm::None, word);
+        wait_for("the PA-scoped plan to be accepted", || {
+            view(&e, run)
+                .session
+                .team_plan
+                .as_ref()
+                .is_some_and(|p| p.accepted_rev == 2)
+        });
+        let v = view(&e, run);
+        let state = v.session.team_plan.as_ref().unwrap();
+        assert_eq!(state.max_score, 0);
+        assert_eq!(state.requires_qe, requires_qe);
+        assert_eq!(
+            v.session
+                .assurance
+                .enforces(crate::assurance::QE_ACCEPTANCE),
+            requires_qe
+        );
+        assert_eq!(
+            v.units
+                .iter()
+                .filter(|u| crate::qe_acceptance::is_qe_unit(u))
+                .count(),
+            usize::from(requires_qe)
+        );
+        let accepted = settled(&e, run, tev::PLAN_ACCEPTED, 2);
+        let tests: Vec<_> = accepted[1]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["catalog"] == "test")
+            .collect();
+        assert_eq!(tests.len(), usize::from(requires_qe));
+        if let Some(test) = tests.first() {
+            assert_eq!(test["floor_reason"], crate::plan::CONTRACT_QE_REASON);
+        }
+    }
+    release_all(&worker);
 }
 
 // ── X3: a plan or preset step's declared deliverables are the ENGINE's floor ─────────────────────
