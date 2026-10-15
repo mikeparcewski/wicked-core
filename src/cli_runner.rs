@@ -309,6 +309,10 @@ struct AgentVerdictWire {
     /// run as `judge_unavailable` on the bus path too. `default`: absent from an older runner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     seat_failure: Option<String>,
+    /// (operator ruling 2026-10-14) The fallback-judge disclosure. `default`: absent from an
+    /// older runner (the bus path's judge is the evaluator daemon's, never a fallback seat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    judge_fallback: Option<crate::assurance::JudgeFallback>,
 }
 
 impl From<AgentVerdictWire> for crate::validator::AgentVerdict {
@@ -319,6 +323,7 @@ impl From<AgentVerdictWire> for crate::validator::AgentVerdict {
             judge_cli: v.judge_cli,
             judge_distinct: v.judge_distinct,
             seat_failure: v.seat_failure,
+            judge_fallback: v.judge_fallback,
         }
     }
 }
@@ -331,6 +336,7 @@ impl From<crate::validator::AgentVerdict> for AgentVerdictWire {
             judge_cli: v.judge_cli,
             judge_distinct: v.judge_distinct,
             seat_failure: v.seat_failure,
+            judge_fallback: v.judge_fallback,
         }
     }
 }
@@ -419,6 +425,7 @@ fn bus_request_agent_verdict(
                 judge_cli: None,
                 judge_distinct: None,
                 seat_failure: None,
+                judge_fallback: None,
                 pass: false,
                 reasoning: $reason,
             }
@@ -516,6 +523,7 @@ fn bus_request_agent_verdict(
                         judge_cli: resp.judge_cli,
                         judge_distinct: None,
                         seat_failure: None,
+                        judge_fallback: None,
                         pass: resp.pass,
                         reasoning: resp.reasoning,
                     };
@@ -538,6 +546,7 @@ fn bus_request_agent_verdict(
         judge_cli: None,
         judge_distinct: None,
         seat_failure: None,
+        judge_fallback: None,
         pass: false,
         reasoning: format!(
             "gate eval bus-path DENY: evaluator daemon did not respond within {GATE_EVAL_TIMEOUT:?}. \
@@ -767,8 +776,12 @@ fn worktree_evidence_for_judge(workdir: &std::path::Path) -> Option<String> {
 
 /// `run_roster` — the RUN's configured seat keys (`AgentSession::clis`): the judge is drawn from
 /// the registry seats the launcher actually configured for this run (review of #449, RT-1), not
-/// from every registry record; empty = no intersection (the bus path, tests). `benched` — the
-/// run's BENCHED seat keys (`AgentSession::benched_seats`, F-7R2-006): never a judge.
+/// from every registry record; empty = no intersection (the bus path, tests). `bench` — the
+/// run's BENCHED seats with their reasons (`AgentSession::benched_seats`, F-7R2-006): never a
+/// judge, and named in a fallback judge's disclosure (operator ruling 2026-10-14). `work_authors` —
+/// for an evaluator unit, every seat that authored the work its judge reads
+/// ([`crate::pipeline::work_authors`]): never a judge of it; `author_binaries` — the binaries
+/// they ran ([`JudgeFallbackCtx::author_binaries`]).
 ///
 /// `exec_bus` — the bus exec mediation resolved for this unit (`None` off exec): the pinned judge
 /// publishes its evaluation request there ([`gate_eval_bus_db`]).
@@ -779,7 +792,9 @@ pub(crate) fn run_unit_and_judge(
     agent_review_target: Option<&str>,
     emit_delta: &DeltaSink,
     run_roster: &[String],
-    benched: &[String],
+    bench: &[crate::domain::BenchedSeat],
+    work_authors: &[String],
+    author_binaries: Option<&[String]>,
     exec_bus: Option<&str>,
     team: Option<&crate::team::runner::TeamRunner>,
 ) -> (
@@ -787,6 +802,16 @@ pub(crate) fn run_unit_and_judge(
     Option<crate::validator::AgentVerdict>,
     crate::workflow::UnitEvidence,
 ) {
+    let benched: Vec<String> = bench.iter().map(|b| b.cli.clone()).collect();
+    // (operator ruling 2026-10-14) The fallback judge seats, read from the registry per call —
+    // only for a run the caller knows (its roster): the bus worker knows neither roster nor
+    // bench, and its judge is the evaluator daemon's.
+    let registry = if run_roster.is_empty() {
+        Vec::new()
+    } else {
+        full_registry()
+    };
+    let pool = judge_fallback_pool(&registry);
     run_unit_and_judge_on(
         runner,
         input,
@@ -794,7 +819,14 @@ pub(crate) fn run_unit_and_judge(
         emit_delta,
         &crate::registry_roster(),
         run_roster,
-        benched,
+        &benched,
+        JudgeFallbackCtx {
+            pool: &pool,
+            registry: &registry,
+            bench,
+            work_authors,
+            author_binaries,
+        },
         exec_bus,
         team,
     )
@@ -957,6 +989,77 @@ fn run_unit_and_judge_with_roster(
         roster,
         run_roster,
         benched,
+        JudgeFallbackCtx::default(),
+        None,
+        None,
+    )
+}
+
+/// [`run_unit_and_judge_with_roster`] with the fallback judge armed (operator ruling 2026-10-14):
+/// `fallback` is what production reads from the registry and the run's bench.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn run_unit_and_judge_with_fallback(
+    runner: &Arc<dyn StepRunner>,
+    input: &StepInput,
+    emit_delta: &DeltaSink,
+    roster: &[crate::AgenticCli],
+    run_roster: &[String],
+    bench: &[crate::domain::BenchedSeat],
+    pool: &[crate::AgenticCli],
+    work_authors: &[String],
+) -> (
+    StepOutput,
+    Option<crate::validator::AgentVerdict>,
+    crate::workflow::UnitEvidence,
+) {
+    run_unit_and_judge_with_launches(
+        runner,
+        input,
+        emit_delta,
+        roster,
+        run_roster,
+        bench,
+        pool,
+        work_authors,
+        Some(&[]),
+    )
+}
+
+/// [`run_unit_and_judge_with_fallback`] with the authors' recorded binaries (codex r2/r3).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn run_unit_and_judge_with_launches(
+    runner: &Arc<dyn StepRunner>,
+    input: &StepInput,
+    emit_delta: &DeltaSink,
+    roster: &[crate::AgenticCli],
+    run_roster: &[String],
+    bench: &[crate::domain::BenchedSeat],
+    pool: &[crate::AgenticCli],
+    work_authors: &[String],
+    author_binaries: Option<&[String]>,
+) -> (
+    StepOutput,
+    Option<crate::validator::AgentVerdict>,
+    crate::workflow::UnitEvidence,
+) {
+    let benched: Vec<String> = bench.iter().map(|b| b.cli.clone()).collect();
+    run_unit_and_judge_on(
+        runner,
+        input,
+        None,
+        emit_delta,
+        roster,
+        run_roster,
+        &benched,
+        JudgeFallbackCtx {
+            pool,
+            registry: roster,
+            bench,
+            work_authors,
+            author_binaries,
+        },
         None,
         None,
     )
@@ -986,6 +1089,7 @@ pub(crate) fn run_unit_and_judge_with_team(
         roster,
         &[],
         &[],
+        JudgeFallbackCtx::default(),
         exec_bus,
         team,
     )
@@ -1096,22 +1200,535 @@ fn benched_judge_unavailable(
     roster: &[crate::AgenticCli],
     unbenched: &[crate::AgenticCli],
     benched: &[String],
-) -> Option<crate::validator::AgentVerdict> {
+    bench: &[crate::domain::BenchedSeat],
+) -> Option<BenchedJudge> {
     if benched.is_empty() || crate::validator::distinct_judge_available(excluded, roster) {
         return None;
     }
-    let lost: Vec<String> = crate::validator::distinct_judge_keys(excluded, unbenched)
+    let lost_keys: Vec<String> = crate::validator::distinct_judge_keys(excluded, unbenched)
         .into_iter()
         .filter(|k| benched.iter().any(|b| b == k))
-        .map(|k| format!("{k} (benched for this run after a seat failure)"))
         .collect();
-    if lost.is_empty() {
+    if lost_keys.is_empty() {
         return None;
     }
-    Some(crate::validator::AgentVerdict::from_judge_error(
+    let lost: Vec<String> = lost_keys
+        .iter()
+        .map(|k| match bench_reason(bench, k) {
+            // (operator ruling 2026-10-14) The bench's own words when the run recorded them: a
+            // launcher bench (codex's worktree bench) is not "a seat failure".
+            Some(why) => format!("{k} (benched for this run: {})", short_reason(why)),
+            None => format!("{k} (benched for this run after a seat failure)"),
+        })
+        .collect();
+    Some(BenchedJudge {
+        held: crate::validator::AgentVerdict::from_judge_error(
+            who,
+            crate::validator::JudgeUnavailable {
+                refusals: lost.clone(),
+            }
+            .into(),
+        ),
+        lost_keys,
+        lost,
+    })
+}
+
+/// [`benched_judge_unavailable`]'s hold: the seat-failure verdict, and the benched preferred
+/// judges it names (keys, and the refusal lines the verdict quotes).
+struct BenchedJudge {
+    held: crate::validator::AgentVerdict,
+    lost_keys: Vec<String>,
+    lost: Vec<String>,
+}
+
+/// (operator ruling 2026-10-14) The seats that may judge IN PLACE of the run's preferred judge
+/// when every preferred judge seat is benched for the run or fails as a seat while judging, in
+/// preference order: Claude Code, then Antigravity. `WICKED_JUDGE_FALLBACK` (comma-separated
+/// keys, read at call time) narrows or reorders the list — only these two keys are honoured; empty or
+/// `off` disables the fallback, which keeps the pre-ruling hold (`judge_unavailable`).
+pub(crate) const JUDGE_FALLBACK_SEATS: &[&str] = &["claude", "agy"];
+
+/// The judge's run context beyond its roster (operator ruling 2026-10-14): the fallback seats'
+/// registry records (`pool`, [`judge_fallback_pool`]), the FULL registry they and every party's
+/// identity are resolved against (`registry`), the run's bench WITH its reasons
+/// (`AgentSession::benched_seats`, named in the disclosure), and the authors of the work an
+/// evaluator unit's judge reads (`work_authors`, [`crate::pipeline::work_authors`]: the creator
+/// never judges its own work). The default (all empty) is "no fallback, no extra authors": the bus
+/// worker, which knows none of them, and the tests that pin the pre-ruling paths.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct JudgeFallbackCtx<'a> {
+    pub pool: &'a [crate::AgenticCli],
+    pub registry: &'a [crate::AgenticCli],
+    pub bench: &'a [crate::domain::BenchedSeat],
+    pub work_authors: &'a [String],
+    /// The binaries those authors actually ran ([`crate::pipeline::work_author_binaries`]); `None`
+    /// when one cannot be established — then no fallback judge is seated.
+    pub author_binaries: Option<&'a [String]>,
+}
+
+/// (codex r1 on the fallback) The parties a FALLBACK judge must be distinct from: the judge's own
+/// exclusion plus every seat that authored the work an evaluator unit's judge reads
+/// (`work_authors`, instance and cli key). The run's own rotation keeps its pre-ruling exclusion.
+fn fallback_parties<'a>(excluded: &[&'a str], work_authors: &'a [String]) -> Vec<&'a str> {
+    let mut out: Vec<&'a str> = excluded.to_vec();
+    for a in work_authors {
+        for k in [a.as_str(), wicked_apps_core::spawn::seat_cli_key(a)] {
+            if !out.contains(&k) {
+                out.push(k);
+            }
+        }
+    }
+    out
+}
+
+/// The normalized identity of the binary a launch of `key` with `invocation` actually runs: the
+/// launcher's own resolution ([`crate::execute_wrapped::launch_invocation`], then its quote-aware
+/// [`crate::execute_wrapped::template_binary`]), basename + case-folded.
+pub(crate) fn launched_identity(key: &str, invocation: Option<String>) -> String {
+    invocation_identity(&crate::execute_wrapped::launch_invocation(key, invocation))
+}
+
+/// (codex r6) EVERY identity a launch of `key` with `invocation` may execute: the wrapped
+/// invocation's binary ([`launched_identity`]) and its registry record's other carriers — the
+/// `binary` field and the ACP adapter's CLI ([`record_identities`]) — so an author is excluded by
+/// whichever carrier actually ran it.
+pub(crate) fn launched_identities(key: &str, invocation: Option<String>) -> Vec<String> {
+    let mut out = vec![launched_identity(key, invocation)];
+    let registry = full_registry();
+    let cli = wicked_apps_core::spawn::seat_cli_key(key);
+    if let Some(rec) = registry
+        .iter()
+        .find(|c| c.key == key)
+        .or_else(|| registry.iter().find(|c| c.key == cli))
+    {
+        for id in record_identities(rec) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// Every identity a registry record may execute: its headless invocation's binary (quote-aware),
+/// its `binary` field, and its ACP adapter's CLI (`claude-agent-acp` → `claude`, `codex-acp` →
+/// `codex`, `agy-acp` → `agy`).
+pub(crate) fn record_identities(c: &crate::AgenticCli) -> Vec<String> {
+    let mut out = vec![invocation_identity(&c.headless_invocation)];
+    let bin = crate::validator::normalize_identity(&c.binary);
+    if !bin.is_empty() && !out.contains(&bin) {
+        out.push(bin);
+    }
+    if let Some(a) = c.acp.as_ref() {
+        let b = crate::validator::normalize_identity(&a.binary);
+        let cli = b
+            .strip_suffix("-agent-acp")
+            .or_else(|| b.strip_suffix("-acp"))
+            .unwrap_or(&b)
+            .to_string();
+        if !cli.is_empty() && !out.contains(&cli) {
+            out.push(cli);
+        }
+    }
+    out
+}
+
+/// The normalized identity of the binary an invocation template runs, read quote-aware as the
+/// launcher reads it ([`crate::execute_wrapped::template_binary`]: `"/opt/Anti Gravity/agy" -p`
+/// is `agy`), basename + case-folded.
+pub(crate) fn invocation_identity(invocation: &str) -> String {
+    crate::validator::normalize_identity(&crate::execute_wrapped::template_binary(invocation))
+}
+
+/// The fallback seat keys in force: [`JUDGE_FALLBACK_SEATS`], or `WICKED_JUDGE_FALLBACK`.
+pub(crate) fn judge_fallback_keys() -> Vec<String> {
+    judge_fallback_keys_from(std::env::var("WICKED_JUDGE_FALLBACK").ok().as_deref())
+}
+
+fn judge_fallback_keys_from(env: Option<&str>) -> Vec<String> {
+    match env.map(str::trim) {
+        None => JUDGE_FALLBACK_SEATS.iter().map(|k| k.to_string()).collect(),
+        Some(v) if v.is_empty() || v.eq_ignore_ascii_case("off") => Vec::new(),
+        // Only the ruling's seats, narrowed or reordered — never another key (codex r5).
+        Some(v) => v
+            .split(',')
+            .map(str::trim)
+            .filter(|k| JUDGE_FALLBACK_SEATS.contains(k))
+            .map(str::to_string)
+            .collect(),
+    }
+}
+
+/// The FULL registry (built-ins merged with the user's `clis.toml`), unfiltered: what the
+/// fallback seats and every party's identity are resolved against.
+pub(crate) fn full_registry() -> Vec<crate::AgenticCli> {
+    // The same user path the execution carriers resolve (HOME, then USERPROFILE), so the records
+    // checked are the records run (codex r7).
+    let user = wicked_council::registry::default_user_path();
+    wicked_council::registry::load(user.as_deref()).unwrap_or_default()
+}
+
+/// The fallback seats' records from `registry` (the full one), in fallback order. Unfiltered on
+/// purpose: Antigravity's built-in record is neither council- nor work-enabled, so
+/// [`crate::registry_roster`] drops it, and the operator ruling seats it as a JUDGE only (a fenced
+/// verdict prompt, not governed work on the tree).
+pub(crate) fn judge_fallback_pool(registry: &[crate::AgenticCli]) -> Vec<crate::AgenticCli> {
+    judge_fallback_keys()
+        .iter()
+        .filter_map(|k| registry.iter().find(|c| &c.key == k).cloned())
+        .collect()
+}
+
+/// The recorded bench reason for `key` (its own key or its CLI's), if the run recorded one.
+fn bench_reason<'a>(bench: &'a [crate::domain::BenchedSeat], key: &str) -> Option<&'a str> {
+    bench
+        .iter()
+        .find(|b| b.cli == key)
+        .or_else(|| {
+            bench
+                .iter()
+                .find(|b| wicked_apps_core::spawn::seat_cli_key(&b.cli) == key)
+        })
+        .map(|b| b.reason.as_str())
+}
+
+/// A bench reason's headline for the disclosure line: the text before its first `: ` (the
+/// worktree bench's "codex cannot work in this run's worktree on this host"), at most 160 chars.
+/// The full reason stays on [`crate::assurance::JudgeFallback::reason`].
+fn short_reason(why: &str) -> String {
+    let head = why.split(": ").next().unwrap_or(why).trim();
+    let mut out: String = head.chars().take(160).collect();
+    if head.chars().count() > 160 {
+        out.push('…');
+    }
+    out
+}
+
+/// The fallback seats that may judge THIS unit: in the pool, not ballot-only (core#572: judging
+/// is work, and a seat recorded as ballot-only never does it), with an invocation, not declared
+/// unusable by the launcher, not benched for the run (any instance), not already tried by the
+/// rotation, and identity-distinct from every party — the creator, every author, the evaluator,
+/// the validator author, the team and the launch exclusion (`excluded`), each resolved to the
+/// binary it runs against the full `registry` (and the pool), plus `extra_ids` (the authors'
+/// identities as the judge rotation resolved them, the unit's own dispatched invocation). Each is
+/// marked work-eligible for the judge rotation only.
+///
+/// `None` — fail closed, no fallback — when a party's key resolves to NO registry record: its
+/// binary is unknown (an ad-hoc launch seat, an alias outside the registry), so no seat can be
+/// shown distinct from it.
+fn fallback_candidates(
+    pool: &[crate::AgenticCli],
+    registry: &[crate::AgenticCli],
+    excluded: &[&str],
+    extra_ids: &[String],
+    benched: &[String],
+    tried: &[String],
+) -> Option<Vec<crate::AgenticCli>> {
+    let mut ids: Vec<String> = extra_ids.to_vec();
+    for k in excluded {
+        let cli = wicked_apps_core::spawn::seat_cli_key(k);
+        let rec = registry
+            .iter()
+            .chain(pool)
+            .find(|c| c.key == *k)
+            .or_else(|| registry.iter().chain(pool).find(|c| c.key == cli));
+        match rec {
+            Some(c) => ids.extend(record_identities(c)),
+            None => {
+                eprintln!(
+                    "wicked-core: no fallback judge — party `{k}` names no registry seat, so its \
+                     binary is unknown and no seat can be shown distinct from it (operator ruling \
+                     2026-10-14)"
+                );
+                return None;
+            }
+        }
+    }
+    Some(
+        pool.iter()
+            // (codex r5) The record must run the CLI its key names on EVERY carrier the runner may
+            // pick — its headless invocation, its `binary`, and its ACP adapter (`claude-agent-acp`
+            // runs claude, `agy-acp` runs agy) — so the identity checked is the identity executed.
+            // An override record that names another binary is no fallback seat.
+            .filter(|c| record_runs_its_key(c))
+            .filter(|c| !c.enabled_for_council || c.seat_eligible_for_work)
+            .filter(|c| !c.headless_invocation.trim().is_empty())
+            .filter(|c| c.health.as_ref().is_none_or(|h| h.usable))
+            .filter(|c| {
+                // Any instance of a benched CLI is benched (codex r3).
+                let cli = wicked_apps_core::spawn::seat_cli_key(&c.key);
+                !benched
+                    .iter()
+                    .any(|b| wicked_apps_core::spawn::seat_cli_key(b) == cli)
+            })
+            .filter(|c| !tried.iter().any(|t| t == &c.key))
+            .filter(|c| {
+                // Never an instance of a party's CLI, whatever it invokes (codex r4).
+                let cli = wicked_apps_core::spawn::seat_cli_key(&c.key);
+                !excluded
+                    .iter()
+                    .any(|k| wicked_apps_core::spawn::seat_cli_key(k) == cli)
+            })
+            .filter(|c| {
+                // Both spellings: the launcher's quote-aware read and the rotation's (codex r3).
+                !ids.contains(&invocation_identity(&c.headless_invocation))
+                    && !ids.contains(&crate::validator::seat_identity(c))
+            })
+            .map(|c| {
+                let mut c = c.clone();
+                c.seat_eligible_for_work = true;
+                c
+            })
+            .collect(),
+    )
+}
+
+/// (codex r5) Whether a fallback seat's registry record runs the CLI its key names on every
+/// carrier: its headless invocation's binary, its `binary` field and (when set) its ACP adapter
+/// binary all resolve to the key's CLI (`claude`, `agy`; an adapter is `<cli>-acp` or
+/// `<cli>-agent-acp`).
+fn record_runs_its_key(c: &crate::AgenticCli) -> bool {
+    let cli = wicked_apps_core::spawn::seat_cli_key(&c.key).to_ascii_lowercase();
+    let adapter_ok = c.acp.as_ref().is_none_or(|a| {
+        let b = crate::validator::normalize_identity(&a.binary);
+        b == format!("{cli}-acp") || b == format!("{cli}-agent-acp")
+    });
+    invocation_identity(&c.headless_invocation) == cli
+        && crate::validator::normalize_identity(&c.binary) == cli
+        && adapter_ok
+}
+
+/// (codex r1 on the fallback) Whether a rotation's `JudgeUnavailable` was made ONLY of genuine
+/// seat refusals: every failure reported with its output (`refused` covers `refusals`), and no
+/// output names a verdict. A seat that exited non-zero AFTER writing `REJECT …` answered: asking
+/// another judge then would be verdict shopping, so no fallback is seated.
+fn only_seat_refusals(refusals: &[String], refused: &[(String, String)]) -> bool {
+    refused.len() >= refusals.len()
+        && refused
+            .iter()
+            .all(|(_, out)| !crate::validator::names_a_verdict(out))
+}
+
+/// Why the preferred judges are out, for the disclosure: `"<seat> benched: <reason>"` per seat
+/// (the run's recorded bench reason, else "a seat failure earlier in the run").
+fn benched_preferred_reason(lost: &[String], bench: &[crate::domain::BenchedSeat]) -> String {
+    lost.iter()
+        .map(|k| match bench_reason(bench, k) {
+            Some(why) => format!("{k} benched: {}", short_reason(why)),
+            None => format!("{k} benched: a seat failure earlier in the run"),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// `JudgeUnavailable` refusal lines (`"<seat> (<cause>)"`) as the preferred keys and the
+/// disclosure reason (`"<seat> unavailable: <cause>"`).
+fn unavailable_preferred(refusals: &[String]) -> (Vec<String>, String) {
+    let mut keys = Vec::new();
+    let mut parts = Vec::new();
+    for r in refusals {
+        let (k, cause) = match r.split_once(" (") {
+            Some((k, rest)) => (k.to_string(), rest.trim_end_matches(')').to_string()),
+            None => (r.clone(), "failed as a seat".to_string()),
+        };
+        parts.push(format!("{k} unavailable: {cause}"));
+        keys.push(k);
+    }
+    (keys, parts.join("; "))
+}
+
+/// Where a judge rotation's `(seat, output)` refusals are reported for the run's bench.
+type RefusalSink<'a> = dyn Fn(&[(String, String)]) + 'a;
+
+/// What a fallback judge attempt came to.
+enum FallbackJudge {
+    /// No fallback seat may judge this unit: the caller keeps the pre-ruling verdict (the hold).
+    NoCandidate,
+    /// A fallback seat answered: its verdict (labelled), or its verdict-less answer (escalates).
+    Answered(crate::validator::AgentVerdict),
+    /// Every fallback seat failed as a seat (or errored): the hold stands, naming them too.
+    Failed(Vec<String>),
+}
+
+/// (operator ruling 2026-10-14) Seat a FALLBACK judge for a unit whose preferred judge seats
+/// (`preferred`, why: `reason`) are all benched or failed as seats. Only a seat
+/// [`fallback_candidates`] admits is asked; the rotation over them is the ordinary judge
+/// rotation (seat refusals reported for the bench, no verdict shopping). A fallback that cannot
+/// produce an answer — every candidate refused, timed out or errored — never REJECTs: the
+/// caller's hold stands. The answer carries the [`crate::assurance::JudgeFallback`] disclosure,
+/// and the run's live output says which seat judged in whose place.
+#[allow(clippy::too_many_arguments)]
+fn fallback_judge(
+    who: &str,
+    criterion: &str,
+    work: &str,
+    excluded: &[&str],
+    candidates: &[crate::AgenticCli],
+    preferred: Vec<String>,
+    reason: String,
+    runner: &dyn StepRunner,
+    note_refusals: &RefusalSink<'_>,
+    emit_delta: &DeltaSink,
+) -> FallbackJudge {
+    if candidates.is_empty() {
+        return FallbackJudge::NoCandidate;
+    }
+    let names = crate::validator::distinct_judge_keys(excluded, candidates);
+    if names.is_empty() {
+        return FallbackJudge::NoCandidate;
+    }
+    emit_delta(&format!(
+        "{who}: the run's judge is out ({reason}) — asking a fallback judge seat ({})",
+        names.join(", ")
+    ));
+    let label = |seat: &str| {
+        format!(
+            "judge: {seat} (fallback; {})",
+            if reason.is_empty() {
+                format!("{} unavailable", preferred.join(", "))
+            } else {
+                reason.clone()
+            }
+        )
+    };
+    let disclosure = |seat: &str| crate::assurance::JudgeFallback {
+        seat: seat.to_string(),
+        preferred: preferred.clone(),
+        reason: reason.clone(),
+        label: label(seat),
+    };
+    // One seat at a time: the next is asked only after a GENUINE seat refusal
+    // ([`only_seat_refusals`]); a seat that wrote a verdict and exited non-zero ends the fallback
+    // with the hold (no verdict shopping).
+    let mut failures: Vec<String> = Vec::new();
+    for key in &names {
+        let Some(seat) = candidates.iter().find(|c| &c.key == key) else {
+            continue;
+        };
+        let (verdict, refused) = crate::validator::agent_validate_with_refusals(
+            criterion,
+            work,
+            excluded,
+            std::slice::from_ref(seat),
+            runner,
+        );
+        note_refusals(&refused);
+        match verdict {
+            Ok(mut av) => {
+                let fb = disclosure(av.judge_cli.as_deref().unwrap_or(key));
+                emit_delta(&fb.label);
+                eprintln!("wicked-core: {} (operator ruling 2026-10-14)", fb.label);
+                av.judge_fallback = Some(fb);
+                return FallbackJudge::Answered(av);
+            }
+            Err(e) => {
+                if let Some(nv) = e.downcast_ref::<crate::validator::JudgeNoVerdict>() {
+                    // An answer without a verdict escalates, labelled — never a re-ask.
+                    let fb = disclosure(&nv.seat);
+                    emit_delta(&fb.label);
+                    let mut av = crate::validator::AgentVerdict::from_judge_error(who, e);
+                    av.reasoning = format!("{} — {}", fb.label, av.reasoning);
+                    av.judge_fallback = Some(fb);
+                    return FallbackJudge::Answered(av);
+                }
+                match e.downcast_ref::<crate::validator::JudgeUnavailable>() {
+                    Some(u) => {
+                        failures.extend(u.refusals.iter().map(|r| format!("{r} — fallback judge")));
+                        if !only_seat_refusals(&u.refusals, &refused) {
+                            // It answered something and exited non-zero: stop, hold.
+                            return FallbackJudge::Failed(failures);
+                        }
+                    }
+                    None => {
+                        failures.push(format!("fallback judge {key} could not judge ({e})"));
+                        return FallbackJudge::Failed(failures);
+                    }
+                }
+            }
+        }
+    }
+    FallbackJudge::Failed(failures)
+}
+
+/// The hold a fallback could not lift: `held` (the pre-ruling seat-failure verdict) with the
+/// fallback seats' own failures appended to what it names.
+fn held_with_fallback_failures(
+    who: &str,
+    held: crate::validator::AgentVerdict,
+    preferred_refusals: Vec<String>,
+    fallback: FallbackJudge,
+) -> crate::validator::AgentVerdict {
+    match fallback {
+        FallbackJudge::NoCandidate => held,
+        FallbackJudge::Answered(av) => av,
+        FallbackJudge::Failed(more) => {
+            let mut refusals = preferred_refusals;
+            refusals.extend(more);
+            crate::validator::AgentVerdict::from_judge_error(
+                who,
+                crate::validator::JudgeUnavailable { refusals }.into(),
+            )
+        }
+    }
+}
+
+/// (operator ruling 2026-10-14) A judge rotation's error: when every seat it walked failed AS A
+/// SEAT ([`crate::validator::JudgeUnavailable`]), a fallback seat the rotation did not walk
+/// judges in their place; any other error keeps its pre-ruling shape.
+#[allow(clippy::too_many_arguments)]
+fn judge_error_or_fallback(
+    who: &str,
+    e: anyhow::Error,
+    refused: &[(String, String)],
+    criterion: &str,
+    work: &str,
+    excluded: &[&str],
+    extra_ids: Option<Vec<String>>,
+    walked: &[crate::AgenticCli],
+    benched: &[String],
+    fallback: JudgeFallbackCtx<'_>,
+    runner: &dyn StepRunner,
+    note_refusals: &RefusalSink<'_>,
+    emit_delta: &DeltaSink,
+) -> crate::validator::AgentVerdict {
+    let Some(refusals) = e
+        .downcast_ref::<crate::validator::JudgeUnavailable>()
+        .map(|u| u.refusals.clone())
+    else {
+        return crate::validator::AgentVerdict::from_judge_error(who, e);
+    };
+    let held = crate::validator::AgentVerdict::from_judge_error(who, e);
+    if !only_seat_refusals(&refusals, refused) {
+        return held;
+    }
+    let (preferred, reason) = unavailable_preferred(&refusals);
+    let tried = crate::validator::distinct_judge_keys(excluded, walked);
+    let Some(candidates) = extra_ids.and_then(|ids| {
+        fallback_candidates(
+            fallback.pool,
+            fallback.registry,
+            excluded,
+            &ids,
+            benched,
+            &tried,
+        )
+    }) else {
+        return held;
+    };
+    let fb = fallback_judge(
         who,
-        crate::validator::JudgeUnavailable { refusals: lost }.into(),
-    ))
+        criterion,
+        work,
+        excluded,
+        &candidates,
+        preferred,
+        reason,
+        runner,
+        note_refusals,
+        emit_delta,
+    );
+    held_with_fallback_failures(who, held, refusals, fb)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1123,6 +1740,7 @@ fn run_unit_and_judge_on(
     roster: &[crate::AgenticCli],
     run_roster: &[String],
     benched: &[String],
+    fallback: JudgeFallbackCtx<'_>,
     exec_bus: Option<&str>,
     team: Option<&crate::team::runner::TeamRunner>,
 ) -> (
@@ -1346,6 +1964,36 @@ fn run_unit_and_judge_on(
     // The pool is the run's configured seats when any of them is a registry seat; a run whose
     // roster names NO registry seat (an ad-hoc launch roster, a test's fabricated keys) keeps
     // the registry as its pool — there is nothing to intersect with, and a judge must exist.
+    // (codex r1-r3 on the fallback) The identities a FALLBACK judge must not share beyond the
+    // parties' registry records: the authors' identities as the rotation resolved them, the
+    // binary this unit is launched with ([`launched_identity`], the launcher's own resolution),
+    // and the binary every author of the work actually ran (`author_binaries`, recorded at each
+    // dispatch). `None` — no fallback — when an author's binary cannot be established. Read only
+    // when a fallback is considered (it reads the registry).
+    let fallback_ids = |author_ids: &[String]| -> Option<Vec<String>> {
+        let Some(binaries) = fallback.author_binaries else {
+            eprintln!(
+                "wicked-core: no fallback judge — an author of this work has no recorded binary \
+                 (operator ruling 2026-10-14)"
+            );
+            return None;
+        };
+        // (codex r4) …and THIS unit's own recorded authors' binaries (a Build unit's judge).
+        if !crate::pipeline::author_binaries_known(&input.unit) {
+            eprintln!(
+                "wicked-core: no fallback judge — an author of this unit has no recorded binary \
+                 (operator ruling 2026-10-14)"
+            );
+            return None;
+        }
+        let mut v = author_ids.to_vec();
+        v.extend(binaries.iter().cloned());
+        v.extend(input.unit.authored_binaries.iter().cloned());
+        if let Some(k) = input.unit.assigned_cli.as_deref() {
+            v.push(launched_identity(k, input.unit.assigned_invocation.clone()));
+        }
+        Some(v)
+    };
     let pool = judge_pool(roster, run_roster);
     // (core#772) The same pool BEFORE the run's bench: a judge seat benched earlier in this run
     // (a quota / sign-in refusal while judging) must not turn "no distinct judge" into an
@@ -1616,10 +2264,47 @@ fn run_unit_and_judge_on(
             } else {
                 &unbenched
             };
-            if let Some(v) =
-                benched_judge_unavailable("agent validator", &excluded, roster, bench_pool, benched)
-            {
-                break 'pinned Some(v);
+            if let Some(b) = benched_judge_unavailable(
+                "agent validator",
+                &excluded,
+                roster,
+                bench_pool,
+                benched,
+                fallback.bench,
+            ) {
+                // (operator ruling 2026-10-14) Every preferred judge is benched: a distinct
+                // fallback seat judges in its place, disclosed; with none, the hold stands.
+                let parties = fallback_parties(&excluded, fallback.work_authors);
+                let fb = match fallback_ids(&author_ids).and_then(|ids| {
+                    fallback_candidates(
+                        fallback.pool,
+                        fallback.registry,
+                        &parties,
+                        &ids,
+                        benched,
+                        &[],
+                    )
+                }) {
+                    Some(candidates) => fallback_judge(
+                        "agent validator",
+                        &judge_criterion,
+                        work_for_agent,
+                        &parties,
+                        &candidates,
+                        b.lost_keys.clone(),
+                        benched_preferred_reason(&b.lost_keys, fallback.bench),
+                        &**runner,
+                        &note_refusals,
+                        emit_delta,
+                    ),
+                    None => FallbackJudge::NoCandidate,
+                };
+                break 'pinned Some(held_with_fallback_failures(
+                    "agent validator",
+                    b.held,
+                    b.lost,
+                    fb,
+                ));
             }
             if !crate::validator::distinct_judge_available(&excluded, roster) {
                 let creator_id = crate::validator::excluded_identity(work_author, roster);
@@ -1710,8 +2395,23 @@ fn run_unit_and_judge_on(
                 // Carries the judge seat + distinctness for `gateEvaluated` (core#431).
                 Ok(av) => av,
                 // (core#772) Every judge seat failed as a seat ⇒ a seat-failure denial, not a
-                // REJECT; any other error keeps the fail-closed REJECT shape.
-                Err(e) => crate::validator::AgentVerdict::from_judge_error("agent validator", e),
+                // REJECT; any other error keeps the fail-closed REJECT shape. (operator ruling
+                // 2026-10-14) Before the hold, a distinct fallback seat judges in their place.
+                Err(e) => judge_error_or_fallback(
+                    "agent validator",
+                    e,
+                    &refused,
+                    &judge_criterion,
+                    work_for_agent,
+                    &fallback_parties(&excluded, fallback.work_authors),
+                    fallback_ids(&author_ids),
+                    roster,
+                    benched,
+                    fallback,
+                    &**runner,
+                    &note_refusals,
+                    emit_delta,
+                ),
             })
         };
         if pinned.is_some() {
@@ -1735,16 +2435,49 @@ fn run_unit_and_judge_on(
             let author_ids = author_identities(&excluded, roster);
             let run_x = without_author_binaries(&eligible_run, &excluded, &author_ids);
             let roster = run_x.as_slice();
-            if let Some(v) = benched_judge_unavailable(
+            let criterion = crate::validator::default_judge_criterion(&input.unit);
+            if let Some(b) = benched_judge_unavailable(
                 "default judge",
                 &excluded,
                 roster,
                 &unbenched_run,
                 benched,
+                fallback.bench,
             ) {
-                Some(v)
+                // (operator ruling 2026-10-14) As on the pinned path: a distinct fallback seat
+                // judges in place of the benched preferred judges; with none, the hold stands.
+                let parties = fallback_parties(&excluded, fallback.work_authors);
+                let fb = match fallback_ids(&author_ids).and_then(|ids| {
+                    fallback_candidates(
+                        fallback.pool,
+                        fallback.registry,
+                        &parties,
+                        &ids,
+                        benched,
+                        &[],
+                    )
+                }) {
+                    Some(candidates) => fallback_judge(
+                        "default judge",
+                        &criterion,
+                        work_for_agent,
+                        &parties,
+                        &candidates,
+                        b.lost_keys.clone(),
+                        benched_preferred_reason(&b.lost_keys, fallback.bench),
+                        &**runner,
+                        &note_refusals,
+                        emit_delta,
+                    ),
+                    None => FallbackJudge::NoCandidate,
+                };
+                Some(held_with_fallback_failures(
+                    "default judge",
+                    b.held,
+                    b.lost,
+                    fb,
+                ))
             } else if crate::validator::distinct_judge_available(&excluded, roster) {
-                let criterion = crate::validator::default_judge_criterion(&input.unit);
                 eprintln!(
                     "wicked-core: unit {} changed the worktree tree with no pinned validator — \
                      convening the default judge (evaluator ≠ creator '{work_author}') \
@@ -1761,7 +2494,21 @@ fn run_unit_and_judge_on(
                 note_refusals(&refused);
                 Some(match verdict {
                     Ok(av) => av,
-                    Err(e) => crate::validator::AgentVerdict::from_judge_error("default judge", e),
+                    Err(e) => judge_error_or_fallback(
+                        "default judge",
+                        e,
+                        &refused,
+                        &criterion,
+                        work_for_agent,
+                        &fallback_parties(&excluded, fallback.work_authors),
+                        fallback_ids(&author_ids),
+                        roster,
+                        benched,
+                        fallback,
+                        &**runner,
+                        &note_refusals,
+                        emit_delta,
+                    ),
                 })
             } else {
                 let creator_id = crate::validator::excluded_identity(work_author, roster);
@@ -2782,6 +3529,8 @@ fn run_cli_runner(
                     // (F-7R2-006): the bus-mediated judge picks from the whole registry roster.
                     &[],
                     &[],
+                    &[],
+                    None,
                     // Exec mediation's judge publishes over the bus this consumer runs on.
                     Some(db.path()),
                     // T5: the SAME attempt-runner seam as the in-process worker.
@@ -6040,5 +6789,942 @@ mod t5_bus_worker_tests {
             serde_json::json!(claimed[0]),
             "the snapshot rides task.completed to the actor"
         );
+    }
+}
+
+/// (operator ruling 2026-10-14) The FALLBACK judge: when every preferred judge seat is benched for
+/// the run (codex's worktree bench) or fails as a seat, a distinct fallback seat (Claude Code, then
+/// Antigravity) judges in its place, disclosed; with none, the `judge_unavailable` hold stands.
+#[cfg(test)]
+mod judge_fallback_tests {
+    use super::*;
+    use crate::workflow::{StepOutput, StepRunner};
+    use std::sync::Mutex;
+
+    fn seat(key: &str, invocation: &str) -> crate::AgenticCli {
+        use wicked_council::{Category, Confidence, InputMode};
+        crate::AgenticCli {
+            key: key.into(),
+            display_name: key.into(),
+            binary: wicked_apps_core::spawn::seat_cli_key(key).into(),
+            headless_invocation: invocation.into(),
+            category: Category::default(),
+            input_mode: InputMode::default(),
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::default(),
+            enabled_for_council: true,
+            seat_eligible_for_work: true,
+            acp: None,
+            capabilities: None,
+            login_invocation: None,
+            logout_invocation: None,
+            governance_class: None,
+            credential: None,
+            free_tier: None,
+            health: None,
+        }
+    }
+
+    /// The host registry 59232ebc ran against (crew roster on :7801): agy is not on it.
+    fn registry() -> Vec<crate::AgenticCli> {
+        vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+            seat("pi", "pi -p {PROMPT}"),
+            seat("copilot", "copilot -p {PROMPT}"),
+            seat("opencode", "opencode run {PROMPT}"),
+        ]
+    }
+
+    /// The fallback pool as production reads it: claude's record, and agy's built-in record —
+    /// neither council- nor work-enabled.
+    fn fallback_pool() -> Vec<crate::AgenticCli> {
+        let mut agy = seat("agy", "agy -p {PROMPT}");
+        agy.enabled_for_council = false;
+        agy.seat_eligible_for_work = false;
+        vec![seat("claude", "claude -p {PROMPT}"), agy]
+    }
+
+    fn worktree_bench() -> Vec<crate::domain::BenchedSeat> {
+        vec![crate::domain::BenchedSeat {
+            cli: "codex".into(),
+            reason: crate::distribute::CODEX_WORKTREE_BENCH.into(),
+            source: "launcher".into(),
+        }]
+    }
+
+    /// Judge sessions record their seat and answer per `answers` (default PASS); the unit itself
+    /// reports prose.
+    struct Seats {
+        judged_on: Mutex<Vec<String>>,
+        answers: Vec<(&'static str, StepStatus, &'static str)>,
+    }
+    impl Seats {
+        fn new(answers: Vec<(&'static str, StepStatus, &'static str)>) -> Arc<Self> {
+            Arc::new(Self {
+                judged_on: Mutex::new(Vec::new()),
+                answers,
+            })
+        }
+        fn judged(&self) -> Vec<String> {
+            self.judged_on.lock().unwrap().clone()
+        }
+    }
+    impl StepRunner for Seats {
+        fn run_unit(&self, input: &StepInput) -> StepOutput {
+            let mut out = StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: input.unit_ix,
+                attempt: input.attempt,
+                output: "checked: npm test passes".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            };
+            if input.unit.session_id == "validator" {
+                let s = input.unit.assigned_cli.clone().unwrap_or_default();
+                self.judged_on.lock().unwrap().push(s.clone());
+                match self.answers.iter().find(|(k, _, _)| *k == s) {
+                    Some((_, status, text)) => {
+                        out.status = *status;
+                        out.output = text.to_string();
+                    }
+                    None => out.output = "PASS\nthe fix is right\nPASS".into(),
+                }
+            }
+            out
+        }
+    }
+
+    /// Run 59232ebc's Check unit (ord 5): pi checks claude's fix under a pinned validator, on a
+    /// run seated claude + codex + pi with codex benched for the worktree.
+    fn check_unit(dir: &std::path::Path) -> StepInput {
+        let mut unit = crate::domain::WorkUnit::pending("r:check", "r", 5, "Check the fix");
+        unit.assigned_cli = Some("pi".into());
+        unit.authored_by = vec!["claude".into()];
+        unit.authored_binaries = vec!["claude".into()];
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "the run left a change in its worktree".into(),
+            script: "git status --porcelain | grep -q .".into(),
+            approved: true,
+        });
+        StepInput {
+            run_id: "r".into(),
+            unit_ix: 4,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.to_path_buf()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        }
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "wicked-core-judge-fallback-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn run_roster() -> Vec<String> {
+        ["claude", "codex", "pi"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Run 59232ebc, before the ruling: the only distinct judge (codex) is benched for the
+    /// worktree, so the Check gate's judge is a seat failure — `judge_unavailable`, the operator
+    /// approves by hand. With the fallback armed, agy judges in codex's place — never claude (the
+    /// creator AND the validator author), never pi (the evaluator), never codex — and every
+    /// receipt says so.
+    #[test]
+    fn run_59232ebc_a_benched_codex_judge_falls_back_to_agy_disclosed() {
+        let dir = tmp("59232ebc");
+        let input = check_unit(&dir);
+        let seats = Seats::new(vec![]);
+        let runner: Arc<dyn StepRunner> = seats.clone();
+        let deltas: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let d2 = deltas.clone();
+        let sink = move |c: &str| d2.lock().unwrap().push(c.to_string());
+
+        // TODAY (no fallback): the hold, naming codex.
+        let (_, held, _) = run_unit_and_judge_with_roster(
+            &runner,
+            &input,
+            None,
+            &sink,
+            &registry(),
+            &run_roster(),
+            &["codex".to_string()],
+        );
+        let held = held.expect("a required judge that cannot run is a verdict, not a skip");
+        assert!(!held.pass && held.judge_cli.is_none(), "{held:?}");
+        let f = held.seat_failure.as_deref().expect("seat failure");
+        assert!(
+            f.contains("codex (benched for this run after a seat failure)"),
+            "{f}"
+        );
+        assert!(seats.judged().is_empty(), "nobody was asked");
+
+        // AFTER: the fallback seats armed, the bench's reasons known.
+        let bench = worktree_bench();
+        let (_, v, ev) = run_unit_and_judge_with_fallback(
+            &runner,
+            &input,
+            &sink,
+            &registry(),
+            &run_roster(),
+            &bench,
+            &fallback_pool(),
+            &[],
+        );
+        let v = v.expect("the fallback judge ruled");
+        assert!(v.pass, "{v:?}");
+        assert!(v.seat_failure.is_none(), "{v:?}");
+        assert_eq!(v.judge_cli.as_deref(), Some("agy"));
+        assert_eq!(
+            seats.judged(),
+            vec!["agy".to_string()],
+            "only agy was asked"
+        );
+        let fb = v
+            .judge_fallback
+            .as_ref()
+            .expect("the fallback is disclosed");
+        assert_eq!(fb.seat, "agy");
+        assert_eq!(fb.preferred, vec!["codex".to_string()]);
+        assert_eq!(
+            fb.label,
+            "judge: agy (fallback; codex benched: codex cannot work in this run's worktree on \
+             this host)"
+        );
+        assert!(fb.reason.starts_with("codex benched: "), "{}", fb.reason);
+        assert!(
+            deltas.lock().unwrap().iter().any(|d| d == &fb.label),
+            "the run's live output names the fallback: {:?}",
+            deltas.lock().unwrap()
+        );
+        assert!(ev.judge_refusals.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No distinct eligible fallback seat: today's hold, unchanged. agy benched (signed out) and
+    /// claude a party ⇒ nobody is asked, and the hold names the bench in its own words.
+    #[test]
+    fn with_no_distinct_fallback_seat_the_hold_stands() {
+        let dir = tmp("nofallback");
+        let input = check_unit(&dir);
+        let seats = Seats::new(vec![]);
+        let runner: Arc<dyn StepRunner> = seats.clone();
+        let mut bench = worktree_bench();
+        bench.push(crate::domain::BenchedSeat {
+            cli: "agy".into(),
+            reason: "not_logged_in".into(),
+            source: "judge".into(),
+        });
+        let (_, v, _) = run_unit_and_judge_with_fallback(
+            &runner,
+            &input,
+            &|_| {},
+            &registry(),
+            &run_roster(),
+            &bench,
+            &fallback_pool(),
+            &[],
+        );
+        let v = v.expect("hold");
+        assert!(!v.pass && v.judge_cli.is_none() && v.judge_fallback.is_none());
+        let f = v.seat_failure.as_deref().unwrap();
+        assert!(
+            f.contains("codex (benched for this run: codex cannot work in this run's worktree"),
+            "the launcher bench is named as what it is, not a seat failure: {f}"
+        );
+        assert!(seats.judged().is_empty(), "{:?}", seats.judged());
+
+        // A ballot-only fallback record never judges (core#572), nor one the launcher declared
+        // unusable.
+        let mut pool = fallback_pool();
+        pool[1].enabled_for_council = true; // agy: ballot-only now
+        let mut claude = pool[0].clone();
+        claude.health = Some(wicked_council::types::SeatHealth::unusable("signed out"));
+        pool[0] = claude;
+        let cands = fallback_candidates(&pool, &registry(), &["pi"], &[], &["codex".into()], &[]);
+        assert_eq!(cands.map(|c| c.len()), Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fallback seat that cannot answer (signed out) never REJECTs: the hold stands and names
+    /// it beside the benched preferred judge; it is reported for the run's bench.
+    #[test]
+    fn a_fallback_seat_that_refuses_keeps_the_hold_and_is_reported() {
+        let dir = tmp("refuses");
+        let input = check_unit(&dir);
+        let seats = Seats::new(vec![(
+            "agy",
+            StepStatus::Failed,
+            "(cli `agy` exited 1) Not logged in · Please run /login",
+        )]);
+        let runner: Arc<dyn StepRunner> = seats.clone();
+        let (_, v, ev) = run_unit_and_judge_with_fallback(
+            &runner,
+            &input,
+            &|_| {},
+            &registry(),
+            &run_roster(),
+            &worktree_bench(),
+            &fallback_pool(),
+            &[],
+        );
+        let v = v.expect("hold");
+        assert!(!v.pass && v.judge_cli.is_none() && v.judge_fallback.is_none());
+        let f = v.seat_failure.as_deref().unwrap();
+        assert!(
+            f.contains("codex (benched for this run:") && f.contains("agy ("),
+            "{f}"
+        );
+        assert!(!v.reasoning.contains("REJECT"), "{}", v.reasoning);
+        assert_eq!(seats.judged(), vec!["agy".to_string()]);
+        assert_eq!(
+            ev.judge_refusals,
+            vec![crate::workflow::JudgeRefusal {
+                seat: "agy".into(),
+                reason: "not_logged_in".into(),
+            }]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The preferred judge RAN and failed as a seat (copilot's quota refusal, exit 0): the
+    /// rotation's seat failure is lifted by a fallback seat the rotation did not walk, disclosed
+    /// as "unavailable" (not benched). A verdict-less fallback answer escalates (no REJECT, no
+    /// re-ask).
+    #[test]
+    fn a_preferred_judge_that_fails_as_a_seat_falls_back_and_no_verdict_still_escalates() {
+        let dir = tmp("quota");
+        let input = check_unit(&dir);
+        let roster: Vec<String> = ["claude", "copilot", "pi"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let seats = Seats::new(vec![(
+            "copilot",
+            StepStatus::Ok,
+            "Error: You have exceeded your monthly quota (Request ID: D7DE:0)",
+        )]);
+        let runner: Arc<dyn StepRunner> = seats.clone();
+        let (_, v, _) = run_unit_and_judge_with_fallback(
+            &runner,
+            &input,
+            &|_| {},
+            &registry(),
+            &roster,
+            &[],
+            &fallback_pool(),
+            &[],
+        );
+        let v = v.expect("judged");
+        assert!(v.pass && v.judge_cli.as_deref() == Some("agy"), "{v:?}");
+        assert_eq!(
+            seats.judged(),
+            vec!["copilot".to_string(), "agy".to_string()]
+        );
+        let fb = v.judge_fallback.expect("disclosed");
+        assert_eq!(fb.preferred, vec!["copilot".to_string()]);
+        assert!(
+            fb.label
+                .starts_with("judge: agy (fallback; copilot unavailable: "),
+            "{}",
+            fb.label
+        );
+
+        // agy answers with no verdict word: escalation, labelled, never a REJECT.
+        let seats2 = Seats::new(vec![
+            (
+                "copilot",
+                StepStatus::Ok,
+                "Error: You have exceeded your monthly quota (Request ID: D7DE:0)",
+            ),
+            (
+                "agy",
+                StepStatus::Ok,
+                "I looked at it and it seems fine overall",
+            ),
+        ]);
+        let runner2: Arc<dyn StepRunner> = seats2.clone();
+        let (_, v2, _) = run_unit_and_judge_with_fallback(
+            &runner2,
+            &input,
+            &|_| {},
+            &registry(),
+            &roster,
+            &[],
+            &fallback_pool(),
+            &[],
+        );
+        let v2 = v2.expect("escalates");
+        assert!(!v2.pass && v2.judge_cli.is_none(), "{v2:?}");
+        assert!(
+            v2.seat_failure
+                .as_deref()
+                .is_some_and(|s| s.contains(crate::validator::JUDGE_NO_VERDICT)),
+            "{v2:?}"
+        );
+        assert!(
+            v2.reasoning.starts_with("judge: agy (fallback; "),
+            "{}",
+            v2.reasoning
+        );
+        // (codex r1) …and the receipt still carries the disclosure.
+        assert_eq!(
+            v2.judge_fallback.as_ref().map(|f| f.seat.as_str()),
+            Some("agy")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The DEFAULT judge (no pinned validator): its contract excludes only the work's authors, so
+    /// Claude Code — first in fallback order — judges pi's change when codex is benched.
+    #[test]
+    fn the_default_judge_falls_back_to_claude_when_claude_is_no_party() {
+        use std::process::Command;
+        fn sh(cwd: &std::path::Path, args: &[&str]) {
+            // spawn-audit: test-only — a git fixture building the layout under test.
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+        let base = tmp("default");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        sh(&repo, &["init", "-q", "."]);
+        sh(&repo, &["config", "user.email", "t@example.invalid"]);
+        sh(&repo, &["config", "user.name", "t"]);
+        sh(&repo, &["config", "commit.gpgsign", "false"]);
+        sh(&repo, &["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("README.md"), "base\n").unwrap();
+        sh(&repo, &["add", "-A"]);
+        sh(&repo, &["commit", "-qm", "base"]);
+        let wt = base.join("wt");
+        sh(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "wicked/fb",
+            ],
+        );
+        let mut unit = crate::domain::WorkUnit::pending("r:fix", "r", 4, "Fix the tip");
+        unit.assigned_cli = Some("pi".into());
+        unit.default_floor = true;
+        unit.worktree_baseline = Some(crate::worktree_guard::snapshot(&wt, &repo).unwrap());
+        std::fs::write(wt.join("tip.mjs"), "export const tip = (p) => p / 100;\n").unwrap();
+        let input = StepInput {
+            workdir: Some(wt.clone()),
+            unit,
+            ..check_unit(&wt)
+        };
+        let seats = Seats::new(vec![]);
+        let runner: Arc<dyn StepRunner> = seats.clone();
+        let roster: Vec<String> = vec!["codex".into(), "pi".into()];
+        let (_, v, _) = run_unit_and_judge_with_fallback(
+            &runner,
+            &input,
+            &|_| {},
+            &registry(),
+            &roster,
+            &worktree_bench(),
+            &fallback_pool(),
+            &[],
+        );
+        let v = v.expect("the default judge ruled");
+        assert_eq!(v.judge_cli.as_deref(), Some("claude"), "{v:?}");
+        let fb = v.judge_fallback.expect("disclosed");
+        assert!(fb
+            .label
+            .starts_with("judge: claude (fallback; codex benched: "));
+        assert!(!seats.judged().iter().any(|s| s == "pi" || s == "codex"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (codex r1, P1) A preferred judge that wrote a verdict and exited non-zero ANSWERED: no
+    /// fallback judge is asked after it (no verdict shopping) — the pre-ruling hold stands.
+    #[test]
+    fn a_preferred_judge_that_answered_then_exited_nonzero_gets_no_fallback() {
+        let dir = tmp("answered");
+        let input = check_unit(&dir);
+        let roster: Vec<String> = ["claude", "copilot", "pi"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let seats = Seats::new(vec![(
+            "copilot",
+            StepStatus::Failed,
+            "REJECT\nthe change is unsafe\nREJECT",
+        )]);
+        let runner: Arc<dyn StepRunner> = seats.clone();
+        let (_, v, _) = run_unit_and_judge_with_fallback(
+            &runner,
+            &input,
+            &|_| {},
+            &registry(),
+            &roster,
+            &[],
+            &fallback_pool(),
+            &[],
+        );
+        let v = v.expect("hold");
+        assert!(!v.pass && v.judge_fallback.is_none(), "{v:?}");
+        assert_eq!(
+            seats.judged(),
+            vec!["copilot".to_string()],
+            "agy never asked"
+        );
+        // …and inside the fallback: a fallback seat that answered and exited non-zero ends it.
+        let mut pool = fallback_pool();
+        pool.insert(1, seat("gemini", "gemini -p {PROMPT}"));
+        let seats2 = Seats::new(vec![("gemini", StepStatus::Failed, "PASS\nok\nPASS")]);
+        let runner2: Arc<dyn StepRunner> = seats2.clone();
+        let mut reg = registry();
+        reg.push(seat("gemini", "gemini -p {PROMPT}"));
+        let (_, v2, _) = run_unit_and_judge_with_fallback(
+            &runner2,
+            &input,
+            &|_| {},
+            &reg,
+            &run_roster(),
+            &worktree_bench(),
+            &pool,
+            &[],
+        );
+        let v2 = v2.expect("hold");
+        assert!(!v2.pass && v2.judge_fallback.is_none(), "{v2:?}");
+        assert_eq!(
+            seats2.judged(),
+            vec!["gemini".to_string()],
+            "agy never asked"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (codex r1, P1) An evaluator unit's judge reads the CREATOR's work: every seat that
+    /// authored it is excluded from the fallback — a fallback agy never judges agy's own build.
+    #[test]
+    fn the_creator_of_the_work_never_judges_it_even_as_a_fallback() {
+        let dir = tmp("creator");
+        let mut input = check_unit(&dir);
+        input.unit.authored_by = Vec::new();
+        let seats = Seats::new(vec![]);
+        let runner: Arc<dyn StepRunner> = seats.clone();
+        // The work's author is agy (a launch that made it work-eligible); pi evaluates.
+        let authors = vec!["agy".to_string()];
+        let (_, v, _) = run_unit_and_judge_with_fallback(
+            &runner,
+            &input,
+            &|_| {},
+            &registry(),
+            &run_roster(),
+            &worktree_bench(),
+            &fallback_pool(),
+            &authors,
+        );
+        let v = v.expect("hold");
+        assert!(!v.pass && v.judge_cli.is_none(), "{v:?}");
+        assert!(seats.judged().is_empty(), "{:?}", seats.judged());
+        // A unit dispatched under an agy invocation (an alias key) is agy for the fallback.
+        let mut aliased = check_unit(&dir);
+        aliased.unit.assigned_invocation = Some("agy -p {PROMPT}".into());
+        let seats3 = Seats::new(vec![]);
+        let runner3: Arc<dyn StepRunner> = seats3.clone();
+        let (_, v3, _) = run_unit_and_judge_with_fallback(
+            &runner3,
+            &aliased,
+            &|_| {},
+            &registry(),
+            &run_roster(),
+            &worktree_bench(),
+            &fallback_pool(),
+            &[],
+        );
+        assert!(v3.expect("hold").judge_cli.is_none());
+        assert!(seats3.judged().is_empty(), "{:?}", seats3.judged());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (codex r2/r3, P1) The binary an author ACTUALLY ran is excluded: a creator dispatched as
+    /// `copilot` with an agy invocation (recorded at dispatch, kept across a reassign), or this
+    /// unit launched under a QUOTED agy path, leaves agy no fallback judge; work whose author has
+    /// no recorded binary gets no fallback; a quoted fallback invocation is still agy; and any
+    /// instance of a benched CLI is benched.
+    #[test]
+    fn an_authors_actual_binary_is_excluded_even_under_another_key_or_a_quoted_path() {
+        let dir = tmp("launched");
+        let seats = Seats::new(vec![]);
+        let runner: Arc<dyn StepRunner> = seats.clone();
+        let mut input = check_unit(&dir);
+        input.unit.authored_by = Vec::new();
+        let authors = vec!["copilot".to_string(), "claude".to_string()];
+        // The build ran copilot-as-agy, then was reassigned to claude: both binaries recorded.
+        let binaries = vec!["agy".to_string(), "claude".to_string()];
+        let (_, v, _) = run_unit_and_judge_with_launches(
+            &runner,
+            &input,
+            &|_| {},
+            &registry(),
+            &run_roster(),
+            &worktree_bench(),
+            &fallback_pool(),
+            &authors,
+            Some(&binaries),
+        );
+        assert!(v.expect("hold").judge_cli.is_none());
+        assert!(seats.judged().is_empty(), "{:?}", seats.judged());
+        // An author whose binary was never recorded: no fallback.
+        let (_, v0, _) = run_unit_and_judge_with_launches(
+            &runner,
+            &input,
+            &|_| {},
+            &registry(),
+            &run_roster(),
+            &worktree_bench(),
+            &fallback_pool(),
+            &authors,
+            None,
+        );
+        assert!(v0.expect("hold").judge_cli.is_none());
+        assert!(seats.judged().is_empty(), "{:?}", seats.judged());
+        // This unit dispatched under a QUOTED agy path (with a space): still agy.
+        let mut quoted = check_unit(&dir);
+        quoted.unit.assigned_invocation =
+            Some("\"/Applications/Anti Gravity/bin/agy\" -p {PROMPT}".to_string());
+        let (_, v2, _) = run_unit_and_judge_with_fallback(
+            &runner,
+            &quoted,
+            &|_| {},
+            &registry(),
+            &run_roster(),
+            &worktree_bench(),
+            &fallback_pool(),
+            &[],
+        );
+        assert!(v2.expect("hold").judge_cli.is_none());
+        assert!(seats.judged().is_empty(), "{:?}", seats.judged());
+        // A QUOTED fallback invocation is agy too: an agy author excludes it.
+        let mut qpool = fallback_pool();
+        qpool[1].headless_invocation = "\"/opt/Anti Gravity/agy\" -p {PROMPT}".into();
+        let reg = registry();
+        let c = fallback_candidates(&qpool, &reg, &["pi"], &["agy".to_string()], &[], &[])
+            .expect("known parties");
+        assert!(c.iter().all(|s| s.key != "agy"), "{c:?}");
+        // Any instance of a benched CLI is benched, both ways round.
+        let mut inst = seat("claude#2", "claude -p {PROMPT}");
+        inst.enabled_for_council = false;
+        let none = fallback_candidates(
+            std::slice::from_ref(&inst),
+            &reg,
+            &["pi"],
+            &[],
+            &["claude".into()],
+            &[],
+        )
+        .expect("known parties");
+        assert!(none.is_empty(), "{none:?}");
+        let none2 = fallback_candidates(
+            std::slice::from_ref(&inst),
+            &reg,
+            &["pi"],
+            &[],
+            &["claude#1".into()],
+            &[],
+        )
+        .expect("known parties");
+        assert!(none2.is_empty(), "{none2:?}");
+        // The 59232ebc shape with its recorded binary (claude built it): agy still judges.
+        let built = vec!["claude".to_string()];
+        let (_, v4, _) = run_unit_and_judge_with_launches(
+            &runner,
+            &check_unit(&dir),
+            &|_| {},
+            &registry(),
+            &run_roster(),
+            &worktree_bench(),
+            &fallback_pool(),
+            &["claude".to_string()],
+            Some(&built),
+        );
+        assert_eq!(v4.expect("judged").judge_cli.as_deref(), Some("agy"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (codex r3) The authors' binaries come from the per-dispatch record, which a reassign
+    /// never clears; a unit with authors but no record (persisted before it) is unknown.
+    #[test]
+    fn the_authors_binaries_are_the_dispatch_record() {
+        use crate::domain::{StageKind, WorkUnit};
+        let mut build = WorkUnit::pending("r:fix", "r", 1, "fix");
+        build.stage = StageKind::Build;
+        build.assigned_cli = Some("claude".into()); // reassigned from copilot; invocation cleared
+        build.authored_by = vec!["copilot".into(), "claude".into()];
+        build.authored_binaries = vec!["agy".into(), "claude".into()];
+        let mut planned = WorkUnit::pending("r:later", "r", 2, "never dispatched");
+        planned.stage = StageKind::Build;
+        planned.assigned_cli = Some("pi".into());
+        let check = WorkUnit::pending("r:check", "r", 3, "check");
+        let units = vec![build.clone(), planned, check];
+        assert_eq!(
+            crate::pipeline::work_author_binaries(&units, 3),
+            Some(vec!["agy".to_string(), "claude".to_string()])
+        );
+        // (codex r5) A Creator-role unit of another stage is an author for the fallback: its
+        // recorded binary counts, and one dispatched with none recorded is unknown.
+        let mut test_creator = WorkUnit::pending("r:test", "r", 2, "write the tests");
+        test_creator.stage = StageKind::Test;
+        test_creator.role = crate::workflow::PhaseRole::Creator;
+        test_creator.assigned_cli = Some("copilot".into());
+        test_creator.authored_binaries = vec!["agy".into()];
+        let with_test = vec![
+            test_creator.clone(),
+            WorkUnit::pending("r:c", "r", 3, "check"),
+        ];
+        assert_eq!(
+            crate::pipeline::work_author_binaries(&with_test, 3),
+            Some(vec!["agy".to_string()])
+        );
+        assert!(
+            crate::pipeline::fallback_work_authors(&with_test, 3).contains(&"copilot".to_string())
+        );
+        // (codex r7) A floor fix recorded on an earlier evaluator unit is an author too.
+        let mut reviewed = WorkUnit::pending("r:review", "r", 2, "review");
+        reviewed.stage = StageKind::Review;
+        reviewed.role = crate::workflow::PhaseRole::Evaluator;
+        reviewed.authored_by = vec!["copilot".into()];
+        reviewed.authored_binaries = vec!["copilot".into(), "agy".into()];
+        let with_fix = vec![reviewed, WorkUnit::pending("r:c", "r", 3, "check")];
+        assert_eq!(
+            crate::pipeline::work_author_binaries(&with_fix, 3),
+            Some(vec!["copilot".to_string(), "agy".to_string()])
+        );
+        assert!(
+            crate::pipeline::fallback_work_authors(&with_fix, 3).contains(&"copilot".to_string())
+        );
+        test_creator.authored_binaries.clear();
+        test_creator.last_attempt = Some(0);
+        assert_eq!(
+            crate::pipeline::work_author_binaries(&[test_creator], 3),
+            None
+        );
+        let mut legacy = build;
+        legacy.authored_binaries.clear();
+        assert_eq!(
+            crate::pipeline::work_author_binaries(std::slice::from_ref(&legacy), 3),
+            None
+        );
+        // (codex r4) A later dispatch of that legacy unit never makes its history look complete.
+        assert!(crate::domain::stamp_author(
+            &mut legacy,
+            "pi".into(),
+            vec!["pi".into()]
+        ));
+        assert_eq!(
+            legacy.authored_binaries,
+            vec![
+                crate::domain::UNKNOWN_AUTHOR_BINARY.to_string(),
+                "pi".to_string()
+            ]
+        );
+        assert_eq!(crate::pipeline::work_author_binaries(&[legacy], 3), None);
+        // A fresh unit's first dispatch records seat and binary, nothing unknown.
+        let mut fresh = WorkUnit::pending("r:new", "r", 1, "fix");
+        assert!(crate::domain::stamp_author(
+            &mut fresh,
+            "copilot".into(),
+            vec!["agy".into()]
+        ));
+        assert_eq!(fresh.authored_binaries, vec!["agy".to_string()]);
+        assert!(!crate::domain::stamp_author(
+            &mut fresh,
+            "copilot".into(),
+            vec!["agy".into()]
+        ));
+        // (codex r6) A non-build Creator dispatched before the record: its next stamp keeps the
+        // unknown mark, so a reassign never makes that history look complete.
+        let mut creator = WorkUnit::pending("r:t", "r", 2, "tests");
+        assert!(crate::domain::stamp_author_binaries(
+            &mut creator,
+            true,
+            vec!["pi".into()]
+        ));
+        assert_eq!(
+            creator.authored_binaries,
+            vec![
+                crate::domain::UNKNOWN_AUTHOR_BINARY.to_string(),
+                "pi".to_string()
+            ]
+        );
+    }
+
+    /// (codex r6, P1) A party is excluded by EVERY carrier its record may run — its invocation,
+    /// its `binary` field and its ACP adapter — so a seat keyed `copilot` whose record runs claude
+    /// leaves claude no fallback.
+    #[test]
+    fn a_party_is_excluded_by_every_carrier_its_record_runs() {
+        let mut odd = seat("copilot", "copilot -p {PROMPT}");
+        odd.binary = "claude".into();
+        let ids = record_identities(&odd);
+        assert!(ids.contains(&"copilot".to_string()) && ids.contains(&"claude".to_string()));
+        let mut acp = seat("copilot", "copilot -p {PROMPT}");
+        acp.acp = crate::registry_roster()
+            .into_iter()
+            .find(|c| c.key == "claude")
+            .and_then(|c| c.acp);
+        if acp.acp.is_some() {
+            assert!(record_identities(&acp).contains(&"claude".to_string()));
+        }
+        let mut reg = registry();
+        reg.retain(|c| c.key != "copilot");
+        reg.push(odd);
+        let cands = fallback_candidates(&fallback_pool(), &reg, &["copilot", "pi"], &[], &[], &[])
+            .expect("known parties");
+        assert!(cands.iter().all(|c| c.key != "claude"), "{cands:?}");
+        assert!(cands.iter().any(|c| c.key == "agy"), "{cands:?}");
+    }
+
+    /// (codex r4, P1/P2) A Build unit's OWN recorded binaries are excluded from its fallback
+    /// judge (it ran copilot-as-agy, then was reassigned to claude), an unknown own history holds,
+    /// and no instance of a party's CLI is a fallback whatever it invokes.
+    #[test]
+    fn a_units_own_author_binaries_and_party_instances_are_excluded() {
+        let dir = tmp("own");
+        let seats = Seats::new(vec![]);
+        let runner: Arc<dyn StepRunner> = seats.clone();
+        let mut build = check_unit(&dir);
+        build.unit.assigned_cli = Some("claude".into());
+        build.unit.authored_by = vec!["copilot".into(), "claude".into()];
+        build.unit.authored_binaries = vec!["agy".into(), "claude".into()];
+        // pi is launch-excluded from judging, so codex (benched) was the only preferred judge.
+        build.unit.exclude_seats = vec!["pi".into()];
+        let (_, v, _) = run_unit_and_judge_with_fallback(
+            &runner,
+            &build,
+            &|_| {},
+            &registry(),
+            &run_roster(),
+            &worktree_bench(),
+            &fallback_pool(),
+            &[],
+        );
+        assert!(v.expect("hold").judge_cli.is_none());
+        assert!(seats.judged().is_empty(), "{:?}", seats.judged());
+        let mut unknown = build.clone();
+        unknown.unit.authored_binaries =
+            vec![crate::domain::UNKNOWN_AUTHOR_BINARY.into(), "claude".into()];
+        let (_, v2, _) = run_unit_and_judge_with_fallback(
+            &runner,
+            &unknown,
+            &|_| {},
+            &registry(),
+            &run_roster(),
+            &worktree_bench(),
+            &fallback_pool(),
+            &[],
+        );
+        assert!(v2.expect("hold").judge_cli.is_none());
+        assert!(seats.judged().is_empty(), "{:?}", seats.judged());
+        // `claude#2` invoking agy is still claude's instance: never a fallback when claude is a party.
+        let mut inst = seat("claude#2", "agy -p {PROMPT}");
+        inst.enabled_for_council = false;
+        let reg = registry();
+        let c = fallback_candidates(
+            std::slice::from_ref(&inst),
+            &reg,
+            &["claude"],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("known parties");
+        assert!(c.is_empty(), "{c:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_fallback_seats_and_the_off_switch() {
+        assert_eq!(judge_fallback_keys_from(None), vec!["claude", "agy"]);
+        assert!(judge_fallback_keys_from(Some("")).is_empty());
+        assert!(judge_fallback_keys_from(Some(" off ")).is_empty());
+        assert_eq!(
+            judge_fallback_keys_from(Some("agy, claude")),
+            vec!["agy", "claude"]
+        );
+        // (codex r5) Only the ruling's seats: another key is ignored.
+        assert_eq!(judge_fallback_keys_from(Some("reviewer, agy")), vec!["agy"]);
+        // (codex r5) A record must run its key's CLI on every carrier.
+        let claude = seat("claude", "claude -p {PROMPT}");
+        assert!(record_runs_its_key(&claude));
+        let mut odd = claude.clone();
+        odd.headless_invocation = "agy -p {PROMPT}".into();
+        assert!(!record_runs_its_key(&odd), "invocation runs another CLI");
+        let mut odd2 = claude.clone();
+        odd2.binary = "agy".into();
+        assert!(!record_runs_its_key(&odd2), "binary names another CLI");
+        let mut acp = claude.clone();
+        acp.acp = crate::registry_roster()
+            .into_iter()
+            .find(|c| c.key == "claude")
+            .and_then(|c| c.acp);
+        assert!(record_runs_its_key(&acp), "claude-agent-acp runs claude");
+        if let Some(a) = acp.acp.as_mut() {
+            a.binary = "agy-acp".into();
+            assert!(!record_runs_its_key(&acp), "an ACP adapter of another CLI");
+        }
+        assert_eq!(
+            short_reason(crate::distribute::CODEX_WORKTREE_BENCH),
+            "codex cannot work in this run's worktree on this host"
+        );
+        assert_eq!(short_reason("not_logged_in"), "not_logged_in");
+        // A fallback candidate never shares an author's identity, even under another key.
+        let mut alias = seat("agy", "claude -p {PROMPT}");
+        alias.enabled_for_council = false;
+        let ids = vec!["claude".to_string()];
+        let reg = registry();
+        assert_eq!(
+            fallback_candidates(&[alias], &reg, &["claude"], &ids, &[], &[]).map(|c| c.len()),
+            Some(0)
+        );
+        // …nor a seat benched under an instance key.
+        let c = seat("claude", "claude -p {PROMPT}");
+        assert_eq!(
+            fallback_candidates(
+                std::slice::from_ref(&c),
+                &reg,
+                &["pi"],
+                &[],
+                &["claude#2".into()],
+                &[]
+            )
+            .map(|c| c.len()),
+            Some(0)
+        );
+        // (codex r1) A party whose key names no registry seat has an unknown binary: no fallback.
+        assert!(fallback_candidates(&[c], &reg, &["writer"], &[], &[], &[]).is_none());
     }
 }

@@ -15324,6 +15324,7 @@ No further next steps — both questions fully answered.";
             tool_cmd: None,
             worker_failed_clis: Vec::new(),
             authored_by: Vec::new(),
+            authored_binaries: Vec::new(),
             depends_on: Vec::new(),
             required_deliverables: Vec::new(),
             executes_code: false,
