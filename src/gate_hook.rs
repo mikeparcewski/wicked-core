@@ -12944,9 +12944,6 @@ mod boundary_tests {
             std::env::temp_dir().join(format!("wicked-hook-install-fence-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&repo);
         std::fs::create_dir_all(repo.join("wicked-worktrees/run-1/sub")).unwrap();
-        // Resolve Unix temp aliases such as /var; Windows keeps a bash-friendly drive
-        // spelling rather than canonicalize's verbatim \\?\ prefix.
-        #[cfg(unix)]
         let repo = std::fs::canonicalize(&repo).unwrap();
         let wt = repo.join("wicked-worktrees").join("run-1");
         let roots = crate::path_policy::AllowedRoots {
@@ -12973,16 +12970,14 @@ mod boundary_tests {
         };
         // Fresh attempt: judged from the worktree.
         assert_eq!(judge("npm ci"), None);
-        // Call 1 allowed: `cd <clone>` — inside the read grant, the shell moved; persist it as the
+        // Call 1 allowed: `cd <clone>` — nothing to refuse, the shell moved; persist it as the
         // allow exit does.
-        let cd_clone = format!("cd {}", shell_read_951_path(&repo));
+        let cd_clone = format!("cd {}", repo.display());
         assert_eq!(judge(&cd_clone), None);
         track_install_fence_cwd(&cd_clone, &wt, None, &state);
-        // The sidecar holds the resolved directory; on Windows that is the canonical `\\?\` long-name
-        // spelling of the temp dir (`RUNNER~1` vs `runneradmin`), so compare canonical paths.
         assert_eq!(
-            std::fs::canonicalize(std::fs::read_to_string(&state).unwrap().trim()).unwrap(),
-            std::fs::canonicalize(&repo).unwrap()
+            std::fs::read_to_string(&state).unwrap().trim(),
+            repo.to_string_lossy()
         );
         // A benign intermediate call keeps the tracking.
         assert_eq!(judge("git status"), None);
@@ -13001,7 +12996,7 @@ mod boundary_tests {
             repo.to_string_lossy()
         );
         // A `cd` back into the worktree re-allows — and the sidecar is dropped (= the worktree).
-        let cd_back = format!("cd {}", shell_read_951_path(&wt));
+        let cd_back = format!("cd {}", wt.display());
         assert_eq!(judge(&cd_back), None);
         track_install_fence_cwd(&cd_back, &wt, None, &state);
         assert!(!state.exists(), "back at the worktree ⇒ no sidecar");
