@@ -267,26 +267,6 @@ pub(crate) fn write_class_call(params: &Value) -> Option<WriteClassCall> {
     Some(WriteClassCall { tool, kind, path })
 }
 
-/// ACP `ToolKind`s / tool names that RUN A COMMAND — the calls the remote-write fence judges
-/// (F-7R2-012). `execute` is the protocol's kind; the names are the seats' shell tools (claude's
-/// `Bash`, pi's `bash`, codex's `shell`/`exec_command`, copilot/opencode `run_command`/`terminal`).
-const EXECUTE_TOOL_NAMES: [&str; 14] = [
-    "bash",
-    "shell",
-    "sh",
-    "execute",
-    "exec",
-    "exec_command",
-    "execute_command",
-    "run_command",
-    "run_shell_command",
-    "run_terminal_cmd",
-    "shell_command",
-    "terminal",
-    "command",
-    "powershell",
-];
-
 /// The command text of an EXECUTE-class permission request, or `None` when the call runs no
 /// command. Matched by ACP `kind == "execute"` or by tool name; the text is read from the tool's
 /// own arguments (`command`, `cmd`, `commandLine`, `script`, `args` joined), falling back to
@@ -298,10 +278,10 @@ pub(crate) fn execute_command(params: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .map(|k| k.to_ascii_lowercase());
     let by_kind = kind.as_deref() == Some("execute");
-    let tool = tool_name(params).map(|t| t.to_ascii_lowercase());
+    let tool = tool_name(params);
     let by_name = tool
         .as_deref()
-        .is_some_and(|t| EXECUTE_TOOL_NAMES.contains(&t) || t.ends_with("__bash"));
+        .is_some_and(wicked_governance::is_shell_tool);
     if !(by_kind || by_name) {
         return None;
     }
@@ -582,6 +562,85 @@ mod tests {
             {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
             {"optionId": "reject_always", "name": "Never", "kind": "reject_always"},
         ])
+    }
+
+    /// core#951: the actual pi/codex wire spelling must reach the shared read boundary.
+    #[test]
+    fn shell_read_951_acp_and_chat_reject_and_audit_the_command() {
+        let dir = std::env::temp_dir().join(format!(
+            "shell_read_951_acp_and_chat_reject_and_audit_the_command-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = dir.as_path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let outside = dir.as_path().join("tip.mjs");
+        std::fs::write(&outside, "secret").unwrap();
+        let decisions = dir.as_path().join("decisions.jsonl");
+        let boundary = crate::gate_hook::BoundaryCtx {
+            roots: crate::path_policy::AllowedRoots {
+                write: vec![scratch.clone()],
+                read: vec![],
+            },
+            cwd: scratch,
+            home: None,
+            claude_config_dir: None,
+            pre_build_scope: false,
+            write_posture: crate::write_posture::WritePosture::Full,
+            deliverable_roots: vec![],
+            estate_store_pinned: false,
+            graph_write_dir: None,
+            graph_store_db: None,
+        };
+        let db = dir.join("gov.db");
+        drop(wicked_apps_core::open_store(db.to_str()).unwrap());
+        let gate = AcpGate {
+            scope: "unit",
+            phase: "unit-951",
+            phase_alias: None,
+            catalog_alias: None,
+            db: db.to_str(),
+            decisions_path: decisions.to_str().unwrap(),
+            boundary: Some(boundary),
+        };
+        let command = format!("cat -n '{}'", outside.display());
+        for (tool, input) in [
+            ("bash", json!({"command": command})),
+            ("shell", json!({"command": ["bash", "-lc", command]})),
+            ("exec_command", json!({"argv": ["cat", "-n", outside]})),
+        ] {
+            let params =
+                json!({"toolName": tool, "toolCall": {"rawInput": input}, "options": opts()});
+            let (result, allowed) = permission_result(&gate, &params);
+            assert!(!allowed, "ACP: {params}");
+            assert_eq!(result["outcome"]["optionId"], "reject");
+            let (result, allowed) = chat_boundary_result(gate.boundary.as_ref().unwrap(), &params);
+            assert!(!allowed, "chat: {params}");
+            assert_eq!(result["outcome"]["optionId"], "reject");
+        }
+        let log = std::fs::read_to_string(decisions).unwrap();
+        let claims: Vec<wicked_apps_core::ConformanceClaim> = log
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        assert_eq!(claims.len(), 3, "{log}");
+        for claim in claims {
+            assert_eq!(claim.policy_ids, [crate::gate_hook::BOUNDARY_READ_RULE_ID]);
+            assert!(crate::gate_hook::is_advisory_deny(&claim), "{claim:?}");
+            assert!(
+                claim
+                    .obligations
+                    .iter()
+                    .any(|s| s.contains("cat -n") && s.contains("tip.mjs")),
+                "{claim:?}"
+            );
+        }
+        for tool in ["bash", "shell", "exec_command"] {
+            assert!(
+                log.contains(&format!("\"_wicked_tool_call\":\"{tool}\"")),
+                "{log}"
+            );
+        }
     }
 
     /// THE END-TO-END PROOF, and the reason this module exists.

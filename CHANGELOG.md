@@ -45,6 +45,10 @@ Two release tracks share this file, newest entry first regardless of track:
   evaluator daemon's judge is unchanged. Pinned by `cli_runner::judge_fallback_tests` and
   `tests/judge_fallback.rs` (the 59232ebc shape through the actor: the hold with the fallback off, then a
   completed run judged by agy, with a disclosed fallback on every gate).
+- **core** Shell tools on every carrier now apply the filesystem read boundary to existing literal
+  path operands, including input redirects and changes of directory. Blocked reads remain advisory
+  and retain the tool and command in the audit; write escapes keep their fatal verdict (core#951).
+
 - **The editor-plugin workflow builds protocol 2.** The built-in `editor-plugin` preset's design, build and test
   steps still asked for a `protocol [1]` editor on the `wicked.editor/1` plumbing and judged conformance cases
   0-6 and 8-12 only. They now name `protocol [1, 2]` and the surfaces declaration the host renders (card, options

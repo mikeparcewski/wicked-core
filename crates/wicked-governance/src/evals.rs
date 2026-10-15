@@ -168,8 +168,8 @@ const COMMAND_KEYS: [&str; 6] = [
     "argv",
 ];
 
-/// The shell tools whose input carries a command (#708; `acp_permission::EXECUTE_TOOL_NAMES` plus
-/// an MCP `*__bash`), compared case-insensitively.
+/// The shell tools whose input carries a command, shared with the core boundary and ACP
+/// permission checks so a carrier's spelling cannot bypass a shell fence (core#951).
 const SHELL_TOOL_NAMES: [&str; 14] = [
     "bash",
     "shell",
@@ -187,7 +187,8 @@ const SHELL_TOOL_NAMES: [&str; 14] = [
     "powershell",
 ];
 
-fn is_shell_tool(tool: &str) -> bool {
+/// Whether this seat tool runs a shell command, regardless of carrier spelling or case.
+pub fn is_shell_tool(tool: &str) -> bool {
     let t = tool.to_ascii_lowercase();
     SHELL_TOOL_NAMES.contains(&t.as_str()) || t.ends_with("__bash")
 }

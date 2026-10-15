@@ -30,13 +30,13 @@
 //! observable, but the execute backend remains the phase opener of record.
 
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use wicked_apps_core::{
     open_store_ro, ConformanceClaim, Decision, GraphRead, GraphStore, HardenedCommand, NodeKind,
     ToNode, CONFORMANCE_CLAIM,
 };
-use wicked_governance::{conform, decide, recall_rules, select_any, RuleQuery};
+use wicked_governance::{conform, decide, is_shell_tool, recall_rules, select_any, RuleQuery};
 use wicked_orchestration::{apply_gate, get_phase, Phase};
 
 use crate::domain::put_node;
@@ -929,9 +929,10 @@ pub(crate) fn boundary_denial_tracked(
     // the check above never sees it, and a shell write out of the worktree was permitted. This is a
     // WRITE escape → unit-fatal (is_write = true). DEFENSE-IN-DEPTH, not a hermetic sandbox: the
     // shell is Turing-complete, so a determined escape (via `$(...)`, a variable, `base64|sh`) can
-    // still evade a scan of the literal command — the honest containment guarantee remains OS-level,
-    // which this codebase does not yet have. This closes the DIRECT, common escapes the finding names.
-    if tool == "Bash" {
+    // still evade a scan of the literal command. Reads below skip unresolvable operands (`$(…)`,
+    // `$VAR`, globs) rather than failing closed and breaking ordinary runs (core#951). The OS floor
+    // (container / Seatbelt) is the hermetic layer; this scan closes direct, literal escapes only.
+    if is_shell_tool(tool) {
         if let Some(command) = context.get("command").and_then(serde_json::Value::as_str) {
             // REMOTE-WRITE FENCE (F-7R2-012, wave 6): a `git push` / `gh pr create|merge|edit|
             // comment` / `gh api` mutation / `gh release` from a worker seat is refused whatever
@@ -1026,6 +1027,24 @@ pub(crate) fn boundary_denial_tracked(
                     ),
                     false, // placeholder — posture-based advisory/fatal decided in evaluate_tool_call
                 ));
+            }
+            // core#951: a shell read has the SAME roots and sibling-worker fence as Read.
+            // Hold it until every fatal write check above has won; a blocked read is advisory.
+            for target in resolved_bash_read_targets(command, &here, home) {
+                let path = target.to_string_lossy();
+                if let Some(tree) = sibling_worktree_target(&path, context, tool, cwd, home) {
+                    advisory.get_or_insert_with(|| {
+                        format!(
+                            "{SIBLING_WORKTREE_REASON_PREFIX} shell command `{command}` reads another \
+                             run's worktree ({}) — {SIBLING_WORKTREE_REMEDY}",
+                            tree.display()
+                        )
+                    });
+                } else if let Err(d) = crate::path_policy::check(&path, roots, false, cwd, home) {
+                    advisory.get_or_insert_with(|| {
+                        format!("Shell read leaves the unit boundary: {d}; command: `{command}`")
+                    });
+                }
             }
             if let Some(reason) = advisory {
                 return Some((reason, false));
@@ -1182,7 +1201,7 @@ pub(crate) fn phase_scope_denial(
     // SAME admission a path-bearing write tool gets below (`bash_phase_scope_denial`). Before this
     // the fence saw only `Write`/`Edit`/`NotebookEdit` and a heredoc walked straight through it
     // (the guard then tripped and the unit died).
-    if tool == "Bash" {
+    if is_shell_tool(tool) {
         return bash_phase_scope_denial(
             pre_build_scope,
             posture,
@@ -1408,6 +1427,12 @@ pub(crate) fn bash_write_phase_scope(
 /// The tokens keep their quotes and escapes: they are WORDS as spelled. A write target taken from
 /// them is judged only after [`resolve_shell_word`] reads it as the shell will (core#922).
 fn shell_tokens(command: &str) -> Vec<String> {
+    shell_tokens_with_operators(command, false)
+}
+
+/// Reads need argument boundaries even beside glued input redirects and sequence operators.
+/// Keep the write scan's token spelling intact while sharing its quote/escape lexer (core#951).
+fn shell_tokens_with_operators(command: &str, split_operators: bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut chars = command.chars().peekable();
@@ -1459,7 +1484,44 @@ fn shell_tokens(command: &str) -> Vec<String> {
                 in_double = true;
                 cur.push(ch);
             }
+            '#' if split_operators && cur.is_empty() => {
+                // A comment is not a command's argument stream, including paths in it.
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+                out.push(";".to_string());
+            }
+            '\n' if split_operators => {
+                flush(&mut cur, &mut out);
+                out.push(";".to_string());
+            }
             c if c.is_whitespace() => flush(&mut cur, &mut out),
+            c @ ('<' | '>' | '&' | '|') if split_operators => {
+                let mut op = if matches!(c, '<' | '>') && cur.chars().all(|c| c.is_ascii_digit()) {
+                    std::mem::take(&mut cur)
+                } else {
+                    flush(&mut cur, &mut out);
+                    String::new()
+                };
+                op.push(c);
+                if chars.peek().is_some_and(|n| {
+                    matches!(
+                        (c, *n),
+                        ('<', '<' | '>' | '&')
+                            | ('>', '>' | '|' | '&')
+                            | ('&', '&' | '>')
+                            | ('|', '|' | '&')
+                    )
+                }) {
+                    op.push(chars.next().unwrap());
+                    if op == "<<" && chars.peek() == Some(&'<') {
+                        op.push(chars.next().unwrap());
+                    }
+                }
+                out.push(op);
+            }
             ';' | '(' | ')' => {
                 flush(&mut cur, &mut out);
                 out.push(ch.to_string());
@@ -1890,6 +1952,161 @@ pub(crate) fn resolved_bash_write_targets(command: &str, home: Option<&Path>) ->
     let mut words: Vec<String> = Vec::new();
     collect_bash_write_targets(command, true, home, &mut words);
     resolve_targets(command, words, home, true)
+}
+
+/// Literal shell operands that already exist, resolved like core#922 write targets. Program
+/// names are excluded, but arguments are program-agnostic: a new reader needs no allowlist.
+fn resolved_bash_read_targets(command: &str, cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let home = home.filter(|_| !command_may_set_home(command));
+    let mut out = Vec::new();
+    collect_bash_read_targets(command, Some(cwd.to_path_buf()), home, true, &mut out);
+    out
+}
+
+fn collect_bash_read_targets(
+    command: &str,
+    mut here: Option<PathBuf>,
+    home: Option<&Path>,
+    unwrap_inline: bool,
+    out: &mut Vec<PathBuf>,
+) {
+    let command = strip_quoted_heredoc_bodies(command);
+    let mut stack = Vec::new();
+    let owned = shell_tokens_with_operators(&command, true);
+    let mut start = 0;
+    for end in 0..=owned.len() {
+        if end < owned.len()
+            && !matches!(
+                owned[end].as_str(),
+                ";" | "|" | "||" | "&&" | "&" | "|&" | "(" | ")"
+            )
+        {
+            continue;
+        }
+        collect_shell_segment_reads(&owned[start..end], &mut here, home, unwrap_inline, out);
+        if end < owned.len() {
+            if owned[end] == "(" {
+                stack.push(here.clone());
+            } else if owned[end] == ")" {
+                if let Some(parent) = stack.pop() {
+                    here = parent;
+                }
+            }
+        }
+        start = end + 1;
+    }
+}
+
+fn collect_shell_segment_reads(
+    tokens: &[String],
+    here: &mut Option<PathBuf>,
+    home: Option<&Path>,
+    unwrap_inline: bool,
+    out: &mut Vec<PathBuf>,
+) {
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let word = tokens[i].as_str();
+        if let Some(takes_next) = redirection_operand(word) {
+            // Input redirects can precede the program. Heredoc delimiters, here-strings and
+            // descriptor duplications are not filenames; output targets were judged as writes.
+            let input = word.trim_start_matches(|c: char| c.is_ascii_digit());
+            if let Some(rest) = input
+                .strip_prefix('<')
+                .filter(|r| !r.starts_with(['<', '&', '>']))
+            {
+                if let Some(target) = if rest.is_empty() {
+                    tokens.get(i + 1).map(String::as_str)
+                } else {
+                    Some(rest)
+                } {
+                    out.extend(existing_shell_read_paths(target, here.as_deref(), home));
+                }
+            }
+            if takes_next {
+                i += 1;
+            }
+        } else {
+            words.push(word);
+        }
+        i += 1;
+    }
+    match unwrap_program(&words) {
+        Unwrapped::Inline { word, .. } if unwrap_inline => {
+            // The outer shell removes one quote layer before the inner shell lexes its script.
+            // Opaque expansions remain opaque; reads never fail closed on unknown operands.
+            if let Some((inner, _)) = lex_shell_word(word, home, true, !cfg!(windows)) {
+                collect_bash_read_targets(&inner, here.clone(), home, false, out);
+            }
+        }
+        Unwrapped::Program { idx, .. } => {
+            for (i, word) in words.iter().enumerate().skip(1) {
+                if i != idx {
+                    out.extend(existing_shell_read_paths(word, here.as_deref(), home));
+                }
+            }
+            if words
+                .get(idx)
+                .is_some_and(|p| matches!(program_basename(p), "cd" | "pushd"))
+            {
+                let dest = words[idx + 1..].iter().find(|w| !w.starts_with('-'));
+                let raw = dest.copied().or_else(|| {
+                    (program_basename(words[idx]) == "cd" && words.len() == idx + 1).then_some("~")
+                });
+                // An unknown cd makes subsequent relative operands unknown too. Absolute
+                // operands are still checked, and a later absolute cd restores a known cwd.
+                *here = raw.and_then(|raw| {
+                    existing_shell_read_paths(raw, here.as_deref(), home)
+                        .into_iter()
+                        .find(|p| p.is_dir())
+                });
+                out.extend(here.iter().cloned());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn existing_shell_read_paths(word: &str, cwd: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
+    // Strip assignment-style option prefixes BEFORE resolving, preserving quoted/escaped `~`
+    // and `$HOME` semantics (`--opt="/path"`, `--git-dir=/path`, `if=/path`). Also judge the
+    // whole word: an ordinary filename can itself contain `=`. URLs are never local operands.
+    let Some(readings) = resolve_shell_readings(word, home) else {
+        return Vec::new();
+    };
+    if readings.iter().any(|p| p.contains("://")) {
+        return Vec::new();
+    }
+    let operands: Vec<String> = readings
+        .iter()
+        .filter_map(|p| {
+            p.split_once('=')
+                .and_then(|(key, _)| strip_shell_prefix(word, &format!("{key}=")))
+        })
+        .flat_map(|raw| resolve_shell_readings(&raw, home).unwrap_or_default())
+        .collect();
+    readings
+        .into_iter()
+        .chain(operands)
+        .filter_map(|p| {
+            let path_like = p.contains('/') || (cfg!(windows) && p.contains('\\'));
+            if (p.starts_with('-') && !path_like) || p.contains("://") {
+                return None;
+            }
+            let base = if Path::new(&p).is_absolute() {
+                Path::new("")
+            } else {
+                cwd?
+            };
+            let path = crate::path_policy::normalize_for_fence(&p, base, home);
+            // Normalize before skipping devices: `/dev/../outside` is not a device read.
+            if path.starts_with("/dev") && path != Path::new("/dev") {
+                return None;
+            }
+            path.exists().then_some(path)
+        })
+        .collect()
 }
 
 /// Resolve each word of `command`; `drop_sinks` drops the standard write sinks — for WRITE
@@ -3937,7 +4154,7 @@ pub(crate) fn evaluate_tool_call(
             // ALLOWED: the seat's shell runs this call, so its trailing `cd` is where the install
             // fence judges the next one from (review of #456, F1). Only here — every deny above
             // returned 2 before this point, and a refused call never moved the shell.
-            if tool == "Bash" {
+            if is_shell_tool(tool) {
                 // Install-fence cwd tracking is subprocess-only (boundary.is_none()).
                 if boundary.is_none() {
                     if let Some(command) =
@@ -6156,8 +6373,8 @@ mod tests {
     }
 
     /// issue #540 — boundary: `git -C <sibling>` with a write subcommand and
-    /// `cd <sibling> && cp …` are denied by `boundary_denial_tracked`; read git subcommands
-    /// and in-boundary cds are admitted. Tests Creator posture (boundary is all-posture).
+    /// `cd <sibling> && cp …` are denied by `boundary_denial_tracked`; core#951 also requires
+    /// a read grant for read git subcommands there. In-boundary cds are admitted on every posture.
     #[test]
     fn boundary_denies_git_c_and_cd_to_sibling_named_in_540() {
         use crate::path_policy::AllowedRoots;
@@ -6187,12 +6404,10 @@ mod tests {
             .expect("git -C <sibling> commit is denied");
         assert!(reason.contains("leaves the unit boundary"), "{reason}");
 
-        // git -C <sibling> status: read subcommand → allowed.
-        assert_eq!(
-            check(&format!("git -C {} status", w(&sibling))),
-            None,
-            "git -C <sibling> status is a read subcommand — admitted"
-        );
+        // core#951: a read subcommand still needs a read grant for its existing target.
+        let (_, fatal) = check(&format!("git -C {} status", w(&sibling)))
+            .expect("git -C <sibling> status is outside the read boundary");
+        assert!(!fatal, "a blocked read must stay advisory");
 
         // cd <sibling> && cp: denied (sibling is outside write roots; issue #540).
         // Paths under system temp are advisory by core#264 — the key is DENIED, not fatal here.
@@ -9169,6 +9384,286 @@ mod boundary_tests {
         json!({ "path": path })
     }
 
+    /// core#951: changing carriers must not turn a blocked Read into an allowed shell read.
+    #[test]
+    fn shell_read_951_repro_and_operand_resolution() {
+        let dir = std::env::temp_dir().join(format!(
+            "shell_read_951_repro_and_operand_resolution-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = dir.as_path().join("scratch");
+        let outside = dir.as_path().join("outside space");
+        std::fs::create_dir_all(scratch.join("-dir")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let file = outside.join("tip.mjs");
+        std::fs::write(&file, "secret").unwrap();
+        std::fs::write(outside.join("eq=tip.mjs"), "secret").unwrap();
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![scratch.clone()],
+            read: vec![],
+        };
+        assert!(
+            !boundary_denial_with(
+                &roots,
+                &scratch,
+                None,
+                None,
+                &ctx(file.to_str().unwrap()),
+                "Read"
+            )
+            .unwrap()
+            .1
+        );
+        for tool in ["Bash", "bash", "BaSh", "shell", "exec_command"] {
+            for command in [
+                format!("cat -n '{}'", file.display()),
+                "reader '-dir/../../outside space/tip.mjs'".to_string(),
+                format!("cat '{}'", outside.join("eq=tip.mjs").display()),
+                format!("cat<'{}'", file.display()),
+                format!("cd '{}' && cat -n tip.mjs", outside.display()),
+                format!("pushd '{}' && cat tip.mjs", outside.display()),
+                format!("reader --opt='{}'", file.display()),
+                format!("git -C '{}' status", outside.display()),
+                format!("git --git-dir='{}' status", outside.display()),
+                format!("cat <'{}'", file.display()),
+                format!("<'{}' cat", file.display()),
+                format!("sh -lc \"cat -n '{}'\"", file.display()),
+                "cat ~/tip.mjs".to_string(),
+                "cat \"$HOME/tip.mjs\"".to_string(),
+                format!(
+                    "cat {}/tip.mjs",
+                    outside.display().to_string().replace(' ', "\\ ")
+                ),
+            ] {
+                let (reason, fatal) = boundary_denial_with(
+                    &roots,
+                    &scratch,
+                    Some(&outside),
+                    None,
+                    &json!({"command": command}),
+                    tool,
+                )
+                .unwrap_or_else(|| panic!("shell read escaped: {tool}: {command}"));
+                assert!(
+                    !fatal,
+                    "a prevented read is advisory: {tool}: {command}: {reason}"
+                );
+                assert!(
+                    reason.contains(&command),
+                    "the audit must retain the command: {reason}"
+                );
+            }
+        }
+        #[cfg(unix)]
+        {
+            let command = format!("cat '/dev/..{}'", file.display());
+            let (_, fatal) = boundary_denial_with(
+                &roots,
+                &scratch,
+                None,
+                None,
+                &json!({"command": command}),
+                "bash",
+            )
+            .expect("a traversal out of /dev must not inherit the device exemption");
+            assert!(!fatal);
+        }
+    }
+
+    #[test]
+    fn shell_read_951_allows_normal_work_and_declared_read_roots() {
+        let dir = std::env::temp_dir().join(format!(
+            "shell_read_951_allows_normal_work_and_declared_read_roots-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = dir.as_path().join("scratch");
+        let runtime = dir.as_path().join("runtime");
+        for path in [
+            scratch.join("src"),
+            scratch.join("scripts"),
+            runtime.clone(),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        for path in [
+            scratch.join("src/x.rs"),
+            scratch.join("scripts/a.mjs"),
+            runtime.join("skill.md"),
+        ] {
+            std::fs::write(path, "x").unwrap();
+        }
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![scratch.clone()],
+            read: vec![runtime.clone()],
+        };
+        for command in [
+            "ls".to_string(),
+            "git status".into(),
+            "printf ok # /etc/hosts".into(),
+            "npm test".into(),
+            "cat src/x.rs".into(),
+            "rg foo src/".into(),
+            "node scripts/a.mjs".into(),
+            "cargo test".into(),
+            "/usr/bin/env node x.js".into(),
+            "cat -n tip.mjs".into(),
+            "cat /dev/null".into(),
+            "cat /dev/./null".into(),
+            "cat $VAR".into(),
+            "cat $(choose_file)".into(),
+            "cat /unresolved/*".into(),
+            "fetch https://example.com/a".into(),
+            "fetch https://example.com/query?file=/etc/hosts".into(),
+            "cat /wicked-nonexistent-951/file".into(),
+            format!("cat '{}'", runtime.join("skill.md").display()),
+        ] {
+            assert_eq!(
+                boundary_denial_with(
+                    &roots,
+                    &scratch,
+                    None,
+                    None,
+                    &json!({"command": command}),
+                    "bash"
+                ),
+                None,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_read_951_uses_tracked_cwd_and_fences_sibling_worktrees() {
+        let dir = std::env::temp_dir().join(format!(
+            "shell_read_951_uses_tracked_cwd_and_fences_sibling_worktrees-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = dir.as_path().join("wicked-worktrees/run-1");
+        let sibling = dir.as_path().join("wicked-worktrees/run-2");
+        let outside = dir.as_path().join("outside");
+        for path in [&scratch, &sibling, &outside] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        for path in [sibling.join("secret"), outside.join("tip.mjs")] {
+            std::fs::write(path, "x").unwrap();
+        }
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![scratch.clone()],
+            read: vec![dir.as_path().to_path_buf()],
+        };
+        let command = format!("cat '{}'", sibling.join("secret").display());
+        let (reason, fatal) = boundary_denial_with(
+            &roots,
+            &scratch,
+            None,
+            None,
+            &json!({"command": command}),
+            "bash",
+        )
+        .expect("the clone read grant must not expose a sibling worker");
+        assert!(reason.contains(SIBLING_WORKTREE_REASON_PREFIX));
+        assert!(!fatal);
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![scratch.clone()],
+            read: vec![],
+        };
+        let state = dir.as_path().join("cwd");
+        track_install_fence_cwd(
+            &format!("cd '{}'", outside.display()),
+            &scratch,
+            None,
+            &state,
+        );
+        let (_, fatal) = boundary_denial_tracked(
+            &roots,
+            &scratch,
+            None,
+            None,
+            &json!({"command": "cat tip.mjs"}),
+            "bash",
+            Some(&state),
+            false,
+            &[],
+        )
+        .expect("read from persisted cwd must be checked");
+        assert!(!fatal);
+        #[cfg(unix)]
+        {
+            // The cd itself is readable, but its bare operand follows a symlink outside the grant.
+            let secret = dir.join("secret");
+            std::fs::write(&secret, "x").unwrap();
+            std::os::unix::fs::symlink(&secret, outside.join("link")).unwrap();
+            let roots = crate::path_policy::AllowedRoots {
+                write: vec![scratch.clone()],
+                read: vec![outside.clone()],
+            };
+            let command = format!("cd '{}'&&cat link", outside.display());
+            let (_, fatal) = boundary_denial_with(
+                &roots,
+                &scratch,
+                None,
+                None,
+                &json!({"command": command}),
+                "bash",
+            )
+            .expect("the relative operand must use the cd destination");
+            assert!(!fatal);
+            let command = format!("(cd '{}'); cat link", outside.display());
+            assert_eq!(
+                boundary_denial_with(
+                    &roots,
+                    &scratch,
+                    None,
+                    None,
+                    &json!({"command": command}),
+                    "bash"
+                ),
+                None,
+                "a subshell cd must not move the outer shell"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_read_951_write_escapes_stay_fatal_on_every_carrier() {
+        let scratch = std::env::temp_dir().join("wicked-shell-951-write");
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![scratch.clone()],
+            read: vec![],
+        };
+        let outside = scratch
+            .ancestors()
+            .last()
+            .unwrap()
+            .join("wicked-outside-951/f");
+        for tool in ["bash", "shell", "exec_command"] {
+            let command = format!("cat /etc/hosts; echo x > {}", outside.display());
+            let (reason, fatal) = boundary_denial_with(
+                &roots,
+                &scratch,
+                None,
+                None,
+                &json!({"command": command}),
+                tool,
+            )
+            .expect("shell write escape");
+            assert!(fatal, "write must win over read: {tool}: {reason}");
+            assert!(phase_scope_denial(
+                true,
+                crate::write_posture::WritePosture::Full,
+                &json!({"command": "echo x > src/x.rs"}),
+                tool,
+                &scratch,
+                None,
+                &[]
+            )
+            .is_some());
+        }
+    }
+
     /// core#264. Run fc46a3a1 produced its deliverable correctly and was then unit-FAILED over one
     /// blocked Bash redirect to `/private/tmp/out.txt`. A blocked write into the SYSTEM temp is
     /// benign scratch: STILL blocked, STILL audited, but ADVISORY — on the Bash arm and the
@@ -10482,7 +10977,8 @@ mod boundary_tests {
         let wt = repo.join("wicked-worktrees").join("run-1");
         let roots = crate::path_policy::AllowedRoots {
             write: vec![wt.clone()],
-            read: vec![],
+            // core#951: entering the clone now requires a read grant; installs there still deny.
+            read: vec![repo.clone()],
         };
         let state =
             install_fence_cwd_path(&decisions_path_for("run-1", 0).to_string_lossy(), "unit-3");
@@ -10503,7 +10999,7 @@ mod boundary_tests {
         };
         // Fresh attempt: judged from the worktree.
         assert_eq!(judge("npm ci"), None);
-        // Call 1 allowed: `cd <clone>` — nothing to refuse, the shell moved; persist it as the
+        // Call 1 allowed: `cd <clone>` — inside the read grant, the shell moved; persist it as the
         // allow exit does.
         let cd_clone = format!("cd {}", repo.display());
         assert_eq!(judge(&cd_clone), None);
@@ -10941,13 +11437,17 @@ mod boundary_tests {
         });
     }
 
-    /// A Bash command with no write target is not a boundary question — a read/list is not an escape.
+    /// core#951: commands without operands pass; a listing outside the read roots is advisory.
     #[test]
-    fn a_bash_command_with_no_write_target_is_not_judged() {
+    fn a_bash_command_without_path_operands_passes_but_an_outside_listing_is_refused() {
         let wt = std::env::temp_dir().join("wicked-boundary-wt5");
         std::fs::create_dir_all(&wt).unwrap();
         with_roots(Some(wt.to_str().unwrap()), || {
-            assert!(boundary_denial_untracked(&json!({"command": "ls /"}), "Bash").is_none());
+            assert!(boundary_denial_untracked(&json!({"command": "ls"}), "Bash").is_none());
+            let command = format!("ls '{}'", wt.ancestors().last().unwrap().display());
+            let (_, fatal) = boundary_denial_untracked(&json!({"command": command}), "Bash")
+                .expect("the filesystem root is outside the read grant");
+            assert!(!fatal);
         });
     }
 
