@@ -3487,12 +3487,9 @@ pub(crate) fn build_worker_command(
 /// (C5) Whether a governed launch of `argv` keeps a per-call check on the interim host floor:
 /// claude (the gate hook) or codex in its own bounded sandbox (no bypass flag).
 fn host_floor_keeps_a_check(argv: &[String]) -> bool {
-    let stem = argv
-        .first()
-        .and_then(|b| std::path::Path::new(b).file_stem())
-        .and_then(|s| s.to_str())
-        .map(str::to_ascii_lowercase);
-    stem.as_deref() == Some("claude") || launches_bounded_codex(argv)
+    // The SAME claude predicate hook arming uses (codex c5-r7): a binary only one of the two
+    // calls claude would be admitted with no hook armed.
+    argv.first().is_some_and(|b| binary_is_claude(b)) || launches_bounded_codex(argv)
 }
 
 fn launches_bounded_codex(argv: &[String]) -> bool {
@@ -7315,7 +7312,12 @@ mod tests {
             "--dangerously-bypass-approvals-and-sandbox",
         ])));
         assert!(!launches_bounded_codex(&[]));
-        // C5: the host-floor rule over the final argv.
+        // C5: the host-floor rule over the final argv. The hook-arming predicate decides (codex
+        // c5-r7): what it does not call claude is not admitted as claude.
+        assert_eq!(
+            host_floor_keeps_a_check(&v(&["/opt/bin/Claude", "-p", "x"])),
+            binary_is_claude("/opt/bin/Claude")
+        );
         assert!(host_floor_keeps_a_check(&v(&[
             "/opt/tools/claude",
             "-p",

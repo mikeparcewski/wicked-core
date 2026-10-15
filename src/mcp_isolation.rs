@@ -95,9 +95,21 @@ pub(crate) fn seat_mcp_pin_flags(
         }
         SeatCli::Codex => {
             let mut flags = Vec::new();
-            for name in codex_mcp_server_names(&config_home(cli, seat_root)?.join("config.toml"))? {
-                flags.push("-c".to_string());
-                flags.push(format!("mcp_servers.{name}.enabled=false"));
+            // The seat home AND a trusted project's own `.codex/config.toml` (codex c5-r7: the
+            // removed ACP refusal read both; codex merges a trusted project's layer, so a server
+            // declared only there is pinned off too).
+            let mut sources = vec![config_home(cli, seat_root)?.join("config.toml")];
+            if let Some(cwd) = cwd {
+                sources.push(cwd.join(".codex").join("config.toml"));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for source in sources {
+                for name in codex_mcp_server_names(&source)? {
+                    if seen.insert(name.clone()) {
+                        flags.push("-c".to_string());
+                        flags.push(format!("mcp_servers.{name}.enabled=false"));
+                    }
+                }
             }
             Ok(flags)
         }
@@ -561,6 +573,31 @@ mod tests {
                 "{name}: {flags:?}"
             );
         }
+        // (C5, codex c5-r7) A server declared only in a trusted project's `.codex/config.toml`
+        // is pinned off too; one declared in both is pinned once.
+        std::fs::create_dir_all(ws.join(".codex")).unwrap();
+        std::fs::write(
+            ws.join(".codex").join("config.toml"),
+            "[mcp_servers.project-only]\ncommand = \"/bin/echo\"\n\n[mcp_servers.probe]\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        let flags =
+            seat_mcp_pin_flags(SeatCli::Codex, Some(&codex), Some(&ws)).expect("codex pins");
+        assert!(
+            flags
+                .windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "mcp_servers.project-only.enabled=false"),
+            "{flags:?}"
+        );
+        assert_eq!(
+            flags
+                .iter()
+                .filter(|f| *f == "mcp_servers.probe.enabled=false")
+                .count(),
+            1,
+            "{flags:?}"
+        );
+        std::fs::remove_dir_all(ws.join(".codex")).unwrap();
         // Review of #672 (HIGH): under the operator-inherit hatch there is no engine-minted seat
         // root (`SeatConfig::Inherit` sets no configuration variable), and the operator's OWN
         // home is exactly where an ambient MCP server is most likely to be. The pin reads that
