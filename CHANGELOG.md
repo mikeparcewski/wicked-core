@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Agent judges, validator authoring and failure triage follow the seat floor.** Under the container floor these
+  engine-internal sessions ran the host CLIs (ungoverned internal calls), outside any seat container: on a host where
+  the agents are signed in only through their seat containers they failed, and they read the operator's own CLI
+  configuration. They now take the same arming path as a worker (`runs_in_seat`): a seat container with the agent's
+  brokered sign-in, the gateway as the only egress, and the floor's mounts. A judge that cannot arm (signed out, no
+  runtime) is a seat failure, so the rotation moves to the next judge, as before. They stay ungoverned (no gate hook,
+  no `ask` tool, no MCP channel, no governance files). The PTY session carrier refuses them under the container floor,
+  as it refuses governed units. Under `WICKED_SEAT_FLOOR=host` nothing changes.
+
 - **Governed container seats ask the operator mid-turn with the MCP `ask` tool (DES-CONTAINER-FLOOR step 5).**
   C5 removed ACP and with it in-turn questions; crew now serves an MCP `ask` route, reached by seat containers only
   through agentgateway's 8700 route (exact `POST`/`GET /api/v1/mcp/ask` matches). The engine owns the questions
