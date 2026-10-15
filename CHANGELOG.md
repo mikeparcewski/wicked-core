@@ -14,6 +14,16 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core, core-ts: a diagnostic line no longer kills the thread that writes it (core#957).** Several
+  unattended runs at once in a Node host (crew) could hang a unit in `executing`, or stop the actor
+  ("core actor stopped") with no panic printed. Node hands the addon a non-blocking stderr pipe; when
+  its reader lagged, a write failed with EAGAIN, std's `eprintln!` panicked, and the panic message was
+  lost the same way — so a worker died with its unit's result, or the actor died. wicked-core,
+  wicked-council, wicked-apps-core, wicked-governance and wicked-core-ts now shadow `eprintln!` with a
+  write that drops the line when stderr refuses it. `tests/concurrent_engine_runs.rs` runs five
+  concurrent unattended runs on two stub seats (launched, and bus-requested beside campaign nodes),
+  and again in a child process whose stderr is a full non-blocking pipe.
+
 - **core-ts**: `Core.qeReviewersAdmitted(seatsJson)` judges a whole roster's QE
   reviewer admission against one routing snapshot, off the Node thread (wicked-crew#1021).
 - **core**: `qe_reviewers_admitted` judges every seat's QE reviewer admission against one routing
