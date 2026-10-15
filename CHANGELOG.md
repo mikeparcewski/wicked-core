@@ -14,6 +14,17 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The container floor keeps codex on repository runs.** The worktree bench (core#769) benched every codex seat on a
+  run bound to a repository, because the account's signed requirements bundle forbids `approval_policy = "never"`, and
+  on the host codex's own sandbox sends commands for an approval nobody can give (`approval request failed`). In a
+  seat container the engine runs codex with `--sandbox danger-full-access` inside the container's own boundary, and
+  under the bundle's `on-request` fallback its commands run without an approval. So the bench now applies only off the
+  container floor (`WICKED_SEAT_FLOOR=container` keeps codex; `WICKED_CODEX_WORKTREE_OK=1` still opts out
+  anywhere). A bundle that allows only `untrusted` still refuses commands in a container, and the existing
+  `approval_unavailable` seat refusal benches that seat when it happens. `Core.worktreeBenched()` follows the same
+  rule. A decision council's ballots run the host CLIs on every floor, so they keep the bench on a bound run. Stacked
+  on the change that runs agent judges and triage in seat containers (they no longer run host codex).
+
 - **Agent judges, validator authoring and failure triage follow the seat floor.** Under the container floor these
   engine-internal sessions ran the host CLIs (ungoverned internal calls), outside any seat container: on a host where
   the agents are signed in only through their seat containers they failed, and they read the operator's own CLI
