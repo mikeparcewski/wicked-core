@@ -20,8 +20,8 @@
 //! seat and PATH order decides which one a spawn gets; see `wicked-council`'s registry note.
 //!
 //! When an ACP binary is unavailable or fails during the handshake, `AcpStepRunner`
-//! emits a warning and prepends it to `StepOutput.output` so it is visible in both
-//! streaming and persisted contexts. The run then continues with single-shot fallback.
+//! discloses it on `CoreEvent::AcpFallback` and in the daemon log, never in the seat's
+//! output (core#970). The run then continues with single-shot fallback.
 //! HTTP transport is not yet implemented (no registry entry uses it today).
 //!
 //! # Session lifecycle
