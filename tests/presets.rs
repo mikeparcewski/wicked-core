@@ -573,6 +573,8 @@ fn e_a_campaign_node_naming_a_preset_launches_it() {
                 human_confirm: HumanConfirm::None,
                 repo_ref: None,
                 workflow_id: Some("my-flow".into()),
+                skip_qe_acceptance_reason: None,
+                force_qe_acceptance: false,
             },
         }],
         name: "camp".into(),

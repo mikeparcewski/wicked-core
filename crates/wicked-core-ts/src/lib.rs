@@ -795,19 +795,11 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
     let clis: Vec<AgenticCli> = serde_json::from_str(&o.clis_json)
         .map_err(|e| err(format!("clisJson is not a valid AgenticCli array: {e}")))?;
     let plan = o.plan_json.as_deref().map(parse_plan).transpose()?;
-    let qe_acceptance = match (
+    let qe_acceptance = wicked_core::assurance::QeOverride::from_wire(
         o.skip_qe_acceptance_reason,
         o.force_qe_acceptance.unwrap_or(false),
-    ) {
-        (Some(_), true) => {
-            return Err(err(
-                "skipQeAcceptanceReason and forceQeAcceptance are mutually exclusive",
-            ))
-        }
-        (Some(reason), false) => wicked_core::assurance::QeOverride::Skip(reason),
-        (None, true) => wicked_core::assurance::QeOverride::Force,
-        (None, false) => wicked_core::assurance::QeOverride::Auto,
-    };
+    )
+    .map_err(|_| err("skipQeAcceptanceReason and forceQeAcceptance are mutually exclusive"))?;
     let deliver_step = o
         .deliver_step_json
         .as_deref()
@@ -987,6 +979,27 @@ impl Core {
             }
         }
         .to_string()
+    }
+
+    /// (QE acceptance) Turn QE acceptance OFF for the launches the engine makes on its own —
+    /// campaign nodes as they dispatch and bus `wicked.crew.run.requested` requests — with this
+    /// reason (non-empty), or back on with `null`. While off, such a launch that gives no QE word of
+    /// its own (`skip_qe_acceptance_reason` / `force_qe_acceptance` on its campaign `run_spec` or bus
+    /// `args`) and whose contract requires QE acceptance is skipped with `reason`, labelled like an
+    /// operator skip (`assurance.qe {status: "skipped", basis: "operator"}`, "QE acceptance skipped by
+    /// operator: <reason>") on the run, every gate and the delivery; any other run is left as it is.
+    /// `launchRun` is not affected (it carries its own `skipQeAcceptanceReason`). Throws on a blank
+    /// reason. Read at each launch. An addon without this method predates it; crew keys on its
+    /// presence.
+    #[napi]
+    pub fn set_qe_acceptance_off(&self, reason: Option<String>) -> napi::Result<()> {
+        self.inner.set_qe_acceptance_off(reason).map_err(err)
+    }
+
+    /// The standing reason while QE acceptance is off for engine-originated launches, else `null`.
+    #[napi]
+    pub fn qe_acceptance_off(&self) -> Option<String> {
+        self.inner.qe_acceptance_off()
     }
 
     /// Publish one event on this engine's bus (`WICKED_BUS_DB`), given as wicked-bus `emit()`

@@ -87,6 +87,91 @@ pub enum QeOverride {
     Skip(String),
     /// Require it whatever the score says.
     Force,
+    /// The HOST's standing skip ([`HostQeAcceptance`]: "QE acceptance off"), on a launch the engine
+    /// made on its own (a campaign node, a bus request) that carried no word of its own: skip, for
+    /// this reason, ONLY when the run's contract requires QE acceptance; on any other run it is no
+    /// word at all (a standing setting is never a refusal). Labelled exactly like [`Self::Skip`].
+    Standing(String),
+}
+
+impl QeOverride {
+    /// The word as every launch wire spells it (`LaunchOptions`, a campaign node's
+    /// [`crate::campaign::RunSpec`], a bus `wicked.crew.run.requested`'s `args`): a skip reason, or
+    /// a force, or neither. Both at once is refused (one word per launch).
+    pub fn from_wire(skip_reason: Option<String>, force: bool) -> Result<Self, String> {
+        match (skip_reason, force) {
+            (Some(_), true) => Err(
+                "skip_qe_acceptance_reason and force_qe_acceptance are mutually exclusive: skip \
+                 QE acceptance with a reason, or force it"
+                    .to_string(),
+            ),
+            (Some(reason), false) => Ok(Self::Skip(reason)),
+            (None, true) => Ok(Self::Force),
+            (None, false) => Ok(Self::Auto),
+        }
+    }
+}
+
+/// A launch refused because its QE word cannot apply ([`RunAssurance::with_qe_override`]: a blank
+/// skip reason, or a skip or force on a run whose workflow does not require QE acceptance). Typed so
+/// a caller that retries transient faults (the bus launch bridge) can tell a refusal that will never
+/// succeed from one that might.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QeOverrideRefused(pub String);
+
+impl std::fmt::Display for QeOverrideRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the launch is refused: {}", self.0)
+    }
+}
+
+impl std::error::Error for QeOverrideRefused {}
+
+/// The host's standing "QE acceptance off" word for the launches the ENGINE makes on its own —
+/// campaign nodes and bus `wicked.crew.run.requested` requests — set by the host
+/// ([`crate::Core::set_qe_acceptance_off`]; crew feeds its daemon setting into it). `Some(reason)`:
+/// such a launch that carries no QE word of its own, and whose contract requires QE acceptance, is
+/// skipped with `reason`, labelled exactly like an operator skip. `None` (the default): nothing is
+/// skipped. Shared between the handle, the actor and the bus bridge thread; read at each launch.
+#[derive(Debug, Clone, Default)]
+pub struct HostQeAcceptance(std::sync::Arc<std::sync::RwLock<Option<String>>>);
+
+impl HostQeAcceptance {
+    /// Turn QE acceptance off for engine-originated launches, with this reason (non-empty), or
+    /// back on (`None`).
+    pub fn set(&self, reason: Option<String>) -> Result<(), String> {
+        let reason = match reason {
+            Some(r) if r.trim().is_empty() => {
+                return Err(
+                    "turning QE acceptance off needs a reason (the reason is empty)".to_string(),
+                )
+            }
+            Some(r) => Some(r.trim().to_string()),
+            None => None,
+        };
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = reason;
+        Ok(())
+    }
+
+    /// The word an engine-originated launch runs under: its own explicit word when it gave one,
+    /// else the standing skip when QE acceptance is off, else [`QeOverride::Auto`].
+    pub fn word_for(&self, explicit: QeOverride) -> QeOverride {
+        match (explicit, self.get()) {
+            (QeOverride::Auto, Some(reason)) => QeOverride::Standing(reason),
+            (explicit, _) => explicit,
+        }
+    }
+
+    /// The standing skip reason, when QE acceptance is off.
+    pub fn get(&self) -> Option<String> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// A run's QE acceptance decision, on [`RunAssurance::qe`] and every receipt.
@@ -190,6 +275,10 @@ impl RunAssurance {
         if *over == QeOverride::Auto {
             return Ok(self);
         }
+        // The host's standing skip applies only where there is something to skip.
+        if matches!(over, QeOverride::Standing(_)) && self.qe.is_none() {
+            return Ok(self);
+        }
         let Some(qe) = self.qe.as_mut() else {
             return Err(format!(
                 "this run's workflow does not require QE acceptance ({QE_ACCEPTANCE}), so there is \
@@ -199,7 +288,7 @@ impl RunAssurance {
         };
         qe.basis = QE_BASIS_OPERATOR.to_string();
         match over {
-            QeOverride::Skip(reason) => {
+            QeOverride::Skip(reason) | QeOverride::Standing(reason) => {
                 let reason = reason.trim();
                 if reason.is_empty() {
                     return Err(
@@ -444,6 +533,62 @@ mod tests {
             RunAssurance::default().with_qe_override(&QeOverride::Auto),
             Ok(RunAssurance::default())
         );
+    }
+
+    #[test]
+    fn the_standing_skip_applies_only_where_qe_is_required() {
+        let off = QeOverride::Standing("QE acceptance is off on this daemon".into());
+        let r = requiring_qe().with_qe_override(&off).unwrap();
+        let q = r.qe.as_ref().unwrap();
+        assert_eq!(
+            (q.status.as_str(), q.basis.as_str(), q.reason.as_str()),
+            (
+                QE_SKIPPED,
+                QE_BASIS_OPERATOR,
+                "QE acceptance skipped by operator: QE acceptance is off on this daemon"
+            )
+        );
+        assert!(!r.enforces(QE_ACCEPTANCE));
+        // Not required: untouched, never refused.
+        assert_eq!(
+            RunAssurance::default().with_qe_override(&off),
+            Ok(RunAssurance::default())
+        );
+    }
+
+    #[test]
+    fn the_wire_word_and_the_host_setting_refuse_what_cannot_apply() {
+        assert_eq!(QeOverride::from_wire(None, false), Ok(QeOverride::Auto));
+        assert_eq!(QeOverride::from_wire(None, true), Ok(QeOverride::Force));
+        assert_eq!(
+            QeOverride::from_wire(Some("why".into()), false),
+            Ok(QeOverride::Skip("why".into()))
+        );
+        assert!(QeOverride::from_wire(Some("why".into()), true)
+            .unwrap_err()
+            .contains("mutually exclusive"));
+        let host = HostQeAcceptance::default();
+        assert_eq!(host.get(), None);
+        assert!(host
+            .set(Some("  ".into()))
+            .unwrap_err()
+            .contains("needs a reason"));
+        host.set(Some(" off here ".into())).unwrap();
+        assert_eq!(host.clone().get().as_deref(), Some("off here"));
+        // The launch's own word wins; no word reads the standing skip while it is set.
+        host.set(Some("off".into())).unwrap();
+        assert_eq!(host.word_for(QeOverride::Force), QeOverride::Force);
+        assert_eq!(
+            host.word_for(QeOverride::Skip("spike".into())),
+            QeOverride::Skip("spike".into())
+        );
+        assert_eq!(
+            host.word_for(QeOverride::Auto),
+            QeOverride::Standing("off".into())
+        );
+        host.set(None).unwrap();
+        assert_eq!(host.get(), None);
+        assert_eq!(host.word_for(QeOverride::Auto), QeOverride::Auto);
     }
 
     #[test]
