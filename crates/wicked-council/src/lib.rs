@@ -26,6 +26,21 @@
 //! The worker keeps its shared `Arc<Mutex<..>>` state for live coordination; the durable
 //! task/verdict/ranking records are backed by the estate store.
 
+// (core#957) A diagnostic line never kills the thread that writes it. std's `eprintln!` PANICS when
+// the write fails, and a Node host hands this addon a stderr that is a non-blocking pipe: when the
+// reader lags, a write fails with EAGAIN. The panic message is lost the same way, so the thread
+// died with no trace — a worker took its unit's result with it (the run hung in `executing`) and the
+// actor took the engine ("core actor stopped"). This crate-wide shadow of `eprintln!` (textual
+// scope: every module declared below) writes the same line and drops it when stderr refuses it.
+// Unit tests keep std's macro, whose output the test harness captures.
+#[cfg(not(test))]
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
+    }};
+}
+
 pub mod bus;
 pub mod dispatch;
 pub mod ids;
