@@ -9248,6 +9248,9 @@ fn dispatch_unit(
     // unit's own dispatch history, so `next_attempt` stays fresh whatever the attempt's outcome
     // (a worker exit never reaches the fold's write) and `None` means exactly "never dispatched"
     // (the dead-seat gate's never-seated clause, des-adjudicated §4.7).
+    // (the fallback judge) Whether this unit was dispatched before THIS dispatch, read before the
+    // stamp below: a Creator unit with no recorded binary then has an unrecorded author.
+    let previously_dispatched = unit.last_attempt.is_some();
     let attempt_changed = unit.last_attempt != Some(session.attempt);
     if attempt_changed {
         unit.last_attempt = Some(session.attempt);
@@ -9270,8 +9273,10 @@ fn dispatch_unit(
         );
     if builds {
         if let Some(seat) = unit.assigned_cli.clone() {
-            if !unit.authored_by.contains(&seat) {
-                unit.authored_by.push(seat);
+            // …and every binary that dispatch may run (the fallback judge never shares one).
+            let binaries =
+                crate::cli_runner::launched_identities(&seat, unit.assigned_invocation.clone());
+            if crate::domain::stamp_author(&mut unit, seat, binaries) {
                 team_changed = true;
             }
         }
@@ -9290,6 +9295,19 @@ fn dispatch_unit(
         unit.assigned_cli = Some(alt);
         unit.assigned_invocation = None;
         team_changed = true;
+    }
+    // (codex r5/r6) A Creator-role unit of another stage authors the artifact an evaluator's judge
+    // reads: the binaries of its FINAL seat for this dispatch (after the reseat above) are recorded
+    // for the fallback judge. Its seat is not added to `authored_by`, which evaluator seating reads
+    // for Build/Recon work only.
+    if !builds && unit.tool_cmd.is_none() && unit.role == crate::workflow::PhaseRole::Creator {
+        if let Some(seat) = unit.assigned_cli.clone() {
+            let binaries =
+                crate::cli_runner::launched_identities(&seat, unit.assigned_invocation.clone());
+            if crate::domain::stamp_author_binaries(&mut unit, previously_dispatched, binaries) {
+                team_changed = true;
+            }
+        }
     }
     // (core#810) The worker pool is re-filled against the run's CURRENT seats at every dispatch:
     // a failover, a bench reseat or an operator reassign moves `assigned_cli` after distribution,
@@ -10114,11 +10132,14 @@ fn dispatch_unit(
     // (F-7R2-006 / review RT-1) The run's roster and bench ride to the worker thread: the agent
     // judge is drawn from the seats this run configured, never a benched one.
     let run_roster_keys: Vec<String> = session.clis.clone();
-    let benched_keys: Vec<String> = session
-        .benched_seats
-        .iter()
-        .map(|b| b.cli.clone())
-        .collect();
+    // (operator ruling 2026-10-14) …with its reasons: a fallback judge's disclosure names why.
+    let bench: Vec<crate::domain::BenchedSeat> = session.benched_seats.clone();
+    // (operator ruling 2026-10-14, codex r1/r8) Every seat that authored the run's work before this
+    // unit — and every binary it may have run — is excluded from this unit's FALLBACK judge,
+    // whether or not the unit's judge reads a creator's cold output (`None`: an author's binary
+    // cannot be established, so no fallback judge).
+    let work_authors: Vec<String> = pipeline::fallback_work_authors(&units, unit.ord);
+    let author_binaries: Option<Vec<String>> = pipeline::work_author_binaries(&units, unit.ord);
     let runner = runner.clone();
     let tx = self_tx.clone();
     // The bus exec mediation is armed over (a publish that fell back in-process): the judge still
@@ -10163,7 +10184,9 @@ fn dispatch_unit(
             agent_review_target.as_deref(),
             &emit,
             &run_roster_keys,
-            &benched_keys,
+            &bench,
+            &work_authors,
+            author_binaries.as_deref(),
             exec_bus.as_deref(),
             team_runner.as_ref(),
         );

@@ -57,6 +57,26 @@ pub struct OperatorJudgment {
     pub reason: Option<String>,
 }
 
+/// (operator ruling 2026-10-14) A judge seated IN PLACE of the run's preferred judge, because
+/// every preferred judge seat was benched for the run (codex's worktree bench, a sign-in refusal)
+/// or failed as a seat while judging. The fallback seat is drawn from the fallback seats (Claude
+/// Code, then Antigravity — `cli_runner::JUDGE_FALLBACK_SEATS`), distinct from every seat the
+/// contract excludes (the creator, every author, the evaluator, the validator author, the team).
+/// Labelled on the gate, its receipt and the delivery receipt — never silent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JudgeFallback {
+    /// The seat that judged.
+    pub seat: String,
+    /// The preferred judge seats it stood in for, in rotation order.
+    pub preferred: Vec<String>,
+    /// Why they could not judge, in the engine's words (`<seat> benched: <reason>` / `<seat>
+    /// unavailable: <cause>`, `; `-joined).
+    pub reason: String,
+    /// The disclosure line: `judge: <seat> (fallback; <preferred> benched: <reason>)`.
+    pub label: String,
+}
+
 /// Why an instrument is absent from a receipt.
 pub const SKIP_REDUCED: &str = "reduced_assurance";
 pub const SKIP_NO_DISTINCT_SEAT: &str = "no_distinct_seat";
@@ -401,6 +421,11 @@ pub struct AssuranceReceipt {
     /// no judge could rule; absent when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operator_judges: Vec<OperatorJudgment>,
+    /// (operator ruling 2026-10-14) Every judge seated as a FALLBACK for a benched or unavailable
+    /// preferred judge ([`JudgeFallback`]); on a gate receipt at most one, on a delivery receipt
+    /// every gate's. Absent when every judge was the run's own (the routine case).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub judge_fallbacks: Vec<JudgeFallback>,
 }
 
 impl AssuranceReceipt {

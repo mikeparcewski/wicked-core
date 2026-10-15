@@ -547,6 +547,47 @@ pub struct PoolSeating {
     pub shortfall: Option<String>,
 }
 
+/// (operator ruling 2026-10-14, the fallback judge) The [`WorkUnit::authored_binaries`] entry that
+/// marks an INCOMPLETE history: the unit had authors before binaries were recorded (persisted before
+/// the record existed), so some author's binary can never be established. Kept across later
+/// dispatches, so a new recorded launch never makes the history look complete.
+pub const UNKNOWN_AUTHOR_BINARY: &str = "(unrecorded)";
+
+/// Record that `seat`, running `binary`, authored `unit` (a dispatch, a floor fix). Returns whether
+/// anything changed. A unit that already had authors but no recorded binary gets
+/// [`UNKNOWN_AUTHOR_BINARY`] first.
+pub fn stamp_author(unit: &mut WorkUnit, seat: String, binaries: Vec<String>) -> bool {
+    let mut changed = stamp_author_binaries(unit, !unit.authored_by.is_empty(), binaries);
+    if !unit.authored_by.contains(&seat) {
+        unit.authored_by.push(seat);
+        changed = true;
+    }
+    changed
+}
+
+/// Record `binaries` (every identity one authoring launch may execute) on `unit`. `had_authors`:
+/// the unit was authored before this stamp — with no binary recorded yet, that history is from
+/// before the record, so [`UNKNOWN_AUTHOR_BINARY`] goes first and stays.
+pub fn stamp_author_binaries(
+    unit: &mut WorkUnit,
+    had_authors: bool,
+    binaries: Vec<String>,
+) -> bool {
+    let mut changed = false;
+    if had_authors && unit.authored_binaries.is_empty() {
+        unit.authored_binaries
+            .push(UNKNOWN_AUTHOR_BINARY.to_string());
+        changed = true;
+    }
+    for b in binaries {
+        if !unit.authored_binaries.contains(&b) {
+            unit.authored_binaries.push(b);
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// One seat benched for a run ([`AgentSession::benched_seats`], F-7R2-006).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BenchedSeat {
@@ -948,6 +989,14 @@ pub struct WorkUnit {
     /// test and security-review units were dispatched onto claude, then codex).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub authored_by: Vec<String>,
+    /// (operator ruling 2026-10-14, the fallback judge) The BINARY each of those dispatches actually
+    /// ran — the launcher's own resolution of the seat and the invocation it was dispatched with
+    /// (`cli_runner::launched_identity`), stamped beside [`Self::authored_by`] and never cleared, so
+    /// a reassign that clears `assigned_invocation` cannot erase it. A fallback judge never shares
+    /// one; a unit with authors but no recorded binaries (persisted before this field) has authors
+    /// whose binaries cannot be established, and no fallback judge is seated for its work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authored_binaries: Vec<String>,
     /// The PHASE IDS this unit's work depends on — carried verbatim from the backing phase's
     /// [`depends_on`](crate::workflow::PhaseDef::depends_on) at plan time (FINDING-024).
     ///
@@ -1402,6 +1451,7 @@ impl WorkUnit {
             tool_cmd: None,
             worker_failed_clis: Vec::new(),
             authored_by: Vec::new(),
+            authored_binaries: Vec::new(),
             depends_on: Vec::new(),
             pre_build_scope: false,
             team_run: false,
