@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core: a run whose contract requires QE acceptance gets a QE test whatever its band (core#960).**
+  A QE-required plan without a `test` step (for example a PA-scoped `build → review` that scored low)
+  could never earn acceptance or a waiver, so it could never deliver. Floor fill now adds a `test`
+  after the plan's last step that may change the tree and before its deliver step (floor reason "the
+  run's assurance contract requires QE acceptance"), where a QE unit is reachable. A manual override
+  cannot remove it while it is owed. Operator and standing skips, and plans with no code creator, are
+  unchanged. Under a QE contract `test` steps are placed by this rule, not by catalog order. The
+  built-in `migration` preset gains a `test` after `cleanup`, which changes code after `verify`.
 - **core, core-ts: a diagnostic line no longer kills the thread that writes it (core#957).** Several
   unattended runs at once in a Node host (crew) could hang a unit in `executing`, or stop the actor
   ("core actor stopped") with no panic printed. Node hands the addon a non-blocking stderr pipe; when

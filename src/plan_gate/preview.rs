@@ -55,6 +55,7 @@ pub struct PlanPreview {
 
 /// Preview `plan` as a launch with `human_confirm` would decide it. `Err` carries the refusal the
 /// launch would return (compose, provenance, the override in auto mode, …).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn preview_plan(
     plan: &PlanSteps,
     human_confirm: &HumanConfirm,
@@ -63,6 +64,7 @@ pub(crate) fn preview_plan(
     deliver_step: Option<&PlanStep>,
     rules: &dyn super::RuleSource,
     requires_evaluator: bool,
+    requires_qe: bool,
 ) -> anyhow::Result<PlanPreview> {
     // The launch's synchronous checks, then its decision — the same calls, in the same order.
     if let Err(r) = super::precheck(plan, deliver_step, human_confirm) {
@@ -105,6 +107,7 @@ pub(crate) fn preview_plan(
             deliver_step: deliver_step.cloned(),
             // (core#934, codex r1) The launch's contract floor, so the preview matches it.
             requires_evaluator,
+            requires_qe,
             ..super::TeamPlanState::default()
         },
         human_confirm,
@@ -159,7 +162,16 @@ mod tests {
     }
 
     fn preview_of(p: &PlanSteps, hc: &HumanConfirm) -> anyhow::Result<PlanPreview> {
-        preview_plan(p, hc, None, None, None, &crate::plan_gate::NoRules, false)
+        preview_plan(
+            p,
+            hc,
+            None,
+            None,
+            None,
+            &crate::plan_gate::NoRules,
+            false,
+            false,
+        )
     }
 
     fn preview(v: Value, hc: HumanConfirm) -> Value {
@@ -313,6 +325,7 @@ mod tests {
             None,
             &rules,
             false,
+            false,
         )
         .expect("a pending-scope preview is not refused by a rule the launch has not read");
         assert_eq!(p.graph, "pending_pa_scope");
@@ -326,12 +339,47 @@ mod tests {
             None,
             &rules,
             false,
+            false,
         );
         assert!(
             declared.is_err(),
             "the declared plan is refused by the rule"
         );
         assert!(rules.0.get() > 0);
+    }
+
+    #[test]
+    fn core_960_preview_honors_the_qe_contract_at_a_low_score() {
+        let p = plan(json!({"steps": [
+            {"catalog": "build", "id": "build"},
+            {"catalog": "review", "id": "review"}
+        ], "touch": ["docs/small-fix.md"]}));
+        for requires_qe in [false, true] {
+            let preview = preview_plan(
+                &p,
+                &HumanConfirm::None,
+                None,
+                None,
+                None,
+                &crate::plan_gate::NoRules,
+                true,
+                requires_qe,
+            )
+            .unwrap();
+            assert_eq!(preview.band, "0-19");
+            let tests: Vec<_> = preview
+                .steps
+                .iter()
+                .filter(|s| s.catalog == "test")
+                .collect();
+            assert_eq!(tests.len(), usize::from(requires_qe));
+            if let Some(test) = tests.first() {
+                assert_eq!(
+                    test.floor_reason.as_deref(),
+                    Some(crate::plan::CONTRACT_QE_REASON)
+                );
+            }
+        }
     }
 
     /// The launch's refusals are the preview's: an override in auto mode, an unknown catalog id,
@@ -393,6 +441,7 @@ mod tests {
             Some(&d),
             &crate::plan_gate::NoRules,
             false,
+            false,
         )
         .unwrap();
         assert!(p.floor.contains(&"deliver".to_string()), "{:?}", p.floor);
@@ -407,7 +456,7 @@ mod tests {
             &HumanConfirm::All,
             None,
             None,
-            Some(&d), &crate::plan_gate::NoRules, false,
+            Some(&d), &crate::plan_gate::NoRules, false, false,
         )
         .is_err());
     }

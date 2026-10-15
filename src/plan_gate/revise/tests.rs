@@ -755,6 +755,7 @@ fn a_creator_less_accepted_plan_has_an_empty_floor_at_any_recorded_band() {
                 obligations: &[],
                 ran: &[],
                 requires_evaluator: false,
+                requires_qe: false,
             },
         )
         .unwrap();

@@ -1494,6 +1494,63 @@ fn a_plan_the_worst_case_floor_would_push_past_the_limit_is_refused_at_launch() 
     );
 }
 
+/// core#960: the scope step and band floor fit exactly, but the QE contract owes one more test.
+/// Refuse before persisting a session; the same preset fits when the operator skips QE.
+#[test]
+fn core_960_a_qe_contract_floor_past_the_limit_is_refused_synchronously() {
+    let dir = tmp_dir("qe-limit");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    {
+        let mut store = wicked_apps_core::open_store(Some(&db)).unwrap();
+        wicked_core::put_preset_requiring(
+            &mut store,
+            PresetSpec {
+                name: "qe-limit".into(),
+                project_id: None,
+                steps: builds(UNIT_LIMIT - 6)
+                    .steps
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, step)| wicked_core::PlanStep {
+                        id: format!("build-{ix}"),
+                        ..step
+                    })
+                    .collect(),
+                created_by: "api".into(),
+            },
+            Some(vec![
+                wicked_core::assurance::DISTINCT_EVALUATOR.into(),
+                wicked_core::assurance::JUDGE.into(),
+                wicked_core::assurance::QE_ACCEPTANCE.into(),
+            ]),
+            0,
+        )
+        .unwrap();
+    }
+    let mut rig = spawn(&db);
+    let mut launch = spec("qe-over-limit", HumanConfirm::None, None);
+    launch.workflow = Some("qe-limit".into());
+    let msg = refused_launch(&rig, "qe-over-limit", launch);
+    assert!(msg.contains("251 authored units"), "{msg}");
+    assert!(msg.contains("6 the floor may add"), "{msg}");
+    assert!(
+        msg.contains("test_plan, design, architecture, test, review, security_review"),
+        "{msg}"
+    );
+    assert!(msg.contains("256-unit governed limit"), "{msg}");
+
+    let mut launch = spec("qe-limit-skipped", HumanConfirm::None, None);
+    launch.workflow = Some("qe-limit".into());
+    launch.qe_acceptance = wicked_core::assurance::QeOverride::Skip("tests run elsewhere".into());
+    rig.core
+        .launch_run(launch)
+        .expect("fits when QE is skipped");
+    rig.tap.until("the skipped run's plan_approval pause", |s| {
+        paused_on_plan(s, "qe-limit-skipped").is_some()
+    });
+    assert_eq!(unit_ids(&rig.core, "qe-limit-skipped").len(), UNIT_LIMIT);
+}
+
 /// A plan that fits WITH its scope step and the worst-case floor still launches (and floors to
 /// exactly the limit once its PA's answer — none, so 100 — is scored).
 #[test]
