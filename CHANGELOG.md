@@ -14,6 +14,11 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core-ts**: `Core.qeReviewersAdmitted(seatsJson)` judges a whole roster's QE
+  reviewer admission against one routing snapshot, off the Node thread (wicked-crew#1021).
+- **core**: `qe_reviewers_admitted` judges every seat's QE reviewer admission against one routing
+  snapshot, returning the same verdicts as per-seat `qe_reviewer_admitted` calls (wicked-crew#1021).
+
 - **A benched or unavailable judge gets a disclosed fallback judge (operator ruling 2026-10-14).** On a host
   whose codex cannot run commands, codex is benched for every repository-bound run. When every other run seat
   was a party to the work, every gate escalated `judge_unavailable` and the operator approved each one by hand

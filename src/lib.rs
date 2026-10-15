@@ -445,6 +445,26 @@ pub fn qe_reviewer_admitted(key: &str, invocation: Option<String>) -> bool {
     )
 }
 
+/// Judge a whole roster's QE reviewer admission against one routing snapshot, in input order.
+/// Each result is the same as calling [`qe_reviewer_admitted`] for that seat against the same
+/// skills root; the skills ladder is resolved only once for the whole batch.
+pub fn qe_reviewers_admitted(seats: &[(String, Option<String>)]) -> Vec<bool> {
+    if seats.is_empty() {
+        return Vec::new(); // no seat, no skills-root walk (agy on #956)
+    }
+    let snapshot = crate::skills_snapshot::routing_snapshot();
+    seats
+        .iter()
+        .map(|(key, invocation)| {
+            crate::distribute::qe_reviewer_admitted_against(
+                snapshot.as_ref(),
+                key,
+                invocation.clone(),
+            )
+        })
+        .collect()
+}
+
 /// Resolve the council roster from the registry (built-ins merged with the user's
 /// `~/.config/wicked-council/clis.toml`), keeping every seat that may vote OR work (core#572:
 /// routing reads `seat_eligible_for_work`, a decision's ballots `enabled_for_council`). This is

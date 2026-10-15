@@ -205,6 +205,12 @@ export declare class Core {
    */
   static qeReviewerAdmitted(key: string, invocation?: string | undefined | null): boolean
   /**
+   * Judge a whole roster's QE reviewer admission against one routing snapshot, off the Node
+   * thread (wicked-crew#1021). `seatsJson` is an array of `{key, invocation?}` (invocation may
+   * be null); resolves to `[{key, admitted}]` in input order. Invalid JSON rejects the promise.
+   */
+  static qeReviewersAdmitted(seatsJson: string): Promise<string>
+  /**
    * Whether this addon carries DES-TEAMING-002 T3's plan launch: `LaunchOptions.planJson` /
    * `deliverStepJson` and `confirmGate(…, planJson)`. napi IGNORES an undeclared object field,
    * so a launcher keys on this static's presence before it sends a plan — an older addon would
