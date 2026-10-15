@@ -726,7 +726,8 @@ fn m3_chat_launches_its_c1_unit_list_with_no_scope_step() {
 /// creator plan with no declared `touch`, the PA scopes it first (`pa-scope`, ord 1, X1), and this
 /// rig's PA declares nothing, so the plan fails closed at 100 and floor fill adds the 70-100 phases
 /// migration lacks (`test_plan`, `architecture`, `review`, `security_review`) at their catalog-order
-/// positions.
+/// positions. (core#960) migration requires QE acceptance, and `cleanup` changes code after `verify`,
+/// so the QE contract adds a `test` after `cleanup`: QE judges the tree that ships.
 #[test]
 fn m2_migration_launches_the_preset_with_its_bold_cells() {
     let dir = tmp_dir("migration");
@@ -763,6 +764,7 @@ fn m2_migration_launches_the_preset_with_its_bold_cells() {
             r("cutover", "build", "creator", hcu, f),
             r("verify", "test", "evaluator", hci, f),
             r("cleanup", "build", "creator", "auto", f),
+            r("test", "test", "evaluator", hci, f),
             r("review", "review", "evaluator", "auto", f),
             r("security_review", "review", "evaluator", "auto", f),
         ]
