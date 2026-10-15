@@ -1423,22 +1423,41 @@ fn floor_types(
         .collect()
 }
 
+/// Whether the QE contract floor would add a test step to this plan.
+fn owes_qe_test(
+    catalog: &[crate::workflow::PhaseDef],
+    plan: &PlanSteps,
+    requires_qe: bool,
+) -> bool {
+    requires_qe
+        && plan.has_creator_in(catalog)
+        && plan.steps.iter().any(|s| code_work_step(catalog, s))
+        && !plan.steps.iter().any(|s| s.catalog == "test")
+}
+
 /// The phase types floor fill could insert into `plan` in the WORST case: the top band's floor
 /// (read from `THRESHOLDS` — the highest score any plan can reach, destructive or not) minus the
-/// types the plan already has. Floor fill inserts exactly one step per missing floor type and a
-/// ratchet never exceeds the top band, so `plan` units plus this count is an exact upper bound on
+/// types the plan already has, plus the QE contract's test when owed. Floor fill inserts exactly
+/// one step per missing floor type and a ratchet never exceeds the top band, so `plan` units
+/// plus this count is an exact upper bound on
 /// what the run will plan — what a launch's synchronous unit limit checks (codex round 5 on #622)
 /// before any score exists.
 pub fn worst_case_floor_additions(
     catalog: &[crate::workflow::PhaseDef],
     plan: &PlanSteps,
     delivers: bool,
+    requires_qe: bool,
 ) -> Vec<String> {
     let top = crate::review_scale::floor_for(u8::MAX, true);
-    floor_types(catalog, plan, &top.phases, delivers)
+    let mut additions: Vec<_> = floor_types(catalog, plan, &top.phases, delivers)
         .into_iter()
         .filter(|ty| !plan.steps.iter().any(|s| &s.catalog == ty))
-        .collect()
+        .collect();
+    if owes_qe_test(catalog, plan, requires_qe) && !additions.iter().any(|ty| ty == "test") {
+        additions.push("test".to_string());
+    }
+    additions.sort_by_key(|ty| catalog.iter().position(|e| &e.id == ty));
+    additions
 }
 
 /// Floor-fill a plan and compose it (DES-TEAMING-002 §8.5): every floor phase type missing from
@@ -1508,9 +1527,7 @@ pub fn floor_fill(
     // §8.5 floor override: none in auto mode; in manual mode recorded, and never a pinned BAND
     // floor phase in a high-risk band. It exempts floor types from the fill; it removes no
     // authored step.
-    let qe_reachable = creator && plan.steps.iter().any(|s| code_work_step(catalog, s));
-    let owes_qe =
-        input.requires_qe && qe_reachable && !plan.steps.iter().any(|s| s.catalog == "test");
+    let owes_qe = owes_qe_test(catalog, plan, input.requires_qe);
     let mut exempt: Vec<&str> = Vec::new();
     if let Some(ov) = &plan.floor_override {
         if matches!(input.human_confirm, crate::domain::HumanConfirm::None) {

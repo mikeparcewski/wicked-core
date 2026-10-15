@@ -1538,6 +1538,14 @@ pub(crate) fn run(
                         Some((plan, _)) => crate::plan_gate::worst_case_floor_additions(
                             plan,
                             spec.deliver_step.as_ref(),
+                            launch_plan_assurance(
+                                selected_def
+                                    .as_ref()
+                                    .and_then(|d| d.required_instruments.as_deref()),
+                                spec.reduced_assurance,
+                                &spec.qe_acceptance,
+                            )
+                            .enforces(crate::assurance::QE_ACCEPTANCE),
                         ),
                         None => Vec::new(),
                     };
@@ -4113,6 +4121,21 @@ fn validate_session_id(run_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The contract used by planning before a launch session exists (and by previews).
+fn launch_plan_assurance(
+    instruments: Option<&[String]>,
+    reduced_assurance: bool,
+    qe_acceptance: &crate::assurance::QeOverride,
+) -> crate::assurance::RunAssurance {
+    let assurance = crate::assurance::RunAssurance::new(instruments, reduced_assurance);
+    // A QE word that cannot apply is refused by the launch elsewhere. Keep the un-overridden
+    // contract for these planning checks until that refusal, rather than weakening its floors.
+    assurance
+        .clone()
+        .with_qe_override(qe_acceptance)
+        .unwrap_or(assurance)
+}
+
 /// (DES-TEAMING-002 §8.4-§8.6, T3) Put a launch's plan — its user-composed `plan`, or the steps
 /// of the preset its `workflow` names — through the one plan pipeline: `plan.proposed`, the
 /// intent score against the run's graph at `base_commit` (`path.scored`), floor fill, compose,
@@ -4185,7 +4208,11 @@ fn team_plan_at_launch(
         {
             stub.assurance
         }
-        _ => crate::assurance::RunAssurance::new(instruments.as_deref(), spec.reduced_assurance),
+        _ => launch_plan_assurance(
+            instruments.as_deref(),
+            spec.reduced_assurance,
+            &spec.qe_acceptance,
+        ),
     };
     let prior = crate::plan_gate::TeamPlanState {
         roster: spec
@@ -4318,7 +4345,11 @@ fn preview_launch_plan(
         Some(name) => crate::preset::required_instruments(&*store, project_id, name)?,
         None => None,
     };
-    let assurance = crate::assurance::RunAssurance::new(instruments.as_deref(), false);
+    let assurance = launch_plan_assurance(
+        instruments.as_deref(),
+        false,
+        &crate::assurance::QeOverride::Auto,
+    );
     // (WT-C3) The testing rules a launch filed in `project_id` would compose under; a preview
     // is not teamed (no run exists), so its kinds fail closed exactly as the launch's do.
     let rules = crate::plan_gate::StoreRules {

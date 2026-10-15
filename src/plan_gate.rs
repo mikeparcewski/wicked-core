@@ -1261,6 +1261,7 @@ pub(crate) fn precheck(
 pub(crate) fn worst_case_floor_additions(
     plan: &PlanSteps,
     deliver_step: Option<&PlanStep>,
+    requires_qe: bool,
 ) -> Vec<String> {
     // A plan the launch refuses for two deliver sources is counted as authored (it never runs).
     let plan = with_default_ids(&with_deliver(plan, deliver_step).unwrap_or_else(|_| plan.clone()));
@@ -1268,6 +1269,7 @@ pub(crate) fn worst_case_floor_additions(
         crate::catalog::catalog(),
         &plan,
         deliver_step.is_some(),
+        requires_qe,
     )
 }
 
@@ -2592,42 +2594,96 @@ mod tests {
     /// §8.5's 70-100 row), with the non-code substitution and `deliver` only for a delivering run.
     #[test]
     fn worst_case_floor_additions_are_the_top_band_types_the_plan_lacks() {
-        let adds =
-            |v: serde_json::Value, d: Option<&PlanStep>| worst_case_floor_additions(&plan(v), d);
-        assert_eq!(
-            adds(json!({"steps": [{"catalog": "build"}]}), None),
-            [
-                "test_plan",
-                "design",
-                "architecture",
-                "review",
-                "security_review"
-            ]
-        );
-        assert_eq!(
-            adds(
-                json!({"steps": [{"catalog": "build"}, {"catalog": "review"}]}),
-                None
-            ),
-            ["test_plan", "design", "architecture", "security_review"]
-        );
-        // No creator step: an empty floor.
-        assert!(adds(json!({"steps": [{"catalog": "understand"}]}), None).is_empty());
-        // A non-code run: `critique` fills the review slot, and no diff-floored
-        // `security_review` (core#649).
-        assert_eq!(
-            adds(json!({"steps": [{"catalog": "produce"}]}), None),
-            ["test_plan", "design", "architecture", "critique"]
-        );
-        // A delivering run carries its deliver step, so `deliver` is never an addition.
-        let d: PlanStep = serde_json::from_value(json!({
-            "catalog": "deliver", "id": "deliver", "executor": {"type": "tool", "cmd": ["true"]}
-        }))
-        .unwrap();
-        assert_eq!(
-            adds(json!({"steps": [{"catalog": "build"}]}), Some(&d)).len(),
-            5
-        );
+        let adds = |v: serde_json::Value, d: Option<&PlanStep>, requires_qe: bool| {
+            worst_case_floor_additions(&plan(v), d, requires_qe)
+        };
+        for requires_qe in [false, true] {
+            let expected = if requires_qe {
+                vec![
+                    "test_plan",
+                    "design",
+                    "architecture",
+                    "test",
+                    "review",
+                    "security_review",
+                ]
+            } else {
+                vec![
+                    "test_plan",
+                    "design",
+                    "architecture",
+                    "review",
+                    "security_review",
+                ]
+            };
+            assert_eq!(
+                adds(json!({"steps": [{"catalog": "build"}]}), None, requires_qe),
+                expected
+            );
+            let expected = if requires_qe {
+                vec![
+                    "test_plan",
+                    "design",
+                    "architecture",
+                    "test",
+                    "security_review",
+                ]
+            } else {
+                vec!["test_plan", "design", "architecture", "security_review"]
+            };
+            assert_eq!(
+                adds(
+                    json!({"steps": [{"catalog": "build"}, {"catalog": "review"}]}),
+                    None,
+                    requires_qe
+                ),
+                expected
+            );
+            // An authored test already meets the contract; count it only once.
+            assert_eq!(
+                adds(
+                    json!({"steps": [{"catalog": "build"}, {"catalog": "test"}]}),
+                    None,
+                    requires_qe
+                ),
+                [
+                    "test_plan",
+                    "design",
+                    "architecture",
+                    "review",
+                    "security_review"
+                ]
+            );
+            // No creator step: an empty floor, even when a step does code work.
+            for catalog in ["understand", "review"] {
+                assert!(
+                    adds(json!({"steps": [{"catalog": catalog}]}), None, requires_qe).is_empty()
+                );
+            }
+            // A non-code run substitutes critique and owes neither security_review nor test.
+            assert_eq!(
+                adds(
+                    json!({"steps": [{"catalog": "produce"}]}),
+                    None,
+                    requires_qe
+                ),
+                ["test_plan", "design", "architecture", "critique"]
+            );
+            // A delivering run carries its deliver step, so deliver is never an addition.
+            let d: PlanStep = serde_json::from_value(json!({
+                "catalog": "deliver", "id": "deliver", "executor": {"type": "tool", "cmd": ["true"]}
+            }))
+            .unwrap();
+            assert_eq!(
+                adds(
+                    json!({"steps": [{"catalog": "build"}]}),
+                    Some(&d),
+                    requires_qe
+                )
+                .len(),
+                if requires_qe { 6 } else { 5 }
+            );
+        }
     }
 
     /// WT-C4 (DES-walkthrough-proof §4.12 S5): the shipped testing starter, read by the engine

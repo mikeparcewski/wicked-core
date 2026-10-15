@@ -872,11 +872,8 @@ fn x1_r2_m2_a_restart_after_the_scope_fold_decides_the_plan_not_completes_the_ru
     release_all(&w2);
 }
 
-/// core#960: a QE-required preset that authors build -> review reaches the lowest band after
-/// PA scope. Its persisted contract adds a QE unit; an operator skip on that same launch does not.
-#[test]
-fn core_960_a_launch_adds_required_qe_unless_the_operator_skips_it() {
-    let rig = rig("core-960");
+fn qe_contract_engine(name: &str) -> Engine {
+    let rig = rig(name);
     let db = rig.dir.join("core.db").to_string_lossy().into_owned();
     {
         // Seed before spawning the sole store writer.
@@ -912,7 +909,15 @@ fn core_960_a_launch_adds_required_qe_unless_the_operator_skips_it() {
     });
     let cfg = team_cfg(&rig, Duration::from_millis(300));
     let core = Core::spawn_with_engine_team(db, Arc::new(StubDispatcher), worker.clone(), cfg);
-    let e = wire(core, worker.clone(), rig);
+    wire(core, worker, rig)
+}
+
+/// core#960: a QE-required preset that authors build -> review reaches the lowest band after
+/// PA scope. Its persisted contract adds a QE unit; an operator skip on that same launch does not.
+#[test]
+fn core_960_a_launch_adds_required_qe_unless_the_operator_skips_it() {
+    let e = qe_contract_engine("core-960");
+    let worker = e.worker.clone();
     for (run, word, requires_qe) in [
         ("qe-required", crate::assurance::QeOverride::Auto, true),
         (
@@ -959,6 +964,95 @@ fn core_960_a_launch_adds_required_qe_unless_the_operator_skips_it() {
         }
     }
     release_all(&worker);
+}
+
+/// core#960: campaign launches have no Planning stub. Both the node's own skip and the
+/// host's standing skip must reach the plan contract before the PA adds any mandatory test.
+#[test]
+fn core_960_a_campaign_adds_required_qe_unless_the_node_or_host_skips_it() {
+    use crate::campaign::{CampaignDef, CampaignNode, DenialGatePolicy, FailurePolicy, RunSpec};
+
+    let e = qe_contract_engine("core-960-campaign");
+    for (campaign, skip, host_skip, requires_qe) in [
+        ("qe-required-campaign", None, None, true),
+        (
+            "qe-skipped-campaign",
+            Some("tests run elsewhere"),
+            None,
+            false,
+        ),
+        (
+            "qe-standing-campaign",
+            None,
+            Some("host runs tests elsewhere"),
+            false,
+        ),
+    ] {
+        e.core
+            .set_qe_acceptance_off(host_skip.map(str::to_string))
+            .unwrap();
+        e.core
+            .launch_campaign(CampaignDef {
+                id: campaign.into(),
+                name: campaign.into(),
+                nodes: vec![CampaignNode {
+                    node_id: "node".into(),
+                    run_spec: RunSpec {
+                        problem: "core#960 campaign QE floor".into(),
+                        clis: vec![cli("a"), cli("b")],
+                        entity_mode: crate::EntityMode::Shared,
+                        human_confirm: HumanConfirm::None,
+                        repo_ref: None,
+                        workflow_id: Some("qe-contract".into()),
+                        skip_qe_acceptance_reason: skip.map(str::to_string),
+                        force_qe_acceptance: false,
+                    },
+                }],
+                edges: vec![],
+                policy: FailurePolicy::ContinueIndependent,
+                max_concurrency: 1,
+                denial_gate: DenialGatePolicy::default(),
+            })
+            .expect("launch campaign");
+        let run = format!("{campaign}:node:a0");
+        wait_for("the campaign's PA-scoped plan to be accepted", || {
+            e.core.sessions_detail().unwrap().iter().any(|v| {
+                v.session.id == run
+                    && v.session
+                        .team_plan
+                        .as_ref()
+                        .is_some_and(|p| p.accepted_rev == 2)
+            })
+        });
+        let v = view(&e, &run);
+        let state = v.session.team_plan.as_ref().unwrap();
+        assert_eq!(state.max_score, 0);
+        assert_eq!(state.requires_qe, requires_qe);
+        assert_eq!(
+            v.session
+                .assurance
+                .enforces(crate::assurance::QE_ACCEPTANCE),
+            requires_qe
+        );
+        assert_eq!(
+            v.units
+                .iter()
+                .filter(|u| crate::qe_acceptance::is_qe_unit(u))
+                .count(),
+            usize::from(requires_qe)
+        );
+        let accepted = settled(&e, &run, tev::PLAN_ACCEPTED, 2);
+        assert_eq!(
+            accepted[1]["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|s| s["catalog"] == "test")
+                .count(),
+            usize::from(requires_qe)
+        );
+    }
+    release_all(&e.worker);
 }
 
 // ── X3: a plan or preset step's declared deliverables are the ENGINE's floor ─────────────────────
