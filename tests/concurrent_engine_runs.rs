@@ -35,6 +35,7 @@ fn hermetic_process() {
             "WICKED_BUS_DB",
             "WICKED_BUS_EXEC",
             "WICKED_SKILLS_SNAPSHOT",
+            "WICKED_BASE_SKILL_REF",
             "WICKED_OTEL_ENDPOINT",
             "WICKED_ESTATE_DB",
         ] {
