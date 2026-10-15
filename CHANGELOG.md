@@ -470,6 +470,11 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.11.2** — 2026-10-15 — patch release on main 42b9ddc, carrying #966 (core#957: a diagnostic
+  line no longer kills the thread that writes it). In a Node host the addon's stderr is a non-blocking
+  pipe. When its reader lagged, std's `eprintln!` panicked on EAGAIN and the panic message was lost, so a
+  unit worker died with its result (the run hung in `executing`) or the actor died (`core actor stopped`).
+  Several concurrent unattended runs made it likely. A patch: no surface change.
 - **core-ts 0.11.1** — 2026-10-15 — patch release on main 2835fb2, carrying #952 (QE acceptance on
   engine-made launches: `LaunchSpec` QE fields, `Core.setQeAcceptanceOff`), #953 (a benched or unavailable
   judge gets a disclosed fallback judge), #956 (`Core.qeReviewersAdmitted`: a whole roster's QE reviewer
