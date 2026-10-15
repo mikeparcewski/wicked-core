@@ -613,6 +613,27 @@ fn propose_plan_json(
     serde_json::to_string(&proposal).map_err(err)
 }
 
+fn qe_reviewers_admitted_json(seats_json: &str) -> napi::Result<String> {
+    #[derive(serde::Deserialize)]
+    struct Seat {
+        key: String,
+        invocation: Option<String>,
+    }
+    let seats: Vec<Seat> = serde_json::from_str(seats_json).map_err(|e| {
+        err(format!(
+            "seatsJson is not a valid QE reviewer seat array: {e}"
+        ))
+    })?;
+    let seats: Vec<_> = seats.into_iter().map(|s| (s.key, s.invocation)).collect();
+    let admitted = wicked_core::qe_reviewers_admitted(&seats);
+    let results: Vec<_> = seats
+        .iter()
+        .zip(admitted)
+        .map(|((key, _), admitted)| serde_json::json!({ "key": key, "admitted": admitted }))
+        .collect();
+    serde_json::to_string(&results).map_err(err)
+}
+
 fn task<F>(f: F) -> AsyncTask<CoreTask>
 where
     F: FnOnce() -> napi::Result<String> + Send + 'static,
@@ -939,6 +960,14 @@ impl Core {
     #[napi]
     pub fn qe_reviewer_admitted(key: String, invocation: Option<String>) -> bool {
         wicked_core::qe_reviewer_admitted(&key, invocation)
+    }
+
+    /// Judge a whole roster's QE reviewer admission against one routing snapshot, off the Node
+    /// thread (wicked-crew#1021). `seatsJson` is an array of `{key, invocation?}` (invocation may
+    /// be null); resolves to `[{key, admitted}]` in input order. Invalid JSON rejects the promise.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn qe_reviewers_admitted(seats_json: String) -> AsyncTask<CoreTask> {
+        task(move || qe_reviewers_admitted_json(&seats_json))
     }
 
     /// Whether this addon carries DES-TEAMING-002 T3's plan launch: `LaunchOptions.planJson` /
@@ -2749,6 +2778,35 @@ mod tests {
         let unbound = Core::worktree_benched(roster, false).unwrap();
         assert_eq!(unbound, "[]");
         assert!(Core::worktree_benched("{}".into(), true).is_err());
+    }
+
+    #[test]
+    fn qe_reviewers_admitted_answers_the_roster_as_json() {
+        let roster = r#"[{"key":"claude"},{"key":"pi","invocation":null},{"key":"claude#2","invocation":"claude -p {PROMPT}"},{"key":"claude","invocation":"pi {PROMPT}"}]"#;
+        let result: serde_json::Value =
+            serde_json::from_str(&qe_reviewers_admitted_json(roster).unwrap()).unwrap();
+        let rows = result.as_array().unwrap();
+        assert_eq!(rows.len(), 4);
+        for (row, key) in rows.iter().zip(["claude", "pi", "claude#2", "claude"]) {
+            assert_eq!(row["key"], key);
+            assert!(row["admitted"].is_boolean(), "{row}");
+            assert_eq!(row.as_object().unwrap().len(), 2);
+        }
+        assert_eq!(qe_reviewers_admitted_json("[]").unwrap(), "[]");
+        for bad in [
+            "not json",
+            "{}",
+            "[{}]",
+            r#"[{"key":"pi","invocation":42}]"#,
+        ] {
+            let error = qe_reviewers_admitted_json(bad).unwrap_err();
+            assert!(
+                error
+                    .reason
+                    .contains("seatsJson is not a valid QE reviewer seat array"),
+                "{error}"
+            );
+        }
     }
 
     /// (DC-S1) `Core.considerRules()`: the binding answers the governance split as JSON — a
