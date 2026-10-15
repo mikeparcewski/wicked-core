@@ -449,6 +449,9 @@ pub fn qe_reviewer_admitted(key: &str, invocation: Option<String>) -> bool {
 /// Each result is the same as calling [`qe_reviewer_admitted`] for that seat against the same
 /// skills root; the skills ladder is resolved only once for the whole batch.
 pub fn qe_reviewers_admitted(seats: &[(String, Option<String>)]) -> Vec<bool> {
+    if seats.is_empty() {
+        return Vec::new(); // no seat, no skills-root walk (agy on #956)
+    }
     let snapshot = crate::skills_snapshot::routing_snapshot();
     seats
         .iter()

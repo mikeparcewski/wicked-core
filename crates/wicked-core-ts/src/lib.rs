@@ -625,7 +625,13 @@ fn qe_reviewers_admitted_json(seats_json: &str) -> napi::Result<String> {
         ))
     })?;
     let seats: Vec<_> = seats.into_iter().map(|s| (s.key, s.invocation)).collect();
-    let admitted = wicked_core::qe_reviewers_admitted(&seats);
+    // The batch runs on a libuv worker thread and the routing snapshot logs with `eprintln!`, which
+    // panics when stderr cannot be written (a full non-blocking pipe). A panic must not cross napi's
+    // C boundary and abort the daemon: it becomes the promise's rejection (codex on #956).
+    let admitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wicked_core::qe_reviewers_admitted(&seats)
+    }))
+    .map_err(|_| err("QE reviewer admission panicked while reading the skills root".to_string()))?;
     let results: Vec<_> = seats
         .iter()
         .zip(admitted)
