@@ -2981,48 +2981,26 @@ pub(crate) fn run(
                 }
             }
             Command::ConveneDecision { req, clis, reply } => {
-                // (operator ruling 2026-10-11) Eligible = the RUN's roster minus its benches
-                // (quota, auth, dead seats — `benched_seats`), intersected with what the caller
-                // handed (which already excludes the dispute's parties, so evaluator≠creator
-                // holds). A run with no configured roster (an ad-hoc caller) keeps the caller's.
-                // A ballot-only seat (`seat_eligible_for_work: false`) is never in the work roster
-                // `clis` persists, so it stays eligible unless benched (codex r1).
-                let clis: Vec<crate::AgenticCli> =
-                    match crate::domain::get_session(&store, &req.session_id) {
-                        Ok(Some(session)) => {
-                            let roster = eligible_roster_keys(&session);
-                            // Ballots run the host CLIs on every floor: the host worktree bench
-                            // still applies to them (the container floor lifts it for seats only).
-                            let host_bench = crate::distribute::host_worktree_benched(
-                                &clis,
-                                session.repo_ref.is_some(),
-                            );
-                            clis.into_iter()
-                                .filter(|c| !session.benched_seats.iter().any(|b| b.cli == c.key))
-                                .filter(|c| !host_bench.iter().any(|b| b.cli == c.key))
-                                .filter(|c| {
-                                    // By CLI key: a run configured `codex#2` keeps the `codex`
-                                    // ballot record the registry hands (codex r2).
-                                    (session.clis.is_empty()
-                                        && !wicked_council::registry::is_opt_in(&c.key))
-                                        || !c.seat_eligible_for_work
-                                        || roster.iter().any(|k| {
-                                            wicked_apps_core::spawn::seat_cli_key(k) == c.key
-                                        })
-                                })
-                                .collect()
-                        }
-                        // No run roster to say the operator picked them: opt-in seats sit out.
-                        _ => clis
-                            .into_iter()
-                            .filter(|c| !wicked_council::registry::is_opt_in(&c.key))
-                            .collect(),
-                    };
+                // (operator ruling 2026-10-11) Eligible = the run's unbenched roster intersected
+                // with what the caller handed (which already excludes the dispute's parties, so
+                // evaluator≠creator holds) — `council_roster`.
+                let session = crate::domain::get_session(&store, &req.session_id)
+                    .ok()
+                    .flatten();
+                let clis =
+                    council_roster(session.as_ref(), clis, in_process_governance().is_some());
                 // The system setting (size, stagger) and a fresh seed, read per council.
                 let pick = crate::decision::CouncilPick::from_env();
                 // (core#590 S5) The ballots are slow subprocess turns: run them off the actor
                 // thread, relaying the council's lifecycle events back through the emit point.
-                let disp = dispatcher.clone();
+                // (C5 follow-up) The ballots follow the seat floor, as the judges and triage do:
+                // under the container floor each one runs in its seat's container through the
+                // run's step runner (`decision::SeatBallots`); under the host floor nothing changes.
+                let (disp, ballots_in) = ballot_dispatcher(
+                    &dispatcher,
+                    &runner,
+                    crate::container_floor::container_mode(),
+                );
                 let op_home = operational_home.clone();
                 let relay = council_event_relay(self_tx.clone());
                 std::thread::spawn(move || {
@@ -3035,6 +3013,10 @@ pub(crate) fn run(
                             op_home.as_deref(),
                             pick,
                         )
+                        .map(|mut v| {
+                            v.ballots_in = ballots_in.map(str::to_string);
+                            v
+                        })
                     }))
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("decision council thread panicked")));
                     let _ = reply.send(result);
@@ -4154,6 +4136,68 @@ fn notify_campaign(self_tx: &Sender<Command>, run_id: &str, outcome: crate::camp
         run_id: run_id.to_string(),
         outcome,
     });
+}
+
+/// The seats a decision council on `session`'s dispute may draw from (operator ruling
+/// 2026-10-11): the RUN's roster minus its benches (quota, auth, dead seats — `benched_seats`),
+/// intersected with what the caller handed (which already excludes the dispute's parties). A run
+/// with no configured roster (an ad-hoc caller) keeps the caller's; with no run at all, opt-in
+/// seats sit out. A ballot-only seat (`seat_eligible_for_work: false`) is never in the work roster
+/// `clis` persists, so it stays eligible unless benched (codex r1).
+///
+/// (C5 follow-up) The ballots follow the seat floor ([`ballot_dispatcher`]), so the worktree bench
+/// is the run's own rule (`distribute::worktree_benched`): on a run bound to a repository codex
+/// sits out, unless the operator opted out or the container floor carries the ballots on a store
+/// whose units are armed in seat containers (`contained`, `in_process_governance`).
+fn council_roster(
+    session: Option<&crate::domain::AgentSession>,
+    clis: Vec<crate::AgenticCli>,
+    contained: bool,
+) -> Vec<crate::AgenticCli> {
+    let Some(session) = session else {
+        return clis
+            .into_iter()
+            .filter(|c| !wicked_council::registry::is_opt_in(&c.key))
+            .collect();
+    };
+    let roster = eligible_roster_keys(session);
+    let ballot_bench =
+        crate::distribute::worktree_benched(&clis, session.repo_ref.is_some(), contained);
+    clis.into_iter()
+        .filter(|c| !session.benched_seats.iter().any(|b| b.cli == c.key))
+        .filter(|c| !ballot_bench.iter().any(|b| b.cli == c.key))
+        .filter(|c| {
+            // By CLI key: a run configured `codex#2` keeps the `codex` ballot record the registry
+            // hands (codex r2).
+            (session.clis.is_empty() && !wicked_council::registry::is_opt_in(&c.key))
+                || !c.seat_eligible_for_work
+                || roster
+                    .iter()
+                    .any(|k| wicked_apps_core::spawn::seat_cli_key(k) == c.key)
+        })
+        .collect()
+}
+
+/// (C5 follow-up) The dispatcher a decision council's ballots go through, and where they run.
+/// Under the container seat floor the ballots follow the floor, as the run's judges and triage do
+/// (`execute_wrapped::runs_in_seat`): the dispatcher is handed [`crate::decision::SeatBallots`],
+/// so each ballot runs in its seat's container through `runner`, sharing the dispatcher's seat
+/// health. Under any other floor the ballots stay the host CLI subprocesses they always were. A
+/// dispatcher that runs no CLI of its own (a test stub) is kept as it is and names no place.
+fn ballot_dispatcher(
+    dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
+    runner: &Arc<dyn StepRunner>,
+    container_floor: bool,
+) -> (Arc<dyn Dispatcher + Send + Sync>, Option<&'static str>) {
+    if !container_floor {
+        return (dispatcher.clone(), Some(crate::decision::BALLOTS_IN_HOST));
+    }
+    match dispatcher
+        .with_ballot_carrier(Arc::new(crate::decision::SeatBallots::new(runner.clone())))
+    {
+        Some(carried) => (carried, Some(crate::decision::BALLOTS_IN_SEAT_CONTAINER)),
+        None => (dispatcher.clone(), None),
+    }
 }
 
 /// Build an [`crate::decision::EventRelay`] that posts council lifecycle events
@@ -27127,5 +27171,135 @@ mod work_author_tests {
         );
         // A creator unit is never refused here: it has no work to be distinct from.
         assert!(refuse_author_reassign(&s, &units, 0, "codex").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod council_ballot_tests {
+    use super::*;
+    use crate::domain::{AgentSession, HumanConfirm};
+
+    fn seat(key: &str) -> crate::AgenticCli {
+        wicked_council::registry::builtin()
+            .into_iter()
+            .find(|c| c.key == key)
+            .unwrap_or_else(|| panic!("the registry ships {key}"))
+    }
+
+    fn bound_run() -> AgentSession {
+        AgentSession {
+            intent_amendments: Vec::new(),
+            id: "run-bound".into(),
+            workflow_id: "wf".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec!["claude".into(), "codex".into()],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: Some("proof-repo".into()),
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            project_id: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
+            team: None,
+            team_plan: None,
+            exclude_seats: Vec::new(),
+            evidence_root: None,
+            assurance: Default::default(),
+        }
+    }
+
+    /// C5 follow-up: once the ballots run in seat containers, the codex worktree bench lifts for
+    /// them under the condition the run's own units use (core#963): the container floor on a store
+    /// whose units are armed in seats. The host floor, and a store that cannot arm its units, keep
+    /// codex out of a bound run's council; an unbound run keeps it everywhere.
+    #[test]
+    fn a_bound_runs_council_keeps_codex_only_where_its_ballots_run_in_seats() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = (
+            std::env::var_os("WICKED_CODEX_WORKTREE_OK"),
+            std::env::var_os(crate::container_floor::SEAT_FLOOR_ENV),
+        );
+        std::env::remove_var("WICKED_CODEX_WORKTREE_OK");
+        let keys = |floor: &str, session: &AgentSession, contained: bool| {
+            std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, floor);
+            council_roster(
+                Some(session),
+                vec![seat("claude"), seat("codex")],
+                contained,
+            )
+            .into_iter()
+            .map(|c| c.key)
+            .collect::<Vec<_>>()
+        };
+        let bound = bound_run();
+        assert_eq!(keys("container", &bound, true), vec!["claude", "codex"]);
+        assert_eq!(keys("container", &bound, false), vec!["claude"]);
+        assert_eq!(keys("host", &bound, true), vec!["claude"]);
+        let unbound = AgentSession {
+            repo_ref: None,
+            ..bound_run()
+        };
+        assert_eq!(keys("host", &unbound, true), vec!["claude", "codex"]);
+        for (k, v) in [
+            ("WICKED_CODEX_WORKTREE_OK", prev.0),
+            (crate::container_floor::SEAT_FLOOR_ENV, prev.1),
+        ] {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// Under the container floor the council's dispatcher carries its ballots to the seats (and
+    /// says so); under the host floor it is the dispatcher the engine was given.
+    #[test]
+    fn the_ballot_dispatcher_follows_the_floor() {
+        let real: Arc<dyn Dispatcher + Send + Sync> =
+            Arc::new(wicked_council::dispatch::RealDispatcher::default());
+        let runner: Arc<dyn StepRunner> = Arc::new(crate::workflow::StubStepRunner);
+        let (host, at) = ballot_dispatcher(&real, &runner, false);
+        assert!(Arc::ptr_eq(&host, &real));
+        assert_eq!(at, Some(crate::decision::BALLOTS_IN_HOST));
+        let (carried, at) = ballot_dispatcher(&real, &runner, true);
+        assert!(!Arc::ptr_eq(&carried, &real));
+        assert_eq!(at, Some(crate::decision::BALLOTS_IN_SEAT_CONTAINER));
+    }
+
+    /// codex council-r1/r2: a run named `council` (fresh, or persisted before ballots existed)
+    /// keeps ordinary work units — its planned units are `<run>:<phase>` — while the engine's
+    /// ballot is internal.
+    #[test]
+    fn a_run_named_council_keeps_ordinary_work_units() {
+        let planned =
+            crate::domain::WorkUnit::pending("council:review", "council", 2, "review the change");
+        assert!(!crate::execute_wrapped::is_engine_internal(&planned));
+        assert!(!crate::execute_wrapped::is_council_ballot(&planned));
+        let ballot = crate::domain::WorkUnit::pending(
+            crate::execute_wrapped::COUNCIL_BALLOT_UNIT,
+            "council",
+            1,
+            "ballot",
+        );
+        assert!(crate::execute_wrapped::is_engine_internal(&ballot));
+        assert!(
+            validate_session_id("council").is_ok(),
+            "a caller may still name a run so"
+        );
     }
 }

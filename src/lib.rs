@@ -2420,6 +2420,180 @@ mod tests {
         assert_eq!(verdict.seated as usize, size);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// C5 follow-up: a decision council's ballots follow the seat floor, as the judges and triage
+    /// do. Driven through the PRODUCTION dispatcher (`RealDispatcher`) and the public entry point:
+    /// under the container floor every ballot is a `council` session handed to the engine's step
+    /// runner (the worker arming path, ungoverned, no repository) and the host CLI never runs; the
+    /// verdict says the ballots ran in seat containers. Under the host floor the same seats run
+    /// their host programs and the runner is never asked.
+    #[cfg(unix)]
+    #[test]
+    fn council_ballots_follow_the_seat_floor() {
+        use std::sync::{Arc, Mutex};
+        use wicked_council::types::{Category, Confidence, InputMode};
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("wcore-council-floor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("worker")).unwrap();
+        // The host tripwire: a seat program that records it ran on the host, then votes 1.
+        let marker = dir.join("host-ballots.log");
+        let host_cli = dir.join("host-seat");
+        std::fs::write(
+            &host_cli,
+            format!(
+                "#!/bin/sh\necho ran-on-host >> '{}'\necho 'RECOMMENDATION: 1 — host'\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&host_cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let seat = |key: &str| AgenticCli {
+            key: key.into(),
+            display_name: key.into(),
+            binary: host_cli.display().to_string(),
+            headless_invocation: format!("{} {{PROMPT}}", host_cli.display()),
+            category: Category::AgenticCoder,
+            input_mode: InputMode::PromptArg,
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::default(),
+            enabled_for_council: true,
+            seat_eligible_for_work: true,
+            acp: None,
+            capabilities: None,
+            login_invocation: None,
+            logout_invocation: None,
+            governance_class: None,
+            credential: None,
+            free_tier: None,
+            health: None,
+        };
+        /// The seat runner: records each unit and answers as a seat container would.
+        #[derive(Default)]
+        struct Seats(Mutex<Vec<crate::workflow::StepInput>>);
+        impl crate::workflow::StepRunner for Seats {
+            fn run_unit(&self, i: &crate::workflow::StepInput) -> crate::workflow::StepOutput {
+                self.0.lock().unwrap().push(i.clone());
+                crate::workflow::StepOutput {
+                    run_id: i.run_id.clone(),
+                    unit_ix: i.unit_ix,
+                    attempt: i.attempt,
+                    output: "RECOMMENDATION: 2 — ran in a seat container\nTOP_RISK: none\n".into(),
+                    status: crate::workflow::StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let set = |k: &str, v: &std::ffi::OsStr| std::env::set_var(k, v);
+        let prev: Vec<(&str, Option<std::ffi::OsString>)> = [
+            crate::container_floor::SEAT_FLOOR_ENV,
+            wicked_apps_core::spawn::WORKER_HOME_ENV,
+        ]
+        .into_iter()
+        .map(|k| (k, std::env::var_os(k)))
+        .collect();
+        set(
+            wicked_apps_core::spawn::WORKER_HOME_ENV,
+            dir.join("worker").as_os_str(),
+        );
+        let convene = |floor: &str, n: usize| {
+            set(
+                crate::container_floor::SEAT_FLOOR_ENV,
+                std::ffi::OsStr::new(floor),
+            );
+            let runner = Arc::new(Seats::default());
+            let core = Core::spawn_with_engine(
+                dir.join(format!("core-{n}.db")).to_str().unwrap(),
+                Arc::new(wicked_council::dispatch::RealDispatcher::default()),
+                runner.clone(),
+            );
+            let verdict = core
+                .convene_decision(
+                    DecisionRequest {
+                        session_id: format!("run-floor-{n}"),
+                        ord: 1,
+                        question: "Is the finding at src/a.rs:10 a defect?".into(),
+                        options: vec!["Monitor: yes".into(), "Worker: no".into()],
+                        evidence: "src/a.rs:10".into(),
+                    },
+                    vec![seat("a"), seat("b")],
+                )
+                .expect("the council rules");
+            let seen = runner.0.lock().unwrap().clone();
+            (verdict, seen)
+        };
+
+        let (verdict, seen) = convene("container", 1);
+        assert!(
+            !marker.exists(),
+            "no ballot runs the host CLI under the container floor: {:?}",
+            std::fs::read_to_string(&marker)
+        );
+        let mut keys: Vec<_> = seen
+            .iter()
+            .map(|i| i.unit.assigned_cli.clone().unwrap_or_default())
+            .collect();
+        keys.sort();
+        assert_eq!(keys, vec!["a", "b"], "every ballot went to its seat");
+        for i in &seen {
+            assert_eq!(i.unit.session_id, "council");
+            assert!(
+                crate::execute_wrapped::runs_in_seat(i),
+                "the worker arming path"
+            );
+            assert!(i.governance.is_none(), "a ballot stays ungoverned");
+            assert!(i.workdir.is_none(), "a ballot gets no repository");
+            assert!(i
+                .unit
+                .description
+                .contains("Is the finding at src/a.rs:10 a defect?"));
+            assert!(i.run_id.starts_with("council-"), "{}", i.run_id);
+        }
+        assert_ne!(seen[0].run_id, seen[1].run_id, "one run id per ballot");
+        assert_eq!(
+            verdict.winner,
+            Some(1),
+            "the seats' votes decide: {verdict:?}"
+        );
+        assert_eq!(
+            verdict.ballots_in.as_deref(),
+            Some(crate::decision::BALLOTS_IN_SEAT_CONTAINER)
+        );
+
+        let (verdict, seen) = convene("host", 2);
+        assert!(
+            seen.is_empty(),
+            "the host floor never hands a ballot to the seat runner"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().lines().count(),
+            2,
+            "both ballots ran their host CLI"
+        );
+        assert_eq!(verdict.winner, Some(0), "{verdict:?}");
+        assert_eq!(
+            verdict.ballots_in.as_deref(),
+            Some(crate::decision::BALLOTS_IN_HOST)
+        );
+
+        for (k, v) in prev {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 // ── Test-harness hygiene (core#311) — the LIB test binary's pre-main arming ──────────────────

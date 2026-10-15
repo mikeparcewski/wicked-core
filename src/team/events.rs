@@ -1057,6 +1057,11 @@ pub struct CouncilRuled {
     /// The eligible seats the draw was made from.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub eligible: Vec<String>,
+    /// (C5 follow-up) Where the ballots ran: `seat_container` under the container seat floor,
+    /// `host` otherwise (`DecisionVerdict::ballots_in`). Absent on a ruling recorded before the
+    /// field, and when nothing was convened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ballots_in: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
