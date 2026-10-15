@@ -864,6 +864,14 @@ pub(crate) fn floor_fix_unit(
     u
 }
 
+/// (core#969, core#970) An ENGINE note on a unit's live output (the floor's heartbeat, a floor fix,
+/// a fallback judge): on a line of its own. The seat's own text streams through the same sink
+/// with no trailing newline, so a bare note fused onto its last sentence (run 24590a4b:
+/// "…confirming the bug and the fix empirically.agent validator: the run's judge is out …").
+pub(crate) fn engine_note(emit_delta: &DeltaSink, text: &str) {
+    emit_delta(&format!("\n{}\n", text.trim()));
+}
+
 /// (core#782) Run a floor fix's seat ([`floor_fix_unit`]), then hand back the read-only phase's
 /// input for the floor that follows: its guard baseline re-taken on the fixed tree (a baseline
 /// that cannot be re-taken stays, so the guard sees the fix as a mutation and denies — fail
@@ -875,22 +883,28 @@ fn run_floor_fix(
     fix: &crate::repo_checks::FloorFix,
     emit_delta: &DeltaSink,
 ) -> (StepInput, StepOutput) {
-    emit_delta(&format!(
+    engine_note(
+        emit_delta,
+        &format!(
         "floor fix: seat '{}' makes the operator's fix; the `{}` phase does not run again — only \
          the floor re-runs, on the fixed tree",
         fix.seat,
         input.unit.phase_id().unwrap_or("read-only")
-    ));
+    ),
+    );
     let fixer = StepInput {
         unit: floor_fix_unit(&input.unit, fix),
         ..input.clone()
     };
     let out = runner.run_unit_streaming(&fixer, emit_delta);
     if out.status != StepStatus::Ok {
-        emit_delta(&format!(
-            "floor fix: seat '{}' ended {:?}; the floor still decides",
-            fix.seat, out.status
-        ));
+        engine_note(
+            emit_delta,
+            &format!(
+                "floor fix: seat '{}' ended {:?}; the floor still decides",
+                fix.seat, out.status
+            ),
+        );
     }
     let mut next = input.clone();
     let git_dir = next
@@ -946,7 +960,7 @@ fn with_floor_heartbeat<R>(
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         s.spawn(move || {
             let t0 = std::time::Instant::now();
-            emit(&format!("{label} — 0 min"));
+            engine_note(emit, &format!("{label} — 0 min"));
             // Tick ONLY on a timeout. `Disconnected` means `stop_tx` was dropped without a send —
             // `work` panicked and the closure unwound — and the ticker must exit so the scope can
             // join it and propagate the panic; `is_err()` would spin here forever, emitting false
@@ -955,7 +969,10 @@ fn with_floor_heartbeat<R>(
                 stop_rx.recv_timeout(every),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout)
             ) {
-                emit(&format!("{label} — {} min", t0.elapsed().as_secs() / 60));
+                engine_note(
+                    emit,
+                    &format!("{label} — {} min", t0.elapsed().as_secs() / 60),
+                );
             }
         });
         let r = work();
@@ -1578,10 +1595,13 @@ fn fallback_judge(
     if names.is_empty() {
         return FallbackJudge::NoCandidate;
     }
-    emit_delta(&format!(
-        "{who}: the run's judge is out ({reason}) — asking a fallback judge seat ({})",
-        names.join(", ")
-    ));
+    engine_note(
+        emit_delta,
+        &format!(
+            "{who}: the run's judge is out ({reason}) — asking a fallback judge seat ({})",
+            names.join(", ")
+        ),
+    );
     let label = |seat: &str| {
         format!(
             "judge: {seat} (fallback; {})",
@@ -1617,7 +1637,7 @@ fn fallback_judge(
         match verdict {
             Ok(mut av) => {
                 let fb = disclosure(av.judge_cli.as_deref().unwrap_or(key));
-                emit_delta(&fb.label);
+                engine_note(emit_delta, &fb.label);
                 eprintln!("wicked-core: {} (operator ruling 2026-10-14)", fb.label);
                 av.judge_fallback = Some(fb);
                 return FallbackJudge::Answered(av);
@@ -1626,7 +1646,7 @@ fn fallback_judge(
                 if let Some(nv) = e.downcast_ref::<crate::validator::JudgeNoVerdict>() {
                     // An answer without a verdict escalates, labelled — never a re-ask.
                     let fb = disclosure(&nv.seat);
-                    emit_delta(&fb.label);
+                    engine_note(emit_delta, &fb.label);
                     let mut av = crate::validator::AgentVerdict::from_judge_error(who, e);
                     av.reasoning = format!("{} — {}", fb.label, av.reasoning);
                     av.judge_fallback = Some(fb);
@@ -1837,11 +1857,14 @@ fn run_unit_and_judge_on(
     let input = fixed.as_ref().map(|(i, _)| i).unwrap_or(input);
     let output = match floor_rerun {
         Some(r) => {
-            emit_delta(&format!(
-                "repo checks floor re-run ({}): the seat does not run again; the repository's \
+            engine_note(
+                emit_delta,
+                &format!(
+                    "repo checks floor re-run ({}): the seat does not run again; the repository's \
                  checks re-run on the tree as it stands",
-                r.mode.as_wire()
-            ));
+                    r.mode.as_wire()
+                ),
+            );
             // (core#782) A floor fix's tool calls are this attempt's: its governance evidence
             // (the hook's decisions log) and its tools fold with the reviewed output.
             let (files, tools, governed) = match &fixed {
@@ -6198,7 +6221,8 @@ mod floor_heartbeat_tests {
             at_return.len(),
             "no heartbeat after the work returned (the thread is joined by the scope)"
         );
-        assert_eq!(after[0].1, format!("{label} — 0 min"), "{after:?}");
+        // (core#969) An engine note is on a line of its own ([`engine_note`]).
+        assert_eq!(after[0].1, format!("\n{label} — 0 min\n"), "{after:?}");
         assert!(
             after[0].0 < Duration::from_millis(200),
             "the first heartbeat is immediate: {after:?}"
@@ -6212,7 +6236,7 @@ mod floor_heartbeat_tests {
         assert!(
             after
                 .iter()
-                .all(|(_, s)| s.starts_with(&format!("{label} — "))),
+                .all(|(_, s)| s.starts_with(&format!("\n{label} — ")) && s.ends_with('\n')),
             "{after:?}"
         );
         for w in after.windows(2) {
@@ -6264,7 +6288,7 @@ mod floor_heartbeat_tests {
         let seen = seen.lock().unwrap().clone();
         assert_eq!(
             seen.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>(),
-            vec!["floor — 0 min"]
+            vec!["\nfloor — 0 min\n"]
         );
     }
 }
@@ -7014,7 +7038,12 @@ mod judge_fallback_tests {
         );
         assert!(fb.reason.starts_with("codex benched: "), "{}", fb.reason);
         assert!(
-            deltas.lock().unwrap().iter().any(|d| d == &fb.label),
+            // (core#969) On a line of its own ([`engine_note`]).
+            deltas
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|d| d == &format!("\n{}\n", fb.label)),
             "the run's live output names the fallback: {:?}",
             deltas.lock().unwrap()
         );

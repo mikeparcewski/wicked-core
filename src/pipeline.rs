@@ -1308,7 +1308,7 @@ pub(crate) fn apply_and_finish_unit(
     let agent_denial = agent_verdict_denial(agent_verdict);
     // (core#850, EX-02) The run's assurance contract. A judge the unit WANTED but could not
     // convene (no seat distinct from the work's author) is a HOLD when the contract requires the
-    // judge: the gate denies under `judge_unavailable` (sign a judge seat in, approve to re-run),
+    // judge: the gate denies under `judge_unavailable` (approve = the operator judges, core#969),
     // never a deterministic-only approve. A `reduced` run keeps the disclosed skip.
     let assurance = run_session
         .as_ref()
@@ -1322,9 +1322,9 @@ pub(crate) fn apply_and_finish_unit(
             crate::domain::UnitDenial::new(
                 crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE,
                 format!(
-                    "the run requires a judge ({}) and none could run: {why}. Sign a judge seat \
-                     distinct from the work's author in, then approve to re-run the phase \
-                     (or relaunch with reduced assurance, disclosed)",
+                    "the run requires a judge ({}) and none could run: {why}. Approve to judge \
+                     the work yourself (or sign a judge seat distinct from the work's author in \
+                     and relaunch, or relaunch with reduced assurance, disclosed)",
                     crate::assurance::JUDGE
                 ),
             )
@@ -1593,12 +1593,14 @@ pub(crate) fn apply_and_finish_unit(
         .or(evaluator_verdict_denial)
         .or(qe_veto)
         .or(judged.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
-        .or(judge_hold)
         .or(evaluator_denial)
         .or(hook_denial)
         // (operator ruling 2026-10-11, codex r1 on #907) A judge that could not rule wins only when
         // NO other layer denied — the operator's judgment at its gate then answers the one open
-        // question, never a governance veto hidden behind it.
+        // question, never a governance veto hidden behind it. (core#969, codex r1) That holds for
+        // the REQUIRED judge's hold too (`judge_hold`, same source): it used to rank above the
+        // evaluator's and the hook's denials, so an approve there could count a vetoed unit.
+        .or(judge_hold)
         .or(unavailable.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
         .or(qe_unavailable);
 
@@ -3979,6 +3981,16 @@ mod judge_bench_tests {
         sid: &str,
         reduced: bool,
     ) -> (bool, Option<String>, crate::assurance::AssuranceReceipt) {
+        fold_with_skipped_judge_on(sid, reduced, false)
+    }
+
+    /// `governed`: the output reports a governed run with tool calls and no hook record at all —
+    /// the hook's own fail-closed denial.
+    fn fold_with_skipped_judge_on(
+        sid: &str,
+        reduced: bool,
+        governed: bool,
+    ) -> (bool, Option<String>, crate::assurance::AssuranceReceipt) {
         let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
         let mut sink = |_e: CoreEvent| {};
         let Planned {
@@ -4025,8 +4037,8 @@ mod judge_bench_tests {
             EntityMode::Shared,
             sid,
             0,
-            false,
-            false,
+            governed,
+            governed,
             &cli_keys,
             None,
             &evidence,
@@ -4269,7 +4281,7 @@ mod judge_bench_tests {
     }
 
     /// core#850 (EX-02): a run whose contract requires the judge HOLDS when the judge could not
-    /// run — the gate denies under `judge_unavailable` (sign a judge seat in, approve to re-run) —
+    /// run — the gate denies under `judge_unavailable` (approve = the operator judges, core#969) —
     /// and its receipt says the judge was skipped for want of a distinct seat. Before, the gate
     /// approved deterministic-only and said so only in `agentVerdict: "skipped"`.
     #[test]
@@ -4297,6 +4309,20 @@ mod judge_bench_tests {
             .detail
             .as_deref()
             .is_some_and(|d| d.contains("distinct")));
+    }
+
+    /// core#969 (codex r1): the required judge's hold (`judge_unavailable`) answers only the judge's
+    /// open question. A governance denial on the same fold wins over it, so the operator's Approve at
+    /// a `judge_unavailable` gate can never count a unit the hook vetoed.
+    #[test]
+    fn core_969_a_governance_denial_outranks_the_required_judges_hold() {
+        let (approved, source, _) = fold_with_skipped_judge_on("core969-hook", false, true);
+        assert!(!approved);
+        assert_ne!(
+            source.as_deref(),
+            Some(crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE),
+            "the hook's veto must not hide behind the judge hold"
+        );
     }
 
     /// core#850 (EX-02): the explicit `reduced` opt-in keeps the disclosed skip — the gate

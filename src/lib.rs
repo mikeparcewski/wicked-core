@@ -604,8 +604,9 @@ impl Core {
     /// real council dispatcher + the ACP multi-CLI session runner. ACP is the default — each CLI
     /// runs its wrapper binary in a persistent session so turns within a run share prompt-cache.
     /// Governed units (gate-hook injection required) always route to the single-shot wrapped runner;
-    /// ACP is not used for those. When an ACP binary is absent, the runner emits a warning in the
-    /// step output and falls back to single-shot invocation automatically. The actor lives until
+    /// ACP is not used for those. When an ACP binary is absent, the runner falls back to
+    /// single-shot invocation automatically and discloses it on `CoreEvent::AcpFallback` (and the
+    /// daemon log), never in the step output (core#970). The actor lives until
     /// every `Core` handle is dropped. Tests use [`Core::spawn_with_engine`] to inject a stub
     /// runner instead.
     pub fn spawn(path: impl Into<String>) -> Core {

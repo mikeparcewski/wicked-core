@@ -6702,31 +6702,48 @@ fn apply_step_result(
     // only floor it CAN carry). No validator pin and no LLM judge — a deterministic fold check,
     // which sidesteps core#297's stated objection to pinning a floor on build phases.
     const MIN_SUBSTANCE_CHARS: usize = 200;
+    // (core#970) A read-only phase whose EVERY output a human confirms (`GateSpec::HumanConfirm` —
+    // a chat's answer step, its turn gate) is judged by that human: a one-line answer is an
+    // answer, not "no reviewable substance". The ACP reroute's disclosure, prepended to every
+    // codex answer, used to pad such answers past this floor; without it a short, correct chat
+    // answer failed the floor and never reached the chat. The exemption lowers the floor to "an
+    // answer exists": an empty or whitespace-only output is still no substance.
+    let human_reads_every_output =
+        !unit.executes_code && matches!(unit.gate, crate::workflow::GateSpec::HumanConfirm { .. });
+    let prose_chars = output.output.trim().chars().count();
     let no_prose = unit.role != crate::workflow::PhaseRole::Evaluator
-        && output.output.trim().chars().count() < MIN_SUBSTANCE_CHARS;
+        && if human_reads_every_output {
+            prose_chars == 0
+        } else {
+            prose_chars < MIN_SUBSTANCE_CHARS
+        };
     let code_without_diff = unit.role == crate::workflow::PhaseRole::Creator
         && unit.executes_code
         && session.workdir.is_some();
     // (crew#972, run 7d8c9c98) "No change" is THIS unit's: its tree against its own dispatch
     // baseline (`evidence.tree_changed`), not only a worktree clean at HEAD — a creator whose
     // writes were all denied passed its gate because EARLIER phases had already changed the
-    // worktree. Only an explicit declaration (a line `NO CHANGE NEEDED`) exempts it.
+    // worktree. Only an explicit declaration ([`declares_no_change`], core#929) exempts it.
     let clean = worktree_is_clean(session.workdir.as_deref());
-    let declared_no_change = output.output.lines().any(|l| l.trim() == NO_CHANGE_NEEDED);
+    let declared_no_change = declares_no_change(&output.output);
     let left_no_change = clean || evidence.tree_changed == Some(false);
+    // The prose arm rejects only over a clean worktree (a diff is substance of its own) — except
+    // under the human-confirm exemption, where `no_prose` already means "no answer at all": an
+    // empty answer is no answer however dirty the worktree is (core#970, codex r5).
+    let prose_rejects = no_prose && (clean || human_reads_every_output);
     if output.governed
-        && ((no_prose && clean) || (code_without_diff && !declared_no_change && left_no_change))
+        && (prose_rejects || (code_without_diff && !declared_no_change && left_no_change))
     {
         const NO_SUBSTANCE: &str = "phase produced no reviewable substance";
         const NO_DIFF: &str = "executes-code phase reported done but left no change in the \
                                worktree (done is re-derived from the diff, never asserted)";
         const NO_OWN_DIFF: &str = "the build step changed nothing in the worktree (its writes \
-                                   may have been refused); it did not declare NO CHANGE NEEDED, \
-                                   so done is not accepted — retry it on a seat that can write, \
-                                   or reassign";
+                                   may have been refused); it did not declare NO CHANGE NEEDED \
+                                   (a line that starts with it), so done is not accepted — retry \
+                                   it on a seat that can write, or reassign";
         // `no_prose` wins the tie so the pre-existing rejection keeps its exact record shape —
         // the new arm only ever rejects folds that previously passed.
-        let why: &'static str = if no_prose && clean {
+        let why: &'static str = if prose_rejects {
             NO_SUBSTANCE
         } else if clean {
             NO_DIFF
@@ -7563,10 +7580,20 @@ fn denial_gate_prompt(
         }
         // (core#774 follow-up) The judge could not run; the prompt names the failed seats (the
         // reason's head line) and never reads "verdict is NOT PASS".
-        "judge_unavailable" => format!(
+        // (core#969) Approve here IS the operator's judgment (`judge_by_operator`): the work
+        // counts, labelled "judged by operator". Only a team member's step keeps the team gate's
+        // answer, which re-runs it.
+        "judge_unavailable" if unit.member_step.is_some() => format!(
             "Unit {ord} could not be judged — no eligible judge seat remained: {}. The work was \
              not rejected. Sign a judge seat in (or reassign), then approve to re-run the phase, \
              or reject to cancel the run{note}",
+            reason_head(reason)
+        ),
+        "judge_unavailable" => format!(
+            "Unit {ord} could not be judged — no eligible judge seat remained: {}. The work was \
+             not rejected. Approve to judge it yourself (it counts, labelled \"judged by \
+             operator\"), request changes to send it back for rework, or reject to cancel the \
+             run{note}",
             reason_head(reason)
         ),
         // (DES-L1 PR-1A) The generic verdict gate names its THREE arms — retry, request changes
@@ -10852,6 +10879,30 @@ fn run_tool_cmd_jailed(
 /// code-evidence floor accepts an unchanged tree only with it.
 pub(crate) const NO_CHANGE_NEEDED: &str = "NO CHANGE NEEDED";
 
+/// (core#929) Whether `output` declares [`NO_CHANGE_NEEDED`]: a line that STARTS with the marker,
+/// its markdown emphasis (`*`, `_`, `` ` ``) and surrounding blanks stripped, followed by nothing or
+/// by its reason after a separator (`**NO CHANGE NEEDED** — the fix is already in the tree`,
+/// `NO CHANGE NEEDED: attempt 0 landed it`). Case-sensitive. A line that only MENTIONS the marker
+/// (`reply with: NO CHANGE NEEDED`, `I cannot declare NO CHANGE NEEDED`) never declares it (codex
+/// r1, r2): only the line's opening is read, so no wording before it can turn prose into the
+/// declaration. A marker a carrier fused onto the previous sentence (`state:NO CHANGE NEEDED`, the
+/// ACP carrier joining two agent messages, run 24590a4b) is not read either; the floor's refusal
+/// names the form.
+pub(crate) fn declares_no_change(output: &str) -> bool {
+    let m = NO_CHANGE_NEEDED;
+    output.lines().any(|l| {
+        let s: String = l
+            .chars()
+            .filter(|c| !matches!(c, '*' | '_' | '`'))
+            .collect();
+        let s = s.trim();
+        s.strip_prefix(m).is_some_and(|rest| {
+            let rest = rest.trim_start();
+            rest.is_empty() || rest.starts_with(['—', '–', '-', ':', '.', ';', ',', '('])
+        })
+    })
+}
+
 fn worktree_is_clean(workdir: Option<&str>) -> bool {
     let Some(wd) = workdir else {
         return true;
@@ -12225,15 +12276,21 @@ pub(crate) fn confirm_gate_as(
                             == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE
                 })
         });
-    // A team member's step and the PA's own steps owe their team accounting (the PA's review of a
-    // member step, the member's record): they keep today's answer here (codex r1 on #907).
+    // A team MEMBER's step owes its team accounting (the PA's review of it, the member's record):
+    // it keeps today's answer here (codex r1 on #907).
     // (core#937) An ORDINARY step of a teamed run does not: its gate's `gate.decided` was published
     // when it was denied, and re-running it only walked back into the same judge-less gate (run
     // 0d2b9fa4: every approve re-ran `verify`, and the run could not pass it). The operator's
     // approve there is the judgment, exactly as on an un-teamed run.
+    // (core#969) Neither does a PA step — on a teamed run that is every non-evaluator step the
+    // team does not own, the build step included. Its gate's `gate.decided` was published at the
+    // denial too, and the ledger pause it may still owe is opened by `judge_by_operator`
+    // ([`team_gate::operator_judgment_dispute`]). Re-running it walked into a loop (run 24590a4b:
+    // approve re-dispatched the Fix step, whose tree attempt 0 had already changed, so the
+    // substance floor failed it as "changed nothing", again and again).
     let team_unit = crate::domain::session_units(store, run_id)?
         .get(session.unit_ix)
-        .is_some_and(|u| u.member_step.is_some() || team_gate::is_pa_step(u));
+        .is_some_and(|u| u.member_step.is_some());
     if judge_unavailable_gate && !adjudication_open && !team_unit {
         if let crate::workflow::HumanDecision::Approve { amend, .. } = &decision {
             return judge_by_operator(
@@ -12995,6 +13052,23 @@ fn judge_by_operator(
     }
     let ord = u.ord;
     let mut s = session;
+    // (core#969, codex r1) A PA step's `PLAN` / `PLAN+` lines ride its ACCEPTED output: the fold
+    // records them only on a pass (`team_gate::record_plan_lines`), and the operator's judgment is
+    // the acceptance here, so they are recorded from the output it accepted (resolved above).
+    if let Some(text) = crate::domain::get_work_output(store, &u.id) {
+        let accepted = crate::workflow::StepOutput {
+            run_id: run_id.to_string(),
+            unit_ix: ix,
+            attempt,
+            output: text,
+            status: crate::workflow::StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        };
+        team_gate::record_plan_lines(&mut s, &u, &accepted);
+    }
     // (DES-QE-EVERY-SEAT §3.4.1, codex r2 F16) What the operator judges is read from the unit's
     // PERSISTED evidence, not only the gate's winning source: when no isolated QE reviewer could
     // run, the run's QE decision becomes the operator's — a labelled bypass of automated QE (crew's
@@ -15558,6 +15632,61 @@ mod substance_gate_tests {
             "the standard failure path emits StepFailed carrying the substance denial, \
              kinded SubstanceRejected (a core veto, not a worker failure)"
         );
+    }
+
+    /// core#970: a chat's answer step — read-only, every output confirmed by a human at its turn
+    /// gate — is judged by that human. A correct one-line answer passes this floor; the same output
+    /// on a phase that executes code still meets it.
+    #[test]
+    fn core_970_a_short_answer_a_human_confirms_is_not_no_substance() {
+        for (executes_code, rejected) in [(false, false), (true, true)] {
+            let run_id = format!("substance-ask-{executes_code}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_with(&mut store, &run_id, PhaseRole::Neutral, |u| {
+                u.executes_code = executes_code;
+                u.gate = crate::workflow::GateSpec::HumanConfirm {
+                    unconditional: true,
+                };
+            });
+            let mut subs = crate::event_log::EventSink::default();
+            let (_applied, _session, unit) = fold(
+                &mut store,
+                &mut subs,
+                &run_id,
+                "`perPerson(100, 15, 2)` returns 800 today (`tiny-tip/tip.mjs:3`).",
+                true,
+            );
+            assert_eq!(
+                unit.denial_reason.as_deref() == Some(NO_SUBSTANCE),
+                rejected,
+                "executes_code {executes_code}: {:?}",
+                unit.denial_reason
+            );
+        }
+    }
+
+    /// (core#970, codex r4) The exemption lowers the floor to "an answer exists", not to nothing:
+    /// an empty or whitespace-only output on the same human-confirmed read-only phase is still
+    /// "no reviewable substance".
+    #[test]
+    fn core_970_an_empty_answer_a_human_confirms_is_still_no_substance() {
+        for (i, output) in ["", "  \n\t "].into_iter().enumerate() {
+            let run_id = format!("substance-ask-empty-{i}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_with(&mut store, &run_id, PhaseRole::Neutral, |u| {
+                u.executes_code = false;
+                u.gate = crate::workflow::GateSpec::HumanConfirm {
+                    unconditional: true,
+                };
+            });
+            let mut subs = crate::event_log::EventSink::default();
+            let (_applied, _session, unit) = fold(&mut store, &mut subs, &run_id, output, true);
+            assert_eq!(
+                unit.denial_reason.as_deref(),
+                Some(NO_SUBSTANCE),
+                "output {output:?}"
+            );
+        }
     }
 
     /// Every event the fold emitted, drained.
@@ -18815,6 +18944,216 @@ mod request_changes_tests {
         )));
     }
 
+    /// core#969, run 24590a4b: on a TEAMED run every non-evaluator step the team does not own is
+    /// a PA step — the build step included. Its gate held at `judge_unavailable` (the fallback
+    /// judge answered empty), and the operator's approve WITH A NOTE re-dispatched the build
+    /// (`unitReworkAmended`), whose unchanged tree then failed the substance floor, again and
+    /// again. The approve is the judgment there too: the unit counts, labelled, and nothing re-runs.
+    #[test]
+    fn core_969_approve_with_a_note_at_judge_unavailable_on_a_pa_build_step_judges_it() {
+        let run_id = format!("op-judge-pa-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_judge_unavailable_verify(&mut store, &run_id);
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        session.team = Some(crate::domain::RunTeamState::default());
+        put_node(&mut store, session.to_node()).unwrap();
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        let u = &mut units[3];
+        u.team_run = true;
+        u.owner = crate::workflow::StepOwner::Pa;
+        u.role = crate::workflow::PhaseRole::Creator;
+        u.tool_cmd = None;
+        u.member_step = None;
+        assert!(team_gate::is_pa_step(u), "the seeded unit is a PA step");
+        put_node(&mut store, u.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        confirm_gate_as(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            &run_id,
+            HumanDecision::Approve {
+                amend: Some("Operator judged: the fix is right. Go on.".into()),
+                amend_scope: crate::workflow::AmendScope::Cursor,
+            },
+            Some("operator".into()),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.unit_ix, 4,
+            "the run moved on, the build did not re-run"
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(units[3].status, UnitStatus::Done);
+        let r = units[3].assurance.as_ref().expect("a receipt");
+        assert!(
+            r.ran.iter().any(|i| i == crate::assurance::OPERATOR_JUDGE),
+            "{r:?}"
+        );
+        assert_eq!(
+            r.operator_judges[0].note.as_deref(),
+            Some("Operator judged: the fix is right. Go on.")
+        );
+        let events = drain(&erx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::UnitReworkAmended { .. })),
+            "the note is the judgment's, never a rework amendment: {events:?}"
+        );
+    }
+
+    /// core#969 (codex r1): the operator's judgment is the PA step's ACCEPTANCE, so the `PLAN+` lines
+    /// of the output it accepted are held for the plan as a passing fold holds them.
+    #[test]
+    fn core_969_an_operator_judged_pa_step_keeps_its_plan_lines() {
+        let run_id = format!("op-judge-pa-plan-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_judge_unavailable_verify(&mut store, &run_id);
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        // The PA step is an EARLY one (ix 1): a held line is taken into a revision by the advance
+        // (`advance_or_pause`); one held when only the deliver step is left is dropped by design.
+        session.unit_ix = 1;
+        session.team = Some(crate::domain::RunTeamState::default());
+        session.team_plan = Some(crate::plan_gate::TeamPlanState {
+            rev: 1,
+            accepted_rev: 1,
+            ..Default::default()
+        });
+        put_node(&mut store, session.to_node()).unwrap();
+        let pa = session
+            .clis
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "claude".into());
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        let u = &mut units[1];
+        u.status = UnitStatus::Rejected;
+        u.denial = Some(UnitDenial::new(
+            crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE,
+            "agy (answered nothing (empty output)) — fallback judge",
+        ));
+        u.denial_reason = Some("agy (answered nothing (empty output)) — fallback judge".into());
+        u.team_run = true;
+        u.owner = crate::workflow::StepOwner::Pa;
+        u.role = crate::workflow::PhaseRole::Creator;
+        u.tool_cmd = None;
+        u.member_step = None;
+        u.assigned_cli = Some(pa);
+        put_node(&mut store, u.to_node()).unwrap();
+        persist_rejected_transcript(
+            &mut store,
+            &session,
+            u,
+            "Fixed tipPercent and added the test.\nPLAN+ {\"steps\":[{\"catalog\":\"security_review\"}],\"reason\":\"auth\"}\n",
+        );
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        confirm_gate_as(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            &run_id,
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: crate::workflow::AmendScope::Cursor,
+            },
+            Some("operator".into()),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        // Held for the next advance, or already taken by it into a revision (the approve advances
+        // the run, `advance_or_pause`): either way the PA's line reached the plan. Before the fix
+        // it was never recorded, so neither could happen.
+        let tp = session.team_plan.expect("the run's plan state");
+        assert!(
+            tp.rev > 1
+                || tp
+                    .plan_lines
+                    .iter()
+                    .any(|l| l.ord == 2 && l.text.starts_with("PLAN+ ")),
+            "{tp:?}"
+        );
+    }
+
+    /// core#969: the hold says what Approve does — the operator judges — except on a team
+    /// member's step, which keeps the team gate's re-run.
+    #[test]
+    fn core_969_the_judge_unavailable_prompt_says_approve_judges_the_work() {
+        let mut u = WorkUnit::pending("r:u4", "r", 4, "fix");
+        let reason = "agy (answered nothing (empty output)) — fallback judge";
+        u.denial = Some(UnitDenial::new(
+            crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE,
+            reason,
+        ));
+        let p = denial_gate_prompt(&u, "judge_unavailable", reason, None, "");
+        assert!(p.contains("Approve to judge it yourself"), "{p}");
+        assert!(!p.contains("approve to re-run"), "{p}");
+        u.member_step = Some(Default::default());
+        let p = denial_gate_prompt(&u, "judge_unavailable", reason, None, "");
+        assert!(p.contains("approve to re-run the phase"), "{p}");
+    }
+
+    /// core#929: the NO CHANGE NEEDED declaration opens its line, decorated or followed by a reason;
+    /// a mention anywhere else is prose (codex r1, r2).
+    #[test]
+    fn core_929_no_change_needed_is_read_decorated_or_fused() {
+        for yes in [
+            "prose\nNO CHANGE NEEDED\n",
+            "  NO CHANGE NEEDED  ",
+            "**NO CHANGE NEEDED** — the fix is already in the tree",
+            "`NO CHANGE NEEDED`",
+            "NO CHANGE NEEDED: attempt 0 landed it",
+        ] {
+            assert!(declares_no_change(yes), "{yes:?}");
+        }
+        for no in [
+            "Change nothing; reply with the line NO CHANGE NEEDED.",
+            "I cannot declare NO CHANGE NEEDED",
+            "I cannot truthfully declare: NO CHANGE NEEDED",
+            "If no edits are required, reply with: NO CHANGE NEEDED",
+            "Checked the tree. NO CHANGE NEEDED",
+            "If no edits are required, reply with NO CHANGE NEEDED",
+            "NO CHANGE NEEDED? No: I changed tip.mjs",
+            "NO CHANGE NEEDED is what I would say, but I edited tip.mjs",
+            "no change needed",
+            "NO CHANGE NEEDEDS",
+            "XNO CHANGE NEEDED",
+            "I changed tip.mjs and added a test.",
+            "",
+        ] {
+            assert!(!declares_no_change(no), "{no:?}");
+        }
+    }
+
     /// core#937, run 0d2b9fa4: a TEAMED run's ordinary step (`verify`, not a member step or a PA
     /// step) escalated `judge_unavailable`, and every approve re-ran it into the same judge-less
     /// gate — the operator-as-judge arm skipped any run with a team. The approve is the judgment
@@ -19328,6 +19667,41 @@ mod code_evidence_floor_tests {
         assert_eq!(unit.status, UnitStatus::Rejected);
         let why = unit.denial_reason.clone().unwrap_or_default();
         assert!(why.contains("changed nothing"), "{why}");
+    }
+
+    /// (core#970, codex r5) The human-confirm exemption accepts a SHORT answer, never an empty one —
+    /// and that holds over a dirty worktree too (an earlier phase's change is not this read-only
+    /// step's answer), where the ordinary prose arm would let any output through.
+    #[test]
+    fn an_empty_human_confirmed_answer_over_a_dirty_worktree_is_still_no_substance() {
+        for (i, output) in ["", "  \n\t "].into_iter().enumerate() {
+            let wt = git_worktree(&format!("empty-answer-dirty-{i}"));
+            std::fs::write(wt.join("design-notes.md"), "an earlier phase's change\n").unwrap();
+            let run_id = format!("empty-answer-dirty-{i}");
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed(
+                &mut store,
+                &run_id,
+                PhaseRole::Neutral,
+                false,
+                Some(wt.to_string_lossy().into_owned()),
+            );
+            let mut u = crate::domain::session_units(&store, &run_id)
+                .unwrap()
+                .remove(0);
+            u.gate = crate::workflow::GateSpec::HumanConfirm {
+                unconditional: true,
+            };
+            put_node(&mut store, u.to_node()).unwrap();
+            let mut subs = crate::event_log::EventSink::default();
+            let (_session, unit) = fold(&mut store, &mut subs, &run_id, output, true);
+            assert_eq!(unit.status, UnitStatus::Rejected, "output {output:?}");
+            assert_eq!(
+                unit.denial_reason.as_deref(),
+                Some("phase produced no reviewable substance"),
+                "output {output:?}"
+            );
+        }
     }
 
     /// …and an explicit `NO CHANGE NEEDED` line is the one way such a step passes the floor.

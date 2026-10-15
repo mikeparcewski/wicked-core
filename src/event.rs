@@ -634,8 +634,9 @@ pub enum CoreEvent {
         output_bytes: usize,
     },
     /// The ACP runner fell back to single-shot wrapped-CLI execution for this unit.
-    /// `reason` is the human-readable warning already prepended to step output; `fallback_kind`
-    /// is a stable slug for UI dispatch (see acp_runner constants).
+    /// This event is the disclosure channel: `reason` is the human-readable warning (it is not
+    /// prepended to step output, core#970); `fallback_kind` is a stable slug for UI dispatch
+    /// (see acp_runner constants).
     AcpFallback {
         session: String,
         cli_key: String,
