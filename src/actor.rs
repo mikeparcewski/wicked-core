@@ -6672,7 +6672,15 @@ fn apply_step_result(
     // only floor it CAN carry). No validator pin and no LLM judge — a deterministic fold check,
     // which sidesteps core#297's stated objection to pinning a floor on build phases.
     const MIN_SUBSTANCE_CHARS: usize = 200;
+    // (core#970) A read-only phase whose EVERY output a human confirms (`GateSpec::HumanConfirm` —
+    // a chat's answer step, its turn gate) is judged by that human: a one-line answer is an
+    // answer, not "no reviewable substance". The ACP reroute's disclosure, prepended to every
+    // codex answer, used to pad such answers past this floor; without it a short, correct chat
+    // answer failed the floor and never reached the chat.
+    let human_reads_every_output =
+        !unit.executes_code && matches!(unit.gate, crate::workflow::GateSpec::HumanConfirm { .. });
     let no_prose = unit.role != crate::workflow::PhaseRole::Evaluator
+        && !human_reads_every_output
         && output.output.trim().chars().count() < MIN_SUBSTANCE_CHARS;
     let code_without_diff = unit.role == crate::workflow::PhaseRole::Creator
         && unit.executes_code
@@ -15585,6 +15593,37 @@ mod substance_gate_tests {
             "the standard failure path emits StepFailed carrying the substance denial, \
              kinded SubstanceRejected (a core veto, not a worker failure)"
         );
+    }
+
+    /// core#970: a chat's answer step — read-only, every output confirmed by a human at its turn
+    /// gate — is judged by that human. A correct one-line answer passes this floor; the same output
+    /// on a phase that executes code still meets it.
+    #[test]
+    fn core_970_a_short_answer_a_human_confirms_is_not_no_substance() {
+        for (executes_code, rejected) in [(false, false), (true, true)] {
+            let run_id = format!("substance-ask-{executes_code}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_with(&mut store, &run_id, PhaseRole::Neutral, |u| {
+                u.executes_code = executes_code;
+                u.gate = crate::workflow::GateSpec::HumanConfirm {
+                    unconditional: true,
+                };
+            });
+            let mut subs = crate::event_log::EventSink::default();
+            let (_applied, _session, unit) = fold(
+                &mut store,
+                &mut subs,
+                &run_id,
+                "`perPerson(100, 15, 2)` returns 800 today (`tiny-tip/tip.mjs:3`).",
+                true,
+            );
+            assert_eq!(
+                unit.denial_reason.as_deref() == Some(NO_SUBSTANCE),
+                rejected,
+                "executes_code {executes_code}: {:?}",
+                unit.denial_reason
+            );
+        }
     }
 
     /// Every event the fold emitted, drained.
