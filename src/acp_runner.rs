@@ -3920,7 +3920,7 @@ acp_input_governance = true
         assert!(
             out.output
                 .contains(crate::execute_wrapped::MANAGED_HOOKS_ONLY_REFUSAL)
-                && out.output.contains("ACP is unavailable"),
+                && out.output.contains("silence the engine's gate hook"),
             "refused with the escalation: {}",
             out.output
         );

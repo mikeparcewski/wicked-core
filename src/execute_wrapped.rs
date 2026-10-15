@@ -5263,7 +5263,10 @@ pub(crate) fn managed_hooks_only_source(
                 .ok()
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
                 .is_some_and(|v| {
+                    // Either one silences the engine's `--settings` gate hook (codex c5-r11:
+                    // `disableAllHooks` too — the gate is the only per-call check without ACP).
                     v.get("allowManagedHooksOnly") == Some(&serde_json::Value::Bool(true))
+                        || v.get("disableAllHooks") == Some(&serde_json::Value::Bool(true))
                 })
         })
         .cloned()
@@ -5275,10 +5278,9 @@ pub(crate) const MANAGED_HOOKS_ONLY_REFUSAL: &str =
 
 fn managed_hooks_only_refusal_reason(source: &std::path::Path) -> String {
     format!(
-        "{MANAGED_HOOKS_ONLY_REFUSAL}: org settings allow only managed hooks \
-         (`allowManagedHooksOnly: true` in {}); ACP is unavailable — refusing the governed unit \
-         rather than running it ungoverned. Configure the seat's ACP bridge (`[cli.acp]`) so it \
-         runs on the ACP carrier (core#653)",
+        "{MANAGED_HOOKS_ONLY_REFUSAL}: settings in {} silence the engine's gate hook \
+         (`allowManagedHooksOnly: true` or `disableAllHooks: true`); refusing the governed unit \
+         rather than running it ungoverned. Remove that setting for the seat (core#653, C5)",
         source.display()
     )
 }
@@ -8433,6 +8435,14 @@ mod tests {
             managed_hooks_only_source(&[missing, off, broken, on.clone()]),
             Some(on)
         );
+        // C5 (codex c5-r11): `disableAllHooks: true` silences the gate hook just the same.
+        let silenced = w("managed-settings.json", r#"{"disableAllHooks": true}"#);
+        assert_eq!(
+            managed_hooks_only_source(std::slice::from_ref(&silenced)),
+            Some(silenced)
+        );
+        let kept = w("kept.json", r#"{"disableAllHooks": false}"#);
+        assert_eq!(managed_hooks_only_source(&[kept]), None);
         // The worker home's server-managed cache is the first candidate for the seat's dir.
         let c = claude_settings_candidates(Some(&dir));
         assert_eq!(c.first(), Some(&dir.join("remote-settings.json")));
@@ -8504,7 +8514,7 @@ mod tests {
         assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
         assert!(
             out.output.contains(MANAGED_HOOKS_ONLY_REFUSAL)
-                && out.output.contains("ACP is unavailable")
+                && out.output.contains("silence the engine's gate hook")
                 && out.output.contains("allowManagedHooksOnly"),
             "the refusal names the escalation: {}",
             out.output
