@@ -23,9 +23,10 @@ Two release tracks share this file, newest entry first regardless of track:
   on its receipt, and still pauses on the team dispute its ledger owes. The hold and the judge-required
   denial now say what Approve does ("Approve to judge it yourself"). An empty fallback-judge answer was
   already a seat failure (the next fallback seat, else the hold); that is unchanged and pinned.
-- **`NO CHANGE NEEDED` is read when it starts or ends a line, decorated or fused (core#929).**
-  `**NO CHANGE NEEDED** — …` and a carrier-joined `…state:NO CHANGE NEEDED` now declare it; prose
-  that only mentions it mid-sentence does not. The floor's refusal names the form.
+- **`NO CHANGE NEEDED` is read however it is decorated, when it opens its line (core#929).**
+  `**NO CHANGE NEEDED** — the fix is already in the tree` and `NO CHANGE NEEDED: attempt 0 landed it`
+  now declare it; a line that only mentions it (`reply with: NO CHANGE NEEDED`) does not. The floor's
+  refusal names the form ("a line that starts with it").
 - **Engine notes on a unit's live output stand on their own line (core#969, core#970).** The repo
   checks floor heartbeat, floor-fix and fallback-judge notes no longer fuse onto the seat's last
   sentence ("…empirically.agent validator: the run's judge is out …").
