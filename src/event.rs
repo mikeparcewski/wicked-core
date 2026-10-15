@@ -1338,9 +1338,15 @@ pub enum CoreEvent {
         /// recommends — the field's own JSON Schema `default`, when it names one of the delivered
         /// options. `None` (ABSENT on the wire) ⇒ nothing is preselected.
         recommended: Option<u32>,
+        /// (ask, additive) `"ask"` for a seat's MCP `ask` question; absent for every other producer.
         source: Option<String>,
+        /// (ask, additive) The asking unit's ordinal and dispatch attempt.
         ord: Option<u32>,
         attempt: Option<u32>,
+        /// (ask, additive) The seat key that asked (the roster instance, e.g. `pi` or `codex#2`):
+        /// the unit's seat for that attempt, so a consumer names the asker without reading which
+        /// seat the run is running now. Absent for every other producer.
+        seat: Option<String>,
     },
     /// The elicitation identified by `elicitation_id` reached a terminal state. `session` is the
     /// `run_id`. `action` mirrors the resolved `action` field from the `elicitation/create`
@@ -2622,6 +2628,7 @@ impl CoreEvent {
                 source,
                 ord,
                 attempt,
+                seat,
             } => {
                 let mut v = json!({
                     "type": "elicitationCreated",
@@ -2644,6 +2651,9 @@ impl CoreEvent {
                 }
                 if let Some(attempt) = attempt {
                     v["attempt"] = json!(attempt);
+                }
+                if let Some(seat) = seat {
+                    v["seat"] = json!(seat);
                 }
                 v
             }
@@ -2803,6 +2813,7 @@ mod tests {
                 source: None,
                 ord: None,
                 attempt: None,
+                seat: None,
             }
             .to_json()
         };
@@ -2824,6 +2835,7 @@ mod tests {
             source: None,
             ord: None,
             attempt: None,
+            seat: None,
         }
         .to_json();
         assert_eq!(

@@ -34,6 +34,11 @@ Two release tracks share this file, newest entry first regardless of track:
   no `ask` tool, no MCP channel, no governance files). The PTY session carrier refuses them under the container floor,
   as it refuses governed units. Under `WICKED_SEAT_FLOOR=host` nothing changes.
 
+- **An ask question's `elicitationCreated` frame names the seat that asked.** Additive `seat` (the asking unit's
+  roster seat key for that attempt, e.g. `pi` or `codex#2`), beside `source: "ask"`, `ord` and `attempt`; absent for
+  every other producer. Studio's question card read the run's current lead seat, which named the wrong agent when
+  another unit asked (a pi question shown as "Codex · is asking").
+
 - **Governed container seats ask the operator mid-turn with the MCP `ask` tool (DES-CONTAINER-FLOOR step 5).**
   C5 removed ACP and with it in-turn questions; crew now serves an MCP `ask` route, reached by seat containers only
   through agentgateway's 8700 route (exact `POST`/`GET /api/v1/mcp/ask` matches). The engine owns the questions
