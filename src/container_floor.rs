@@ -128,6 +128,13 @@ pub fn default_seat_floor() -> String {
     }
 }
 
+/// Whether the operator explicitly chose the labelled interim HOST floor (`WICKED_SEAT_FLOOR=host`).
+/// Products always choose a floor ([`default_seat_floor`]); an unset floor is a library embedding or
+/// a test, which keeps the pre-C5 wrapped behaviour.
+pub(crate) fn host_floor_chosen() -> bool {
+    std::env::var(SEAT_FLOOR_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("host"))
+}
+
 /// Whether governed units run in the container floor on this host ([`SEAT_FLOOR_ENV`]).
 pub(crate) fn container_mode() -> bool {
     container_mode_from(std::env::var(SEAT_FLOOR_ENV).ok().as_deref())

@@ -2627,7 +2627,7 @@ impl WrappedCliStepRunner {
             // hook) or codex in its own bounded sandbox — whatever seat key carries it and whatever
             // floor resolves below. Anything else is refused, never run with only a disclosure.
             if governed
-                && !crate::container_floor::container_mode()
+                && crate::container_floor::host_floor_chosen()
                 && !host_floor_keeps_a_check(&argv)
             {
                 return floor_refused(
@@ -7056,6 +7056,11 @@ mod tests {
         // Wrapped exec path ⇒ env write lock + "no snapshot" pinned (#402 pass 3; see
         // `scratch_redirect_applies_to_a_nonclaude_seat`).
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        // C5: the labelled interim host floor, chosen explicitly (products default to container).
+        let _floor = VarGuard::set(
+            crate::container_floor::SEAT_FLOOR_ENV,
+            std::path::Path::new("host"),
+        );
         let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
         let (tx, rx) = std::sync::mpsc::channel();
         let runner = WrappedCliStepRunner::with_tx(tx);
@@ -7249,6 +7254,11 @@ mod tests {
     #[test]
     fn a_governed_unit_on_a_floor_class_seat_in_a_worktree_is_governed_by_the_floor() {
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        // C5: the labelled interim host floor, chosen explicitly (products default to container).
+        let _floor = VarGuard::set(
+            crate::container_floor::SEAT_FLOOR_ENV,
+            std::path::Path::new("host"),
+        );
         let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
         let (base, _clone, own, _sibling) =
             crate::worker_sandbox::tests::clone_with_two_runs("ig1c2-wrapped");
@@ -7379,6 +7389,11 @@ mod tests {
     #[test]
     fn a_codex_seat_launching_another_binary_is_not_governed_by_codex_sandbox() {
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        // C5: the labelled interim host floor, chosen explicitly (products default to container).
+        let _floor = VarGuard::set(
+            crate::container_floor::SEAT_FLOOR_ENV,
+            std::path::Path::new("host"),
+        );
         let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
         if seat_governance_class("codex") != wicked_council::GovernanceClass::OsSandboxFloor {
             eprintln!("execute_wrapped: this host's codex record is not floor-class — skips");
