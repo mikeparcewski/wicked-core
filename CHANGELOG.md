@@ -14,6 +14,16 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **opencode seats get the MCP `ask` tool.** opencode 2.0.25 connects an MCP server named in its configuration files
+  (`initialize`, `tools/list`) but never offers its tools to the model, either directly or in Code Mode, even once
+  `GET /api/mcp` reports it `connected`; a server registered through its own serve API is offered. So a governed
+  container opencode seat's pinned server script now registers the engine's `wicked` server
+  (`PUT /api/experimental/mcp/wicked`, then `connect`, for the run's directory) before `opencode run`: the gateway
+  route, `codemode: false` (the tool is `wicked_ask`), `timeout.execution` = the ask timeout + 60 s, and the seat's
+  `WICKED_MCP_TOKEN` filled into the body on curl's stdin, never argv (`WICKED_OPENCODE_ASK` carries the body with a
+  slot). The seat's MCP deny (`"*_*": "deny"`) gains an exact `"wicked_ask": "allow"` read after it, at the top level
+  and on the governed agent. A failed registration is logged and the seat runs without the tool. Still not copilot.
+
 - **Governed container seats ask the operator mid-turn with the MCP `ask` tool (DES-CONTAINER-FLOOR step 5).**
   C5 removed ACP and with it in-turn questions; crew now serves an MCP `ask` route, reached by seat containers only
   through agentgateway's 8700 route (exact `POST`/`GET /api/v1/mcp/ask` matches). The engine owns the questions
