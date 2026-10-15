@@ -9,10 +9,15 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use std::collections::BTreeMap;
+
+use wicked_apps_core::{open_store, ToNode};
+use wicked_core::assurance::QeOverride;
 use wicked_core::{
-    BusDb, BusEmit, CampaignDef, CampaignNode, CampaignStatus, Core, CoreEvent, DenialGatePolicy,
-    EntityMode, FailurePolicy, HumanConfirm, RunSpec, StepInput, StepOutput, StepRunner,
-    StepStatus,
+    put_node, BusDb, BusEmit, Campaign, CampaignDef, CampaignEdge, CampaignGateDecision,
+    CampaignNode, CampaignStatus, Core, CoreEvent, DenialGatePolicy, EdgeCondition, EntityMode,
+    FailurePolicy, HumanConfirm, LaunchSpec, NodeStatus, PlanStep, PresetSpec, RunSpec, StepInput,
+    StepOutput, StepRunner, StepStatus,
 };
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
@@ -329,7 +334,6 @@ fn a_campaign_nodes_word_that_cannot_apply_is_refused() {
         assert!(Instant::now() < deadline, "the campaign settles: {st}");
         std::thread::sleep(Duration::from_millis(50));
     }
-    let _ = CampaignStatus::PartiallyCompleted;
 }
 
 /// Bus requests: with the setting off, a QE request with no word is skipped with the setting's
@@ -388,4 +392,277 @@ fn bus_requests_take_their_own_word_or_the_hosts_and_a_refused_word_is_dropped()
     );
     assert!(core.sessions().unwrap().iter().all(|s| s != "b-bad"));
     bridge.stop();
+}
+
+/// Every event until each of `sids` has STARTED (or `within`), as JSON — for runs that park (a
+/// preset's plan approval) rather than end.
+fn events_until_started(
+    ev: &std::sync::mpsc::Receiver<CoreEvent>,
+    sids: &[&str],
+    within: Duration,
+) -> Vec<serde_json::Value> {
+    let seen = std::cell::RefCell::new(std::collections::BTreeSet::<String>::new());
+    collect_until(ev, within, |e| {
+        if let CoreEvent::SessionStarted { session, .. } = e {
+            seen.borrow_mut().insert(session.clone());
+        }
+        sids.iter().all(|s| seen.borrow().contains(*s))
+    })
+    .iter()
+    .map(|e| e.to_json())
+    .collect()
+}
+
+fn node_status_of(core: &Core, campaign: &str, node: &str) -> Option<NodeStatus> {
+    core.campaign_detail(campaign)
+        .ok()
+        .flatten()
+        .and_then(|c| c.node_status.get(node).copied())
+}
+
+fn wait_node(core: &Core, campaign: &str, node: &str, want: NodeStatus) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while node_status_of(core, campaign, node) != Some(want) {
+        assert!(
+            Instant::now() < deadline,
+            "{campaign}/{node} never reached {want:?} (at {:?})",
+            node_status_of(core, campaign, node)
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// codex r1: the setting is read when a node DISPATCHES, not when its campaign launches. Node `a`
+/// launches with the setting on (required) and parks at its gate; the setting goes off; once `a` is
+/// approved and completes, its dependent `b` dispatches under the standing skip.
+#[test]
+fn a_dependent_node_reads_the_setting_when_it_dispatches() {
+    let core = engine("camp-later");
+    let ev = core.subscribe();
+    let mut a = node("a", "qe-one", None, false);
+    a.run_spec.human_confirm = HumanConfirm::All;
+    let mut def = campaign("ql", vec![a, node("b", "qe-one", None, false)]);
+    def.edges = vec![CampaignEdge {
+        from: "a".into(),
+        to: "b".into(),
+        condition: EdgeCondition::OnSuccess,
+    }];
+    core.launch_campaign(def).expect("launch");
+    wait_node(&core, "ql", "a", NodeStatus::AwaitingHuman);
+    core.set_qe_acceptance_off(Some(OFF.into())).unwrap();
+    core.confirm_campaign_gate("ql", "a", CampaignGateDecision::Approve { amend: None })
+        .expect("approve a");
+    let evs = events_until_done(&ev, &["ql:a:a0", "ql:b:a0"], Duration::from_secs(60));
+    let qa = started_qe(&evs, "ql:a:a0");
+    assert_eq!(
+        (qa["status"].as_str(), qa["basis"].as_str()),
+        (Some("required"), Some("plan")),
+        "a launched while the setting was on: {qa}"
+    );
+    skipped_with(&started_qe(&evs, "ql:b:a0"), OFF);
+}
+
+/// The crash artifact `dispatch` can leave: `node` persisted Running under its derived run id, with
+/// no session written (the p13 SC-C6/F1b window).
+fn crashed_at(def: CampaignDef, node: &str) -> Campaign {
+    let cid = def.id.clone();
+    let node_status = def
+        .nodes
+        .iter()
+        .map(|n| {
+            let s = if n.node_id == node {
+                NodeStatus::Running
+            } else {
+                NodeStatus::Pending
+            };
+            (n.node_id.clone(), s)
+        })
+        .collect();
+    let mut node_run_id = BTreeMap::new();
+    node_run_id.insert(node.to_string(), format!("{cid}:{node}:a0"));
+    Campaign {
+        id: cid.clone(),
+        def_id: cid,
+        status: CampaignStatus::Running,
+        def,
+        node_status,
+        node_run_id,
+        node_attempt: BTreeMap::new(),
+        pending_decision: BTreeMap::new(),
+        pending_decision_amend: BTreeMap::new(),
+        pending_failure_gates: Vec::new(),
+        fail_fast_tripped: false,
+    }
+}
+
+/// codex r1: a node relaunched on resume (it crashed before its session was written) takes the host
+/// word CURRENT at the relaunch, and a node's own word survives the relaunch.
+#[test]
+fn a_node_relaunched_on_resume_reads_the_current_setting_and_keeps_its_own_word() {
+    for (cid, own_force) in [("qx", false), ("qy", true)] {
+        let db = db_path(&format!("camp-resume-{cid}"));
+        {
+            let mut store = open_store(Some(&db)).expect("open store");
+            let def = campaign(cid, vec![node("x", "qe-one", None, own_force)]);
+            put_node(&mut store, crashed_at(def, "x").to_node()).expect("persist the artifact");
+        }
+        let core = Core::spawn_with_engine(db, Arc::new(NoBallots), Arc::new(OkRunner));
+        core.register_workflow(QE_ONE).expect("register qe-one");
+        core.set_qe_acceptance_off(Some(OFF.into())).unwrap();
+        let ev = core.subscribe();
+        let run = format!("{cid}:x:a0");
+        core.resume_campaign(cid).expect("resume");
+        let evs = events_until_started(&ev, &[run.as_str()], Duration::from_secs(30));
+        let qe = started_qe(&evs, &run);
+        if own_force {
+            assert_eq!(
+                (qe["status"].as_str(), qe["basis"].as_str()),
+                (Some("required"), Some("operator")),
+                "the node's own force survives the relaunch: {qe}"
+            );
+        } else {
+            skipped_with(&qe, OFF);
+        }
+    }
+}
+
+fn step(catalog: &str, id: &str, depends_on: &[&str]) -> PlanStep {
+    PlanStep {
+        catalog: catalog.into(),
+        id: id.into(),
+        depends_on: if depends_on.is_empty() {
+            None
+        } else {
+            Some(depends_on.iter().map(|s| s.to_string()).collect())
+        },
+        ..Default::default()
+    }
+}
+
+/// codex r1: the PRESET the engine resolves decides whether the standing skip applies, on both
+/// engine-originated paths: the built-in `bug` preset requires QE acceptance (the engine's own
+/// table), so a campaign node and a bus request naming it are skipped; a saved preset that declares
+/// no `qe_acceptance` requires none, so the same requests naming it get no decision (and are not
+/// refused). (A saved preset cannot shadow a built-in globally, and these launches are unfiled, so
+/// no project shadow reaches them.)
+#[test]
+fn the_resolved_preset_decides_where_the_standing_skip_applies() {
+    for saved in [false, true] {
+        let tag = if saved { "saved" } else { "builtin" };
+        let workflow = if saved { "my-flow" } else { "bug" };
+        let dir = std::path::PathBuf::from(db_path(&format!("preset-{tag}")))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let core = engine(&format!("preset-{tag}"));
+        if saved {
+            core.put_preset(PresetSpec {
+                name: "my-flow".into(),
+                project_id: None,
+                steps: vec![
+                    step("build", "make", &[]),
+                    step("review", "check", &["make"]),
+                ],
+                created_by: "api".into(),
+            })
+            .expect("save my-flow");
+        }
+        core.set_qe_acceptance_off(Some(OFF.into())).unwrap();
+        let ev = core.subscribe();
+        let bus_db = dir.join("bus.db").to_str().unwrap().to_string();
+        let bridge = core.connect_bus(bus_db.clone(), vec![cli("codex"), cli("claude")]);
+        let cid = format!("qp{tag}");
+        core.launch_campaign(campaign(&cid, vec![node("n", workflow, None, false)]))
+            .expect("launch");
+        let bus_run = format!("bp-{tag}");
+        BusDb::open(&bus_db)
+            .unwrap()
+            .emit(&BusEmit::new(
+                wicked_core::RUN_REQUESTED,
+                "wicked-cli",
+                "cli.run",
+                serde_json::json!({ "workflow": workflow, "problem": "Fix the thing.",
+                    "args": { "session_id": bus_run } }),
+            ))
+            .unwrap();
+        let node_run = format!("{cid}:n:a0");
+        let evs = events_until_started(
+            &ev,
+            &[node_run.as_str(), bus_run.as_str()],
+            Duration::from_secs(60),
+        );
+        for run in [&node_run, &bus_run] {
+            let qe = started_qe(&evs, run);
+            if saved {
+                assert!(qe.is_null(), "{run}: the saved preset requires no QE: {qe}");
+            } else {
+                skipped_with(&qe, OFF);
+            }
+        }
+        bridge.stop();
+        let _ = core.cancel_campaign(&cid);
+        let _ = core.cancel_run(&bus_run);
+    }
+}
+
+/// codex r2: the straight-through `Core::launch` records no assurance contract, so it refuses ANY QE
+/// word — an explicit skip, a force, or the host's standing skip — rather than dropping it.
+#[test]
+fn the_straight_through_path_refuses_every_qe_word() {
+    let core = engine("straight");
+    let events = core.subscribe();
+    for (i, word) in [
+        QeOverride::Skip("why".into()),
+        QeOverride::Force,
+        QeOverride::Standing(OFF.into()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sid = format!("straight-{i}");
+        core.launch(LaunchSpec {
+            base_ref: None,
+            project_id: None,
+            problem: "Fix the thing.".into(),
+            clis: vec![cli("codex"), cli("claude")],
+            entity_mode: EntityMode::Shared,
+            session_id: sid.clone(),
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            repo_ref: None,
+            workflow: Some("qe-one".into()),
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            plan: None,
+            deliver_step: None,
+            exclude_seats: Vec::new(),
+            evidence_root: None,
+            primary: None,
+            reduced_assurance: false,
+            deliverables: Vec::new(),
+            qe_acceptance: word.clone(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(Instant::now() < deadline, "{word:?}: no refusal");
+            match events.recv_timeout(Duration::from_secs(1)) {
+                Ok(CoreEvent::Error { message, .. }) => {
+                    assert!(
+                        message.contains("QE acceptance word") && message.contains("launch_run"),
+                        "{word:?}: {message}"
+                    );
+                    break;
+                }
+                Ok(CoreEvent::SessionStarted { session, .. }) if session == sid => {
+                    panic!("{word:?}: the straight-through path started a run it cannot label")
+                }
+                _ => continue,
+            }
+        }
+        assert!(
+            core.sessions().unwrap().iter().all(|s| *s != sid),
+            "{word:?}: nothing persisted"
+        );
+    }
 }

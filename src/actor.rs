@@ -1272,16 +1272,12 @@ pub(crate) fn run(
                         "a reduced-assurance launch must use launch_run: the straight-through \
                          path does not record the run's assurance contract"
                     )),
-                    // (QE acceptance) …and so is an explicit QE skip or force.
-                    Ok(None)
-                        if matches!(
-                            qe_acceptance,
-                            crate::assurance::QeOverride::Skip(_)
-                                | crate::assurance::QeOverride::Force
-                        ) =>
-                    {
+                    // (QE acceptance) …and so is a QE word: an explicit skip or force, or the
+                    // host's standing skip (which only `launch_run` resolves against a contract).
+                    Ok(None) if qe_acceptance != crate::assurance::QeOverride::Auto => {
                         Err(anyhow::anyhow!(
-                            "a launch that skips or forces QE acceptance must use launch_run: the \
+                            "a launch with a QE acceptance word (a skip, a force, or the host's \
+                             standing skip) must use launch_run: the \
                              straight-through path does not record the run's assurance contract"
                         ))
                     }
