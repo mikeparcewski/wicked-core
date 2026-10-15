@@ -47,7 +47,9 @@ Two release tracks share this file, newest entry first regardless of track:
   completed run judged by agy, with a disclosed fallback on every gate).
 - **core** Shell tools on every carrier now apply the filesystem read boundary to existing literal
   path operands, including input redirects and changes of directory. Blocked reads remain advisory
-  and retain the tool and command in the audit; write escapes keep their fatal verdict (core#951).
+  and retain the tool and command in the audit; write escapes keep their fatal verdict. Wrapper
+  options, sourced environment files, attached path flags, file URLs and call-level working
+  directories are covered; failed directory changes preserve the known cwd (core#951).
 
 - **The editor-plugin workflow builds protocol 2.** The built-in `editor-plugin` preset's design, build and test
   steps still asked for a `protocol [1]` editor on the `wicked.editor/1` plumbing and judged conformance cases
