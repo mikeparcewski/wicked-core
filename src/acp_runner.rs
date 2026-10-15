@@ -5932,28 +5932,31 @@ fn ungoverned_fallback_refusal(input: &StepInput, cli_key: &str, cause: &str) ->
     }
 }
 
-/// Run the single-shot fallback, prepending `warning` to the output so it appears in
-/// both the streaming view and the persisted `StepOutput.output` (visible in studio). Retries a
-/// TRANSIENT worker failure up to [`MAX_TRANSIENT_RETRIES`] times (FINDING #5) so a single API blip
-/// in a long GOVERNED phase does not fail the whole run. The retry notice is folded into the
-/// PERSISTED output (not just streamed) so an operator/Studio can see a unit succeeded after retries.
+/// Run the single-shot fallback. `warning` is the reroute's disclosure, which every caller has
+/// ALREADY published as `CoreEvent::AcpFallback` (its labelled home, where studio shows it): it
+/// goes to the daemon log, never into the seat's stream or its `StepOutput.output` (core#970 —
+/// prepended there, it was fused onto every chat answer and read by the reviewer as the seat's
+/// own words). Retries a TRANSIENT worker failure up to [`MAX_TRANSIENT_RETRIES`] times
+/// (FINDING #5) so a single API blip in a long GOVERNED phase does not fail the whole run. The
+/// retry notice is folded into the PERSISTED output (not just streamed) so an operator/Studio can
+/// see a unit succeeded after retries.
 fn fallback_with_warning(
     warning: String,
     input: &StepInput,
     emit: &DeltaSink,
     fallback: &WrappedCliStepRunner,
 ) -> StepOutput {
-    emit(&format!("{warning}\n"));
+    eprintln!("{warning}");
     // Only governed campaign units are retried — see `should_retry_worker`.
     let governed = input.governance.is_some();
     let mut result = fallback.run_unit_streaming(input, emit);
     // Retry decision reads the RAW runner output (the "(cli … exited N)" message), before the
-    // warning is prepended below.
+    // retry note is prepended below.
     let mut retries_done = 0u32;
     while should_retry_worker(governed, result.status, &result.output, retries_done) {
         retries_done += 1;
         emit(&format!(
-            "[wicked-core] worker hit a transient CLI/connection failure; retrying \
+            "\n[wicked-core] worker hit a transient CLI/connection failure; retrying \
              ({retries_done}/{MAX_TRANSIENT_RETRIES})\n"
         ));
         result = fallback.run_unit_streaming(input, emit);
@@ -5970,13 +5973,14 @@ fn fallback_with_warning(
     } else {
         String::new()
     };
-    let warning = format!("{warning}\n{retry_note}");
-    let warning = warning.trim_end().to_string();
-    result.output = if result.output.is_empty() {
-        warning
-    } else {
-        format!("{warning}\n{}", result.output)
-    };
+    let retry_note = retry_note.trim_end();
+    if !retry_note.is_empty() {
+        result.output = if result.output.is_empty() {
+            retry_note.to_string()
+        } else {
+            format!("{retry_note}\n{}", result.output)
+        };
+    }
     result
 }
 

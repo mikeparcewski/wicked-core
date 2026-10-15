@@ -1308,7 +1308,7 @@ pub(crate) fn apply_and_finish_unit(
     let agent_denial = agent_verdict_denial(agent_verdict);
     // (core#850, EX-02) The run's assurance contract. A judge the unit WANTED but could not
     // convene (no seat distinct from the work's author) is a HOLD when the contract requires the
-    // judge: the gate denies under `judge_unavailable` (sign a judge seat in, approve to re-run),
+    // judge: the gate denies under `judge_unavailable` (approve = the operator judges, core#969),
     // never a deterministic-only approve. A `reduced` run keeps the disclosed skip.
     let assurance = run_session
         .as_ref()
@@ -1322,9 +1322,9 @@ pub(crate) fn apply_and_finish_unit(
             crate::domain::UnitDenial::new(
                 crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE,
                 format!(
-                    "the run requires a judge ({}) and none could run: {why}. Sign a judge seat \
-                     distinct from the work's author in, then approve to re-run the phase \
-                     (or relaunch with reduced assurance, disclosed)",
+                    "the run requires a judge ({}) and none could run: {why}. Approve to judge \
+                     the work yourself (or sign a judge seat distinct from the work's author in \
+                     and relaunch, or relaunch with reduced assurance, disclosed)",
                     crate::assurance::JUDGE
                 ),
             )
