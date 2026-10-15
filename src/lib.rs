@@ -690,7 +690,7 @@ impl Core {
         let bus_bridge_actor = bus_bridge.clone();
         // The host's standing QE word (`set_qe_acceptance_off`), shared with the actor (campaign
         // nodes) and the bus bridge (bus requests).
-        let qe_host = crate::assurance::HostQeAcceptance::default();
+        let qe_host = crate::assurance::HostQeAcceptance::from_env();
         let qe_host_actor = qe_host.clone();
         let team_link = crate::team::publish::TeamLink::spawn(&team_cfg, tx.clone());
         std::thread::spawn(move || {
@@ -769,7 +769,7 @@ impl Core {
         let bus_bridge_actor = bus_bridge.clone();
         // The host's standing QE word (`set_qe_acceptance_off`), shared with the actor (campaign
         // nodes) and the bus bridge (bus requests).
-        let qe_host = crate::assurance::HostQeAcceptance::default();
+        let qe_host = crate::assurance::HostQeAcceptance::from_env();
         let qe_host_actor = qe_host.clone();
         let team_link = crate::team::publish::TeamLink::spawn(&team_cfg, tx.clone());
         let publishes = matches!(team_link, crate::team::publish::TeamLink::Publisher { .. });
@@ -860,7 +860,7 @@ impl Core {
         let bus_bridge_actor = bus_bridge.clone();
         // The host's standing QE word (`set_qe_acceptance_off`), shared with the actor (campaign
         // nodes) and the bus bridge (bus requests).
-        let qe_host = crate::assurance::HostQeAcceptance::default();
+        let qe_host = crate::assurance::HostQeAcceptance::from_env();
         let qe_host_actor = qe_host.clone();
         let team_link = crate::team::publish::TeamLink::spawn(&team_cfg, tx.clone());
         std::thread::spawn(move || {
@@ -934,7 +934,9 @@ impl Core {
     /// request args) and whose contract requires QE acceptance is skipped with `reason`, persisted
     /// and labelled exactly like an operator skip ("QE acceptance skipped by operator: <reason>",
     /// `basis: "operator"`) on the run, every gate and the delivery. A launch whose contract does
-    /// not require it is left as it is: the setting is never a refusal. Read at each launch.
+    /// not require it is left as it is: the setting is never a refusal. Read at each launch. A
+    /// `Core` starts with [`crate::assurance::QE_ACCEPTANCE_OFF_ENV`]'s reason when the host set it
+    /// before spawning (so no bus request can launch under the default in between).
     pub fn set_qe_acceptance_off(&self, reason: Option<String>) -> Result<(), String> {
         self.qe_host.set(reason)
     }

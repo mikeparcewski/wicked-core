@@ -136,7 +136,27 @@ impl std::error::Error for QeOverrideRefused {}
 #[derive(Debug, Clone, Default)]
 pub struct HostQeAcceptance(std::sync::Arc<std::sync::RwLock<Option<String>>>);
 
+/// The environment variable a host sets BEFORE `Core::spawn*` to start the engine with QE
+/// acceptance already off for its own launches (the value is the reason). The bus bridge is armed
+/// inside `spawn`, so a host that only called [`crate::Core::set_qe_acceptance_off`] afterwards
+/// would leave a window in which a bus request launches under the default. Read once, at spawn;
+/// the setter changes it from then on. Unset or blank: QE acceptance is required.
+pub const QE_ACCEPTANCE_OFF_ENV: &str = "WICKED_QE_ACCEPTANCE_OFF";
+
 impl HostQeAcceptance {
+    /// The setting a `Core` starts with: [`QE_ACCEPTANCE_OFF_ENV`]'s reason when it is set and not
+    /// blank, else off-nothing (QE acceptance required).
+    pub fn from_env() -> Self {
+        let host = Self::default();
+        if let Some(reason) = std::env::var(QE_ACCEPTANCE_OFF_ENV)
+            .ok()
+            .filter(|r| !r.trim().is_empty())
+        {
+            let _ = host.set(Some(reason));
+        }
+        host
+    }
+
     /// Turn QE acceptance off for engine-originated launches, with this reason (non-empty), or
     /// back on (`None`).
     pub fn set(&self, reason: Option<String>) -> Result<(), String> {
