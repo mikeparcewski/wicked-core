@@ -4213,6 +4213,11 @@ fn arm_input_governance(
     // file is never written with a hole the argv flag also lacks.
     let deny = deny_rules(skills_root, operational_home).map_err(std::io::Error::other)?;
     let settings = serde_json::json!({
+        // C5 (codex c5-core-r12): without ACP the gate hook is the only per-call check, so the
+        // engine's flag-scope settings pin `disableAllHooks: false` — it outranks the user scope the
+        // operator-config hatch loads (`--setting-sources user`). Only managed settings outrank it,
+        // and a managed hook-silencer is refused before spawn (`managed_hooks_only_source`).
+        "disableAllHooks": false,
         "hooks": {
             "PreToolUse": [
                 { "matcher": "*", "hooks": [ hook ] }
@@ -7868,6 +7873,11 @@ mod tests {
             "the Read/Edit fence is in the settings file: {deny:?}"
         );
         assert!(deny.contains(&"Bash(sudo:*)"), "{deny:?}");
+        assert_eq!(
+            json["disableAllHooks"],
+            serde_json::Value::Bool(false),
+            "the flag-scope settings keep hooks on over an inherited user scope (C5)"
+        );
         assert_eq!(
             json["hooks"]["PreToolUse"][0]["matcher"], "*",
             "the hook governs EVERY tool"
