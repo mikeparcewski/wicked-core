@@ -526,6 +526,8 @@ pub(crate) fn run_started_ms(root: &Path, run_id: &str) -> Option<i64> {
 /// there is no second path an event could take to the socket while skipping the log.
 #[derive(Default)]
 pub struct EventSink {
+    /// Ask state belongs to this actor, and is released with it even on unwinding.
+    pub(crate) asks: crate::ask::Registry,
     subscribers: Vec<std::sync::mpsc::Sender<CoreEvent>>,
     /// Where this sink records. `None` ⇒ fan out only, for embedders and tests that want no
     /// filesystem writes.
@@ -538,6 +540,7 @@ impl EventSink {
         Self {
             subscribers: Vec::new(),
             root: Some(root),
+            asks: Default::default(),
         }
     }
 
@@ -546,6 +549,13 @@ impl EventSink {
     /// filesystem writes), and a caller that needs the durable trail has to handle that.
     pub(crate) fn log_root(&self) -> Option<&Path> {
         self.root.as_deref()
+    }
+
+    /// Resolve displayed asks and discard queued asks before the actor exits.
+    pub(crate) fn close_asks(&mut self) {
+        for resolved in self.asks.drain() {
+            self.emit(resolved);
+        }
     }
 
     /// Register a live subscriber.
@@ -563,12 +573,190 @@ impl EventSink {
             append(root, &ev);
         }
         self.subscribers.retain(|s| s.send(ev.clone()).is_ok());
+        if let CoreEvent::RunCancelled { session, .. }
+        | CoreEvent::SessionFailed { session, .. }
+        | CoreEvent::SessionCompleted { session } = &ev
+        {
+            for resolved in self.asks.close_run(session) {
+                self.emit(resolved);
+            }
+        }
+    }
+}
+
+impl Drop for EventSink {
+    fn drop(&mut self) {
+        // Also release questions on an abnormal actor exit; never touch another actor's queue.
+        self.close_asks();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn open_ask(sink: &mut EventSink, run: &str) -> (crate::AskTicket, Option<CoreEvent>) {
+        sink.asks.open(
+            crate::mcp_gate::McpUnit {
+                run_id: run.into(),
+                ord: 3,
+                attempt: 2,
+                seat: "claude".into(),
+                scope: "scope".into(),
+                phase: "unit-3".into(),
+                phase_id: "build".into(),
+                catalog: String::new(),
+                role: crate::workflow::PhaseRole::Creator,
+                posture: crate::write_posture::WritePosture::Full,
+                mode: crate::mcp_gate::McpMode::Ask,
+                decisions_path: "/unused".into(),
+                db_path: String::new(),
+            },
+            crate::AskRequest {
+                question: "Continue?".into(),
+                choices: None,
+                recommended: None,
+            },
+        )
+    }
+
+    #[test]
+    fn ask_terminal_frames_close_open_question_and_drop_queue_after_recording_and_fanout() {
+        for kind in ["cancelled", "failed", "completed"] {
+            let root = tmp(&format!("ask-terminal-{kind}"));
+            let run = format!("ask-terminal-{kind}");
+            let other_run = format!("ask-other-{kind}");
+            let mut sink = EventSink::persistent(root.clone());
+            let (tx, rx) = std::sync::mpsc::channel();
+            sink.push(tx);
+            let (first, created) = open_ask(&mut sink, &run);
+            sink.emit(created.unwrap());
+            let (second, created) = open_ask(&mut sink, &run);
+            assert!(created.is_none());
+            let (other, _) = open_ask(&mut sink, &other_run);
+            let terminal = match kind {
+                "cancelled" => CoreEvent::RunCancelled {
+                    session: run.clone(),
+                    tool_children_killed: 0,
+                },
+                "failed" => CoreEvent::SessionFailed {
+                    session: run.clone(),
+                    ord: 3,
+                },
+                _ => CoreEvent::SessionCompleted {
+                    session: run.clone(),
+                },
+            };
+            let terminal_type = terminal.to_json()["type"].clone();
+            sink.emit(terminal);
+            let records = read_run(&root, &run);
+            let live: Vec<_> = rx.try_iter().map(|ev| ev.to_json()).collect();
+            assert_eq!(records.len(), 3);
+            assert_eq!(live.len(), 3);
+            assert_eq!(records[0]["type"], "elicitationCreated");
+            assert_eq!(records[0]["elicitationId"], first.elicitation_id);
+            assert_eq!(records[1]["type"], terminal_type);
+            for (record, frame) in records.iter().zip(&live) {
+                assert_eq!(record["type"], frame["type"]);
+                assert_eq!(record["elicitationId"], frame["elicitationId"]);
+            }
+            for ticket in [&first, &second] {
+                assert!(!sink.asks.is_open(&ticket.elicitation_id));
+                assert!(sink.asks.close(&ticket.elicitation_id, "timeout").is_none());
+            }
+            let resolved = &records[2];
+            assert_eq!(resolved["elicitationId"], first.elicitation_id);
+            assert_eq!(resolved["type"], "elicitationResolved");
+            assert_eq!(resolved["action"], "cancel");
+            assert_eq!(resolved["reason"], "teardown");
+            assert!(resolved.get("answer").is_none());
+            assert!(resolved["heldMs"].is_u64());
+            assert!(!records
+                .iter()
+                .any(|ev| ev["elicitationId"] == second.elicitation_id));
+            assert!(sink.asks.close_run(&run).is_empty());
+            assert!(sink.asks.is_open(&other.elicitation_id));
+            sink.asks.close_run(&other_run);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn ask_sink_unwind_teardown_does_not_touch_another_engines_same_run_queue() {
+        let root = tmp("ask-sink-unwind");
+        let run = "same-run";
+        let mut other = EventSink::default();
+        let (other_first, _) = open_ask(&mut other, run);
+        let (other_queued, created) = open_ask(&mut other, run);
+        assert!(created.is_none());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut sink = EventSink::persistent(root.clone());
+        sink.push(tx);
+        let (first, created) = open_ask(&mut sink, run);
+        assert!(
+            created.is_some(),
+            "each engine has its own queue even for the same run id"
+        );
+        sink.emit(created.unwrap());
+        let (queued, created) = open_ask(&mut sink, run);
+        assert!(created.is_none());
+        assert!(std::panic::catch_unwind(move || {
+            let _sink = sink;
+            panic!("simulate abnormal actor exit");
+        })
+        .is_err());
+        let records = read_run(&root, run);
+        let live: Vec<_> = rx.try_iter().map(|event| event.to_json()).collect();
+        for frames in [&records, &live] {
+            assert_eq!(frames.len(), 2, "{frames:?}");
+            assert_eq!(frames[0]["elicitationId"], first.elicitation_id);
+            assert_eq!(frames[1]["elicitationId"], first.elicitation_id);
+            assert_eq!(frames[1]["action"], "cancel");
+            assert_eq!(frames[1]["reason"], "teardown");
+            assert!(!frames
+                .iter()
+                .any(|event| event["elicitationId"] == queued.elicitation_id));
+        }
+        assert!(other.asks.is_open(&other_first.elicitation_id));
+        assert!(!other.asks.is_open(&other_queued.elicitation_id));
+        let promoted = other
+            .asks
+            .close(&other_first.elicitation_id, "timeout")
+            .unwrap();
+        assert_eq!(
+            promoted[1].to_json()["elicitationId"],
+            other_queued.elicitation_id
+        );
+        other.close_asks();
+        assert!(other.asks.drain().is_empty(), "teardown is idempotent");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ask_created_frame_is_recorded_before_its_resolution() {
+        let root = tmp("ask-created-resolved");
+        let mut sink = EventSink::persistent(root.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        sink.push(tx);
+        let run = "ask-created-resolved";
+        let (ticket, created) = open_ask(&mut sink, run);
+        // Even if the registry entry is already closed, the durable question must survive.
+        let resolved = sink.asks.close(&ticket.elicitation_id, "timeout").unwrap();
+        sink.emit(created.unwrap());
+        for resolved in resolved {
+            sink.emit(resolved);
+        }
+        let records = read_run(&root, run);
+        let live: Vec<_> = rx.try_iter().map(|ev| ev.to_json()).collect();
+        for frames in [&records, &live] {
+            assert_eq!(frames.len(), 2);
+            assert_eq!(frames[0]["type"], "elicitationCreated");
+            assert_eq!(frames[1]["type"], "elicitationResolved");
+            assert_eq!(frames[0]["elicitationId"], ticket.elicitation_id);
+            assert_eq!(frames[1]["elicitationId"], ticket.elicitation_id);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     /// A scratch log root. No env var and no thread-local: the root is a plain argument now, so tests
     /// are isolated by construction and can run in parallel with nothing to restore.

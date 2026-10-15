@@ -812,7 +812,7 @@ fn arm_worker_mcp_channel_at(
     Some((token, binding))
 }
 
-fn resolve(token: &str) -> Option<McpUnit> {
+pub(crate) fn resolve(token: &str) -> Option<McpUnit> {
     lock_registry()
         .get(token)
         .and_then(|slot| slot.as_ref().map(|(_, unit)| unit.clone()))

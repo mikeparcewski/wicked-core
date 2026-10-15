@@ -117,6 +117,22 @@ pub(crate) fn seat_mcp_pin_flags(
     }
 }
 
+/// Return isolation flags and whether ask can be handed to this seat. Codex merges per-key
+/// overrides with ambient entries, so any existing `wicked` entry must stay disabled.
+pub(crate) fn seat_mcp_pin_flags_with_ask(
+    cli: SeatCli,
+    seat_root: Option<&std::path::Path>,
+    cwd: Option<&std::path::Path>,
+    ask_enabled: bool,
+) -> Result<(Vec<String>, bool), String> {
+    let flags = seat_mcp_pin_flags(cli, seat_root, cwd)?;
+    let collision = cli == SeatCli::Codex
+        && flags
+            .iter()
+            .any(|flag| flag == "mcp_servers.wicked.enabled=false");
+    Ok((flags, ask_enabled && !collision))
+}
+
 /// The configuration home whose MCP config a seat will actually read: its ENGINE-MINTED root when
 /// it has one, and otherwise — under the operator-inherit hatch, where `SeatConfig::Inherit`
 /// touches no CLI configuration variable — the CLI's OWN home, `$CODEX_HOME` / `$COPILOT_HOME`
@@ -714,5 +730,63 @@ mod tests {
             let err = opencode_config(Some(bad)).expect_err(bad);
             assert!(err.contains("OPENCODE_CONFIG_CONTENT"), "{bad}: {err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod ask_pin_tests {
+    use super::*;
+    #[test]
+    fn ask_codex_pin_refuses_ambient_wicked_in_either_config_source() {
+        let root =
+            std::env::temp_dir().join(format!("wicked-ask-pin-{}", uuid::Uuid::new_v4().simple()));
+        let home = root.join("seat");
+        let project = root.join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(project.join(".codex")).unwrap();
+        for source in [home.join("config.toml"), project.join(".codex/config.toml")] {
+            for entry in [
+                "[mcp_servers.wicked]\ncommand = 'echo'\n",
+                "[mcp_servers.wicked]\nurl = 'http://old'\nenabled = false\n",
+                "[mcp_servers.wicked]\nurl = 'http://old'\nenabled_tools = ['other']\n",
+                "",
+            ] {
+                std::fs::write(
+                    &source,
+                    format!("{entry}[mcp_servers.ambient]\ncommand = 'echo'\n"),
+                )
+                .unwrap();
+                for requested in [false, true] {
+                    let (flags, enabled) = seat_mcp_pin_flags_with_ask(
+                        SeatCli::Codex,
+                        Some(&home),
+                        Some(&project),
+                        requested,
+                    )
+                    .unwrap();
+                    assert_eq!(enabled, requested && entry.is_empty());
+                    assert!(flags
+                        .iter()
+                        .any(|s| s == "mcp_servers.ambient.enabled=false"));
+                    assert_eq!(
+                        flags
+                            .iter()
+                            .any(|s| s == "mcp_servers.wicked.enabled=false"),
+                        !entry.is_empty()
+                    );
+                    let config =
+                        crate::execute_wrapped::ask_seat_config(SeatCli::Codex, enabled, 600, &[]);
+                    assert_eq!(config.flags.is_empty(), !enabled);
+                    if enabled {
+                        assert!(config
+                            .flags
+                            .iter()
+                            .any(|s| s == "mcp_servers.wicked.enabled=true"));
+                    }
+                }
+            }
+            std::fs::remove_file(source).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

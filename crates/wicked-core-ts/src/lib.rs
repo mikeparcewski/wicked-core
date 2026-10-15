@@ -538,6 +538,23 @@ impl Task for CoreTask {
     }
 }
 
+/// The ask close binding returns a JS boolean rather than a JSON string.
+pub struct CloseAskTask {
+    core: wicked_core::Core,
+    id: String,
+    reason: String,
+}
+impl Task for CloseAskTask {
+    type Output = bool;
+    type JsValue = bool;
+    fn compute(&mut self) -> napi::Result<bool> {
+        Ok(self.core.close_ask(&self.id, &self.reason))
+    }
+    fn resolve(&mut self, _env: Env, output: bool) -> napi::Result<bool> {
+        Ok(output)
+    }
+}
+
 /// `Core.busRead()`'s JSON `{ next, rows }`.
 fn bus_read_json(
     core: &wicked_core::Core,
@@ -1352,6 +1369,31 @@ impl Core {
     pub fn cancel_run(&self, run_id: String) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || core.cancel_run(&run_id).map(status_token).map_err(err))
+    }
+
+    /// The unit a bound MCP token belongs to: `{runId, ord, attempt, seat, timeoutSecs}`; rejects
+    /// `invalid_token: …`. Records and emits nothing (crew queues asks per run before opening).
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn ask_unit(&self, token: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || core.ask_unit_json(&token).map_err(err))
+    }
+
+    /// Open an operator question with `{token, question, choices?, recommended?}`.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn open_ask(&self, request_json: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || core.open_ask_json(&request_json).map_err(err))
+    }
+
+    /// Close an unanswered question (`timeout` or `teardown`); false if already resolved.
+    #[napi(ts_return_type = "Promise<boolean>")]
+    pub fn close_ask(&self, elicitation_id: String, reason: String) -> AsyncTask<CloseAskTask> {
+        AsyncTask::new(CloseAskTask {
+            core: self.inner.clone(),
+            id: elicitation_id,
+            reason,
+        })
     }
 
     /// Resolve a pending ACP elicitation. `action` must be `"accept"`, `"decline"`, or `"cancel"`;

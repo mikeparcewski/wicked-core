@@ -934,6 +934,8 @@ impl Drop for EpochCleanup {
                     elicitation_id: id.clone(),
                     action: self.in_flight_action.clone().unwrap_or_default(),
                     reason: self.in_flight_reason.clone().unwrap_or_default(),
+                    answer: None,
+                    held_ms: None,
                 },
             ));
         }
@@ -3621,6 +3623,7 @@ mod tests {
                 elicitation_id,
                 action,
                 reason,
+                ..
             }) => {
                 assert_eq!(session, "run-29d");
                 assert_eq!(elicitation_id, "eid-29d");

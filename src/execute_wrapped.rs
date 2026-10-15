@@ -2254,6 +2254,33 @@ impl WrappedCliStepRunner {
         // `<label>\n<output>` blocks — so a wrapped reviewer/creator with `depends_on` sees the
         // work it depends on. Empty (no change) for a unit with no prior outputs.
         let prompt = format!("{}{task}", prior_context_prefix(&input.prior_outputs));
+        let seat_cli = wicked_apps_core::spawn::SeatCli::from_binary(&binary);
+        let container = crate::container_floor::container_mode();
+        // Ungoverned workers do not need ask discovery or configuration before spawning.
+        let otherwise_eligible = input.governance.is_some()
+            && ask_seat_enabled(
+                true,
+                container,
+                seat_cli,
+                crate::mcp_gate::daemon_crew_url().as_deref(),
+                crate::container_floor::offline_seats(),
+                self.operational_home.is_some(),
+                true,
+            );
+        // Warm the first unit's route before rendering any ask flags/files. Use the same
+        // cached runtime and <operational_home>/gateway directory as container_floor::arm.
+        // A process-cached route cannot provide a gateway to an offline or homeless runner.
+        let gateway_ok = otherwise_eligible
+            && self.operational_home.as_deref().is_some_and(|home| {
+                crate::seat_gateway::mcp_route_ready()
+                    || crate::container_floor::runtime()
+                        .ok()
+                        .is_some_and(|runtime| {
+                            crate::seat_gateway::ensure_gateway(&runtime, &home.join("gateway"))
+                                .is_ok()
+                        })
+            });
+        let mut ask_enabled = gateway_ok && crate::seat_gateway::mcp_route_ready();
         let mut argv = build_argv(&invocation, &prompt, &input.unit.allowed_skills);
         // F-036: set below when a NO-CODE phase lands on a non-claude seat that exposes no
         // read-only lever — folded into the governance disclosure so the record says which
@@ -2264,14 +2291,12 @@ impl WrappedCliStepRunner {
         // `--` guard); binaries without a JSON mode → passthrough (byte-identical raw-line stream).
         // (core#412) codex → `exec --json`, pi → `-p --mode json`, each with its JSON adapter, so
         // the seat's usage is captured; the unit's text stays what plain mode printed.
-        let seat_cli = wicked_apps_core::spawn::SeatCli::from_binary(&binary);
         let codex_json = seat_cli == wicked_apps_core::spawn::SeatCli::Codex
             && inject_codex_json_flag(&mut argv);
         let pi_json =
             seat_cli == wicked_apps_core::spawn::SeatCli::Pi && inject_pi_json_mode(&mut argv);
         // opencode's JSON mode is the container carrier's only (outside it, the wrapped
         // opencode launch stays byte-identical to before: codex hl-r1).
-        let container = crate::container_floor::container_mode();
         if container && seat_cli == wicked_apps_core::spawn::SeatCli::Opencode {
             inject_opencode_json_format(&mut argv);
         }
@@ -2413,20 +2438,26 @@ impl WrappedCliStepRunner {
             // cannot read or cannot address REFUSES the launch (fail closed, like the skills
             // composition): a governed worker never gets an ungoverned tool channel because a
             // file was unreadable.
-            match crate::mcp_isolation::seat_mcp_pin_flags(
+            match crate::mcp_isolation::seat_mcp_pin_flags_with_ask(
                 wicked_apps_core::spawn::SeatCli::from_binary(&binary),
                 seat_config.root(),
                 Some(&input.workdir.clone().unwrap_or_else(|| sandbox_for(input))),
+                ask_enabled,
             ) {
-                Ok(pins) if !pins.is_empty() => {
-                    eprintln!(
-                        "wicked-core: unit {} on '{cli_key}' launches with the seat's MCP pin \
+                Ok((pins, enabled)) => {
+                    if ask_enabled && !enabled {
+                        eprintln!("wicked-core: unit {} on '{cli_key}': ask MCP server not handed because an ambient mcp_servers.wicked entry would merge with the engine server; wicked remains disabled", input.unit.ord);
+                    }
+                    ask_enabled = enabled;
+                    if !pins.is_empty() {
+                        eprintln!(
+                            "wicked-core: unit {} on '{cli_key}' launches with the seat's MCP pin \
                          {pins:?} (core#660)",
-                        input.unit.ord
-                    );
-                    apply_seat_posture(&mut argv, &pins);
+                            input.unit.ord
+                        );
+                        apply_seat_posture(&mut argv, &pins);
+                    }
                 }
-                Ok(_) => {}
                 Err(why) => return posture_refusal(input, &why),
             }
             if let (Some(s), true) = (handed, delivery.delivers_skills()) {
@@ -2442,6 +2473,22 @@ impl WrappedCliStepRunner {
                     &cli_key,
                 ));
             }
+        }
+
+        if ask_enabled {
+            if let Some(reason) = pi_ask_refusal(seat_cli, &argv) {
+                ask_enabled = false;
+                eprintln!("wicked-core: unit {} on '{cli_key}': ask MCP server not handed because {reason}", input.unit.ord);
+            }
+        }
+        let ask_config = if input.governance.is_some() {
+            ask_seat_config(seat_cli, ask_enabled, crate::ask::timeout_secs(), &argv)
+        } else {
+            AskSeatConfig::default()
+        };
+        apply_seat_posture(&mut argv, &ask_config.flags);
+        if input.governance.is_some() && !ask_enabled {
+            eprintln!("wicked-core: unit {} on '{cli_key}': ask MCP server not handed (requires a supported governed container seat, a loopback crew URL with a port, a ready gateway MCP route and no ambient wicked collision)", input.unit.ord);
         }
 
         // GOVERNED unit + claude → arm INPUT governance (DES-OUTGOV-003 §2): write a per-run settings
@@ -2482,6 +2529,7 @@ impl WrappedCliStepRunner {
                     &mut argv,
                     handed.map(|s| s.root.as_path()),
                     operational_home,
+                    ask_enabled,
                 ) {
                     Ok(env) => {
                         // (EVT-016) GovernanceContextArmed — wrapped-CLI path successfully armed
@@ -3020,6 +3068,9 @@ impl WrappedCliStepRunner {
             for (k, v) in &seat_gateway_env {
                 cmd.env(k, v);
             }
+            if uses_container_seat(governed, container) {
+                seat_files.extend(ask_config.files.iter().cloned());
+            }
             if let Err(why) = crate::container_floor::write_unit_seat_files(
                 &mut cmd,
                 seat_cli.root_name().unwrap_or_default(),
@@ -3226,6 +3277,7 @@ impl WrappedCliStepRunner {
             // is governed. Bound until the worker exits (the guard drops after `run_bounded`); an
             // ungoverned unit or a daemon with no broker gets neither variable.
             let mcp_channel = crate::mcp_gate::arm_worker_mcp_channel(&mut cmd, input);
+            cmd.envs(ask_config.env.iter().cloned());
             // A container seat reaches the broker only through its gateway's MCP route (the
             // daemon's loopback URL names the seat's own loopback); no route, no broker URL.
             if mcp_channel.is_some() && gateway_lease.is_some() {
@@ -3500,6 +3552,117 @@ fn template_overrides_settings(argv: &[String]) -> bool {
     argv.iter()
         .skip(1)
         .any(|a| a == "--settings" || a.starts_with("--settings="))
+}
+
+/// Pure handoff decision, evaluated after warming the gateway when otherwise eligible.
+fn ask_seat_enabled(
+    governed: bool,
+    container: bool,
+    cli: wicked_apps_core::spawn::SeatCli,
+    crew_url: Option<&str>,
+    offline: bool,
+    has_operational_home: bool,
+    route_ready: bool,
+) -> bool {
+    use wicked_apps_core::spawn::SeatCli;
+    governed
+        && container
+        && !offline
+        && has_operational_home
+        && matches!(cli, SeatCli::Claude | SeatCli::Codex | SeatCli::Pi)
+        && crew_url.and_then(crate::seat_gateway::crew_port).is_some()
+        && route_ready
+}
+
+/// Pi's project approval enables project-local MCP sources, which can replace `wicked`.
+/// Treat approval as a handoff collision even if a no-approval flag is also present.
+fn pi_ask_refusal(cli: wicked_apps_core::spawn::SeatCli, argv: &[String]) -> Option<&'static str> {
+    (cli == wicked_apps_core::spawn::SeatCli::Pi
+        && argv.iter().skip(1).take_while(|a| *a != "--")
+            .any(|a| matches!(a.as_str(), "--approve" | "-a")))
+        .then_some("pi --approve/-a trusts project-local MCP servers that can replace the engine's wicked server")
+}
+
+#[derive(Default)]
+pub(crate) struct AskSeatConfig {
+    pub(crate) flags: Vec<String>,
+    pub(crate) files: Vec<(PathBuf, String)>,
+    pub(crate) env: Vec<(String, String)>,
+}
+
+/// Static config only: the CLI expands the capability from its environment, never argv/files.
+pub(crate) fn ask_seat_config(
+    cli: wicked_apps_core::spawn::SeatCli,
+    enabled: bool,
+    timeout: u64,
+    argv: &[String],
+) -> AskSeatConfig {
+    use wicked_apps_core::spawn::SeatCli;
+    let mut config = AskSeatConfig {
+        flags: vec![],
+        files: vec![],
+        env: vec![],
+    };
+    if !enabled || pi_ask_refusal(cli, argv).is_some() {
+        // Container seat homes survive retries. Reconcile our MCP file even when ask is
+        // withheld so a previous attempt cannot leave its server active.
+        if cli == SeatCli::Pi {
+            config.files.push((
+                PathBuf::from("mcp.json"),
+                serde_json::json!({"mcpServers": {}}).to_string(),
+            ));
+        }
+        return config;
+    }
+    let url = crate::seat_gateway::ASK_URL;
+    let headers = serde_json::json!({"Authorization": "Bearer ${WICKED_MCP_TOKEN}"});
+    match cli {
+        SeatCli::Claude => {
+            config.flags = vec![
+                "--mcp-config".into(),
+                serde_json::json!({"mcpServers": {
+                    "wicked": {"type": "http", "url": url, "headers": headers}
+                }})
+                .to_string(),
+            ];
+            config.env = vec![(
+                "MCP_TOOL_TIMEOUT".into(),
+                ((timeout + 60) * 1000).to_string(),
+            )];
+        }
+        SeatCli::Codex => {
+            let settings = [
+                "mcp_servers.wicked.enabled=true".into(),
+                format!("mcp_servers.wicked.url=\"{url}\""),
+                "mcp_servers.wicked.bearer_token_env_var=\"WICKED_MCP_TOKEN\"".into(),
+                format!("mcp_servers.wicked.tool_timeout_sec={}", timeout + 60),
+                "mcp_servers.wicked.startup_timeout_sec=20".into(),
+            ];
+            config.flags = settings
+                .into_iter()
+                .flat_map(|s| ["-c".into(), s])
+                .collect();
+        }
+        SeatCli::Pi => {
+            // Pi 1.1.0 ignores project-local configuration with this flag, including .pi/mcp.json.
+            config.flags.push("--no-approve".into());
+            if argv
+                .iter()
+                .skip(1)
+                .take_while(|a| *a != "--")
+                .any(|a| matches!(a.as_str(), "--no-extensions" | "-ne"))
+            {
+                config.flags.extend(["-e".into(), "builtin:mcp".into()]);
+            }
+            config.files =
+                vec![(PathBuf::from("mcp.json"),
+                serde_json::json!({"mcpServers": {"wicked": {
+                    "url": url, "headers": headers, "exposure": "direct", "timeout": timeout + 60
+                }}}).to_string())];
+        }
+        _ => {}
+    }
+    config
 }
 
 /// (C5) Whether a governed launch of `argv` keeps a per-call check on the interim host floor:
@@ -4165,6 +4328,7 @@ fn arm_input_governance(
     // The engine's own operational state home (codex round 8), fenced in the settings file's deny
     // list exactly as in the argv flag.
     operational_home: Option<&Path>,
+    ask_enabled: bool,
 ) -> std::io::Result<GovLaunch> {
     let scope = crate::scope::resolve_scope(input.entity_mode, &input.run_id, &input.unit.id);
     let phase = crate::scope::unit_phase(input.unit.ord);
@@ -4212,6 +4376,13 @@ fn arm_input_governance(
     // (codex round 9) an unspellable fenced directory refuses the launch here too — the settings
     // file is never written with a hole the argv flag also lacks.
     let deny = deny_rules(skills_root, operational_home).map_err(std::io::Error::other)?;
+    // acceptEdits still prompts for MCP tools. Grant only the handed ask tool; the
+    // wildcard PreToolUse hook continues to audit it and fence every other MCP tool.
+    let allow: Vec<&str> = if ask_enabled {
+        vec!["mcp__wicked__ask"]
+    } else {
+        vec![]
+    };
     let settings = serde_json::json!({
         // C5 (codex c5-core-r12): without ACP the gate hook is the only per-call check, so the
         // engine's flag-scope settings pin `disableAllHooks: false` — it outranks the user scope the
@@ -4227,10 +4398,7 @@ fn arm_input_governance(
         // braces on purpose: the flag is the one that survives if this file fails to arm, and the
         // file is the one that survives an operator template that pins its own `--disallowedTools`.
         //
-        // `allow` is EMPTY (D-7, DES-L4 PR-⑦): no MCP server is registered for the worker any more,
-        // so there is nothing to allow-list; grounding calls are ordinary Bash (the shim), judged by
-        // the gate hook like every other tool call.
-        "permissions": { "deny": deny, "allow": [] }
+        "permissions": { "deny": deny, "allow": allow }
     });
     let dir = decisions_path
         .parent()
@@ -7812,7 +7980,7 @@ mod tests {
             required_skills: Vec::new(),
         };
         let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
-        let g = arm_input_governance(&input, &gov, &mut argv, None, None).unwrap();
+        let g = arm_input_governance(&input, &gov, &mut argv, None, None, false).unwrap();
 
         assert_eq!(g.db_path, "/abs/estate.db", "the child gets the store path");
         // scope/phase ride the RETURNED struct (→ env), pinned to the unit's real values.
@@ -10138,7 +10306,7 @@ mod tests {
                 required_skills: Vec::new(),
             };
             let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
-            arm_input_governance(&input, gov, &mut argv, None, None).unwrap();
+            arm_input_governance(&input, gov, &mut argv, None, None, false).unwrap();
             // Locate each injected config file from the argv (never index a fixed position). Since
             // D-7 (DES-L4 PR-⑦) `--mcp-config` is NEVER injected; `file_after` proves its absence.
             let file_after = |flag: &str| {
@@ -13345,7 +13513,7 @@ mod tests {
             required_skills: Vec::new(),
         };
         let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
-        let g = arm_input_governance(&input, &gov, &mut argv, Some(root), None).unwrap();
+        let g = arm_input_governance(&input, &gov, &mut argv, Some(root), None, false).unwrap();
         assert_eq!(g.skills_root.as_deref(), Some(root));
         assert!(
             g.extra_write_roots.is_empty(),
@@ -14964,7 +15132,8 @@ mod project_graph_end_to_end_tests {
                 .clone()
                 .expect("a governed unit on a file-backed store must carry a governance context");
             let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
-            let settings_db = match arm_input_governance(input, &gov, &mut argv, None, None) {
+            let settings_db = match arm_input_governance(input, &gov, &mut argv, None, None, false)
+            {
                 Ok(g) => g.code_graph_db,
                 Err(e) => panic!("arming failed: {e}"),
             };
@@ -15236,5 +15405,427 @@ mod project_graph_end_to_end_tests {
             DENIED_BASH.len() + crate::remote_write_fence::REMOTE_WRITE_BASH_RULES.len(),
             "one union, each rule once"
         );
+    }
+}
+
+#[cfg(test)]
+mod ask_config_tests {
+    use super::*;
+    use wicked_apps_core::spawn::SeatCli;
+
+    fn assert_ask_withheld_config(cli: SeatCli, config: &AskSeatConfig) {
+        assert!(config.flags.is_empty() && config.env.is_empty());
+        if cli == SeatCli::Pi {
+            assert_eq!(
+                config.files,
+                [(PathBuf::from("mcp.json"), "{\"mcpServers\":{}}".into())]
+            );
+        } else {
+            assert!(config.files.is_empty());
+        }
+    }
+
+    #[test]
+    fn ask_claude_rendered_settings_allow_only_the_handed_tool_and_keep_the_gate() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        seed_probe_for_test(
+            &resolve_wicked_core_exe(),
+            Ok((
+                crate::gate_hook::GATE_PROTOCOL_VERSION,
+                Some(env!("CARGO_PKG_VERSION").to_string()),
+            )),
+        );
+        let gov = crate::workflow::GovernanceContext {
+            human_confirm: Default::default(),
+            db_path: "/abs/estate.db".into(),
+            code_graph_db: None,
+            extra_write_roots: vec![],
+            extra_read_roots: vec![],
+            project_id: None,
+        };
+        let mut input = StepInput {
+            run_id: format!("ask-settings-{}", uuid::Uuid::new_v4()),
+            unit_ix: 0,
+            attempt: 0,
+            unit: WorkUnit::pending("s:u1", "s", 3, "ask a question"),
+            workflow_id: "wf-x".into(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: None,
+            governance: Some(gov.clone()),
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: vec![],
+        };
+        let mut prior_deny = None;
+        for enabled in [false, true] {
+            input.attempt += 1;
+            let mut argv = [
+                "claude",
+                "--permission-mode",
+                "acceptEdits",
+                "-p",
+                "--",
+                "prompt",
+            ]
+            .map(str::to_owned)
+            .to_vec();
+            let config = ask_seat_config(SeatCli::Claude, enabled, 600, &argv);
+            apply_seat_posture(&mut argv, &config.flags);
+            arm_input_governance(&input, &gov, &mut argv, None, None, enabled).unwrap();
+            let settings_idx = argv.iter().position(|arg| arg == "--settings").unwrap();
+            let settings: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&argv[settings_idx + 1]).unwrap()).unwrap();
+            assert_eq!(argv.iter().any(|arg| arg == "--mcp-config"), enabled);
+            assert_eq!(
+                settings["permissions"]["allow"],
+                if enabled {
+                    serde_json::json!(["mcp__wicked__ask"])
+                } else {
+                    serde_json::json!([])
+                }
+            );
+            assert_eq!(settings["disableAllHooks"], false);
+            let hooks = settings["hooks"]["PreToolUse"].as_array().unwrap();
+            assert_eq!(hooks.len(), 1);
+            assert_eq!(hooks[0]["matcher"], "*");
+            assert_eq!(hooks[0]["hooks"].as_array().unwrap().len(), 1);
+            assert!(matches!(
+                hooks[0]["hooks"][0]["type"].as_str(),
+                Some("command" | "http")
+            ));
+            let deny = &settings["permissions"]["deny"];
+            assert!(!deny.as_array().unwrap().is_empty());
+            if let Some(prior) = &prior_deny {
+                assert_eq!(deny, prior, "ask handoff must preserve the deny fence");
+            }
+            prior_deny = Some(deny.clone());
+        }
+        std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&input.run_id)).unwrap();
+    }
+
+    #[test]
+    fn ask_pi_reused_container_home_clears_the_server_on_a_withheld_launch() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        use wicked_apps_core::spawn::SeatConfig;
+        let root = wicked_apps_core::spawn::hermetic_test_worker_home()
+            .join(format!("ask-pi-{}", uuid::Uuid::new_v4()));
+        let seat = SeatConfig::Isolated {
+            cli: SeatCli::Pi,
+            root: Some(root.clone()),
+            set: vec![("PI_CODING_AGENT_DIR", root.clone())],
+            strip: vec![],
+        };
+        for (enabled, flags) in [
+            (false, vec![]),
+            (true, vec!["--approve"]),
+            (true, vec!["-a"]),
+        ] {
+            let mut prior_home = None;
+            // Render two launches into the same run/seat/posture home using the production
+            // safe writer. No CLI or container is spawned.
+            for (handed, args) in [(true, vec![]), (enabled, flags)] {
+                let home =
+                    crate::container_floor::container_seat_config(seat.clone(), "run", "full")
+                        .unwrap();
+                if let Some(prior) = &prior_home {
+                    assert_eq!(home.root().unwrap(), prior);
+                }
+                let mut argv = vec!["pi".to_owned()];
+                argv.extend(args.into_iter().map(str::to_owned));
+                let config = ask_seat_config(SeatCli::Pi, handed, 600, &argv);
+                // spawn-audit: test-only — never spawned; only carries the config-home env.
+                let mut cmd = Command::new("unused");
+                home.apply(&mut cmd);
+                crate::container_floor::write_unit_seat_files(&mut cmd, "pi", &config.files)
+                    .unwrap();
+                let json: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(home.root().unwrap().join("mcp.json")).unwrap(),
+                )
+                .unwrap();
+                if prior_home.is_none() {
+                    assert_eq!(
+                        json["mcpServers"]["wicked"]["url"],
+                        crate::seat_gateway::ASK_URL
+                    );
+                } else {
+                    assert_eq!(json, serde_json::json!({"mcpServers": {}}));
+                    assert_ask_withheld_config(SeatCli::Pi, &config);
+                }
+                prior_home = Some(home.root().unwrap().to_path_buf());
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ask_per_cli_configs_require_loopback_and_a_ready_gateway_route() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        for governed in [false, true] {
+            for container in [false, true] {
+                for url in [
+                    None,
+                    Some(""),
+                    Some("http://example.com:7871"),
+                    Some("http://127.0.0.1"),
+                    Some("https://127.0.0.1:7871"),
+                    Some("http://127.0.0.1:7871"),
+                    Some("http://localhost:7871/"),
+                    Some("http://[::1]:7871"),
+                ] {
+                    let enabled = ask_seat_enabled(
+                        governed,
+                        container,
+                        SeatCli::Claude,
+                        url,
+                        false,
+                        true,
+                        true,
+                    );
+                    assert_eq!(
+                        enabled,
+                        governed
+                            && container
+                            && matches!(
+                                url,
+                                Some(
+                                    "http://127.0.0.1:7871"
+                                        | "http://localhost:7871/"
+                                        | "http://[::1]:7871"
+                                )
+                            )
+                    );
+                    let config = ask_seat_config(SeatCli::Claude, enabled, 600, &[]);
+                    assert!(config.files.is_empty());
+                    let mut argv = vec!["claude".into(), "-p".into(), "--".into(), "prompt".into()];
+                    super::inject_isolation_flags(
+                        &mut argv,
+                        "claude -p {PROMPT}",
+                        None,
+                        Some("prompt"),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    apply_seat_posture(&mut argv, &config.flags);
+                    assert!(argv.contains(&"--strict-mcp-config".into()));
+                    assert_eq!(argv.contains(&"--mcp-config".into()), enabled);
+                    if enabled {
+                        let i = argv.iter().position(|s| s == "--mcp-config").unwrap();
+                        assert!(i < argv.iter().position(|s| s == "--").unwrap());
+                        assert_eq!(
+                            serde_json::from_str::<serde_json::Value>(&argv[i + 1]).unwrap(),
+                            serde_json::json!({
+                                "mcpServers": {"wicked": {"type": "http", "url": crate::seat_gateway::ASK_URL,
+                                "headers": {"Authorization": "Bearer ${WICKED_MCP_TOKEN}"}}}
+                            })
+                        );
+                    }
+                    for cli in [SeatCli::Claude, SeatCli::Codex, SeatCli::Pi] {
+                        let config = ask_seat_config(cli, enabled, 600, &[]);
+                        if !enabled {
+                            assert_ask_withheld_config(cli, &config);
+                        }
+                    }
+                }
+            }
+        }
+        let config = ask_seat_config(SeatCli::Codex, true, 600, &[]);
+        assert!(config.files.is_empty() && config.env.is_empty());
+        assert_eq!(
+            config.flags,
+            [
+                "-c",
+                "mcp_servers.wicked.enabled=true",
+                "-c",
+                "mcp_servers.wicked.url=\"http://agw:8700/api/v1/mcp/ask\"",
+                "-c",
+                "mcp_servers.wicked.bearer_token_env_var=\"WICKED_MCP_TOKEN\"",
+                "-c",
+                "mcp_servers.wicked.tool_timeout_sec=660",
+                "-c",
+                "mcp_servers.wicked.startup_timeout_sec=20"
+            ]
+        );
+        for cli in [SeatCli::Opencode, SeatCli::Copilot] {
+            let config = ask_seat_config(cli, true, 600, &[]);
+            assert!(config.flags.is_empty() && config.files.is_empty() && config.env.is_empty());
+        }
+    }
+
+    #[test]
+    fn ask_handoff_decision_requires_every_prerequisite_and_probe_success() {
+        for governed in [false, true] {
+            for container in [false, true] {
+                for cli in [
+                    SeatCli::Claude,
+                    SeatCli::Codex,
+                    SeatCli::Pi,
+                    SeatCli::Opencode,
+                    SeatCli::Copilot,
+                ] {
+                    for route_ready in [false, true] {
+                        for url in [
+                            None,
+                            Some("http://example.com:7871"),
+                            Some("http://127.0.0.1:7871"),
+                        ] {
+                            let enabled = ask_seat_enabled(
+                                governed,
+                                container,
+                                cli,
+                                url,
+                                false,
+                                true,
+                                route_ready,
+                            );
+                            assert_eq!(
+                                enabled,
+                                governed
+                                    && container
+                                    && matches!(
+                                        cli,
+                                        SeatCli::Claude | SeatCli::Codex | SeatCli::Pi
+                                    )
+                                    && url == Some("http://127.0.0.1:7871")
+                                    && route_ready
+                            );
+                            let config = ask_seat_config(cli, enabled, 600, &[]);
+                            if !enabled {
+                                assert_ask_withheld_config(cli, &config);
+                            }
+                        }
+                    }
+                    // The first unit becomes eligible as soon as its warmup probe succeeds.
+                    assert!(!ask_seat_enabled(
+                        true,
+                        true,
+                        cli,
+                        Some("http://localhost:7871"),
+                        false,
+                        true,
+                        false
+                    ));
+                    assert_eq!(
+                        ask_seat_enabled(
+                            true,
+                            true,
+                            cli,
+                            Some("http://localhost:7871"),
+                            false,
+                            true,
+                            true
+                        ),
+                        matches!(cli, SeatCli::Claude | SeatCli::Codex | SeatCli::Pi)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ask_handoff_requires_network_and_operational_home_even_with_a_cached_route() {
+        for cli in [SeatCli::Claude, SeatCli::Codex, SeatCli::Pi] {
+            for offline in [false, true] {
+                for has_operational_home in [false, true] {
+                    for route_ready in [false, true] {
+                        let enabled = ask_seat_enabled(
+                            true,
+                            true,
+                            cli,
+                            Some("http://localhost:7871"),
+                            offline,
+                            has_operational_home,
+                            route_ready,
+                        );
+                        assert_eq!(enabled, !offline && has_operational_home && route_ready);
+                        let config = ask_seat_config(cli, enabled, 600, &[]);
+                        if !enabled {
+                            assert_ask_withheld_config(cli, &config);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ask_pi_builtin_extension_only_when_extensions_are_disabled() {
+        for (args, disabled) in [
+            (vec!["pi", "-p", "prompt"], false),
+            (vec!["pi", "--no-extensions", "-p", "prompt"], true),
+            (vec!["pi", "-ne", "-p", "--", "prompt"], true),
+            (vec!["pi", "--no-extensions", "-p", "--", "prompt"], true),
+            (vec!["pi", "-p", "--", "--no-extensions"], false),
+            (vec!["pi", "-p", "--", "-ne"], false),
+        ] {
+            let mut argv: Vec<_> = args.into_iter().map(str::to_owned).collect();
+            let config = ask_seat_config(SeatCli::Pi, true, 600, &argv);
+            apply_seat_posture(&mut argv, &config.flags);
+            assert_eq!(
+                argv.iter().filter(|a| *a == "builtin:mcp").count(),
+                usize::from(disabled)
+            );
+            assert_eq!(argv.iter().filter(|a| *a == "--no-approve").count(), 1);
+            let guard = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+            assert!(argv.iter().position(|a| a == "--no-approve").unwrap() < guard);
+            if disabled {
+                assert!(argv.iter().position(|a| a == "builtin:mcp").unwrap() < guard);
+            }
+            assert!(config.env.is_empty());
+            assert_eq!(config.files.len(), 1);
+            assert_eq!(config.files[0].0, PathBuf::from("mcp.json"));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&config.files[0].1).unwrap(),
+                serde_json::json!({
+                    "mcpServers": {"wicked": {"url": crate::seat_gateway::ASK_URL,
+                    "headers": {"Authorization": "Bearer ${WICKED_MCP_TOKEN}"}, "exposure": "direct", "timeout": 660}}
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn ask_pi_refuses_project_approval_but_ignores_prompt_text_after_guard() {
+        for flag in ["--approve", "-a"] {
+            for isolation in ["--no-extensions", "-ne", "--no-approve", "-na"] {
+                let argv = ["pi", isolation, flag, "-p", "--", "prompt"].map(str::to_owned);
+                let reason = pi_ask_refusal(SeatCli::Pi, &argv).unwrap();
+                assert!(reason.contains("project-local MCP") && reason.contains("wicked"));
+                let config = ask_seat_config(SeatCli::Pi, true, 600, &argv);
+                assert_ask_withheld_config(SeatCli::Pi, &config);
+            }
+            let mut argv = ["pi", "-ne", "-p", "--", flag].map(str::to_owned).to_vec();
+            assert!(pi_ask_refusal(SeatCli::Pi, &argv).is_none());
+            let config = ask_seat_config(SeatCli::Pi, true, 600, &argv);
+            assert_eq!(config.files.len(), 1);
+            apply_seat_posture(&mut argv, &config.flags);
+            assert_eq!(
+                &argv[..7],
+                ["pi", "-ne", "-p", "--no-approve", "-e", "builtin:mcp", "--"]
+            );
+            assert_eq!(argv.last().unwrap(), flag);
+        }
+    }
+
+    #[test]
+    fn ask_claude_tool_timeout_env_has_sixty_seconds_of_headroom_in_milliseconds() {
+        for timeout in [10, 70, 600, 3600] {
+            let config = ask_seat_config(SeatCli::Claude, true, timeout, &[]);
+            assert_eq!(
+                config.env,
+                [(
+                    "MCP_TOOL_TIMEOUT".into(),
+                    ((timeout + 60) * 1000).to_string()
+                )]
+            );
+        }
     }
 }

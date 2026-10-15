@@ -349,6 +349,12 @@ export declare class Core {
    * token. Safe whether the run is executing or paused.
    */
   cancelRun(runId: string): Promise<string>
+  /** The unit a bound MCP token belongs to: `{runId, ord, attempt, seat, timeoutSecs}` (JSON). */
+  askUnit(token: string): Promise<string>
+  /** Open an operator question with `{token, question, choices?, recommended?}`. */
+  openAsk(requestJson: string): Promise<string>
+  /** Close an unanswered question (`timeout` or `teardown`); false if already resolved. */
+  closeAsk(elicitationId: string, reason: string): Promise<boolean>
   /**
    * Resolve a pending ACP elicitation. `action` must be `"accept"`, `"decline"`, or `"cancel"`;
    * `response` is the human's typed/selected value as a JSON-typed value — pass `null` for

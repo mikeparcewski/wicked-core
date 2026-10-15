@@ -14,6 +14,18 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Governed container seats ask the operator mid-turn with the MCP `ask` tool (DES-CONTAINER-FLOOR step 5).**
+  C5 removed ACP and with it in-turn questions; crew now serves an MCP `ask` route, reached by seat containers only
+  through agentgateway's 8700 route (exact `POST`/`GET /api/v1/mcp/ask` matches). The engine owns the questions
+  (`src/ask.rs`, actor-owned): `openAsk` (bound token, non-terminal run, byte caps, distinct choices) emits the existing
+  `elicitationCreated` frame when the run has no open question and queues the rest; the operator's answer through the
+  existing `resolve_elicitation` emits `elicitationResolved` with `answer` and `heldMs` and promotes the next one;
+  `closeAsk` (timeout/teardown), a run's terminal frame and actor shutdown close them. Additive frame fields (absent when
+  unset): `source`, `ord`, `attempt`; `answer`, `heldMs`. napi: `askUnit`, `openAsk`, `closeAsk`. Seats get static
+  config with the token taken from their own env: claude `--mcp-config` (+ `MCP_TOOL_TIMEOUT`; the gate hook allows
+  exactly `mcp__wicked__ask`), codex `-c mcp_servers.wicked.*`, pi `mcp.json` + `-e builtin:mcp` + `--no-approve`.
+  `WICKED_ASK_TIMEOUT_SECS` (default 600). Not opencode, copilot or the host floor.
+
 - **BREAKING (C5): governed seats default to the container carrier, and ACP is removed from the seats.**
   The `wicked-core` CLI (and crew's daemon) set `WICKED_SEAT_FLOOR=container` unless the operator chose
   a floor; `WICKED_SEAT_FLOOR=host` keeps the labelled interim host floor. Every unit runs its CLI's
