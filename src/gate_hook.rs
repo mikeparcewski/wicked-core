@@ -2317,7 +2317,13 @@ fn existing_shell_read_paths(word: &str, cwd: Option<&Path>, home: Option<&Path>
         .chain(operands)
         .flat_map(|p| {
             let operand = p.strip_prefix('-').and_then(|flags| {
+                #[cfg(not(windows))]
                 let at = flags.find(['/', '~', '.'])?;
+                #[cfg(windows)]
+                let at = flags.char_indices().find_map(|(at, c)| {
+                    (matches!(c, '/' | '~' | '.') || starts_with_windows_drive_path(&flags[at..]))
+                        .then_some(at)
+                })?;
                 (at > 0 && flags[..at].bytes().all(|c| c.is_ascii_alphabetic()))
                     .then(|| flags[at..].to_string())
             });
@@ -2345,6 +2351,14 @@ fn existing_shell_read_paths(word: &str, cwd: Option<&Path>, home: Option<&Path>
         .collect()
 }
 
+#[cfg(windows)]
+fn starts_with_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.first().is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(1) == Some(&b':')
+        && matches!(bytes.get(2), Some(b'/' | b'\\'))
+}
+
 /// File URLs name local paths too, including their percent-encoded bytes. Other URL schemes
 /// are not filesystem operands; strip a file URL's authority, query and fragment before judging.
 fn local_shell_read_path(p: String) -> Option<String> {
@@ -2355,7 +2369,10 @@ fn local_shell_read_path(p: String) -> Option<String> {
     else {
         return (!p.contains("://")).then_some(p);
     };
-    let path = if rest.starts_with('/') {
+    let starts_with_path = rest.starts_with('/');
+    #[cfg(windows)]
+    let starts_with_path = starts_with_path || starts_with_windows_drive_path(rest);
+    let path = if starts_with_path {
         rest
     } else {
         &rest[rest.find('/')?..]
@@ -2373,7 +2390,15 @@ fn local_shell_read_path(p: String) -> Option<String> {
             bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
         }
     }
-    String::from_utf8(bytes).ok()
+    let path = String::from_utf8(bytes).ok()?;
+    // A file URL's leading slash precedes the drive, rather than naming a drive-rooted
+    // path: both file:///D:/x and file://localhost/D:/x refer to D:/x on Windows.
+    #[cfg(windows)]
+    let path = match path.strip_prefix('/') {
+        Some(rest) if starts_with_windows_drive_path(rest) => rest.to_string(),
+        _ => path,
+    };
+    Some(path)
 }
 
 /// Resolve each word of `command`; `drop_sinks` drops the standard write sinks — for WRITE
@@ -6883,7 +6908,7 @@ mod tests {
         };
         let ctx = |cmd: &str| serde_json::json!({ "command": cmd });
         let check = |cmd: &str| boundary_denial_with(&roots, &wt, None, None, &ctx(cmd), "Bash");
-        let w = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let w = shell_read_951_path;
 
         // git -C <sibling> commit: write subcommand → denied (issue #540).
         // Note: paths under system temp are advisory by the core#264 carve-out — the key
@@ -9799,6 +9824,22 @@ mod protocol_tests {
     }
 }
 
+/// Spell a fixture path as a seat would pass it to bash, including on Windows.
+#[cfg(test)]
+pub(crate) fn shell_read_951_path(path: &Path) -> String {
+    let path = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    let path = path.replace('\\', "/");
+    shell_read_951_word(&path)
+}
+
+#[cfg(test)]
+fn shell_read_951_word(word: &str) -> String {
+    // Adjacent quoted strings preserve an embedded single quote in bash without
+    // backslash escapes, which the native Windows reading treats as path separators.
+    quote_shell_word(word).replace("'\\''", "'\"'\"'")
+}
+
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
@@ -9918,13 +9959,19 @@ mod boundary_tests {
             &outside,
             &[format!(
                 "env -S env cat {}",
-                outside.join("tip.mjs").display()
+                shell_read_951_path(&outside.join("tip.mjs"))
             )],
         );
         shell_read_951_r2_assert_reads(
             &scratch,
             &outside,
-            &["env -S 'cat /etc/hosts' \"$UNKNOWN\"".into()],
+            &[format!(
+                "env -S {} \"$UNKNOWN\"",
+                shell_read_951_word(&format!(
+                    "cat {}",
+                    shell_read_951_path(&outside.join("tip.mjs"))
+                ))
+            )],
         );
         // A trailing argument containing syntax stays one literal argument.
         assert!(bash_write_targets("env -S cat cat '; touch /outside/new-951'").is_empty());
@@ -9986,7 +10033,7 @@ mod boundary_tests {
 
     #[test]
     fn shell_read_951_r4_cwd_candidates_are_linear_and_capped() {
-        let base = PathBuf::from("/repo/worktree");
+        let base = std::env::temp_dir().join("shell-read-951-cwd/worktree");
         let destinations: Vec<_> = (0..30).map(|i| format!("d{i}")).collect();
         // Fail safely on the old exponential implementation before trying all 30.
         assert!(shell_cwd_candidates(vec![base.clone()], &destinations[..10], None).len() <= 21);
@@ -10012,16 +10059,19 @@ mod boundary_tests {
     fn shell_read_951_r4_nested_inline_reads_have_their_own_depth_budget() {
         let (_, scratch, outside) = shell_read_951_r2_fixture("r4-depth");
         let file = outside.join("tip.mjs");
-        let mut command = format!("cat {}", file.display());
-        let mut commands = vec!["sh -c 'sh -c \"cat /etc/hosts\"'".into()];
+        let mut command = format!("cat {}", shell_read_951_path(&file));
+        let mut commands = vec![format!(
+            "sh -c {}",
+            shell_read_951_word(&format!("sh -c {}", shell_read_951_word(&command)))
+        )];
         for _ in 0..8 {
-            command = format!("sh -c {}", quote_shell_word(&command));
+            command = format!("sh -c {}", shell_read_951_word(&command));
             commands.push(command.clone());
         }
         shell_read_951_r2_assert_reads(&scratch, &outside, &commands);
         let mut operands = ShellOperands::default();
         collect_shell_operands(
-            &format!("sh -c {}", quote_shell_word(&command)),
+            &format!("sh -c {}", shell_read_951_word(&command)),
             None,
             8,
             true,
@@ -10033,6 +10083,7 @@ mod boundary_tests {
         );
     }
 
+    // This row needs a symlink without the Windows symlink privilege requirement.
     #[cfg(unix)]
     #[test]
     fn shell_read_951_r4_dash_prefixed_operands_are_checked() {
@@ -10080,11 +10131,13 @@ mod boundary_tests {
 
     #[test]
     fn shell_read_951_r4_all_heredoc_bodies_are_read_data() {
-        let (_, scratch, _) = shell_read_951_r2_fixture("r4-heredocs");
+        let (_, scratch, outside) = shell_read_951_r2_fixture("r4-heredocs");
         let roots = crate::path_policy::AllowedRoots {
             write: vec![scratch.clone()],
             read: vec![],
         };
+        // Use a real fixture on both OSes so a missed body scan would fail everywhere.
+        let file = shell_read_951_path(&outside.join("tip.mjs"));
         for command in [
             "cat <<EOF\nSee /etc/hosts for an example.\nEOF",
             "cat <<EOF # <<FAKE\nSee /etc/hosts for an example.\nEOF",
@@ -10098,6 +10151,7 @@ mod boundary_tests {
             "cat <<'E\\OF'\nSee /etc/hosts\nE\\OF",
             "cat <<$EOF\nSee /etc/hosts\n$EOF",
         ] {
+            let command = command.replace("/etc/hosts", &file);
             assert_eq!(
                 boundary_denial_with(
                     &roots,
@@ -10110,7 +10164,7 @@ mod boundary_tests {
                 None,
                 "{command}"
             );
-            let after = format!("{command}\ncat /etc/hosts");
+            let after = format!("{command}\ncat {file}");
             assert!(
                 boundary_denial_with(
                     &roots,
@@ -10219,28 +10273,29 @@ mod boundary_tests {
     #[test]
     fn shell_read_951_r3_unwraps_scripts_arguments_and_assignments() {
         let (_, scratch, outside) = shell_read_951_r2_fixture("r3-unwrap");
-        let file = outside.join("tip.mjs");
+        let file = shell_read_951_path(&outside.join("tip.mjs"));
+        let script = shell_read_951_word(&format!("cat -n {file}"));
         shell_read_951_r2_assert_reads(
             &scratch,
             &outside,
             &[
-                format!("eval cat -n {}", file.display()),
-                format!("sh -c 'cat \"$1\"' _ {}", file.display()),
-                format!("sh -cl 'cat -n {}'", file.display()),
-                format!("sh -ce 'cat -n {}'", file.display()),
-                format!("bash -ec 'cat -n {}'", file.display()),
-                format!("bash --rcfile nonexistent -c 'cat -n {}'", file.display()),
-                format!("bash --rcfile {} -c true", file.display()),
-                format!("bash --init-file {} -c true", file.display()),
-                format!("env -S 'cat -n {}'", file.display()),
-                format!("env --split-string 'cat -n {}'", file.display()),
-                format!("env --split-string='cat -n {}'", file.display()),
-                format!("BASH_ENV+={} bash -c true", file.display()),
-                format!("ENV+={} sh -c true", file.display()),
-                format!("A+=1 bash -c 'cat -n {}'", file.display()),
-                format!("env BASH_ENV+={} bash -c true", file.display()),
-                format!("export BASH_ENV={}", file.display()),
-                format!("declare ENV+={}", file.display()),
+                format!("eval cat -n {}", shell_read_951_word(&file)),
+                format!("sh -c 'cat \"$1\"' _ {file}"),
+                format!("sh -cl {script}"),
+                format!("sh -ce {script}"),
+                format!("bash -ec {script}"),
+                format!("bash --rcfile nonexistent -c {script}"),
+                format!("bash --rcfile {file} -c true"),
+                format!("bash --init-file {file} -c true"),
+                format!("env -S {script}"),
+                format!("env --split-string {script}"),
+                format!("env --split-string={script}"),
+                format!("BASH_ENV+={file} bash -c true"),
+                format!("ENV+={file} sh -c true"),
+                format!("A+=1 bash -c {script}"),
+                format!("env BASH_ENV+={file} bash -c true"),
+                format!("export BASH_ENV={file}"),
+                format!("declare ENV+={file}"),
             ],
         );
     }
@@ -10248,16 +10303,19 @@ mod boundary_tests {
     #[test]
     fn shell_read_951_r3_clustered_flags_and_case_insensitive_file_urls() {
         let (_, scratch, outside) = shell_read_951_r2_fixture("r3-flags");
+        let file = shell_read_951_path(&outside.join("tip.mjs"));
+        let input = shell_read_951_path(&scratch.join("scripts/a.mjs"));
+        let url = shell_read_951_file_url(&outside.join("tip.mjs"), false);
         shell_read_951_r2_assert_reads(
             &scratch,
             &outside,
             &[
-                format!("grep -if{}/tip.mjs /dev/null", outside.display()),
-                format!("sed -nf{}/tip.mjs /dev/null", outside.display()),
+                format!("grep -if{file} {input}"),
+                format!("sed -nf{file} {input}"),
                 "reader -nf~/tip.mjs".into(),
                 "reader -nf../outside/tip.mjs".into(),
-                format!("curl -s FILE://{}/tip.mjs", outside.display()),
-                format!("curl -s FiLe://{}/tip.mjs", outside.display()),
+                format!("curl -s {}", url.replacen("file://", "FILE://", 1)),
+                format!("curl -s {}", url.replacen("file://", "FiLe://", 1)),
             ],
         );
     }
@@ -10271,12 +10329,13 @@ mod boundary_tests {
         };
         let mut missed = Vec::new();
         for dest in [&outside, &dir] {
+            let evil = shell_read_951_path(&dest.join("evil.txt"));
             for command in [
-                format!("env -C {} rm tip.mjs", dest.display()),
-                format!("env --chdir={} touch evil.txt", dest.display()),
-                format!("env -C {} git reset --hard", dest.display()),
-                format!("env -S 'touch {}/evil.txt'", dest.display()),
-                format!("eval touch {}/evil.txt", dest.display()),
+                format!("env -C {} rm tip.mjs", shell_read_951_path(dest)),
+                format!("env --chdir={} touch evil.txt", shell_read_951_path(dest)),
+                format!("env -C {} git reset --hard", shell_read_951_path(dest)),
+                format!("env -S {}", shell_read_951_word(&format!("touch {evil}"))),
+                format!("eval touch {}", shell_read_951_word(&evil)),
             ] {
                 if !boundary_denial_with(
                     &roots,
@@ -10306,6 +10365,7 @@ mod boundary_tests {
         );
     }
 
+    // The fixture uses a symlink, which requires extra privileges on Windows.
     #[cfg(unix)]
     #[test]
     fn shell_read_951_r3_in_process_carriers_include_prior_root_cwds() {
@@ -10354,7 +10414,7 @@ mod boundary_tests {
                     Some(&boundary),
                 )
             };
-            assert_eq!(call(&format!("cd {}", prior.display())), 0);
+            assert_eq!(call(&format!("cd {}", shell_read_951_path(&prior))), 0);
             assert_eq!(
                 call("cat outside/tip.mjs"),
                 2,
@@ -10368,7 +10428,7 @@ mod boundary_tests {
 
     #[test]
     fn shell_read_951_r3_allows_root_delimiters_and_assignment_builtins() {
-        let (_, scratch, _) = shell_read_951_r2_fixture("r3-allowed");
+        let (_, scratch, outside) = shell_read_951_r2_fixture("r3-allowed");
         std::fs::create_dir_all(scratch.join("src")).unwrap();
         std::fs::write(scratch.join("Cargo.toml"), "[package]").unwrap();
         let roots = crate::path_policy::AllowedRoots {
@@ -10397,7 +10457,11 @@ mod boundary_tests {
             }
         }
         for builtin in ["export", "declare", "local", "readonly", "typeset"] {
-            for assignment in ["TMPDIR=/tmp", "CC=/usr/bin/cc", "CC+=/usr/bin/cc"] {
+            for assignment in [
+                format!("TMPDIR={}", shell_read_951_path(&outside)),
+                format!("CC={}", shell_read_951_path(&outside.join("tip.mjs"))),
+                format!("CC+={}", shell_read_951_path(&outside.join("tip.mjs"))),
+            ] {
                 let command = format!("{builtin} {assignment} && cargo test");
                 if boundary_denial_with(
                     &roots,
@@ -10414,6 +10478,18 @@ mod boundary_tests {
             }
         }
         assert!(denied.is_empty(), "ordinary commands denied: {denied:#?}");
+    }
+
+    fn shell_read_951_file_url(path: &Path, localhost: bool) -> String {
+        let path = path.to_string_lossy().into_owned();
+        #[cfg(windows)]
+        let path = path.replace('\\', "/");
+        let path = path.replace('%', "%25").replace(' ', "%20");
+        let authority = if localhost { "localhost" } else { "" };
+        // A Windows drive follows the authority's slash: localhost/D:/x, not localhostD:/x.
+        #[cfg(windows)]
+        let path = if localhost { format!("/{path}") } else { path };
+        shell_read_951_word(&format!("file://{authority}{path}"))
     }
 
     fn shell_read_951_r2_fixture(name: &str) -> (PathBuf, PathBuf, PathBuf) {
@@ -10498,6 +10574,7 @@ mod boundary_tests {
     fn shell_read_951_r2_wrappers_and_sourced_assignments() {
         let (_, scratch, outside) = shell_read_951_r2_fixture("wrappers");
         let file = outside.join("tip.mjs");
+        let script = shell_read_951_word(&format!("cat -n {}", shell_read_951_path(&file)));
         let mut commands: Vec<String> = [
             "eval",
             "sh -o noglob -c",
@@ -10517,19 +10594,19 @@ mod boundary_tests {
         .iter()
         .map(|prefix| {
             if prefix.starts_with("xargs") {
-                format!("{prefix} '{}'", file.display())
+                format!("{prefix} {}", shell_read_951_path(&file))
             } else {
-                format!("{prefix} \"cat -n '{}'\"", file.display())
+                format!("{prefix} {script}")
             }
         })
         .collect();
         commands.extend([
-            format!("xargs -a '{}'", file.display()),
-            format!("xargs --arg-file '{}'", file.display()),
-            format!("BASH_ENV='{}' bash -c true", file.display()),
-            format!("ENV='{}' sh -c true", file.display()),
-            format!("env BASH_ENV='{}' bash -c true", file.display()),
-            format!("env -C '{}' cat tip.mjs", outside.display()),
+            format!("xargs -a {}", shell_read_951_path(&file)),
+            format!("xargs --arg-file {}", shell_read_951_path(&file)),
+            format!("BASH_ENV={} bash -c true", shell_read_951_path(&file)),
+            format!("ENV={} sh -c true", shell_read_951_path(&file)),
+            format!("env BASH_ENV={} bash -c true", shell_read_951_path(&file)),
+            format!("env -C {} cat tip.mjs", shell_read_951_path(&outside)),
             "env -C -dir cat ../../outside/tip.mjs".into(),
         ]);
         shell_read_951_r2_assert_reads(&scratch, &outside, &commands);
@@ -10537,17 +10614,28 @@ mod boundary_tests {
 
     #[test]
     fn shell_read_951_r2_wrapper_prefixes_are_not_operands() {
-        let (_, scratch, _) = shell_read_951_r2_fixture("prefixes");
+        let (_, scratch, outside) = shell_read_951_r2_fixture("prefixes");
         let roots = crate::path_policy::AllowedRoots {
             write: vec![scratch.clone()],
             read: vec![],
         };
         let denied: Vec<_> = [
-            "CI=1 TMPDIR=/tmp npm test",
-            "env CC=/usr/bin/cc cargo test",
-            "timeout 30 /usr/bin/env node scripts/a.mjs",
-            "nice -n 1 /usr/bin/env node scripts/a.mjs",
-            "xargs -I /tmp echo ok",
+            // Existing paths outside the grant keep these controls meaningful on Windows.
+            format!("CI=1 TMPDIR={} npm test", shell_read_951_path(&outside)),
+            format!(
+                "env CC={} cargo test",
+                shell_read_951_path(&outside.join("tip.mjs"))
+            ),
+            format!("xargs -I {} echo ok", shell_read_951_path(&outside)),
+            // These rows use Unix filesystem locations, which need not exist on Windows.
+            #[cfg(unix)]
+            "CI=1 TMPDIR=/tmp npm test".into(),
+            #[cfg(unix)]
+            "env CC=/usr/bin/cc cargo test".into(),
+            "timeout 30 /usr/bin/env node scripts/a.mjs".into(),
+            "nice -n 1 /usr/bin/env node scripts/a.mjs".into(),
+            #[cfg(unix)]
+            "xargs -I /tmp echo ok".into(),
         ]
         .into_iter()
         .filter(|command| {
@@ -10572,18 +10660,70 @@ mod boundary_tests {
     fn shell_read_951_r2_attached_flags_and_file_urls() {
         let (_, scratch, outside) = shell_read_951_r2_fixture("operands");
         std::fs::write(outside.join("tip space.mjs"), "secret").unwrap();
+        let file = shell_read_951_path(&outside.join("tip.mjs"));
+        let input = shell_read_951_path(&scratch.join("scripts/a.mjs"));
+        let url = shell_read_951_file_url(&outside.join("tip.mjs"), false);
         shell_read_951_r2_assert_reads(
             &scratch,
             &outside,
             &[
-                format!("sed -f{}/tip.mjs /dev/null", outside.display()),
-                format!("git -C{} status", outside.display()),
-                format!("curl -s file://{}/tip.mjs", outside.display()),
-                format!("reader --input=file://{}/tip.mjs", outside.display()),
-                format!("curl file://localhost{}/tip.mjs", outside.display()),
-                format!("curl file://{}/tip%20space.mjs", outside.display()),
+                format!("sed -f{file} {input}"),
+                format!("git -C{} status", shell_read_951_path(&outside)),
+                format!("curl -s {url}"),
+                format!("reader --input={url}"),
+                format!(
+                    "curl {}",
+                    shell_read_951_file_url(&outside.join("tip.mjs"), true)
+                ),
+                format!(
+                    "curl {}",
+                    shell_read_951_file_url(&outside.join("tip space.mjs"), false)
+                ),
             ],
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_read_951_r5_windows_drive_operands_and_file_urls() {
+        let (_, scratch, outside) = shell_read_951_r2_fixture("r5-windows-drives");
+        let file = outside.join("tip space.mjs");
+        std::fs::write(&file, "secret").unwrap();
+        let native = file.to_string_lossy().into_owned().replace('/', "\\");
+        let forward = native.replace('\\', "/");
+        assert_eq!(shell_read_951_path(&file), format!("'{forward}'"));
+        let mut commands = Vec::new();
+        for path in [&native, &forward] {
+            // Single quotes preserve native backslashes for bash; the ordinary helper
+            // uses forward slashes. Both spellings must reach the same boundary.
+            let word = shell_read_951_word(path);
+            let directory = path.rsplit_once(['\\', '/']).unwrap().0;
+            commands.extend([
+                format!("sed -f{word} scripts/a.mjs"),
+                format!("grep -if{word} scripts/a.mjs"),
+                format!("git -C{} status", shell_read_951_word(directory)),
+            ]);
+            for url in [
+                format!("file://{path}"),
+                format!("file:///{path}"),
+                format!("file://localhost/{path}"),
+                format!("FiLe://localhost/{}", path.replace(' ', "%20")),
+            ] {
+                assert_eq!(
+                    local_shell_read_path(url.clone()),
+                    Some(path.to_string()),
+                    "{url}"
+                );
+                let word = shell_read_951_word(&url);
+                commands.push(format!("curl {word}"));
+                commands.push(format!("reader --input={word}"));
+            }
+        }
+        // A drive-relative spelling does not meet the absolute drive-prefix rule.
+        for path in ["D:x", "D:", "1:/x", "localhostD:/x", "é:/x"] {
+            assert!(!starts_with_windows_drive_path(path), "{path}");
+        }
+        shell_read_951_r2_assert_reads(&scratch, &outside, &commands);
     }
 
     #[test]
@@ -10600,6 +10740,7 @@ mod boundary_tests {
         for tool in ["Bash", "bash", "shell", "exec_command"] {
             for key in ["workdir", "cwd", "working_directory", "dir"] {
                 for (workdir, command) in [(&dir, "true"), (&outside, "cat link")] {
+                    // Only Unix creates the symlink above; Windows requires extra privileges.
                     if !cfg!(unix) && command == "cat link" {
                         continue;
                     }
@@ -10650,23 +10791,28 @@ mod boundary_tests {
         );
         for tool in ["Bash", "bash", "BaSh", "shell", "exec_command"] {
             for command in [
-                format!("cat -n '{}'", file.display()),
+                format!("cat -n {}", shell_read_951_path(&file)),
                 "reader '-dir/../../outside space/tip.mjs'".to_string(),
-                format!("cat '{}'", outside.join("eq=tip.mjs").display()),
-                format!("cat<'{}'", file.display()),
-                format!("cd '{}' && cat -n tip.mjs", outside.display()),
-                format!("pushd '{}' && cat tip.mjs", outside.display()),
-                format!("reader --opt='{}'", file.display()),
-                format!("git -C '{}' status", outside.display()),
-                format!("git --git-dir='{}' status", outside.display()),
-                format!("cat <'{}'", file.display()),
-                format!("<'{}' cat", file.display()),
-                format!("sh -lc \"cat -n '{}'\"", file.display()),
+                format!("cat {}", shell_read_951_path(&outside.join("eq=tip.mjs"))),
+                format!("cat<{}", shell_read_951_path(&file)),
+                format!("cd {} && cat -n tip.mjs", shell_read_951_path(&outside)),
+                format!("pushd {} && cat tip.mjs", shell_read_951_path(&outside)),
+                format!("reader --opt={}", shell_read_951_path(&file)),
+                format!("git -C {} status", shell_read_951_path(&outside)),
+                format!("git --git-dir={} status", shell_read_951_path(&outside)),
+                format!("cat <{}", shell_read_951_path(&file)),
+                format!("<{} cat", shell_read_951_path(&file)),
+                format!(
+                    "sh -lc {}",
+                    shell_read_951_word(&format!("cat -n {}", shell_read_951_path(&file)))
+                ),
                 "cat ~/tip.mjs".to_string(),
                 "cat \"$HOME/tip.mjs\"".to_string(),
                 format!(
                     "cat {}/tip.mjs",
-                    outside.display().to_string().replace(' ', "\\ ")
+                    // Turn the helper's quoted spaces into escaped spaces, retaining this
+                    // lexer regression with bash-valid forward slashes on Windows as well.
+                    shell_read_951_path(&outside).replace(' ', "'\\ '")
                 ),
             ] {
                 let (reason, fatal) = boundary_denial_with(
@@ -10688,9 +10834,13 @@ mod boundary_tests {
                 );
             }
         }
+        // /dev traversal is a Unix device-exemption regression.
         #[cfg(unix)]
         {
-            let command = format!("cat '/dev/..{}'", file.display());
+            let command = format!(
+                "cat {}",
+                shell_read_951_path(&Path::new("/dev/..").join(file.strip_prefix("/").unwrap()))
+            );
             let (_, fatal) = boundary_denial_with(
                 &roots,
                 &scratch,
@@ -10742,7 +10892,10 @@ mod boundary_tests {
             "cargo test".into(),
             "/usr/bin/env node x.js".into(),
             "cat -n tip.mjs".into(),
+            // Windows has no native /dev device tree.
+            #[cfg(unix)]
             "cat /dev/null".into(),
+            #[cfg(unix)]
             "cat /dev/./null".into(),
             "cat $VAR".into(),
             "cat $(choose_file)".into(),
@@ -10750,7 +10903,7 @@ mod boundary_tests {
             "fetch https://example.com/a".into(),
             "fetch https://example.com/query?file=/etc/hosts".into(),
             "cat /wicked-nonexistent-951/file".into(),
-            format!("cat '{}'", runtime.join("skill.md").display()),
+            format!("cat {}", shell_read_951_path(&runtime.join("skill.md"))),
         ] {
             assert_eq!(
                 boundary_denial_with(
@@ -10787,7 +10940,7 @@ mod boundary_tests {
             write: vec![scratch.clone()],
             read: vec![dir.as_path().to_path_buf()],
         };
-        let command = format!("cat '{}'", sibling.join("secret").display());
+        let command = format!("cat {}", shell_read_951_path(&sibling.join("secret")));
         let (reason, fatal) = boundary_denial_with(
             &roots,
             &scratch,
@@ -10805,7 +10958,7 @@ mod boundary_tests {
         };
         let state = dir.as_path().join("cwd");
         track_install_fence_cwd(
-            &format!("cd '{}'", outside.display()),
+            &format!("cd {}", shell_read_951_path(&outside)),
             &scratch,
             None,
             &state,
@@ -10833,7 +10986,7 @@ mod boundary_tests {
                 write: vec![scratch.clone()],
                 read: vec![outside.clone()],
             };
-            let command = format!("cd '{}'&&cat link", outside.display());
+            let command = format!("cd {}&&cat link", shell_read_951_path(&outside));
             let (_, fatal) = boundary_denial_with(
                 &roots,
                 &scratch,
@@ -10844,7 +10997,7 @@ mod boundary_tests {
             )
             .expect("the relative operand must use the cd destination");
             assert!(!fatal);
-            let command = format!("(cd '{}'); cat link", outside.display());
+            let command = format!("(cd {}); cat link", shell_read_951_path(&outside));
             assert!(
                 boundary_denial_with(
                     &roots,
@@ -10863,6 +11016,9 @@ mod boundary_tests {
     #[test]
     fn shell_read_951_write_escapes_stay_fatal_on_every_carrier() {
         let scratch = std::env::temp_dir().join("wicked-shell-951-write");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let read = scratch.with_extension("mjs");
+        std::fs::write(&read, "secret").unwrap();
         let roots = crate::path_policy::AllowedRoots {
             write: vec![scratch.clone()],
             read: vec![],
@@ -10873,7 +11029,11 @@ mod boundary_tests {
             .unwrap()
             .join("wicked-outside-951/f");
         for tool in ["bash", "shell", "exec_command"] {
-            let command = format!("cat /etc/hosts; echo x > {}", outside.display());
+            let command = format!(
+                "cat {}; echo x > {}",
+                shell_read_951_path(&read),
+                shell_read_951_path(&outside)
+            );
             let (reason, fatal) = boundary_denial_with(
                 &roots,
                 &scratch,
@@ -12206,6 +12366,9 @@ mod boundary_tests {
             std::env::temp_dir().join(format!("wicked-hook-install-fence-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&repo);
         std::fs::create_dir_all(repo.join("wicked-worktrees/run-1/sub")).unwrap();
+        // Resolve Unix temp aliases such as /var; Windows keeps a bash-friendly drive
+        // spelling rather than canonicalize's verbatim \\?\ prefix.
+        #[cfg(unix)]
         let repo = std::fs::canonicalize(&repo).unwrap();
         let wt = repo.join("wicked-worktrees").join("run-1");
         let roots = crate::path_policy::AllowedRoots {
@@ -12234,7 +12397,7 @@ mod boundary_tests {
         assert_eq!(judge("npm ci"), None);
         // Call 1 allowed: `cd <clone>` — inside the read grant, the shell moved; persist it as the
         // allow exit does.
-        let cd_clone = format!("cd {}", repo.display());
+        let cd_clone = format!("cd {}", shell_read_951_path(&repo));
         assert_eq!(judge(&cd_clone), None);
         track_install_fence_cwd(&cd_clone, &wt, None, &state);
         assert_eq!(
@@ -12258,7 +12421,7 @@ mod boundary_tests {
             repo.to_string_lossy()
         );
         // A `cd` back into the worktree re-allows — and the sidecar is dropped (= the worktree).
-        let cd_back = format!("cd {}", wt.display());
+        let cd_back = format!("cd {}", shell_read_951_path(&wt));
         assert_eq!(judge(&cd_back), None);
         track_install_fence_cwd(&cd_back, &wt, None, &state);
         assert!(!state.exists(), "back at the worktree ⇒ no sidecar");
@@ -12677,7 +12840,7 @@ mod boundary_tests {
         std::fs::create_dir_all(&wt).unwrap();
         with_roots(Some(wt.to_str().unwrap()), || {
             assert!(boundary_denial_untracked(&json!({"command": "ls"}), "Bash").is_none());
-            let command = format!("ls '{}'", wt.parent().unwrap().display());
+            let command = format!("ls {}", shell_read_951_path(wt.parent().unwrap()));
             let (_, fatal) = boundary_denial_untracked(&json!({"command": command}), "Bash")
                 .expect("the parent directory is outside the read grant");
             assert!(!fatal);

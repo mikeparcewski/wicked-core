@@ -620,7 +620,7 @@ mod tests {
             decisions_path: decisions.to_str().unwrap(),
             boundary: Some(boundary),
         };
-        let command = format!("cat -n '{}'", outside.display());
+        let command = format!("cat -n {}", crate::gate_hook::shell_read_951_path(&outside));
         for (tool, input) in [
             ("bash", json!({"command": command})),
             ("shell", json!({"command": ["bash", "-lc", command]})),
@@ -698,7 +698,7 @@ mod tests {
             decisions_path: decisions.to_str().unwrap(),
             boundary: Some(boundary),
         };
-        let command = format!("cat -n '{}'", file.display());
+        let command = format!("cat -n {}", crate::gate_hook::shell_read_951_path(&file));
         let mut cases = vec![
             (
                 "shell",
