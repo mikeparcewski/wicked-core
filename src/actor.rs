@@ -10840,15 +10840,26 @@ pub(crate) const NO_CHANGE_NEEDED: &str = "NO CHANGE NEEDED";
 /// (`reply with the line NO CHANGE NEEDED.`) does not declare it.
 pub(crate) fn declares_no_change(output: &str) -> bool {
     let m = NO_CHANGE_NEEDED;
-    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric());
+    // (codex r1) The marker must DECLARE, never be mentioned: after it, nothing or a separator that
+    // starts its reason; before it (the suffix form), nothing or the end of a sentence or clause —
+    // a carrier-fused `state:` included. `I cannot declare NO CHANGE NEEDED` and `reply with NO
+    // CHANGE NEEDED` are prose about the marker, not the declaration.
+    let opens_reason = |rest: &str| {
+        let rest = rest.trim_start();
+        rest.is_empty() || rest.starts_with(['—', '–', '-', ':', '.', ';', ',', '('])
+    };
+    let ends_clause = |head: &str| {
+        let head = head.trim_end();
+        head.is_empty() || head.ends_with(['.', ':', '!', '?', ';', '—', '–', '-', ')'])
+    };
     output.lines().any(|l| {
         let s: String = l
             .chars()
             .filter(|c| !matches!(c, '*' | '_' | '`'))
             .collect();
         let s = s.trim();
-        (s.starts_with(m) && !word(s[m.len()..].chars().next()))
-            || (s.ends_with(m) && !word(s[..s.len() - m.len()].chars().next_back()))
+        (s.starts_with(m) && opens_reason(&s[m.len()..]))
+            || (s.ends_with(m) && ends_clause(&s[..s.len() - m.len()]))
     })
 }
 
@@ -13001,6 +13012,23 @@ fn judge_by_operator(
     }
     let ord = u.ord;
     let mut s = session;
+    // (core#969, codex r1) A PA step's `PLAN` / `PLAN+` lines ride its ACCEPTED output: the fold
+    // records them only on a pass (`team_gate::record_plan_lines`), and the operator's judgment is
+    // the acceptance here, so they are recorded from the output it accepted (resolved above).
+    if let Some(text) = crate::domain::get_work_output(store, &u.id) {
+        let accepted = crate::workflow::StepOutput {
+            run_id: run_id.to_string(),
+            unit_ix: ix,
+            attempt,
+            output: text,
+            status: crate::workflow::StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        };
+        team_gate::record_plan_lines(&mut s, &u, &accepted);
+    }
     // (DES-QE-EVERY-SEAT §3.4.1, codex r2 F16) What the operator judges is read from the unit's
     // PERSISTED evidence, not only the gate's winning source: when no isolated QE reviewer could
     // run, the run's QE decision becomes the operator's — a labelled bypass of automated QE (crew's
@@ -18896,6 +18924,91 @@ mod request_changes_tests {
         );
     }
 
+    /// core#969 (codex r1): the operator's judgment is the PA step's ACCEPTANCE, so the `PLAN+` lines
+    /// of the output it accepted are held for the plan as a passing fold holds them.
+    #[test]
+    fn core_969_an_operator_judged_pa_step_keeps_its_plan_lines() {
+        let run_id = format!("op-judge-pa-plan-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_judge_unavailable_verify(&mut store, &run_id);
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        // The PA step is an EARLY one (ix 1): a held line is taken into a revision by the advance
+        // (`advance_or_pause`); one held when only the deliver step is left is dropped by design.
+        session.unit_ix = 1;
+        session.team = Some(crate::domain::RunTeamState::default());
+        session.team_plan = Some(crate::plan_gate::TeamPlanState {
+            rev: 1,
+            accepted_rev: 1,
+            ..Default::default()
+        });
+        put_node(&mut store, session.to_node()).unwrap();
+        let pa = session
+            .clis
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "claude".into());
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        let u = &mut units[1];
+        u.status = UnitStatus::Rejected;
+        u.denial = Some(UnitDenial::new(
+            crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE,
+            "agy (answered nothing (empty output)) — fallback judge",
+        ));
+        u.denial_reason = Some("agy (answered nothing (empty output)) — fallback judge".into());
+        u.team_run = true;
+        u.owner = crate::workflow::StepOwner::Pa;
+        u.role = crate::workflow::PhaseRole::Creator;
+        u.tool_cmd = None;
+        u.member_step = None;
+        u.assigned_cli = Some(pa);
+        put_node(&mut store, u.to_node()).unwrap();
+        persist_rejected_transcript(
+            &mut store,
+            &session,
+            u,
+            "Fixed tipPercent and added the test.\nPLAN+ {\"steps\":[{\"catalog\":\"security_review\"}],\"reason\":\"auth\"}\n",
+        );
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        confirm_gate_as(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            &run_id,
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: crate::workflow::AmendScope::Cursor,
+            },
+            Some("operator".into()),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        // Held for the next advance, or already taken by it into a revision (the approve advances
+        // the run, `advance_or_pause`): either way the PA's line reached the plan. Before the fix
+        // it was never recorded, so neither could happen.
+        let tp = session.team_plan.expect("the run's plan state");
+        assert!(
+            tp.rev > 1
+                || tp
+                    .plan_lines
+                    .iter()
+                    .any(|l| l.ord == 2 && l.text.starts_with("PLAN+ ")),
+            "{tp:?}"
+        );
+    }
+
     /// core#969: the hold says what Approve does — the operator judges — except on a team
     /// member's step, which keeps the team gate's re-run.
     #[test]
@@ -18925,11 +19038,16 @@ mod request_changes_tests {
             "NO CHANGE NEEDED: attempt 0 landed it",
             "Verifying current state:NO CHANGE NEEDED",
             "Checked the tree. NO CHANGE NEEDED",
+            "Done — NO CHANGE NEEDED",
         ] {
             assert!(declares_no_change(yes), "{yes:?}");
         }
         for no in [
             "Change nothing; reply with the line NO CHANGE NEEDED.",
+            "I cannot declare NO CHANGE NEEDED",
+            "If no edits are required, reply with NO CHANGE NEEDED",
+            "NO CHANGE NEEDED? No: I changed tip.mjs",
+            "NO CHANGE NEEDED is what I would say, but I edited tip.mjs",
             "no change needed",
             "NO CHANGE NEEDEDS",
             "XNO CHANGE NEEDED",
