@@ -1443,13 +1443,21 @@ fn may_change_the_tree(catalog: &[crate::workflow::PhaseDef], step: &PlanStep) -
             })
 }
 
+/// The last step, in running order, that may change the tree the deliver step ships: a step after
+/// the deliver step (an install dry run the deliver step is hoisted before) changes nothing that
+/// was delivered (agy review).
 fn last_tree_changing_step(
     catalog: &[crate::workflow::PhaseDef],
     steps: &[PlanStep],
     ran: &[String],
 ) -> Option<usize> {
+    let deliver_at = (0..steps.len())
+        .filter(|&i| steps[i].catalog == DELIVER_ID)
+        .map(|i| run_position(steps, ran, i))
+        .min();
     (0..steps.len())
         .filter(|&i| may_change_the_tree(catalog, &steps[i]))
+        .filter(|&i| deliver_at.is_none_or(|d| run_position(steps, ran, i) < d))
         .max_by_key(|&i| run_position(steps, ran, i))
 }
 
@@ -1584,8 +1592,8 @@ pub fn floor_fill(
     // §8.5 floor override: none in auto mode; in manual mode recorded, and never a pinned BAND
     // floor phase in a high-risk band. It exempts floor types from the fill; it removes no
     // authored step.
-    let owes_qe = owes_qe_test(catalog, &plan.steps, input.ran, input.requires_qe);
     let mut exempt: Vec<&str> = Vec::new();
+    let mut removes_test = false;
     if let Some(ov) = &plan.floor_override {
         if matches!(input.human_confirm, crate::domain::HumanConfirm::None) {
             return Err(PlanRefusal::OverrideInAutoMode);
@@ -1594,9 +1602,14 @@ pub fn floor_fill(
             let Some(e) = entry(c) else {
                 return Err(PlanRefusal::OverrideUnknownEntry { catalog: c.clone() });
             };
-            // (core#960) The contract requires test even below the band's test threshold.
-            if owes_qe && c == "test" {
-                return Err(PlanRefusal::OverrideRemovesRequiredQe { catalog: c.clone() });
+            // (core#960) Under a QE contract, whether removing `test` is allowed is decided after
+            // floor fill, which may itself add the code creator (agy review): see below.
+            if input.requires_qe && c == "test" {
+                removes_test = true;
+                if floor.contains(c) {
+                    exempt.push(c);
+                }
+                continue;
             }
             // Validated against the COMPUTED floor first: the pinned rule binds floor phases only.
             if !floor.contains(c) {
@@ -1667,17 +1680,20 @@ pub fn floor_fill(
         // After every floor predecessor, before the first floor successor, and within that
         // window at its catalog-order position.
         let (preds, succs) = (&floor[..k], &floor[k + 1..]);
+        // Under a QE contract a `test` step sits where the QE rule put it (after the last tree
+        // change), not at its catalog slot, so it anchors no other floor type (agy review).
+        let anchors = |s: &PlanStep| !(input.requires_qe && s.catalog == "test");
         let lo = steps
             .iter()
-            .rposition(|s| preds.contains(&s.catalog))
+            .rposition(|s| anchors(s) && preds.contains(&s.catalog))
             .map_or(0, |i| i + 1);
         let hi = steps[lo..]
             .iter()
-            .position(|s| succs.contains(&s.catalog))
+            .position(|s| anchors(s) && succs.contains(&s.catalog))
             .map_or(steps.len(), |i| lo + i);
         let at = steps[lo..hi]
             .iter()
-            .rposition(|s| order(&s.catalog) < order(ty))
+            .rposition(|s| anchors(s) && order(&s.catalog) < order(ty))
             .map_or(lo, |i| lo + i + 1);
         let id = fresh_id(&steps, ty);
         let executor = (ty == "deliver")
@@ -1711,6 +1727,20 @@ pub fn floor_fill(
     // (core#960) A band/rule/authored test before a later tree change cannot verify the final
     // tree. Apply the contract after ordinary floor insertion, reading the revision's done prefix
     // in running order, and place the test immediately after the last tree-changing step.
+    // An override that names `test` under a QE contract: refused when the plan, as floor fill left
+    // it, still owes the QE test; otherwise it is an ordinary exemption, held to the floor.
+    if removes_test {
+        if owes_qe_test(catalog, &steps, input.ran, input.requires_qe) {
+            return Err(PlanRefusal::OverrideRemovesRequiredQe {
+                catalog: "test".to_string(),
+            });
+        }
+        if !floor.iter().any(|t| t == "test") {
+            return Err(PlanRefusal::OverrideNotInFloor {
+                catalog: "test".to_string(),
+            });
+        }
+    }
     let contract_test_id = if owes_qe_test(catalog, &steps, input.ran, input.requires_qe) {
         let c = last_tree_changing_step(catalog, &steps, input.ran)
             .expect("QE is owed after a tree change");
@@ -3435,6 +3465,94 @@ mod tests {
             assert!(units
                 .iter()
                 .any(|u| crate::qe_acceptance::is_qe_unit(u) && u.ord > review.ord));
+        }
+
+        /// (agy review) A code step after the deliver step (an install dry run the deliver step is
+        /// hoisted before) changes nothing that ships: the contract test goes before deliver, once.
+        #[test]
+        fn core_960_a_tree_change_after_deliver_puts_the_test_before_deliver() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "deliver", "id": "deliver", "executes_code": true,
+                 "executor": {"type": "tool", "cmd": ["true"]}},
+                {"catalog": "run", "id": "dry-run", "executes_code": true,
+                 "executor": {"type": "tool", "cmd": ["true"]}}
+            ]}));
+            let f = fill_qe_contract(&p, true, &[]).unwrap();
+            let ids = phase_ids(&f);
+            let pos = |id: &str| ids.iter().position(|i| *i == id).unwrap();
+            assert!(
+                pos("test") > pos("build") && pos("test") < pos("deliver"),
+                "{ids:?}"
+            );
+            assert_eq!(
+                ids.iter().filter(|i| i.starts_with("test")).count(),
+                1,
+                "{ids:?}"
+            );
+            // Filling the result again (a revision) adds no second test.
+            let again = PlanSteps {
+                steps: f
+                    .steps
+                    .steps
+                    .iter()
+                    .map(|s| PlanStep {
+                        added_by: None,
+                        floor_reason: None,
+                        floor_rule: None,
+                        ..s.clone()
+                    })
+                    .collect(),
+                ..f.steps.clone()
+            };
+            let f2 = fill_qe_contract(&again, true, &[]).unwrap();
+            assert_eq!(
+                phase_ids(&f2)
+                    .iter()
+                    .filter(|i| i.starts_with("test"))
+                    .count(),
+                1
+            );
+        }
+
+        /// (agy review) Under a QE contract an override never removes `test`, even when the
+        /// authored plan's code creator only arrives with floor fill.
+        #[test]
+        fn core_960_an_override_cannot_remove_test_before_floor_adds_the_creator() {
+            let p = plan(json!({
+                "steps": [
+                    {"catalog": "produce", "id": "draft"},
+                    {"catalog": "run", "id": "cutover", "executes_code": true,
+                     "executor": {"type": "tool", "cmd": ["true"]}},
+                    {"catalog": "review", "id": "review"}
+                ],
+                "override": {"remove": ["test"], "reason": "tests run elsewhere"}
+            }));
+            assert_eq!(
+                fill_qe_contract(&p, true, &[]).unwrap_err(),
+                PlanRefusal::OverrideRemovesRequiredQe {
+                    catalog: "test".into()
+                }
+            );
+        }
+
+        /// (agy review) A test the QE rule placed late anchors no other floor type: a revision that
+        /// must add `review` still puts it at its catalog slot, and is not refused.
+        #[test]
+        fn core_960_a_late_qe_test_anchors_no_other_floor_type() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "security_review", "id": "sec", "executes_code": true},
+                {"catalog": "test", "id": "verify"}
+            ]}));
+            let held = [HeldObligation {
+                rule: "R-test".into(),
+                token: "step:test".into(),
+            }];
+            let f = fill_qe_contract_in(&p, true, &held, 45, &[]).expect("not refused");
+            let ids = phase_ids(&f);
+            let pos = |id: &str| ids.iter().position(|i| *i == id).unwrap();
+            assert!(pos("review") < pos("sec"), "{ids:?}");
         }
 
         /// (codex r4) A test after the deliver step decides nothing the delivery was gated on: the
