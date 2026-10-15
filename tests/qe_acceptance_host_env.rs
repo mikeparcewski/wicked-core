@@ -7,38 +7,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wicked_core::assurance::QE_ACCEPTANCE_OFF_ENV;
-use wicked_core::{BusDb, BusEmit, Core, CoreEvent, StepInput, StepOutput, StepRunner, StepStatus};
-use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
+use wicked_core::{
+    BusBridgeState, BusDb, BusEmit, Core, CoreEvent, StepInput, StepOutput, StepRunner, StepStatus,
+};
+use wicked_council::types::{Dispatcher, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
 
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
     wicked_apps_core::emit::hermetic_test_spool();
-}
-
-fn cli(key: &str) -> AgenticCli {
-    AgenticCli {
-        key: key.into(),
-        display_name: key.into(),
-        binary: "unused".into(),
-        headless_invocation: "unused {PROMPT}".into(),
-        category: Category::default(),
-        input_mode: InputMode::default(),
-        version_probe: vec![],
-        trust_flags: vec![],
-        alt_binaries: vec![],
-        confidence: Confidence::default(),
-        enabled_for_council: true,
-        seat_eligible_for_work: true,
-        acp: None,
-        capabilities: None,
-        login_invocation: None,
-        logout_invocation: None,
-        governance_class: None,
-        credential: None,
-        free_tier: None,
-        health: None,
-    }
 }
 
 struct NoBallots;
@@ -86,13 +63,40 @@ fn a_core_spawned_with_the_env_starts_with_qe_acceptance_off() {
     assert_eq!(plain.qe_acceptance_off(), None);
     drop(plain);
 
+    // codex r4: the bridge `spawn` arms itself (`WICKED_BUS_DB`) is the one a request can reach
+    // before any setter call, so it must already carry the boot value — no `connect_bus` here. Its
+    // roster is the registry's, read from a scratch HOME seating two fake CLIs and nothing else.
+    let home = dir.join("home");
+    std::fs::create_dir_all(home.join(".config/wicked-council")).unwrap();
+    std::env::set_var("HOME", &home);
+    let mut toml = String::new();
+    for c in wicked_core::registry_roster() {
+        let seated = c.key == "codex" || c.key == "claude";
+        toml.push_str(&format!(
+            "[[cli]]\nkey = {key:?}\ndisplay_name = {key:?}\nbinary = \"unused\"\n\
+             headless_invocation = \"unused {{PROMPT}}\"\n{off}\n",
+            key = c.key,
+            off = if seated {
+                ""
+            } else {
+                "enabled_for_council = false\nseat_eligible_for_work = false\n"
+            }
+        ));
+    }
+    std::fs::write(home.join(".config/wicked-council/clis.toml"), toml).unwrap();
+    std::env::set_var("WICKED_BUS_DB", &bus_db);
     std::env::set_var(QE_ACCEPTANCE_OFF_ENV, "off at boot");
     let core = Core::spawn_with_engine(db, Arc::new(NoBallots), Arc::new(OkRunner));
     std::env::remove_var(QE_ACCEPTANCE_OFF_ENV);
+    std::env::remove_var("WICKED_BUS_DB");
+    assert!(
+        matches!(core.bus_bridge_state(), BusBridgeState::Armed { .. }),
+        "spawn armed the bridge: {:?}",
+        core.bus_bridge_state()
+    );
     assert_eq!(core.qe_acceptance_off().as_deref(), Some("off at boot"));
     core.register_workflow(QE_ONE).expect("register qe-one");
     let ev = core.subscribe();
-    let bridge = core.connect_bus(bus_db.clone(), vec![cli("codex"), cli("claude")]);
     BusDb::open(&bus_db)
         .unwrap()
         .emit(&BusEmit::new(
@@ -124,6 +128,6 @@ fn a_core_spawned_with_the_env_starts_with_qe_acceptance_off() {
     // The setter takes over from there.
     core.set_qe_acceptance_off(None).unwrap();
     assert_eq!(core.qe_acceptance_off(), None);
-    bridge.stop();
+    drop(core);
     let _ = std::fs::remove_dir_all(&dir);
 }
