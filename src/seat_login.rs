@@ -137,7 +137,17 @@ fn broker_files(cli: &str) -> Result<&'static [&'static str], String> {
             "openai.key",
             "codex.auth.json",
         ]),
-        "pi" => Ok(&["pi.token"]),
+        // The provider key, the retained login record and each subscription's route files
+        // (`seat_credentials::SUBSCRIPTION_ROUTES`).
+        "pi" => Ok(&[
+            "pi.token",
+            "pi.auth.json",
+            "pi.anthropic.token",
+            "pi.chatgpt.token",
+            "pi.chatgpt.account",
+            "pi.copilot.token",
+            "pi.copilot.host",
+        ]),
         "opencode" => Ok(&["opencode.token"]),
         "copilot" => Err("copilot credential path and gateway route are not configured".into()),
         _ => Err("unsupported login CLI".into()),
@@ -259,7 +269,8 @@ pub(crate) fn extract_tokens(
                 token_file("openai.token", token),
             ])
         }
-        "pi" | "opencode" => {
+        "pi" => extract_pi(files),
+        "opencode" => {
             // Both existing gateway routes target OpenAI. Selecting an arbitrary provider's
             // first key would silently send it to the wrong upstream. OAuth is a later slice.
             for path in credential_paths(cli) {
@@ -269,15 +280,13 @@ pub(crate) fn extract_tokens(
                 let value = parse_json(cli, bytes)?;
                 let key = if path.ends_with("auth.json") {
                     let kind = value.pointer("/openai/type").and_then(Value::as_str);
-                    let expected = if cli == "pi" { "api_key" } else { "api" };
+                    let expected = "api";
                     if kind.is_some_and(|k| k != expected) {
                         return Err(format!(
                             "{cli}: unsupported OpenAI credential type; expected provider key"
                         ));
                     }
                     nonempty(value.pointer("/openai/key"))
-                } else if cli == "pi" {
-                    nonempty(value.pointer("/providers/openai/apiKey"))
                 } else {
                     nonempty(value.pointer("/provider/openai/options/apiKey"))
                 };
@@ -291,10 +300,255 @@ pub(crate) fn extract_tokens(
     }
 }
 
+/// pi's provider ids the broker serves, and the subscription each OAuth sign-in rides.
+const PI_OAUTH: &[(&str, crate::seat_credentials::Subscription)] = &[
+    (
+        "anthropic",
+        crate::seat_credentials::Subscription::PiAnthropic,
+    ),
+    (
+        "openai-codex",
+        crate::seat_credentials::Subscription::PiChatgpt,
+    ),
+    (
+        "github-copilot",
+        crate::seat_credentials::Subscription::PiCopilot,
+    ),
+];
+
+/// The field of the broker's copy of pi's Copilot entry that keeps the plan endpoint the
+/// token exchange named (`endpoints.api`); pi itself never reads the broker's copy.
+pub(crate) const COPILOT_ENDPOINT_FIELD: &str = "wickedApiEndpoint";
+
+/// The Copilot API host a Copilot token names (`proxy-ep=proxy.<plan>.githubcopilot.com`, as pi
+/// derives it), else the exchange's plan `endpoint`, else the individual plan's host. Validated
+/// before it reaches a route.
+fn copilot_host_from_token(token: &str, endpoint: Option<&str>) -> Result<String, String> {
+    let host = token
+        .split(';')
+        .find_map(|kv| kv.strip_prefix("proxy-ep="))
+        .map(|h| match h.strip_prefix("proxy.") {
+            Some(rest) => format!("api.{rest}"),
+            None => h.to_string(),
+        })
+        .or_else(|| {
+            endpoint.map(|e| {
+                e.strip_prefix("https://")
+                    .unwrap_or(e)
+                    .trim_end_matches('/')
+                    .to_string()
+            })
+        })
+        .unwrap_or_else(|| "api.individual.githubcopilot.com".into());
+    crate::seat_gateway::validate_copilot_host(&host)?;
+    Ok(host)
+}
+
+/// One pi OAuth entry's route files (pure; `value` is the provider's `auth.json` entry).
+fn pi_oauth_files(
+    sub: crate::seat_credentials::Subscription,
+    value: &Value,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    use crate::seat_credentials::Subscription;
+    let route = sub.route();
+    let access =
+        nonempty(value.get("access")).ok_or_else(|| missing("pi", "the OAuth access token"))?;
+    validate_optional_token(value.get("refresh"))?;
+    pi_entry_expiry(value)?;
+    let mut out = vec![token_file(route.file, access)];
+    match sub {
+        Subscription::PiAnthropic => {}
+        Subscription::PiChatgpt => {
+            let account = nonempty(value.get("accountId"))
+                .ok_or_else(|| missing("pi", "openai-codex accountId"))?;
+            crate::seat_gateway::validate_chatgpt_account(Some(account))?;
+            out.push(token_file(route.account_file.unwrap_or_default(), account));
+        }
+        Subscription::PiCopilot => {
+            if nonempty(value.get("enterpriseUrl")).is_some() {
+                return Err("pi: GitHub Enterprise Copilot sign-ins are not supported yet".into());
+            }
+            // The GitHub token the broker re-exchanges for each new Copilot token.
+            nonempty(value.get("refresh"))
+                .ok_or_else(|| missing("pi", "github-copilot GitHub token"))?;
+            let host =
+                copilot_host_from_token(access, nonempty(value.get(COPILOT_ENDPOINT_FIELD)))?;
+            out.push(token_file(route.host_file.unwrap_or_default(), &host));
+        }
+    }
+    Ok(out)
+}
+
+/// A pi entry's expiry in Unix seconds (pi stores milliseconds); `None` when it has none.
+fn pi_entry_expiry(value: &Value) -> Result<Option<u64>, String> {
+    match value.get("expires").filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(|ms| Some(ms / 1000))
+            .ok_or_else(|| "pi: invalid credential expiry".into()),
+    }
+}
+
+/// pi's providers a login stored that the broker cannot serve yet (named in the ingest report,
+/// never silently dropped).
+fn pi_skipped(value: &Value) -> Vec<String> {
+    let Some(map) = value.as_object() else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter(|(id, v)| {
+            let kind = v.get("type").and_then(Value::as_str);
+            let served = match id.as_str() {
+                "openai" => kind == Some("api_key"),
+                id => PI_OAUTH.iter().any(|(p, _)| *p == id) && kind == Some("oauth"),
+            };
+            !served
+        })
+        .map(|(id, v)| {
+            format!(
+                "{id} ({})",
+                v.get("type").and_then(Value::as_str).unwrap_or("unknown")
+            )
+        })
+        .collect()
+}
+
+/// pi: every provider the login stored that the broker can serve (DES-SEAT-LOGIN-SUBSCRIPTIONS
+/// decision 1). The OpenAI API key keeps its route (`pi.token`); each OAuth sign-in gets its own;
+/// the whole `auth.json` is retained for the refresher when any OAuth sign-in is present.
+fn extract_pi(files: &[(String, Vec<u8>)]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut out = Vec::new();
+    let mut skipped = Vec::new();
+    if let Some(bytes) = input_file("pi", files, "pi/auth.json")? {
+        let value = parse_json("pi", bytes)?;
+        if !value.is_object() {
+            return Err("pi: auth.json is not an object".into());
+        }
+        if let Some(openai) = value.get("openai") {
+            match openai.get("type").and_then(Value::as_str) {
+                Some("api_key") | None => {
+                    if let Some(key) = nonempty(openai.get("key")) {
+                        out.push(token_file("pi.token", key));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut oauth = false;
+        for (id, sub) in PI_OAUTH {
+            let Some(entry) = value.get(*id) else {
+                continue;
+            };
+            if entry.get("type").and_then(Value::as_str) != Some("oauth") {
+                continue;
+            }
+            out.extend(pi_oauth_files(*sub, entry)?);
+            oauth = true;
+        }
+        if oauth {
+            out.push(("pi.auth.json".into(), bytes.to_vec()));
+        }
+        skipped = pi_skipped(&value);
+    }
+    if !out.iter().any(|(n, _)| n == "pi.token") {
+        if let Some(bytes) = input_file("pi", files, "pi/models.json")? {
+            let value = parse_json("pi", bytes)?;
+            if let Some(key) = nonempty(value.pointer("/providers/openai/apiKey")) {
+                out.push(token_file("pi.token", key));
+            }
+        }
+    }
+    if out.is_empty() {
+        let mut why = missing(
+            "pi",
+            "a supported sign-in (Anthropic Claude Pro/Max, OpenAI ChatGPT Plus/Pro, GitHub \
+             Copilot, or an OpenAI API key)",
+        );
+        if !skipped.is_empty() {
+            why.push_str(&format!("; not supported yet: {}", skipped.join(", ")));
+        }
+        return Err(why);
+    }
+    Ok(out)
+}
+
+/// The providers of `cli`'s login that ingest stored nowhere (not supported yet), by name only.
+pub(crate) fn skipped_providers(cli: &str, files: &[(String, Vec<u8>)]) -> Vec<String> {
+    if cli != "pi" {
+        return Vec::new();
+    }
+    input_file(cli, files, "pi/auth.json")
+        .ok()
+        .flatten()
+        .and_then(|b| parse_json(cli, b).ok())
+        .map(|v| pi_skipped(&v))
+        .unwrap_or_default()
+}
+
+/// pi's signed-in subscriptions at `now` from the broker's route files and retained record:
+/// `(valid, any_present, earliest valid expiry)`. A subscription whose record entry has expired
+/// is not valid: its seat never gets that provider's placeholder (decision 7).
+fn pi_subscriptions(
+    files: &[(String, Vec<u8>)],
+    now: u64,
+) -> Result<
+    (
+        Vec<crate::seat_credentials::Subscription>,
+        bool,
+        Option<u64>,
+    ),
+    String,
+> {
+    let present = |name: &str| files.iter().any(|(p, b)| p == name && !b.is_empty());
+    let record = match files
+        .iter()
+        .find(|(p, b)| p == "pi.auth.json" && !b.is_empty())
+    {
+        Some((_, b)) => Some(parse_json("pi", b)?),
+        None => None,
+    };
+    let (mut valid, mut any, mut earliest) = (Vec::new(), false, None::<u64>);
+    for (id, sub) in PI_OAUTH {
+        let route = sub.route();
+        if !present(route.file) || route.account_file.is_some_and(|a| !present(a)) {
+            continue;
+        }
+        any = true;
+        let expiry = match record.as_ref().and_then(|r| r.get(*id)) {
+            Some(entry) => pi_entry_expiry(entry)?,
+            None => None,
+        };
+        if expiry.is_some_and(|e| e <= now) {
+            continue;
+        }
+        if let Some(e) = expiry {
+            earliest = Some(earliest.map_or(e, |x: u64| x.min(e)));
+        }
+        valid.push(*sub);
+    }
+    Ok((valid, any, earliest))
+}
+
 /// Only expiry is projected from retained credentials; no token is put in a status/report.
 fn credential_expiry(cli: &str, value: &Value) -> Result<Option<u64>, String> {
     if cli == "codex" && value.get("auth_mode").and_then(Value::as_str) == Some("apikey") {
         return Ok(None);
+    }
+    if cli == "pi" {
+        // The earliest of the record's OAuth sign-ins (the next one the refresher is due on).
+        let mut earliest = None::<u64>;
+        for (id, _) in PI_OAUTH {
+            if let Some(entry) = value
+                .get(*id)
+                .filter(|e| e.get("type").and_then(Value::as_str) == Some("oauth"))
+            {
+                if let Some(e) = pi_entry_expiry(entry)? {
+                    earliest = Some(earliest.map_or(e, |x| x.min(e)));
+                }
+            }
+        }
+        return Ok(earliest);
     }
     let (field, divisor) = match cli {
         "claude" => (value.pointer("/claudeAiOauth/expiresAt"), 1000),
@@ -334,9 +588,12 @@ pub(crate) struct IngestReport {
     pub(crate) cli: String,
     pub(crate) files: Vec<String>,
     pub(crate) expires_at: Option<u64>,
-    /// The ChatGPT account the gateway's route must carry (codex ChatGPT sign-in only).
+    /// Providers the login stored that the broker cannot serve yet (by name, never a value).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) skipped: Vec<String>,
+    /// The literals the agent's routes must carry: ChatGPT accounts, Copilot hosts.
     #[serde(skip)]
-    pub(crate) chatgpt_account: Option<String>,
+    pub(crate) literals: crate::seat_gateway::RouteLiterals,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -400,6 +657,22 @@ fn status_from_files(cli: &str, files: &[(String, Vec<u8>)], now: u64) -> Broker
         return BrokerStatus::Unknown(e);
     }
     let present = |name: &str| files.iter().any(|(p, b)| p == name && !b.is_empty());
+    if cli == "pi" {
+        return match pi_subscriptions(files, now) {
+            Err(e) => BrokerStatus::Unknown(e),
+            Ok((valid, any, earliest)) => {
+                if present("pi.token") || !valid.is_empty() {
+                    BrokerStatus::SignedIn {
+                        expires_at: earliest,
+                    }
+                } else if any {
+                    BrokerStatus::Expired
+                } else {
+                    BrokerStatus::SignedOut
+                }
+            }
+        };
+    }
     let archive = match cli {
         "claude" => Some("claude.credentials.json"),
         "codex" => Some("codex.auth.json"),
@@ -425,7 +698,6 @@ fn status_from_files(cli: &str, files: &[(String, Vec<u8>)], now: u64) -> Broker
             Some(_) => return BrokerStatus::Unknown("codex: unsupported auth_mode".into()),
             None => present("openai.key") || (present("openai.token") && present("openai.account")),
         },
-        "pi" => present("pi.token"),
         "opencode" => present("opencode.token"),
         _ => false,
     };
@@ -588,6 +860,15 @@ fn volume_exists(rt: &Runtime, volume: &str) -> Result<bool, String> {
         .any(|name| name == volume))
 }
 
+/// Broker files read whole by a status reading (retained OAuth records and route literals);
+/// every other broker file is read as a presence marker only.
+fn is_archive(name: &str) -> bool {
+    matches!(
+        name,
+        "claude.credentials.json" | "codex.auth.json" | "pi.auth.json"
+    )
+}
+
 #[cfg(unix)]
 fn read_volume(
     rt: &Runtime,
@@ -597,7 +878,7 @@ fn read_volume(
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut files = Vec::new();
     for path in paths {
-        let archive = matches!(*path, "claude.credentials.json" | "codex.auth.json");
+        let archive = is_archive(path);
         let out = execute(rt, &read_argv(volume, path, broker && !archive))?;
         if out.status.code() == Some(44) {
             continue;
@@ -634,6 +915,7 @@ fn ingest(
     }
     let input = read_volume(rt, volume, credential_paths(cli), false)?;
     let tokens = extract_tokens(cli, &input)?;
+    let skipped = skipped_providers(cli, &input);
     // codex lg-r2 C4: journal before any broker mutation, including stale-mode clearing.
     std::fs::create_dir_all(dir.join("refresh")).map_err(|e| e.to_string())?;
     let mut marker = std::fs::File::create(crate::seat_refresh::pending_path(dir, cli))
@@ -657,7 +939,7 @@ fn ingest(
         &staged,
     )?;
     publish_ingest(rt, gw, dir, cli, volume, &tokens, owned)?;
-    broker_report(rt, gw, cli)
+    broker_report(rt, gw, cli).map(|report| IngestReport { skipped, ..report })
 }
 
 #[cfg(unix)]
@@ -697,17 +979,11 @@ fn broker_report(rt: &Runtime, gw: &Gateway, cli: &str) -> Result<IngestReport, 
     let files = read_volume(rt, &volumes(gw).1, broker_files(cli)?, false)?;
     let mut expires_at = None;
     for (name, bytes) in &files {
-        if !bytes.is_empty()
-            && matches!(name.as_str(), "claude.credentials.json" | "codex.auth.json")
-        {
+        if !bytes.is_empty() && is_archive(name) {
             expires_at = credential_expiry(cli, &parse_json(cli, bytes)?)?;
         }
     }
-    let chatgpt_account = files
-        .iter()
-        .find(|(n, b)| n == "openai.account" && !b.is_empty())
-        .map(|(_, b)| String::from_utf8_lossy(b).trim().to_string());
-    crate::seat_gateway::validate_chatgpt_account(chatgpt_account.as_deref())?;
+    let literals = route_literals(cli, &files)?;
     Ok(IngestReport {
         cli: cli.into(),
         files: files
@@ -716,8 +992,42 @@ fn broker_report(rt: &Runtime, gw: &Gateway, cli: &str) -> Result<IngestReport, 
             .map(|(n, _)| n.clone())
             .collect(),
         expires_at,
-        chatgpt_account,
+        skipped: Vec::new(),
+        literals,
     })
+}
+
+/// The route literals `cli`'s broker files name (pure): codex's ChatGPT account, and each
+/// subscription route's account and Copilot host. Validated before they reach the gateway.
+pub(crate) fn route_literals(
+    cli: &str,
+    files: &[(String, Vec<u8>)],
+) -> Result<crate::seat_gateway::RouteLiterals, String> {
+    let read = |name: &str| {
+        files
+            .iter()
+            .find(|(n, b)| n == name && !b.is_empty())
+            .map(|(_, b)| String::from_utf8_lossy(b).trim().to_string())
+    };
+    let mut literals = crate::seat_gateway::RouteLiterals::default();
+    if cli == "codex" {
+        if let Some(account) = read("openai.account") {
+            literals.accounts.push(("openai.token".into(), account));
+        }
+    }
+    for route in crate::seat_credentials::SUBSCRIPTION_ROUTES
+        .iter()
+        .filter(|r| r.cli == cli)
+    {
+        if let Some(account) = route.account_file.and_then(read) {
+            literals.accounts.push((route.file.into(), account));
+        }
+        if let Some(host) = route.host_file.and_then(read) {
+            literals.hosts.push((route.file.into(), host));
+        }
+    }
+    literals.validate(cli)?;
+    Ok(literals)
 }
 
 /// Caller holds the broker lock. Repair sign-in before refresh checks expiry (codex lg-r2 C4).
@@ -752,7 +1062,7 @@ pub(crate) fn repair_ingest(
         publish_ingest(rt, gw, dir, cli, &volume, &tokens, owned)?;
     }
     let report = broker_report(rt, gw, cli)?;
-    crate::seat_gateway::route_sign_in(rt, gw, dir, cli, report.chatgpt_account.as_deref())?;
+    crate::seat_gateway::route_sign_in(rt, gw, dir, cli, &report.literals)?;
     crate::seat_gateway::remove_broker_file(rt, gw, dir, cli, &format!("{cli}.ingest.next"))?;
     crate::seat_refresh::clear_pending(dir, cli)?;
     crate::seat_refresh::record_last(dir, cli, None);
@@ -855,18 +1165,37 @@ pub(crate) fn kind_from_files(
     }
 }
 
+/// What a signed-in agent's seat is armed with at `now` (pure over the broker's route files and
+/// retained records): its native kind ([`kind_from_files`]) and every valid subscription. `None`
+/// when neither is usable.
+pub(crate) fn sign_in_from_files(
+    cli: &str,
+    files: &[(String, Vec<u8>)],
+    now: u64,
+) -> Option<crate::seat_credentials::SeatSignIn> {
+    let kind = kind_from_files(cli, files);
+    let subscriptions = match cli {
+        "pi" => pi_subscriptions(files, now).ok()?.0,
+        _ => Vec::new(),
+    };
+    (kind.is_some() || !subscriptions.is_empty()).then_some(crate::seat_credentials::SeatSignIn {
+        kind,
+        subscriptions,
+    })
+}
+
 /// The sign-in a governed seat of `cli` runs on (DES-CONTAINER-FLOOR §6): the kind of the
 /// credential the user signed in with in the agent's login container, read from the broker of
 /// the daemon whose gateway dir is `dir`. Signed out, expired, mid-publication or unreadable =
 /// the reason, and the unit is refused before its seat starts (never launched to fail upstream).
 /// A failed refresh of a still-valid credential still runs (the status says so on the tab).
 #[cfg(unix)]
-pub(crate) fn seat_credential_kind(
+pub(crate) fn seat_sign_in(
     rt: &Runtime,
     gw: &Gateway,
     dir: &Path,
     cli: &str,
-) -> Result<crate::seat_credentials::CredentialKind, String> {
+) -> Result<crate::seat_credentials::SeatSignIn, String> {
     // codex c6-r1: the broker's files are read one helper at a time; holding the mutation lock that
     // ingest, sign-out and refresh hold means the snapshot is never torn by one of them.
     let _lock = crate::seat_refresh::mutation_lock(dir)?;
@@ -882,7 +1211,11 @@ pub(crate) fn seat_credential_kind(
     );
     match status {
         BrokerStatus::SignedIn { .. } | BrokerStatus::RefreshFailing { .. } => {
-            kind_from_files(cli, &files)
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| "system clock precedes Unix epoch")?
+                .as_secs();
+            sign_in_from_files(cli, &files, now)
                 .ok_or_else(|| format!("{cli}: the broker holds no usable sign-in"))
         }
         BrokerStatus::SignedOut => Err(format!("{cli} is not signed in")),
@@ -917,12 +1250,12 @@ fn settle_broker(rt: &Runtime, gw: &Gateway, dir: &Path, cli: &str) -> Result<()
 
 /// Native Windows has no seat sign-ins (the container floor needs a Unix host).
 #[cfg(not(unix))]
-pub(crate) fn seat_credential_kind(
+pub(crate) fn seat_sign_in(
     _rt: &crate::container_floor::Runtime,
     _gw: &crate::seat_gateway::Gateway,
     _dir: &Path,
     _cli: &str,
-) -> Result<crate::seat_credentials::CredentialKind, String> {
+) -> Result<crate::seat_credentials::SeatSignIn, String> {
     Err("seat sign-ins need a Unix host".into())
 }
 
@@ -954,7 +1287,7 @@ pub(crate) fn ingest_and_route(
     } else {
         broker_report(rt, gw, cli)?
     };
-    crate::seat_gateway::route_sign_in(rt, gw, dir, cli, report.chatgpt_account.as_deref())?;
+    crate::seat_gateway::route_sign_in(rt, gw, dir, cli, &report.literals)?;
     crate::seat_gateway::remove_broker_file(rt, gw, dir, cli, &format!("{cli}.ingest.next"))?;
     crate::seat_refresh::clear_pending(dir, cli)?;
     // codex lg-r1 #8: the retry source survives every write/publish failure. codex lg-r4: the
@@ -1908,8 +2241,8 @@ esac
         std::fs::write(fake.dir.join("broker/pi.token"), "FAKE-key").unwrap();
         let open = new_session(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap();
         assert_eq!(
-            seat_credential_kind(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap(),
-            crate::seat_credentials::CredentialKind::ProviderKey
+            seat_sign_in(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap(),
+            crate::seat_credentials::CredentialKind::ProviderKey.into()
         );
         assert_eq!(
             read_session(&fake.dir, &fake.gw, "pi").unwrap(),
@@ -1917,7 +2250,7 @@ esac
         );
         assert!(!fake.calls().contains(&format!("volume rm {open}")));
         write_session_state(&fake.dir, "pi", &open, true).unwrap();
-        assert!(seat_credential_kind(&fake.rt, &fake.gw, &fake.dir, "pi").is_ok());
+        assert!(seat_sign_in(&fake.rt, &fake.gw, &fake.dir, "pi").is_ok());
         assert_eq!(read_session(&fake.dir, &fake.gw, "pi").unwrap(), None);
         assert!(fake.calls().contains(&format!("volume rm {open}")));
     }
@@ -2433,6 +2766,177 @@ esac
         }
     }
 
+    fn pi_jwt(account: &str) -> String {
+        let e = |v: Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(&v).unwrap());
+        format!(
+            "{}.{}.FAKE-sig",
+            e(json!({"alg": "none"})),
+            e(json!({"https://api.openai.com/auth": {"chatgpt_account_id": account}}))
+        )
+    }
+
+    /// The three subscription sign-ins pi's `/login` stores (FAKE values), plus an API key.
+    fn pi_login() -> Value {
+        json!({
+            "openai": {"type": "api_key", "key": "FAKE-pi-key"},
+            "anthropic": {"type": "oauth", "access": "sk-ant-oat01-FAKE-access",
+                "refresh": "FAKE-ant-refresh", "expires": 4_000_000_000_000_u64},
+            "openai-codex": {"type": "oauth", "access": pi_jwt("acct-FAKE-0002"),
+                "refresh": "FAKE-oai-refresh", "expires": 4_100_000_000_000_u64,
+                "accountId": "acct-FAKE-0002"},
+            "github-copilot": {"type": "oauth",
+                "access": "tid=FAKE;exp=1;proxy-ep=proxy.business.githubcopilot.com;",
+                "refresh": "FAKE-gho-token", "expires": 3_900_000_000_000_u64},
+            "xai": {"type": "oauth", "access": "FAKE-xai", "refresh": "FAKE-xai-r", "expires": 1}
+        })
+    }
+
+    /// DES-SEAT-LOGIN-SUBSCRIPTIONS decision 1: every subscription a pi login stored gets its own
+    /// route files, the whole record is retained for the refresher, and what the broker cannot
+    /// serve yet is reported by name.
+    #[test]
+    fn pi_subscriptions_each_get_their_route_files_and_the_record_is_retained() {
+        let login = pi_login();
+        let input = vec![file("pi/auth.json", login.clone())];
+        let files = extract_tokens("pi", &input).unwrap();
+        let get = |n: &str| {
+            files
+                .iter()
+                .find(|(f, _)| f == n)
+                .map(|(_, b)| String::from_utf8(b.clone()).unwrap())
+        };
+        assert_eq!(get("pi.token").as_deref(), Some("FAKE-pi-key"));
+        assert_eq!(
+            get("pi.anthropic.token").as_deref(),
+            Some("sk-ant-oat01-FAKE-access")
+        );
+        assert_eq!(get("pi.chatgpt.token"), Some(pi_jwt("acct-FAKE-0002")));
+        assert_eq!(get("pi.chatgpt.account").as_deref(), Some("acct-FAKE-0002"));
+        assert_eq!(
+            get("pi.copilot.token").as_deref(),
+            Some("tid=FAKE;exp=1;proxy-ep=proxy.business.githubcopilot.com;")
+        );
+        assert_eq!(
+            get("pi.copilot.host").as_deref(),
+            Some("api.business.githubcopilot.com")
+        );
+        let record: Value = serde_json::from_str(&get("pi.auth.json").unwrap()).unwrap();
+        assert_eq!(record, login);
+        for (name, _) in &files {
+            assert!(
+                broker_files("pi").unwrap().contains(&name.as_str()),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            skipped_providers("pi", &input),
+            vec!["xai (oauth)".to_string()]
+        );
+        // The route literals the gateway carries come from the broker files alone.
+        let literals = route_literals("pi", &files).unwrap();
+        assert_eq!(
+            literals.accounts,
+            vec![("pi.chatgpt.token".into(), "acct-FAKE-0002".into())]
+        );
+        assert_eq!(
+            literals.hosts,
+            vec![(
+                "pi.copilot.token".into(),
+                "api.business.githubcopilot.com".into()
+            )]
+        );
+        // The earliest OAuth expiry is the record's (the refresher's next due entry).
+        assert_eq!(
+            credential_expiry("pi", &login).unwrap(),
+            Some(3_900_000_000)
+        );
+    }
+
+    #[test]
+    fn pi_refuses_inputs_that_would_reach_a_header_or_another_host() {
+        let with = |id: &str, patch: Value| {
+            let mut login = pi_login();
+            for (k, v) in patch.as_object().unwrap() {
+                login[id][k] = v.clone();
+            }
+            extract_tokens("pi", &[file("pi/auth.json", login)])
+        };
+        assert!(with("openai-codex", json!({"accountId": "FAKE\r\nx-evil: 1"})).is_err());
+        assert!(with("openai-codex", json!({"accountId": null})).is_err());
+        assert!(with(
+            "github-copilot",
+            json!({"access": "tid=x;proxy-ep=evil.example.com;"})
+        )
+        .is_err());
+        assert!(
+            with("github-copilot", json!({"enterpriseUrl": "corp.ghe.com"}))
+                .unwrap_err()
+                .contains("Enterprise")
+        );
+        assert!(with("github-copilot", json!({"refresh": null})).is_err());
+        assert!(with("anthropic", json!({"access": "FAKE with space"})).is_err());
+        assert!(with("anthropic", json!({"expires": "soon"})).is_err());
+        // A Copilot token without a proxy endpoint rides the individual plan's host.
+        let files = with("github-copilot", json!({"access": "tid=FAKE"})).unwrap();
+        assert!(files
+            .iter()
+            .any(|(n, b)| n == "pi.copilot.host" && b == b"api.individual.githubcopilot.com"));
+    }
+
+    /// A Copilot token naming no `proxy-ep` takes the plan endpoint the exchange named (kept in
+    /// the broker's copy of the record), never silently the individual plan's.
+    #[test]
+    fn pi_copilot_host_falls_back_to_the_exchanges_plan_endpoint() {
+        let mut login = pi_login();
+        login["github-copilot"]["access"] = json!("tid=FAKE-no-proxy");
+        login["github-copilot"][COPILOT_ENDPOINT_FIELD] =
+            json!("https://api.business.githubcopilot.com/");
+        let files = extract_tokens("pi", &[file("pi/auth.json", login.clone())]).unwrap();
+        assert!(files
+            .iter()
+            .any(|(n, b)| n == "pi.copilot.host" && b == b"api.business.githubcopilot.com"));
+        login["github-copilot"][COPILOT_ENDPOINT_FIELD] = json!("https://evil.example.com");
+        assert!(extract_tokens("pi", &[file("pi/auth.json", login)]).is_err());
+    }
+
+    /// Decision 7: an expired subscription is not placed in the seat; the agent is expired only
+    /// when nothing valid is left, and a valid API key keeps it signed in.
+    #[test]
+    fn pi_status_and_seat_sign_in_count_only_valid_subscriptions() {
+        use crate::seat_credentials::{CredentialKind, Subscription};
+        let files = extract_tokens("pi", &[file("pi/auth.json", pi_login())]).unwrap();
+        let now = 3_950_000_000; // copilot (3.9e9) expired; anthropic and chatgpt valid
+        let sign_in = sign_in_from_files("pi", &files, now).unwrap();
+        assert_eq!(sign_in.kind, Some(CredentialKind::ProviderKey));
+        assert_eq!(
+            sign_in.subscriptions,
+            vec![Subscription::PiAnthropic, Subscription::PiChatgpt]
+        );
+        assert_eq!(
+            status_from_files("pi", &files, now),
+            BrokerStatus::SignedIn {
+                expires_at: Some(4_000_000_000)
+            }
+        );
+        let no_key: Vec<_> = files
+            .iter()
+            .filter(|(n, _)| n != "pi.token")
+            .cloned()
+            .collect();
+        assert_eq!(
+            status_from_files("pi", &no_key, 4_200_000_000),
+            BrokerStatus::Expired
+        );
+        assert_eq!(sign_in_from_files("pi", &no_key, 4_200_000_000), None);
+        assert_eq!(status_from_files("pi", &[], now), BrokerStatus::SignedOut);
+        // Gateway init creates empty route files: empty = signed out.
+        let empty: Vec<_> = files.iter().map(|(n, _)| (n.clone(), Vec::new())).collect();
+        assert_eq!(
+            status_from_files("pi", &empty, now),
+            BrokerStatus::SignedOut
+        );
+    }
+
     #[test]
     fn opencode_provider_key_accepts_auth_and_placeholder_config_shapes() {
         for (path, value) in [
@@ -2525,7 +3029,24 @@ esac
 
     #[test]
     fn unsupported_providers_oauth_and_copilot_fail_without_selecting_another_key() {
-        for cli in ["pi", "opencode"] {
+        // pi names what it cannot serve yet, and never selects another provider's key for it.
+        let err = extract_tokens(
+            "pi",
+            &[file(
+                "auth.json",
+                json!({"anthropic": {"type": "api_key", "key": "FAKE-wrong-provider"},
+                    "openai": {"type": "oauth", "access": "FAKE-oauth", "key": "FAKE-do-not-use"}}),
+            )],
+        )
+        .unwrap_err();
+        assert!(err.contains("supported sign-in"), "{err}");
+        assert!(
+            err.contains("anthropic (api_key)") && err.contains("openai (oauth)"),
+            "{err}"
+        );
+        assert!(!err.contains("FAKE"), "{err}");
+        {
+            let cli = "opencode";
             let other = vec![file(
                 "auth.json",
                 json!({"anthropic": {"type": "api", "key": "FAKE-wrong-provider"}}),
@@ -2857,7 +3378,11 @@ esac
             cli: "claude".into(),
             files: vec!["anthropic.token".into(), "claude.credentials.json".into()],
             expires_at: Some(200),
-            chatgpt_account: Some("FAKE-account-id".into()),
+            skipped: Vec::new(),
+            literals: crate::seat_gateway::RouteLiterals {
+                accounts: vec![("openai.token".into(), "FAKE-account-id".into())],
+                hosts: Vec::new(),
+            },
         };
         // The account id rides to the gateway config only; never into the report's output.
         assert_eq!(
@@ -2966,11 +3491,14 @@ esac
                     tls: false,
                     credential_file: std::path::PathBuf::from("/broker/openai.token"),
                     kind: Some(crate::seat_credentials::CredentialKind::CodexChatgpt),
+                    unit_header: None,
                 }],
                 egress_hosts: vec![],
                 hook_upstream: None,
                 mcp_upstream: None,
-                chatgpt_account: None,
+                chatgpt_accounts: Default::default(),
+                copilot_hosts: Default::default(),
+                legacy_chatgpt_account: None,
             },
         )
         .unwrap();
@@ -3139,6 +3667,350 @@ esac
         );
         assert!(!all_logs.contains("FAKE-codex-access-v2"));
         assert!(!all_logs.contains("FAKE-codex-access") && !all_logs.contains(&key.bearer));
+    }
+
+    /// LIVE (`WICKED_CONTAINER_LIVE=1`): pi's subscription sign-ins end to end with FAKE
+    /// credentials (DES-SEAT-LOGIN-SUBSCRIPTIONS). A login volume holding pi's `auth.json` with
+    /// Anthropic, ChatGPT and Copilot sign-ins is ingested; the real pi CLI, run in its seat image
+    /// with only the placeholder files `seat_files` renders, reaches a stub upstream through each
+    /// route, and the stub sees the broker's token (and the ChatGPT account), never the unit key
+    /// or a placeholder. Another agent's unit key is refused on pi's routes; the Copilot token is
+    /// renewed by the broker's exchange; sign-out empties every route.
+    #[cfg(unix)]
+    #[test]
+    fn live_pi_subscriptions_reach_the_upstream_only_through_their_routes() {
+        use crate::seat_credentials::{seat_files, Subscription};
+        use crate::seat_gateway::{
+            attach, configure_gateway, ensure_gateway, register_live, GatewayConfig, UnitKey,
+        };
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        let rt = crate::container_floor::runtime().expect("a container runtime answers");
+        let image = crate::container_floor::ensure_seat_image(&rt, "pi").unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("wicked-pi-live-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("stub")).unwrap();
+        std::fs::create_dir_all(dir.join("seat")).unwrap();
+        let gw = Gateway::for_dir(&dir);
+        let run = |argv: &[&str]| {
+            let mut c = rt.cmd();
+            c.args(argv);
+            output_within(c, Duration::from_secs(90)).unwrap()
+        };
+        let stub = format!("{}-stub", gw.name);
+        // 8080: the model upstream, logging what each request carried; 8081: the token endpoints.
+        std::fs::write(
+            dir.join("stub/stub.js"),
+            "const h=require('http');h.createServer((q,r)=>{q.resume();q.on('end',()=>{\
+             console.log('UPSTREAM '+JSON.stringify({url:q.url,auth:q.headers['authorization']||'',\
+             acct:q.headers['chatgpt-account-id']||'',unit:q.headers['x-wicked-unit']||''}));\
+             r.statusCode=401;r.end('{}')})}).listen(8080);\
+             h.createServer((q,r)=>{q.resume();q.on('end',()=>{console.log('TOKEN '+q.method+' '+(q.headers['authorization']||''));\
+             r.setHeader('content-type','application/json');\
+             if(q.method==='GET')return r.end(JSON.stringify({token:'tid=FAKE-pi-copilot-v2;proxy-ep=proxy.individual.githubcopilot.com',\
+             expires_at:Math.floor(Date.now()/1000)+1800}));\
+             r.end(JSON.stringify({access_token:'FAKE-pi-renewed',expires_in:3600}))})}).listen(8081)",
+        )
+        .unwrap();
+        let mut config = GatewayConfig::default();
+        config.providers.retain(|r| r.owner() == Some("pi"));
+        for route in &mut config.providers {
+            route.upstream_host = format!("{stub}:8080");
+            route.tls = false;
+        }
+        configure_gateway(&dir, &config).unwrap();
+        let gw = ensure_gateway(&rt, &dir).expect("the gateway starts");
+        let stub_dir = format!(
+            "type=bind,src={},dst=/s,readonly",
+            dir.join("stub").display()
+        );
+        let o = run(&[
+            "run",
+            "-d",
+            "--name",
+            &stub,
+            "--network",
+            &gw.external_network,
+            "--mount",
+            &stub_dir,
+            &image,
+            "node",
+            "/s/stub.js",
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let seat_net = format!("{}-seat", gw.name);
+        run(&["network", "rm", &seat_net]);
+        assert!(run(&["network", "create", "--internal", &seat_net])
+            .status
+            .success());
+        attach(&rt, &gw, &seat_net).expect("attached as agw");
+        let key = UnitKey::new("run-pi", "run-pi#1", "pi");
+        let codex = UnitKey::new("run-pi", "run-pi#2", "codex");
+        register_live(&rt, &gw, &dir, key.clone()).unwrap();
+        register_live(&rt, &gw, &dir, codex.clone()).unwrap();
+        // What pi's `/login` leaves in the login volume (FAKE values; Copilot due soonest).
+        let mut login = pi_login();
+        login["github-copilot"]["expires"] = json!(4_000_000_000_000_u64 - 1);
+        login["github-copilot"]["access"] =
+            json!("tid=FAKE-pi-copilot;proxy-ep=proxy.individual.githubcopilot.com");
+        let volume = login_volume(&gw.name, "pi");
+        run(&["volume", "rm", &volume]);
+        assert!(run(&["volume", "create", &volume]).status.success());
+        checked(&rt, &init_login_argv(&volume, "pi")).unwrap();
+        let write = helper_argv(
+            &volume,
+            false,
+            "10001",
+            format!("printf '%s' '{login}' > /in/pi/auth.json"),
+        );
+        checked(&rt, &write).unwrap();
+        write_session(&dir, "pi", &volume).unwrap();
+        let report = ingest_and_route(&rt, &gw, &dir, "pi").expect("ingested");
+        let sign_in = seat_sign_in(&rt, &gw, &dir, "pi").expect("pi is signed in");
+        let upstream = || {
+            let o = run(&["logs", &stub]);
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+        };
+        // A raw request on each route, as pi's unit and as codex's unit.
+        let curl = |port: u16, unit: &str| {
+            let header = format!("x-wicked-unit: {unit}");
+            let url = format!("http://agw:{port}/probe-{port}");
+            let o = run(&[
+                "run",
+                "--rm",
+                "--network",
+                &seat_net,
+                &image,
+                "curl",
+                "-s",
+                "--max-time",
+                "6",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "-H",
+                &header,
+                "-H",
+                "authorization: Bearer PLACEHOLDER-not-a-token",
+                "-d",
+                "{}",
+                &url,
+            ]);
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+        let foreign: Vec<String> = [4006, 4007, 4008]
+            .iter()
+            .map(|p| curl(*p, &codex.key))
+            .collect();
+        let absent: Vec<String> = [4006, 4007, 4008]
+            .iter()
+            .map(|p| curl(*p, "wk-unknown"))
+            .collect();
+        // The real pi CLI with only its placeholder files, one model per subscription.
+        // The same rendering arming does (`container_floor::placeholder_handoff`).
+        let url = crate::seat_gateway::credential_gateway_url(
+            "pi",
+            crate::seat_credentials::CredentialKind::ProviderKey,
+        );
+        let files = seat_files("pi", &sign_in, &key.key, &url);
+        for (name, body) in &files {
+            std::fs::write(dir.join("seat").join(name), body).unwrap();
+        }
+        let seat_dir = format!(
+            "type=bind,src={},dst=/p,readonly",
+            dir.join("seat").display()
+        );
+        for model in [
+            "anthropic/claude-sonnet-5",
+            "openai-codex/gpt-5.5",
+            "github-copilot/gpt-5.5",
+        ] {
+            let script = format!(
+                "mkdir -p /tmp/pi && cp /p/* /tmp/pi/ && PI_CODING_AGENT_DIR=/tmp/pi HOME=/tmp \
+                 timeout 60 pi -p --mode json --no-extensions --model {model} hi </dev/null 2>&1 | tail -c 600; true"
+            );
+            let o = run(&[
+                "run",
+                "--rm",
+                "--network",
+                &seat_net,
+                "--user",
+                "10001",
+                "--read-only",
+                "--tmpfs",
+                "/tmp:rw,exec",
+                "--mount",
+                &seat_dir,
+                &image,
+                "sh",
+                "-c",
+                &script,
+            ]);
+            eprintln!(
+                "pi {model}: {}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+        }
+        // `docker logs` can trail the container's writes: wait for all three routes' lines.
+        let mut seen = String::new();
+        for _ in 0..40 {
+            seen = upstream();
+            if seen.contains("/v1/messages")
+                && seen.contains("/codex/responses")
+                && seen.contains("tid=")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        *crate::seat_refresh::TEST_URL.lock().unwrap() = Some(format!("http://{stub}:8081/token"));
+        let refreshed = crate::seat_refresh::refresh(&rt, &gw, &dir, "pi", true);
+        *crate::seat_refresh::TEST_URL.lock().unwrap() = None;
+        let after_refresh = {
+            let mut last = String::new();
+            for _ in 0..30 {
+                curl(4008, &key.key);
+                last = upstream();
+                if last.contains("FAKE-pi-copilot-v2") {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            last
+        };
+        let status_in = broker_status(&rt, &gw, "pi");
+        sign_out_and_route(&rt, &gw, &dir, "pi").expect("signed out");
+        let before_out = upstream().len();
+        for port in [4006, 4007, 4008] {
+            curl(port, &key.key);
+        }
+        let after_out = upstream()[before_out..].to_string();
+        let status_out = broker_status(&rt, &gw, "pi");
+        let logs = run(&["logs", &gw.name]);
+        let gw_logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&logs.stdout),
+            String::from_utf8_lossy(&logs.stderr)
+        );
+        run(&["rm", "-f", &stub, &gw.name]);
+        run(&["network", "rm", &seat_net, &gw.external_network]);
+        let (cfg, broker) = crate::seat_gateway::volumes(&gw);
+        run(&["volume", "rm", &cfg, &broker, &volume]);
+        let _ = std::fs::remove_dir_all(&dir);
+        for line in gw_logs.lines().filter(|l| {
+            !l.contains("DirectResponse")
+                && (l.contains("\"scope\":\"request\"")
+                    || l.contains("error")
+                    || l.contains("warn"))
+        }) {
+            eprintln!("GW {}", &line[..line.len().min(700)]);
+        }
+        eprintln!("report={report:?}\nsign_in={sign_in:?}\nforeign={foreign:?} absent={absent:?}\nseen={seen}\nrefreshed={refreshed:?}");
+        assert_eq!(report.skipped, vec!["xai (oauth)".to_string()]);
+        assert_eq!(
+            sign_in.subscriptions,
+            vec![
+                Subscription::PiAnthropic,
+                Subscription::PiChatgpt,
+                Subscription::PiCopilot
+            ]
+        );
+        assert!(
+            foreign.iter().all(|c| c == "401"),
+            "codex's unit on pi's routes: {foreign:?}"
+        );
+        // The refusals were the gateway's: no foreign or unknown probe reached the upstream (the
+        // stub answers 401 too). `seen` predates every probe pi's own unit makes.
+        assert!(
+            !seen.contains("/probe-"),
+            "a refused probe reached the upstream: {seen}"
+        );
+        assert!(absent.iter().all(|c| c == "401"), "{absent:?}");
+        let upstream_lines: Vec<Value> = seen
+            .lines()
+            .filter_map(|l| l.strip_prefix("UPSTREAM "))
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let by = |path: &str| {
+            upstream_lines
+                .iter()
+                .find(|v| v["url"].as_str().unwrap().contains(path))
+        };
+        let anthropic = by("/v1/messages").expect("pi reached the anthropic route");
+        assert_eq!(anthropic["auth"], "Bearer sk-ant-oat01-FAKE-access");
+        let chatgpt = by("/codex/responses").expect("pi reached the ChatGPT route");
+        assert_eq!(
+            chatgpt["auth"],
+            format!("Bearer {}", pi_jwt("acct-FAKE-0002"))
+        );
+        assert_eq!(chatgpt["acct"], "acct-FAKE-0002");
+        let copilot = upstream_lines.iter().find(|v| v["url"] == "/responses");
+        assert_eq!(
+            copilot.map(|v| v["auth"].clone()),
+            Some(json!(
+                "Bearer tid=FAKE-pi-copilot;proxy-ep=proxy.individual.githubcopilot.com"
+            )),
+            "{seen}"
+        );
+        for line in &upstream_lines {
+            assert_eq!(line["unit"], "", "the unit header never leaves the gateway");
+            assert!(
+                !line.to_string().contains(&key.key) && !line.to_string().contains("PLACEHOLDER")
+            );
+        }
+        assert!(
+            matches!(
+                refreshed,
+                Ok(crate::seat_refresh::Outcome::Refreshed { .. })
+            ),
+            "{refreshed:?}"
+        );
+        assert!(
+            seen.contains("TOKEN GET Bearer FAKE-gho-token")
+                || after_refresh.contains("TOKEN GET Bearer FAKE-gho-token")
+        );
+        assert!(
+            after_refresh.contains("Bearer tid=FAKE-pi-copilot-v2"),
+            "{after_refresh}"
+        );
+        assert!(
+            matches!(status_in, BrokerStatus::SignedIn { .. }),
+            "{status_in:?}"
+        );
+        assert!(!after_out.contains("FAKE"), "{after_out}");
+        assert_eq!(status_out, BrokerStatus::SignedOut);
+        // Every synthetic credential, original and renewed, stays out of the gateway's log and
+        // out of what ingest reports.
+        let chatgpt_jwt = pi_jwt("acct-FAKE-0002");
+        let report_text = format!("{report:?}");
+        for secret in [
+            "sk-ant-oat01-FAKE-access",
+            chatgpt_jwt.as_str(),
+            "FAKE-ant-refresh",
+            "FAKE-oai-refresh",
+            "FAKE-gho-token",
+            "FAKE-pi-copilot",
+            "FAKE-pi-key",
+            "FAKE-pi-renewed",
+            &key.key,
+        ] {
+            assert!(!gw_logs.contains(secret), "{secret} in the gateway log");
+            assert!(
+                !report_text.contains(secret),
+                "{secret} in the ingest report"
+            );
+        }
     }
 
     /// The FAKE claude the C6 live test builds into a seat image: no account, no network auth.

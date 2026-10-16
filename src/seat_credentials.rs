@@ -1,7 +1,7 @@
 //! Pure, per-unit CLI credential files. Only placeholders enter a seat; the gateway owns
 //! upstream credentials and refresh. Paths are relative to the runner's isolated CLI home.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,186 @@ pub(crate) enum CredentialKind {
 }
 
 const ACCOUNT_ID: &str = "acct-PLACEHOLDER";
+
+/// One brokered subscription provider of an agent (DES-SEAT-LOGIN-SUBSCRIPTIONS decision 1):
+/// its own broker file, its own static gateway route and its own placeholder entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[allow(clippy::enum_variant_names)] // one agent's variants today; opencode's and copilot's follow
+pub(crate) enum Subscription {
+    /// pi's Anthropic (Claude Pro/Max) OAuth.
+    PiAnthropic,
+    /// pi's `openai-codex` (ChatGPT Plus/Pro) OAuth.
+    PiChatgpt,
+    /// pi's GitHub Copilot sign-in (the broker holds the exchanged Copilot token).
+    PiCopilot,
+}
+
+/// A subscription's static gateway route and broker files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SubscriptionRoute {
+    pub(crate) sub: Subscription,
+    pub(crate) cli: &'static str,
+    pub(crate) provider: crate::seat_gateway::Provider,
+    pub(crate) port: u16,
+    /// The route's credential handling ([`crate::seat_gateway::render`]).
+    pub(crate) kind: CredentialKind,
+    /// The broker file the route serves (nonempty = signed in).
+    pub(crate) file: &'static str,
+    /// The header the unit's key rides; `None` = the kind's native credential header.
+    pub(crate) unit_header: Option<&'static str>,
+    /// The broker file holding the route's ChatGPT account id (a literal on the route).
+    pub(crate) account_file: Option<&'static str>,
+    /// The broker file holding the route's Copilot API host (a literal on the route).
+    pub(crate) host_file: Option<&'static str>,
+}
+
+/// Every subscription route, in port order. Adding a provider is one row here.
+pub(crate) const SUBSCRIPTION_ROUTES: &[SubscriptionRoute] = {
+    use crate::seat_gateway::{Provider, UNIT_HEADER};
+    &[
+        SubscriptionRoute {
+            sub: Subscription::PiAnthropic,
+            cli: "pi",
+            provider: Provider::Anthropic,
+            port: 4006,
+            kind: CredentialKind::ClaudeOauth,
+            file: "pi.anthropic.token",
+            unit_header: Some(UNIT_HEADER),
+            account_file: None,
+            host_file: None,
+        },
+        SubscriptionRoute {
+            sub: Subscription::PiChatgpt,
+            cli: "pi",
+            provider: Provider::ChatGpt,
+            port: 4007,
+            kind: CredentialKind::CodexChatgpt,
+            file: "pi.chatgpt.token",
+            unit_header: Some(UNIT_HEADER),
+            account_file: Some("pi.chatgpt.account"),
+            host_file: None,
+        },
+        SubscriptionRoute {
+            sub: Subscription::PiCopilot,
+            cli: "pi",
+            provider: Provider::Copilot,
+            port: 4008,
+            kind: CredentialKind::ProviderKey,
+            file: "pi.copilot.token",
+            unit_header: Some(UNIT_HEADER),
+            account_file: None,
+            host_file: Some("pi.copilot.host"),
+        },
+    ]
+};
+
+impl Subscription {
+    pub(crate) fn route(self) -> &'static SubscriptionRoute {
+        SUBSCRIPTION_ROUTES
+            .iter()
+            .find(|r| r.sub == self)
+            .expect("every subscription has a route")
+    }
+
+    /// The gateway origin the seat reaches this subscription's route at.
+    pub(crate) fn gateway_url(self) -> String {
+        format!("http://agw:{}", self.route().port)
+    }
+}
+
+/// What a signed-in agent's seat is armed with: the native credential kind (claude, codex, and
+/// pi's or opencode's provider API key), the brokered subscriptions it holds, or both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SeatSignIn {
+    pub(crate) kind: Option<CredentialKind>,
+    pub(crate) subscriptions: Vec<Subscription>,
+}
+
+impl From<CredentialKind> for SeatSignIn {
+    fn from(kind: CredentialKind) -> Self {
+        Self {
+            kind: Some(kind),
+            subscriptions: Vec::new(),
+        }
+    }
+}
+
+/// The constant ChatGPT access placeholder: an unsigned JWT carrying the placeholder account
+/// (pi decodes the account from the access token; the unit itself rides `x-wicked-unit`).
+fn chatgpt_placeholder_jwt() -> String {
+    let encode = |v: &Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap());
+    let claims = json!({
+        "exp": 4102444800_u64,
+        "https://api.openai.com/auth": {"chatgpt_account_id": ACCOUNT_ID}
+    });
+    format!(
+        "{}.{}.PLACEHOLDER-not-a-signature",
+        encode(&json!({"alg": "none", "typ": "JWT"})),
+        encode(&claims)
+    )
+}
+
+/// Every placeholder file of a seat signed in with `sign_in`: the native kind's files
+/// ([`placeholder_files`]) with each subscription's entries merged in. Only constant placeholders
+/// land in a CLI's credential store; the unit's key is written beside each route's URL (pi's
+/// `models.json` headers), never into the store (DES-SEAT-LOGIN-SUBSCRIPTIONS decision 3).
+pub(crate) fn seat_files(
+    cli: &str,
+    sign_in: &SeatSignIn,
+    unit_key: &str,
+    gateway_url: &str,
+) -> Vec<(PathBuf, String)> {
+    let mut files = sign_in
+        .kind
+        .map(|kind| placeholder_files(cli, kind, unit_key, gateway_url))
+        .unwrap_or_default();
+    if cli != "pi" {
+        return files;
+    }
+    let mut take = |name: &str| -> Value {
+        match files.iter().position(|(p, _)| p == Path::new(name)) {
+            Some(i) => serde_json::from_str(&files.remove(i).1).unwrap_or_else(|_| json!({})),
+            None => json!({}),
+        }
+    };
+    let mut models = take("models.json");
+    let mut auth = take("auth.json");
+    for sub in &sign_in.subscriptions {
+        let (id, entry, base) = match sub {
+            Subscription::PiAnthropic => (
+                "anthropic",
+                json!({"type": "oauth", "access": "sk-ant-oat01-PLACEHOLDER-not-a-token",
+                    "refresh": "PLACEHOLDER-refresh-not-a-token", "expires": 4102444800000_u64}),
+                sub.gateway_url(),
+            ),
+            Subscription::PiChatgpt => (
+                "openai-codex",
+                json!({"type": "oauth", "access": chatgpt_placeholder_jwt(),
+                    "refresh": "PLACEHOLDER-refresh-not-a-token", "expires": 4102444800000_u64,
+                    "accountId": ACCOUNT_ID}),
+                format!("{}/backend-api", sub.gateway_url()),
+            ),
+            // An api_key entry: pi's Copilot OAuth mode derives an https base URL from the token.
+            Subscription::PiCopilot => (
+                "github-copilot",
+                json!({"type": "api_key", "key": "PLACEHOLDER-not-a-token"}),
+                sub.gateway_url(),
+            ),
+        };
+        auth[id] = entry;
+        models["providers"][id] = json!({
+            "baseUrl": base,
+            "headers": {crate::seat_gateway::UNIT_HEADER: unit_key}
+        });
+    }
+    if !sign_in.subscriptions.is_empty() || models != json!({}) {
+        files.push((PathBuf::from("models.json"), models.to_string()));
+    }
+    // Always written: pi's run home persists across units, and a placeholder of a provider the
+    // broker no longer holds must not survive into this one.
+    files.push((PathBuf::from("auth.json"), auth.to_string()));
+    files
+}
 
 /// The exact apiKey value to register, excluding the HTTP `Bearer ` prefix. Codex sends the
 /// entire JWT, not just its per-unit signature. No JWT is signed by or trusted as a provider.
@@ -234,6 +414,102 @@ mod tests {
                 sent_bearer(cli, kind, "wk-test-PLACEHOLDER-unit-2")
             );
         }
+    }
+
+    /// Decision 3: pi's credential store holds only constant placeholders; the unit's key is
+    /// written once per route, as that route's `x-wicked-unit` header in `models.json`.
+    #[test]
+    fn pi_subscription_placeholders_are_constant_and_the_unit_rides_a_header() {
+        let sign_in = SeatSignIn {
+            kind: Some(CredentialKind::ProviderKey),
+            subscriptions: vec![
+                Subscription::PiAnthropic,
+                Subscription::PiChatgpt,
+                Subscription::PiCopilot,
+            ],
+        };
+        let files = seat_files("pi", &sign_in, KEY, URL);
+        assert_eq!(files.len(), 2);
+        let get = |name: &str| -> Value {
+            serde_json::from_str(&files.iter().find(|(p, _)| p == Path::new(name)).unwrap().1)
+                .unwrap()
+        };
+        let auth = get("auth.json");
+        assert!(
+            !auth.to_string().contains(KEY),
+            "the store never holds the unit key"
+        );
+        assert!(auth["anthropic"]["access"]
+            .as_str()
+            .unwrap()
+            .contains("sk-ant-oat"));
+        assert_eq!(auth["anthropic"]["expires"], 4102444800000_u64);
+        assert_eq!(auth["openai-codex"]["accountId"], ACCOUNT_ID);
+        let jwt = auth["openai-codex"]["access"].as_str().unwrap();
+        let claims: Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(jwt.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            claims["https://api.openai.com/auth"]["chatgpt_account_id"],
+            ACCOUNT_ID
+        );
+        assert_eq!(auth["github-copilot"]["type"], "api_key");
+        let models = get("models.json");
+        // The provider-key route keeps its own entry beside the subscriptions.
+        assert_eq!(models["providers"]["openai"]["apiKey"], KEY);
+        for (id, base) in [
+            ("anthropic", "http://agw:4006"),
+            ("openai-codex", "http://agw:4007/backend-api"),
+            ("github-copilot", "http://agw:4008"),
+        ] {
+            assert_eq!(models["providers"][id]["baseUrl"], base, "{id}");
+            assert_eq!(
+                models["providers"][id]["headers"][crate::seat_gateway::UNIT_HEADER],
+                KEY,
+                "{id}"
+            );
+        }
+        // Without subscriptions the key mode keeps its models.json, and auth.json is rewritten
+        // empty: an earlier unit's subscription placeholders never survive in the run home.
+        let mut expected = placeholder_files("pi", CredentialKind::ProviderKey, KEY, URL);
+        expected.push((PathBuf::from("auth.json"), "{}".into()));
+        let only_key = seat_files("pi", &CredentialKind::ProviderKey.into(), KEY, URL);
+        assert_eq!(only_key.len(), 2);
+        for (path, body) in &expected {
+            let got = &only_key.iter().find(|(p, _)| p == path).unwrap().1;
+            assert_eq!(
+                serde_json::from_str::<Value>(got).unwrap(),
+                serde_json::from_str::<Value>(body).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_routes_are_unique_owned_served_and_reachable() {
+        let defaults = crate::seat_gateway::GatewayConfig::default();
+        let mut ports = std::collections::BTreeSet::new();
+        for r in SUBSCRIPTION_ROUTES {
+            assert!(ports.insert(r.port), "{:?}", r.sub);
+            assert_eq!(crate::seat_gateway::route_owner(r.file), Some(r.cli));
+            for f in [Some(r.file), r.account_file, r.host_file]
+                .into_iter()
+                .flatten()
+            {
+                assert_eq!(crate::seat_gateway::route_owner(f), Some(r.cli), "{f}");
+            }
+            assert!(defaults.providers.iter().any(
+                |p| p.port == r.port && p.credential_file == Path::new("/broker").join(r.file)
+            ));
+            assert!(crate::container_floor::GATEWAY_PORTS.contains(&r.port));
+            assert_eq!(r.sub.route().port, r.port);
+        }
+        assert!(defaults
+            .providers
+            .iter()
+            .all(|p| crate::container_floor::GATEWAY_PORTS.contains(&p.port)));
     }
 
     #[test]

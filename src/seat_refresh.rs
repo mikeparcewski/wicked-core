@@ -34,7 +34,7 @@ const PASS_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 /// The pinned OSS image the token request runs in (curl verifies TLS against its CA bundle).
 pub(crate) const REFRESH_IMAGE: &str = "curlimages/curl:8.11.1";
 /// The agents whose sign-in is an OAuth record the broker can refresh.
-pub(crate) const REFRESHABLE: &[&str] = &["claude", "codex"];
+pub(crate) const REFRESHABLE: &[&str] = &["claude", "codex", "pi"];
 
 /// One provider's refresh flow.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +68,15 @@ pub(crate) fn flow(cli: &str) -> Option<Flow> {
     })
 }
 
+/// The stub endpoint under test; `None` in production (a refresh token only goes to its provider).
+fn test_url() -> Option<String> {
+    #[cfg(test)]
+    if let Some(stub) = TEST_URL.lock().ok().and_then(|u| u.clone()) {
+        return Some(stub);
+    }
+    None
+}
+
 /// (tests) The stub token endpoint the live test points every flow at. No production override:
 /// a refresh token only ever goes to the provider.
 #[cfg(test)]
@@ -78,6 +87,7 @@ pub(crate) fn record_file(cli: &str) -> Option<&'static str> {
     match cli {
         "claude" => Some("claude.credentials.json"),
         "codex" => Some("codex.auth.json"),
+        "pi" => Some("pi.auth.json"),
         _ => None,
     }
 }
@@ -87,8 +97,181 @@ fn login_path(cli: &str) -> Option<&'static str> {
     match cli {
         "claude" => Some("claude/.credentials.json"),
         "codex" => Some("codex/auth.json"),
+        "pi" => Some("pi/auth.json"),
         _ => None,
     }
+}
+
+/// One token request the refresher makes for a record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Request {
+    /// An OAuth refresh: a JSON POST to the provider's token endpoint.
+    Post { url: String, body: Value },
+    /// Copilot's token exchange: a GET authorized by the GitHub token (sent on stdin as a
+    /// header, never on a command line), with the client's identifying headers.
+    BearerGet {
+        url: String,
+        token: String,
+        headers: Vec<(&'static str, &'static str)>,
+    },
+}
+
+/// GitHub's Copilot token exchange (the endpoint pi's own refresh calls).
+const COPILOT_EXCHANGE_URL: &str = "https://api.github.com/copilot_internal/v2/token";
+/// The identifying headers pi sends with the exchange (`github-copilot.js` COPILOT_HEADERS).
+const PI_COPILOT_HEADERS: &[(&str, &str)] = &[
+    ("accept", "application/json"),
+    ("user-agent", "GitHubCopilotChat/0.35.0"),
+    ("editor-version", "vscode/1.107.0"),
+    ("editor-plugin-version", "copilot-chat/0.35.0"),
+    ("copilot-integration-id", "vscode-chat"),
+];
+
+/// pi's refreshable entries, in no particular order: provider id → the flow its tokens renew by.
+const PI_ENTRIES: &[&str] = &["anthropic", "openai-codex", "github-copilot"];
+
+/// The next refresh of `record` at `now`: the entry it renews (pi: a provider id; `None` for
+/// the single-record agents) and its request. pi renews the entry expiring first, one entry per
+/// committed generation (DES-SEAT-LOGIN-SUBSCRIPTIONS decision 8); `None` = nothing refreshable
+/// (or, unless `force`, nothing due).
+pub(crate) fn next_refresh(
+    cli: &str,
+    record: &Value,
+    now: u64,
+    force: bool,
+) -> Option<(Option<String>, Request)> {
+    if cli != "pi" {
+        let flow = flow(cli)?;
+        let body = request_body(cli, record, &flow)?;
+        let expires_at = crate::seat_login::record_expiry(cli, record).ok()?;
+        if !force && !due(expires_at, now) {
+            return None;
+        }
+        return Some((
+            None,
+            Request::Post {
+                url: flow.url,
+                body,
+            },
+        ));
+    }
+    let id = due_entries(cli, record, now, force).into_iter().next()?;
+    let request = entry_request(cli, record, &id)?;
+    Some((Some(id), request))
+}
+
+/// The entries of a multi-entry record that a pass renews at `now`, soonest-expiring first:
+/// those due (or, with `force`, every renewable one). Each is tried once per pass.
+pub(crate) fn due_entries(cli: &str, record: &Value, now: u64, force: bool) -> Vec<String> {
+    if cli != "pi" {
+        return Vec::new();
+    }
+    let mut candidates: Vec<(u64, &str)> = PI_ENTRIES
+        .iter()
+        .filter_map(|id| {
+            let entry = record.get(*id)?;
+            (entry.get("type").and_then(Value::as_str) == Some("oauth")).then_some(())?;
+            str_at(entry, "/refresh")?;
+            // An entry with no expiry is renewable but never due on its own: only `force` takes
+            // it (last).
+            let exp = entry
+                .get("expires")
+                .and_then(Value::as_u64)
+                .filter(|ms| *ms > 0)
+                .map(|ms| ms / 1000);
+            Some((exp.unwrap_or(u64::MAX), *id))
+        })
+        .filter(|(exp, _)| force || (*exp != u64::MAX && due(Some(*exp), now)))
+        .collect();
+    candidates.sort();
+    candidates
+        .into_iter()
+        .map(|(_, id)| id.to_string())
+        .collect()
+}
+
+/// The token request that renews entry `id` of `cli`'s record.
+pub(crate) fn entry_request(cli: &str, record: &Value, id: &str) -> Option<Request> {
+    let _ = cli;
+    let entry = record.get(id)?;
+    let refresh = str_at(entry, "/refresh")?.to_string();
+    let request = match id {
+        "anthropic" => {
+            let flow = flow("claude")?;
+            Request::Post {
+                url: flow.url,
+                body: json!({"grant_type": "refresh_token", "refresh_token": refresh,
+                    "client_id": flow.client_id}),
+            }
+        }
+        "openai-codex" => {
+            let flow = flow("codex")?;
+            Request::Post {
+                url: flow.url,
+                body: json!({"grant_type": "refresh_token", "refresh_token": refresh,
+                    "client_id": flow.client_id, "scope": "openid profile email"}),
+            }
+        }
+        _ => Request::BearerGet {
+            url: test_url().unwrap_or_else(|| COPILOT_EXCHANGE_URL.into()),
+            token: refresh,
+            headers: PI_COPILOT_HEADERS.to_vec(),
+        },
+    };
+    Some(request)
+}
+
+/// Fold a token answer into pi's entry `id` of `record` (at `now`, Unix seconds).
+pub(crate) fn apply_pi_answer(
+    record: &Value,
+    id: &str,
+    answer: &Value,
+    now: u64,
+) -> Result<Value, String> {
+    let mut out = record.clone();
+    let entry = out
+        .get_mut(id)
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| format!("pi: the record has no {id} entry"))?;
+    if id == "github-copilot" {
+        let token =
+            str_at(answer, "/token").ok_or("pi: the Copilot token exchange returned no token")?;
+        let expires_at = answer
+            .get("expires_at")
+            .and_then(Value::as_u64)
+            .ok_or("pi: the Copilot token exchange returned no expires_at")?;
+        entry.insert("access".into(), json!(token));
+        entry.insert("expires".into(), json!(expires_at.saturating_mul(1000)));
+        // The plan endpoint THIS exchange names, kept (in the broker's copy only) for a token
+        // that names no `proxy-ep`; an answer naming none drops an earlier generation's.
+        match str_at(answer, "/endpoints/api") {
+            Some(api) => {
+                entry.insert(crate::seat_login::COPILOT_ENDPOINT_FIELD.into(), json!(api));
+            }
+            None => {
+                entry.remove(crate::seat_login::COPILOT_ENDPOINT_FIELD);
+            }
+        }
+        return Ok(out);
+    }
+    let access =
+        str_at(answer, "/access_token").ok_or("pi: the token endpoint returned no access_token")?;
+    if answer.get("refresh_token").is_some() && str_at(answer, "/refresh_token").is_none() {
+        return Err("pi: invalid refresh_token in token answer".into());
+    }
+    let expires_in = answer
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .ok_or("pi: the token endpoint returned no expires_in")?;
+    entry.insert("access".into(), json!(access));
+    if let Some(r) = str_at(answer, "/refresh_token") {
+        entry.insert("refresh".into(), json!(r));
+    }
+    entry.insert(
+        "expires".into(),
+        json!(now.saturating_add(expires_in).saturating_mul(1000)),
+    );
+    Ok(out)
 }
 
 fn str_at<'a>(v: &'a Value, p: &str) -> Option<&'a str> {
@@ -377,6 +560,11 @@ fn write_pending_state(dir: &Path, cli: &str, state: &[u8]) -> Result<(), String
     result
 }
 
+/// The marker of a route-literal publication not yet confirmed (removed once it succeeds).
+fn literals_pending_path(dir: &Path, cli: &str) -> PathBuf {
+    dir.join("refresh").join(format!("{cli}.literals.pending"))
+}
+
 pub(crate) fn rescue_path(dir: &Path, cli: &str) -> PathBuf {
     dir.join("refresh").join(format!("{cli}.rescue"))
 }
@@ -583,6 +771,7 @@ mod live {
 
     /// POST `body` to `url` from a short-lived hardened curl container on `network`; the body
     /// rides stdin and the answer stdout. Errors name the status only, never the answer.
+    #[cfg(test)]
     pub(crate) fn post_json(
         rt: &Runtime,
         dir: &Path,
@@ -591,7 +780,71 @@ mod live {
         url: &str,
         body: &Value,
     ) -> Result<Value, String> {
-        let bytes = encode_request(body)?;
+        send(
+            rt,
+            dir,
+            cli,
+            network,
+            &Request::Post {
+                url: url.into(),
+                body: body.clone(),
+            },
+        )
+    }
+
+    /// The curl argv and stdin of `request` (pure): a POST's body and a GET's credential header
+    /// both ride stdin, so no credential is ever a command-line argument.
+    pub(crate) fn request_argv(request: &Request) -> Result<(Vec<String>, Vec<u8>), String> {
+        let mut argv: Vec<String> = ["-sS", "--max-time", "30", "--fail"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let stdin = match request {
+            Request::Post { url, body } => {
+                argv.extend(
+                    [
+                        "-X",
+                        "POST",
+                        "-H",
+                        "content-type: application/json",
+                        "-H",
+                        "accept: application/json",
+                        "--data-binary",
+                        "@-",
+                        url,
+                    ]
+                    .map(str::to_string),
+                );
+                encode_request(body)?
+            }
+            Request::BearerGet {
+                url,
+                token,
+                headers,
+            } => {
+                if token.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                    return Err("invalid credential token".into());
+                }
+                for (name, value) in headers {
+                    argv.extend(["-H".to_string(), format!("{name}: {value}")]);
+                }
+                argv.extend(["-H".to_string(), "@-".to_string(), url.clone()]);
+                format!("authorization: Bearer {token}\n").into_bytes()
+            }
+        };
+        Ok((argv, stdin))
+    }
+
+    /// Make `request` from a short-lived hardened curl container on `network`; the answer comes
+    /// back on stdout. Errors name the status only, never the answer.
+    pub(crate) fn send(
+        rt: &Runtime,
+        dir: &Path,
+        cli: &str,
+        network: &str,
+        request: &Request,
+    ) -> Result<Value, String> {
+        let (curl, bytes) = request_argv(request)?;
         if !crate::container_floor::image_present(rt, REFRESH_IMAGE) {
             let mut pull = rt.cmd();
             pull.args(["pull", "-q", REFRESH_IMAGE]);
@@ -622,22 +875,10 @@ mod live {
             "--memory",
             "64m",
             REFRESH_IMAGE,
-            "-sS",
-            "--max-time",
-            "30",
-            "--fail",
-            "-X",
-            "POST",
-            "-H",
-            "content-type: application/json",
-            "-H",
-            "accept: application/json",
-            "--data-binary",
-            "@-",
-            url,
         ]
         .into_iter()
         .map(str::to_string)
+        .chain(curl)
         .collect::<Vec<_>>();
         let out = crate::seat_gateway::mutation_helper(rt, dir, cli, &argv, &bytes, POST_TIMEOUT)?;
         if out.len() > MAX_ANSWER {
@@ -661,7 +902,10 @@ mod live {
         if crate::seat_login::complete_sign_out(rt, gw, dir, cli)? {
             return Ok(Outcome::NotRefreshable);
         }
-        let (Some(flow), Some(file)) = (flow(cli), record_file(cli)) else {
+        let (Some(flow), Some(file)) = (
+            flow(if cli == "pi" { "claude" } else { cli }),
+            record_file(cli),
+        ) else {
             return Ok(Outcome::NotRefreshable);
         };
         crate::seat_login::repair_ingest(rt, gw, dir, cli)?;
@@ -673,45 +917,132 @@ mod live {
         let Some(bytes) = bytes else {
             return Ok(Outcome::NotRefreshable);
         };
-        let record: Value =
+        let mut record: Value =
             serde_json::from_slice(&bytes).map_err(|_| format!("{cli}: unreadable record"))?;
-        let Some(body) = request_body(cli, &record, &flow) else {
-            return Ok(Outcome::NotRefreshable);
-        };
-        encode_request(&body)?; // codex lg-r2 C6: reject oversized records even before NotDue.
-        let expires_at = crate::seat_login::record_expiry(cli, &record)?;
-        let now = unix_now();
-        if !force && !due(expires_at, now) {
-            return Ok(Outcome::NotDue { expires_at });
+        if let Some(body) = request_body(cli, &record, &flow) {
+            encode_request(&body)?; // codex lg-r2 C6: reject oversized records even before NotDue.
         }
-        let result = (|| {
-            let answer = post_json(rt, dir, cli, &gw.external_network, &flow.url, &body)?;
-            let new = apply_answer(cli, &record, &answer, now)?;
-            let new_bytes = serde_json::to_vec(&new).map_err(|_| "could not encode the record")?;
-            let files = crate::seat_login::extract_tokens(
-                cli,
-                &[(login_path(cli).unwrap_or_default().into(), new_bytes)],
-            )?;
-            commit_refresh(
+        let now = unix_now();
+        let multi = cli == "pi";
+        // A multi-entry record renews each eligible entry once per pass, one committed generation
+        // at a time, so a rotated refresh token is stored before the next entry's request is made
+        // (DES-SEAT-LOGIN-SUBSCRIPTIONS decision 8). One entry's refused request never strands the
+        // others; a failure to store a generation stops the pass.
+        let plan: Vec<Option<String>> = if multi {
+            due_entries(cli, &record, now, force)
+                .into_iter()
+                .map(Some)
+                .collect()
+        } else if next_refresh(cli, &record, now, force).is_some() {
+            vec![None]
+        } else {
+            Vec::new()
+        };
+        let refreshable = if multi {
+            !due_entries(cli, &record, now, true).is_empty()
+        } else {
+            request_body(cli, &record, &flow).is_some()
+        };
+        let mut refreshed = false;
+        let mut failures: Vec<String> = Vec::new();
+        for entry in &plan {
+            let request = match entry {
+                Some(id) => entry_request(cli, &record, id),
+                None => next_refresh(cli, &record, now, force).map(|(_, r)| r),
+            };
+            let Some(request) = request else {
+                continue;
+            };
+            let answered =
+                send(rt, dir, cli, &gw.external_network, &request).and_then(|answer| match entry {
+                    Some(id) => apply_pi_answer(&record, id, &answer, now),
+                    None => apply_answer(cli, &record, &answer, now),
+                });
+            let new = match answered {
+                Ok(new) => new,
+                Err(e) if multi => {
+                    failures.push(format!("{}: {e}", entry.as_deref().unwrap_or(cli)));
+                    continue;
+                }
+                Err(e) => {
+                    failures.push(e);
+                    break;
+                }
+            };
+            let committed = (|| {
+                let new_bytes =
+                    serde_json::to_vec(&new).map_err(|_| "could not encode the record")?;
+                let files = crate::seat_login::extract_tokens(
+                    cli,
+                    &[(login_path(cli).unwrap_or_default().into(), new_bytes)],
+                )?;
+                commit_refresh(
+                    dir,
+                    cli,
+                    file,
+                    &files,
+                    |name, b| crate::seat_gateway::set_broker_credential(rt, gw, dir, cli, name, b),
+                    |name| crate::seat_gateway::remove_broker_file(rt, gw, dir, cli, name),
+                )
+            })();
+            if let Err(e) = committed {
+                failures.push(e);
+                break;
+            }
+            record = new;
+            refreshed = true;
+        }
+        // The route literals follow the stored record on every pass (a renewed Copilot token can
+        // name another plan host; a crash between a commit and its publication heals here).
+        // A publication that failed (or was interrupted) is retried until it succeeds: its
+        // marker is written before and removed only after the gateway has the literals.
+        if multi && failures.is_empty() {
+            let published = (|| {
+                let bytes =
+                    serde_json::to_vec(&record).map_err(|_| "could not encode the record")?;
+                let files = crate::seat_login::extract_tokens(
+                    cli,
+                    &[(login_path(cli).unwrap_or_default().into(), bytes)],
+                )?;
+                let literals = crate::seat_login::route_literals(cli, &files)?;
+                let marker = literals_pending_path(dir, cli);
+                if marker.exists()
+                    || !crate::seat_gateway::route_literals_current(dir, cli, &literals)?
+                {
+                    if !marker.exists() {
+                        create_private_file(&marker, b"route literals unpublished")?;
+                    }
+                    crate::seat_gateway::route_sign_in(rt, gw, dir, cli, &literals)?;
+                    remove_private_file(&marker)?;
+                }
+                Ok::<(), String>(())
+            })();
+            if let Err(e) = published {
+                failures.push(format!("route literals: {e}"));
+            }
+        }
+        if !plan.is_empty() || !failures.is_empty() {
+            record_last(
                 dir,
                 cli,
-                file,
-                &files,
-                |name, b| crate::seat_gateway::set_broker_credential(rt, gw, dir, cli, name, b),
-                |name| crate::seat_gateway::remove_broker_file(rt, gw, dir, cli, name),
-            )?;
-            crate::seat_login::record_expiry(cli, &new)
-        })();
-        record_last(
-            dir,
-            cli,
-            Some(&LastRefresh {
-                ok: result.is_ok(),
-                at: now,
-                error: result.as_ref().err().cloned(),
-            }),
-        );
-        result.map(|expires_at| Outcome::Refreshed { expires_at })
+                Some(&LastRefresh {
+                    ok: failures.is_empty(),
+                    at: now,
+                    error: (!failures.is_empty()).then(|| failures.join("; ")),
+                }),
+            );
+        }
+        if !failures.is_empty() {
+            return Err(failures.join("; "));
+        }
+        let expires_at = crate::seat_login::record_expiry(cli, &record)?;
+        if refreshed {
+            Ok(Outcome::Refreshed { expires_at })
+        } else if !refreshable {
+            Ok(Outcome::NotRefreshable)
+        } else {
+            Ok(Outcome::NotDue { expires_at })
+        }
     }
 
     /// Start the daemon's refresher loop for gateway dir `dir`, once per process: a first pass
@@ -746,12 +1077,190 @@ mod live {
     }
 }
 
+#[cfg(all(unix, test))]
+pub(crate) use live::request_argv;
 #[cfg(unix)]
 pub(crate) use live::{refresh, start};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pi_record() -> Value {
+        json!({
+            "openai": {"type": "api_key", "key": "FAKE-key"},
+            "anthropic": {"type": "oauth", "access": "sk-ant-oat01-FAKE-a",
+                "refresh": "FAKE-ant-r", "expires": 2_000_000_000_000_u64},
+            "openai-codex": {"type": "oauth", "access": "FAKE.jwt.x", "refresh": "FAKE-oai-r",
+                "expires": 1_000_000_000_000_u64, "accountId": "acct-FAKE"},
+            "github-copilot": {"type": "oauth", "access": "tid=FAKE", "refresh": "FAKE-gho",
+                "expires": 1_500_000_000_000_u64}
+        })
+    }
+
+    /// Decision 8: pi renews the entry expiring first, with that provider's own flow.
+    #[test]
+    fn pi_refreshes_the_earliest_due_entry_with_its_providers_flow() {
+        // The flows' URLs read the live tests' stub override: wait out any live test.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let record = pi_record();
+        assert_eq!(next_refresh("pi", &record, 100, false), None, "nothing due");
+        let (entry, request) = next_refresh("pi", &record, 1_000_000_000, false).unwrap();
+        assert_eq!(entry.as_deref(), Some("openai-codex"));
+        let Request::Post { url, body } = request else {
+            panic!("an OAuth refresh is a POST")
+        };
+        assert_eq!(url, "https://auth.openai.com/oauth/token");
+        assert_eq!(body["refresh_token"], "FAKE-oai-r");
+        assert_eq!(body["client_id"], "app_EMoamEEZ73f0CkXaXp7hrann");
+        // Once codex's entry is renewed, Copilot's exchange is next.
+        let renewed = apply_pi_answer(
+            &record,
+            "openai-codex",
+            &json!({"access_token": "FAKE-new-a", "refresh_token": "FAKE-new-r", "expires_in": 3600}),
+            1_600_000_000,
+        )
+        .unwrap();
+        assert_eq!(renewed["openai-codex"]["refresh"], "FAKE-new-r");
+        assert_eq!(renewed["openai-codex"]["expires"], 1_600_003_600_000_u64);
+        assert_eq!(renewed["openai-codex"]["accountId"], "acct-FAKE");
+        let (entry, request) = next_refresh("pi", &renewed, 1_500_000_000, false).unwrap();
+        assert_eq!(entry.as_deref(), Some("github-copilot"));
+        let Request::BearerGet {
+            url,
+            token,
+            headers,
+        } = request.clone()
+        else {
+            panic!("Copilot's exchange is a GET")
+        };
+        assert_eq!(url, "https://api.github.com/copilot_internal/v2/token");
+        assert_eq!(token, "FAKE-gho");
+        assert!(headers.contains(&("copilot-integration-id", "vscode-chat")));
+        let exchanged = apply_pi_answer(
+            &renewed,
+            "github-copilot",
+            &json!({"token": "tid=FAKE-2;proxy-ep=proxy.individual.githubcopilot.com", "expires_at": 1_500_001_800_u64}),
+            1_500_000_000,
+        )
+        .unwrap();
+        assert_eq!(
+            exchanged["github-copilot"]["refresh"], "FAKE-gho",
+            "the GitHub token stays"
+        );
+        assert_eq!(
+            exchanged["github-copilot"]["expires"],
+            1_500_001_800_000_u64
+        );
+        // A forced refresh takes the earliest entry; Anthropic's renews by claude's flow.
+        let (entry, _) = next_refresh("pi", &exchanged, 0, true).unwrap();
+        assert_eq!(entry.as_deref(), Some("github-copilot"));
+        let mut only_anthropic = exchanged.clone();
+        only_anthropic["github-copilot"]["type"] = json!("api_key");
+        only_anthropic["openai-codex"]
+            .as_object_mut()
+            .unwrap()
+            .remove("refresh");
+        let (entry, request) = next_refresh("pi", &only_anthropic, 0, true).unwrap();
+        assert_eq!(entry.as_deref(), Some("anthropic"));
+        assert!(
+            matches!(request, Request::Post { ref url, .. } if url.contains("platform.claude.com"))
+        );
+        // A pass plans every renewable entry when forced (each tried once), only the due ones
+        // otherwise, and none for a record without refresh tokens (not refreshable).
+        assert_eq!(
+            due_entries("pi", &record, 0, true),
+            vec!["openai-codex", "github-copilot", "anthropic"]
+        );
+        assert_eq!(
+            due_entries("pi", &record, 1_499_999_500, false),
+            vec!["openai-codex", "github-copilot"]
+        );
+        let mut no_refresh = record.clone();
+        for id in ["anthropic", "openai-codex", "github-copilot"] {
+            no_refresh[id].as_object_mut().unwrap().remove("refresh");
+        }
+        assert!(due_entries("pi", &no_refresh, 0, true).is_empty());
+        // An entry with no expiry is renewable when forced, never due by itself.
+        let mut no_expiry = record.clone();
+        no_expiry["anthropic"]
+            .as_object_mut()
+            .unwrap()
+            .remove("expires");
+        assert!(due_entries("pi", &no_expiry, 3_000_000_000, false)
+            .iter()
+            .all(|e| e != "anthropic"));
+        assert_eq!(
+            due_entries("pi", &no_expiry, 0, true)
+                .last()
+                .map(String::as_str),
+            Some("anthropic")
+        );
+        // The exchange's plan endpoint is kept for a token that names none.
+        let with_endpoint = apply_pi_answer(
+            &record,
+            "github-copilot",
+            &json!({"token": "tid=FAKE-3", "expires_at": 1_u64,
+                "endpoints": {"api": "https://api.business.githubcopilot.com"}}),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            with_endpoint["github-copilot"][crate::seat_login::COPILOT_ENDPOINT_FIELD],
+            "https://api.business.githubcopilot.com"
+        );
+        // A later exchange naming no endpoint drops the earlier generation's.
+        let without = apply_pi_answer(
+            &with_endpoint,
+            "github-copilot",
+            &json!({"token": "tid=FAKE-4", "expires_at": 2_u64}),
+            0,
+        )
+        .unwrap();
+        assert!(without["github-copilot"]
+            .get(crate::seat_login::COPILOT_ENDPOINT_FIELD)
+            .is_none());
+        // A refresh answer must carry what the CLI needs.
+        assert!(apply_pi_answer(&record, "anthropic", &json!({"access_token": "x"}), 1).is_err());
+        assert!(apply_pi_answer(&record, "github-copilot", &json!({"token": "x"}), 1).is_err());
+        assert!(apply_pi_answer(
+            &record,
+            "xai",
+            &json!({"access_token": "x", "expires_in": 1}),
+            1
+        )
+        .is_err());
+    }
+
+    /// The exchange's GitHub token rides stdin as a header, never a command-line argument.
+    #[cfg(unix)]
+    #[test]
+    fn a_bearer_get_keeps_its_token_off_the_command_line() {
+        let request = Request::BearerGet {
+            url: "https://api.github.com/copilot_internal/v2/token".into(),
+            token: "FAKE-gho-secret".into(),
+            headers: PI_COPILOT_HEADERS.to_vec(),
+        };
+        let (argv, stdin) = request_argv(&request).unwrap();
+        assert!(!argv.iter().any(|a| a.contains("FAKE-gho-secret")));
+        assert_eq!(stdin, b"authorization: Bearer FAKE-gho-secret\n");
+        assert!(argv.windows(2).any(|w| w == ["-H", "@-"]));
+        let injected = Request::BearerGet {
+            url: "u".into(),
+            token: "FAKE\r\nx-evil: 1".into(),
+            headers: Vec::new(),
+        };
+        assert!(request_argv(&injected).is_err());
+        let (argv, stdin) = request_argv(&Request::Post {
+            url: "u".into(),
+            body: json!({"refresh_token": "FAKE-r"}),
+        })
+        .unwrap();
+        assert!(!argv.iter().any(|a| a.contains("FAKE-r")));
+        assert!(String::from_utf8(stdin).unwrap().contains("FAKE-r"));
+    }
 
     #[test]
     fn first_staging_failure_retries_and_exhaustion_rescues_rotated_record_exclusively() {
