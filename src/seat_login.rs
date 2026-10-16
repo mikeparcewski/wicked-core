@@ -115,7 +115,7 @@ fn login_homes(cli: &str) -> &'static [(&'static str, &'static str)] {
         "codex" => &[("CODEX_HOME", "codex")],
         "pi" => &[("PI_CODING_AGENT_DIR", "pi")],
         "opencode" => &[("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data")],
-        // COPILOT_HOME is unconfirmed. HOME alone confines its default files to the volume.
+        "copilot" => &[("COPILOT_HOME", "copilot")],
         _ => &[],
     }
 }
@@ -129,6 +129,8 @@ fn credential_paths(cli: &str) -> &'static [&'static str] {
         "pi" => &["pi/auth.json", "pi/models.json"],
         // opencode 2.x keeps credentials in its SQLite DB; the login exports them here.
         "opencode" => &["data/opencode/wicked-auth.json"],
+        // Written only because the init helper seeds `storeTokenPlaintext` (no keychain here).
+        "copilot" => &["copilot/config.json"],
         _ => &[],
     }
 }
@@ -166,7 +168,7 @@ fn broker_files(cli: &str) -> Result<&'static [&'static str], String> {
             "opencode.copilot.host",
             "opencode.anthropic.key",
         ]),
-        "copilot" => Err("copilot credential path and gateway route are not configured".into()),
+        "copilot" => Ok(&["copilot.token"]),
         _ => Err("unsupported login CLI".into()),
     }
 }
@@ -288,6 +290,7 @@ pub(crate) fn extract_tokens(
         }
         "pi" => extract_pi(files),
         "opencode" => extract_opencode(files),
+        "copilot" => extract_copilot(files),
         _ => Err("unsupported login CLI".into()),
     }
 }
@@ -550,6 +553,39 @@ fn extract_opencode(files: &[(String, Vec<u8>)]) -> Result<Vec<(String, Vec<u8>)
         return Err(why);
     }
     Ok(out)
+}
+
+/// copilot: the token of the last signed-in github.com user from `copilot/config.json` (JSON
+/// behind a `//` comment header). GitHub Enterprise hosts are refused by name.
+fn extract_copilot(files: &[(String, Vec<u8>)]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let cli = "copilot";
+    let bytes = input_file(cli, files, "copilot/config.json")?
+        .ok_or_else(|| missing(cli, "config.json (did the login store its token?)"))?;
+    // The file as copilot writes it: optional BOM, `//` header lines, then JSON.
+    let text = std::str::from_utf8(bytes).map_err(|_| "copilot: invalid credential JSON")?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let body: String = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let value = parse_json(cli, body.as_bytes())?;
+    let host = nonempty(value.pointer("/lastLoggedInUser/host"))
+        .ok_or_else(|| missing(cli, "lastLoggedInUser.host"))?;
+    if host != "https://github.com" {
+        return Err("copilot: GitHub Enterprise sign-ins are not supported yet".into());
+    }
+    let login = nonempty(value.pointer("/lastLoggedInUser/login"))
+        .ok_or_else(|| missing(cli, "lastLoggedInUser.login"))?;
+    let tokens = value
+        .get("authTokens")
+        .and_then(Value::as_object)
+        .ok_or_else(|| missing(cli, "authTokens"))?;
+    let token = [format!("{host}:{login}"), format!("{host}:{login}:github")]
+        .iter()
+        .find_map(|k| nonempty(tokens.get(k).and_then(|t| t.get("token"))))
+        .ok_or_else(|| missing(cli, "the signed-in user's token"))?;
+    Ok(vec![token_file("copilot.token", token)])
 }
 
 /// opencode's exported sign-ins the broker cannot serve yet, by integration and method only.
@@ -833,11 +869,11 @@ fn status_from_files(cli: &str, files: &[(String, Vec<u8>)], now: u64) -> Broker
         return BrokerStatus::Unknown(e);
     }
     let present = |name: &str| files.iter().any(|(p, b)| p == name && !b.is_empty());
-    if matches!(cli, "pi" | "opencode") {
-        let key = if cli == "pi" {
-            "pi.token"
-        } else {
-            "opencode.token"
+    if matches!(cli, "pi" | "opencode" | "copilot") {
+        let key = match cli {
+            "pi" => "pi.token",
+            "opencode" => "opencode.token",
+            _ => "copilot has no key route",
         };
         return match subscriptions(cli, files, now) {
             Err(e) => BrokerStatus::Unknown(e),
@@ -994,13 +1030,26 @@ fn init_login_argv(volume: &str, cli: &str) -> Vec<String> {
         .chain(std::iter::once("/in".to_string()))
         .collect();
     let dirs = dirs.join(" ");
+    let seed = match cli {
+        // copilot stores its token in the system keychain, and with none (a container) only
+        // after the user consents to plaintext; the throwaway volume's settings consent up
+        // front, so the login writes `copilot/config.json`, which ingest moves to the broker.
+        "copilot" => format!(
+            " && printf '%s' '{COPILOT_SETTINGS}' > /in/copilot/settings.json \
+             && chown 10001 /in/copilot/settings.json"
+        ),
+        _ => String::new(),
+    };
     helper_argv(
         volume,
         false,
         "0",
-        format!("mkdir -p {dirs} && chown 10001 {dirs} && chmod 700 {dirs}"),
+        format!("mkdir -p {dirs}{seed} && chown 10001 {dirs} && chmod 700 {dirs}"),
     )
 }
+
+/// The copilot settings its login volume is seeded with (`storeTokenPlaintext`, see above).
+const COPILOT_SETTINGS: &str = r#"{"storeTokenPlaintext":true}"#;
 
 #[cfg(unix)]
 fn execute(rt: &Runtime, argv: &[String]) -> Result<std::process::Output, String> {
@@ -1358,7 +1407,7 @@ pub(crate) fn sign_in_from_files(
 ) -> Option<crate::seat_credentials::SeatSignIn> {
     let kind = kind_from_files(cli, files);
     let subscriptions = match cli {
-        "pi" | "opencode" => subscriptions(cli, files, now).ok()?.0,
+        "pi" | "opencode" | "copilot" => subscriptions(cli, files, now).ok()?.0,
         _ => Vec::new(),
     };
     (kind.is_some() || !subscriptions.is_empty()).then_some(crate::seat_credentials::SeatSignIn {
@@ -2726,7 +2775,11 @@ esac
                     "XDG_DATA_HOME=/home/login/data",
                 ],
             ),
-            ("copilot", vec!["copilot", "login"], vec![]),
+            (
+                "copilot",
+                vec!["copilot", "login"],
+                vec!["COPILOT_HOME=/home/login/copilot"],
+            ),
         ] {
             let volume = login_volume("wicked-agw-test", cli);
             let argv = login_argv(
@@ -2763,7 +2816,7 @@ esac
             for forbidden in [
                 "ANTHROPIC_API_KEY",
                 "OPENAI_API_KEY",
-                "COPILOT_HOME",
+                "COPILOT_GITHUB_TOKEN",
                 "/broker",
                 "@",
                 "FAKE-secret",
@@ -2792,6 +2845,12 @@ esac
             let argv = login_argv(Path::new("/rt"), cli, "img", "vol", "net");
             let script = init_login_argv("vol", cli).last().unwrap().clone();
             let (mkdir, rest) = script.split_once(" && ").unwrap();
+            // copilot's plaintext-consent seed sits between the mkdir and the hand-over.
+            let rest = rest
+                .split(" && ")
+                .filter(|step| !step.contains("settings.json"))
+                .collect::<Vec<_>>()
+                .join(" && ");
             let created: Vec<&str> = mkdir
                 .strip_prefix("mkdir -p ")
                 .unwrap()
@@ -3120,6 +3179,69 @@ esac
         );
     }
 
+    /// What `copilot login` leaves with plaintext storage consented (FAKE values): JSON behind
+    /// the CLI's `//` header, the token under `<host>:<login>` and `<host>:<login>:github`.
+    fn copilot_config() -> String {
+        "// User settings belong in settings.json.\n// This file is managed automatically.\n{\n  \"authTokens\": {\n    \"https://github.com:fake-user:github\": {\"token\": \"FAKE-gho-cp\"},\n    \"https://github.com:fake-user\": {\"token\": \"FAKE-gho-cp\"}\n  },\n  \"loggedInUsers\": [{\"host\": \"https://github.com\", \"login\": \"fake-user\", \"kind\": \"githubDotCom\"}],\n  \"lastLoggedInUser\": {\"host\": \"https://github.com\", \"login\": \"fake-user\"}\n}\n".into()
+    }
+
+    /// DES-SEAT-LOGIN-SUBSCRIPTIONS: copilot's login token (behind its JSONC header) is the
+    /// broker's one file; GitHub Enterprise, a missing token and a missing user are refused.
+    #[test]
+    fn copilot_login_token_is_ingested_from_its_plaintext_config() {
+        use crate::seat_credentials::Subscription;
+        let cfg = |body: String| vec![("copilot/config.json".to_string(), body.into_bytes())];
+        let files = extract_tokens("copilot", &cfg(copilot_config())).unwrap();
+        assert_eq!(files, vec![token_file("copilot.token", "FAKE-gho-cp")]);
+        let sign_in = sign_in_from_files("copilot", &files, 100).unwrap();
+        assert_eq!(sign_in.kind, None);
+        assert_eq!(sign_in.subscriptions, vec![Subscription::Copilot]);
+        assert_eq!(
+            status_from_files("copilot", &files, 100),
+            BrokerStatus::SignedIn { expires_at: None }
+        );
+        assert_eq!(
+            status_from_files("copilot", &[], 100),
+            BrokerStatus::SignedOut
+        );
+        let ghe = copilot_config().replace("https://github.com", "https://corp.ghe.com");
+        assert!(extract_tokens("copilot", &cfg(ghe))
+            .unwrap_err()
+            .contains("Enterprise"));
+        let no_token = copilot_config().replace("FAKE-gho-cp", "");
+        let err = extract_tokens("copilot", &cfg(no_token)).unwrap_err();
+        assert!(err.contains("token") && !err.contains("FAKE"), "{err}");
+        // As copilot may write it: a BOM before the header, or before bare JSON; CRLF lines.
+        for body in [
+            format!("\u{feff}{}", copilot_config()),
+            format!(
+                "\u{feff}{}",
+                copilot_config()
+                    .lines()
+                    .filter(|l| !l.starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            copilot_config().replace('\n', "\r\n"),
+        ] {
+            assert_eq!(
+                extract_tokens("copilot", &cfg(body)).unwrap(),
+                vec![token_file("copilot.token", "FAKE-gho-cp")]
+            );
+        }
+        let invalid = vec![("copilot/config.json".to_string(), vec![0xff, 0xfe, b'{'])];
+        assert!(extract_tokens("copilot", &invalid).is_err());
+        let no_user = copilot_config().replace("lastLoggedInUser", "somethingElse");
+        assert!(extract_tokens("copilot", &cfg(no_user)).is_err());
+        // The init helper seeds copilot's plaintext consent beside its home.
+        let init = init_login_argv("vol", "copilot");
+        assert!(init.last().unwrap().contains("/in/copilot/settings.json"));
+        assert!(init
+            .last()
+            .unwrap()
+            .contains(r#"{"storeTokenPlaintext":true}"#));
+    }
+
     /// What opencode's login leaves after `auth export` (FAKE values): its ChatGPT sign-in, its
     /// Copilot device sign-in, an Anthropic key and an inactive older OpenAI key.
     fn opencode_login() -> Value {
@@ -3431,7 +3553,7 @@ esac
         assert!(err.contains("xai (key)") && !err.contains("FAKE"), "{err}");
         assert!(extract_tokens("copilot", &[])
             .unwrap_err()
-            .contains("not configured"));
+            .contains("config.json"));
     }
 
     #[test]
@@ -3583,6 +3705,7 @@ esac
                 Some(K::ProviderKey),
             ),
             ("copilot", vec![f("pi.token", "FAKE-key")], None),
+            ("copilot", vec![f("copilot.token", "FAKE-gho")], None),
         ] {
             assert_eq!(kind_from_files(cli, &files), want, "{cli} {files:?}");
             // Whenever there is a kind, the status agrees the agent is signed in.
@@ -4754,6 +4877,383 @@ esac
             "FAKE-oc-ant",
             &key.key,
         ] {
+            assert!(!gw_logs.contains(secret), "{secret} in the gateway log");
+            assert!(
+                !report_text.contains(secret),
+                "{secret} in the ingest report"
+            );
+        }
+    }
+
+    /// LIVE (`WICKED_CONTAINER_LIVE=1`): the copilot CLI's sign-in end to end with FAKE
+    /// credentials. Its login's `config.json` is ingested; the real copilot 1.0.96 CLI runs in
+    /// its BYOK mode with only the env arming renders (the unit key as its bearer) and reaches a
+    /// stub upstream through the Copilot route, which sees the broker's GitHub token, never the
+    /// unit key; pi's unit is refused there; sign-out empties the route.
+    #[cfg(unix)]
+    #[test]
+    fn live_copilot_sign_in_reaches_the_upstream_only_through_its_route() {
+        use crate::seat_gateway::{
+            attach, configure_gateway, ensure_gateway, register_live, GatewayConfig, UnitKey,
+        };
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        let rt = crate::container_floor::runtime().expect("a container runtime answers");
+        let image = crate::container_floor::ensure_seat_image(&rt, "copilot").unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("wicked-cp-live-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("stub")).unwrap();
+        let gw = Gateway::for_dir(&dir);
+        let run = |argv: &[&str]| {
+            let mut c = rt.cmd();
+            c.args(argv);
+            output_within(c, Duration::from_secs(120)).unwrap()
+        };
+        let stub = format!("{}-stub", gw.name);
+        std::fs::write(
+            dir.join("stub/stub.js"),
+            "const h=require('http');h.createServer((q,r)=>{q.resume();q.on('end',()=>{\
+             console.log('UPSTREAM '+JSON.stringify({url:q.url,auth:q.headers['authorization']||''}));\
+             r.statusCode=401;r.end('{}')})}).listen(8080);",
+        )
+        .unwrap();
+        let mut config = GatewayConfig::default();
+        config.providers.retain(|r| r.owner() == Some("copilot"));
+        for route in &mut config.providers {
+            route.upstream_host = format!("{stub}:8080");
+            route.tls = false;
+        }
+        configure_gateway(&dir, &config).unwrap();
+        let gw = ensure_gateway(&rt, &dir).expect("the gateway starts");
+        let stub_dir = format!(
+            "type=bind,src={},dst=/s,readonly",
+            dir.join("stub").display()
+        );
+        // The copilot image has node only inside its own package: the stub runs from pi's.
+        let node_image = crate::container_floor::ensure_seat_image(&rt, "pi").unwrap();
+        let o = run(&[
+            "run",
+            "-d",
+            "--name",
+            &stub,
+            "--network",
+            &gw.external_network,
+            "--mount",
+            &stub_dir,
+            &node_image,
+            "node",
+            "/s/stub.js",
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let seat_net = format!("{}-seat", gw.name);
+        run(&["network", "rm", &seat_net]);
+        assert!(run(&["network", "create", "--internal", &seat_net])
+            .status
+            .success());
+        attach(&rt, &gw, &seat_net).expect("attached as agw");
+        let key = UnitKey::new("run-cp", "run-cp#1", "copilot");
+        let pi = UnitKey::new("run-cp", "run-cp#2", "pi");
+        register_live(&rt, &gw, &dir, key.clone()).unwrap();
+        register_live(&rt, &gw, &dir, pi.clone()).unwrap();
+        // The real `copilot login`, in the seeded login volume, against a fake-CA api.github.com
+        // on the login's network: proves the seeded consent makes copilot persist its token.
+        let tls = dir.join("tls");
+        std::fs::create_dir_all(&tls).unwrap();
+        let openssl = |args: &[&str]| {
+            // spawn-audit: test-only — a throwaway FAKE CA and certificate for the TLS stub.
+            let o = std::process::Command::new("openssl")
+                .args(args)
+                .current_dir(&tls)
+                .output()
+                .expect("openssl (live test only)");
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        };
+        openssl(&[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            "ca.key",
+            "-out",
+            "ca.pem",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=FAKE live CA",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign",
+        ]);
+        openssl(&[
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            "gh.key",
+            "-out",
+            "gh.csr",
+            "-subj",
+            "/CN=api.github.com",
+        ]);
+        std::fs::write(
+            tls.join("gh.ext"),
+            "subjectAltName=DNS:api.github.com\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n",
+        )
+        .unwrap();
+        openssl(&[
+            "x509",
+            "-req",
+            "-in",
+            "gh.csr",
+            "-CA",
+            "ca.pem",
+            "-CAkey",
+            "ca.key",
+            "-CAcreateserial",
+            "-out",
+            "gh.pem",
+            "-days",
+            "1",
+            "-extfile",
+            "gh.ext",
+        ]);
+        for f in ["gh.key", "gh.pem", "ca.pem"] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(tls.join(f), std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        std::fs::write(
+            tls.join("gh.js"),
+            "const https=require('https'),fs=require('fs');https.createServer({key:fs.readFileSync('/t/gh.key'),\
+             cert:fs.readFileSync('/t/gh.pem')},(q,r)=>{r.setHeader('content-type','application/json');\
+             if(q.url.startsWith('/copilot_internal/user'))return r.end(JSON.stringify({login:'fake-user',\
+             chat_enabled:true,endpoints:{api:'https://api.individual.githubcopilot.com'}}));\
+             if(q.url.startsWith('/user'))return r.end(JSON.stringify({login:'fake-user',id:1}));\
+             r.statusCode=404;r.end('{}')}).listen(443)",
+        )
+        .unwrap();
+        let ghstub = format!("{}-ghstub", gw.name);
+        let tls_mount = format!("type=bind,src={},dst=/t,readonly", tls.display());
+        let o = run(&[
+            "run",
+            "-d",
+            "--name",
+            &ghstub,
+            "--network",
+            &gw.external_network,
+            "--network-alias",
+            "api.github.com",
+            "--user",
+            "0",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "NET_BIND_SERVICE",
+            "--mount",
+            &tls_mount,
+            &node_image,
+            "node",
+            "/t/gh.js",
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let volume = login_volume(&gw.name, "copilot");
+        run(&["volume", "rm", &volume]);
+        assert!(run(&["volume", "create", &volume]).status.success());
+        checked(&rt, &init_login_argv(&volume, "copilot")).unwrap();
+        // The login argv the Agents tab runs, non-interactive: the token on stdin, the FAKE CA.
+        let mut login = login_argv(&rt.cli, "copilot", &image, &volume, &gw.external_network);
+        login.retain(|a| a != "-it");
+        let at = login.iter().position(|a| *a == image).unwrap();
+        login.truncate(at);
+        login.extend(
+            [
+                "-i",
+                "--mount",
+                &tls_mount,
+                "-e",
+                "SSL_CERT_FILE=/t/ca.pem",
+                "-e",
+                "COPILOT_AUTO_UPDATE=false",
+                &image,
+                "copilot",
+                "login",
+                "--with-token",
+            ]
+            .map(String::from),
+        );
+        {
+            use std::io::Write;
+            let mut c = rt.cmd();
+            c.args(&login[1..])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let mut child = c.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"gho_FAKEcopilotlogin000000000000000000\n")
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("Signed in")
+                    || String::from_utf8_lossy(&out.stderr).contains("Signed in"),
+                "copilot login: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        run(&["rm", "-f", &ghstub]);
+        write_session(&dir, "copilot", &volume).unwrap();
+        let report = ingest_and_route(&rt, &gw, &dir, "copilot").expect("ingested");
+        let sign_in = seat_sign_in(&rt, &gw, &dir, "copilot").expect("copilot is signed in");
+        let upstream = || {
+            let o = run(&["logs", &stub]);
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+        };
+        let curl = |unit: &str| {
+            let header = format!("authorization: Bearer {unit}");
+            let o = run(&[
+                "run",
+                "--rm",
+                "--network",
+                &seat_net,
+                &node_image,
+                "curl",
+                "-s",
+                "--max-time",
+                "6",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "-H",
+                &header,
+                "-d",
+                "{}",
+                "http://agw:4012/probe-4012",
+            ]);
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+        let foreign = curl(&pi.key);
+        let mut env = crate::seat_gateway::seat_env_for_sign_in("copilot", &sign_in, &key.key);
+        assert!(
+            !format!("{report:?}").contains("gho_FAKE"),
+            "the ingest report names files, never the token"
+        );
+        let argv: Vec<String> = [
+            "copilot",
+            "-p",
+            "say hi",
+            "--allow-all-tools",
+            "--model",
+            "gpt-5.5",
+        ]
+        .map(String::from)
+        .to_vec();
+        if let Some(wire) = crate::seat_gateway::copilot_wire_api(&argv, |_| None) {
+            env.push(("COPILOT_PROVIDER_WIRE_API".into(), wire.into()));
+        }
+        let mut docker: Vec<String> = [
+            "run",
+            "--rm",
+            "--network",
+            &seat_net,
+            "--user",
+            "10001",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,exec",
+            "-w",
+            "/tmp",
+            "-e",
+            "HOME=/tmp",
+            "-e",
+            "COPILOT_HOME=/tmp/cp",
+        ]
+        .map(String::from)
+        .to_vec();
+        for (k, v) in &env {
+            docker.extend(["-e".into(), format!("{k}={v}")]);
+        }
+        docker.push(image.clone());
+        docker.extend(["timeout".into(), "90".into()]);
+        docker.extend(argv);
+        let refs: Vec<&str> = docker.iter().map(String::as_str).collect();
+        let o = run(&refs);
+        eprintln!(
+            "copilot: {}",
+            String::from_utf8_lossy(&o.stdout)
+                .chars()
+                .take(600)
+                .collect::<String>()
+        );
+        let mut seen = String::new();
+        for _ in 0..40 {
+            seen = upstream();
+            if seen.contains("gho_FAKEcopilotlogin") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let status_in = broker_status(&rt, &gw, "copilot");
+        sign_out_and_route(&rt, &gw, &dir, "copilot").expect("signed out");
+        let before_out = upstream().len();
+        curl(&key.key);
+        std::thread::sleep(Duration::from_secs(1));
+        let after_out = upstream()[before_out..].to_string();
+        let status_out = broker_status(&rt, &gw, "copilot");
+        let logs = run(&["logs", &gw.name]);
+        let gw_logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&logs.stdout),
+            String::from_utf8_lossy(&logs.stderr)
+        );
+        run(&["rm", "-f", &stub, &gw.name]);
+        run(&["network", "rm", &seat_net, &gw.external_network]);
+        let (cfg, broker) = crate::seat_gateway::volumes(&gw);
+        run(&["volume", "rm", &cfg, &broker, &volume]);
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("report={report:?}\nsign_in={sign_in:?}\nforeign={foreign}\nseen={seen}");
+        assert_eq!(foreign, "401", "pi's unit on copilot's route");
+        assert!(
+            !seen.contains("/probe-"),
+            "a refused probe reached the upstream: {seen}"
+        );
+        let lines: Vec<Value> = seen
+            .lines()
+            .filter_map(|l| l.strip_prefix("UPSTREAM "))
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let model_call = lines
+            .iter()
+            .find(|v| v["url"] == "/responses")
+            .expect("copilot reached the Copilot route");
+        assert_eq!(
+            model_call["auth"], "Bearer gho_FAKEcopilotlogin000000000000000000",
+            "the token copilot's own login stored, from the broker"
+        );
+        for line in &lines {
+            assert!(!line.to_string().contains(&key.key), "{line}");
+        }
+        assert_eq!(status_in, BrokerStatus::SignedIn { expires_at: None });
+        assert!(!after_out.contains("FAKE"), "{after_out}");
+        assert_eq!(status_out, BrokerStatus::SignedOut);
+        let report_text = format!("{report:?}");
+        for secret in ["gho_FAKEcopilotlogin", &key.key] {
             assert!(!gw_logs.contains(secret), "{secret} in the gateway log");
             assert!(
                 !report_text.contains(secret),
