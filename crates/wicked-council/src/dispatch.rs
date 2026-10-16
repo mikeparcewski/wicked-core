@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use wicked_apps_core::HardenedCommand;
 
 use crate::types::{
-    AgenticCli, BallotContext, Category, CouncilTask, DispatchOutcome, Dispatcher, InputMode,
-    SeatFailure, SeatFailureKind, TimedOutcome, Vote, STDERR_CAPTURE_LIMIT,
+    AgenticCli, BallotCarrier, BallotContext, BallotRun, Category, CouncilTask, DispatchOutcome,
+    Dispatcher, InputMode, SeatFailure, SeatFailureKind, TimedOutcome, Vote, STDERR_CAPTURE_LIMIT,
 };
 
 /// The fixed 4-question scaffold, rendered onto the task.
@@ -138,6 +138,10 @@ pub struct RealDispatcher {
     /// Source of the host-load sample for dispatch-budget scaling (#557). Defaults to
     /// [`RealLoadSource`]; tests inject a [`FixedLoadSource`] to pin the factor.
     load_source: Arc<dyn LoadSource>,
+    /// Where the ballots run when it is not this process's own isolated host subprocess
+    /// ([`Dispatcher::with_ballot_carrier`]): the engine's seat containers under the container
+    /// seat floor. `None` = the host CLI, as always.
+    carrier: Option<Arc<dyn BallotCarrier>>,
 }
 
 /// Env var overriding the agentic/chat CLI budget, in whole seconds.
@@ -266,6 +270,7 @@ impl Default for RealDispatcher {
             bench: BenchConfig::default(),
             seats: Arc::new(Mutex::new(HashMap::new())),
             load_source: Arc::new(RealLoadSource),
+            carrier: None,
         }
     }
 }
@@ -304,6 +309,7 @@ impl RealDispatcher {
             bench: BenchConfig::from_env(),
             seats: Arc::new(Mutex::new(HashMap::new())),
             load_source: Arc::new(RealLoadSource),
+            carrier: None,
         }
     }
 
@@ -702,8 +708,14 @@ impl RealDispatcher {
             armed: probing,
         };
 
-        // Isolation: a per-dispatch tempdir under the system temp root.
-        let workdir = match make_tempdir(&cli.key, &task.id) {
+        // Isolation: a per-dispatch tempdir under the system temp root — for the host CLI only; a
+        // carrier isolates the ballot its own way (a seat container's own working tree).
+        let workdir = match self
+            .carrier
+            .is_none()
+            .then(|| make_tempdir(&cli.key, &task.id))
+            .transpose()
+        {
             Ok(d) => d,
             Err(e) => {
                 // The seat never ran, so this outcome must not touch its health; the guard
@@ -741,12 +753,22 @@ impl RealDispatcher {
             let _permit = seat_permits().acquire();
             let queued = queue_started.elapsed();
             let run_started = Instant::now();
-            let result = run_in_isolation(cli, prompt, &workdir, timeout, timeout_note.as_deref());
+            let result = match (&self.carrier, &workdir) {
+                (Some(carrier), _) => {
+                    carrier.run_ballot(cli, &task.id, prompt, timeout, timeout_note.as_deref())
+                }
+                (None, Some(workdir)) => {
+                    run_in_isolation(cli, prompt, workdir, timeout, timeout_note.as_deref())
+                }
+                (None, None) => unreachable!("the host path always makes its tempdir"),
+            };
             (result, queued, run_started.elapsed())
         };
 
         // Best-effort cleanup; never fail the dispatch on a cleanup error.
-        let _ = std::fs::remove_dir_all(&workdir);
+        if let Some(workdir) = &workdir {
+            let _ = std::fs::remove_dir_all(workdir);
+        }
 
         let outcome = match result {
             Err(f) => DispatchOutcome::Failed(f),
@@ -765,7 +787,19 @@ impl RealDispatcher {
                 // just that the seat exited 1.
                 .with_output(&run.stdout, &run.stderr),
             ),
-            Ok(run) => DispatchOutcome::Voted(parse_vote(cli, &run.stdout)),
+            Ok(run) => {
+                let mut vote = parse_vote(cli, &run.stdout);
+                if let Some(carrier) = &self.carrier {
+                    // The provenance says where the ballot ran (C5: a seat container).
+                    vote.provenance = format!(
+                        "cli={} ({}), {}",
+                        cli.key,
+                        cli.display_name,
+                        carrier.ran_in()
+                    );
+                }
+                DispatchOutcome::Voted(vote)
+            }
         };
         // A real dispatch ran to a real outcome: this is the ONLY thing that moves health. A
         // parsed, non-empty vote is the readiness signal (it clears everything, probation
@@ -791,6 +825,18 @@ impl Dispatcher for RealDispatcher {
             Some(SeatHealth::Probation { .. }) => true,
             _ => false,
         }
+    }
+
+    fn with_ballot_carrier(
+        &self,
+        carrier: Arc<dyn BallotCarrier>,
+    ) -> Option<Arc<dyn Dispatcher + Send + Sync>> {
+        // A clone shares the seat-health map (an `Arc`): the carried ballots and any host ballot
+        // this dispatcher still runs keep one failure streak per seat.
+        Some(Arc::new(RealDispatcher {
+            carrier: Some(carrier),
+            ..self.clone()
+        }))
     }
 
     fn dispatch(&self, cli: &AgenticCli, task: &CouncilTask) -> Option<Vote> {
@@ -839,14 +885,6 @@ fn make_tempdir(cli_key: &str, task_id: &str) -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// One isolated CLI run that reached completion.
-struct IsolatedRun {
-    exit_ok: bool,
-    exit_code: Option<i32>,
-    stdout: String,
-    stderr: String,
-}
-
 /// Build the argv from `headless_invocation` and `input_mode`, run it isolated in
 /// `workdir` bounded by `timeout`, and return `(exit_success, stdout)`.
 ///
@@ -863,7 +901,7 @@ fn run_in_isolation(
     workdir: &PathBuf,
     timeout: Duration,
     timeout_note: Option<&str>,
-) -> Result<IsolatedRun, SeatFailure> {
+) -> Result<BallotRun, SeatFailure> {
     let mut argv = tokenize(&cli.headless_invocation);
     if argv.is_empty() {
         return Err(SeatFailure::new(
@@ -1058,7 +1096,7 @@ fn run_in_isolation(
         Ok(o) => o,
         Err(e) => return Err(SeatFailure::new(SeatFailureKind::WaitFailed, e.to_string())),
     };
-    Ok(IsolatedRun {
+    Ok(BallotRun {
         exit_ok: output.status.success(),
         exit_code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -2869,10 +2907,10 @@ mod failure_diagnostics_tests {
     /// Pass `load1: None, load5: None` and any `cpus` for factor=1.0 (no scaling).
     /// Pass `load1: Some(cpus as f64 * 2.0)` for factor=2.0 (load_induced=true).
     #[derive(Debug)]
-    struct FixedLoadSource {
-        load1: Option<f64>,
-        load5: Option<f64>,
-        cpus: usize,
+    pub(super) struct FixedLoadSource {
+        pub(super) load1: Option<f64>,
+        pub(super) load5: Option<f64>,
+        pub(super) cpus: usize,
     }
 
     impl LoadSource for FixedLoadSource {
@@ -3105,5 +3143,168 @@ mod failure_diagnostics_tests {
                 "a timeout at factor 1 must advance the bench streak as before; health = {other:?}"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod carrier_tests {
+    use super::*;
+    use crate::types::{BallotCarrier, BallotRun, Confidence};
+
+    /// A carrier that records each ballot and answers with `answer` (or fails it).
+    #[derive(Debug)]
+    struct Recording {
+        answer: Result<String, ()>,
+        seen: Mutex<Vec<(String, String, String, Duration)>>,
+    }
+
+    impl BallotCarrier for Recording {
+        fn run_ballot(
+            &self,
+            cli: &AgenticCli,
+            task_id: &str,
+            prompt: &str,
+            timeout: Duration,
+            _timeout_note: Option<&str>,
+        ) -> Result<BallotRun, SeatFailure> {
+            self.seen.lock().unwrap().push((
+                cli.key.clone(),
+                task_id.to_string(),
+                prompt.to_string(),
+                timeout,
+            ));
+            match &self.answer {
+                Ok(stdout) => Ok(BallotRun {
+                    exit_ok: true,
+                    exit_code: Some(0),
+                    stdout: stdout.clone(),
+                    stderr: String::new(),
+                }),
+                Err(()) => Ok(BallotRun {
+                    exit_ok: false,
+                    exit_code: None,
+                    stdout: "Not logged in · Please run /login".into(),
+                    stderr: String::new(),
+                }),
+            }
+        }
+        fn ran_in(&self) -> &str {
+            "seat container"
+        }
+    }
+
+    /// A seat whose host program does not exist: a host dispatch could only fail to spawn.
+    fn host_seat() -> AgenticCli {
+        AgenticCli {
+            key: "codex".into(),
+            display_name: "Codex".into(),
+            binary: "wicked-no-such-host-cli".into(),
+            headless_invocation: "wicked-no-such-host-cli exec {PROMPT}".into(),
+            category: Category::AgenticCoder,
+            input_mode: InputMode::PromptArg,
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::Verified,
+            enabled_for_council: true,
+            seat_eligible_for_work: true,
+            acp: None,
+            capabilities: None,
+            login_invocation: None,
+            logout_invocation: None,
+            governance_class: None,
+            credential: None,
+            free_tier: None,
+            health: None,
+        }
+    }
+
+    fn task() -> CouncilTask {
+        CouncilTask {
+            id: "t-carrier".into(),
+            topic: "Which position does the evidence support?".into(),
+            options: vec!["yes".into(), "no".into()],
+            criteria: vec!["general".into()],
+            session_id: "s".into(),
+        }
+    }
+
+    /// C5 follow-up: a dispatcher handed a carrier runs every ballot there — the rendered ballot,
+    /// the task, the scaled budget — never the host CLI; the vote is parsed from the carrier's
+    /// output and its provenance names where it ran. Without the carrier the same seat can only
+    /// fail to spawn its (absent) host program.
+    #[test]
+    fn a_carried_ballot_runs_on_the_carrier_and_never_spawns_the_host_cli() {
+        let d = RealDispatcher {
+            timeout: Duration::from_secs(7),
+            load_source: Arc::new(super::failure_diagnostics_tests::FixedLoadSource {
+                load1: None,
+                load5: None,
+                cpus: 8,
+            }),
+            ..RealDispatcher::default()
+        };
+        let cli = host_seat();
+        let host = d.dispatch_ballot_detailed(&cli, &task(), &BallotContext::default());
+        assert!(
+            matches!(&host, DispatchOutcome::Failed(f) if f.kind == SeatFailureKind::SpawnFailed),
+            "{host:?}"
+        );
+        let rec = Arc::new(Recording {
+            answer: Ok("RECOMMENDATION: 2 — ran in a seat container\nTOP_RISK: none\n".into()),
+            seen: Mutex::new(Vec::new()),
+        });
+        let carried = d
+            .with_ballot_carrier(rec.clone())
+            .expect("the real dispatcher carries");
+        let out = carried.dispatch_ballot_detailed(&cli, &task(), &BallotContext::default());
+        let DispatchOutcome::Voted(vote) = out else {
+            panic!("the carried ballot votes: {out:?}")
+        };
+        assert_eq!(vote.recommendation, "2 — ran in a seat container");
+        assert!(
+            vote.provenance.contains("seat container"),
+            "{}",
+            vote.provenance
+        );
+        let seen = rec.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "codex");
+        assert_eq!(seen[0].1, "t-carrier");
+        assert_eq!(seen[0].2, render_ballot(&task(), &BallotContext::default()));
+        assert_eq!(seen[0].3, Duration::from_secs(7));
+    }
+
+    /// The carried dispatcher shares the seat health of the one it came from: carried failures
+    /// bench the seat for both, and the refusal on the carrier's output is classified as on the host.
+    #[test]
+    fn a_carried_failure_counts_on_the_shared_seat_health() {
+        let d = RealDispatcher {
+            bench: BenchConfig {
+                threshold: 2,
+                base: Duration::from_secs(60),
+                max: Duration::from_secs(60),
+            },
+            ..RealDispatcher::default()
+        };
+        let rec = Arc::new(Recording {
+            answer: Err(()),
+            seen: Mutex::new(Vec::new()),
+        });
+        let carried = d.with_ballot_carrier(rec).unwrap();
+        let cli = host_seat();
+        for _ in 0..2 {
+            let out = carried.dispatch_ballot_detailed(&cli, &task(), &BallotContext::default());
+            let DispatchOutcome::Failed(f) = out else {
+                panic!("a refused carried ballot fails: {out:?}")
+            };
+            assert_eq!(f.kind, SeatFailureKind::NonZeroExit);
+            assert!(
+                f.reason.is_some(),
+                "the sign-in refusal is classified: {f:?}"
+            );
+        }
+        assert!(carried.seat_benched("codex"));
+        assert!(d.seat_benched("codex"), "one seat health for both");
     }
 }

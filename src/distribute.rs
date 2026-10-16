@@ -362,19 +362,6 @@ pub(crate) fn codex_worktree_ok(operator_ok: bool, seat_floor: Option<&str>) -> 
     operator_ok || crate::container_floor::container_mode_from(seat_floor)
 }
 
-/// The worktree bench for a call that runs the HOST CLI whatever the seat floor: a decision
-/// council's ballots (`wicked_council` dispatch, with codex's registered `--sandbox
-/// workspace-write`). Lifting the bench under the container floor is about seat containers only,
-/// so a ballot on a bound run still leaves codex out unless the operator opted out — else a host
-/// approval refusal there would bench a codex seat that works in its container for the whole run.
-pub(crate) fn host_worktree_benched(clis: &[AgenticCli], bound: bool) -> Vec<BenchedSeat> {
-    worktree_benched_with(
-        clis,
-        bound,
-        std::env::var_os("WICKED_CODEX_WORKTREE_OK").is_some(),
-    )
-}
-
 pub(crate) fn worktree_benched_with(
     clis: &[AgenticCli],
     bound: bool,
@@ -3434,26 +3421,5 @@ mod worktree_bench_tests {
             CODEX_WORKTREE_BENCH.contains("host floor"),
             "{CODEX_WORKTREE_BENCH}"
         );
-    }
-
-    /// A host-only call (a decision council's ballots) keeps the bench on a bound run whatever the
-    /// floor, unless the operator opted out.
-    #[test]
-    fn host_only_calls_keep_the_codex_bench_on_a_bound_run() {
-        let _env = crate::test_env::ENV_LOCK
-            .write()
-            .unwrap_or_else(|p| p.into_inner());
-        let prev = std::env::var_os("WICKED_CODEX_WORKTREE_OK");
-        std::env::remove_var("WICKED_CODEX_WORKTREE_OK");
-        let clis = [seat("claude"), seat("codex")];
-        let keys = |b: Vec<BenchedSeat>| b.into_iter().map(|s| s.cli).collect::<Vec<_>>();
-        assert_eq!(keys(host_worktree_benched(&clis, true)), vec!["codex"]);
-        assert!(host_worktree_benched(&clis, false).is_empty());
-        std::env::set_var("WICKED_CODEX_WORKTREE_OK", "1");
-        assert!(host_worktree_benched(&clis, true).is_empty());
-        match prev {
-            Some(v) => std::env::set_var("WICKED_CODEX_WORKTREE_OK", v),
-            None => std::env::remove_var("WICKED_CODEX_WORKTREE_OK"),
-        }
     }
 }

@@ -1524,6 +1524,36 @@ impl DispatchOutcome {
     }
 }
 
+/// One ballot that ran to completion on its carrier: how the CLI exited and what it wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BallotRun {
+    pub exit_ok: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Where a ballot runs when it is NOT the host CLI subprocess
+/// ([`crate::dispatch::RealDispatcher`]'s own isolated tempdir run). The engine hands one under
+/// the container seat floor, so a ballot runs in the seat's container like the run's workers and
+/// judges, on the sign-in that seat has there.
+pub trait BallotCarrier: Send + Sync + std::fmt::Debug {
+    /// Run `prompt` on `cli`'s seat for council task `task_id`, bounded by `timeout`. A run that
+    /// outlives `timeout` is stopped and reported [`SeatFailureKind::TimedOut`] (with
+    /// `timeout_note` when given), exactly as the host path reports it.
+    fn run_ballot(
+        &self,
+        cli: &AgenticCli,
+        task_id: &str,
+        prompt: &str,
+        timeout: std::time::Duration,
+        timeout_note: Option<&str>,
+    ) -> Result<BallotRun, SeatFailure>;
+
+    /// Where the ballot ran, as the vote's provenance names it (`"seat container"`).
+    fn ran_in(&self) -> &str;
+}
+
 /// Isolated, timeboxed dispatch of the 4-question scaffold to one CLI.
 pub trait Dispatcher {
     /// Dispatch the scaffold to one CLI and collect its vote (`None` on failure/timeout).
@@ -1585,6 +1615,16 @@ pub trait Dispatcher {
     /// The default — a dispatcher with no health gate — benches nothing.
     fn seat_benched(&self, _key: &str) -> bool {
         false
+    }
+
+    /// This dispatcher with its ballots run by `carrier` instead of host CLI subprocesses, sharing
+    /// its seat health (a seat's failure streak stays one streak). `None` for a dispatcher that
+    /// runs no CLI of its own (a test stub): there is nothing to move.
+    fn with_ballot_carrier(
+        &self,
+        _carrier: std::sync::Arc<dyn BallotCarrier>,
+    ) -> Option<std::sync::Arc<dyn Dispatcher + Send + Sync>> {
+        None
     }
 }
 

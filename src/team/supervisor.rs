@@ -2780,6 +2780,7 @@ fn convene_one(
         seats: Vec::new(),
         seed: None,
         eligible: Vec::new(),
+        ballots_in: None,
     };
     let (by, ruled) = if c.over_cap {
         ("engine".to_string(), no(tev_reason::CAP))
@@ -2820,6 +2821,7 @@ fn convene_one(
                         seats: v.seats.clone(),
                         seed: Some(v.seed),
                         eligible: v.eligible.clone(),
+                        ballots_in: v.ballots_in.clone(),
                     },
                 )
             }

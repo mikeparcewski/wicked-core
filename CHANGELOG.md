@@ -14,6 +14,20 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Decision-council ballots follow the seat floor.** Under the container floor a council's ballots ran the host CLIs
+  (`wicked_council` dispatch, an isolated host subprocess), so on a host where the agents are signed in only through
+  their seat containers a ballot could not authenticate, and it read the operator's own CLI configuration. Now each
+  ballot runs as one of the engine's own sessions (a `council` ballot, like the agent judge and triage) through the
+  run's step runner, so it takes the worker arming path: the seat's container, its brokered sign-in, the gateway as
+  the only egress. It stays ungoverned (no gate hook, no ask tool, no repository). The council's seat health, its
+  load-scaled ballot budget (a ballot that outlives it is cancelled), its concurrency ceiling and its vote parsing are
+  unchanged (`wicked_council`: a `BallotCarrier` the dispatcher runs ballots through, `Dispatcher::with_ballot_carrier`).
+  A seat that reads its prompt from stdin or a file is refused by name (every shipped seat takes it on the command
+  line). Under the host floor nothing changes. The codex worktree bench now applies to ballots by the run's own rule,
+  so a bound run's council keeps codex under the container floor. The ruling says where the ballots ran:
+  `DecisionVerdict.ballots_in` and the `council.ruled` team event's `ballots_in` (`seat_container` or `host`). A failed
+  judge, triage or ballot session keeps both of its CLI's output streams, so a refusal printed on stderr is classified.
+
 - **The container floor keeps codex on repository runs.** The worktree bench (core#769) benched every codex seat on a
   run bound to a repository, because the account's signed requirements bundle forbids `approval_policy = "never"`, and
   on the host codex's own sandbox sends commands for an approval nobody can give (`approval request failed`). In a
@@ -22,8 +36,8 @@ Two release tracks share this file, newest entry first regardless of track:
   container floor (`WICKED_SEAT_FLOOR=container` keeps codex; `WICKED_CODEX_WORKTREE_OK=1` still opts out
   anywhere). A bundle that allows only `untrusted` still refuses commands in a container, and the existing
   `approval_unavailable` seat refusal benches that seat when it happens. `Core.worktreeBenched()` follows the same
-  rule. A decision council's ballots run the host CLIs on every floor, so they keep the bench on a bound run. Stacked
-  on the change that runs agent judges and triage in seat containers (they no longer run host codex).
+  rule, and so do a decision council's ballots, which follow the seat floor too (below). Stacked on the change that runs
+  agent judges and triage in seat containers (they no longer run host codex).
 
 - **Agent judges, validator authoring and failure triage follow the seat floor.** Under the container floor these
   engine-internal sessions ran the host CLIs (ungoverned internal calls), outside any seat container: on a host where

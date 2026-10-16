@@ -2047,9 +2047,64 @@ impl StepRunner for WrappedCliStepRunner {
     }
 }
 
+/// (codex council-r1 on #971) A decision-council ballot is one-shot: a fresh synthetic run id per
+/// ballot, never resumed. Its repo-less sandbox (`sandbox_root`) and, under the container floor,
+/// its seat home (`.wicked-container/<run>-<digest>/`) would otherwise accumulate per ballot —
+/// CLI session history and caches included — since no run lifecycle ever ends a synthetic run.
+/// The guard lives on the runner thread for the whole launch and removes both when it drops, so
+/// cleanup happens only after the seat process is done (a timed-out ballot's cancel included).
+struct BallotScratch {
+    run_id: String,
+    home: std::cell::RefCell<Option<PathBuf>>,
+}
+
+impl BallotScratch {
+    fn new(run_id: &str) -> Self {
+        BallotScratch {
+            run_id: run_id.to_string(),
+            home: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Record the ballot's container seat home BEFORE it is built (codex council-r2): the run
+    /// directory [`crate::container_floor::container_run_dir`] names under the seat root, so a
+    /// setup that fails after creating it is cleaned too. Only a `council-` run directory under
+    /// `.wicked-container` is ever recorded.
+    fn note_root(&self, config: &wicked_apps_core::spawn::SeatConfig) {
+        if let wicked_apps_core::spawn::SeatConfig::Isolated {
+            root: Some(root), ..
+        } = config
+        {
+            let run_dir = crate::container_floor::container_run_dir(root, &self.run_id);
+            let owned = run_dir
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n == ".wicked-container")
+                && run_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("council-"));
+            if owned {
+                *self.home.borrow_mut() = Some(run_dir);
+            }
+        }
+    }
+}
+
+impl Drop for BallotScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(sandbox_root(&self.run_id));
+        if let Some(home) = self.home.borrow_mut().take() {
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
+}
+
 impl WrappedCliStepRunner {
     /// Run one unit's CLI, streaming stdout lines through `emit` as they arrive.
     fn exec(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
+        let ballot_scratch =
+            is_council_ballot(&input.unit).then(|| BallotScratch::new(&input.run_id));
         let cli_key = input
             .unit
             .assigned_cli
@@ -2113,6 +2168,14 @@ impl WrappedCliStepRunner {
         .and_then(|c| {
             let posture =
                 crate::write_posture::WritePosture::of(&input.unit, input.workdir.is_some());
+            if let Some(g) = &ballot_scratch {
+                if uses_container_seat(
+                    runs_in_seat(input),
+                    crate::container_floor::container_mode(),
+                ) {
+                    g.note_root(&c);
+                }
+            }
             let c = config_for_container_launch(
                 c,
                 runs_in_seat(input),
@@ -2991,7 +3054,11 @@ impl WrappedCliStepRunner {
             // review session never resumes (or records) the run's ordinary session on this seat
             // (codex hl-r1 P1 / hl-r2: a reviewer on the executor's seat would read its history).
             let headless = (container && structured).then(|| {
-                let turn = input.unit.qe_review_session.is_none().then(|| {
+                // The engine's own sessions (judge, triage, ballot) are one-shot under a run id of
+                // their own: nothing to resume, and no entry to leave behind (codex council-r2).
+                let turn = (input.unit.qe_review_session.is_none()
+                    && !is_engine_internal(&input.unit))
+                .then(|| {
                     self.sessions.begin(
                         crate::headless::SessionKey {
                             run_id: input.run_id.clone(),
@@ -3449,7 +3516,16 @@ impl WrappedCliStepRunner {
                     tools,
                 ),
                 Ok((code, out, err, _, _, tools)) => {
-                    let detail = if !out.trim().is_empty() { out } else { err };
+                    // An engine-internal session (judge, triage, council ballot) keeps BOTH
+                    // streams: its caller classifies the refusal from this text, and a CLI that
+                    // prints progress on stdout says why it stopped on stderr (codex council-r3).
+                    let detail = match (out.trim().is_empty(), err.trim().is_empty()) {
+                        (false, false) if is_engine_internal(&input.unit) => {
+                            format!("{out}\n{err}")
+                        }
+                        (false, _) => out,
+                        _ => err,
+                    };
                     (
                         StepStatus::Failed,
                         format!("(cli `{cli_key}` exited {code}) {detail}"),
@@ -5542,7 +5618,7 @@ fn uses_container_seat(seated: bool, container_mode: bool) -> bool {
 }
 
 /// Whether this unit follows the run's seat floor: every governed unit, and the engine's own
-/// judge, validator-authoring and triage sessions ([`is_engine_internal`]). Under the container
+/// judge, validator-authoring, triage and council-ballot sessions ([`is_engine_internal`]). Under the container
 /// floor those run in seat containers through the same arming as a worker (the agent's brokered
 /// sign-in, the gateway as the only egress, the floor's mounts), never as a host CLI: on such a
 /// host the agents are signed in only in their seat containers, and a host judge would read the
@@ -6044,12 +6120,25 @@ const LAYOUT_PREFIX: &str =
     " ||| WORKTREE LAYOUT (the root of your working copy — every path below \
      is relative to it; `dir/ [manifest]` marks a project root, `dir/ {…}` a container of them): ";
 
-/// Is this unit one of the engine's OWN sessions — the agent judge (`validator`) or failure triage
-/// (`triage`) — rather than a run's work unit? Their prompts are fully authored verdict contracts
-/// that must stay byte-exact ([`skill_prompt`]), and they are handed the skills snapshot only when
-/// they name a skill (`WrappedCliStepRunner::exec`).
+/// Is this unit one of the engine's OWN sessions — the agent judge (`validator`), failure triage
+/// (`triage`) or a decision-council ballot under the container floor ([`is_council_ballot`]) —
+/// rather than a run's work unit? Their prompts are fully authored verdict contracts that must
+/// stay byte-exact ([`skill_prompt`]), they are handed the skills snapshot only when they name a
+/// skill (`WrappedCliStepRunner::exec`), and they follow the seat floor ungoverned
+/// ([`runs_in_seat`]).
 pub(crate) fn is_engine_internal(unit: &WorkUnit) -> bool {
-    matches!(unit.session_id.as_str(), "validator" | "triage")
+    matches!(unit.session_id.as_str(), "validator" | "triage") || is_council_ballot(unit)
+}
+
+/// The unit id of a decision-council ballot (`decision::SeatBallots`), in session `council`.
+pub(crate) const COUNCIL_BALLOT_UNIT: &str = "council-ballot";
+
+/// Whether `unit` is a decision-council ballot: session `council` AND the ballot's unit id. A run's
+/// units carry the run id as their session id but are named `<run>:<phase>` (`plan::plan_units`),
+/// so a run a caller named `council` (or one persisted before ballots existed) is never read as a
+/// ballot (codex council-r1/r2).
+pub(crate) fn is_council_ballot(unit: &WorkUnit) -> bool {
+    unit.session_id == "council" && unit.id == COUNCIL_BALLOT_UNIT
 }
 
 /// The [`StepOutput`] for a unit the skills admission REFUSED before launch
@@ -7638,6 +7727,153 @@ mod tests {
         assert!(runs_in_seat(&input("validator", "x")));
         assert!(runs_in_seat(&input("triage", "x")));
         assert!(!runs_in_seat(&input("s", "x")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (codex council-r1/r2 on #971) A ballot's one-shot scratch goes when the launch ends: its
+    /// sandbox, and its own `council-` run home (recorded BEFORE setup, so a setup that failed
+    /// after creating it is cleaned too), never another run's home.
+    #[test]
+    fn a_ballot_removes_its_sandbox_and_its_own_seat_home_when_the_launch_ends() {
+        use wicked_apps_core::spawn::SeatConfig;
+        let base = std::env::temp_dir().join(format!("ballot-scratch-test-{}", std::process::id()));
+        let root = base.join("claude");
+        std::fs::create_dir_all(&root).unwrap();
+        let seat = SeatConfig::Isolated {
+            cli: wicked_apps_core::spawn::SeatCli::Claude,
+            root: Some(root.clone()),
+            set: Vec::new(),
+            strip: Vec::new(),
+        };
+        // A non-ballot run's home is never recorded, so never removed.
+        let other = crate::container_floor::container_run_dir(&root, "run-1");
+        std::fs::create_dir_all(other.join("full")).unwrap();
+        let g = BallotScratch::new("run-1");
+        g.note_root(&seat);
+        drop(g);
+        assert!(other.exists(), "a non-ballot run's home stays");
+        // The ballot: a setup that created its run directory (partially seeded) and then failed.
+        let run_id = format!("council-scratch-{}", std::process::id());
+        let sandbox = sandbox_root(&run_id);
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let mine = crate::container_floor::container_run_dir(&root, &run_id);
+        std::fs::create_dir_all(mine.join("full")).unwrap();
+        std::fs::write(mine.join("full").join("AGENTS.md"), "seeded").unwrap();
+        let g = BallotScratch::new(&run_id);
+        g.note_root(&seat);
+        drop(g);
+        assert!(!sandbox.exists(), "the ballot's sandbox is removed");
+        assert!(!mine.exists(), "the ballot's seat home is removed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// codex council-r3: a failed council ballot keeps both of its CLI's streams, so the council
+    /// classifies a refusal printed on stderr after progress on stdout (the host path's
+    /// `with_output(stdout, stderr)`), through the real wrapped runner and the real dispatcher.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_ballot_keeps_both_streams_for_the_council_to_classify() {
+        use wicked_council::types::{BallotContext, DispatchOutcome, Dispatcher};
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let _host = VarGuard::set(
+            crate::container_floor::SEAT_FLOOR_ENV,
+            std::path::Path::new("host"),
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-ballot-streams-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let stub = dir.join("ballot-seat");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho 'starting the ballot'\necho 'Not logged in \u{b7} Please run /login' >&2\nexit 1\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut unit = WorkUnit::pending(COUNCIL_BALLOT_UNIT, "council", 1, "ballot");
+        unit.assigned_cli = Some("ballot-seat".to_string());
+        unit.assigned_invocation = Some(format!("{} {{PROMPT}}", stub.display()));
+        let input = StepInput {
+            run_id: format!("council-streams-{}", std::process::id()),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-council".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: None,
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner = std::sync::Arc::new(WrappedCliStepRunner::with_tx(tx));
+        let out = runner.run_unit(&input);
+        let _ = std::fs::remove_dir_all(sandbox_for(&input));
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(out.output.contains("starting the ballot"), "{}", out.output);
+        assert!(out.output.contains("Not logged in"), "{}", out.output);
+        // An ordinary unit's failure text is unchanged: stdout when it has any.
+        let mut plain = input.clone();
+        plain.unit.id = "run:review".into();
+        plain.unit.session_id = "run".into();
+        plain.run_id = format!("plain-streams-{}", std::process::id());
+        let p = runner.run_unit(&plain);
+        let _ = std::fs::remove_dir_all(sandbox_for(&plain));
+        assert!(!p.output.contains("Not logged in"), "{}", p.output);
+        // Through the carrier and the production dispatcher, the refusal is classified.
+        let seat = wicked_council::AgenticCli {
+            key: "ballot-seat".into(),
+            display_name: "ballot-seat".into(),
+            binary: stub.display().to_string(),
+            headless_invocation: format!("{} {{PROMPT}}", stub.display()),
+            category: wicked_council::Category::AgenticCoder,
+            input_mode: wicked_council::InputMode::PromptArg,
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: wicked_council::Confidence::default(),
+            enabled_for_council: true,
+            seat_eligible_for_work: true,
+            acp: None,
+            capabilities: None,
+            login_invocation: None,
+            logout_invocation: None,
+            governance_class: None,
+            credential: None,
+            free_tier: None,
+            health: None,
+        };
+        let carried = wicked_council::dispatch::RealDispatcher::default()
+            .with_ballot_carrier(std::sync::Arc::new(crate::decision::SeatBallots::new(
+                runner.clone(),
+            )))
+            .unwrap();
+        let task = wicked_council::CouncilTask {
+            id: "t-streams".into(),
+            topic: "q".into(),
+            options: vec!["a".into(), "b".into()],
+            criteria: vec!["general".into()],
+            session_id: "s".into(),
+        };
+        let outcome = carried.dispatch_ballot_detailed(&seat, &task, &BallotContext::default());
+        let DispatchOutcome::Failed(f) = outcome else {
+            panic!("a refused ballot fails: {outcome:?}")
+        };
+        assert!(
+            f.reason.is_some(),
+            "the stderr refusal is classified: {f:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

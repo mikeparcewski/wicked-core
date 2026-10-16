@@ -912,6 +912,7 @@ impl Stream {
                 seats: Vec::new(),
                 seed: None,
                 eligible: Vec::new(),
+                ballots_in: None,
             }),
         )
     }
@@ -2136,6 +2137,7 @@ fn a_ruling_records_the_drawn_seats_and_the_seed_on_the_dispute() {
             "opencode".into(),
             "pi".into(),
         ],
+        ballots_in: Some("seat_container".into()),
     };
     let d = dispute_of(&r);
     assert_eq!(d.seats, vec!["codex", "opencode", "pi"]);
@@ -2143,13 +2145,14 @@ fn a_ruling_records_the_drawn_seats_and_the_seed_on_the_dispute() {
     let wire = serde_json::to_value(&r).unwrap();
     assert_eq!(wire["seats"], json!(["codex", "opencode", "pi"]));
     assert_eq!(wire["seed"], json!(77));
-    // A ruling recorded before the fields still loads, with no seats and no seed.
+    assert_eq!(wire["ballots_in"], json!("seat_container"));
+    // A ruling recorded before the fields still loads, with no seats, no seed and no place.
     let mut old = wire.clone();
-    for k in ["seats", "seed", "eligible"] {
+    for k in ["seats", "seed", "eligible", "ballots_in"] {
         old.as_object_mut().unwrap().remove(k);
     }
     let back: CouncilRuled = serde_json::from_value(old).unwrap();
-    assert!(back.seats.is_empty() && back.seed.is_none());
+    assert!(back.seats.is_empty() && back.seed.is_none() && back.ballots_in.is_none());
     // A council that was drawn but reached no verdict still names who sat.
     let none = CouncilRuled {
         verdict: Verdict::NoVerdict,

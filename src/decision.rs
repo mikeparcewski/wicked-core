@@ -40,6 +40,173 @@ pub fn real_dispatcher() -> Arc<dyn Dispatcher + Send + Sync> {
     Arc::new(RealDispatcher::from_env())
 }
 
+/// Where a council's ballots ran, as [`DecisionVerdict::ballots_in`] records it.
+pub const BALLOTS_IN_SEAT_CONTAINER: &str = "seat_container";
+/// The host CLI subprocess (`wicked_council::dispatch::run_in_isolation`): every floor but the
+/// container floor.
+pub const BALLOTS_IN_HOST: &str = "host";
+
+/// (C5 follow-up) The ballot carrier under the container seat floor: each ballot runs as one of
+/// the engine's OWN sessions (a `council` ballot, [`crate::execute_wrapped::is_council_ballot`])
+/// through the run's step runner, so it takes the same arming path as a worker, a judge and
+/// triage (`execute_wrapped::runs_in_seat`): the seat's container, its brokered sign-in, the
+/// gateway as the only egress. On such a host the agents are signed in only in their seat
+/// containers, so a host ballot could not authenticate (and would read the operator's own
+/// configuration). The session stays UNGOVERNED, as a judge's does: no gate hook, no ask tool, no
+/// MCP channel, no repository (`workdir: None`), and the ballot prompt goes through byte-exact.
+pub(crate) struct SeatBallots {
+    runner: Arc<dyn crate::workflow::StepRunner>,
+}
+
+impl std::fmt::Debug for SeatBallots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SeatBallots")
+    }
+}
+
+impl SeatBallots {
+    pub(crate) fn new(runner: Arc<dyn crate::workflow::StepRunner>) -> Self {
+        SeatBallots { runner }
+    }
+}
+
+/// How long a timed-out ballot's seat is given to stop after it is cancelled, before the ballot
+/// reports its timeout anyway (the runner's cancel tears the container down on its own).
+const BALLOT_CANCEL_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The run id one carried ballot runs under: unique per ballot, so a runner keying sessions or
+/// cancels by run id never mixes two ballots (or a ballot and a run).
+fn ballot_run_id(task_id: &str, cli_key: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let safe = |s: &str| -> String { s.chars().filter(|c| c.is_ascii_alphanumeric()).collect() };
+    format!(
+        "council-{}-{}-{}",
+        safe(task_id),
+        safe(cli_key),
+        N.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+impl wicked_council::types::BallotCarrier for SeatBallots {
+    fn run_ballot(
+        &self,
+        cli: &AgenticCli,
+        task_id: &str,
+        prompt: &str,
+        timeout: std::time::Duration,
+        timeout_note: Option<&str>,
+    ) -> Result<wicked_council::types::BallotRun, wicked_council::types::SeatFailure> {
+        use crate::workflow::StepStatus;
+        use wicked_council::types::{BallotRun, InputMode, SeatFailure, SeatFailureKind};
+        // The seat's carrier hands the prompt on argv (`{PROMPT}`), as it does for every worker
+        // and judge; a seat registered to read it from stdin or a file would get the wrong
+        // input, so it is refused by name instead (every shipped seat is `PromptArg`).
+        if cli.input_mode != InputMode::PromptArg {
+            return Err(SeatFailure::new(
+                if cli.input_mode == InputMode::PtySession {
+                    SeatFailureKind::PtyUnsupported
+                } else {
+                    SeatFailureKind::SpawnFailed
+                },
+                format!(
+                    "seat `{}` reads its prompt as {:?}; a ballot in a seat container is handed \
+                     its prompt on the command line only",
+                    cli.key, cli.input_mode
+                ),
+            ));
+        }
+        let run_id = ballot_run_id(task_id, &cli.key);
+        let mut unit = crate::domain::WorkUnit::pending(
+            crate::execute_wrapped::COUNCIL_BALLOT_UNIT,
+            "council",
+            1,
+            prompt,
+        );
+        unit.assigned_cli = Some(cli.key.clone());
+        unit.assigned_invocation = Some(cli.headless_invocation.clone());
+        let input = crate::workflow::StepInput {
+            run_id: run_id.clone(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-council".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: None,
+            // UNGOVERNED: the engine's own ballot, like the agent judge (`validator`).
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runner = self.runner.clone();
+        std::thread::spawn(move || {
+            let out =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runner.run_unit(&input)));
+            let _ = tx.send(out);
+        });
+        let out = match rx.recv_timeout(timeout) {
+            Ok(out) => out.ok(),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Stop the seat (the runner cancels the ballot's container), give it a moment,
+                // and report the timeout as the host path does.
+                self.runner.on_run_complete(&run_id);
+                let _ = rx.recv_timeout(BALLOT_CANCEL_DRAIN);
+                let msg = match timeout_note {
+                    Some(note) => format!("exceeded {timeout:?} dispatch budget ({note})"),
+                    None => format!("exceeded {timeout:?} dispatch budget"),
+                };
+                return Err(SeatFailure::new(
+                    SeatFailureKind::TimedOut,
+                    format!("{msg} in its seat container"),
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+        };
+        // The ballot's process has exited: nothing to cancel (a cancel would leave a tombstone per
+        // ballot in the runner for the daemon's life), and an engine-internal session registers no
+        // resumable session to forget (`WrappedCliStepRunner::exec`).
+        let out = match out {
+            Some(out) => out,
+            None => {
+                return Err(SeatFailure::new(
+                    SeatFailureKind::Panicked,
+                    "the ballot's seat runner panicked",
+                ))
+            }
+        };
+        match out.status {
+            StepStatus::Ok => Ok(BallotRun {
+                exit_ok: true,
+                exit_code: Some(0),
+                stdout: out.output,
+                stderr: String::new(),
+            }),
+            StepStatus::TimedOut => Err(SeatFailure::new(
+                SeatFailureKind::TimedOut,
+                format!("the seat burned its turn ceiling: {}", out.output.trim()),
+            )),
+            // A refusal (the floor could not arm, a sign-in refusal, an exit) carries the
+            // seat's own words, classified like a host CLI's exit.
+            StepStatus::Failed | StepStatus::Cancelled | StepStatus::ElicitationFailed => {
+                Ok(BallotRun {
+                    exit_ok: false,
+                    exit_code: None,
+                    stdout: out.output,
+                    stderr: String::new(),
+                })
+            }
+        }
+    }
+
+    fn ran_in(&self) -> &str {
+        "seat container"
+    }
+}
+
 /// Fans council lifecycle events back to the actor's single emit point (via
 /// `Command::EmitEvent`), making deliberation visible to subscribers while a vote is
 /// still in flight. `None` keeps the historical silent behaviour (tests, straight-line
@@ -346,6 +513,10 @@ pub struct DecisionVerdict {
     /// WHY there is no ruling, when `winner` is `None` — named as specifically as the council's
     /// record allows (the seats' own failures, the council's own failure, or its state).
     pub no_ruling_reason: Option<String>,
+    /// Where the ballots ran: [`BALLOTS_IN_SEAT_CONTAINER`] under the container seat floor,
+    /// [`BALLOTS_IN_HOST`] otherwise. `None` when the caller did not say (a direct
+    /// [`convene_decision`] call; the engine's command always does).
+    pub ballots_in: Option<String>,
 }
 
 /// The 0-based option a recommendation names: its leading integer, 1-based on the ballot, when
@@ -489,6 +660,7 @@ fn ruling(task_id: String, status: Option<&PollStatus>, options: usize) -> Decis
         seats: Vec::new(),
         seed: 0,
         eligible: Vec::new(),
+        ballots_in: None,
     };
     let Some(status) = status else {
         return none("council returned no status".to_string(), 0, 0);
@@ -526,6 +698,7 @@ fn ruling(task_id: String, status: Option<&PollStatus>, options: usize) -> Decis
         seats: Vec::new(),
         seed: 0,
         eligible: Vec::new(),
+        ballots_in: None,
     }
 }
 
@@ -1312,5 +1485,98 @@ mod tests {
             "mistyped fields → zero defaults, absent seat count → unknown, got {:?}",
             events[1]
         );
+    }
+
+    /// A seat runner for [`SeatBallots`]: answers after `delay` and counts the cancels.
+    struct SlowSeat {
+        delay: std::time::Duration,
+        runs: AtomicUsize,
+        cancels: AtomicUsize,
+    }
+
+    impl crate::workflow::StepRunner for SlowSeat {
+        fn run_unit(&self, i: &crate::workflow::StepInput) -> crate::workflow::StepOutput {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            crate::workflow::StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: 0,
+                attempt: 0,
+                output: "RECOMMENDATION: 1 — in a seat".into(),
+                status: crate::workflow::StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+        fn on_run_complete(&self, _run_id: &str) {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn slow(delay_ms: u64) -> Arc<SlowSeat> {
+        Arc::new(SlowSeat {
+            delay: std::time::Duration::from_millis(delay_ms),
+            runs: AtomicUsize::new(0),
+            cancels: AtomicUsize::new(0),
+        })
+    }
+
+    /// codex council-r1: a ballot that answers in time cancels nothing (no tombstone per ballot
+    /// in the runner); one that outlives its budget is cancelled once and reported `TimedOut`.
+    #[test]
+    fn a_seat_ballot_is_cancelled_only_when_it_outlives_its_budget() {
+        use wicked_council::types::{BallotCarrier, SeatFailureKind};
+        let quick = slow(0);
+        let carrier = SeatBallots::new(quick.clone());
+        let run = carrier
+            .run_ballot(
+                &seat("pi"),
+                "t1",
+                "ballot",
+                std::time::Duration::from_secs(5),
+                None,
+            )
+            .expect("the seat answered");
+        assert!(run.exit_ok);
+        assert_eq!(run.stdout, "RECOMMENDATION: 1 — in a seat");
+        assert_eq!(quick.cancels.load(Ordering::SeqCst), 0);
+
+        let late = slow(1500);
+        let carrier = SeatBallots::new(late.clone());
+        let f = carrier
+            .run_ballot(
+                &seat("pi"),
+                "t2",
+                "ballot",
+                std::time::Duration::from_millis(100),
+                Some("40s × 1.00"),
+            )
+            .unwrap_err();
+        assert_eq!(f.kind, SeatFailureKind::TimedOut);
+        assert!(f.detail.contains("in its seat container"), "{f:?}");
+        assert_eq!(late.cancels.load(Ordering::SeqCst), 1);
+    }
+
+    /// codex council-r1: the seat carrier hands the prompt on the command line, so a seat that
+    /// reads it another way is refused by name before anything runs.
+    #[test]
+    fn a_seat_ballot_refuses_a_seat_that_does_not_read_its_prompt_from_argv() {
+        use wicked_council::types::{BallotCarrier, InputMode, SeatFailureKind};
+        let runner = slow(0);
+        let carrier = SeatBallots::new(runner.clone());
+        for mode in [InputMode::Stdin, InputMode::AtFile, InputMode::PtySession] {
+            let mut s = seat("pi");
+            s.input_mode = mode;
+            let f = carrier
+                .run_ballot(&s, "t3", "ballot", std::time::Duration::from_secs(5), None)
+                .unwrap_err();
+            assert!(f.detail.contains("command line only"), "{f:?}");
+            if mode == InputMode::PtySession {
+                assert_eq!(f.kind, SeatFailureKind::PtyUnsupported);
+            }
+        }
+        assert_eq!(runner.runs.load(Ordering::SeqCst), 0);
     }
 }
