@@ -4583,7 +4583,8 @@ esac
             .expect("opencode reached the ChatGPT route");
         assert_eq!(chatgpt["auth"], "Bearer FAKE-oc-access");
         assert_eq!(chatgpt["acct"], "acct-FAKE-oc");
-        let copilot = find(&|v| v["auth"] == "Bearer FAKE-gho-oc");
+        // An inference request, not only the model listing.
+        let copilot = find(&|v| v["url"] == "/responses" && v["auth"] == "Bearer FAKE-gho-oc");
         assert!(
             copilot.is_some(),
             "opencode reached the Copilot route: {seen}"

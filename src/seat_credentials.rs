@@ -325,7 +325,8 @@ pub(crate) fn placeholder_files(
             "opencode.json",
             json!({"provider": {"openai": {"options": {
                 "baseURL": format!("{}/v1", gateway_url.trim_end_matches('/')),
-                "apiKey": unit_key
+                "apiKey": unit_key,
+                "headers": {crate::seat_gateway::UNIT_HEADER: unit_key}
             }}}}),
         ),
         _ => return Vec::new(),
@@ -678,6 +679,17 @@ mod tests {
             seat_files("opencode", &key_only, KEY, URL),
             placeholder_files("opencode", CredentialKind::ProviderKey, KEY, URL)
         );
+        // The key route reads the unit from its header too, so a DB row (which opencode prefers
+        // over the config key) can never stand in for this unit.
+        let key_config: Value =
+            serde_json::from_str(&seat_files("opencode", &key_only, KEY, URL)[0].1).unwrap();
+        assert_eq!(
+            key_config["provider"]["openai"]["options"]["headers"][header],
+            KEY
+        );
+        let gw = crate::seat_gateway::GatewayConfig::default();
+        let route = gw.providers.iter().find(|r| r.port == 4004).unwrap();
+        assert_eq!(route.unit_header.as_deref(), Some(header));
     }
 
     #[test]
