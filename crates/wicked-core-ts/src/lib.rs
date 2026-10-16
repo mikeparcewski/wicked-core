@@ -645,6 +645,12 @@ fn propose_plan_json(
     serde_json::to_string(&proposal).map_err(err)
 }
 
+/// `Core.listPresets()`'s answer: the project-resolved presets as a JSON array.
+fn list_presets_json(core: &wicked_core::Core, project_id: Option<&str>) -> napi::Result<String> {
+    let presets = core.list_presets(project_id).map_err(err)?;
+    serde_json::to_string(&presets).map_err(err)
+}
+
 fn qe_reviewers_admitted_json(seats_json: &str) -> napi::Result<String> {
     #[derive(serde::Deserialize)]
     struct Seat {
@@ -1736,14 +1742,13 @@ impl Core {
 
     /// The presets a launch in `projectId` sees (null ⇒ the global set), sorted by name, as a JSON
     /// array of `Preset` objects: every global preset (built-ins included, `created_by: "builtin"`),
-    /// with a project row replacing the global row of the same name.
+    /// with a project row replacing the global row of the same name. (DES-CHAT-FIRST-001 C2) A
+    /// built-in row also carries `title`, `summary` and `use_when` (2–4 phrases); a saved preset
+    /// carries none of the three keys, and an older engine never sends them.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn list_presets(&self, project_id: Option<String>) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
-        task(move || {
-            let presets = core.list_presets(project_id.as_deref()).map_err(err)?;
-            serde_json::to_string(&presets).map_err(err)
-        })
+        task(move || list_presets_json(&core, project_id.as_deref()))
     }
 
     // ── Team transport (DES-TEAMING-002 P1) ────────────────────────────────────
@@ -3119,6 +3124,58 @@ mod tests {
         assert!(preview(build, Some("all"), None, Some("{")).is_err());
         let e = preview(docs, None, Some("no-such-repo"), None).unwrap_err();
         assert!(e.reason.contains("no-such-repo"), "{}", e.reason);
+    }
+
+    /// (DES-CHAT-FIRST-001 C2) `Core.listPresets()`: every built-in row carries `title`, `summary`
+    /// and 2–4 `use_when` phrases on the wire; a project row that shadows `feature` carries none.
+    #[test]
+    fn list_presets_json_carries_the_builtin_descriptors() {
+        hermetic_spool();
+        let db_path = temp_store_path("list-presets-descriptors");
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(StubDispatcher);
+        let core =
+            wicked_core::Core::spawn_with_engine(db_path, dispatcher, Arc::new(StubStepRunner));
+        let v: serde_json::Value =
+            serde_json::from_str(&list_presets_json(&core, None).unwrap()).unwrap();
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), wicked_core::builtin_presets().len());
+        for row in rows {
+            let name = row["name"].as_str().unwrap();
+            let d = wicked_core::builtin_preset_descriptor(name).unwrap();
+            assert_eq!(row["title"], d.title, "{name}");
+            assert_eq!(row["summary"], d.summary, "{name}");
+            let use_when: Vec<&str> = row["use_when"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap())
+                .collect();
+            assert_eq!(use_when, d.use_when, "{name}");
+        }
+        let project = core.project_create("alpha", None).unwrap();
+        core.put_preset(wicked_core::PresetSpec {
+            name: "feature".into(),
+            project_id: Some(project.id.clone()),
+            steps: vec![wicked_core::PlanStep {
+                catalog: "understand".into(),
+                id: "u".into(),
+                ..Default::default()
+            }],
+            created_by: "api".into(),
+        })
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&list_presets_json(&core, Some(&project.id)).unwrap()).unwrap();
+        let shadow = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "feature")
+            .unwrap();
+        assert_eq!(shadow["scope"], format!("project:{}", project.id));
+        for key in ["title", "summary", "use_when"] {
+            assert!(shadow.get(key).is_none(), "{key} on {shadow}");
+        }
     }
 
     /// (T8 (c)) `Core.proposePlan()` rejects bad JSON and an unknown run (no store write).

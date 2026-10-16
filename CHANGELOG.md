@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Built-in workflows describe themselves (DES-CHAT-FIRST-001 C2).** Each built-in preset now has a short title, a
+  one-line summary and 2–4 "use when" phrases in plain operator language (`catalog::builtin_preset_descriptor`, code
+  data beside `builtin_presets`, pinned by a test for every built-in). `Preset` gains the optional `title`, `summary`
+  and `use_when` fields. A listing (`list_presets`, `list_all_presets`, `resolve`) stamps them on a row that IS the
+  seeded built-in, read from the catalog, so an existing store gains them with no rewrite. A saved preset has none,
+  including a project row that shadows a built-in's name. The keys are absent from the wire when unset, and a row
+  written before them still reads. `Core.listPresets()` carries them through **core-ts**. They are display data only:
+  they are never part of a composed def, and the engine's strict `WorkflowDef` parser does not accept them.
+
 - **Decision-council ballots follow the seat floor.** Under the container floor a council's ballots ran the host CLIs
   (`wicked_council` dispatch, an isolated host subprocess), so on a host where the agents are signed in only through
   their seat containers a ballot could not authenticate, and it read the operator's own CLI configuration. Now each

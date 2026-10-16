@@ -241,8 +241,9 @@ pub use wicked_governance::{
 };
 
 pub use catalog::{
-    builtin_preset_instruments, builtin_presets, catalog, catalog_entries, catalog_entry,
-    CatalogEntry, CATALOG_IDS, SECURITY_REVIEW_SKILL,
+    builtin_preset_descriptor, builtin_preset_instruments, builtin_presets, catalog,
+    catalog_entries, catalog_entry, CatalogEntry, PresetDescriptor, CATALOG_IDS,
+    SECURITY_REVIEW_SKILL,
 };
 pub use graph_browser::{
     browse_nodes, graph_kinds, list_node_notes, node_detail, NeighborEdge, NodeDetail, NodeNote,
