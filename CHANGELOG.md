@@ -622,6 +622,8 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.13.1** — 2026-10-16 — patch release on main, carrying #986.
+  - **Host-side sign-in:** codex, pi and opencode run their own native login on the host, inside a throwaway isolated home (file storage, never the keychain), so the browser's localhost callback works. The credential is ingested into the broker as before, and the seat container still sees only placeholders. copilot uses GitHub's device code. claude is unchanged.
 - **core-ts 0.13.0** — 2026-10-16 — minor release on main dfcdedd, carrying #981, #982, #983, #984, #980 and #979.
   - **Container sign-in for every seat:**
     - codex (#981): its config home is created before the device login runs.
