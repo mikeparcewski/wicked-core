@@ -14,6 +14,12 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **copilot signs in for container seats (BYOK on the Copilot route).** `copilot login` keeps its GitHub token in a
+  keychain, or in plaintext only with consent; the login volume now seeds that consent (`COPILOT_HOME`), and ingest
+  moves the last github.com user's token from `config.json` to the broker (`copilot.token`; GitHub Enterprise is
+  refused by name). Governed copilot seats run the CLI's BYOK mode against gateway route 4012, which sends the broker's
+  GitHub token to the Copilot API: the seat holds only its unit key (`COPILOT_PROVIDER_BEARER_TOKEN`), and GPT models
+  use the responses wire API. GitHub-native features (its MCP server, cloud sessions) are not available in BYOK mode.
 - **opencode signs in on the container floor: API keys, ChatGPT and GitHub Copilot.** opencode 2.x keeps credentials
   in SQLite, so ingest (which read an `auth.json` opencode never writes) could not find even an API key. The login
   now runs opencode's own `auth export` after `auth login`, into the same throwaway volume; ingest takes each

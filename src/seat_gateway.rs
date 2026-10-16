@@ -934,7 +934,37 @@ pub(crate) fn seat_env_for_sign_in(
             )
         });
     }
+    if cli == "copilot"
+        && sign_in
+            .subscriptions
+            .contains(&crate::seat_credentials::Subscription::Copilot)
+    {
+        // The CLI's BYOK mode against the Copilot route: the bearer is the unit's key, the
+        // gateway sends the broker's GitHub token upstream (DES-SEAT-LOGIN-SUBSCRIPTIONS 7).
+        let url = crate::seat_credentials::Subscription::Copilot.gateway_url();
+        env.extend([
+            ("COPILOT_PROVIDER_BASE_URL".to_string(), url),
+            ("COPILOT_PROVIDER_TYPE".to_string(), "openai".to_string()),
+            (
+                "COPILOT_PROVIDER_BEARER_TOKEN".to_string(),
+                bearer.to_string(),
+            ),
+            ("COPILOT_AUTO_UPDATE".to_string(), "false".to_string()),
+        ]);
+    }
     env
+}
+
+/// The wire API copilot's BYOK mode must use for the model `argv` selects (`--model X` or
+/// `--model=X`): GPT models are served on `/responses` (the CLI's own rule: GPT-5 needs it),
+/// every other model on the default chat completions. `None` = the default.
+pub(crate) fn copilot_wire_api(argv: &[String]) -> Option<&'static str> {
+    let model = argv.iter().enumerate().find_map(|(i, a)| {
+        a.strip_prefix("--model=")
+            .map(str::to_string)
+            .or_else(|| (a == "--model").then(|| argv.get(i + 1).cloned()).flatten())
+    })?;
+    model.starts_with("gpt-").then_some("responses")
 }
 
 // codex lg-r1 #3: seat-login is a separate process; keep publication inside this
@@ -2225,6 +2255,56 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// The copilot seat's BYOK env: the Copilot route, the unit's key as the bearer (the only
+    /// credential the seat holds); the wire API follows the unit's model.
+    #[test]
+    fn copilot_seats_run_byok_on_the_copilot_route() {
+        let sign_in = crate::seat_credentials::SeatSignIn {
+            kind: None,
+            subscriptions: vec![crate::seat_credentials::Subscription::Copilot],
+        };
+        let env = seat_env_for_sign_in("copilot", &sign_in, "wk-test-PLACEHOLDER");
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("COPILOT_PROVIDER_BASE_URL"), Some("http://agw:4012"));
+        assert_eq!(get("COPILOT_PROVIDER_TYPE"), Some("openai"));
+        assert_eq!(
+            get("COPILOT_PROVIDER_BEARER_TOKEN"),
+            Some("wk-test-PLACEHOLDER")
+        );
+        assert_eq!(get("OPENAI_API_KEY"), None);
+        assert_eq!(get("HTTPS_PROXY"), Some("http://agw:3000"));
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            copilot_wire_api(&argv(&["copilot", "--model", "gpt-5.5", "-p", "x"])),
+            Some("responses")
+        );
+        assert_eq!(
+            copilot_wire_api(&argv(&["copilot", "--model=gpt-6.1-sol"])),
+            Some("responses")
+        );
+        assert_eq!(
+            copilot_wire_api(&argv(&["copilot", "--model", "claude-sonnet-5"])),
+            None
+        );
+        assert_eq!(copilot_wire_api(&argv(&["copilot", "-p", "x"])), None);
+        // copilot's route reads the unit from Authorization (its BYOK bearer) and admits only it.
+        let config = GatewayConfig {
+            units: vec![
+                UnitKey::new("r", "r#1", "copilot"),
+                UnitKey::new("r", "r#2", "pi"),
+            ],
+            ..Default::default()
+        };
+        let rendered = render(&config);
+        let p = &bind(&rendered, 4012)["listeners"][0]["routes"][0]["policies"];
+        assert_eq!(
+            p["apiKey"]["location"],
+            json!({"header": {"name": "authorization", "prefix": "Bearer "}})
+        );
+        assert_eq!(p["apiKey"]["keys"].as_array().unwrap().len(), 1);
+        assert_eq!(p["apiKey"]["keys"][0]["metadata"]["seat"], "copilot");
     }
 
     fn bind(rendered: &Value, port: u16) -> &Value {

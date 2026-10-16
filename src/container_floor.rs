@@ -2049,7 +2049,7 @@ impl Drop for GatewayLease {
 /// Whether an online seat of `cli` has a gateway credential route at all (offline seats need
 /// none). Which credential it presents is the agent's sign-in, read from the broker at arm time.
 fn gateway_route_defined(cli: &str, online: bool) -> Result<(), String> {
-    if online && !matches!(cli, "claude" | "codex" | "pi" | "opencode") {
+    if online && !matches!(cli, "claude" | "codex" | "pi" | "opencode" | "copilot") {
         return Err(format!(
             "no gateway credential route is defined for seat {cli}"
         ));
@@ -2225,7 +2225,12 @@ pub(crate) fn arm(
                 "{run_id}#{ord}@{}",
                 &uuid::Uuid::new_v4().simple().to_string()[..8]
             );
-            let (key, env, files) = placeholder_handoff(cli, kind, run_id, &unit);
+            let (key, mut env, files) = placeholder_handoff(cli, kind, run_id, &unit);
+            if cli == "copilot" {
+                if let Some(wire) = crate::seat_gateway::copilot_wire_api(&argv) {
+                    env.push(("COPILOT_PROVIDER_WIRE_API".into(), wire.into()));
+                }
+            }
             let since = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs().saturating_sub(1).to_string())
@@ -2859,8 +2864,7 @@ mod tests {
     fn offline_copilot_image_needs_no_credential_kind() {
         assert!(seat_package("copilot").is_some());
         assert!(gateway_route_defined("copilot", false).is_ok());
-        assert!(gateway_route_defined("copilot", true).is_err());
-        for cli in ["claude", "codex", "pi", "opencode"] {
+        for cli in ["claude", "codex", "pi", "opencode", "copilot"] {
             assert!(gateway_route_defined(cli, true).is_ok(), "{cli}");
         }
     }

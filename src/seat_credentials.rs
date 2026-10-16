@@ -34,6 +34,9 @@ pub(crate) enum Subscription {
     OpencodeCopilot,
     /// opencode's `anthropic` API key (opencode 2.0.25 has no Claude subscription sign-in).
     OpencodeAnthropicKey,
+    /// The copilot CLI's GitHub sign-in (`copilot login`); its seat runs the CLI's BYOK mode
+    /// against the Copilot route, so no GitHub credential enters the seat.
+    Copilot,
 }
 
 /// A subscription's static gateway route and broker files.
@@ -133,6 +136,19 @@ pub(crate) const SUBSCRIPTION_ROUTES: &[SubscriptionRoute] = {
             account_file: None,
             host_file: None,
             record_key: "anthropic",
+        },
+        // The copilot CLI authenticates its unit on Authorization (its BYOK bearer env).
+        SubscriptionRoute {
+            sub: Subscription::Copilot,
+            cli: "copilot",
+            provider: Provider::Copilot,
+            port: 4012,
+            kind: CredentialKind::ProviderKey,
+            file: "copilot.token",
+            unit_header: None,
+            account_file: None,
+            host_file: None,
+            record_key: "github",
         },
     ]
 };
