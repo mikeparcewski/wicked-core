@@ -573,6 +573,9 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.12.1** — 2026-10-16 — patch release on main fd83177, carrying #976 and #971.
+  - **Host floor routing:** seats the host floor refuses for governed work (anything but claude and a bounded codex) are benched for governed work, with a reason naming the fix. They are no longer routed a unit and then refused. They can still judge, triage and vote, which run ungoverned. `Core.worktreeBenched` reports the bench (`governed_only`).
+  - **Decision councils:** ballots follow the seat floor (#971).
 - **core-ts 0.12.0** — 2026-10-16 — minor release on main 97ab97b, carrying C5 (#950), with #958, #962, #963, #964 and #965 folded in.
   - **Breaking:** governed seats default to the container carrier and ACP is removed from the seats. `WICKED_SEAT_FLOOR=host` keeps the labelled interim host floor, where only claude and codex may run governed.
   - **Ask tool:** in-turn questions return through the MCP `ask` tool (agentgateway), the ask frame names the asking seat, and opencode seats get the tool.
