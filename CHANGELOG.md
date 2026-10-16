@@ -559,6 +559,12 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.12.0** — 2026-10-16 — minor release on main 97ab97b, carrying C5 (#950), with #958, #962, #963, #964 and #965 folded in.
+  - **Breaking:** governed seats default to the container carrier and ACP is removed from the seats. `WICKED_SEAT_FLOOR=host` keeps the labelled interim host floor, where only claude and codex may run governed.
+  - **Ask tool:** in-turn questions return through the MCP `ask` tool (agentgateway), the ask frame names the asking seat, and opencode seats get the tool.
+  - **Judges and triage:** agent judges, validator authoring and triage follow the seat floor.
+  - **Codex:** the container floor keeps codex on repository runs.
+  - Also includes the estate 0.29.3 pin (#974). Crew pins it in 0.13.0.
 - **core-ts 0.11.3** — 2026-10-15 — patch release on main e231ba8, carrying #967 (core#960: a run whose
   contract requires QE acceptance gets a `test` step after its last tree change, whatever its band) and
   #972 (core#969: Approve at `judge_unavailable` judges a team run's PA step instead of re-running it;
