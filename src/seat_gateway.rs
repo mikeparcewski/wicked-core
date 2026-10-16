@@ -928,8 +928,22 @@ pub(crate) fn seat_env_for_sign_in(
             )
         });
     }
+    if cli == "opencode" {
+        // The seat's own server logs out the placeholder rows of sign-ins the broker no longer
+        // holds before it imports the current ones (`worker_sandbox::opencode_pinned_server_argv`).
+        let held = crate::seat_credentials::opencode_row_integrations(&sign_in.subscriptions);
+        let stale: Vec<&str> = crate::seat_credentials::OPENCODE_ROW_INTEGRATIONS
+            .iter()
+            .copied()
+            .filter(|i| !held.contains(i))
+            .collect();
+        env.push((OPENCODE_LOGOUT_ENV.into(), stale.join(" ")));
+    }
     env
 }
+
+/// The env naming the opencode integrations whose placeholder rows a seat logs out.
+pub(crate) const OPENCODE_LOGOUT_ENV: &str = "WICKED_OPENCODE_LOGOUT";
 
 // codex lg-r1 #3: seat-login is a separate process; keep publication inside this
 // transaction too. All callers acquire PUBLISH_LOCK -> CONFIG_LOCK -> config/.lock.

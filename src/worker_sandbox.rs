@@ -939,6 +939,10 @@ pub(crate) fn codex_sandbox_off_under_floor(argv: &mut Vec<String>) -> bool {
 /// [`crate::execute_wrapped::ask_seat_config`]), the script registers the `wicked` server through
 /// the server's own API for the run's directory before `run` (opencode 2.0.25 never offers a
 /// configuration file's MCP tools), with the seat's token on curl's stdin, never on a command line.
+/// Before either, it reconciles the seat's sign-in placeholder rows in opencode's credential DB:
+/// it logs out the integrations named by `WICKED_OPENCODE_LOGOUT` and imports the constant rows
+/// beside `OPENCODE_CONFIG` (`seat_credentials::OPENCODE_IMPORT_FILE`; idempotent: a present row
+/// is skipped). The rows hold no unit material, so concurrent units sharing the DB agree.
 pub(crate) fn opencode_pinned_server_argv(argv: &[String], port: u16) -> Option<Vec<String>> {
     if program_stem(argv) != Some("opencode") || argv.get(1).map(String::as_str) != Some("run") {
         return None;
@@ -958,6 +962,15 @@ while [ "$i" -lt 150 ]; do
   if curl -s -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null; then break; fi
   i=$((i + 1)); sleep 0.1
 done
+srv_url="http://127.0.0.1:$port"
+for it in ${WICKED_OPENCODE_LOGOUT:-}; do
+  case "$it" in openai|github-copilot) "$oc" auth logout "$it" "wicked-seat-$it" --server "$srv_url" >/dev/null 2>&1 || : ;; esac
+done
+rows="${OPENCODE_CONFIG%/*}/wicked-credentials.json"
+if [ -n "${OPENCODE_CONFIG:-}" ] && [ -f "$rows" ]; then
+  "$oc" auth import --server "$srv_url" "$rows" >/dev/null 2>&1 \
+    || echo "wicked-core: opencode's sign-in placeholders could not be imported" >&2
+fi
 case "${WICKED_OPENCODE_ASK:-}" in *__WICKED_MCP_TOKEN__*)
   au="opencode:${OPENCODE_SERVER_PASSWORD:-$OPENCODE_PASSWORD}"
   slot=__WICKED_MCP_TOKEN__
@@ -1158,6 +1171,85 @@ pub(crate) fn plan_seat_floor(launch: SeatLaunch<'_>, write_roots: Vec<PathBuf>)
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    /// DES-SEAT-LOGIN-SUBSCRIPTIONS decision 7: before the run, the pinned script logs out the
+    /// placeholder rows of integrations the broker no longer holds (only the known ones) and
+    /// imports the constant rows beside the unit's `OPENCODE_CONFIG`, through the seat's own
+    /// server; with neither, it sends nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_pinned_opencode_script_reconciles_the_sign_in_rows_before_the_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("wicked-oc-rows-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        let unit = dir.join("home/opencode/.wicked-units/u1");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&unit).unwrap();
+        let log = dir.join("log");
+        let write = |p: std::path::PathBuf, body: String| {
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let oc = write(
+            bin.join("opencode"),
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = serve ]; then exec sleep 30; fi\necho \"oc $*\" >> {}\n",
+                log.display()
+            ),
+        );
+        write(bin.join("curl"), "#!/bin/sh\nexit 0\n".into());
+        std::fs::write(unit.join("opencode.json"), "{}").unwrap();
+        let rows = unit.join(crate::seat_credentials::OPENCODE_IMPORT_FILE);
+        std::fs::write(&rows, "[]").unwrap();
+        let argv: Vec<String> = [oc.to_str().unwrap(), "run", "do it"]
+            .map(String::from)
+            .to_vec();
+        let pinned = opencode_pinned_server_argv(&argv, 4998).unwrap();
+        for reconcile in [true, false] {
+            let _ = std::fs::remove_file(&log);
+            // spawn-audit: test-only — the engine's pinned script with a fake opencode.
+            let mut cmd = std::process::Command::new(&pinned[0]);
+            cmd.args(&pinned[1..])
+                .current_dir(&dir)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env_remove("WICKED_OPENCODE_ASK");
+            if reconcile {
+                cmd.env("OPENCODE_CONFIG", unit.join("opencode.json")).env(
+                    "WICKED_OPENCODE_LOGOUT",
+                    "github-copilot not-an-integration",
+                );
+            } else {
+                cmd.env_remove("OPENCODE_CONFIG")
+                    .env_remove("WICKED_OPENCODE_LOGOUT");
+            }
+            let out = cmd.output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+            let log = std::fs::read_to_string(&log).unwrap();
+            let lines: Vec<&str> = log.lines().collect();
+            let run = lines
+                .iter()
+                .position(|l| l.starts_with("oc run "))
+                .expect("ran");
+            if reconcile {
+                let server = "--server http://127.0.0.1:4998";
+                assert_eq!(
+                    lines[0],
+                    format!("oc auth logout github-copilot wicked-seat-github-copilot {server}")
+                );
+                assert_eq!(
+                    lines[1],
+                    format!("oc auth import {server} {}", rows.display())
+                );
+                assert_eq!(run, 2, "{log}");
+                assert!(!log.contains("not-an-integration"), "{log}");
+            } else {
+                assert_eq!(run, 0, "{log}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// L15: the pinned opencode script registers the ask server through the server's API for the
     /// run's directory when handed `WICKED_OPENCODE_ASK`: the token reaches curl on stdin (never

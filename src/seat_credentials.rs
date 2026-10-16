@@ -21,7 +21,6 @@ const ACCOUNT_ID: &str = "acct-PLACEHOLDER";
 /// One brokered subscription provider of an agent (DES-SEAT-LOGIN-SUBSCRIPTIONS decision 1):
 /// its own broker file, its own static gateway route and its own placeholder entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[allow(clippy::enum_variant_names)] // one agent's variants today; opencode's and copilot's follow
 pub(crate) enum Subscription {
     /// pi's Anthropic (Claude Pro/Max) OAuth.
     PiAnthropic,
@@ -29,6 +28,12 @@ pub(crate) enum Subscription {
     PiChatgpt,
     /// pi's GitHub Copilot sign-in (the broker holds the exchanged Copilot token).
     PiCopilot,
+    /// opencode's `openai` ChatGPT sign-in (`chatgpt-browser` / `chatgpt-headless`).
+    OpencodeChatgpt,
+    /// opencode's `github-copilot` device sign-in (the broker holds the GitHub token).
+    OpencodeCopilot,
+    /// opencode's `anthropic` API key (opencode 2.0.25 has no Claude subscription sign-in).
+    OpencodeAnthropicKey,
 }
 
 /// A subscription's static gateway route and broker files.
@@ -48,6 +53,9 @@ pub(crate) struct SubscriptionRoute {
     pub(crate) account_file: Option<&'static str>,
     /// The broker file holding the route's Copilot API host (a literal on the route).
     pub(crate) host_file: Option<&'static str>,
+    /// The entry of the CLI's own credential record this route serves (pi's provider id,
+    /// opencode's integration id).
+    pub(crate) record_key: &'static str,
 }
 
 /// Every subscription route, in port order. Adding a provider is one row here.
@@ -64,6 +72,7 @@ pub(crate) const SUBSCRIPTION_ROUTES: &[SubscriptionRoute] = {
             unit_header: Some(UNIT_HEADER),
             account_file: None,
             host_file: None,
+            record_key: "anthropic",
         },
         SubscriptionRoute {
             sub: Subscription::PiChatgpt,
@@ -75,6 +84,7 @@ pub(crate) const SUBSCRIPTION_ROUTES: &[SubscriptionRoute] = {
             unit_header: Some(UNIT_HEADER),
             account_file: Some("pi.chatgpt.account"),
             host_file: None,
+            record_key: "openai-codex",
         },
         SubscriptionRoute {
             sub: Subscription::PiCopilot,
@@ -86,6 +96,43 @@ pub(crate) const SUBSCRIPTION_ROUTES: &[SubscriptionRoute] = {
             unit_header: Some(UNIT_HEADER),
             account_file: None,
             host_file: Some("pi.copilot.host"),
+            record_key: "github-copilot",
+        },
+        SubscriptionRoute {
+            sub: Subscription::OpencodeChatgpt,
+            cli: "opencode",
+            provider: Provider::ChatGpt,
+            port: 4009,
+            kind: CredentialKind::CodexChatgpt,
+            file: "opencode.chatgpt.token",
+            unit_header: Some(UNIT_HEADER),
+            account_file: Some("opencode.chatgpt.account"),
+            host_file: None,
+            record_key: "openai",
+        },
+        SubscriptionRoute {
+            sub: Subscription::OpencodeCopilot,
+            cli: "opencode",
+            provider: Provider::Copilot,
+            port: 4010,
+            kind: CredentialKind::ProviderKey,
+            file: "opencode.copilot.token",
+            unit_header: Some(UNIT_HEADER),
+            account_file: None,
+            host_file: Some("opencode.copilot.host"),
+            record_key: "github-copilot",
+        },
+        SubscriptionRoute {
+            sub: Subscription::OpencodeAnthropicKey,
+            cli: "opencode",
+            provider: Provider::Anthropic,
+            port: 4011,
+            kind: CredentialKind::ClaudeApiKey,
+            file: "opencode.anthropic.key",
+            unit_header: Some(UNIT_HEADER),
+            account_file: None,
+            host_file: None,
+            record_key: "anthropic",
         },
     ]
 };
@@ -150,6 +197,12 @@ pub(crate) fn seat_files(
         .kind
         .map(|kind| placeholder_files(cli, kind, unit_key, gateway_url))
         .unwrap_or_default();
+    if cli == "opencode" {
+        if sign_in.subscriptions.is_empty() {
+            return files;
+        }
+        return opencode_files(files, &sign_in.subscriptions, unit_key);
+    }
     if cli != "pi" {
         return files;
     }
@@ -182,6 +235,7 @@ pub(crate) fn seat_files(
                 json!({"type": "api_key", "key": "PLACEHOLDER-not-a-token"}),
                 sub.gateway_url(),
             ),
+            _ => continue,
         };
         auth[id] = entry;
         models["providers"][id] = json!({
@@ -277,6 +331,85 @@ pub(crate) fn placeholder_files(
         _ => return Vec::new(),
     };
     vec![(PathBuf::from(path), serde_json::to_string(&value).unwrap())]
+}
+
+/// The opencode credential rows a seat's own server imports (`opencode auth import`), next to
+/// its per-unit `opencode.json`: constant placeholders, identical for every unit, so concurrent
+/// units sharing the seat's credential DB never overwrite each other (decision 3).
+pub(crate) const OPENCODE_IMPORT_FILE: &str = "wicked-credentials.json";
+/// The integrations whose rows the broker may place; a row of one not held is logged out.
+pub(crate) const OPENCODE_ROW_INTEGRATIONS: &[&str] = &["openai", "github-copilot"];
+
+/// The opencode integrations `subs` hold DB rows for (the ChatGPT and Copilot sign-ins; an API
+/// key needs none: its `opencode.json` key is enough).
+pub(crate) fn opencode_row_integrations(subs: &[Subscription]) -> Vec<&'static str> {
+    subs.iter()
+        .filter_map(|s| match s {
+            Subscription::OpencodeChatgpt => Some("openai"),
+            Subscription::OpencodeCopilot => Some("github-copilot"),
+            _ => None,
+        })
+        .collect()
+}
+
+fn opencode_files(
+    mut files: Vec<(PathBuf, String)>,
+    subs: &[Subscription],
+    unit_key: &str,
+) -> Vec<(PathBuf, String)> {
+    let mut config = match files
+        .iter()
+        .position(|(p, _)| p == Path::new("opencode.json"))
+    {
+        Some(i) => serde_json::from_str(&files.remove(i).1).unwrap_or_else(|_| json!({})),
+        None => json!({}),
+    };
+    let header = json!({crate::seat_gateway::UNIT_HEADER: unit_key});
+    let mut rows = Vec::new();
+    for sub in subs {
+        let (id, options, row) = match sub {
+            Subscription::OpencodeChatgpt => (
+                "openai",
+                json!({"baseURL": format!("{}/backend-api/codex", sub.gateway_url()),
+                    "headers": header}),
+                Some(json!({"type": "oauth", "methodID": "chatgpt-headless",
+                    "refresh": "PLACEHOLDER-refresh-not-a-token",
+                    "access": chatgpt_placeholder_jwt(), "expires": 4102444800000_u64,
+                    "metadata": {"accountID": ACCOUNT_ID}})),
+            ),
+            // opencode reads the Copilot API from the row's endpoint, the token from the row.
+            Subscription::OpencodeCopilot => (
+                "github-copilot",
+                json!({"headers": header}),
+                Some(json!({"type": "oauth", "methodID": "device",
+                    "refresh": "PLACEHOLDER-not-a-token", "access": "PLACEHOLDER-not-a-token",
+                    "expires": 0, "metadata": {"apiEndpoint": sub.gateway_url()}})),
+            ),
+            Subscription::OpencodeAnthropicKey => (
+                "anthropic",
+                json!({"baseURL": format!("{}/v1", sub.gateway_url()),
+                    "apiKey": "PLACEHOLDER-not-a-key", "headers": header}),
+                None,
+            ),
+            _ => continue,
+        };
+        config["provider"][id]["options"] = options;
+        if let Some(value) = row {
+            rows.push(
+                json!({"id": format!("wicked-seat-{id}"), "integrationID": id,
+                "label": "wicked seat", "active": true, "value": value}),
+            );
+        }
+    }
+    // `opencode.json` stays first: the runner points OPENCODE_CONFIG at the first file.
+    files.insert(0, (PathBuf::from("opencode.json"), config.to_string()));
+    if !rows.is_empty() {
+        files.push((
+            PathBuf::from(OPENCODE_IMPORT_FILE),
+            Value::Array(rows).to_string(),
+        ));
+    }
+    files
 }
 
 #[cfg(test)]
@@ -485,6 +618,66 @@ mod tests {
                 serde_json::from_str::<Value>(body).unwrap()
             );
         }
+    }
+
+    /// opencode: its per-unit `opencode.json` (first: OPENCODE_CONFIG points at it) routes each
+    /// provider with the unit's header; the DB rows it imports are constant (no unit material),
+    /// so concurrent units sharing the seat's credential DB agree (decision 3).
+    #[test]
+    fn opencode_placeholders_route_by_header_and_import_constant_rows() {
+        let sign_in = SeatSignIn {
+            kind: None,
+            subscriptions: vec![
+                Subscription::OpencodeChatgpt,
+                Subscription::OpencodeCopilot,
+                Subscription::OpencodeAnthropicKey,
+            ],
+        };
+        let files = seat_files("opencode", &sign_in, KEY, URL);
+        assert_eq!(files[0].0, PathBuf::from("opencode.json"));
+        let config: Value = serde_json::from_str(&files[0].1).unwrap();
+        let header = crate::seat_gateway::UNIT_HEADER;
+        assert_eq!(
+            config["provider"]["openai"]["options"]["baseURL"],
+            "http://agw:4009/backend-api/codex"
+        );
+        assert_eq!(
+            config["provider"]["anthropic"]["options"]["baseURL"],
+            "http://agw:4011/v1"
+        );
+        for id in ["openai", "github-copilot", "anthropic"] {
+            assert_eq!(
+                config["provider"][id]["options"]["headers"][header], KEY,
+                "{id}"
+            );
+        }
+        let (path, rows) = &files[1];
+        assert_eq!(path, &PathBuf::from(OPENCODE_IMPORT_FILE));
+        assert!(!rows.contains(KEY), "the rows hold no unit material");
+        let other = seat_files("opencode", &sign_in, "wk-test-PLACEHOLDER-unit-2", URL);
+        assert_eq!(&other[1].1, rows, "every unit imports the same rows");
+        let rows: Value = serde_json::from_str(rows).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 2);
+        assert_eq!(
+            rows[1]["value"]["metadata"]["apiEndpoint"],
+            "http://agw:4010"
+        );
+        assert_eq!(rows[0]["value"]["metadata"]["accountID"], ACCOUNT_ID);
+        // The seat logs out only the rows of integrations the broker no longer holds.
+        let env = crate::seat_gateway::seat_env_for_sign_in("opencode", &sign_in, KEY);
+        let logout = |env: &[(String, String)]| {
+            env.iter()
+                .find(|(k, _)| k == crate::seat_gateway::OPENCODE_LOGOUT_ENV)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(logout(&env).as_deref(), Some(""));
+        let key_only: SeatSignIn = CredentialKind::ProviderKey.into();
+        let env = crate::seat_gateway::seat_env_for_sign_in("opencode", &key_only, KEY);
+        assert_eq!(logout(&env).as_deref(), Some("openai github-copilot"));
+        assert_eq!(
+            seat_files("opencode", &key_only, KEY, URL),
+            placeholder_files("opencode", CredentialKind::ProviderKey, KEY, URL)
+        );
     }
 
     #[test]

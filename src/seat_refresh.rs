@@ -34,7 +34,7 @@ const PASS_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 /// The pinned OSS image the token request runs in (curl verifies TLS against its CA bundle).
 pub(crate) const REFRESH_IMAGE: &str = "curlimages/curl:8.11.1";
 /// The agents whose sign-in is an OAuth record the broker can refresh.
-pub(crate) const REFRESHABLE: &[&str] = &["claude", "codex", "pi"];
+pub(crate) const REFRESHABLE: &[&str] = &["claude", "codex", "pi", "opencode"];
 
 /// One provider's refresh flow.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +88,7 @@ pub(crate) fn record_file(cli: &str) -> Option<&'static str> {
         "claude" => Some("claude.credentials.json"),
         "codex" => Some("codex.auth.json"),
         "pi" => Some("pi.auth.json"),
+        "opencode" => Some("opencode.credentials.json"),
         _ => None,
     }
 }
@@ -98,8 +99,14 @@ fn login_path(cli: &str) -> Option<&'static str> {
         "claude" => Some("claude/.credentials.json"),
         "codex" => Some("codex/auth.json"),
         "pi" => Some("pi/auth.json"),
+        "opencode" => Some("data/opencode/wicked-auth.json"),
         _ => None,
     }
+}
+
+/// Agents whose record holds several sign-ins, each renewed on its own (an entry at a time).
+fn multi_entry(cli: &str) -> bool {
+    matches!(cli, "pi" | "opencode")
 }
 
 /// One token request the refresher makes for a record.
@@ -140,7 +147,7 @@ pub(crate) fn next_refresh(
     now: u64,
     force: bool,
 ) -> Option<(Option<String>, Request)> {
-    if cli != "pi" {
+    if !multi_entry(cli) {
         let flow = flow(cli)?;
         let body = request_body(cli, record, &flow)?;
         let expires_at = crate::seat_login::record_expiry(cli, record).ok()?;
@@ -163,14 +170,26 @@ pub(crate) fn next_refresh(
 /// The entries of a multi-entry record that a pass renews at `now`, soonest-expiring first:
 /// those due (or, with `force`, every renewable one). Each is tried once per pass.
 pub(crate) fn due_entries(cli: &str, record: &Value, now: u64, force: bool) -> Vec<String> {
-    if cli != "pi" {
-        return Vec::new();
-    }
-    let mut candidates: Vec<(u64, &str)> = PI_ENTRIES
+    // opencode's only renewable sign-in is its ChatGPT one (codex's flow); Copilot's GitHub
+    // token does not expire.
+    let entries: &[&str] = match cli {
+        "pi" => PI_ENTRIES,
+        "opencode" => &["openai"],
+        _ => return Vec::new(),
+    };
+    let mut candidates: Vec<(u64, &str)> = entries
         .iter()
         .filter_map(|id| {
-            let entry = record.get(*id)?;
+            let entry = crate::seat_login::record_entry(cli, record, id)?;
             (entry.get("type").and_then(Value::as_str) == Some("oauth")).then_some(())?;
+            if cli == "opencode"
+                && !matches!(
+                    entry.get("methodID").and_then(Value::as_str),
+                    Some("chatgpt-browser" | "chatgpt-headless")
+                )
+            {
+                return None;
+            }
             str_at(entry, "/refresh")?;
             // An entry with no expiry is renewable but never due on its own: only `force` takes
             // it (last).
@@ -192,8 +211,7 @@ pub(crate) fn due_entries(cli: &str, record: &Value, now: u64, force: bool) -> V
 
 /// The token request that renews entry `id` of `cli`'s record.
 pub(crate) fn entry_request(cli: &str, record: &Value, id: &str) -> Option<Request> {
-    let _ = cli;
-    let entry = record.get(id)?;
+    let entry = crate::seat_login::record_entry(cli, record, id)?;
     let refresh = str_at(entry, "/refresh")?.to_string();
     let request = match id {
         "anthropic" => {
@@ -204,7 +222,7 @@ pub(crate) fn entry_request(cli: &str, record: &Value, id: &str) -> Option<Reque
                     "client_id": flow.client_id}),
             }
         }
-        "openai-codex" => {
+        "openai-codex" | "openai" => {
             let flow = flow("codex")?;
             Request::Post {
                 url: flow.url,
@@ -222,24 +240,52 @@ pub(crate) fn entry_request(cli: &str, record: &Value, id: &str) -> Option<Reque
 }
 
 /// Fold a token answer into pi's entry `id` of `record` (at `now`, Unix seconds).
+#[cfg(test)]
 pub(crate) fn apply_pi_answer(
     record: &Value,
     id: &str,
     answer: &Value,
     now: u64,
 ) -> Result<Value, String> {
+    apply_entry_answer("pi", record, id, answer, now)
+}
+
+/// Fold a token answer into `cli`'s entry `id` of `record` (at `now`, Unix seconds): pi's
+/// provider object, opencode's active credential value of that integration.
+pub(crate) fn apply_entry_answer(
+    cli: &str,
+    record: &Value,
+    id: &str,
+    answer: &Value,
+    now: u64,
+) -> Result<Value, String> {
     let mut out = record.clone();
-    let entry = out
-        .get_mut(id)
+    let slot = match cli {
+        "pi" => out.get_mut(id),
+        "opencode" => {
+            let active = crate::seat_login::opencode_active(record, id)
+                .and_then(|row| row.get("id").cloned());
+            out.as_array_mut().and_then(|rows| {
+                rows.iter_mut()
+                    .find(|r| {
+                        r.get("integrationID").and_then(Value::as_str) == Some(id)
+                            && active.as_ref().is_none_or(|a| r.get("id") == Some(a))
+                    })
+                    .and_then(|r| r.get_mut("value"))
+            })
+        }
+        _ => None,
+    };
+    let entry = slot
         .and_then(Value::as_object_mut)
-        .ok_or_else(|| format!("pi: the record has no {id} entry"))?;
+        .ok_or_else(|| format!("{cli}: the record has no {id} entry"))?;
     if id == "github-copilot" {
         let token =
-            str_at(answer, "/token").ok_or("pi: the Copilot token exchange returned no token")?;
+            str_at(answer, "/token").ok_or("the Copilot token exchange returned no token")?;
         let expires_at = answer
             .get("expires_at")
             .and_then(Value::as_u64)
-            .ok_or("pi: the Copilot token exchange returned no expires_at")?;
+            .ok_or("the Copilot token exchange returned no expires_at")?;
         entry.insert("access".into(), json!(token));
         entry.insert("expires".into(), json!(expires_at.saturating_mul(1000)));
         // The plan endpoint THIS exchange names, kept (in the broker's copy only) for a token
@@ -255,14 +301,14 @@ pub(crate) fn apply_pi_answer(
         return Ok(out);
     }
     let access =
-        str_at(answer, "/access_token").ok_or("pi: the token endpoint returned no access_token")?;
+        str_at(answer, "/access_token").ok_or("the token endpoint returned no access_token")?;
     if answer.get("refresh_token").is_some() && str_at(answer, "/refresh_token").is_none() {
-        return Err("pi: invalid refresh_token in token answer".into());
+        return Err("invalid refresh_token in token answer".into());
     }
     let expires_in = answer
         .get("expires_in")
         .and_then(Value::as_u64)
-        .ok_or("pi: the token endpoint returned no expires_in")?;
+        .ok_or("the token endpoint returned no expires_in")?;
     entry.insert("access".into(), json!(access));
     if let Some(r) = str_at(answer, "/refresh_token") {
         entry.insert("refresh".into(), json!(r));
@@ -903,7 +949,9 @@ mod live {
             return Ok(Outcome::NotRefreshable);
         }
         let (Some(flow), Some(file)) = (
-            flow(if cli == "pi" { "claude" } else { cli }),
+            // Multi-entry records' flows are per entry ([`next_refresh`]); claude's stands in for
+            // the record-level checks below.
+            flow(if multi_entry(cli) { "claude" } else { cli }),
             record_file(cli),
         ) else {
             return Ok(Outcome::NotRefreshable);
@@ -923,7 +971,7 @@ mod live {
             encode_request(&body)?; // codex lg-r2 C6: reject oversized records even before NotDue.
         }
         let now = unix_now();
-        let multi = cli == "pi";
+        let multi = multi_entry(cli);
         // A multi-entry record renews each eligible entry once per pass, one committed generation
         // at a time, so a rotated refresh token is stored before the next entry's request is made
         // (DES-SEAT-LOGIN-SUBSCRIPTIONS decision 8). One entry's refused request never strands the
@@ -955,7 +1003,7 @@ mod live {
             };
             let answered =
                 send(rt, dir, cli, &gw.external_network, &request).and_then(|answer| match entry {
-                    Some(id) => apply_pi_answer(&record, id, &answer, now),
+                    Some(id) => apply_entry_answer(cli, &record, id, &answer, now),
                     None => apply_answer(cli, &record, &answer, now),
                 });
             let new = match answered {
@@ -1232,6 +1280,45 @@ mod tests {
             1
         )
         .is_err());
+    }
+
+    /// opencode renews only its ChatGPT sign-in (codex's flow), inside its export's ACTIVE row;
+    /// its Copilot GitHub token does not expire, and an inactive row is never touched.
+    #[test]
+    fn opencode_refreshes_its_active_chatgpt_row_by_codexs_flow() {
+        let export = json!([
+            {"id": "old", "integrationID": "openai", "label": "OAuth", "active": false,
+                "value": {"type": "oauth", "methodID": "chatgpt-headless", "refresh": "FAKE-old-r",
+                    "access": "FAKE-old-a", "expires": 1_000_u64}},
+            {"id": "cur", "integrationID": "openai", "label": "OAuth", "active": true,
+                "value": {"type": "oauth", "methodID": "chatgpt-headless", "refresh": "FAKE-r",
+                    "access": "FAKE-a", "expires": 2_000_000_000_000_u64,
+                    "metadata": {"accountID": "acct-FAKE"}}},
+            {"id": "gh", "integrationID": "github-copilot", "label": "OAuth", "active": true,
+                "value": {"type": "oauth", "methodID": "device", "refresh": "FAKE-gho",
+                    "access": "FAKE-gho", "expires": 0}}
+        ]);
+        assert!(due_entries("opencode", &export, 0, false).is_empty());
+        assert_eq!(due_entries("opencode", &export, 0, true), vec!["openai"]);
+        let Some(Request::Post { url, body }) = entry_request("opencode", &export, "openai") else {
+            panic!("a POST to codex's endpoint")
+        };
+        assert_eq!(url, "https://auth.openai.com/oauth/token");
+        assert_eq!(body["refresh_token"], "FAKE-r", "the active row's token");
+        let renewed = apply_entry_answer(
+            "opencode",
+            &export,
+            "openai",
+            &json!({"access_token": "FAKE-a2", "refresh_token": "FAKE-r2", "expires_in": 60}),
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(renewed[1]["value"]["access"], "FAKE-a2");
+        assert_eq!(renewed[1]["value"]["refresh"], "FAKE-r2");
+        assert_eq!(renewed[1]["value"]["expires"], 1_060_000_u64);
+        assert_eq!(renewed[1]["value"]["metadata"]["accountID"], "acct-FAKE");
+        assert_eq!(renewed[0], export[0], "the inactive row is untouched");
+        assert_eq!(renewed[2], export[2]);
     }
 
     /// The exchange's GitHub token rides stdin as a header, never a command-line argument.
