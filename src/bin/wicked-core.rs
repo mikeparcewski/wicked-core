@@ -472,6 +472,15 @@ fn main() {
         _ => {}
     }
 
+    // C5: governed units run in seat containers unless the operator chose a floor (`host` = the
+    // labelled interim host floor), set before the engine exists.
+    let floor = wicked_core::default_seat_floor();
+    if !floor.trim().eq_ignore_ascii_case("container") {
+        eprintln!(
+            "wicked-core: WICKED_SEAT_FLOOR={floor} — governed seats run on the interim HOST floor, \
+             not in containers"
+        );
+    }
     let core = Core::spawn(store_path(&args));
 
     match args.get(1).map(String::as_str) {
@@ -608,14 +617,17 @@ fn provision_validator_cmd(args: &[String]) {
         fail("provision-validator requires --criterion \"...\"");
         return;
     };
-    let mut store = match wicked_apps_core::open_store(Some(&store_path(args))) {
+    let db = store_path(args);
+    let mut store = match wicked_apps_core::open_store(Some(&db)) {
         Ok(s) => s,
         Err(e) => {
             fail(&format!("provision-validator: open store failed: {e}"));
             return;
         }
     };
-    let runner = WrappedCliStepRunner::default();
+    // Under the container floor, bound to the store's state home: the authoring session arms a
+    // seat container, whose only egress is that home's gateway.
+    let runner = WrappedCliStepRunner::for_standalone_authoring(&db);
     match wicked_core::provision_validator(&criterion, &runner, &mut store) {
         Ok(pin) => {
             println!("provisioned UNAPPROVED validator, pin: {pin}");
@@ -781,7 +793,8 @@ fn gate_phase_cmd(args: &[String]) {
     // The name it saves under, bounded to a valid preset name BEFORE anything is authored.
     let new_name = wicked_core::gated_preset_name(&workflow, &phase);
     // 3. AUTHOR + APPROVE a validator for the criterion (live `claude`), as the sole store writer.
-    let runner = WrappedCliStepRunner::default();
+    // Bound to the store's state home (the container floor's gateway), as provision-validator.
+    let runner = WrappedCliStepRunner::for_standalone_authoring(&store_path(args));
     let unapproved = match wicked_core::provision_validator(&criterion, &runner, &mut store) {
         Ok(p) => p,
         Err(e) => {

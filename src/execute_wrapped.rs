@@ -1827,6 +1827,13 @@ struct WrappedCancelRegistry {
     /// this tombstone until terminal cleanup so that late registration is born cancelled instead
     /// of starting a stale child in the newly reassigned worktree.
     reassigned: std::collections::HashSet<WrappedWorkerKey>,
+    /// (C5) A run whose end (cancel / completion) this carrier saw, with the last launch sequence
+    /// that end covers: a launch of the run still preparing when it ended (skills, config, the
+    /// floor) registers later and must be born cancelled, never start a CLI after the run is
+    /// terminal. A resume admits launches from its `min_launch_seq` on again.
+    ended: std::collections::HashMap<String, u64>,
+    /// (C5) The engine is shutting down: every registration from here on is born cancelled.
+    shutdown: bool,
 }
 
 /// Per-unit wall-clock timeout. Default 2 h — agentic CLIs doing real multi-file extraction
@@ -1875,6 +1882,23 @@ impl WrappedCliStepRunner {
         }
     }
 
+    /// The runner for the `wicked-core` CLI's standalone validator authoring on the store at
+    /// `db_path`. Under the container floor the authoring session arms a seat container, whose only
+    /// egress is the gateway under the store's operational state home (its canonical parent, as for
+    /// [`with_tx_for_store`](Self::with_tx_for_store)), so the runner is bound to it. On any other
+    /// floor it is the [`Default`] runner, exactly as before (codex judges-r2: binding a home there
+    /// would change which skills snapshots the launch admits).
+    pub fn for_standalone_authoring(db_path: &str) -> Self {
+        if crate::container_floor::container_mode() {
+            WrappedCliStepRunner {
+                operational_home: crate::state_home::operational_home_of_db(db_path),
+                ..Self::default()
+            }
+        } else {
+            Self::default()
+        }
+    }
+
     fn worker_key(input: &StepInput) -> WrappedWorkerKey {
         WrappedWorkerKey {
             run_id: input.run_id.clone(),
@@ -1889,7 +1913,11 @@ impl WrappedCliStepRunner {
         let key = Self::worker_key(input);
         let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
-        if guard.reassigned.contains(&key) {
+        let ended = guard
+            .ended
+            .get(&key.run_id)
+            .is_some_and(|&bound| key.launch_seq <= bound);
+        if ended || guard.shutdown || guard.reassigned.contains(&key) {
             token.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         guard.tokens.entry(key).or_default().push(token.clone());
@@ -1911,6 +1939,12 @@ impl WrappedCliStepRunner {
     /// again; a superseded launch of the old lifecycle stays fenced by its `launch_seq`).
     pub(crate) fn reopen_run_sessions(&self, run_id: &str, min_launch_seq: u64) {
         self.sessions.reopen_run(run_id, min_launch_seq);
+        // A launch of the resumed lifecycle runs; one of the ended lifecycle stays fenced:
+        // `min_launch_seq` is the HIGHEST sequence the ended lifecycle minted (codex c5-r2).
+        let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.ended.contains_key(run_id) {
+            guard.ended.insert(run_id.to_string(), min_launch_seq);
+        }
     }
 
     /// Forget the container carrier's sessions of `run_id` on seat `cli_key`.
@@ -1921,6 +1955,20 @@ impl WrappedCliStepRunner {
     /// Kill every in-flight wrapped worker of `run_id` (crew#277). Called from the runner's
     /// `on_run_complete`, which the actor invokes on every run-terminal transition — cancel
     /// included. Idempotent; a token with no live child is a no-op.
+    /// (C5, codex c5-r2) Engine shutdown: cancel EVERY wrapped worker — internal judge calls
+    /// (`validator-*` / `triage-*`, epoch 0) included, which no run lifecycle names — and make any
+    /// later registration born cancelled.
+    pub(crate) fn cancel_all_workers(&self) {
+        let tokens: Vec<CancelToken> = {
+            let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
+            guard.shutdown = true;
+            guard.tokens.drain().flat_map(|(_, v)| v).collect()
+        };
+        for t in tokens {
+            t.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn cancel_run_workers(&self, run_id: &str) {
         self.sessions.forget_run(run_id);
         let tokens = {
@@ -1936,6 +1984,7 @@ impl WrappedCliStepRunner {
                 .flat_map(|key| guard.tokens.remove(&key).unwrap_or_default())
                 .collect();
             guard.reassigned.retain(|key| key.run_id != run_id);
+            guard.ended.insert(run_id.to_string(), u64::MAX);
             tokens
         };
         for t in tokens {
@@ -1987,6 +2036,10 @@ impl StepRunner for WrappedCliStepRunner {
 
     fn on_run_complete(&self, run_id: &str) {
         self.cancel_run_workers(run_id);
+    }
+
+    fn on_shutdown(&self) {
+        self.cancel_all_workers();
     }
 
     fn cancel_reassigned_worker(&self, run_id: &str, epoch: u64, launch_seq: u64) {
@@ -2062,7 +2115,7 @@ impl WrappedCliStepRunner {
                 crate::write_posture::WritePosture::of(&input.unit, input.workdir.is_some());
             let c = config_for_container_launch(
                 c,
-                input.governance.is_some(),
+                runs_in_seat(input),
                 crate::container_floor::container_mode(),
                 &input.run_id,
                 posture.label(),
@@ -2089,7 +2142,7 @@ impl WrappedCliStepRunner {
         };
         // agy lg-r1 A1: hold until the unit exits, including every early refusal/panic.
         let _config_home_guard = if uses_container_seat(
-            input.governance.is_some(),
+            runs_in_seat(input),
             crate::container_floor::container_mode(),
         ) {
             match seat_config.root().map(|home| {
@@ -2218,6 +2271,33 @@ impl WrappedCliStepRunner {
         // `<label>\n<output>` blocks — so a wrapped reviewer/creator with `depends_on` sees the
         // work it depends on. Empty (no change) for a unit with no prior outputs.
         let prompt = format!("{}{task}", prior_context_prefix(&input.prior_outputs));
+        let seat_cli = wicked_apps_core::spawn::SeatCli::from_binary(&binary);
+        let container = crate::container_floor::container_mode();
+        // Ungoverned workers do not need ask discovery or configuration before spawning.
+        let otherwise_eligible = input.governance.is_some()
+            && ask_seat_enabled(
+                true,
+                container,
+                seat_cli,
+                crate::mcp_gate::daemon_crew_url().as_deref(),
+                crate::container_floor::offline_seats(),
+                self.operational_home.is_some(),
+                true,
+            );
+        // Warm the first unit's route before rendering any ask flags/files. Use the same
+        // cached runtime and <operational_home>/gateway directory as container_floor::arm.
+        // A process-cached route cannot provide a gateway to an offline or homeless runner.
+        let gateway_ok = otherwise_eligible
+            && self.operational_home.as_deref().is_some_and(|home| {
+                crate::seat_gateway::mcp_route_ready()
+                    || crate::container_floor::runtime()
+                        .ok()
+                        .is_some_and(|runtime| {
+                            crate::seat_gateway::ensure_gateway(&runtime, &home.join("gateway"))
+                                .is_ok()
+                        })
+            });
+        let mut ask_enabled = gateway_ok && crate::seat_gateway::mcp_route_ready();
         let mut argv = build_argv(&invocation, &prompt, &input.unit.allowed_skills);
         // F-036: set below when a NO-CODE phase lands on a non-claude seat that exposes no
         // read-only lever — folded into the governance disclosure so the record says which
@@ -2228,14 +2308,12 @@ impl WrappedCliStepRunner {
         // `--` guard); binaries without a JSON mode → passthrough (byte-identical raw-line stream).
         // (core#412) codex → `exec --json`, pi → `-p --mode json`, each with its JSON adapter, so
         // the seat's usage is captured; the unit's text stays what plain mode printed.
-        let seat_cli = wicked_apps_core::spawn::SeatCli::from_binary(&binary);
         let codex_json = seat_cli == wicked_apps_core::spawn::SeatCli::Codex
             && inject_codex_json_flag(&mut argv);
         let pi_json =
             seat_cli == wicked_apps_core::spawn::SeatCli::Pi && inject_pi_json_mode(&mut argv);
         // opencode's JSON mode is the container carrier's only (outside it, the wrapped
         // opencode launch stays byte-identical to before: codex hl-r1).
-        let container = crate::container_floor::container_mode();
         if container && seat_cli == wicked_apps_core::spawn::SeatCli::Opencode {
             inject_opencode_json_format(&mut argv);
         }
@@ -2377,20 +2455,26 @@ impl WrappedCliStepRunner {
             // cannot read or cannot address REFUSES the launch (fail closed, like the skills
             // composition): a governed worker never gets an ungoverned tool channel because a
             // file was unreadable.
-            match crate::mcp_isolation::seat_mcp_pin_flags(
+            match crate::mcp_isolation::seat_mcp_pin_flags_with_ask(
                 wicked_apps_core::spawn::SeatCli::from_binary(&binary),
                 seat_config.root(),
                 Some(&input.workdir.clone().unwrap_or_else(|| sandbox_for(input))),
+                ask_enabled,
             ) {
-                Ok(pins) if !pins.is_empty() => {
-                    eprintln!(
-                        "wicked-core: unit {} on '{cli_key}' launches with the seat's MCP pin \
+                Ok((pins, enabled)) => {
+                    if ask_enabled && !enabled {
+                        eprintln!("wicked-core: unit {} on '{cli_key}': ask MCP server not handed because an ambient mcp_servers.wicked entry would merge with the engine server; wicked remains disabled", input.unit.ord);
+                    }
+                    ask_enabled = enabled;
+                    if !pins.is_empty() {
+                        eprintln!(
+                            "wicked-core: unit {} on '{cli_key}' launches with the seat's MCP pin \
                          {pins:?} (core#660)",
-                        input.unit.ord
-                    );
-                    apply_seat_posture(&mut argv, &pins);
+                            input.unit.ord
+                        );
+                        apply_seat_posture(&mut argv, &pins);
+                    }
                 }
-                Ok(_) => {}
                 Err(why) => return posture_refusal(input, &why),
             }
             if let (Some(s), true) = (handed, delivery.delivers_skills()) {
@@ -2406,6 +2490,22 @@ impl WrappedCliStepRunner {
                     &cli_key,
                 ));
             }
+        }
+
+        if ask_enabled {
+            if let Some(reason) = pi_ask_refusal(seat_cli, &argv) {
+                ask_enabled = false;
+                eprintln!("wicked-core: unit {} on '{cli_key}': ask MCP server not handed because {reason}", input.unit.ord);
+            }
+        }
+        let ask_config = if input.governance.is_some() {
+            ask_seat_config(seat_cli, ask_enabled, crate::ask::timeout_secs(), &argv)
+        } else {
+            AskSeatConfig::default()
+        };
+        apply_seat_posture(&mut argv, &ask_config.flags);
+        if input.governance.is_some() && !ask_enabled {
+            eprintln!("wicked-core: unit {} on '{cli_key}': ask MCP server not handed (requires a supported governed container seat, a loopback crew URL with a port, a ready gateway MCP route and no ambient wicked collision)", input.unit.ord);
         }
 
         // GOVERNED unit + claude → arm INPUT governance (DES-OUTGOV-003 §2): write a per-run settings
@@ -2430,12 +2530,23 @@ impl WrappedCliStepRunner {
                     eprintln!("wicked-core: unit {}: {why}", input.unit.ord);
                     return governance_refusal(input, &why);
                 }
+                // C5 (codex c5-r8): claude keeps the LAST `--settings`, and the engine's goes in
+                // right after the executable — a template's own would replace the gate hook. With
+                // ACP gone the hook is the only per-call check: refuse rather than run unchecked.
+                if template_overrides_settings(&argv) {
+                    let why = "the unit's claude invocation carries its own `--settings`, which \
+                               would replace the engine's gate-hook settings; a governed unit runs \
+                               with the engine's settings only — remove it from the template";
+                    eprintln!("wicked-core: unit {}: {why}", input.unit.ord);
+                    return governance_refusal(input, why);
+                }
                 match arm_input_governance(
                     input,
                     gov,
                     &mut argv,
                     handed.map(|s| s.root.as_path()),
                     operational_home,
+                    ask_enabled,
                 ) {
                     Ok(env) => {
                         // (EVT-016) GovernanceContextArmed — wrapped-CLI path successfully armed
@@ -2576,8 +2687,24 @@ impl WrappedCliStepRunner {
             // (IG1-core-2) What armed the write boundary (`Ok(launcher)`), or why none did and
             // whether that was already disclosed — read by the `os_sandbox`-class arm below.
             let floor: Result<&'static str, (String, bool)>;
-            let sandbox = if uses_container_seat(governed, crate::container_floor::container_mode())
+            // C5 (codex c5-r1..r6): ACP is gone from the seats, so on the interim host floor a
+            // governed unit runs only when the FINAL argv keeps a per-call check — claude (its gate
+            // hook) or codex in its own bounded sandbox — whatever seat key carries it and whatever
+            // floor resolves below. Anything else is refused, never run with only a disclosure.
+            if governed
+                && crate::container_floor::host_floor_chosen()
+                && !host_floor_keeps_a_check(&argv)
             {
+                return floor_refused(
+                    input,
+                    &cli_key,
+                    crate::worker_sandbox::FloorUnarmed::NeedsContainerFloor,
+                );
+            }
+            let sandbox = if uses_container_seat(
+                runs_in_seat(input),
+                crate::container_floor::container_mode(),
+            ) {
                 // The container floor (opt-in, WICKED_SEAT_FLOOR=container): the unit's floor —
                 // writes only to its tree and admitted roots (none of the tree under a fenced
                 // posture), git state, its seat home, secrets masked — rendered as a hardened
@@ -2618,7 +2745,12 @@ impl WrappedCliStepRunner {
                     .as_ref()
                     .map(|g| g.phase.clone())
                     .unwrap_or_else(|| crate::scope::unit_phase(input.unit.ord));
-                let gov_dir = decisions_path.parent().map(Path::to_path_buf);
+                // An engine-internal judge/triage session is ungoverned: no decisions log and no
+                // launch settings file to mount (and none created under the governance root).
+                let gov_dir = decisions_path
+                    .parent()
+                    .filter(|_| governed)
+                    .map(Path::to_path_buf);
                 let mut plan = crate::worker_sandbox::plan_seat_floor(
                     crate::worker_sandbox::SeatLaunch {
                         cwd: &cwd,
@@ -2632,8 +2764,11 @@ impl WrappedCliStepRunner {
                     floor_roots,
                 );
                 // The engine's own launch file (claude's settings) stays read-only to the seat.
-                plan.inputs.pinned =
-                    vec![decisions_path.with_file_name(format!("settings-{phase}.json"))];
+                plan.inputs.pinned = if governed {
+                    vec![decisions_path.with_file_name(format!("settings-{phase}.json"))]
+                } else {
+                    Vec::new()
+                };
                 // The git anchor: the dir the actor pinned from the registered repository.
                 plan.inputs.trusted_git_dir = input
                     .unit
@@ -2906,7 +3041,11 @@ impl WrappedCliStepRunner {
             let composed = compose_seat_opencode_config(
                 &delivery,
                 is_opencode,
-                uses_container_seat(governed, crate::container_floor::container_mode()),
+                ask_config.env.iter().any(|(k, _)| k == OPENCODE_ASK_ENV),
+                uses_container_seat(
+                    runs_in_seat(input),
+                    crate::container_floor::container_mode(),
+                ),
                 || std::env::var(crate::skills_snapshot::OPENCODE_CONFIG_ENV).ok(),
                 inherits_operator_config,
             );
@@ -2959,6 +3098,9 @@ impl WrappedCliStepRunner {
             }
             for (k, v) in &seat_gateway_env {
                 cmd.env(k, v);
+            }
+            if uses_container_seat(governed, container) {
+                seat_files.extend(ask_config.files.iter().cloned());
             }
             if let Err(why) = crate::container_floor::write_unit_seat_files(
                 &mut cmd,
@@ -3166,6 +3308,7 @@ impl WrappedCliStepRunner {
             // is governed. Bound until the worker exits (the guard drops after `run_bounded`); an
             // ungoverned unit or a daemon with no broker gets neither variable.
             let mcp_channel = crate::mcp_gate::arm_worker_mcp_channel(&mut cmd, input);
+            cmd.envs(ask_config.env.iter().cloned());
             // A container seat reaches the broker only through its gateway's MCP route (the
             // daemon's loopback URL names the seat's own loopback); no route, no broker URL.
             if mcp_channel.is_some() && gateway_lease.is_some() {
@@ -3434,6 +3577,164 @@ pub(crate) fn build_worker_command(
 /// (IG1-core-2, review) Whether `argv` — the command a unit actually launches — runs codex itself
 /// (its program's stem is `codex`) with its own sandbox in a bounded mode and no bypass flag. The
 /// seat record's class is a prediction; a wrapper or an invocation that drops the mode is refused.
+/// (C5) Whether a claude template names its own `--settings` (either spelling) — before the engine
+/// inserts its own.
+fn template_overrides_settings(argv: &[String]) -> bool {
+    argv.iter()
+        .skip(1)
+        .any(|a| a == "--settings" || a.starts_with("--settings="))
+}
+
+/// Pure handoff decision, evaluated after warming the gateway when otherwise eligible.
+fn ask_seat_enabled(
+    governed: bool,
+    container: bool,
+    cli: wicked_apps_core::spawn::SeatCli,
+    crew_url: Option<&str>,
+    offline: bool,
+    has_operational_home: bool,
+    route_ready: bool,
+) -> bool {
+    use wicked_apps_core::spawn::SeatCli;
+    governed
+        && container
+        && !offline
+        && has_operational_home
+        && matches!(
+            cli,
+            SeatCli::Claude | SeatCli::Codex | SeatCli::Pi | SeatCli::Opencode
+        )
+        && crew_url.and_then(crate::seat_gateway::crew_port).is_some()
+        && route_ready
+}
+
+/// Pi's project approval enables project-local MCP sources, which can replace `wicked`.
+/// Treat approval as a handoff collision even if a no-approval flag is also present.
+fn pi_ask_refusal(cli: wicked_apps_core::spawn::SeatCli, argv: &[String]) -> Option<&'static str> {
+    (cli == wicked_apps_core::spawn::SeatCli::Pi
+        && argv.iter().skip(1).take_while(|a| *a != "--")
+            .any(|a| matches!(a.as_str(), "--approve" | "-a")))
+        .then_some("pi --approve/-a trusts project-local MCP servers that can replace the engine's wicked server")
+}
+
+/// The opencode seat's ask registration (`PUT /api/experimental/mcp/wicked` body), read by the
+/// pinned server script.
+pub(crate) const OPENCODE_ASK_ENV: &str = "WICKED_OPENCODE_ASK";
+/// Where that body takes the seat's token (`wmt_<hex>`, JSON-safe), filled in by the script.
+pub(crate) const OPENCODE_ASK_TOKEN_SLOT: &str = "__WICKED_MCP_TOKEN__";
+
+#[derive(Default)]
+pub(crate) struct AskSeatConfig {
+    pub(crate) flags: Vec<String>,
+    pub(crate) files: Vec<(PathBuf, String)>,
+    pub(crate) env: Vec<(String, String)>,
+}
+
+/// Static config only: the CLI expands the capability from its environment, never argv/files.
+pub(crate) fn ask_seat_config(
+    cli: wicked_apps_core::spawn::SeatCli,
+    enabled: bool,
+    timeout: u64,
+    argv: &[String],
+) -> AskSeatConfig {
+    use wicked_apps_core::spawn::SeatCli;
+    let mut config = AskSeatConfig {
+        flags: vec![],
+        files: vec![],
+        env: vec![],
+    };
+    if !enabled || pi_ask_refusal(cli, argv).is_some() {
+        // Container seat homes survive retries. Reconcile our MCP file even when ask is
+        // withheld so a previous attempt cannot leave its server active.
+        if cli == SeatCli::Pi {
+            config.files.push((
+                PathBuf::from("mcp.json"),
+                serde_json::json!({"mcpServers": {}}).to_string(),
+            ));
+        }
+        return config;
+    }
+    let url = crate::seat_gateway::ASK_URL;
+    let headers = serde_json::json!({"Authorization": "Bearer ${WICKED_MCP_TOKEN}"});
+    match cli {
+        SeatCli::Claude => {
+            config.flags = vec![
+                "--mcp-config".into(),
+                serde_json::json!({"mcpServers": {
+                    "wicked": {"type": "http", "url": url, "headers": headers}
+                }})
+                .to_string(),
+            ];
+            config.env = vec![(
+                "MCP_TOOL_TIMEOUT".into(),
+                ((timeout + 60) * 1000).to_string(),
+            )];
+        }
+        SeatCli::Codex => {
+            let settings = [
+                "mcp_servers.wicked.enabled=true".into(),
+                format!("mcp_servers.wicked.url=\"{url}\""),
+                "mcp_servers.wicked.bearer_token_env_var=\"WICKED_MCP_TOKEN\"".into(),
+                format!("mcp_servers.wicked.tool_timeout_sec={}", timeout + 60),
+                "mcp_servers.wicked.startup_timeout_sec=20".into(),
+            ];
+            config.flags = settings
+                .into_iter()
+                .flat_map(|s| ["-c".into(), s])
+                .collect();
+        }
+        // opencode 2.0.25 connects a server from its configuration files (`initialize`,
+        // `tools/list`) but never offers its tools to the model, directly or in Code Mode; a server
+        // registered through its own serve API is offered (`wicked_ask`) and held to the timeout
+        // (L15 probes). So the launch registers it: this variable is read by the pinned server
+        // script ([`crate::worker_sandbox::opencode_pinned_server_argv`]), which puts the seat's
+        // own `WICKED_MCP_TOKEN` in place of [`OPENCODE_ASK_TOKEN_SLOT`] on its stdin (never argv).
+        // Only a launch that script runs (`opencode run` with no `--server`) is handed it.
+        SeatCli::Opencode => {
+            if crate::worker_sandbox::opencode_pinned_server_argv(argv, 0).is_some() {
+                config.env = vec![(
+                    OPENCODE_ASK_ENV.into(),
+                    serde_json::json!({"config": {
+                        "type": "remote",
+                        "url": url,
+                        "headers": {"Authorization": format!("Bearer {OPENCODE_ASK_TOKEN_SLOT}")},
+                        "codemode": false,
+                        "timeout": {"execution": (timeout + 60) * 1000}
+                    }})
+                    .to_string(),
+                )];
+            }
+        }
+        SeatCli::Pi => {
+            // Pi 1.1.0 ignores project-local configuration with this flag, including .pi/mcp.json.
+            config.flags.push("--no-approve".into());
+            if argv
+                .iter()
+                .skip(1)
+                .take_while(|a| *a != "--")
+                .any(|a| matches!(a.as_str(), "--no-extensions" | "-ne"))
+            {
+                config.flags.extend(["-e".into(), "builtin:mcp".into()]);
+            }
+            config.files =
+                vec![(PathBuf::from("mcp.json"),
+                serde_json::json!({"mcpServers": {"wicked": {
+                    "url": url, "headers": headers, "exposure": "direct", "timeout": timeout + 60
+                }}}).to_string())];
+        }
+        _ => {}
+    }
+    config
+}
+
+/// (C5) Whether a governed launch of `argv` keeps a per-call check on the interim host floor:
+/// claude (the gate hook) or codex in its own bounded sandbox (no bypass flag).
+fn host_floor_keeps_a_check(argv: &[String]) -> bool {
+    // The SAME claude predicate hook arming uses (codex c5-r7): a binary only one of the two
+    // calls claude would be admitted with no hook armed.
+    argv.first().is_some_and(|b| binary_is_claude(b)) || launches_bounded_codex(argv)
+}
+
 fn launches_bounded_codex(argv: &[String]) -> bool {
     argv.first().is_some_and(|bin| {
         std::path::Path::new(bin)
@@ -4089,6 +4390,7 @@ fn arm_input_governance(
     // The engine's own operational state home (codex round 8), fenced in the settings file's deny
     // list exactly as in the argv flag.
     operational_home: Option<&Path>,
+    ask_enabled: bool,
 ) -> std::io::Result<GovLaunch> {
     let scope = crate::scope::resolve_scope(input.entity_mode, &input.run_id, &input.unit.id);
     let phase = crate::scope::unit_phase(input.unit.ord);
@@ -4136,7 +4438,19 @@ fn arm_input_governance(
     // (codex round 9) an unspellable fenced directory refuses the launch here too — the settings
     // file is never written with a hole the argv flag also lacks.
     let deny = deny_rules(skills_root, operational_home).map_err(std::io::Error::other)?;
+    // acceptEdits still prompts for MCP tools. Grant only the handed ask tool; the
+    // wildcard PreToolUse hook continues to audit it and fence every other MCP tool.
+    let allow: Vec<&str> = if ask_enabled {
+        vec!["mcp__wicked__ask"]
+    } else {
+        vec![]
+    };
     let settings = serde_json::json!({
+        // C5 (codex c5-core-r12): without ACP the gate hook is the only per-call check, so the
+        // engine's flag-scope settings pin `disableAllHooks: false` — it outranks the user scope the
+        // operator-config hatch loads (`--setting-sources user`). Only managed settings outrank it,
+        // and a managed hook-silencer is refused before spawn (`managed_hooks_only_source`).
+        "disableAllHooks": false,
         "hooks": {
             "PreToolUse": [
                 { "matcher": "*", "hooks": [ hook ] }
@@ -4146,10 +4460,7 @@ fn arm_input_governance(
         // braces on purpose: the flag is the one that survives if this file fails to arm, and the
         // file is the one that survives an operator template that pins its own `--disallowedTools`.
         //
-        // `allow` is EMPTY (D-7, DES-L4 PR-⑦): no MCP server is registered for the worker any more,
-        // so there is nothing to allow-list; grounding calls are ordinary Bash (the shim), judged by
-        // the gate hook like every other tool call.
-        "permissions": { "deny": deny, "allow": [] }
+        "permissions": { "deny": deny, "allow": allow }
     });
     let dir = decisions_path
         .parent()
@@ -5187,7 +5498,10 @@ pub(crate) fn managed_hooks_only_source(
                 .ok()
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
                 .is_some_and(|v| {
+                    // Either one silences the engine's `--settings` gate hook (codex c5-r11:
+                    // `disableAllHooks` too — the gate is the only per-call check without ACP).
                     v.get("allowManagedHooksOnly") == Some(&serde_json::Value::Bool(true))
+                        || v.get("disableAllHooks") == Some(&serde_json::Value::Bool(true))
                 })
         })
         .cloned()
@@ -5199,10 +5513,9 @@ pub(crate) const MANAGED_HOOKS_ONLY_REFUSAL: &str =
 
 fn managed_hooks_only_refusal_reason(source: &std::path::Path) -> String {
     format!(
-        "{MANAGED_HOOKS_ONLY_REFUSAL}: org settings allow only managed hooks \
-         (`allowManagedHooksOnly: true` in {}); ACP is unavailable — refusing the governed unit \
-         rather than running it ungoverned. Configure the seat's ACP bridge (`[cli.acp]`) so it \
-         runs on the ACP carrier (core#653)",
+        "{MANAGED_HOOKS_ONLY_REFUSAL}: settings in {} silence the engine's gate hook \
+         (`allowManagedHooksOnly: true` or `disableAllHooks: true`); refusing the governed unit \
+         rather than running it ungoverned. Remove that setting for the seat (core#653, C5)",
         source.display()
     )
 }
@@ -5223,8 +5536,20 @@ pub(crate) fn governance_refusal(input: &StepInput, why: &str) -> StepOutput {
 }
 
 // codex lg-r2 C5 / agy lg-r1 A6: config selection and arming share one predicate.
-fn uses_container_seat(governed: bool, container_mode: bool) -> bool {
-    governed && container_mode
+// `seated` is [`runs_in_seat`]: a governed unit, or one of the engine's own judge/triage sessions.
+fn uses_container_seat(seated: bool, container_mode: bool) -> bool {
+    seated && container_mode
+}
+
+/// Whether this unit follows the run's seat floor: every governed unit, and the engine's own
+/// judge, validator-authoring and triage sessions ([`is_engine_internal`]). Under the container
+/// floor those run in seat containers through the same arming as a worker (the agent's brokered
+/// sign-in, the gateway as the only egress, the floor's mounts), never as a host CLI: on such a
+/// host the agents are signed in only in their seat containers, and a host judge would read the
+/// operator's own configuration. They stay UNGOVERNED (no gate hook, no ask tool, no MCP channel):
+/// an authored verdict call has no tool calls to judge. Under the host floor nothing changes.
+pub(crate) fn runs_in_seat(input: &StepInput) -> bool {
+    input.governance.is_some() || is_engine_internal(&input.unit)
 }
 
 fn config_for_container_launch(
@@ -5244,6 +5569,8 @@ fn config_for_container_launch(
 fn compose_seat_opencode_config(
     delivery: &crate::skills_snapshot::SkillsDelivery,
     is_opencode: bool,
+    // The launch registers the engine's `wicked` ask server: admit exactly its one tool.
+    admit_ask: bool,
     container_seat: bool,
     mut host_config: impl FnMut() -> Option<String>,
     inherit: impl FnOnce() -> bool,
@@ -5261,7 +5588,12 @@ fn compose_seat_opencode_config(
             None
         }
     });
-    crate::mcp_isolation::opencode_config(base.as_deref()).map(Some)
+    let admitted: &[&str] = if admit_ask {
+        &[crate::mcp_isolation::OPENCODE_ASK_TOOL]
+    } else {
+        &[]
+    };
+    crate::mcp_isolation::opencode_config_admitting(base.as_deref(), admitted).map(Some)
 }
 
 /// The [`StepOutput`] for a governed unit whose seat container did not arm: nothing ran. The
@@ -6093,6 +6425,7 @@ mod tests {
         let composed = compose_seat_opencode_config(
             &crate::skills_snapshot::SkillsDelivery::None,
             true,
+            false,
             true,
             || panic!("host OPENCODE_CONFIG_CONTENT must not be read"),
             || panic!("inherit hatch must not be read"),
@@ -6104,6 +6437,7 @@ mod tests {
         let host = compose_seat_opencode_config(
             &crate::skills_snapshot::SkillsDelivery::None,
             true,
+            false,
             false,
             || Some(r#"{"provider":{"openai":{"options":{"apiKey":"FAKE-host-key"}}}}"#.into()),
             || true,
@@ -6789,6 +7123,85 @@ mod tests {
         runner.unregister_token(&late, &late_token);
     }
 
+    /// (C5, codex c5-r1) A launch of a run that ENDED while it was still preparing registers late
+    /// and is born cancelled (the pre-spawn guard then never starts it); a resume admits the new
+    /// lifecycle's launches again while the old one stays fenced.
+    #[test]
+    fn a_launch_registering_after_its_run_ended_is_born_cancelled_until_a_resume() {
+        let runner = WrappedCliStepRunner::default();
+        let make = |launch_seq| StepInput {
+            run_id: "ended-run".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: WorkUnit::pending("ended-run:u1", "ended-run", 1, "work"),
+            workflow_id: "wf".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: None,
+            governance: None,
+            prior_outputs: Vec::new(),
+            elicitation_epoch: 1,
+            process_gen: None,
+            launch_seq,
+            required_skills: Vec::new(),
+        };
+        let other = StepInput {
+            run_id: "other-run".to_string(),
+            ..make(3)
+        };
+        runner.cancel_run_workers("ended-run");
+        let late = make(3);
+        let late_token = runner.register_token(&late);
+        assert!(late_token.load(std::sync::atomic::Ordering::Relaxed));
+        let other_token = runner.register_token(&other);
+        assert!(!other_token.load(std::sync::atomic::Ordering::Relaxed));
+        runner.reopen_run_sessions("ended-run", 3);
+        let stale = make(3);
+        let stale_token = runner.register_token(&stale);
+        assert!(
+            stale_token.load(std::sync::atomic::Ordering::Relaxed),
+            "the old lifecycle stays fenced"
+        );
+        let resumed = make(4);
+        let resumed_token = runner.register_token(&resumed);
+        assert!(!resumed_token.load(std::sync::atomic::Ordering::Relaxed));
+        for (i, t) in [
+            (&late, &late_token),
+            (&other, &other_token),
+            (&stale, &stale_token),
+            (&resumed, &resumed_token),
+        ] {
+            runner.unregister_token(i, t);
+        }
+    }
+
+    /// (C5, codex c5-r2) Shutdown cancels every wrapped worker — an internal judge call no run
+    /// lifecycle names included — and a later registration is born cancelled.
+    #[test]
+    fn shutdown_cancels_every_wrapped_worker_and_later_registrations() {
+        let runner = WrappedCliStepRunner::default();
+        let judge = StepInput {
+            run_id: "validator-abc".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: WorkUnit::pending("validator-abc:u1", "validator-abc", 1, "judge"),
+            workflow_id: "wf".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: None,
+            governance: None,
+            prior_outputs: Vec::new(),
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let token = runner.register_token(&judge);
+        assert!(!token.load(std::sync::atomic::Ordering::Relaxed));
+        crate::workflow::StepRunner::on_shutdown(&runner);
+        assert!(token.load(std::sync::atomic::Ordering::Relaxed));
+        let late = runner.register_token(&judge);
+        assert!(late.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
     /// The design's pre-spawn guard: a token born cancelled (reassign won the
     /// dispatch-to-registration race) must stop `run_bounded` from EVER spawning the child, not
     /// merely kill it a poll tick later. A fixture that would create a marker file on start lets
@@ -6901,6 +7314,11 @@ mod tests {
         // Wrapped exec path ⇒ env write lock + "no snapshot" pinned (#402 pass 3; see
         // `scratch_redirect_applies_to_a_nonclaude_seat`).
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        // C5: the labelled interim host floor, chosen explicitly (products default to container).
+        let _floor = VarGuard::set(
+            crate::container_floor::SEAT_FLOOR_ENV,
+            std::path::Path::new("host"),
+        );
         let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
         let (tx, rx) = std::sync::mpsc::channel();
         let runner = WrappedCliStepRunner::with_tx(tx);
@@ -6940,41 +7358,17 @@ mod tests {
         };
 
         let out = runner.run_unit(&input);
-
-        let unenforced = rx
-            .try_iter()
-            .filter_map(|c| match c {
-                crate::command::Command::EmitEvent(
-                    crate::event::CoreEvent::GovernanceUnenforced {
-                        cli, reason, ord, ..
-                    },
-                ) => Some((cli, reason, ord)),
-                _ => None,
-            })
-            .next()
-            .expect("a governed unit that could not be armed must announce it");
-        assert_eq!(
-            unenforced.0, "/bin/echo",
-            "names the binary, not the seat key"
-        );
-        assert_eq!(unenforced.2, 4);
-        // IG1-core-2: agy is of class `os_sandbox`; a scratch dir is not a run worktree, so the
-        // floor did not arm — the disclosure names that cause, and `sandboxUnenforced` rides it.
+        // C5 (codex c5-r4..r6): on the interim host floor a governed unit runs only on claude (its
+        // gate hook) or bounded codex; an OS-floor seat whose floor did not arm is refused with the reason, never run with only
+        // a disclosure (before C5 it ran, disclosed or floor-governed).
+        let _ = rx.try_iter().count();
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
         assert!(
-            unenforced
-                .1
-                .contains("its OS-sandbox governance floor did not arm (not_a_worktree"),
-            "the reason must say WHY it could not be armed: {}",
-            unenforced.1
+            out.output.contains("needs_container_floor"),
+            "{}",
+            out.output
         );
-        // The unit still runs — this is a disclosure, not a fallback or a failure.
-        assert_eq!(out.status, StepStatus::Ok);
-        assert!(!out.governed, "and it is honestly reported as ungoverned");
-        assert!(
-            !crate::gate_hook::decisions_path_for("run-unenf", 0).exists(),
-            "no marker is written when the floor did not arm"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!out.governed);
     }
 
     /// Container floor (codex review r1, P1): a seat wrapper goes through `run_bounded` — the
@@ -7110,6 +7504,143 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// codex judges-r1: the CLI's standalone validator authoring runner is bound to its store's
+    /// state home, so a container-floor authoring session has the gateway dir it needs to arm.
+    #[test]
+    fn a_store_bound_runner_knows_its_operational_home() {
+        let dir = std::env::temp_dir().join(format!("wicked-for-store-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("core.db");
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let runner = |floor: &str| {
+            let _f = VarGuard::set(
+                crate::container_floor::SEAT_FLOOR_ENV,
+                std::path::Path::new(floor),
+            );
+            WrappedCliStepRunner::for_standalone_authoring(db.to_str().unwrap())
+        };
+        let contained = runner("container");
+        assert_eq!(
+            contained.operational_home,
+            crate::state_home::operational_home_of_db(db.to_str().unwrap())
+        );
+        assert!(contained.operational_home.is_some());
+        // The host floor keeps the default runner (no home: the launch rules are unchanged).
+        assert!(runner("host").operational_home.is_none());
+        assert!(WrappedCliStepRunner::default().operational_home.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L15 (C5 follow-up): the engine's own judge and triage sessions follow the seat floor. Under
+    /// the container floor an ungoverned judge/triage unit takes the SAME arming path as a governed
+    /// worker (here: refused for want of a runtime, never run on the host); under the host floor it
+    /// runs on the host exactly as before; and an ordinary ungoverned unit is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn judge_and_triage_sessions_follow_the_seat_floor() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-cf-judge-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        // A stub named `pi` (a seat with an image), so a container refusal is the runtime's.
+        let stub = dir.join("pi");
+        std::fs::write(&stub, "#!/bin/sh\necho ran-on-host\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _rt = VarGuard::set(
+            crate::container_floor::RUNTIME_ENV,
+            &dir.join("no-such-runtime"),
+        );
+        let input = |session: &str, run_id: &str| {
+            let mut u = WorkUnit::pending(format!("{session}-agent"), session, 1, "judge this");
+            u.assigned_cli = Some("pi".to_string());
+            u.assigned_invocation = Some(format!("{} {{PROMPT}}", stub.display()));
+            StepInput {
+                run_id: run_id.to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-validator".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: None,
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            }
+        };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner = WrappedCliStepRunner::with_tx(tx);
+        let run = |i: &StepInput| {
+            let out = runner.run_unit(i);
+            let _ = std::fs::remove_dir_all(sandbox_for(i));
+            out
+        };
+        {
+            let _mode = VarGuard::set(
+                crate::container_floor::SEAT_FLOOR_ENV,
+                std::path::Path::new("container"),
+            );
+            for session in ["validator", "triage"] {
+                let i = input(
+                    session,
+                    &format!("{session}-cf-judge-{}", std::process::id()),
+                );
+                let out = run(&i);
+                assert_eq!(out.status, StepStatus::Failed, "{session}: {}", out.output);
+                assert!(
+                    out.output.contains("no_container_runtime"),
+                    "{session}: {}",
+                    out.output
+                );
+                assert!(
+                    !out.output.contains("ran-on-host"),
+                    "{session}: never a host CLI under the container floor: {}",
+                    out.output
+                );
+                assert!(!out.governed, "a judge stays ungoverned");
+                assert!(
+                    !crate::gate_hook::gov_run_dir(&i.run_id).exists(),
+                    "{session}: no governance files are created for an ungoverned judge"
+                );
+            }
+            // An ordinary ungoverned unit keeps its host launch.
+            let out = run(&input("s", &format!("s-cf-plain-{}", std::process::id())));
+            assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+            assert!(out.output.contains("ran-on-host"), "{}", out.output);
+        }
+        let _mode = VarGuard::set(
+            crate::container_floor::SEAT_FLOOR_ENV,
+            std::path::Path::new("host"),
+        );
+        for session in ["validator", "triage"] {
+            let out = run(&input(
+                session,
+                &format!("{session}-host-judge-{}", std::process::id()),
+            ));
+            assert_eq!(out.status, StepStatus::Ok, "{session}: {}", out.output);
+            assert!(
+                out.output.contains("ran-on-host"),
+                "{session}: {}",
+                out.output
+            );
+        }
+        assert!(runs_in_seat(&input("validator", "x")));
+        assert!(runs_in_seat(&input("triage", "x")));
+        assert!(!runs_in_seat(&input("s", "x")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// IG1-core-2: a governed unit on an `os_sandbox`-class seat in a linked run worktree arms the
     /// repository boundary, writes the `os_sandbox` ARMED marker (roots verbatim, launcher named)
     /// before the CLI runs, reports `governed: true`, and the fold passes it — no
@@ -7118,6 +7649,11 @@ mod tests {
     #[test]
     fn a_governed_unit_on_a_floor_class_seat_in_a_worktree_is_governed_by_the_floor() {
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        // C5: the labelled interim host floor, chosen explicitly (products default to container).
+        let _floor = VarGuard::set(
+            crate::container_floor::SEAT_FLOOR_ENV,
+            std::path::Path::new("host"),
+        );
         let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
         let (base, _clone, own, _sibling) =
             crate::worker_sandbox::tests::clone_with_two_runs("ig1c2-wrapped");
@@ -7156,43 +7692,17 @@ mod tests {
             required_skills: Vec::new(),
         };
         let out = runner.run_unit(&input);
-        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
-        assert!(out.governed, "the armed floor governs the unit");
-        let events: Vec<_> = rx.try_iter().collect();
+        // C5 (codex c5-r4..r6): on the interim host floor a governed unit runs only on claude (its
+        // gate hook) or bounded codex; an OS-floor seat even with its floor armed is refused with the reason, never run with only
+        // a disclosure (before C5 it ran, disclosed or floor-governed).
+        let _ = rx.try_iter().count();
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
         assert!(
-            !events.iter().any(|c| matches!(
-                c,
-                crate::command::Command::EmitEvent(
-                    crate::event::CoreEvent::GovernanceUnenforced { .. }
-                        | crate::event::CoreEvent::SandboxUnenforced { .. }
-                )
-            )),
-            "an armed floor discloses nothing"
+            out.output.contains("needs_container_floor"),
+            "{}",
+            out.output
         );
-        let log = std::fs::read_to_string(crate::gate_hook::decisions_path_for(&run_id, 0))
-            .expect("the os_sandbox marker is written");
-        let marker: serde_json::Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
-        assert_eq!(marker["_wicked_gov_armed"], "unit-2");
-        assert_eq!(marker["_wicked_gov_carrier"], "os_sandbox");
-        assert_eq!(
-            marker["_wicked_gov_roots"],
-            serde_json::json!([own.to_string_lossy()])
-        );
-        assert!(
-            ["sandbox-exec", "bwrap"].contains(&marker["_wicked_gov_boundary"].as_str().unwrap()),
-            "{marker}"
-        );
-        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
-        assert_eq!(
-            crate::gate_hook::fold_input_denial_with_activity(
-                &mut store, &run_id, 0, "unit-2", true, true
-            )
-            .unwrap(),
-            None,
-            "the fold accepts a governed, contained floor attempt"
-        );
-        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
-        let _ = std::fs::remove_dir_all(&base);
+        assert!(!out.governed);
     }
 
     /// IG1-core-2 (review): codex's own sandbox counts as the floor only when the LAUNCHED argv
@@ -7225,14 +7735,60 @@ mod tests {
             "--dangerously-bypass-approvals-and-sandbox",
         ])));
         assert!(!launches_bounded_codex(&[]));
+        // C5 (codex c5-r8): a template's own `--settings` would replace the gate hook's.
+        assert!(template_overrides_settings(&v(&[
+            "claude",
+            "--settings",
+            "./team.json",
+            "-p",
+            "x"
+        ])));
+        assert!(template_overrides_settings(&v(&[
+            "claude",
+            "--settings=./team.json",
+            "-p",
+            "x"
+        ])));
+        assert!(!template_overrides_settings(&v(&[
+            "claude", "-p", "--model", "m", "x"
+        ])));
+        // C5: the host-floor rule over the final argv. The hook-arming predicate decides (codex
+        // c5-r7): what it does not call claude is not admitted as claude.
+        assert_eq!(
+            host_floor_keeps_a_check(&v(&["/opt/bin/Claude", "-p", "x"])),
+            binary_is_claude("/opt/bin/Claude")
+        );
+        assert!(host_floor_keeps_a_check(&v(&[
+            "/opt/tools/claude",
+            "-p",
+            "x"
+        ])));
+        assert!(host_floor_keeps_a_check(&v(&[
+            "codex",
+            "exec",
+            "--sandbox",
+            "workspace-write",
+            "p"
+        ])));
+        assert!(!host_floor_keeps_a_check(&v(&[
+            "codex", "--yolo", "exec", "p"
+        ])));
+        assert!(!host_floor_keeps_a_check(&v(&["codex", "exec", "p"])));
+        assert!(!host_floor_keeps_a_check(&v(&["pi", "-p", "x"])));
+        assert!(!host_floor_keeps_a_check(&v(&["copilot", "-p", "x"])));
     }
 
     /// IG1-core-2 (review): a governed unit on the `codex` seat whose invocation does not launch
-    /// codex is NOT governed by codex's sandbox — no marker, `governed: false`, both disclosures.
+    /// codex is NOT governed by codex's sandbox — and (C5) on the interim host floor it is refused.
     #[cfg(unix)]
     #[test]
     fn a_codex_seat_launching_another_binary_is_not_governed_by_codex_sandbox() {
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        // C5: the labelled interim host floor, chosen explicitly (products default to container).
+        let _floor = VarGuard::set(
+            crate::container_floor::SEAT_FLOOR_ENV,
+            std::path::Path::new("host"),
+        );
         let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
         if seat_governance_class("codex") != wicked_council::GovernanceClass::OsSandboxFloor {
             eprintln!("execute_wrapped: this host's codex record is not floor-class — skips");
@@ -7274,26 +7830,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!out.governed, "an echo is not codex's sandbox");
+        // C5 (codex c5-r5): with ACP gone nothing else would hold it, so the unit is REFUSED
+        // (fail closed) — before C5 it ran with only a disclosure.
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
         assert!(
-            events.iter().any(|c| matches!(
-                c,
-                crate::command::Command::EmitEvent(
-                    crate::event::CoreEvent::GovernanceUnenforced { reason, .. }
-                ) if reason.contains("does not run codex with its own bounded")
-            )),
-            "{} events, none matched",
-            events.len()
+            out.output.contains("needs_container_floor"),
+            "{}",
+            out.output
         );
-        assert!(
-            events.iter().any(|c| matches!(
-                c,
-                crate::command::Command::EmitEvent(
-                    crate::event::CoreEvent::SandboxUnenforced { .. }
-                )
-            )),
-            "{} events, none matched",
-            events.len()
-        );
+        let _ = events;
     }
 
     /// The converse, so the event cannot degrade into noise on every ungoverned internal call:
@@ -7655,7 +8200,7 @@ mod tests {
             required_skills: Vec::new(),
         };
         let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
-        let g = arm_input_governance(&input, &gov, &mut argv, None, None).unwrap();
+        let g = arm_input_governance(&input, &gov, &mut argv, None, None, false).unwrap();
 
         assert_eq!(g.db_path, "/abs/estate.db", "the child gets the store path");
         // scope/phase ride the RETURNED struct (→ env), pinned to the unit's real values.
@@ -7716,6 +8261,11 @@ mod tests {
             "the Read/Edit fence is in the settings file: {deny:?}"
         );
         assert!(deny.contains(&"Bash(sudo:*)"), "{deny:?}");
+        assert_eq!(
+            json["disableAllHooks"],
+            serde_json::Value::Bool(false),
+            "the flag-scope settings keep hooks on over an inherited user scope (C5)"
+        );
         assert_eq!(
             json["hooks"]["PreToolUse"][0]["matcher"], "*",
             "the hook governs EVERY tool"
@@ -8283,6 +8833,14 @@ mod tests {
             managed_hooks_only_source(&[missing, off, broken, on.clone()]),
             Some(on)
         );
+        // C5 (codex c5-r11): `disableAllHooks: true` silences the gate hook just the same.
+        let silenced = w("managed-settings.json", r#"{"disableAllHooks": true}"#);
+        assert_eq!(
+            managed_hooks_only_source(std::slice::from_ref(&silenced)),
+            Some(silenced)
+        );
+        let kept = w("kept.json", r#"{"disableAllHooks": false}"#);
+        assert_eq!(managed_hooks_only_source(&[kept]), None);
         // The worker home's server-managed cache is the first candidate for the seat's dir.
         let c = claude_settings_candidates(Some(&dir));
         assert_eq!(c.first(), Some(&dir.join("remote-settings.json")));
@@ -8354,7 +8912,7 @@ mod tests {
         assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
         assert!(
             out.output.contains(MANAGED_HOOKS_ONLY_REFUSAL)
-                && out.output.contains("ACP is unavailable")
+                && out.output.contains("silence the engine's gate hook")
                 && out.output.contains("allowManagedHooksOnly"),
             "the refusal names the escalation: {}",
             out.output
@@ -9968,7 +10526,7 @@ mod tests {
                 required_skills: Vec::new(),
             };
             let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
-            arm_input_governance(&input, gov, &mut argv, None, None).unwrap();
+            arm_input_governance(&input, gov, &mut argv, None, None, false).unwrap();
             // Locate each injected config file from the argv (never index a fixed position). Since
             // D-7 (DES-L4 PR-⑦) `--mcp-config` is NEVER injected; `file_after` proves its absence.
             let file_after = |flag: &str| {
@@ -11171,13 +11729,7 @@ mod tests {
             production.contains("prior_context_prefix(&input.prior_outputs)"),
             "the wrapped exec no longer prepends the run's prior context (core #470)"
         );
-        // And the ACP carrier reads the SAME const (no second wording).
-        let acp = include_str!("acp_runner.rs");
-        assert!(
-            acp.contains("crate::execute_wrapped::PRIOR_CONTEXT_PREAMBLE")
-                && !acp.contains("\"CONTEXT (prior phases of this run)"),
-            "the ACP carrier must read the shared preamble const, not its own literal"
-        );
+        // (C5) The ACP carrier, the only other reader, is gone with ACP.
     }
 
     /// A pty turn is submitted as one line, and a canonical-mode terminal DISCARDS any line that
@@ -13181,7 +13733,7 @@ mod tests {
             required_skills: Vec::new(),
         };
         let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
-        let g = arm_input_governance(&input, &gov, &mut argv, Some(root), None).unwrap();
+        let g = arm_input_governance(&input, &gov, &mut argv, Some(root), None, false).unwrap();
         assert_eq!(g.skills_root.as_deref(), Some(root));
         assert!(
             g.extra_write_roots.is_empty(),
@@ -14800,7 +15352,8 @@ mod project_graph_end_to_end_tests {
                 .clone()
                 .expect("a governed unit on a file-backed store must carry a governance context");
             let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
-            let settings_db = match arm_input_governance(input, &gov, &mut argv, None, None) {
+            let settings_db = match arm_input_governance(input, &gov, &mut argv, None, None, false)
+            {
                 Ok(g) => g.code_graph_db,
                 Err(e) => panic!("arming failed: {e}"),
             };
@@ -15072,5 +15625,504 @@ mod project_graph_end_to_end_tests {
             DENIED_BASH.len() + crate::remote_write_fence::REMOTE_WRITE_BASH_RULES.len(),
             "one union, each rule once"
         );
+    }
+}
+
+#[cfg(test)]
+mod ask_config_tests {
+    use super::*;
+    use wicked_apps_core::spawn::SeatCli;
+
+    fn assert_ask_withheld_config(cli: SeatCli, config: &AskSeatConfig) {
+        assert!(config.flags.is_empty() && config.env.is_empty());
+        if cli == SeatCli::Pi {
+            assert_eq!(
+                config.files,
+                [(PathBuf::from("mcp.json"), "{\"mcpServers\":{}}".into())]
+            );
+        } else {
+            assert!(config.files.is_empty());
+        }
+    }
+
+    #[test]
+    fn ask_claude_rendered_settings_allow_only_the_handed_tool_and_keep_the_gate() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        seed_probe_for_test(
+            &resolve_wicked_core_exe(),
+            Ok((
+                crate::gate_hook::GATE_PROTOCOL_VERSION,
+                Some(env!("CARGO_PKG_VERSION").to_string()),
+            )),
+        );
+        let gov = crate::workflow::GovernanceContext {
+            human_confirm: Default::default(),
+            db_path: "/abs/estate.db".into(),
+            code_graph_db: None,
+            extra_write_roots: vec![],
+            extra_read_roots: vec![],
+            project_id: None,
+        };
+        let mut input = StepInput {
+            run_id: format!("ask-settings-{}", uuid::Uuid::new_v4()),
+            unit_ix: 0,
+            attempt: 0,
+            unit: WorkUnit::pending("s:u1", "s", 3, "ask a question"),
+            workflow_id: "wf-x".into(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: None,
+            governance: Some(gov.clone()),
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: vec![],
+        };
+        let mut prior_deny = None;
+        for enabled in [false, true] {
+            input.attempt += 1;
+            let mut argv = [
+                "claude",
+                "--permission-mode",
+                "acceptEdits",
+                "-p",
+                "--",
+                "prompt",
+            ]
+            .map(str::to_owned)
+            .to_vec();
+            let config = ask_seat_config(SeatCli::Claude, enabled, 600, &argv);
+            apply_seat_posture(&mut argv, &config.flags);
+            arm_input_governance(&input, &gov, &mut argv, None, None, enabled).unwrap();
+            let settings_idx = argv.iter().position(|arg| arg == "--settings").unwrap();
+            let settings: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&argv[settings_idx + 1]).unwrap()).unwrap();
+            assert_eq!(argv.iter().any(|arg| arg == "--mcp-config"), enabled);
+            assert_eq!(
+                settings["permissions"]["allow"],
+                if enabled {
+                    serde_json::json!(["mcp__wicked__ask"])
+                } else {
+                    serde_json::json!([])
+                }
+            );
+            assert_eq!(settings["disableAllHooks"], false);
+            let hooks = settings["hooks"]["PreToolUse"].as_array().unwrap();
+            assert_eq!(hooks.len(), 1);
+            assert_eq!(hooks[0]["matcher"], "*");
+            assert_eq!(hooks[0]["hooks"].as_array().unwrap().len(), 1);
+            assert!(matches!(
+                hooks[0]["hooks"][0]["type"].as_str(),
+                Some("command" | "http")
+            ));
+            let deny = &settings["permissions"]["deny"];
+            assert!(!deny.as_array().unwrap().is_empty());
+            if let Some(prior) = &prior_deny {
+                assert_eq!(deny, prior, "ask handoff must preserve the deny fence");
+            }
+            prior_deny = Some(deny.clone());
+        }
+        std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&input.run_id)).unwrap();
+    }
+
+    // Container seat homes are seeded only on Unix (the container floor is Linux-in-a-VM; native Windows refuses it).
+    #[cfg(unix)]
+    #[test]
+    fn ask_pi_reused_container_home_clears_the_server_on_a_withheld_launch() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        use wicked_apps_core::spawn::SeatConfig;
+        let root = wicked_apps_core::spawn::hermetic_test_worker_home()
+            .join(format!("ask-pi-{}", uuid::Uuid::new_v4()));
+        let seat = SeatConfig::Isolated {
+            cli: SeatCli::Pi,
+            root: Some(root.clone()),
+            set: vec![("PI_CODING_AGENT_DIR", root.clone())],
+            strip: vec![],
+        };
+        for (enabled, flags) in [
+            (false, vec![]),
+            (true, vec!["--approve"]),
+            (true, vec!["-a"]),
+        ] {
+            let mut prior_home = None;
+            // Render two launches into the same run/seat/posture home using the production
+            // safe writer. No CLI or container is spawned.
+            for (handed, args) in [(true, vec![]), (enabled, flags)] {
+                let home =
+                    crate::container_floor::container_seat_config(seat.clone(), "run", "full")
+                        .unwrap();
+                if let Some(prior) = &prior_home {
+                    assert_eq!(home.root().unwrap(), prior);
+                }
+                let mut argv = vec!["pi".to_owned()];
+                argv.extend(args.into_iter().map(str::to_owned));
+                let config = ask_seat_config(SeatCli::Pi, handed, 600, &argv);
+                // spawn-audit: test-only — never spawned; only carries the config-home env.
+                let mut cmd = Command::new("unused");
+                home.apply(&mut cmd);
+                crate::container_floor::write_unit_seat_files(&mut cmd, "pi", &config.files)
+                    .unwrap();
+                let json: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(home.root().unwrap().join("mcp.json")).unwrap(),
+                )
+                .unwrap();
+                if prior_home.is_none() {
+                    assert_eq!(
+                        json["mcpServers"]["wicked"]["url"],
+                        crate::seat_gateway::ASK_URL
+                    );
+                } else {
+                    assert_eq!(json, serde_json::json!({"mcpServers": {}}));
+                    assert_ask_withheld_config(SeatCli::Pi, &config);
+                }
+                prior_home = Some(home.root().unwrap().to_path_buf());
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ask_per_cli_configs_require_loopback_and_a_ready_gateway_route() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        for governed in [false, true] {
+            for container in [false, true] {
+                for url in [
+                    None,
+                    Some(""),
+                    Some("http://example.com:7871"),
+                    Some("http://127.0.0.1"),
+                    Some("https://127.0.0.1:7871"),
+                    Some("http://127.0.0.1:7871"),
+                    Some("http://localhost:7871/"),
+                    Some("http://[::1]:7871"),
+                ] {
+                    let enabled = ask_seat_enabled(
+                        governed,
+                        container,
+                        SeatCli::Claude,
+                        url,
+                        false,
+                        true,
+                        true,
+                    );
+                    assert_eq!(
+                        enabled,
+                        governed
+                            && container
+                            && matches!(
+                                url,
+                                Some(
+                                    "http://127.0.0.1:7871"
+                                        | "http://localhost:7871/"
+                                        | "http://[::1]:7871"
+                                )
+                            )
+                    );
+                    let config = ask_seat_config(SeatCli::Claude, enabled, 600, &[]);
+                    assert!(config.files.is_empty());
+                    let mut argv = vec!["claude".into(), "-p".into(), "--".into(), "prompt".into()];
+                    super::inject_isolation_flags(
+                        &mut argv,
+                        "claude -p {PROMPT}",
+                        None,
+                        Some("prompt"),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    apply_seat_posture(&mut argv, &config.flags);
+                    assert!(argv.contains(&"--strict-mcp-config".into()));
+                    assert_eq!(argv.contains(&"--mcp-config".into()), enabled);
+                    if enabled {
+                        let i = argv.iter().position(|s| s == "--mcp-config").unwrap();
+                        assert!(i < argv.iter().position(|s| s == "--").unwrap());
+                        assert_eq!(
+                            serde_json::from_str::<serde_json::Value>(&argv[i + 1]).unwrap(),
+                            serde_json::json!({
+                                "mcpServers": {"wicked": {"type": "http", "url": crate::seat_gateway::ASK_URL,
+                                "headers": {"Authorization": "Bearer ${WICKED_MCP_TOKEN}"}}}
+                            })
+                        );
+                    }
+                    for cli in [SeatCli::Claude, SeatCli::Codex, SeatCli::Pi] {
+                        let config = ask_seat_config(cli, enabled, 600, &[]);
+                        if !enabled {
+                            assert_ask_withheld_config(cli, &config);
+                        }
+                    }
+                }
+            }
+        }
+        let config = ask_seat_config(SeatCli::Codex, true, 600, &[]);
+        assert!(config.files.is_empty() && config.env.is_empty());
+        assert_eq!(
+            config.flags,
+            [
+                "-c",
+                "mcp_servers.wicked.enabled=true",
+                "-c",
+                "mcp_servers.wicked.url=\"http://agw:8700/api/v1/mcp/ask\"",
+                "-c",
+                "mcp_servers.wicked.bearer_token_env_var=\"WICKED_MCP_TOKEN\"",
+                "-c",
+                "mcp_servers.wicked.tool_timeout_sec=660",
+                "-c",
+                "mcp_servers.wicked.startup_timeout_sec=20"
+            ]
+        );
+        // copilot has no broker route; opencode only on a launch the pinned server script runs.
+        for cli in [SeatCli::Opencode, SeatCli::Copilot] {
+            let config = ask_seat_config(cli, true, 600, &[]);
+            assert!(config.flags.is_empty() && config.files.is_empty() && config.env.is_empty());
+        }
+    }
+
+    /// L15: opencode is handed the ask server as a registration body for its pinned server script
+    /// (its configuration files' MCP tools are never offered): the gateway route, codemode off,
+    /// the timeout with headroom in milliseconds, and the token as a slot the script fills from the
+    /// seat's env. A launch the script does not run (`--server`, not `run`) is handed nothing.
+    #[test]
+    fn ask_opencode_is_a_registration_body_for_the_pinned_server_script() {
+        let argv: Vec<String> = ["opencode", "run", "--format", "json", "do it"]
+            .map(String::from)
+            .to_vec();
+        let config = ask_seat_config(SeatCli::Opencode, true, 600, &argv);
+        assert!(config.flags.is_empty() && config.files.is_empty());
+        assert_eq!(config.env.len(), 1);
+        assert_eq!(config.env[0].0, OPENCODE_ASK_ENV);
+        let body: serde_json::Value = serde_json::from_str(&config.env[0].1).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"config": {
+                "type": "remote",
+                "url": crate::seat_gateway::ASK_URL,
+                "headers": {"Authorization": "Bearer __WICKED_MCP_TOKEN__"},
+                "codemode": false,
+                "timeout": {"execution": 660_000}
+            }})
+        );
+        assert!(!config.env[0].1.contains("wmt_"), "never a token");
+        for other in [
+            vec!["opencode", "run", "--server", "http://127.0.0.1:1", "x"],
+            vec!["opencode", "serve"],
+        ] {
+            let argv: Vec<String> = other.into_iter().map(String::from).collect();
+            let config = ask_seat_config(SeatCli::Opencode, true, 600, &argv);
+            assert!(config.env.is_empty(), "{argv:?}");
+        }
+        assert!(ask_seat_config(SeatCli::Opencode, false, 600, &argv)
+            .env
+            .is_empty());
+    }
+
+    /// The composed opencode document admits exactly the ask tool when the launch registers it,
+    /// and nothing otherwise.
+    #[test]
+    fn ask_opencode_document_admits_only_the_ask_tool_when_handed() {
+        for admit in [false, true] {
+            let doc = compose_seat_opencode_config(
+                &crate::skills_snapshot::SkillsDelivery::None,
+                true,
+                admit,
+                true,
+                || None,
+                || false,
+            )
+            .unwrap()
+            .unwrap();
+            let v: serde_json::Value = serde_json::from_str(&doc).unwrap();
+            for rules in [&v["permission"], &v["agent"]["build"]["permission"]] {
+                assert_eq!(rules["*_*"], "deny");
+                assert_eq!(
+                    rules.get("wicked_ask").and_then(|r| r.as_str()),
+                    admit.then_some("allow")
+                );
+            }
+            let deny = doc.find("\"*_*\"").unwrap();
+            if admit {
+                assert!(doc[deny..].contains("\"wicked_ask\":\"allow\""), "{doc}");
+            }
+        }
+    }
+
+    #[test]
+    fn ask_handoff_decision_requires_every_prerequisite_and_probe_success() {
+        for governed in [false, true] {
+            for container in [false, true] {
+                for cli in [
+                    SeatCli::Claude,
+                    SeatCli::Codex,
+                    SeatCli::Pi,
+                    SeatCli::Opencode,
+                    SeatCli::Copilot,
+                ] {
+                    for route_ready in [false, true] {
+                        for url in [
+                            None,
+                            Some("http://example.com:7871"),
+                            Some("http://127.0.0.1:7871"),
+                        ] {
+                            let enabled = ask_seat_enabled(
+                                governed,
+                                container,
+                                cli,
+                                url,
+                                false,
+                                true,
+                                route_ready,
+                            );
+                            assert_eq!(
+                                enabled,
+                                governed
+                                    && container
+                                    && matches!(
+                                        cli,
+                                        SeatCli::Claude
+                                            | SeatCli::Codex
+                                            | SeatCli::Pi
+                                            | SeatCli::Opencode
+                                    )
+                                    && url == Some("http://127.0.0.1:7871")
+                                    && route_ready
+                            );
+                            let config = ask_seat_config(cli, enabled, 600, &[]);
+                            if !enabled {
+                                assert_ask_withheld_config(cli, &config);
+                            }
+                        }
+                    }
+                    // The first unit becomes eligible as soon as its warmup probe succeeds.
+                    assert!(!ask_seat_enabled(
+                        true,
+                        true,
+                        cli,
+                        Some("http://localhost:7871"),
+                        false,
+                        true,
+                        false
+                    ));
+                    assert_eq!(
+                        ask_seat_enabled(
+                            true,
+                            true,
+                            cli,
+                            Some("http://localhost:7871"),
+                            false,
+                            true,
+                            true
+                        ),
+                        matches!(
+                            cli,
+                            SeatCli::Claude | SeatCli::Codex | SeatCli::Pi | SeatCli::Opencode
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ask_handoff_requires_network_and_operational_home_even_with_a_cached_route() {
+        for cli in [SeatCli::Claude, SeatCli::Codex, SeatCli::Pi] {
+            for offline in [false, true] {
+                for has_operational_home in [false, true] {
+                    for route_ready in [false, true] {
+                        let enabled = ask_seat_enabled(
+                            true,
+                            true,
+                            cli,
+                            Some("http://localhost:7871"),
+                            offline,
+                            has_operational_home,
+                            route_ready,
+                        );
+                        assert_eq!(enabled, !offline && has_operational_home && route_ready);
+                        let config = ask_seat_config(cli, enabled, 600, &[]);
+                        if !enabled {
+                            assert_ask_withheld_config(cli, &config);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ask_pi_builtin_extension_only_when_extensions_are_disabled() {
+        for (args, disabled) in [
+            (vec!["pi", "-p", "prompt"], false),
+            (vec!["pi", "--no-extensions", "-p", "prompt"], true),
+            (vec!["pi", "-ne", "-p", "--", "prompt"], true),
+            (vec!["pi", "--no-extensions", "-p", "--", "prompt"], true),
+            (vec!["pi", "-p", "--", "--no-extensions"], false),
+            (vec!["pi", "-p", "--", "-ne"], false),
+        ] {
+            let mut argv: Vec<_> = args.into_iter().map(str::to_owned).collect();
+            let config = ask_seat_config(SeatCli::Pi, true, 600, &argv);
+            apply_seat_posture(&mut argv, &config.flags);
+            assert_eq!(
+                argv.iter().filter(|a| *a == "builtin:mcp").count(),
+                usize::from(disabled)
+            );
+            assert_eq!(argv.iter().filter(|a| *a == "--no-approve").count(), 1);
+            let guard = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+            assert!(argv.iter().position(|a| a == "--no-approve").unwrap() < guard);
+            if disabled {
+                assert!(argv.iter().position(|a| a == "builtin:mcp").unwrap() < guard);
+            }
+            assert!(config.env.is_empty());
+            assert_eq!(config.files.len(), 1);
+            assert_eq!(config.files[0].0, PathBuf::from("mcp.json"));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&config.files[0].1).unwrap(),
+                serde_json::json!({
+                    "mcpServers": {"wicked": {"url": crate::seat_gateway::ASK_URL,
+                    "headers": {"Authorization": "Bearer ${WICKED_MCP_TOKEN}"}, "exposure": "direct", "timeout": 660}}
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn ask_pi_refuses_project_approval_but_ignores_prompt_text_after_guard() {
+        for flag in ["--approve", "-a"] {
+            for isolation in ["--no-extensions", "-ne", "--no-approve", "-na"] {
+                let argv = ["pi", isolation, flag, "-p", "--", "prompt"].map(str::to_owned);
+                let reason = pi_ask_refusal(SeatCli::Pi, &argv).unwrap();
+                assert!(reason.contains("project-local MCP") && reason.contains("wicked"));
+                let config = ask_seat_config(SeatCli::Pi, true, 600, &argv);
+                assert_ask_withheld_config(SeatCli::Pi, &config);
+            }
+            let mut argv = ["pi", "-ne", "-p", "--", flag].map(str::to_owned).to_vec();
+            assert!(pi_ask_refusal(SeatCli::Pi, &argv).is_none());
+            let config = ask_seat_config(SeatCli::Pi, true, 600, &argv);
+            assert_eq!(config.files.len(), 1);
+            apply_seat_posture(&mut argv, &config.flags);
+            assert_eq!(
+                &argv[..7],
+                ["pi", "-ne", "-p", "--no-approve", "-e", "builtin:mcp", "--"]
+            );
+            assert_eq!(argv.last().unwrap(), flag);
+        }
+    }
+
+    #[test]
+    fn ask_claude_tool_timeout_env_has_sixty_seconds_of_headroom_in_milliseconds() {
+        for timeout in [10, 70, 600, 3600] {
+            let config = ask_seat_config(SeatCli::Claude, true, timeout, &[]);
+            assert_eq!(
+                config.env,
+                [(
+                    "MCP_TOOL_TIMEOUT".into(),
+                    ((timeout + 60) * 1000).to_string()
+                )]
+            );
+        }
     }
 }

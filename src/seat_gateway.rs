@@ -347,7 +347,7 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
         })
         .collect();
     binds.push(json!({"port": 3000, "tunnelProtocol": "connect", "listeners": []}));
-    // Crew's MCP broker: exactly its two unit-token routes (the token in the body is the
+    // Crew's MCP broker: only the unit-token broker/ask routes (the token is the
     // credential, verified by the engine); every other broker route stays unreachable.
     if let Some(up) = &config.mcp_upstream {
         binds.push(json!({
@@ -355,9 +355,17 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
             "listeners": [{ "routes": [{
                 "matches": [
                     {"path": {"exact": "/api/v1/mcp/call"}, "method": "POST"},
-                    {"path": {"exact": "/api/v1/mcp/tools"}, "method": "POST"}
+                    {"path": {"exact": "/api/v1/mcp/tools"}, "method": "POST"},
+                    {"path": {"exact": "/api/v1/mcp/ask"}, "method": "POST"},
+                    {"path": {"exact": "/api/v1/mcp/ask"}, "method": "GET"}
                 ],
-                "backends": [{"host": up}]
+                // Ask holds response headers until the human answers. Match the CLI's budget
+                // instead of inheriting a shorter HTTP deadline (agentgateway v1.6 TimeoutPolicy).
+                "policies": {"timeout": {"requestTimeout": format!("{}s", crate::ask::timeout_secs() + 60),
+                    "backendRequestTimeout": format!("{}s", crate::ask::timeout_secs() + 60)}},
+                "backends": [{"host": up, "policies": {"http": {
+                    "requestTimeout": format!("{}s", crate::ask::timeout_secs() + 60)
+                }}}]
             }]}]
         }));
     }
@@ -625,12 +633,13 @@ fn probe_once(
     found
 }
 
-/// The MCP broker URL a container seat is handed (crew's two unit-token routes only).
+/// The MCP broker URL a container seat is handed.
 pub(crate) const MCP_URL: &str = "http://agw:8700";
+pub(crate) const ASK_URL: &str = "http://agw:8700/api/v1/mcp/ask";
 
 /// The port of the daemon's broker URL (`WICKED_CREW_URL`), when it names a loopback host: the
 /// gateway reaches the host's loopback only through the runtime's host alias.
-fn crew_port(url: &str) -> Option<u16> {
+pub(crate) fn crew_port(url: &str) -> Option<u16> {
     let rest = url.trim().strip_prefix("http://")?;
     let authority = rest.split('/').next()?;
     let (host, port) = authority.rsplit_once(':')?;
@@ -2575,7 +2584,7 @@ esac
     /// Codex gw-r1 (P2): the MCP listener exists only with a reachable broker, and passes exactly
     /// crew's two unit-token routes (never a prefix: the operator's broker routes stay unreachable).
     #[test]
-    fn the_mcp_route_passes_only_the_two_unit_token_routes() {
+    fn the_mcp_route_passes_exactly_four_unit_token_matches() {
         assert!(!render(&plain_config())["binds"]
             .as_array()
             .unwrap()
@@ -2597,7 +2606,9 @@ esac
             route["matches"],
             json!([
                 {"path": {"exact": "/api/v1/mcp/call"}, "method": "POST"},
-                {"path": {"exact": "/api/v1/mcp/tools"}, "method": "POST"}
+                {"path": {"exact": "/api/v1/mcp/tools"}, "method": "POST"},
+                {"path": {"exact": "/api/v1/mcp/ask"}, "method": "POST"},
+                {"path": {"exact": "/api/v1/mcp/ask"}, "method": "GET"}
             ])
         );
         assert_eq!(route["backends"][0]["host"], "host.lima.internal:7701");

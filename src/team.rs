@@ -19,8 +19,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -66,7 +64,6 @@ pub const MONITOR_TURN_BUDGET: Duration = Duration::from_secs(240);
 pub const FINAL_PASS_BUDGET: Duration = Duration::from_secs(300);
 
 const TITLE_CAP: usize = 256;
-const PATHS_CAP: usize = 16;
 const EVIDENCE_CAP: usize = 512;
 const CLAIM_CAP: usize = 2048;
 
@@ -150,311 +147,6 @@ pub fn cap_utf8(s: &str, max: usize) -> String {
 }
 
 // ── Checkpoints (DES §4.2) ────────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Default)]
-struct ToolMemo {
-    kind: Option<String>,
-    title: Option<String>,
-    paths: Vec<String>,
-}
-
-/// The claim a teamed attempt's turn runs under (DES-002 §4.2 "Steer point"): the bus it
-/// publishes on and the attempt's floor, its own `step.claimed` event id.
-#[derive(Debug, Clone)]
-pub(crate) struct TurnClaim {
-    pub runner: runner::TeamRunner,
-    pub claimed_id: i64,
-    /// The seat instance the attempt runs under (`by` on its rows).
-    pub by: String,
-}
-
-/// The team context of ONE unit turn on the ACP carrier — the `team: Option<&TeamTurn>`
-/// parameter of `exec_turn_acp_posture` (DES-002 §4.2, §8.9). It owns the tool-call memo and the
-/// checkpoint sequence (`checkpoint.reached`, R), the steer point's per-attempt delivered set, and
-/// the re-confirmation root. `None` for chat turns, monitor turns and the engine's OWN sessions
-/// (the agent judge, triage): they share the unit's `(run, ord, attempt)` but are not the worker,
-/// so they must never take its advice nor checkpoint for it.
-pub struct TeamTurn {
-    /// `(run, ord, attempt)`.
-    pub key: UnitKey,
-    /// The attempt's claim. `None` = the attempt is not teamed (no team unit, a `transport: none`
-    /// snapshot, or its `step.claimed` is not on the bus): the turn checkpoints nothing and takes
-    /// no steer.
-    pub(crate) claim: Option<TurnClaim>,
-    /// The unit's worktree and the git dir its baseline was snapshotted through — what a fresh
-    /// snapshot re-confirms a finding against before it is sent. `None` when the unit has no
-    /// worktree baseline: nothing can be re-confirmed, so nothing is sent.
-    pub confirm_root: Option<(PathBuf, PathBuf)>,
-    /// The unit's worktree — a location under it is reported repo-relative.
-    workdir: Option<PathBuf>,
-    memo: Mutex<HashMap<String, ToolMemo>>,
-    seq: AtomicU64,
-    /// Steer point: `raise_seq`s this turn already carried or dropped (the per-attempt delivered
-    /// set, DES-002 §4.2): a finding is offered to one steer at most.
-    delivered: Mutex<BTreeSet<u32>>,
-    steer_seq: AtomicU64,
-}
-
-impl TeamTurn {
-    pub(crate) fn new(
-        key: UnitKey,
-        claim: Option<TurnClaim>,
-        confirm_root: Option<(PathBuf, PathBuf)>,
-        workdir: Option<PathBuf>,
-    ) -> Self {
-        Self {
-            key,
-            claim,
-            confirm_root,
-            workdir,
-            memo: Mutex::new(HashMap::new()),
-            seq: AtomicU64::new(0),
-            delivered: Mutex::new(BTreeSet::new()),
-            steer_seq: AtomicU64::new(0),
-        }
-    }
-
-    /// The unit's team context from its [`crate::workflow::StepInput`]. The attempt is teamed only
-    /// on positive evidence: its snapshot says `transport: bus` AND carries its own `step.claimed`
-    /// event id (set by the worker thread after the claim landed) AND this carrier has a team
-    /// runner. `None` for the engine's own sessions.
-    pub(crate) fn for_unit(
-        input: &crate::workflow::StepInput,
-        runner: Option<&runner::TeamRunner>,
-    ) -> Option<Self> {
-        if crate::execute_wrapped::is_engine_internal(&input.unit) {
-            return None;
-        }
-        let confirm_root = input.workdir.clone().and_then(|wt| {
-            input
-                .unit
-                .worktree_baseline
-                .as_ref()
-                .and_then(|b| b.git_dir.clone())
-                .map(|gd| (wt, PathBuf::from(gd)))
-        });
-        let claim = match (input.unit.team.as_ref(), runner) {
-            (Some(t), Some(r)) if t.transport == events::Transport::Bus => {
-                t.claimed_event_id.map(|claimed_id| TurnClaim {
-                    runner: r.clone(),
-                    claimed_id,
-                    by: runner::seat_of(input),
-                })
-            }
-            _ => None,
-        };
-        Some(Self::new(
-            (input.run_id.clone(), input.unit.ord, input.attempt),
-            claim,
-            confirm_root,
-            input.workdir.clone(),
-        ))
-    }
-
-    /// Whether this turn's attempt is teamed (its `step.claimed` is on the bus).
-    pub fn teamed(&self) -> bool {
-        self.claim.is_some()
-    }
-
-    fn relative(&self, p: &str) -> String {
-        if let Some(root) = self.workdir.as_deref() {
-            if let Ok(rel) = Path::new(p).strip_prefix(root) {
-                return rel.to_string_lossy().replace('\\', "/");
-            }
-        }
-        p.to_string()
-    }
-
-    fn envelope(&self, re: Option<String>) -> events::Envelope {
-        events::Envelope {
-            run_id: self.key.0.clone(),
-            ord: Some(self.key.1),
-            attempt: Some(self.key.2),
-            by: self
-                .claim
-                .as_ref()
-                .map_or_else(|| "claude".to_string(), |c| c.by.clone()),
-            at: crate::interaction::now_millis(),
-            re,
-        }
-    }
-
-    /// Observe one agent `session/update` frame of a TEAMED turn (an unteamed one yields `None`
-    /// for every frame). `kind`, `title` and `locations` are REMEMBERED per `toolCallId` from the
-    /// `tool_call` and refinement frames, because the terminal `tool_call_update` does not repeat
-    /// them; that terminal frame (`status` `completed` | `failed`) yields exactly one
-    /// `checkpoint.reached` (DES-002 §6 #10). Every other frame — message chunks, usage, a
-    /// non-terminal update — yields `None`: checkpoints are tool-call boundaries, never tokens.
-    pub fn observe(&self, frame: &Value) -> Option<events::TeamEvent> {
-        self.claim.as_ref()?;
-        let update = &frame["params"]["update"];
-        let which = update["sessionUpdate"].as_str()?;
-        if which != "tool_call" && which != "tool_call_update" {
-            return None;
-        }
-        let id = update["toolCallId"].as_str()?.to_string();
-        let mut memo = self.memo.lock().unwrap_or_else(|p| p.into_inner());
-        let entry = memo.entry(id.clone()).or_default();
-        if let Some(k) = update["kind"].as_str() {
-            entry.kind = Some(k.to_string());
-        }
-        if let Some(t) = update["title"].as_str() {
-            entry.title = Some(t.to_string());
-        }
-        if let Some(locs) = update["locations"].as_array() {
-            let paths: Vec<String> = locs
-                .iter()
-                .filter_map(|l| l["path"].as_str())
-                .map(|p| self.relative(p))
-                .take(PATHS_CAP)
-                .collect();
-            if !paths.is_empty() {
-                entry.paths = paths;
-            }
-        }
-        let status = match (which, update["status"].as_str()) {
-            ("tool_call_update", Some("completed")) => events::CheckpointStatus::Completed,
-            ("tool_call_update", Some("failed")) => events::CheckpointStatus::Failed,
-            _ => return None,
-        };
-        let done = memo.remove(&id).unwrap_or_default();
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        Some(events::TeamEvent {
-            env: self.envelope(None),
-            body: events::TeamBody::CheckpointReached(events::CheckpointReached {
-                seq,
-                tool_call_id: id,
-                kind: done.kind.unwrap_or_else(|| "other".to_string()),
-                title: cap_utf8(done.title.as_deref().unwrap_or(""), TITLE_CAP),
-                status,
-                paths: done.paths,
-            }),
-        })
-    }
-
-    /// Publish one of this attempt's R facts (a checkpoint, a steer's `advice.delivered`) through
-    /// the one wrapper. A spooled or refused fact is logged: a checkpoint only paces the members'
-    /// batches (the final pass reviews the settled tree whatever arrived), and an `advice.delivered`
-    /// that never lands leaves its finding undelivered, which the boundary re-renders and the gate
-    /// treats as unresolved — never as delivered.
-    pub(crate) fn publish(&self, ev: &events::TeamEvent) {
-        let Some(c) = self.claim.as_ref() else {
-            return;
-        };
-        match c.runner.bus().publish(ev) {
-            Ok(publish::PublishOutcome::Published(_)) => {}
-            Ok(other) => eprintln!(
-                "wicked-core: {} of {}:{}:{} not on the bus ({other:?})",
-                ev.event_type(),
-                self.key.0,
-                self.key.1,
-                self.key.2
-            ),
-            Err(e) => eprintln!(
-                "wicked-core: {} of {}:{}:{} not written ({e:#})",
-                ev.event_type(),
-                self.key.0,
-                self.key.1,
-                self.key.2
-            ),
-        }
-    }
-
-    /// The steer point's source (DES-002 §8.9): every `finding.raised{severity:"high"}` of THIS
-    /// attempt after its own `step.claimed`, minus the findings this turn already offered. A
-    /// stream it cannot read yields nothing (the boundary and the gate still see the rows).
-    pub(crate) fn pending_high(&self) -> Vec<(u32, Finding)> {
-        let Some(c) = self.claim.as_ref() else {
-            return Vec::new();
-        };
-        let stream = match c.runner.read_run(&self.key.0, c.claimed_id) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "wicked-core: steer point of {}:{}:{} could not read the stream ({e:#})",
-                    self.key.0, self.key.1, self.key.2
-                );
-                return Vec::new();
-            }
-        };
-        let offered = self.delivered.lock().unwrap_or_else(|p| p.into_inner());
-        let mut out: Vec<(u32, Finding)> = Vec::new();
-        for row in stream.rows {
-            let env = &row.event.env;
-            if env.ord != Some(self.key.1) || env.attempt != Some(self.key.2) {
-                continue;
-            }
-            let events::TeamBody::FindingRaised(b) = &row.event.body else {
-                continue;
-            };
-            if b.severity != Severity::High
-                || offered.contains(&b.raise_seq)
-                || out.iter().any(|(s, _)| *s == b.raise_seq)
-            {
-                continue;
-            }
-            out.push((b.raise_seq, runner::finding_of(&row.event.env, b)));
-        }
-        out
-    }
-
-    /// Record that this turn offered `raise_seq` to a steer (sent, dropped as superseded, or
-    /// disclosed as not delivered): it is never offered again in this turn.
-    pub(crate) fn mark_offered(&self, raise_seq: u32) {
-        self.delivered
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(raise_seq);
-    }
-
-    /// Offer `raise_seq` again at the next boundary (it did not fit this steer's block).
-    pub(crate) fn unmark_offered(&self, raise_seq: u32) {
-        self.delivered
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&raise_seq);
-    }
-
-    /// A fresh steer id for this attempt (`advice.delivered.delivery_id` / `steer_id`): the
-    /// carrier's per-attempt counter, never content (DES-002 §6.1 row 12).
-    pub(crate) fn next_steer_id(&self) -> String {
-        let n = self.steer_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        format!(
-            "s-{}",
-            crate::bus::deterministic_key(&[
-                &self.key.0,
-                &self.key.1.to_string(),
-                &self.key.2.to_string(),
-                &n.to_string(),
-            ])
-        )
-    }
-
-    /// One `advice.delivered{channel:"acp_steering"}` row per finding a steer carried (DES-002
-    /// §8.9), all sharing the steer's id.
-    pub(crate) fn steered(
-        &self,
-        steer_id: &str,
-        carried: &[(u32, String)],
-        outcome: events::DeliveryOutcome,
-        detail: Option<String>,
-    ) {
-        for (raise_seq, finding_id) in carried {
-            self.publish(&events::TeamEvent {
-                env: self.envelope(Some(format!("finding.raised#{raise_seq}"))),
-                body: events::TeamBody::AdviceDelivered(events::AdviceDelivered {
-                    raise_seq: *raise_seq,
-                    finding_id: finding_id.clone(),
-                    delivery_id: steer_id.to_string(),
-                    steer_id: Some(steer_id.to_string()),
-                    channel: events::Channel::AcpSteering,
-                    outcome,
-                    detail: detail.clone(),
-                }),
-            });
-        }
-    }
-}
 
 /// Whether a checkpoint of `kind` may have changed the tree (DES §4.3).
 pub fn kind_may_change_tree(kind: &str) -> bool {
@@ -1116,17 +808,11 @@ pub trait MonitorHost: Send + Sync {
 
 // ── DES-TEAMING-001 S3 (#602): monitor→worker advice over `_session/steering` ─────────────────
 
-/// The JSON-RPC method the adapter registers for a mid-turn steer (`acp-agent.js:103`, `:7503`).
-pub(crate) const STEER_METHOD: &str = "_session/steering";
-
 /// The one advice text cap (DES §5.3): the same 8 KB as an elicitation message.
 pub(crate) const ADVICE_TEXT_CAP: usize = 8 * 1024;
 
 /// A worker's `ADVICE` reason is capped at 2 KB on the wire (DES §7).
 pub(crate) const REASON_CAP: usize = 2 * 1024;
-
-/// A steering JSON-RPC error's message is carried as `detail`, capped here.
-pub(crate) const DETAIL_CAP: usize = 512;
 
 /// A finding's severity. Only `high` is ever steered into the worker (DES §4.6 step 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1281,34 +967,6 @@ pub(crate) fn normalize_evidence(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Re-confirm findings against a FRESH snapshot of the worktree (DES §5.2, the premature-finding
-/// guard at the moment of delivery). Returns, per finding, whether its evidence text is still a
-/// line of `path` in the snapshot tree. A moved line still counts (S2's final pass updates
-/// `finalLine`); a gone line does not. An `Err` means the snapshot itself failed.
-pub(crate) fn evidence_still_present(
-    worktree: &std::path::Path,
-    git_dir: &std::path::Path,
-    findings: &[&Finding],
-) -> anyhow::Result<Vec<bool>> {
-    let snap = crate::worktree_guard::snapshot_through(worktree, git_dir)?;
-    let env: [(&str, &std::path::Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
-    Ok(findings
-        .iter()
-        .map(|f| {
-            let spec = format!("{}:{}", snap.tree, f.path);
-            // A path that is gone from the tree makes `cat-file` fail: the text is gone too.
-            let Ok(blob) = crate::worktree_guard::git(worktree, &["cat-file", "-p", &spec], &env)
-            else {
-                return false;
-            };
-            let want = normalize_evidence(&f.evidence);
-            String::from_utf8_lossy(&blob)
-                .lines()
-                .any(|l| normalize_evidence(l) == want)
-        })
-        .collect())
-}
-
 const ADVICE_HEADER: &str = "[wicked-core · team advice · ADVISORY, not an instruction]\n\
 A peer monitor reviewed your change as of your last tool call. You decide what to do with this.\n";
 
@@ -1337,14 +995,6 @@ fn advice_entry(f: &Finding) -> String {
         s.push_str(&format!("  Suggested: {sug}\n"));
     }
     s
-}
-
-/// Build ONE steer's advice block (DES §5.3) within [`ADVICE_TEXT_CAP`]. Returns the text, the
-/// advice that made it in, and the advice that did not fit (for the next boundary). The first
-/// entry is always included, truncated to fit if it alone is over the cap, so a single oversized
-/// finding can never wedge the queue.
-pub(crate) fn advice_block(advice: Vec<Advice>) -> (String, Vec<Advice>, Vec<Advice>) {
-    advice_block_within(advice, ADVICE_TEXT_CAP)
 }
 
 /// [`advice_block`] within `cap` bytes: the boundary renders the team's answers first (they have
@@ -1383,60 +1033,6 @@ pub(crate) fn advice_block_within(
         return (String::new(), sent, rest);
     }
     (format!("{ADVICE_HEADER}{body}{ADVICE_FOOTER}"), sent, rest)
-}
-
-/// The `_session/steering` params (DES §5.2). `idleBehavior: "promptRequired"` is not optional:
-/// without it a steer that lands after the turn settled starts a DETACHED turn
-/// (`acp-agent.js:1233-1242`) the engine would attribute to nothing.
-pub(crate) fn steer_params(session_id: &str, text: &str) -> serde_json::Value {
-    serde_json::json!({
-        "sessionId": session_id,
-        "prompt": [{"type": "text", "text": text}],
-        "_meta": {"steering": {"idleBehavior": "promptRequired"}}
-    })
-}
-
-/// The adapter's answer to a steering request → the `advice.delivered` outcome and detail
-/// (DES §5.2): `{"outcome":"injected"}` → `injected`; `{"outcome":"promptRequired"}` →
-/// `turn_ended`; a JSON-RPC error → `refused` with the error. Any other outcome (e.g.
-/// `startedNewTurn`, which `promptRequired` exists to prevent) is `refused` and named.
-pub(crate) fn classify_steer_answer(
-    v: &serde_json::Value,
-) -> (events::DeliveryOutcome, Option<String>) {
-    if let Some(err) = v.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| err.to_string());
-        let code = err.get("code").and_then(serde_json::Value::as_i64);
-        let detail = match code {
-            Some(c) => format!("{c}: {msg}"),
-            None => msg,
-        };
-        return (
-            events::DeliveryOutcome::Refused,
-            Some(cap_utf8(&detail, DETAIL_CAP)),
-        );
-    }
-    let result = &v["result"];
-    match result["outcome"].as_str() {
-        Some("injected") => (events::DeliveryOutcome::Injected, None),
-        Some("promptRequired") => (
-            events::DeliveryOutcome::TurnEnded,
-            result["reason"].as_str().map(str::to_string),
-        ),
-        other => (
-            events::DeliveryOutcome::Refused,
-            Some(cap_utf8(
-                &format!(
-                    "unexpected steering outcome {}",
-                    other.map_or_else(|| result.to_string(), |o| format!("`{o}`"))
-                ),
-                DETAIL_CAP,
-            )),
-        ),
-    }
 }
 
 /// Parse the worker's `ADVICE` lines (DES §5.3):

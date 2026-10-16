@@ -487,60 +487,6 @@ fn finding_line(severity: &str, path: &str, line: u32, evidence: &str, claim: &s
 
 // ── (a) DES-001 S2 #1: checkpoints at terminal tool calls, never per token ──────────────────────
 
-/// DES-001 #1 on rows: a CLAIMED attempt's `tool_call` (kind `edit`) then its terminal
-/// `tool_call_update` yields exactly ONE `checkpoint.reached` carrying the kind, title and paths
-/// the earlier frame named; an unclaimed attempt (no `step.claimed` on the bus) yields none.
-#[test]
-fn t6_a1_a_claimed_turn_checkpoints_once_per_terminal_tool_call() {
-    let rig = rig("t6a1");
-    let runner = super::super::runner::TeamRunner::from_config(&TeamConfig::new(
-        Some(rig.bus.clone()),
-        Some(rig.outbox.clone()),
-    ))
-    .unwrap();
-    let claim = Some(super::super::TurnClaim {
-        runner,
-        claimed_id: 7,
-        by: "claude#1".into(),
-    });
-    let frame = |u: Value| json!({"method": "session/update", "params": {"update": u}});
-    let frames = [
-        frame(json!({"sessionUpdate": "agent_message_chunk", "content": {"text": "Let me"}})),
-        frame(
-            json!({"sessionUpdate": "tool_call", "toolCallId": "toolu_1", "kind": "edit",
-            "title": "Edit src/retire.ts", "locations": [{"path": "/wt/src/retire.ts"}]}),
-        ),
-        frame(
-            json!({"sessionUpdate": "tool_call_update", "toolCallId": "toolu_1",
-            "status": "in_progress"}),
-        ),
-        frame(
-            json!({"sessionUpdate": "tool_call_update", "toolCallId": "toolu_1",
-            "status": "completed"}),
-        ),
-    ];
-    let teamed =
-        super::super::TeamTurn::new((RUN.into(), 3, 1), claim, None, Some(PathBuf::from("/wt")));
-    let out: Vec<TeamEvent> = frames.iter().filter_map(|f| teamed.observe(f)).collect();
-    assert_eq!(out.len(), 1, "{out:?}");
-    let TeamBody::CheckpointReached(b) = &out[0].body else {
-        panic!("{out:?}")
-    };
-    assert_eq!(
-        (b.seq, b.kind.as_str(), b.title.as_str(), b.paths.clone()),
-        (
-            1,
-            "edit",
-            "Edit src/retire.ts",
-            vec!["src/retire.ts".to_string()]
-        )
-    );
-    assert_eq!(b.status, tev::CheckpointStatus::Completed);
-    assert_eq!((out[0].env.ord, out[0].env.attempt), (Some(3), Some(1)));
-    let unclaimed = super::super::TeamTurn::new((RUN.into(), 3, 1), None, None, None);
-    assert!(frames.iter().all(|f| unclaimed.observe(f).is_none()));
-}
-
 // ── (a) DES-001 S2 #2: batching ──────────────────────────────────────────────────────────────────
 
 /// DES-001 #2 on rows: 30 tree-changing checkpoints inside the interval with one tree change make

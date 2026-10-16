@@ -107,11 +107,6 @@ impl TeamRunner {
         })
     }
 
-    /// The one publish wrapper this runner writes through.
-    pub fn bus(&self) -> &TeamBus {
-        &self.bus
-    }
-
     /// Every `wicked.team.*` row of `run_id` after `after`, in `event_id` order. Rows of the run
     /// that do not parse are counted, never applied (`malformed`).
     pub fn read_run(&self, run_id: &str, after: i64) -> anyhow::Result<RunStream> {

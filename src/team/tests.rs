@@ -8,26 +8,6 @@ use super::*;
 const A: &str = "f-3fa9c2e1d0b4a7e6";
 const B: &str = "f-0123456789abcdef";
 
-fn f(id: &str, severity: Severity) -> Finding {
-    Finding {
-        finding_id: id.to_string(),
-        monitor_id: "m1".to_string(),
-        seat: "claude#2".to_string(),
-        severity,
-        path: "src/retire.ts".to_string(),
-        line: 41,
-        evidence: "fetchCoverage(scope).then(setCount)".to_string(),
-        claim: "no cancellation".to_string(),
-        suggestion: None,
-        tree: "t".to_string(),
-        in_diff: true,
-        checkpoint_seq: 1,
-        anchor: String::new(),
-        carried_from_attempt: None,
-        target: Default::default(),
-    }
-}
-
 /// #602 acceptance 5 (parsing half): DECLINE and ACCEPT lines with their reasons, every separator
 /// the DES grammar allows, the last line per id wins, and non-matching lines are ignored.
 #[test]
@@ -69,69 +49,6 @@ fn a_reason_is_capped_at_2kb_on_a_char_boundary() {
     let p = parse_advice_lines(&format!("ADVICE {A}: DECLINE — {long}"));
     assert!(p[A].reason.len() <= REASON_CAP);
     assert!(p[A].reason.chars().all(|c| c == 'é'));
-}
-
-#[test]
-fn the_steer_answer_is_classified_as_the_des_says() {
-    use serde_json::json;
-    assert_eq!(
-        classify_steer_answer(&json!({"id":5,"result":{"outcome":"injected"}})),
-        (events::DeliveryOutcome::Injected, None)
-    );
-    assert_eq!(
-        classify_steer_answer(
-            &json!({"id":5,"result":{"outcome":"promptRequired","reason":"noRunningTurn"}})
-        ),
-        (
-            events::DeliveryOutcome::TurnEnded,
-            Some("noRunningTurn".to_string())
-        )
-    );
-    let (o, d) = classify_steer_answer(
-        &json!({"id":5,"error":{"code":-32602,"message":"Invalid params: unsupported steering idleBehavior"}}),
-    );
-    assert_eq!(o, events::DeliveryOutcome::Refused);
-    assert_eq!(
-        d.as_deref(),
-        Some("-32602: Invalid params: unsupported steering idleBehavior")
-    );
-    // A detached turn is exactly what promptRequired prevents: never read as delivered.
-    let (o, d) = classify_steer_answer(&json!({"id":5,"result":{"outcome":"startedNewTurn"}}));
-    assert_eq!(o, events::DeliveryOutcome::Refused);
-    assert!(d.unwrap().contains("startedNewTurn"));
-}
-
-#[test]
-fn the_steer_params_always_carry_prompt_required() {
-    let p = steer_params("sess", "advice");
-    assert_eq!(
-        p,
-        serde_json::json!({"sessionId":"sess","prompt":[{"type":"text","text":"advice"}],
-            "_meta":{"steering":{"idleBehavior":"promptRequired"}}})
-    );
-}
-
-/// One steer stays within 8 KB; what does not fit waits for the next boundary, and a single
-/// oversized finding is truncated rather than wedging the queue.
-#[test]
-fn the_advice_block_is_capped_and_overflow_is_kept() {
-    let mut big = f(A, Severity::High);
-    big.claim = "x".repeat(5000);
-    let mut big2 = f(B, Severity::High);
-    big2.claim = "y".repeat(5000);
-    let (text, sent, rest) = advice_block(vec![Advice { finding: big }, Advice { finding: big2 }]);
-    assert!(text.len() <= ADVICE_TEXT_CAP, "{}", text.len());
-    assert_eq!(sent.len(), 1);
-    assert_eq!(rest.len(), 1);
-    assert_eq!(rest[0].finding.finding_id, B);
-
-    let mut huge = f(A, Severity::High);
-    huge.claim = "z".repeat(20_000);
-    let (text, sent, rest) = advice_block(vec![Advice { finding: huge }]);
-    assert!(text.len() <= ADVICE_TEXT_CAP);
-    assert_eq!(sent.len(), 1);
-    assert!(rest.is_empty());
-    assert!(text.ends_with("The gate reviews each finding together with your answer.\n"));
 }
 
 #[test]
@@ -310,14 +227,4 @@ fn help_answers_and_change_requests_parse() {
     assert_eq!(c.len(), 1);
     assert_eq!(c[0].0[0].catalog, "test_plan");
     assert_eq!(c[0].1, "no tests");
-}
-
-/// A carried finding says so in the advice block (T6 (k)).
-#[test]
-fn a_carried_finding_is_labelled_in_the_advice_block() {
-    let mut c = f(A, Severity::High);
-    c.carried_from_attempt = Some(1);
-    let (text, sent, _) = advice_block(vec![Advice { finding: c }]);
-    assert_eq!(sent.len(), 1);
-    assert!(text.contains("carried_from_attempt:1"), "{text}");
 }

@@ -317,7 +317,8 @@ impl PersistentStepRunner {
         let governed = input.governance.is_some();
         // Container floor: this carrier opens the CLI in a host PTY, outside any seat container,
         // so no governed unit runs here (codex review r2): refused, the failover ladder moves it.
-        if governed && crate::container_floor::container_mode() {
+        // The engine's own judge and triage sessions follow the seat floor too.
+        if crate::execute_wrapped::runs_in_seat(input) && crate::container_floor::container_mode() {
             let cli = input.unit.assigned_cli.as_deref().unwrap_or("claude");
             return crate::execute_wrapped::floor_refused(
                 input,

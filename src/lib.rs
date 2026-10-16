@@ -30,6 +30,8 @@ macro_rules! eprintln {
 mod acp_permission;
 mod acp_runner;
 mod actor;
+pub(crate) mod ask;
+pub use ask::{AskError, AskRequest, AskTicket, AskUnit};
 mod applications;
 pub mod assumptions;
 pub mod assurance;
@@ -194,7 +196,7 @@ pub use code_graph::{
     index_repo, rank_symbols, recon_repo, repo_graph_root_for_store, RankedSymbol,
 };
 pub use command::InjectTarget;
-pub use container_floor::seat_image_main;
+pub use container_floor::{default_seat_floor, seat_image_main};
 pub use decision::{DecisionRequest, DecisionVerdict};
 pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
 pub use domain::{
@@ -439,11 +441,14 @@ pub fn host_boundary() -> serde_json::Value {
 /// (core#769, crew Agents page A5) The engine's worktree bench as a pure predicate: the seats a run
 /// BOUND to one repository benches before routing, with the reason that run would persist on
 /// [`AgentSession::benched_seats`] (source `launcher`). Today that is every codex seat, unless the
-/// host sets `WICKED_CODEX_WORKTREE_OK` (read at call time, as the launch reads it). An unbound run
-/// benches none. Exported so a consumer (crew's roster) can say a seat will be benched on repository
+/// host sets `WICKED_CODEX_WORKTREE_OK` or the seat floor is the container floor
+/// (`WICKED_SEAT_FLOOR=container`; both read at call time, as the launch reads them). An unbound
+/// run benches none. Exported so a consumer (crew's roster) can say a seat will be benched on repository
 /// work without restating the rule.
 pub fn worktree_benched(clis: &[AgenticCli], bound: bool) -> Vec<BenchedSeat> {
-    crate::distribute::worktree_benched(clis, bound)
+    // A consumer's question is about a daemon on its file-backed store (crew's), whose governed
+    // units are armed in seat containers under the container floor.
+    crate::distribute::worktree_benched(clis, bound, true)
 }
 
 /// (crew Agents page A4) Whether this host's skill routing admits `key` (with its roster
@@ -1077,6 +1082,43 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
         rx.recv()
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Open an operator question for a still-bound unit on a nonterminal run, through the actor.
+    pub fn open_ask(&self, token: &str, request: AskRequest) -> Result<AskTicket, AskError> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::OpenAsk {
+                unit: token.into(),
+                request,
+                reply,
+            })
+            .map_err(|_| AskError::RunEnded("core actor stopped".into()))?;
+        rx.recv()
+            .map_err(|_| AskError::RunEnded("core actor dropped the reply".into()))?
+    }
+
+    /// The unit `token` is bound to, as JSON (`invalid_token: …` otherwise); records nothing.
+    pub fn ask_unit_json(&self, token: &str) -> Result<String, String> {
+        ask::ask_unit_json(token)
+    }
+
+    /// JSON face for the napi binding. The capability is never inferred from caller identity.
+    pub fn open_ask_json(&self, request_json: &str) -> Result<String, String> {
+        ask::open_ask_json(self, request_json)
+    }
+
+    /// Close a question once; a concurrent human resolution wins if it removed the ticket first.
+    pub fn close_ask(&self, elicitation_id: &str, reason: &str) -> bool {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::CloseAsk {
+                id: elicitation_id.into(),
+                reason: reason.into(),
+                reply,
+            })
+            .is_ok()
+            && rx.recv().unwrap_or(false)
     }
 
     /// Resolve a pending ACP elicitation for `run_id`. The `action` must be one of `"accept"`,
