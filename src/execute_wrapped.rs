@@ -3816,7 +3816,9 @@ fn host_floor_keeps_a_check(argv: &[String]) -> bool {
 
 /// (C5) The SEAT-level half of the host-floor rule, read by routing's launch bench
 /// ([`crate::distribute::launch_benched`]) so a seat the executor would refuse on the interim host
-/// floor is never routed a unit, failed over to, or seated as a judge or triage. It judges the argv
+/// floor is never routed a governed unit, reassigned one or failed over to (it still judges,
+/// triages and votes: those calls are ungoverned, [`crate::domain::BenchedSeat::governed_only`]).
+/// It judges the argv
 /// `exec` builds for the seat before any phase lever — the launch template ([`launch_invocation`]:
 /// the roster's template for the key, else the registry's), plus, for a non-claude binary, the
 /// seat's resolved posture ([`resolve_seat_posture`]) — with the SAME predicate the executor

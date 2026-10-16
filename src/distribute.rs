@@ -3588,6 +3588,18 @@ mod worktree_bench_tests {
         let wire = serde_json::to_value(&bound).unwrap();
         assert_eq!(wire[0]["governed_only"], serde_json::json!(true));
         assert!(wire[4].get("governed_only").is_none(), "{wire}");
+        // A codex seat both rules name (a template that turns its sandbox off): the worktree bench,
+        // which binds every call, wins over the governed-only host-floor bench.
+        let mut loose = record("codex");
+        loose.headless_invocation = "codex --yolo exec {PROMPT}".into();
+        let both = launch_benched(std::slice::from_ref(&loose), true, true);
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].reason, CODEX_WORKTREE_BENCH);
+        assert!(!both[0].governed_only);
+        assert_eq!(
+            launch_benched(std::slice::from_ref(&loose), false, true)[0].reason,
+            HOST_FLOOR_BENCH
+        );
         // Units that are not armed are not refused by the executor: no host-floor bench.
         assert!(launch_benched(&clis, false, false).is_empty());
         assert_eq!(keys_of(&launch_benched(&clis, true, false)), vec!["codex"]);

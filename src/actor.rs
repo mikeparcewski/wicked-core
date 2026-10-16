@@ -27328,7 +27328,15 @@ mod council_ballot_tests {
         };
         assert_eq!(keys(&run), vec!["claude", "codex", "pi"]);
         // …while a bench that binds every call (a quota refusal) keeps pi out.
-        run.benched_seats[0].governed_only = false;
+        assert!(crate::domain::bench_seat(
+            &mut run.benched_seats,
+            crate::domain::BenchedSeat {
+                cli: "pi".into(),
+                reason: "quota_exhausted".into(),
+                source: "ballot".into(),
+                governed_only: false,
+            }
+        ));
         assert_eq!(keys(&run), vec!["claude", "codex"]);
         for (k, v) in names.iter().zip(prev) {
             match v {

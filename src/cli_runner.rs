@@ -778,7 +778,8 @@ fn worktree_evidence_for_judge(workdir: &std::path::Path) -> Option<String> {
 /// the registry seats the launcher actually configured for this run (review of #449, RT-1), not
 /// from every registry record; empty = no intersection (the bus path, tests). `bench` — the
 /// run's BENCHED seats with their reasons (`AgentSession::benched_seats`, F-7R2-006): never a
-/// judge, and named in a fallback judge's disclosure (operator ruling 2026-10-14). `work_authors` —
+/// judge — except a seat benched for governed work only (`BenchedSeat::governed_only`, C5: the
+/// judge is ungoverned), which this drops first — and named in a fallback judge's disclosure (operator ruling 2026-10-14). `work_authors` —
 /// for an evaluator unit, every seat that authored the work its judge reads
 /// ([`crate::pipeline::work_authors`]): never a judge of it; `author_binaries` — the binaries
 /// they ran ([`JudgeFallbackCtx::author_binaries`]).
@@ -7063,6 +7064,17 @@ mod judge_fallback_tests {
     /// claude's fix. The same seat under a bench that binds every call is never asked.
     #[test]
     fn a_host_floor_benched_seat_still_judges_but_is_never_routed_governed_work() {
+        // The fallback ladder resolves seat identities through the registry: no operator file.
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let home = tmp("hostfloor-judge-home");
+        let prev: Vec<_> = ["HOME", "USERPROFILE"]
+            .iter()
+            .map(std::env::var_os)
+            .collect();
+        std::env::set_var("HOME", &home);
+        std::env::set_var("USERPROFILE", &home);
         let dir = tmp("hostfloor-judge");
         let mut input = check_unit(&dir);
         input.unit.assigned_cli = Some("codex".into());
@@ -7101,8 +7113,20 @@ mod judge_fallback_tests {
         assert!(v.judge_fallback.is_none(), "{v:?}");
         assert_eq!(seats.judged(), vec!["opencode".to_string()]);
 
+        // The seat then refuses as a judge: that bench binds every call and REPLACES the host-floor
+        // one (`bench_seat`), so the seat is never asked again.
         let mut every_call = host_floor.clone();
-        every_call[0].governed_only = false;
+        assert!(crate::domain::bench_seat(
+            &mut every_call,
+            crate::domain::BenchedSeat {
+                cli: "opencode".into(),
+                reason: "not_logged_in".into(),
+                source: "judge".into(),
+                governed_only: false,
+            }
+        ));
+        assert_eq!(every_call.len(), 1);
+        assert!(!every_call[0].governed_only);
         let seats = Seats::new(vec![]);
         let runner: Arc<dyn StepRunner> = seats.clone();
         let (_, v, _) = run_unit_and_judge_with_fallback(
@@ -7119,6 +7143,13 @@ mod judge_fallback_tests {
         assert_ne!(v.judge_cli.as_deref(), Some("opencode"), "{v:?}");
         assert!(!seats.judged().contains(&"opencode".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+        for (k, v) in ["HOME", "USERPROFILE"].iter().zip(prev) {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 
     /// No distinct eligible fallback seat: today's hold, unchanged. agy benched (signed out) and
