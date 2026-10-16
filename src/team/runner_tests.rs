@@ -830,7 +830,9 @@ fn bus_judge_by(
     let (seen, stop, h) = eval_daemon(&rig.bus, judge_cli);
     let worker = Seat::new(|_| {});
     let r: Arc<dyn StepRunner> = worker.clone();
-    let tr = runner(rig);
+    // core#978: the request's `excluded_seats` come from S's folded ledger, so the fold must land
+    // inside the budget; on a slow Windows runner 400 ms did not (the ledger was synthesized empty).
+    let tr = patient_runner(rig);
     let mut i = judged_input(run, floor, &wd);
     i.unit.assigned_cli = author.map(str::to_string);
     let (_, verdict, _) =
