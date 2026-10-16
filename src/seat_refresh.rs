@@ -1286,6 +1286,10 @@ mod tests {
     /// its Copilot GitHub token does not expire, and an inactive row is never touched.
     #[test]
     fn opencode_refreshes_its_active_chatgpt_row_by_codexs_flow() {
+        // The flows' URLs read the live tests' stub override: wait out any live test.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let export = json!([
             {"id": "old", "integrationID": "openai", "label": "OAuth", "active": false,
                 "value": {"type": "oauth", "methodID": "chatgpt-headless", "refresh": "FAKE-old-r",
