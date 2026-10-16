@@ -997,6 +997,14 @@ fi
 if [ -n "$changed" ]; then
   curl -sS -f -o /dev/null -u "$srv_au" -X POST "$srv_url/api/location/reload" || refuse "reload"
 fi
+# Verify, never assume: every row this unit needs is present and active now (activating a row
+# another unit removed meanwhile still answers success).
+if [ -n "$keep" ]; then
+  listed=$(curl -sS -f -u "$srv_au" "$srv_url/api/credential") || refuse "verify"
+  for id in $keep; do
+    printf '%s' "$listed" | grep -q "\"id\":\"$id\",[^}]*\"active\":true" || refuse "row $id missing or inactive"
+  done
+fi
 case "${WICKED_OPENCODE_ASK:-}" in *__WICKED_MCP_TOKEN__*)
   au="opencode:${OPENCODE_SERVER_PASSWORD:-$OPENCODE_PASSWORD}"
   slot=__WICKED_MCP_TOKEN__
@@ -1199,40 +1207,65 @@ pub(crate) fn plan_seat_floor(launch: SeatLaunch<'_>, write_roots: Vec<PathBuf>)
 pub(crate) mod tests {
 
     /// DES-SEAT-LOGIN-SUBSCRIPTIONS decision 7: before the run, the pinned script reconciles the
-    /// engine's credential rows through the server's API: it removes engine rows the unit's file
-    /// does not name (never another label's), imports and activates the file's rows, and rebuilds
-    /// the server's locations; any failure refuses the run; with nothing to place or remove it
-    /// sends no mutation at all.
+    /// engine's credential rows through the server's API against a stateful fake server: it
+    /// removes engine rows the unit's file does not name (never another row), imports and
+    /// activates the file's rows, rebuilds the locations, and verifies every needed row is present
+    /// and active. A failure at ANY step, or a row another unit removed meanwhile, refuses the run.
     #[cfg(unix)]
     #[test]
     fn the_pinned_opencode_script_reconciles_the_sign_in_rows_before_the_run() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("wicked-oc-rows-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir =
+            std::env::temp_dir().join(format!("wicked-oc-rows-{}", uuid::Uuid::new_v4().simple()));
         let bin = dir.join("bin");
         let unit = dir.join("home/opencode/.wicked-units/u1");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&unit).unwrap();
-        let log = dir.join("log");
-        let write = |p: std::path::PathBuf, body: String| {
+        let write = |p: std::path::PathBuf, body: &str| {
             std::fs::write(&p, body).unwrap();
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         };
+        // The fake server's credential table: one `<id> <label-kind> <active>` line per row.
+        let state = dir.join("state");
+        let log = dir.join("log");
         write(
             bin.join("opencode"),
-            format!(
-                "#!/bin/sh\nif [ \"$1\" = serve ]; then exec sleep 30; fi\necho \"oc $*\" >> {}\n",
-                log.display()
-            ),
+            r#"#!/bin/sh
+if [ "$1" = serve ]; then exec sleep 30; fi
+echo "oc $*" >> "$T/log"
+if [ "$1 $2" = "auth import" ]; then
+  [ "$FAIL_AT" = import ] && exit 1
+  for id in $(grep -o '"id":"[^"]*"' "$5" | sed 's/^"id":"//; s/"$//'); do
+    grep -q "^$id " "$T/state" || echo "$id engine false" >> "$T/state"
+  done
+fi
+"#,
         );
-        // The server's credential list: a stale engine row, a current one, a foreign row.
         write(
             bin.join("curl"),
-            format!(
-                "#!/bin/sh\nl={log}\ncase \"$*\" in\n  *'-X '*) echo \"curl $*\" >> $l; [ -e {fail} ] && exit 22; exit 0;;\n  */api/credential) printf '%s' '{{\"data\":[{{\"id\":\"wicked-seat-openai-0ld0ld00\",\"label\":\"wicked seat\"}},{{\"id\":\"wicked-seat-openai-11112222\",\"label\":\"wicked seat\"}},{{\"id\":\"user-row\",\"label\":\"API key\"}}]}}';;\n  *) exit 0;;\nesac\n",
-                log = log.display(),
-                fail = dir.join("fail").display()
-            ),
+            r#"#!/bin/sh
+for a do url=$a; done
+case "$*" in
+  *'-X DELETE'*) echo "curl DELETE ${url##*/}" >> "$T/log"; [ "$FAIL_AT" = remove ] && exit 22
+    grep -v "^${url##*/} " "$T/state" > "$T/s.new"; mv "$T/s.new" "$T/state";;
+  *'/activate') id=${url%/activate}; id=${id##*/}; echo "curl ACTIVATE $id" >> "$T/log"
+    [ "$FAIL_AT" = activate ] && exit 22
+    sed "s/^$id \(.*\) false$/$id \1 true/" "$T/state" > "$T/s.new"; mv "$T/s.new" "$T/state"
+    # Another unit removes the row right after (activate still answers success).
+    [ "$FAIL_AT" = vanish ] && { grep -v "^$id " "$T/state" > "$T/s.new"; mv "$T/s.new" "$T/state"; }; exit 0;;
+  *'/api/location/reload') echo "curl RELOAD" >> "$T/log"; [ "$FAIL_AT" = reload ] && exit 22; exit 0;;
+  *'/api/credential') n=$(cat "$T/lists" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > "$T/lists"
+    [ "$FAIL_AT" = list ] && [ $n -eq 1 ] && exit 22
+    [ "$FAIL_AT" = verify ] && [ $n -eq 2 ] && exit 22
+    printf '{"data":['; sep=""
+    while read -r id kind active; do
+      label="wicked seat"; [ "$kind" = engine ] || label="API key"
+      printf '%s{"id":"%s","integrationID":"x","label":"%s","active":%s,"value":{"type":"key","key":"P"}}' "$sep" "$id" "$label" "$active"; sep=,
+    done < "$T/state"
+    printf ']}';;
+  *) exit 0;;
+esac
+"#,
         );
         std::fs::write(unit.join("opencode.json"), "{}").unwrap();
         let rows = unit.join(crate::seat_credentials::OPENCODE_IMPORT_FILE);
@@ -1245,15 +1278,22 @@ pub(crate) mod tests {
             .map(String::from)
             .to_vec();
         let pinned = opencode_pinned_server_argv(&argv, 4998).unwrap();
-        // No JSON tool is assumed in the seat image.
-        assert!(!pinned[2].contains("jq "));
-        let run = |config: bool| {
+        assert!(
+            !pinned[2].contains("jq "),
+            "no JSON tool is assumed in the seat image"
+        );
+        let initial = "wicked-seat-openai-0ld0ld00 engine true\nwicked-seat-openai-11112222 engine false\nuser-row foreign true\n";
+        let run = |config: bool, fail: &str| {
+            std::fs::write(&state, initial).unwrap();
             let _ = std::fs::remove_file(&log);
-            // spawn-audit: test-only — the engine's pinned script with fake opencode and curl.
+            let _ = std::fs::remove_file(dir.join("lists"));
+            // spawn-audit: test-only — the engine's pinned script with a fake opencode and server.
             let mut cmd = std::process::Command::new(&pinned[0]);
             cmd.args(&pinned[1..])
                 .current_dir(&dir)
                 .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("T", &dir)
+                .env("FAIL_AT", fail)
                 .env("OPENCODE_SERVER_PASSWORD", "nonce-not-a-secret")
                 .env_remove("WICKED_OPENCODE_ASK");
             if config {
@@ -1262,56 +1302,52 @@ pub(crate) mod tests {
                 cmd.env_remove("OPENCODE_CONFIG");
             }
             let out = cmd.output().unwrap();
-            (out, std::fs::read_to_string(&log).unwrap_or_default())
+            (
+                out,
+                std::fs::read_to_string(&log).unwrap_or_default(),
+                std::fs::read_to_string(&state).unwrap(),
+            )
         };
-        let (out, log_text) = run(true);
-        assert!(out.status.success(), "{out:?}");
-        let lines: Vec<&str> = log_text.lines().collect();
-        let server = "http://127.0.0.1:4998";
-        assert!(
-            lines[0].contains(&format!(
-                "-X DELETE {server}/api/credential/wicked-seat-openai-0ld0ld00"
-            )),
-            "{log_text}"
-        );
-        assert!(
-            !log_text.contains("user-row"),
-            "another label's row is never touched"
-        );
-        assert!(
-            !log_text.contains("/api/credential/wicked-seat-openai-11112222 "),
-            "a current row is never removed: {log_text}"
-        );
+        let (out, log_text, table) = run(true, "");
+        assert!(out.status.success(), "{out:?} {log_text}");
         assert_eq!(
-            lines[1],
-            format!("oc auth import --server {server} {}", rows.display())
+            table,
+            "wicked-seat-openai-11112222 engine true\nuser-row foreign true\nwicked-seat-github-copilot-33334444 engine true\n",
+            "the stale engine row is gone, the unit's rows are present and active, another row untouched"
         );
-        assert!(lines[2].contains(&format!(
-            "-X POST {server}/api/credential/wicked-seat-openai-11112222/activate"
-        )));
-        assert!(lines[3].contains(&format!(
-            "-X POST {server}/api/credential/wicked-seat-github-copilot-33334444/activate"
-        )));
-        assert!(lines[4].contains(&format!("-X POST {server}/api/location/reload")));
+        let order: Vec<&str> = log_text.lines().collect();
+        assert_eq!(order[0], "curl DELETE wicked-seat-openai-0ld0ld00");
+        assert!(order[1].starts_with("oc auth import --server http://127.0.0.1:4998 "));
+        assert_eq!(order[2], "curl ACTIVATE wicked-seat-openai-11112222");
+        assert_eq!(
+            order[3],
+            "curl ACTIVATE wicked-seat-github-copilot-33334444"
+        );
+        assert_eq!(order[4], "curl RELOAD");
         assert!(
-            lines[5].starts_with(&format!("oc run --server {server}")),
+            order[5].starts_with("oc run --server http://127.0.0.1:4998"),
             "{log_text}"
         );
-        // A failed step refuses the run.
-        std::fs::write(dir.join("fail"), "").unwrap();
-        let (out, log_text) = run(true);
-        assert!(!out.status.success());
-        assert!(String::from_utf8_lossy(&out.stderr).contains("could not be reconciled"));
-        assert!(!log_text.contains("oc run "), "{log_text}");
-        std::fs::remove_file(dir.join("fail")).unwrap();
-        // No unit file: engine rows are removed (a key-only seat), nothing is imported.
-        let (out, log_text) = run(false);
+        // A failure at any step, or a row removed under the unit, refuses the run.
+        for fail in [
+            "list", "remove", "import", "activate", "reload", "verify", "vanish",
+        ] {
+            let (out, log_text, _) = run(true, fail);
+            assert!(!out.status.success(), "{fail}: {log_text}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("could not be reconciled"),
+                "{fail}"
+            );
+            assert!(!log_text.contains("oc run "), "{fail}: {log_text}");
+        }
+        // No unit file (a key-only seat): engine rows are removed, nothing is imported.
+        let (out, log_text, table) = run(false, "");
         assert!(out.status.success(), "{out:?}");
+        assert_eq!(table, "user-row foreign true\n");
         assert!(
-            log_text.contains("DELETE") && !log_text.contains("auth import"),
+            !log_text.contains("auth import") && log_text.contains("RELOAD"),
             "{log_text}"
         );
-        assert!(log_text.contains("/api/location/reload"), "{log_text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
