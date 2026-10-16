@@ -3823,6 +3823,10 @@ fn host_floor_keeps_a_check(argv: &[String]) -> bool {
 /// applies to the final argv ([`host_floor_keeps_a_check`]). The phase levers `exec` adds after
 /// this point only bound codex further (`--sandbox read-only`, a scratch-rooted
 /// `workspace-write`), never unbound it, so a seat this says yes to is not refused by the executor.
+/// The converse is deliberately conservative: a codex seat whose own template and posture are
+/// unbounded is benched, although the read-only lever would bound it for a no-code unit — the
+/// bench is per seat, not per unit (no shipped record is such a seat: the builtin posture is
+/// bounded, and [`bound_ungated_posture`] caps an override).
 pub(crate) fn seat_keeps_host_floor_check(
     cli_key: &str,
     assigned_invocation: Option<String>,

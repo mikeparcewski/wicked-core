@@ -164,7 +164,7 @@ pub(crate) struct PreDistributed {
     pub session_id: String,
     pub session: AgentSession,
     pub units: Vec<crate::domain::WorkUnit>,
-    /// The launch roster — needed by `distribute_units_on` to convene the council.
+    /// The launch roster — needed by `distribute_units_on_benched` to convene the council.
     pub clis: Vec<AgenticCli>,
     pub workflow_id: String,
     pub cli_keys: Vec<String>,
@@ -356,7 +356,7 @@ pub(crate) fn workflow_overlay_dir() -> Option<std::path::PathBuf> {
 /// Emits `SessionStarted` (when `!session_already_started`) + `UnitPlanned×n`. Leaves the session
 /// at `Distributing`. Store-writing — runs on the actor (single-writer) thread.
 ///
-/// The caller spawns a thread, calls `distribute::distribute_units_on(&pre.units, &pre.clis, ...)`
+/// The caller spawns a thread, calls `distribute::distribute_units_on_benched(&pre.units, &pre.clis, ...)`
 /// there, then posts `Command::PlanReady` (or `PlanFailed`) back to the actor. The actor arm calls
 /// [`apply_distributions`] to finish the setup and dispatch unit 0.
 #[allow(clippy::too_many_arguments)]
@@ -497,7 +497,13 @@ pub(crate) fn pre_distribute(
         if let Ok(Some(existing)) = crate::domain::get_session(&*store, session_id) {
             session.run_branch = existing.run_branch;
             session.base_commit = existing.base_commit;
-            session.benched_seats = existing.benched_seats;
+            // The launch bench computed above (the floor in force NOW) is folded in, the
+            // recorded reason winning for a seat both name.
+            let launch_bench =
+                std::mem::replace(&mut session.benched_seats, existing.benched_seats);
+            for seat in launch_bench {
+                crate::domain::bench_seat(&mut session.benched_seats, seat);
+            }
             // (EP-K3) The launch's judge exclusion is the run's, recorded on the stub.
             session.exclude_seats = existing.exclude_seats;
             // (WT-C2) …and so is its evidence root.
@@ -857,7 +863,7 @@ pub(crate) fn apply_distributions(
 
 /// PLAN + DISTRIBUTE (used by the sync operator CLI + tests): the full sequential path — plan,
 /// persist, distribute (deterministic, core#590 S5), apply assignments. For the interactive actor engine the
-/// call is split: [`pre_distribute`] on the actor thread + `distribute_units_on` off-thread +
+/// call is split: [`pre_distribute`] on the actor thread + `distribute_units_on_benched` off-thread +
 /// [`apply_distributions`] back on the actor thread via `Command::PlanReady`.
 ///
 /// `workflow_registry`: when `Some`, the actor-owned runtime registry is consulted first for
@@ -925,10 +931,13 @@ pub(crate) fn plan_and_distribute(
         reduced_assurance,
         qe_acceptance,
     )?;
-    let distributions = distribute::distribute_units_on(
+    // The run's launch bench (`distribute::launch_benched`, persisted on the session) is honoured
+    // here as on the actor's launch route: a seat it benched is never routed a unit.
+    let distributions = distribute::distribute_units_on_benched(
         &pre.units,
         clis,
         session_id,
+        &pre.session.benched_seats,
         !pre.session
             .assurance
             .enforces(crate::assurance::DISTINCT_EVALUATOR),

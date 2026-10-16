@@ -428,7 +428,7 @@ pub(crate) enum Command {
         pin: String,
         reply: std::sync::mpsc::Sender<anyhow::Result<String>>,
     },
-    /// Distribution complete — the distribute worker thread finished `distribute_units_on`
+    /// Distribution complete — the distribute worker thread finished `distribute_units_on_benched`
     /// successfully. The actor arm calls `pipeline::apply_distributions` to write assignments to the
     /// store and dispatch unit 0. Sent by the off-actor distribute thread; processed on actor thread.
     PlanReady {

@@ -189,19 +189,10 @@ fn teamed_distribution(candidates: &[AgenticCli]) -> Distribution {
     }
 }
 
-/// Route every unit to a seat (deterministic — no council; see the module docs).
-pub fn distribute_units_on(
-    units: &[WorkUnit],
-    clis: &[AgenticCli],
-    session_id: &str,
-    allow_same_seat: bool,
-) -> anyhow::Result<Vec<Distribution>> {
-    distribute_units_on_benched(units, clis, session_id, &[], allow_same_seat)
-}
-
-/// [`distribute_units_on`] for a run that already BENCHED seats (F-7R2-006): `prior_benched` —
-/// the session's persisted bench set (a resume, a re-plan) — is honoured beside the roster's
-/// own health verdicts; a benched seat is never routed to.
+/// Route every unit to a seat (deterministic — no council; see the module docs), for a run that
+/// may already have BENCHED seats (F-7R2-006): `prior_benched` — the session's persisted bench set
+/// (its launch bench, a resume, a re-plan) — is honoured beside the roster's own health verdicts;
+/// a benched seat is never routed to.
 pub fn distribute_units_on_benched(
     units: &[WorkUnit],
     clis: &[AgenticCli],
@@ -269,7 +260,7 @@ fn governed_first(unit: &WorkUnit, pool: &[AgenticCli]) -> Vec<AgenticCli> {
 /// narrowed — or `None` when every roster seat is a candidate.
 type Candidates = Option<(Vec<AgenticCli>, String)>;
 
-/// [`distribute_units_on`] against an explicit skills root (`None` ⇒ no seat is constrained), so
+/// [`distribute_units_on_benched`] against an explicit skills root (`None` ⇒ no seat is constrained), so
 /// the routing is testable without the process environment — the same split the admission has
 /// (`resolve_ladder` / `resolve_ladder_in`).
 #[cfg(test)]
@@ -3467,9 +3458,10 @@ mod worktree_bench_tests {
             "{CODEX_WORKTREE_BENCH}"
         );
     }
-    /// A builtin registry record by key (its own template and posture).
+    /// A builtin registry record by key (its own template and posture) — the builtins only, never
+    /// the operator's clis.toml.
     fn record(key: &str) -> AgenticCli {
-        crate::registry_roster()
+        wicked_council::registry::builtin()
             .into_iter()
             .find(|c| c.key == key)
             .unwrap_or_else(|| panic!("a builtin `{key}` seat"))
