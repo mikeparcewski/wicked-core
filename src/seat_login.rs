@@ -43,6 +43,13 @@ fn login_container(login_volume: &str) -> String {
     login_volume.to_string()
 }
 
+/// opencode's login command: its own `auth login`, then (only if it succeeded) `auth export` of
+/// the credential rows it stored (opencode 2.x keeps them in SQLite, never an `auth.json`) to the
+/// file ingest reads, written whole or not at all (a temporary file renamed into place). A failed
+/// login or export leaves no export and exits nonzero: ingest reports the sign-in missing, and the
+/// user signs in again.
+const OPENCODE_LOGIN: &str = "d=\"$XDG_DATA_HOME/opencode\" && opencode auth login && umask 077 && mkdir -p \"$d\" && { opencode auth export > \"$d/wicked-auth.json.tmp\" && mv \"$d/wicked-auth.json.tmp\" \"$d/wicked-auth.json\" || { rm -f \"$d/wicked-auth.json.tmp\"; exit 1; }; }";
+
 /// Pure argv rendering: no host environment or credentials are forwarded. Callers validate CLI
 /// names before using the returned argv.
 pub(crate) fn login_argv(
@@ -88,7 +95,8 @@ pub(crate) fn login_argv(
     let command: &[&str] = match cli {
         "claude" => &["claude", "auth", "login"],
         "codex" => &["codex", "login", "--device-auth"],
-        "opencode" => &["opencode", "auth", "login"],
+        // The login, then its own export of what it stored, into the same throwaway volume.
+        "opencode" => &["sh", "-c", OPENCODE_LOGIN],
         "pi" => &["pi"], // /login is entered inside the TUI.
         "copilot" => &["copilot", "login"],
         _ => &[],
@@ -119,7 +127,8 @@ fn credential_paths(cli: &str) -> &'static [&'static str] {
         "claude" => &["claude/.credentials.json", "claude/settings.json"],
         "codex" => &["codex/auth.json"],
         "pi" => &["pi/auth.json", "pi/models.json"],
-        "opencode" => &["data/opencode/auth.json", "config/opencode/opencode.json"],
+        // opencode 2.x keeps credentials in its SQLite DB; the login exports them here.
+        "opencode" => &["data/opencode/wicked-auth.json"],
         _ => &[],
     }
 }
@@ -148,7 +157,15 @@ fn broker_files(cli: &str) -> Result<&'static [&'static str], String> {
             "pi.copilot.token",
             "pi.copilot.host",
         ]),
-        "opencode" => Ok(&["opencode.token"]),
+        "opencode" => Ok(&[
+            "opencode.token",
+            "opencode.credentials.json",
+            "opencode.chatgpt.token",
+            "opencode.chatgpt.account",
+            "opencode.copilot.token",
+            "opencode.copilot.host",
+            "opencode.anthropic.key",
+        ]),
         "copilot" => Err("copilot credential path and gateway route are not configured".into()),
         _ => Err("unsupported login CLI".into()),
     }
@@ -270,32 +287,7 @@ pub(crate) fn extract_tokens(
             ])
         }
         "pi" => extract_pi(files),
-        "opencode" => {
-            // Both existing gateway routes target OpenAI. Selecting an arbitrary provider's
-            // first key would silently send it to the wrong upstream. OAuth is a later slice.
-            for path in credential_paths(cli) {
-                let Some(bytes) = input_file(cli, files, path)? else {
-                    continue;
-                };
-                let value = parse_json(cli, bytes)?;
-                let key = if path.ends_with("auth.json") {
-                    let kind = value.pointer("/openai/type").and_then(Value::as_str);
-                    let expected = "api";
-                    if kind.is_some_and(|k| k != expected) {
-                        return Err(format!(
-                            "{cli}: unsupported OpenAI credential type; expected provider key"
-                        ));
-                    }
-                    nonempty(value.pointer("/openai/key"))
-                } else {
-                    nonempty(value.pointer("/provider/openai/options/apiKey"))
-                };
-                if let Some(key) = key {
-                    return Ok(vec![token_file(broker_files(cli)?[0], key)]);
-                }
-            }
-            Err(missing(cli, "OpenAI provider key in auth/config JSON"))
-        }
+        "opencode" => extract_opencode(files),
         _ => Err("unsupported login CLI".into()),
     }
 }
@@ -375,18 +367,20 @@ fn pi_oauth_files(
                 copilot_host_from_token(access, nonempty(value.get(COPILOT_ENDPOINT_FIELD)))?;
             out.push(token_file(route.host_file.unwrap_or_default(), &host));
         }
+        _ => return Err("pi: not a pi subscription".into()),
     }
     Ok(out)
 }
 
-/// A pi entry's expiry in Unix seconds (pi stores milliseconds); `None` when it has none.
+/// A pi or opencode entry's expiry in Unix seconds (both store milliseconds); `None` when it has
+/// none (opencode writes `0` for a credential that does not expire).
 fn pi_entry_expiry(value: &Value) -> Result<Option<u64>, String> {
     match value.get("expires").filter(|v| !v.is_null()) {
         None => Ok(None),
         Some(v) => v
             .as_u64()
-            .map(|ms| Some(ms / 1000))
-            .ok_or_else(|| "pi: invalid credential expiry".into()),
+            .map(|ms| (ms > 0).then_some(ms / 1000))
+            .ok_or_else(|| "invalid credential expiry".into()),
     }
 }
 
@@ -473,8 +467,135 @@ fn extract_pi(files: &[(String, Vec<u8>)]) -> Result<Vec<(String, Vec<u8>)>, Str
     Ok(out)
 }
 
+/// opencode: the active credential of each integration its login exported, onto the route
+/// files that integration's sign-in rides; the whole export is retained when a refreshable
+/// (ChatGPT) sign-in is present.
+fn extract_opencode(files: &[(String, Vec<u8>)]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let cli = "opencode";
+    let bytes = input_file(cli, files, "data/opencode/wicked-auth.json")?
+        .ok_or_else(|| missing(cli, "the login's credential export"))?;
+    let export = parse_json(cli, bytes)?;
+    if !export.is_array() {
+        return Err("opencode: the credential export is not a list".into());
+    }
+    let mut out = Vec::new();
+    let mut retain = false;
+    if let Some(value) = opencode_active(&export, "openai").map(|r| &r["value"]) {
+        match (
+            value.get("type").and_then(Value::as_str),
+            value.get("methodID").and_then(Value::as_str),
+        ) {
+            (Some("key"), _) => {
+                let key = nonempty(value.get("key")).ok_or_else(|| missing(cli, "openai key"))?;
+                out.push(token_file("opencode.token", key));
+            }
+            (Some("oauth"), Some("chatgpt-browser" | "chatgpt-headless")) => {
+                let access = nonempty(value.get("access"))
+                    .ok_or_else(|| missing(cli, "the ChatGPT access token"))?;
+                validate_optional_token(value.get("refresh"))?;
+                pi_entry_expiry(value)?;
+                let account = nonempty(value.pointer("/metadata/accountID"))
+                    .ok_or_else(|| missing(cli, "the ChatGPT accountID"))?;
+                crate::seat_gateway::validate_chatgpt_account(Some(account))?;
+                out.push(token_file("opencode.chatgpt.token", access));
+                out.push(token_file("opencode.chatgpt.account", account));
+                retain = true;
+            }
+            _ => {}
+        }
+    }
+    if let Some(value) = opencode_active(&export, "github-copilot").map(|r| &r["value"]) {
+        if value.get("type").and_then(Value::as_str) == Some("oauth") {
+            if nonempty(value.pointer("/metadata/enterpriseUrl")).is_some() {
+                return Err(
+                    "opencode: GitHub Enterprise Copilot sign-ins are not supported yet".into(),
+                );
+            }
+            // opencode sends the GitHub token itself to the Copilot API (refresh = access).
+            let token = nonempty(value.get("refresh"))
+                .or_else(|| nonempty(value.get("access")))
+                .ok_or_else(|| missing(cli, "the GitHub token"))?;
+            let host = match nonempty(value.pointer("/metadata/apiEndpoint")) {
+                Some(url) => url
+                    .strip_prefix("https://")
+                    .unwrap_or(url)
+                    .trim_end_matches('/')
+                    .to_string(),
+                None => crate::seat_gateway::COPILOT_DEFAULT_HOST.to_string(),
+            };
+            crate::seat_gateway::validate_copilot_host(&host)?;
+            out.push(token_file("opencode.copilot.token", token));
+            out.push(token_file("opencode.copilot.host", &host));
+        }
+    }
+    if let Some(value) = opencode_active(&export, "anthropic").map(|r| &r["value"]) {
+        if value.get("type").and_then(Value::as_str) == Some("key") {
+            let key = nonempty(value.get("key")).ok_or_else(|| missing(cli, "anthropic key"))?;
+            out.push(token_file("opencode.anthropic.key", key));
+        }
+    }
+    if retain {
+        out.push(("opencode.credentials.json".into(), bytes.to_vec()));
+    }
+    if out.is_empty() {
+        let mut why = missing(
+            cli,
+            "a supported sign-in (OpenAI ChatGPT via chatgpt-headless or chatgpt-browser, GitHub \
+             Copilot, or an OpenAI or Anthropic API key)",
+        );
+        let skipped = opencode_skipped(&export);
+        if !skipped.is_empty() {
+            why.push_str(&format!("; not supported yet: {}", skipped.join(", ")));
+        }
+        return Err(why);
+    }
+    Ok(out)
+}
+
+/// opencode's exported sign-ins the broker cannot serve yet, by integration and method only.
+fn opencode_skipped(export: &Value) -> Vec<String> {
+    let Some(rows) = export.as_array() else {
+        return Vec::new();
+    };
+    let mut ids: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.get("integrationID").and_then(Value::as_str))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids.into_iter()
+        .filter_map(|id| {
+            let value = &opencode_active(export, id)?["value"];
+            let kind = value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let method = value.get("methodID").and_then(Value::as_str);
+            let served = matches!(
+                (id, kind, method),
+                ("openai" | "anthropic", "key", _)
+                    | (
+                        "openai",
+                        "oauth",
+                        Some("chatgpt-browser" | "chatgpt-headless")
+                    )
+                    | ("github-copilot", "oauth", _)
+            );
+            (!served).then(|| format!("{id} ({})", method.unwrap_or(kind)))
+        })
+        .collect()
+}
+
 /// The providers of `cli`'s login that ingest stored nowhere (not supported yet), by name only.
 pub(crate) fn skipped_providers(cli: &str, files: &[(String, Vec<u8>)]) -> Vec<String> {
+    if cli == "opencode" {
+        return input_file(cli, files, "data/opencode/wicked-auth.json")
+            .ok()
+            .flatten()
+            .and_then(|b| parse_json(cli, b).ok())
+            .map(|v| opencode_skipped(&v))
+            .unwrap_or_default();
+    }
     if cli != "pi" {
         return Vec::new();
     }
@@ -486,10 +607,44 @@ pub(crate) fn skipped_providers(cli: &str, files: &[(String, Vec<u8>)]) -> Vec<S
         .unwrap_or_default()
 }
 
-/// pi's signed-in subscriptions at `now` from the broker's route files and retained record:
+/// The broker file retaining `cli`'s whole login record (for its refresher and expiries).
+fn retained_record(cli: &str) -> Option<&'static str> {
+    match cli {
+        "pi" => Some("pi.auth.json"),
+        "opencode" => Some("opencode.credentials.json"),
+        _ => None,
+    }
+}
+
+/// The entry `key` of `cli`'s login record: pi's provider object; opencode's credential value
+/// of that integration (its active one).
+pub(crate) fn record_entry<'a>(cli: &str, record: &'a Value, key: &str) -> Option<&'a Value> {
+    match cli {
+        "pi" => record.get(key),
+        "opencode" => opencode_active(record, key).map(|row| &row["value"]),
+        _ => None,
+    }
+}
+
+/// The active row of integration `id` in an `opencode auth export` (an array of credential
+/// entries); with no row marked active, the only one.
+pub(crate) fn opencode_active<'a>(export: &'a Value, id: &str) -> Option<&'a Value> {
+    let rows: Vec<&Value> = export
+        .as_array()?
+        .iter()
+        .filter(|r| r.get("integrationID").and_then(Value::as_str) == Some(id))
+        .collect();
+    rows.iter()
+        .copied()
+        .find(|r| r.get("active").and_then(Value::as_bool) == Some(true))
+        .or_else(|| (rows.len() == 1).then(|| rows[0]))
+}
+
+/// `cli`'s signed-in subscriptions at `now` from the broker's route files and retained record:
 /// `(valid, any_present, earliest valid expiry)`. A subscription whose record entry has expired
 /// is not valid: its seat never gets that provider's placeholder (decision 7).
-fn pi_subscriptions(
+fn subscriptions(
+    cli: &str,
     files: &[(String, Vec<u8>)],
     now: u64,
 ) -> Result<
@@ -501,21 +656,25 @@ fn pi_subscriptions(
     String,
 > {
     let present = |name: &str| files.iter().any(|(p, b)| p == name && !b.is_empty());
-    let record = match files
-        .iter()
-        .find(|(p, b)| p == "pi.auth.json" && !b.is_empty())
+    let record = match retained_record(cli)
+        .and_then(|name| files.iter().find(|(p, b)| p == name && !b.is_empty()))
     {
-        Some((_, b)) => Some(parse_json("pi", b)?),
+        Some((_, b)) => Some(parse_json(cli, b)?),
         None => None,
     };
     let (mut valid, mut any, mut earliest) = (Vec::new(), false, None::<u64>);
-    for (id, sub) in PI_OAUTH {
-        let route = sub.route();
+    for route in crate::seat_credentials::SUBSCRIPTION_ROUTES
+        .iter()
+        .filter(|r| r.cli == cli)
+    {
         if !present(route.file) || route.account_file.is_some_and(|a| !present(a)) {
             continue;
         }
         any = true;
-        let expiry = match record.as_ref().and_then(|r| r.get(*id)) {
+        let expiry = match record
+            .as_ref()
+            .and_then(|r| record_entry(cli, r, route.record_key))
+        {
             Some(entry) => pi_entry_expiry(entry)?,
             None => None,
         };
@@ -525,7 +684,7 @@ fn pi_subscriptions(
         if let Some(e) = expiry {
             earliest = Some(earliest.map_or(e, |x: u64| x.min(e)));
         }
-        valid.push(*sub);
+        valid.push(route.sub);
     }
     Ok((valid, any, earliest))
 }
@@ -534,6 +693,23 @@ fn pi_subscriptions(
 fn credential_expiry(cli: &str, value: &Value) -> Result<Option<u64>, String> {
     if cli == "codex" && value.get("auth_mode").and_then(Value::as_str) == Some("apikey") {
         return Ok(None);
+    }
+    if cli == "opencode" {
+        let mut earliest = None::<u64>;
+        for route in crate::seat_credentials::SUBSCRIPTION_ROUTES
+            .iter()
+            .filter(|r| r.cli == "opencode")
+        {
+            if let Some(e) = record_entry(cli, value, route.record_key)
+                .filter(|e| e.get("type").and_then(Value::as_str) == Some("oauth"))
+                .map(pi_entry_expiry)
+                .transpose()?
+                .flatten()
+            {
+                earliest = Some(earliest.map_or(e, |x| x.min(e)));
+            }
+        }
+        return Ok(earliest);
     }
     if cli == "pi" {
         // The earliest of the record's OAuth sign-ins (the next one the refresher is due on).
@@ -657,11 +833,16 @@ fn status_from_files(cli: &str, files: &[(String, Vec<u8>)], now: u64) -> Broker
         return BrokerStatus::Unknown(e);
     }
     let present = |name: &str| files.iter().any(|(p, b)| p == name && !b.is_empty());
-    if cli == "pi" {
-        return match pi_subscriptions(files, now) {
+    if matches!(cli, "pi" | "opencode") {
+        let key = if cli == "pi" {
+            "pi.token"
+        } else {
+            "opencode.token"
+        };
+        return match subscriptions(cli, files, now) {
             Err(e) => BrokerStatus::Unknown(e),
             Ok((valid, any, earliest)) => {
-                if present("pi.token") || !valid.is_empty() {
+                if present(key) || !valid.is_empty() {
                     BrokerStatus::SignedIn {
                         expires_at: earliest,
                     }
@@ -698,7 +879,6 @@ fn status_from_files(cli: &str, files: &[(String, Vec<u8>)], now: u64) -> Broker
             Some(_) => return BrokerStatus::Unknown("codex: unsupported auth_mode".into()),
             None => present("openai.key") || (present("openai.token") && present("openai.account")),
         },
-        "opencode" => present("opencode.token"),
         _ => false,
     };
     if !active {
@@ -865,7 +1045,10 @@ fn volume_exists(rt: &Runtime, volume: &str) -> Result<bool, String> {
 fn is_archive(name: &str) -> bool {
     matches!(
         name,
-        "claude.credentials.json" | "codex.auth.json" | "pi.auth.json"
+        "claude.credentials.json"
+            | "codex.auth.json"
+            | "pi.auth.json"
+            | "opencode.credentials.json"
     )
 }
 
@@ -1175,7 +1358,7 @@ pub(crate) fn sign_in_from_files(
 ) -> Option<crate::seat_credentials::SeatSignIn> {
     let kind = kind_from_files(cli, files);
     let subscriptions = match cli {
-        "pi" => pi_subscriptions(files, now).ok()?.0,
+        "pi" | "opencode" => subscriptions(cli, files, now).ok()?.0,
         _ => Vec::new(),
     };
     (kind.is_some() || !subscriptions.is_empty()).then_some(crate::seat_credentials::SeatSignIn {
@@ -2537,7 +2720,7 @@ esac
             ("pi", vec!["pi"], vec!["PI_CODING_AGENT_DIR=/home/login/pi"]),
             (
                 "opencode",
-                vec!["opencode", "auth", "login"],
+                vec!["sh", "-c", OPENCODE_LOGIN],
                 vec![
                     "XDG_CONFIG_HOME=/home/login/config",
                     "XDG_DATA_HOME=/home/login/data",
@@ -2937,23 +3120,208 @@ esac
         );
     }
 
+    /// What opencode's login leaves after `auth export` (FAKE values): its ChatGPT sign-in, its
+    /// Copilot device sign-in, an Anthropic key and an inactive older OpenAI key.
+    fn opencode_login() -> Value {
+        json!([
+            {"id": "c0", "integrationID": "openai", "label": "API key", "active": false,
+                "value": {"type": "key", "key": "FAKE-old-key"}},
+            {"id": "c1", "integrationID": "openai", "label": "OAuth", "active": true,
+                "value": {"type": "oauth", "methodID": "chatgpt-headless", "refresh": "FAKE-oc-r",
+                    "access": "FAKE-oc-access", "expires": 4_000_000_000_000_u64,
+                    "metadata": {"accountID": "acct-FAKE-oc"}}},
+            {"id": "c2", "integrationID": "github-copilot", "label": "OAuth", "active": true,
+                "value": {"type": "oauth", "methodID": "device", "refresh": "FAKE-gho-oc",
+                    "access": "FAKE-gho-oc", "expires": 0,
+                    "metadata": {"apiEndpoint": "https://api.business.githubcopilot.com"}}},
+            {"id": "c3", "integrationID": "anthropic", "label": "API key", "active": true,
+                "value": {"type": "key", "key": "FAKE-oc-ant"}}
+        ])
+    }
+
+    /// The opencode login command: a failed login exports nothing and fails; a failed export
+    /// leaves no export (whole or nothing) and fails; both succeeding leave the export, private.
+    #[cfg(unix)]
     #[test]
-    fn opencode_provider_key_accepts_auth_and_placeholder_config_shapes() {
-        for (path, value) in [
-            (
-                "data/opencode/auth.json",
-                json!({"openai": {"type": "api", "key": "FAKE-opencode-key"}}),
-            ),
-            (
-                "opencode.json",
-                json!({"provider": {"openai": {"options": {"apiKey": "FAKE-opencode-key"}}}}),
-            ),
-        ] {
-            assert_eq!(
-                extract_tokens("opencode", &[file(path, value)]).unwrap(),
-                vec![token_file("opencode.token", "FAKE-opencode-key")]
+    fn opencode_login_exports_only_after_a_successful_login_and_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("wicked-oc-login-{}", uuid::Uuid::new_v4().simple()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake = bin.join("opencode");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ncase \"$2\" in\n  login) [ -e \"$FAKE_DIR/login_fails\" ] && exit 3; exit 0;;\n  export) printf '[{\"partial\":'; [ -e \"$FAKE_DIR/export_fails\" ] && exit 4; printf '1}]';;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run = |case: &str| {
+            let data = dir.join(case);
+            let _ = std::fs::remove_dir_all(&data);
+            // spawn-audit: test-only — the engine's login command with a fake opencode.
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", OPENCODE_LOGIN])
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("XDG_DATA_HOME", &data)
+                .env("FAKE_DIR", &dir)
+                .output()
+                .unwrap();
+            (out.status.success(), data.join("opencode"))
+        };
+        std::fs::write(dir.join("login_fails"), "").unwrap();
+        let (ok, d) = run("a");
+        assert!(!ok && !d.join("wicked-auth.json").exists());
+        std::fs::remove_file(dir.join("login_fails")).unwrap();
+        std::fs::write(dir.join("export_fails"), "").unwrap();
+        let (ok, d) = run("b");
+        assert!(!ok);
+        assert!(!d.join("wicked-auth.json").exists() && !d.join("wicked-auth.json.tmp").exists());
+        std::fs::remove_file(dir.join("export_fails")).unwrap();
+        let (ok, d) = run("c");
+        assert!(ok);
+        assert_eq!(
+            std::fs::read_to_string(d.join("wicked-auth.json")).unwrap(),
+            "[{\"partial\":1}]"
+        );
+        let mode = std::fs::metadata(d.join("wicked-auth.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "the export is private");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// opencode 2.x keeps its sign-ins in SQLite; the login exports them, and ingest takes the
+    /// ACTIVE credential of each integration onto its own route files (decision 1).
+    #[test]
+    fn opencode_export_maps_each_active_sign_in_to_its_route_files() {
+        let login = opencode_login();
+        let input = vec![file("data/opencode/wicked-auth.json", login.clone())];
+        let files = extract_tokens("opencode", &input).unwrap();
+        let get = |n: &str| {
+            files
+                .iter()
+                .find(|(f, _)| f == n)
+                .map(|(_, b)| String::from_utf8(b.clone()).unwrap())
+        };
+        assert_eq!(get("opencode.token"), None, "the inactive key is not used");
+        assert_eq!(
+            get("opencode.chatgpt.token").as_deref(),
+            Some("FAKE-oc-access")
+        );
+        assert_eq!(
+            get("opencode.chatgpt.account").as_deref(),
+            Some("acct-FAKE-oc")
+        );
+        assert_eq!(
+            get("opencode.copilot.token").as_deref(),
+            Some("FAKE-gho-oc")
+        );
+        assert_eq!(
+            get("opencode.copilot.host").as_deref(),
+            Some("api.business.githubcopilot.com")
+        );
+        assert_eq!(
+            get("opencode.anthropic.key").as_deref(),
+            Some("FAKE-oc-ant")
+        );
+        let retained: Value =
+            serde_json::from_str(&get("opencode.credentials.json").unwrap()).unwrap();
+        assert_eq!(retained, login);
+        for (name, _) in &files {
+            assert!(
+                broker_files("opencode").unwrap().contains(&name.as_str()),
+                "{name}"
             );
         }
+        // Only the ChatGPT sign-in expires; Copilot's `expires: 0` is none.
+        assert_eq!(
+            credential_expiry("opencode", &login).unwrap(),
+            Some(4_000_000_000)
+        );
+        let literals = route_literals("opencode", &files).unwrap();
+        assert_eq!(
+            literals.accounts,
+            vec![("opencode.chatgpt.token".into(), "acct-FAKE-oc".into())]
+        );
+        // A key-only login keeps the existing provider-key route.
+        let key_only = json!([{"id": "k", "integrationID": "openai", "label": "API key",
+            "active": true, "value": {"type": "key", "key": "FAKE-opencode-key"}}]);
+        assert_eq!(
+            extract_tokens("opencode", &[file("wicked-auth.json", key_only)]).unwrap(),
+            vec![token_file("opencode.token", "FAKE-opencode-key")]
+        );
+        // The pre-2.x files are no longer read (opencode never writes them).
+        assert!(extract_tokens(
+            "opencode",
+            &[file(
+                "data/opencode/auth.json",
+                json!({"openai": {"type": "api", "key": "FAKE"}})
+            )]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn opencode_refuses_header_shaped_accounts_foreign_hosts_and_enterprise() {
+        let with = |idx: usize, pointer: &str, v: Value| {
+            let mut login = opencode_login();
+            *login[idx].pointer_mut(pointer).unwrap() = v;
+            extract_tokens("opencode", &[file("wicked-auth.json", login)])
+        };
+        assert!(with(1, "/value/metadata/accountID", json!("FAKE\r\nx-evil: 1")).is_err());
+        assert!(with(
+            2,
+            "/value/metadata/apiEndpoint",
+            json!("https://evil.example.com")
+        )
+        .is_err());
+        assert!(with(
+            2,
+            "/value/metadata",
+            json!({"enterpriseUrl": "corp.ghe.com"})
+        )
+        .unwrap_err()
+        .contains("Enterprise"));
+        assert!(with(1, "/value/access", json!("FAKE with space")).is_err());
+        assert!(extract_tokens("opencode", &[file("wicked-auth.json", json!({"a": 1}))]).is_err());
+    }
+
+    #[test]
+    fn opencode_status_and_sign_in_count_only_valid_subscriptions() {
+        use crate::seat_credentials::Subscription;
+        let files =
+            extract_tokens("opencode", &[file("wicked-auth.json", opencode_login())]).unwrap();
+        let sign_in = sign_in_from_files("opencode", &files, 100).unwrap();
+        assert_eq!(sign_in.kind, None);
+        assert_eq!(
+            sign_in.subscriptions,
+            vec![
+                Subscription::OpencodeChatgpt,
+                Subscription::OpencodeCopilot,
+                Subscription::OpencodeAnthropicKey
+            ]
+        );
+        // The ChatGPT sign-in expired: Copilot and the Anthropic key still serve.
+        let later = sign_in_from_files("opencode", &files, 4_100_000_000).unwrap();
+        assert_eq!(
+            later.subscriptions,
+            vec![
+                Subscription::OpencodeCopilot,
+                Subscription::OpencodeAnthropicKey
+            ]
+        );
+        assert_eq!(
+            status_from_files("opencode", &files, 100),
+            BrokerStatus::SignedIn {
+                expires_at: Some(4_000_000_000)
+            }
+        );
+        assert_eq!(
+            status_from_files("opencode", &[], 100),
+            BrokerStatus::SignedOut
+        );
     }
 
     #[test]
@@ -3003,8 +3371,9 @@ esac
             (
                 "opencode",
                 vec![file(
-                    "auth.json",
-                    json!({"openai": {"type": "api", "key": "FAKE-key"}}),
+                    "wicked-auth.json",
+                    json!([{"id": "c1", "integrationID": "openai", "label": "API key",
+                        "active": true, "value": {"type": "key", "key": "FAKE-key"}}]),
                 )],
             ),
         ] {
@@ -3045,23 +3414,21 @@ esac
             "{err}"
         );
         assert!(!err.contains("FAKE"), "{err}");
-        {
-            let cli = "opencode";
-            let other = vec![file(
-                "auth.json",
-                json!({"anthropic": {"type": "api", "key": "FAKE-wrong-provider"}}),
-            )];
-            assert!(extract_tokens(cli, &other)
-                .unwrap_err()
-                .contains("OpenAI provider key"));
-            let oauth = vec![file(
-                "auth.json",
-                json!({"openai": {"type": "oauth", "access": "FAKE-oauth", "key": "FAKE-do-not-use"}}),
-            )];
-            assert!(extract_tokens(cli, &oauth)
-                .unwrap_err()
-                .contains("unsupported OpenAI credential type"));
-        }
+        // opencode names what it cannot serve yet (token sharing has no in-container callback).
+        let err = extract_tokens(
+            "opencode",
+            &[file(
+                "wicked-auth.json",
+                json!([{"id": "c1", "integrationID": "openai", "label": "OAuth", "active": true,
+                    "value": {"type": "oauth", "methodID": "chatgpt-token-sharing",
+                        "access": "FAKE-ts", "refresh": "FAKE-ts-r", "expires": 1}},
+                    {"id": "c2", "integrationID": "xai", "label": "API key", "active": true,
+                    "value": {"type": "key", "key": "FAKE-xai"}}]),
+            )],
+        )
+        .unwrap_err();
+        assert!(err.contains("openai (chatgpt-token-sharing)"), "{err}");
+        assert!(err.contains("xai (key)") && !err.contains("FAKE"), "{err}");
         assert!(extract_tokens("copilot", &[])
             .unwrap_err()
             .contains("not configured"));
@@ -4003,6 +4370,388 @@ esac
             "FAKE-pi-copilot",
             "FAKE-pi-key",
             "FAKE-pi-renewed",
+            &key.key,
+        ] {
+            assert!(!gw_logs.contains(secret), "{secret} in the gateway log");
+            assert!(
+                !report_text.contains(secret),
+                "{secret} in the ingest report"
+            );
+        }
+    }
+
+    /// LIVE (`WICKED_CONTAINER_LIVE=1`): opencode's sign-ins end to end with FAKE credentials
+    /// (DES-SEAT-LOGIN-SUBSCRIPTIONS). Its login export (ChatGPT, Copilot, an Anthropic key) is
+    /// ingested; the real opencode CLI, launched through the engine's pinned-server script with
+    /// only the placeholder files `seat_files` renders (the script imports the constant credential
+    /// rows), reaches a stub upstream through each route, which sees the broker's credential and
+    /// never the unit key, a placeholder or `x-wicked-unit`. pi's unit is refused on opencode's
+    /// routes; sign-out empties them.
+    #[cfg(unix)]
+    #[test]
+    fn live_opencode_sign_ins_reach_the_upstream_only_through_their_routes() {
+        use crate::seat_credentials::seat_files;
+        use crate::seat_gateway::{
+            attach, configure_gateway, ensure_gateway, register_live, GatewayConfig, UnitKey,
+        };
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        let rt = crate::container_floor::runtime().expect("a container runtime answers");
+        let image = crate::container_floor::ensure_seat_image(&rt, "opencode").unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("wicked-oc-live-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("stub")).unwrap();
+        std::fs::create_dir_all(dir.join("seat")).unwrap();
+        let gw = Gateway::for_dir(&dir);
+        let run = |argv: &[&str]| {
+            let mut c = rt.cmd();
+            c.args(argv);
+            output_within(c, Duration::from_secs(120)).unwrap()
+        };
+        let stub = format!("{}-stub", gw.name);
+        std::fs::write(
+            dir.join("stub/stub.js"),
+            "const h=require('http');h.createServer((q,r)=>{q.resume();q.on('end',()=>{\
+             console.log('UPSTREAM '+JSON.stringify({url:q.url,auth:q.headers['authorization']||'',\
+             key:q.headers['x-api-key']||'',acct:q.headers['chatgpt-account-id']||'',\
+             unit:q.headers['x-wicked-unit']||''}));r.statusCode=401;r.end('{}')})}).listen(8080);",
+        )
+        .unwrap();
+        let mut config = GatewayConfig::default();
+        config.providers.retain(|r| r.owner() == Some("opencode"));
+        for route in &mut config.providers {
+            route.upstream_host = format!("{stub}:8080");
+            route.tls = false;
+        }
+        configure_gateway(&dir, &config).unwrap();
+        let gw = ensure_gateway(&rt, &dir).expect("the gateway starts");
+        let stub_dir = format!(
+            "type=bind,src={},dst=/s,readonly",
+            dir.join("stub").display()
+        );
+        let o = run(&[
+            "run",
+            "-d",
+            "--name",
+            &stub,
+            "--network",
+            &gw.external_network,
+            "--mount",
+            &stub_dir,
+            &image,
+            "sh",
+            "-c",
+            "exec node /s/stub.js",
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let seat_net = format!("{}-seat", gw.name);
+        run(&["network", "rm", &seat_net]);
+        assert!(run(&["network", "create", "--internal", &seat_net])
+            .status
+            .success());
+        attach(&rt, &gw, &seat_net).expect("attached as agw");
+        let key = UnitKey::new("run-oc", "run-oc#1", "opencode");
+        let pi = UnitKey::new("run-oc", "run-oc#2", "pi");
+        register_live(&rt, &gw, &dir, key.clone()).unwrap();
+        register_live(&rt, &gw, &dir, pi.clone()).unwrap();
+        let login = opencode_login();
+        let volume = login_volume(&gw.name, "opencode");
+        run(&["volume", "rm", &volume]);
+        assert!(run(&["volume", "create", &volume]).status.success());
+        checked(&rt, &init_login_argv(&volume, "opencode")).unwrap();
+        let write = helper_argv(
+            &volume,
+            false,
+            "10001",
+            format!("mkdir -p /in/data/opencode && printf '%s' '{login}' > /in/data/opencode/wicked-auth.json"),
+        );
+        checked(&rt, &write).unwrap();
+        write_session(&dir, "opencode", &volume).unwrap();
+        let report = ingest_and_route(&rt, &gw, &dir, "opencode").expect("ingested");
+        let sign_in = seat_sign_in(&rt, &gw, &dir, "opencode").expect("opencode is signed in");
+        let upstream = || {
+            let o = run(&["logs", &stub]);
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+        };
+        let curl = |port: u16, unit: &str| {
+            let header = format!("x-wicked-unit: {unit}");
+            let url = format!("http://agw:{port}/probe-{port}");
+            let o = run(&[
+                "run",
+                "--rm",
+                "--network",
+                &seat_net,
+                &image,
+                "curl",
+                "-s",
+                "--max-time",
+                "6",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "-H",
+                &header,
+                "-d",
+                "{}",
+                &url,
+            ]);
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+        let foreign: Vec<String> = [4009, 4010, 4011]
+            .iter()
+            .map(|p| curl(*p, &pi.key))
+            .collect();
+        // The unit's files, as arming renders them, in the per-unit dir OPENCODE_CONFIG names.
+        let url = crate::seat_gateway::credential_gateway_url(
+            "opencode",
+            crate::seat_credentials::CredentialKind::ProviderKey,
+        );
+        for (name, body) in seat_files("opencode", &sign_in, &key.key, &url) {
+            std::fs::write(dir.join("seat").join(name), body).unwrap();
+        }
+        // One credential DB shared by every run, as a seat home is, seeded with an engine row an
+        // earlier unit placed that this sign-in no longer holds: the pinned script removes it.
+        let data = format!("{}-ocdata", gw.name);
+        run(&["volume", "rm", &data]);
+        assert!(run(&["volume", "create", &data]).status.success());
+        checked(
+            &rt,
+            &helper_argv(&data, false, "0", "chown 10001 /in && chmod 700 /in".into()),
+        )
+        .unwrap();
+        let data_mount = format!("type=volume,src={data},dst=/data");
+        let stale = r#"[{"id":"wicked-seat-github-copilot-deadbeef","integrationID":"github-copilot","label":"wicked seat","active":true,"value":{"type":"oauth","methodID":"device","refresh":"PLACEHOLDER-old","access":"PLACEHOLDER-old","expires":0,"metadata":{"apiEndpoint":"http://agw:4999"}}}]"#;
+        let seed = format!(
+            "printf '%s' '{stale}' > /tmp/stale.json && opencode auth import --standalone /tmp/stale.json"
+        );
+        let o = run(&[
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--user",
+            "10001",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,exec",
+            "-w",
+            "/tmp",
+            "--mount",
+            &data_mount,
+            "-e",
+            "HOME=/tmp",
+            "-e",
+            "XDG_CONFIG_HOME=/tmp/config",
+            "-e",
+            "XDG_DATA_HOME=/data",
+            &image,
+            "sh",
+            "-c",
+            &seed,
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let seat_dir = format!(
+            "type=bind,src={},dst=/u,readonly",
+            dir.join("seat").display()
+        );
+        for model in [
+            "openai/gpt-5.5",
+            "github-copilot/gpt-5.5",
+            "anthropic/claude-sonnet-5",
+        ] {
+            let argv: Vec<String> = ["opencode", "run", "--format", "json", "-m", model, "hi"]
+                .map(String::from)
+                .to_vec();
+            let pinned = crate::worker_sandbox::opencode_pinned_server_argv(&argv, 4567).unwrap();
+            let mut docker: Vec<String> = [
+                "run",
+                "--rm",
+                "--network",
+                &seat_net,
+                "--user",
+                "10001",
+                "--read-only",
+                "--tmpfs",
+                "/tmp:rw,exec",
+                "-w",
+                "/tmp",
+                "-e",
+                "TMPDIR=/tmp",
+                "--mount",
+                &seat_dir,
+                "-e",
+                "HOME=/tmp",
+                "-e",
+                "XDG_CONFIG_HOME=/tmp/config",
+                "-e",
+                "XDG_DATA_HOME=/data",
+                "-e",
+                "OPENCODE_CONFIG=/u/opencode.json",
+                "-e",
+                "OPENCODE_SERVER_PASSWORD=nonce-FAKE",
+                "-e",
+                "OPENCODE_PASSWORD=nonce-FAKE",
+                "-e",
+                "OPENCODE_DISABLE_AUTOUPDATE=1",
+            ]
+            .map(String::from)
+            .to_vec();
+            docker.extend(["--mount".into(), data_mount.clone()]);
+            docker.push(image.clone());
+            docker.extend(["timeout".into(), "90".into()]);
+            docker.extend(pinned);
+            let refs: Vec<&str> = docker.iter().map(String::as_str).collect();
+            let o = run(&refs);
+            eprintln!(
+                "opencode {model}: {}",
+                String::from_utf8_lossy(&o.stderr)
+                    .chars()
+                    .rev()
+                    .take(400)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            );
+        }
+        let mut seen = String::new();
+        for _ in 0..40 {
+            seen = upstream();
+            if seen.contains("/backend-api/codex/responses")
+                && seen.contains("FAKE-gho-oc")
+                && seen.contains("/v1/messages")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let exported = run(&[
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--user",
+            "10001",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,exec",
+            "-w",
+            "/tmp",
+            "--mount",
+            &data_mount,
+            "-e",
+            "HOME=/tmp",
+            "-e",
+            "XDG_CONFIG_HOME=/tmp/config",
+            "-e",
+            "XDG_DATA_HOME=/data",
+            &image,
+            "opencode",
+            "auth",
+            "export",
+            "--standalone",
+        ]);
+        let exported: Value = serde_json::from_slice(&exported.stdout).unwrap_or(json!([]));
+        let status_in = broker_status(&rt, &gw, "opencode");
+        sign_out_and_route(&rt, &gw, &dir, "opencode").expect("signed out");
+        let before_out = upstream().len();
+        for port in [4009, 4010, 4011] {
+            curl(port, &key.key);
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        let after_out = upstream()[before_out..].to_string();
+        let status_out = broker_status(&rt, &gw, "opencode");
+        let logs = run(&["logs", &gw.name]);
+        let gw_logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&logs.stdout),
+            String::from_utf8_lossy(&logs.stderr)
+        );
+        run(&["rm", "-f", &stub, &gw.name]);
+        run(&["network", "rm", &seat_net, &gw.external_network]);
+        let (cfg, broker) = crate::seat_gateway::volumes(&gw);
+        run(&["volume", "rm", &cfg, &broker, &volume, &data]);
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("report={report:?}\nsign_in={sign_in:?}\nforeign={foreign:?}\nseen={seen}");
+        assert!(
+            foreign.iter().all(|c| c == "401"),
+            "pi's unit on opencode's routes: {foreign:?}"
+        );
+        assert!(
+            !seen.contains("/probe-"),
+            "a refused probe reached the upstream: {seen}"
+        );
+        let lines: Vec<Value> = seen
+            .lines()
+            .filter_map(|l| l.strip_prefix("UPSTREAM "))
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let find = |pred: &dyn Fn(&Value) -> bool| lines.iter().find(|v| pred(v)).cloned();
+        let chatgpt = find(&|v| v["url"] == "/backend-api/codex/responses" && v["auth"] != "")
+            .expect("opencode reached the ChatGPT route");
+        assert_eq!(chatgpt["auth"], "Bearer FAKE-oc-access");
+        assert_eq!(chatgpt["acct"], "acct-FAKE-oc");
+        // An inference request, not only the model listing.
+        let copilot = find(&|v| v["url"] == "/responses" && v["auth"] == "Bearer FAKE-gho-oc");
+        assert!(
+            copilot.is_some(),
+            "opencode reached the Copilot route: {seen}"
+        );
+        let anthropic = find(&|v| v["url"].as_str().unwrap_or("").starts_with("/v1/messages"))
+            .expect("opencode reached the Anthropic route");
+        assert_eq!(anthropic["key"], "FAKE-oc-ant");
+        for line in &lines {
+            assert_eq!(line["unit"], "", "the unit header never leaves the gateway");
+            let text = line.to_string();
+            assert!(
+                !text.contains(&key.key) && !text.contains("PLACEHOLDER"),
+                "{text}"
+            );
+        }
+        // The shared DB holds exactly the engine's current rows, active; the stale one is gone.
+        let ids: Vec<&str> = exported
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 2, "{exported}");
+        assert!(
+            ids.iter()
+                .all(|id| id.starts_with("wicked-seat-") && !id.ends_with("deadbeef")),
+            "{ids:?}"
+        );
+        assert!(exported
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["active"] == true));
+        assert!(
+            !exported.to_string().contains("FAKE"),
+            "the seat DB holds no credential"
+        );
+        assert!(
+            matches!(status_in, BrokerStatus::SignedIn { .. }),
+            "{status_in:?}"
+        );
+        assert!(!after_out.contains("FAKE"), "{after_out}");
+        assert_eq!(status_out, BrokerStatus::SignedOut);
+        let report_text = format!("{report:?}");
+        for secret in [
+            "FAKE-oc-access",
+            "FAKE-oc-r",
+            "FAKE-gho-oc",
+            "FAKE-oc-ant",
             &key.key,
         ] {
             assert!(!gw_logs.contains(secret), "{secret} in the gateway log");

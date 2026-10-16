@@ -262,7 +262,13 @@ impl Default for GatewayConfig {
                 ),
             ]
             .into_iter()
-            .map(|(provider, port, kind, file)| (provider, port, kind, file, None))
+            // opencode's key route reads the unit from its header too: a credential row in the
+            // seat's shared DB wins over its config key, and a row another unit imported must not
+            // turn this unit's requests into another unit's (codex review of #983).
+            .map(|(provider, port, kind, file)| {
+                let header = (file == "opencode.token").then_some(UNIT_HEADER);
+                (provider, port, kind, file, header)
+            })
             .chain(
                 crate::seat_credentials::SUBSCRIPTION_ROUTES
                     .iter()

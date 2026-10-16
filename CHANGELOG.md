@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **opencode signs in on the container floor: API keys, ChatGPT and GitHub Copilot.** opencode 2.x keeps credentials
+  in SQLite, so ingest (which read an `auth.json` opencode never writes) could not find even an API key. The login
+  now runs opencode's own `auth export` after `auth login`, into the same throwaway volume; ingest takes each
+  integration's active credential onto its route (OpenAI key 4004, ChatGPT 4009, Copilot 4010 with its plan host,
+  Anthropic key 4011) and names what it cannot serve (`skipped`, e.g. ChatGPT token sharing). The seat's per-unit
+  `opencode.json` routes each provider with the unit's `x-wicked-unit` header; the credential rows its ChatGPT and
+  Copilot plugins need are constant placeholders the pinned-server script imports (after logging out rows of sign-ins
+  the broker no longer holds), so concurrent units sharing the DB agree. The refresher renews the active ChatGPT row
+  by codex's flow.
 - **pi signs in with its subscriptions on the container floor; each gateway route admits only its owner agent.** pi's
   `/login` OAuth records (Anthropic Claude Pro/Max, OpenAI ChatGPT Plus/Pro via `openai-codex`, GitHub Copilot) are
   ingested beside its OpenAI API key, each onto its own broker file and static gateway route (4006-4008,
