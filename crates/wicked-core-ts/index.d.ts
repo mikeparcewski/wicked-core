@@ -191,10 +191,11 @@ export declare class Core {
    * (core#769, crew Agents page A5) The engine's worktree bench as a pure predicate: given a
    * JSON array of `AgenticCli` seats (the engine-shaped roster, as `launchRun`'s `clisJson`) and
    * whether the run is BOUND to one repository, the JSON array of `BenchedSeat` (`{cli, reason,
-   * source: "launcher"}`) the launch would bench before routing. Reads
-   * `WICKED_CODEX_WORKTREE_OK` and `WICKED_SEAT_FLOOR` at call time, as the launch does (the
-   * container floor keeps codex). An addon without this static
-   * predates it; crew keys on its presence.
+   * source: "launcher"}`) the launch would bench before routing: on the interim host floor
+   * every seat that cannot keep a per-call check there (anything but claude and a bounded codex),
+   * bound or not (C5); on a bound run every codex seat. Reads `WICKED_CODEX_WORKTREE_OK` and
+   * `WICKED_SEAT_FLOOR` at call time, as the launch does (the container floor keeps codex). An
+   * addon without this static predates it; crew keys on its presence.
    */
   static worktreeBenched(clisJson: string, bound: boolean): string
   /**

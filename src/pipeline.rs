@@ -435,8 +435,9 @@ pub(crate) fn pre_distribute(
         EntityMode::Isolated => None,
     };
 
-    // (F-EDIT-5 / F-LEARN-3) The worktree bench, on every launch route (campaign, synchronous).
-    let worktree_bench = crate::distribute::worktree_benched(
+    // The launch bench (C5 host floor; F-EDIT-5 / F-LEARN-3 worktree), on every launch route
+    // (campaign, synchronous).
+    let worktree_bench = crate::distribute::launch_benched(
         clis,
         repo_ref.is_some(),
         crate::actor::in_process_governance().is_some(),

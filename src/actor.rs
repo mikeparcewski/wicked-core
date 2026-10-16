@@ -1510,7 +1510,7 @@ pub(crate) fn run(
                     };
                     if needs_seat && !spec.clis.is_empty() {
                         let mut benched = crate::distribute::launcher_benched(&spec.clis);
-                        for seat in crate::distribute::worktree_benched(
+                        for seat in crate::distribute::launch_benched(
                             &spec.clis,
                             repo_ref.is_some(),
                             in_process_governance().is_some(),
@@ -1601,8 +1601,10 @@ pub(crate) fn run(
                         run_branch: None,
                         base_commit: None,
                         finished_at: None,
-                        // (F-EDIT-5 / F-LEARN-3) codex seats are benched on a worktree-bound run.
-                        benched_seats: crate::distribute::worktree_benched(
+                        // The launch bench (`distribute::launch_benched`): seats that cannot keep a
+                        // per-call check on the host floor (C5), and codex on a worktree-bound run
+                        // (F-EDIT-5 / F-LEARN-3).
+                        benched_seats: crate::distribute::launch_benched(
                             &spec.clis,
                             repo_ref.is_some(),
                             in_process_governance().is_some(),
@@ -4145,8 +4147,10 @@ fn notify_campaign(self_tx: &Sender<Command>, run_id: &str, outcome: crate::camp
 /// seats sit out. A ballot-only seat (`seat_eligible_for_work: false`) is never in the work roster
 /// `clis` persists, so it stays eligible unless benched (codex r1).
 ///
-/// (C5 follow-up) The ballots follow the seat floor ([`ballot_dispatcher`]), so the worktree bench
-/// is the run's own rule (`distribute::worktree_benched`): on a run bound to a repository codex
+/// (C5 follow-up) The ballots follow the seat floor ([`ballot_dispatcher`]), so the ballots' bench
+/// is the run's own launch bench (`distribute::launch_benched`): on the host floor only the seats
+/// that keep a per-call check there sit (as the run's `benched_seats` already say), and on a run
+/// bound to a repository codex
 /// sits out, unless the operator opted out or the container floor carries the ballots on a store
 /// whose units are armed in seat containers (`contained`, `in_process_governance`).
 fn council_roster(
@@ -4162,7 +4166,7 @@ fn council_roster(
     };
     let roster = eligible_roster_keys(session);
     let ballot_bench =
-        crate::distribute::worktree_benched(&clis, session.repo_ref.is_some(), contained);
+        crate::distribute::launch_benched(&clis, session.repo_ref.is_some(), contained);
     clis.into_iter()
         .filter(|c| !session.benched_seats.iter().any(|b| b.cli == c.key))
         .filter(|c| !ballot_bench.iter().any(|b| b.cli == c.key))

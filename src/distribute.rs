@@ -319,21 +319,41 @@ pub(crate) const CODEX_WORKTREE_BENCH: &str = "codex cannot work in this run's w
     on the host floor (the container floor keeps codex; set WICKED_CODEX_WORKTREE_OK=1 on a host \
     where codex runs commands)";
 
-/// (F-EDIT-5 / F-LEARN-3) The worktree bench: on a run BOUND to a repository, every codex seat
-/// (any instance) is benched with [`CODEX_WORKTREE_BENCH`], so it is never routed a unit, failed
-/// over to, or seated as a judge — a codex seat that cannot run a command used to pass a build it
-/// never wrote (run 7d8c9c98) and FAIL a review it never read (run 07965bf6). Unbound runs, hosts
-/// that set `WICKED_CODEX_WORKTREE_OK=1`, and the container floor keep codex
-/// ([`codex_worktree_ok`]). `contained` is whether this run's work units can run in seat
-/// containers at all: they are armed only with a governance context, which a store the gate hook
-/// cannot open (`:memory:`, `postgres://`; `actor::in_process_governance`) does not give, and then
-/// they run on the host and keep the bench.
-pub(crate) fn worktree_benched(
+/// The LAUNCH bench: the seats a run sets aside before anything routes, persisted on
+/// [`AgentSession::benched_seats`](crate::domain::AgentSession) — what routing, the
+/// evaluator≠creator reassignment, the failover ladder and the judge/triage selection all read
+/// through [`eligible_seats`]. Two rules, the first reason winning for a seat both take:
+///
+/// 1. (C5) The HOST-FLOOR bench: when the interim host floor is chosen
+///    ([`crate::container_floor::host_floor_chosen`]) and this run's units are armed (`contained`,
+///    below), every seat that cannot keep a per-call check there
+///    ([`crate::execute_wrapped::seat_keeps_host_floor_check`] — claude, or a bounded codex) is
+///    benched with [`HOST_FLOOR_BENCH`], bound or not: the executor refuses such a governed unit
+///    `needs_container_floor`, so routing one to it only strands the run.
+/// 2. (F-EDIT-5 / F-LEARN-3) The worktree bench: on a run BOUND to a repository, every codex seat
+///    (any instance) is benched with [`CODEX_WORKTREE_BENCH`], so it is never routed a unit, failed
+///    over to, or seated as a judge — a codex seat that cannot run a command used to pass a build
+///    it never wrote (run 7d8c9c98) and FAIL a review it never read (run 07965bf6). Unbound runs,
+///    hosts that set `WICKED_CODEX_WORKTREE_OK=1`, and the container floor keep codex
+///    ([`codex_worktree_ok`]).
+///
+/// `contained` is whether this run's work units are armed at all: they are armed only with a
+/// governance context, which a store the gate hook cannot open (`:memory:`, `postgres://`;
+/// `actor::in_process_governance`) does not give, and then they run on the host ungoverned — the
+/// executor's host-floor refusal does not apply, and codex keeps the worktree bench.
+pub(crate) fn launch_benched(
     clis: &[AgenticCli],
     bound: bool,
     contained: bool,
 ) -> Vec<BenchedSeat> {
-    worktree_benched_with(
+    let mut benched = host_floor_benched_with(
+        clis,
+        contained && crate::container_floor::host_floor_chosen(),
+        |c| {
+            crate::execute_wrapped::seat_keeps_host_floor_check(&c.key, invocation_of(clis, &c.key))
+        },
+    );
+    let worktree = worktree_benched_with(
         clis,
         bound,
         codex_worktree_ok(
@@ -343,7 +363,36 @@ pub(crate) fn worktree_benched(
                 .as_deref()
                 .filter(|_| contained),
         ),
-    )
+    );
+    for seat in worktree {
+        crate::domain::bench_seat(&mut benched, seat);
+    }
+    benched
+}
+
+/// (C5) Why a seat is benched on the interim host floor.
+pub(crate) const HOST_FLOOR_BENCH: &str = "runs only on the container floor: on the host floor \
+    only claude and a bounded codex keep a per-call check, so a governed unit on this seat is \
+    refused (needs_container_floor) — set WICKED_SEAT_FLOOR=container or remove the seat";
+
+/// The host-floor rule of [`launch_benched`], pure: with the host floor in force, every seat
+/// `keeps_check` says no to, with [`HOST_FLOOR_BENCH`] (source `launcher`).
+pub(crate) fn host_floor_benched_with(
+    clis: &[AgenticCli],
+    host_floor: bool,
+    keeps_check: impl Fn(&AgenticCli) -> bool,
+) -> Vec<BenchedSeat> {
+    if !host_floor {
+        return Vec::new();
+    }
+    clis.iter()
+        .filter(|c| !keeps_check(c))
+        .map(|c| BenchedSeat {
+            cli: c.key.clone(),
+            reason: HOST_FLOOR_BENCH.to_string(),
+            source: "launcher".to_string(),
+        })
+        .collect()
 }
 
 /// Whether a bound run keeps its codex seats: the operator said so (`WICKED_CODEX_WORKTREE_OK`),
@@ -3392,12 +3441,8 @@ mod worktree_bench_tests {
         std::env::remove_var("WICKED_CODEX_WORKTREE_OK");
         std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, "container");
         let two = [seat("claude"), seat("codex")];
-        assert!(worktree_benched(&two, true, true).is_empty(), "contained");
-        assert_eq!(
-            worktree_benched(&two, true, false).len(),
-            1,
-            "not contained"
-        );
+        assert!(launch_benched(&two, true, true).is_empty(), "contained");
+        assert_eq!(launch_benched(&two, true, false).len(), 1, "not contained");
         for (k, v) in [
             ("WICKED_CODEX_WORKTREE_OK", prev.0),
             (crate::container_floor::SEAT_FLOOR_ENV, prev.1),
@@ -3421,5 +3466,137 @@ mod worktree_bench_tests {
             CODEX_WORKTREE_BENCH.contains("host floor"),
             "{CODEX_WORKTREE_BENCH}"
         );
+    }
+    /// A builtin registry record by key (its own template and posture).
+    fn record(key: &str) -> AgenticCli {
+        crate::registry_roster()
+            .into_iter()
+            .find(|c| c.key == key)
+            .unwrap_or_else(|| panic!("a builtin `{key}` seat"))
+    }
+
+    /// (C5) On the interim host floor every seat that keeps no per-call check is benched with a
+    /// reason that names the fix, and the bench is what routing reads: such a seat is never routed
+    /// a unit. Off the host floor nothing is benched by this rule.
+    #[test]
+    fn the_host_floor_benches_seats_that_keep_no_check_and_routing_never_seats_them() {
+        let clis = [
+            record("claude"),
+            record("codex"),
+            record("opencode"),
+            record("copilot"),
+            record("pi"),
+        ];
+        let keeps = |c: &AgenticCli| matches!(c.key.as_str(), "claude" | "codex");
+        let b = host_floor_benched_with(&clis, true, keeps);
+        let keys: Vec<&str> = b.iter().map(|s| s.cli.as_str()).collect();
+        assert_eq!(keys, vec!["opencode", "copilot", "pi"]);
+        assert!(b
+            .iter()
+            .all(|s| s.reason == HOST_FLOOR_BENCH && s.source == "launcher"));
+        assert!(HOST_FLOOR_BENCH.contains("WICKED_SEAT_FLOOR=container"));
+        let eligible: Vec<&str> = eligible_seats(&clis, &b)
+            .iter()
+            .map(|c| c.key.as_str())
+            .collect();
+        assert_eq!(eligible, vec!["claude", "codex"]);
+        assert!(host_floor_benched_with(&clis, false, keeps).is_empty());
+
+        // Routing: the first seat in roster order that is NOT benched takes the unit — the
+        // smoke's opencode-first roster no longer routes its first unit to opencode.
+        let roster = [record("opencode"), record("pi"), record("claude")];
+        let bench = host_floor_benched_with(&roster, true, keeps);
+        let unit = WorkUnit::pending("u1", "s1", 1, "Build the thing");
+        let dists = distribute_units_against_benched(&[unit], &roster, "s1", None, &bench)
+            .expect("claude is eligible");
+        assert_eq!(dists[0].assigned_cli, "claude");
+        assert!(dists[0]
+            .degraded_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("2 of 3 seats benched") && r.contains("container floor")));
+
+        // No seat keeps a check ⇒ the plan is refused by name (NoEligibleSeat), never routed.
+        let only = [record("opencode"), record("copilot")];
+        let bench = host_floor_benched_with(&only, true, keeps);
+        let err = distribute_units_against_benched(
+            &[WorkUnit::pending("u1", "s1", 1, "Build")],
+            &only,
+            "s1",
+            None,
+            &bench,
+        )
+        .expect_err("no eligible seat");
+        let refusal = err
+            .downcast_ref::<crate::NoEligibleSeat>()
+            .expect("a typed NoEligibleSeat");
+        assert_eq!(refusal.benched_seats.len(), 2);
+        assert!(err.to_string().contains("container floor"), "{err}");
+    }
+
+    /// (C5) [`launch_benched`] end to end: the floor read at call time, the seat's own record
+    /// judged by the executor's predicate (a custom seat included), containment honoured, and the
+    /// worktree bench layered on a bound run.
+    #[test]
+    fn launch_benched_reads_the_floor_and_judges_each_seat_record() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!("wc-hostfloor-bench-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let keys = [
+            "HOME",
+            "USERPROFILE",
+            "WICKED_CODEX_WORKTREE_OK",
+            crate::container_floor::SEAT_FLOOR_ENV,
+        ];
+        let prev: Vec<_> = keys.iter().map(|k| std::env::var_os(k)).collect();
+        // No operator clis.toml: the builtin records decide.
+        std::env::set_var("HOME", &home);
+        std::env::set_var("USERPROFILE", &home);
+        std::env::remove_var("WICKED_CODEX_WORKTREE_OK");
+        let mut judge = record("pi");
+        judge.key = "smoke-judge".into();
+        judge.binary = "smoke-judge".into();
+        judge.headless_invocation = "smoke-judge {PROMPT}".into();
+        let clis = [
+            record("claude"),
+            record("codex"),
+            record("opencode"),
+            record("copilot"),
+            record("pi"),
+            judge,
+        ];
+        let keys_of =
+            |b: &[BenchedSeat]| -> Vec<String> { b.iter().map(|s| s.cli.clone()).collect() };
+
+        std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, "host");
+        let unbound = launch_benched(&clis, false, true);
+        assert_eq!(
+            keys_of(&unbound),
+            vec!["opencode", "copilot", "pi", "smoke-judge"]
+        );
+        assert!(unbound.iter().all(|s| s.reason == HOST_FLOOR_BENCH));
+        let bound = launch_benched(&clis, true, true);
+        assert_eq!(
+            keys_of(&bound),
+            vec!["opencode", "copilot", "pi", "smoke-judge", "codex"]
+        );
+        assert_eq!(bound[4].reason, CODEX_WORKTREE_BENCH);
+        // Units that are not armed are not refused by the executor: no host-floor bench.
+        assert!(launch_benched(&clis, false, false).is_empty());
+        assert_eq!(keys_of(&launch_benched(&clis, true, false)), vec!["codex"]);
+
+        // The container floor keeps every seat.
+        std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, "container");
+        assert!(launch_benched(&clis, false, true).is_empty());
+        assert!(launch_benched(&clis, true, true).is_empty());
+
+        for (k, v) in keys.iter().zip(prev) {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

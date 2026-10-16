@@ -2754,6 +2754,9 @@ impl WrappedCliStepRunner {
             // governed unit runs only when the FINAL argv keeps a per-call check — claude (its gate
             // hook) or codex in its own bounded sandbox — whatever seat key carries it and whatever
             // floor resolves below. Anything else is refused, never run with only a disclosure.
+            // Routing knows the rule through the launch bench (`seat_keeps_host_floor_check`, the
+            // same predicate over the seat's launch argv), so this is reached only by a launch the
+            // seat's record did not predict (a template the bench never saw).
             if governed
                 && crate::container_floor::host_floor_chosen()
                 && !host_floor_keeps_a_check(&argv)
@@ -3809,6 +3812,36 @@ fn host_floor_keeps_a_check(argv: &[String]) -> bool {
     // The SAME claude predicate hook arming uses (codex c5-r7): a binary only one of the two
     // calls claude would be admitted with no hook armed.
     argv.first().is_some_and(|b| binary_is_claude(b)) || launches_bounded_codex(argv)
+}
+
+/// (C5) The SEAT-level half of the host-floor rule, read by routing's launch bench
+/// ([`crate::distribute::launch_benched`]) so a seat the executor would refuse on the interim host
+/// floor is never routed a unit, failed over to, or seated as a judge or triage. It judges the argv
+/// `exec` builds for the seat before any phase lever — the launch template ([`launch_invocation`]:
+/// the roster's template for the key, else the registry's), plus, for a non-claude binary, the
+/// seat's resolved posture ([`resolve_seat_posture`]) — with the SAME predicate the executor
+/// applies to the final argv ([`host_floor_keeps_a_check`]). The phase levers `exec` adds after
+/// this point only bound codex further (`--sandbox read-only`, a scratch-rooted
+/// `workspace-write`), never unbound it, so a seat this says yes to is not refused by the executor.
+pub(crate) fn seat_keeps_host_floor_check(
+    cli_key: &str,
+    assigned_invocation: Option<String>,
+) -> bool {
+    seat_keeps_host_floor_check_with(
+        &launch_invocation(cli_key, assigned_invocation),
+        resolve_seat_posture(cli_key),
+    )
+}
+
+/// [`seat_keeps_host_floor_check`] with the template and the resolved posture handed in (the
+/// testable seam: no registry read).
+pub(crate) fn seat_keeps_host_floor_check_with(invocation: &str, posture: Vec<String>) -> bool {
+    let mut argv = build_argv(invocation, "", &[]);
+    // `exec` applies a seat posture to non-claude binaries only (the claude branch arms the hook).
+    if !binary_is_claude(&template_binary(invocation)) {
+        apply_seat_posture(&mut argv, &posture);
+    }
+    host_floor_keeps_a_check(&argv)
 }
 
 fn launches_bounded_codex(argv: &[String]) -> bool {
@@ -8012,6 +8045,65 @@ mod tests {
         assert!(!host_floor_keeps_a_check(&v(&["codex", "exec", "p"])));
         assert!(!host_floor_keeps_a_check(&v(&["pi", "-p", "x"])));
         assert!(!host_floor_keeps_a_check(&v(&["copilot", "-p", "x"])));
+    }
+
+    /// (C5) The seat-level classifier routing's launch bench reads: the seat's launch template plus
+    /// its resolved posture, judged by the executor's own predicate. claude and a bounded codex
+    /// keep a check on the host floor; opencode, copilot, pi, agy and a custom seat do not.
+    #[test]
+    fn seat_keeps_host_floor_check_is_the_executor_predicate_over_the_seat_launch_argv() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let bounded = v(&["--sandbox", "workspace-write"]);
+        assert!(seat_keeps_host_floor_check_with(
+            "claude -p {PROMPT}",
+            vec![]
+        ));
+        // claude takes no posture on the wrapped path: a stray flag cannot change its verdict.
+        assert!(seat_keeps_host_floor_check_with(
+            "/opt/tools/claude -p {PROMPT}",
+            v(&["--yolo"])
+        ));
+        assert!(seat_keeps_host_floor_check_with(
+            "codex exec --skip-git-repo-check \"{PROMPT}\"",
+            bounded.clone()
+        ));
+        assert!(!seat_keeps_host_floor_check_with(
+            "codex exec {PROMPT}",
+            vec![]
+        ));
+        assert!(!seat_keeps_host_floor_check_with(
+            "codex --yolo exec {PROMPT}",
+            bounded.clone()
+        ));
+        for inv in [
+            "opencode run {PROMPT}",
+            "copilot -p {PROMPT}",
+            "pi -p {PROMPT}",
+            "smoke-judge {PROMPT}",
+        ] {
+            assert!(
+                !seat_keeps_host_floor_check_with(inv, bounded.clone()),
+                "{inv}"
+            );
+        }
+        // Every builtin record, with the posture `exec` resolves for it (the cap included): the
+        // classifier and the executor's check over the argv `exec` builds (prompt and posture
+        // applied the same way) agree, and only claude and codex keep a check.
+        for c in wicked_council::registry::builtin() {
+            let posture = bound_ungated_posture(&c.key, c.trust_flags.clone());
+            let keeps = seat_keeps_host_floor_check_with(&c.headless_invocation, posture.clone());
+            let mut argv = build_argv(&c.headless_invocation, "the prompt", &[]);
+            if !binary_is_claude(&template_binary(&c.headless_invocation)) {
+                apply_seat_posture(&mut argv, &posture);
+            }
+            assert_eq!(keeps, host_floor_keeps_a_check(&argv), "{}", c.key);
+            assert_eq!(
+                keeps,
+                matches!(c.key.as_str(), "claude" | "codex"),
+                "{}",
+                c.key
+            );
+        }
     }
 
     /// IG1-core-2 (review): a governed unit on the `codex` seat whose invocation does not launch
