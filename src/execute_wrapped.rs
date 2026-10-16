@@ -2047,9 +2047,62 @@ impl StepRunner for WrappedCliStepRunner {
     }
 }
 
+/// (codex council-r1 on #971) A decision-council ballot is one-shot: a fresh synthetic run id per
+/// ballot, never resumed. Its repo-less sandbox (`sandbox_root`) and, under the container floor,
+/// its seat home (`.wicked-container/<run>-<digest>/`) would otherwise accumulate per ballot —
+/// CLI session history and caches included — since no run lifecycle ever ends a synthetic run.
+/// The guard lives on the runner thread for the whole launch and removes both when it drops, so
+/// cleanup happens only after the seat process is done (a timed-out ballot's cancel included).
+struct BallotScratch {
+    run_id: String,
+    home: std::cell::RefCell<Option<PathBuf>>,
+}
+
+impl BallotScratch {
+    fn new(run_id: &str) -> Self {
+        BallotScratch {
+            run_id: run_id.to_string(),
+            home: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Record the ballot's container seat home (the run directory above the posture leaf), only
+    /// when it is the ballot's own: a `council-` run directory under `.wicked-container`.
+    fn note_seat(&self, config: &wicked_apps_core::spawn::SeatConfig) {
+        if let wicked_apps_core::spawn::SeatConfig::Isolated {
+            root: Some(leaf), ..
+        } = config
+        {
+            let run_dir = leaf.parent().map(Path::to_path_buf);
+            let owned = run_dir.as_ref().is_some_and(|d| {
+                d.parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|n| n == ".wicked-container")
+                    && d.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("council-"))
+            });
+            if owned {
+                *self.home.borrow_mut() = run_dir;
+            }
+        }
+    }
+}
+
+impl Drop for BallotScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(sandbox_root(&self.run_id));
+        if let Some(home) = self.home.borrow_mut().take() {
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
+}
+
 impl WrappedCliStepRunner {
     /// Run one unit's CLI, streaming stdout lines through `emit` as they arrive.
     fn exec(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
+        let ballot_scratch =
+            is_council_ballot(&input.unit).then(|| BallotScratch::new(&input.run_id));
         let cli_key = input
             .unit
             .assigned_cli
@@ -2122,7 +2175,12 @@ impl WrappedCliStepRunner {
             )?;
             c.ensure_dirs().map(|()| c)
         }) {
-            Ok(c) => c,
+            Ok(c) => {
+                if let Some(g) = &ballot_scratch {
+                    g.note_seat(&c);
+                }
+                c
+            }
             Err(e) => {
                 return StepOutput {
                     run_id: input.run_id.clone(),
@@ -7665,6 +7723,49 @@ mod tests {
         assert!(runs_in_seat(&input("triage", "x")));
         assert!(!runs_in_seat(&input("s", "x")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (codex council-r1 on #971) A ballot's one-shot scratch goes when the launch ends: its
+    /// sandbox, and its own `council-` run home under `.wicked-container`, never anything else.
+    #[test]
+    fn a_ballot_removes_its_sandbox_and_its_own_seat_home_when_the_launch_ends() {
+        use wicked_apps_core::spawn::SeatConfig;
+        let run_id = format!("council-scratch-{}", std::process::id());
+        let sandbox = sandbox_root(&run_id);
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let base = std::env::temp_dir().join(format!("ballot-scratch-test-{}", std::process::id()));
+        let mk = |rel: &str| {
+            let p = base.join(rel);
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        };
+        let owned_leaf = mk(&format!(".wicked-container/{run_id}-abc123/full"));
+        let foreign_leaf = mk("elsewhere/council-x-abc/full");
+        let other_run_leaf = mk(".wicked-container/run-1-abc/full");
+        let seat = |leaf: &PathBuf| SeatConfig::Isolated {
+            cli: wicked_apps_core::spawn::SeatCli::Claude,
+            root: Some(leaf.clone()),
+            set: Vec::new(),
+            strip: Vec::new(),
+        };
+        for leaf in [&foreign_leaf, &other_run_leaf] {
+            let g = BallotScratch::new(&format!("{run_id}-other"));
+            g.note_seat(&seat(leaf));
+            drop(g);
+            assert!(
+                leaf.exists(),
+                "never removes a home that is not a ballot's: {leaf:?}"
+            );
+        }
+        let g = BallotScratch::new(&run_id);
+        g.note_seat(&seat(&owned_leaf));
+        drop(g);
+        assert!(!sandbox.exists(), "the ballot's sandbox is removed");
+        assert!(
+            !owned_leaf.parent().unwrap().exists(),
+            "the ballot's seat home is removed"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// codex council-r3: a failed council ballot keeps both of its CLI's streams, so the council
