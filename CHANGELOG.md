@@ -14,6 +14,8 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core, core-ts: the estate library crates no longer panic on a refused stderr write (estate#333).** wicked-estate 0.29.3 shadows `eprintln!` in every library crate core links, as core#966 did for core's own crates. A diagnostic on a host thread, for example the model2vec fallback when the memory store opens offline, no longer kills that thread when a Node host's non-blocking stderr pipe refuses the write. All estate pins move to 0.29.3.
+
 - **Approving a `judge_unavailable` gate on a team run's build step judges the work instead of
   re-running it (core#969).** On a teamed run every non-evaluator step the team does not own is a PA
   step, the build step included, and the operator-as-judge arm skipped every PA step: Approve (with or
