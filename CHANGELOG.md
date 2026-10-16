@@ -69,6 +69,32 @@ Two release tracks share this file, newest entry first regardless of track:
   In-turn questions and per-tool permission asks return with DES-CONTAINER-FLOOR step 5 (the MCP `ask`
   tool through agentgateway, seccomp notify); until then they are not available.
 
+- **core, core-ts: the estate library crates no longer panic on a refused stderr write (estate#333).** wicked-estate 0.29.3 shadows `eprintln!` in every library crate core links, as core#966 did for core's own crates. A diagnostic on a host thread, for example the model2vec fallback when the memory store opens offline, no longer kills that thread when a Node host's non-blocking stderr pipe refuses the write. All estate pins move to 0.29.3.
+
+- **Approving a `judge_unavailable` gate on a team run's build step judges the work instead of
+  re-running it (core#969).** On a teamed run every non-evaluator step the team does not own is a PA
+  step, the build step included, and the operator-as-judge arm skipped every PA step: Approve (with or
+  without a note) re-dispatched the step, whose tree its first attempt had already changed, so the
+  substance floor failed it as "changed nothing", again and again (verify-e2e r4, run 24590a4b). Now
+  only a team member's step keeps the team gate's re-run. A PA step is judged by the operator, labelled
+  on its receipt, and still pauses on the team dispute its ledger owes. The hold and the judge-required
+  denial now say what Approve does ("Approve to judge it yourself"). An empty fallback-judge answer was
+  already a seat failure (the next fallback seat, else the hold); that is unchanged and pinned.
+- **`NO CHANGE NEEDED` is read however it is decorated, when it opens its line (core#929).**
+  `**NO CHANGE NEEDED** — the fix is already in the tree` and `NO CHANGE NEEDED: attempt 0 landed it`
+  now declare it; a line that only mentions it (`reply with: NO CHANGE NEEDED`) does not. The floor's
+  refusal names the form ("a line that starts with it").
+- **Engine notes on a unit's live output stand on their own line (core#969, core#970).** The repo
+  checks floor heartbeat, floor-fix and fallback-judge notes no longer fuse onto the seat's last
+  sentence ("…empirically.agent validator: the run's judge is out …").
+- **The ACP read-only reroute's disclosure is no longer the seat's output (core#970).** It was emitted
+  into the unit's output stream and prepended to `StepOutput.output`, so every chat answer on that
+  carrier began with "[wicked-core] unit N … F-036 / core#431" and the chat's reviewer flagged it. It
+  stays on `acpFallback` (and the daemon log). C5 removes this reroute altogether.
+- **A short chat answer is an answer (core#970).** A read-only step whose every output a human
+  confirms (a chat's answer step) no longer fails the substance floor for being under 200 characters;
+  the reroute disclosure used to pad such answers past it. An empty or whitespace-only answer still
+  fails it, over a clean or a dirty worktree.
 - **core: a run whose contract requires QE acceptance gets a QE test whatever its band (core#960).**
   A QE-required plan without a `test` step (for example a PA-scoped `build → review` that scored low)
   could never earn acceptance or a waiver, so it could never deliver. Floor fill now adds a `test`
@@ -533,6 +559,12 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.11.3** — 2026-10-15 — patch release on main e231ba8, carrying #967 (core#960: a run whose
+  contract requires QE acceptance gets a `test` step after its last tree change, whatever its band) and
+  #972 (core#969: Approve at `judge_unavailable` judges a team run's PA step instead of re-running it;
+  core#929: `NO CHANGE NEEDED` declares only when it opens its line; core#970: no engine text in a
+  seat's answer, engine notes on their own line, and a short human-confirmed chat answer passes the
+  substance floor). A patch: no surface change.
 - **core-ts 0.11.2** — 2026-10-15 — patch release on main 42b9ddc, carrying #966 (core#957: a diagnostic
   line no longer kills the thread that writes it). In a Node host the addon's stderr is a non-blocking
   pipe. When its reader lagged, std's `eprintln!` panicked on EAGAIN and the panic message was lost, so a

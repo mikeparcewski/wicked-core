@@ -20,8 +20,8 @@
 //! seat and PATH order decides which one a spawn gets; see `wicked-council`'s registry note.
 //!
 //! When an ACP binary is unavailable or fails during the handshake, `AcpStepRunner`
-//! emits a warning and prepends it to `StepOutput.output` so it is visible in both
-//! streaming and persisted contexts. The run then continues with single-shot fallback.
+//! discloses it on `CoreEvent::AcpFallback` and in the daemon log, never in the seat's
+//! output (core#970). The run then continues with single-shot fallback.
 //! HTTP transport is not yet implemented (no registry entry uses it today).
 //!
 //! # Session lifecycle
@@ -1512,8 +1512,9 @@ pub(crate) fn is_worker_originated_failure(output: &str) -> bool {
 /// - the ACP binary is not on PATH
 /// - the handshake fails or the session dies mid-run
 ///
-/// All fallbacks prepend a `[wicked-core] ACP …` warning to `StepOutput.output` so
-/// the degradation is visible in both streaming output and persisted logs.
+/// Every fallback is disclosed on [`CoreEvent::AcpFallback`] and in the daemon log
+/// (core#970); the seat's output is left untouched, so the disclosure never reads as
+/// part of the agent's answer.
 /// Stable `fallback_kind` slugs carried on [`CoreEvent::AcpFallback`] for UI dispatch.
 pub(crate) mod fallback_kind {
     // RETIRED: `handshake_failed`. Its only emitter was the governed-ACP branch removed with
@@ -2873,7 +2874,7 @@ mod tests {
     /// `{PROMPT}` (execute_wrapped.rs:1228), and that prompt carries `|||` and newlines — pipes and
     /// command separators to `cmd`. So Windows names a binary that cannot exist: the spawn fails
     /// fast, without a shell, and every assertion below except the execution proof still holds,
-    /// because `fallback_with_warning` prepends its warning whether or not the child runs.
+    /// because `fallback_with_warning` discloses the fallback whether or not the child runs.
     /// FINDING-060's regression, now asserted the other way round.
     ///
     /// The ACP path once armed governance the bridge never applied, so a governed unit ran with
