@@ -338,20 +338,10 @@ pub(crate) fn placeholder_files(
 /// its per-unit `opencode.json`: constant placeholders, identical for every unit, so concurrent
 /// units sharing the seat's credential DB never overwrite each other (decision 3).
 pub(crate) const OPENCODE_IMPORT_FILE: &str = "wicked-credentials.json";
-/// The integrations whose rows the broker may place; a row of one not held is logged out.
-pub(crate) const OPENCODE_ROW_INTEGRATIONS: &[&str] = &["openai", "github-copilot"];
-
-/// The opencode integrations `subs` hold DB rows for (the ChatGPT and Copilot sign-ins; an API
-/// key needs none: its `opencode.json` key is enough).
-pub(crate) fn opencode_row_integrations(subs: &[Subscription]) -> Vec<&'static str> {
-    subs.iter()
-        .filter_map(|s| match s {
-            Subscription::OpencodeChatgpt => Some("openai"),
-            Subscription::OpencodeCopilot => Some("github-copilot"),
-            _ => None,
-        })
-        .collect()
-}
+/// The label of every row the engine places in a seat's opencode DB (ids `wicked-seat-…`): the
+/// pinned-server script removes each engine row the unit's file does not name
+/// (`worker_sandbox::opencode_pinned_server_argv`).
+pub(crate) const OPENCODE_ROW_LABEL: &str = "wicked seat";
 
 fn opencode_files(
     mut files: Vec<(PathBuf, String)>,
@@ -396,9 +386,14 @@ fn opencode_files(
         };
         config["provider"][id]["options"] = options;
         if let Some(value) = row {
+            // Versioned by content: a changed placeholder is a new row (imported and activated)
+            // and the old one is removed, never silently kept because its id exists.
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(value.to_string().as_bytes());
+            let tag: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
             rows.push(
-                json!({"id": format!("wicked-seat-{id}"), "integrationID": id,
-                "label": "wicked seat", "active": true, "value": value}),
+                json!({"id": format!("wicked-seat-{id}-{tag}"), "integrationID": id,
+                "label": OPENCODE_ROW_LABEL, "active": true, "value": value}),
             );
         }
     }
@@ -664,17 +659,22 @@ mod tests {
             "http://agw:4010"
         );
         assert_eq!(rows[0]["value"]["metadata"]["accountID"], ACCOUNT_ID);
-        // The seat logs out only the rows of integrations the broker no longer holds.
-        let env = crate::seat_gateway::seat_env_for_sign_in("opencode", &sign_in, KEY);
-        let logout = |env: &[(String, String)]| {
-            env.iter()
-                .find(|(k, _)| k == crate::seat_gateway::OPENCODE_LOGOUT_ENV)
-                .map(|(_, v)| v.clone())
-        };
-        assert_eq!(logout(&env).as_deref(), Some(""));
+        // Every row carries the engine's label and a content-versioned id (a changed placeholder
+        // is a new row, never silently kept because its id exists); the pinned script removes
+        // engine rows the unit's file does not name.
+        for row in rows.as_array().unwrap() {
+            assert_eq!(row["label"], OPENCODE_ROW_LABEL);
+            let id = row["id"].as_str().unwrap();
+            let integration = row["integrationID"].as_str().unwrap();
+            let tag = id
+                .strip_prefix(&format!("wicked-seat-{integration}-"))
+                .unwrap();
+            assert!(
+                tag.len() == 8 && tag.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{id}"
+            );
+        }
         let key_only: SeatSignIn = CredentialKind::ProviderKey.into();
-        let env = crate::seat_gateway::seat_env_for_sign_in("opencode", &key_only, KEY);
-        assert_eq!(logout(&env).as_deref(), Some("openai github-copilot"));
         assert_eq!(
             seat_files("opencode", &key_only, KEY, URL),
             placeholder_files("opencode", CredentialKind::ProviderKey, KEY, URL)

@@ -43,9 +43,12 @@ fn login_container(login_volume: &str) -> String {
     login_volume.to_string()
 }
 
-/// opencode's login command: its own `auth login`, then `auth export` of the credential rows it
-/// stored (opencode 2.x keeps them in SQLite, never an `auth.json`) to the file ingest reads.
-const OPENCODE_LOGIN: &str = "opencode auth login; umask 077; mkdir -p \"$XDG_DATA_HOME/opencode\" && opencode auth export > \"$XDG_DATA_HOME/opencode/wicked-auth.json\"";
+/// opencode's login command: its own `auth login`, then (only if it succeeded) `auth export` of
+/// the credential rows it stored (opencode 2.x keeps them in SQLite, never an `auth.json`) to the
+/// file ingest reads, written whole or not at all (a temporary file renamed into place). A failed
+/// login or export leaves no export and exits nonzero: ingest reports the sign-in missing, and the
+/// user signs in again.
+const OPENCODE_LOGIN: &str = "d=\"$XDG_DATA_HOME/opencode\" && opencode auth login && umask 077 && mkdir -p \"$d\" && { opencode auth export > \"$d/wicked-auth.json.tmp\" && mv \"$d/wicked-auth.json.tmp\" \"$d/wicked-auth.json\" || { rm -f \"$d/wicked-auth.json.tmp\"; exit 1; }; }";
 
 /// Pure argv rendering: no host environment or credentials are forwarded. Callers validate CLI
 /// names before using the returned argv.
@@ -3136,6 +3139,59 @@ esac
         ])
     }
 
+    /// The opencode login command: a failed login exports nothing and fails; a failed export
+    /// leaves no export (whole or nothing) and fails; both succeeding leave the export, private.
+    #[cfg(unix)]
+    #[test]
+    fn opencode_login_exports_only_after_a_successful_login_and_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("wicked-oc-login-{}", uuid::Uuid::new_v4().simple()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake = bin.join("opencode");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ncase \"$2\" in\n  login) [ -e \"$FAKE_DIR/login_fails\" ] && exit 3; exit 0;;\n  export) printf '[{\"partial\":'; [ -e \"$FAKE_DIR/export_fails\" ] && exit 4; printf '1}]';;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run = |case: &str| {
+            let data = dir.join(case);
+            let _ = std::fs::remove_dir_all(&data);
+            // spawn-audit: test-only — the engine's login command with a fake opencode.
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", OPENCODE_LOGIN])
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("XDG_DATA_HOME", &data)
+                .env("FAKE_DIR", &dir)
+                .output()
+                .unwrap();
+            (out.status.success(), data.join("opencode"))
+        };
+        std::fs::write(dir.join("login_fails"), "").unwrap();
+        let (ok, d) = run("a");
+        assert!(!ok && !d.join("wicked-auth.json").exists());
+        std::fs::remove_file(dir.join("login_fails")).unwrap();
+        std::fs::write(dir.join("export_fails"), "").unwrap();
+        let (ok, d) = run("b");
+        assert!(!ok);
+        assert!(!d.join("wicked-auth.json").exists() && !d.join("wicked-auth.json.tmp").exists());
+        std::fs::remove_file(dir.join("export_fails")).unwrap();
+        let (ok, d) = run("c");
+        assert!(ok);
+        assert_eq!(
+            std::fs::read_to_string(d.join("wicked-auth.json")).unwrap(),
+            "[{\"partial\":1}]"
+        );
+        let mode = std::fs::metadata(d.join("wicked-auth.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "the export is private");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// opencode 2.x keeps its sign-ins in SQLite; the login exports them, and ingest takes the
     /// ACTIVE credential of each integration onto its own route files (decision 1).
     #[test]
@@ -4463,12 +4519,47 @@ esac
         for (name, body) in seat_files("opencode", &sign_in, &key.key, &url) {
             std::fs::write(dir.join("seat").join(name), body).unwrap();
         }
-        let env = crate::seat_gateway::seat_env_for_sign_in("opencode", &sign_in, &key.key);
-        let logout = env
-            .iter()
-            .find(|(k, _)| k == crate::seat_gateway::OPENCODE_LOGOUT_ENV)
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default();
+        // One credential DB shared by every run, as a seat home is, seeded with an engine row an
+        // earlier unit placed that this sign-in no longer holds: the pinned script removes it.
+        let data = format!("{}-ocdata", gw.name);
+        run(&["volume", "rm", &data]);
+        assert!(run(&["volume", "create", &data]).status.success());
+        checked(
+            &rt,
+            &helper_argv(&data, false, "0", "chown 10001 /in && chmod 700 /in".into()),
+        )
+        .unwrap();
+        let data_mount = format!("type=volume,src={data},dst=/data");
+        let stale = r#"[{"id":"wicked-seat-github-copilot-deadbeef","integrationID":"github-copilot","label":"wicked seat","active":true,"value":{"type":"oauth","methodID":"device","refresh":"PLACEHOLDER-old","access":"PLACEHOLDER-old","expires":0,"metadata":{"apiEndpoint":"http://agw:4999"}}}]"#;
+        let seed = format!(
+            "printf '%s' '{stale}' > /tmp/stale.json && opencode auth import --standalone /tmp/stale.json"
+        );
+        let o = run(&[
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--user",
+            "10001",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,exec",
+            "-w",
+            "/tmp",
+            "--mount",
+            &data_mount,
+            "-e",
+            "HOME=/tmp",
+            "-e",
+            "XDG_CONFIG_HOME=/tmp/config",
+            "-e",
+            "XDG_DATA_HOME=/data",
+            &image,
+            "sh",
+            "-c",
+            &seed,
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         let seat_dir = format!(
             "type=bind,src={},dst=/u,readonly",
             dir.join("seat").display()
@@ -4503,7 +4594,7 @@ esac
                 "-e",
                 "XDG_CONFIG_HOME=/tmp/config",
                 "-e",
-                "XDG_DATA_HOME=/tmp/data",
+                "XDG_DATA_HOME=/data",
                 "-e",
                 "OPENCODE_CONFIG=/u/opencode.json",
                 "-e",
@@ -4515,7 +4606,7 @@ esac
             ]
             .map(String::from)
             .to_vec();
-            docker.extend(["-e".into(), format!("WICKED_OPENCODE_LOGOUT={logout}")]);
+            docker.extend(["--mount".into(), data_mount.clone()]);
             docker.push(image.clone());
             docker.extend(["timeout".into(), "90".into()]);
             docker.extend(pinned);
@@ -4544,6 +4635,33 @@ esac
             }
             std::thread::sleep(Duration::from_millis(250));
         }
+        let exported = run(&[
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--user",
+            "10001",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,exec",
+            "-w",
+            "/tmp",
+            "--mount",
+            &data_mount,
+            "-e",
+            "HOME=/tmp",
+            "-e",
+            "XDG_CONFIG_HOME=/tmp/config",
+            "-e",
+            "XDG_DATA_HOME=/data",
+            &image,
+            "opencode",
+            "auth",
+            "export",
+            "--standalone",
+        ]);
+        let exported: Value = serde_json::from_slice(&exported.stdout).unwrap_or(json!([]));
         let status_in = broker_status(&rt, &gw, "opencode");
         sign_out_and_route(&rt, &gw, &dir, "opencode").expect("signed out");
         let before_out = upstream().len();
@@ -4562,7 +4680,7 @@ esac
         run(&["rm", "-f", &stub, &gw.name]);
         run(&["network", "rm", &seat_net, &gw.external_network]);
         let (cfg, broker) = crate::seat_gateway::volumes(&gw);
-        run(&["volume", "rm", &cfg, &broker, &volume]);
+        run(&["volume", "rm", &cfg, &broker, &volume, &data]);
         let _ = std::fs::remove_dir_all(&dir);
         eprintln!("report={report:?}\nsign_in={sign_in:?}\nforeign={foreign:?}\nseen={seen}");
         assert!(
@@ -4600,6 +4718,28 @@ esac
                 "{text}"
             );
         }
+        // The shared DB holds exactly the engine's current rows, active; the stale one is gone.
+        let ids: Vec<&str> = exported
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 2, "{exported}");
+        assert!(
+            ids.iter()
+                .all(|id| id.starts_with("wicked-seat-") && !id.ends_with("deadbeef")),
+            "{ids:?}"
+        );
+        assert!(exported
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["active"] == true));
+        assert!(
+            !exported.to_string().contains("FAKE"),
+            "the seat DB holds no credential"
+        );
         assert!(
             matches!(status_in, BrokerStatus::SignedIn { .. }),
             "{status_in:?}"
