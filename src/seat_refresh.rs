@@ -1101,6 +1101,10 @@ mod tests {
     /// Decision 8: pi renews the entry expiring first, with that provider's own flow.
     #[test]
     fn pi_refreshes_the_earliest_due_entry_with_its_providers_flow() {
+        // The flows' URLs read the live tests' stub override: wait out any live test.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let record = pi_record();
         assert_eq!(next_refresh("pi", &record, 100, false), None, "nothing due");
         let (entry, request) = next_refresh("pi", &record, 1_000_000_000, false).unwrap();
