@@ -72,8 +72,10 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const REAP_TIMEOUT: Duration = Duration::from_secs(20);
 const SWEEP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// The gateway's listeners a seat may connect to: CONNECT 3000, Anthropic 4000, OpenAI 4001,
-/// ChatGPT 4002, pi 4003, opencode 4004, Claude OAuth 4005, the ask MCP 8700 and the gate hook
-/// 8711 ([`crate::seat_gateway`], [`crate::hook_relay`]).
+/// ChatGPT 4002, pi 4003, opencode 4004, Claude OAuth 4005, the subscription routes 4006-4012
+/// ([`crate::seat_credentials::SUBSCRIPTION_ROUTES`]), the ask MCP 8700 and the gate hook 8711
+/// ([`crate::seat_gateway`], [`crate::hook_relay`]). Each route admits only its owner agent's
+/// unit keys, so a reachable port is not a usable credential.
 pub(crate) const GATEWAY_PORTS: &[u16] = &[
     3000,
     4000,
@@ -82,6 +84,13 @@ pub(crate) const GATEWAY_PORTS: &[u16] = &[
     4003,
     4004,
     4005,
+    4006,
+    4007,
+    4008,
+    4009,
+    4010,
+    4011,
+    4012,
     8700,
     crate::hook_relay::HOOK_PORT,
 ];
@@ -2050,20 +2059,24 @@ fn gateway_route_defined(cli: &str, online: bool) -> Result<(), String> {
 
 fn placeholder_handoff(
     cli: &str,
-    kind: crate::seat_credentials::CredentialKind,
+    sign_in: impl Into<crate::seat_credentials::SeatSignIn>,
     run: &str,
     unit: &str,
 ) -> SeatCredential {
+    let sign_in = sign_in.into();
     let mut key = crate::seat_gateway::UnitKey::new(run, unit, cli);
-    let files = crate::seat_credentials::placeholder_files(
-        cli,
-        kind,
-        &key.key,
-        &crate::seat_gateway::credential_gateway_url(cli, kind),
-    );
-    key.bearer = crate::seat_credentials::sent_bearer(cli, kind, &key.key);
-    key.key = key.bearer.clone();
-    let env = crate::seat_gateway::seat_env_for(cli, kind, &key.bearer);
+    let url = sign_in
+        .kind
+        .map(|kind| crate::seat_gateway::credential_gateway_url(cli, kind))
+        .unwrap_or_default();
+    let files = crate::seat_credentials::seat_files(cli, &sign_in, &key.key, &url);
+    if let Some(kind) = sign_in.kind {
+        key.bearer = crate::seat_credentials::sent_bearer(cli, kind, &key.key);
+        key.key = key.bearer.clone();
+    } else {
+        key.bearer = key.key.clone();
+    }
+    let env = crate::seat_gateway::seat_env_for_sign_in(cli, &sign_in, &key.bearer);
     (key, env, files)
 }
 
@@ -2199,7 +2212,7 @@ pub(crate) fn arm(
             // The agent's sign-in (DES §6): the user signed in once in its login container, and
             // the broker holds that credential. The seat's placeholder takes its shape and its
             // requests ride its route; signed out (or expired) = refused before the seat starts.
-            let kind = crate::seat_login::seat_credential_kind(&rt, &gw, dir, cli)
+            let kind = crate::seat_login::seat_sign_in(&rt, &gw, dir, cli)
                 .map_err(|e| (FloorUnarmed::AgentSignedOut, e))?;
             crate::seat_gateway::attach(&rt, &gw, &network).map_err(down)?;
             // The seat's namespace: a sidecar allows output only to the gateway's own address on
@@ -2893,13 +2906,24 @@ mod tests {
                 ..Default::default()
             };
             let rendered = crate::seat_gateway::render(&config);
-            for bind in rendered["binds"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .take(config.providers.len())
-            {
+            for (route, bind) in config.providers.iter().zip(
+                rendered["binds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .take(config.providers.len()),
+            ) {
                 let auth = &bind["listeners"][0]["routes"][0]["policies"]["apiKey"];
+                if route.owner().is_some_and(|o| o != cli) {
+                    // Another agent's route never admits this seat (route ownership).
+                    assert_eq!(
+                        auth["keys"],
+                        serde_json::json!([]),
+                        "{cli} on {}",
+                        route.port
+                    );
+                    continue;
+                }
                 assert_eq!(auth["keys"][0]["key"], key.bearer);
                 assert_eq!(auth["keys"][0]["metadata"]["unit"], "test-unit-1");
             }

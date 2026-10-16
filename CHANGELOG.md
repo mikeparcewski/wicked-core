@@ -14,6 +14,16 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **pi signs in with its subscriptions on the container floor; each gateway route admits only its owner agent.** pi's
+  `/login` OAuth records (Anthropic Claude Pro/Max, OpenAI ChatGPT Plus/Pro via `openai-codex`, GitHub Copilot) are
+  ingested beside its OpenAI API key, each onto its own broker file and static gateway route (4006-4008,
+  `seat_credentials::SUBSCRIPTION_ROUTES`); what the broker cannot serve yet is named in the ingest report's
+  `skipped`. The seat holds only constant placeholders in pi's `auth.json`; its unit key rides an `x-wicked-unit`
+  header from `models.json`, which the gateway checks and strips. Only valid (unexpired) subscriptions are placed.
+  The broker's refresher renews pi's entries one committed generation at a time (claude's and codex's flows; the
+  Copilot token by GitHub's exchange, its GitHub token on curl's stdin). Every model route now admits only its owner
+  agent's unit keys: before, any seat's key was accepted on every route. ChatGPT account and Copilot host literals are
+  per route (a legacy single account is read as codex's). DES-SEAT-LOGIN-SUBSCRIPTIONS.
 - **Codex signs in from its login container.** The login ran `codex login --device-auth` with
   `CODEX_HOME=/home/login/codex`, a directory nothing had created in the fresh login volume, and codex refuses a
   `CODEX_HOME` that does not exist ("Error loading configuration"): the login exited before any sign-in, and ingest

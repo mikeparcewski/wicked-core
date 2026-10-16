@@ -56,12 +56,30 @@ pub(crate) struct GatewayConfig {
     /// `host:port` of crew's MCP broker as the gateway reaches it; `None` = no MCP route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) mcp_upstream: Option<String>,
-    /// The signed-in ChatGPT account (an identifier, not a credential: the broker holds the
-    /// token). agentgateway v1.6.0 sets request headers from literals only, so the ChatGPT route
-    /// carries it here; `None` = signed out (the header is removed and the upstream refuses).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) chatgpt_account: Option<String>,
+    /// The signed-in ChatGPT account of each ChatGPT route, keyed by the route's credential file
+    /// (an identifier, not a credential: the broker holds the token). agentgateway v1.6.0 sets
+    /// request headers from literals only, so the route carries it here; absent = signed out
+    /// (the header is removed and the upstream refuses).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) chatgpt_accounts: std::collections::BTreeMap<String, String>,
+    /// The Copilot API host of each Copilot route's credential, keyed by credential file (the
+    /// account's plan endpoint, e.g. `api.individual.githubcopilot.com`); absent = the default.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) copilot_hosts: std::collections::BTreeMap<String, String>,
+    /// Read-only: the single ChatGPT account an earlier engine persisted (codex's route). It is
+    /// folded into [`Self::chatgpt_accounts`] on load and never written again.
+    #[serde(default, rename = "chatgpt_account", skip_serializing)]
+    pub(crate) legacy_chatgpt_account: Option<String>,
 }
+
+/// The route file codex's ChatGPT sign-in is served from (the legacy account's owner).
+const CODEX_CHATGPT_FILE: &str = "openai.token";
+/// The header the newer agents' routes authenticate a unit by (pi, opencode): their CLIs send it
+/// from a per-unit config file, so the CLI's own credential store holds only constant
+/// placeholders (DES-SEAT-LOGIN-SUBSCRIPTIONS decision 3).
+pub(crate) const UNIT_HEADER: &str = "x-wicked-unit";
+/// The Copilot API host a Copilot route uses when its credential names none.
+pub(crate) const COPILOT_DEFAULT_HOST: &str = "api.githubcopilot.com";
 
 /// A seat's revocable placeholder key and the identity authenticated requests carry.
 /// Its `Debug` implementation redacts the key so diagnostics cannot print it.
@@ -118,6 +136,10 @@ pub(crate) struct ModelRoute {
     /// Absent on older configs: preserve their native API-key policy.
     #[serde(default)]
     pub(crate) kind: Option<CredentialKind>,
+    /// The request header a unit's key is read from on this route; `None` = the kind's native
+    /// credential header (`authorization` / `x-api-key`). The header is removed upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) unit_header: Option<String>,
 }
 
 impl ModelRoute {
@@ -126,8 +148,36 @@ impl ModelRoute {
             Provider::Anthropic => CredentialKind::ClaudeApiKey,
             Provider::OpenAI => CredentialKind::CodexApiKey,
             Provider::ChatGpt => CredentialKind::CodexChatgpt,
+            Provider::Copilot => CredentialKind::ProviderKey,
         })
     }
+
+    /// The agent whose sign-in this route serves, from its credential file; `None` for a file
+    /// no agent owns (an operator's or a test's custom route), which keeps every unit's key.
+    pub(crate) fn owner(&self) -> Option<&'static str> {
+        route_owner(self.credential_file.file_name()?.to_str()?)
+    }
+
+    fn file_name(&self) -> &str {
+        self.credential_file
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("")
+    }
+}
+
+/// The agent that owns broker file `file` (DES-SEAT-LOGIN-SUBSCRIPTIONS decision 2): a route
+/// admits only that agent's unit keys, so one agent's seat never spends another's sign-in.
+pub(crate) fn route_owner(file: &str) -> Option<&'static str> {
+    let stem = file.split('.').next()?;
+    Some(match stem {
+        "anthropic" | "claude" => "claude",
+        "openai" | "codex" => "codex",
+        "pi" => "pi",
+        "opencode" => "opencode",
+        "copilot" => "copilot",
+        _ => return None,
+    })
 }
 
 /// The native API each model listener preserves. The seat-env helper uses the standard ports.
@@ -136,6 +186,8 @@ pub(crate) enum Provider {
     Anthropic,
     OpenAI,
     ChatGpt,
+    /// The GitHub Copilot API (an OpenAI-shaped wire at the account's plan host).
+    Copilot,
 }
 
 impl Provider {
@@ -144,6 +196,7 @@ impl Provider {
             Self::Anthropic => 4000,
             Self::OpenAI => 4001,
             Self::ChatGpt => 4002,
+            Self::Copilot => 4012,
         }
     }
 
@@ -151,8 +204,8 @@ impl Provider {
     fn config_key(self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",
-            // ChatGPT's backend speaks the OpenAI wire.
-            Self::OpenAI | Self::ChatGpt => "openAI",
+            // ChatGPT's backend and the Copilot API speak the OpenAI wire.
+            Self::OpenAI | Self::ChatGpt | Self::Copilot => "openAI",
         }
     }
 
@@ -161,6 +214,7 @@ impl Provider {
             Self::Anthropic => "anthropic",
             Self::OpenAI => "openai",
             Self::ChatGpt => "chatgpt",
+            Self::Copilot => "copilot",
         }
     }
 }
@@ -208,13 +262,20 @@ impl Default for GatewayConfig {
                 ),
             ]
             .into_iter()
-            .map(|(provider, port, kind, file)| ModelRoute {
+            .map(|(provider, port, kind, file)| (provider, port, kind, file, None))
+            .chain(
+                crate::seat_credentials::SUBSCRIPTION_ROUTES
+                    .iter()
+                    .map(|r| (r.provider, r.port, r.kind, r.file, r.unit_header)),
+            )
+            .map(|(provider, port, kind, file, header)| ModelRoute {
                 port,
                 provider,
                 upstream_host: String::new(),
                 tls: true,
                 credential_file: PathBuf::from(format!("/broker/{file}")),
                 kind: Some(kind),
+                unit_header: header.map(str::to_string),
             })
             .collect(),
             // `WICKED_SEAT_EGRESS_HOSTS`: the hostnames (comma-separated) seats may reach
@@ -227,7 +288,9 @@ impl Default for GatewayConfig {
                 .collect(),
             hook_upstream: None,
             mcp_upstream: None,
-            chatgpt_account: None,
+            chatgpt_accounts: Default::default(),
+            copilot_hosts: Default::default(),
+            legacy_chatgpt_account: None,
         }
     }
 }
@@ -235,19 +298,16 @@ impl Default for GatewayConfig {
 /// Render JSON (also valid YAML), preserving the proven Anthropic fixture's policies and body
 /// routes. Empty keys still render `strict`: no model request becomes anonymous at idle.
 pub(crate) fn render(config: &GatewayConfig) -> Value {
-    let keys: Vec<Value> = config
-        .units
-        .iter()
-        .map(|u| {
-            json!({
-                "key": u.key,
-                "metadata": {
-                    "name": format!("unit-{}", u.unit),
-                    "run": u.run, "unit": u.unit, "seat": u.seat
-                }
-            })
+    let key_of = |u: &UnitKey| {
+        json!({
+            "key": u.key,
+            "metadata": {
+                "name": format!("unit-{}", u.unit),
+                "run": u.run, "unit": u.unit, "seat": u.seat
+            }
         })
-        .collect();
+    };
+    let keys: Vec<Value> = config.units.iter().map(key_of).collect();
     let mut binds: Vec<Value> = config
         .providers
         .iter()
@@ -263,13 +323,24 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
                     "/v1/responses": "responses",
                     "*": "passthrough"
                 }),
-                Provider::ChatGpt => json!({"*": "passthrough"}),
+                Provider::ChatGpt | Provider::Copilot => json!({"*": "passthrough"}),
             };
             let mut provider = serde_json::Map::new();
             provider.insert(route.provider.config_key().into(), json!({}));
             let kind = route.credential_kind();
-            let location = match kind {
-                CredentialKind::ClaudeApiKey => json!({"header": {"name": "x-api-key"}}),
+            // DES-SEAT-LOGIN-SUBSCRIPTIONS decision 2: a route admits only its owner's units.
+            let route_keys: Vec<Value> = match route.owner() {
+                Some(owner) => config
+                    .units
+                    .iter()
+                    .filter(|u| u.seat == owner)
+                    .map(key_of)
+                    .collect(),
+                None => keys.clone(),
+            };
+            let location = match (route.unit_header.as_deref(), kind) {
+                (Some(header), _) => json!({"header": {"name": header}}),
+                (None, CredentialKind::ClaudeApiKey) => json!({"header": {"name": "x-api-key"}}),
                 // v1.6.0 schema/config.json: LocalAPIKeys.location / AuthorizationLocation.
                 // Native OpenAI clients send Authorization: Bearer <placeholder>.
                 _ => {
@@ -280,7 +351,7 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
                 "apiKey": {
                     "mode": "strict",
                     "location": location,
-                    "keys": keys
+                    "keys": route_keys
                 },
                 "ai": {"routes": routes}
             });
@@ -294,25 +365,42 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
                     | CredentialKind::CodexChatgpt
                     | CredentialKind::ProviderKey
             );
-            if broker_bearer {
+            if broker_bearer || route.provider == Provider::ChatGpt {
                 // Preserve Authorization as proved by the broker spike. Native Anthropic ai
-                // backends inject x-api-key; OAuth needs a plain host backend instead.
+                // backends inject x-api-key; OAuth needs a plain host backend instead. For
+                // ChatGPT the broker's access token replaces the seat's placeholder bearer.
                 policies["backendAuth"] =
                     json!({"key": {"value": {"file": route.credential_file}}});
+            }
+            // Headers the upstream must not see (the unit's own key header, a stray API key)
+            // and the literal ones it must (v1.6.0 HeaderModifier.set takes literals only).
+            let mut remove: Vec<&str> = Vec::new();
+            let mut set = serde_json::Map::new();
+            if let Some(header) = route.unit_header.as_deref() {
+                remove.push(header);
             }
             if kind == CredentialKind::ClaudeOauth {
-                policies["requestHeaderModifier"] = json!({"remove": ["x-api-key"]});
+                remove.push("x-api-key");
             }
             if route.provider == Provider::ChatGpt {
-                // The broker's access token replaces the seat's placeholder bearer (watched
-                // file); the account header is a literal (v1.6.0 HeaderModifier.set takes
-                // literals only), as the broker spike proved (`linux/broker/config.yaml`).
-                policies["backendAuth"] =
-                    json!({"key": {"value": {"file": route.credential_file}}});
-                policies["requestHeaderModifier"] = match config.chatgpt_account.as_deref() {
-                    Some(acct) => json!({"set": {"chatgpt-account-id": acct}}),
-                    None => json!({"remove": ["chatgpt-account-id"]}),
-                };
+                // The account header is a literal, as the broker spike proved
+                // (`linux/broker/config.yaml`); absent = signed out, the header is removed.
+                match config.chatgpt_accounts.get(route.file_name()) {
+                    Some(acct) => {
+                        set.insert("chatgpt-account-id".into(), json!(acct));
+                    }
+                    None => remove.push("chatgpt-account-id"),
+                }
+            }
+            let mut modifier = serde_json::Map::new();
+            if !set.is_empty() {
+                modifier.insert("set".into(), Value::Object(set));
+            }
+            if !remove.is_empty() {
+                modifier.insert("remove".into(), json!(remove));
+            }
+            if !modifier.is_empty() {
+                policies["requestHeaderModifier"] = Value::Object(modifier);
             }
             if !route.upstream_host.is_empty() {
                 backend["hostOverride"] = json!(route.upstream_host);
@@ -320,23 +408,32 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
                     policies["backendTLS"] = json!({});
                 }
             }
-            let backends =
-                if route.provider == Provider::ChatGpt || kind == CredentialKind::ClaudeOauth {
-                    let host = if route.upstream_host.is_empty() {
-                        match route.provider {
-                            Provider::ChatGpt => "chatgpt.com:443",
-                            _ => "api.anthropic.com:443",
-                        }
-                    } else {
-                        &route.upstream_host
-                    };
-                    if route.upstream_host.is_empty() || route.tls {
-                        policies["backendTLS"] = json!({});
+            let host_backend = matches!(route.provider, Provider::ChatGpt | Provider::Copilot)
+                || kind == CredentialKind::ClaudeOauth;
+            let backends = if host_backend {
+                let host = if route.upstream_host.is_empty() {
+                    match route.provider {
+                        Provider::ChatGpt => "chatgpt.com:443".to_string(),
+                        Provider::Copilot => format!(
+                            "{}:443",
+                            config
+                                .copilot_hosts
+                                .get(route.file_name())
+                                .map(String::as_str)
+                                .unwrap_or(COPILOT_DEFAULT_HOST)
+                        ),
+                        _ => "api.anthropic.com:443".to_string(),
                     }
-                    json!([{"host": host}])
                 } else {
-                    json!([{"ai": backend}])
+                    route.upstream_host.clone()
                 };
+                if route.upstream_host.is_empty() || route.tls {
+                    policies["backendTLS"] = json!({});
+                }
+                json!([{"host": host}])
+            } else {
+                json!([{"ai": backend}])
+            };
             json!({
                 "port": route.port,
                 "listeners": [{ "routes": [{
@@ -518,6 +615,12 @@ fn env_at_port(provider: Provider, port: u16, key: &str) -> Vec<(String, String)
             "OPENAI_API_KEY",
             format!("http://agw:{port}/backend-api/codex"),
         ),
+        // Copilot seats are configured by their own CLI's settings, never by this env.
+        Provider::Copilot => (
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY",
+            format!("http://agw:{port}"),
+        ),
     };
     vec![
         (base.into(), url),
@@ -598,6 +701,13 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
 fn load_config(dir: &Path) -> Result<GatewayConfig, String> {
     let mut config: GatewayConfig =
         read_json(&dir.join("config/gateway.json"))?.unwrap_or_default();
+    // An earlier engine's single account was codex's: one representation from here on.
+    if let Some(account) = config.legacy_chatgpt_account.take() {
+        config
+            .chatgpt_accounts
+            .entry(CODEX_CHATGPT_FILE.to_string())
+            .or_insert(account);
+    }
     config.units = read_json(&dir.join("config/units.json"))?.unwrap_or_default();
     Ok(config)
 }
@@ -796,6 +906,30 @@ pub(crate) fn seat_env_for(cli: &str, kind: CredentialKind, bearer: &str) -> Vec
     env
 }
 
+/// The env of a seat signed in with `sign_in`. A subscription's CLI reads its route from its own
+/// config file (pi `models.json`), so a provider API-key env override (which would switch the
+/// CLI into API-key mode for that provider) and the native base URLs are kept out; only the
+/// CONNECT proxy stays.
+pub(crate) fn seat_env_for_sign_in(
+    cli: &str,
+    sign_in: &crate::seat_credentials::SeatSignIn,
+    bearer: &str,
+) -> Vec<(String, String)> {
+    let mut env = match sign_in.kind {
+        Some(kind) => seat_env_for(cli, kind, bearer),
+        None => seat_env_all(bearer),
+    };
+    if sign_in.kind.is_none() || !sign_in.subscriptions.is_empty() {
+        env.retain(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "ANTHROPIC_API_KEY" | "OPENAI_API_KEY" | "ANTHROPIC_BASE_URL" | "OPENAI_BASE_URL"
+            )
+        });
+    }
+    env
+}
+
 // codex lg-r1 #3: seat-login is a separate process; keep publication inside this
 // transaction too. All callers acquire PUBLISH_LOCK -> CONFIG_LOCK -> config/.lock.
 struct ConfigTransaction {
@@ -875,17 +1009,88 @@ pub(crate) fn validate_chatgpt_account(account: Option<&str>) -> Result<(), Stri
     Ok(())
 }
 
+/// Accept only a Copilot API host (`api.githubcopilot.com` or `api.<plan>.githubcopilot.com`)
+/// before it becomes a route's upstream: a credential never redirects the gateway elsewhere.
+pub(crate) fn validate_copilot_host(host: &str) -> Result<(), String> {
+    let plan_ok = |p: &str| {
+        !p.is_empty()
+            && p.len() <= 63
+            && p.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    };
+    let ok = host == COPILOT_DEFAULT_HOST
+        || host
+            .strip_prefix("api.")
+            .and_then(|r| r.strip_suffix(".githubcopilot.com"))
+            .is_some_and(plan_ok);
+    if ok {
+        Ok(())
+    } else {
+        Err("the Copilot API host is not a githubcopilot.com API host".into())
+    }
+}
+
+/// The literals a sign-in publishes on its agent's routes, keyed by route credential file: each
+/// ChatGPT route's account id and each Copilot route's API host. Identifiers, never credentials.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RouteLiterals {
+    pub(crate) accounts: Vec<(String, String)>,
+    pub(crate) hosts: Vec<(String, String)>,
+}
+
+impl RouteLiterals {
+    pub(crate) fn validate(&self, cli: &str) -> Result<(), String> {
+        for (file, account) in &self.accounts {
+            if route_owner(file) != Some(cli) {
+                return Err(format!("{cli}: route {file} is not this agent's"));
+            }
+            validate_chatgpt_account(Some(account))?;
+        }
+        for (file, host) in &self.hosts {
+            if route_owner(file) != Some(cli) {
+                return Err(format!("{cli}: route {file} is not this agent's"));
+            }
+            validate_copilot_host(host)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn set_chatgpt_account(dir: &Path, account: Option<&str>) -> Result<(), String> {
     validate_chatgpt_account(account)?;
     let _transaction = config_transaction(dir)?;
-    set_chatgpt_account_locked(dir, account)
+    let literals = RouteLiterals {
+        accounts: account
+            .map(|a| vec![(CODEX_CHATGPT_FILE.to_string(), a.to_string())])
+            .unwrap_or_default(),
+        hosts: Vec::new(),
+    };
+    set_route_literals_locked(dir, "codex", &literals)
 }
 
-fn set_chatgpt_account_locked(dir: &Path, account: Option<&str>) -> Result<(), String> {
-    validate_chatgpt_account(account)?;
+/// Replace every literal on `cli`'s routes with `literals` (empty = signed out).
+fn set_route_literals_locked(
+    dir: &Path,
+    cli: &str,
+    literals: &RouteLiterals,
+) -> Result<(), String> {
+    literals.validate(cli)?;
     let mut config = load_config(dir)?;
-    config.chatgpt_account = account.map(str::to_string);
+    config
+        .chatgpt_accounts
+        .retain(|file, _| route_owner(file) != Some(cli));
+    config
+        .copilot_hosts
+        .retain(|file, _| route_owner(file) != Some(cli));
+    for (file, account) in &literals.accounts {
+        config
+            .chatgpt_accounts
+            .insert(file.clone(), account.clone());
+    }
+    for (file, host) in &literals.hosts {
+        config.copilot_hosts.insert(file.clone(), host.clone());
+    }
     let mut settings = config.clone();
     settings.units.clear();
     atomic_json(&dir.join("config/gateway.json"), &settings)?;
@@ -897,12 +1102,10 @@ pub(crate) fn route_sign_in(
     gw: &Gateway,
     dir: &Path,
     cli: &str,
-    account: Option<&str>,
+    literals: &RouteLiterals,
 ) -> Result<(), String> {
     let _transaction = config_transaction(dir)?;
-    if cli == "codex" {
-        set_chatgpt_account_locked(dir, account)?;
-    }
+    set_route_literals_locked(dir, cli, literals)?;
     rerender_without_pending(dir)?; // agy lg-r1 A8: never resurrect pending revocations.
     let config = load_config(dir)?;
     persist_units(dir, &config)?;
@@ -918,9 +1121,7 @@ pub(crate) fn confirm_sign_out(
     cli: &str,
 ) -> Result<(), String> {
     let _transaction = config_transaction(dir)?;
-    if cli == "codex" {
-        set_chatgpt_account_locked(dir, None)?;
-    }
+    set_route_literals_locked(dir, cli, &RouteLiterals::default())?;
     rerender_without_pending(dir)?;
     // agy lg-r1 A3: only a running gateway can acknowledge a generation.
     match gw_state(rt, gw, CLI_TIMEOUT) {
@@ -1995,6 +2196,185 @@ mod tests {
         }
     }
 
+    fn bind(rendered: &Value, port: u16) -> &Value {
+        rendered["binds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["port"] == port)
+            .unwrap()
+    }
+
+    /// DES-SEAT-LOGIN-SUBSCRIPTIONS decision 2: a model route admits only its owner agent's unit
+    /// keys (a pi seat can no longer spend codex's sign-in, nor codex pi's); a route no agent
+    /// owns keeps every key; readiness keeps every key.
+    #[test]
+    fn each_route_admits_only_its_owner_agents_units() {
+        let mut config = GatewayConfig::default();
+        let pi = UnitKey::new("r", "r#1", "pi");
+        let codex = UnitKey::new("r", "r#2", "codex");
+        config.units = vec![pi.clone(), codex.clone()];
+        config.providers.push(ModelRoute {
+            port: 4999 - 1,
+            provider: Provider::OpenAI,
+            upstream_host: "stub:8080".into(),
+            tls: false,
+            credential_file: PathBuf::from("/broker/custom.key"),
+            kind: Some(CredentialKind::ProviderKey),
+            unit_header: None,
+        });
+        let rendered = render(&config);
+        let keys = |port: u16| -> Vec<String> {
+            bind(&rendered, port)["listeners"][0]["routes"][0]["policies"]["apiKey"]["keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|k| k["key"].as_str().unwrap().to_string())
+                .collect()
+        };
+        for port in [4001, 4002] {
+            assert_eq!(keys(port), vec![codex.key.clone()], "{port}");
+        }
+        for port in [4003, 4006, 4007, 4008] {
+            assert_eq!(keys(port), vec![pi.key.clone()], "{port}");
+        }
+        for port in [4000, 4004, 4005] {
+            assert!(keys(port).is_empty(), "{port}");
+        }
+        assert_eq!(keys(4998), vec![pi.key.clone(), codex.key.clone()]);
+        let ready = &bind(&rendered, READY_PORT)["listeners"][0]["routes"][0]["policies"];
+        assert_eq!(ready["apiKey"]["keys"].as_array().unwrap().len(), 2);
+    }
+
+    /// Decision 3/4: the subscription routes read the unit from `x-wicked-unit` and strip it,
+    /// carry their own ChatGPT account and Copilot host, and inject the broker's bearer.
+    #[test]
+    fn subscription_routes_render_their_unit_header_account_and_host() {
+        let mut config = GatewayConfig {
+            units: vec![UnitKey::new("r", "r#1", "pi")],
+            ..Default::default()
+        };
+        config
+            .chatgpt_accounts
+            .insert("pi.chatgpt.token".into(), "acct-FAKE-pi".into());
+        config
+            .chatgpt_accounts
+            .insert("openai.token".into(), "acct-FAKE-codex".into());
+        let rendered = render(&config);
+        let policies =
+            |port: u16| bind(&rendered, port)["listeners"][0]["routes"][0]["policies"].clone();
+        let backends =
+            |port: u16| bind(&rendered, port)["listeners"][0]["routes"][0]["backends"].clone();
+        for port in [4006, 4007, 4008] {
+            let p = policies(port);
+            assert_eq!(
+                p["apiKey"]["location"],
+                json!({"header": {"name": UNIT_HEADER}})
+            );
+            assert!(
+                p["requestHeaderModifier"]["remove"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(UNIT_HEADER)),
+                "{port}"
+            );
+            assert!(
+                p["backendAuth"]["key"]["value"]["file"].is_string(),
+                "{port}"
+            );
+        }
+        assert_eq!(
+            policies(4007)["requestHeaderModifier"]["set"],
+            json!({"chatgpt-account-id": "acct-FAKE-pi"})
+        );
+        assert_eq!(
+            policies(4002)["requestHeaderModifier"],
+            json!({"set": {"chatgpt-account-id": "acct-FAKE-codex"}})
+        );
+        assert!(policies(4006)["requestHeaderModifier"]["remove"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("x-api-key")));
+        assert_eq!(backends(4006), json!([{"host": "api.anthropic.com:443"}]));
+        assert_eq!(backends(4007), json!([{"host": "chatgpt.com:443"}]));
+        assert_eq!(
+            backends(4008),
+            json!([{"host": "api.githubcopilot.com:443"}])
+        );
+        config.copilot_hosts.insert(
+            "pi.copilot.token".into(),
+            "api.business.githubcopilot.com".into(),
+        );
+        let rendered = render(&config);
+        assert_eq!(
+            bind(&rendered, 4008)["listeners"][0]["routes"][0]["backends"],
+            json!([{"host": "api.business.githubcopilot.com:443"}])
+        );
+        // The existing routes keep their native credential headers.
+        assert_eq!(
+            policies(4003)["apiKey"]["location"],
+            json!({"header": {"name": "authorization", "prefix": "Bearer "}})
+        );
+    }
+
+    #[test]
+    fn route_literals_are_per_agent_validated_and_a_legacy_account_is_folded_into_codex() {
+        let temp = TempDir::new();
+        fs::create_dir_all(temp.0.join("config")).unwrap();
+        fs::write(
+            temp.0.join("config/gateway.json"),
+            r#"{"units":[],"providers":[],"egress_hosts":[],"chatgpt_account":"acct-FAKE-old"}"#,
+        )
+        .unwrap();
+        let loaded = load_config(&temp.0).unwrap();
+        assert_eq!(
+            loaded
+                .chatgpt_accounts
+                .get("openai.token")
+                .map(String::as_str),
+            Some("acct-FAKE-old")
+        );
+        assert!(!serde_json::to_string(&loaded)
+            .unwrap()
+            .contains("\"chatgpt_account\""));
+        let pi = RouteLiterals {
+            accounts: vec![("pi.chatgpt.token".into(), "acct-FAKE-pi".into())],
+            hosts: vec![(
+                "pi.copilot.token".into(),
+                "api.individual.githubcopilot.com".into(),
+            )],
+        };
+        set_route_literals_locked(&temp.0, "pi", &pi).unwrap();
+        let after = load_config(&temp.0).unwrap();
+        assert_eq!(
+            after.chatgpt_accounts.len(),
+            2,
+            "codex's account is untouched"
+        );
+        set_route_literals_locked(&temp.0, "pi", &RouteLiterals::default()).unwrap();
+        let after = load_config(&temp.0).unwrap();
+        assert_eq!(after.chatgpt_accounts.len(), 1);
+        assert!(after.copilot_hosts.is_empty());
+        // One agent can never set another's route literal, nor an arbitrary host.
+        let foreign = RouteLiterals {
+            accounts: vec![("openai.token".into(), "acct-FAKE".into())],
+            hosts: Vec::new(),
+        };
+        assert!(set_route_literals_locked(&temp.0, "pi", &foreign).is_err());
+        for bad in [
+            "evil.example.com",
+            "api.githubcopilot.com.evil.com",
+            "api..githubcopilot.com",
+            "api.EVIL.githubcopilot.com",
+            "api.a.b.githubcopilot.com",
+        ] {
+            assert!(validate_copilot_host(bad).is_err(), "{bad}");
+        }
+        for good in ["api.githubcopilot.com", "api.individual.githubcopilot.com"] {
+            assert!(validate_copilot_host(good).is_ok(), "{good}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn timed_out_writer_cleanup_is_confirmed_or_blocks_next_mutation() {
@@ -2205,7 +2585,7 @@ cat > "$base/written"
             &Gateway::for_dir(&temp.0),
             &temp.0,
             "codex",
-            None,
+            &RouteLiterals::default(),
         )
         .unwrap();
         assert!(load_config(&temp.0).unwrap().units.is_empty());
@@ -2269,7 +2649,13 @@ cat > "$base/written"
             fresh.units.is_empty(),
             "the child must not restore its old snapshot"
         );
-        assert_eq!(fresh.chatgpt_account.as_deref(), Some("FAKE-new-account"));
+        assert_eq!(
+            fresh
+                .chatgpt_accounts
+                .get("openai.token")
+                .map(String::as_str),
+            Some("FAKE-new-account")
+        );
         assert!(!fs::read_to_string(temp.0.join("config/config.json"))
             .unwrap()
             .contains(&key.key));
@@ -2368,7 +2754,10 @@ esac
             "FAKE-preserved"
         );
         let adopted = load_config(&temp.0).unwrap();
-        assert_eq!(adopted.providers.len(), 6);
+        assert_eq!(
+            adopted.providers.len(),
+            6 + crate::seat_credentials::SUBSCRIPTION_ROUTES.len()
+        );
         assert_eq!(adopted.providers[0], old.providers[0]);
         let oauth = adopted.providers.iter().find(|r| r.port == 4005).unwrap();
         assert_eq!(oauth.upstream_host, "FAKE-upstream:8080");
@@ -2417,11 +2806,14 @@ esac
                 tls: false,
                 credential_file: PathBuf::from("/broker/anthropic.key"),
                 kind: Some(CredentialKind::ClaudeApiKey),
+                unit_header: None,
             }],
             egress_hosts: vec!["registry.npmjs.org".into()],
             hook_upstream: None,
             mcp_upstream: None,
-            chatgpt_account: None,
+            chatgpt_accounts: Default::default(),
+            copilot_hosts: Default::default(),
+            legacy_chatgpt_account: None,
         }
     }
 
@@ -2478,11 +2870,14 @@ esac
                     tls: false,
                     credential_file: PathBuf::from("/broker/anthropic.key"),
                     kind: Some(CredentialKind::ClaudeApiKey),
+                    unit_header: None,
                 }],
                 egress_hosts: vec![],
                 hook_upstream: None,
                 mcp_upstream: None,
-                chatgpt_account: None,
+                chatgpt_accounts: Default::default(),
+                copilot_hosts: Default::default(),
+                legacy_chatgpt_account: None,
             },
         )
         .unwrap();
@@ -2807,14 +3202,21 @@ esac
         let rendered = render(&config);
         for (index, route) in config.providers.iter().enumerate() {
             let auth = &rendered["binds"][index]["listeners"][0]["routes"][0]["policies"]["apiKey"];
-            let location = if route.credential_kind() == CredentialKind::ClaudeApiKey {
+            let location = if let Some(header) = route.unit_header.as_deref() {
+                json!({"header": {"name": header}})
+            } else if route.credential_kind() == CredentialKind::ClaudeApiKey {
                 json!({"header": {"name": "x-api-key"}})
             } else {
                 json!({"header": {"name": "authorization", "prefix": "Bearer "}})
             };
             assert_eq!(auth["location"], location);
             assert_eq!(auth["mode"], "strict");
-            assert_eq!(auth["keys"][0]["key"], config.units[0].key);
+            // The unit is claude's: only claude's routes admit it.
+            if route.owner() == Some("claude") {
+                assert_eq!(auth["keys"][0]["key"], config.units[0].key);
+            } else {
+                assert_eq!(auth["keys"], json!([]), "{}", route.port);
+            }
         }
     }
 
@@ -2870,7 +3272,9 @@ esac
             json!({"*": "passthrough"})
         );
         // Signed in: the spike's proven form (linux/broker/config.yaml, port 4002).
-        config.chatgpt_account = Some("acct-FAKE-0001".into());
+        config
+            .chatgpt_accounts
+            .insert("openai.token".into(), "acct-FAKE-0001".into());
         let rendered = render(&config);
         let route = &rendered["binds"][index]["listeners"][0]["routes"][0];
         assert_eq!(
@@ -2885,14 +3289,18 @@ esac
         let temp = TempDir::new();
         set_chatgpt_account(&temp.0, Some("acct-FAKE_1.x")).unwrap();
         assert_eq!(
-            load_config(&temp.0).unwrap().chatgpt_account.as_deref(),
+            load_config(&temp.0)
+                .unwrap()
+                .chatgpt_accounts
+                .get("openai.token")
+                .map(String::as_str),
             Some("acct-FAKE_1.x")
         );
         for bad in ["", "a b", "a\r\nx-evil: 1", "a\"b", &"x".repeat(129)] {
             assert!(set_chatgpt_account(&temp.0, Some(bad)).is_err(), "{bad:?}");
         }
         set_chatgpt_account(&temp.0, None).unwrap();
-        assert_eq!(load_config(&temp.0).unwrap().chatgpt_account, None);
+        assert!(load_config(&temp.0).unwrap().chatgpt_accounts.is_empty());
     }
 
     #[test]
@@ -2995,9 +3403,17 @@ esac
             openai["policies"]["apiKey"]["location"],
             json!({"header": {"name": "authorization", "prefix": "Bearer "}})
         );
-        for bind in &rendered["binds"].as_array().unwrap()[..config.providers.len()] {
+        for (route, bind) in config
+            .providers
+            .iter()
+            .zip(&rendered["binds"].as_array().unwrap()[..config.providers.len()])
+        {
             let auth = &bind["listeners"][0]["routes"][0]["policies"]["apiKey"];
             assert_eq!(auth["mode"], "strict");
+            if route.owner() != Some("claude") {
+                assert_eq!(auth["keys"], json!([]), "{}", route.port);
+                continue;
+            }
             assert_eq!(auth["keys"].as_array().unwrap().len(), 2);
             for (index, unit) in config.units.iter().enumerate() {
                 assert_eq!(auth["keys"][index]["key"], unit.key);
