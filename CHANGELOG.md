@@ -14,6 +14,16 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **codex, pi and opencode sign in on the host; copilot uses its device flow.** Their browser logins listen on a
+  loopback callback that the host browser cannot reach inside a login container, and ChatGPT device codes need an
+  account that allows them. `seat-login argv` now runs the host's own CLI under `env -i` with a throwaway home
+  (`<gateway dir>/login/<session>/`, 0700): HOME, TMPDIR, the XDG dirs, `CODEX_HOME` and `PI_CODING_AGENT_DIR` all
+  point into it, and only PATH, locale, proxy and CA variables pass through. codex stores its credential in a file
+  (`cli_auth_credentials_store="file"`), opencode uses `--standalone` (never the operator's background service), and
+  pi starts with no tools, extensions, MCP or context. The banner names the host and seat versions. Ingest reads the
+  same paths (`openat` + `O_NOFOLLOW`), then deletes the home; a login that left nothing usable is deleted before any
+  broker change, and sign-out or a new sign-in first ends a login still running (its recorded process group). claude keeps
+  its login container; copilot keeps its container with `copilot login --device-code`.
 - **copilot signs in for container seats (BYOK on the Copilot route).** `copilot login` keeps its GitHub token in a
   keychain, or in plaintext only with consent; the login volume now seeds that consent (`COPILOT_HOME`), and ingest
   moves the last github.com user's token from `config.json` to the broker (`copilot.token`; GitHub Enterprise is

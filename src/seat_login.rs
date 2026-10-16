@@ -43,15 +43,220 @@ fn login_container(login_volume: &str) -> String {
     login_volume.to_string()
 }
 
-/// opencode's login command: its own `auth login`, then (only if it succeeded) `auth export` of
-/// the credential rows it stored (opencode 2.x keeps them in SQLite, never an `auth.json`) to the
+/// The agents whose one-time sign-in runs the HOST's own CLI (DES-SEAT-LOGIN-SUBSCRIPTIONS
+/// "Host-side login"). Their browser logins listen on a loopback callback (codex and pi on
+/// `127.0.0.1:1455`, pi's Claude login on `:53692`, opencode on `[::1]:1455`), which the
+/// operator's browser reaches only when the login runs on the host; in a login container it was
+/// unreachable, and the device-code fallbacks need an account that allows device codes. The CLI
+/// runs with a throwaway home ([`host_login_argv`]); the seat still sees placeholders only.
+/// claude (a paste-the-code flow) and copilot (GitHub's device flow, which every account has)
+/// keep their login container.
+pub(crate) fn host_login(cli: &str) -> bool {
+    matches!(cli, "codex" | "pi" | "opencode")
+}
+
+/// The throwaway home of host login session `session` (a [`login_volume`] name): under the
+/// daemon's gateway directory, which no seat ever sees (`cover_gateway_dir`).
+fn login_home(dir: &Path, session: &str) -> std::path::PathBuf {
+    dir.join("login").join(session)
+}
+
+/// The pid file of host login session `session` (written by the login's own shell).
+fn login_pid_file(dir: &Path, session: &str) -> std::path::PathBuf {
+    dir.join("login").join(format!("{session}.pid"))
+}
+
+/// The host login's own command, run in the throwaway home: it records its pid (`$2`, the
+/// session's pid file; the PTY child leads its own process group, so this is also the group a
+/// sign-out ends), shows the banner (`$1`), then becomes the CLI.
+const HOST_LOGIN: &str = "cd \"$HOME\" || exit 1; printf '%s' \"$$\" > \"$2\" || exit 1; printf '%s\\n\\n' \"$1\"; shift 2; exec \"$@\"";
+
+/// opencode's login: its own `auth login`, then (only if it succeeded) `auth export` of the
+/// credential rows it stored (opencode 2.x keeps them in SQLite, never an `auth.json`) to the
 /// file ingest reads, written whole or not at all (a temporary file renamed into place). A failed
 /// login or export leaves no export and exits nonzero: ingest reports the sign-in missing, and the
-/// user signs in again.
-const OPENCODE_LOGIN: &str = "d=\"$XDG_DATA_HOME/opencode\" && opencode auth login && umask 077 && mkdir -p \"$d\" && { opencode auth export > \"$d/wicked-auth.json.tmp\" && mv \"$d/wicked-auth.json.tmp\" \"$d/wicked-auth.json\" || { rm -f \"$d/wicked-auth.json.tmp\"; exit 1; }; }";
+/// user signs in again. `--standalone`: a private server inside this throwaway home, never the
+/// operator's background opencode service (which holds the operator's own credentials).
+const OPENCODE_HOST_LOGIN: &str = "cd \"$HOME\" || exit 1; printf '%s' \"$$\" > \"$2\" || exit 1; printf '%s\\n\\n' \"$1\"; oc=$3; d=\"$XDG_DATA_HOME/opencode\" && \"$oc\" auth login --standalone && umask 077 && mkdir -p \"$d\" && { \"$oc\" auth export --standalone > \"$d/wicked-auth.json.tmp\" && mv \"$d/wicked-auth.json.tmp\" \"$d/wicked-auth.json\" || { rm -f \"$d/wicked-auth.json.tmp\"; exit 1; }; }";
+
+/// The daemon variables a host login keeps: the search path, locale and terminal, and the
+/// network settings a corporate host needs to reach the vendor (proxy, CA bundle). Everything
+/// else is dropped (`env -i`): no API key, token, or CLI home override of the operator's reaches
+/// the login.
+const HOST_LOGIN_PASSTHROUGH: &[&str] = &[
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "USER",
+    "LOGNAME",
+    "COLORTERM",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+];
+
+/// The isolated environment of a host login in throwaway `home`: HOME, TMPDIR, every XDG base
+/// directory and the CLI's own home variable all point inside it, so neither the operator's real
+/// logins nor anything under the real `~` is read or written.
+fn host_login_env(home: &Path, cli: &str) -> Vec<(String, String)> {
+    let h = home.to_string_lossy();
+    let mut env: Vec<(String, String)> = [
+        ("HOME", String::new()),
+        ("TMPDIR", "/tmp".into()),
+        ("XDG_CONFIG_HOME", "/config".into()),
+        ("XDG_DATA_HOME", "/data".into()),
+        ("XDG_STATE_HOME", "/state".into()),
+        ("XDG_CACHE_HOME", "/cache".into()),
+    ]
+    .into_iter()
+    .map(|(k, sub)| (k.to_string(), format!("{h}{sub}")))
+    .collect();
+    for (var, dir) in login_homes(cli) {
+        let value = format!("{h}/{dir}");
+        match env.iter_mut().find(|(k, _)| k == var) {
+            Some(slot) => slot.1 = value,
+            None => env.push(((*var).to_string(), value)),
+        }
+    }
+    env
+}
+
+/// The directories a host login's environment names (all created 0700 before the login runs:
+/// codex refuses a `CODEX_HOME` that does not exist).
+fn host_login_dirs(home: &Path, cli: &str) -> Vec<std::path::PathBuf> {
+    host_login_env(home, cli)
+        .into_iter()
+        .map(|(_, v)| std::path::PathBuf::from(v))
+        .filter(|p| p != home)
+        .collect()
+}
+
+/// The host CLI's own login command (after the executable), forcing file storage where the CLI
+/// could otherwise use the macOS keychain: codex's `cli_auth_credentials_store` (`auto` may pick
+/// the keychain). pi writes `auth.json` and opencode its SQLite DB, both under the throwaway home.
+/// pi's login is `/login` inside its TUI, so the TUI starts with no tools, extensions, MCP,
+/// skills, context files, prompt templates or saved session: a sign-in terminal, not an agent.
+fn host_login_command(cli: &str) -> &'static [&'static str] {
+    match cli {
+        "codex" => &["login", "-c", "cli_auth_credentials_store=\"file\""],
+        "pi" => &[
+            "--no-tools",
+            "--no-extensions",
+            "--no-mcp",
+            "--no-skills",
+            "--no-context-files",
+            "--no-prompt-templates",
+            "--no-session",
+            "--no-approve",
+        ],
+        _ => &[],
+    }
+}
+
+/// What the operator does in the host login terminal, shown first.
+fn host_login_hint(cli: &str) -> &'static str {
+    match cli {
+        "codex" => "Your browser opens: sign in with ChatGPT there (no device code needed). If it does not open, open the URL below in a browser on this machine.",
+        "pi" => "Type /login, choose \"Sign in with an account\", then Anthropic (Claude Pro/Max), GitHub Copilot, or \"OpenAI Codex (legacy)\" > Browser login (ChatGPT). Repeat /login for more providers, then exit pi (ctrl+d) to finish.",
+        "opencode" => "Choose OpenAI > \"Codex browser (legacy)\" for ChatGPT, GitHub Copilot, or an API key. \"Sign in with ChatGPT\" is not supported for seats yet.",
+        _ => "",
+    }
+}
+
+/// The first `x.y.z` in a `--version` answer.
+fn parse_version(text: &str) -> Option<String> {
+    text.split(|c: char| c.is_whitespace() || c == 'v' || c == ',')
+        .find(|w| {
+            let parts: Vec<&str> = w.split('.').collect();
+            parts.len() == 3
+                && parts
+                    .iter()
+                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(str::to_string)
+}
+
+/// The version the seat image pins for `cli` (`@scope/pkg@x.y.z`).
+fn pinned_version(cli: &str) -> Option<&'static str> {
+    crate::container_floor::seat_package(cli).and_then(|p| p.rsplit_once('@').map(|(_, v)| v))
+}
+
+/// The banner of a host login: what runs, where the credential goes, the version check, and the
+/// operator's next step. The credential format is what ingest validates; a host CLI that wrote
+/// another shape is refused there by name, never half-imported.
+fn host_login_banner(cli: &str, host: &str, pinned: Option<&str>) -> String {
+    let check = match pinned {
+        Some(p) if p != host => format!(
+            "WARNING: the seats run {cli} {p}; if the sign-in is refused, install {cli} {p} on this host"
+        ),
+        Some(_) => "the version the seats run".to_string(),
+        None => "the seat image is the operator's own".to_string(),
+    };
+    format!(
+        "wicked: signing in {cli} for container seats with this host's {cli} {host} ({check}).\n\
+         It runs in a throwaway home: your own {cli} sign-in is never read or changed, and the \
+         home is deleted when this terminal ends.\n{}",
+        host_login_hint(cli)
+    )
+}
+
+/// The host executable named `cli` on `path` (the daemon's search path).
+#[cfg(unix)]
+fn find_on_path(cli: &str, path: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path?)
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(cli))
+        .find(|p| {
+            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+}
+
+/// Pure argv of a host login: `env -i` with only [`HOST_LOGIN_PASSTHROUGH`] (from `daemon_env`)
+/// and the throwaway home's variables, then `sh -c` running the CLI in that home.
+pub(crate) fn host_login_argv(
+    cli: &str,
+    exe: &Path,
+    home: &Path,
+    pid_file: &Path,
+    banner: &str,
+    daemon_env: &[(String, String)],
+) -> Vec<String> {
+    let mut argv = vec!["/usr/bin/env".to_string(), "-i".to_string()];
+    for name in HOST_LOGIN_PASSTHROUGH {
+        if let Some((_, v)) = daemon_env.iter().find(|(k, _)| k == name) {
+            argv.push(format!("{name}={v}"));
+        }
+    }
+    argv.push("TERM=xterm-256color".into());
+    for (k, v) in host_login_env(home, cli) {
+        argv.push(format!("{k}={v}"));
+    }
+    let script = if cli == "opencode" {
+        OPENCODE_HOST_LOGIN
+    } else {
+        HOST_LOGIN
+    };
+    argv.extend(["/bin/sh".into(), "-c".into(), script.into()]);
+    argv.push("wicked-login".into());
+    argv.push(banner.into());
+    argv.push(pid_file.to_string_lossy().into_owned());
+    argv.push(exe.to_string_lossy().into_owned());
+    argv.extend(host_login_command(cli).iter().map(|s| (*s).to_string()));
+    argv
+}
 
 /// Pure argv rendering: no host environment or credentials are forwarded. Callers validate CLI
-/// names before using the returned argv.
+/// names before using the returned argv. Only the container-login agents (not [`host_login`]).
 pub(crate) fn login_argv(
     rt: &Path,
     cli: &str,
@@ -94,11 +299,9 @@ pub(crate) fn login_argv(
     argv.push(image.into());
     let command: &[&str] = match cli {
         "claude" => &["claude", "auth", "login"],
-        "codex" => &["codex", "login", "--device-auth"],
-        // The login, then its own export of what it stored, into the same throwaway volume.
-        "opencode" => &["sh", "-c", OPENCODE_LOGIN],
-        "pi" => &["pi"], // /login is entered inside the TUI.
-        "copilot" => &["copilot", "login"],
+        // GitHub's device flow: copilot picks its loopback web flow unless it detects a headless
+        // host, and a login container is not detected as one (its callback was unreachable).
+        "copilot" => &["copilot", "login", "--device-code"],
         _ => &[],
     };
     argv.extend(command.iter().map(|s| (*s).to_string()));
@@ -1138,15 +1341,43 @@ fn ingest(
     volume: &str,
 ) -> Result<IngestReport, String> {
     let owned = broker_files(cli)?;
-    if !volume_exists(rt, volume)? {
-        return Err(missing(cli, "login volume"));
+    if !login_exists(rt, dir, cli, volume)? {
+        return Err(missing(
+            cli,
+            if host_login(cli) {
+                "login home"
+            } else {
+                "login volume"
+            },
+        ));
     }
+    // A host-login agent's session from before the upgrade is still a login volume.
+    let from_home = host_login(cli) && std::fs::symlink_metadata(login_home(dir, volume)).is_ok();
+    let read = if from_home {
+        read_home(&login_home(dir, volume), credential_paths(cli))
+    } else {
+        read_volume(rt, volume, credential_paths(cli), false)
+    };
+    let (input, tokens) = match read.and_then(|input| {
+        let tokens = extract_tokens(cli, &input)?;
+        Ok((input, tokens))
+    }) {
+        Ok(read) => read,
+        Err(e) => {
+            // A host login that left nothing usable (cancelled, failed, or another shape) is
+            // over: its throwaway home goes now, before any broker change, and the operator
+            // signs in again. A login container's volume is kept for a retry, as before.
+            if from_home {
+                remove_login_home(dir, volume)?;
+                crate::seat_refresh::remove_private_file(&session_path(dir, cli))?;
+            }
+            return Err(e);
+        }
+    };
     if !volume_exists(rt, &volumes(gw).1)? {
         // codex lg-r3 R3: first sign-in provisions storage without taking daemon ownership.
         crate::seat_gateway::init_gateway_volumes(rt, gw, dir)?;
     }
-    let input = read_volume(rt, volume, credential_paths(cli), false)?;
-    let tokens = extract_tokens(cli, &input)?;
     let skipped = skipped_providers(cli, &input);
     // codex lg-r2 C4: journal before any broker mutation, including stale-mode clearing.
     std::fs::create_dir_all(dir.join("refresh")).map_err(|e| e.to_string())?;
@@ -1473,7 +1704,7 @@ fn settle_broker(rt: &Runtime, gw: &Gateway, dir: &Path, cli: &str) -> Result<()
     // An uncommitted session is a login that may still be open: it is never touched here.
     if let Some(volume) = read_session(dir, gw, cli)? {
         if session_committed(dir, cli)? {
-            remove_login_volume(rt, &volume)?;
+            discard_login(rt, dir, cli, &volume)?;
             crate::seat_refresh::remove_private_file(&session_path(dir, cli))?;
         }
     }
@@ -1506,8 +1737,9 @@ pub(crate) fn ingest_and_route(
     complete_sign_out(rt, gw, dir, cli)?;
     let volume = read_session(dir, gw, cli)?.ok_or_else(|| missing(cli, "login session"))?;
     // The terminal has ended: its container is stopped before the volume is read, so whatever the
-    // CLI wrote is final and nothing still holds the volume when it is removed.
-    stop_login_container(rt, &volume)?;
+    // CLI wrote is final and nothing still holds the volume when it is removed. A host login's
+    // process group was ended with its terminal.
+    halt_login(rt, dir, cli, &volume)?;
     repair_ingest(rt, gw, dir, cli)?;
     // codex lg-r3 R2: rescue or staging can survive even a failed pending-marker write.
     if !signin_pending(dir, cli) {
@@ -1527,7 +1759,7 @@ pub(crate) fn ingest_and_route(
     // LAST, after the volume is confirmed gone (a retry of a committed session whose volume is
     // already absent just finishes here).
     write_session_state(dir, cli, &volume, true)?;
-    remove_login_volume(rt, &volume)?;
+    discard_login(rt, dir, cli, &volume)?;
     match std::fs::remove_file(session_path(dir, cli)) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1592,7 +1824,9 @@ pub(crate) fn complete_sign_out(
     }
     if let Some(volume) = read_session(dir, gw, cli)? {
         // codex lg-r3 R4: retry a crash between removal of the volume and its session marker.
-        if volume_exists(rt, &volume)? {
+        if host_login(cli) {
+            discard_login(rt, dir, cli, &volume)?;
+        } else if volume_exists(rt, &volume)? {
             remove_login_volume(rt, &volume)?;
         } else {
             stop_login_container(rt, &volume)?;
@@ -1657,15 +1891,24 @@ fn new_session(rt: &Runtime, gw: &Gateway, dir: &Path, cli: &str) -> Result<Stri
     }
     let previous = read_session(dir, gw, cli)?;
     if let Some(old) = &previous {
-        remove_login_volume(rt, old)?;
+        discard_login(rt, dir, cli, old)?;
         std::fs::remove_file(session_path(dir, cli)).map_err(|e| e.to_string())?;
+    }
+    if host_login(cli) {
+        // A home whose session marker never got written (a crash between the two) is swept too.
+        sweep_login_homes(dir, gw, cli)?;
     }
     let volume = loop {
         let candidate = login_volume(&gw.name, cli);
-        if previous.as_ref() != Some(&candidate) && !volume_exists(rt, &candidate)? {
+        if previous.as_ref() != Some(&candidate) && !login_exists(rt, dir, cli, &candidate)? {
             break candidate;
         }
     };
+    if host_login(cli) {
+        create_login_home(dir, cli, &volume)?;
+        write_session(dir, cli, &volume)?;
+        return Ok(volume);
+    }
     checked(rt, &["volume".into(), "create".into(), volume.clone()])?;
     write_session(dir, cli, &volume)?;
     crate::seat_gateway::mutation_helper(
@@ -1677,6 +1920,254 @@ fn new_session(rt: &Runtime, gw: &Gateway, dir: &Path, cli: &str) -> Result<Stri
         TIMEOUT,
     )?;
     Ok(volume)
+}
+
+/// Create the throwaway home of host login session `session` and every directory its
+/// environment names, each 0700 and new (an existing path is refused, never reused).
+#[cfg(unix)]
+fn create_login_home(dir: &Path, cli: &str, session: &str) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let root = dir.join("login");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&root)
+        .map_err(|e| format!("could not create the login directory: {e}"))?;
+    let home = login_home(dir, session);
+    let made = std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&home)
+        .and_then(|()| {
+            host_login_dirs(&home, cli)
+                .iter()
+                .try_for_each(|d| std::fs::DirBuilder::new().mode(0o700).create(d))
+        });
+    if let Err(e) = made {
+        let _ = remove_login_home(dir, session);
+        return Err(format!("could not create the login home: {e}"));
+    }
+    Ok(())
+}
+
+/// Remove the throwaway home (and pid file) of host login session `session`; one already gone
+/// counts as removed. `remove_dir_all` never follows a symlink out of the home. Callers end the
+/// login's processes first ([`stop_host_login`]), so nothing recreates the home afterwards.
+fn remove_login_home(dir: &Path, session: &str) -> Result<(), String> {
+    match std::fs::remove_dir_all(login_home(dir, session)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("could not remove the login home: {e}")),
+    }
+    match std::fs::remove_file(login_pid_file(dir, session)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("could not remove the login pid file: {e}")),
+    }
+}
+
+/// Seconds since the process started, from `ps -o etime=` (`[[dd-]hh:]mm:ss`).
+#[cfg(unix)]
+fn process_age(pid: i32) -> Option<u64> {
+    use wicked_apps_core::HardenedCommand;
+    let mut cmd = std::process::Command::new("ps");
+    cmd.hardened();
+    cmd.args(["-o", "etime=", "-p", &pid.to_string()])
+        .stdin(std::process::Stdio::null());
+    let out = output_within(cmd, TIMEOUT)?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let (days, clock) = match text.split_once('-') {
+        Some((d, c)) => (d.parse::<u64>().ok()?, c.to_string()),
+        None => (0, text),
+    };
+    let mut secs = 0u64;
+    for part in clock.split(':') {
+        secs = secs * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(days * 86_400 + secs)
+}
+
+/// End the processes of host login session `session`, if its login still runs: SIGTERM to its
+/// process group, then SIGKILL after a grace. A pid is ours only when it still leads its own
+/// process group and started no later than its pid file was written (a recycled pid is a
+/// process started after ours died, so after the file). A sign-out or a new sign-in while the
+/// login terminal is open would otherwise leave the CLI running, free to write a credential
+/// into a home nobody tracks any more.
+#[cfg(unix)]
+fn stop_host_login(dir: &Path, session: &str) -> Result<(), String> {
+    let file = login_pid_file(dir, session);
+    let (text, written) = match std::fs::read_to_string(&file)
+        .and_then(|t| Ok((t, std::fs::metadata(&file)?.modified()?)))
+    {
+        Ok(read) => read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("could not read the login pid file: {e}")),
+    };
+    let Some(pid) = text.trim().parse::<i32>().ok().filter(|p| *p > 1) else {
+        return Ok(());
+    };
+    let alive = |pid: i32| unsafe { libc::kill(pid, 0) == 0 };
+    // SAFETY: getpgid/kill/killpg take plain integers; no memory is shared.
+    if !alive(pid) || unsafe { libc::getpgid(pid) } != pid {
+        return Ok(());
+    }
+    let since_written = SystemTime::now()
+        .duration_since(written)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match process_age(pid) {
+        Some(age) if age + 2 >= since_written => {}
+        _ => return Ok(()),
+    }
+    unsafe { libc::killpg(pid, libc::SIGTERM) };
+    let deadline = std::time::Instant::now() + LOGIN_STOP_WAIT;
+    while alive(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if alive(pid) {
+        unsafe { libc::killpg(pid, libc::SIGKILL) };
+    }
+    Ok(())
+}
+
+/// Remove every throwaway home of `cli`'s host logins under this daemon's gateway directory,
+/// ending any login still running in one.
+#[cfg(unix)]
+fn sweep_login_homes(dir: &Path, gw: &Gateway, cli: &str) -> Result<(), String> {
+    let prefix = format!("{}-login-{cli}-", gw.name);
+    let entries = match std::fs::read_dir(dir.join("login")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut sessions: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let name = name
+                .strip_suffix(".pid")
+                .map(str::to_string)
+                .unwrap_or(name);
+            name.strip_prefix(&prefix)
+                .is_some_and(|n| n.len() == 8 && n.bytes().all(|c| c.is_ascii_hexdigit()))
+                .then_some(name)
+        })
+        .collect();
+    sessions.sort();
+    sessions.dedup();
+    for session in sessions {
+        stop_host_login(dir, &session)?;
+        remove_login_home(dir, &session)?;
+    }
+    Ok(())
+}
+
+/// Read `paths` from host login home `home` as [`read_volume`] reads a login volume: a missing
+/// file is skipped; a symlink anywhere on the path, a non-regular file or an oversized one is
+/// refused. Every component is opened relative to its parent with `O_NOFOLLOW` (`openat`), and
+/// the file itself non-blocking and checked with `fstat`, so no link or FIFO swapped in after a
+/// check is ever followed or waited on.
+#[cfg(unix)]
+fn read_home(home: &Path, paths: &[&str]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let open = |at: Option<&OwnedFd>, name: &[u8], flags: i32| -> std::io::Result<OwnedFd> {
+        use std::os::fd::AsRawFd;
+        let c = CString::new(name).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+        let base = at.map_or(libc::AT_FDCWD, |f| f.as_raw_fd());
+        // SAFETY: `c` is a valid C string; the returned fd is owned exactly once below.
+        let fd =
+            unsafe { libc::openat(base, c.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+    };
+    let dir_flags = libc::O_RDONLY | libc::O_DIRECTORY;
+    let root = open(None, home.as_os_str().as_bytes(), dir_flags)
+        .map_err(|_| "the login home is missing".to_string())?;
+    let mut files = Vec::new();
+    'paths: for path in paths {
+        let refused = || format!("could not read credential file {path}");
+        let parts: Vec<&str> = path.split('/').collect();
+        let (name, parents) = parts.split_last().expect("a non-empty path");
+        let mut held: Option<OwnedFd> = None;
+        for part in parents {
+            match open(
+                Some(held.as_ref().unwrap_or(&root)),
+                part.as_bytes(),
+                dir_flags,
+            ) {
+                Ok(fd) => held = Some(fd),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue 'paths,
+                Err(_) => return Err(refused()),
+            }
+        }
+        let parent = held.as_ref().unwrap_or(&root);
+        let fd = match open(
+            Some(parent),
+            name.as_bytes(),
+            libc::O_RDONLY | libc::O_NONBLOCK,
+        ) {
+            Ok(fd) => fd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(refused()),
+        };
+        let file = std::fs::File::from(fd);
+        if !file.metadata().is_ok_and(|m| m.is_file()) {
+            return Err(refused());
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| refused())?;
+        if bytes.len() > MAX_FILE_BYTES {
+            return Err(format!("credential file {path} exceeds size limit"));
+        }
+        files.push(((*path).into(), bytes));
+    }
+    Ok(files)
+}
+
+/// Whether login session `session` still holds its store. For a host-login agent that is its
+/// home, or a login volume a container session from before the upgrade left (the session
+/// marker records no backend, so both are looked for).
+#[cfg(unix)]
+fn login_exists(rt: &Runtime, dir: &Path, cli: &str, session: &str) -> Result<bool, String> {
+    if host_login(cli) && std::fs::symlink_metadata(login_home(dir, session)).is_ok() {
+        return Ok(true);
+    }
+    volume_exists(rt, session)
+}
+
+/// End session `session`'s login: a host login's process group (normally gone with its
+/// terminal) and any login container, including a pre-upgrade one of a host-login agent.
+#[cfg(unix)]
+fn halt_login(rt: &Runtime, dir: &Path, cli: &str, session: &str) -> Result<(), String> {
+    if host_login(cli) {
+        stop_host_login(dir, session)?;
+        if !volume_exists(rt, session)? {
+            return Ok(());
+        }
+    }
+    stop_login_container(rt, session)
+}
+
+/// Remove session `session`'s credential-bearing store after ending its login: the host home,
+/// and a login volume (a host-login agent's pre-upgrade container session keeps its volume
+/// until it is confirmed removed, never orphaned by the marker's removal).
+#[cfg(unix)]
+fn discard_login(rt: &Runtime, dir: &Path, cli: &str, session: &str) -> Result<(), String> {
+    if host_login(cli) {
+        stop_host_login(dir, session)?;
+        remove_login_home(dir, session)?;
+        if !volume_exists(rt, session)? {
+            return Ok(());
+        }
+    }
+    remove_login_volume(rt, session)
 }
 
 /// Stop and remove the login container of session `volume`, if it still runs. Its terminal is
@@ -1847,6 +2338,93 @@ fn prepare_login_argv(
     ))
 }
 
+/// The host CLI's `--version`, run as the login will run (isolated environment, in the
+/// throwaway home). `None` when it cannot run or names no version: then `exe` is not the coding
+/// agent the seat runs (e.g. another tool of that name earlier on PATH).
+#[cfg(unix)]
+fn host_version(
+    exe: &Path,
+    home: &Path,
+    cli: &str,
+    daemon_env: &[(String, String)],
+) -> Option<String> {
+    let argv = host_login_argv(cli, exe, home, Path::new("-"), "", daemon_env);
+    // `env -i <vars> /bin/sh -c …`: keep the vars, run the executable directly.
+    let vars = argv
+        .iter()
+        .skip(2)
+        .take_while(|a| *a != "/bin/sh")
+        .filter_map(|a| a.split_once('='));
+    use wicked_apps_core::HardenedCommand;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.hardened();
+    cmd.arg("--version")
+        .env_clear()
+        .envs(vars)
+        .current_dir(home)
+        .stdin(std::process::Stdio::null());
+    let out = output_within(cmd, TIMEOUT)?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_version(&String::from_utf8_lossy(&out.stdout))
+        .or_else(|| parse_version(&String::from_utf8_lossy(&out.stderr)))
+}
+
+/// Open a host login session for `cli` and render its argv (see [`host_login`]). `daemon_env` is
+/// the daemon's environment, of which only [`HOST_LOGIN_PASSTHROUGH`] reaches the login.
+#[cfg(unix)]
+fn prepare_host_login_argv(
+    rt: &Runtime,
+    gw: &Gateway,
+    dir: &Path,
+    cli: &str,
+    daemon_env: &[(String, String)],
+) -> Result<Vec<String>, String> {
+    broker_files(cli).map_err(|e| format!("{cli} cannot sign in for container seats yet: {e}"))?;
+    let pinned =
+        if std::env::var_os(format!("WICKED_SEAT_IMAGE_{}", cli.to_ascii_uppercase())).is_some() {
+            None
+        } else {
+            pinned_version(cli)
+        };
+    let path = daemon_env
+        .iter()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| std::ffi::OsStr::new(v.as_str()));
+    let exe = find_on_path(cli, path).ok_or_else(|| {
+        format!(
+            "{cli} is not installed on this host: its sign-in runs this host's own {cli}{}. Install it, then sign in again",
+            pinned.map(|v| format!(" (the seats run {cli} {v})")).unwrap_or_default()
+        )
+    })?;
+    // The version probe runs in a throwaway home of its own, before any session exists: a
+    // probe that fails touches no session marker (codex review: a failure after `new_session`
+    // could delete a concurrent sign-in's marker outside the mutation lock). A probe home a
+    // crash leaves behind matches the session pattern, so the next sign-in sweeps it.
+    let probe = login_volume(&gw.name, cli);
+    create_login_home(dir, cli, &probe)?;
+    let version = host_version(&exe, &login_home(dir, &probe), cli, daemon_env);
+    remove_login_home(dir, &probe)?;
+    let Some(version) = version else {
+        return Err(format!(
+            "could not run this host's {cli} ({}): it answered no version, so it may be another tool of that name",
+            exe.display()
+        ));
+    };
+    let session = new_session(rt, gw, dir, cli)?;
+    let home = login_home(dir, &session);
+    let banner = host_login_banner(cli, &version, pinned);
+    Ok(host_login_argv(
+        cli,
+        &exe,
+        &home,
+        &login_pid_file(dir, &session),
+        &banner,
+        daemon_env,
+    ))
+}
+
 #[cfg(unix)]
 fn dispatch(verb: &str, cli: &str) -> Result<i32, String> {
     let dir = std::env::var_os(GATEWAY_DIR_ENV).map(std::path::PathBuf::from);
@@ -1855,14 +2433,16 @@ fn dispatch(verb: &str, cli: &str) -> Result<i32, String> {
         .map_err(|why| format!("a container runtime is required: {}", why.describe()))?;
     match verb {
         "argv" => {
-            let image = crate::container_floor::ensure_seat_image(&rt, cli)?;
-            let argv = prepare_login_argv(
-                &rt,
-                &gw,
-                dir.as_deref().expect("validated directory"),
-                cli,
-                &image,
-            )?;
+            let dir = dir.as_deref().expect("validated directory");
+            let argv = if host_login(cli) {
+                let env: Vec<(String, String)> = std::env::vars_os()
+                    .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                    .collect();
+                prepare_host_login_argv(&rt, &gw, dir, cli, &env)?
+            } else {
+                let image = crate::container_floor::ensure_seat_image(&rt, cli)?;
+                prepare_login_argv(&rt, &gw, dir, cli, &image)?
+            };
             println!(
                 "{}",
                 serde_json::to_string(&argv).map_err(|_| "could not encode login argv")?
@@ -2031,6 +2611,29 @@ esac
         }
     }
 
+    /// Write `content` at `path` in `cli`'s open host login home (what the host CLI leaves).
+    #[cfg(unix)]
+    fn host_input(fake: &FakeRuntime, cli: &str, path: &str, content: &str) {
+        let session = read_session(&fake.dir, &fake.gw, cli)
+            .unwrap()
+            .expect("an open login session");
+        let file = login_home(&fake.dir, &session).join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, content).unwrap();
+    }
+
+    /// A recorded host login session of `cli` whose home holds `content` at `path`.
+    #[cfg(unix)]
+    fn host_login_with(dir: &Path, gw_name: &str, cli: &str, path: &str, content: &str) -> String {
+        let session = login_volume(gw_name, cli);
+        create_login_home(dir, cli, &session).unwrap();
+        let file = login_home(dir, &session).join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, content).unwrap();
+        write_session(dir, cli, &session).unwrap();
+        session
+    }
+
     #[cfg(unix)]
     impl Drop for FakeRuntime {
         fn drop(&mut self) {
@@ -2110,11 +2713,11 @@ esac
         register_unit(&fake.dir, live.clone()).unwrap();
         let before = std::fs::read(fake.dir.join("config/units.json")).unwrap();
         let argv =
-            prepare_login_argv(&fake.rt, &fake.gw, &fake.dir, "codex", "FAKE-image").unwrap();
+            prepare_login_argv(&fake.rt, &fake.gw, &fake.dir, "claude", "FAKE-image").unwrap();
         assert!(argv
             .windows(2)
             .any(|w| w[0] == "--network" && w[1] == fake.gw.external_network));
-        prepare_login_argv(&fake.rt, &fake.gw, &fake.dir, "codex", "FAKE-image").unwrap();
+        prepare_login_argv(&fake.rt, &fake.gw, &fake.dir, "claude", "FAKE-image").unwrap();
         assert_eq!(
             std::fs::read(fake.dir.join("config/units.json")).unwrap(),
             before
@@ -2122,15 +2725,15 @@ esac
         assert!(!fake.calls().contains("container inspect"));
         assert!(!fake.calls().contains("cat > /v/"));
         std::fs::write(fake.dir.join("network"), "bridge true").unwrap();
-        assert!(prepare_login_argv(&fake.rt, &fake.gw, &fake.dir, "codex", "FAKE-image").is_err());
+        assert!(prepare_login_argv(&fake.rt, &fake.gw, &fake.dir, "claude", "FAKE-image").is_err());
         std::fs::write(fake.dir.join("network"), "overlay false").unwrap();
-        assert!(prepare_login_argv(&fake.rt, &fake.gw, &fake.dir, "codex", "FAKE-image").is_err());
+        assert!(prepare_login_argv(&fake.rt, &fake.gw, &fake.dir, "claude", "FAKE-image").is_err());
 
         // First ingest has no broker volume yet; initialization keeps existing files, too.
         std::fs::write(fake.dir.join("volumes"), "").unwrap();
         std::fs::write(fake.dir.join("broker/anthropic.token"), "FAKE-live-claude").unwrap();
         new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
-        std::fs::write(fake.dir.join("input"), chatgpt().to_string()).unwrap();
+        host_input(&fake, "codex", "codex/auth.json", &chatgpt().to_string());
         ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
         assert_eq!(
             std::fs::read(fake.dir.join("config/units.json")).unwrap(),
@@ -2340,32 +2943,40 @@ esac
         std::fs::write(fake.dir.join("calls"), "").unwrap();
         let mut invalid = chatgpt();
         invalid["tokens"]["account_id"] = json!("FAKE\r\nx-evil: 1");
-        std::fs::write(fake.dir.join("input"), invalid.to_string()).unwrap();
+        host_input(&fake, "codex", "codex/auth.json", &invalid.to_string());
         assert!(ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").is_err());
         assert!(!fake.calls().contains("cat > /v/"));
+        // Nothing usable: the host login is over and its home is gone.
+        assert_eq!(read_session(&fake.dir, &fake.gw, "codex").unwrap(), None);
+        assert!(!login_home(&fake.dir, &session).exists());
+        let session = new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        host_input(&fake, "codex", "codex/auth.json", &chatgpt().to_string());
+        std::fs::write(fake.dir.join("fail_publish"), "").unwrap();
+        assert!(ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").is_err());
+        assert!(fake.calls().contains("cat > /v/.openai.token.new"));
         assert_eq!(
             read_session(&fake.dir, &fake.gw, "codex").unwrap(),
             Some(session.clone())
         );
-        std::fs::write(fake.dir.join("input"), chatgpt().to_string()).unwrap();
-        std::fs::write(fake.dir.join("fail_publish"), "").unwrap();
-        assert!(ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").is_err());
-        assert!(fake.calls().contains("cat > /v/.openai.token.new"));
-        assert!(!fake.calls().contains("volume rm"));
-        assert_eq!(
-            read_session(&fake.dir, &fake.gw, "codex").unwrap(),
-            Some(session)
-        );
         std::fs::remove_file(fake.dir.join("fail_publish")).unwrap();
-        std::fs::write(fake.dir.join("fail_remove"), "").unwrap();
-        assert!(ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").is_err());
+        ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        assert!(!login_home(&fake.dir, &session).exists());
         assert!(read_session(&fake.dir, &fake.gw, "codex")
             .unwrap()
-            .is_some());
+            .is_none());
+        // A login container keeps its session (and volume) for a retry until removal succeeds.
+        let session = new_session(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        std::fs::write(fake.dir.join("input"), oauth(9_000_000_000_000).to_string()).unwrap();
+        std::fs::write(fake.dir.join("fail_remove"), "").unwrap();
+        assert!(ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").is_err());
+        assert_eq!(
+            read_session(&fake.dir, &fake.gw, "claude").unwrap(),
+            Some(session)
+        );
         std::fs::remove_file(fake.dir.join("fail_remove")).unwrap();
-        ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
         assert!(fake.calls().contains("volume rm"));
-        assert!(read_session(&fake.dir, &fake.gw, "codex")
+        assert!(read_session(&fake.dir, &fake.gw, "claude")
             .unwrap()
             .is_none());
     }
@@ -2392,8 +3003,8 @@ esac
     fn new_login_sessions_remove_previous_volume_and_ingest_only_recorded_session() {
         use std::os::unix::fs::PermissionsExt;
         let fake = FakeRuntime::new();
-        let first = new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
-        let second = new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        let first = new_session(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        let second = new_session(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
         assert_ne!(first, second);
         let calls = fake.calls();
         assert!(
@@ -2401,20 +3012,20 @@ esac
                 < calls.find(&format!("volume create {second}")).unwrap()
         );
         assert_eq!(
-            read_session(&fake.dir, &fake.gw, "codex").unwrap(),
+            read_session(&fake.dir, &fake.gw, "claude").unwrap(),
             Some(second.clone())
         );
         assert_eq!(
-            std::fs::metadata(session_path(&fake.dir, "codex"))
+            std::fs::metadata(session_path(&fake.dir, "claude"))
                 .unwrap()
                 .permissions()
                 .mode()
                 & 0o777,
             0o600
         );
-        std::fs::write(fake.dir.join("input"), chatgpt().to_string()).unwrap();
+        std::fs::write(fake.dir.join("input"), oauth(9_000_000_000_000).to_string()).unwrap();
         std::fs::write(fake.dir.join("calls"), "").unwrap();
-        ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
         assert!(fake.calls().contains(&format!("{second}:/in:ro")));
         assert!(!fake.calls().contains(&first));
     }
@@ -2425,7 +3036,7 @@ esac
         for sign_out in [false, true] {
             let fake = FakeRuntime::new();
             new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
-            std::fs::write(fake.dir.join("input"), chatgpt().to_string()).unwrap();
+            host_input(&fake, "codex", "codex/auth.json", &chatgpt().to_string());
             std::fs::write(fake.dir.join("calls"), "").unwrap();
             let held = crate::seat_refresh::mutation_lock(&fake.dir).unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
@@ -2480,11 +3091,11 @@ esac
             read_session(&fake.dir, &fake.gw, "pi").unwrap(),
             Some(open.clone())
         );
-        assert!(!fake.calls().contains(&format!("volume rm {open}")));
+        assert!(login_home(&fake.dir, &open).exists());
         write_session_state(&fake.dir, "pi", &open, true).unwrap();
         assert!(seat_sign_in(&fake.rt, &fake.gw, &fake.dir, "pi").is_ok());
         assert_eq!(read_session(&fake.dir, &fake.gw, "pi").unwrap(), None);
-        assert!(fake.calls().contains(&format!("volume rm {open}")));
+        assert!(!login_home(&fake.dir, &open).exists());
     }
 
     #[cfg(unix)]
@@ -2492,7 +3103,7 @@ esac
     fn committed_ingest_retry_preserves_since_rotated_record() {
         let fake = FakeRuntime::new();
         new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
-        std::fs::write(fake.dir.join("input"), chatgpt().to_string()).unwrap();
+        host_input(&fake, "codex", "codex/auth.json", &chatgpt().to_string());
         std::fs::write(fake.dir.join("fail_publish"), "").unwrap();
         assert!(ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").is_err());
         assert!(session_committed(&fake.dir, "codex").unwrap());
@@ -2762,22 +3373,8 @@ esac
                 vec!["CLAUDE_CONFIG_DIR=/home/login/claude"],
             ),
             (
-                "codex",
-                vec!["codex", "login", "--device-auth"],
-                vec!["CODEX_HOME=/home/login/codex"],
-            ),
-            ("pi", vec!["pi"], vec!["PI_CODING_AGENT_DIR=/home/login/pi"]),
-            (
-                "opencode",
-                vec!["sh", "-c", OPENCODE_LOGIN],
-                vec![
-                    "XDG_CONFIG_HOME=/home/login/config",
-                    "XDG_DATA_HOME=/home/login/data",
-                ],
-            ),
-            (
                 "copilot",
-                vec!["copilot", "login"],
+                vec!["copilot", "login", "--device-code"],
                 vec!["COPILOT_HOME=/home/login/copilot"],
             ),
         ] {
@@ -2841,7 +3438,7 @@ esac
     /// is missing, so the login wrote nothing and ingest reported "missing auth.json".
     #[test]
     fn init_creates_every_configuration_home_the_login_names() {
-        for cli in ["claude", "codex", "pi", "opencode", "copilot"] {
+        for cli in ["claude", "copilot"] {
             let argv = login_argv(Path::new("/rt"), cli, "img", "vol", "net");
             let script = init_login_argv("vol", cli).last().unwrap().clone();
             let (mkdir, rest) = script.split_once(" && ").unwrap();
@@ -2877,52 +3474,397 @@ esac
                 assert!(created.contains(&home.as_str()), "{cli}: {home} is created");
             }
         }
-        let codex = init_login_argv("vol", "codex");
-        assert!(codex
+        let claude = init_login_argv("vol", "claude");
+        assert!(claude
             .last()
             .unwrap()
-            .starts_with("mkdir -p /in/codex /in && "));
+            .starts_with("mkdir -p /in/claude /in && "));
     }
 
-    /// The same regression against the real codex seat image: after the init helper, the
-    /// login's `CODEX_HOME` loads (signed out), where before it failed at config load.
+    /// The host login argv (DES-SEAT-LOGIN-SUBSCRIPTIONS "Host-side login"): `env -i` keeps only
+    /// the passthrough list, every home variable points into the throwaway home, the CLI runs in
+    /// that home, and codex is told to store its credential in a file (never the keychain).
     #[cfg(unix)]
     #[test]
-    fn live_codex_login_home_exists_before_the_login_runs() {
-        let _env = crate::test_env::ENV_LOCK
-            .read()
-            .unwrap_or_else(|p| p.into_inner());
-        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
-            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
-            return;
-        }
-        let rt = crate::container_floor::runtime().expect("a container runtime answers");
-        let image = crate::container_floor::ensure_seat_image(&rt, "codex").unwrap();
-        let volume = login_volume("wicked-agw-livehome", "codex");
-        let _ = execute(&rt, &["volume".into(), "rm".into(), volume.clone()]);
-        checked(&rt, &["volume".into(), "create".into(), volume.clone()]).unwrap();
-        let status = |init: bool| {
-            if init {
-                checked(&rt, &init_login_argv(&volume, "codex")).unwrap();
+    fn host_login_argv_isolates_every_home_and_forwards_no_secret() {
+        let daemon: Vec<(String, String)> = [
+            ("PATH", "/opt/bin:/usr/bin"),
+            ("LANG", "en_US.UTF-8"),
+            ("HTTPS_PROXY", "http://proxy.example:3128"),
+            ("HOME", "/FAKE-operator-home"),
+            ("CODEX_HOME", "/FAKE-operator-home/.codex"),
+            ("OPENAI_API_KEY", "FAKE-secret"),
+            ("GH_TOKEN", "FAKE-secret"),
+            ("ANTHROPIC_API_KEY", "FAKE-secret"),
+            ("XDG_CONFIG_HOME", "/FAKE-operator-home/.config"),
+            ("OPENCODE_DB", "/FAKE-operator-home/db"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let home = Path::new("/state/gateway/login/wicked-agw-x-login-codex-0000abcd");
+        for (cli, homes, tail) in [
+            (
+                "codex",
+                vec!["CODEX_HOME=/state/gateway/login/wicked-agw-x-login-codex-0000abcd/codex"],
+                vec![
+                    "/opt/bin/codex",
+                    "login",
+                    "-c",
+                    "cli_auth_credentials_store=\"file\"",
+                ],
+            ),
+            (
+                "pi",
+                vec![
+                    "PI_CODING_AGENT_DIR=/state/gateway/login/wicked-agw-x-login-codex-0000abcd/pi",
+                ],
+                vec![
+                    "/opt/bin/pi",
+                    "--no-tools",
+                    "--no-extensions",
+                    "--no-mcp",
+                    "--no-skills",
+                    "--no-context-files",
+                    "--no-prompt-templates",
+                    "--no-session",
+                    "--no-approve",
+                ],
+            ),
+            ("opencode", vec![], vec!["/opt/bin/opencode"]),
+        ] {
+            let exe = Path::new("/opt/bin").join(cli);
+            let argv = host_login_argv(cli, &exe, home, Path::new("/state/PID"), "BANNER", &daemon);
+            assert_eq!(&argv[..2], ["/usr/bin/env", "-i"], "{cli}");
+            let sh = argv.iter().position(|a| a == "/bin/sh").unwrap();
+            let vars = &argv[2..sh];
+            let h = home.display();
+            for want in [
+                "PATH=/opt/bin:/usr/bin".to_string(),
+                "LANG=en_US.UTF-8".into(),
+                "HTTPS_PROXY=http://proxy.example:3128".into(),
+                "TERM=xterm-256color".into(),
+                format!("HOME={h}"),
+                format!("TMPDIR={h}/tmp"),
+                format!("XDG_CONFIG_HOME={h}/config"),
+                format!("XDG_DATA_HOME={h}/data"),
+                format!("XDG_STATE_HOME={h}/state"),
+                format!("XDG_CACHE_HOME={h}/cache"),
+            ]
+            .into_iter()
+            .chain(homes.iter().map(|s| s.to_string()))
+            {
+                assert!(vars.contains(&want), "{cli}: {want} in {vars:?}");
             }
-            let mut argv = login_argv(&rt.cli, "codex", &image, &volume, "none");
-            argv.retain(|a| a != "-it");
-            let at = argv.iter().position(|a| *a == image).unwrap();
-            argv.truncate(at + 1);
-            argv.extend(["codex", "login", "status"].map(String::from));
-            let out = execute(&rt, &argv[1..]).unwrap();
-            String::from_utf8_lossy(&out.stdout).into_owned()
-                + &String::from_utf8_lossy(&out.stderr)
-        };
-        let before = status(false);
-        let after = status(true);
-        let _ = execute(&rt, &["volume".into(), "rm".into(), volume.clone()]);
-        assert!(
-            before.contains("does not exist"),
-            "the bug reproduces: {before}"
+            // One value per variable: the operator's own homes never survive.
+            for var in ["HOME=", "XDG_CONFIG_HOME=", "CODEX_HOME="] {
+                assert!(
+                    vars.iter().filter(|v| v.starts_with(var)).count() <= 1,
+                    "{cli}: {var}"
+                );
+            }
+            let encoded = serde_json::to_string(&argv).unwrap();
+            for forbidden in [
+                "FAKE-secret",
+                "/FAKE-operator-home",
+                "OPENCODE_DB",
+                "GH_TOKEN",
+            ] {
+                assert!(!encoded.contains(forbidden), "{cli}: {forbidden}");
+            }
+            assert_eq!(argv[sh + 1], "-c");
+            assert_eq!(argv[sh + 3], "wicked-login");
+            assert_eq!(argv[sh + 4], "BANNER");
+            assert_eq!(argv[sh + 5], "/state/PID");
+            assert_eq!(&argv[sh + 6..], tail.as_slice(), "{cli}");
+        }
+        // opencode: its own private server, never the operator's background service.
+        let oc = host_login_argv(
+            "opencode",
+            Path::new("/o"),
+            home,
+            Path::new("/p"),
+            "B",
+            &daemon,
         );
-        assert!(!after.contains("does not exist"), "{after}");
-        assert!(after.contains("Not logged in"), "{after}");
+        let script = &oc[oc.iter().position(|a| a == "-c").unwrap() + 1];
+        assert!(script.contains("\"$oc\" auth login --standalone &&"));
+        assert!(script.contains("\"$oc\" auth export --standalone >"));
+        assert!(script.starts_with("cd \"$HOME\" || exit 1;"));
+    }
+
+    #[test]
+    fn host_login_banner_names_both_versions_and_the_next_step() {
+        assert_eq!(parse_version("codex-cli 0.162.1\n"), Some("0.162.1".into()));
+        assert_eq!(parse_version("opencode v2.0.25"), Some("2.0.25".into()));
+        assert_eq!(parse_version("1.1.0"), Some("1.1.0".into()));
+        assert_eq!(parse_version("copilot version: 1.34"), None);
+        assert_eq!(pinned_version("codex"), Some("0.162.1"));
+        let same = host_login_banner("codex", "0.162.1", Some("0.162.1"));
+        assert!(
+            same.contains("codex 0.162.1 (the version the seats run)"),
+            "{same}"
+        );
+        let skew = host_login_banner("pi", "1.3.0", Some("1.1.0"));
+        assert!(skew.contains("WARNING: the seats run pi 1.1.0"), "{skew}");
+        assert!(skew.contains("/login"));
+        assert!(host_login_banner("opencode", "2.0.25", None).contains("Codex browser (legacy)"));
+        for cli in ["claude", "copilot"] {
+            assert!(!host_login(cli), "{cli} keeps its login container");
+        }
+    }
+
+    /// A host login session: a fresh 0700 throwaway home with every directory its environment
+    /// names (codex refuses a `CODEX_HOME` that does not exist), under the gateway directory;
+    /// a new session sweeps the previous one and any orphaned home; ingest reads only the
+    /// recorded session's home and removes it.
+    #[cfg(unix)]
+    #[test]
+    fn host_login_sessions_own_a_private_home_and_remove_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = FakeRuntime::new();
+        let first = new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        let home = login_home(&fake.dir, &first);
+        for d in std::iter::once(home.clone()).chain(host_login_dirs(&home, "codex")) {
+            let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", d.display());
+        }
+        assert!(home.join("codex").is_dir());
+        let orphan = login_home(&fake.dir, &format!("{}-login-codex-0000abcd", fake.gw.name));
+        std::fs::create_dir_all(orphan.join("codex")).unwrap();
+        let other = login_home(&fake.dir, &format!("{}-login-pi-0000abcd", fake.gw.name));
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(home.join("codex/auth.json"), chatgpt().to_string()).unwrap();
+        let second = new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        assert!(
+            !home.exists() && !orphan.exists(),
+            "previous and orphaned homes are swept"
+        );
+        assert!(other.exists(), "another agent's login is left alone");
+        assert!(!fake.calls().contains("volume create"), "no login volume");
+        host_input(&fake, "codex", "codex/auth.json", &chatgpt().to_string());
+        ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        assert_eq!(
+            std::fs::read(fake.dir.join("broker/openai.token")).unwrap(),
+            b"FAKE-codex-access"
+        );
+        assert!(!login_home(&fake.dir, &second).exists());
+        assert_eq!(read_session(&fake.dir, &fake.gw, "codex").unwrap(), None);
+    }
+
+    /// A cancelled or failed host login (nothing usable in its home) and a home that smuggles a
+    /// symlink both end the session: the home is removed before any broker change.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_login_that_left_nothing_usable_is_cleaned_up_before_any_broker_change() {
+        let fake = FakeRuntime::new();
+        let session = new_session(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap();
+        std::fs::write(fake.dir.join("calls"), "").unwrap();
+        let err = ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap_err();
+        assert!(err.contains("pi"), "{err}");
+        assert!(!login_home(&fake.dir, &session).exists());
+        assert_eq!(read_session(&fake.dir, &fake.gw, "pi").unwrap(), None);
+        assert!(!fake.calls().contains("cat > /v/"), "no broker write");
+        // A symlinked credential file is refused, never followed.
+        let session = new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        let elsewhere = fake.dir.join("elsewhere.json");
+        std::fs::write(&elsewhere, chatgpt().to_string()).unwrap();
+        std::os::unix::fs::symlink(
+            &elsewhere,
+            login_home(&fake.dir, &session).join("codex/auth.json"),
+        )
+        .unwrap();
+        assert!(ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").is_err());
+        assert!(!login_home(&fake.dir, &session).exists());
+        assert!(elsewhere.exists(), "the link's target is never touched");
+        assert!(!fake.calls().contains("cat > /v/"));
+        // Sign-out removes an open host login's home too.
+        let session = new_session(&fake.rt, &fake.gw, &fake.dir, "opencode").unwrap();
+        sign_out_and_route(&fake.rt, &fake.gw, &fake.dir, "opencode").unwrap();
+        assert!(!login_home(&fake.dir, &session).exists());
+        assert_eq!(read_session(&fake.dir, &fake.gw, "opencode").unwrap(), None);
+    }
+
+    /// The host CLI is found on the daemon's PATH and must answer a version; the session it
+    /// opened is removed when it does not (another tool of that name, e.g. AWS's `copilot`).
+    #[cfg(unix)]
+    #[test]
+    fn host_login_argv_needs_the_cli_on_path_answering_a_version() {
+        let fake = FakeRuntime::new();
+        let bin = fake.dir.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let env = |path: &Path| vec![("PATH".to_string(), path.display().to_string())];
+        let err = prepare_host_login_argv(&fake.rt, &fake.gw, &fake.dir, "codex", &env(&bin))
+            .unwrap_err();
+        assert!(err.contains("codex is not installed on this host"), "{err}");
+        assert_eq!(read_session(&fake.dir, &fake.gw, "codex").unwrap(), None);
+        // A stand-in that records where it ran and with which environment.
+        crate::test_env::install_stub(
+            &bin.join("codex"),
+            "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$HOME\" \"$CODEX_HOME\" \"${OPENAI_API_KEY:-unset}\" > \"$HOME/../probe\"\necho 'codex-cli 9.9.9'\n",
+        );
+        let argv =
+            prepare_host_login_argv(&fake.rt, &fake.gw, &fake.dir, "codex", &env(&bin)).unwrap();
+        let session = read_session(&fake.dir, &fake.gw, "codex").unwrap().unwrap();
+        let home = login_home(&fake.dir, &session);
+        assert_eq!(argv.last().unwrap(), "cli_auth_credentials_store=\"file\"");
+        let banner = &argv[argv.iter().position(|a| a == "wicked-login").unwrap() + 1];
+        assert!(
+            banner.contains("codex 9.9.9") && banner.contains("WARNING"),
+            "{banner}"
+        );
+        // The version probe ran isolated, in a home of its own that is already gone.
+        let probe = std::fs::read_to_string(fake.dir.join("login/probe")).unwrap();
+        let lines: Vec<String> = probe.lines().map(str::to_string).collect();
+        let probe_home = Path::new(&lines[1]);
+        assert_ne!(probe_home, home, "{probe}");
+        assert!(probe_home.starts_with(fake.dir.join("login")), "{probe}");
+        assert!(!probe_home.exists(), "the probe home is removed");
+        assert_eq!(lines[2], format!("{}/codex", lines[1]));
+        assert_eq!(lines[3], "unset");
+        // The argv itself, run as the PTY runs it, executes the CLI in the throwaway home and
+        // records its pid for sign-out.
+        // spawn-audit: test-only — runs the printed argv as crew's PTY does (it is `env -i`).
+        let out = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("wicked: signing in codex"));
+        let probe = std::fs::read_to_string(fake.dir.join("login/probe")).unwrap();
+        let h = home.display().to_string();
+        let canon = home.canonicalize().unwrap().display().to_string();
+        let lines: Vec<&str> = probe.lines().collect();
+        assert!(lines[0] == h || lines[0] == canon, "{probe}");
+        assert_eq!(
+            &lines[1..],
+            [h.clone(), format!("{h}/codex"), "unset".into()]
+        );
+        let pid = std::fs::read_to_string(login_pid_file(&fake.dir, &session)).unwrap();
+        assert!(pid.parse::<i32>().is_ok_and(|p| p > 1), "{pid}");
+        // Not a coding agent (no version): refused, and its session removed.
+        crate::test_env::install_stub(&bin.join("pi"), "#!/bin/sh\necho 'not that tool'\n");
+        let err =
+            prepare_host_login_argv(&fake.rt, &fake.gw, &fake.dir, "pi", &env(&bin)).unwrap_err();
+        assert!(err.contains("answered no version"), "{err}");
+        assert_eq!(read_session(&fake.dir, &fake.gw, "pi").unwrap(), None);
+    }
+
+    /// codex review r1 #1: a sign-out (or a new sign-in) while the host login terminal is still
+    /// open ends that login's process group before its home goes, so the CLI cannot write a
+    /// credential into a home nobody tracks. A recycled pid (one that started after the pid
+    /// file) is never signalled.
+    #[cfg(unix)]
+    #[test]
+    fn sign_out_ends_a_still_running_host_login_before_removing_its_home() {
+        use std::os::unix::process::CommandExt;
+        let fake = FakeRuntime::new();
+        let session = new_session(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap();
+        let pid_file = login_pid_file(&fake.dir, &session);
+        // spawn-audit: test-only — a stand-in login: records its pid as the login shell does.
+        let mut login = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf '%s' \"$$\" > \"$1\"; exec sleep 60", "sh"])
+            .arg(&pid_file)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !pid_file.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        sign_out_and_route(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap();
+        let status = login.wait().unwrap();
+        assert!(!status.success(), "the login was ended: {status:?}");
+        assert!(!login_home(&fake.dir, &session).exists());
+        assert!(!pid_file.exists());
+        // A pid file older than the process it names is a recycled pid: left alone.
+        let session = new_session(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap();
+        let pid_file = login_pid_file(&fake.dir, &session);
+        // spawn-audit: test-only — an unrelated process that happens to lead its group.
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        std::fs::write(&pid_file, other.id().to_string()).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&pid_file)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        sign_out_and_route(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap();
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "a recycled pid is never signalled"
+        );
+        other.kill().unwrap();
+        let _ = other.wait();
+    }
+
+    /// codex review r1 #2: a codex/pi/opencode login VOLUME a container session left from before
+    /// the upgrade is still found, stopped and removed (never orphaned by its marker's removal).
+    #[cfg(unix)]
+    #[test]
+    fn a_pre_upgrade_container_session_of_a_host_login_agent_is_still_removed() {
+        let fake = FakeRuntime::new();
+        let legacy = format!("{}-login-codex-0000abcd", fake.gw.name);
+        let mut volumes = std::fs::read_to_string(fake.dir.join("volumes")).unwrap();
+        volumes.push_str(&format!("{legacy}\n"));
+        std::fs::write(fake.dir.join("volumes"), volumes).unwrap();
+        write_session(&fake.dir, "codex", &legacy).unwrap();
+        // Its credential is still ingested from the volume, as before the upgrade.
+        std::fs::write(fake.dir.join("input"), chatgpt().to_string()).unwrap();
+        ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        assert!(fake.calls().contains(&format!("{legacy}:/in:ro")));
+        assert!(fake.calls().contains(&format!("volume rm {legacy}")));
+        assert_eq!(read_session(&fake.dir, &fake.gw, "codex").unwrap(), None);
+        // A sign-out of an open legacy session removes its volume too.
+        std::fs::write(fake.dir.join("calls"), "").unwrap();
+        write_session(&fake.dir, "codex", &legacy).unwrap();
+        sign_out_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        assert!(fake.calls().contains(&format!("volume rm {legacy}")));
+        assert_eq!(read_session(&fake.dir, &fake.gw, "codex").unwrap(), None);
+    }
+
+    /// codex review r1 #4: no component is followed through a symlink and no FIFO is waited on.
+    #[cfg(unix)]
+    #[test]
+    fn read_home_follows_no_link_at_any_depth_and_never_blocks_on_a_fifo() {
+        let dir = std::env::temp_dir().join(format!("wicked-rh-{}", uuid::Uuid::new_v4().simple()));
+        let real = dir.join("real");
+        std::fs::create_dir_all(real.join("codex")).unwrap();
+        std::fs::write(real.join("codex/auth.json"), "FAKE").unwrap();
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(real.join("codex"), home.join("codex")).unwrap();
+        assert!(
+            read_home(&home, &["codex/auth.json"]).is_err(),
+            "a linked directory"
+        );
+        std::fs::remove_file(home.join("codex")).unwrap();
+        std::fs::create_dir(home.join("codex")).unwrap();
+        std::os::unix::fs::symlink(real.join("codex/auth.json"), home.join("codex/auth.json"))
+            .unwrap();
+        assert!(
+            read_home(&home, &["codex/auth.json"]).is_err(),
+            "a linked file"
+        );
+        std::fs::remove_file(home.join("codex/auth.json")).unwrap();
+        let fifo =
+            std::ffi::CString::new(home.join("codex/auth.json").as_os_str().as_encoded_bytes())
+                .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(read_home(&home, &["codex/auth.json"]).is_err(), "a FIFO");
+        std::fs::remove_file(home.join("codex/auth.json")).unwrap();
+        assert_eq!(read_home(&home, &["codex/auth.json"]).unwrap(), Vec::new());
+        std::fs::write(home.join("codex/auth.json"), "FAKE-ok").unwrap();
+        assert_eq!(
+            read_home(&home, &["codex/auth.json"]).unwrap(),
+            vec![("codex/auth.json".to_string(), b"FAKE-ok".to_vec())]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3274,17 +4216,21 @@ esac
         let fake = bin.join("opencode");
         std::fs::write(
             &fake,
-            "#!/bin/sh\ncase \"$2\" in\n  login) [ -e \"$FAKE_DIR/login_fails\" ] && exit 3; exit 0;;\n  export) printf '[{\"partial\":'; [ -e \"$FAKE_DIR/export_fails\" ] && exit 4; printf '1}]';;\nesac\n",
+            "#!/bin/sh\n[ \"$3\" = --standalone ] || exit 9\ncase \"$2\" in\n  login) [ -e \"$FAKE_DIR/login_fails\" ] && exit 3; exit 0;;\n  export) printf '[{\"partial\":'; [ -e \"$FAKE_DIR/export_fails\" ] && exit 4; printf '1}]';;\nesac\n",
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let run = |case: &str| {
             let data = dir.join(case);
             let _ = std::fs::remove_dir_all(&data);
+            std::fs::create_dir_all(&data).unwrap();
             // spawn-audit: test-only — the engine's login command with a fake opencode.
             let out = std::process::Command::new("/bin/sh")
-                .args(["-c", OPENCODE_LOGIN])
-                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .args(["-c", OPENCODE_HOST_LOGIN, "wicked-login", "BANNER"])
+                .arg(dir.join(format!("{case}.pid")))
+                .arg(&fake)
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &data)
                 .env("XDG_DATA_HOME", &data)
                 .env("FAKE_DIR", &dir)
                 .output()
@@ -4019,19 +4965,14 @@ esac
         attach(&rt, &gw, &seat_net).expect("attached as agw");
         let key = UnitKey::new("run-login", "run-login#1", "codex");
         register_live(&rt, &gw, &dir, key.clone()).unwrap();
-        // What the user's login container leaves behind (FAKE values).
-        let volume = login_volume(&gw.name, "codex");
-        run(&["volume", "rm", &volume]);
-        assert!(run(&["volume", "create", &volume]).status.success());
-        checked(&rt, &init_login_argv(&volume, "codex")).unwrap();
-        let auth = serde_json::to_string(&chatgpt()).unwrap();
-        let write = helper_argv(
-            &volume,
-            false,
-            "10001",
-            format!("printf '%s' '{auth}' > /in/codex/auth.json"),
+        // What the user's host login leaves in its throwaway home (FAKE values).
+        let volume = host_login_with(
+            &dir,
+            &gw.name,
+            "codex",
+            "codex/auth.json",
+            &serde_json::to_string(&chatgpt()).unwrap(),
         );
-        checked(&rt, &write).unwrap();
         let ask = |want: &dyn Fn(&str) -> bool| {
             let bearer = format!("authorization: Bearer {}", key.bearer);
             let mut last = String::new();
@@ -4066,11 +5007,10 @@ esac
             }
             last
         };
-        write_session(&dir, "codex", &volume).unwrap();
         let report = ingest_and_route(&rt, &gw, &dir, "codex").expect("ingested");
         let signed_in = ask(&|b| b.contains("FAKE-codex-access") && b.contains("FAKE-account-id"));
         let status_in = broker_status(&rt, &gw, "codex");
-        let login_gone = !volume_exists(&rt, &volume).unwrap();
+        let login_gone = !login_home(&dir, &volume).exists();
         // The broker's one refresher: a forced refresh against the stub token endpoint; the
         // gateway serves the new token with no restart (it watches its backendAuth file).
         *crate::seat_refresh::TEST_URL.lock().unwrap() = Some(format!("http://{stub}:8081/token"));
@@ -4100,7 +5040,7 @@ esac
         run(&["rm", "-f", &stub, &gw.name]);
         run(&["network", "rm", &seat_net, &gw.external_network]);
         let (cfg, broker) = crate::seat_gateway::volumes(&gw);
-        run(&["volume", "rm", &cfg, &broker, &volume]);
+        run(&["volume", "rm", &cfg, &broker]);
         let _ = std::fs::remove_dir_all(&dir);
         eprintln!("signed_in={signed_in:?}\nsigned_out={signed_out:?}\nreport={report:?}");
         assert!(
@@ -4118,7 +5058,7 @@ esac
         );
         assert!(
             login_gone,
-            "the throwaway login volume is removed after ingest"
+            "the throwaway login home is removed after ingest"
         );
         assert!(
             !signed_out.contains("FAKE-codex-access") && !signed_out.contains("FAKE-account-id"),
@@ -4243,24 +5183,17 @@ esac
         let codex = UnitKey::new("run-pi", "run-pi#2", "codex");
         register_live(&rt, &gw, &dir, key.clone()).unwrap();
         register_live(&rt, &gw, &dir, codex.clone()).unwrap();
-        // What pi's `/login` leaves in the login volume (FAKE values; Copilot due soonest).
+        // What pi's `/login` leaves in the throwaway home (FAKE values; Copilot due soonest).
         let mut login = pi_login();
         login["github-copilot"]["expires"] = json!(4_000_000_000_000_u64 - 1);
         login["github-copilot"]["access"] =
             json!("tid=FAKE-pi-copilot;proxy-ep=proxy.individual.githubcopilot.com");
-        let volume = login_volume(&gw.name, "pi");
-        run(&["volume", "rm", &volume]);
-        assert!(run(&["volume", "create", &volume]).status.success());
-        checked(&rt, &init_login_argv(&volume, "pi")).unwrap();
-        let write = helper_argv(
-            &volume,
-            false,
-            "10001",
-            format!("printf '%s' '{login}' > /in/pi/auth.json"),
-        );
-        checked(&rt, &write).unwrap();
-        write_session(&dir, "pi", &volume).unwrap();
+        let volume = host_login_with(&dir, &gw.name, "pi", "pi/auth.json", &login.to_string());
         let report = ingest_and_route(&rt, &gw, &dir, "pi").expect("ingested");
+        assert!(
+            !login_home(&dir, &volume).exists(),
+            "the throwaway home is removed"
+        );
         let sign_in = seat_sign_in(&rt, &gw, &dir, "pi").expect("pi is signed in");
         let upstream = || {
             let o = run(&["logs", &stub]);
@@ -4396,7 +5329,7 @@ esac
         run(&["rm", "-f", &stub, &gw.name]);
         run(&["network", "rm", &seat_net, &gw.external_network]);
         let (cfg, broker) = crate::seat_gateway::volumes(&gw);
-        run(&["volume", "rm", &cfg, &broker, &volume]);
+        run(&["volume", "rm", &cfg, &broker]);
         let _ = std::fs::remove_dir_all(&dir);
         for line in gw_logs.lines().filter(|l| {
             !l.contains("DirectResponse")
@@ -4583,19 +5516,18 @@ esac
         register_live(&rt, &gw, &dir, key.clone()).unwrap();
         register_live(&rt, &gw, &dir, pi.clone()).unwrap();
         let login = opencode_login();
-        let volume = login_volume(&gw.name, "opencode");
-        run(&["volume", "rm", &volume]);
-        assert!(run(&["volume", "create", &volume]).status.success());
-        checked(&rt, &init_login_argv(&volume, "opencode")).unwrap();
-        let write = helper_argv(
-            &volume,
-            false,
-            "10001",
-            format!("mkdir -p /in/data/opencode && printf '%s' '{login}' > /in/data/opencode/wicked-auth.json"),
+        let volume = host_login_with(
+            &dir,
+            &gw.name,
+            "opencode",
+            "data/opencode/wicked-auth.json",
+            &login.to_string(),
         );
-        checked(&rt, &write).unwrap();
-        write_session(&dir, "opencode", &volume).unwrap();
         let report = ingest_and_route(&rt, &gw, &dir, "opencode").expect("ingested");
+        assert!(
+            !login_home(&dir, &volume).exists(),
+            "the throwaway home is removed"
+        );
         let sign_in = seat_sign_in(&rt, &gw, &dir, "opencode").expect("opencode is signed in");
         let upstream = || {
             let o = run(&["logs", &stub]);
@@ -4803,7 +5735,7 @@ esac
         run(&["rm", "-f", &stub, &gw.name]);
         run(&["network", "rm", &seat_net, &gw.external_network]);
         let (cfg, broker) = crate::seat_gateway::volumes(&gw);
-        run(&["volume", "rm", &cfg, &broker, &volume, &data]);
+        run(&["volume", "rm", &cfg, &broker, &data]);
         let _ = std::fs::remove_dir_all(&dir);
         eprintln!("report={report:?}\nsign_in={sign_in:?}\nforeign={foreign:?}\nseen={seen}");
         assert!(
