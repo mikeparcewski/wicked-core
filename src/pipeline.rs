@@ -1141,6 +1141,7 @@ pub(crate) fn apply_and_finish_unit(
                         cli: seat.clone(),
                         reason: why.clone(),
                         source: "judge".to_string(),
+                        governed_only: false,
                     },
                 ) {
                     changed = true;

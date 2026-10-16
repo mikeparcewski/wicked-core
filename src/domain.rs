@@ -600,6 +600,19 @@ pub struct BenchedSeat {
     /// Who benched it: `launcher` (the roster's health probe), `ballot` (a council seat failure),
     /// `worker` (a unit's worker failed with an auth refusal).
     pub source: String,
+    /// (C5) Whether the bench binds GOVERNED work only — a unit routed, reassigned or failed over
+    /// to the seat — and not the engine's ungoverned calls (the agent judge, triage, a decision
+    /// ballot: `governance: None`), which the executor never refuses for it. Set by the host-floor
+    /// bench alone ([`crate::distribute::HOST_FLOOR_BENCH`]): the executor refuses a governed unit on
+    /// such a seat and nothing else. Absent on the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub governed_only: bool,
+}
+
+/// The bench an UNGOVERNED engine call reads — the agent judge, triage, a decision ballot: `bench`
+/// minus every seat benched for governed work only ([`BenchedSeat::governed_only`]).
+pub fn ungoverned_bench(bench: &[BenchedSeat]) -> Vec<BenchedSeat> {
+    bench.iter().filter(|b| !b.governed_only).cloned().collect()
 }
 
 impl BenchedSeat {

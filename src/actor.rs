@@ -4148,9 +4148,9 @@ fn notify_campaign(self_tx: &Sender<Command>, run_id: &str, outcome: crate::camp
 /// `clis` persists, so it stays eligible unless benched (codex r1).
 ///
 /// (C5 follow-up) The ballots follow the seat floor ([`ballot_dispatcher`]), so the ballots' bench
-/// is the run's own launch bench (`distribute::launch_benched`): on the host floor only the seats
-/// that keep a per-call check there sit (as the run's `benched_seats` already say), and on a run
-/// bound to a repository codex
+/// is the run's own launch bench (`distribute::launch_benched`) minus its governed-only entries (a
+/// ballot is ungoverned, so the host-floor bench does not take a seat out of the council): on a
+/// run bound to a repository codex
 /// sits out, unless the operator opted out or the container floor carries the ballots on a store
 /// whose units are armed in seat containers (`contained`, `in_process_governance`).
 fn council_roster(
@@ -4164,11 +4164,23 @@ fn council_roster(
             .filter(|c| !wicked_council::registry::is_opt_in(&c.key))
             .collect();
     };
-    let roster = eligible_roster_keys(session);
-    let ballot_bench =
-        crate::distribute::launch_benched(&clis, session.repo_ref.is_some(), contained);
+    // (C5) A ballot is an ungoverned engine call (`governance: None`): a seat benched for governed
+    // work only (the host-floor bench) still votes. Every other bench — quota, auth, dead seats,
+    // the codex worktree bench — keeps it out.
+    let run_bench = crate::domain::ungoverned_bench(&session.benched_seats);
+    let roster: Vec<String> = session
+        .clis
+        .iter()
+        .filter(|k| !run_bench.iter().any(|b| &b.cli == *k))
+        .cloned()
+        .collect();
+    let ballot_bench = crate::domain::ungoverned_bench(&crate::distribute::launch_benched(
+        &clis,
+        session.repo_ref.is_some(),
+        contained,
+    ));
     clis.into_iter()
-        .filter(|c| !session.benched_seats.iter().any(|b| b.cli == c.key))
+        .filter(|c| !run_bench.iter().any(|b| b.cli == c.key))
         .filter(|c| !ballot_bench.iter().any(|b| b.cli == c.key))
         .filter(|c| {
             // By CLI key: a run configured `codex#2` keeps the `codex` ballot record the registry
@@ -6128,6 +6140,7 @@ fn apply_step_result(
                             cli: cli.clone(),
                             reason: why.clone(),
                             source: "worker".to_string(),
+                            governed_only: false,
                         },
                     ) {
                         put_node(store, session.to_node())?;
@@ -6500,11 +6513,13 @@ fn apply_step_result(
                 // configured and may still use — never a benched one (in run b86c14c1 the judge
                 // itself ran on signed-out pi and errored, escalating every failure to a human).
                 let run_roster_keys: Vec<String> = session.clis.clone();
-                let benched_keys: Vec<String> = session
-                    .benched_seats
-                    .iter()
-                    .map(|b| b.cli.clone())
-                    .collect();
+                // (C5) Triage is an ungoverned engine call: a seat benched for governed work
+                // only (the host-floor bench) may still triage.
+                let benched_keys: Vec<String> =
+                    crate::domain::ungoverned_bench(&session.benched_seats)
+                        .into_iter()
+                        .map(|b| b.cli)
+                        .collect();
                 std::thread::spawn(move || {
                     let ctx = format!("{run_id2}-u{unit_ix2}-a{attempt2}");
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -21860,6 +21875,7 @@ mod def_gate_disclosure_tests {
                 cli: "pi".into(),
                 reason: "timed_out (2/2 ballots, no vote returned)".into(),
                 source: "ballot".into(),
+                governed_only: false,
             }],
         );
         let prompt = run_level_prompt(&mut store);
@@ -25333,6 +25349,7 @@ mod turn_timeout_vs_cancel_tests {
                 cli: "b".into(),
                 reason: "not_logged_in".into(),
                 source: "worker".into(),
+                governed_only: false,
             },
         ));
         assert!(
@@ -25342,6 +25359,7 @@ mod turn_timeout_vs_cancel_tests {
                     cli: "b".into(),
                     reason: "again".into(),
                     source: "ballot".into(),
+                    governed_only: false,
                 },
             ),
             "the first reason wins"
@@ -26242,6 +26260,7 @@ mod dead_seat_park_tests {
                 cli: "codex".into(),
                 reason: "not_logged_in".into(),
                 source: "ballot".into(),
+                governed_only: false,
             }],
         };
         let parked = park_at_dead_seat_gate(&mut store, &mut subs, &tx, &run_id, &refusal).unwrap();
@@ -27002,6 +27021,7 @@ mod work_author_tests {
                     cli: (*c).to_string(),
                     reason: "quota_exhausted".into(),
                     source: "worker".into(),
+                    governed_only: false,
                 })
                 .collect(),
             team: None,
@@ -27268,6 +27288,55 @@ mod council_ballot_tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    /// (C5) A ballot is ungoverned: on the host floor a seat benched for governed work only (pi,
+    /// which keeps no per-call check there) still votes; any other bench on it keeps it out.
+    #[test]
+    fn the_host_floor_bench_does_not_take_a_seat_out_of_the_council() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let home =
+            std::env::temp_dir().join(format!("wc-council-hostfloor-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let names = [
+            "HOME",
+            "USERPROFILE",
+            "WICKED_CODEX_WORKTREE_OK",
+            crate::container_floor::SEAT_FLOOR_ENV,
+        ];
+        let prev: Vec<_> = names.iter().map(std::env::var_os).collect();
+        std::env::set_var("HOME", &home);
+        std::env::set_var("USERPROFILE", &home);
+        std::env::remove_var("WICKED_CODEX_WORKTREE_OK");
+        std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, "host");
+        let clis = vec![seat("claude"), seat("codex"), seat("pi")];
+        let mut run = AgentSession {
+            repo_ref: None,
+            clis: vec!["claude".into(), "codex".into(), "pi".into()],
+            ..bound_run()
+        };
+        run.benched_seats = crate::distribute::launch_benched(&clis, false, true);
+        assert_eq!(run.benched_seats.len(), 1, "{:?}", run.benched_seats);
+        assert!(run.benched_seats[0].governed_only);
+        let keys = |s: &AgentSession| {
+            council_roster(Some(s), clis.clone(), true)
+                .into_iter()
+                .map(|c| c.key)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&run), vec!["claude", "codex", "pi"]);
+        // …while a bench that binds every call (a quota refusal) keeps pi out.
+        run.benched_seats[0].governed_only = false;
+        assert_eq!(keys(&run), vec!["claude", "codex"]);
+        for (k, v) in names.iter().zip(prev) {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// Under the container floor the council's dispatcher carries its ballots to the seats (and

@@ -382,6 +382,7 @@ pub(crate) fn host_floor_benched_with(
             cli: c.key.clone(),
             reason: HOST_FLOOR_BENCH.to_string(),
             source: "launcher".to_string(),
+            governed_only: true,
         })
         .collect()
 }
@@ -416,6 +417,7 @@ pub(crate) fn worktree_benched_with(
             cli: c.key.clone(),
             reason: CODEX_WORKTREE_BENCH.to_string(),
             source: "launcher".to_string(),
+            governed_only: false,
         })
         .collect()
 }
@@ -433,6 +435,7 @@ pub(crate) fn launcher_benched(clis: &[AgenticCli]) -> Vec<BenchedSeat> {
                     .clone()
                     .unwrap_or_else(|| "unusable (launcher health probe)".to_string()),
                 source: "launcher".to_string(),
+                governed_only: false,
             })
         })
         .collect()
@@ -2016,6 +2019,7 @@ mod tests {
             cli: "pi".into(),
             reason: "not_logged_in".into(),
             source: "ballot".into(),
+            governed_only: false,
         };
         let dists = distribute_units_against_benched(
             &[tool_unit(1, "index")],
@@ -2384,6 +2388,7 @@ mod tests {
             cli: "pi".to_string(),
             reason: "auth_refusal (worker transcript)".to_string(),
             source: "worker".to_string(),
+            governed_only: false,
         };
         let err = distribute_units_against_benched(
             &build_and_review(),
@@ -3220,6 +3225,7 @@ mod tests {
             cli: "claude#2".into(),
             reason: "not_logged_in".into(),
             source: "worker".into(),
+            governed_only: false,
         }];
         let p = refill_pool(&u, &clis, &bench, Some("claude")).unwrap();
         assert_eq!(p.monitors, ["codex"], "{p:?}");
@@ -3567,13 +3573,21 @@ mod worktree_bench_tests {
             keys_of(&unbound),
             vec!["opencode", "copilot", "pi", "smoke-judge"]
         );
-        assert!(unbound.iter().all(|s| s.reason == HOST_FLOOR_BENCH));
+        assert!(unbound
+            .iter()
+            .all(|s| s.reason == HOST_FLOOR_BENCH && s.governed_only));
         let bound = launch_benched(&clis, true, true);
         assert_eq!(
             keys_of(&bound),
             vec!["opencode", "copilot", "pi", "smoke-judge", "codex"]
         );
         assert_eq!(bound[4].reason, CODEX_WORKTREE_BENCH);
+        // The worktree bench binds every call (judges and ballots included), as before.
+        assert!(!bound[4].governed_only);
+        // On the wire the flag rides only when set.
+        let wire = serde_json::to_value(&bound).unwrap();
+        assert_eq!(wire[0]["governed_only"], serde_json::json!(true));
+        assert!(wire[4].get("governed_only").is_none(), "{wire}");
         // Units that are not armed are not refused by the executor: no host-floor bench.
         assert!(launch_benched(&clis, false, false).is_empty());
         assert_eq!(keys_of(&launch_benched(&clis, true, false)), vec!["codex"]);
