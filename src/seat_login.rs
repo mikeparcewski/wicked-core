@@ -316,15 +316,28 @@ const PI_OAUTH: &[(&str, crate::seat_credentials::Subscription)] = &[
     ),
 ];
 
+/// The field of the broker's copy of pi's Copilot entry that keeps the plan endpoint the
+/// token exchange named (`endpoints.api`); pi itself never reads the broker's copy.
+pub(crate) const COPILOT_ENDPOINT_FIELD: &str = "wickedApiEndpoint";
+
 /// The Copilot API host a Copilot token names (`proxy-ep=proxy.<plan>.githubcopilot.com`, as pi
-/// derives it), or the individual plan's host. Validated before it reaches a route.
-fn copilot_host_from_token(token: &str) -> Result<String, String> {
+/// derives it), else the exchange's plan `endpoint`, else the individual plan's host. Validated
+/// before it reaches a route.
+fn copilot_host_from_token(token: &str, endpoint: Option<&str>) -> Result<String, String> {
     let host = token
         .split(';')
         .find_map(|kv| kv.strip_prefix("proxy-ep="))
         .map(|h| match h.strip_prefix("proxy.") {
             Some(rest) => format!("api.{rest}"),
             None => h.to_string(),
+        })
+        .or_else(|| {
+            endpoint.map(|e| {
+                e.strip_prefix("https://")
+                    .unwrap_or(e)
+                    .trim_end_matches('/')
+                    .to_string()
+            })
         })
         .unwrap_or_else(|| "api.individual.githubcopilot.com".into());
     crate::seat_gateway::validate_copilot_host(&host)?;
@@ -358,7 +371,8 @@ fn pi_oauth_files(
             // The GitHub token the broker re-exchanges for each new Copilot token.
             nonempty(value.get("refresh"))
                 .ok_or_else(|| missing("pi", "github-copilot GitHub token"))?;
-            let host = copilot_host_from_token(access)?;
+            let host =
+                copilot_host_from_token(access, nonempty(value.get(COPILOT_ENDPOINT_FIELD)))?;
             out.push(token_file(route.host_file.unwrap_or_default(), &host));
         }
     }
@@ -2869,6 +2883,22 @@ esac
             .any(|(n, b)| n == "pi.copilot.host" && b == b"api.individual.githubcopilot.com"));
     }
 
+    /// A Copilot token naming no `proxy-ep` takes the plan endpoint the exchange named (kept in
+    /// the broker's copy of the record), never silently the individual plan's.
+    #[test]
+    fn pi_copilot_host_falls_back_to_the_exchanges_plan_endpoint() {
+        let mut login = pi_login();
+        login["github-copilot"]["access"] = json!("tid=FAKE-no-proxy");
+        login["github-copilot"][COPILOT_ENDPOINT_FIELD] =
+            json!("https://api.business.githubcopilot.com/");
+        let files = extract_tokens("pi", &[file("pi/auth.json", login.clone())]).unwrap();
+        assert!(files
+            .iter()
+            .any(|(n, b)| n == "pi.copilot.host" && b == b"api.business.githubcopilot.com"));
+        login["github-copilot"][COPILOT_ENDPOINT_FIELD] = json!("https://evil.example.com");
+        assert!(extract_tokens("pi", &[file("pi/auth.json", login)]).is_err());
+    }
+
     /// Decision 7: an expired subscription is not placed in the seat; the agent is expired only
     /// when nothing valid is left, and a valid API key keeps it signed in.
     #[test]
@@ -3954,8 +3984,26 @@ esac
         );
         assert!(!after_out.contains("FAKE"), "{after_out}");
         assert_eq!(status_out, BrokerStatus::SignedOut);
-        for secret in ["FAKE-access", "FAKE-gho-token", "FAKE-pi-copilot", &key.key] {
+        // Every synthetic credential, original and renewed, stays out of the gateway's log and
+        // out of what ingest reports.
+        let chatgpt_jwt = pi_jwt("acct-FAKE-0002");
+        let report_text = format!("{report:?}");
+        for secret in [
+            "sk-ant-oat01-FAKE-access",
+            chatgpt_jwt.as_str(),
+            "FAKE-ant-refresh",
+            "FAKE-oai-refresh",
+            "FAKE-gho-token",
+            "FAKE-pi-copilot",
+            "FAKE-pi-key",
+            "FAKE-pi-renewed",
+            &key.key,
+        ] {
             assert!(!gw_logs.contains(secret), "{secret} in the gateway log");
+            assert!(
+                !report_text.contains(secret),
+                "{secret} in the ingest report"
+            );
         }
     }
 

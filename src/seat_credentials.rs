@@ -150,7 +150,7 @@ pub(crate) fn seat_files(
         .kind
         .map(|kind| placeholder_files(cli, kind, unit_key, gateway_url))
         .unwrap_or_default();
-    if sign_in.subscriptions.is_empty() || cli != "pi" {
+    if cli != "pi" {
         return files;
     }
     let mut take = |name: &str| -> Value {
@@ -189,7 +189,11 @@ pub(crate) fn seat_files(
             "headers": {crate::seat_gateway::UNIT_HEADER: unit_key}
         });
     }
-    files.push((PathBuf::from("models.json"), models.to_string()));
+    if !sign_in.subscriptions.is_empty() || models != json!({}) {
+        files.push((PathBuf::from("models.json"), models.to_string()));
+    }
+    // Always written: pi's run home persists across units, and a placeholder of a provider the
+    // broker no longer holds must not survive into this one.
     files.push((PathBuf::from("auth.json"), auth.to_string()));
     files
 }
@@ -468,11 +472,19 @@ mod tests {
                 "{id}"
             );
         }
-        // Without subscriptions nothing changes for the existing modes.
-        assert_eq!(
-            seat_files("pi", &CredentialKind::ProviderKey.into(), KEY, URL),
-            placeholder_files("pi", CredentialKind::ProviderKey, KEY, URL)
-        );
+        // Without subscriptions the key mode keeps its models.json, and auth.json is rewritten
+        // empty: an earlier unit's subscription placeholders never survive in the run home.
+        let mut expected = placeholder_files("pi", CredentialKind::ProviderKey, KEY, URL);
+        expected.push((PathBuf::from("auth.json"), "{}".into()));
+        let only_key = seat_files("pi", &CredentialKind::ProviderKey.into(), KEY, URL);
+        assert_eq!(only_key.len(), 2);
+        for (path, body) in &expected {
+            let got = &only_key.iter().find(|(p, _)| p == path).unwrap().1;
+            assert_eq!(
+                serde_json::from_str::<Value>(got).unwrap(),
+                serde_json::from_str::<Value>(body).unwrap()
+            );
+        }
     }
 
     #[test]

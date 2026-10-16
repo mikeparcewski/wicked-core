@@ -153,7 +153,7 @@ impl ModelRoute {
     }
 
     /// The agent whose sign-in this route serves, from its credential file; `None` for a file
-    /// no agent owns (an operator's or a test's custom route), which keeps every unit's key.
+    /// no agent owns, which admits no unit (an operator's custom route names its agent's file).
     pub(crate) fn owner(&self) -> Option<&'static str> {
         route_owner(self.credential_file.file_name()?.to_str()?)
     }
@@ -328,7 +328,8 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
             let mut provider = serde_json::Map::new();
             provider.insert(route.provider.config_key().into(), json!({}));
             let kind = route.credential_kind();
-            // DES-SEAT-LOGIN-SUBSCRIPTIONS decision 2: a route admits only its owner's units.
+            // DES-SEAT-LOGIN-SUBSCRIPTIONS decision 2: a route admits only its owner's units, and
+            // a route whose credential file no agent owns admits none (fail closed).
             let route_keys: Vec<Value> = match route.owner() {
                 Some(owner) => config
                     .units
@@ -336,7 +337,7 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
                     .filter(|u| u.seat == owner)
                     .map(key_of)
                     .collect(),
-                None => keys.clone(),
+                None => Vec::new(),
             };
             let location = match (route.unit_header.as_deref(), kind) {
                 (Some(header), _) => json!({"header": {"name": header}}),
@@ -1095,6 +1096,30 @@ fn set_route_literals_locked(
     settings.units.clear();
     atomic_json(&dir.join("config/gateway.json"), &settings)?;
     persist_units(dir, &config)
+}
+
+/// Whether the served config already carries exactly `literals` on `cli`'s routes.
+pub(crate) fn route_literals_current(
+    dir: &Path,
+    cli: &str,
+    literals: &RouteLiterals,
+) -> Result<bool, String> {
+    let config = load_config(dir)?;
+    let owned = |m: &std::collections::BTreeMap<String, String>| -> Vec<(String, String)> {
+        m.iter()
+            .filter(|(f, _)| route_owner(f) == Some(cli))
+            .map(|(f, v)| (f.clone(), v.clone()))
+            .collect()
+    };
+    let sorted = |v: &[(String, String)]| {
+        let mut v = v.to_vec();
+        v.sort();
+        v
+    };
+    Ok(
+        owned(&config.chatgpt_accounts) == sorted(&literals.accounts)
+            && owned(&config.copilot_hosts) == sorted(&literals.hosts),
+    )
 }
 
 pub(crate) fn route_sign_in(
@@ -2207,7 +2232,7 @@ mod tests {
 
     /// DES-SEAT-LOGIN-SUBSCRIPTIONS decision 2: a model route admits only its owner agent's unit
     /// keys (a pi seat can no longer spend codex's sign-in, nor codex pi's); a route no agent
-    /// owns keeps every key; readiness keeps every key.
+    /// owns admits none; readiness keeps every key.
     #[test]
     fn each_route_admits_only_its_owner_agents_units() {
         let mut config = GatewayConfig::default();
@@ -2241,7 +2266,10 @@ mod tests {
         for port in [4000, 4004, 4005] {
             assert!(keys(port).is_empty(), "{port}");
         }
-        assert_eq!(keys(4998), vec![pi.key.clone(), codex.key.clone()]);
+        assert!(
+            keys(4998).is_empty(),
+            "a route no agent owns admits no unit"
+        );
         let ready = &bind(&rendered, READY_PORT)["listeners"][0]["routes"][0]["policies"];
         assert_eq!(ready["apiKey"]["keys"].as_array().unwrap().len(), 2);
     }

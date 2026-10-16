@@ -155,6 +155,17 @@ pub(crate) fn next_refresh(
             },
         ));
     }
+    let id = due_entries(cli, record, now, force).into_iter().next()?;
+    let request = entry_request(cli, record, &id)?;
+    Some((Some(id), request))
+}
+
+/// The entries of a multi-entry record that a pass renews at `now`, soonest-expiring first:
+/// those due (or, with `force`, every renewable one). Each is tried once per pass.
+pub(crate) fn due_entries(cli: &str, record: &Value, now: u64, force: bool) -> Vec<String> {
+    if cli != "pi" {
+        return Vec::new();
+    }
     let mut candidates: Vec<(u64, &str)> = PI_ENTRIES
         .iter()
         .filter_map(|id| {
@@ -167,7 +178,15 @@ pub(crate) fn next_refresh(
         .filter(|(exp, _)| force || due(Some(*exp), now))
         .collect();
     candidates.sort();
-    let (_, id) = *candidates.first()?;
+    candidates
+        .into_iter()
+        .map(|(_, id)| id.to_string())
+        .collect()
+}
+
+/// The token request that renews entry `id` of `cli`'s record.
+pub(crate) fn entry_request(cli: &str, record: &Value, id: &str) -> Option<Request> {
+    let _ = cli;
     let entry = record.get(id)?;
     let refresh = str_at(entry, "/refresh")?.to_string();
     let request = match id {
@@ -193,7 +212,7 @@ pub(crate) fn next_refresh(
             headers: PI_COPILOT_HEADERS.to_vec(),
         },
     };
-    Some((Some(id.to_string()), request))
+    Some(request)
 }
 
 /// Fold a token answer into pi's entry `id` of `record` (at `now`, Unix seconds).
@@ -217,6 +236,11 @@ pub(crate) fn apply_pi_answer(
             .ok_or("pi: the Copilot token exchange returned no expires_at")?;
         entry.insert("access".into(), json!(token));
         entry.insert("expires".into(), json!(expires_at.saturating_mul(1000)));
+        // The plan endpoint the exchange names, kept (in the broker's copy only) for a token
+        // that names no `proxy-ep`.
+        if let Some(api) = str_at(answer, "/endpoints/api") {
+            entry.insert(crate::seat_login::COPILOT_ENDPOINT_FIELD.into(), json!(api));
+        }
         return Ok(out);
     }
     let access =
@@ -883,20 +907,53 @@ mod live {
             encode_request(&body)?; // codex lg-r2 C6: reject oversized records even before NotDue.
         }
         let now = unix_now();
-        // pi renews one entry per committed generation, so a rotated refresh token is stored
-        // before the next entry's request is made (DES-SEAT-LOGIN-SUBSCRIPTIONS decision 8).
+        let multi = cli == "pi";
+        // A multi-entry record renews each eligible entry once per pass, one committed generation
+        // at a time, so a rotated refresh token is stored before the next entry's request is made
+        // (DES-SEAT-LOGIN-SUBSCRIPTIONS decision 8). One entry's refused request never strands the
+        // others; a failure to store a generation stops the pass.
+        let plan: Vec<Option<String>> = if multi {
+            due_entries(cli, &record, now, force)
+                .into_iter()
+                .map(Some)
+                .collect()
+        } else if next_refresh(cli, &record, now, force).is_some() {
+            vec![None]
+        } else {
+            Vec::new()
+        };
+        let refreshable = if multi {
+            !due_entries(cli, &record, now, true).is_empty()
+        } else {
+            request_body(cli, &record, &flow).is_some()
+        };
         let mut refreshed = false;
-        for _ in 0..PI_ENTRIES.len().max(1) {
-            let Some((entry, request)) = next_refresh(cli, &record, now, force && !refreshed)
-            else {
-                break;
+        let mut failures: Vec<String> = Vec::new();
+        for entry in &plan {
+            let request = match entry {
+                Some(id) => entry_request(cli, &record, id),
+                None => next_refresh(cli, &record, now, force).map(|(_, r)| r),
             };
-            let result = (|| {
-                let answer = send(rt, dir, cli, &gw.external_network, &request)?;
-                let new = match entry.as_deref() {
-                    Some(id) => apply_pi_answer(&record, id, &answer, now)?,
-                    None => apply_answer(cli, &record, &answer, now)?,
-                };
+            let Some(request) = request else {
+                continue;
+            };
+            let answered =
+                send(rt, dir, cli, &gw.external_network, &request).and_then(|answer| match entry {
+                    Some(id) => apply_pi_answer(&record, id, &answer, now),
+                    None => apply_answer(cli, &record, &answer, now),
+                });
+            let new = match answered {
+                Ok(new) => new,
+                Err(e) if multi => {
+                    failures.push(format!("{}: {e}", entry.as_deref().unwrap_or(cli)));
+                    continue;
+                }
+                Err(e) => {
+                    failures.push(e);
+                    break;
+                }
+            };
+            let committed = (|| {
                 let new_bytes =
                     serde_json::to_vec(&new).map_err(|_| "could not encode the record")?;
                 let files = crate::seat_login::extract_tokens(
@@ -910,33 +967,46 @@ mod live {
                     &files,
                     |name, b| crate::seat_gateway::set_broker_credential(rt, gw, dir, cli, name, b),
                     |name| crate::seat_gateway::remove_broker_file(rt, gw, dir, cli, name),
-                )?;
-                // A renewed Copilot token can name another plan host: the route follows it.
-                let literals = crate::seat_login::route_literals(cli, &files)?;
-                if !literals.hosts.is_empty() {
-                    crate::seat_gateway::route_sign_in(rt, gw, dir, cli, &literals)?;
-                }
-                Ok::<Value, String>(new)
+                )
             })();
+            if let Err(e) = committed {
+                failures.push(e);
+                break;
+            }
+            record = new;
+            refreshed = true;
+        }
+        // The route literals follow the stored record on every pass (a renewed Copilot token can
+        // name another plan host; a crash between a commit and its publication heals here).
+        if multi {
+            let bytes = serde_json::to_vec(&record).map_err(|_| "could not encode the record")?;
+            let files = crate::seat_login::extract_tokens(
+                cli,
+                &[(login_path(cli).unwrap_or_default().into(), bytes)],
+            )?;
+            let literals = crate::seat_login::route_literals(cli, &files)?;
+            if !crate::seat_gateway::route_literals_current(dir, cli, &literals)? {
+                crate::seat_gateway::route_sign_in(rt, gw, dir, cli, &literals)?;
+            }
+        }
+        if !plan.is_empty() {
             record_last(
                 dir,
                 cli,
                 Some(&LastRefresh {
-                    ok: result.is_ok(),
+                    ok: failures.is_empty(),
                     at: now,
-                    error: result.as_ref().err().cloned(),
+                    error: (!failures.is_empty()).then(|| failures.join("; ")),
                 }),
             );
-            record = result?;
-            refreshed = true;
-            if cli != "pi" {
-                break;
-            }
+        }
+        if !failures.is_empty() {
+            return Err(failures.join("; "));
         }
         let expires_at = crate::seat_login::record_expiry(cli, &record)?;
         if refreshed {
             Ok(Outcome::Refreshed { expires_at })
-        } else if request_body(cli, &record, &flow).is_none() && cli != "pi" {
+        } else if !refreshable {
             Ok(Outcome::NotRefreshable)
         } else {
             Ok(Outcome::NotDue { expires_at })
@@ -1061,6 +1131,34 @@ mod tests {
         assert_eq!(entry.as_deref(), Some("anthropic"));
         assert!(
             matches!(request, Request::Post { ref url, .. } if url.contains("platform.claude.com"))
+        );
+        // A pass plans every renewable entry when forced (each tried once), only the due ones
+        // otherwise, and none for a record without refresh tokens (not refreshable).
+        assert_eq!(
+            due_entries("pi", &record, 0, true),
+            vec!["openai-codex", "github-copilot", "anthropic"]
+        );
+        assert_eq!(
+            due_entries("pi", &record, 1_499_999_500, false),
+            vec!["openai-codex", "github-copilot"]
+        );
+        let mut no_refresh = record.clone();
+        for id in ["anthropic", "openai-codex", "github-copilot"] {
+            no_refresh[id].as_object_mut().unwrap().remove("refresh");
+        }
+        assert!(due_entries("pi", &no_refresh, 0, true).is_empty());
+        // The exchange's plan endpoint is kept for a token that names none.
+        let with_endpoint = apply_pi_answer(
+            &record,
+            "github-copilot",
+            &json!({"token": "tid=FAKE-3", "expires_at": 1_u64,
+                "endpoints": {"api": "https://api.business.githubcopilot.com"}}),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            with_endpoint["github-copilot"][crate::seat_login::COPILOT_ENDPOINT_FIELD],
+            "https://api.business.githubcopilot.com"
         );
         // A refresh answer must carry what the CLI needs.
         assert!(apply_pi_answer(&record, "anthropic", &json!({"access_token": "x"}), 1).is_err());
