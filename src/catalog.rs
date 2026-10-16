@@ -220,6 +220,159 @@ pub fn builtin_preset_instruments(name: &str) -> Option<Vec<String>> {
     })
 }
 
+/// (DES-CHAT-FIRST-001 C2) How a built-in preset is described to an operator: a short `title`, a
+/// one-line `summary`, and 2–4 `use_when` phrases (when to pick it). Plain operator language — this
+/// copy is what a picker shows and what the chat's workflow digest offers. Display data only: it is
+/// never part of a composed def (the engine's `WorkflowDef` parser is strict and never sees it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresetDescriptor {
+    pub title: &'static str,
+    pub summary: &'static str,
+    pub use_when: &'static [&'static str],
+}
+
+/// (DES-CHAT-FIRST-001 C2) The descriptor of built-in preset `name` (`None` for a name that is not a
+/// built-in). Code data beside [`builtin_presets`], as [`builtin_preset_instruments`] is: a listing
+/// stamps it on the built-in's row when it reads it, so a re-seed never drops it and an existing
+/// store gains it with no rewrite. Every built-in has one (pinned by a test).
+pub fn builtin_preset_descriptor(name: &str) -> Option<PresetDescriptor> {
+    let (title, summary, use_when): (&str, &str, &[&str]) = match name {
+        "bug" => (
+            "Fix a bug",
+            "Find the cause of a bug, reproduce it, fix it and check that the fix holds.",
+            &[
+                "something is broken",
+                "an error or crash to fix",
+                "something that used to work no longer does",
+            ],
+        ),
+        "capture-learnings" => (
+            "Capture learnings",
+            "Read a repository's recent changes and write down what they teach for future work.",
+            &[
+                "save lessons after a stretch of work",
+                "record what changes often and why",
+            ],
+        ),
+        "chat" => (
+            "Chat",
+            "Answer questions about your code and work without changing anything.",
+            &[
+                "ask a question",
+                "explain or explore code",
+                "talk something through",
+            ],
+        ),
+        "demo" => (
+            "Demo video",
+            "Plan, record and review a narrated demo video of an app.",
+            &["record a product demo", "show a feature working on video"],
+        ),
+        "domain-extraction" => (
+            "Map the domain",
+            "Work out what a codebase does as a set of requirements and check how much of the code they cover.",
+            &[
+                "document what an existing system does",
+                "build a requirements map from code",
+            ],
+        ),
+        "editor-plugin" => (
+            "Editor plugin",
+            "Design, build, test and install a studio editor plugin for a kind of file.",
+            &[
+                "edit a new kind of file in studio",
+                "change how studio edits an artifact",
+            ],
+        ),
+        "feature" => (
+            "Build a feature",
+            "Clarify, design, build, review and test a change to your application.",
+            &[
+                "add new behaviour to an app",
+                "a new screen, endpoint or option",
+                "a change that needs a design and tests",
+            ],
+        ),
+        "interactive-chat" => (
+            "Discuss a document",
+            "Talk a document through and revise it from the conversation.",
+            &[
+                "go over a document together",
+                "revise a document by discussing it",
+            ],
+        ),
+        "interactive-draft" => (
+            "Draft a document",
+            "Write a new document from a brief.",
+            &[
+                "write a new doc, spec or proposal",
+                "turn notes into a first draft",
+            ],
+        ),
+        "interactive-edit" => (
+            "Edit a document",
+            "Make the changes you ask for to an existing document.",
+            &[
+                "change an existing document",
+                "tighten or restructure a draft",
+            ],
+        ),
+        "learn" => (
+            "Learn a topic",
+            "Research a topic or event from outside sources and save what was learned to the repository.",
+            &[
+                "learn about a library, tool or standard",
+                "catch up on a recent event",
+                "refresh knowledge saved earlier",
+            ],
+        ),
+        "mcp-server" => (
+            "MCP server",
+            "Design, build, test, review and install an MCP server.",
+            &[
+                "build a new MCP server",
+                "give agents a new tool",
+            ],
+        ),
+        "migration" => (
+            "Migration",
+            "Plan and carry out a move to something new, with a confirmed cutover, then remove the old path.",
+            &[
+                "move to a new library, service or schema",
+                "replace an old system step by step",
+                "a change that needs a cutover",
+            ],
+        ),
+        "onboarding" => (
+            "Set up a repository",
+            "Index a repository so the agents can find their way around it.",
+            &["add a new repository", "re-index a repository"],
+        ),
+        "qe-author-tests" => (
+            "Write tests",
+            "Write tests for how existing code behaves and run them with the repository's own test setup.",
+            &[
+                "add missing tests",
+                "cover existing behaviour with tests",
+            ],
+        ),
+        "steering-author" => (
+            "Write steering rules",
+            "Read your sources and propose steering rules for you to approve.",
+            &[
+                "turn team practices into rules",
+                "propose rules from docs or code",
+            ],
+        ),
+        _ => return None,
+    };
+    Some(PresetDescriptor {
+        title,
+        summary,
+        use_when,
+    })
+}
+
 /// One built-in preset's steps by name (`None` for a name that is not a built-in). Test fixtures.
 #[cfg(test)]
 pub(crate) fn builtin_preset(name: &str) -> Option<Vec<PlanStep>> {
@@ -1140,6 +1293,34 @@ mod tests {
             !plan.executes_code,
             "the author writes a storyline, never the tree"
         );
+    }
+
+    /// DES-CHAT-FIRST-001 C2: every built-in preset has a title, a one-line summary and 2–4 short
+    /// `use_when` phrases, and no name outside the built-ins has a descriptor.
+    #[test]
+    fn every_builtin_preset_has_a_descriptor() {
+        for (name, _) in builtin_presets() {
+            let d = builtin_preset_descriptor(name)
+                .unwrap_or_else(|| panic!("built-in preset `{name}` has no descriptor"));
+            assert!(!d.title.trim().is_empty(), "{name}: empty title");
+            assert!(d.title.len() <= 40, "{name}: title too long");
+            assert!(!d.summary.trim().is_empty(), "{name}: empty summary");
+            assert!(!d.summary.contains('\n'), "{name}: summary is one line");
+            assert!(d.summary.len() <= 120, "{name}: summary too long");
+            assert!(
+                (2..=4).contains(&d.use_when.len()),
+                "{name}: {} use_when phrases",
+                d.use_when.len()
+            );
+            for phrase in d.use_when {
+                assert!(
+                    !phrase.trim().is_empty() && phrase.len() <= 60,
+                    "{name}: `{phrase}`"
+                );
+            }
+        }
+        assert_eq!(builtin_preset_descriptor("no-such-preset"), None);
+        assert_eq!(builtin_preset_descriptor("campaign-x-y"), None);
     }
 
     /// WT-C1 (N5, dormant): no built-in preset references the walkthrough entries — a walkthrough

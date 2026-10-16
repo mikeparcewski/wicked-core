@@ -50,6 +50,34 @@ pub struct Preset {
     /// = the defaults. A built-in's own come from the catalog, never from this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_instruments: Option<Vec<String>>,
+    /// (DES-CHAT-FIRST-001 C2) A short display name (`"Build a feature"`). Display data only, never
+    /// part of the composed def. A built-in's comes from the catalog
+    /// ([`crate::catalog::builtin_preset_descriptor`]), stamped when a listing reads the row; a saved
+    /// preset has none today. Absent on the wire when unset, so an older reader sees no new key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// (C2) One line on what the workflow does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// (C2) 2–4 short phrases saying when to pick it. Empty (absent on the wire) when unset.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub use_when: Vec<String>,
+}
+
+impl Preset {
+    /// The row with its built-in descriptor stamped (DES-CHAT-FIRST-001 C2): only a row that IS the
+    /// seeded built-in (`created_by: "builtin"`) gets one, so a saved preset that shadows a built-in's
+    /// name (globally or in a project) shows its own row, undescribed, and is listed by name.
+    fn with_builtin_descriptor(mut self) -> Self {
+        if self.created_by == BUILTIN_CREATED_BY {
+            if let Some(d) = crate::catalog::builtin_preset_descriptor(&self.name) {
+                self.title = Some(d.title.to_string());
+                self.summary = Some(d.summary.to_string());
+                self.use_when = d.use_when.iter().map(|s| s.to_string()).collect();
+            }
+        }
+        self
+    }
 }
 
 /// What a caller asks to save.
@@ -215,6 +243,9 @@ pub(crate) fn builtin_preset_def(name: &str) -> crate::workflow::WorkflowDef {
         updated_at: 0,
         deleted_at: None,
         required_instruments: None,
+        title: None,
+        summary: None,
+        use_when: Vec::new(),
     };
     compose_preset(&preset).unwrap_or_else(|e| panic!("built-in preset `{name}` composes: {e}"))
 }
@@ -267,6 +298,9 @@ pub fn seed_builtins(store: &mut dyn GraphStore, now_ms: i64) -> anyhow::Result<
             updated_at: now_ms,
             deleted_at: None,
             required_instruments: None,
+            title: None,
+            summary: None,
+            use_when: Vec::new(),
         });
     }
     if !rows.is_empty() {
@@ -321,6 +355,9 @@ pub fn put_preset_requiring(
         updated_at: now_ms,
         deleted_at: None,
         required_instruments,
+        title: None,
+        summary: None,
+        use_when: Vec::new(),
     };
     compose_preset(&preset).map_err(|e| PresetError::InvalidSteps(e.to_string()))?;
     crate::domain::put_node(store, preset.to_node())?;
@@ -372,7 +409,10 @@ pub fn list_presets(
     for p in rows {
         by_name.insert(p.name.clone(), p);
     }
-    Ok(by_name.into_values().collect())
+    Ok(by_name
+        .into_values()
+        .map(Preset::with_builtin_descriptor)
+        .collect())
 }
 
 /// The preset a launch naming `name` in `project_id` runs: the project's live row, else the
@@ -384,10 +424,10 @@ pub fn resolve(
 ) -> anyhow::Result<Option<Preset>> {
     if let Some(p) = project_id {
         if let Some(preset) = get_row(store, &scope_for(Some(p)), name)? {
-            return Ok(Some(preset));
+            return Ok(Some(preset.with_builtin_descriptor()));
         }
     }
-    get_row(store, GLOBAL_SCOPE, name)
+    Ok(get_row(store, GLOBAL_SCOPE, name)?.map(Preset::with_builtin_descriptor))
 }
 
 /// (QE acceptance) The instruments a launch of preset `name` requires: a built-in's declaration
@@ -420,6 +460,7 @@ pub fn list_all_presets(store: &dyn GraphRead) -> anyhow::Result<Vec<Preset>> {
         .iter()
         .filter_map(|n| Preset::from_node(n).ok())
         .filter(|p| p.deleted_at.is_none())
+        .map(Preset::with_builtin_descriptor)
         .collect())
 }
 
@@ -459,6 +500,9 @@ mod tests {
             updated_at: 7,
             deleted_at: None,
             required_instruments: None,
+            title: Some("My flow".into()),
+            summary: Some("Does my thing.".into()),
+            use_when: vec!["when I need it".into()],
         };
         let node = p.to_node();
         assert_eq!(node.kind, NodeKind::Other("plan_preset".into()));
@@ -505,6 +549,9 @@ mod tests {
             updated_at: 1,
             deleted_at: None,
             required_instruments: None,
+            title: None,
+            summary: None,
+            use_when: Vec::new(),
         };
         crate::domain::put_node(&mut store, stale.to_node()).unwrap();
         assert_eq!(
@@ -545,6 +592,9 @@ mod tests {
             updated_at: 1,
             deleted_at: None,
             required_instruments: None,
+            title: None,
+            summary: None,
+            use_when: Vec::new(),
         };
         crate::domain::put_node(&mut store, saved.to_node()).unwrap();
         assert_eq!(
@@ -691,6 +741,88 @@ mod tests {
         assert_ne!(n, gated_preset_name(&long, "build"));
     }
 
+    /// DES-CHAT-FIRST-001 C2: a listing carries every built-in's descriptor, read from the catalog,
+    /// on an existing store whose rows were seeded without one (no rewrite needed).
+    #[test]
+    fn a_listing_carries_every_builtin_descriptor() {
+        let mut store = mem_store();
+        seed_builtins(&mut store, 1).unwrap();
+        // The stored rows carry no descriptor: it is stamped on read, never seeded.
+        let raw = get_row(&store, GLOBAL_SCOPE, "feature").unwrap().unwrap();
+        assert_eq!((raw.title.as_deref(), raw.use_when.len()), (None, 0));
+        let listed = list_presets(&store, None).unwrap();
+        assert_eq!(listed.len(), crate::catalog::builtin_presets().len());
+        for p in &listed {
+            let d = crate::catalog::builtin_preset_descriptor(&p.name).unwrap();
+            assert_eq!(p.title.as_deref(), Some(d.title), "{}", p.name);
+            assert_eq!(p.summary.as_deref(), Some(d.summary), "{}", p.name);
+            assert_eq!(p.use_when, d.use_when, "{}", p.name);
+        }
+        let feature = resolve(&store, None, "feature").unwrap().unwrap();
+        assert_eq!(feature.title.as_deref(), Some("Build a feature"));
+        assert!(list_all_presets(&store)
+            .unwrap()
+            .iter()
+            .all(|p| p.title.is_some()));
+        // On the wire: the three keys, beside the row's own.
+        let wire = serde_json::to_value(&feature).unwrap();
+        assert_eq!(wire["title"], "Build a feature");
+        assert!(wire["summary"].is_string());
+        assert!(wire["use_when"].as_array().is_some_and(|a| a.len() >= 2));
+    }
+
+    /// C2: a saved preset (a project row shadowing `feature`, a user's global `chat`) shows its own
+    /// row, undescribed — listed by name — and its wire carries none of the three keys.
+    #[test]
+    fn a_saved_preset_has_no_descriptor_even_under_a_builtin_name() {
+        let mut store = mem_store();
+        seed_builtins(&mut store, 1).unwrap();
+        let pid = crate::project::create_project(&mut store, "alpha", None, 1)
+            .unwrap()
+            .id;
+        put_preset(&mut store, user("feature", Some(&pid)), 2).unwrap();
+        put_preset(&mut store, user("mine", None), 2).unwrap();
+        let in_project = list_presets(&store, Some(&pid)).unwrap();
+        let shadow = in_project.iter().find(|p| p.name == "feature").unwrap();
+        assert_eq!(shadow.scope, format!("project:{pid}"));
+        assert_eq!(
+            (
+                shadow.title.as_ref(),
+                shadow.summary.as_ref(),
+                shadow.use_when.len()
+            ),
+            (None, None, 0)
+        );
+        let wire = serde_json::to_value(shadow).unwrap();
+        for key in ["title", "summary", "use_when"] {
+            assert!(wire.get(key).is_none(), "{key} on {wire}");
+        }
+        let mine = resolve(&store, None, "mine").unwrap().unwrap();
+        assert_eq!(mine.title, None);
+        assert!(resolve(&store, Some(&pid), "feature")
+            .unwrap()
+            .unwrap()
+            .title
+            .is_none());
+        // Outside the project the built-in is described as usual.
+        assert!(resolve(&store, None, "feature")
+            .unwrap()
+            .unwrap()
+            .title
+            .is_some());
+    }
+
+    /// C2: a row written before the fields existed reads back with none (serde defaults).
+    #[test]
+    fn a_row_without_descriptor_keys_still_reads() {
+        let row = serde_json::json!({
+            "name": "old", "scope": "global", "steps": [{"catalog": "understand", "id": "u"}],
+            "created_by": "api", "updated_at": 1
+        });
+        let p: Preset = serde_json::from_value(row).unwrap();
+        assert_eq!((p.title, p.summary, p.use_when.len()), (None, None, 0));
+    }
+
     #[test]
     fn a_project_row_shadows_only_its_project() {
         let mut store = mem_store();
@@ -761,6 +893,9 @@ mod tests {
             updated_at: 0,
             deleted_at: None,
             required_instruments: None,
+            title: None,
+            summary: None,
+            use_when: Vec::new(),
         };
         let def = compose_preset(&p).unwrap();
         assert_eq!(def.id, "my-flow");
