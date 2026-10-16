@@ -2225,12 +2225,7 @@ pub(crate) fn arm(
                 "{run_id}#{ord}@{}",
                 &uuid::Uuid::new_v4().simple().to_string()[..8]
             );
-            let (key, mut env, files) = placeholder_handoff(cli, kind, run_id, &unit);
-            if cli == "copilot" {
-                if let Some(wire) = crate::seat_gateway::copilot_wire_api(&argv) {
-                    env.push(("COPILOT_PROVIDER_WIRE_API".into(), wire.into()));
-                }
-            }
+            let (key, env, files) = placeholder_handoff(cli, kind, run_id, &unit);
             let since = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs().saturating_sub(1).to_string())

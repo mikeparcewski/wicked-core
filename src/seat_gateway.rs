@@ -955,15 +955,28 @@ pub(crate) fn seat_env_for_sign_in(
     env
 }
 
-/// The wire API copilot's BYOK mode must use for the model `argv` selects (`--model X` or
-/// `--model=X`): GPT models are served on `/responses` (the CLI's own rule: GPT-5 needs it),
-/// every other model on the default chat completions. `None` = the default.
-pub(crate) fn copilot_wire_api(argv: &[String]) -> Option<&'static str> {
-    let model = argv.iter().enumerate().find_map(|(i, a)| {
+/// The wire API copilot's BYOK mode must use for the model its seat sends, resolved as copilot
+/// does: `COPILOT_PROVIDER_WIRE_MODEL`, else `--model X`/`--model=X`, else `COPILOT_MODEL`, else
+/// `COPILOT_PROVIDER_MODEL_ID`. GPT models are served on `/responses` (the CLI's own rule: GPT-5
+/// needs it), every other model on the default chat completions. `None` = the default, or an
+/// explicit `COPILOT_PROVIDER_WIRE_API` already chosen (never overridden).
+pub(crate) fn copilot_wire_api(
+    args: &[String],
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<&'static str> {
+    if env("COPILOT_PROVIDER_WIRE_API").is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
+    let flag = args.iter().enumerate().find_map(|(i, a)| {
         a.strip_prefix("--model=")
             .map(str::to_string)
-            .or_else(|| (a == "--model").then(|| argv.get(i + 1).cloned()).flatten())
-    })?;
+            .or_else(|| (a == "--model").then(|| args.get(i + 1).cloned()).flatten())
+    });
+    let model = env("COPILOT_PROVIDER_WIRE_MODEL")
+        .filter(|m| !m.is_empty())
+        .or(flag)
+        .or_else(|| env("COPILOT_MODEL").filter(|m| !m.is_empty()))
+        .or_else(|| env("COPILOT_PROVIDER_MODEL_ID").filter(|m| !m.is_empty()))?;
     model.starts_with("gpt-").then_some("responses")
 }
 
@@ -2276,19 +2289,63 @@ mod tests {
         assert_eq!(get("OPENAI_API_KEY"), None);
         assert_eq!(get("HTTPS_PROXY"), Some("http://agw:3000"));
         let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let none = |_: &str| None::<String>;
         assert_eq!(
-            copilot_wire_api(&argv(&["copilot", "--model", "gpt-5.5", "-p", "x"])),
+            copilot_wire_api(&argv(&["copilot", "--model", "gpt-5.5", "-p", "x"]), none),
             Some("responses")
         );
         assert_eq!(
-            copilot_wire_api(&argv(&["copilot", "--model=gpt-6.1-sol"])),
+            copilot_wire_api(&argv(&["copilot", "--model=gpt-6.1-sol"]), none),
             Some("responses")
         );
         assert_eq!(
-            copilot_wire_api(&argv(&["copilot", "--model", "claude-sonnet-5"])),
+            copilot_wire_api(&argv(&["copilot", "--model", "claude-sonnet-5"]), none),
             None
         );
-        assert_eq!(copilot_wire_api(&argv(&["copilot", "-p", "x"])), None);
+        assert_eq!(copilot_wire_api(&argv(&["copilot", "-p", "x"]), none), None);
+        // copilot's own precedence: the BYOK wire model, then the flag, then the env model.
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(
+            copilot_wire_api(&argv(&["copilot"]), env(&[("COPILOT_MODEL", "gpt-5.5")])),
+            Some("responses")
+        );
+        assert_eq!(
+            copilot_wire_api(
+                &argv(&["copilot"]),
+                env(&[("COPILOT_PROVIDER_MODEL_ID", "gpt-5.5")])
+            ),
+            Some("responses")
+        );
+        assert_eq!(
+            copilot_wire_api(
+                &argv(&["copilot", "--model", "gpt-5.5"]),
+                env(&[("COPILOT_PROVIDER_WIRE_MODEL", "claude-sonnet-5")])
+            ),
+            None
+        );
+        assert_eq!(
+            copilot_wire_api(
+                &argv(&["copilot", "--model", "claude-sonnet-5"]),
+                env(&[("COPILOT_MODEL", "gpt-5.5")])
+            ),
+            None,
+            "the flag wins over the env model"
+        );
+        assert_eq!(
+            copilot_wire_api(
+                &argv(&["copilot", "--model", "gpt-5.5"]),
+                env(&[("COPILOT_PROVIDER_WIRE_API", "completions")])
+            ),
+            None,
+            "an explicit wire API is never overridden"
+        );
         // copilot's route reads the unit from Authorization (its BYOK bearer) and admits only it.
         let config = GatewayConfig {
             units: vec![

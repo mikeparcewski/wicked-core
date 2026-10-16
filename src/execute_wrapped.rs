@@ -3169,6 +3169,26 @@ impl WrappedCliStepRunner {
             for (k, v) in &seat_gateway_env {
                 cmd.env(k, v);
             }
+            // copilot's BYOK seat: the wire API follows the model the seat will send, resolved
+            // from its final argv and env as copilot resolves it (DES-SEAT-LOGIN-SUBSCRIPTIONS 7).
+            if seat_gateway_env
+                .iter()
+                .any(|(k, _)| k == "COPILOT_PROVIDER_BASE_URL")
+            {
+                let args: Vec<String> = cmd
+                    .get_args()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                let env_of = |key: &str| {
+                    cmd.get_envs()
+                        .find(|(k, _)| *k == key)
+                        .and_then(|(_, v)| v)
+                        .map(|v| v.to_string_lossy().into_owned())
+                };
+                if let Some(wire) = crate::seat_gateway::copilot_wire_api(&args, env_of) {
+                    cmd.env("COPILOT_PROVIDER_WIRE_API", wire);
+                }
+            }
             if uses_container_seat(governed, container) {
                 seat_files.extend(ask_config.files.iter().cloned());
             }
