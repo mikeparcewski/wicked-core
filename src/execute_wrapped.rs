@@ -2066,24 +2066,26 @@ impl BallotScratch {
         }
     }
 
-    /// Record the ballot's container seat home (the run directory above the posture leaf), only
-    /// when it is the ballot's own: a `council-` run directory under `.wicked-container`.
-    fn note_seat(&self, config: &wicked_apps_core::spawn::SeatConfig) {
+    /// Record the ballot's container seat home BEFORE it is built (codex council-r2): the run
+    /// directory [`crate::container_floor::container_run_dir`] names under the seat root, so a
+    /// setup that fails after creating it is cleaned too. Only a `council-` run directory under
+    /// `.wicked-container` is ever recorded.
+    fn note_root(&self, config: &wicked_apps_core::spawn::SeatConfig) {
         if let wicked_apps_core::spawn::SeatConfig::Isolated {
-            root: Some(leaf), ..
+            root: Some(root), ..
         } = config
         {
-            let run_dir = leaf.parent().map(Path::to_path_buf);
-            let owned = run_dir.as_ref().is_some_and(|d| {
-                d.parent()
-                    .and_then(Path::file_name)
-                    .is_some_and(|n| n == ".wicked-container")
-                    && d.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("council-"))
-            });
+            let run_dir = crate::container_floor::container_run_dir(root, &self.run_id);
+            let owned = run_dir
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n == ".wicked-container")
+                && run_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("council-"));
             if owned {
-                *self.home.borrow_mut() = run_dir;
+                *self.home.borrow_mut() = Some(run_dir);
             }
         }
     }
@@ -2166,6 +2168,14 @@ impl WrappedCliStepRunner {
         .and_then(|c| {
             let posture =
                 crate::write_posture::WritePosture::of(&input.unit, input.workdir.is_some());
+            if let Some(g) = &ballot_scratch {
+                if uses_container_seat(
+                    runs_in_seat(input),
+                    crate::container_floor::container_mode(),
+                ) {
+                    g.note_root(&c);
+                }
+            }
             let c = config_for_container_launch(
                 c,
                 runs_in_seat(input),
@@ -2175,12 +2185,7 @@ impl WrappedCliStepRunner {
             )?;
             c.ensure_dirs().map(|()| c)
         }) {
-            Ok(c) => {
-                if let Some(g) = &ballot_scratch {
-                    g.note_seat(&c);
-                }
-                c
-            }
+            Ok(c) => c,
             Err(e) => {
                 return StepOutput {
                     run_id: input.run_id.clone(),
@@ -7725,46 +7730,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// (codex council-r1 on #971) A ballot's one-shot scratch goes when the launch ends: its
-    /// sandbox, and its own `council-` run home under `.wicked-container`, never anything else.
+    /// (codex council-r1/r2 on #971) A ballot's one-shot scratch goes when the launch ends: its
+    /// sandbox, and its own `council-` run home (recorded BEFORE setup, so a setup that failed
+    /// after creating it is cleaned too), never another run's home.
     #[test]
     fn a_ballot_removes_its_sandbox_and_its_own_seat_home_when_the_launch_ends() {
         use wicked_apps_core::spawn::SeatConfig;
-        let run_id = format!("council-scratch-{}", std::process::id());
-        let sandbox = sandbox_root(&run_id);
-        std::fs::create_dir_all(&sandbox).unwrap();
         let base = std::env::temp_dir().join(format!("ballot-scratch-test-{}", std::process::id()));
-        let mk = |rel: &str| {
-            let p = base.join(rel);
-            std::fs::create_dir_all(&p).unwrap();
-            p
-        };
-        let owned_leaf = mk(&format!(".wicked-container/{run_id}-abc123/full"));
-        let foreign_leaf = mk("elsewhere/council-x-abc/full");
-        let other_run_leaf = mk(".wicked-container/run-1-abc/full");
-        let seat = |leaf: &PathBuf| SeatConfig::Isolated {
+        let root = base.join("claude");
+        std::fs::create_dir_all(&root).unwrap();
+        let seat = SeatConfig::Isolated {
             cli: wicked_apps_core::spawn::SeatCli::Claude,
-            root: Some(leaf.clone()),
+            root: Some(root.clone()),
             set: Vec::new(),
             strip: Vec::new(),
         };
-        for leaf in [&foreign_leaf, &other_run_leaf] {
-            let g = BallotScratch::new(&format!("{run_id}-other"));
-            g.note_seat(&seat(leaf));
-            drop(g);
-            assert!(
-                leaf.exists(),
-                "never removes a home that is not a ballot's: {leaf:?}"
-            );
-        }
+        // A non-ballot run's home is never recorded, so never removed.
+        let other = crate::container_floor::container_run_dir(&root, "run-1");
+        std::fs::create_dir_all(other.join("full")).unwrap();
+        let g = BallotScratch::new("run-1");
+        g.note_root(&seat);
+        drop(g);
+        assert!(other.exists(), "a non-ballot run's home stays");
+        // The ballot: a setup that created its run directory (partially seeded) and then failed.
+        let run_id = format!("council-scratch-{}", std::process::id());
+        let sandbox = sandbox_root(&run_id);
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let mine = crate::container_floor::container_run_dir(&root, &run_id);
+        std::fs::create_dir_all(mine.join("full")).unwrap();
+        std::fs::write(mine.join("full").join("AGENTS.md"), "seeded").unwrap();
         let g = BallotScratch::new(&run_id);
-        g.note_seat(&seat(&owned_leaf));
+        g.note_root(&seat);
         drop(g);
         assert!(!sandbox.exists(), "the ballot's sandbox is removed");
-        assert!(
-            !owned_leaf.parent().unwrap().exists(),
-            "the ballot's seat home is removed"
-        );
+        assert!(!mine.exists(), "the ballot's seat home is removed");
         let _ = std::fs::remove_dir_all(&base);
     }
 

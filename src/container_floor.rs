@@ -1764,6 +1764,31 @@ fn seed_container_settings(
     write_private_file(&target.join(name), &bytes).map_err(anyhow::Error::msg)
 }
 
+/// The run's own directory under a container seat root: `<root>/.wicked-container/<run>-<digest>`
+/// (the posture leaf goes under it). One definition, so a caller that must clean a run's seat home
+/// finds exactly the directory [`container_seat_config`] creates.
+pub(crate) fn container_run_dir(root: &Path, run: &str) -> PathBuf {
+    let run_name: String = run
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-_".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // The digest avoids sanitized-name collisions across runs.
+    use sha2::{Digest, Sha256};
+    let suffix = format!("{:x}", Sha256::digest(run.as_bytes()));
+    // The seat root is the engine's own worker-home path: resolve its existing ancestors (macOS
+    // `/var` -> `/private/var`) so the no-follow walk only refuses links the seat could plant
+    // under it.
+    let base = crate::worker_sandbox::canon_lenient(root).unwrap_or_else(|| root.to_path_buf());
+    base.join(".wicked-container")
+        .join(format!("{run_name}-{}", &suffix[..12]))
+}
+
 // codex lg-r1 #4: shared only within one run/seat/posture; never seed credentials.
 // This per-unit launcher has no run-end hook. Run homes remain for session resume until
 // the worker home is cleaned; unit cleanup must not delete another live unit's home.
@@ -1782,27 +1807,7 @@ pub(crate) fn container_seat_config(
     else {
         anyhow::bail!("container seats require an isolated config home");
     };
-    let run_name: String = run
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || "-_".contains(c) {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    // The digest avoids sanitized-name collisions across runs.
-    use sha2::{Digest, Sha256};
-    let suffix = format!("{:x}", Sha256::digest(run.as_bytes()));
-    // The seat root is the engine's own worker-home path: resolve its existing ancestors (macOS
-    // `/var` -> `/private/var`) so the no-follow walk below only refuses links the seat could
-    // plant under it.
-    let base = crate::worker_sandbox::canon_lenient(&root).unwrap_or_else(|| root.clone());
-    let target = base
-        .join(".wicked-container")
-        .join(format!("{run_name}-{}", &suffix[..12]))
-        .join(posture);
+    let target = container_run_dir(&root, run).join(posture);
     #[cfg(unix)]
     private_dir(&target)?;
     // Explicit non-credential documents supplied by seat homes. Config/auth JSON and TOML
