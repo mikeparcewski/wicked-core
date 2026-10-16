@@ -612,6 +612,15 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.13.0** — 2026-10-16 — minor release on main dfcdedd, carrying #981, #982, #983, #984, #980 and #979.
+  - **Container sign-in for every seat:**
+    - codex (#981): its config home is created before the device login runs.
+    - pi (#982): subscription sign-ins for Anthropic, ChatGPT and GitHub Copilot.
+    - opencode (#983): API keys, ChatGPT and Copilot, read through `auth export`.
+    - copilot (#984): BYOK on the Copilot route.
+    - Each sign-in has its own broker file and gateway route, and the seat holds only placeholders.
+  - **Security:** each model route admits only its own agent's seats. Before this, any seat's key was accepted on every route.
+  - **Presets (#980):** built-in workflows carry `title`, `summary` and `use_when` (DES-CHAT-FIRST-001 C2).
 - **core-ts 0.12.1** — 2026-10-16 — patch release on main fd83177, carrying #976 and #971.
   - **Host floor routing:** seats the host floor refuses for governed work (anything but claude and a bounded codex) are benched for governed work, with a reason naming the fix. They are no longer routed a unit and then refused. They can still judge, triage and vote, which run ungoverned. `Core.worktreeBenched` reports the bench (`governed_only`).
   - **Decision councils:** ballots follow the seat floor (#971).
