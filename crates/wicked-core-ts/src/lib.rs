@@ -2828,7 +2828,8 @@ mod tests {
         let bound: Vec<serde_json::Value> =
             serde_json::from_str(&Core::worktree_benched(roster.clone(), true).unwrap()).unwrap();
         let floor = std::env::var("WICKED_SEAT_FLOOR").unwrap_or_default();
-        let host_floor = !floor.trim().is_empty() && !floor.trim().eq_ignore_ascii_case("container");
+        let host_floor =
+            !floor.trim().is_empty() && !floor.trim().eq_ignore_ascii_case("container");
         if host_floor {
             // (C5) The interim host floor: every seat here runs binary `x`, which keeps no per-call
             // check there, so all four are benched, bound or not.
