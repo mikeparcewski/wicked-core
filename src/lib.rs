@@ -438,17 +438,19 @@ pub fn host_boundary() -> serde_json::Value {
     crate::worker_sandbox::host_boundary()
 }
 
-/// (core#769, crew Agents page A5) The engine's worktree bench as a pure predicate: the seats a run
-/// BOUND to one repository benches before routing, with the reason that run would persist on
-/// [`AgentSession::benched_seats`] (source `launcher`). Today that is every codex seat, unless the
-/// host sets `WICKED_CODEX_WORKTREE_OK` or the seat floor is the container floor
-/// (`WICKED_SEAT_FLOOR=container`; both read at call time, as the launch reads them). An unbound
-/// run benches none. Exported so a consumer (crew's roster) can say a seat will be benched on repository
+/// (core#769, crew Agents page A5) The engine's launch bench as a pure predicate: the seats a run
+/// (BOUND to one repository, or not) benches before routing, with the reason that run would
+/// persist on [`AgentSession::benched_seats`] (source `launcher`). Two rules
+/// (`distribute::launch_benched`): on the interim host floor (`WICKED_SEAT_FLOOR` set to anything
+/// but `container`), every seat that cannot keep a per-call check there — anything but claude and a
+/// bounded codex — bound or not (C5); and on a bound run every codex seat, unless the host sets
+/// `WICKED_CODEX_WORKTREE_OK` or the seat floor is the container floor. Both env variables are read
+/// at call time, as the launch reads them. An unbound run off the host floor benches none. Exported so a consumer (crew's roster) can say a seat will be benched on repository
 /// work without restating the rule.
 pub fn worktree_benched(clis: &[AgenticCli], bound: bool) -> Vec<BenchedSeat> {
     // A consumer's question is about a daemon on its file-backed store (crew's), whose governed
     // units are armed in seat containers under the container floor.
-    crate::distribute::worktree_benched(clis, bound, true)
+    crate::distribute::launch_benched(clis, bound, true)
 }
 
 /// (crew Agents page A4) Whether this host's skill routing admits `key` (with its roster

@@ -778,7 +778,8 @@ fn worktree_evidence_for_judge(workdir: &std::path::Path) -> Option<String> {
 /// the registry seats the launcher actually configured for this run (review of #449, RT-1), not
 /// from every registry record; empty = no intersection (the bus path, tests). `bench` — the
 /// run's BENCHED seats with their reasons (`AgentSession::benched_seats`, F-7R2-006): never a
-/// judge, and named in a fallback judge's disclosure (operator ruling 2026-10-14). `work_authors` —
+/// judge — except a seat benched for governed work only (`BenchedSeat::governed_only`, C5: the
+/// judge is ungoverned), which this drops first — and named in a fallback judge's disclosure (operator ruling 2026-10-14). `work_authors` —
 /// for an evaluator unit, every seat that authored the work its judge reads
 /// ([`crate::pipeline::work_authors`]): never a judge of it; `author_binaries` — the binaries
 /// they ran ([`JudgeFallbackCtx::author_binaries`]).
@@ -802,6 +803,9 @@ pub(crate) fn run_unit_and_judge(
     Option<crate::validator::AgentVerdict>,
     crate::workflow::UnitEvidence,
 ) {
+    // (C5) The judge is an ungoverned engine call: a seat benched for governed work only (the
+    // host-floor bench) still judges.
+    let bench = &crate::domain::ungoverned_bench(bench);
     let benched: Vec<String> = bench.iter().map(|b| b.cli.clone()).collect();
     // (operator ruling 2026-10-14) The fallback judge seats, read from the registry per call —
     // only for a run the caller knows (its roster): the bus worker knows neither roster nor
@@ -1061,6 +1065,9 @@ fn run_unit_and_judge_with_launches(
     Option<crate::validator::AgentVerdict>,
     crate::workflow::UnitEvidence,
 ) {
+    // (C5) The judge is an ungoverned engine call: a seat benched for governed work only (the
+    // host-floor bench) still judges.
+    let bench = &crate::domain::ungoverned_bench(bench);
     let benched: Vec<String> = bench.iter().map(|b| b.cli.clone()).collect();
     run_unit_and_judge_on(
         runner,
@@ -6876,6 +6883,7 @@ mod judge_fallback_tests {
             cli: "codex".into(),
             reason: crate::distribute::CODEX_WORKTREE_BENCH.into(),
             source: "launcher".into(),
+            governed_only: false,
         }]
     }
 
@@ -7051,6 +7059,99 @@ mod judge_fallback_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// (C5) On the host floor opencode keeps no per-call check, so the launch bench takes it out of
+    /// governed work — never out of judging, which is ungoverned: it judges codex's check of
+    /// claude's fix. The same seat under a bench that binds every call is never asked.
+    #[test]
+    fn a_host_floor_benched_seat_still_judges_but_is_never_routed_governed_work() {
+        // The fallback ladder resolves seat identities through the registry: no operator file.
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let home = tmp("hostfloor-judge-home");
+        let prev: Vec<_> = ["HOME", "USERPROFILE"]
+            .iter()
+            .map(std::env::var_os)
+            .collect();
+        std::env::set_var("HOME", &home);
+        std::env::set_var("USERPROFILE", &home);
+        let dir = tmp("hostfloor-judge");
+        let mut input = check_unit(&dir);
+        input.unit.assigned_cli = Some("codex".into());
+        let roster: Vec<String> = ["claude", "codex", "opencode"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let host_floor = vec![crate::domain::BenchedSeat {
+            cli: "opencode".into(),
+            reason: crate::distribute::HOST_FLOOR_BENCH.into(),
+            source: "launcher".into(),
+            governed_only: true,
+        }];
+        // Routing reads the bench: opencode is never handed governed work.
+        let reg = registry();
+        let routable: Vec<&str> = crate::distribute::eligible_seats(&reg, &host_floor)
+            .iter()
+            .map(|c| c.key.as_str())
+            .collect();
+        assert!(!routable.contains(&"opencode"), "{routable:?}");
+
+        let seats = Seats::new(vec![]);
+        let runner: Arc<dyn StepRunner> = seats.clone();
+        let (_, v, _) = run_unit_and_judge_with_fallback(
+            &runner,
+            &input,
+            &|_| {},
+            &reg,
+            &roster,
+            &host_floor,
+            &fallback_pool(),
+            &[],
+        );
+        let v = v.expect("opencode judged");
+        assert_eq!(v.judge_cli.as_deref(), Some("opencode"), "{v:?}");
+        assert!(v.judge_fallback.is_none(), "{v:?}");
+        assert_eq!(seats.judged(), vec!["opencode".to_string()]);
+
+        // The seat then refuses as a judge: that bench binds every call and REPLACES the host-floor
+        // one (`bench_seat`), so the seat is never asked again.
+        let mut every_call = host_floor.clone();
+        assert!(crate::domain::bench_seat(
+            &mut every_call,
+            crate::domain::BenchedSeat {
+                cli: "opencode".into(),
+                reason: "not_logged_in".into(),
+                source: "judge".into(),
+                governed_only: false,
+            }
+        ));
+        assert_eq!(every_call.len(), 1);
+        assert!(!every_call[0].governed_only);
+        let seats = Seats::new(vec![]);
+        let runner: Arc<dyn StepRunner> = seats.clone();
+        let (_, v, _) = run_unit_and_judge_with_fallback(
+            &runner,
+            &input,
+            &|_| {},
+            &reg,
+            &roster,
+            &every_call,
+            &fallback_pool(),
+            &[],
+        );
+        let v = v.expect("a verdict or a hold");
+        assert_ne!(v.judge_cli.as_deref(), Some("opencode"), "{v:?}");
+        assert!(!seats.judged().contains(&"opencode".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+        for (k, v) in ["HOME", "USERPROFILE"].iter().zip(prev) {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
     /// No distinct eligible fallback seat: today's hold, unchanged. agy benched (signed out) and
     /// claude a party ⇒ nobody is asked, and the hold names the bench in its own words.
     #[test]
@@ -7064,6 +7165,7 @@ mod judge_fallback_tests {
             cli: "agy".into(),
             reason: "not_logged_in".into(),
             source: "judge".into(),
+            governed_only: false,
         });
         let (_, v, _) = run_unit_and_judge_with_fallback(
             &runner,

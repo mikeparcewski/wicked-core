@@ -186,7 +186,8 @@ pub struct AgentSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<i64>,
     /// (F-7R2-006, wave 6) Seats BENCHED for this run — never convened, never a failover or judge
-    /// target, never a triage judge. Two sources: the launcher's health probe on the roster it
+    /// target, never a triage judge; a `governed_only` entry (the C5 host-floor bench) only keeps
+    /// the seat from governed work and still lets it judge, triage and vote. Two sources: the launcher's health probe on the roster it
     /// handed (`AgenticCli::health.usable == false`) and an authentication failure observed IN
     /// the run (a `not_logged_in` council ballot, a worker exit with an auth refusal, an ACP
     /// `unauthenticated`/`auth_failed` handshake) — and, F-7R3-001, a seat that is DEAD for the
@@ -600,6 +601,19 @@ pub struct BenchedSeat {
     /// Who benched it: `launcher` (the roster's health probe), `ballot` (a council seat failure),
     /// `worker` (a unit's worker failed with an auth refusal).
     pub source: String,
+    /// (C5) Whether the bench binds GOVERNED work only — a unit routed, reassigned or failed over
+    /// to the seat — and not the engine's ungoverned calls (the agent judge, triage, a decision
+    /// ballot: `governance: None`), which the executor never refuses for it. Set by the host-floor
+    /// bench alone ([`crate::distribute::HOST_FLOOR_BENCH`]): the executor refuses a governed unit on
+    /// such a seat and nothing else. Absent on the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub governed_only: bool,
+}
+
+/// The bench an UNGOVERNED engine call reads — the agent judge, triage, a decision ballot: `bench`
+/// minus every seat benched for governed work only ([`BenchedSeat::governed_only`]).
+pub fn ungoverned_bench(bench: &[BenchedSeat]) -> Vec<BenchedSeat> {
+    bench.iter().filter(|b| !b.governed_only).cloned().collect()
 }
 
 impl BenchedSeat {
@@ -610,13 +624,23 @@ impl BenchedSeat {
 }
 
 /// Add `seat` to `benched` unless a seat with the same key is already there (the first reason
-/// wins — it is the one that actually took the seat out).
+/// wins — it is the one that actually took the seat out). One exception, by scope (C5): a bench
+/// that binds EVERY call replaces one that binds governed work only
+/// ([`BenchedSeat::governed_only`]) — a host-floor-benched seat that then fails as a judge, or
+/// that the codex worktree bench also names, is out of every call from then on. Returns whether
+/// `benched` changed.
 pub fn bench_seat(benched: &mut Vec<BenchedSeat>, seat: BenchedSeat) -> bool {
-    if benched.iter().any(|b| b.cli == seat.cli) {
-        return false;
+    match benched.iter_mut().find(|b| b.cli == seat.cli) {
+        Some(existing) if existing.governed_only && !seat.governed_only => {
+            *existing = seat;
+            true
+        }
+        Some(_) => false,
+        None => {
+            benched.push(seat);
+            true
+        }
     }
-    benched.push(seat);
-    true
 }
 
 /// `"N of M seats benched: a (r — s), b (r — s)"` for `degradedReason`, or `None` when nothing is
@@ -1829,6 +1853,29 @@ pub struct SessionView {
 
 #[cfg(test)]
 mod tests {
+    /// (C5) A bench binding every call replaces a governed-only one for the same seat, never the
+    /// reverse; a record persisted before the field reads as binding every call.
+    #[test]
+    fn an_all_call_bench_dominates_a_governed_only_one() {
+        let b = |reason: &str, governed_only: bool| BenchedSeat {
+            cli: "opencode".into(),
+            reason: reason.into(),
+            source: "launcher".into(),
+            governed_only,
+        };
+        let mut bench = vec![b("host floor", true)];
+        assert!(!bench_seat(&mut bench, b("host floor again", true)));
+        assert!(bench_seat(&mut bench, b("not_logged_in", false)));
+        assert_eq!(bench, vec![b("not_logged_in", false)]);
+        assert!(!bench_seat(&mut bench, b("host floor", true)));
+        assert_eq!(bench, vec![b("not_logged_in", false)]);
+        assert!(ungoverned_bench(&[b("host floor", true)]).is_empty());
+        let legacy: BenchedSeat =
+            serde_json::from_str(r#"{"cli":"pi","reason":"quota_exhausted","source":"ballot"}"#)
+                .unwrap();
+        assert!(!legacy.governed_only);
+    }
+
     /// (core#810) The pool's fill rides the unit's RECORD: `pool` and `pool_seating` round-trip
     /// through the store node, and a pool-free unit writes neither key (older rows unchanged).
     #[test]

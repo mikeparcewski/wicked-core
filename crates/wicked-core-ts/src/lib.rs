@@ -980,10 +980,11 @@ impl Core {
     /// (core#769, crew Agents page A5) The engine's worktree bench as a pure predicate: given a
     /// JSON array of `AgenticCli` seats (the engine-shaped roster, as `launchRun`'s `clisJson`) and
     /// whether the run is BOUND to one repository, the JSON array of `BenchedSeat` (`{cli, reason,
-    /// source: "launcher"}`) the launch would bench before routing. Reads
-    /// `WICKED_CODEX_WORKTREE_OK` and `WICKED_SEAT_FLOOR` at call time, as the launch does (the
-    /// container floor keeps codex). An addon without this static
-    /// predates it; crew keys on its presence.
+    /// source: "launcher"}`) the launch would bench before routing: on the interim host floor
+    /// every seat that cannot keep a per-call check there (anything but claude and a bounded codex),
+    /// bound or not (C5); on a bound run every codex seat. Reads `WICKED_CODEX_WORKTREE_OK` and
+    /// `WICKED_SEAT_FLOOR` at call time, as the launch does (the container floor keeps codex). An
+    /// addon without this static predates it; crew keys on its presence.
     #[napi]
     pub fn worktree_benched(clis_json: String, bound: bool) -> napi::Result<String> {
         let clis: Vec<AgenticCli> = serde_json::from_str(&clis_json)
@@ -2827,7 +2828,17 @@ mod tests {
         let bound: Vec<serde_json::Value> =
             serde_json::from_str(&Core::worktree_benched(roster.clone(), true).unwrap()).unwrap();
         let floor = std::env::var("WICKED_SEAT_FLOOR").unwrap_or_default();
-        if std::env::var_os("WICKED_CODEX_WORKTREE_OK").is_none()
+        let host_floor =
+            !floor.trim().is_empty() && !floor.trim().eq_ignore_ascii_case("container");
+        if host_floor {
+            // (C5) The interim host floor: every seat here runs binary `x`, which keeps no per-call
+            // check there, so all four are benched, bound or not.
+            assert_eq!(bound.len(), 4, "{bound:?}");
+            assert!(bound[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("container floor"));
+        } else if std::env::var_os("WICKED_CODEX_WORKTREE_OK").is_none()
             && !floor.trim().eq_ignore_ascii_case("container")
         {
             let keys: Vec<&str> = bound.iter().filter_map(|b| b["cli"].as_str()).collect();
@@ -2842,8 +2853,10 @@ mod tests {
             // rule itself is pinned env-free by `distribute::worktree_bench_tests`).
             assert!(bound.is_empty(), "{bound:?}");
         }
-        let unbound = Core::worktree_benched(roster, false).unwrap();
-        assert_eq!(unbound, "[]");
+        let unbound: Vec<serde_json::Value> =
+            serde_json::from_str(&Core::worktree_benched(roster, false).unwrap()).unwrap();
+        // Off the host floor an unbound run benches none; on it, the host-floor bench stays.
+        assert_eq!(unbound.len(), if host_floor { 4 } else { 0 });
         assert!(Core::worktree_benched("{}".into(), true).is_err());
     }
 
