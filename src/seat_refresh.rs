@@ -172,10 +172,16 @@ pub(crate) fn due_entries(cli: &str, record: &Value, now: u64, force: bool) -> V
             let entry = record.get(*id)?;
             (entry.get("type").and_then(Value::as_str) == Some("oauth")).then_some(())?;
             str_at(entry, "/refresh")?;
-            let ms = entry.get("expires").and_then(Value::as_u64)?;
-            Some((ms / 1000, *id))
+            // An entry with no expiry is renewable but never due on its own: only `force` takes
+            // it (last).
+            let exp = entry
+                .get("expires")
+                .and_then(Value::as_u64)
+                .filter(|ms| *ms > 0)
+                .map(|ms| ms / 1000);
+            Some((exp.unwrap_or(u64::MAX), *id))
         })
-        .filter(|(exp, _)| force || due(Some(*exp), now))
+        .filter(|(exp, _)| force || (*exp != u64::MAX && due(Some(*exp), now)))
         .collect();
     candidates.sort();
     candidates
@@ -236,10 +242,15 @@ pub(crate) fn apply_pi_answer(
             .ok_or("pi: the Copilot token exchange returned no expires_at")?;
         entry.insert("access".into(), json!(token));
         entry.insert("expires".into(), json!(expires_at.saturating_mul(1000)));
-        // The plan endpoint the exchange names, kept (in the broker's copy only) for a token
-        // that names no `proxy-ep`.
-        if let Some(api) = str_at(answer, "/endpoints/api") {
-            entry.insert(crate::seat_login::COPILOT_ENDPOINT_FIELD.into(), json!(api));
+        // The plan endpoint THIS exchange names, kept (in the broker's copy only) for a token
+        // that names no `proxy-ep`; an answer naming none drops an earlier generation's.
+        match str_at(answer, "/endpoints/api") {
+            Some(api) => {
+                entry.insert(crate::seat_login::COPILOT_ENDPOINT_FIELD.into(), json!(api));
+            }
+            None => {
+                entry.remove(crate::seat_login::COPILOT_ENDPOINT_FIELD);
+            }
         }
         return Ok(out);
     }
@@ -547,6 +558,11 @@ fn write_pending_state(dir: &Path, cli: &str, state: &[u8]) -> Result<(), String
         let _ = std::fs::remove_file(tmp);
     }
     result
+}
+
+/// The marker of a route-literal publication not yet confirmed (removed once it succeeds).
+fn literals_pending_path(dir: &Path, cli: &str) -> PathBuf {
+    dir.join("refresh").join(format!("{cli}.literals.pending"))
 }
 
 pub(crate) fn rescue_path(dir: &Path, cli: &str) -> PathBuf {
@@ -978,18 +994,34 @@ mod live {
         }
         // The route literals follow the stored record on every pass (a renewed Copilot token can
         // name another plan host; a crash between a commit and its publication heals here).
-        if multi {
-            let bytes = serde_json::to_vec(&record).map_err(|_| "could not encode the record")?;
-            let files = crate::seat_login::extract_tokens(
-                cli,
-                &[(login_path(cli).unwrap_or_default().into(), bytes)],
-            )?;
-            let literals = crate::seat_login::route_literals(cli, &files)?;
-            if !crate::seat_gateway::route_literals_current(dir, cli, &literals)? {
-                crate::seat_gateway::route_sign_in(rt, gw, dir, cli, &literals)?;
+        // A publication that failed (or was interrupted) is retried until it succeeds: its
+        // marker is written before and removed only after the gateway has the literals.
+        if multi && failures.is_empty() {
+            let published = (|| {
+                let bytes =
+                    serde_json::to_vec(&record).map_err(|_| "could not encode the record")?;
+                let files = crate::seat_login::extract_tokens(
+                    cli,
+                    &[(login_path(cli).unwrap_or_default().into(), bytes)],
+                )?;
+                let literals = crate::seat_login::route_literals(cli, &files)?;
+                let marker = literals_pending_path(dir, cli);
+                if marker.exists()
+                    || !crate::seat_gateway::route_literals_current(dir, cli, &literals)?
+                {
+                    if !marker.exists() {
+                        create_private_file(&marker, b"route literals unpublished")?;
+                    }
+                    crate::seat_gateway::route_sign_in(rt, gw, dir, cli, &literals)?;
+                    remove_private_file(&marker)?;
+                }
+                Ok::<(), String>(())
+            })();
+            if let Err(e) = published {
+                failures.push(format!("route literals: {e}"));
             }
         }
-        if !plan.is_empty() {
+        if !plan.is_empty() || !failures.is_empty() {
             record_last(
                 dir,
                 cli,
@@ -1147,6 +1179,21 @@ mod tests {
             no_refresh[id].as_object_mut().unwrap().remove("refresh");
         }
         assert!(due_entries("pi", &no_refresh, 0, true).is_empty());
+        // An entry with no expiry is renewable when forced, never due by itself.
+        let mut no_expiry = record.clone();
+        no_expiry["anthropic"]
+            .as_object_mut()
+            .unwrap()
+            .remove("expires");
+        assert!(due_entries("pi", &no_expiry, 3_000_000_000, false)
+            .iter()
+            .all(|e| e != "anthropic"));
+        assert_eq!(
+            due_entries("pi", &no_expiry, 0, true)
+                .last()
+                .map(String::as_str),
+            Some("anthropic")
+        );
         // The exchange's plan endpoint is kept for a token that names none.
         let with_endpoint = apply_pi_answer(
             &record,
@@ -1160,6 +1207,17 @@ mod tests {
             with_endpoint["github-copilot"][crate::seat_login::COPILOT_ENDPOINT_FIELD],
             "https://api.business.githubcopilot.com"
         );
+        // A later exchange naming no endpoint drops the earlier generation's.
+        let without = apply_pi_answer(
+            &with_endpoint,
+            "github-copilot",
+            &json!({"token": "tid=FAKE-4", "expires_at": 2_u64}),
+            0,
+        )
+        .unwrap();
+        assert!(without["github-copilot"]
+            .get(crate::seat_login::COPILOT_ENDPOINT_FIELD)
+            .is_none());
         // A refresh answer must carry what the CLI needs.
         assert!(apply_pi_answer(&record, "anthropic", &json!({"access_token": "x"}), 1).is_err());
         assert!(apply_pi_answer(&record, "github-copilot", &json!({"token": "x"}), 1).is_err());

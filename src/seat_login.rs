@@ -3930,6 +3930,12 @@ esac
             foreign.iter().all(|c| c == "401"),
             "codex's unit on pi's routes: {foreign:?}"
         );
+        // The refusals were the gateway's: no foreign or unknown probe reached the upstream (the
+        // stub answers 401 too). `seen` predates every probe pi's own unit makes.
+        assert!(
+            !seen.contains("/probe-"),
+            "a refused probe reached the upstream: {seen}"
+        );
         assert!(absent.iter().all(|c| c == "401"), "{absent:?}");
         let upstream_lines: Vec<Value> = seen
             .lines()
