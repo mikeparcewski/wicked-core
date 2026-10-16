@@ -14,6 +14,11 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Codex signs in from its login container.** The login ran `codex login --device-auth` with
+  `CODEX_HOME=/home/login/codex`, a directory nothing had created in the fresh login volume, and codex refuses a
+  `CODEX_HOME` that does not exist ("Error loading configuration"): the login exited before any sign-in, and ingest
+  then reported `signed out; missing auth.json`. The login volume's init helper now creates each CLI's configuration
+  home (one table drives both the login's env and the directories), handing the volume root over last.
 - **Built-in workflows describe themselves (DES-CHAT-FIRST-001 C2).** Each built-in preset now has a short title, a
   one-line summary and 2–4 "use when" phrases in plain operator language (`catalog::builtin_preset_descriptor`, code
   data beside `builtin_presets`, pinned by a test for every built-in). `Preset` gains the optional `title`, `summary`

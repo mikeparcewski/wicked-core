@@ -81,19 +81,8 @@ pub(crate) fn login_argv(
         "-e".into(),
         "HOME=/home/login".into(),
     ];
-    let env: &[&str] = match cli {
-        "claude" => &["CLAUDE_CONFIG_DIR=/home/login/claude"],
-        "codex" => &["CODEX_HOME=/home/login/codex"],
-        "pi" => &["PI_CODING_AGENT_DIR=/home/login/pi"],
-        "opencode" => &[
-            "XDG_CONFIG_HOME=/home/login/config",
-            "XDG_DATA_HOME=/home/login/data",
-        ],
-        // COPILOT_HOME is unconfirmed. HOME alone confines its default files to the volume.
-        _ => &[],
-    };
-    for value in env {
-        argv.extend(["-e".into(), (*value).into()]);
+    for (var, dir) in login_homes(cli) {
+        argv.extend(["-e".into(), format!("{var}=/home/login/{dir}")]);
     }
     argv.push(image.into());
     let command: &[&str] = match cli {
@@ -106,6 +95,21 @@ pub(crate) fn login_argv(
     };
     argv.extend(command.iter().map(|s| (*s).to_string()));
     argv
+}
+
+/// Each CLI's configuration-home variable and its directory under the throwaway HOME. The init
+/// helper creates every one of them before the login runs: codex refuses a `CODEX_HOME` that
+/// does not exist ("Error loading configuration"), so its login exited before any sign-in and
+/// ingest then found no `auth.json`.
+fn login_homes(cli: &str) -> &'static [(&'static str, &'static str)] {
+    match cli {
+        "claude" => &[("CLAUDE_CONFIG_DIR", "claude")],
+        "codex" => &[("CODEX_HOME", "codex")],
+        "pi" => &[("PI_CODING_AGENT_DIR", "pi")],
+        "opencode" => &[("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data")],
+        // COPILOT_HOME is unconfirmed. HOME alone confines its default files to the volume.
+        _ => &[],
+    }
 }
 
 /// Paths under the throwaway HOME, aligned with login_argv. Bare names are accepted by the
@@ -527,12 +531,22 @@ fn revoke_argv(volume: &str, files: &[&str]) -> Vec<String> {
     )
 }
 
-fn init_login_argv(volume: &str) -> Vec<String> {
+/// Own the volume as the login user and create the CLI's configuration homes ([`login_homes`]).
+/// The helper has CHOWN and FOWNER, never DAC_OVERRIDE or DAC_READ_SEARCH: the homes are made
+/// while root still owns the volume, and the volume root is handed over LAST, since root can no
+/// longer reach a child once `/in` is another user's 0700 directory.
+fn init_login_argv(volume: &str, cli: &str) -> Vec<String> {
+    let dirs: Vec<String> = login_homes(cli)
+        .iter()
+        .map(|(_, dir)| format!("/in/{dir}"))
+        .chain(std::iter::once("/in".to_string()))
+        .collect();
+    let dirs = dirs.join(" ");
     helper_argv(
         volume,
         false,
         "0",
-        "chown 10001 /in && chmod 700 /in".into(),
+        format!("mkdir -p {dirs} && chown 10001 {dirs} && chmod 700 {dirs}"),
     )
 }
 
@@ -1089,7 +1103,14 @@ fn new_session(rt: &Runtime, gw: &Gateway, dir: &Path, cli: &str) -> Result<Stri
     };
     checked(rt, &["volume".into(), "create".into(), volume.clone()])?;
     write_session(dir, cli, &volume)?;
-    crate::seat_gateway::mutation_helper(rt, dir, cli, &init_login_argv(&volume), &[], TIMEOUT)?;
+    crate::seat_gateway::mutation_helper(
+        rt,
+        dir,
+        cli,
+        &init_login_argv(&volume, cli),
+        &[],
+        TIMEOUT,
+    )?;
     Ok(volume)
 }
 
@@ -1464,7 +1485,7 @@ esac
                     "FAKE-login",
                     "FAKE-ext",
                 ),
-                init_login_argv("FAKE-login"),
+                init_login_argv("FAKE-login", cli),
             ];
             for path in credential_paths(cli) {
                 argvs.push(read_argv("FAKE-login", path, false));
@@ -2246,6 +2267,89 @@ esac
         }
     }
 
+    /// Regression (codex sign-in on the container floor): the login container's configuration
+    /// homes exist before the CLI starts. `codex login` exits at config load when `CODEX_HOME`
+    /// is missing, so the login wrote nothing and ingest reported "missing auth.json".
+    #[test]
+    fn init_creates_every_configuration_home_the_login_names() {
+        for cli in ["claude", "codex", "pi", "opencode", "copilot"] {
+            let argv = login_argv(Path::new("/rt"), cli, "img", "vol", "net");
+            let script = init_login_argv("vol", cli).last().unwrap().clone();
+            let (mkdir, rest) = script.split_once(" && ").unwrap();
+            let created: Vec<&str> = mkdir
+                .strip_prefix("mkdir -p ")
+                .unwrap()
+                .split(' ')
+                .collect();
+            assert_eq!(
+                created.last(),
+                Some(&"/in"),
+                "{cli}: the volume root, handed over last"
+            );
+            assert_eq!(
+                rest,
+                format!("chown 10001 {0} && chmod 700 {0}", created.join(" ")),
+                "{cli}: every created directory is the login user's, private"
+            );
+            let homes: Vec<String> = argv
+                .windows(2)
+                .filter(|w| w[0] == "-e")
+                .filter_map(|w| w[1].split_once("=/home/login/"))
+                .map(|(_, dir)| format!("/in/{dir}"))
+                .collect();
+            assert_eq!(homes.len(), login_homes(cli).len(), "{cli}");
+            for home in &homes {
+                assert!(created.contains(&home.as_str()), "{cli}: {home} is created");
+            }
+        }
+        let codex = init_login_argv("vol", "codex");
+        assert!(codex
+            .last()
+            .unwrap()
+            .starts_with("mkdir -p /in/codex /in && "));
+    }
+
+    /// The same regression against the real codex seat image: after the init helper, the
+    /// login's `CODEX_HOME` loads (signed out), where before it failed at config load.
+    #[cfg(unix)]
+    #[test]
+    fn live_codex_login_home_exists_before_the_login_runs() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        let rt = crate::container_floor::runtime().expect("a container runtime answers");
+        let image = crate::container_floor::ensure_seat_image(&rt, "codex").unwrap();
+        let volume = login_volume("wicked-agw-livehome", "codex");
+        let _ = execute(&rt, &["volume".into(), "rm".into(), volume.clone()]);
+        checked(&rt, &["volume".into(), "create".into(), volume.clone()]).unwrap();
+        let status = |init: bool| {
+            if init {
+                checked(&rt, &init_login_argv(&volume, "codex")).unwrap();
+            }
+            let mut argv = login_argv(&rt.cli, "codex", &image, &volume, "none");
+            argv.retain(|a| a != "-it");
+            let at = argv.iter().position(|a| *a == image).unwrap();
+            argv.truncate(at + 1);
+            argv.extend(["codex", "login", "status"].map(String::from));
+            let out = execute(&rt, &argv[1..]).unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr)
+        };
+        let before = status(false);
+        let after = status(true);
+        let _ = execute(&rt, &["volume".into(), "rm".into(), volume.clone()]);
+        assert!(
+            before.contains("does not exist"),
+            "the bug reproduces: {before}"
+        );
+        assert!(!after.contains("does not exist"), "{after}");
+        assert!(after.contains("Not logged in"), "{after}");
+    }
+
     #[test]
     fn claude_oauth_extracts_access_and_preserves_original_refresh_record() {
         let input = vec![file("claude/.credentials.json", oauth(4102444800000))];
@@ -2688,11 +2792,11 @@ esac
         let presence = read_argv("fake-broker", "anthropic.token", true);
         assert!(presence.last().unwrap().contains("printf present"));
         assert!(!presence.last().unwrap().contains("head -c"));
-        let init = init_login_argv("wicked-login-claude");
+        let init = init_login_argv("wicked-login-claude", "claude");
         assert!(init
             .last()
             .unwrap()
-            .contains("chown 10001 /in && chmod 700 /in"));
+            .contains("chown 10001 /in/claude /in && chmod 700 /in/claude /in"));
         assert!(init.windows(2).any(|w| w == ["--cap-add", "CHOWN"]));
     }
 
@@ -2901,13 +3005,13 @@ esac
         let volume = login_volume(&gw.name, "codex");
         run(&["volume", "rm", &volume]);
         assert!(run(&["volume", "create", &volume]).status.success());
-        checked(&rt, &init_login_argv(&volume)).unwrap();
+        checked(&rt, &init_login_argv(&volume, "codex")).unwrap();
         let auth = serde_json::to_string(&chatgpt()).unwrap();
         let write = helper_argv(
             &volume,
             false,
             "10001",
-            format!("mkdir -p /in/codex && printf '%s' '{auth}' > /in/codex/auth.json"),
+            format!("printf '%s' '{auth}' > /in/codex/auth.json"),
         );
         checked(&rt, &write).unwrap();
         let ask = |want: &dyn Fn(&str) -> bool| {
