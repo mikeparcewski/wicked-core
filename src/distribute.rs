@@ -3549,7 +3549,7 @@ mod worktree_bench_tests {
             "WICKED_CODEX_WORKTREE_OK",
             crate::container_floor::SEAT_FLOOR_ENV,
         ];
-        let prev: Vec<_> = keys.iter().map(|k| std::env::var_os(k)).collect();
+        let prev: Vec<_> = keys.iter().map(std::env::var_os).collect();
         // No operator clis.toml: the builtin records decide.
         std::env::set_var("HOME", &home);
         std::env::set_var("USERPROFILE", &home);
