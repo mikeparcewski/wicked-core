@@ -6887,9 +6887,19 @@ mod tests {
         assert!(hook.get("url").is_none(), "{hook}");
         let cmd = hook["command"].as_str().unwrap();
         let url = format!("http://agw:{}/hook/ab12", crate::hook_relay::HOOK_PORT);
-        assert!(cmd.contains(&format!(" -O - {url};")), "{cmd}");
+        assert!(cmd.contains(&format!(" -O - {url})")), "{cmd}");
         assert!(cmd.contains("/floor/busybox wget -q -Y off"), "{cmd}");
+        // The payload is posted from claude's own stdin, never a file a seat process could
+        // rewrite between the write and the post (codex review of core#988).
+        assert!(cmd.contains("--post-file - "), "{cmd}");
+        assert!(!cmd.contains("mktemp"), "{cmd}");
         assert!(cmd.contains("exit 2;"), "a failed post blocks: {cmd}");
+        // A 2xx answer that is not a JSON object is no decision for claude (it would allow).
+        assert!(
+            cmd.contains("case \"$out\" in '{'*) printf '%s' \"$out\""),
+            "{cmd}"
+        );
+        assert!(cmd.contains(crate::hook_relay::NOT_A_DECISION), "{cmd}");
         assert!(container_gate_hook("ab12; rm -rf /").is_none());
         assert!(container_gate_hook("").is_none());
     }

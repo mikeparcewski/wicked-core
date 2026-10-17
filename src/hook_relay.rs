@@ -94,15 +94,20 @@ pub(crate) fn hook_url(token: &str) -> String {
 /// claude shows as the deny reason).
 pub(crate) const UNREACHABLE: &str =
     "the gate hook could not reach the engine relay; the call is denied (fail closed)";
+/// What it prints when a 2xx answer is not a hook decision (a JSON object).
+pub(crate) const NOT_A_DECISION: &str =
+    "the relay answer is not a hook decision; the call is denied (fail closed)";
 
 /// The command hook a container seat runs for every tool call (core#988): the payload claude
-/// writes on stdin goes to a private temp file (claude's stdin is not always openable as a path)
-/// and is posted with the floor's busybox, never a tool from the seat image; the relay's answer is
-/// printed as the hook's JSON. A failed post (no route, a non-2xx answer, a timeout) exits 2,
-/// claude's blocking code, with [`UNREACHABLE`] as the reason; `onFailure: "block"` on the hook
-/// covers whatever this command itself cannot (it is killed, or the shell is missing). `-Y off`:
-/// the seat's proxy variables never apply to the relay. `None` when `token` is not the hex a
-/// relay token is (it is spliced into the command).
+/// writes on its stdin is posted straight from that stdin (`--post-file -`, never a file another
+/// process in the seat could rewrite between the write and the post) with the floor's busybox,
+/// never a tool from the seat image. A failed post (no route, a non-2xx answer, a timeout) exits
+/// 2, claude's blocking code, with [`UNREACHABLE`] as the reason; a 2xx answer is printed as the
+/// hook's JSON only when it is a JSON object (the relay always answers one), else it exits 2
+/// with [`NOT_A_DECISION`] (claude reads plain stdout as no decision, which would allow).
+/// `onFailure: "block"` on the hook covers whatever this command itself cannot (it is killed, or
+/// the shell is missing). `-Y off`: the seat's proxy variables never apply to the relay. `None`
+/// when `token` is not the hex a relay token is (it is spliced into the command).
 pub(crate) fn hook_command(token: &str) -> Option<String> {
     if token.is_empty() || !token.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
@@ -111,9 +116,10 @@ pub(crate) fn hook_command(token: &str) -> Option<String> {
     let url = hook_url(token);
     let wait = HOOK_TIMEOUT.as_secs() + 25;
     Some(format!(
-        "f=$({bb} mktemp) || exit 2; {bb} cat > \"$f\" && {bb} wget -q -Y off -T {wait} \
-         --header 'Content-Type: application/json' --post-file \"$f\" -O - {url}; rc=$?; \
-         {bb} rm -f \"$f\"; [ \"$rc\" = 0 ] || {{ echo '{UNREACHABLE}' >&2; exit 2; }}"
+        "out=$({bb} wget -q -Y off -T {wait} --header 'Content-Type: application/json' \
+         --post-file - -O - {url}) || {{ echo '{UNREACHABLE}' >&2; exit 2; }}; \
+         case \"$out\" in '{{'*) printf '%s' \"$out\" ;; \
+         *) echo '{NOT_A_DECISION}' >&2; exit 2 ;; esac"
     ))
 }
 
