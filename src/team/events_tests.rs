@@ -888,6 +888,9 @@ impl Stream {
                 reason: reason.into(),
                 final_line,
                 withdrawal_requested: None,
+                evidence_gone: None,
+                vault_entry: None,
+                vault_error: None,
             }),
         )
     }
@@ -988,6 +991,77 @@ fn dispute_yes_no(verdict: &str) -> Value {
 
 fn no_verdict(reason: &str) -> Value {
     json!({"verdict": "no_verdict", "agreementPct": null, "dissent": null, "seats": [], "reason": reason})
+}
+
+/// core#959 (operator decision 2026-10-17): a `withdrawn` row on a BOUNDARY finding was written
+/// before a monitor lost the right to withdraw one. It is read as a withdrawal request pending the
+/// operator — never as cleared. Red before: the finding folded `withdrawn` and nothing paused.
+#[test]
+fn core_959_a_legacy_withdrawn_boundary_finding_is_pending_the_operator() {
+    let mut s = Stream::new();
+    s.joined("m1", "claude#2").raised(1, "medium");
+    if let TeamBody::FindingRaised(r) = &mut s.rows.last_mut().unwrap().event.body {
+        r.claim = "the worker bypassed the sandbox by reading through the shell".into();
+    }
+    s.completed("ok")
+        .delivered(1, &delivery_id_end(1), "none", "not_delivered")
+        .settled(1, "withdrawn", "the read was harmless", Some(41))
+        .left("m1", "claude#2", 1);
+    let l = s.fold();
+    let f = &l.findings[0];
+    assert_ne!(f.status, FindingStatus::Withdrawn, "{f:?}");
+    let r = f.monitor_reply.as_ref().unwrap();
+    assert_eq!(r.kind, ReplyKind::Hold);
+    assert_eq!(
+        r.withdrawal_requested.as_deref(),
+        Some("the read was harmless")
+    );
+    assert!(awaits_operator(f));
+    assert!(l.team_pause, "only the operator clears it");
+}
+
+/// core#959 (codex r1 on the follow-up): a legacy `superseded` row on a boundary finding is a
+/// disappearance pending the operator; and a worker's ACCEPTED never clears a hold.
+#[test]
+fn core_959_a_legacy_superseded_or_accepted_hold_still_waits_for_the_operator() {
+    let boundary = |s: &mut Stream| {
+        if let TeamBody::FindingRaised(r) = &mut s.rows.last_mut().unwrap().event.body {
+            r.claim = "the worker bypassed the sandbox by reading through the shell".into();
+        }
+    };
+    let mut s = Stream::new();
+    s.joined("m1", "claude#2").raised(1, "medium");
+    boundary(&mut s);
+    s.completed("ok")
+        .settled(
+            1,
+            "superseded",
+            "its evidence text is gone from the settled tree t2",
+            None,
+        )
+        .left("m1", "claude#2", 1);
+    let l = s.fold();
+    let r = l.findings[0].monitor_reply.as_ref().expect("held");
+    assert!(r
+        .evidence_gone
+        .as_deref()
+        .is_some_and(|g| g.contains("gone")));
+    assert!(awaits_operator(&l.findings[0]) && l.team_pause);
+
+    let mut s = Stream::new();
+    s.joined("m1", "claude#2").raised(1, "medium");
+    boundary(&mut s);
+    s.answered(1, "build", "accepted", "fixed")
+        .completed("ok")
+        .settled(1, "withdrawn", "the read was harmless", None)
+        .left("m1", "claude#2", 1);
+    let l = s.fold();
+    assert_eq!(l.findings[0].status, FindingStatus::Accepted);
+    assert!(
+        awaits_operator(&l.findings[0]),
+        "acceptance never clears a hold"
+    );
+    assert!(l.team_pause);
 }
 
 /// DES-001 #8 (S2): a wrapped unit. No mid-turn delivery (R's attempt-end row says

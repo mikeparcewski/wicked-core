@@ -1175,6 +1175,9 @@ pub struct LiveTeamRun {
     /// (T6) The run's seats (`AgentSession::clis`; the first is the PA): the supervisor's member
     /// candidates even when the run's `path.started` has aged off the bus.
     pub roster: Vec<String>,
+    /// (core#959) The run's evidence root (`AgentSession::evidence_root`): where the supervisor
+    /// vaults a finding held for the operator. `None` for a run without one.
+    pub evidence_root: Option<String>,
 }
 
 /// Build the read view for a team run (`None` for a run that is not a team run).

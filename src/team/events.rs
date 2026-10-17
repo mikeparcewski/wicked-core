@@ -642,6 +642,10 @@ pub struct PathStarted {
     /// written, so an old row re-serialises byte-identical).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub governance: Vec<SeatGovernance>,
+    /// (core#959) The run's evidence root (`AgentSession::evidence_root`): where the supervisor
+    /// vaults a finding held for the operator. Additive; absent for a run without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_root: Option<String>,
 }
 
 /// (IG1-core-3) One roster seat's governance class on `path.started.governance`.
@@ -1014,6 +1018,16 @@ pub struct FindingSettled {
     /// Additive: absent on every other settle and on an older row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withdrawal_requested: Option<String>,
+    /// (core#959) On a `held` settle of a boundary finding whose cited text is gone: the
+    /// disappearance ([`super::MonitorReply::evidence_gone`]). Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_gone: Option<String>,
+    /// (core#959) The wicked-vault entry of a held finding ([`super::vault::record_hold`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_entry: Option<String>,
+    /// (core#959) Why a held finding has no vault entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1590,8 +1604,8 @@ pub fn pause_findings(ledger: &TeamLedger) -> (Vec<String>, Option<String>) {
     }
     if !held.is_empty() {
         why.push(format!(
-            "boundary finding(s) whose monitor asked to withdraw them, which only the operator \
-             clears: {}",
+            "boundary finding(s) held for the operator (a withdrawal request, or cited text that \
+             is gone), which only the operator clears: {}",
             held.join(", ")
         ));
         for id in held {
@@ -1607,12 +1621,20 @@ pub fn pause_findings(ledger: &TeamLedger) -> (Vec<String>, Option<String>) {
 /// (core#959, operator decision 2026-10-17) A finding whose monitor asked to withdraw it when a
 /// monitor may not ([`MonitorReply::withdrawal_requested`]): the operator alone clears it, so it
 /// pauses the ledger whatever its severity and no council rules on it.
+/// (codex r1 on the follow-up) Whatever the worker answered: its acceptance does not clear a hold
+/// either — only the operator does.
 pub fn awaits_operator(f: &LedgerFinding) -> bool {
-    is_unaccepted(f)
+    f.status != FindingStatus::Withdrawn
         && f.monitor_reply
             .as_ref()
-            .is_some_and(|r| r.withdrawal_requested.is_some())
+            .is_some_and(MonitorReply::holds_for_operator)
 }
+
+/// (core#959) The held reason of a `withdrawn` row on a boundary finding written before a monitor
+/// lost the right to withdraw one: read as a pending withdrawal request.
+pub const LEGACY_WITHDRAWAL_HELD: &str =
+    "held for the operator: this boundary finding was settled withdrawn or superseded before only \
+     the operator could clear one; that settle is read as a request (core#959)";
 
 /// The gate's half of DES-001 §6.7: a unit pauses `team_dispute` only when the gate approved
 /// (`outcome.approved`) and its ledger pauses. A denied unit is denied, never paused.
@@ -1895,6 +1917,9 @@ pub fn synthesize_timeout(mut ledger: TeamLedger) -> TeamLedger {
                 kind: ReplyKind::Hold,
                 reason: "no reply (final pass timed out)".to_string(),
                 withdrawal_requested: None,
+                evidence_gone: None,
+                vault_entry: None,
+                vault_error: None,
             });
         }
         if f.dispute.is_none() {
@@ -1987,7 +2012,23 @@ struct FindingAcc {
 
 impl FindingAcc {
     fn into_ledger(self) -> LedgerFinding {
-        let settled = self.settled.as_ref().map(|s| s.status);
+        // (core#959, operator decision 2026-10-17) A boundary finding is never withdrawn by its
+        // monitor: a `withdrawn` row on one predates the rule, and is read as what it now is — a
+        // withdrawal request, pending the operator.
+        let legacy_withdrawal = self.settled.as_ref().is_some_and(|s| {
+            s.status == SettledStatus::Withdrawn && super::is_boundary_finding(&self.finding)
+        });
+        // …and a `superseded` one (its cited text gone) is a disappearance pending the operator
+        // (codex r1 on the follow-up).
+        let legacy_gone = self.settled.as_ref().is_some_and(|s| {
+            s.status == SettledStatus::Superseded && super::is_boundary_finding(&self.finding)
+        });
+        let legacy_withdrawal_or_gone = legacy_withdrawal || legacy_gone;
+        let settled = self
+            .settled
+            .as_ref()
+            .map(|s| s.status)
+            .filter(|_| !legacy_withdrawal_or_gone);
         let status = match settled {
             Some(SettledStatus::Withdrawn) => FindingStatus::Withdrawn,
             Some(SettledStatus::Superseded) => FindingStatus::Superseded,
@@ -1998,6 +2039,16 @@ impl FindingAcc {
             },
         };
         let monitor_reply = self.settled.as_ref().and_then(|s| {
+            if legacy_withdrawal_or_gone {
+                return Some(MonitorReply {
+                    kind: ReplyKind::Hold,
+                    reason: LEGACY_WITHDRAWAL_HELD.to_string(),
+                    withdrawal_requested: legacy_withdrawal.then(|| s.reason.clone()),
+                    evidence_gone: legacy_gone.then(|| s.reason.clone()),
+                    vault_entry: s.vault_entry.clone(),
+                    vault_error: s.vault_error.clone(),
+                });
+            }
             let kind = match s.status {
                 SettledStatus::Held => ReplyKind::Hold,
                 SettledStatus::Withdrawn => ReplyKind::Withdraw,
@@ -2007,6 +2058,9 @@ impl FindingAcc {
                 kind,
                 reason: s.reason.clone(),
                 withdrawal_requested: s.withdrawal_requested.clone(),
+                evidence_gone: s.evidence_gone.clone(),
+                vault_entry: s.vault_entry.clone(),
+                vault_error: s.vault_error.clone(),
             })
         });
         // A no-verdict with no reason is the council call failing to say why: `error`.

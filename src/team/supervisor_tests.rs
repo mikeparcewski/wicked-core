@@ -250,6 +250,7 @@ pub(crate) fn sup_cfg(rig: &Rig) -> SupervisorConfig {
         publish_bound: Duration::from_millis(500),
         engine: None,
         outputs: super::super::publish::OutputStash::default(),
+        vault: Arc::new(super::super::vault::CliVault::default()),
     }
 }
 
@@ -867,6 +868,263 @@ fn core_959_a_monitor_cannot_withdraw_a_boundary_finding() {
     }
 }
 
+/// The #951 claim: a boundary circumvention.
+const BOUNDARY_CLAIM: &str = "the worker read the file through the shell: a self-acknowledged \
+                              circumvention of the access-control boundary";
+
+/// Evidence the supervisor vaulted, recorded instead of written (core#959).
+#[derive(Debug, Default)]
+struct FakeVault {
+    recorded: std::sync::Mutex<Vec<(PathBuf, super::super::vault::VaultRecord, Value)>>,
+}
+
+impl super::super::vault::EvidenceVault for FakeVault {
+    fn record(
+        &self,
+        vault_dir: &std::path::Path,
+        rec: &super::super::vault::VaultRecord,
+        _budget: Duration,
+    ) -> Result<String, String> {
+        let artifact: Value =
+            serde_json::from_slice(&std::fs::read(&rec.artifact).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        let mut v = self.recorded.lock().unwrap();
+        v.push((vault_dir.to_path_buf(), rec.clone(), artifact));
+        Ok(format!("ENTRY{}", v.len()))
+    }
+}
+
+/// A harness whose run has an evidence root and a fake vault (core#959).
+fn vaulted_harness(name: &str) -> (Harness, Arc<FakeVault>, PathBuf) {
+    let vault = Arc::new(FakeVault::default());
+    let v2 = vault.clone();
+    let h = Harness::with(
+        name,
+        move |rig| {
+            let mut c = sup_cfg(rig);
+            c.vault = v2.clone();
+            c
+        },
+        FakeCouncil::yes(),
+    );
+    let root = h.fx.dir.with_extension("evidence");
+    let _ = std::fs::remove_dir_all(&root);
+    (h, vault, root)
+}
+
+fn set_evidence_root(h: &mut Harness, root: &std::path::Path) {
+    h.core.runs.get_mut(RUN).expect("armed").evidence_root =
+        Some(root.to_string_lossy().into_owned());
+}
+
+/// core#959 (b): the withdrawal request AND the original finding are written to the vault, under
+/// the run's evidence root, and the settled row names the vault entry. Red before: nothing was
+/// vaulted (the request lived on the bus and in the ledger only).
+#[test]
+fn core_959_b_a_withdrawal_request_is_vaulted_with_its_finding() {
+    let (mut h, vault, root) = vaulted_harness("core959vault");
+    let hit = finding_line("high", "src/lib.rs", 3, "    let x = 5;", BOUNDARY_CLAIM);
+    h.host.set_reply(move |_, p| {
+        if p.contains("hold round") {
+            let id = p
+                .split_whitespace()
+                .find(|w| w.starts_with("f-"))
+                .unwrap()
+                .to_string();
+            Ok(format!("WITHDRAW {id} — the read was harmless\nDONE"))
+        } else {
+            Ok(format!("{hit}\nDONE"))
+        }
+    });
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.pump();
+    set_evidence_root(&mut h, &root);
+    h.claim(3, 1, "claude#1");
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 5;\n}\n");
+    h.complete(3, 1, "claude#1", "ok");
+    h.pump();
+    let rec = vault.recorded.lock().unwrap();
+    assert_eq!(rec.len(), 1, "{rec:#?}");
+    let (dir, r, artifact) = &rec[0];
+    assert_eq!(dir, &root.join("team").join("vault"));
+    assert_eq!(r.scope, format!("run:{RUN}"));
+    assert!(r.claim.starts_with("finding:f-"), "{r:?}");
+    assert_eq!(artifact["withdrawal_requested"], "the read was harmless");
+    assert_eq!(
+        artifact["finding"]["claim"], BOUNDARY_CLAIM,
+        "the original finding"
+    );
+    let settled = h.rows(tev::FINDING_SETTLED);
+    assert_eq!(settled[0]["vault_entry"], "ENTRY1");
+    let l = h.folded(3, 1);
+    let mr = l.findings[0].monitor_reply.as_ref().unwrap();
+    assert_eq!(mr.vault_entry.as_deref(), Some("ENTRY1"));
+    assert!(l.team_pause);
+}
+
+/// core#959 (a, supersede): a boundary finding whose cited line is gone at the final pass is NOT
+/// superseded: it is held for the operator with the disappearance recorded (and vaulted). Red
+/// before: it settled `superseded` and nothing paused.
+#[test]
+fn core_959_a_a_boundary_finding_whose_line_is_gone_is_held_not_superseded() {
+    let (mut h, vault, root) = vaulted_harness("core959gone");
+    let hit = finding_line("medium", "src/lib.rs", 3, "    let x = 5;", BOUNDARY_CLAIM);
+    h.host.set_reply(move |_, p| {
+        if p.contains("hold round") {
+            Ok("DONE".into())
+        } else {
+            Ok(format!("{hit}\nDONE"))
+        }
+    });
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.pump();
+    set_evidence_root(&mut h, &root);
+    h.claim(3, 1, "claude#1");
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 5;\n}\n");
+    h.checkpoint(3, 1, 1, "edit");
+    h.pump();
+    assert_eq!(h.rows(tev::FINDING_RAISED).len(), 1);
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {}\n");
+    h.complete(3, 1, "claude#1", "ok");
+    h.pump();
+    let settled = h.rows(tev::FINDING_SETTLED);
+    assert_eq!(settled.len(), 1, "{settled:#?}");
+    assert_eq!(settled[0]["status"], "held");
+    assert!(
+        settled[0]["evidence_gone"]
+            .as_str()
+            .is_some_and(|g| g.contains("evidence text is gone")),
+        "{settled:#?}"
+    );
+    let l = h.folded(3, 1);
+    let f = &l.findings[0];
+    assert!(tev::awaits_operator(f), "{f:?}");
+    assert!(l.team_pause);
+    assert_eq!(vault.recorded.lock().unwrap().len(), 1);
+}
+
+/// core#959 (a, redrive): attempt 1 held a boundary finding for the operator (its monitor asked
+/// to withdraw it); the daemon restarts before the operator decides. The redrive carries the
+/// finding AND its withdrawal request into attempt 2, which stays paused for the operator. Red
+/// before: the carry re-raised the bare finding, the hold round saw no reply, a council YES
+/// cleared it and nothing paused.
+#[test]
+fn core_959_a_a_redrive_carries_the_withdrawal_request_forward() {
+    let mut h = Harness::new("core959carry");
+    let hit = finding_line("high", "src/lib.rs", 3, "    let x = 5;", BOUNDARY_CLAIM);
+    h.host.set_reply(move |_, p| {
+        if p.contains("hold round") {
+            let id = p
+                .split_whitespace()
+                .find(|w| w.starts_with("f-"))
+                .unwrap()
+                .to_string();
+            Ok(format!("WITHDRAW {id} — the read was harmless\nDONE"))
+        } else {
+            Ok(format!("{hit}\nDONE"))
+        }
+    });
+    let floor = h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim(3, 1, "claude#1");
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 5;\n}\n");
+    h.complete(3, 1, "claude#1", "ok");
+    h.pump();
+    assert!(h.folded(3, 1).team_pause, "attempt 1 waits on the operator");
+
+    // The restart: the operator never decided; attempt 2 is the redrive.
+    let mut b = restarted(&h, floor);
+    let tail = BusDb::shared(&h.rig.bus).unwrap().tail_event_id().unwrap();
+    let (cursor, _) = replay(&mut b, &h.rig.bus, tail, None);
+    h.core = b;
+    h.host.set_reply(|_, _| Ok("DONE".into()));
+    h.cursor = cursor;
+    h.claim(3, 2, "claude#1");
+    h.pump();
+    h.complete(3, 2, "claude#1", "ok");
+    h.pump();
+    let l = h.folded(3, 2);
+    assert_eq!(l.findings.len(), 1, "{l:#?}");
+    let f = &l.findings[0];
+    assert_eq!(f.finding.carried_from_attempt, Some(1));
+    let r = f.monitor_reply.as_ref().expect("held");
+    assert_eq!(
+        r.withdrawal_requested.as_deref(),
+        Some("the read was harmless"),
+        "the request is never dropped: {f:#?}"
+    );
+    assert!(tev::awaits_operator(f));
+    assert!(l.team_pause, "only the operator clears it");
+    assert!(
+        h.rows(tev::COUNCIL_CALLED)
+            .iter()
+            .all(|c| c["attempt"] != 2),
+        "no council rules on it"
+    );
+}
+
+/// core#959 (codex r1 on the follow-up): a SAME-PROCESS retry (no restart: the earlier attempt is
+/// live) carries the earlier attempt's hold too. Red before: only dead attempts were carried.
+#[test]
+fn core_959_a_a_same_process_retry_carries_the_hold() {
+    let mut h = Harness::new("core959retry");
+    let hit = finding_line("high", "src/lib.rs", 3, "    let x = 5;", BOUNDARY_CLAIM);
+    h.host.set_reply(move |_, p| {
+        if p.contains("hold round") {
+            let id = p
+                .split_whitespace()
+                .find(|w| w.starts_with("f-"))
+                .unwrap()
+                .to_string();
+            Ok(format!("WITHDRAW {id} — the read was harmless\nDONE"))
+        } else {
+            Ok(format!("{hit}\nDONE"))
+        }
+    });
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim(3, 1, "claude#1");
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 5;\n}\n");
+    h.complete(3, 1, "claude#1", "ok");
+    h.pump();
+    h.host.set_reply(|_, _| Ok("DONE".into()));
+    h.claim(3, 2, "claude#1");
+    h.pump();
+    h.complete(3, 2, "claude#1", "ok");
+    h.pump();
+    let l = h.folded(3, 2);
+    let f = l
+        .findings
+        .iter()
+        .find(|f| f.finding.claim == BOUNDARY_CLAIM)
+        .unwrap_or_else(|| panic!("the held finding is carried: {l:#?}"));
+    assert_eq!(
+        f.monitor_reply
+            .as_ref()
+            .and_then(|r| r.withdrawal_requested.as_deref()),
+        Some("the read was harmless")
+    );
+    assert!(l.team_pause);
+}
+
+/// core#959 (codex r1 on the follow-up): a run launched after the supervisor started learns its
+/// evidence root from its `path.started`.
+#[test]
+fn core_959_b_path_started_names_the_evidence_root() {
+    let mut h = Harness::new("core959root");
+    h.publish(&fixture_with(tev::PATH_STARTED, 0, RUN, |p| {
+        p["cli"] = json!("claude#1");
+        p["roster"] = json!(["claude#1", "claude#2"]);
+        p["evidence_root"] = json!("/evidence/run-1");
+    }));
+    h.pump();
+    assert_eq!(
+        h.core
+            .runs
+            .get(RUN)
+            .and_then(|s| s.evidence_root.as_deref()),
+        Some("/evidence/run-1")
+    );
+}
+
 // ── (b) a restart between two batches loses no finding ──────────────────────────────────────────
 
 /// T6 (b): supervisor A raises F1 in attempt 1's first batch; the daemon restarts (A is gone, and
@@ -905,6 +1163,7 @@ fn t6_b_a_restart_between_two_batches_loses_no_finding() {
             ..Default::default()
         },
         roster: vec!["claude#1".into(), "claude#2".into()],
+        evidence_root: None,
     });
     let tail = BusDb::shared(&h.rig.bus).unwrap().tail_event_id().unwrap();
     let (cursor, jobs) = replay(&mut b, &h.rig.bus, tail, None);
@@ -1578,6 +1837,7 @@ fn t6_the_thread_replays_a_live_run_then_folds_a_live_attempt() {
                 ..Default::default()
             },
             roster: vec!["claude#1".into(), "claude#2".into()],
+            evidence_root: None,
         }])
     });
     let mut cfg = sup_cfg(&rig);
@@ -1700,6 +1960,7 @@ fn restarted(h: &Harness, floor: i64) -> SupervisorCore {
             ..Default::default()
         },
         roster: vec!["claude#1".into(), "claude#2".into()],
+        evidence_root: None,
     });
     b
 }
@@ -2425,6 +2686,7 @@ fn a_carried_tree_high_is_not_superseded_when_the_settled_tree_is_unavailable() 
             ..Default::default()
         },
         roster: vec!["claude#1".into(), "claude#2".into()],
+        evidence_root: None,
     });
     let tail = BusDb::shared(&h.rig.bus).unwrap().tail_event_id().unwrap();
     let (cursor, _) = replay(&mut b, &h.rig.bus, tail, None);
