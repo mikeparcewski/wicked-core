@@ -2165,9 +2165,18 @@ pub(crate) fn default_judge_criterion(unit: &WorkUnit) -> String {
 ///
 /// The pid keeps ids distinct across processes sharing a runner; the counter, within one.
 fn validator_run_id() -> String {
+    one_shot_run_id("validator")
+}
+
+/// A fresh runner session id for ONE engine-internal call (a validation, a validator authoring, a
+/// triage judgement): `<prefix>-<pid>-<seq>`, never reused. The caller releases it with
+/// `on_run_complete`, and the wrapped runner TOMBSTONES a released run id — a later launch under
+/// it is born cancelled ("killed by run cancellation") — so an id derived from anything that can
+/// repeat (a re-dispatched unit restarts at attempt 0, core#992) kills the next call.
+fn one_shot_run_id(prefix: &str) -> String {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     format!(
-        "validator-{}-{}",
+        "{prefix}-{}-{}",
         std::process::id(),
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     )
@@ -2489,9 +2498,10 @@ pub fn triage_failure(
             unit.assigned_invocation = Some(invocation);
         }
     }
-    // Unique per (run, unit, attempt): session-based runners key long-lived CLI
-    // processes by run_id — a constant here would cross-contaminate their caches.
-    let triage_run_id = format!("triage-{triage_ctx}");
+    // One session per judgement (core#992): session-based runners key long-lived CLI processes
+    // by run_id, and the id is released below. `triage_ctx` names the run, unit and attempt for
+    // the operator; it does not make the id unique (a re-dispatch restarts at attempt 0).
+    let triage_run_id = one_shot_run_id(&format!("triage-{triage_ctx}"));
     let input = StepInput {
         run_id: triage_run_id.clone(),
         unit_ix: 0,
@@ -5200,6 +5210,85 @@ mod tests {
         assert_eq!(
             released, dispatched,
             "run ids were not released 1:1 — sessions leak"
+        );
+    }
+
+    /// core#992: a re-dispatched unit restarts at attempt 0, so its next failure is triaged with
+    /// the SAME `(run, unit, attempt)` context as the first. The wrapped runner tombstones every
+    /// run id `on_run_complete` released (a later launch under it is born cancelled), so a reused
+    /// triage id killed the second judge as "run cancellation". This runner keeps that contract.
+    #[test]
+    fn a_second_triage_of_the_same_unit_and_attempt_runs_under_a_fresh_id() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Tombstoning {
+            ended: Mutex<Vec<String>>,
+            dispatched: Mutex<Vec<String>>,
+        }
+        impl StepRunner for Tombstoning {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                self.dispatched.lock().unwrap().push(input.run_id.clone());
+                let born_cancelled = self.ended.lock().unwrap().contains(&input.run_id);
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: if born_cancelled {
+                        "(cli `pi` was killed by run cancellation)".into()
+                    } else {
+                        "DECISION: ESCALATE\nthe seat has no model".into()
+                    },
+                    status: if born_cancelled {
+                        StepStatus::Cancelled
+                    } else {
+                        StepStatus::Ok
+                    },
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+            fn on_run_complete(&self, run_id: &str) {
+                self.ended.lock().unwrap().push(run_id.to_string());
+            }
+        }
+
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("pi", "pi {PROMPT}"),
+        ];
+        let runner = Tombstoning::default();
+        for _ in 0..2 {
+            let (decision, _) = triage_failure(
+                "boom",
+                "reproduce",
+                "copilot",
+                "copilot",
+                &roster,
+                &runner,
+                "r-u2-a0",
+            )
+            .expect("the judge runs");
+            assert!(
+                matches!(decision, TriageDecision::Escalate(_)),
+                "{decision:?}"
+            );
+        }
+        let dispatched = runner.dispatched.lock().unwrap().clone();
+        assert_ne!(dispatched[0], dispatched[1], "{dispatched:?}");
+        assert!(
+            dispatched
+                .iter()
+                .all(|id| id.starts_with("triage-r-u2-a0-")),
+            "{dispatched:?}"
+        );
+        assert_eq!(
+            *runner.ended.lock().unwrap(),
+            dispatched,
+            "each judgement is released"
         );
     }
 

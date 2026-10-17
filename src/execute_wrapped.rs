@@ -2047,29 +2047,35 @@ impl StepRunner for WrappedCliStepRunner {
     }
 }
 
-/// (codex council-r1 on #971) A decision-council ballot is one-shot: a fresh synthetic run id per
-/// ballot, never resumed. Its repo-less sandbox (`sandbox_root`) and, under the container floor,
-/// its seat home (`.wicked-container/<run>-<digest>/`) would otherwise accumulate per ballot —
-/// CLI session history and caches included — since no run lifecycle ever ends a synthetic run.
-/// The guard lives on the runner thread for the whole launch and removes both when it drops, so
-/// cleanup happens only after the seat process is done (a timed-out ballot's cancel included).
-struct BallotScratch {
+/// (codex council-r1 on #971; core#992) Every engine-internal session ([`is_engine_internal`]: a
+/// decision-council ballot, an agent judge, a triage judgement) is one-shot: a fresh synthetic run
+/// id per call ([`ONE_SHOT_RUN_PREFIXES`]), never resumed. Its repo-less sandbox (`sandbox_root`)
+/// and, under the container floor, its seat home (`.wicked-container/<run>-<digest>/`) would
+/// otherwise accumulate per call — CLI session history and caches included — since no run
+/// lifecycle ever ends a synthetic run. The guard lives on the runner thread for the whole launch
+/// and removes both when it drops, so cleanup happens only after the seat process is done (a
+/// timed-out call's cancel included).
+struct OneShotScratch {
     run_id: String,
     home: std::cell::RefCell<Option<PathBuf>>,
 }
 
-impl BallotScratch {
+/// The run-id prefixes of the engine's one-shot sessions (`decision` ballots, `validator`'s
+/// `one_shot_run_id`): only a seat home named for one of them is ever removed.
+const ONE_SHOT_RUN_PREFIXES: [&str; 3] = ["council-", "validator-", "triage-"];
+
+impl OneShotScratch {
     fn new(run_id: &str) -> Self {
-        BallotScratch {
+        OneShotScratch {
             run_id: run_id.to_string(),
             home: std::cell::RefCell::new(None),
         }
     }
 
-    /// Record the ballot's container seat home BEFORE it is built (codex council-r2): the run
+    /// Record the session's container seat home BEFORE it is built (codex council-r2): the run
     /// directory [`crate::container_floor::container_run_dir`] names under the seat root, so a
-    /// setup that fails after creating it is cleaned too. Only a `council-` run directory under
-    /// `.wicked-container` is ever recorded.
+    /// setup that fails after creating it is cleaned too. Only a one-shot run directory
+    /// ([`ONE_SHOT_RUN_PREFIXES`]) under `.wicked-container` is ever recorded.
     fn note_root(&self, config: &wicked_apps_core::spawn::SeatConfig) {
         if let wicked_apps_core::spawn::SeatConfig::Isolated {
             root: Some(root), ..
@@ -2083,7 +2089,7 @@ impl BallotScratch {
                 && run_dir
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("council-"));
+                    .is_some_and(|n| ONE_SHOT_RUN_PREFIXES.iter().any(|p| n.starts_with(p)));
             if owned {
                 *self.home.borrow_mut() = Some(run_dir);
             }
@@ -2091,7 +2097,7 @@ impl BallotScratch {
     }
 }
 
-impl Drop for BallotScratch {
+impl Drop for OneShotScratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(sandbox_root(&self.run_id));
         if let Some(home) = self.home.borrow_mut().take() {
@@ -2103,8 +2109,8 @@ impl Drop for BallotScratch {
 impl WrappedCliStepRunner {
     /// Run one unit's CLI, streaming stdout lines through `emit` as they arrive.
     fn exec(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
-        let ballot_scratch =
-            is_council_ballot(&input.unit).then(|| BallotScratch::new(&input.run_id));
+        let one_shot_scratch =
+            is_engine_internal(&input.unit).then(|| OneShotScratch::new(&input.run_id));
         let cli_key = input
             .unit
             .assigned_cli
@@ -2168,7 +2174,7 @@ impl WrappedCliStepRunner {
         .and_then(|c| {
             let posture =
                 crate::write_posture::WritePosture::of(&input.unit, input.workdir.is_some());
-            if let Some(g) = &ballot_scratch {
+            if let Some(g) = &one_shot_scratch {
                 if uses_container_seat(
                     runs_in_seat(input),
                     crate::container_floor::container_mode(),
@@ -7824,7 +7830,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// (codex council-r1/r2 on #971) A ballot's one-shot scratch goes when the launch ends: its
+    /// (codex council-r1/r2 on #971; core#992) A one-shot session's scratch goes when the launch ends: its
     /// sandbox, and its own `council-` run home (recorded BEFORE setup, so a setup that failed
     /// after creating it is cleaned too), never another run's home.
     #[test]
@@ -7842,7 +7848,7 @@ mod tests {
         // A non-ballot run's home is never recorded, so never removed.
         let other = crate::container_floor::container_run_dir(&root, "run-1");
         std::fs::create_dir_all(other.join("full")).unwrap();
-        let g = BallotScratch::new("run-1");
+        let g = OneShotScratch::new("run-1");
         g.note_root(&seat);
         drop(g);
         assert!(other.exists(), "a non-ballot run's home stays");
@@ -7853,11 +7859,22 @@ mod tests {
         let mine = crate::container_floor::container_run_dir(&root, &run_id);
         std::fs::create_dir_all(mine.join("full")).unwrap();
         std::fs::write(mine.join("full").join("AGENTS.md"), "seeded").unwrap();
-        let g = BallotScratch::new(&run_id);
+        let g = OneShotScratch::new(&run_id);
         g.note_root(&seat);
         drop(g);
         assert!(!sandbox.exists(), "the ballot's sandbox is removed");
         assert!(!mine.exists(), "the ballot's seat home is removed");
+        // (core#992) A triage judgement is one-shot too: its own scratch goes the same way.
+        let run_id = format!("triage-r-u2-a0-{}-7", std::process::id());
+        let sandbox = sandbox_root(&run_id);
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let mine = crate::container_floor::container_run_dir(&root, &run_id);
+        std::fs::create_dir_all(mine.join("full")).unwrap();
+        let g = OneShotScratch::new(&run_id);
+        g.note_root(&seat);
+        drop(g);
+        assert!(!sandbox.exists(), "the judgement's sandbox is removed");
+        assert!(!mine.exists(), "the judgement's seat home is removed");
         let _ = std::fs::remove_dir_all(&base);
     }
 
