@@ -1054,7 +1054,8 @@ pub struct WorkUnit {
     /// it is no second launch knob: the composed def IS the team marker. It rides the unit (not
     /// the session, which records only a synthetic `wf-<session>` id) so a re-route of a
     /// persisted plan still knows it is a team run. Read by the evaluator≠creator fence: a team
-    /// run never grades on its creator seat (§8.1, seam D1).
+    /// run prefers a model-distinct evaluator seat and never grades on its creator seat unless
+    /// its operator launched it `reduced` (§8.1, seam D1; core#991).
     ///
     /// `#[serde(default)]` + skip-if-false: pre-existing units deserialize, and non-team units
     /// serialize byte-identical to before the field existed.

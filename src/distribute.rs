@@ -198,10 +198,9 @@ pub fn distribute_units_on_benched(
     clis: &[AgenticCli],
     session_id: &str,
     prior_benched: &[BenchedSeat],
-    // (core#850, EX-01) `true` only for a run whose assurance contract does not enforce
-    // `distinct_evaluator` (a `reduced` launch, or a workflow that does not require it): the
-    // creator-seat fallback then stands, disclosed. `false` refuses it with `NoEligibleSeat`.
-    allow_same_seat: bool,
+    // (core#850, EX-01; core#991) The run's assurance contract: it decides whether a review may
+    // stay on its creator's seat (see `distribute_seated`).
+    assurance: &crate::assurance::RunAssurance,
 ) -> anyhow::Result<Vec<Distribution>> {
     // core#401: the skills root the seats are judged against. Resolved ONLY when a seated unit
     // names a skill — a skill-free run consults no ladder and logs no fallback line, exactly as
@@ -221,7 +220,7 @@ pub fn distribute_units_on_benched(
         session_id,
         snapshot.as_ref(),
         prior_benched,
-        allow_same_seat,
+        assurance,
     )
 }
 
@@ -273,9 +272,9 @@ pub(crate) fn distribute_units_against(
     distribute_units_against_benched(units, clis, session_id, snapshot, &[])
 }
 
-/// The routing tests' seam: [`distribute_seated`] with the creator-seat fallback ALLOWED (a
-/// `reduced` run), so the routing mechanics are tested apart from the core#850 refusal, which
-/// its own tests pin.
+/// The routing tests' seam: [`distribute_seated`] for a `reduced` run (the creator-seat fallback
+/// allowed), so the routing mechanics are tested apart from the core#850 refusal, which its own
+/// tests pin.
 #[cfg(test)]
 pub(crate) fn distribute_units_against_benched(
     units: &[WorkUnit],
@@ -284,7 +283,14 @@ pub(crate) fn distribute_units_against_benched(
     snapshot: Option<&SkillsSnapshot>,
     prior_benched: &[BenchedSeat],
 ) -> anyhow::Result<Vec<Distribution>> {
-    distribute_seated(units, configured, session_id, snapshot, prior_benched, true)
+    distribute_seated(
+        units,
+        configured,
+        session_id,
+        snapshot,
+        prior_benched,
+        &crate::assurance::RunAssurance::new(None, true),
+    )
 }
 
 /// The seats of `clis` a run may still route to: eligible for WORK (core#572 — a ballot-only
@@ -480,7 +486,7 @@ pub(crate) fn distribute_seated(
     session_id: &str,
     snapshot: Option<&SkillsSnapshot>,
     prior_benched: &[BenchedSeat],
-    allow_same_seat: bool,
+    assurance: &crate::assurance::RunAssurance,
 ) -> anyhow::Result<Vec<Distribution>> {
     // (core#591) BEFORE anything reads the roster: a duplicate seat key makes the launch template,
     // the evaluator≠creator fence and the seat's configuration home all ambiguous at once, and
@@ -701,14 +707,18 @@ pub(crate) fn distribute_seated(
         }
         .into());
     }
-    // (DES-TEAMING-002 §8.1, seam D1) A team run refuses the creator-seat fallback even on a
-    // BENCH-FREE roster: no distinct CLI and no usable second instance ⇒ `NoEligibleSeat`, naming
-    // the units and the instance that would satisfy them. The engine never mints or signs in an
-    // instance; the launcher adds the ones it has configured to the roster.
-    // (core#850, EX-01) …and so does every run whose assurance contract enforces
-    // `distinct_evaluator`: the bench-free creator-seat fallback is admitted only by an explicit
-    // `reduced` launch (or a workflow that does not require a distinct evaluator), and disclosed.
-    if !same_seat.is_empty() && (team_run || !allow_same_seat) {
+    // (core#850, EX-01) A run whose assurance contract enforces `distinct_evaluator` refuses the
+    // creator-seat fallback even on a BENCH-FREE roster: no distinct CLI and no usable second
+    // instance ⇒ `NoEligibleSeat`, naming the units and the instance that would satisfy them. The
+    // engine never mints or signs in an instance; the launcher adds the ones it has configured to
+    // the roster. The fallback is admitted, and disclosed, only when the contract waives the
+    // instrument: an explicit `reduced` launch, or — for a run that is not a team run — a workflow
+    // that does not require it. (DES-TEAMING-002 §8.1, D1; core#991) A TEAM run takes it only from
+    // the explicit `reduced` launch: a workflow that omits the instrument never makes a team run
+    // grade its own work, and a reduced one-seat team run reviews on its creator seat.
+    let allow_same_seat = !assurance.enforces(crate::assurance::DISTINCT_EVALUATOR)
+        && (!team_run || assurance.reduced());
+    if !same_seat.is_empty() && !allow_same_seat {
         // Reached only BENCH-FREE (the bench arm above returned otherwise), so every configured
         // seat is usable: an instance the roster already holds is a builder or refused by the
         // unit's skills, and the remedy is a FRESH key. An unusable configured instance is named
@@ -728,23 +738,17 @@ pub(crate) fn distribute_seated(
                 }
             }
         }
-        let why = if team_run {
-            "a team run never grades on its creator seat".to_string()
-        } else {
-            format!(
-                "the run requires a distinct evaluator ({}) \u{2014} launch with reduced \
-                 assurance to let the creator's seat evaluate, disclosed on every receipt",
-                crate::assurance::DISTINCT_EVALUATOR
-            )
-        };
         return Err(crate::NoEligibleSeat {
             run_id: session_id.to_string(),
             benched: format!(
                 "evaluator\u{2260}creator unsatisfiable for unit(s) {ords:?}: {} \u{2014} no \
                  seat distinct from the creator and no usable second instance (add a signed-in \
-                 {} to the roster); {why}",
+                 {} to the roster); the run requires a distinct evaluator ({}) \u{2014} launch \
+                 with reduced assurance to let the creator's seat evaluate, disclosed on every \
+                 receipt",
                 if team_run { "team run" } else { "this run" },
-                missing.join(" or ")
+                missing.join(" or "),
+                crate::assurance::DISTINCT_EVALUATOR
             ),
             benched_seats: benched.clone(),
         }
@@ -2619,18 +2623,19 @@ mod tests {
         );
     }
 
-    /// D1 (b): roster `[claude]`, bench-free — refused `NoEligibleSeat`, naming the unit and the
-    /// missing instance. Never `creator_seat`.
+    /// D1 (b): roster `[claude]`, bench-free, full assurance — refused `NoEligibleSeat`, naming
+    /// the unit and the missing instance. Never `creator_seat` (a `reduced` launch is core#991).
     #[test]
     fn d1_b_team_run_without_a_second_instance_is_refused_bench_free() {
-        let err = distribute_units_against_benched(
+        let err = distribute_seated(
             &team_build_and_review(),
             &[seat("claude")],
             "r1",
             None,
             &[],
+            &crate::assurance::RunAssurance::default(),
         )
-        .expect_err("a team run never falls back to the creator seat");
+        .expect_err("a full-assurance team run never falls back to the creator seat");
         let refusal = err
             .downcast_ref::<crate::NoEligibleSeat>()
             .unwrap_or_else(|| panic!("must be NoEligibleSeat: {err:?}"));
@@ -2640,8 +2645,64 @@ mod tests {
             refusal.benched,
             "evaluator\u{2260}creator unsatisfiable for unit(s) [2]: team run \u{2014} no seat \
              distinct from the creator and no usable second instance (add a signed-in claude#2 \
-             to the roster); a team run never grades on its creator seat"
+             to the roster); the run requires a distinct evaluator (distinct_evaluator) \u{2014} \
+             launch with reduced assurance to let the creator's seat evaluate, disclosed on every \
+             receipt"
         );
+    }
+
+    /// core#991: a team run launched `reduced` (the contract waives `distinct_evaluator`) on a
+    /// one-seat roster seats its review on the creator seat, disclosed `creator_seat` — the
+    /// assurance contract, not the run's shape, decides whether the creator's seat may evaluate.
+    #[test]
+    fn a_reduced_team_run_on_one_seat_reviews_on_the_creator_seat_disclosed() {
+        let dists = distribute_seated(
+            &team_build_and_review(),
+            &[seat("pi")],
+            "r1",
+            None,
+            &[],
+            &crate::assurance::RunAssurance::new(None, true),
+        )
+        .expect("a reduced team run is not refused");
+        assert_eq!(dists[1].assigned_cli, "pi");
+        assert_eq!(
+            dists[1].distinctness_fallback.as_deref(),
+            Some(DISTINCTNESS_FALLBACK_CREATOR_SEAT)
+        );
+        assert_eq!(dists[0].distinctness_fallback, None);
+    }
+
+    /// core#991 (codex r1): the creator seat grades a TEAM run only by the explicit `reduced`
+    /// launch. A full contract whose workflow omits `distinct_evaluator` (a saved preset with
+    /// `required_instruments: []` or `["judge"]`) still refuses the team run; the NON-team run of
+    /// that contract keeps the disclosed fallback (core#850).
+    #[test]
+    fn a_full_contract_without_the_instrument_never_lets_a_team_run_grade_itself() {
+        for declared in [vec![], vec![crate::assurance::JUDGE.to_string()]] {
+            let full = crate::assurance::RunAssurance::new(Some(&declared), false);
+            assert!(!full.enforces(crate::assurance::DISTINCT_EVALUATOR));
+            let err = distribute_seated(
+                &team_build_and_review(),
+                &[seat("pi")],
+                "r1",
+                None,
+                &[],
+                &full,
+            )
+            .expect_err("a full team run is refused");
+            assert!(
+                err.downcast_ref::<crate::NoEligibleSeat>().is_some(),
+                "{err:?}"
+            );
+            let dists =
+                distribute_seated(&build_and_review(), &[seat("pi")], "r1", None, &[], &full)
+                    .expect("a non-team run keeps the fallback");
+            assert_eq!(
+                dists[1].distinctness_fallback.as_deref(),
+                Some(DISTINCTNESS_FALLBACK_CREATOR_SEAT)
+            );
+        }
     }
 
     /// D1 (c): `claude#2` listed but not signed in (health not usable) — refused too. The bench
@@ -2707,10 +2768,16 @@ mod tests {
             Some(DISTINCTNESS_FALLBACK_CREATOR_SEAT)
         );
 
-        // (b) shape: team, no second instance ⇒ refused, naming the unit.
-        let err =
-            distribute_units_against(&all_builder_units(true), &without, "r1", Some(&snapshot))
-                .expect_err("team run on an all-builder roster is refused");
+        // (b) shape: team, full assurance, no second instance ⇒ refused, naming the unit.
+        let err = distribute_seated(
+            &all_builder_units(true),
+            &without,
+            "r1",
+            Some(&snapshot),
+            &[],
+            &crate::assurance::RunAssurance::default(),
+        )
+        .expect_err("team run on an all-builder roster is refused");
         let refusal = err
             .downcast_ref::<crate::NoEligibleSeat>()
             .unwrap_or_else(|| panic!("must be NoEligibleSeat: {err:?}"));
@@ -2718,7 +2785,9 @@ mod tests {
             refusal.benched,
             "evaluator\u{2260}creator unsatisfiable for unit(s) [3]: team run \u{2014} no seat \
              distinct from the creator and no usable second instance (add a signed-in codex#2 \
-             to the roster); a team run never grades on its creator seat"
+             to the roster); the run requires a distinct evaluator (distinct_evaluator) \u{2014} \
+             launch with reduced assurance to let the creator's seat evaluate, disclosed on every \
+             receipt"
         );
 
         // (a) shape: team, a usable claude#2 ⇒ the review moves there, `same_cli_instance`.
@@ -2787,7 +2856,7 @@ mod tests {
             "r1",
             None,
             &[],
-            false,
+            &crate::assurance::RunAssurance::default(),
         )
         .expect_err("a full-assurance run is refused");
         let refusal = err
@@ -2807,7 +2876,7 @@ mod tests {
             "r1",
             None,
             &[],
-            false,
+            &crate::assurance::RunAssurance::default(),
         )
         .expect("a second instance satisfies it");
         assert_eq!(dists[1].assigned_cli, "claude#2");
@@ -3020,12 +3089,14 @@ mod tests {
     fn t6_d1_a_pa_build_and_a_member_build_leave_no_evaluator_seat_and_refuse() {
         for stage in [StageKind::Review, StageKind::Test] {
             let units = team_member_build_then(stage, true);
-            let err = distribute_units_against_benched(
+            // Full assurance (a team run's contract unless launched reduced, core#991).
+            let err = distribute_seated(
                 &units,
                 &[seat("claude"), seat("codex")],
                 "r1",
                 None,
                 &[],
+                &crate::assurance::RunAssurance::default(),
             )
             .expect_err("both seats built: no distinct evaluator");
             let refusal = err
@@ -3058,13 +3129,14 @@ mod tests {
         .expect("a third seat is distinct from the builder and the PA");
         assert_eq!(dists[0].assigned_cli, "codex");
         assert_eq!(dists[1].assigned_cli, "pi", "not the PA, not the builder");
-        // Without the third seat: refused, never the PA and never the builder.
-        let err = distribute_units_against_benched(
+        // Without the third seat, full assurance: refused, never the PA and never the builder.
+        let err = distribute_seated(
             &units,
             &[seat("claude"), seat("codex")],
             "r1",
             None,
             &[],
+            &crate::assurance::RunAssurance::default(),
         )
         .expect_err("no seat is distinct from both the member builder and the PA");
         assert!(
