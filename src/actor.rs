@@ -9427,21 +9427,20 @@ fn dispatch_unit(
     // cwd is already a throwaway sandbox; a Tool unit is the engine's own command.
     let notes_root = (unit.tool_cmd.is_none()
         && session.workdir.is_some()
-        && crate::write_posture::WritePosture::of(&unit, true)
-            == crate::write_posture::WritePosture::ReadOnly)
-        .then(|| crate::worktree_guard::notes_root(run_id, unit.ord))
-        .and_then(|dir| match std::fs::create_dir_all(&dir) {
-            Ok(()) => Some(dir.to_string_lossy().into_owned()),
-            Err(e) => {
-                eprintln!(
-                    "wicked-core: could not create the notes root {} for unit {} of run \
+        && crate::write_posture::takes_notes_root(&unit))
+    .then(|| crate::worktree_guard::notes_root(run_id, unit.ord))
+    .and_then(|dir| match std::fs::create_dir_all(&dir) {
+        Ok(()) => Some(dir.to_string_lossy().into_owned()),
+        Err(e) => {
+            eprintln!(
+                "wicked-core: could not create the notes root {} for unit {} of run \
                      {run_id}: {e} — the unit runs without one (its output is still its record)",
-                    dir.display(),
-                    unit.ord
-                );
-                None
-            }
-        });
+                dir.display(),
+                unit.ord
+            );
+            None
+        }
+    });
     // (DES-L1 PR-1B) Record the attempt this dispatch mints ON the unit — `last_attempt` is the
     // unit's own dispatch history, so `next_attempt` stays fresh whatever the attempt's outcome
     // (a worker exit never reaches the fold's write) and `None` means exactly "never dispatched"

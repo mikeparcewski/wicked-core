@@ -492,7 +492,17 @@ fn the_executor_directive_is_evidence_only_and_resumes_a_same_tree_run() {
     let mut bare = qe_unit("pi", ledger);
     bare.qe_ledger_root = None;
     assert!(super::super::unit_directive(&bare, "q").contains("accept (writer, executor, isolated"));
-    assert!(reviewer_brief("/d").len() < 520);
+    assert!(reviewer_brief("/d", None).len() < 520);
+    // (core#928) The scratch line, with a realistic notes root, keeps the brief one short line.
+    let scratch = std::path::Path::new(
+        "/var/folders/4c/rvzl16px0yx907_m1rx6mwrw0000gp/T/wicked-core-notes/run-0123456789ab/unit-6/tmp",
+    );
+    let b = reviewer_brief("/d", Some(scratch));
+    assert!(
+        b.contains(&format!("Stage any helper file in {}", scratch.display())),
+        "{b}"
+    );
+    assert!(b.len() < 700, "{}", b.len());
 }
 
 /// A scripted seat: every reviewer turn it is handed is recorded, and it answers per seat.

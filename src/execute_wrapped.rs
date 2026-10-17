@@ -3175,6 +3175,16 @@ impl WrappedCliStepRunner {
             for (k, v) in &floor_env {
                 cmd.env(k, v);
             }
+            // (core#928) The QE unit's temp is its notes root, a root its fence admits (on every
+            // floor): `<cwd>/tmp` and the floor's own scratch are outside its admitted roots, so
+            // the reviewer's staged verdict script was refused and the verdict lost.
+            if let Some(tmp) = crate::write_posture::unit_scratch_tmp(&input.unit) {
+                if std::fs::create_dir_all(&tmp).is_ok() && tmp.is_dir() {
+                    for k in ["TMPDIR", "TMP", "TEMP"] {
+                        cmd.env(k, &tmp);
+                    }
+                }
+            }
             for (k, v) in &seat_gateway_env {
                 cmd.env(k, v);
             }
@@ -9031,6 +9041,104 @@ mod tests {
             seen.contains("SEEN=[UNSET]"),
             "a unit with no QE ledger root is handed none; got: {seen}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#928: the QE reviewer staged its verdict-writer script in `$TMPDIR` / `/tmp`, and the
+    /// deliverable-roots fence refused both — its only admitted root was the QE ledger — so the
+    /// verdict was lost and QE acceptance read `invalid`. The QE unit now gets a notes root, and
+    /// its worker's temp is inside it: a write there passes the same fence that refuses the tree.
+    /// Red on main: the worker saw `TMPDIR=<cwd>/tmp`, inside the tree the fence refuses.
+    #[cfg(unix)]
+    #[test]
+    fn core_928_the_qe_units_temp_is_a_root_its_fence_admits() {
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("wicked-928-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let wt = dir.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let probe = dir.join("probe.sh");
+        std::fs::write(&probe, "echo \"TMP=[${TMPDIR:-UNSET}]\"\n").unwrap();
+        let ledger = dir.join("evidence").join(".wicked-qe");
+        std::fs::create_dir_all(&ledger).unwrap();
+        let mut u = WorkUnit::pending("s:u6", "s", 6, "QE acceptance");
+        u.role = crate::workflow::PhaseRole::Evaluator;
+        u.repo_checks_floor = true;
+        u.assigned_cli = Some("probe".to_string());
+        u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
+        u.qe_ledger_root = Some(ledger.to_string_lossy().into_owned());
+        assert!(
+            crate::write_posture::takes_notes_root(&u),
+            "the QE unit is minted a notes root at dispatch"
+        );
+        u.notes_root = Some(dir.join("notes").to_string_lossy().into_owned());
+        let input = StepInput {
+            run_id: "run-928".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u.clone(),
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(wt.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let seen = WrappedCliStepRunner::default().run_unit(&input).output;
+        let tmp = seen
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("TMP=[")?.strip_suffix(']'))
+            .unwrap_or_else(|| panic!("the probe ran: {seen}"))
+            .to_string();
+        let posture = crate::write_posture::WritePosture::of(&u, true);
+        let roots = crate::write_posture::unit_admitted_roots(posture, &u, &[]);
+        let staged = format!("{tmp}/qe_verdict_1.mjs");
+        let denial = crate::gate_hook::phase_scope_denial(
+            false,
+            posture,
+            &serde_json::json!({ "path": staged }),
+            "Write",
+            &wt,
+            None,
+            &roots,
+        );
+        assert!(denial.is_none(), "TMPDIR={tmp}: {denial:?}");
+        assert!(
+            crate::gate_hook::bash_write_phase_scope(
+                false,
+                posture,
+                &format!("cat > \"{staged}\" <<'EOF'\n// verdict writer\nEOF"),
+                &wt,
+                None,
+                &roots
+            )
+            .is_none(),
+            "a heredoc into the scratch is admitted too"
+        );
+        // (codex r1) The shell fence resolves no `$TMPDIR`, so the reviewer's brief spells the
+        // scratch as the absolute path the worker was handed.
+        let brief = crate::qe_acceptance::review::reviewer_brief(
+            "/d",
+            crate::write_posture::unit_scratch_tmp(&u).as_deref(),
+        );
+        assert!(
+            brief.contains(&format!("Stage any helper file in {tmp}")),
+            "{brief}"
+        );
+        // The tree stays refused.
+        assert!(crate::gate_hook::phase_scope_denial(
+            false,
+            posture,
+            &serde_json::json!({ "path": wt.join("tmp/x.mjs").to_string_lossy() }),
+            "Write",
+            &wt,
+            None,
+            &roots,
+        )
+        .is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

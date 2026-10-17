@@ -27,6 +27,13 @@ Two release tracks share this file, newest entry first regardless of track:
   (`finding.settled.withdrawal_requested`, ledger `monitorReply.withdrawalRequested`), settles it `held`, convenes no
   council on it, and the ledger pauses (`teamPause`, whatever the severity) for the operator's decision at the gate.
   Every other finding may still be withdrawn by its monitor. Operator decision 2026-10-17.
+- **The QE reviewer can stage its verdict script (core#928).** A bound run's QE unit (deliverable-roots for its
+  interpreters) admits its notes root and its QE ledger root, but it was never given a notes root, and its worker's
+  `TMPDIR` pointed at `<worktree>/tmp`, inside the tree its fence refuses. A reviewer that staged its verdict writer in
+  `$TMPDIR` or `/tmp` was refused, lost its verdict, and QE acceptance read `invalid`. The QE unit now gets a notes
+  root at dispatch, and its worker's `TMPDIR`/`TMP`/`TEMP` is `<notes root>/tmp` on every floor. The reviewer's brief
+  names that scratch dir as an absolute path (the shell fence resolves no `$TMPDIR`). The tree, and `/tmp`
+  itself, stay refused.
 - **codex, pi and opencode sign in on the host; copilot uses its device flow.** Their browser logins listen on a
   loopback callback that the host browser cannot reach inside a login container, and ChatGPT device codes need an
   account that allows them. `seat-login argv` now runs the host's own CLI under `env -i` with a throwaway home

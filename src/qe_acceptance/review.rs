@@ -76,14 +76,25 @@ pub(crate) fn evidence_directive(skill: &str, resume: Option<&str>) -> String {
     )
 }
 
-/// The reviewer turn's whole task: the evidence path, nothing else.
-pub(crate) fn reviewer_brief(dir: &str) -> String {
+/// The reviewer turn's whole task: the evidence path, nothing else — and (core#928) the absolute
+/// scratch dir it may stage a helper file in ([`crate::write_posture::unit_scratch_tmp`]): spelled
+/// out, because the shell fence resolves no `$TMPDIR` in a write target.
+pub(crate) fn reviewer_brief(dir: &str, scratch: Option<&Path>) -> String {
+    let stage = scratch
+        .map(|t| {
+            format!(
+                " Stage any helper file in {} (spell that absolute path; /tmp and the worktree \
+                 are refused).",
+                t.display()
+            )
+        })
+        .unwrap_or_default();
     format!(
         "Run its accept action as the ISOLATED REVIEWER: accept --phase review --evidence {dir}. \
          wicked-core started this session for this review alone, so you hold no plan writing or \
          test execution: open the acceptance reviewer here, judge only the scenario, plan and \
          evidence files in that directory, record the verdict in the QE ledger (stamped with \
-         ${REVIEW_SESSION_ENV} and WICKED_RUN_ID), and change nothing else."
+         ${REVIEW_SESSION_ENV} and WICKED_RUN_ID), and change nothing else.{stage}"
     )
 }
 
@@ -98,7 +109,7 @@ pub(crate) fn reviewer_unit(
     nonce: Option<&str>,
 ) -> WorkUnit {
     let mut u = unit.clone();
-    u.description = reviewer_brief(dir);
+    u.description = reviewer_brief(dir, crate::write_posture::unit_scratch_tmp(unit).as_deref());
     if u.assigned_cli.as_deref() != Some(seat.seat.as_str()) {
         u.assigned_cli = Some(seat.seat.clone());
         u.assigned_invocation = seat.invocation.clone();
