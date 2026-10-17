@@ -6100,13 +6100,19 @@ esac
             !format!("{report:?}").contains("gho_FAKE"),
             "the ingest report names files, never the token"
         );
-        // core#990: no `--model`, as a governed unit's argv carries none; the wire API is
-        // resolved from the seat's own env, as execute_wrapped resolves it.
+        // core#990: no `--model`, as a governed unit's argv carries none; the default model and
+        // the wire API are resolved from the seat's own argv and env, as execute_wrapped does.
         let argv: Vec<String> = ["copilot", "-p", "say hi", "--allow-all-tools"]
             .map(String::from)
             .to_vec();
-        let env_of = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
-        if let Some(wire) = crate::seat_gateway::copilot_wire_api(&argv, env_of) {
+        let env_of = |env: &Vec<(String, String)>, k: &str| {
+            env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+        };
+        if let Some(model) = crate::seat_gateway::copilot_default_model(&argv, |k| env_of(&env, k))
+        {
+            env.push(("COPILOT_MODEL".into(), model.into()));
+        }
+        if let Some(wire) = crate::seat_gateway::copilot_wire_api(&argv, |k| env_of(&env, k)) {
             env.push(("COPILOT_PROVIDER_WIRE_API".into(), wire.into()));
         }
         let mut docker: Vec<String> = [

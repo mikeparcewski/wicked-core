@@ -950,26 +950,60 @@ pub(crate) fn seat_env_for_sign_in(
                 bearer.to_string(),
             ),
             ("COPILOT_AUTO_UPDATE".to_string(), "false".to_string()),
-            // BYOK refuses to start without a model (core#990: "BYOK providers require an
-            // explicit model"); the documented default, which a roster's `--model` overrides.
-            ("COPILOT_MODEL".to_string(), COPILOT_SEAT_MODEL.to_string()),
         ]);
     }
     env
 }
 
-/// The model a copilot seat runs when its roster entry names none (core#990). BYOK mode has no
-/// server model catalogue to pick from, and copilot exits before any call without a model. This
-/// one is served on every Copilot plan; an operator picks another with `--model <id>` in the
-/// seat's `headless_invocation` (clis.toml), which copilot ranks above `COPILOT_MODEL`, as
-/// [`copilot_wire_api`] does.
+/// The model a copilot seat runs when nothing on its argv or env names one (core#990): BYOK mode
+/// has no server model catalogue to pick from, and copilot exits before any call without a model
+/// ("BYOK providers require an explicit model"). A preference, not a promise: the models a
+/// Copilot account may use differ by plan and policy, and an operator picks another with
+/// `--model <id>` in the seat's `headless_invocation` (clis.toml).
 pub(crate) const COPILOT_SEAT_MODEL: &str = "gpt-5-mini";
 
+/// The model copilot's `--model X` / `--model=X` selects on `args`: the LAST one, as copilot
+/// takes it, never past a `--`.
+fn copilot_model_flag(args: &[String]) -> Option<String> {
+    let mut model = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" {
+            break;
+        }
+        if let Some(m) = a.strip_prefix("--model=") {
+            model = Some(m.to_string());
+        } else if a == "--model" {
+            model = args.get(i + 1).cloned();
+            i += 1;
+        }
+        i += 1;
+    }
+    model
+}
+
+/// The default model a copilot BYOK seat needs (core#990): [`COPILOT_SEAT_MODEL`] when neither
+/// its argv (`--model`) nor its env (`COPILOT_MODEL`, `COPILOT_PROVIDER_MODEL_ID`) selects one,
+/// else `None`, so an explicit selection is never shadowed (codex review of core#990). Applied
+/// at the final resolution, where the seat's argv and env are complete.
+pub(crate) fn copilot_default_model(
+    args: &[String],
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<&'static str> {
+    let named = |k: &str| env(k).is_some_and(|m| !m.is_empty());
+    (copilot_model_flag(args).is_none()
+        && !named("COPILOT_MODEL")
+        && !named("COPILOT_PROVIDER_MODEL_ID"))
+    .then_some(COPILOT_SEAT_MODEL)
+}
+
 /// The wire API copilot's BYOK mode must use for the model its seat sends, resolved as copilot
-/// does: `COPILOT_PROVIDER_WIRE_MODEL`, else `--model X`/`--model=X`, else `COPILOT_MODEL`, else
-/// `COPILOT_PROVIDER_MODEL_ID`. GPT models are served on `/responses` (the CLI's own rule: GPT-5
-/// needs it), every other model on the default chat completions. `None` = the default, or an
-/// explicit `COPILOT_PROVIDER_WIRE_API` already chosen (never overridden).
+/// does: `COPILOT_PROVIDER_WIRE_MODEL`, else the last `--model X`/`--model=X`, else
+/// `COPILOT_MODEL`, else `COPILOT_PROVIDER_MODEL_ID`. GPT models are served on `/responses`
+/// (the CLI's own rule: GPT-5 needs it), every other model on the default chat completions.
+/// `None` = the default, or an explicit `COPILOT_PROVIDER_WIRE_API` already chosen (never
+/// overridden).
 pub(crate) fn copilot_wire_api(
     args: &[String],
     env: impl Fn(&str) -> Option<String>,
@@ -977,14 +1011,9 @@ pub(crate) fn copilot_wire_api(
     if env("COPILOT_PROVIDER_WIRE_API").is_some_and(|v| !v.is_empty()) {
         return None;
     }
-    let flag = args.iter().enumerate().find_map(|(i, a)| {
-        a.strip_prefix("--model=")
-            .map(str::to_string)
-            .or_else(|| (a == "--model").then(|| args.get(i + 1).cloned()).flatten())
-    });
     let model = env("COPILOT_PROVIDER_WIRE_MODEL")
         .filter(|m| !m.is_empty())
-        .or(flag)
+        .or_else(|| copilot_model_flag(args))
         .or_else(|| env("COPILOT_MODEL").filter(|m| !m.is_empty()))
         .or_else(|| env("COPILOT_PROVIDER_MODEL_ID").filter(|m| !m.is_empty()))?;
     model.starts_with("gpt-").then_some("responses")
@@ -2298,22 +2327,65 @@ mod tests {
         );
         assert_eq!(get("OPENAI_API_KEY"), None);
         assert_eq!(get("HTTPS_PROXY"), Some("http://agw:3000"));
-        // core#990 (red on main): BYOK exits 1 without a model, so the seat always names one.
-        assert_eq!(get("COPILOT_MODEL"), Some(COPILOT_SEAT_MODEL));
         let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let none = |_: &str| None::<String>;
-        // The seat's own env resolves the wire API for the default model (`gpt-*` → responses);
-        // a roster `--model` outranks it.
+        // core#990 (red on main): BYOK exits 1 without a model. The seat's env names none, so the
+        // final resolution supplies the default; any explicit selection keeps it out.
+        assert_eq!(get("COPILOT_MODEL"), None);
         let seat = |k: &str| get(k).map(str::to_string);
         assert_eq!(
-            copilot_wire_api(&argv(&["copilot", "-p", "x"]), seat),
+            copilot_default_model(&argv(&["copilot", "-p", "x"]), seat),
+            Some(COPILOT_SEAT_MODEL)
+        );
+        for args in [
+            &["copilot", "--model", "claude-sonnet-5", "-p", "x"][..],
+            &["copilot", "--model=gpt-5.4"],
+        ] {
+            assert_eq!(copilot_default_model(&argv(args), none), None, "{args:?}");
+        }
+        let only =
+            |k: &'static str, v: &'static str| move |n: &str| (n == k).then(|| v.to_string());
+        assert_eq!(
+            copilot_default_model(&argv(&["copilot"]), only("COPILOT_MODEL", "gpt-5.4")),
+            None
+        );
+        assert_eq!(
+            copilot_default_model(
+                &argv(&["copilot"]),
+                only("COPILOT_PROVIDER_MODEL_ID", "claude-sonnet-4")
+            ),
+            None,
+            "a model id alone is a selection; the default never shadows it"
+        );
+        assert_eq!(
+            copilot_default_model(&argv(&["copilot"]), only("COPILOT_MODEL", "")),
+            Some(COPILOT_SEAT_MODEL)
+        );
+        // The default's wire API (`gpt-*` → responses), as the seat resolves it after the default.
+        assert_eq!(
+            copilot_wire_api(
+                &argv(&["copilot", "-p", "x"]),
+                only("COPILOT_MODEL", COPILOT_SEAT_MODEL)
+            ),
             Some("responses")
+        );
+        // copilot takes the LAST `--model`, in either spelling, and none past a `--`.
+        assert_eq!(
+            copilot_wire_api(
+                &argv(&["copilot", "--model", "gpt-5.4", "--model=claude-sonnet-4"]),
+                none
+            ),
+            None
         );
         assert_eq!(
             copilot_wire_api(
-                &argv(&["copilot", "--model", "claude-sonnet-5", "-p", "x"]),
-                seat
+                &argv(&["copilot", "--model=claude-sonnet-4", "--model", "gpt-5.4"]),
+                none
             ),
+            Some("responses")
+        );
+        assert_eq!(
+            copilot_wire_api(&argv(&["copilot", "--", "--model", "gpt-5.4"]), none),
             None
         );
         assert_eq!(

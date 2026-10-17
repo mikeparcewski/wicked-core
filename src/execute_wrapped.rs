@@ -3179,13 +3179,22 @@ impl WrappedCliStepRunner {
                     .get_args()
                     .map(|a| a.to_string_lossy().into_owned())
                     .collect();
-                let env_of = |key: &str| {
+                fn env_of(cmd: &Command, key: &str) -> Option<String> {
                     cmd.get_envs()
                         .find(|(k, _)| *k == key)
                         .and_then(|(_, v)| v)
                         .map(|v| v.to_string_lossy().into_owned())
-                };
-                if let Some(wire) = crate::seat_gateway::copilot_wire_api(&args, env_of) {
+                }
+                // A seat that names no model gets the default (BYOK refuses to start without
+                // one, core#990); an explicit selection is never shadowed.
+                if let Some(model) =
+                    crate::seat_gateway::copilot_default_model(&args, |k| env_of(&cmd, k))
+                {
+                    cmd.env("COPILOT_MODEL", model);
+                }
+                if let Some(wire) =
+                    crate::seat_gateway::copilot_wire_api(&args, |k| env_of(&cmd, k))
+                {
                     cmd.env("COPILOT_PROVIDER_WIRE_API", wire);
                 }
             }
