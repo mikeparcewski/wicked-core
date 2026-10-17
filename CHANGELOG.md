@@ -14,6 +14,8 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core, core-ts: estate memory recall includes operator memories (estate#338).** wicked-estate 0.30.0 lands an operator memory at `operator:<user|local>`, a scope every project's recall includes, and a derived entity keeps its episode's facets. All estate pins move to 0.30.0.
+
 - **Every path that cleared a boundary finding now waits for the operator, and the hold is vaulted (core#959
   follow-up).** Operator decision 2026-10-17, on top of the hold-round rule:
   - A redrive (a restart, or a same-process retry) carries a finding held for the operator into the new attempt
