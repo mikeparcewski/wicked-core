@@ -454,6 +454,73 @@ wire_enum! {
 pub struct MonitorReply {
     pub kind: ReplyKind,
     pub reason: String,
+    /// (core#959, operator decision 2026-10-17) The monitor answered `WITHDRAW` on a BOUNDARY
+    /// finding ([`is_boundary_finding`]): a monitor may not withdraw one, so the engine records
+    /// the request — this is the monitor's reason — beside the original finding, settles it held
+    /// (`kind: hold`), and the ledger pauses for the operator, the only one who clears it.
+    /// Absent otherwise.
+    #[serde(
+        rename = "withdrawalRequested",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub withdrawal_requested: Option<String>,
+}
+
+/// (core#959) Whether a finding names a circumvention of a boundary or of governance — the
+/// access-control boundary, the sandbox, a gate, a policy hook — read from its claim: a
+/// circumvention verb AND a boundary noun. Such a finding is never withdrawn by its monitor
+/// ([`MonitorReply::withdrawal_requested`]); only the operator clears it. Over-matching only
+/// costs an operator decision; the claim is the monitor's own words, the evidence line is code.
+pub fn is_boundary_finding(f: &Finding) -> bool {
+    names_boundary_circumvention(&f.claim)
+}
+
+/// [`is_boundary_finding`]'s reading of a claim.
+pub(crate) fn names_boundary_circumvention(claim: &str) -> bool {
+    // Stems, each matched at the START of a word (codex r1: "evading" is a circumvention; the
+    // "gate" inside "aggregate" is not a boundary).
+    const VERBS: [&str; 13] = [
+        "circumvent",
+        "bypass",
+        "evad",
+        "evasion",
+        "sidestep",
+        "side-step",
+        "work around",
+        "worked around",
+        "working around",
+        "workaround",
+        "get around",
+        "got around",
+        "getting around",
+    ];
+    const NOUNS: [&str; 14] = [
+        "boundar",
+        "sandbox",
+        "access control",
+        "access-control",
+        "governance",
+        "guard",
+        "gate",
+        "permission",
+        "jail",
+        "posture",
+        "denial",
+        "allowlist",
+        "write root",
+        "polic",
+    ];
+    let claim = claim.to_lowercase();
+    let at_word_start = |stem: &str| {
+        claim.match_indices(stem).any(|(i, _)| {
+            !claim[..i]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric())
+        })
+    };
+    VERBS.iter().any(|v| at_word_start(v)) && NOUNS.iter().any(|n| at_word_start(n))
 }
 
 /// A one-off council's verdict on a dispute (S6 fills it).
@@ -1211,6 +1278,7 @@ pub(crate) fn parse_hold_lines(reply: &str) -> BTreeMap<String, MonitorReply> {
             MonitorReply {
                 kind,
                 reason: cap_utf8(after_separator(&rest[id.len()..]), REASON_CAP),
+                withdrawal_requested: None,
             },
         );
     }

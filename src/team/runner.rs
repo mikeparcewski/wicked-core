@@ -1255,6 +1255,12 @@ pub fn render_for_gate(snap: &UnitTeamSnapshot) -> Option<String> {
                 token(&r.kind),
                 cap_utf8(&r.reason, 512)
             ));
+            if let Some(w) = &r.withdrawal_requested {
+                s.push_str(&format!(
+                    "  monitor asked to withdraw it (operator decision required): {}\n",
+                    cap_utf8(w, 512)
+                ));
+            }
         }
         if let Some(d) = &f.dispute {
             s.push_str(&format!(

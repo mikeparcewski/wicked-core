@@ -796,6 +796,77 @@ fn t6_a8_a_wrapped_unit_gets_the_final_pass_ledger_and_the_hold_round() {
     assert_eq!(h.rows(tev::MEMBER_LEFT).len(), 1);
 }
 
+/// core#959 (operator decision 2026-10-17), the Ask run of #951: the monitor raised "a
+/// self-acknowledged circumvention of the access-control boundary" and then answered WITHDRAW at
+/// the hold round, and the finding was settled `withdrawn`. A monitor may not withdraw a
+/// boundary finding: the request is recorded beside the original, the finding stays held, no
+/// council rules on it, and the ledger pauses for the operator — whatever its severity.
+#[test]
+fn core_959_a_monitor_cannot_withdraw_a_boundary_finding() {
+    for severity in ["high", "medium"] {
+        let mut h = Harness::new(&format!("core959{severity}"));
+        let hit = finding_line(
+            severity,
+            "src/lib.rs",
+            3,
+            "    let x = 5;",
+            "the worker read the file through the shell: a self-acknowledged circumvention of \
+             the access-control boundary, not a resolved exception",
+        );
+        h.host.set_reply(move |_, p| {
+            if p.contains("hold round") {
+                let id = p
+                    .split_whitespace()
+                    .find(|w| w.starts_with("f-"))
+                    .unwrap()
+                    .to_string();
+                Ok(format!("WITHDRAW {id} — the read was harmless\nDONE"))
+            } else {
+                Ok(format!("{hit}\nDONE"))
+            }
+        });
+        h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+        h.claim(3, 1, "claude#1");
+        h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 5;\n}\n");
+        h.complete(3, 1, "claude#1", "ok");
+        h.pump();
+        assert_eq!(h.host.prompts_matching("hold round").len(), 1);
+        let settled = h.rows(tev::FINDING_SETTLED);
+        assert_eq!(settled.len(), 1, "{severity}");
+        assert_eq!(settled[0]["status"], "held", "{severity}");
+        assert_eq!(
+            settled[0]["withdrawal_requested"], "the read was harmless",
+            "{severity}"
+        );
+        let l = h.folded(3, 1);
+        assert_eq!(l.findings.len(), 1, "the original is never removed");
+        let f = &l.findings[0];
+        assert_ne!(f.status, FindingStatus::Withdrawn, "{severity}");
+        assert!(f.finding.claim.contains("access-control boundary"));
+        let r = f.monitor_reply.as_ref().unwrap();
+        assert_eq!(r.kind, ReplyKind::Hold, "{severity}");
+        assert_eq!(r.reason, BOUNDARY_WITHDRAWAL_HELD);
+        assert_eq!(
+            r.withdrawal_requested.as_deref(),
+            Some("the read was harmless")
+        );
+        assert!(tev::awaits_operator(f));
+        assert!(l.team_pause, "only the operator clears it ({severity})");
+        // (codex r1) The operator's gate names it, whatever its severity.
+        let (ids, why) = tev::pause_findings(&l);
+        assert_eq!(ids, vec![f.finding.finding_id.clone()], "{severity}");
+        assert!(
+            why.as_deref()
+                .is_some_and(|w| w.contains("only the operator clears")),
+            "{why:?}"
+        );
+        assert!(
+            h.rows(tev::COUNCIL_CALLED).is_empty(),
+            "no council may clear it ({severity})"
+        );
+    }
+}
+
 // ── (b) a restart between two batches loses no finding ──────────────────────────────────────────
 
 /// T6 (b): supervisor A raises F1 in attempt 1's first batch; the daemon restarts (A is gone, and

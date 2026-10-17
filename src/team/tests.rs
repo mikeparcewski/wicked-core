@@ -191,6 +191,31 @@ fn hold_lines_parse_and_the_last_per_id_wins() {
     assert_eq!(p[B].kind, ReplyKind::Hold, "last line wins");
 }
 
+/// core#959: a boundary finding names a circumvention (verb) of a boundary (noun); either alone
+/// is an ordinary finding its monitor may still withdraw.
+#[test]
+fn core_959_a_boundary_finding_names_a_circumvention_of_a_boundary() {
+    for yes in [
+        "a self-acknowledged circumvention of the access-control boundary, not a resolved exception",
+        "the worker bypassed the sandbox by reading through the shell",
+        "Worked around the write-posture denial by staging in /tmp",
+        "this sidesteps the governance gate",
+        "The worker is evading the sandbox by reading through the shell",
+        "it got around the write-root policy",
+    ] {
+        assert!(names_boundary_circumvention(yes), "{yes}");
+    }
+    for no in [
+        "x is wrong",
+        "off-by-one at the array boundary",
+        "bypass the cache on a cold start",
+        "the gate's denial text is stale",
+        "The cache bypass returns stale aggregate totals.",
+    ] {
+        assert!(!names_boundary_circumvention(no), "{no}");
+    }
+}
+
 /// DES-002 §8.8: a member's answer to a rejected step: `HOLD <step> — why` holds, `ACCEPT <step>`
 /// takes the rejection; neither (or another step's line) is no answer.
 #[test]
