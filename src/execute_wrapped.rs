@@ -2741,6 +2741,8 @@ impl WrappedCliStepRunner {
             let mut floor_env: Vec<(&'static str, PathBuf)> = Vec::new();
             // Container floor: the seat's gateway env and registration.
             let mut seat_gateway_env: Vec<(String, String)> = Vec::new();
+            // A copilot seat on its Copilot route: the account its sign-in may use (OD-1).
+            let mut copilot_account: Option<Option<crate::copilot_account::CopilotAccount>> = None;
             // Its placeholder credential files (C4), written once the seat's env names its home.
             let mut seat_files: Vec<(PathBuf, String)> = Vec::new();
             let mut gateway_lease: Option<crate::container_floor::GatewayLease> = None;
@@ -2905,6 +2907,7 @@ impl WrappedCliStepRunner {
                     Ok(c) => {
                         seat_cleanup = Some(c.cleanup);
                         seat_gateway_env = c.env;
+                        copilot_account = c.copilot_account;
                         seat_files = c.files;
                         gateway_lease = c.lease;
                         argv = c.argv;
@@ -3181,25 +3184,35 @@ impl WrappedCliStepRunner {
                 .iter()
                 .any(|(k, _)| k == "COPILOT_PROVIDER_BASE_URL")
             {
-                let args: Vec<String> = cmd
-                    .get_args()
-                    .map(|a| a.to_string_lossy().into_owned())
-                    .collect();
+                // The SEAT's argv, never the command's: the container wrapper ends in `--`, and
+                // copilot's flags after it would be invisible to the scan (codex review, OD-1).
+                let args: Vec<String> = argv.clone();
                 fn env_of(cmd: &Command, key: &str) -> Option<String> {
                     cmd.get_envs()
                         .find(|(k, _)| *k == key)
                         .and_then(|(_, v)| v)
                         .map(|v| v.to_string_lossy().into_owned())
                 }
-                // A seat that names no model gets the default (BYOK refuses to start without
-                // one, core#990); an explicit selection is never shadowed.
-                if let Some(model) =
-                    crate::seat_gateway::copilot_default_model(&args, |k| env_of(&cmd, k))
-                {
-                    cmd.env("COPILOT_MODEL", model);
+                // The seat runs a model its account may use (OD-1): a seat that names none gets
+                // the preferred allowed one (BYOK refuses to start without a model, core#990);
+                // an explicit selection is kept when allowed and refused by name otherwise.
+                let account = copilot_account.clone().flatten();
+                let selected = crate::copilot_account::selected_model(&args, |k| env_of(&cmd, k));
+                match crate::copilot_account::seat_model(selected.as_deref(), account.as_ref()) {
+                    Ok(Some(model)) => {
+                        cmd.env("COPILOT_MODEL", model);
+                    }
+                    Ok(None) => {}
+                    Err(why) => {
+                        eprintln!("wicked-core: unit {}: copilot: {why}", input.unit.ord);
+                        if let Some(lease) = gateway_lease.take() {
+                            let _ = lease.release();
+                        }
+                        return seat_model_refused(input, &cli_key, &why);
+                    }
                 }
                 if let Some(wire) =
-                    crate::seat_gateway::copilot_wire_api(&args, |k| env_of(&cmd, k))
+                    crate::copilot_account::wire_api(&args, |k| env_of(&cmd, k), account.as_ref())
                 {
                     cmd.env("COPILOT_PROVIDER_WIRE_API", wire);
                 }
@@ -5774,6 +5787,25 @@ pub(crate) fn floor_refused(
         unit_ix: input.unit_ix,
         attempt: input.attempt,
         output: crate::worker_sandbox::floor_refusal_text(cli_key, why),
+        status: StepStatus::Failed,
+        usage: None,
+        files: Vec::new(),
+        tools: Vec::new(),
+        governed: false,
+    }
+}
+
+/// The [`StepOutput`] for a copilot unit whose model its account may not use (or whose account
+/// is not resolved yet): nothing ran. Read as a seat failure, so the run fails over.
+pub(crate) fn seat_model_refused(input: &StepInput, cli_key: &str, why: &str) -> StepOutput {
+    StepOutput {
+        run_id: input.run_id.clone(),
+        unit_ix: input.unit_ix,
+        attempt: input.attempt,
+        output: format!(
+            "(seat '{cli_key}' could not run this governed unit: {why}; the unit is refused \
+             rather than sent to a model the account cannot use)"
+        ),
         status: StepStatus::Failed,
         usage: None,
         files: Vec::new(),

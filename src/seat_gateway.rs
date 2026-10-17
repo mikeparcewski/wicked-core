@@ -66,6 +66,12 @@ pub(crate) struct GatewayConfig {
     /// account's plan endpoint, e.g. `api.individual.githubcopilot.com`); absent = the default.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub(crate) copilot_hosts: std::collections::BTreeMap<String, String>,
+    /// The models the copilot CLI's sign-in may use, keyed by its route's credential file, as
+    /// the broker read them with that credential (identifiers, never credentials). A copilot
+    /// seat runs only one of these; absent = not resolved yet, and its units are refused.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) copilot_models:
+        std::collections::BTreeMap<String, crate::copilot_account::CopilotAccount>,
     /// Read-only: the single ChatGPT account an earlier engine persisted (codex's route). It is
     /// folded into [`Self::chatgpt_accounts`] on load and never written again.
     #[serde(default, rename = "chatgpt_account", skip_serializing)]
@@ -80,6 +86,8 @@ const CODEX_CHATGPT_FILE: &str = "openai.token";
 pub(crate) const UNIT_HEADER: &str = "x-wicked-unit";
 /// The Copilot API host a Copilot route uses when its credential names none.
 pub(crate) const COPILOT_DEFAULT_HOST: &str = "api.githubcopilot.com";
+/// The route file of the copilot CLI's own sign-in (its GitHub token).
+pub(crate) const COPILOT_CLI_FILE: &str = "copilot.token";
 
 /// A seat's revocable placeholder key and the identity authenticated requests carry.
 /// Its `Debug` implementation redacts the key so diagnostics cannot print it.
@@ -296,6 +304,7 @@ impl Default for GatewayConfig {
             mcp_upstream: None,
             chatgpt_accounts: Default::default(),
             copilot_hosts: Default::default(),
+            copilot_models: Default::default(),
             legacy_chatgpt_account: None,
         }
     }
@@ -398,6 +407,15 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
                     }
                     None => remove.push("chatgpt-account-id"),
                 }
+            }
+            if route.file_name() == COPILOT_CLI_FILE {
+                // copilot's BYOK mode sends no Copilot client headers; the route sends the CLI's
+                // own integration id, the one the broker listed the account's models with, so
+                // the models a seat may run are the ones these requests may use (OD-1).
+                set.insert(
+                    "copilot-integration-id".into(),
+                    json!(crate::copilot_account::INTEGRATION_ID),
+                );
             }
             let mut modifier = serde_json::Map::new();
             if !set.is_empty() {
@@ -1002,16 +1020,11 @@ pub(crate) fn seat_env_for_sign_in(
     env
 }
 
-/// The model a copilot seat runs when nothing on its argv or env names one (core#990): BYOK mode
-/// has no server model catalogue to pick from, and copilot exits before any call without a model
-/// ("BYOK providers require an explicit model"). A preference, not a promise: the models a
-/// Copilot account may use differ by plan and policy, and an operator picks another with
-/// `--model <id>` in the seat's `headless_invocation` (clis.toml).
-pub(crate) const COPILOT_SEAT_MODEL: &str = "gpt-5-mini";
-
 /// The model copilot's `--model X` / `--model=X` selects on `args`: the LAST one, as copilot
-/// takes it, never past a `--`.
-fn copilot_model_flag(args: &[String]) -> Option<String> {
+/// takes it, never past a `--`. A copilot seat with no selection is given one of its account's
+/// allowed models ([`crate::copilot_account::seat_model`]): BYOK mode has no server catalogue and
+/// refuses to start without a model (core#990).
+pub(crate) fn copilot_model_flag(args: &[String]) -> Option<String> {
     let mut model = None;
     let mut i = 0;
     while i < args.len() {
@@ -1030,21 +1043,6 @@ fn copilot_model_flag(args: &[String]) -> Option<String> {
     model
 }
 
-/// The default model a copilot BYOK seat needs (core#990): [`COPILOT_SEAT_MODEL`] when neither
-/// its argv (`--model`) nor its env (`COPILOT_MODEL`, `COPILOT_PROVIDER_MODEL_ID`) selects one,
-/// else `None`, so an explicit selection is never shadowed (codex review of core#990). Applied
-/// at the final resolution, where the seat's argv and env are complete.
-pub(crate) fn copilot_default_model(
-    args: &[String],
-    env: impl Fn(&str) -> Option<String>,
-) -> Option<&'static str> {
-    let named = |k: &str| env(k).is_some_and(|m| !m.is_empty());
-    (copilot_model_flag(args).is_none()
-        && !named("COPILOT_MODEL")
-        && !named("COPILOT_PROVIDER_MODEL_ID"))
-    .then_some(COPILOT_SEAT_MODEL)
-}
-
 /// The wire API copilot's BYOK mode must use for the model its seat sends, resolved as copilot
 /// does: `COPILOT_PROVIDER_WIRE_MODEL`, else the last `--model X`/`--model=X`, else
 /// `COPILOT_MODEL`, else `COPILOT_PROVIDER_MODEL_ID`. GPT models are served on `/responses`
@@ -1058,11 +1056,7 @@ pub(crate) fn copilot_wire_api(
     if env("COPILOT_PROVIDER_WIRE_API").is_some_and(|v| !v.is_empty()) {
         return None;
     }
-    let model = env("COPILOT_PROVIDER_WIRE_MODEL")
-        .filter(|m| !m.is_empty())
-        .or_else(|| copilot_model_flag(args))
-        .or_else(|| env("COPILOT_MODEL").filter(|m| !m.is_empty()))
-        .or_else(|| env("COPILOT_PROVIDER_MODEL_ID").filter(|m| !m.is_empty()))?;
+    let model = crate::copilot_account::selected_model(args, &env)?;
     model.starts_with("gpt-").then_some("responses")
 }
 
@@ -1167,11 +1161,13 @@ pub(crate) fn validate_copilot_host(host: &str) -> Result<(), String> {
 }
 
 /// The literals a sign-in publishes on its agent's routes, keyed by route credential file: each
-/// ChatGPT route's account id and each Copilot route's API host. Identifiers, never credentials.
+/// ChatGPT route's account id, each Copilot route's API host, and the models the copilot CLI's
+/// sign-in may use. Identifiers, never credentials.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RouteLiterals {
     pub(crate) accounts: Vec<(String, String)>,
     pub(crate) hosts: Vec<(String, String)>,
+    pub(crate) models: Vec<(String, crate::copilot_account::CopilotAccount)>,
 }
 
 impl RouteLiterals {
@@ -1188,6 +1184,12 @@ impl RouteLiterals {
             }
             validate_copilot_host(host)?;
         }
+        for (file, account) in &self.models {
+            if route_owner(file) != Some(cli) {
+                return Err(format!("{cli}: route {file} is not this agent's"));
+            }
+            account.validate()?;
+        }
         Ok(())
     }
 }
@@ -1200,7 +1202,7 @@ pub(crate) fn set_chatgpt_account(dir: &Path, account: Option<&str>) -> Result<(
         accounts: account
             .map(|a| vec![(CODEX_CHATGPT_FILE.to_string(), a.to_string())])
             .unwrap_or_default(),
-        hosts: Vec::new(),
+        ..Default::default()
     };
     set_route_literals_locked(dir, "codex", &literals)
 }
@@ -1219,6 +1221,9 @@ fn set_route_literals_locked(
     config
         .copilot_hosts
         .retain(|file, _| route_owner(file) != Some(cli));
+    config
+        .copilot_models
+        .retain(|file, _| route_owner(file) != Some(cli));
     for (file, account) in &literals.accounts {
         config
             .chatgpt_accounts
@@ -1226,6 +1231,9 @@ fn set_route_literals_locked(
     }
     for (file, host) in &literals.hosts {
         config.copilot_hosts.insert(file.clone(), host.clone());
+    }
+    for (file, account) in &literals.models {
+        config.copilot_models.insert(file.clone(), account.clone());
     }
     let mut settings = config.clone();
     settings.units.clear();
@@ -1251,10 +1259,28 @@ pub(crate) fn route_literals_current(
         v.sort();
         v
     };
+    let mut models: Vec<_> = literals.models.clone();
+    models.sort_by(|x, y| x.0.cmp(&y.0));
+    let owned_models: Vec<_> = config
+        .copilot_models
+        .iter()
+        .filter(|(f, _)| route_owner(f) == Some(cli))
+        .map(|(f, v)| (f.clone(), v.clone()))
+        .collect();
     Ok(
         owned(&config.chatgpt_accounts) == sorted(&literals.accounts)
-            && owned(&config.copilot_hosts) == sorted(&literals.hosts),
+            && owned(&config.copilot_hosts) == sorted(&literals.hosts)
+            && owned_models == models,
     )
+}
+
+/// The models the copilot CLI's sign-in may use, as last published on its route (`None` = not
+/// resolved yet, or no gateway config). Read by the unit that arms a copilot seat.
+pub(crate) fn copilot_account(dir: &Path) -> Option<crate::copilot_account::CopilotAccount> {
+    load_config(dir)
+        .ok()?
+        .copilot_models
+        .remove(COPILOT_CLI_FILE)
 }
 
 pub(crate) fn route_sign_in(
@@ -2376,43 +2402,21 @@ mod tests {
         assert_eq!(get("HTTPS_PROXY"), Some("http://agw:3000"));
         let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let none = |_: &str| None::<String>;
-        // core#990 (red on main): BYOK exits 1 without a model. The seat's env names none, so the
-        // final resolution supplies the default; any explicit selection keeps it out.
+        // core#990: BYOK exits 1 without a model, and the seat's env names none: the runner gives
+        // it one of its account's allowed models (`copilot_account::seat_model`, OD-1).
         assert_eq!(get("COPILOT_MODEL"), None);
         let seat = |k: &str| get(k).map(str::to_string);
         assert_eq!(
-            copilot_default_model(&argv(&["copilot", "-p", "x"]), seat),
-            Some(COPILOT_SEAT_MODEL)
-        );
-        for args in [
-            &["copilot", "--model", "claude-sonnet-5", "-p", "x"][..],
-            &["copilot", "--model=gpt-5.4"],
-        ] {
-            assert_eq!(copilot_default_model(&argv(args), none), None, "{args:?}");
-        }
-        let only =
-            |k: &'static str, v: &'static str| move |n: &str| (n == k).then(|| v.to_string());
-        assert_eq!(
-            copilot_default_model(&argv(&["copilot"]), only("COPILOT_MODEL", "gpt-5.4")),
+            crate::copilot_account::selected_model(&argv(&["copilot", "-p", "x"]), seat),
             None
         );
-        assert_eq!(
-            copilot_default_model(
-                &argv(&["copilot"]),
-                only("COPILOT_PROVIDER_MODEL_ID", "claude-sonnet-4")
-            ),
-            None,
-            "a model id alone is a selection; the default never shadows it"
-        );
-        assert_eq!(
-            copilot_default_model(&argv(&["copilot"]), only("COPILOT_MODEL", "")),
-            Some(COPILOT_SEAT_MODEL)
-        );
-        // The default's wire API (`gpt-*` → responses), as the seat resolves it after the default.
+        let only =
+            |k: &'static str, v: &'static str| move |n: &str| (n == k).then(|| v.to_string());
+        // An allowed model's wire API (`gpt-*` → responses), as the seat resolves it.
         assert_eq!(
             copilot_wire_api(
                 &argv(&["copilot", "-p", "x"]),
-                only("COPILOT_MODEL", COPILOT_SEAT_MODEL)
+                only("COPILOT_MODEL", "gpt-4.1")
             ),
             Some("responses")
         );
@@ -2626,6 +2630,27 @@ mod tests {
             bind(&rendered, 4008)["listeners"][0]["routes"][0]["backends"],
             json!([{"host": "api.business.githubcopilot.com:443"}])
         );
+        // OD-1: the copilot CLI's route targets its account's own Copilot API host, and sends the
+        // CLI's integration id (the one its models were listed with); pi's route sends its own.
+        assert_eq!(
+            backends(4012),
+            json!([{"host": "api.githubcopilot.com:443"}])
+        );
+        assert_eq!(
+            policies(4012)["requestHeaderModifier"]["set"],
+            json!({"copilot-integration-id": crate::copilot_account::INTEGRATION_ID})
+        );
+        assert!(policies(4008)["requestHeaderModifier"]["set"]
+            .get("copilot-integration-id")
+            .is_none());
+        config.copilot_hosts.insert(
+            COPILOT_CLI_FILE.into(),
+            "api.individual.githubcopilot.com".into(),
+        );
+        assert_eq!(
+            bind(&render(&config), 4012)["listeners"][0]["routes"][0]["backends"],
+            json!([{"host": "api.individual.githubcopilot.com:443"}])
+        );
         // The existing routes keep their native credential headers.
         assert_eq!(
             policies(4003)["apiKey"]["location"],
@@ -2659,6 +2684,7 @@ mod tests {
                 "pi.copilot.token".into(),
                 "api.individual.githubcopilot.com".into(),
             )],
+            models: Vec::new(),
         };
         set_route_literals_locked(&temp.0, "pi", &pi).unwrap();
         let after = load_config(&temp.0).unwrap();
@@ -2671,10 +2697,61 @@ mod tests {
         let after = load_config(&temp.0).unwrap();
         assert_eq!(after.chatgpt_accounts.len(), 1);
         assert!(after.copilot_hosts.is_empty());
+        // copilot's account (OD-1): its host and models are published together, read back by
+        // the unit that arms a copilot seat, compared as current, and cleared on sign-out.
+        let account = crate::copilot_account::CopilotAccount {
+            models: vec![crate::copilot_account::CopilotModel {
+                id: "gpt-4.1".into(),
+                endpoints: vec!["/responses".into()],
+                multiplier: None,
+                price: None,
+            }],
+            default: None,
+            resolved_at: 5,
+        };
+        let copilot = RouteLiterals {
+            hosts: vec![(
+                COPILOT_CLI_FILE.into(),
+                "api.individual.githubcopilot.com".into(),
+            )],
+            models: vec![(COPILOT_CLI_FILE.into(), account.clone())],
+            ..Default::default()
+        };
+        assert_eq!(copilot_account(&temp.0), None);
+        set_route_literals_locked(&temp.0, "copilot", &copilot).unwrap();
+        assert_eq!(copilot_account(&temp.0), Some(account.clone()));
+        assert!(route_literals_current(&temp.0, "copilot", &copilot).unwrap());
+        assert!(!route_literals_current(&temp.0, "copilot", &RouteLiterals::default()).unwrap());
+        assert!(
+            set_route_literals_locked(
+                &temp.0,
+                "pi",
+                &RouteLiterals {
+                    models: vec![(COPILOT_CLI_FILE.into(), account.clone())],
+                    ..Default::default()
+                }
+            )
+            .is_err(),
+            "pi can never set copilot's models"
+        );
+        let mut bad = account.clone();
+        bad.models[0].id = "gpt 4.1".into();
+        assert!(set_route_literals_locked(
+            &temp.0,
+            "copilot",
+            &RouteLiterals {
+                models: vec![(COPILOT_CLI_FILE.into(), bad)],
+                ..Default::default()
+            }
+        )
+        .is_err());
+        set_route_literals_locked(&temp.0, "copilot", &RouteLiterals::default()).unwrap();
+        assert_eq!(copilot_account(&temp.0), None);
         // One agent can never set another's route literal, nor an arbitrary host.
         let foreign = RouteLiterals {
             accounts: vec![("openai.token".into(), "acct-FAKE".into())],
             hosts: Vec::new(),
+            models: Vec::new(),
         };
         assert!(set_route_literals_locked(&temp.0, "pi", &foreign).is_err());
         for bad in [
@@ -3129,6 +3206,7 @@ esac
             mcp_upstream: None,
             chatgpt_accounts: Default::default(),
             copilot_hosts: Default::default(),
+            copilot_models: Default::default(),
             legacy_chatgpt_account: None,
         }
     }
@@ -3193,6 +3271,7 @@ esac
                 mcp_upstream: None,
                 chatgpt_accounts: Default::default(),
                 copilot_hosts: Default::default(),
+                copilot_models: Default::default(),
                 legacy_chatgpt_account: None,
             },
         )
