@@ -253,6 +253,29 @@ pub(crate) fn unit_admitted_roots(
     admitted_roots(posture, unit.notes_root.as_deref(), extra_write_roots)
 }
 
+/// (core#464, core#928) Whether a dispatched unit gets a NOTES ROOT: a read-only unit, and the QE
+/// unit (deliverable-roots for its interpreters), whose admitted roots are its notes root and its
+/// QE ledger root ([`unit_admitted_roots`]) — without one it had no place to stage a scratch file
+/// and lost its verdict to a refused `/tmp` write.
+pub(crate) fn takes_notes_root(unit: &WorkUnit) -> bool {
+    WritePosture::of(unit, true) == WritePosture::ReadOnly
+        || crate::qe_acceptance::carries_ledger_root(unit)
+}
+
+/// (core#928) The temp dir (`TMPDIR`/`TMP`/`TEMP`) a QE unit's worker is handed: `<notes root>/tmp`,
+/// inside a root its fence admits. The launcher's default (`<cwd>/tmp`) sits in the tree the
+/// deliverable-roots fence refuses, so every `mktemp` / `$TMPDIR` write the reviewer made to
+/// stage its verdict was refused. `None` for every other unit (their temp is unchanged).
+pub(crate) fn unit_scratch_tmp(unit: &WorkUnit) -> Option<PathBuf> {
+    if !crate::qe_acceptance::carries_ledger_root(unit) {
+        return None;
+    }
+    unit.notes_root
+        .as_deref()
+        .filter(|n| !n.trim().is_empty())
+        .map(|n| Path::new(n).join("tmp"))
+}
+
 /// The env spelling of [`admitted_roots`] for the hook-subprocess carrier: the roots joined
 /// with the platform's PATH separator, exactly as `WICKED_WRITE_ROOTS` is. `None` when a root
 /// contains the separator and cannot be joined — the launcher then arms an EMPTY list rather than
