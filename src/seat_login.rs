@@ -371,7 +371,13 @@ fn broker_files(cli: &str) -> Result<&'static [&'static str], String> {
             "opencode.copilot.host",
             "opencode.anthropic.key",
         ]),
-        "copilot" => Ok(&["copilot.token"]),
+        // The GitHub token, and the account's Copilot API host and models the broker read with
+        // it (`copilot_account`): identifiers beside the credential, emptied with it.
+        "copilot" => Ok(&[
+            "copilot.token",
+            crate::copilot_account::HOST_FILE,
+            crate::copilot_account::MODELS_FILE,
+        ]),
         _ => Err("unsupported login CLI".into()),
     }
 }
@@ -1489,6 +1495,18 @@ pub(crate) fn route_literals(
             literals.hosts.push((route.file.into(), host));
         }
     }
+    if cli == "copilot" {
+        let models = files
+            .iter()
+            .find(|(n, b)| n == crate::copilot_account::MODELS_FILE && !b.is_empty());
+        if let Some((_, bytes)) = models {
+            let account = crate::copilot_account::parse_models_file(bytes)
+                .ok_or("copilot: the stored Copilot model list is unreadable")?;
+            literals
+                .models
+                .push((crate::seat_gateway::COPILOT_CLI_FILE.into(), account));
+        }
+    }
     literals.validate(cli)?;
     Ok(literals)
 }
@@ -1746,11 +1764,25 @@ pub(crate) fn ingest_and_route(
         crate::seat_refresh::repair_refresh(rt, gw, dir, cli)?;
     }
     let imported = !session_committed(dir, cli)?;
-    let report = if imported {
+    let mut report = if imported {
         ingest(rt, gw, dir, cli, &volume)?
     } else {
         broker_report(rt, gw, cli)?
     };
+    // copilot: the account's Copilot API host and the models it may use, read with the new
+    // token (DES-SEAT-LOGIN-SUBSCRIPTIONS OD-1). A failed read does not undo the sign-in: it is
+    // shown on the tab, its units are refused by name, and the refresh pass retries it.
+    let mut account_error = None;
+    if cli == "copilot" {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        match crate::seat_refresh::resolve_copilot(rt, gw, dir, now) {
+            Ok(_) => report.literals = broker_report(rt, gw, cli)?.literals,
+            Err(e) => account_error = Some((now, format!("reading the Copilot account: {e}"))),
+        }
+    }
     crate::seat_gateway::route_sign_in(rt, gw, dir, cli, &report.literals)?;
     crate::seat_gateway::remove_broker_file(rt, gw, dir, cli, &format!("{cli}.ingest.next"))?;
     crate::seat_refresh::clear_pending(dir, cli)?;
@@ -1765,7 +1797,17 @@ pub(crate) fn ingest_and_route(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.to_string()),
     }
-    if imported {
+    if let Some((at, error)) = account_error {
+        crate::seat_refresh::record_last(
+            dir,
+            cli,
+            Some(&crate::seat_refresh::LastRefresh {
+                ok: false,
+                at,
+                error: Some(error),
+            }),
+        );
+    } else if imported {
         crate::seat_refresh::record_last(dir, cli, None);
     }
     // codex lg-r3 R4: only a committed sign-in may supersede a sign-out intent.
@@ -4146,6 +4188,38 @@ esac
             status_from_files("copilot", &[], 100),
             BrokerStatus::SignedOut
         );
+        // OD-1: the account the broker read beside the token becomes the route's literals (its
+        // host and models); the account files alone are no sign-in.
+        let account = crate::copilot_account::account_models(
+            &json!({"data": [{"id": "gpt-4.1", "capabilities": {"type": "chat"}}]}),
+            9,
+        )
+        .unwrap();
+        let mut with = files.clone();
+        with.extend(
+            crate::copilot_account::account_files("api.individual.githubcopilot.com", &account)
+                .unwrap(),
+        );
+        assert_eq!(broker_files("copilot").unwrap().len(), 3);
+        let literals = route_literals("copilot", &with).unwrap();
+        assert_eq!(
+            literals.hosts,
+            vec![(
+                "copilot.token".to_string(),
+                "api.individual.githubcopilot.com".to_string()
+            )]
+        );
+        assert_eq!(
+            literals.models,
+            vec![("copilot.token".to_string(), account)]
+        );
+        assert_eq!(
+            status_from_files("copilot", &with[1..], 100),
+            BrokerStatus::SignedOut
+        );
+        assert!(
+            route_literals("copilot", &[("copilot.models".to_string(), b"{".to_vec())]).is_err()
+        );
         let ghe = copilot_config().replace("https://github.com", "https://corp.ghe.com");
         assert!(extract_tokens("copilot", &cfg(ghe))
             .unwrap_err()
@@ -4818,6 +4892,7 @@ esac
             literals: crate::seat_gateway::RouteLiterals {
                 accounts: vec![("openai.token".into(), "FAKE-account-id".into())],
                 hosts: Vec::new(),
+                models: Vec::new(),
             },
         };
         // The account id rides to the gateway config only; never into the report's output.
@@ -4934,6 +5009,7 @@ esac
                 mcp_upstream: None,
                 chatgpt_accounts: Default::default(),
                 copilot_hosts: Default::default(),
+                copilot_models: Default::default(),
                 legacy_chatgpt_account: None,
             },
         )
@@ -5821,9 +5897,11 @@ esac
     /// credentials. Its login's `config.json` is ingested; the real copilot 1.0.96 CLI runs in
     /// its BYOK mode with only the env arming renders (the unit key as its bearer) and reaches a
     /// stub upstream through the Copilot route, which sees the broker's GitHub token, never the
-    /// unit key; pi's unit is refused there; sign-out empties the route. core#990: the seat's
-    /// argv names no model (as a governed unit's does), the env's default model is sent on the
-    /// wire API it needs, and the turn completes (exit 0) on the stub's answer.
+    /// unit key; pi's unit is refused there; sign-out empties the route. OD-1: at sign-in the
+    /// broker reads the account's Copilot API host and models with the token (from the stub);
+    /// the seat's argv names no model (as a governed unit's does), so it is given the preferred
+    /// model the account allows, sent on the wire API it needs, and the turn completes (exit 0)
+    /// on the stub's answer.
     #[cfg(unix)]
     #[test]
     fn live_copilot_sign_in_reaches_the_upstream_only_through_its_route() {
@@ -5854,7 +5932,15 @@ esac
             "const h=require('http');let n=0;h.createServer((q,r)=>{let b='';\
              q.on('data',d=>b+=d);q.on('end',()=>{let m='';try{m=JSON.parse(b).model||''}catch{}\
              console.log('UPSTREAM '+JSON.stringify({url:q.url,auth:q.headers['authorization']||'',\
-             model:m}));if(q.method!=='POST'||!/responses$/.test(q.url)){r.statusCode=404;\
+             model:m,cii:q.headers['copilot-integration-id']||''}));\
+             if(q.method==='GET'&&q.url==='/copilot_internal/user')return r.end(JSON.stringify(\
+             {login:'fake-user',endpoints:{api:'https://api.individual.githubcopilot.com'}}));\
+             if(q.method==='GET'&&q.url==='/models')return r.end(JSON.stringify({data:[\
+             {id:'gpt-5-mini',capabilities:{type:'chat'},policy:{state:'unconfigured'}},\
+             {id:'gpt-4.1',capabilities:{type:'chat'},policy:{state:'enabled'},\
+             model_picker_enabled:true,supported_endpoints:['/chat/completions','/responses']},\
+             {id:'text-embedding-3-small',capabilities:{type:'embeddings'}}]}));\
+             if(q.method!=='POST'||!/responses$/.test(q.url)){r.statusCode=404;\
              return r.end('{}')}n++;r.setHeader('content-type','text/event-stream');\
              const ev=(t,d)=>r.write('event: '+t+'\\ndata: '+JSON.stringify({type:t,...d})+'\\n\\n');\
              const item={type:'message',id:'msg_'+n,role:'assistant',status:'completed',\
@@ -6060,7 +6146,14 @@ esac
         }
         run(&["rm", "-f", &ghstub]);
         write_session(&dir, "copilot", &volume).unwrap();
-        let report = ingest_and_route(&rt, &gw, &dir, "copilot").expect("ingested");
+        // OD-1: the broker reads the account (its Copilot API host, its models) with the token
+        // at sign-in; both reads go to the stub here.
+        *crate::seat_refresh::COPILOT_TEST_ORIGIN.lock().unwrap() =
+            Some(format!("http://{stub}:8080"));
+        let report = ingest_and_route(&rt, &gw, &dir, "copilot");
+        *crate::seat_refresh::COPILOT_TEST_ORIGIN.lock().unwrap() = None;
+        let report = report.expect("ingested");
+        let account = crate::seat_gateway::copilot_account(&dir);
         let sign_in = seat_sign_in(&rt, &gw, &dir, "copilot").expect("copilot is signed in");
         let upstream = || {
             let o = run(&["logs", &stub]);
@@ -6108,11 +6201,16 @@ esac
         let env_of = |env: &Vec<(String, String)>, k: &str| {
             env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
         };
-        if let Some(model) = crate::seat_gateway::copilot_default_model(&argv, |k| env_of(&env, k))
+        let refused = crate::copilot_account::seat_model(Some("gpt-5-mini"), account.as_ref());
+        let selected = crate::copilot_account::selected_model(&argv, |k| env_of(&env, k));
+        if let Some(model) =
+            crate::copilot_account::seat_model(selected.as_deref(), account.as_ref()).unwrap()
         {
-            env.push(("COPILOT_MODEL".into(), model.into()));
+            env.push(("COPILOT_MODEL".into(), model));
         }
-        if let Some(wire) = crate::seat_gateway::copilot_wire_api(&argv, |k| env_of(&env, k)) {
+        if let Some(wire) =
+            crate::copilot_account::wire_api(&argv, |k| env_of(&env, k), account.as_ref())
+        {
             env.push(("COPILOT_PROVIDER_WIRE_API".into(), wire.into()));
         }
         let mut docker: Vec<String> = [
@@ -6197,12 +6295,41 @@ esac
             model_call["auth"], "Bearer gho_FAKEcopilotlogin000000000000000000",
             "the token copilot's own login stored, from the broker"
         );
-        // core#990: with no model in its argv the seat sends the default one, and the turn ends.
+        // OD-1: the account was read with the brokered token, its host is the route's, and with
+        // no model in its argv the seat sends the preferred model the account allows (gpt-5-mini
+        // is unconfigured on this account), with the CLI's integration id; the turn ends.
+        for path in ["/copilot_internal/user", "/models"] {
+            let read = lines
+                .iter()
+                .find(|v| v["url"] == path)
+                .unwrap_or_else(|| panic!("the broker read {path}: {seen}"));
+            assert_eq!(
+                read["auth"],
+                "Bearer gho_FAKEcopilotlogin000000000000000000"
+            );
+        }
         assert_eq!(
-            model_call["model"],
-            crate::seat_gateway::COPILOT_SEAT_MODEL,
-            "{seen}"
+            lines.iter().find(|v| v["url"] == "/models").unwrap()["cii"],
+            crate::copilot_account::INTEGRATION_ID
         );
+        assert_eq!(
+            report.literals.hosts,
+            vec![(
+                "copilot.token".to_string(),
+                "api.individual.githubcopilot.com".to_string()
+            )]
+        );
+        let ids: Vec<_> = account
+            .as_ref()
+            .expect("the account was resolved at sign-in")
+            .models
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
+        assert_eq!(ids, ["gpt-4.1"]);
+        assert!(refused.unwrap_err().contains("allowed: gpt-4.1"));
+        assert_eq!(model_call["model"], "gpt-4.1", "{seen}");
+        assert_eq!(model_call["cii"], crate::copilot_account::INTEGRATION_ID);
         assert!(
             !copilot_out.contains("require an explicit model"),
             "{copilot_out}"

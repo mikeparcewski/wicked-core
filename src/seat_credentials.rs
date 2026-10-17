@@ -147,7 +147,8 @@ pub(crate) const SUBSCRIPTION_ROUTES: &[SubscriptionRoute] = {
             file: "copilot.token",
             unit_header: None,
             account_file: None,
-            host_file: None,
+            // The account's Copilot API host, read by the broker with the token (OD-1).
+            host_file: Some(crate::copilot_account::HOST_FILE),
             record_key: "github",
         },
     ]

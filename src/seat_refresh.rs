@@ -33,8 +33,9 @@ pub(crate) const REFRESH_MARGIN_SECS: u64 = 15 * 60;
 const PASS_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 /// The pinned OSS image the token request runs in (curl verifies TLS against its CA bundle).
 pub(crate) const REFRESH_IMAGE: &str = "curlimages/curl:8.11.1";
-/// The agents whose sign-in is an OAuth record the broker can refresh.
-pub(crate) const REFRESHABLE: &[&str] = &["claude", "codex", "pi", "opencode"];
+/// The agents whose sign-in the broker's pass keeps current: an OAuth record it refreshes, or
+/// (copilot) the account's Copilot API host and models it re-reads with the GitHub token.
+pub(crate) const REFRESHABLE: &[&str] = &["claude", "codex", "pi", "opencode", "copilot"];
 
 /// One provider's refresh flow.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +82,35 @@ fn test_url() -> Option<String> {
 /// a refresh token only ever goes to the provider.
 #[cfg(test)]
 pub(crate) static TEST_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// (tests) The stub origin serving both copilot account reads (`/copilot_internal/user`,
+/// `/models`). No production override: the GitHub token only goes to GitHub and the account's
+/// own validated Copilot API host.
+#[cfg(test)]
+pub(crate) static COPILOT_TEST_ORIGIN: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+/// The two reads that resolve a copilot sign-in's account (DES-SEAT-LOGIN-SUBSCRIPTIONS OD-1),
+/// as the copilot CLI makes them: GitHub names the account's Copilot API, which lists the
+/// models. `host` = `None` builds the first; `Some(host)` the second, at that validated host.
+pub(crate) fn copilot_account_request(token: &str, host: Option<&str>) -> Request {
+    use crate::copilot_account::{MODELS_HEADERS, USER_HEADERS, USER_URL};
+    #[cfg(test)]
+    let origin = COPILOT_TEST_ORIGIN.lock().ok().and_then(|o| o.clone());
+    #[cfg(not(test))]
+    let origin: Option<String> = None;
+    let (url, headers) = match (host, origin) {
+        (None, Some(o)) => (format!("{o}/copilot_internal/user"), USER_HEADERS),
+        (None, None) => (USER_URL.to_string(), USER_HEADERS),
+        (Some(_), Some(o)) => (format!("{o}/models"), MODELS_HEADERS),
+        (Some(h), None) => (format!("https://{h}/models"), MODELS_HEADERS),
+    };
+    Request::BearerGet {
+        url,
+        token: token.to_string(),
+        headers: headers.to_vec(),
+    }
+}
 
 /// The broker file that retains `cli`'s whole OAuth record.
 pub(crate) fn record_file(cli: &str) -> Option<&'static str> {
@@ -948,6 +978,9 @@ mod live {
         if crate::seat_login::complete_sign_out(rt, gw, dir, cli)? {
             return Ok(Outcome::NotRefreshable);
         }
+        if cli == "copilot" {
+            return copilot_pass(rt, gw, dir, force);
+        }
         let (Some(flow), Some(file)) = (
             // Multi-entry records' flows are per entry ([`next_refresh`]); claude's stands in for
             // the record-level checks below.
@@ -1093,6 +1126,114 @@ mod live {
         }
     }
 
+    /// copilot's pass (caller holds the mutation lock): re-read the account when it was never
+    /// read, or was read [`RESOLVE_EVERY_SECS`](crate::copilot_account::RESOLVE_EVERY_SECS) ago,
+    /// or with `force`. A failed read keeps what was published before and is shown on the tab.
+    fn copilot_pass(
+        rt: &Runtime,
+        gw: &Gateway,
+        dir: &Path,
+        force: bool,
+    ) -> Result<Outcome, String> {
+        let cli = "copilot";
+        crate::seat_login::repair_ingest(rt, gw, dir, cli)?;
+        if crate::seat_login::signin_pending(dir, cli) {
+            return Err("sign-in incomplete; retry ingest first".into());
+        }
+        let now = unix_now();
+        let fresh = crate::seat_gateway::copilot_account(dir).is_some_and(|a| {
+            a.resolved_at <= now
+                && now
+                    < a.resolved_at
+                        .saturating_add(crate::copilot_account::RESOLVE_EVERY_SECS)
+        });
+        // An account whose publication did not complete is read and published again, however
+        // recent its `resolved_at` (codex review: the literal is persisted before the gateway
+        // has it).
+        if fresh && !force && !literals_pending_path(dir, cli).exists() {
+            return Ok(Outcome::NotDue { expires_at: None });
+        }
+        match resolve_copilot(rt, gw, dir, now) {
+            Ok(true) => {
+                record_last(
+                    dir,
+                    cli,
+                    Some(&LastRefresh {
+                        ok: true,
+                        at: now,
+                        error: None,
+                    }),
+                );
+                Ok(Outcome::Refreshed { expires_at: None })
+            }
+            Ok(false) => Ok(Outcome::NotRefreshable),
+            Err(e) => {
+                let e = format!("reading the Copilot account: {e}");
+                record_last(
+                    dir,
+                    cli,
+                    Some(&LastRefresh {
+                        ok: false,
+                        at: now,
+                        error: Some(e.clone()),
+                    }),
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Read the copilot sign-in's account with the brokered GitHub token, keep it beside the
+    /// token and publish it on the route (caller holds the mutation lock). `Ok(false)` = signed
+    /// out. Errors name the step and status only, never an answer or the token.
+    pub(crate) fn resolve_copilot(
+        rt: &Runtime,
+        gw: &Gateway,
+        dir: &Path,
+        now: u64,
+    ) -> Result<bool, String> {
+        let cli = "copilot";
+        let Some(token) =
+            crate::seat_login::read_broker_record(rt, gw, crate::seat_gateway::COPILOT_CLI_FILE)?
+        else {
+            return Ok(false);
+        };
+        let token = String::from_utf8(token).map_err(|_| "invalid credential token")?;
+        let token = token.trim();
+        let user = send(
+            rt,
+            dir,
+            cli,
+            &gw.external_network,
+            &copilot_account_request(token, None),
+        )
+        .map_err(|e| format!("copilot_internal/user: {e}"))?;
+        let host = crate::copilot_account::api_host(&user)?;
+        let list = send(
+            rt,
+            dir,
+            cli,
+            &gw.external_network,
+            &copilot_account_request(token, Some(&host)),
+        )
+        .map_err(|e| format!("{host}/models: {e}"))?;
+        let account = crate::copilot_account::account_models(&list, now)?;
+        let files = crate::copilot_account::account_files(&host, &account)?;
+        for (name, bytes) in &files {
+            crate::seat_gateway::set_broker_credential(rt, gw, dir, cli, name, bytes)?;
+        }
+        let literals = crate::seat_login::route_literals(cli, &files)?;
+        // Journal the publication: its marker outlives a failed or interrupted publish, so the
+        // next pass publishes again instead of trusting the persisted `resolved_at`.
+        let marker = literals_pending_path(dir, cli);
+        if !marker.exists() {
+            create_private_file(&marker, b"route literals unpublished")?;
+        }
+        crate::seat_gateway::route_sign_in(rt, gw, dir, cli, &literals)?;
+        remove_private_file(&marker)?;
+        Ok(true)
+    }
+
     /// Start the daemon's refresher loop for gateway dir `dir`, once per process: a first pass
     /// runs now (a credential that expired between runs is refreshed before the seat starts),
     /// then one every [`PASS_EVERY`].
@@ -1128,7 +1269,7 @@ mod live {
 #[cfg(all(unix, test))]
 pub(crate) use live::request_argv;
 #[cfg(unix)]
-pub(crate) use live::{refresh, start};
+pub(crate) use live::{refresh, resolve_copilot, start};
 
 #[cfg(test)]
 mod tests {

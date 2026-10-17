@@ -1985,6 +1985,10 @@ pub(crate) struct ArmedContainer {
     pub(crate) files: Vec<(PathBuf, String)>,
     /// The seat's gateway registration, released after the unit ([`GatewayLease::release`]).
     pub(crate) lease: Option<GatewayLease>,
+    /// A copilot seat on its Copilot route: the account its sign-in may use, as published on
+    /// that route (`Some(None)` = not resolved yet); `None` for every other seat. The runner
+    /// gives the seat one of its models, or refuses the unit by name (OD-1).
+    pub(crate) copilot_account: Option<Option<crate::copilot_account::CopilotAccount>>,
 }
 
 /// How many times a lease retries an unconfirmed revocation before quarantining the gateway.
@@ -2218,52 +2222,58 @@ pub(crate) fn arm(
     // fresh placeholder key. No gateway dir (an engine with no state home) = no egress at all.
     gateway_route_defined(cli, gateway_dir.is_some() && network != "none")
         .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
-    let (env, files, lease, seat_args) = match gateway_dir.filter(|_| network != "none") {
-        Some(dir) => {
-            let down = |e: String| (FloorUnarmed::GatewayUnavailable, e);
-            let gw = crate::seat_gateway::ensure_gateway(&rt, dir).map_err(down)?;
-            // The broker's one refresher runs beside this daemon's gateway (a credential that
-            // expired between runs is refreshed before the seat starts).
-            #[cfg(unix)]
-            crate::seat_refresh::start(&rt, &gw, dir);
-            // The agent's sign-in (DES §6): the user signed in once in its login container, and
-            // the broker holds that credential. The seat's placeholder takes its shape and its
-            // requests ride its route; signed out (or expired) = refused before the seat starts.
-            let kind = crate::seat_login::seat_sign_in(&rt, &gw, dir, cli)
-                .map_err(|e| (FloorUnarmed::AgentSignedOut, e))?;
-            crate::seat_gateway::attach(&rt, &gw, &network).map_err(down)?;
-            // The seat's namespace: a sidecar allows output only to the gateway's own address on
-            // its ports (an internal network alone still reaches the VM host's services).
-            let gw_ip = gateway_ip(&rt, &gw.name, &network).map_err(down)?;
-            start_netns_sidecar(&rt, &name, &network, &gw_ip).map_err(down)?;
-            // One execution's identity (codex gw-r1 P3): a retry or a reviewer session of the
-            // same unit ordinal never reads another execution's requests as its own.
-            let unit = format!(
-                "{run_id}#{ord}@{}",
-                &uuid::Uuid::new_v4().simple().to_string()[..8]
-            );
-            // The route a sign-in needs on the CLI's own argv (codex + ChatGPT: its provider).
-            let seat_args = crate::seat_gateway::seat_args_for(cli, kind.kind);
-            let (key, env, files) = placeholder_handoff(cli, kind, run_id, &unit);
-            let since = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs().saturating_sub(1).to_string())
-                .unwrap_or_default();
-            // The lease owns the key BEFORE the first registration step (codex gw-r2 P2): a
-            // failed persist, publish or readiness check drops it, which revokes the key.
-            let lease = GatewayLease {
-                runtime: rt.clone(),
-                dir: dir.to_path_buf(),
-                gateway: gw.clone(),
-                key: key.key.clone(),
-                unit,
-                since,
-            };
-            crate::seat_gateway::register_live(&rt, &gw, dir, key.clone()).map_err(down)?;
-            (env, files, Some(lease), seat_args)
-        }
-        None => (Vec::new(), Vec::new(), None, Vec::new()),
-    };
+    let (env, files, lease, seat_args, copilot_account) =
+        match gateway_dir.filter(|_| network != "none") {
+            Some(dir) => {
+                let down = |e: String| (FloorUnarmed::GatewayUnavailable, e);
+                let gw = crate::seat_gateway::ensure_gateway(&rt, dir).map_err(down)?;
+                // The broker's one refresher runs beside this daemon's gateway (a credential that
+                // expired between runs is refreshed before the seat starts).
+                #[cfg(unix)]
+                crate::seat_refresh::start(&rt, &gw, dir);
+                // The agent's sign-in (DES §6): the user signed in once in its login container, and
+                // the broker holds that credential. The seat's placeholder takes its shape and its
+                // requests ride its route; signed out (or expired) = refused before the seat starts.
+                let kind = crate::seat_login::seat_sign_in(&rt, &gw, dir, cli)
+                    .map_err(|e| (FloorUnarmed::AgentSignedOut, e))?;
+                crate::seat_gateway::attach(&rt, &gw, &network).map_err(down)?;
+                // The seat's namespace: a sidecar allows output only to the gateway's own address on
+                // its ports (an internal network alone still reaches the VM host's services).
+                let gw_ip = gateway_ip(&rt, &gw.name, &network).map_err(down)?;
+                start_netns_sidecar(&rt, &name, &network, &gw_ip).map_err(down)?;
+                // One execution's identity (codex gw-r1 P3): a retry or a reviewer session of the
+                // same unit ordinal never reads another execution's requests as its own.
+                let unit = format!(
+                    "{run_id}#{ord}@{}",
+                    &uuid::Uuid::new_v4().simple().to_string()[..8]
+                );
+                // The route a sign-in needs on the CLI's own argv (codex + ChatGPT: its provider).
+                let seat_args = crate::seat_gateway::seat_args_for(cli, kind.kind);
+                let copilot_account = (cli == "copilot"
+                    && kind
+                        .subscriptions
+                        .contains(&crate::seat_credentials::Subscription::Copilot))
+                .then(|| crate::seat_gateway::copilot_account(dir));
+                let (key, env, files) = placeholder_handoff(cli, kind, run_id, &unit);
+                let since = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs().saturating_sub(1).to_string())
+                    .unwrap_or_default();
+                // The lease owns the key BEFORE the first registration step (codex gw-r2 P2): a
+                // failed persist, publish or readiness check drops it, which revokes the key.
+                let lease = GatewayLease {
+                    runtime: rt.clone(),
+                    dir: dir.to_path_buf(),
+                    gateway: gw.clone(),
+                    key: key.key.clone(),
+                    unit,
+                    since,
+                };
+                crate::seat_gateway::register_live(&rt, &gw, dir, key.clone()).map_err(down)?;
+                (env, files, Some(lease), seat_args, copilot_account)
+            }
+            None => (Vec::new(), Vec::new(), None, Vec::new(), None),
+        };
     let user = operator_user();
     let workdir = inp.cwd.canonicalize().unwrap_or_else(|_| inp.cwd.clone());
     let memory = std::env::var(MEMORY_ENV).ok();
@@ -2302,6 +2312,7 @@ pub(crate) fn arm(
         env,
         files,
         lease,
+        copilot_account,
     })
 }
 
