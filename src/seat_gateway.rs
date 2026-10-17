@@ -915,7 +915,8 @@ pub(crate) fn seat_env_for(cli: &str, kind: CredentialKind, bearer: &str) -> Vec
     env
 }
 
-/// The model provider id a codex seat signed in with ChatGPT uses (core#989).
+/// The prefix of the model provider id a codex seat signed in with ChatGPT uses (core#989); each
+/// execution's id adds a fresh suffix ([`seat_args_for`]).
 pub(crate) const CODEX_GATEWAY_PROVIDER: &str = "wicked-gateway";
 
 /// The CLI arguments a seat signed in with `kind` needs to reach its route, appended to its argv
@@ -931,6 +932,11 @@ pub(crate) const CODEX_GATEWAY_PROVIDER: &str = "wicked-gateway";
 /// discovered https origin, around the gateway. A custom provider is not routed
 /// (`supports_codex_backend_routes` is the built-in provider's alone), so the gateway stays the
 /// only path and the broker's credential the only one upstream.
+///
+/// The provider id is fresh per execution (`wicked-gateway-<hex>`): codex MERGES an override
+/// table into a same-named table of its config layers, so a provider table a seat left in its
+/// own config home (an `env_key`, an `experimental_bearer_token`) would otherwise change how this
+/// one authenticates (codex review of core#989).
 pub(crate) fn seat_args_for(cli: &str, kind: Option<CredentialKind>) -> Vec<String> {
     match (cli, kind) {
         ("codex", Some(CredentialKind::CodexChatgpt)) => {
@@ -938,7 +944,8 @@ pub(crate) fn seat_args_for(cli: &str, kind: Option<CredentialKind>) -> Vec<Stri
                 "{}/backend-api/codex",
                 credential_gateway_url(cli, CredentialKind::CodexChatgpt)
             );
-            let p = CODEX_GATEWAY_PROVIDER;
+            let nonce = uuid::Uuid::new_v4().simple().to_string();
+            let p = format!("{CODEX_GATEWAY_PROVIDER}-{}", &nonce[..12]);
             vec![
                 "-c".into(),
                 format!("model_provider=\"{p}\""),
@@ -3592,14 +3599,29 @@ esac
     #[test]
     fn a_chatgpt_codex_seat_uses_its_own_provider_at_the_route() {
         let args = seat_args_for("codex", Some(CredentialKind::CodexChatgpt));
+        // A fresh provider id per execution, so no table in the seat's config layers merges in.
+        let id = args[1]
+            .strip_prefix("model_provider=\"")
+            .and_then(|r| r.strip_suffix('"'))
+            .expect("the provider selection")
+            .to_string();
+        let suffix = id
+            .strip_prefix(&format!("{CODEX_GATEWAY_PROVIDER}-"))
+            .expect("the provider id prefix");
+        assert!(
+            suffix.len() == 12 && suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "{id}"
+        );
+        let again = seat_args_for("codex", Some(CredentialKind::CodexChatgpt));
+        assert_ne!(args[1], again[1], "a fresh id per execution");
         assert_eq!(
             args,
             vec![
                 "-c".to_string(),
-                format!("model_provider=\"{CODEX_GATEWAY_PROVIDER}\""),
+                format!("model_provider=\"{id}\""),
                 "-c".into(),
                 format!(
-                    "model_providers.{CODEX_GATEWAY_PROVIDER}={{name=\"wicked gateway\",\
+                    "model_providers.{id}={{name=\"wicked gateway\",\
                      base_url=\"http://agw:4002/backend-api/codex\",wire_api=\"responses\",\
                      requires_openai_auth=true}}"
                 ),

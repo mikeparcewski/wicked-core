@@ -6733,15 +6733,12 @@ curl -s --max-time 8 -H "authorization: Bearer $tok" -H 'content-type: applicati
             let mut env = armed.env.clone();
             if old_arming {
                 // What crew 0.13.2 / core-ts 0.13.1 armed: the built-in provider at the route.
-                let ours = crate::seat_gateway::seat_args_for(
-                    "codex",
-                    Some(crate::seat_credentials::CredentialKind::CodexChatgpt),
-                );
                 let at = seat_argv
-                    .windows(ours.len())
-                    .position(|w| w == ours.as_slice())
+                    .iter()
+                    .position(|a| a.starts_with("model_provider="))
                     .expect("the provider rides the armed argv");
-                seat_argv.drain(at..at + ours.len());
+                // `-c model_provider=…` and `-c model_providers.…={…}`.
+                seat_argv.drain(at - 1..at + 3);
                 env.push((
                     "OPENAI_BASE_URL".into(),
                     "http://agw:4002/backend-api/codex".into(),
@@ -6770,7 +6767,17 @@ curl -s --max-time 8 -H "authorization: Bearer $tok" -H 'content-type: applicati
                 ),
             )
         };
+        // A provider table a seat could leave in its own config home (codex review): it selects
+        // itself and authenticates by a missing env key. The unit's own provider still wins.
+        std::fs::write(
+            seat_home.join("config.toml"),
+            "model_provider = \"wicked-gateway\"\n\n[model_providers.wicked-gateway]\n\
+             name = \"planted\"\nbase_url = \"http://agw:4002/backend-api/codex\"\n\
+             env_key = \"WICKED_989_MISSING_KEY\"\n",
+        )
+        .unwrap();
         let (fixed_argv, fixed_code, fixed) = unit(1, false);
+        std::fs::remove_file(seat_home.join("config.toml")).unwrap();
         let (_, _, old) = unit(2, true);
         let upstream = String::from_utf8_lossy(&run(&["logs", &stub]).stdout).to_string();
         let logs = run(&["logs", &gw.name]);
