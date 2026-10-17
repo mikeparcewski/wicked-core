@@ -1306,6 +1306,92 @@ fn fallback_parties<'a>(excluded: &[&'a str], work_authors: &'a [String]) -> Vec
     out
 }
 
+/// (core#954, operator decision 2026-10-17) Widen an evaluator unit's judge exclusion with the
+/// work's `creators` when a judge distinct from all of them remains (`has_judge`, asked of the
+/// widened set over the path's own eligible seats). When none does, `excluded` is left as it was
+/// and the reason is returned: the rotation then judges as before, and a creator that judges is
+/// disclosed ([`disclose_creator_judge`]) — never silently.
+fn exclude_creators<'a>(
+    excluded: &mut Vec<&'a str>,
+    creators: &'a [String],
+    has_judge: impl Fn(&[&str]) -> bool,
+) -> Option<String> {
+    if creators.is_empty() {
+        return None;
+    }
+    let mut widened = excluded.clone();
+    widened.extend(
+        creators
+            .iter()
+            .map(String::as_str)
+            .filter(|c| !excluded.contains(c)),
+    );
+    if has_judge(&widened) {
+        *excluded = widened;
+        return None;
+    }
+    Some(format!(
+        "no eligible judge seat distinct from the work's creators [{}]",
+        creators.join(", ")
+    ))
+}
+
+/// (core#954) Who the work's creators are, for [`disclose_creator_judge`]: their seat keys (instance
+/// and cli key) and every identity they ran — resolved from the registry and recorded at dispatch.
+struct CreatorIds<'a> {
+    keys: &'a [String],
+    ids: Vec<String>,
+    roster: &'a [crate::AgenticCli],
+}
+
+impl<'a> CreatorIds<'a> {
+    fn of(keys: &'a [String], binaries: &[String], roster: &'a [crate::AgenticCli]) -> Self {
+        let k: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let mut ids = author_identities(&k, roster);
+        ids.extend(binaries.iter().cloned());
+        CreatorIds { keys, ids, roster }
+    }
+
+    fn names(&self, seat: &str) -> bool {
+        let cli = wicked_apps_core::spawn::seat_cli_key(seat);
+        self.keys.iter().any(|k| k == seat || k == cli)
+            || self
+                .ids
+                .contains(&crate::validator::excluded_identity(seat, self.roster))
+    }
+}
+
+/// (core#954) A verdict the rotation rendered after [`exclude_creators`] found no judge distinct
+/// from the work's creators: labelled on the gate, its receipt and the delivery receipt as a
+/// [`crate::assurance::JudgeFallback`] (no preferred seat — there was none), `judgeDistinct: false`,
+/// and named in the run's live output. A verdict no seat rendered, or one a fallback seat already
+/// labels, passes through.
+fn disclose_creator_judge(
+    mut av: crate::validator::AgentVerdict,
+    seat: Option<String>,
+    creator_fallback: Option<&str>,
+    creators: &CreatorIds<'_>,
+    emit_delta: &DeltaSink,
+) -> crate::validator::AgentVerdict {
+    let (Some(why), Some(seat), None) = (creator_fallback, seat, &av.judge_fallback) else {
+        return av;
+    };
+    if !creators.names(&seat) {
+        return av;
+    }
+    let fb = crate::assurance::JudgeFallback {
+        label: format!("judge: {seat} (creator fallback; {why})"),
+        seat,
+        preferred: Vec::new(),
+        reason: why.to_string(),
+    };
+    engine_note(emit_delta, &fb.label);
+    eprintln!("wicked-core: {} (core#954)", fb.label);
+    av.judge_distinct = Some(false);
+    av.judge_fallback = Some(fb);
+    av
+}
+
 /// The normalized identity of the binary a launch of `key` with `invocation` actually runs: the
 /// launcher's own resolution ([`crate::execute_wrapped::launch_invocation`], then its quote-aware
 /// [`crate::execute_wrapped::template_binary`]), basename + case-folded.
@@ -1962,6 +2048,33 @@ fn run_unit_and_judge_on(
             }
         }
     }
+    // (core#954, operator decision 2026-10-17) An EVALUATOR unit's judge reads the work's
+    // creators' output, so its own rotation excludes them too (instance and cli key) — unless that
+    // leaves no eligible judge seat ([`exclude_creators`]); then the rotation judges as before,
+    // disclosed ([`disclose_creator_judge`]). Every other unit's rotation is unchanged.
+    let creators: Vec<String> = if input.unit.role == crate::workflow::PhaseRole::Evaluator {
+        let mut v: Vec<String> = Vec::new();
+        for a in fallback.work_authors {
+            for k in [a.as_str(), crate::team::runner::seat_key(a)] {
+                if !v.iter().any(|e| e == k) {
+                    v.push(k.to_string());
+                }
+            }
+        }
+        v
+    } else {
+        Vec::new()
+    };
+    // (core#954, codex r1) The binaries the creators actually ran (recorded at dispatch): a seat
+    // invoking one judges the creator's work as surely as the creator's own key.
+    let creator_bins: Vec<String> = if creators.is_empty() {
+        Vec::new()
+    } else {
+        fallback
+            .author_binaries
+            .map(<[String]>::to_vec)
+            .unwrap_or_default()
+    };
     // What the bus-path request names as excluded: the team monitors plus the launch exclusion.
     let mut bus_excluded: Vec<String> = team_authors.clone();
     // (crew#972, codex r1) …and every seat this unit was ever dispatched on, as on the inline path.
@@ -2269,10 +2382,28 @@ fn run_unit_and_judge_on(
             let mut excluded: Vec<&str> =
                 vec![crate::validator::DETERMINISTIC_VALIDATOR_SEAT, work_author];
             excluded.extend(team_excluded.iter().map(String::as_str));
+            let creator_fallback = exclude_creators(&mut excluded, &creators, |ex| {
+                let mut ids = author_identities(ex, roster);
+                ids.extend(creator_bins.iter().cloned());
+                let all = without_author_binaries(&eligible, ex, &ids);
+                let configured = without_author_binaries(&eligible_configured, ex, &ids);
+                crate::validator::distinct_judge_available(ex, judge_roster(ex, &configured, &all))
+            });
+            if let Some(why) = &creator_fallback {
+                engine_note(
+                    emit_delta,
+                    &format!("agent validator: {why} — the run's own judge rotation decides"),
+                );
+            }
             // The authors' invocation identities, resolved against the FULL registry before any
             // bench/health filter, drop every other seat sharing one: a benched creator alias must
             // not leave its binary looking distinct on another seat (codex r1/r2 on #893).
-            let author_ids = author_identities(&excluded, roster);
+            let mut author_ids = author_identities(&excluded, roster);
+            // (core#954, codex r1) …and every binary the creators actually ran, once excluded.
+            if creator_fallback.is_none() {
+                author_ids.extend(creator_bins.iter().cloned());
+            }
+            let creator_ids = CreatorIds::of(&creators, &creator_bins, roster);
             let eligible_x = without_author_binaries(&eligible, &excluded, &author_ids);
             let configured_x =
                 without_author_binaries(&eligible_configured, &excluded, &author_ids);
@@ -2423,7 +2554,33 @@ fn run_unit_and_judge_on(
             }
             Some(match verdict {
                 // Carries the judge seat + distinctness for `gateEvaluated` (core#431).
-                Ok(av) => av,
+                Ok(av) => {
+                    let seat = av.judge_cli.clone();
+                    disclose_creator_judge(
+                        av,
+                        seat,
+                        creator_fallback.as_deref(),
+                        &creator_ids,
+                        emit_delta,
+                    )
+                }
+                // (core#954, codex r1) A creator that answered without a verdict is disclosed too.
+                Err(e)
+                    if creator_fallback.is_some()
+                        && e.downcast_ref::<crate::validator::JudgeNoVerdict>()
+                            .is_some() =>
+                {
+                    let seat = e
+                        .downcast_ref::<crate::validator::JudgeNoVerdict>()
+                        .map(|nv| nv.seat.clone());
+                    disclose_creator_judge(
+                        crate::validator::AgentVerdict::from_judge_error("agent validator", e),
+                        seat,
+                        creator_fallback.as_deref(),
+                        &creator_ids,
+                        emit_delta,
+                    )
+                }
                 // (core#772) Every judge seat failed as a seat ⇒ a seat-failure denial, not a
                 // REJECT; any other error keeps the fail-closed REJECT shape. (operator ruling
                 // 2026-10-14) Before the hold, a distinct fallback seat judges in their place.
@@ -2459,10 +2616,28 @@ fn run_unit_and_judge_on(
                 .unwrap_or(crate::validator::DETERMINISTIC_VALIDATOR_SEAT);
             let mut excluded: Vec<&str> = vec![work_author];
             excluded.extend(team_excluded.iter().map(String::as_str));
+            let creator_fallback = exclude_creators(&mut excluded, &creators, |ex| {
+                let mut ids = author_identities(ex, roster);
+                ids.extend(creator_bins.iter().cloned());
+                crate::validator::distinct_judge_available(
+                    ex,
+                    &without_author_binaries(&eligible_run, ex, &ids),
+                )
+            });
+            if let Some(why) = &creator_fallback {
+                engine_note(
+                    emit_delta,
+                    &format!("default judge: {why} — the run's own judge rotation decides"),
+                );
+            }
             // The authors' invocation identities, resolved against the FULL registry before any
             // bench/health filter, drop every other seat sharing one: a benched creator alias must
             // not leave its binary looking distinct on another seat (codex r1/r2 on #893).
-            let author_ids = author_identities(&excluded, roster);
+            let mut author_ids = author_identities(&excluded, roster);
+            if creator_fallback.is_none() {
+                author_ids.extend(creator_bins.iter().cloned());
+            }
+            let creator_ids = CreatorIds::of(&creators, &creator_bins, roster);
             let run_x = without_author_binaries(&eligible_run, &excluded, &author_ids);
             let roster = run_x.as_slice();
             let criterion = crate::validator::default_judge_criterion(&input.unit);
@@ -2523,7 +2698,33 @@ fn run_unit_and_judge_on(
                 );
                 note_refusals(&refused);
                 Some(match verdict {
-                    Ok(av) => av,
+                    Ok(av) => {
+                        let seat = av.judge_cli.clone();
+                        disclose_creator_judge(
+                            av,
+                            seat,
+                            creator_fallback.as_deref(),
+                            &creator_ids,
+                            emit_delta,
+                        )
+                    }
+                    // (core#954, codex r1) A creator that answered without a verdict is disclosed too.
+                    Err(e)
+                        if creator_fallback.is_some()
+                            && e.downcast_ref::<crate::validator::JudgeNoVerdict>()
+                                .is_some() =>
+                    {
+                        let seat = e
+                            .downcast_ref::<crate::validator::JudgeNoVerdict>()
+                            .map(|nv| nv.seat.clone());
+                        disclose_creator_judge(
+                            crate::validator::AgentVerdict::from_judge_error("default judge", e),
+                            seat,
+                            creator_fallback.as_deref(),
+                            &creator_ids,
+                            emit_delta,
+                        )
+                    }
                     Err(e) => judge_error_or_fallback(
                         "default judge",
                         e,
@@ -7857,5 +8058,148 @@ mod judge_fallback_tests {
         );
         // (codex r1) A party whose key names no registry seat has an unknown binary: no fallback.
         assert!(fallback_candidates(&[c], &reg, &["writer"], &[], &[], &[]).is_none());
+    }
+
+    /// core#954: an EVALUATOR unit (claude, also the validator author) checks the work codex
+    /// built, under a pinned validator. `roster` is the run's seats.
+    fn evaluator_unit(dir: &std::path::Path) -> StepInput {
+        let mut input = check_unit(dir);
+        input.unit.assigned_cli = Some("claude".into());
+        input.unit.authored_by = Vec::new();
+        input.unit.authored_binaries = Vec::new();
+        input.unit.role = crate::workflow::PhaseRole::Evaluator;
+        input
+    }
+
+    fn judge_954(
+        input: &StepInput,
+        run: &[&str],
+        work_authors: &[String],
+    ) -> (Arc<Seats>, crate::validator::AgentVerdict, Vec<String>) {
+        judge_954_with(input, run, work_authors, &[], vec![])
+    }
+
+    fn judge_954_with(
+        input: &StepInput,
+        run: &[&str],
+        work_authors: &[String],
+        binaries: &[String],
+        answers: Vec<(&'static str, StepStatus, &'static str)>,
+    ) -> (Arc<Seats>, crate::validator::AgentVerdict, Vec<String>) {
+        let seats = Seats::new(answers);
+        let runner: Arc<dyn StepRunner> = seats.clone();
+        let deltas: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let d2 = deltas.clone();
+        let sink = move |c: &str| d2.lock().unwrap().push(c.to_string());
+        let run: Vec<String> = run.iter().map(|s| s.to_string()).collect();
+        let (_, v, _) = run_unit_and_judge_with_launches(
+            &runner,
+            input,
+            &sink,
+            &registry(),
+            &run,
+            &[],
+            &fallback_pool(),
+            work_authors,
+            Some(binaries),
+        );
+        let deltas = deltas.lock().unwrap().clone();
+        (seats, v.expect("a pinned judge ruled"), deltas)
+    }
+
+    /// core#954 (codex r1): a creator dispatched as `copilot` that actually RAN codex's binary —
+    /// codex is the creator too, and never judges while pi can.
+    #[test]
+    fn core_954_a_seat_running_a_creators_recorded_binary_does_not_judge() {
+        let dir = tmp("954-bin");
+        let input = evaluator_unit(&dir);
+        let (seats, v, _) = judge_954_with(
+            &input,
+            &["claude", "codex", "pi", "copilot"],
+            &["copilot".into()],
+            &["codex".into()],
+            vec![],
+        );
+        assert_eq!(seats.judged(), vec!["pi".to_string()], "{v:?}");
+        assert!(v.judge_fallback.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#954 (codex r1): the creator fallback that answered without a verdict holds the gate
+    /// AND is disclosed (as a fallback seat's verdict-less answer is).
+    #[test]
+    fn core_954_a_creator_judge_without_a_verdict_is_still_disclosed() {
+        let dir = tmp("954-nv");
+        let input = evaluator_unit(&dir);
+        let (_, v, _) = judge_954_with(
+            &input,
+            &["claude", "codex"],
+            &["codex".into()],
+            &[],
+            vec![(
+                "codex",
+                StepStatus::Ok,
+                "I looked at it and it seems reasonable.",
+            )],
+        );
+        assert!(!v.pass && v.seat_failure.is_some(), "{v:?}");
+        let fb = v.judge_fallback.as_ref().expect("disclosed");
+        assert_eq!(fb.seat, "codex");
+        assert!(fb.label.contains("creator fallback"), "{}", fb.label);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#954: the run's own judge rotation never seats the work's creator on an evaluator
+    /// unit's gate while another eligible seat exists. Before the fix the rotation (anchored on
+    /// claude) picked codex — the seat that built the work judged it.
+    #[test]
+    fn core_954_an_evaluator_judge_rotation_skips_the_creator_when_a_seat_remains() {
+        let dir = tmp("954-three");
+        let input = evaluator_unit(&dir);
+        let (seats, v, _) = judge_954(&input, &["claude", "codex", "pi"], &["codex".into()]);
+        assert_eq!(
+            seats.judged(),
+            vec!["pi".to_string()],
+            "codex built the work"
+        );
+        assert_eq!(v.judge_cli.as_deref(), Some("pi"));
+        assert_eq!(v.judge_distinct, Some(true));
+        assert!(
+            v.judge_fallback.is_none(),
+            "the routine case is not labelled: {v:?}"
+        );
+        // A non-evaluator unit's rotation is unchanged (the creator is its own assigned seat).
+        let mut neutral = evaluator_unit(&dir);
+        neutral.unit.role = crate::workflow::PhaseRole::Neutral;
+        let (seats, _, _) = judge_954(&neutral, &["claude", "codex", "pi"], &["codex".into()]);
+        assert_eq!(seats.judged(), vec!["codex".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#954: with no eligible seat distinct from the creators (a two-seat run), the rotation
+    /// judges as before — and says so: a `creator fallback` disclosure on the verdict (the gate,
+    /// its receipt and the delivery receipt carry it), `judgeDistinct: false`, and a line in the
+    /// run's live output. Never silent.
+    #[test]
+    fn core_954_a_two_seat_run_falls_back_to_the_creator_judge_disclosed() {
+        let dir = tmp("954-two");
+        let input = evaluator_unit(&dir);
+        let (seats, v, deltas) = judge_954(&input, &["claude", "codex"], &["codex".into()]);
+        assert_eq!(seats.judged(), vec!["codex".to_string()]);
+        assert_eq!(v.judge_cli.as_deref(), Some("codex"));
+        assert_eq!(v.judge_distinct, Some(false));
+        let fb = v.judge_fallback.as_ref().expect("disclosed");
+        assert_eq!(fb.seat, "codex");
+        assert!(fb.preferred.is_empty());
+        assert_eq!(
+            fb.label,
+            "judge: codex (creator fallback; no eligible judge seat distinct from the work's \
+             creators [codex])"
+        );
+        assert!(
+            deltas.iter().any(|d| d == &format!("\n{}\n", fb.label)),
+            "{deltas:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
