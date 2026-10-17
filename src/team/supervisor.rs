@@ -2288,6 +2288,7 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                         status: SettledStatus::Superseded,
                         reason: format!("its evidence text is gone from the {settled_on}"),
                         final_line: None,
+                        withdrawal_requested: None,
                     }),
                 };
                 u.publish(&ev);
@@ -2340,7 +2341,8 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
             let deliveries = delivery_outcomes(&rows);
             let mut u = job.unit.lock().unwrap_or_else(|p| p.into_inner());
             for f in tev::unresolved_highs(&ledger) {
-                if f.dispute.is_some() {
+                // (core#959) A finding awaiting the operator gets no council: none may clear it.
+                if f.dispute.is_some() || tev::awaits_operator(f) {
                     continue;
                 }
                 let Some(seq) = u.book.raise_of(&f.finding.finding_id) else {
@@ -2606,6 +2608,11 @@ fn delivery_outcomes(rows: &[TeamRow]) -> BTreeMap<u32, String> {
     out
 }
 
+/// (core#959) The held reason of a boundary finding its monitor asked to withdraw.
+pub(crate) const BOUNDARY_WITHDRAWAL_HELD: &str =
+    "held for the operator: a monitor may not withdraw a boundary finding; its withdrawal request \
+     is recorded beside it and only the operator clears it (core#959)";
+
 /// DES-001 §4.7 step 5: one turn per member with ≥1 unaccepted finding, listing each with the
 /// worker's state; `finding.settled{held|withdrawn}` for every unaccepted finding — exactly one
 /// each — and silence (no line, a failed turn, no time left) is HOLD.
@@ -2678,12 +2685,27 @@ fn hold_round(
         };
         for (seq, f) in items {
             let reply = replies.get(&f.finding.finding_id).cloned();
-            let (status, reason) = match reply {
-                Some(r) if r.kind == ReplyKind::Withdraw => (SettledStatus::Withdrawn, r.reason),
-                Some(r) => (SettledStatus::Held, r.reason),
+            let (status, reason, withdrawal_requested) = match reply {
+                // (core#959, operator decision 2026-10-17) A monitor may not withdraw a boundary
+                // finding: its request is recorded beside the finding, which stays held for the
+                // operator (`tev::awaits_operator`).
+                Some(r)
+                    if r.kind == ReplyKind::Withdraw && super::is_boundary_finding(&f.finding) =>
+                {
+                    (
+                        SettledStatus::Held,
+                        BOUNDARY_WITHDRAWAL_HELD.to_string(),
+                        Some(r.reason),
+                    )
+                }
+                Some(r) if r.kind == ReplyKind::Withdraw => {
+                    (SettledStatus::Withdrawn, r.reason, None)
+                }
+                Some(r) => (SettledStatus::Held, r.reason, None),
                 None => (
                     SettledStatus::Held,
                     "no reply (counted as hold)".to_string(),
+                    None,
                 ),
             };
             let ev = TeamEvent {
@@ -2694,6 +2716,7 @@ fn hold_round(
                     status,
                     reason,
                     final_line: final_lines.get(&seq).copied(),
+                    withdrawal_requested,
                 }),
             };
             u.publish(&ev);

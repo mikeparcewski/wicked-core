@@ -1009,6 +1009,11 @@ pub struct FindingSettled {
     pub status: SettledStatus,
     pub reason: String,
     pub final_line: Option<u32>,
+    /// (core#959) On a `held` settle: the monitor's `WITHDRAW` reason on a boundary finding,
+    /// which a monitor may not withdraw ([`super::MonitorReply::withdrawal_requested`]).
+    /// Additive: absent on every other settle and on an older row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawal_requested: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1558,6 +1563,55 @@ pub fn pauses(final_pass: FinalPass, findings: &[LedgerFinding]) -> bool {
             .iter()
             .filter(|f| is_unresolved_high(f))
             .any(|f| f.dispute.as_ref().is_none_or(|d| d.verdict != Verdict::Yes))
+        || findings.iter().any(awaits_operator)
+}
+
+/// The findings a paused ledger names to the operator, and why: the unresolved HIGHs without a
+/// council YES, then (core#959) every finding awaiting the operator ([`awaits_operator`]) whatever
+/// its severity. `None` when it names none (the pause is an incomplete record).
+pub fn pause_findings(ledger: &TeamLedger) -> (Vec<String>, Option<String>) {
+    let highs: Vec<String> = unresolved_highs(ledger)
+        .iter()
+        .map(|f| f.finding.finding_id.clone())
+        .collect();
+    let held: Vec<String> = ledger
+        .findings
+        .iter()
+        .filter(|f| awaits_operator(f))
+        .map(|f| f.finding.finding_id.clone())
+        .collect();
+    let mut why: Vec<String> = Vec::new();
+    let mut ids = highs.clone();
+    if !highs.is_empty() {
+        why.push(format!(
+            "unresolved HIGH finding(s) without a council YES: {}",
+            highs.join(", ")
+        ));
+    }
+    if !held.is_empty() {
+        why.push(format!(
+            "boundary finding(s) whose monitor asked to withdraw them, which only the operator \
+             clears: {}",
+            held.join(", ")
+        ));
+        for id in held {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    let why = (!why.is_empty()).then(|| why.join("; "));
+    (ids, why)
+}
+
+/// (core#959, operator decision 2026-10-17) A finding whose monitor asked to withdraw it when a
+/// monitor may not ([`MonitorReply::withdrawal_requested`]): the operator alone clears it, so it
+/// pauses the ledger whatever its severity and no council rules on it.
+pub fn awaits_operator(f: &LedgerFinding) -> bool {
+    is_unaccepted(f)
+        && f.monitor_reply
+            .as_ref()
+            .is_some_and(|r| r.withdrawal_requested.is_some())
 }
 
 /// The gate's half of DES-001 §6.7: a unit pauses `team_dispute` only when the gate approved
@@ -1840,6 +1894,7 @@ pub fn synthesize_timeout(mut ledger: TeamLedger) -> TeamLedger {
             f.monitor_reply = Some(MonitorReply {
                 kind: ReplyKind::Hold,
                 reason: "no reply (final pass timed out)".to_string(),
+                withdrawal_requested: None,
             });
         }
         if f.dispute.is_none() {
@@ -1951,6 +2006,7 @@ impl FindingAcc {
             Some(MonitorReply {
                 kind,
                 reason: s.reason.clone(),
+                withdrawal_requested: s.withdrawal_requested.clone(),
             })
         });
         // A no-verdict with no reason is the council call failing to say why: `error`.

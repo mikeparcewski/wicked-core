@@ -887,6 +887,7 @@ impl Stream {
                 status: tok(status),
                 reason: reason.into(),
                 final_line,
+                withdrawal_requested: None,
             }),
         )
     }

@@ -1073,18 +1073,9 @@ pub(super) fn operator_judgment_dispute(unit: &WorkUnit) -> Option<DisputeOpen> 
     if !tev::gate_pauses(true, ledger) {
         return None;
     }
-    let unresolved: Vec<String> = tev::unresolved_highs(ledger)
-        .iter()
-        .map(|f| f.finding.finding_id.clone())
-        .collect();
-    let why = if unresolved.is_empty() {
-        "the team's record of this step is incomplete".to_string()
-    } else {
-        format!(
-            "unresolved HIGH finding(s) without a council YES: {}",
-            unresolved.join(", ")
-        )
-    };
+    // (core#959) …and every boundary finding awaiting the operator, whatever its severity.
+    let (unresolved, why) = tev::pause_findings(ledger);
+    let why = why.unwrap_or_else(|| "the team's record of this step is incomplete".to_string());
     Some(DisputeOpen {
         prompt: format!(
             "Team dispute on unit {} ({}): you judged the work at its judge_unavailable gate, but \
@@ -1128,10 +1119,8 @@ pub(super) fn decide_unit_review(
         }
     };
     let pause = tev::gate_pauses(approved, ledger);
-    let unresolved: Vec<String> = tev::unresolved_highs(ledger)
-        .iter()
-        .map(|f| f.finding.finding_id.clone())
-        .collect();
+    // (core#959) …and every boundary finding awaiting the operator, whatever its severity.
+    let (unresolved, held_why) = tev::pause_findings(ledger);
     publish_fire(unit_event(
         &session.id,
         unit.ord,
@@ -1154,7 +1143,7 @@ pub(super) fn decide_unit_review(
     if !pause {
         return None;
     }
-    let why = if unresolved.is_empty() {
+    let why = held_why.unwrap_or_else(|| {
         format!(
             "the team's record of this step is incomplete (final pass: {})",
             serde_json::to_value(ledger.final_pass)
@@ -1162,12 +1151,7 @@ pub(super) fn decide_unit_review(
                 .and_then(|v| v.as_str().map(str::to_string))
                 .unwrap_or_default()
         )
-    } else {
-        format!(
-            "unresolved HIGH finding(s) without a council YES: {}",
-            unresolved.join(", ")
-        )
-    };
+    });
     Some(DisputeOpen {
         prompt: format!(
             "Team dispute on unit {} ({}): {why}. The gate approved the work, but the run does \

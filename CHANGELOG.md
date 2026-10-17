@@ -20,6 +20,13 @@ Two release tracks share this file, newest entry first regardless of track:
   so: a `judgeFallbacks` entry on the receipt (and the delivery receipt) labelled `judge: <seat> (creator fallback; no
   eligible judge seat distinct from the work's creators [...])`, `judgeDistinct: false`, and a line in the run's live
   output. Operator decision 2026-10-17. The bus path's evaluator daemon is unchanged.
+- **A monitor cannot withdraw a boundary finding; only the operator clears it (core#959).** A team finding whose claim
+  names a circumvention of a boundary or of governance (a circumvention word and a boundary word: "circumvention of
+  the access-control boundary", "bypassed the sandbox") is no longer settled `withdrawn` when its monitor answers
+  `WITHDRAW` at the hold round. The engine records the request as evidence beside the untouched original finding
+  (`finding.settled.withdrawal_requested`, ledger `monitorReply.withdrawalRequested`), settles it `held`, convenes no
+  council on it, and the ledger pauses (`teamPause`, whatever the severity) for the operator's decision at the gate.
+  Every other finding may still be withdrawn by its monitor. Operator decision 2026-10-17.
 - **codex, pi and opencode sign in on the host; copilot uses its device flow.** Their browser logins listen on a
   loopback callback that the host browser cannot reach inside a login container, and ChatGPT device codes need an
   account that allows them. `seat-login argv` now runs the host's own CLI under `env -i` with a throwaway home
