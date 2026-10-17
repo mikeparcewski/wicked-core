@@ -101,6 +101,9 @@ const SEAT_ENTRY: &str = "/floor/launch";
 const LANDRUN: &str = "/floor/landrun";
 /// Where the floor image is mounted in every seat.
 const FLOOR_DIR: &str = "/floor";
+/// The floor's static busybox, the only client a container seat's gate hook uses
+/// ([`crate::hook_relay::hook_command`]).
+pub(crate) const FLOOR_BUSYBOX: &str = "/floor/busybox";
 const CANARY_FILE: &str = "/wicked-canary/probe";
 /// The loopback port the launcher's network canary listens on (outside every grant; the
 /// launcher refuses a policy that grants it).
@@ -114,7 +117,8 @@ const FLOOR_DOCKERFILE: &str = include_str!("../containers/floor.Dockerfile");
 /// The CLIs the engine ships a seat image for (the registry's seat keys), each with the npm
 /// package at the version the engine is verified against.
 const SEAT_PACKAGES: &[(&str, &str)] = &[
-    // 2.1.295+: an HTTP hook honours `onFailure: "block"` (the gate hook fails closed).
+    // 2.1.295+: a hook honours `onFailure: "block"` (the gate hook fails closed; core#988 probed
+    // the command hook's exit 1 and timeout on 2.1.296).
     ("claude", "@anthropic-ai/claude-code@2.1.296"),
     ("codex", "@openai/codex@0.162.1"),
     ("pi", "@earendil-works/pi-coding-agent@1.1.0"),

@@ -3978,17 +3978,21 @@ fn quote_exe_command(exe: &str) -> String {
     }
 }
 
-/// A container seat's gate hook: an HTTP hook to the engine's relay through the gateway. A hook
-/// that cannot reach the relay (connection failure, non-2xx, timeout) is a NON-blocking error
-/// unless `onFailure` says block (claude >= 2.1.295, the seat image's pin): an unreachable judge
-/// must deny, never wave the tool call through (`probe/hookfail`: without it a Write ran).
-pub(crate) fn container_gate_hook(token: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "http",
-        "url": crate::hook_relay::hook_url(token),
+/// A container seat's gate hook: a command hook that posts each tool call to the engine's relay
+/// through the gateway with the floor's busybox ([`crate::hook_relay::hook_command`]). Not
+/// claude's HTTP hook: Claude Code refuses one whose host resolves to a private address, and the
+/// gateway's `agw` is one (core#988: every call was blocked before it reached the relay). A hook
+/// that fails (cannot reach the relay, times out, is killed) is a NON-blocking error unless
+/// `onFailure` says block (claude >= 2.1.295, the seat image's pin): an unreachable judge must
+/// deny, never wave the tool call through (`probe/hookfail`: without it a Write ran). `None` when
+/// the token cannot be spliced into a command (never a minted one).
+pub(crate) fn container_gate_hook(token: &str) -> Option<serde_json::Value> {
+    Some(serde_json::json!({
+        "type": "command",
+        "command": crate::hook_relay::hook_command(token)?,
         "timeout": 90,
         "onFailure": "block"
-    })
+    }))
 }
 
 /// Resolve the absolute path to the `wicked-core` binary for the gate-hook command.
@@ -4308,7 +4312,7 @@ fn which_binary(name: &str) -> Result<String, ()> {
 /// ENV (never interpolated into the shell hook command) so caller-controlled ids cannot inject shell
 /// metacharacters.
 struct GovLaunch {
-    /// Container floor: the unit's gate-hook relay token (its settings name an HTTP hook).
+    /// Container floor: the unit's gate-hook relay token (its settings name the relayed hook).
     hook_token: Option<String>,
     decisions_path: PathBuf,
     db_path: String,
@@ -4553,11 +4557,12 @@ fn arm_input_governance(
     // can't be shell-expanded (POSIX single-quote disables ALL expansion; on Windows cmd `$`/backtick are
     // not special, so double-quote for spaces — a `"` is illegal in a Windows path anyway).
     let command = quote_exe_command(&exe);
-    // Container floor: the seat cannot run the host binary, so its hook is an HTTP hook to the
+    // Container floor: the seat cannot run the host binary, so its hook posts each call to the
     // engine's relay through the gateway (`crate::hook_relay`), keyed by a per-unit token.
     let hook_token = crate::container_floor::container_mode().then(crate::hook_relay::mint_token);
     let hook = match &hook_token {
-        Some(t) => container_gate_hook(t),
+        Some(t) => container_gate_hook(t)
+            .ok_or_else(|| std::io::Error::other("the gate hook's relay token is not hex"))?,
         None => serde_json::json!({ "type": "command", "command": command }),
     };
     // D-7 (DES-L4 PR-⑦): the CLI-registered estate MCP is NO LONGER handed to the worker — no
@@ -4611,11 +4616,16 @@ fn arm_input_governance(
     // Write the ARMED marker BEFORE the CLI runs: its presence lets the actor-side fold distinguish a
     // governed unit that legitimately made no tool-calls (marker only) from one whose evidence was erased
     // or whose hook never fired (marker absent → fail closed). Closes the council evidence-integrity blocker.
-    crate::gate_hook::write_armed_marker_for(
-        &decisions_path,
-        &phase,
-        Some(crate::gate_hook::CARRIER_WRAPPED_CLI),
-    )
+    // A relayed hook (container floor) is named on the marker, so a unit whose calls never
+    // reached the relay is attributed to the relay, not to a managed-hooks setting (core#988).
+    match &hook_token {
+        Some(_) => crate::gate_hook::write_relayed_armed_marker(&decisions_path, &phase),
+        None => crate::gate_hook::write_armed_marker_for(
+            &decisions_path,
+            &phase,
+            Some(crate::gate_hook::CARRIER_WRAPPED_CLI),
+        ),
+    }
     .map_err(|e| std::io::Error::other(e.to_string()))?;
     // Insert `--settings <path>` right after the binary so it parses as a flag (never demoted past the
     // prompt / a `--` guard).
@@ -6865,17 +6875,23 @@ mod tests {
     }
     use super::*;
 
-    /// Codex gw-r1 (P1): the container seat's HTTP gate hook fails CLOSED when the relay cannot
-    /// be reached, and its URL carries only the unit's token.
+    /// Codex gw-r1 (P1): the container seat's gate hook fails CLOSED when the relay cannot be
+    /// reached, and carries only the unit's token. core#988: it is a COMMAND hook (claude refuses
+    /// an HTTP hook to the gateway's private address) that posts with the floor's busybox, and a
+    /// token that is not hex is never spliced into it.
     #[test]
     fn the_container_gate_hook_blocks_when_the_relay_fails() {
-        let hook = container_gate_hook("ab12");
-        assert_eq!(hook["type"], "http");
+        let hook = container_gate_hook("ab12").expect("a hex token");
+        assert_eq!(hook["type"], "command");
         assert_eq!(hook["onFailure"], "block");
-        assert_eq!(
-            hook["url"],
-            format!("http://agw:{}/hook/ab12", crate::hook_relay::HOOK_PORT)
-        );
+        assert!(hook.get("url").is_none(), "{hook}");
+        let cmd = hook["command"].as_str().unwrap();
+        let url = format!("http://agw:{}/hook/ab12", crate::hook_relay::HOOK_PORT);
+        assert!(cmd.contains(&format!(" -O - {url};")), "{cmd}");
+        assert!(cmd.contains("/floor/busybox wget -q -Y off"), "{cmd}");
+        assert!(cmd.contains("exit 2;"), "a failed post blocks: {cmd}");
+        assert!(container_gate_hook("ab12; rm -rf /").is_none());
+        assert!(container_gate_hook("").is_none());
     }
 
     /// The fence and injector entry points with NO operational state home (the tests here fence

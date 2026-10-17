@@ -5292,6 +5292,24 @@ pub fn write_armed_marker_for(
     append_armed_marker(decisions_path, &marker)
 }
 
+/// (core#988) Companion key on a wrapped marker whose gate hook is RELAYED: a container seat's
+/// hook posts each call to the engine's relay through the gateway ([`crate::hook_relay`]).
+const ARMED_HOOK_KEY: &str = "_wicked_gov_hook";
+/// The value of [`ARMED_HOOK_KEY`] for the relayed hook.
+const HOOK_RELAYED: &str = "relay";
+
+/// (core#988) Append the ARMED sentinel for `phase` of a wrapped unit whose gate hook is relayed
+/// (the container floor), so a unit whose calls never reached the relay is denied as such, not
+/// attributed to a managed-hooks setting that cannot apply there.
+pub(crate) fn write_relayed_armed_marker(decisions_path: &Path, phase: &str) -> anyhow::Result<()> {
+    let marker = serde_json::json!({
+        ARMED_MARKER_KEY: phase,
+        ARMED_CARRIER_KEY: CARRIER_WRAPPED_CLI,
+        ARMED_HOOK_KEY: HOOK_RELAYED,
+    });
+    append_armed_marker(decisions_path, &marker)
+}
+
 /// (IG1-core-1) Append the ARMED sentinel for `phase` naming the [`CARRIER_OS_SANDBOX`] carrier,
 /// the write roots the boundary admitted (verbatim, in order) and the launcher that armed it
 /// (`"sandbox-exec"` | `"bwrap"` | `"seat:codex"`), under the same advisory lock as claims:
@@ -6235,6 +6253,9 @@ pub(crate) fn fold_input_denial_in(
     // scoped to the wrapped carrier: the ACP carrier answers `session/request_permission`
     // in-process and the OS-sandbox floor has no per-call channel, so neither runs a hook.
     let mut carrier = ArmedCarrier::Wrapped;
+    // core#988: the marker says the hook is relayed (a container seat), so a hook that never ran
+    // is a hook whose calls never reached the relay.
+    let mut relayed = false;
     let mut saw_hook_fired = false;
     let mut has_claim_lines = false; // any ConformanceClaim present for `phase`
     let mut pending_tool: Option<String> = None; // tool name from the last annotation (this phase)
@@ -6263,6 +6284,7 @@ pub(crate) fn fold_input_denial_in(
             if mp == phase {
                 saw_marker = true;
                 carrier = ArmedCarrier::of_marker(&v);
+                relayed = v.get(ARMED_HOOK_KEY).and_then(|x| x.as_str()) == Some(HOOK_RELAYED);
             }
             continue;
         }
@@ -6391,12 +6413,25 @@ pub(crate) fn fold_input_denial_in(
         && !saw_hook_fired
         && denial.is_none()
     {
-        denial = Some(fail_closed(format!(
-            "{GOVERNANCE_UNPROVEN}: input governance denied {phase} (fail-closed): the unit made \
-             tool calls on the wrapped carrier but its gate-hook never ran — the hook was not \
-             loaded (an org `allowManagedHooksOnly` setting blocks `--settings` hooks), so every \
-             call went unchecked (core#653)"
-        )));
+        // The cause differs by where the hook runs: a container seat's hook is the engine's own
+        // relayed command (no managed setting reaches the seat), so its calls never reached the
+        // relay and were blocked there (core#988); a host seat's `--settings` hook was dropped.
+        denial = Some(fail_closed(if relayed {
+            format!(
+                "{GOVERNANCE_UNPROVEN}: input governance denied {phase} (fail-closed): the unit \
+                 made tool calls in its container seat but none reached the engine's gate-hook \
+                 relay — the seat's hook could not post them (the gateway's hook route or the \
+                 relay was unreachable, or the CLI refused the hook; its output names the error), \
+                 so every call was blocked unjudged (core#988)"
+            )
+        } else {
+            format!(
+                "{GOVERNANCE_UNPROVEN}: input governance denied {phase} (fail-closed): the unit \
+                 made tool calls on the wrapped carrier but its gate-hook never ran — the hook \
+                 was not loaded (an org `allowManagedHooksOnly` setting blocks `--settings` \
+                 hooks), so every call went unchecked (core#653)"
+            )
+        }));
     }
     Ok(denial)
 }
@@ -9855,6 +9890,60 @@ mod tests {
             fold_input_denial_with_activity(&mut store, &run_id, 4, "unit-1", true, true)
                 .unwrap()
                 .is_some_and(|d| d.reason.starts_with(GOVERNANCE_UNPROVEN)),
+        );
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
+    /// core#988 (red on main): a container seat's relayed hook whose calls never reached the
+    /// relay is denied as `governance_unproven` NAMING the relay, never `allowManagedHooksOnly`
+    /// (no managed setting reaches a seat container); a host seat's wrapped marker keeps the #653
+    /// text, and a relayed unit whose hook fired passes like any wrapped one.
+    #[test]
+    fn a_relayed_hook_that_never_reached_the_relay_is_attributed_to_the_relay() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = format!("relayed-988-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let p0 = decisions_path_for(&run_id, 0);
+        write_relayed_armed_marker(&p0, "unit-1").unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&p0).unwrap().trim()).unwrap();
+        assert_eq!(marker_phase(&v), Some("unit-1"));
+        assert_eq!(marker_carrier(&v), Some(CARRIER_WRAPPED_CLI));
+        assert_eq!(v[ARMED_HOOK_KEY], HOOK_RELAYED);
+        let denial = fold_input_denial_with_activity(&mut store, &run_id, 0, "unit-1", true, true)
+            .unwrap()
+            .expect("tool calls that never reached the relay must deny");
+        assert!(
+            denial.reason.starts_with(GOVERNANCE_UNPROVEN),
+            "{}",
+            denial.reason
+        );
+        assert!(denial.reason.contains("relay"), "{}", denial.reason);
+        assert!(denial.reason.contains("core#988"), "{}", denial.reason);
+        assert!(
+            !denial.reason.contains("allowManagedHooksOnly"),
+            "{}",
+            denial.reason
+        );
+        // The host seat's wrapped marker keeps its own cause.
+        let p1 = decisions_path_for(&run_id, 1);
+        write_armed_marker_for(&p1, "unit-1", Some(CARRIER_WRAPPED_CLI)).unwrap();
+        let host = fold_input_denial_with_activity(&mut store, &run_id, 1, "unit-1", true, true)
+            .unwrap()
+            .expect("deny");
+        assert!(
+            host.reason.contains("allowManagedHooksOnly"),
+            "{}",
+            host.reason
+        );
+        // A relayed unit whose hook ran passes.
+        let p2 = decisions_path_for(&run_id, 2);
+        write_relayed_armed_marker(&p2, "unit-1").unwrap();
+        write_hook_fired(&p2, "unit-1");
+        append_decision(&p2, &allow_claim("ok-988", "unit-1")).unwrap();
+        assert_eq!(
+            fold_input_denial_with_activity(&mut store, &run_id, 2, "unit-1", true, true).unwrap(),
+            None
         );
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
     }

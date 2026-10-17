@@ -1,14 +1,23 @@
 //! The gate hook for a claude seat in the container floor (slice C3).
 //!
 //! A governed claude unit is judged before every tool call by `wicked-core gate-hook`, a HOST
-//! binary claude runs as a command hook. Inside a Linux seat container that command does not
-//! exist, so the seat's settings name an HTTP hook instead: claude POSTs the same PreToolUse
-//! payload to `http://agw:<HOOK_PORT>/hook/<token>`, the daemon's gateway routes it to this
-//! relay on the host's loopback, and the relay runs the unchanged host `gate-hook` with exactly
-//! the environment the seat's command would have carried, then answers in claude's hook JSON.
+//! binary claude runs as a command hook. Inside a Linux seat container that binary does not
+//! exist, so the seat's settings name a small command hook instead ([`hook_command`]): it posts
+//! the same PreToolUse payload with the floor's own static busybox (`/floor/busybox wget`, from
+//! the engine's read-only floor image) to `http://agw:<HOOK_PORT>/hook/<token>`, the daemon's
+//! gateway routes it to this relay on the host's loopback, and the relay runs the unchanged host
+//! `gate-hook` with exactly the environment the seat's command would have carried, then answers
+//! in claude's hook JSON, which the command prints as its own answer.
+//!
+//! Why a command and not claude's `type: "http"` hook (core#988): Claude Code refuses an HTTP
+//! hook whose host resolves to a private or link-local address (only loopback is exempt), and
+//! `agw` is the seat network's private address, so every call was blocked before it reached the
+//! relay. A command hook is outside that guard; it still rides the one egress the seat has (the
+//! gateway's hook route) and, with `onFailure: "block"`, any failure (an unreachable relay, a
+//! non-2xx answer, a timeout) denies the call.
 //!
 //! **Glue only.** The judgement, the decisions log and the store are the existing gate hook's;
-//! the relay maps its exit code to the HTTP hook's JSON answer: 0 → its own stdout (or `{}`),
+//! the relay maps its exit code to the hook's JSON answer: 0 → its own stdout (or `{}`),
 //! 2 → deny with its stderr as the reason, anything else (a crash, a timeout, an unknown token)
 //! → deny. A token is minted per unit, known only to that seat and the relay, and revoked when
 //! the unit ends.
@@ -24,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use wicked_apps_core::HardenedCommand;
 
-/// The gateway port the seat's HTTP hook calls (not a browser-blocked port).
+/// The gateway port the seat's gate hook posts to (not a browser-blocked port).
 pub(crate) const HOOK_PORT: u16 = 8711;
 /// How long one tool call's judgement may take before it is denied.
 const HOOK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -76,9 +85,36 @@ pub(crate) fn mint_token() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
-/// The HTTP hook URL a seat holding `token` calls.
+/// The relay URL a seat holding `token` posts its tool calls to (through the gateway).
 pub(crate) fn hook_url(token: &str) -> String {
     format!("http://agw:{HOOK_PORT}/hook/{token}")
+}
+
+/// What a container seat's gate hook prints when the relay cannot answer (its stderr, which
+/// claude shows as the deny reason).
+pub(crate) const UNREACHABLE: &str =
+    "the gate hook could not reach the engine relay; the call is denied (fail closed)";
+
+/// The command hook a container seat runs for every tool call (core#988): the payload claude
+/// writes on stdin goes to a private temp file (claude's stdin is not always openable as a path)
+/// and is posted with the floor's busybox, never a tool from the seat image; the relay's answer is
+/// printed as the hook's JSON. A failed post (no route, a non-2xx answer, a timeout) exits 2,
+/// claude's blocking code, with [`UNREACHABLE`] as the reason; `onFailure: "block"` on the hook
+/// covers whatever this command itself cannot (it is killed, or the shell is missing). `-Y off`:
+/// the seat's proxy variables never apply to the relay. `None` when `token` is not the hex a
+/// relay token is (it is spliced into the command).
+pub(crate) fn hook_command(token: &str) -> Option<String> {
+    if token.is_empty() || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bb = crate::container_floor::FLOOR_BUSYBOX;
+    let url = hook_url(token);
+    let wait = HOOK_TIMEOUT.as_secs() + 25;
+    Some(format!(
+        "f=$({bb} mktemp) || exit 2; {bb} cat > \"$f\" && {bb} wget -q -Y off -T {wait} \
+         --header 'Content-Type: application/json' --post-file \"$f\" -O - {url}; rc=$?; \
+         {bb} rm -f \"$f\"; [ \"$rc\" = 0 ] || {{ echo '{UNREACHABLE}' >&2; exit 2; }}"
+    ))
 }
 
 /// What one unit's gate hook runs with: the seat command's explicit variables and its working
@@ -585,5 +621,295 @@ mod tests {
             None => std::env::remove_var("WICKED_CORE_EXE"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LIVE (`WICKED_CONTAINER_LIVE=1`), core#988: a governed claude unit on the container floor
+    /// has every tool call judged by the engine's relay. The real claude seat (its pinned CLI, the
+    /// floor's launcher, Landlock, the netns sidecar) runs with the engine's settings: its command
+    /// hook posts each call through the real gateway's hook route to this process's relay, which
+    /// runs the (fake) host gate hook. The model (a stub behind the Anthropic route) asks for two
+    /// Bash calls: the gate allows the first (it runs) and denies the second (it never runs, and
+    /// claude reports the gate's reason). The same seat with a revoked token has its call denied.
+    /// On main (an HTTP hook to `agw`) claude refused every call: "HTTP hook blocked".
+    #[cfg(unix)]
+    #[test]
+    fn live_a_container_claude_units_calls_are_judged_through_the_relay() {
+        use crate::container_floor::{arm, finalize, output_within};
+        use crate::seat_gateway::{configure_gateway, ensure_gateway, Gateway, GatewayConfig};
+        use crate::worker_sandbox::FloorInputs;
+        use std::path::Path;
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        struct Restore(Vec<(&'static str, Option<OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (k, v) in self.0.drain(..) {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            [
+                "WICKED_WORKER_HOME",
+                "WICKED_CORE_EXE",
+                "WICKED_SEAT_IMAGE_CLAUDE",
+            ]
+            .into_iter()
+            .map(|k| (k, std::env::var_os(k)))
+            .collect(),
+        );
+        std::env::remove_var("WICKED_SEAT_IMAGE_CLAUDE");
+        let rt = crate::container_floor::runtime().expect("a container runtime answers");
+        let image = crate::container_floor::ensure_seat_image(&rt, "claude").unwrap();
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("wicked-988-live-{}", uuid::Uuid::new_v4().simple()));
+        let dir = base.join("state/gateway");
+        let worker = base.join("worker");
+        let seat_home = worker.join("seat-claude");
+        for d in [&dir, &seat_home, &base.join("stub")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::env::set_var("WICKED_WORKER_HOME", &worker);
+        // The host gate hook the relay runs (as `wicked-core gate-hook`): records each payload,
+        // denies the call that writes DENIED.txt, allows the rest.
+        let calls = base.join("hook-calls.ndjson");
+        let fake = base.join("gate-hook.sh");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = gate-hook ] || exit 3\np=$(cat)\nprintf '%s\\n' \"$p\" >> '{}'\n\
+                 case \"$p\" in *DENIED.txt*) echo 'DENIED-BY-THE-RELAYED-GATE' >&2; exit 2;; esac\n\
+                 exit 0\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("WICKED_CORE_EXE", &fake);
+        let run = |argv: &[&str]| {
+            let mut c = rt.cmd();
+            c.args(argv);
+            output_within(c, Duration::from_secs(60)).unwrap()
+        };
+        let gw = Gateway::for_dir(&dir);
+        let stub = format!("{}-stub", gw.name);
+        // The Anthropic stub: two Bash calls, then text; it logs each request's last tool result.
+        std::fs::write(
+            base.join("stub/stub.js"),
+            "require('http').createServer((q,r)=>{let b='';q.on('data',d=>b+=d);q.on('end',()=>{\
+             let j={};try{j=JSON.parse(b)}catch{}\
+             const res=(j.messages||[]).flatMap(m=>Array.isArray(m.content)?\
+             m.content.filter(c=>c.type==='tool_result'):[]);\
+             const main=(j.tools||[]).some(t=>t.name==='Bash');const step=res.length;\
+             console.log('UPSTREAM '+JSON.stringify({url:q.url,main,step,last:res[step-1]||null}));\
+             const cmds=['echo allowed > ALLOWED.txt','echo denied > DENIED.txt'];\
+             const tool=main&&step<cmds.length;\
+             const content=tool?[{type:'tool_use',id:'toolu_'+step,name:'Bash',\
+             input:{command:cmds[step],description:'probe'}}]:[{type:'text',text:'STUB-DONE'}];\
+             const stop=tool?'tool_use':'end_turn';\
+             const msg={id:'msg_'+step,type:'message',role:'assistant',model:j.model||'m',\
+             content:[],stop_reason:null,stop_sequence:null,usage:{input_tokens:1,output_tokens:1}};\
+             if(!j.stream){r.setHeader('content-type','application/json');\
+             return r.end(JSON.stringify({...msg,content,stop_reason:stop}))}\
+             r.setHeader('content-type','text/event-stream');\
+             const ev=(t,d)=>r.write('event: '+t+'\\ndata: '+JSON.stringify({type:t,...d})+'\\n\\n');\
+             ev('message_start',{message:msg});content.forEach((c,i)=>{if(c.type==='text'){\
+             ev('content_block_start',{index:i,content_block:{type:'text',text:''}});\
+             ev('content_block_delta',{index:i,delta:{type:'text_delta',text:c.text}})}else{\
+             ev('content_block_start',{index:i,content_block:{...c,input:{}}});\
+             ev('content_block_delta',{index:i,delta:{type:'input_json_delta',\
+             partial_json:JSON.stringify(c.input)}})}ev('content_block_stop',{index:i})});\
+             ev('message_delta',{delta:{stop_reason:stop,stop_sequence:null},usage:{output_tokens:1}});\
+             ev('message_stop',{});r.end()})}).listen(8080)",
+        )
+        .unwrap();
+        let mut config = GatewayConfig::default();
+        for route in &mut config.providers {
+            route.upstream_host = format!("{stub}:8080");
+            route.tls = false;
+        }
+        configure_gateway(&dir, &config).unwrap();
+        let gw = ensure_gateway(&rt, &dir).expect("the gateway starts");
+        assert!(
+            crate::seat_gateway::hook_route_ready(),
+            "the gateway reaches this process's relay"
+        );
+        crate::seat_gateway::set_broker_credential(
+            &rt,
+            &gw,
+            &dir,
+            "claude",
+            "anthropic.key",
+            b"FAKE-988-broker-key",
+        )
+        .unwrap();
+        let stub_mount = format!(
+            "type=bind,src={},dst=/s,readonly",
+            base.join("stub").display()
+        );
+        let o = run(&[
+            "run",
+            "-d",
+            "--name",
+            &stub,
+            "--network",
+            &gw.external_network,
+            "--mount",
+            &stub_mount,
+            &image,
+            "node",
+            "/s/stub.js",
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        // A real linked run worktree with the engine's pin, as a governed unit has.
+        let repo = base.join("repo");
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            // spawn-audit: test-only — local git over a temp repo.
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        };
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "i"]);
+        git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let pin = crate::worktree_guard::pinned_git_dir(&wt, &repo).unwrap();
+        let inputs = FloorInputs {
+            cwd: wt.clone(),
+            write_roots: vec![wt.clone()],
+            read_only: false,
+            seat_dirs: vec![seat_home.clone()],
+            unmask: vec![],
+            pinned: vec![],
+            net: vec![],
+            home: None,
+            trusted_git_dir: Some(pin),
+        };
+        // One governed claude unit with the engine's container settings for `token`.
+        let unit = |ord: u32, token: &str| {
+            let settings = serde_json::json!({
+                "disableAllHooks": false,
+                "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+                    crate::execute_wrapped::container_gate_hook(token).unwrap()
+                ]}]}
+            })
+            .to_string();
+            let argv: Vec<String> = [
+                "claude",
+                "-p",
+                "run the two commands",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--model",
+                "claude-sonnet-4-5",
+                "--dangerously-skip-permissions",
+                "--settings",
+                &settings,
+            ]
+            .map(String::from)
+            .to_vec();
+            let armed = arm(&inputs, &argv, "run-988", ord, &[], None, Some(&dir))
+                .expect("a signed-in claude seat arms");
+            let full: Vec<String> = armed.wrapper.iter().chain(&armed.argv).cloned().collect();
+            let mut cmd = crate::execute_wrapped::build_worker_command(&full, None);
+            cmd.env("CLAUDE_CONFIG_DIR", &seat_home);
+            for (k, v) in &armed.env {
+                cmd.env(k, v);
+            }
+            crate::container_floor::write_unit_seat_files(&mut cmd, "claude", &armed.files)
+                .expect("placeholder files");
+            let out = output_within(finalize(cmd), Duration::from_secs(150)).expect("the seat ran");
+            if let Some(lease) = armed.lease {
+                let _ = lease.release();
+            }
+            drop(armed.cleanup);
+            (
+                out.status.code(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            )
+        };
+        let token = mint_token();
+        let reg = register(
+            &token,
+            HookContext {
+                env: vec![],
+                cwd: Some(wt.clone()),
+            },
+        )
+        .expect("the relay runs");
+        let (code, judged) = unit(1, &token);
+        let allowed = wt.join("ALLOWED.txt").exists();
+        let denied = wt.join("DENIED.txt").exists();
+        let judged_calls = std::fs::read_to_string(&calls).unwrap_or_default();
+        // The same seat once its token is revoked (the unit ended): its first call is denied.
+        drop(reg);
+        let _ = std::fs::remove_file(wt.join("ALLOWED.txt"));
+        let (_, revoked) = unit(2, &token);
+        let revoked_ran = wt.join("ALLOWED.txt").exists();
+        let upstream = String::from_utf8_lossy(&run(&["logs", &stub]).stdout).to_string();
+        run(&["rm", "-f", &stub, &gw.name]);
+        run(&["network", "rm", &gw.external_network]);
+        let (cfg, broker) = crate::seat_gateway::volumes(&gw);
+        run(&["volume", "rm", &cfg, &broker]);
+        let _ = std::fs::remove_dir_all(&base);
+        let tail = |s: &str| {
+            let c: Vec<char> = s.chars().collect();
+            c[c.len().saturating_sub(2000)..].iter().collect::<String>()
+        };
+        eprintln!(
+            "code={code:?}\njudged={}\nrevoked={}\ncalls={judged_calls}\nupstream={upstream}",
+            tail(&judged),
+            tail(&revoked)
+        );
+        assert!(!judged.contains("HTTP hook blocked"), "{}", tail(&judged));
+        assert!(
+            judged_calls.contains("ALLOWED.txt") && judged_calls.contains("DENIED.txt"),
+            "both calls reached the host gate hook through the relay: {judged_calls}"
+        );
+        assert!(allowed, "the allowed call ran: {}", tail(&judged));
+        assert!(!denied, "the denied call never ran: {}", tail(&judged));
+        assert!(
+            judged.contains("DENIED-BY-THE-RELAYED-GATE"),
+            "claude reports the gate's reason: {}",
+            tail(&judged)
+        );
+        assert!(judged.contains("STUB-DONE"), "{}", tail(&judged));
+        assert_eq!(code, Some(0), "{}", tail(&judged));
+        assert!(
+            !revoked_ran,
+            "a revoked token's call never ran: {}",
+            tail(&revoked)
+        );
+        assert!(
+            revoked.contains("unknown or revoked hook token"),
+            "{}",
+            tail(&revoked)
+        );
     }
 }
