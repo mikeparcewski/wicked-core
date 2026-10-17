@@ -69,7 +69,8 @@ const HAND_AUTHORED = `${BEGIN}
  * may start with 'install fence:' (a package-manager install outside the unit's worktree, judged
  * from the seat's shell cwd tracked across its tool calls — best-effort, never hermetic);
  * sandboxPosture {session, ord, cli, posture: 'os' | 'advisory', reason} (the write containment
- * the assigned seat runs under — 'os' = the seat is on the OS-sandbox floor, the run is bound to a
+ * the assigned seat runs under — 'os' = the unit runs in its own seat container on the container
+ * seat floor, or the seat is on the OS-sandbox floor, the run is bound to a
  * worktree and the host launcher arms; 'advisory' = one of the three failed, reason names which —
  * command-text fences + worktree guard only); worktreeRetained {session, path, reason} (a terminal run's worktree
  * kept because it holds uncommitted work — cancel included).
