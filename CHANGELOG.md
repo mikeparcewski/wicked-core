@@ -14,6 +14,12 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **An evaluator unit's judge never judges the work it reads when another seat can (core#954).** The run's own judge
+  rotation on an evaluator unit now also excludes the work's creators (every earlier author of the work, instance and
+  cli key). When that leaves no eligible judge seat (a two-seat run), the rotation judges as before and the gate says
+  so: a `judgeFallbacks` entry on the receipt (and the delivery receipt) labelled `judge: <seat> (creator fallback; no
+  eligible judge seat distinct from the work's creators [...])`, `judgeDistinct: false`, and a line in the run's live
+  output. Operator decision 2026-10-17. The bus path's evaluator daemon is unchanged.
 - **codex, pi and opencode sign in on the host; copilot uses its device flow.** Their browser logins listen on a
   loopback callback that the host browser cannot reach inside a login container, and ChatGPT device codes need an
   account that allows them. `seat-login argv` now runs the host's own CLI under `env -i` with a throwaway home

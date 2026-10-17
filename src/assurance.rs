@@ -62,6 +62,9 @@ pub struct OperatorJudgment {
 /// or failed as a seat while judging. The fallback seat is drawn from the fallback seats (Claude
 /// Code, then Antigravity — `cli_runner::JUDGE_FALLBACK_SEATS`), distinct from every seat the
 /// contract excludes (the creator, every author, the evaluator, the validator author, the team).
+/// (core#954) The same record discloses an evaluator unit's judge that is one of the work's
+/// creators because no other eligible seat could judge: `preferred` is empty (there was no
+/// distinct seat to stand in for) and the label reads `judge: <seat> (creator fallback; …)`.
 /// Labelled on the gate, its receipt and the delivery receipt — never silent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
