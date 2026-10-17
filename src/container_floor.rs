@@ -1510,6 +1510,19 @@ pub(crate) fn image_argv(argv: &[String], cli: &str) -> Vec<String> {
         .collect()
 }
 
+/// `argv` with the sign-in's route arguments ([`crate::seat_gateway::seat_args_for`]) at its
+/// end, before a `--` separator if it has one: the innermost subcommand reads them. codex drops
+/// root-level `-c` overrides once its `exec` subcommand carries its own (the engine's do), so a
+/// provider placed after the binary was silently ignored (core#989, probed on 0.162.1).
+pub(crate) fn with_seat_args(mut argv: Vec<String>, seat_args: Vec<String>) -> Vec<String> {
+    if argv.is_empty() {
+        return argv;
+    }
+    let at = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    argv.splice(at..at, seat_args);
+    argv
+}
+
 /// The operator's `uid:gid` (the seat's writes land owned by them).
 fn operator_user() -> String {
     #[cfg(unix)]
@@ -2201,7 +2214,7 @@ pub(crate) fn arm(
     // fresh placeholder key. No gateway dir (an engine with no state home) = no egress at all.
     gateway_route_defined(cli, gateway_dir.is_some() && network != "none")
         .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
-    let (env, files, lease) = match gateway_dir.filter(|_| network != "none") {
+    let (env, files, lease, seat_args) = match gateway_dir.filter(|_| network != "none") {
         Some(dir) => {
             let down = |e: String| (FloorUnarmed::GatewayUnavailable, e);
             let gw = crate::seat_gateway::ensure_gateway(&rt, dir).map_err(down)?;
@@ -2225,6 +2238,8 @@ pub(crate) fn arm(
                 "{run_id}#{ord}@{}",
                 &uuid::Uuid::new_v4().simple().to_string()[..8]
             );
+            // The route a sign-in needs on the CLI's own argv (codex + ChatGPT: its provider).
+            let seat_args = crate::seat_gateway::seat_args_for(cli, kind.kind);
             let (key, env, files) = placeholder_handoff(cli, kind, run_id, &unit);
             let since = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2241,9 +2256,9 @@ pub(crate) fn arm(
                 since,
             };
             crate::seat_gateway::register_live(&rt, &gw, dir, key.clone()).map_err(down)?;
-            (env, files, Some(lease))
+            (env, files, Some(lease), seat_args)
         }
-        None => (Vec::new(), Vec::new(), None),
+        None => (Vec::new(), Vec::new(), None, Vec::new()),
     };
     let user = operator_user();
     let workdir = inp.cwd.canonicalize().unwrap_or_else(|_| inp.cwd.clone());
@@ -2277,7 +2292,7 @@ pub(crate) fn arm(
     });
     Ok(ArmedContainer {
         wrapper,
-        argv: image_argv(&argv, cli),
+        argv: with_seat_args(image_argv(&argv, cli), seat_args),
         tool: tool_name(&rt.cli),
         cleanup,
         env,
@@ -3437,6 +3452,42 @@ mod tests {
         };
         assert!(mount_plan(&spec).unwrap_err().contains("cannot be mounted"));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#989: a sign-in's route arguments go LAST (before a `--`), where codex's innermost
+    /// subcommand reads them (a root-level `-c` is dropped once `exec` has its own); an empty
+    /// argv stays empty.
+    #[test]
+    fn seat_args_go_last_before_a_separator() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            with_seat_args(
+                s(&["codex", "exec", "x", "--json", "-c", "notify=[]"]),
+                s(&["-c", "a=1"])
+            ),
+            s(&[
+                "codex",
+                "exec",
+                "x",
+                "--json",
+                "-c",
+                "notify=[]",
+                "-c",
+                "a=1"
+            ])
+        );
+        assert_eq!(
+            with_seat_args(
+                s(&["codex", "exec", "--json", "--", "-x"]),
+                s(&["-c", "a=1"])
+            ),
+            s(&["codex", "exec", "--json", "-c", "a=1", "--", "-x"])
+        );
+        assert_eq!(
+            with_seat_args(s(&["claude", "-p", "x"]), vec![]),
+            s(&["claude", "-p", "x"])
+        );
+        assert!(with_seat_args(vec![], s(&["-c", "a=1"])).is_empty());
     }
 
     #[test]
