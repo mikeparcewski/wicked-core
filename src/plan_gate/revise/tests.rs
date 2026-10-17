@@ -618,6 +618,39 @@ fn a_first_creator_pa_change_is_scored_from_its_touch_and_held_as_first_creator(
     assert_eq!(r.state.max_score, 100, "the ratchet records it");
 }
 
+/// crew#1059: a delivering run's answer-only plan took no deliver step; the PA's `PLAN+` that
+/// adds its first creator step ("Continue in Build") gains it from the run's retained deliver
+/// step, last, with the launch's command.
+#[test]
+fn continuing_a_delivering_ask_in_build_gains_the_deliver_step() {
+    let hc = HumanConfirm::None;
+    let mut s = accepted(json!([{"catalog":"understand","id":"answer-1"}]), 0, &hc);
+    s.deliver_step = Some(
+        serde_json::from_value(json!({"catalog": "deliver", "id": "deliver",
+            "executor": {"type": "tool", "cmd": ["ship"]}}))
+        .unwrap(),
+    );
+    let change = pa_block(
+        r#"[{"catalog":"build","id":"build"}]"#,
+        Some(r#"["src/retire.ts"]"#),
+        Some(ScoreScope {
+            repo_root: Some(std::env::temp_dir()),
+            base_commit: None,
+        }),
+    );
+    let r = revise("r", &s, change, &["answer-1".into()], &hc, Some(1), 0).unwrap();
+    let ids = def_ids(&r);
+    assert_eq!(ids.last().map(String::as_str), Some("deliver"), "{ids:?}");
+    let steps = &r.state.pending.as_ref().expect("held: first creator").steps;
+    let deliver = steps.steps.iter().find(|p| p.id == "deliver").unwrap();
+    assert_eq!(
+        deliver.executor,
+        Some(crate::workflow::PhaseExecutor::Tool {
+            cmd: vec!["ship".to_string()]
+        })
+    );
+}
+
 /// The second creator addition (the accepted plan already has one) is an ordinary change: no
 /// re-score, below high risk it proceeds in auto mode, and its touch is not read (`[]`).
 #[test]
