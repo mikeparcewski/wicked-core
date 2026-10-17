@@ -938,9 +938,7 @@ pub(crate) fn plan_and_distribute(
         clis,
         session_id,
         &pre.session.benched_seats,
-        !pre.session
-            .assurance
-            .enforces(crate::assurance::DISTINCT_EVALUATOR),
+        &pre.session.assurance,
     )?;
     apply_distributions(store, &mut pre, distributions, emit)?;
     Ok(Planned {

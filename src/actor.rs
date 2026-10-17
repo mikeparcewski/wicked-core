@@ -1776,9 +1776,7 @@ pub(crate) fn run(
                                         &pre.clis,
                                         &sid,
                                         &pre.session.benched_seats,
-                                        !pre.session
-                                            .assurance
-                                            .enforces(crate::assurance::DISTINCT_EVALUATOR),
+                                        &pre.session.assurance,
                                     )
                                 }));
                             match result {
@@ -2010,9 +2008,7 @@ pub(crate) fn run(
                                         &pre.clis,
                                         &sid,
                                         &pre.session.benched_seats,
-                                        !pre.session
-                                            .assurance
-                                            .enforces(crate::assurance::DISTINCT_EVALUATOR),
+                                        &pre.session.assurance,
                                     )
                                 }));
                             match result {
@@ -3453,9 +3449,7 @@ pub(crate) fn run(
                         let benched_c: Vec<crate::domain::BenchedSeat> = Vec::new();
                         let units_for_routing = units.clone();
                         let clis_keys = session.clis.clone();
-                        let allow_same_seat_c = !session
-                            .assurance
-                            .enforces(crate::assurance::DISTINCT_EVALUATOR);
+                        let assurance_c = session.assurance.clone();
                         let ord_c = ord;
                         // Emit UnitReassigned now (new_cli=None indicates a re-route).
                         emit(
@@ -3488,7 +3482,7 @@ pub(crate) fn run(
                                         &clis,
                                         &run_id_c,
                                         &benched_c,
-                                        allow_same_seat_c,
+                                        &assurance_c,
                                     )
                                 }));
                             match result {
@@ -11911,9 +11905,7 @@ fn check_def_runs(
         &roster,
         &session.id,
         &session.benched_seats,
-        !session
-            .assurance
-            .enforces(crate::assurance::DISTINCT_EVALUATOR),
+        &session.assurance,
     )?;
     Ok(())
 }
@@ -12002,9 +11994,7 @@ fn replan_for_accepted_edit(
         &pre.clis,
         run_id,
         &pre.session.benched_seats,
-        !pre.session
-            .assurance
-            .enforces(crate::assurance::DISTINCT_EVALUATOR),
+        &pre.session.assurance,
     )?;
     pipeline::apply_distributions(store, &mut pre, distributions, &mut |ev| {
         emit(subscribers, ev)

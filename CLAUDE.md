@@ -30,8 +30,10 @@ open to check a claim.
 - Single-writer store actor — never open the shared SQLite from a second writer.
 - Workflows are data (`WorkflowDef` JSON, see `workflows/`); gates are
   deny-dominates. evaluator≠creator is enforced where it can be and DISCLOSED where it
-  cannot (`src/distribute.rs`): a team run, or a roster whose distinct seat is benched,
-  refuses with `NoEligibleSeat`; a bench-free ordinary run on a too-small roster keeps the
+  cannot (`src/distribute.rs`): a roster whose distinct seat is benched, or a run whose
+  assurance contract enforces `distinct_evaluator` (every run not launched `reduced`, unless an
+  ordinary run's workflow drops the instrument; a team run needs the explicit `reduced`),
+  refuses with `NoEligibleSeat`; otherwise a bench-free run on a too-small roster keeps the
   review on the creator seat and stamps `distinctness_fallback: "creator_seat"` (a second
   instance of the same CLI is `"same_cli_instance"`). A pinned gate with no distinct judge
   skips the judge (`judge_skipped`, wire `agentVerdict: "skipped"`, `judgeDistinct: false`)
