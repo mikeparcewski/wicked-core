@@ -612,6 +612,26 @@ fn t2_g_b_an_understand_only_plan_scores_0_and_proceeds_in_auto_mode() {
     assert_eq!(dispatched_ords(seen, "rgu"), [(1, 0)]);
 }
 
+/// crew#1059: a DELIVERING launch (crew's repo-bound ask: `deliver: "pr"`) of a read-only plan —
+/// the ask's `answer-N` steps — plans no deliver step, so the answer is not followed by a deliver
+/// gate that can only fail "nothing to deliver".
+#[test]
+fn a_delivering_launch_of_a_read_only_plan_plans_no_deliver_step() {
+    let dir = tmp_dir("dlvask");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let mut rig = spawn(&db);
+    let p = plan(json!({"steps": [{"catalog": "understand", "id": "answer-1"}]}));
+    let mut s = spec("rdask", HumanConfirm::None, Some(p));
+    s.deliver_step = Some(deliver_step());
+    rig.core.launch_run(s).unwrap();
+    rig.tap.until("the first dispatch", |s| {
+        !dispatched_ords(s, "rdask").is_empty()
+    });
+    assert_eq!(unit_ids(&rig.core, "rdask"), ["answer-1"]);
+    let accepted = of_type(&rig.tap.seen, "rdask", ACCEPTED);
+    assert_eq!(catalogs(&accepted[0]["steps"]), ["understand"]);
+}
+
 // ── T3 (a) manual mode ───────────────────────────────────────────────────────────────────────────
 
 /// T3 (a): manual mode (`before:1` and `all`) pauses `plan_approval` before the first execution
@@ -1645,7 +1665,8 @@ fn a_renamed_duplicate_or_second_source_deliver_step_is_refused_at_launch() {
 /// gate re-opens, nothing is accepted.
 #[test]
 fn a_renamed_deliver_step_is_refused_as_a_gate_edit() {
-    let dir = tmp_dir("dlvedit");
+    // Its own dir: `dlvedit` is the editor-plugin test's, and `tmp_dir` wipes it (a parallel race).
+    let dir = tmp_dir("dlvrename");
     let db = dir.join("estate.db").to_str().unwrap().to_string();
     let mut rig = spawn(&db);
     let p = plan(json!({"steps": [{"catalog": "build", "id": "build"}], "touch": ["src/sso.rs"]}));

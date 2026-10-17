@@ -3158,22 +3158,21 @@ fn a_reassign_while_the_plan_is_held_dispatches_nothing() {
 }
 
 /// MEDIUM 5: a manual plan whose released unit IS the deliver unit still stops at the deliver
-/// gate (`auto_deliver: false`) — the plan approval never answers the push.
+/// gate (`auto_deliver: false`) — the plan approval never answers the push. The plan authors the
+/// step: a launch's own deliver step rides only a plan that may change the tree (crew#1059).
 #[test]
 fn a_released_deliver_unit_still_stops_at_its_deliver_gate() {
     let rig = rig("r10dl");
     let e = engine(&rig, fast(&rig));
-    let deliver: crate::PlanStep = serde_json::from_value(serde_json::json!({
-        "catalog": "deliver", "id": "deliver", "instructions": "push and open the PR",
-        "executor": {"type": "tool", "cmd": ["true"]}
-    }))
-    .unwrap();
     try_launch_plan(
         &e,
         "r10d",
-        serde_json::json!({"steps": []}),
+        serde_json::json!({"steps": [{
+            "catalog": "deliver", "id": "deliver", "instructions": "push and open the PR",
+            "executor": {"type": "tool", "cmd": ["true"]}
+        }]}),
         HumanConfirm::All,
-        Some(deliver),
+        None,
     )
     .expect("launch");
     wait_for("the plan_approval gate", || {

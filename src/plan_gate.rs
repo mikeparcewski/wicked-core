@@ -91,8 +91,9 @@ pub struct TeamPlanState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roster: Vec<Value>,
     /// The run DELIVERS (`LaunchSpec.deliver_step`): the launcher's `deliver` step, appended to
-    /// every plan of the run that has none of its own, and the command that puts `deliver` in the
-    /// floor (§8.5). `None` for a run that does not deliver.
+    /// every plan of the run that has a creator step and none of its own (see `delivered`),
+    /// and the command that puts `deliver` in the floor (§8.5). `None` for a run that does not
+    /// deliver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deliver_step: Option<PlanStep>,
     /// (X-MIG M9) The launch's declared deliverables (`LaunchSpec.deliverables`), kept so every
@@ -725,7 +726,8 @@ pub(crate) fn check_deliver_step(step: &PlanStep) -> Result<(), String> {
 
 /// `plan` with the run's `deliver` step added (codex round 6 on #622): ONE source of the
 /// deliver step. A delivering launch whose plan also authors a `deliver` step is refused, never
-/// silently resolved to one of them.
+/// silently resolved to one of them. A plan with no creator step takes no deliver step
+/// ([`delivered`], crew#1059).
 ///
 /// (X-MIG M12, DES-W7-M12) The step is appended, except in a plan that pauses for CONSENT before
 /// a write outside the run (a step gated `consent_before`, mcp-server's `install`): there the pull
@@ -744,6 +746,9 @@ fn with_deliver(plan: &PlanSteps, deliver: Option<&PlanStep>) -> Result<PlanStep
                 own.id
             ));
         }
+        if delivered(plan, Some(d)).is_none() {
+            return Ok(out);
+        }
         match consent_anchor(&out.steps) {
             Some(at) => {
                 // The anchor KEEPS its own dependencies and adds `deliver` (codex r3 on #866): the
@@ -760,6 +765,17 @@ fn with_deliver(plan: &PlanSteps, deliver: Option<&PlanStep>) -> Result<PlanStep
         }
     }
     Ok(out)
+}
+
+/// The run's deliver step as `plan` takes it (crew#1059): `deliver` ships the work of the plan's
+/// creator steps, so a plan with none — a read-only ask — takes none (it would otherwise park at a
+/// deliver gate that can only fail "nothing to deliver"). The floor's own rule: a plan with no
+/// creator step has an empty floor, `deliver` included (`plan::floor_types`), so a revision
+/// ([`revise::revise`], floor-filled with the run's deliver command) follows it too. The run keeps
+/// its deliver step on [`TeamPlanState::deliver_step`], so a later rev that adds a creator step
+/// (an ask continued in Build) delivers.
+fn delivered<'a>(plan: &PlanSteps, deliver: Option<&'a PlanStep>) -> Option<&'a PlanStep> {
+    deliver.filter(|_| plan.has_creator())
 }
 
 /// The step a delivering run's `deliver` goes before (see [`with_deliver`]): the plan's final
@@ -949,7 +965,7 @@ pub(crate) fn decide(
             Err(e) => (plan, Some(format!("{e:#}"))),
         },
     };
-    let deliver = deliver_cmd(prior.deliver_step.as_ref());
+    let deliver = deliver_cmd(delivered(&plan, prior.deliver_step.as_ref()));
     let proposal_id = ev::mint_proposal_id(run_id, &proposal.by, &proposal.source);
     let base_rev = (prior.accepted_rev > 0).then_some(prior.accepted_rev);
     let events = vec![
@@ -1717,12 +1733,16 @@ mod tests {
         let mut install = ws("install", "run", &["review"]);
         install.gate = Some(crate::workflow::GateSpec::ConsentBefore);
         let plan = PlanSteps {
-            steps: vec![ws("review", "review", &[]), install],
+            steps: vec![
+                ws("build", "build", &[]),
+                ws("review", "review", &["build"]),
+                install,
+            ],
             ..Default::default()
         };
         let out = with_deliver(&plan, Some(&deliver_step_for_test())).unwrap();
         let ids: Vec<_> = out.steps.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["review", "deliver", "install"]);
+        assert_eq!(ids, ["build", "review", "deliver", "install"]);
         // The consent step keeps its own dependencies (its dry-run read) and adds deliver.
         let install = out.steps.iter().find(|s| s.id == "install").unwrap();
         assert_eq!(
@@ -2083,6 +2103,51 @@ mod tests {
             1,
         )
         .unwrap()
+    }
+
+    fn decided_ids(d: &Decided) -> Vec<String> {
+        match &d.verdict {
+            Verdict::Accepted { def } | Verdict::Held { def } => {
+                def.phases.iter().map(|p| p.id.clone()).collect()
+            }
+            Verdict::Refused { reason } => panic!("refused: {reason}"),
+        }
+    }
+
+    /// crew#1059: a delivering run whose plan changes nothing (an ask: `answer-N` read-only
+    /// steps) gets no `deliver` step — there is nothing to deliver, so no deliver gate parks it —
+    /// and the run keeps its deliver step, so a later plan that adds a creator step delivers.
+    #[test]
+    fn a_read_only_plan_of_a_delivering_run_gets_no_deliver_step() {
+        let prior = TeamPlanState {
+            deliver_step: Some(deliver_step_for_test()),
+            ..TeamPlanState::default()
+        };
+        let ask = plan(json!({"steps": [{"catalog": "understand", "id": "answer-1"}]}));
+        let d = launch_decide(&ask, &prior, &HumanConfirm::None, &NoRules);
+        assert_eq!(decided_ids(&d), ["answer-1"]);
+        assert_eq!(
+            d.state.deliver_step, prior.deliver_step,
+            "kept for a later rev"
+        );
+        // The rules read a run that delivers nothing.
+        let rules = Fixed::new(RulesEval::default(), false);
+        launch_decide(&ask, &prior, &HumanConfirm::None, &rules);
+        assert_eq!(rules.asked.borrow()[0]["deliver"], json!(false));
+        // "Continue in Build": a plan with a creator step delivers.
+        let build = plan(json!({"steps": [
+            {"catalog": "understand", "id": "answer-1"},
+            {"catalog": "build", "id": "build", "depends_on": ["answer-1"]}
+        ], "touch": ["src/lib.rs"]}));
+        let d2 = launch_decide(&build, &d.state, &HumanConfirm::None, &NoRules);
+        let ids = decided_ids(&d2);
+        assert_eq!(ids.last().map(String::as_str), Some("deliver"), "{ids:?}");
+        // A Tool-only plan has no creator step: no deliver, as the floor rules for a revision.
+        let run = plan(json!({"steps": [
+            {"catalog": "run", "id": "fmt", "executor": {"type": "tool", "cmd": ["fmt"]}}
+        ]}));
+        let d3 = launch_decide(&run, &prior, &HumanConfirm::None, &NoRules);
+        assert_eq!(decided_ids(&d3), ["fmt"]);
     }
 
     /// WT-C3 (§4.12 B5): the rules are read against the ENGINE-derived context — `kinds` from
