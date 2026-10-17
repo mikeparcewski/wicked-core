@@ -1026,9 +1026,12 @@ pub enum CoreEvent {
     },
     /// (F-E2E-029 review F4; additive) The WRITE CONTAINMENT the seat assigned to an agent unit
     /// actually runs under, disclosed at distribution so an operator is never left believing a
-    /// fence is hermetic: `os` — (IG1-core-3) the seat sits on the OS-sandbox floor (governance
-    /// class `os_sandbox`, or `acp.os_sandbox: true`) AND the run is bound to a linked worktree AND
-    /// this host's launcher arms (codex: its own sandbox); `advisory` — any of the three failed, and
+    /// fence is hermetic: `os` — (core#993) the unit runs on the container seat floor
+    /// (`WICKED_SEAT_FLOOR=container`; a governed or engine-internal unit) in its own seat
+    /// container, the reason naming it; or (IG1-core-3) the seat sits on the OS-sandbox floor
+    /// (governance class `os_sandbox`, or `acp.os_sandbox: true`) AND the run is bound to a linked
+    /// worktree AND this host's launcher arms (codex: its own sandbox); `advisory` — any of the
+    /// three failed, and
     /// `reason` names which (not on the floor; `not_a_worktree`; `no_launcher` / `cannot_arm`), so
     /// containment is the worktree guard plus the command-text fences (remote-write, install),
     /// which a shell can evade. A prediction at distribution: the arm site's marker is the fact. Run `01234444`'s creator ran `advisory` and put 194 MB

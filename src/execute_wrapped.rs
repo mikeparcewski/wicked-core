@@ -5691,7 +5691,7 @@ pub(crate) fn governance_refusal(input: &StepInput, why: &str) -> StepOutput {
 
 // codex lg-r2 C5 / agy lg-r1 A6: config selection and arming share one predicate.
 // `seated` is [`runs_in_seat`]: a governed unit, or one of the engine's own judge/triage sessions.
-fn uses_container_seat(seated: bool, container_mode: bool) -> bool {
+pub(crate) fn uses_container_seat(seated: bool, container_mode: bool) -> bool {
     seated && container_mode
 }
 
@@ -5703,7 +5703,13 @@ fn uses_container_seat(seated: bool, container_mode: bool) -> bool {
 /// operator's own configuration. They stay UNGOVERNED (no gate hook, no ask tool, no MCP channel):
 /// an authored verdict call has no tool calls to judge. Under the host floor nothing changes.
 pub(crate) fn runs_in_seat(input: &StepInput) -> bool {
-    input.governance.is_some() || is_engine_internal(&input.unit)
+    unit_runs_in_seat(&input.unit, input.governance.is_some())
+}
+
+/// [`runs_in_seat`] for a unit before its dispatch input exists: `governed` is whether the
+/// dispatch will arm input governance (distribution's `sandboxPosture` prediction, core#993).
+pub(crate) fn unit_runs_in_seat(unit: &WorkUnit, governed: bool) -> bool {
+    governed || is_engine_internal(unit)
 }
 
 fn config_for_container_launch(

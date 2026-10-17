@@ -727,6 +727,61 @@ pub(crate) fn planned_units(
     }
     Ok(units)
 }
+/// (F-E2E-029 review F4, IG1-core-3, core#993) The `sandboxPosture` a distributed seat is
+/// PREDICTED to run under. `container_floor`: the unit follows the container seat floor (the
+/// carrier's own rule, `execute_wrapped::uses_container_seat` over `unit_runs_in_seat`) — it runs
+/// in its own seat container, an OS-enforced boundary, so `os` with a reason that names the
+/// container (a unit whose container cannot start is refused, never run on the host). Else the host
+/// floor: `os` only when the seat sits on the OS-sandbox floor AND the run is bound to a linked
+/// worktree AND this host's launcher arms; else `advisory`, naming which failed. A prediction: the
+/// arm site's marker is the fact.
+fn sandbox_posture(
+    seat: &AgenticCli,
+    workdir: Option<&std::path::Path>,
+    container_floor: bool,
+) -> (&'static str, String) {
+    if container_floor {
+        return (
+            "os",
+            "the unit runs in its own seat container (the container seat floor): the host exists \
+             inside only through the floor's mounts — the unit's permitted write roots and seat \
+             state read-write, the repository boundary and launch files read-only — Landlock \
+             confines writes and connections inside it, and its only egress is the model gateway \
+             (none for an offline seat); a unit whose container cannot start is refused, never \
+             run on the host"
+                .to_string(),
+        );
+    }
+    match crate::worker_sandbox::predicted_posture(seat, workdir) {
+        Ok(boundary) => (
+            "os",
+            format!(
+                "the seat sits on the OS-sandbox floor and the run is bound to a worktree: the \
+                 kernel write boundary arms ({boundary}), so writes outside the repository \
+                 boundary are refused by the OS"
+            ),
+        ),
+        Err(gap) => {
+            let why = match gap {
+                crate::worker_sandbox::PostureGap::NotOnTheFloor => format!(
+                    "the seat is not on the OS-sandbox floor (governance class {}, \
+                     acp.os_sandbox: false), so it arms no OS write boundary",
+                    wicked_council::governance_class(seat).as_wire()
+                ),
+                crate::worker_sandbox::PostureGap::Unarmed(u) => {
+                    format!("the OS write boundary will not arm — {}", u.describe())
+                }
+            };
+            (
+                "advisory",
+                format!(
+                    "{why}: write containment is the worktree guard plus the command-text fences \
+                     (remote-write, install) — best-effort, a shell can evade a text scan"
+                ),
+            )
+        }
+    }
+}
 
 /// Apply council distributions to the pre-distributed units, persist assignments to the store, and
 /// advance the session to `Executing`. Emits `UnitDistributed×n`. Store-writing — runs on the actor
@@ -737,6 +792,11 @@ pub(crate) fn apply_distributions(
     distributions: Vec<crate::distribute::Distribution>,
     emit: &mut dyn FnMut(CoreEvent),
 ) -> anyhow::Result<()> {
+    // (core#993) Whether each unit runs on the container seat floor, by the carrier's own rule:
+    // dispatch arms input governance exactly when `in_process_governance` answers (the unit's
+    // StepInput, actor.rs), and this runs on the actor thread that holds it.
+    let governed = crate::actor::in_process_governance().is_some();
+    let container_mode = crate::container_floor::container_mode();
     for (u, dist) in pre.units.iter_mut().zip(distributions.iter()) {
         u.assigned_cli = Some(dist.assigned_cli.clone());
         u.assigned_invocation = dist.assigned_invocation.clone();
@@ -804,41 +864,12 @@ pub(crate) fn apply_distributions(
         // command-text fences only, which a shell can evade. A Tool unit has no seat to disclose.
         if !matches!(dist.routing, RoutingInfo::Tool) {
             if let Some(seat) = pre.clis.iter().find(|c| c.key == dist.assigned_cli) {
-                // (IG1-core-3) `os` only when the seat sits on the OS-sandbox floor AND the run
-                // is bound to a linked worktree AND this host's launcher arms; else `advisory`,
-                // naming which of the three failed. A prediction: the arm site's marker is the fact.
                 let workdir = pre.session.workdir.as_deref().map(std::path::Path::new);
-                let (posture, reason) =
-                    match crate::worker_sandbox::predicted_posture(seat, workdir) {
-                        Ok(boundary) => (
-                            "os",
-                            format!(
-                                "the seat sits on the OS-sandbox floor and the run is bound to a \
-                                 worktree: the kernel write boundary arms ({boundary}), so writes \
-                                 outside the repository boundary are refused by the OS"
-                            ),
-                        ),
-                        Err(gap) => {
-                            let why = match gap {
-                                crate::worker_sandbox::PostureGap::NotOnTheFloor => format!(
-                                    "the seat is not on the OS-sandbox floor (governance class \
-                                     {}, acp.os_sandbox: false), so it arms no OS write boundary",
-                                    wicked_council::governance_class(seat).as_wire()
-                                ),
-                                crate::worker_sandbox::PostureGap::Unarmed(u) => {
-                                    format!("the OS write boundary will not arm — {}", u.describe())
-                                }
-                            };
-                            (
-                                "advisory",
-                                format!(
-                                    "{why}: write containment is the worktree guard plus the \
-                                     command-text fences (remote-write, install) — best-effort, \
-                                     a shell can evade a text scan"
-                                ),
-                            )
-                        }
-                    };
+                let container_floor = crate::execute_wrapped::uses_container_seat(
+                    crate::execute_wrapped::unit_runs_in_seat(u, governed),
+                    container_mode,
+                );
+                let (posture, reason) = sandbox_posture(seat, workdir, container_floor);
                 emit(CoreEvent::SandboxPosture {
                     session: pre.session_id.clone(),
                     ord: u.ord,
@@ -3884,6 +3915,70 @@ mod resolve_tests {
             ("codex", "launcher")
         );
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&sid));
+    }
+
+    /// core#993: on the container seat floor a governed seat's posture is `os` naming its seat
+    /// container — never the host floor's `sandbox-exec` / "not on the OS-sandbox floor" — whatever
+    /// the seat's host-floor record says; off it, the host-floor prediction is unchanged. The
+    /// floor decision is the carrier's: a governed or engine-internal unit in container mode.
+    #[test]
+    fn the_container_floor_posture_names_the_container_not_the_host_floor() {
+        use wicked_council::types::{Category, Confidence, InputMode};
+        let mk = |key: &str, class: Option<&str>| AgenticCli {
+            key: key.into(),
+            display_name: key.into(),
+            binary: key.into(),
+            headless_invocation: format!("{key} -p {{PROMPT}}"),
+            category: Category::default(),
+            input_mode: InputMode::default(),
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::default(),
+            enabled_for_council: true,
+            seat_eligible_for_work: true,
+            acp: None,
+            capabilities: None,
+            login_invocation: None,
+            logout_invocation: None,
+            governance_class: class.map(str::to_string),
+            credential: None,
+            free_tier: None,
+            health: None,
+        };
+        for seat in [mk("pi", None), mk("copilot", Some("os_sandbox"))] {
+            let (posture, reason) = sandbox_posture(&seat, None, true);
+            assert_eq!(posture, "os", "{}", seat.key);
+            assert!(reason.contains("its own seat container"), "{reason}");
+            assert!(
+                !reason.contains("sandbox-exec") && !reason.contains("not on the"),
+                "{reason}"
+            );
+            let (host, _) = sandbox_posture(&seat, None, false);
+            assert_eq!(
+                host, "advisory",
+                "{}: no worktree off the container floor",
+                seat.key
+            );
+        }
+        let unit = crate::domain::WorkUnit::pending("r:build", "r", 1, "build");
+        let floor = |u: &crate::domain::WorkUnit, governed, mode| {
+            crate::execute_wrapped::uses_container_seat(
+                crate::execute_wrapped::unit_runs_in_seat(u, governed),
+                mode,
+            )
+        };
+        assert!(floor(&unit, true, true));
+        assert!(
+            !floor(&unit, false, true),
+            "an ungoverned work unit runs on the host"
+        );
+        assert!(!floor(&unit, true, false), "the host floor");
+        let triage = crate::domain::WorkUnit::pending("triage-agent", "triage", 1, "x");
+        assert!(
+            floor(&triage, false, true),
+            "an engine session follows the floor"
+        );
     }
 
     /// DES-TEAMING-002 C2: a preset row resolves BEFORE a registered def of the same name, and the
