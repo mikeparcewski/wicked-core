@@ -660,6 +660,12 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.14.0** — 2026-10-17 — minor release on main 8566071, carrying #994, #995, #996, #998, #999, #1000, #1001, #1002, #1003, #1004, #1005, #1006 and #1007.
+  - **Container floor seats:** claude's gate hook is a relayed command hook (#994); codex's ChatGPT seat uses its own provider (#995); a copilot seat always names its model (#996), and uses its account's Copilot API host and models (#1002); `sandboxPosture` names the seat container (#1001).
+  - **Review and judging:** an evaluator unit's judge rotation excludes the work's creators, with a disclosed fallback (#1003); a reduced team run may review on its creator seat (#999); each triage judgement runs under its own session id (#1000).
+  - **Boundary findings:** a monitor cannot withdraw a boundary finding, and every path that cleared one waits for the operator, with the hold vaulted (#1004, #1006).
+  - **Plans and QE:** a plan with no creator step takes no deliver step (#998); the QE unit's temp is a root its fence admits (#1005).
+  - **Estate:** wicked-estate 0.30.0, so operator memories are recalled in every project (#1007).
 - **core-ts 0.13.1** — 2026-10-16 — patch release on main, carrying #986.
   - **Host-side sign-in:** codex, pi and opencode run their own native login on the host, inside a throwaway isolated home (file storage, never the keychain), so the browser's localhost callback works. The credential is ingested into the broker as before, and the seat container still sees only placeholders. copilot uses GitHub's device code. claude is unchanged.
 - **core-ts 0.13.0** — 2026-10-16 — minor release on main dfcdedd, carrying #981, #982, #983, #984, #980 and #979.
