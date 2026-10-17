@@ -6565,4 +6565,290 @@ curl -s --max-time 8 -H "authorization: Bearer $tok" -H 'content-type: applicati
             "no credential in the gateway log"
         );
     }
+
+    /// LIVE (`WICKED_CONTAINER_LIVE=1`), core#989: a governed codex unit signed in with ChatGPT
+    /// runs to completion on the container floor. A FAKE ChatGPT login is ingested; the floor arms
+    /// the real codex 0.162.1 seat (placeholder auth, the unit's key, the netns sidecar, Landlock)
+    /// with the gateway's ChatGPT route as its own model provider; the turn completes through the
+    /// route with the broker's credential and account upstream, with chatgpt.com unreachable.
+    /// Control: the same seat armed the old way (`OPENAI_BASE_URL` at the route, the built-in
+    /// provider) fails with "workspace routing discovery failed", the E2E's error.
+    #[cfg(unix)]
+    #[test]
+    fn live_a_chatgpt_codex_unit_completes_through_its_route() {
+        use crate::container_floor::{arm, finalize};
+        use crate::seat_gateway::{configure_gateway, ensure_gateway, GatewayConfig};
+        use crate::worker_sandbox::FloorInputs;
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("WICKED_WORKER_HOME", v),
+                    None => std::env::remove_var("WICKED_WORKER_HOME"),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("WICKED_WORKER_HOME"));
+        let rt = crate::container_floor::runtime().expect("a container runtime answers");
+        let node_image = crate::container_floor::ensure_seat_image(&rt, "pi").unwrap();
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("wicked-989-live-{}", uuid::Uuid::new_v4().simple()));
+        let dir = base.join("state/gateway");
+        let worker = base.join("worker");
+        let seat_home = worker.join("seat-codex");
+        for d in [&dir, &seat_home, &base.join("stub")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::env::set_var("WICKED_WORKER_HOME", &worker);
+        let run = |argv: &[&str]| {
+            let mut c = rt.cmd();
+            c.args(argv);
+            output_within(c, Duration::from_secs(60)).unwrap()
+        };
+        let gw = Gateway::for_dir(&dir);
+        let stub = format!("{}-stub", gw.name);
+        // The ChatGPT backend stub: a Responses stream for `…/responses`, 404 for anything else;
+        // it logs what authenticated each request.
+        std::fs::write(
+            base.join("stub/stub.js"),
+            "const h=require('http');let n=0;h.createServer((q,r)=>{q.resume();q.on('end',()=>{\
+             console.log('UPSTREAM '+JSON.stringify({m:q.method,url:q.url,\
+             auth:q.headers['authorization']||'',acct:q.headers['chatgpt-account-id']||''}));\
+             if(q.method!=='POST'||!q.url.endsWith('/responses')){r.statusCode=404;return r.end('{}')}\
+             n++;r.setHeader('content-type','text/event-stream');\
+             const ev=(t,d)=>r.write('event: '+t+'\\ndata: '+JSON.stringify({type:t,...d})+'\\n\\n');\
+             const item={type:'message',id:'msg_'+n,role:'assistant',\
+             content:[{type:'output_text',text:'STUB-DONE'}]};\
+             ev('response.created',{response:{id:'resp_'+n}});\
+             ev('response.output_item.added',{output_index:0,item});\
+             ev('response.output_item.done',{output_index:0,item});\
+             ev('response.completed',{response:{id:'resp_'+n,usage:{input_tokens:1,\
+             input_tokens_details:null,output_tokens:1,output_tokens_details:null,total_tokens:2}}});\
+             r.end()})}).listen(8080)",
+        )
+        .unwrap();
+        let mut config = GatewayConfig::default();
+        for route in &mut config.providers {
+            route.upstream_host = format!("{stub}:8080");
+            route.tls = false;
+        }
+        configure_gateway(&dir, &config).unwrap();
+        let gw = ensure_gateway(&rt, &dir).expect("the gateway starts");
+        let stub_mount = format!(
+            "type=bind,src={},dst=/s,readonly",
+            base.join("stub").display()
+        );
+        let o = run(&[
+            "run",
+            "-d",
+            "--name",
+            &stub,
+            "--network",
+            &gw.external_network,
+            "--mount",
+            &stub_mount,
+            &node_image,
+            "node",
+            "/s/stub.js",
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        // The user's ChatGPT sign-in (FAKE values), ingested into the broker.
+        host_login_with(
+            &dir,
+            &gw.name,
+            "codex",
+            "codex/auth.json",
+            &serde_json::to_string(&chatgpt()).unwrap(),
+        );
+        ingest_and_route(&rt, &gw, &dir, "codex").expect("ingested");
+        // A real linked run worktree with the engine's pin, as a governed unit has.
+        let repo = base.join("repo");
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            // spawn-audit: test-only — local git over a temp repo.
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        };
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "i"]);
+        git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let pin = crate::worktree_guard::pinned_git_dir(&wt, &repo).unwrap();
+        let inputs = FloorInputs {
+            cwd: wt.clone(),
+            write_roots: vec![wt.clone()],
+            read_only: false,
+            seat_dirs: vec![seat_home.clone()],
+            unmask: vec![],
+            pinned: vec![],
+            net: vec![],
+            home: None,
+            trusted_git_dir: Some(pin),
+        };
+        let argv: Vec<String> = [
+            "codex",
+            "exec",
+            "--json",
+            "--skip-git-repo-check",
+            "-s",
+            "danger-full-access",
+            "say hi",
+            // The engine's own `exec` overrides ride every governed codex argv: with one present,
+            // codex drops ROOT-level `-c`, so the provider must ride the subcommand too.
+            "-c",
+            "features.hooks=false",
+        ]
+        .map(String::from)
+        .to_vec();
+        // One governed unit: arm, run the floor's wrapper + the seat's argv, release.
+        let unit = |ord: u32, old_arming: bool| {
+            let armed = arm(
+                &inputs,
+                &argv,
+                "run-989",
+                ord,
+                &[],
+                Some("say hi"),
+                Some(&dir),
+            )
+            .expect("a signed-in codex seat arms");
+            let mut seat_argv = armed.argv.clone();
+            let mut env = armed.env.clone();
+            if old_arming {
+                // What crew 0.13.2 / core-ts 0.13.1 armed: the built-in provider at the route.
+                let at = seat_argv
+                    .iter()
+                    .position(|a| a.starts_with("model_provider="))
+                    .expect("the provider rides the armed argv");
+                // `-c model_provider=…` and `-c model_providers.…={…}`.
+                seat_argv.drain(at - 1..at + 3);
+                env.push((
+                    "OPENAI_BASE_URL".into(),
+                    "http://agw:4002/backend-api/codex".into(),
+                ));
+            }
+            let full: Vec<String> = armed.wrapper.iter().chain(&seat_argv).cloned().collect();
+            let mut cmd = crate::execute_wrapped::build_worker_command(&full, None);
+            cmd.env("CODEX_HOME", &seat_home);
+            for (k, v) in &env {
+                cmd.env(k, v);
+            }
+            crate::container_floor::write_unit_seat_files(&mut cmd, "codex", &armed.files)
+                .expect("placeholder files");
+            let out = output_within(finalize(cmd), Duration::from_secs(150)).expect("the seat ran");
+            if let Some(lease) = armed.lease {
+                let _ = lease.release();
+            }
+            drop(armed.cleanup);
+            (
+                armed.argv,
+                out.status.code(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            )
+        };
+        // A provider table a seat could leave in its own config home (codex review): it selects
+        // itself and authenticates by a missing env key. The unit's own provider still wins.
+        std::fs::write(
+            seat_home.join("config.toml"),
+            "model_provider = \"wicked-gateway\"\n\n[model_providers.wicked-gateway]\n\
+             name = \"planted\"\nbase_url = \"http://agw:4002/backend-api/codex\"\n\
+             env_key = \"WICKED_989_MISSING_KEY\"\n",
+        )
+        .unwrap();
+        let (fixed_argv, fixed_code, fixed) = unit(1, false);
+        std::fs::remove_file(seat_home.join("config.toml")).unwrap();
+        let (_, _, old) = unit(2, true);
+        let upstream = String::from_utf8_lossy(&run(&["logs", &stub]).stdout).to_string();
+        let logs = run(&["logs", &gw.name]);
+        let gw_logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&logs.stdout),
+            String::from_utf8_lossy(&logs.stderr)
+        );
+        sign_out_and_route(&rt, &gw, &dir, "codex").expect("signed out");
+        run(&["rm", "-f", &stub, &gw.name]);
+        run(&["network", "rm", &gw.external_network]);
+        let (cfg, broker) = crate::seat_gateway::volumes(&gw);
+        run(&["volume", "rm", &cfg, &broker]);
+        let _ = std::fs::remove_dir_all(&base);
+        let tail = |s: &str| {
+            s.chars()
+                .rev()
+                .take(1500)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
+        };
+        eprintln!(
+            "argv={fixed_argv:?}\nfixed({fixed_code:?})={}\nold={}\nupstream={upstream}",
+            tail(&fixed),
+            tail(&old)
+        );
+        // The fix: the provider rides the argv, the turn completes through the route.
+        assert!(
+            fixed_argv
+                .iter()
+                .any(|a| a.contains("base_url=\"http://agw:4002/backend-api/codex\"")),
+            "{fixed_argv:?}"
+        );
+        assert!(
+            fixed_argv
+                .last()
+                .is_some_and(|a| a.contains(crate::seat_gateway::CODEX_GATEWAY_PROVIDER)),
+            "the provider rides the subcommand, after the engine's own overrides: {fixed_argv:?}"
+        );
+        assert_eq!(fixed_code, Some(0), "{}", tail(&fixed));
+        assert!(fixed.contains("\"turn.completed\""), "{}", tail(&fixed));
+        assert!(fixed.contains("STUB-DONE"), "{}", tail(&fixed));
+        assert!(!fixed.contains("workspace routing"), "{}", tail(&fixed));
+        let calls: Vec<Value> = upstream
+            .lines()
+            .filter_map(|l| l.strip_prefix("UPSTREAM "))
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let model = calls
+            .iter()
+            .find(|c| c["m"] == "POST" && c["url"] == "/backend-api/codex/responses")
+            .expect("codex's model request reached the route's upstream");
+        assert_eq!(
+            model["auth"], "Bearer FAKE-codex-access",
+            "the broker's credential"
+        );
+        assert_eq!(model["acct"], "FAKE-account-id", "the broker's account");
+        for c in &calls {
+            assert!(!c.to_string().contains("PLACEHOLDER"), "{c}");
+        }
+        // The control: the built-in provider at the route is the E2E's failure.
+        assert!(
+            old.contains("workspace routing discovery failed"),
+            "{}",
+            tail(&old)
+        );
+        assert!(
+            !gw_logs.contains("FAKE-codex-access"),
+            "no credential in the gateway log"
+        );
+    }
 }

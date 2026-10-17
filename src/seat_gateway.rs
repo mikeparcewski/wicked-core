@@ -895,9 +895,6 @@ pub(crate) fn seat_env_for(cli: &str, kind: CredentialKind, bearer: &str) -> Vec
             ("ANTHROPIC_BASE_URL", CredentialKind::ClaudeOauth | CredentialKind::ClaudeApiKey) => {
                 *value = url.clone()
             }
-            ("OPENAI_BASE_URL", CredentialKind::CodexChatgpt) => {
-                *value = format!("{url}/backend-api/codex")
-            }
             ("OPENAI_BASE_URL", CredentialKind::CodexApiKey | CredentialKind::ProviderKey) => {
                 *value = format!("{url}/v1")
             }
@@ -910,7 +907,57 @@ pub(crate) fn seat_env_for(cli: &str, kind: CredentialKind, bearer: &str) -> Vec
     ) {
         env.retain(|(name, _)| name != "ANTHROPIC_API_KEY" && name != "OPENAI_API_KEY");
     }
+    // codex's ChatGPT route is its own model provider ([`seat_args_for`]), never the built-in
+    // OpenAI provider's base URL (core#989).
+    if kind == CredentialKind::CodexChatgpt {
+        env.retain(|(name, _)| name != "OPENAI_BASE_URL");
+    }
     env
+}
+
+/// The prefix of the model provider id a codex seat signed in with ChatGPT uses (core#989); each
+/// execution's id adds a fresh suffix ([`seat_args_for`]).
+pub(crate) const CODEX_GATEWAY_PROVIDER: &str = "wicked-gateway";
+
+/// The CLI arguments a seat signed in with `kind` needs to reach its route, appended to its argv
+/// ([`crate::container_floor::with_seat_args`]).
+///
+/// codex + ChatGPT (core#989): its requests go to the ChatGPT route through a CUSTOM model
+/// provider (`base_url` = the route, `requires_openai_auth`, so the placeholder ChatGPT auth is
+/// what it sends), never the built-in OpenAI provider with `OPENAI_BASE_URL` at the route. On the
+/// built-in provider a `…/backend-api/codex` base makes codex >= 0.162 run ChatGPT workspace
+/// routing discovery first: a direct `GET https://chatgpt.com/backend-api/wham/accounts/check`
+/// outside the route (refused at the gateway's CONNECT listener), whose failure is fatal
+/// ("workspace routing discovery failed"), and whose success would move every request to the
+/// discovered https origin, around the gateway. A custom provider is not routed
+/// (`supports_codex_backend_routes` is the built-in provider's alone), so the gateway stays the
+/// only path and the broker's credential the only one upstream.
+///
+/// The provider id is fresh per execution (`wicked-gateway-<hex>`): codex MERGES an override
+/// table into a same-named table of its config layers, so a provider table a seat left in its
+/// own config home (an `env_key`, an `experimental_bearer_token`) would otherwise change how this
+/// one authenticates (codex review of core#989).
+pub(crate) fn seat_args_for(cli: &str, kind: Option<CredentialKind>) -> Vec<String> {
+    match (cli, kind) {
+        ("codex", Some(CredentialKind::CodexChatgpt)) => {
+            let base = format!(
+                "{}/backend-api/codex",
+                credential_gateway_url(cli, CredentialKind::CodexChatgpt)
+            );
+            let nonce = uuid::Uuid::new_v4().simple().to_string();
+            let p = format!("{CODEX_GATEWAY_PROVIDER}-{}", &nonce[..12]);
+            vec![
+                "-c".into(),
+                format!("model_provider=\"{p}\""),
+                "-c".into(),
+                format!(
+                    "model_providers.{p}={{name=\"wicked gateway\",base_url=\"{base}\",\
+                     wire_api=\"responses\",requires_openai_auth=true}}"
+                ),
+            ]
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// The env of a seat signed in with `sign_in`. A subscription's CLI reads its route from its own
@@ -3528,12 +3575,86 @@ esac
                 .iter()
                 .any(|r| r.port == port && r.kind == Some(kind)));
             let env = seat_env_for(cli, kind, "wk-test-PLACEHOLDER");
-            assert!(env
-                .iter()
-                .any(|(k, v)| k == base && v == &format!("{origin}{suffix}")));
+            let url = format!("{origin}{suffix}");
+            if kind == CredentialKind::CodexChatgpt {
+                // core#989: the route is codex's own provider, never the built-in one's base URL.
+                assert!(!env.iter().any(|(k, _)| k == base), "{env:?}");
+                let args = seat_args_for(cli, Some(kind)).join(" ");
+                assert!(args.contains(&format!("base_url=\"{url}\"")), "{args}");
+            } else {
+                assert!(env.iter().any(|(k, v)| k == base && *v == url));
+                assert!(seat_args_for(cli, Some(kind)).is_empty());
+            }
             assert!(env
                 .iter()
                 .any(|(k, v)| k == "HTTPS_PROXY" && v == "http://agw:3000"));
+        }
+    }
+
+    /// core#989 (red on main): a codex seat signed in with ChatGPT selects a CUSTOM model
+    /// provider at the ChatGPT route, never the built-in OpenAI provider at a
+    /// `…/backend-api/codex` base (which makes codex >= 0.162 run workspace routing discovery
+    /// straight at chatgpt.com, refused at the gateway, and fatal). It sends the placeholder
+    /// ChatGPT auth (`requires_openai_auth`), and no other seat gets an argument.
+    #[test]
+    fn a_chatgpt_codex_seat_uses_its_own_provider_at_the_route() {
+        let args = seat_args_for("codex", Some(CredentialKind::CodexChatgpt));
+        // A fresh provider id per execution, so no table in the seat's config layers merges in.
+        let id = args[1]
+            .strip_prefix("model_provider=\"")
+            .and_then(|r| r.strip_suffix('"'))
+            .expect("the provider selection")
+            .to_string();
+        let suffix = id
+            .strip_prefix(&format!("{CODEX_GATEWAY_PROVIDER}-"))
+            .expect("the provider id prefix");
+        assert!(
+            suffix.len() == 12 && suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "{id}"
+        );
+        let again = seat_args_for("codex", Some(CredentialKind::CodexChatgpt));
+        assert_ne!(args[1], again[1], "a fresh id per execution");
+        assert_eq!(
+            args,
+            vec![
+                "-c".to_string(),
+                format!("model_provider=\"{id}\""),
+                "-c".into(),
+                format!(
+                    "model_providers.{id}={{name=\"wicked gateway\",\
+                     base_url=\"http://agw:4002/backend-api/codex\",wire_api=\"responses\",\
+                     requires_openai_auth=true}}"
+                ),
+            ]
+        );
+        // Each override is valid TOML as codex parses it (`key=value`, the value a TOML value).
+        for pair in args.iter().skip(1).step_by(2) {
+            let (k, v) = pair.split_once('=').unwrap();
+            let doc: toml::Table = toml::from_str(&format!("x = {v}")).expect(pair);
+            assert!(!k.is_empty() && doc.contains_key("x"), "{pair}");
+        }
+        let provider: toml::Table =
+            toml::from_str(&format!("x = {}", args[3].split_once('=').unwrap().1)).unwrap();
+        let p = provider["x"].as_table().unwrap();
+        assert_eq!(p["requires_openai_auth"].as_bool(), Some(true));
+        assert_ne!(
+            p["name"].as_str(),
+            Some("OpenAI"),
+            "the built-in provider's name turns workspace routing back on"
+        );
+        let env = seat_env_for("codex", CredentialKind::CodexChatgpt, "wk-test-PLACEHOLDER");
+        assert!(
+            !env.iter()
+                .any(|(k, _)| k == "OPENAI_BASE_URL" || k == "OPENAI_API_KEY"),
+            "{env:?}"
+        );
+        for (cli, kind) in [
+            ("codex", Some(CredentialKind::CodexApiKey)),
+            ("claude", Some(CredentialKind::ClaudeOauth)),
+            ("pi", Some(CredentialKind::CodexChatgpt)),
+            ("codex", None),
+        ] {
+            assert!(seat_args_for(cli, kind).is_empty(), "{cli} {kind:?}");
         }
     }
 
