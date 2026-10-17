@@ -5821,7 +5821,9 @@ esac
     /// credentials. Its login's `config.json` is ingested; the real copilot 1.0.96 CLI runs in
     /// its BYOK mode with only the env arming renders (the unit key as its bearer) and reaches a
     /// stub upstream through the Copilot route, which sees the broker's GitHub token, never the
-    /// unit key; pi's unit is refused there; sign-out empties the route.
+    /// unit key; pi's unit is refused there; sign-out empties the route. core#990: the seat's
+    /// argv names no model (as a governed unit's does), the env's default model is sent on the
+    /// wire API it needs, and the turn completes (exit 0) on the stub's answer.
     #[cfg(unix)]
     #[test]
     fn live_copilot_sign_in_reaches_the_upstream_only_through_its_route() {
@@ -5849,9 +5851,21 @@ esac
         let stub = format!("{}-stub", gw.name);
         std::fs::write(
             dir.join("stub/stub.js"),
-            "const h=require('http');h.createServer((q,r)=>{q.resume();q.on('end',()=>{\
-             console.log('UPSTREAM '+JSON.stringify({url:q.url,auth:q.headers['authorization']||''}));\
-             r.statusCode=401;r.end('{}')})}).listen(8080);",
+            "const h=require('http');let n=0;h.createServer((q,r)=>{let b='';\
+             q.on('data',d=>b+=d);q.on('end',()=>{let m='';try{m=JSON.parse(b).model||''}catch{}\
+             console.log('UPSTREAM '+JSON.stringify({url:q.url,auth:q.headers['authorization']||'',\
+             model:m}));if(q.method!=='POST'||!/responses$/.test(q.url)){r.statusCode=404;\
+             return r.end('{}')}n++;r.setHeader('content-type','text/event-stream');\
+             const ev=(t,d)=>r.write('event: '+t+'\\ndata: '+JSON.stringify({type:t,...d})+'\\n\\n');\
+             const item={type:'message',id:'msg_'+n,role:'assistant',status:'completed',\
+             content:[{type:'output_text',text:'STUB-DONE',annotations:[]}]};\
+             const resp={id:'resp_'+n,object:'response',status:'completed',model:m,output:[item],\
+             usage:{input_tokens:1,output_tokens:1,total_tokens:2}};\
+             ev('response.created',{response:{...resp,status:'in_progress',output:[]}});\
+             ev('response.output_item.added',{output_index:0,item:{...item,content:[]}});\
+             ev('response.output_text.delta',{output_index:0,content_index:0,item_id:item.id,\
+             delta:'STUB-DONE'});ev('response.output_item.done',{output_index:0,item});\
+             ev('response.completed',{response:resp});r.end()})}).listen(8080);",
         )
         .unwrap();
         let mut config = GatewayConfig::default();
@@ -6086,17 +6100,13 @@ esac
             !format!("{report:?}").contains("gho_FAKE"),
             "the ingest report names files, never the token"
         );
-        let argv: Vec<String> = [
-            "copilot",
-            "-p",
-            "say hi",
-            "--allow-all-tools",
-            "--model",
-            "gpt-5.5",
-        ]
-        .map(String::from)
-        .to_vec();
-        if let Some(wire) = crate::seat_gateway::copilot_wire_api(&argv, |_| None) {
+        // core#990: no `--model`, as a governed unit's argv carries none; the wire API is
+        // resolved from the seat's own env, as execute_wrapped resolves it.
+        let argv: Vec<String> = ["copilot", "-p", "say hi", "--allow-all-tools"]
+            .map(String::from)
+            .to_vec();
+        let env_of = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        if let Some(wire) = crate::seat_gateway::copilot_wire_api(&argv, env_of) {
             env.push(("COPILOT_PROVIDER_WIRE_API".into(), wire.into()));
         }
         let mut docker: Vec<String> = [
@@ -6126,12 +6136,15 @@ esac
         docker.extend(argv);
         let refs: Vec<&str> = docker.iter().map(String::as_str).collect();
         let o = run(&refs);
+        let copilot_out = format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
         eprintln!(
-            "copilot: {}",
-            String::from_utf8_lossy(&o.stdout)
-                .chars()
-                .take(600)
-                .collect::<String>()
+            "copilot ({:?}): {}",
+            o.status.code(),
+            copilot_out.chars().take(600).collect::<String>()
         );
         let mut seen = String::new();
         for _ in 0..40 {
@@ -6178,6 +6191,18 @@ esac
             model_call["auth"], "Bearer gho_FAKEcopilotlogin000000000000000000",
             "the token copilot's own login stored, from the broker"
         );
+        // core#990: with no model in its argv the seat sends the default one, and the turn ends.
+        assert_eq!(
+            model_call["model"],
+            crate::seat_gateway::COPILOT_SEAT_MODEL,
+            "{seen}"
+        );
+        assert!(
+            !copilot_out.contains("require an explicit model"),
+            "{copilot_out}"
+        );
+        assert_eq!(o.status.code(), Some(0), "{copilot_out}");
+        assert!(copilot_out.contains("STUB-DONE"), "{copilot_out}");
         for line in &lines {
             assert!(!line.to_string().contains(&key.key), "{line}");
         }

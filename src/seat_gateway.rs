@@ -950,10 +950,20 @@ pub(crate) fn seat_env_for_sign_in(
                 bearer.to_string(),
             ),
             ("COPILOT_AUTO_UPDATE".to_string(), "false".to_string()),
+            // BYOK refuses to start without a model (core#990: "BYOK providers require an
+            // explicit model"); the documented default, which a roster's `--model` overrides.
+            ("COPILOT_MODEL".to_string(), COPILOT_SEAT_MODEL.to_string()),
         ]);
     }
     env
 }
+
+/// The model a copilot seat runs when its roster entry names none (core#990). BYOK mode has no
+/// server model catalogue to pick from, and copilot exits before any call without a model. This
+/// one is served on every Copilot plan; an operator picks another with `--model <id>` in the
+/// seat's `headless_invocation` (clis.toml), which copilot ranks above `COPILOT_MODEL`, as
+/// [`copilot_wire_api`] does.
+pub(crate) const COPILOT_SEAT_MODEL: &str = "gpt-5-mini";
 
 /// The wire API copilot's BYOK mode must use for the model its seat sends, resolved as copilot
 /// does: `COPILOT_PROVIDER_WIRE_MODEL`, else `--model X`/`--model=X`, else `COPILOT_MODEL`, else
@@ -2288,8 +2298,24 @@ mod tests {
         );
         assert_eq!(get("OPENAI_API_KEY"), None);
         assert_eq!(get("HTTPS_PROXY"), Some("http://agw:3000"));
+        // core#990 (red on main): BYOK exits 1 without a model, so the seat always names one.
+        assert_eq!(get("COPILOT_MODEL"), Some(COPILOT_SEAT_MODEL));
         let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let none = |_: &str| None::<String>;
+        // The seat's own env resolves the wire API for the default model (`gpt-*` → responses);
+        // a roster `--model` outranks it.
+        let seat = |k: &str| get(k).map(str::to_string);
+        assert_eq!(
+            copilot_wire_api(&argv(&["copilot", "-p", "x"]), seat),
+            Some("responses")
+        );
+        assert_eq!(
+            copilot_wire_api(
+                &argv(&["copilot", "--model", "claude-sonnet-5", "-p", "x"]),
+                seat
+            ),
+            None
+        );
         assert_eq!(
             copilot_wire_api(&argv(&["copilot", "--model", "gpt-5.5", "-p", "x"]), none),
             Some("responses")
