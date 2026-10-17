@@ -1261,6 +1261,17 @@ pub fn render_for_gate(snap: &UnitTeamSnapshot) -> Option<String> {
                     cap_utf8(w, 512)
                 ));
             }
+            if let Some(g) = &r.evidence_gone {
+                s.push_str(&format!(
+                    "  {} (operator decision required)\n",
+                    cap_utf8(g, 512)
+                ));
+            }
+            match (&r.vault_entry, &r.vault_error) {
+                (Some(id), _) => s.push_str(&format!("  vault entry: {id}\n")),
+                (None, Some(e)) => s.push_str(&format!("  not vaulted: {}\n", cap_utf8(e, 256))),
+                (None, None) => {}
+            }
         }
         if let Some(d) = &f.dispute {
             s.push_str(&format!(

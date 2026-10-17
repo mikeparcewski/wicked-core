@@ -3945,6 +3945,7 @@ pub(crate) fn run(
                                 status: s.status,
                                 team,
                                 roster: s.clis,
+                                evidence_root: s.evidence_root,
                             })
                         })
                         .collect()

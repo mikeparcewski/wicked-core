@@ -202,6 +202,9 @@ pub struct SupervisorConfig {
     /// (ASK-K3b) The runner's stashed step outputs, read at the final pass of a step that
     /// changed no tree ([`super::publish::OutputStash`]).
     pub outputs: super::publish::OutputStash,
+    /// (core#959) Where a finding held for the operator is recorded as evidence: wicked-vault's
+    /// CLI in production ([`super::vault::CliVault`]).
+    pub vault: Arc<dyn super::vault::EvidenceVault>,
 }
 
 impl SupervisorConfig {
@@ -221,6 +224,7 @@ impl SupervisorConfig {
             publish_bound: cfg.bound(),
             engine: None,
             outputs: cfg.outputs.clone(),
+            vault: Arc::new(super::vault::CliVault::default()),
         })
     }
 
@@ -385,6 +389,11 @@ pub struct UnitTeam {
     rescores: Rescores,
     /// (T4) Where a re-score goes: the engine's command channel.
     engine: Option<Sender<crate::command::Command>>,
+    /// (core#959) Where a finding held for the operator is vaulted.
+    vault: Arc<dyn super::vault::EvidenceVault>,
+    /// (core#959) The raises this attempt already settled `held` for the operator (a carried
+    /// hold): never superseded, never asked again at the hold round.
+    held: BTreeSet<u32>,
 }
 
 /// (T4, §8.7) The re-score bound of one attempt: a checkpoint re-scores only when the tree differs
@@ -458,7 +467,101 @@ impl UnitTeam {
             raised_ids: BTreeMap::new(),
             rescores: Rescores::default(),
             engine: None,
+            vault: Arc::new(super::vault::CliVault::default()),
+            held: BTreeSet::new(),
         }
+    }
+
+    /// (core#959, operator decision 2026-10-17) Vault a finding held for the operator — the
+    /// original finding and what holds it — under the run's evidence root. `(entry, error)`.
+    fn vault_hold(
+        &self,
+        seq: u32,
+        f: &Finding,
+        hold: &OperatorHold,
+        reason: &str,
+        budget: Duration,
+    ) -> (Option<String>, Option<String>) {
+        let (run, ord, attempt) = (&self.ctx.run_id, self.ctx.ord, self.ctx.attempt);
+        let artifact = serde_json::json!({
+            "run": run,
+            "ord": ord,
+            "attempt": attempt,
+            "raise_seq": seq,
+            "finding": f,
+            "held_for_operator": reason,
+            "withdrawal_requested": hold.withdrawal_requested,
+            "evidence_gone": hold.evidence_gone,
+            "recorded_at": crate::interaction::now_millis(),
+        });
+        let kind = if hold.withdrawal_requested.is_some() {
+            "withdrawal-request"
+        } else {
+            "evidence-gone"
+        };
+        let stem = format!("{run}-u{ord}-a{attempt}-r{seq}-{}-{kind}", f.finding_id);
+        match super::vault::record_hold(
+            &*self.vault,
+            self.ctx.evidence_root.as_deref(),
+            &stem,
+            &artifact,
+            budget,
+            |path| super::vault::VaultRecord {
+                scope: format!("run:{run}"),
+                phase: format!("team:{ord}"),
+                claim: format!("finding:{}", f.finding_id),
+                kind: format!("team-finding-{kind}"),
+                criteria: "a team finding naming a boundary circumvention, held for the \
+                           operator: only the operator clears it (core#959)"
+                    .to_string(),
+                artifact: path,
+                actor: f.seat.clone(),
+            },
+        ) {
+            Ok(id) => (Some(id), None),
+            Err(why) => {
+                eprintln!(
+                    "wicked-core: team: {run}:{ord}:{attempt} finding {} held for the operator \
+                     was not vaulted: {why}",
+                    f.finding_id
+                );
+                (None, Some(why))
+            }
+        }
+    }
+
+    /// (core#959) Settle raise `seq` `held` for the operator with `hold`'s marks, vaulting it
+    /// first unless `hold` already names its vault entry.
+    fn settle_held(
+        &mut self,
+        seq: u32,
+        f: &Finding,
+        hold: &OperatorHold,
+        reason: String,
+        final_line: Option<u32>,
+        budget: Duration,
+    ) {
+        let (vault_entry, vault_error) = match &hold.vault_entry {
+            Some(id) => (Some(id.clone()), None),
+            None => self.vault_hold(seq, f, hold, &reason, budget),
+        };
+        let key = self.key();
+        let ev = TeamEvent {
+            env: env_of(&key, &f.seat, Some(format!("finding.raised#{seq}"))),
+            body: TeamBody::FindingSettled(FindingSettled {
+                raise_seq: seq,
+                finding_id: f.finding_id.clone(),
+                status: SettledStatus::Held,
+                reason,
+                final_line,
+                withdrawal_requested: hold.withdrawal_requested.clone(),
+                evidence_gone: hold.evidence_gone.clone(),
+                vault_entry,
+                vault_error,
+            }),
+        };
+        self.held.insert(seq);
+        self.publish(&ev);
     }
 
     fn key(&self) -> UnitKey {
@@ -716,7 +819,10 @@ impl UnitTeam {
     /// Carry a dead attempt's unaccepted finding into this attempt (§4.7 replay step 3): the same
     /// finding, re-raised under this attempt's `raise_seq`, marked with the attempt that first
     /// raised it. The final pass re-confirms it against this attempt's `T_final`.
-    fn carry(&mut self, mut f: Finding, from_attempt: u32) {
+    /// (core#959, operator decision 2026-10-17) A finding the dead attempt held for the operator
+    /// keeps its hold: it is settled `held` again in this attempt with the same marks (and the
+    /// same vault entry), so a redrive never drops a withdrawal request.
+    fn carry(&mut self, mut f: Finding, from_attempt: u32, hold: Option<OperatorHold>) {
         f.carried_from_attempt = Some(f.carried_from_attempt.unwrap_or(from_attempt));
         // The dead attempt's member id is not this attempt's: keep it distinct, so it is never
         // mistaken for (or deduplicated against) a member watching this attempt.
@@ -724,6 +830,19 @@ impl UnitTeam {
         if let super::Admit::New(lf, seq) = self.book.admit(f) {
             let f = lf.finding.clone();
             self.raise(&f, seq, Vec::new());
+            if let Some(h) = hold {
+                self.settle_held(
+                    seq,
+                    &f,
+                    &h,
+                    format!(
+                        "held for the operator: carried from attempt {from_attempt}, where it was \
+                         held for the operator; only the operator clears it (core#959)"
+                    ),
+                    None,
+                    super::vault::VAULT_TIMEOUT,
+                );
+            }
         }
     }
 
@@ -1172,6 +1291,16 @@ fn shown_output(text: &str, cap: usize) -> String {
 
 // ── The run's stream, as the supervisor keeps it ────────────────────────────────────────────────
 
+/// (core#959) What holds a boundary finding for the operator, as the stream recorded it: carried
+/// forward into a redriven attempt, never dropped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OperatorHold {
+    pub withdrawal_requested: Option<String>,
+    pub evidence_gone: Option<String>,
+    /// The vault entry the hold was recorded under, when it was.
+    pub vault_entry: Option<String>,
+}
+
 /// What the stream says about one attempt (from replay and from the live tail alike).
 #[derive(Debug, Clone, Default)]
 struct AttemptSeen {
@@ -1185,17 +1314,24 @@ struct AttemptSeen {
     raised: Vec<(Envelope, FindingRaised)>,
     accepted: BTreeSet<String>,
     closed: BTreeSet<String>,
+    /// (core#959) The findings this attempt held for the operator, by finding id.
+    holds: BTreeMap<String, OperatorHold>,
 }
 
 impl AttemptSeen {
     /// The findings a dead attempt leaves unresolved: raised, and neither accepted by the worker
     /// nor withdrawn / superseded.
-    fn unresolved(&self) -> Vec<(Envelope, FindingRaised)> {
+    /// (core#959) …each with the operator hold it carries, if any.
+    /// A held finding is carried whatever the worker answered (only the operator clears it).
+    fn unresolved(&self) -> Vec<(Envelope, FindingRaised, Option<OperatorHold>)> {
         self.raised
             .iter()
-            .filter(|(_, f)| !self.accepted.contains(&f.finding_id))
-            .filter(|(_, f)| !self.closed.contains(&f.finding_id))
-            .cloned()
+            .filter(|(_, f)| {
+                self.holds.contains_key(&f.finding_id)
+                    || (!self.accepted.contains(&f.finding_id)
+                        && !self.closed.contains(&f.finding_id))
+            })
+            .map(|(e, f)| (e.clone(), f.clone(), self.holds.get(&f.finding_id).cloned()))
             .collect()
     }
 }
@@ -1211,6 +1347,8 @@ struct RunState {
     /// `path.started` was missing at replay: rows before the gap are gone (§4.7).
     gap: bool,
     attempts: BTreeMap<(u32, u32), AttemptSeen>,
+    /// (core#959) The run's evidence root ([`LiveTeamRun::evidence_root`]).
+    evidence_root: Option<String>,
 }
 
 impl RunState {
@@ -1356,6 +1494,11 @@ impl SupervisorCore {
             return;
         };
         self.unknown.remove(&run.run_id);
+        if let Some(st) = self.runs.get_mut(&run.run_id) {
+            if st.evidence_root.is_none() {
+                st.evidence_root = run.evidence_root.clone();
+            }
+        }
         self.runs.entry(run.run_id.clone()).or_insert(RunState {
             floor,
             // The engine's own record of the seats (the PA first): the members' candidates even
@@ -1364,6 +1507,7 @@ impl SupervisorCore {
             roster: run.roster.clone(),
             // Unknown until `path.started` is read: a missing one is the gap (§4.7).
             gap: true,
+            evidence_root: run.evidence_root.clone(),
             ..Default::default()
         });
     }
@@ -1395,6 +1539,11 @@ impl SupervisorCore {
             st.pa = b.cli.clone();
             st.roster = b.roster.clone();
             st.gap = false;
+            // (core#959, codex r1) A run launched after this supervisor started learns its
+            // evidence root here.
+            if b.evidence_root.is_some() {
+                st.evidence_root = b.evidence_root.clone();
+            }
             return Vec::new();
         }
         if !self.runs.contains_key(&run_id) {
@@ -1500,13 +1649,45 @@ impl SupervisorCore {
             }
             TeamBody::FindingSettled(b) => {
                 if let Some(k) = key(&env) {
-                    if b.status != SettledStatus::Held {
-                        let st = self.runs.get_mut(&run_id).expect("armed");
-                        st.attempts
-                            .entry(k)
-                            .or_default()
-                            .closed
-                            .insert(b.finding_id.clone());
+                    let st = self.runs.get_mut(&run_id).expect("armed");
+                    let seen = st.attempts.entry(k).or_default();
+                    // (core#959) A `withdrawn` row on a boundary finding predates the rule: it is a
+                    // withdrawal request pending the operator, never a close.
+                    let boundary = seen
+                        .raised
+                        .iter()
+                        .find(|(_, f)| f.finding_id == b.finding_id)
+                        .is_some_and(|(_, f)| super::names_boundary_circumvention(&f.claim));
+                    let hold = match b.status {
+                        SettledStatus::Held
+                            if b.withdrawal_requested.is_some() || b.evidence_gone.is_some() =>
+                        {
+                            Some(OperatorHold {
+                                withdrawal_requested: b.withdrawal_requested.clone(),
+                                evidence_gone: b.evidence_gone.clone(),
+                                vault_entry: b.vault_entry.clone(),
+                            })
+                        }
+                        SettledStatus::Withdrawn if boundary => Some(OperatorHold {
+                            withdrawal_requested: Some(b.reason.clone()),
+                            evidence_gone: None,
+                            vault_entry: b.vault_entry.clone(),
+                        }),
+                        SettledStatus::Superseded if boundary => Some(OperatorHold {
+                            withdrawal_requested: None,
+                            evidence_gone: Some(b.reason.clone()),
+                            vault_entry: b.vault_entry.clone(),
+                        }),
+                        _ => None,
+                    };
+                    match hold {
+                        Some(h) => {
+                            seen.holds.insert(b.finding_id.clone(), h);
+                        }
+                        None if b.status != SettledStatus::Held => {
+                            seen.closed.insert(b.finding_id.clone());
+                        }
+                        None => {}
                     }
                 }
             }
@@ -1561,6 +1742,7 @@ impl SupervisorCore {
                             phase: String::new(),
                             step_id: b.step_id.clone(),
                             code_graph_db: None,
+                            evidence_root: st.evidence_root.clone(),
                         },
                         self.pub_.clone(),
                     ))),
@@ -1636,22 +1818,47 @@ impl SupervisorCore {
             phase: b.phase.clone(),
             step_id: b.step_id.clone(),
             code_graph_db: b.code_graph_db.clone(),
+            evidence_root: st.evidence_root.clone(),
         };
         // The findings a dead earlier attempt of this unit left unresolved (§4.7 step 3).
-        let carried: Vec<(u32, Envelope, FindingRaised)> = st
+        let carried: Vec<(u32, Envelope, FindingRaised, Option<OperatorHold>)> = st
             .attempts
             .iter()
             // Any dead earlier attempt of the unit, folded or not: a fold the dead process
             // published may never have reached its gate.
-            .filter(|((o, a), s)| *o == k.0 && *a < k.1 && !s.live)
-            .flat_map(|((_, a), s)| s.unresolved().into_iter().map(move |(e, f)| (*a, e, f)))
+            // (core#959, codex r1) …and any earlier attempt of THIS process (a same-process retry):
+            // only its findings held for the operator, which no retry may drop.
+            .filter(|((o, a), _)| *o == k.0 && *a < k.1)
+            .flat_map(|((_, a), s)| {
+                let live = s.live;
+                s.unresolved()
+                    .into_iter()
+                    .filter(move |(_, _, h)| !live || h.is_some())
+                    .map(move |(e, f, h)| (*a, e, f, h))
+            })
             .collect();
+        // (codex r1) The hold of each finding across every carried attempt, merged: a later
+        // attempt's hold must not be lost to an earlier bare copy winning the dedup.
+        let mut merged: BTreeMap<String, OperatorHold> = BTreeMap::new();
+        for (_, _, f, h) in &carried {
+            if let Some(h) = h {
+                let m = merged.entry(f.finding_id.clone()).or_default();
+                m.withdrawal_requested = m
+                    .withdrawal_requested
+                    .take()
+                    .or_else(|| h.withdrawal_requested.clone());
+                m.evidence_gone = m.evidence_gone.take().or_else(|| h.evidence_gone.clone());
+                m.vault_entry = m.vault_entry.take().or_else(|| h.vault_entry.clone());
+            }
+        }
         let _ = claimed_id;
         let mut unit = UnitTeam::new(ctx, self.pub_.clone());
         unit.rescores = Rescores::from_baseline(b.baseline_tree.as_deref().unwrap_or_default());
         unit.engine = self.cfg.engine.clone();
-        for (from, e, f) in carried {
-            unit.carry(super::runner::finding_of(&e, &f), from);
+        unit.vault = self.cfg.vault.clone();
+        for (from, e, f, _) in carried {
+            let hold = merged.get(&f.finding_id).cloned();
+            unit.carry(super::runner::finding_of(&e, &f), from, hold);
         }
         // core#745 (b): an UNBOUND unit has no tree change to wait for, so its members are
         // summoned at the claim — a refusal (or "no distinct seat") is on the record while the PA
@@ -2042,6 +2249,12 @@ impl Clock {
     }
 }
 
+/// (core#959, codex r1) What a final-pass vault record may spend: the pass's time left, less a
+/// margin to publish the hold after it — the hold is never late for the gate because of the vault.
+fn vault_budget(clock: &Clock) -> Duration {
+    clock.left().saturating_sub(Duration::from_secs(2))
+}
+
 /// The attempt's rows, from its `step.claimed` on.
 fn attempt_rows(
     bus_db: &str,
@@ -2267,6 +2480,10 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                     },
                 };
                 let seq = u.book.raises[i];
+                // (core#959) A finding already held for the operator stays as it is.
+                if u.held.contains(&seq) {
+                    continue;
+                }
                 match locate(text.as_deref(), f.finding.line, &f.finding.evidence) {
                     Some(n) => {
                         final_lines.insert(seq, n);
@@ -2280,6 +2497,24 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                     (tev::FindingTarget::Tree, Some(t)) => format!("settled tree {t}"),
                     (tev::FindingTarget::Tree, None) => "settled tree".to_string(),
                 };
+                // (core#959, operator decision 2026-10-17) A boundary finding is never
+                // superseded: its cited text disappearing is recorded as evidence, and it is held
+                // for the operator.
+                if super::is_boundary_finding(&f) {
+                    let gone = format!("its evidence text is gone from the {settled_on}");
+                    u.settle_held(
+                        seq,
+                        &f,
+                        &OperatorHold {
+                            evidence_gone: Some(gone),
+                            ..Default::default()
+                        },
+                        BOUNDARY_GONE_HELD.to_string(),
+                        None,
+                        vault_budget(&clock),
+                    );
+                    continue;
+                }
                 let ev = TeamEvent {
                     env: env_of(&key, &f.seat, Some(format!("finding.raised#{seq}"))),
                     body: TeamBody::FindingSettled(FindingSettled {
@@ -2289,6 +2524,9 @@ pub fn run_final_pass(job: FinalPassJob, host: &dyn MonitorHost, council: &dyn C
                         reason: format!("its evidence text is gone from the {settled_on}"),
                         final_line: None,
                         withdrawal_requested: None,
+                        evidence_gone: None,
+                        vault_entry: None,
+                        vault_error: None,
                     }),
                 };
                 u.publish(&ev);
@@ -2608,6 +2846,11 @@ fn delivery_outcomes(rows: &[TeamRow]) -> BTreeMap<u32, String> {
     out
 }
 
+/// (core#959) The held reason of a boundary finding whose cited text is gone.
+pub(crate) const BOUNDARY_GONE_HELD: &str =
+    "held for the operator: a boundary finding is never superseded; its cited text is gone, \
+     which is recorded beside it, and only the operator clears it (core#959)";
+
 /// (core#959) The held reason of a boundary finding its monitor asked to withdraw.
 pub(crate) const BOUNDARY_WITHDRAWAL_HELD: &str =
     "held for the operator: a monitor may not withdraw a boundary finding; its withdrawal request \
@@ -2635,6 +2878,10 @@ fn hold_round(
         let Some(seq) = u.book.raise_of(&f.finding.finding_id) else {
             continue;
         };
+        // (core#959) Already held for the operator (a carried hold): no monitor answers it.
+        if u.held.contains(&seq) {
+            continue;
+        }
         by_member
             .entry(f.finding.monitor_id.clone())
             .or_default()
@@ -2685,27 +2932,31 @@ fn hold_round(
         };
         for (seq, f) in items {
             let reply = replies.get(&f.finding.finding_id).cloned();
-            let (status, reason, withdrawal_requested) = match reply {
+            let (status, reason) = match reply {
                 // (core#959, operator decision 2026-10-17) A monitor may not withdraw a boundary
-                // finding: its request is recorded beside the finding, which stays held for the
-                // operator (`tev::awaits_operator`).
+                // finding: its request is recorded beside the finding — and in the vault — and the
+                // finding stays held for the operator (`tev::awaits_operator`).
                 Some(r)
                     if r.kind == ReplyKind::Withdraw && super::is_boundary_finding(&f.finding) =>
                 {
-                    (
-                        SettledStatus::Held,
+                    u.settle_held(
+                        seq,
+                        &f.finding,
+                        &OperatorHold {
+                            withdrawal_requested: Some(r.reason),
+                            ..Default::default()
+                        },
                         BOUNDARY_WITHDRAWAL_HELD.to_string(),
-                        Some(r.reason),
-                    )
+                        final_lines.get(&seq).copied(),
+                        vault_budget(clock),
+                    );
+                    continue;
                 }
-                Some(r) if r.kind == ReplyKind::Withdraw => {
-                    (SettledStatus::Withdrawn, r.reason, None)
-                }
-                Some(r) => (SettledStatus::Held, r.reason, None),
+                Some(r) if r.kind == ReplyKind::Withdraw => (SettledStatus::Withdrawn, r.reason),
+                Some(r) => (SettledStatus::Held, r.reason),
                 None => (
                     SettledStatus::Held,
                     "no reply (counted as hold)".to_string(),
-                    None,
                 ),
             };
             let ev = TeamEvent {
@@ -2716,7 +2967,10 @@ fn hold_round(
                     status,
                     reason,
                     final_line: final_lines.get(&seq).copied(),
-                    withdrawal_requested,
+                    withdrawal_requested: None,
+                    evidence_gone: None,
+                    vault_entry: None,
+                    vault_error: None,
                 }),
             };
             u.publish(&ev);

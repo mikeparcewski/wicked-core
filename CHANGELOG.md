@@ -14,6 +14,22 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Every path that cleared a boundary finding now waits for the operator, and the hold is vaulted (core#959
+  follow-up).** Operator decision 2026-10-17, on top of the hold-round rule:
+  - A redrive (a restart, or a same-process retry) carries a finding held for the operator into the new attempt
+    *with* its withdrawal request (same vault entry, holds merged across attempts); it is settled `held` there again,
+    never re-asked, never dropped. A worker's ACCEPTED does not clear a hold either.
+  - A boundary finding whose cited text is gone at the final pass is not superseded: it is settled `held`, with the
+    disappearance recorded (`finding.settled.evidence_gone`, `monitorReply.evidenceGone`).
+  - A `withdrawn` (or `superseded`) row on a boundary finding, written before the rule, is read as a pending request
+    (or disappearance).
+  - The original finding and what holds it are recorded in wicked-vault, the platform's evidence store, through its
+    CLI (`wicked-vault record --artifact`, as the walkthrough proof does): an entry under the run's evidence root
+    (`<evidence root>/team/vault`, its own vault), artifact beside it in `team/holds/`. The settled row and the ledger
+    name the entry (`vault_entry` / `vaultEntry`), or why there is none (`vault_error`: no evidence root, CLI missing,
+    `WICKED_VAULT_BIN` empty, no time left in the final pass); the finding stays held either way. A record spends at
+    most the final pass's remaining time. The run's evidence root reaches the team supervisor through
+    `path.started.evidence_root` and `LiveTeamRun.evidence_root`.
 - **An evaluator unit's judge never judges the work it reads when another seat can (core#954).** The run's own judge
   rotation on an evaluator unit now also excludes the work's creators (every earlier author of the work, instance and
   cli key). When that leaves no eligible judge seat (a two-seat run), the rotation judges as before and the gate says

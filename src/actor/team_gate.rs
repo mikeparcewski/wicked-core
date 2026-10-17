@@ -178,6 +178,8 @@ fn path_started(session: &AgentSession) -> TeamEvent {
                         .to_string(),
                 })
                 .collect(),
+            // (core#959) Where the supervisor vaults a finding held for the operator.
+            evidence_root: session.evidence_root.clone(),
         }),
     )
 }

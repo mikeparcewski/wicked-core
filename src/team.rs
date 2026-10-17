@@ -49,6 +49,7 @@ pub mod events;
 pub mod publish;
 pub mod runner;
 pub mod supervisor;
+pub mod vault;
 
 // ── Constants (DES §4.8; env-overridable for rigs only) ──────────────────────────────────────────
 
@@ -465,6 +466,38 @@ pub struct MonitorReply {
         skip_serializing_if = "Option::is_none"
     )]
     pub withdrawal_requested: Option<String>,
+    /// (core#959, operator decision 2026-10-17) A BOUNDARY finding whose cited text is gone from
+    /// the settled tree (or answer) is not superseded: it is held for the operator, and this
+    /// records the disappearance. Absent otherwise.
+    #[serde(
+        rename = "evidenceGone",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub evidence_gone: Option<String>,
+    /// (core#959) The wicked-vault entry that holds the finding and what put it on hold
+    /// ([`vault::record_hold`]). Absent when no hold, or when the vault refused (then
+    /// `vaultError` says why).
+    #[serde(
+        rename = "vaultEntry",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vault_entry: Option<String>,
+    /// (core#959) Why a held finding has no vault entry.
+    #[serde(
+        rename = "vaultError",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vault_error: Option<String>,
+}
+
+impl MonitorReply {
+    /// (core#959) Whether this reply holds its finding for the operator.
+    pub fn holds_for_operator(&self) -> bool {
+        self.withdrawal_requested.is_some() || self.evidence_gone.is_some()
+    }
 }
 
 /// (core#959) Whether a finding names a circumvention of a boundary or of governance — the
@@ -839,6 +872,9 @@ pub struct AttachCtx {
     pub phase: String,
     pub step_id: String,
     pub code_graph_db: Option<String>,
+    /// (core#959) The run's evidence root (`AgentSession::evidence_root`, armed with the run):
+    /// where an operator-held finding is vaulted. `None` for a run without one.
+    pub evidence_root: Option<String>,
 }
 
 impl AttachCtx {
@@ -1279,6 +1315,9 @@ pub(crate) fn parse_hold_lines(reply: &str) -> BTreeMap<String, MonitorReply> {
                 kind,
                 reason: cap_utf8(after_separator(&rest[id.len()..]), REASON_CAP),
                 withdrawal_requested: None,
+                evidence_gone: None,
+                vault_entry: None,
+                vault_error: None,
             },
         );
     }
