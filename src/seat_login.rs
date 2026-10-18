@@ -1765,14 +1765,27 @@ pub(crate) fn seat_sign_in(
 /// relays it unchanged.
 #[cfg(unix)]
 pub(crate) fn claude_seat_token(rt: &Runtime, gw: &Gateway, dir: &Path) -> Result<String, String> {
+    claude_broker_token(rt, gw, dir)?.ok_or_else(|| "claude is not signed in".into())
+}
+
+/// [`claude_seat_token`], with signed out as `Ok(None)`: the seat-secret guard asks the broker
+/// which token a delivery must not carry (`seat_secret_guard::from_broker`).
+#[cfg(unix)]
+pub(crate) fn claude_broker_token(
+    rt: &Runtime,
+    gw: &Gateway,
+    dir: &Path,
+) -> Result<Option<String>, String> {
     let _lock = crate::seat_refresh::mutation_lock(dir)?;
-    let bytes = read_broker_record(rt, gw, "anthropic.token")?.ok_or("claude is not signed in")?;
+    let Some(bytes) = read_broker_record(rt, gw, "anthropic.token")? else {
+        return Ok(None);
+    };
     let token = String::from_utf8(bytes).map_err(|_| "claude: invalid broker token")?;
     let token = token.trim();
     if token.is_empty() || token.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Err("claude: invalid broker token".into());
     }
-    Ok(token.to_string())
+    Ok(Some(token.to_string()))
 }
 
 /// Native Windows has no seat sign-ins (the container floor needs a Unix host).

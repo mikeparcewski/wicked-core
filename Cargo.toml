@@ -86,6 +86,9 @@ base64 = "0.22"
 # ACP elicitation (DES-002): UUID minting for elicitation IDs + process-gen tokens; structured tracing.
 uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
+# The seat-secret guard's in-process substring search (`seat_secret_guard`): a seat's credential is
+# looked for in the work's objects without ever leaving this process.
+memchr = "2"
 
 [target.'cfg(unix)'.dependencies]
 # `O_NOFOLLOW` for the skills-snapshot containment reads (`skills_snapshot::read_no_follow`): the

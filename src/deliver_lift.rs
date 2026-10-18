@@ -774,6 +774,10 @@ pub(crate) struct LiftContext {
     /// and every unit's gate receipt; `deliverLiftEvaluated.assurance` stamps it with the attempt
     /// and the tree delivered.
     pub assurance: crate::assurance::AssuranceReceipt,
+    /// The daemon's seat gateway dir (`<state home>/gateway`), whose broker holds the credentials
+    /// seats are handed; the seat-secret guard asks it which token the delivery must not carry.
+    /// `None` for an engine with no file-backed state home (no seat was ever brokered).
+    pub gateway_dir: Option<PathBuf>,
 }
 
 /// (core#850) What assured the run being delivered: its contract, every instrument any of its
@@ -834,6 +838,7 @@ pub(crate) fn lift_context(
         verified_tree: session.verified_tree.clone(),
         base_commit: session.base_commit.clone(),
         assurance: delivery_receipt(session, &units),
+        gateway_dir: crate::actor::armed_gateway_dir(),
     })
 }
 
@@ -995,6 +1000,9 @@ pub(crate) fn lift_and_reverify(
              pushed — the deliver gate never pushes a tree it cannot identify."
         )
     })?;
+    // (core#1024 follow-up) Whatever the checks say, a tree that carries a credential the platform
+    // put into a seat never ships: everything the push would add is searched for it first.
+    refuse_seat_credentials(ctx, &now, &delivery_secrets(ctx.gateway_dir.as_deref()))?;
     let verified_base = match report.outcome {
         LiftOutcome::Unchanged | LiftOutcome::Lifted => report.base_after.clone(),
         _ => None,
@@ -1179,6 +1187,62 @@ pub(crate) fn lift_and_reverify(
         verified_base,
         verified_tree: after.tree,
     })
+}
+
+/// The credentials a delivery must not carry: every one this process put into a seat, plus the one
+/// the broker holds now (the work's units may have run before a daemon restart). A broker that
+/// cannot be read is said, and the registry still applies.
+fn delivery_secrets(gateway_dir: Option<&Path>) -> Vec<crate::seat_secret_guard::SeatSecret> {
+    let brokered = crate::seat_secret_guard::from_broker(gateway_dir).unwrap_or_else(|why| {
+        eprintln!(
+            "wicked-core: deliver seat-credential check: the broker's seat token could not be read \
+             ({why}); checking against the credentials this process handed to seats"
+        );
+        Vec::new()
+    });
+    crate::seat_secret_guard::with_injected(brokered)
+}
+
+/// Refuse the delivery when anything the push would add (the run's commits and the tree as it
+/// stands, minus what the remote already has and the run's base) carries one of `secrets`. A scan
+/// that cannot complete refuses too: the deliver gate never ships a tree it could not check.
+pub(crate) fn refuse_seat_credentials(
+    ctx: &LiftContext,
+    now: &crate::worktree_guard::WorktreeSnapshot,
+    secrets: &[crate::seat_secret_guard::SeatSecret],
+) -> Result<(), String> {
+    if secrets.is_empty() {
+        return Ok(());
+    }
+    let git_dir = pinned_git_dir(&ctx.worktree, &ctx.repo_root).map_err(|e| {
+        format!(
+            "deliver: {} — the worktree's git dir could not be pinned to check the work for a \
+             seat's credential ({e}); nothing was pushed.",
+            crate::seat_secret_guard::SEAT_CREDENTIAL_MARKER
+        )
+    })?;
+    let scope = crate::seat_secret_guard::Scope {
+        cwd: &ctx.worktree,
+        git_dir: Some(&git_dir),
+        tips: vec![now.head.clone(), now.tree.clone()],
+        exclude: ctx.base_commit.iter().cloned().collect(),
+        exclude_remotes: true,
+    };
+    match crate::seat_secret_guard::scan_new_objects(&scope, secrets) {
+        Ok(None) => Ok(()),
+        Ok(Some(leak)) => {
+            eprintln!(
+                "wicked-core: deliver refused — {} (the value is not logged)",
+                leak.describe()
+            );
+            Err(crate::seat_secret_guard::deliver_refusal(&leak))
+        }
+        Err(why) => Err(format!(
+            "deliver: {} — the work could not be checked for a seat's credential ({why}); nothing \
+             was pushed — the deliver gate never ships a tree it could not check. Approve to retry.",
+            crate::seat_secret_guard::SEAT_CREDENTIAL_MARKER
+        )),
+    }
 }
 
 // ── Azure DevOps origins (crew#933) ────────────────────────────────────────────────────────────
@@ -1964,7 +2028,48 @@ mod tests {
             verified_tree,
             base_commit: None,
             assurance: Default::default(),
+            gateway_dir: None,
         }
+    }
+
+    /// (core#1024 follow-up) A delivery whose work carries a credential the platform put into a
+    /// seat is refused before anything else can clear it, naming the file and the credential's
+    /// kind, never the value; nothing is pushed (the command never runs on an `Err`).
+    #[test]
+    fn a_delivery_carrying_a_seats_token_is_refused_without_the_value() {
+        // Built at runtime: no bearer-looking literal in the source (core#1024's GitGuardian fix).
+        let token: String = format!(
+            "{}-{}-{}-{}",
+            "sk",
+            "ant",
+            "oat01",
+            (0..96)
+                .map(|i| (b'A' + (i * 7 % 26) as u8) as char)
+                .collect::<String>()
+        );
+        let (clone, wt) = stale_base_layout("seat-credential");
+        // Committed on the run branch, then removed: the push would still ship the commit.
+        std::fs::write(wt.join("leak.json"), format!("{{\"auth\":\"{token}\"}}")).unwrap();
+        run_git(&wt, &["add", "leak.json"]);
+        run_git(&wt, &["commit", "-qm", "debug"]);
+        run_git(&wt, &["rm", "-q", "leak.json"]);
+        run_git(&wt, &["commit", "-qm", "cleanup"]);
+        crate::seat_secret_guard::register(
+            crate::seat_secret_guard::SecretKind::ClaudeSetupToken,
+            &token,
+        );
+        let events = std::cell::RefCell::new(Vec::new());
+        let emit = |ev: CoreEvent| events.borrow_mut().push(ev);
+        let err = lift_and_reverify(&ctx_for(&clone, &wt, None), "seat-credential", 9, 0, &emit)
+            .err()
+            .expect("the delivery is refused");
+        assert!(err.starts_with("deliver: SEAT-CREDENTIAL — "), "{err}");
+        assert!(err.contains("`leak.json`"), "{err}");
+        assert!(err.contains("Nothing was pushed"), "{err}");
+        assert!(!err.contains(&token), "the value must never be shown");
+        let frames = format!("{:?}", events.borrow());
+        assert!(!frames.contains(&token), "no event carries the value");
+        let _ = std::fs::remove_dir_all(clone.parent().unwrap());
     }
 
     /// F-433-001, the load-bearing rule: a lift whose re-verify FAILS leaves the worktree on the

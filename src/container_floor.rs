@@ -2282,6 +2282,12 @@ pub(crate) fn arm(
                     // reaches the runtime client's environment only: `--env NAME`, never argv.
                     let token = crate::seat_login::claude_seat_token(&rt, &gw, dir)
                         .map_err(|e| (FloorUnarmed::AgentSignedOut, e))?;
+                    // The seat-secret guard checks every unit's settled diff, and the delivery,
+                    // for the value this seat now holds (core#1024 follow-up).
+                    crate::seat_secret_guard::register(
+                        crate::seat_secret_guard::SecretKind::ClaudeSetupToken,
+                        &token,
+                    );
                     env.push(("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token));
                 }
                 let since = std::time::SystemTime::now()
