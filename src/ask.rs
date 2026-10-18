@@ -425,6 +425,7 @@ mod tests {
                 run_branch: None,
                 base_commit: None,
                 finished_at: None,
+                seat_failures: Vec::new(),
                 benched_seats: vec![],
                 team: None,
                 team_plan: None,

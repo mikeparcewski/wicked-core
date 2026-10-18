@@ -623,6 +623,14 @@ pub(crate) fn seat_env(provider: Provider, key: &str) -> Vec<(String, String)> {
     env_at_port(provider, provider.port(), key)
 }
 
+/// The seat's `NO_PROXY`: the gateway itself, and the seat's own loopback (core#1010). curl skips
+/// the proxy for loopback on its own, but not every client does: opencode's `run --server
+/// http://127.0.0.1:<port>` (bun) sent its own server's `/api/info` to the gateway, got 405, and
+/// every opencode unit exited 1 ("did not provide a compatible V2 health response"). Loopback is
+/// the seat container's own network namespace; the floor's port pin still decides what may be
+/// reached there, and nothing outside the container is.
+pub(crate) const SEAT_NO_PROXY: &str = "agw,localhost,127.0.0.1,::1";
+
 fn env_at_port(provider: Provider, port: u16, key: &str) -> Vec<(String, String)> {
     let (base, api_key, url) = match provider {
         Provider::Anthropic => (
@@ -652,7 +660,7 @@ fn env_at_port(provider: Provider, port: u16, key: &str) -> Vec<(String, String)
         (api_key.into(), key.into()),
         ("HTTPS_PROXY".into(), "http://agw:3000".into()),
         ("HTTP_PROXY".into(), "http://agw:3000".into()),
-        ("NO_PROXY".into(), "agw".into()),
+        ("NO_PROXY".into(), SEAT_NO_PROXY.into()),
     ]
 }
 
@@ -4177,7 +4185,7 @@ esac
                     (api_key.into(), "placeholder".into()),
                     ("HTTPS_PROXY".into(), "http://agw:3000".into()),
                     ("HTTP_PROXY".into(), "http://agw:3000".into()),
-                    ("NO_PROXY".into(), "agw".into()),
+                    ("NO_PROXY".into(), "agw,localhost,127.0.0.1,::1".into()),
                 ]
             );
         }

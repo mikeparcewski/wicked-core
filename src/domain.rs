@@ -197,6 +197,15 @@ pub struct AgentSession {
     /// seat; rendered into `unitDistributed.degradedReason`. `#[serde(default)]` back-compat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub benched_seats: Vec<BenchedSeat>,
+    /// (core#1010) The seats' unclassified worker failures in this run, by error signature
+    /// ([`failure_signature`]): a seat whose worker exits non-zero with the SAME error
+    /// [`REPEATED_FAILURE_BENCH`] times, and has no successful unit in the run, is benched
+    /// (`repeated_failure`). A deterministic startup failure is not an auth or quota refusal, so
+    /// the transcript classifier never benched it, and the planner kept seating the dead seat.
+    /// Persisted so a resume keeps counting. `#[serde(default)]` + skip-if-empty: older
+    /// sessions deserialize and a run without such failures serializes as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seat_failures: Vec<SeatFailureMark>,
     /// (core#555) The run's APPROVED INTENT AMENDMENTS, in the order a human decided them: the
     /// `amend_intent` arm of a human gate ([`crate::workflow::HumanDecision::AmendIntent`]).
     ///
@@ -639,6 +648,78 @@ pub fn bench_seat(benched: &mut Vec<BenchedSeat>, seat: BenchedSeat) -> bool {
         None => {
             benched.push(seat);
             true
+        }
+    }
+}
+
+/// (core#1010) How many times one seat failed with one error signature in a run
+/// ([`AgentSession::seat_failures`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatFailureMark {
+    /// The roster key.
+    pub cli: String,
+    /// The failure's signature ([`failure_signature`]).
+    pub signature: String,
+    pub count: u32,
+}
+
+/// (core#1010) The same unclassified worker error this many times benches a seat that has no
+/// success in the run: the second identical crash shows the failure does not depend on the unit.
+pub const REPEATED_FAILURE_BENCH: u32 = 2;
+
+/// (core#1010) The signature of a worker failure's transcript: its first error line (a line that
+/// starts with `error`, any case, or carries `error:`), the wrapped runner's own
+/// `` (cli `x` exited N) `` marker removed, digits folded to `#` (a port, a pid, a line number
+/// differ between two runs of the same failure) and whitespace collapsed, at most 160 chars.
+/// `None` when the transcript names no error line: such a failure is never counted.
+pub fn failure_signature(output: &str) -> Option<String> {
+    let text = match output.strip_prefix("(cli `") {
+        Some(rest) => rest.split_once(')').map(|(_, after)| after).unwrap_or(rest),
+        None => output,
+    };
+    let line = text.lines().map(str::trim).find(|l| {
+        let lower = l.to_ascii_lowercase();
+        lower.starts_with("error") || lower.contains("error:")
+    })?;
+    let mut sig = String::new();
+    let mut last_digit = false;
+    for c in line
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+    {
+        if c.is_ascii_digit() {
+            if !last_digit {
+                sig.push('#');
+            }
+            last_digit = true;
+        } else {
+            sig.push(c);
+            last_digit = false;
+        }
+    }
+    let sig: String = sig.chars().take(160).collect();
+    (!sig.is_empty()).then_some(sig)
+}
+
+/// (core#1010) Count one failure of `cli` with `signature` in `marks`; returns the new count.
+pub fn note_seat_failure(marks: &mut Vec<SeatFailureMark>, cli: &str, signature: &str) -> u32 {
+    match marks
+        .iter_mut()
+        .find(|m| m.cli == cli && m.signature == signature)
+    {
+        Some(m) => {
+            m.count = m.count.saturating_add(1);
+            m.count
+        }
+        None => {
+            marks.push(SeatFailureMark {
+                cli: cli.to_string(),
+                signature: signature.to_string(),
+                count: 1,
+            });
+            1
         }
     }
 }
@@ -1856,6 +1937,46 @@ pub struct SessionView {
 mod tests {
     /// (C5) A bench binding every call replaces a governed-only one for the same seat, never the
     /// reverse; a record persisted before the field reads as binding every call.
+    /// (core#1010) A crash's signature is its first error line without the runner's exit marker,
+    /// digits folded; a transcript with no error line has none.
+    #[test]
+    fn a_failure_signature_folds_digits_and_needs_an_error_line() {
+        let a = failure_signature(
+            "(cli `opencode` exited 1) WARNING: x\nError: Server at http://127.0.0.1:49241 \
+             failed\n  at y (z.js:8:1710)",
+        );
+        assert_eq!(
+            a.as_deref(),
+            Some("Error: Server at http://#.#.#.#:# failed")
+        );
+        assert_eq!(
+            a,
+            failure_signature(
+                "(cli `opencode` exited 1)\nError: Server at http://127.0.0.1:50111 failed"
+            )
+        );
+        assert_eq!(
+            failure_signature("thread 'main' panicked\nfatal error: out of memory").as_deref(),
+            Some("fatal error: out of memory")
+        );
+        assert_eq!(failure_signature("(cli `agy` exited 1) boom"), None);
+        let long = format!("error: {}", "x".repeat(400));
+        assert_eq!(
+            failure_signature(&long).map(|s| s.chars().count()),
+            Some(160)
+        );
+        let mut marks = Vec::new();
+        assert_eq!(note_seat_failure(&mut marks, "opencode", "e"), 1);
+        assert_eq!(note_seat_failure(&mut marks, "codex", "e"), 1);
+        assert_eq!(note_seat_failure(&mut marks, "opencode", "e"), 2);
+        assert_eq!(note_seat_failure(&mut marks, "opencode", "f"), 1);
+        // An empty list is not serialized, and a session without the field deserializes.
+        let v = serde_json::to_value(sample_session()).unwrap();
+        assert!(v.get("seatFailures").is_none() && v.get("seat_failures").is_none());
+        let back: AgentSession = serde_json::from_value(v).unwrap();
+        assert!(back.seat_failures.is_empty());
+    }
+
     #[test]
     fn an_all_call_bench_dominates_a_governed_only_one() {
         let b = |reason: &str, governed_only: bool| BenchedSeat {
@@ -2009,6 +2130,7 @@ mod tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
