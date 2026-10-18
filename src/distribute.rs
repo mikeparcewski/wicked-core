@@ -603,15 +603,16 @@ pub(crate) fn distribute_seated(
     }
     // (DES-TEAMING-002 §8.8, seam T6) A member's step (`owner: team`) of a team run runs on a
     // MEMBER seat — never the PA's, the first eligible seat every PA step lands on. A
-    // model-distinct seat first, then another instance; none that admits the step ⇒ the run is
-    // refused, never quietly handed back to the PA (team runs never fall back to one seat).
+    // model-distinct seat first, then another instance. With none that admits the step (one
+    // signed-in seat is the common case, and the built-in presets mark steps `owner: team`), the
+    // step stays on the PA and says so on `unitDistributed.seatConstraint`; the actor then runs
+    // it as the PA's own step (`team_gate::stamp_member_step`, `replanned`). Never silent.
     //
     // Placed BEFORE the evaluator≠creator fence (review round 2 on #628, D1): the fence reads
     // the builder seats, and a member build it did not see on its final seat would let a
     // review/test unit land on that very seat (codex grading codex's build). One ordering — the
     // fence judges final seats — not a second check.
     if team_run {
-        let mut stranded: Vec<u32> = Vec::new();
         for ((u, d), cands) in units.iter().zip(dists.iter_mut()).zip(candidates.iter()) {
             let Some(pa) = pa.as_deref() else {
                 break;
@@ -654,21 +655,18 @@ pub(crate) fn distribute_seated(
                     d.routing = RoutingInfo::Teamed { winner: k.clone() };
                     d.assigned_cli = k;
                 }
-                None => stranded.push(u.ord),
+                None => {
+                    let why = format!(
+                        "member step: no signed-in seat distinct from the PA ({pa}) admits it, so \
+                         it runs on the PA; add a signed-in {} to spread it",
+                        next_instance_key(configured, model_of(pa))
+                    );
+                    d.seat_constraint = Some(match d.seat_constraint.take() {
+                        Some(prior) => format!("{prior}; {why}"),
+                        None => why,
+                    });
+                }
             }
-        }
-        if !stranded.is_empty() {
-            return Err(crate::NoEligibleSeat {
-                run_id: session_id.to_string(),
-                benched: format!(
-                    "member step(s) {stranded:?} of a team run need a seat distinct from the PA \
-                     ({}); add a signed-in {} to the roster",
-                    pa.clone().unwrap_or_default(),
-                    next_instance_key(configured, model_of(pa.as_deref().unwrap_or("claude")))
-                ),
-                benched_seats: benched.clone(),
-            }
-            .into());
         }
     }
     // (DES-TEAMING-002 §8.1, seam D1) A TEAM RUN — units of the run's composed per-run def,
@@ -1132,9 +1130,7 @@ fn enforce_evaluator_distinct(
         .zip(dists.iter())
         // A TOOL unit is no creator seat: its `assigned_cli` is its own program token
         // (`tool_distribution`), which may spell a seat key (`claude --version`) — D1 review.
-        .filter(|(u, _)| {
-            u.tool_cmd.is_none() && matches!(u.stage, StageKind::Build | StageKind::Recon)
-        })
+        .filter(|(u, _)| crate::pipeline::authors_by_dispatch(u))
         .map(|(_, d)| d.assigned_cli.clone())
         .collect();
     // The MODELS behind those seats — `{claude}` for builders on `claude#1` and `claude#2` alike.
@@ -3143,6 +3139,77 @@ mod tests {
             err.downcast_ref::<crate::NoEligibleSeat>().is_some(),
             "{err:?}"
         );
+    }
+
+    /// (operator decision 2026-10-18) A member step on a roster with no seat but the PA's is not a
+    /// refused run: it stays on the PA, disclosed on `seatConstraint`. With a second seat it goes
+    /// there, and nothing is disclosed.
+    #[test]
+    fn a_member_step_with_no_member_seat_runs_on_the_pa_disclosed() {
+        let team_step = || {
+            let mut u = WorkUnit::pending("u1", "r1", 1, "Reproduce the bug");
+            u.stage = StageKind::Recon;
+            u.owner = crate::workflow::StepOwner::Team;
+            u.team_run = true;
+            vec![u]
+        };
+        let dists =
+            distribute_units_against_benched(&team_step(), &[seat("claude")], "r1", None, &[])
+                .expect("a one-seat team run is not refused for its member step");
+        assert_eq!(dists[0].assigned_cli, "claude", "it runs on the PA");
+        let why = dists[0].seat_constraint.as_deref().unwrap_or_default();
+        assert!(
+            why.contains("no signed-in seat distinct from the PA (claude)"),
+            "disclosed: {why}"
+        );
+        let dists = distribute_units_against_benched(
+            &team_step(),
+            &[seat("claude"), seat("codex")],
+            "r1",
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(dists[0].assigned_cli, "codex", "a member seat takes it");
+        assert_eq!(dists[0].seat_constraint, None);
+    }
+
+    /// A member's read step (neutral, no code) is no creator seat: on `[claude (PA), codex]` a
+    /// member triage on codex, a PA build on claude and a review leave the review its distinct
+    /// seat (codex), under full assurance. A member BUILD still is a creator seat (the D1 test
+    /// above refuses that roster).
+    #[test]
+    fn a_member_read_step_does_not_take_the_evaluator_seat() {
+        let mut triage = WorkUnit::pending("u1", "r1", 1, "Triage");
+        triage.stage = StageKind::Recon;
+        triage.owner = crate::workflow::StepOwner::Team;
+        let mut build = WorkUnit::pending("u2", "r1", 2, "Fix");
+        build.stage = StageKind::Build;
+        build.role = crate::workflow::PhaseRole::Creator;
+        build.executes_code = true;
+        let mut review = WorkUnit::pending("u3", "r1", 3, "Review");
+        review.stage = StageKind::Review;
+        review.role = crate::workflow::PhaseRole::Evaluator;
+        let mut units = vec![triage, build, review];
+        for u in &mut units {
+            u.team_run = true;
+        }
+        let dists = distribute_seated(
+            &units,
+            &[seat("claude"), seat("codex")],
+            "r1",
+            None,
+            &[],
+            &crate::assurance::RunAssurance::default(),
+        )
+        .expect("the review has a distinct seat");
+        assert_eq!(dists[0].assigned_cli, "codex", "the member's triage");
+        assert_eq!(dists[1].assigned_cli, "claude", "the PA's build");
+        assert_eq!(
+            dists[2].assigned_cli, "codex",
+            "reviewed off the builder's seat"
+        );
+        assert_eq!(dists[2].distinctness_fallback, None);
     }
 
     // ── crew#477: a build unit is never routed to an ungoverned seat while a governed one is

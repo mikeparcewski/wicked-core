@@ -14,6 +14,19 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The built-in presets hand their independent read steps to the team (DES-TEAMING-002 §8.8, operator decision
+  2026-10-18).** No preset marked a step `owner:"team"`, so the PA did every step that was not a review or a test.
+  Now `bug` triage, `capture-learnings` churn and hotspots, `learn` research and `mcp-server`
+  source-discovery run on a member seat, and the PA accepts or rejects the result at its next boundary; one PA still
+  builds. Two distribution rules make that safe on a small roster:
+  - a member step with no signed-in seat distinct from the PA no longer refuses the run: it runs on the PA, disclosed
+    on `unitDistributed.seatConstraint` (and run as the PA's own step, `member_step.replanned`);
+  - a member's read step (recon stage, neutral role, no code) authors nothing: one rule
+    (`pipeline::authors_by_dispatch` / `authors_work`) keeps it out of the evaluator fence, the dispatch author stamp,
+    `work_authors` (the gate's `same_seat_evaluator` and the re-seat) and the fallback judge's set (a floor fix on it
+    still records its fixer as an author), so on a two-seat roster the review of
+    the PA's build still has its distinct seat. A member build still is an author.
+
 - **Team members (monitors) run again, in their seats' containers.** Since the container seat floor (#927, opt-in
   2026-10-13) and C5 (#950, default 2026-10-15), every member a team run's score asked for was refused before it
   opened (`member.joined{status:"failed"}`, "team monitors ran over ACP, which is removed from the seats"): no run

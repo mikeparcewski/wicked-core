@@ -60,7 +60,8 @@
   "steps": [
    {
     "catalog": "understand",
-    "id": "triage"
+    "id": "triage",
+    "owner": "team"
    },
    {
     "catalog": "test_plan",
@@ -213,12 +214,14 @@
    {
     "catalog": "understand",
     "id": "churn",
+    "owner": "team",
     "instructions": "Phase 1/3 CHURN: produce a ranked list of this repo's most actively-changed files and directories over the last ~12 months, plus the repo's real name (manifest or git remote) and parent project. Use the skill's bounded/sampled git-churn method — never stream the whole history. Do not read code deeply yet; the next phase targets these areas.",
     "skill_ref": "wicked-garden-repo-learn"
    },
    {
     "catalog": "understand",
     "id": "hotspots",
+    "owner": "team",
     "instructions": "Phase 2/3 HOTSPOTS: cross-reference the prior churn ranking with wicked-estate hotspot / blast-radius signals to find the load-bearing code, then READ it through the estate shim (`wicked-garden run scripts/_estate_client.py --readonly call …`, the skill's grounding path) to build a real technical understanding of how the system fits together — not a file listing. Reuse wicked-garden-search for the hotspot signals; follow the skill.",
     "depends_on": [
      "churn"
@@ -446,6 +449,7 @@
    {
     "catalog": "understand",
     "id": "source-discovery",
+    "owner": "team",
     "gate_type": null,
     "instructions": "With an OpenAPI document: run the skill's openapi action against the conversion service and report every tool it yields with its class (read, write, destructive), its input schema summary and its request mapping, plus the skipped operations and why. Without one: inventory the integration surface (SDK calls, CLI, database, events) into a candidate tool list with the same columns. Do not write code in this phase.",
     "skill_ref": "wicked-garden-mcp-scaffold",

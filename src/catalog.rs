@@ -589,8 +589,17 @@ fn bug_preset() -> Vec<PlanStep> {
         depends_on: after.map(|a| vec![a.to_string()]),
         ..PlanStep::default()
     };
+    // (DES-TEAMING-002 §8.8, operator decision 2026-10-18) triage is a second view the PA's fix
+    // rests on: a member seat does it and the PA accepts or rejects the result at its next
+    // boundary. On a roster with no seat but the PA's it runs on the PA, disclosed
+    // (`distribute::distribute_seated`). reproduce is a Test-stage entry: the evaluator fence
+    // already seats it off the builders, and on the PA (a rejected member step re-planned there)
+    // the gate would deny it as the author's own test — so it stays the PA's step.
     vec![
-        step("understand", "triage", None),
+        PlanStep {
+            owner: Some(StepOwner::Team),
+            ..step("understand", "triage", None)
+        },
         step("test_plan", "reproduce", Some("triage")),
         PlanStep {
             instructions: Some(crate::workflow::BUG_FIX_SWEEP_INSTRUCTIONS.to_string()),
@@ -619,14 +628,22 @@ fn capture_learnings_preset() -> Vec<PlanStep> {
         depends_on: after.map(|a| vec![a.to_string()]),
         ..PlanStep::default()
     };
+    // (DES-TEAMING-002 §8.8, operator decision 2026-10-18) churn and hotspots read the repo and
+    // change nothing: a member seat does them, the PA reviews them and writes the capture.
     vec![
-        step("understand", "churn", CAPTURE_CHURN_INSTRUCTIONS, None),
-        step(
-            "understand",
-            "hotspots",
-            CAPTURE_HOTSPOTS_INSTRUCTIONS,
-            Some("churn"),
-        ),
+        PlanStep {
+            owner: Some(StepOwner::Team),
+            ..step("understand", "churn", CAPTURE_CHURN_INSTRUCTIONS, None)
+        },
+        PlanStep {
+            owner: Some(StepOwner::Team),
+            ..step(
+                "understand",
+                "hotspots",
+                CAPTURE_HOTSPOTS_INSTRUCTIONS,
+                Some("churn"),
+            )
+        },
         // capture's work is proposals to the estate store, never a file in the repo: it writes
         // nothing (core#649 option A), so its PA may scope the run `SCOPE {"touch":[]}`, which
         // scores 0, and an auto onboarding capture does not stop at plan approval (crew#552).
@@ -1321,6 +1338,40 @@ mod tests {
         }
         assert_eq!(builtin_preset_descriptor("no-such-preset"), None);
         assert_eq!(builtin_preset_descriptor("campaign-x-y"), None);
+    }
+
+    /// (DES-TEAMING-002 §8.8, operator decision 2026-10-18) The built-in presets hand their
+    /// independent, read-only steps to the team: exactly these, each a neutral entry that writes
+    /// nothing (never a creator, never an evaluator — the fence seats those), so one accountable
+    /// PA still builds and a member's work never changes the tree.
+    #[test]
+    fn the_builtin_presets_give_their_independent_read_only_steps_to_the_team() {
+        let mut team: Vec<(String, String)> = Vec::new();
+        for (name, steps) in builtin_presets() {
+            for s in steps {
+                if s.owner == Some(StepOwner::Team) {
+                    let entry = catalog_entry(&s.catalog).expect("a catalog entry");
+                    assert_eq!(entry.role, PhaseRole::Neutral, "{name}/{}", s.id);
+                    // A Test-stage step re-planned onto the PA would be graded as the author's
+                    // own test: only recon steps go to the team.
+                    assert_eq!(entry.kind, StageKind::Recon, "{name}/{}", s.id);
+                    assert!(!entry.executes_code, "{name}/{}", s.id);
+                    assert_ne!(s.executes_code, Some(true), "{name}/{}", s.id);
+                    team.push((name.to_string(), s.id.clone()));
+                }
+            }
+        }
+        let want: Vec<(String, String)> = [
+            ("bug", "triage"),
+            ("capture-learnings", "churn"),
+            ("capture-learnings", "hotspots"),
+            ("learn", "research"),
+            ("mcp-server", "source-discovery"),
+        ]
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+        assert_eq!(team, want);
     }
 
     /// WT-C1 (N5, dormant): no built-in preset references the walkthrough entries — a walkthrough

@@ -340,18 +340,8 @@ pub(super) fn repick_primary(
     if let Some(tp) = session.team_plan.as_mut() {
         rotate_roster_values(&mut tp.roster, to);
     }
-    // The template the PA steps carry on the new seat: the launch roster's own when a unit of
-    // this run already carries it, else the registry's (as `reseat_off_benched_seat` does).
-    let invocation = units
-        .iter()
-        .find(|u| u.assigned_cli.as_deref() == Some(to) && u.assigned_invocation.is_some())
-        .and_then(|u| u.assigned_invocation.clone())
-        .or_else(|| {
-            crate::registry_roster()
-                .iter()
-                .find(|c| c.key == to)
-                .map(|c| c.headless_invocation.clone())
-        });
+    // The template the PA steps carry on the new seat.
+    let invocation = seat_invocation(units, to);
     for (ix, u) in units.iter_mut().enumerate() {
         if ix == unit_ix
             || !is_pa_step(u)
@@ -2369,6 +2359,31 @@ pub(super) fn advance_past(act: &mut Act<'_>, run_id: &str, ix: usize) -> anyhow
     )
 }
 
+/// The invocation template a unit of this run carries on `seat`: the launch roster's own when a
+/// unit of the run already carries it, else the registry's (as `reseat_off_benched_seat` does).
+/// A unit moved to another seat must carry THAT seat's template: the wrapped carrier runs a
+/// unit's own template before its seat key's (`execute_wrapped::launch_invocation`).
+fn seat_invocation(units: &[WorkUnit], seat: &str) -> Option<String> {
+    units
+        .iter()
+        .find(|u| u.assigned_cli.as_deref() == Some(seat) && u.assigned_invocation.is_some())
+        .and_then(|u| u.assigned_invocation.clone())
+        .or_else(|| {
+            crate::registry_roster()
+                .iter()
+                .find(|c| c.key == seat)
+                .map(|c| c.headless_invocation.clone())
+        })
+}
+
+/// The template a member's step runs on its member: the one stamped with the member, else the
+/// seat's ([`seat_invocation`]; a unit persisted before the stamp).
+fn member_template(units: &[WorkUnit], ms: &crate::domain::MemberStepState) -> Option<String> {
+    ms.member_invocation
+        .clone()
+        .or_else(|| seat_invocation(units, &ms.member))
+}
+
 /// The PA seat instance (`path.started.cli`): the first of the run's seats.
 fn pa_seat(session: &AgentSession) -> String {
     session
@@ -2492,6 +2507,7 @@ pub(super) fn stamp_member_step(session: &AgentSession, unit: &mut WorkUnit) -> 
     }
     unit.member_step = Some(crate::domain::MemberStepState {
         member,
+        member_invocation: unit.assigned_invocation.clone(),
         replanned,
         ..Default::default()
     });
@@ -2515,6 +2531,10 @@ pub(super) fn enter_review(
     let ms = unit.member_step.get_or_insert_with(Default::default);
     ms.reviewing = Some(member_attempt);
     ms.work_team = work_team;
+    // (codex review on #1022) The PA's review runs the PA's CLI, never the member's template.
+    let invocation = seat_invocation(&units, &pa);
+    let unit = &mut units[ix];
+    unit.assigned_invocation = invocation;
     unit.assigned_cli = Some(pa);
     unit.status = crate::domain::UnitStatus::Pending;
     put_node(act.store, unit.to_node())?;
@@ -2547,6 +2567,10 @@ fn accept_member_step(
     dissent: Option<String>,
 ) -> anyhow::Result<Progress> {
     let mut units = crate::domain::session_units(act.store, run_id)?;
+    let member_invocation = units[ix]
+        .member_step
+        .as_ref()
+        .and_then(|ms| member_template(&units, ms));
     let unit = &mut units[ix];
     let ord = unit.ord;
     if let Some(ms) = unit.member_step.as_mut() {
@@ -2556,6 +2580,7 @@ fn accept_member_step(
             unit.team = Some(t);
         }
         unit.assigned_cli = Some(ms.member.clone());
+        unit.assigned_invocation = member_invocation;
         if let (Some(why), Some(last)) = (dissent, ms.reviews.last_mut()) {
             last.member_reason.get_or_insert(why);
         }
@@ -2580,6 +2605,11 @@ fn rework_member_step(
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     let mut units = crate::domain::session_units(act.store, run_id)?;
     let pa = pa_seat(&session);
+    let pa_invocation = seat_invocation(&units, &pa);
+    let member_invocation = units[ix]
+        .member_step
+        .as_ref()
+        .and_then(|ms| member_template(&units, ms));
     let unit = &mut units[ix];
     let ord = unit.ord;
     let ms = unit.member_step.get_or_insert_with(Default::default);
@@ -2593,8 +2623,10 @@ fn rework_member_step(
         ms.replanned = true;
         unit.owner = crate::workflow::StepOwner::Pa;
         unit.assigned_cli = Some(pa);
+        unit.assigned_invocation = pa_invocation;
     } else {
         unit.assigned_cli = Some(ms.member.clone());
+        unit.assigned_invocation = member_invocation;
     }
     let amendment = format!(
         "{} — {reason}",
