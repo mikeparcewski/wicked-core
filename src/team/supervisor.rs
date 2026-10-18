@@ -627,9 +627,12 @@ impl UnitTeam {
     }
 
     /// Summon the plan's members (DES-001 §4.1): the first `plan.monitors` candidates that are
-    /// NOT the creator's instance and ARE admitted. A refused candidate is disclosed as
-    /// `member.joined{status:"failed"}` and starts no process. `plan.monitors == 0` summons
-    /// nothing and publishes nothing.
+    /// NOT the creator's instance and ARE admitted. The creator is dropped from the candidates
+    /// before admission (core#1028): it was never eligible to watch its own step, so offering it
+    /// recorded a bogus `member.joined{status:"failed"}` that read as "could not watch". A
+    /// candidate that IS eligible but refused (the host does not admit it, no baseline) is
+    /// disclosed as `member.joined{status:"failed"}` and starts no process. `plan.monitors == 0`
+    /// summons nothing and publishes nothing.
     fn summon(&mut self, host: &dyn MonitorHost) {
         if self.summoned {
             return;
@@ -640,10 +643,20 @@ impl UnitTeam {
         if want == 0 {
             return;
         }
-        // (ASK-K3b) The plan asked for a member and the roster has no seat but the PA's: the
-        // absence is on the record with a minted identity (one signed-in seat is the common
-        // single-user case; the thread renders "No reviewer — only <seat> is signed in").
-        if self.ctx.plan.candidates.is_empty() {
+        // The unit's actual creator (a member on a team step, a failover's seat) is never its
+        // own monitor, whatever order the plan or the pool put it in.
+        let candidates: Vec<String> = self
+            .ctx
+            .plan
+            .candidates
+            .iter()
+            .filter(|c| **c != self.ctx.creator)
+            .cloned()
+            .collect();
+        // (ASK-K3b) The plan asked for a member and the roster has no seat but the PA's (or the
+        // creator's): the absence is on the record with a minted identity (one signed-in seat is
+        // the common single-user case; the thread renders "No reviewer — only <seat> is signed in").
+        if candidates.is_empty() {
             self.joined(
                 None,
                 "m1",
@@ -663,7 +676,6 @@ impl UnitTeam {
             // baseline was not taken is refused as today: its tree may have changed unseen.
             (None, _) if !self.ctx.bound => String::new(),
             _ => {
-                let candidates = self.ctx.plan.candidates.clone();
                 for (i, seat) in candidates.iter().take(want).enumerate() {
                     self.joined(
                         None,
@@ -676,20 +688,12 @@ impl UnitTeam {
             }
         };
         let mut admitted = 0;
-        let candidates = self.ctx.plan.candidates.clone();
         for (i, seat) in candidates.iter().enumerate() {
             if admitted == want {
                 break;
             }
             let id = format!("m{}", i + 1);
-            let refusal = if seat == &self.ctx.creator {
-                Some(format!(
-                    "'{seat}' is the creator's own seat instance — a member must be distinct"
-                ))
-            } else {
-                host.admitted(seat).err()
-            };
-            if let Some(why) = refusal {
+            if let Err(why) = host.admitted(seat) {
                 self.joined(None, &id, Some(seat), Some(why));
                 continue;
             }
@@ -1392,7 +1396,7 @@ struct RunState {
 impl RunState {
     /// The attempt's member plan: the target from the band and the PA's ask, the candidates in
     /// roster order minus the PA (the PA is never a member; a creator among the candidates is
-    /// refused and disclosed by [`UnitTeam::summon`]).
+    /// dropped by [`UnitTeam::summon`] before admission, core#1028).
     fn plan(&self) -> TeamPlan {
         TeamPlan {
             monitors: monitor_target(self.band.as_deref(), self.asked),
@@ -1411,8 +1415,9 @@ impl TeamPlan {
     /// distribution seated them) summoned first, and a target of at least their count — the band's
     /// target still applies when it is higher (a pool never watches less), and
     /// [`MAX_MONITORS`] caps both. The rest of the roster stays behind them as the fallback order,
-    /// so a pool monitor that [`UnitTeam::summon`] refuses (the creator's own instance after a
-    /// failover, or one the host does not admit) is disclosed and the next candidate fills in.
+    /// so a pool monitor that [`UnitTeam::summon`] cannot seat (the creator's own instance after a
+    /// failover, dropped silently since it was never eligible, core#1028; or one the host does not
+    /// admit, disclosed) is skipped and the next candidate fills in.
     pub(crate) fn with_pool(mut self, monitors: &[String]) -> Self {
         if monitors.is_empty() {
             return self;

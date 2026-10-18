@@ -789,10 +789,11 @@ fn t6_a4_a_moved_line_keeps_its_id_and_gets_its_final_line() {
 
 // ── (a) DES-001 S2 #5 / #6: admission, zero monitors ─────────────────────────────────────────────
 
-/// DES-001 #5 on rows: a candidate that is the creator's instance, or on an unadmitted adapter,
-/// yields `member.joined{status:"failed"}` and opens no session.
+/// DES-001 #5 on rows: a candidate on an unadmitted adapter yields
+/// `member.joined{status:"failed"}` and opens no session. The creator's own instance is never
+/// offered at all (core#1028): it was never eligible, so no failed join is recorded for it.
 #[test]
-fn t6_a5_the_creator_and_an_unadmitted_seat_join_failed_without_a_process() {
+fn t6_a5_the_creator_is_never_offered_and_an_unadmitted_seat_joins_failed() {
     let mut h = Harness::new("t6a5");
     h.host.unadmitted.lock().unwrap().push("codex".into());
     // The PA is claude#1; this step's creator is the member claude#2 (a member's step).
@@ -806,18 +807,18 @@ fn t6_a5_the_creator_and_an_unadmitted_seat_join_failed_without_a_process() {
     h.checkpoint(3, 1, 1, "edit");
     h.pump();
     let joined = h.rows(tev::MEMBER_JOINED);
+    assert!(
+        joined.iter().all(|j| j["seat"] != "claude#2"),
+        "the creator is never offered as its own monitor: {joined:#?}"
+    );
     let failed: Vec<(&str, &str)> = joined
         .iter()
         .filter(|j| j["status"] == "failed")
         .map(|j| (j["seat"].as_str().unwrap(), j["error"].as_str().unwrap()))
         .collect();
-    assert_eq!(failed.len(), 2, "{joined:#?}");
+    assert_eq!(failed.len(), 1, "{joined:#?}");
     assert!(
-        failed[0].0 == "claude#2" && failed[0].1.contains("creator"),
-        "{failed:?}"
-    );
-    assert!(
-        failed[1].0 == "codex" && failed[1].1.contains("admitted"),
+        failed[0].0 == "codex" && failed[0].1.contains("admitted"),
         "{failed:?}"
     );
     let opened: Vec<String> = h
@@ -833,6 +834,59 @@ fn t6_a5_the_creator_and_an_unadmitted_seat_join_failed_without_a_process() {
         vec!["claude#3".to_string()],
         "only the admitted distinct seat opens"
     );
+}
+
+/// core#1028 (the :7721 round-5 rows): a POOL monitor that is the unit's own creator (a team
+/// step done by a member, or a failover onto the pooled seat) is dropped before admission. No
+/// `member.joined{status:"failed"}` names it, and the next candidate watches instead.
+#[test]
+fn a_pooled_creator_is_never_offered_as_its_own_monitor_1028() {
+    let mut h = Harness::new("pool1028");
+    // Lead codex; the triage step is claimed by the member pi, and the pool names pi first.
+    h.start("codex", &["codex", "pi", "opencode"], "0-19");
+    h.publish(&fixture_with(tev::STEP_CLAIMED, 0, RUN, |p| {
+        p["ord"] = json!(2);
+        p["attempt"] = json!(1);
+        p["by"] = json!("pi");
+        p["at"] = json!(crate::interaction::now_millis());
+        p["step_id"] = json!("triage");
+        p["criterion"] = json!("the bug is triaged");
+        p["baseline_tree"] = Value::Null;
+        p["repo"] = json!({"workdir": "/nonexistent", "git_dir": ""});
+        p["monitors"] = json!(["pi"]);
+    }));
+    h.complete_with_output(2, 1, "pi", "triage", ANSWER);
+    h.pump();
+    let joined = h.rows(tev::MEMBER_JOINED);
+    let seats: Vec<&str> = joined.iter().map(|j| j["seat"].as_str().unwrap()).collect();
+    assert_eq!(
+        seats,
+        ["opencode"],
+        "the creator pi is skipped, the next distinct seat is offered: {joined:#?}"
+    );
+}
+
+/// core#1028: when the creator is the plan's only candidate there is no distinct seat, and that
+/// absence (not a failed join naming the creator) is what the record says.
+#[test]
+fn a_plan_of_only_the_creator_records_no_distinct_seat_1028() {
+    let mut h = Harness::new("only1028");
+    h.start("claude#1", &["claude#1", "claude#2"], "40-69");
+    h.claim(3, 1, "claude#2");
+    h.fx.write("src/lib.rs", "fn a() {}\n");
+    h.checkpoint(3, 1, 1, "edit");
+    h.pump();
+    let joined = h.rows(tev::MEMBER_JOINED);
+    assert_eq!(joined.len(), 1, "{joined:#?}");
+    assert!(joined[0]["seat"].is_null(), "{joined:#?}");
+    assert!(
+        joined[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("no seat distinct"),
+        "{joined:#?}"
+    );
+    assert!(h.host.opens.lock().unwrap().is_empty());
 }
 
 /// DES-001 #6 on rows: a docs-only band (S4 `monitors: 0`) summons nothing and publishes no
