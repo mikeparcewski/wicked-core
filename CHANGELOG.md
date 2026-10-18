@@ -14,6 +14,13 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A step's creator is never offered as its own monitor (core#1028).** The team supervisor walked the plan's
+  candidates (a pool monitor first) and recorded `member.joined{status:"failed", error:"… the creator's own seat
+  instance …"}` for the unit's creator before seating a distinct one, which studio showed as "<seat> could not
+  watch". The creator (a member on a team step, a failover's seat) is now dropped from the candidates before
+  admission: no failed join names it, and when it was the only candidate the record says no distinct seat is left.
+  A failed join now means an eligible seat that could not open.
+
 - **The built-in presets hand their independent read steps to the team (DES-TEAMING-002 §8.8, operator decision
   2026-10-18).** No preset marked a step `owner:"team"`, so the PA did every step that was not a review or a test.
   Now `bug` triage, `capture-learnings` churn and hotspots, `learn` research and `mcp-server`
