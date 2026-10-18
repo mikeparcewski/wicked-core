@@ -669,6 +669,9 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.14.2** — 2026-10-18 — patch release on main e0d80f5, carrying #1019.
+  - **opencode through the gateway (#1016):** an opencode seat's model is pinned to a provider the config routes to the agent gateway, and the CLI's own model-catalogue fetch and autoupdate are off, so every model call goes through its gateway route instead of dying on ECONNRESET.
+  - **Any repeated crash benches (#1017):** a unit's failure signature is the runner's exit status plus its last meaningful output line, so ECONNRESET, TypeErrors, segfaults and panics bench a seat, not only lines that say "error".
 - **core-ts 0.14.1** — 2026-10-17 — patch release on main 9e943d5, carrying #1012, #1013 and #1014.
   - **Seat sign-in refresh:** the broker's refresh sends the provider CLI's User-Agent, so Anthropic refreshes stop failing (#1012).
   - **Container QE unit:** the seat image installs wicked-ledger under `/opt/wicked-ledger`, so a container seat's QE unit resolves it (#1013).
