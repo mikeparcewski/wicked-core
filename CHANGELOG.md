@@ -14,6 +14,31 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The seat credential broker no longer impersonates any vendor's client (core#1024).** core#1012 made the
+  broker's own OAuth refresher send the pinned CLIs' User-Agents (and pi's Copilot exchange sent VS Code Copilot
+  Chat's identity headers) to get past the providers' refusal of `curl`. That is gone; the broker makes no token
+  request at all:
+  - **codex, pi, opencode** sign-ins are renewed by the agent's own CLI on this host, the way it renews itself, in
+    a throwaway `env -i` home under the gateway directory (the core#986 host-login isolation): codex by
+    `codex app-server`'s `account/read` with `refreshToken: true`; pi by `pi auth print-bearer-token --provider <id>
+    --min-expiry 16m`, one entry at a time (its Copilot exchange is pi's own); opencode by `auth import`, `models`
+    (provider load renews its ChatGPT sign-in within five minutes of expiry) and `auth export`, on a private
+    `--standalone` server. The broker writes the CLI's own record into the CLI's own store, reads it back, and
+    deletes the home; the record never reaches argv, the environment or a log, and a CLI's output is discarded.
+    A changed store is always taken (a rotated refresh token is never dropped). A CLI that is not installed, or
+    cannot renew, is a failed refresh with a plain reason; the seat runs until the credential expires, then it is
+    signed out until the operator signs in again.
+  - **claude** seats sign in with `claude setup-token` (the login container runs it; the operator pastes the
+    long-lived token it prints back once, unechoed). The seat's claude sends that token itself
+    (`CLAUDE_CODE_OAUTH_TOKEN`, handed to the runtime client's environment, never argv) and its unit rides
+    `x-wicked-unit` (`ANTHROPIC_CUSTOM_HEADERS`); claude's gateway route passes the client's Authorization through
+    unchanged, strips the unit header and any `x-api-key`, and injects nothing. Nothing renews it. A record from an
+    earlier `claude auth login` keeps working until it expires; when it falls due the refresh fails with "sign
+    claude in again". pi's Anthropic route is unchanged.
+  - copilot's account reads (`copilot_internal/user`, `/models`) carry curl's own User-Agent, and the test suite
+    now fails if a vendor client identity (`claude-cli/…`, `codex_cli_rs`, `GitHubCopilotChat`, `editor-version`,
+    a `vscode-chat` integration id, `curl -A`) is spelled in the broker, the gateway or the floor.
+
 - **core, core-ts: a container seat reaches its run's estate through crew's broker (core#1018, option A).** No host
   store reaches a container seat (the container passes only what the carrier set, and the stores are never mounted),
   so every estate read and capture proposal was refused there. The engine now binds each unit's MCP token to its
