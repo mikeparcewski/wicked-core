@@ -211,7 +211,10 @@ fn host_login_banner(cli: &str, host: &str, pinned: Option<&str>) -> String {
 
 /// The host executable named `cli` on `path` (the daemon's search path).
 #[cfg(unix)]
-fn find_on_path(cli: &str, path: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+pub(crate) fn find_on_path(
+    cli: &str,
+    path: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     std::env::split_paths(path?)
         .filter(|d| d.is_absolute())
@@ -298,7 +301,11 @@ pub(crate) fn login_argv(
     }
     argv.push(image.into());
     let command: &[&str] = match cli {
-        "claude" => &["claude", "auth", "login"],
+        // A long-lived token the claude CLI mints for scripts (core#1024): its seats pass it
+        // through, so the broker never renews a claude sign-in. The CLI prints the token and
+        // keeps no copy; the operator pastes it back once (unechoed) and it lands in the
+        // throwaway volume, where ingest reads it.
+        "claude" => &["sh", "-c", CLAUDE_SETUP_TOKEN_LOGIN, "wicked-login"],
         // GitHub's device flow: copilot picks its loopback web flow unless it detects a headless
         // host, and a login container is not detected as one (its callback was unreachable).
         "copilot" => &["copilot", "login", "--device-code"],
@@ -306,6 +313,44 @@ pub(crate) fn login_argv(
     };
     argv.extend(command.iter().map(|s| (*s).to_string()));
     argv
+}
+
+/// Where claude's login leaves the `claude setup-token` token the operator pasted back.
+const CLAUDE_SETUP_TOKEN_PATH: &str = "claude/wicked-setup-token";
+
+/// claude's login: `claude setup-token`, then the token it printed, pasted back unechoed and
+/// written (owner-only) beside the CLI's own files for ingest. No token, no file: ingest reports
+/// the sign-in missing and the operator signs in again.
+const CLAUDE_SETUP_TOKEN_LOGIN: &str = "claude setup-token || exit 1; stty -echo 2>/dev/null; \
+printf '\\033[?2004l\\n%s' 'wicked: copy the token shown above, paste it here (it is not shown) and press Enter: '; \
+IFS= read -r t; ok=$?; stty echo 2>/dev/null; printf '\\n'; \
+[ $ok -eq 0 ] && [ -n \"$t\" ] || { echo 'wicked: no token was pasted; sign claude in again' >&2; exit 1; }; \
+umask 077 && printf '%s' \"$t\" > \"$CLAUDE_CONFIG_DIR/wicked-setup-token\"";
+
+/// The `claude setup-token` token pasted back at sign-in (pure): trimmed, one line of a token's
+/// characters, with the prefix Anthropic's long-lived OAuth tokens carry. Errors never repeat it.
+fn setup_token(bytes: &[u8]) -> Result<String, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "claude: the pasted token is not text".to_string())?
+        .trim();
+    // A terminal still in bracketed-paste mode (the CLI's TUI turns it on) wraps a paste.
+    let text = text
+        .strip_prefix("\u{1b}[200~")
+        .and_then(|t| t.strip_suffix("\u{1b}[201~"))
+        .unwrap_or(text)
+        .trim();
+    let shaped = text.len() <= 4096
+        && text
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_');
+    if !shaped || !text.starts_with("sk-ant-oat") || text.len() < 20 {
+        return Err(
+            "claude: what was pasted is not a `claude setup-token` token (sk-ant-oat…); sign \
+             claude in again and paste the token it prints"
+                .into(),
+        );
+    }
+    Ok(text.to_string())
 }
 
 /// Each CLI's configuration-home variable and its directory under the throwaway HOME. The init
@@ -327,7 +372,11 @@ fn login_homes(cli: &str) -> &'static [(&'static str, &'static str)] {
 /// pure extractor too, so callers may hand it files relative to a CLI's configuration home.
 fn credential_paths(cli: &str) -> &'static [&'static str] {
     match cli {
-        "claude" => &["claude/.credentials.json", "claude/settings.json"],
+        "claude" => &[
+            CLAUDE_SETUP_TOKEN_PATH,
+            "claude/.credentials.json",
+            "claude/settings.json",
+        ],
         "codex" => &["codex/auth.json"],
         "pi" => &["pi/auth.json", "pi/models.json"],
         // opencode 2.x keeps credentials in its SQLite DB; the login exports them here.
@@ -436,7 +485,12 @@ pub(crate) fn extract_tokens(
     broker_files(cli)?;
     match cli {
         "claude" => {
-            for path in credential_paths(cli) {
+            // The seat's pass-through token (core#1024). It is not an OAuth record: nothing to
+            // renew, and it replaces any record an earlier `claude auth login` left.
+            if let Some(bytes) = input_file(cli, files, CLAUDE_SETUP_TOKEN_PATH)? {
+                return Ok(vec![token_file("anthropic.token", &setup_token(bytes)?)]);
+            }
+            for path in &credential_paths(cli)[1..] {
                 let Some(bytes) = input_file(cli, files, path)? else {
                     continue;
                 };
@@ -1705,6 +1759,32 @@ pub(crate) fn seat_sign_in(
     }
 }
 
+/// The token a claude seat signed in with OAuth passes through (core#1024): the operator's own
+/// `claude setup-token` token (or what an earlier `claude auth login` left, until it expires),
+/// read from the broker under its lock. The seat's claude sends it upstream itself; the gateway
+/// relays it unchanged.
+#[cfg(unix)]
+pub(crate) fn claude_seat_token(rt: &Runtime, gw: &Gateway, dir: &Path) -> Result<String, String> {
+    let _lock = crate::seat_refresh::mutation_lock(dir)?;
+    let bytes = read_broker_record(rt, gw, "anthropic.token")?.ok_or("claude is not signed in")?;
+    let token = String::from_utf8(bytes).map_err(|_| "claude: invalid broker token")?;
+    let token = token.trim();
+    if token.is_empty() || token.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("claude: invalid broker token".into());
+    }
+    Ok(token.to_string())
+}
+
+/// Native Windows has no seat sign-ins (the container floor needs a Unix host).
+#[cfg(not(unix))]
+pub(crate) fn claude_seat_token(
+    _rt: &crate::container_floor::Runtime,
+    _gw: &crate::seat_gateway::Gateway,
+    _dir: &Path,
+) -> Result<String, String> {
+    Err("seat sign-ins need a Unix host".into())
+}
+
 /// Finish whatever broker mutation of `cli` a crash interrupted (caller holds the mutation lock):
 /// a helper's cleanup, a sign-out tombstone, an ingest journal, a refresh's staged record. The
 /// same order `ingest_and_route` repairs in.
@@ -1989,6 +2069,105 @@ fn create_login_home(dir: &Path, cli: &str, session: &str) -> Result<(), String>
         return Err(format!("could not create the login home: {e}"));
     }
     Ok(())
+}
+
+/// The throwaway home name of one renewal of `cli`'s sign-in by its own CLI on this host
+/// ([`crate::seat_refresh`]): per daemon and per agent, never a login session's name.
+pub(crate) fn refresh_session(gateway: &str, cli: &str) -> String {
+    format!(
+        "{gateway}-refresh-{cli}-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    )
+}
+
+/// Create renewal `session`'s throwaway home (as a host login's: every directory its
+/// environment names, each 0700 and new) and return its path.
+#[cfg(unix)]
+pub(crate) fn create_refresh_home(
+    dir: &Path,
+    cli: &str,
+    session: &str,
+) -> Result<std::path::PathBuf, String> {
+    create_login_home(dir, cli, session)?;
+    Ok(login_home(dir, session))
+}
+
+/// Remove renewal `session`'s throwaway home; one already gone counts as removed.
+pub(crate) fn remove_refresh_home(dir: &Path, session: &str) -> Result<(), String> {
+    remove_login_home(dir, session)
+}
+
+/// Remove every renewal home of `cli` under this daemon's gateway directory (a crash's leftover:
+/// a copy of the credential). Callers hold the mutation lock, so none is in use.
+#[cfg(unix)]
+pub(crate) fn sweep_refresh_homes(dir: &Path, gw: &Gateway, cli: &str) -> Result<(), String> {
+    let prefix = format!("{}-refresh-{cli}-", gw.name);
+    let entries = match std::fs::read_dir(dir.join("login")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name
+            .strip_prefix(&prefix)
+            .is_some_and(|n| n.len() == 8 && n.bytes().all(|c| c.is_ascii_hexdigit()))
+        {
+            remove_login_home(dir, &name)?;
+        }
+    }
+    Ok(())
+}
+
+/// The whole environment a host CLI renewing its own sign-in runs with in throwaway `home`:
+/// [`HOST_LOGIN_PASSTHROUGH`] from `daemon_env` (search path, locale, the proxy and CA settings a
+/// corporate host needs) and the home's own variables ([`host_login_env`]). Nothing else of the
+/// daemon's reaches it. opencode also reaches its own private server on loopback directly, never
+/// through a proxy, and does not update itself.
+pub(crate) fn host_cli_env(
+    home: &Path,
+    cli: &str,
+    daemon_env: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = HOST_LOGIN_PASSTHROUGH
+        .iter()
+        .filter_map(|name| daemon_env.iter().find(|(k, _)| k == name).cloned())
+        .collect();
+    if cli == "opencode" {
+        for name in ["NO_PROXY", "no_proxy"] {
+            let loopback = "127.0.0.1,localhost,::1";
+            match env.iter_mut().find(|(k, _)| k == name) {
+                Some(slot) => slot.1 = format!("{},{loopback}", slot.1),
+                None => env.push((name.to_string(), loopback.to_string())),
+            }
+        }
+        env.push(("OPENCODE_DISABLE_AUTOUPDATE".into(), "1".into()));
+    }
+    env.extend(host_login_env(home, cli));
+    env
+}
+
+/// Write `bytes` to a NEW file at `path`, owner-only (0600), and sync it.
+#[cfg(unix)]
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("could not write the CLI's store: {}", e.kind()))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("could not write the CLI's store: {}", e.kind()))
+}
+
+/// The file at `path` under host home `home` ([`read_home`]'s checks), `None` when absent.
+#[cfg(unix)]
+pub(crate) fn read_home_file(home: &Path, path: &str) -> Result<Option<Vec<u8>>, String> {
+    Ok(read_home(home, &[path])?.into_iter().next().map(|(_, b)| b))
 }
 
 /// Remove the throwaway home (and pid file) of host login session `session`; one already gone
@@ -2628,7 +2807,8 @@ case "$last" in
         file=${last##*/in/}; file=${file%% *}
         [ -f "$base/broker/$file" ] || exit 44
         case "$last" in *'head -c'*) cat "$base/broker/$file";; *) [ ! -s "$base/broker/$file" ] || printf present;; esac;;
-      *) cat "$base/input";;
+      *wicked-setup-token*) [ -f "$base/setup-token" ] || exit 44; cat "$base/setup-token";;
+      *) [ -f "$base/input" ] || exit 44; cat "$base/input";;
     esac;;
   *': > /in/'*)
     for word in $last; do case "$word" in /in/*) : > "$base/broker/${word#/in/}";; esac; done;;
@@ -3406,12 +3586,141 @@ esac
         format!("FAKE-header.{payload}.FAKE-signature")
     }
 
+    /// core#1024: claude signs in with `claude setup-token` (the real CLI's own flow, run in the
+    /// login container): the token it prints is pasted back unechoed and left for ingest, which
+    /// moves it to the broker as the seat's pass-through token. No OAuth record is kept, an
+    /// earlier one is emptied, and there is nothing for the broker to renew.
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_setup_token_sign_in_is_brokered_for_pass_through() {
+        // Echo is off before the prompt shows, so a paste typed at once is never echoed.
+        assert!(CLAUDE_SETUP_TOKEN_LOGIN.starts_with("claude setup-token || exit 1; stty -echo"));
+        assert!(CLAUDE_SETUP_TOKEN_LOGIN.contains("umask 077"));
+        assert!(CLAUDE_SETUP_TOKEN_LOGIN.ends_with("> \"$CLAUDE_CONFIG_DIR/wicked-setup-token\""));
+        assert_eq!(credential_paths("claude")[0], CLAUDE_SETUP_TOKEN_PATH);
+        assert_eq!(
+            setup_token(b"  sk-ant-oat01-FAKE-setup_token-0123\r\n").unwrap(),
+            "sk-ant-oat01-FAKE-setup_token-0123"
+        );
+        assert_eq!(
+            setup_token(b"\x1b[200~sk-ant-oat01-FAKE-setup_token-0123\x1b[201~\r").unwrap(),
+            "sk-ant-oat01-FAKE-setup_token-0123",
+            "a bracketed paste"
+        );
+        for bad in [
+            &b"sk-ant-api03-FAKE-not-a-setup-token"[..],
+            b"sk-ant-oat01-FAKE token",
+            b"sk-ant-oat01-FAKE\nx-evil: 1",
+            b"https://claude.ai/oauth/FAKE",
+            b"",
+        ] {
+            let e = setup_token(bad).unwrap_err();
+            assert!(!e.contains("FAKE"), "{e}");
+        }
+        let fake = FakeRuntime::new();
+        // An earlier `claude auth login` record is in the broker.
+        std::fs::write(
+            fake.dir.join("broker/claude.credentials.json"),
+            oauth(9_000_000_000_000).to_string(),
+        )
+        .unwrap();
+        std::fs::write(fake.dir.join("broker/anthropic.token"), "FAKE-old-access").unwrap();
+        new_session(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        std::fs::write(
+            fake.dir.join("setup-token"),
+            "sk-ant-oat01-FAKE-setup-0001\n",
+        )
+        .unwrap();
+        let report = ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        assert_eq!(report.files, vec!["anthropic.token".to_string()]);
+        assert_eq!(report.expires_at, None);
+        assert_eq!(
+            std::fs::read(fake.dir.join("broker/anthropic.token")).unwrap(),
+            b"sk-ant-oat01-FAKE-setup-0001"
+        );
+        assert!(
+            std::fs::read(fake.dir.join("broker/claude.credentials.json"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            broker_status(&fake.rt, &fake.gw, "claude"),
+            BrokerStatus::SignedIn { expires_at: None }
+        );
+        let sign_in = seat_sign_in(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        assert_eq!(
+            sign_in.kind,
+            Some(crate::seat_credentials::CredentialKind::ClaudeOauth)
+        );
+        assert_eq!(
+            claude_seat_token(&fake.rt, &fake.gw, &fake.dir).unwrap(),
+            "sk-ant-oat01-FAKE-setup-0001"
+        );
+        assert_eq!(
+            crate::seat_refresh::refresh(&fake.rt, &fake.gw, &fake.dir, "claude", true).unwrap(),
+            crate::seat_refresh::Outcome::NotRefreshable,
+            "a pass-through token is never renewed by the broker"
+        );
+        // A bad paste is refused before the broker changes, and never repeated.
+        new_session(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        std::fs::write(fake.dir.join("setup-token"), "FAKE-pasted-url").unwrap();
+        let err = ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap_err();
+        assert!(
+            err.contains("claude setup-token") && !err.contains("FAKE"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(fake.dir.join("broker/anthropic.token")).unwrap(),
+            b"sk-ant-oat01-FAKE-setup-0001"
+        );
+    }
+
+    /// core#1024: a claude record from an earlier `claude auth login` sign-in is never renewed
+    /// (the broker makes no token request): when it falls due, the refresh fails with a plain
+    /// reason the status carries, and no request leaves the host.
+    #[cfg(unix)]
+    #[test]
+    fn a_due_claude_oauth_record_fails_with_sign_in_again_and_no_request() {
+        let fake = FakeRuntime::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::fs::write(
+            fake.dir.join("broker/claude.credentials.json"),
+            oauth((now + 300) * 1000).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            fake.dir.join("broker/anthropic.token"),
+            "FAKE-claude-access",
+        )
+        .unwrap();
+        std::fs::write(fake.dir.join("calls"), "").unwrap();
+        let err = crate::seat_refresh::refresh(&fake.rt, &fake.gw, &fake.dir, "claude", false)
+            .unwrap_err();
+        assert_eq!(err, crate::seat_refresh::CLAUDE_SIGN_IN_AGAIN);
+        assert!(matches!(
+            with_last_refresh(
+                broker_status(&fake.rt, &fake.gw, "claude"),
+                crate::seat_refresh::last_refresh(&fake.dir, "claude")
+            ),
+            BrokerStatus::RefreshFailing { ref reason, .. } if reason == crate::seat_refresh::CLAUDE_SIGN_IN_AGAIN
+        ));
+        assert!(!fake.calls().contains(crate::seat_refresh::REFRESH_IMAGE));
+        assert_eq!(
+            std::fs::read(fake.dir.join("broker/anthropic.token")).unwrap(),
+            b"FAKE-claude-access",
+            "the record is served until it expires"
+        );
+    }
+
     #[test]
     fn login_argv_per_cli_has_hardening_isolated_home_and_native_command() {
         for (cli, command, config_env) in [
             (
                 "claude",
-                vec!["claude", "auth", "login"],
+                vec!["sh", "-c", CLAUDE_SETUP_TOKEN_LOGIN, "wicked-login"],
                 vec!["CLAUDE_CONFIG_DIR=/home/login/claude"],
             ),
             (
@@ -4983,12 +5292,7 @@ esac
             "const h=require('http');h.createServer((q,r)=>{q.resume();q.on('end',()=>{\
              r.setHeader('content-type','application/json');\
              r.end(JSON.stringify({auth:q.headers['authorization']||'',\
-             acct:q.headers['chatgpt-account-id']||''}))})}).listen(8080);\
-             h.createServer((q,r)=>{let b='';q.on('data',d=>b+=d);q.on('end',()=>{\
-             console.log('TOKEN-REQUEST '+q.url+' '+b);\
-             r.setHeader('content-type','application/json');\
-             if(q.url!=='/token'){r.statusCode=400;return r.end('{\"error\":\"invalid_grant\"}')}\
-             r.end(JSON.stringify({access_token:'FAKE-codex-access-v2',expires_in:3600}))})}).listen(8081)",
+             acct:q.headers['chatgpt-account-id']||''}))})}).listen(8080)",
         )
         .unwrap();
         configure_gateway(
@@ -5087,22 +5391,26 @@ esac
         let signed_in = ask(&|b| b.contains("FAKE-codex-access") && b.contains("FAKE-account-id"));
         let status_in = broker_status(&rt, &gw, "codex");
         let login_gone = !login_home(&dir, &volume).exists();
-        // The broker's one refresher: a forced refresh against the stub token endpoint; the
-        // gateway serves the new token with no restart (it watches its backendAuth file).
-        *crate::seat_refresh::TEST_URL.lock().unwrap() = Some(format!("http://{stub}:8081/token"));
+        // The broker's one refresher (core#1024): a forced refresh is codex's own (a FAKE codex
+        // on this host renews its auth.json); the gateway serves the new token with no restart
+        // (it watches its backendAuth file).
+        crate::seat_refresh::install_stub_clis(
+            &dir.join("bin"),
+            &[("FAKE-codex-access", "FAKE-codex-access-v2")],
+        );
+        *crate::seat_refresh::TEST_CLI_DIR.lock().unwrap() = Some(dir.join("bin"));
         let refreshed = crate::seat_refresh::refresh(&rt, &gw, &dir, "codex", true);
         let after_refresh = ask(&|b| b.contains("FAKE-codex-access-v2"));
         let not_due = crate::seat_refresh::refresh(&rt, &gw, &dir, "codex", false);
-        // A refusing endpoint: the refresh fails, the status says so, the served token stays.
-        *crate::seat_refresh::TEST_URL.lock().unwrap() = Some(format!("http://{stub}:8081/bad"));
+        // codex refuses: the refresh fails, the status says so, the served token stays.
+        std::fs::write(dir.join("refuse-codex"), "").unwrap();
         let refused = crate::seat_refresh::refresh(&rt, &gw, &dir, "codex", true);
         let status_failing = with_last_refresh(
             broker_status(&rt, &gw, "codex"),
             crate::seat_refresh::last_refresh(&dir, "codex"),
         );
-        *crate::seat_refresh::TEST_URL.lock().unwrap() = None;
-        let stub_logs = run(&["logs", &stub]);
-        let token_requests = String::from_utf8_lossy(&stub_logs.stdout).to_string();
+        *crate::seat_refresh::TEST_CLI_DIR.lock().unwrap() = None;
+        let renewals = std::fs::read_to_string(dir.join("stub-cli.log")).unwrap_or_default();
         sign_out_and_route(&rt, &gw, &dir, "codex").expect("signed out");
         let signed_out =
             ask(&|b| !b.contains("FAKE-codex-access") && !b.contains("FAKE-account-id"));
@@ -5157,10 +5465,11 @@ esac
             after_refresh.contains("\"acct\":\"FAKE-account-id\""),
             "{after_refresh}"
         );
-        assert!(
-            token_requests.contains("\"refresh_token\":\"FAKE-codex-refresh\"")
-                && token_requests.contains("app_EMoamEEZ73f0CkXaXp7hrann"),
-            "{token_requests}"
+        assert_eq!(
+            renewals.matches("codex app-server").count(),
+            2,
+            "codex renewed itself (the forced and the refused pass; the fresh one never ran it): \
+             {renewals}"
         );
         assert!(
             matches!(not_due, Ok(crate::seat_refresh::Outcome::NotDue { .. })),
@@ -5209,18 +5518,13 @@ esac
             output_within(c, Duration::from_secs(90)).unwrap()
         };
         let stub = format!("{}-stub", gw.name);
-        // 8080: the model upstream, logging what each request carried; 8081: the token endpoints.
+        // The model upstream, logging what each request carried.
         std::fs::write(
             dir.join("stub/stub.js"),
             "const h=require('http');h.createServer((q,r)=>{q.resume();q.on('end',()=>{\
              console.log('UPSTREAM '+JSON.stringify({url:q.url,auth:q.headers['authorization']||'',\
              acct:q.headers['chatgpt-account-id']||'',unit:q.headers['x-wicked-unit']||''}));\
-             r.statusCode=401;r.end('{}')})}).listen(8080);\
-             h.createServer((q,r)=>{q.resume();q.on('end',()=>{console.log('TOKEN '+q.method+' '+(q.headers['authorization']||''));\
-             r.setHeader('content-type','application/json');\
-             if(q.method==='GET')return r.end(JSON.stringify({token:'tid=FAKE-pi-copilot-v2;proxy-ep=proxy.individual.githubcopilot.com',\
-             expires_at:Math.floor(Date.now()/1000)+1800}));\
-             r.end(JSON.stringify({access_token:'FAKE-pi-renewed',expires_in:3600}))})}).listen(8081)",
+             r.statusCode=401;r.end('{}')})}).listen(8080)",
         )
         .unwrap();
         let mut config = GatewayConfig::default();
@@ -5373,9 +5677,19 @@ esac
             }
             std::thread::sleep(Duration::from_millis(250));
         }
-        *crate::seat_refresh::TEST_URL.lock().unwrap() = Some(format!("http://{stub}:8081/token"));
+        // core#1024: pi renews its own entries (a FAKE pi on this host: its Copilot exchange and
+        // the others), one at a time; the broker makes no token request of its own.
+        crate::seat_refresh::install_stub_clis(
+            &dir.join("bin"),
+            &[
+                ("tid=FAKE-pi-copilot;", "tid=FAKE-pi-copilot-v2;"),
+                ("sk-ant-oat01-FAKE-access", "FAKE-pi-renewed"),
+            ],
+        );
+        *crate::seat_refresh::TEST_CLI_DIR.lock().unwrap() = Some(dir.join("bin"));
         let refreshed = crate::seat_refresh::refresh(&rt, &gw, &dir, "pi", true);
-        *crate::seat_refresh::TEST_URL.lock().unwrap() = None;
+        *crate::seat_refresh::TEST_CLI_DIR.lock().unwrap() = None;
+        let renewals = std::fs::read_to_string(dir.join("stub-cli.log")).unwrap_or_default();
         let after_refresh = {
             let mut last = String::new();
             for _ in 0..30 {
@@ -5475,10 +5789,13 @@ esac
             ),
             "{refreshed:?}"
         );
-        assert!(
-            seen.contains("TOKEN GET Bearer FAKE-gho-token")
-                || after_refresh.contains("TOKEN GET Bearer FAKE-gho-token")
-        );
+        for id in ["anthropic", "openai-codex", "github-copilot"] {
+            assert!(
+                renewals.contains(&format!("pi auth print-bearer-token --provider {id} ")),
+                "{renewals}"
+            );
+        }
+        assert!(!seen.contains("TOKEN") && !after_refresh.contains("TOKEN"));
         assert!(
             after_refresh.contains("Bearer tid=FAKE-pi-copilot-v2"),
             "{after_refresh}"
@@ -6353,25 +6670,25 @@ esac
     }
 
     /// The FAKE claude the C6 live test builds into a seat image: no account, no network auth.
-    /// `claude auth login` shows what the real subscription login shows in a terminal with no
-    /// browser (a link, then a code to paste) and writes a FAKE OAuth record; a headless turn sends
-    /// one model request with whatever credential its seat holds and prints what came back.
+    /// `claude setup-token` shows what the real one shows in a terminal with no browser (a link,
+    /// then a code to paste) and prints a FAKE long-lived token, keeping no copy; a headless turn
+    /// sends one model request as the real claude does with `CLAUDE_CODE_OAUTH_TOKEN` and
+    /// `ANTHROPIC_CUSTOM_HEADERS` (core#1024), and prints what came back.
     #[cfg(unix)]
     const FAKE_CLAUDE: &str = r#"#!/bin/sh
-cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-if [ "$1 $2" = "auth login" ]; then
+if [ "$1" = "setup-token" ]; then
   echo "Browser didn't open? Use the url below to sign in:"
   echo "https://claude.example.invalid/oauth/authorize?code=true"
   printf 'Paste code here if prompted > '
   read code
   [ "$code" = "FAKE-CODE-1234" ] || { echo "Invalid code"; exit 1; }
-  mkdir -p "$cfg" && umask 077
-  printf '%s' '{"claudeAiOauth":{"accessToken":"sk-ant-oat01-FAKE-c6-access","refreshToken":"sk-ant-ort01-FAKE-c6-refresh","expiresAt":4102444800000,"scopes":["user:inference"]}}' > "$cfg/.credentials.json"
-  echo "Login successful."
+  echo "Long-lived authentication token created successfully!"
+  echo "Your OAuth token (valid for 1 year):"
+  echo "sk-ant-oat01-FAKE-c6-setup"
   exit 0
 fi
-tok=$(jq -r '.claudeAiOauth.accessToken // empty' "$cfg/.credentials.json" 2>/dev/null)
-curl -s --max-time 8 -H "authorization: Bearer $tok" -H 'content-type: application/json' \
+curl -s --max-time 8 -H "authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN" -H "$ANTHROPIC_CUSTOM_HEADERS" \
+  -H 'content-type: application/json' \
   -d '{"model":"x","max_tokens":1,"messages":[]}' "$ANTHROPIC_BASE_URL/v1/messages" || echo CURL_FAILED
 "#;
 
@@ -6380,6 +6697,16 @@ curl -s --max-time 8 -H "authorization: Bearer $tok" -H 'content-type: applicati
     /// terminal there, as crew does when its socket drops. Returns the transcript and exit code.
     #[cfg(unix)]
     fn login_terminal(argv: &[String], answer: Option<&str>) -> (String, Option<i32>) {
+        login_terminal_pasting(argv, answer, None)
+    }
+
+    /// [`login_terminal`], then, at the prompt for the token the CLI printed, paste `token`.
+    #[cfg(unix)]
+    fn login_terminal_pasting(
+        argv: &[String],
+        answer: Option<&str>,
+        token: Option<&str>,
+    ) -> (String, Option<i32>) {
         let map = crate::terminal::new_map();
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = crate::terminal::spawn_pty(
@@ -6395,6 +6722,7 @@ curl -s --max-time 8 -H "authorization: Bearer $tok" -H 'content-type: applicati
         let mut transcript = String::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(90);
         let mut typed = false;
+        let mut pasted = false;
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match rx.recv_timeout(left) {
@@ -6410,6 +6738,15 @@ curl -s --max-time 8 -H "authorization: Bearer $tok" -H 'content-type: applicati
                         let terminals = crate::terminal::lock(&map);
                         let mut w = terminals["c6-login"].writer.lock().unwrap();
                         w.write_all(format!("{answer}\r").as_bytes()).unwrap();
+                    }
+                    if !pasted && transcript.contains("(it is not shown)") {
+                        pasted = true;
+                        if let Some(token) = token {
+                            use std::io::Write;
+                            let terminals = crate::terminal::lock(&map);
+                            let mut w = terminals["c6-login"].writer.lock().unwrap();
+                            w.write_all(format!("{token}\r").as_bytes()).unwrap();
+                        }
                     }
                 }
                 Ok(crate::command::Command::TerminalReaderDone { .. }) => break,
@@ -6508,7 +6845,7 @@ curl -s --max-time 8 -H "authorization: Bearer $tok" -H 'content-type: applicati
             "require('http').createServer((q,r)=>{q.resume();q.on('end',()=>{\
              r.setHeader('content-type','application/json');\
              r.end(JSON.stringify({path:q.url,auth:q.headers['authorization']||'',\
-             key:q.headers['x-api-key']||''}))})}).listen(8080)",
+             key:q.headers['x-api-key']||'',unit:q.headers['x-wicked-unit']||''}))})}).listen(8080)",
         )
         .unwrap();
         let mut config = GatewayConfig::default();
@@ -6620,7 +6957,11 @@ curl -s --max-time 8 -H "authorization: Bearer $tok" -H 'content-type: applicati
             .expect("a login session");
         let abandoned_gone = !volume_exists(&rt, &abandoned_volume).unwrap()
             && !volume_exists(&rt, &legacy_volume).unwrap();
-        let (transcript, exit) = login_terminal(&login, Some("FAKE-CODE-1234"));
+        let (transcript, exit) = login_terminal_pasting(
+            &login,
+            Some("FAKE-CODE-1234"),
+            Some("sk-ant-oat01-FAKE-c6-setup"),
+        );
         // 3. Crew's ingest on the terminal's exit.
         let report = ingest_and_route(&rt, &gw, &dir, "claude").expect("ingested");
         let login_gone = !volume_exists(&rt, &volume).unwrap();
@@ -6692,34 +7033,40 @@ curl -s --max-time 8 -H "authorization: Bearer $tok" -H 'content-type: applicati
         assert!(before.1.contains("claude is not signed in"), "{before:?}");
         assert!(
             transcript.contains("https://claude.example.invalid/oauth/authorize")
-                && transcript.contains("Login successful."),
+                && transcript.contains("Long-lived authentication token created"),
             "the user sees the link and the result: {transcript}"
+        );
+        assert_eq!(
+            transcript.matches("sk-ant-oat01-FAKE-c6-setup").count(),
+            1,
+            "the pasted token is not echoed back: {transcript}"
         );
         assert_eq!(exit, Some(0), "{transcript}");
         assert!(
             login_gone,
             "the throwaway login volume is removed after ingest"
         );
-        assert_eq!(
-            report.files,
-            vec![
-                "anthropic.token".to_string(),
-                "claude.credentials.json".into()
-            ]
-        );
-        // The OAuth sign-in's route, and only a placeholder in the seat.
+        assert_eq!(report.files, vec!["anthropic.token".to_string()]);
+        // The OAuth route; no record in the seat, which passes the user's own token through
+        // (core#1024): the gateway injected nothing and stripped the unit's header.
         assert_eq!(base_url.as_deref(), Some("http://agw:4005"));
-        assert!(placeholder.contains("claudeAiOauth"), "{placeholder}");
-        assert!(!placeholder.contains("FAKE-c6-access"), "{placeholder}");
+        assert_eq!(placeholder, "{}");
         assert!(out.status.success(), "{seat_out}\n{seat_err}");
         assert!(
-            seat_out.contains("\"auth\":\"Bearer sk-ant-oat01-FAKE-c6-access\""),
+            seat_out.contains(&format!(
+                "\"auth\":\"Bearer {}\"",
+                "sk-ant-oat01-FAKE-c6-setup"
+            )),
             "the upstream receives the user's credential: {seat_out}\n{seat_err}"
         );
         assert!(seat_out.contains("\"path\":\"/v1/messages\""), "{seat_out}");
+        assert!(
+            seat_out.contains("\"unit\":\"\""),
+            "the unit header stays at the gateway: {seat_out}"
+        );
         assert_eq!(after.0, FloorUnarmed::AgentSignedOut, "{after:?}");
         assert!(
-            !gw_logs.contains("FAKE-c6-access"),
+            !gw_logs.contains("FAKE-c6-setup"),
             "no credential in the gateway log"
         );
     }

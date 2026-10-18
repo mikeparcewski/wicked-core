@@ -1,22 +1,42 @@
 //! The broker's ONE refresher (DES-CONTAINER-FLOOR §6, item 2): the only place a signed-in
-//! agent's OAuth credential is refreshed. Seats never refresh (their placeholder expiry is far in
-//! the future), so parallel seats never race a refresh.
+//! agent's sign-in is renewed. Seats never refresh (their placeholder expiry is far in the
+//! future), so parallel seats never race a refresh.
 //!
-//! **Glue.** The request is built from the broker's retained OAuth record, POSTed to the
-//! provider's token endpoint by a short-lived pinned curl container on the gateway's external
-//! bridge (the body on stdin, the answer on stdout; never argv), and the answer is folded back
-//! into the record, which then goes through the same extraction as a sign-in
+//! **The broker renews nothing itself (core#1024).** It makes no token request and never
+//! presents itself as any vendor's client. A sign-in is renewed by the agent's own CLI, the way
+//! that CLI renews itself, run on this host in a throwaway home under the daemon's gateway
+//! directory (the isolation of its host sign-in, core#986: an `env -i` environment whose HOME,
+//! XDG directories and CLI home all point inside it). The broker writes the CLI's own credential
+//! record there, runs one command of the CLI's that makes it renew its own credential, reads
+//! the CLI's store back, and deletes the home:
+//!
+//! - **codex**: `codex app-server` (its own JSON-RPC server) asked `account/read` with
+//!   `refreshToken: true`, its documented proactive refresh; `auth.json` is then read back.
+//! - **pi**: `pi auth print-bearer-token --provider <id> --min-expiry <m>`, its own request-auth
+//!   path, which renews and persists an OAuth entry with less validity left (the printed token
+//!   goes to /dev/null). One entry per run, each committed before the next (decision 8).
+//! - **opencode**: `opencode auth import` of its own export, `opencode models` (loading its
+//!   providers resolves the active ChatGPT sign-in, which opencode renews within five minutes of
+//!   its expiry), then `opencode auth export`. All three on a private `--standalone` server.
+//! - **claude** seats pass the operator's own long-lived `claude setup-token` token through
+//!   (the gateway relays the client's Authorization unchanged), so there is nothing to renew. A
+//!   record from an earlier `claude auth login` sign-in is never renewed: when it falls due, the
+//!   refresh fails with a plain reason, and the operator signs in again.
+//! - **copilot**: its GitHub token does not expire; the pass re-reads the account's Copilot API
+//!   host and models with it ([`copilot_account_request`]).
+//!
+//! A CLI that cannot renew (not installed, a refused refresh, an exit without a new record) is a
+//! failed refresh recorded with its reason (never the CLI's output, which can hold a token); the
+//! credential is served until it expires, and then the seat is signed out until the operator
+//! signs in again.
+//!
+//! **Glue.** The CLI's new record goes through the same extraction as a sign-in
 //! ([`crate::seat_login::extract_tokens`]). agentgateway watches its `backendAuth` file, so the
-//! new token is served without a restart. The record is written before the token file: a
-//! provider that rotates its refresh token must never leave the broker holding only the old one.
+//! new token is served without a restart. The record is written before the token file: a CLI
+//! that rotates its refresh token must never leave the broker holding only the old one.
 //!
 //! **One per gateway.** A pass holds an exclusive lock file in the daemon's gateway directory
 //! (a second pass skips); the daemon starts one background loop per gateway dir.
-//!
-//! The endpoints and client ids are the ones the pinned CLIs themselves use (read from the
-//! seat images' binaries: claude 2.1.296, codex 0.162.1). A real provider refresh needs a real
-//! sign-in, which this engine never performs on anyone's behalf: the flow is proved against a
-//! stub endpoint.
 
 // Native Windows has no container floor: only the refresher's pure half compiles there.
 #![cfg_attr(not(unix), allow(dead_code))]
@@ -31,74 +51,26 @@ pub(crate) const REFRESH_MARGIN_SECS: u64 = 15 * 60;
 /// How often the daemon's loop looks.
 #[cfg(unix)]
 const PASS_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-/// The pinned OSS image the token request runs in (curl verifies TLS against its CA bundle).
+/// The pinned OSS image the copilot account reads run in (curl verifies TLS against its CA
+/// bundle).
 pub(crate) const REFRESH_IMAGE: &str = "curlimages/curl:8.11.1";
-/// The agents whose sign-in the broker's pass keeps current: an OAuth record it refreshes, or
-/// (copilot) the account's Copilot API host and models it re-reads with the GitHub token.
+/// The agents whose sign-in the broker's pass keeps current: an OAuth record their own CLI
+/// renews, a claude record it reports on, or (copilot) the account's Copilot API host and
+/// models it re-reads with the GitHub token.
 pub(crate) const REFRESHABLE: &[&str] = &["claude", "codex", "pi", "opencode", "copilot"];
 
-/// One provider's refresh flow.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Flow {
-    pub(crate) url: String,
-    pub(crate) client_id: &'static str,
-    /// The User-Agent the request carries: the pinned CLI's own (core#1011). The token request
-    /// runs in a curl container, and curl's default `curl/<version>` is refused by Anthropic's
-    /// token endpoint before it reads the body (`429 rate_limit_error` on every request), so a
-    /// claude or pi sign-in was never renewed and the seat signed out when its token expired.
-    pub(crate) user_agent: &'static str,
+/// Why a claude record is never renewed: its seats pass a `claude setup-token` token through.
+pub(crate) const CLAUDE_SIGN_IN_AGAIN: &str = "claude seats now sign in with a long-lived token \
+     from `claude setup-token`, which the broker does not renew; sign claude in again";
+
+/// Whether `cli`'s own CLI renews its sign-in on this host (the agents that sign in there).
+pub(crate) fn renews_on_host(cli: &str) -> bool {
+    matches!(cli, "codex" | "pi" | "opencode")
 }
 
-/// The User-Agent of the pinned claude CLI (`@anthropic-ai/claude-code@2.1.296`, the seat
-/// image's package; a test keeps the two in step). Anthropic's flow, for claude and pi's
-/// `anthropic` entry alike.
-pub(crate) const CLAUDE_USER_AGENT: &str = "claude-cli/2.1.296 (external, cli)";
-/// The User-Agent of the pinned codex CLI (`@openai/codex@0.162.1`). OpenAI's flow, for codex
-/// and the ChatGPT entries of pi and opencode.
-pub(crate) const CODEX_USER_AGENT: &str = "codex_cli_rs/0.162.1";
-
-pub(crate) fn flow(cli: &str) -> Option<Flow> {
-    let (url, client_id, user_agent) = match cli {
-        "claude" => (
-            "https://platform.claude.com/v1/oauth/token",
-            "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-            CLAUDE_USER_AGENT,
-        ),
-        "codex" => (
-            "https://auth.openai.com/oauth/token",
-            "app_EMoamEEZ73f0CkXaXp7hrann",
-            CODEX_USER_AGENT,
-        ),
-        _ => return None,
-    };
-    #[cfg(test)]
-    if let Some(stub) = TEST_URL.lock().ok().and_then(|u| u.clone()) {
-        return Some(Flow {
-            url: stub,
-            client_id,
-            user_agent,
-        });
-    }
-    Some(Flow {
-        url: url.into(),
-        client_id,
-        user_agent,
-    })
-}
-
-/// The stub endpoint under test; `None` in production (a refresh token only goes to its provider).
-fn test_url() -> Option<String> {
-    #[cfg(test)]
-    if let Some(stub) = TEST_URL.lock().ok().and_then(|u| u.clone()) {
-        return Some(stub);
-    }
-    None
-}
-
-/// (tests) The stub token endpoint the live test points every flow at. No production override:
-/// a refresh token only ever goes to the provider.
+/// (tests) The directory a stub of each renewing CLI is found in, instead of the daemon's PATH.
 #[cfg(test)]
-pub(crate) static TEST_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+pub(crate) static TEST_CLI_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
 
 /// (tests) The stub origin serving both copilot account reads (`/copilot_internal/user`,
 /// `/models`). No production override: the GitHub token only goes to GitHub and the account's
@@ -106,6 +78,17 @@ pub(crate) static TEST_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex:
 #[cfg(test)]
 pub(crate) static COPILOT_TEST_ORIGIN: std::sync::Mutex<Option<String>> =
     std::sync::Mutex::new(None);
+
+/// One account read the copilot pass makes: a GET authorized by the GitHub token (sent on stdin
+/// as a header, never on a command line). It carries no client identity of ours: curl's own
+/// User-Agent, the accept/API-version headers GitHub documents, and, on the model listing, the
+/// copilot CLI's own integration id ([`crate::copilot_account::MODELS_HEADERS`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Request {
+    pub(crate) url: String,
+    pub(crate) token: String,
+    pub(crate) headers: Vec<(&'static str, &'static str)>,
+}
 
 /// The two reads that resolve a copilot sign-in's account (DES-SEAT-LOGIN-SUBSCRIPTIONS OD-1),
 /// as the copilot CLI makes them: GitHub names the account's Copilot API, which lists the
@@ -122,14 +105,15 @@ pub(crate) fn copilot_account_request(token: &str, host: Option<&str>) -> Reques
         (Some(_), Some(o)) => (format!("{o}/models"), MODELS_HEADERS),
         (Some(h), None) => (format!("https://{h}/models"), MODELS_HEADERS),
     };
-    Request::BearerGet {
+    Request {
         url,
         token: token.to_string(),
         headers: headers.to_vec(),
     }
 }
 
-/// The broker file that retains `cli`'s whole OAuth record.
+/// The broker file that retains `cli`'s whole OAuth record (claude's only from an earlier
+/// `claude auth login` sign-in).
 pub(crate) fn record_file(cli: &str) -> Option<&'static str> {
     match cli {
         "claude" => Some("claude.credentials.json"),
@@ -141,7 +125,7 @@ pub(crate) fn record_file(cli: &str) -> Option<&'static str> {
 }
 
 /// The login-volume spelling of the record, for [`crate::seat_login::extract_tokens`].
-fn login_path(cli: &str) -> Option<&'static str> {
+pub(crate) fn login_path(cli: &str) -> Option<&'static str> {
     match cli {
         "claude" => Some("claude/.credentials.json"),
         "codex" => Some("codex/auth.json"),
@@ -156,75 +140,33 @@ fn multi_entry(cli: &str) -> bool {
     matches!(cli, "pi" | "opencode")
 }
 
-/// One token request the refresher makes for a record.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Request {
-    /// An OAuth refresh: a JSON POST to the provider's token endpoint, as the provider's own
-    /// CLI makes it (its User-Agent, [`Flow::user_agent`]).
-    Post {
-        url: String,
-        body: Value,
-        user_agent: &'static str,
-    },
-    /// Copilot's token exchange: a GET authorized by the GitHub token (sent on stdin as a
-    /// header, never on a command line), with the client's identifying headers.
-    BearerGet {
-        url: String,
-        token: String,
-        headers: Vec<(&'static str, &'static str)>,
-    },
-}
-
-/// GitHub's Copilot token exchange (the endpoint pi's own refresh calls).
-const COPILOT_EXCHANGE_URL: &str = "https://api.github.com/copilot_internal/v2/token";
-/// The identifying headers pi sends with the exchange (`github-copilot.js` COPILOT_HEADERS).
-const PI_COPILOT_HEADERS: &[(&str, &str)] = &[
-    ("accept", "application/json"),
-    ("user-agent", "GitHubCopilotChat/0.35.0"),
-    ("editor-version", "vscode/1.107.0"),
-    ("editor-plugin-version", "copilot-chat/0.35.0"),
-    ("copilot-integration-id", "vscode-chat"),
-];
-
-/// pi's refreshable entries, in no particular order: provider id → the flow its tokens renew by.
+/// pi's renewable entries, in no particular order: the provider ids its own CLI renews.
 const PI_ENTRIES: &[&str] = &["anthropic", "openai-codex", "github-copilot"];
 
-/// The next refresh of `record` at `now`: the entry it renews (pi: a provider id; `None` for
-/// the single-record agents) and its request. pi renews the entry expiring first, one entry per
-/// committed generation (DES-SEAT-LOGIN-SUBSCRIPTIONS decision 8); `None` = nothing refreshable
-/// (or, unless `force`, nothing due).
-pub(crate) fn next_refresh(
-    cli: &str,
-    record: &Value,
-    now: u64,
-    force: bool,
-) -> Option<(Option<String>, Request)> {
-    if !multi_entry(cli) {
-        let flow = flow(cli)?;
-        let body = request_body(cli, record, &flow)?;
-        let expires_at = crate::seat_login::record_expiry(cli, record).ok()?;
-        if !force && !due(expires_at, now) {
-            return None;
+/// Whether `cli`'s single record (claude, codex) is a renewable OAuth sign-in: one with a
+/// refresh token, not an API key.
+pub(crate) fn renewable(cli: &str, record: &Value) -> bool {
+    match cli {
+        "claude" => str_at(record, "/claudeAiOauth/refreshToken").is_some(),
+        "codex" => {
+            record.get("auth_mode").and_then(Value::as_str) != Some("apikey")
+                && str_at(record, "/tokens/refresh_token").is_some()
         }
-        return Some((
-            None,
-            Request::Post {
-                url: flow.url,
-                body,
-                user_agent: flow.user_agent,
-            },
-        ));
+        _ => false,
     }
-    let id = due_entries(cli, record, now, force).into_iter().next()?;
-    let request = entry_request(cli, record, &id)?;
-    Some((Some(id), request))
+}
+
+/// Whether `cli`'s single record is due at `now` (or, with `force`, renewable at all).
+pub(crate) fn record_due(cli: &str, record: &Value, now: u64, force: bool) -> bool {
+    renewable(cli, record)
+        && (force || crate::seat_login::record_expiry(cli, record).is_ok_and(|e| due(e, now)))
 }
 
 /// The entries of a multi-entry record that a pass renews at `now`, soonest-expiring first:
 /// those due (or, with `force`, every renewable one). Each is tried once per pass.
 pub(crate) fn due_entries(cli: &str, record: &Value, now: u64, force: bool) -> Vec<String> {
-    // opencode's only renewable sign-in is its ChatGPT one (codex's flow); Copilot's GitHub
-    // token does not expire.
+    // opencode's only renewable sign-in is its ChatGPT one; Copilot's GitHub token does not
+    // expire.
     let entries: &[&str] = match cli {
         "pi" => PI_ENTRIES,
         "opencode" => &["openai"],
@@ -246,12 +188,7 @@ pub(crate) fn due_entries(cli: &str, record: &Value, now: u64, force: bool) -> V
             str_at(entry, "/refresh")?;
             // An entry with no expiry is renewable but never due on its own: only `force` takes
             // it (last).
-            let exp = entry
-                .get("expires")
-                .and_then(Value::as_u64)
-                .filter(|ms| *ms > 0)
-                .map(|ms| ms / 1000);
-            Some((exp.unwrap_or(u64::MAX), *id))
+            Some((entry_expiry(entry).unwrap_or(u64::MAX), *id))
         })
         .filter(|(exp, _)| force || (*exp != u64::MAX && due(Some(*exp), now)))
         .collect();
@@ -262,245 +199,96 @@ pub(crate) fn due_entries(cli: &str, record: &Value, now: u64, force: bool) -> V
         .collect()
 }
 
-/// The token request that renews entry `id` of `cli`'s record.
-pub(crate) fn entry_request(cli: &str, record: &Value, id: &str) -> Option<Request> {
-    let entry = crate::seat_login::record_entry(cli, record, id)?;
-    let refresh = str_at(entry, "/refresh")?.to_string();
-    let request = match id {
-        "anthropic" => {
-            let flow = flow("claude")?;
-            Request::Post {
-                url: flow.url,
-                body: json!({"grant_type": "refresh_token", "refresh_token": refresh,
-                    "client_id": flow.client_id}),
-                user_agent: flow.user_agent,
-            }
-        }
-        "openai-codex" | "openai" => {
-            let flow = flow("codex")?;
-            Request::Post {
-                url: flow.url,
-                body: json!({"grant_type": "refresh_token", "refresh_token": refresh,
-                    "client_id": flow.client_id, "scope": "openid profile email"}),
-                user_agent: flow.user_agent,
-            }
-        }
-        _ => Request::BearerGet {
-            url: test_url().unwrap_or_else(|| COPILOT_EXCHANGE_URL.into()),
-            token: refresh,
-            headers: PI_COPILOT_HEADERS.to_vec(),
-        },
-    };
-    Some(request)
-}
-
-/// Fold a token answer into pi's entry `id` of `record` (at `now`, Unix seconds).
-#[cfg(test)]
-pub(crate) fn apply_pi_answer(
-    record: &Value,
-    id: &str,
-    answer: &Value,
-    now: u64,
-) -> Result<Value, String> {
-    apply_entry_answer("pi", record, id, answer, now)
-}
-
-/// Fold a token answer into `cli`'s entry `id` of `record` (at `now`, Unix seconds): pi's
-/// provider object, opencode's active credential value of that integration.
-pub(crate) fn apply_entry_answer(
-    cli: &str,
-    record: &Value,
-    id: &str,
-    answer: &Value,
-    now: u64,
-) -> Result<Value, String> {
-    let mut out = record.clone();
-    let slot = match cli {
-        "pi" => out.get_mut(id),
-        "opencode" => {
-            let active = crate::seat_login::opencode_active(record, id)
-                .and_then(|row| row.get("id").cloned());
-            out.as_array_mut().and_then(|rows| {
-                rows.iter_mut()
-                    .find(|r| {
-                        r.get("integrationID").and_then(Value::as_str) == Some(id)
-                            && active.as_ref().is_none_or(|a| r.get("id") == Some(a))
-                    })
-                    .and_then(|r| r.get_mut("value"))
-            })
-        }
-        _ => None,
-    };
-    let entry = slot
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| format!("{cli}: the record has no {id} entry"))?;
-    if id == "github-copilot" {
-        let token =
-            str_at(answer, "/token").ok_or("the Copilot token exchange returned no token")?;
-        let expires_at = answer
-            .get("expires_at")
-            .and_then(Value::as_u64)
-            .ok_or("the Copilot token exchange returned no expires_at")?;
-        entry.insert("access".into(), json!(token));
-        entry.insert("expires".into(), json!(expires_at.saturating_mul(1000)));
-        // The plan endpoint THIS exchange names, kept (in the broker's copy only) for a token
-        // that names no `proxy-ep`; an answer naming none drops an earlier generation's.
-        match str_at(answer, "/endpoints/api") {
-            Some(api) => {
-                entry.insert(crate::seat_login::COPILOT_ENDPOINT_FIELD.into(), json!(api));
-            }
-            None => {
-                entry.remove(crate::seat_login::COPILOT_ENDPOINT_FIELD);
-            }
-        }
-        return Ok(out);
-    }
-    let access =
-        str_at(answer, "/access_token").ok_or("the token endpoint returned no access_token")?;
-    if answer.get("refresh_token").is_some() && str_at(answer, "/refresh_token").is_none() {
-        return Err("invalid refresh_token in token answer".into());
-    }
-    let expires_in = answer
-        .get("expires_in")
+/// A pi or opencode entry's expiry in Unix seconds (both store milliseconds; `0` = none).
+fn entry_expiry(entry: &Value) -> Option<u64> {
+    entry
+        .get("expires")
         .and_then(Value::as_u64)
-        .ok_or("the token endpoint returned no expires_in")?;
-    entry.insert("access".into(), json!(access));
-    if let Some(r) = str_at(answer, "/refresh_token") {
-        entry.insert("refresh".into(), json!(r));
-    }
-    entry.insert(
-        "expires".into(),
-        json!(now.saturating_add(expires_in).saturating_mul(1000)),
-    );
-    Ok(out)
+        .filter(|ms| *ms > 0)
+        .map(|ms| ms / 1000)
 }
 
 fn str_at<'a>(v: &'a Value, p: &str) -> Option<&'a str> {
     crate::seat_login::nonempty(v.pointer(p))
 }
 
-/// The token request body for `record`; `None` when the record is not a refreshable OAuth
-/// sign-in (an API key, a record without a refresh token).
-pub(crate) fn request_body(cli: &str, record: &Value, flow: &Flow) -> Option<Value> {
-    match cli {
-        "claude" => {
-            let rt = str_at(record, "/claudeAiOauth/refreshToken")?;
-            let mut body = json!({
-                "grant_type": "refresh_token",
-                "refresh_token": rt,
-                "client_id": flow.client_id,
-            });
-            let scopes: Vec<&str> = record
-                .pointer("/claudeAiOauth/scopes")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).collect())
-                .unwrap_or_default();
-            if !scopes.is_empty() {
-                body["scope"] = json!(scopes.join(" "));
-            }
-            Some(body)
-        }
-        "codex" => {
-            if record.get("auth_mode").and_then(Value::as_str) == Some("apikey") {
-                return None;
-            }
-            let rt = str_at(record, "/tokens/refresh_token")?;
-            Some(json!({
-                "client_id": flow.client_id,
-                "grant_type": "refresh_token",
-                "refresh_token": rt,
-                "scope": "openid profile email",
-            }))
-        }
-        _ => None,
-    }
+/// What one run of a CLI's own renewal did, as the broker judges it from the CLI's store.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Renewal {
+    /// The CLI stored a new record (renewed, or at least rotated): the broker takes it.
+    Renewed(Value),
+    /// The CLI left its record as it was and the credential is still valid: by the CLI's own
+    /// rule it was not due yet (opencode renews within five minutes of expiry).
+    Unchanged,
 }
 
-/// Fold a token endpoint's answer into `record` (at `now`, Unix seconds). The provider may or
-/// may not rotate the refresh token; an absent one keeps the old.
-pub(crate) fn apply_answer(
+/// Judge one run of `cli`'s own renewal (pure): `old` is the record the broker handed it,
+/// `stored` what the CLI's store holds afterwards, `ran` whether the CLI's command succeeded
+/// (`Err` = how it failed, never its output), `entry` the entry it was asked to renew. A store
+/// the CLI changed is taken even when its command then failed: a rotated refresh token must
+/// never be dropped. Errors name the failure only.
+pub(crate) fn judge(
     cli: &str,
-    record: &Value,
-    answer: &Value,
+    entry: Option<&str>,
+    old: &Value,
+    stored: Option<&[u8]>,
+    ran: Result<(), String>,
     now: u64,
-) -> Result<Value, String> {
-    let access = str_at(answer, "/access_token")
-        .ok_or_else(|| format!("{cli}: the token endpoint returned no access_token"))?;
-    // agy lg-r1 A5: absent rotation keeps the old token; a malformed rotation is an error.
-    for key in ["refresh_token", "id_token"] {
-        if answer.get(key).is_some() && str_at(answer, &format!("/{key}")).is_none() {
-            return Err(format!("{cli}: invalid {key} in token answer"));
-        }
+) -> Result<Renewal, String> {
+    let stored = stored.ok_or_else(|| format!("{cli} left no sign-in in its store"))?;
+    let new: Value = serde_json::from_slice(stored)
+        .map_err(|_| format!("{cli} left an unreadable sign-in in its store"))?;
+    if &new != old {
+        crate::seat_login::extract_tokens(
+            cli,
+            &[(login_path(cli).unwrap_or_default().into(), stored.to_vec())],
+        )
+        .map_err(|e| format!("{cli}'s renewed sign-in was refused: {e}"))?;
+        return Ok(Renewal::Renewed(new));
     }
-    let mut out = record.clone();
-    match cli {
-        "claude" => {
-            let o = out
-                .get_mut("claudeAiOauth")
-                .and_then(Value::as_object_mut)
-                .ok_or("claude: the record has no claudeAiOauth")?;
-            o.insert("accessToken".into(), json!(access));
-            if let Some(r) = str_at(answer, "/refresh_token") {
-                o.insert("refreshToken".into(), json!(r));
-            }
-            let expires_in = answer
-                .get("expires_in")
-                .and_then(Value::as_u64)
-                .ok_or("claude: the token endpoint returned no expires_in")?;
-            o.insert(
-                "expiresAt".into(),
-                json!(now.saturating_add(expires_in).saturating_mul(1000)),
-            );
-        }
-        "codex" => {
-            let t = out
-                .get_mut("tokens")
-                .and_then(Value::as_object_mut)
-                .ok_or("codex: the record has no tokens")?;
-            t.insert("access_token".into(), json!(access));
-            for k in ["refresh_token", "id_token"] {
-                if let Some(v) = str_at(answer, &format!("/{k}")) {
-                    t.insert(k.into(), json!(v));
-                }
-            }
-            // codex's own expiry is the access JWT's `exp` (read by the broker status); an
-            // explicit expires_in is recorded too when the endpoint gives one.
-            match answer.get("expires_in").and_then(Value::as_u64) {
-                Some(s) => {
-                    t.insert("expires_at".into(), json!(now.saturating_add(s)));
-                }
-                None => {
-                    t.remove("expires_at");
-                }
-            }
-            out["last_refresh"] = json!(rfc3339(now));
-        }
-        _ => return Err(format!("{cli}: not refreshable")),
+    ran.map_err(|e| format!("{cli} could not renew its sign-in ({e})"))?;
+    let expiry = match entry {
+        Some(id) => crate::seat_login::record_entry(cli, &new, id).and_then(entry_expiry),
+        None => crate::seat_login::record_expiry(cli, &new).ok().flatten(),
+    };
+    if expiry.is_some_and(|e| e <= now) {
+        return Err(format!("{cli} did not renew its expired sign-in"));
     }
-    Ok(out)
+    Ok(Renewal::Unchanged)
 }
 
-/// `now` as `YYYY-MM-DDTHH:MM:SSZ` (codex's `last_refresh` spelling).
-fn rfc3339(now: u64) -> String {
-    let days = now / 86_400;
-    let secs = now % 86_400;
-    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        secs / 3600,
-        (secs / 60) % 60,
-        secs % 60
-    )
+/// pi's `--min-expiry`: renew an entry with less than this much validity left. A forced
+/// renewal asks for more validity than any token has, so pi always renews.
+pub(crate) fn pi_min_expiry(force: bool) -> String {
+    if force {
+        "100000h".into()
+    } else {
+        format!("{}m", REFRESH_MARGIN_SECS / 60 + 1)
+    }
+}
+
+/// The JSON-RPC lines that make `codex app-server` renew its own sign-in: `initialize` (naming
+/// this engine as the client, as the protocol asks), `initialized`, then `account/read` with
+/// `refreshToken: true` (id 2), codex's proactive refresh.
+pub(crate) fn codex_requests() -> Vec<u8> {
+    let lines = [
+        json!({"id": 1, "method": "initialize", "params": {"clientInfo": {
+            "name": "wicked_core", "title": "wicked-core broker",
+            "version": env!("CARGO_PKG_VERSION")}}}),
+        json!({"method": "initialized"}),
+        json!({"id": 2, "method": "account/read", "params": {"refreshToken": true}}),
+    ];
+    lines
+        .iter()
+        .flat_map(|l| format!("{l}\n").into_bytes())
+        .collect()
+}
+
+/// Whether one line codex's server wrote answers request id 2: `Some(true)` a result,
+/// `Some(false)` an error, `None` another message.
+pub(crate) fn codex_answer(line: &[u8]) -> Option<bool> {
+    let v: Value = serde_json::from_slice(line).ok()?;
+    (v.get("id") == Some(&json!(2))).then(|| v.get("result").is_some())
 }
 
 /// Whether a credential expiring at `expires_at` is due at `now`. An unknown expiry is never due.
@@ -788,15 +576,6 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn encode_request(body: &Value) -> Result<Vec<u8>, String> {
-    let bytes = serde_json::to_vec(body).map_err(|_| "could not encode the request")?;
-    // codex lg-r2 C6: an accepted record cannot stream an unbounded token request.
-    if bytes.len() > 64 * 1024 {
-        return Err("token request exceeds 64 KiB".into());
-    }
-    Ok(bytes)
-}
-
 #[cfg(unix)]
 pub(crate) fn repair_refresh(
     rt: &crate::container_floor::Runtime,
@@ -906,85 +685,42 @@ mod live {
     use super::*;
     use crate::container_floor::{output_within, Runtime};
     use crate::seat_gateway::Gateway;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+    use wicked_apps_core::HardenedCommand;
 
     const POST_TIMEOUT: Duration = Duration::from_secs(45);
-    /// The largest token answer read back.
+    /// The largest account answer read back.
     const MAX_ANSWER: usize = 256 * 1024;
+    /// How long one command of a CLI's own renewal may run.
+    const CLI_STEP_TIMEOUT: Duration = Duration::from_secs(90);
+    /// The largest store a CLI's export may print.
+    const MAX_STORE: usize = 1024 * 1024;
 
-    /// POST `body` to `url` from a short-lived hardened curl container on `network`; the body
-    /// rides stdin and the answer stdout. Errors name the status only, never the answer.
-    #[cfg(test)]
-    pub(crate) fn post_json(
-        rt: &Runtime,
-        dir: &Path,
-        cli: &str,
-        network: &str,
-        url: &str,
-        body: &Value,
-    ) -> Result<Value, String> {
-        send(
-            rt,
-            dir,
-            cli,
-            network,
-            &Request::Post {
-                url: url.into(),
-                body: body.clone(),
-                user_agent: CLAUDE_USER_AGENT,
-            },
-        )
-    }
-
-    /// The curl argv and stdin of `request` (pure): a POST's body and a GET's credential header
-    /// both ride stdin, so no credential is ever a command-line argument. The answer's HTTP
-    /// status follows its body on a last line of its own ([`STATUS_FORMAT`], read back by
-    /// [`split_status`]); no `--fail`, so a refusal names its status, not "curl exit 22".
+    /// The curl argv and stdin of an account read (pure): its credential header rides stdin, so
+    /// no credential is ever a command-line argument. The answer's HTTP status follows its body
+    /// on a last line of its own ([`STATUS_FORMAT`], read back by [`split_status`]); no
+    /// `--fail`, so a refusal names its status, not "curl exit 22". No `-A`: curl's own
+    /// User-Agent, never a vendor client's.
     pub(crate) fn request_argv(request: &Request) -> Result<(Vec<String>, Vec<u8>), String> {
         let mut argv: Vec<String> = ["-sS", "--max-time", "30", "-w", STATUS_FORMAT]
             .into_iter()
             .map(str::to_string)
             .collect();
-        let stdin = match request {
-            Request::Post {
-                url,
-                body,
-                user_agent,
-            } => {
-                argv.extend(
-                    [
-                        "-A",
-                        user_agent,
-                        "-X",
-                        "POST",
-                        "-H",
-                        "content-type: application/json",
-                        "-H",
-                        "accept: application/json",
-                        "--data-binary",
-                        "@-",
-                        url,
-                    ]
-                    .map(str::to_string),
-                );
-                encode_request(body)?
-            }
-            Request::BearerGet {
-                url,
-                token,
-                headers,
-            } => {
-                if token.chars().any(|c| c.is_control() || c.is_whitespace()) {
-                    return Err("invalid credential token".into());
-                }
-                for (name, value) in headers {
-                    argv.extend(["-H".to_string(), format!("{name}: {value}")]);
-                }
-                argv.extend(["-H".to_string(), "@-".to_string(), url.clone()]);
-                format!("authorization: Bearer {token}\n").into_bytes()
-            }
-        };
-        Ok((argv, stdin))
+        if request
+            .token
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err("invalid credential token".into());
+        }
+        for (name, value) in &request.headers {
+            argv.extend(["-H".to_string(), format!("{name}: {value}")]);
+        }
+        argv.extend(["-H".to_string(), "@-".to_string(), request.url.clone()]);
+        Ok((
+            argv,
+            format!("authorization: Bearer {}\n", request.token).into_bytes(),
+        ))
     }
 
     /// Make `request` from a short-lived hardened curl container on `network`; the answer comes
@@ -1004,7 +740,7 @@ mod live {
                 Some(o) if o.status.success() => {}
                 _ => {
                     return Err(format!(
-                        "could not pull the refresher image {REFRESH_IMAGE}"
+                        "could not pull the account reader image {REFRESH_IMAGE}"
                     ))
                 }
             }
@@ -1038,9 +774,240 @@ mod live {
             return Err(refusal(code, out));
         }
         if out.len() > MAX_ANSWER {
-            return Err("the token answer exceeds its size limit".into());
+            return Err("the account answer exceeds its size limit".into());
         }
-        serde_json::from_slice(out).map_err(|_| "the token answer is not JSON".into())
+        serde_json::from_slice(out).map_err(|_| "the account answer is not JSON".into())
+    }
+
+    /// The host executable of `cli`'s renewing CLI, on the daemon's search path.
+    fn renewing_exe(cli: &str, daemon_env: &[(String, String)]) -> Result<PathBuf, String> {
+        #[cfg(test)]
+        if let Some(d) = TEST_CLI_DIR.lock().ok().and_then(|d| d.clone()) {
+            return Ok(d.join(cli));
+        }
+        let path = daemon_env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| std::ffi::OsStr::new(v.as_str()));
+        crate::seat_login::find_on_path(cli, path).ok_or_else(|| {
+            format!(
+                "{cli} is not installed on this host: its sign-in is renewed by this host's own \
+                 {cli}. Install it, or sign {cli} in again when the sign-in expires"
+            )
+        })
+    }
+
+    /// Run one command of `exe` in throwaway `home` with `env` (and nothing else): `stdin` is
+    /// written then closed; stdout is kept only when `keep_stdout` (bounded), else discarded,
+    /// and stderr always is (either can hold a credential). The command leads its own process
+    /// group, which is ended afterwards, so a server it started never outlives it. `Err` names
+    /// how it failed (an exit status or a timeout), never what it printed.
+    fn run_step(
+        exe: &Path,
+        args: &[String],
+        home: &Path,
+        env: &[(String, String)],
+        stdin: &[u8],
+        keep_stdout: bool,
+    ) -> (Result<(), String>, Vec<u8>) {
+        use std::io::{Read, Write};
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        let mut cmd = std::process::Command::new(exe);
+        cmd.hardened();
+        cmd.args(args)
+            .env_clear()
+            .envs(env.iter().map(|(k, v)| (k, v)))
+            .current_dir(home)
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(if keep_stdout {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stderr(Stdio::null());
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(_) => return (Err("it could not start".into()), Vec::new()),
+        };
+        let pgid = child.id() as i32;
+        if let Some(mut input) = child.stdin.take() {
+            let bytes = stdin.to_vec();
+            std::thread::spawn(move || {
+                let _ = input.write_all(&bytes);
+            });
+        }
+        let reader = child.stdout.take().map(|out| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = out.take(MAX_STORE as u64 + 1).read_to_end(&mut bytes);
+                bytes
+            })
+        });
+        let start = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if start.elapsed() < CLI_STEP_TIMEOUT => {
+                    std::thread::sleep(Duration::from_millis(50))
+                }
+                _ => break None,
+            }
+        };
+        // SAFETY: killpg takes plain integers; the group is the one this child leads.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let out = reader.and_then(|r| r.join().ok()).unwrap_or_default();
+        let ran = match status {
+            None => Err("it timed out".into()),
+            Some(s) if s.success() => Ok(()),
+            Some(s) => Err(format!("it exited with {s}")),
+        };
+        if out.len() > MAX_STORE {
+            return (Err("its output exceeds the size limit".into()), Vec::new());
+        }
+        (ran, out)
+    }
+
+    /// `codex app-server`: send [`codex_requests`], wait for the answer to request 2 (or the
+    /// step timeout), then close its stdin so it exits. `Ok` = codex answered with a result.
+    fn run_codex(exe: &Path, home: &Path, env: &[(String, String)]) -> Result<(), String> {
+        use std::io::{BufRead, Write};
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        let mut cmd = std::process::Command::new(exe);
+        cmd.hardened();
+        cmd.args(["app-server", "-c", "cli_auth_credentials_store=\"file\""])
+            .env_clear()
+            .envs(env.iter().map(|(k, v)| (k, v)))
+            .current_dir(home)
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().map_err(|_| "it could not start".to_string())?;
+        let pgid = child.id() as i32;
+        let mut input = child.stdin.take();
+        let (tx, rx) = std::sync::mpsc::channel();
+        if let Some(out) = child.stdout.take() {
+            std::thread::spawn(move || {
+                let mut out = std::io::BufReader::new(out);
+                let mut line = Vec::new();
+                // Each line is judged and dropped: an answer can carry a token.
+                while out
+                    .read_until(b'\n', &mut line)
+                    .is_ok_and(|n| n > 0 && line.len() <= MAX_STORE)
+                {
+                    if let Some(ok) = codex_answer(&line) {
+                        let _ = tx.send(ok);
+                        return;
+                    }
+                    line.clear();
+                }
+            });
+        }
+        let sent = input
+            .as_mut()
+            .map(|i| i.write_all(&codex_requests()).and_then(|()| i.flush()));
+        let answer = match sent {
+            Some(Ok(())) => rx.recv_timeout(CLI_STEP_TIMEOUT).ok(),
+            _ => None,
+        };
+        // Closing stdin ends the server; give it a moment to finish writing its store.
+        drop(input);
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            if let Ok(Some(_)) = child.try_wait() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // SAFETY: killpg takes plain integers; the group is the one this child leads.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        let _ = child.kill();
+        let _ = child.wait();
+        match answer {
+            Some(true) => Ok(()),
+            Some(false) => Err("its account/read answered an error".into()),
+            None => Err("its account/read did not answer".into()),
+        }
+    }
+
+    /// Run `cli`'s own renewal of `record` (its `entry`, for pi and opencode) on this host, in a
+    /// throwaway home that is removed afterwards whatever happened, and judge what the CLI
+    /// stored ([`judge`]). The record is written into the CLI's own store (0600 under 0700
+    /// directories) and read back from it; it never reaches an argument, the environment or a
+    /// log.
+    pub(crate) fn renew_on_host(
+        dir: &Path,
+        gw: &Gateway,
+        cli: &str,
+        record: &Value,
+        entry: Option<&str>,
+        force: bool,
+        now: u64,
+    ) -> Result<Renewal, String> {
+        let daemon_env: Vec<(String, String)> = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        let exe = renewing_exe(cli, &daemon_env)?;
+        let bytes = serde_json::to_vec(record).map_err(|_| "could not encode the record")?;
+        let session = crate::seat_login::refresh_session(&gw.name, cli);
+        let home = crate::seat_login::create_refresh_home(dir, cli, &session)?;
+        let env = crate::seat_login::host_cli_env(&home, cli, &daemon_env);
+        let result = (|| {
+            let (ran, stored) = match cli {
+                "codex" => {
+                    crate::seat_login::write_private(&home.join("codex/auth.json"), &bytes)?;
+                    let ran = run_codex(&exe, &home, &env);
+                    (
+                        ran,
+                        crate::seat_login::read_home_file(&home, "codex/auth.json")?,
+                    )
+                }
+                "pi" => {
+                    crate::seat_login::write_private(&home.join("pi/auth.json"), &bytes)?;
+                    let id = entry.ok_or("pi renews one entry at a time")?;
+                    let args: Vec<String> = [
+                        "auth",
+                        "print-bearer-token",
+                        "--provider",
+                        id,
+                        "--min-expiry",
+                        &pi_min_expiry(force),
+                    ]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                    let (ran, _) = run_step(&exe, &args, &home, &env, &[], false);
+                    (
+                        ran,
+                        crate::seat_login::read_home_file(&home, "pi/auth.json")?,
+                    )
+                }
+                "opencode" => {
+                    let step = |args: &[&str], stdin: &[u8], keep: bool| {
+                        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+                        run_step(&exe, &args, &home, &env, stdin, keep)
+                    };
+                    step(&["auth", "import", "--standalone"], &bytes, false)
+                        .0
+                        .map_err(|e| format!("opencode could not take its sign-in ({e})"))?;
+                    let (ran, _) = step(&["models", "--standalone"], &[], false);
+                    let (exported, out) = step(&["auth", "export", "--standalone"], &[], true);
+                    exported.map_err(|e| format!("opencode could not export its sign-in ({e})"))?;
+                    (ran, Some(out))
+                }
+                _ => return Err(format!("{cli} has no renewal of its own on this host")),
+            };
+            judge(cli, entry, record, stored.as_deref(), ran, now)
+        })();
+        crate::seat_login::remove_refresh_home(dir, &session)?;
+        result
     }
 
     /// Refresh `cli` when its credential is due (or `force`). One pass per gateway dir at a time.
@@ -1061,18 +1028,15 @@ mod live {
         if cli == "copilot" {
             return copilot_pass(rt, gw, dir, force);
         }
-        let (Some(flow), Some(file)) = (
-            // Multi-entry records' flows are per entry ([`next_refresh`]); claude's stands in for
-            // the record-level checks below.
-            flow(if multi_entry(cli) { "claude" } else { cli }),
-            record_file(cli),
-        ) else {
+        let Some(file) = record_file(cli) else {
             return Ok(Outcome::NotRefreshable);
         };
         crate::seat_login::repair_ingest(rt, gw, dir, cli)?;
         if crate::seat_login::signin_pending(dir, cli) {
             return Err("sign-in incomplete; retry ingest first".into());
         }
+        // A crash can leave a renewal's throwaway home (a copy of the credential): gone first.
+        crate::seat_login::sweep_refresh_homes(dir, gw, cli)?;
         // Re-read only after acquiring the broker lock (codex lg-r1 #2).
         let bytes = repair_refresh(rt, gw, dir, cli)?;
         let Some(bytes) = bytes else {
@@ -1080,21 +1044,18 @@ mod live {
         };
         let mut record: Value =
             serde_json::from_slice(&bytes).map_err(|_| format!("{cli}: unreadable record"))?;
-        if let Some(body) = request_body(cli, &record, &flow) {
-            encode_request(&body)?; // codex lg-r2 C6: reject oversized records even before NotDue.
-        }
         let now = unix_now();
         let multi = multi_entry(cli);
         // A multi-entry record renews each eligible entry once per pass, one committed generation
-        // at a time, so a rotated refresh token is stored before the next entry's request is made
-        // (DES-SEAT-LOGIN-SUBSCRIPTIONS decision 8). One entry's refused request never strands the
-        // others; a failure to store a generation stops the pass.
+        // at a time, so a rotated refresh token is stored before the next entry is renewed
+        // (DES-SEAT-LOGIN-SUBSCRIPTIONS decision 8). One entry's failed renewal never strands
+        // the others; a failure to store a generation stops the pass.
         let plan: Vec<Option<String>> = if multi {
             due_entries(cli, &record, now, force)
                 .into_iter()
                 .map(Some)
                 .collect()
-        } else if next_refresh(cli, &record, now, force).is_some() {
+        } else if record_due(cli, &record, now, force) {
             vec![None]
         } else {
             Vec::new()
@@ -1102,25 +1063,21 @@ mod live {
         let refreshable = if multi {
             !due_entries(cli, &record, now, true).is_empty()
         } else {
-            request_body(cli, &record, &flow).is_some()
+            renewable(cli, &record)
         };
         let mut refreshed = false;
         let mut failures: Vec<String> = Vec::new();
         for entry in &plan {
-            let request = match entry {
-                Some(id) => entry_request(cli, &record, id),
-                None => next_refresh(cli, &record, now, force).map(|(_, r)| r),
+            let renewed = if renews_on_host(cli) {
+                renew_on_host(dir, gw, cli, &record, entry.as_deref(), force, now)
+            } else {
+                // claude: an earlier `claude auth login` record, never renewed (its seats now
+                // pass a `claude setup-token` token through).
+                Err(CLAUDE_SIGN_IN_AGAIN.to_string())
             };
-            let Some(request) = request else {
-                continue;
-            };
-            let answered =
-                send(rt, dir, cli, &gw.external_network, &request).and_then(|answer| match entry {
-                    Some(id) => apply_entry_answer(cli, &record, id, &answer, now),
-                    None => apply_answer(cli, &record, &answer, now),
-                });
-            let new = match answered {
-                Ok(new) => new,
+            let new = match renewed {
+                Ok(Renewal::Renewed(new)) => new,
+                Ok(Renewal::Unchanged) => continue,
                 Err(e) if multi => {
                     failures.push(format!("{}: {e}", entry.as_deref().unwrap_or(cli)));
                     continue;
@@ -1346,10 +1303,53 @@ mod live {
     }
 }
 
-#[cfg(all(unix, test))]
-pub(crate) use live::request_argv;
 #[cfg(unix)]
 pub(crate) use live::{refresh, resolve_copilot, start};
+#[cfg(all(unix, test))]
+pub(crate) use live::{renew_on_host, request_argv};
+
+/// (tests) FAKE renewing CLIs: shell stubs of codex, pi and opencode that renew the way the real
+/// ones do (in their own store, in the throwaway home they are run in) by rewriting each `from`
+/// of `renames` to its `to`. Each appends its argv and the NAMES of its environment to
+/// `<gateway dir>/stub-cli.log`; a `<gateway dir>/refuse-<cli>` file makes it fail without
+/// touching its store.
+#[cfg(all(unix, test))]
+pub(crate) fn install_stub_clis(bin: &Path, renames: &[(&str, &str)]) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin).unwrap();
+    let sed: String = renames
+        .iter()
+        .map(|(from, to)| format!(" -e 's|{from}|{to}|g'"))
+        .collect();
+    let common = format!(
+        "#!/bin/sh\nd=\"$HOME/../..\"\n\
+         printf '%s %s | %s\\n' \"${{0##*/}}\" \"$*\" \"$(env | cut -d= -f1 | sort | tr '\\n' ' ')\" >> \"$d/stub-cli.log\"\n\
+         renew() {{ sed{sed} \"$1\" > \"$1.new\" && mv \"$1.new\" \"$1\"; }}\n"
+    );
+    let codex = format!(
+        "{common}while IFS= read -r line; do case \"$line\" in *'\"id\":2'*)\n\
+         if [ -f \"$d/refuse-codex\" ]; then echo '{{\"id\":2,\"error\":{{\"code\":-32603,\"message\":\"FAKE refused\"}}}}';\n\
+         else renew \"$CODEX_HOME/auth.json\" && echo '{{\"id\":2,\"result\":{{\"account\":null}}}}'; fi;; esac; done\n"
+    );
+    let pi = format!(
+        "{common}[ -f \"$d/refuse-pi\" ] && exit 1\n\
+         [ \"$1 $2 $3\" = 'auth print-bearer-token --provider' ] || exit 2\n\
+         renew \"$PI_CODING_AGENT_DIR/auth.json\" && echo FAKE-printed-token\n"
+    );
+    let opencode = format!(
+        "{common}s=\"$XDG_DATA_HOME/stub-store.json\"\n\
+         case \"$1 $2\" in\n\
+         'auth import') cat > \"$s\";;\n\
+         'models --standalone') [ -f \"$d/refuse-opencode\" ] && exit 1; renew \"$s\";;\n\
+         'auth export') cat \"$s\";;\n\
+         *) exit 2;; esac\n"
+    );
+    for (name, body) in [("codex", codex), ("pi", pi), ("opencode", opencode)] {
+        let p = bin.join(name);
+        std::fs::write(&p, body).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1367,87 +1367,34 @@ mod tests {
         })
     }
 
-    /// Decision 8: pi renews the entry expiring first, with that provider's own flow.
+    fn claude_record(access: &str, refresh: &str, expires_ms: u64) -> Value {
+        json!({"claudeAiOauth": {
+            "accessToken": access, "refreshToken": refresh,
+            "expiresAt": expires_ms, "scopes": ["user:inference", "user:profile"],
+            "subscriptionType": "max"
+        }})
+    }
+
+    fn codex_record() -> Value {
+        json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "tokens": {
+            "id_token": "FAKE.id.token", "access_token": "FAKE.access.token",
+            "refresh_token": "FAKE-old-refresh", "account_id": "acct-FAKE-1"
+        }, "last_refresh": "2026-01-01T00:00:00Z"})
+    }
+
+    /// Decision 8: pi plans its due entries soonest-expiring first, each renewed on its own; a
+    /// forced pass takes every renewable entry, a record without refresh tokens none.
     #[test]
-    fn pi_refreshes_the_earliest_due_entry_with_its_providers_flow() {
-        // The flows' URLs read the live tests' stub override: wait out any live test.
-        let _env = crate::test_env::ENV_LOCK
-            .read()
-            .unwrap_or_else(|p| p.into_inner());
+    fn pi_plans_its_due_entries_soonest_first() {
         let record = pi_record();
-        assert_eq!(next_refresh("pi", &record, 100, false), None, "nothing due");
-        let (entry, request) = next_refresh("pi", &record, 1_000_000_000, false).unwrap();
-        assert_eq!(entry.as_deref(), Some("openai-codex"));
-        let Request::Post {
-            url,
-            body,
-            user_agent,
-        } = request
-        else {
-            panic!("an OAuth refresh is a POST")
-        };
-        assert_eq!(
-            user_agent, CODEX_USER_AGENT,
-            "OpenAI's flow, as codex makes it"
-        );
-        assert_eq!(url, "https://auth.openai.com/oauth/token");
-        assert_eq!(body["refresh_token"], "FAKE-oai-r");
-        assert_eq!(body["client_id"], "app_EMoamEEZ73f0CkXaXp7hrann");
-        // Once codex's entry is renewed, Copilot's exchange is next.
-        let renewed = apply_pi_answer(
-            &record,
-            "openai-codex",
-            &json!({"access_token": "FAKE-new-a", "refresh_token": "FAKE-new-r", "expires_in": 3600}),
-            1_600_000_000,
-        )
-        .unwrap();
-        assert_eq!(renewed["openai-codex"]["refresh"], "FAKE-new-r");
-        assert_eq!(renewed["openai-codex"]["expires"], 1_600_003_600_000_u64);
-        assert_eq!(renewed["openai-codex"]["accountId"], "acct-FAKE");
-        let (entry, request) = next_refresh("pi", &renewed, 1_500_000_000, false).unwrap();
-        assert_eq!(entry.as_deref(), Some("github-copilot"));
-        let Request::BearerGet {
-            url,
-            token,
-            headers,
-        } = request.clone()
-        else {
-            panic!("Copilot's exchange is a GET")
-        };
-        assert_eq!(url, "https://api.github.com/copilot_internal/v2/token");
-        assert_eq!(token, "FAKE-gho");
-        assert!(headers.contains(&("copilot-integration-id", "vscode-chat")));
-        let exchanged = apply_pi_answer(
-            &renewed,
-            "github-copilot",
-            &json!({"token": "tid=FAKE-2;proxy-ep=proxy.individual.githubcopilot.com", "expires_at": 1_500_001_800_u64}),
-            1_500_000_000,
-        )
-        .unwrap();
-        assert_eq!(
-            exchanged["github-copilot"]["refresh"], "FAKE-gho",
-            "the GitHub token stays"
-        );
-        assert_eq!(
-            exchanged["github-copilot"]["expires"],
-            1_500_001_800_000_u64
-        );
-        // A forced refresh takes the earliest entry; Anthropic's renews by claude's flow.
-        let (entry, _) = next_refresh("pi", &exchanged, 0, true).unwrap();
-        assert_eq!(entry.as_deref(), Some("github-copilot"));
-        let mut only_anthropic = exchanged.clone();
-        only_anthropic["github-copilot"]["type"] = json!("api_key");
-        only_anthropic["openai-codex"]
-            .as_object_mut()
-            .unwrap()
-            .remove("refresh");
-        let (entry, request) = next_refresh("pi", &only_anthropic, 0, true).unwrap();
-        assert_eq!(entry.as_deref(), Some("anthropic"));
         assert!(
-            matches!(request, Request::Post { ref url, .. } if url.contains("platform.claude.com"))
+            due_entries("pi", &record, 100, false).is_empty(),
+            "nothing due"
         );
-        // A pass plans every renewable entry when forced (each tried once), only the due ones
-        // otherwise, and none for a record without refresh tokens (not refreshable).
+        assert_eq!(
+            due_entries("pi", &record, 1_000_000_000, false),
+            vec!["openai-codex"]
+        );
         assert_eq!(
             due_entries("pi", &record, 0, true),
             vec!["openai-codex", "github-copilot", "anthropic"]
@@ -1476,113 +1423,338 @@ mod tests {
                 .map(String::as_str),
             Some("anthropic")
         );
-        // The exchange's plan endpoint is kept for a token that names none.
-        let with_endpoint = apply_pi_answer(
-            &record,
-            "github-copilot",
-            &json!({"token": "tid=FAKE-3", "expires_at": 1_u64,
-                "endpoints": {"api": "https://api.business.githubcopilot.com"}}),
-            0,
-        )
-        .unwrap();
-        assert_eq!(
-            with_endpoint["github-copilot"][crate::seat_login::COPILOT_ENDPOINT_FIELD],
-            "https://api.business.githubcopilot.com"
-        );
-        // A later exchange naming no endpoint drops the earlier generation's.
-        let without = apply_pi_answer(
-            &with_endpoint,
-            "github-copilot",
-            &json!({"token": "tid=FAKE-4", "expires_at": 2_u64}),
-            0,
-        )
-        .unwrap();
-        assert!(without["github-copilot"]
-            .get(crate::seat_login::COPILOT_ENDPOINT_FIELD)
-            .is_none());
-        // A refresh answer must carry what the CLI needs.
-        assert!(apply_pi_answer(&record, "anthropic", &json!({"access_token": "x"}), 1).is_err());
-        assert!(apply_pi_answer(&record, "github-copilot", &json!({"token": "x"}), 1).is_err());
-        assert!(apply_pi_answer(
-            &record,
-            "xai",
-            &json!({"access_token": "x", "expires_in": 1}),
-            1
-        )
-        .is_err());
     }
 
-    /// opencode renews only its ChatGPT sign-in (codex's flow), inside its export's ACTIVE row;
-    /// its Copilot GitHub token does not expire, and an inactive row is never touched.
+    /// opencode renews only its ChatGPT sign-in; its Copilot GitHub token does not expire.
     #[test]
-    fn opencode_refreshes_its_active_chatgpt_row_by_codexs_flow() {
-        // The flows' URLs read the live tests' stub override: wait out any live test.
-        let _env = crate::test_env::ENV_LOCK
-            .read()
-            .unwrap_or_else(|p| p.into_inner());
+    fn opencode_plans_only_its_chatgpt_sign_in() {
         let export = json!([
             {"id": "old", "integrationID": "openai", "label": "OAuth", "active": false,
                 "value": {"type": "oauth", "methodID": "chatgpt-headless", "refresh": "FAKE-old-r",
                     "access": "FAKE-old-a", "expires": 1_000_u64}},
             {"id": "cur", "integrationID": "openai", "label": "OAuth", "active": true,
                 "value": {"type": "oauth", "methodID": "chatgpt-headless", "refresh": "FAKE-r",
-                    "access": "FAKE-a", "expires": 2_000_000_000_000_u64,
-                    "metadata": {"accountID": "acct-FAKE"}}},
+                    "access": "FAKE-a", "expires": 2_000_000_000_000_u64}},
             {"id": "gh", "integrationID": "github-copilot", "label": "OAuth", "active": true,
                 "value": {"type": "oauth", "methodID": "device", "refresh": "FAKE-gho",
                     "access": "FAKE-gho", "expires": 0}}
         ]);
         assert!(due_entries("opencode", &export, 0, false).is_empty());
         assert_eq!(due_entries("opencode", &export, 0, true), vec!["openai"]);
-        let Some(Request::Post { url, body, .. }) = entry_request("opencode", &export, "openai")
-        else {
-            panic!("a POST to codex's endpoint")
-        };
-        assert_eq!(url, "https://auth.openai.com/oauth/token");
-        assert_eq!(body["refresh_token"], "FAKE-r", "the active row's token");
-        let renewed = apply_entry_answer(
-            "opencode",
-            &export,
-            "openai",
-            &json!({"access_token": "FAKE-a2", "refresh_token": "FAKE-r2", "expires_in": 60}),
-            1_000,
-        )
-        .unwrap();
-        assert_eq!(renewed[1]["value"]["access"], "FAKE-a2");
-        assert_eq!(renewed[1]["value"]["refresh"], "FAKE-r2");
-        assert_eq!(renewed[1]["value"]["expires"], 1_060_000_u64);
-        assert_eq!(renewed[1]["value"]["metadata"]["accountID"], "acct-FAKE");
-        assert_eq!(renewed[0], export[0], "the inactive row is untouched");
-        assert_eq!(renewed[2], export[2]);
+        assert_eq!(
+            due_entries("opencode", &export, 2_000_000_000, false),
+            vec!["openai"],
+            "the active row decides"
+        );
     }
 
-    /// The exchange's GitHub token rides stdin as a header, never a command-line argument.
+    /// claude and codex: a single record is due inside the margin, renewable only as an OAuth
+    /// sign-in with a refresh token.
+    #[test]
+    fn a_single_record_is_due_only_as_a_renewable_oauth_sign_in() {
+        let claude = claude_record("FAKE-a", "FAKE-r", 1_000_000_000_000);
+        assert!(record_due("claude", &claude, 1_000_000_000 - 60, false));
+        assert!(!record_due("claude", &claude, 0, false));
+        assert!(record_due("claude", &claude, 0, true));
+        assert!(!renewable("claude", &json!({"claudeAiOauth": {}})));
+        assert!(renewable("codex", &codex_record()));
+        assert!(!renewable("codex", &json!({"auth_mode": "apikey"})));
+        assert!(!renewable("pi", &pi_record()), "pi renews per entry");
+    }
+
+    /// core#1024: the broker judges a CLI's own renewal by its store alone. A changed store is
+    /// taken (even when the command then failed: a rotated refresh token is never dropped); an
+    /// unchanged one is "not due by the CLI's own rule" while valid, a failure once expired or
+    /// when the command failed; an unusable store is refused. No error repeats a credential.
+    #[test]
+    fn a_clis_own_renewal_is_judged_by_its_store() {
+        let now = 1_900_000_000;
+        let old = codex_record();
+        let mut renewed = old.clone();
+        renewed["tokens"]["access_token"] = json!("FAKE.renewed.access");
+        renewed["tokens"]["refresh_token"] = json!("FAKE-rotated-refresh");
+        let bytes = serde_json::to_vec(&renewed).unwrap();
+        assert_eq!(
+            judge("codex", None, &old, Some(&bytes), Ok(()), now).unwrap(),
+            Renewal::Renewed(renewed.clone())
+        );
+        assert_eq!(
+            judge(
+                "codex",
+                None,
+                &old,
+                Some(&bytes),
+                Err("it exited with 1".into()),
+                now
+            )
+            .unwrap(),
+            Renewal::Renewed(renewed),
+            "a rotated store is kept whatever the command said"
+        );
+        let same = serde_json::to_vec(&old).unwrap();
+        assert_eq!(
+            judge("codex", None, &old, Some(&same), Ok(()), now).unwrap(),
+            Renewal::Unchanged
+        );
+        let failed = judge(
+            "codex",
+            None,
+            &old,
+            Some(&same),
+            Err("it timed out".into()),
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(failed, "codex could not renew its sign-in (it timed out)");
+        // An expired entry the CLI left as it was is a failed renewal.
+        let mut expired = pi_record();
+        expired["anthropic"]["expires"] = json!(1_000_u64);
+        let same = serde_json::to_vec(&expired).unwrap();
+        assert_eq!(
+            judge("pi", Some("anthropic"), &expired, Some(&same), Ok(()), now).unwrap_err(),
+            "pi did not renew its expired sign-in"
+        );
+        expired["github-copilot"]["expires"] = json!(3_000_000_000_000_u64);
+        let same = serde_json::to_vec(&expired).unwrap();
+        assert_eq!(
+            judge(
+                "pi",
+                Some("github-copilot"),
+                &expired,
+                Some(&same),
+                Ok(()),
+                now
+            )
+            .unwrap(),
+            Renewal::Unchanged,
+            "a valid entry pi left alone was not due by pi's own rule"
+        );
+        // A store the CLI emptied, or one the broker cannot serve, is refused by name.
+        assert!(judge("codex", None, &old, None, Ok(()), now).is_err());
+        assert!(judge("codex", None, &old, Some(b"not json"), Ok(()), now).is_err());
+        let mut broken = old.clone();
+        broken["tokens"]["account_id"] = json!("FAKE\r\nx-evil: 1");
+        let err = judge(
+            "codex",
+            None,
+            &old,
+            Some(&serde_json::to_vec(&broken).unwrap()),
+            Ok(()),
+            now,
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("codex's renewed sign-in was refused"),
+            "{err}"
+        );
+        for e in [failed, err] {
+            assert!(!e.contains("FAKE"), "{e}");
+        }
+    }
+
+    /// codex's own proactive refresh: `account/read` with `refreshToken: true`, after the
+    /// protocol's handshake, naming this engine (never another client) as the client.
+    #[test]
+    fn codex_is_asked_for_its_own_proactive_refresh() {
+        let lines: Vec<Value> = String::from_utf8(codex_requests())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines[0]["method"], "initialize");
+        assert_eq!(lines[0]["params"]["clientInfo"]["name"], "wicked_core");
+        assert_eq!(lines[1]["method"], "initialized");
+        assert_eq!(
+            lines[2],
+            json!({"id": 2, "method": "account/read", "params": {"refreshToken": true}})
+        );
+        assert_eq!(
+            codex_answer(br#"{"id":2,"result":{"account":null}}"#),
+            Some(true)
+        );
+        assert_eq!(
+            codex_answer(br#"{"id":2,"error":{"code":-32603,"message":"x"}}"#),
+            Some(false)
+        );
+        assert_eq!(codex_answer(br#"{"id":1,"result":{}}"#), None);
+        assert_eq!(codex_answer(br#"{"method":"configWarning"}"#), None);
+        assert_eq!(pi_min_expiry(false), "16m");
+        assert_eq!(pi_min_expiry(true), "100000h");
+    }
+
+    /// core#1024: the broker's own requests (the copilot account reads, its only ones) carry no
+    /// vendor identity: no User-Agent of any client but curl's own, no editor or app headers.
+    /// The GitHub token rides stdin as a header, never a command-line argument.
     #[cfg(unix)]
     #[test]
-    fn a_bearer_get_keeps_its_token_off_the_command_line() {
-        let request = Request::BearerGet {
-            url: "https://api.github.com/copilot_internal/v2/token".into(),
-            token: "FAKE-gho-secret".into(),
-            headers: PI_COPILOT_HEADERS.to_vec(),
-        };
-        let (argv, stdin) = request_argv(&request).unwrap();
-        assert!(!argv.iter().any(|a| a.contains("FAKE-gho-secret")));
-        assert_eq!(stdin, b"authorization: Bearer FAKE-gho-secret\n");
-        assert!(argv.windows(2).any(|w| w == ["-H", "@-"]));
-        let injected = Request::BearerGet {
+    fn the_brokers_own_requests_carry_no_vendor_identity_and_no_token_on_argv() {
+        for host in [None, Some("api.individual.githubcopilot.com")] {
+            let request = copilot_account_request("FAKE-gho-secret", host);
+            let (argv, stdin) = request_argv(&request).unwrap();
+            assert!(!argv.iter().any(|a| a.contains("FAKE-gho-secret")));
+            assert_eq!(stdin, b"authorization: Bearer FAKE-gho-secret\n");
+            assert!(argv.windows(2).any(|w| w == ["-H", "@-"]));
+            let agent = ["-", "A"].concat();
+            assert!(
+                !argv.iter().any(|a| *a == agent || a == "--user-agent"),
+                "{argv:?}"
+            );
+            for header in argv.iter().map(|a| a.to_ascii_lowercase()) {
+                for vendor in ["user-agent:", "editor-", "x-app:"] {
+                    assert!(!header.starts_with(vendor), "{header}");
+                }
+            }
+            assert!(!argv.iter().any(|a| a == "--fail"), "{argv:?}");
+            assert!(argv.windows(2).any(|w| w == ["-w", STATUS_FORMAT]));
+        }
+        let injected = Request {
             url: "u".into(),
             token: "FAKE\r\nx-evil: 1".into(),
             headers: Vec::new(),
         };
         assert!(request_argv(&injected).is_err());
-        let (argv, stdin) = request_argv(&Request::Post {
-            url: "u".into(),
-            body: json!({"refresh_token": "FAKE-r"}),
-            user_agent: CLAUDE_USER_AGENT,
-        })
-        .unwrap();
-        assert!(!argv.iter().any(|a| a.contains("FAKE-r")));
-        assert!(String::from_utf8(stdin).unwrap().contains("FAKE-r"));
+    }
+
+    /// core#1024: no client identity of a vendor's CLI is written anywhere in the broker or the
+    /// gateway (the strings are split here so this file does not match itself).
+    #[test]
+    fn no_vendor_client_identity_is_spelled_in_the_broker_or_the_gateway() {
+        let sources = [
+            include_str!("seat_refresh.rs"),
+            include_str!("seat_gateway.rs"),
+            include_str!("seat_login.rs"),
+            include_str!("copilot_account.rs"),
+            include_str!("container_floor.rs"),
+        ];
+        let needles = [
+            ["claude", "-cli/"].concat(),
+            ["codex", "_cli_rs"].concat(),
+            ["GitHub", "CopilotChat"].concat(),
+            ["editor", "-version"].concat(),
+            ["copilot-integration-id", "\", \"vscode"].concat(),
+            ["\"-", "A\""].concat(),
+        ];
+        for source in sources {
+            for needle in &needles {
+                assert!(!source.contains(needle.as_str()), "{needle} is spelled");
+            }
+        }
+    }
+
+    /// core#1024 (no runtime): codex, pi and opencode each renew their own sign-in on this host,
+    /// in a throwaway home that is gone afterwards; the broker hands the record over in the CLI's
+    /// own store, never on argv, and the CLI's environment holds nothing of the daemon's beyond
+    /// the pass-through list.
+    #[cfg(unix)]
+    #[test]
+    fn each_cli_renews_its_own_sign_in_in_a_throwaway_home() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("c4-renew-{}", uuid::Uuid::new_v4().simple()));
+        let bin = dir.join("bin");
+        install_stub_clis(
+            &bin,
+            &[
+                ("FAKE.access.token", "FAKE.renewed.access"),
+                ("FAKE-ant-r", "FAKE-ant-r2"),
+                ("FAKE-r\"", "FAKE-r2\""),
+            ],
+        );
+        *TEST_CLI_DIR.lock().unwrap() = Some(bin.clone());
+        let gw = crate::seat_gateway::Gateway::for_dir(&dir);
+        let now = 1_900_000_000;
+        let codex = renew_on_host(&dir, &gw, "codex", &codex_record(), None, false, now);
+        let pi = renew_on_host(&dir, &gw, "pi", &pi_record(), Some("anthropic"), true, now);
+        let export = json!([{"id": "cur", "integrationID": "openai", "label": "OAuth",
+            "active": true, "value": {"type": "oauth", "methodID": "chatgpt-headless",
+            "refresh": "FAKE-r", "access": "FAKE-a", "expires": 1_000_u64,
+            "metadata": {"accountID": "acct-FAKE"}}}]);
+        let opencode = renew_on_host(&dir, &gw, "opencode", &export, Some("openai"), false, now);
+        std::fs::write(dir.join("refuse-codex"), "").unwrap();
+        let refused = renew_on_host(&dir, &gw, "codex", &codex_record(), None, true, now);
+        let mut stale = export.clone();
+        stale[0]["value"]["refresh"] = json!("FAKE-q");
+        let expired = renew_on_host(&dir, &gw, "opencode", &stale, Some("openai"), false, now);
+        std::fs::write(dir.join("refuse-opencode"), "").unwrap();
+        let failed = renew_on_host(&dir, &gw, "opencode", &export, Some("openai"), false, now);
+        *TEST_CLI_DIR.lock().unwrap() = Some(dir.join("nothing-here"));
+        let missing = renew_on_host(&dir, &gw, "codex", &codex_record(), None, true, now);
+        *TEST_CLI_DIR.lock().unwrap() = None;
+        let log = std::fs::read_to_string(dir.join("stub-cli.log")).unwrap();
+        let homes: Vec<_> = std::fs::read_dir(dir.join("login"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        std::fs::remove_dir_all(&dir).unwrap();
+        match codex.unwrap() {
+            Renewal::Renewed(r) => {
+                assert_eq!(r["tokens"]["access_token"], "FAKE.renewed.access");
+                assert_eq!(r["tokens"]["refresh_token"], "FAKE-old-refresh");
+            }
+            other => panic!("{other:?}"),
+        }
+        match pi.unwrap() {
+            Renewal::Renewed(r) => assert_eq!(r["anthropic"]["refresh"], "FAKE-ant-r2"),
+            other => panic!("{other:?}"),
+        }
+        match opencode.unwrap() {
+            Renewal::Renewed(r) => assert_eq!(r[0]["value"]["refresh"], "FAKE-r2"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            refused.unwrap_err(),
+            "codex could not renew its sign-in (its account/read answered an error)"
+        );
+        assert_eq!(
+            expired.unwrap_err(),
+            "opencode did not renew its expired sign-in"
+        );
+        assert_eq!(
+            failed.unwrap_err(),
+            "opencode could not renew its sign-in (it exited with exit status: 1)"
+        );
+        assert_eq!(
+            missing.unwrap_err(),
+            "codex could not renew its sign-in (it could not start)"
+        );
+        assert!(homes.is_empty(), "every throwaway home is gone: {homes:?}");
+        // The CLIs' own commands, and nothing of the record on any command line.
+        assert!(log.contains("codex app-server -c cli_auth_credentials_store=\"file\" |"));
+        assert!(
+            log.contains("pi auth print-bearer-token --provider anthropic --min-expiry 100000h |")
+        );
+        assert!(log.contains("opencode auth import --standalone |"));
+        assert!(log.contains("opencode models --standalone |"));
+        assert!(log.contains("opencode auth export --standalone |"));
+        for secret in [
+            "FAKE-old-refresh",
+            "FAKE-ant-r",
+            "FAKE-r",
+            "FAKE.access.token",
+        ] {
+            assert!(
+                !log.lines()
+                    .any(|l| l.split(" | ").next().unwrap().contains(secret)),
+                "{secret} on a command line: {log}"
+            );
+        }
+        // An env -i environment: the throwaway home's own variables and the pass-through list.
+        for line in log.lines() {
+            let names = line.split(" | ").nth(1).unwrap();
+            for name in names.split_whitespace() {
+                let allowed = crate::seat_login::host_cli_env(
+                    Path::new("/h"),
+                    line.split_whitespace().next().unwrap(),
+                    &std::env::vars().collect::<Vec<_>>(),
+                )
+                .iter()
+                .any(|(k, _)| k == name)
+                    || ["PWD", "SHLVL", "_", "OLDPWD"].contains(&name);
+                assert!(allowed, "{name} reached a renewing CLI: {line}");
+            }
+        }
     }
 
     #[test]
@@ -1590,13 +1762,7 @@ mod tests {
         for failures in [1, 3] {
             let dir =
                 std::env::temp_dir().join(format!("c4-stage-{}", uuid::Uuid::new_v4().simple()));
-            let new = apply_answer(
-                "claude",
-                &claude_record(),
-                &json!({"access_token":"FAKE-new", "refresh_token":"FAKE-R2", "expires_in":3600}),
-                2_000_000_000,
-            )
-            .unwrap();
+            let new = claude_record("FAKE-new", "FAKE-R2", 2_003_600_000_000);
             let record = serde_json::to_vec(&new).unwrap();
             let files = crate::seat_login::extract_tokens(
                 "claude",
@@ -1657,9 +1823,11 @@ mod tests {
         }
     }
 
+    /// The copilot account reads ride attached stdio with no runtime logging; a refused read
+    /// names its status and error code, never the body's detail.
     #[cfg(unix)]
     #[test]
-    fn token_answer_uses_attached_stdio_without_runtime_logging() {
+    fn account_reads_use_attached_stdio_without_runtime_logging() {
         let dir = std::env::temp_dir().join(format!("c4-post-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let runtime = dir.join("runtime");
@@ -1672,43 +1840,37 @@ if [ "$1 $2" = 'image inspect' ]; then exit 0; fi
 printf '%s\n' "$*" > "$base/argv"
 cat > "$base/request"
 case "$*" in
-  *refused*) printf '{"error":{"type":"rate_limit_error","message":"FAKE-detail"}}\n429' ;;
-  *) printf '{"access_token":"FAKE-answer","refresh_token":"FAKE-R2"}\n200' ;;
+  *refused*) printf '{"message":"FAKE-detail","error":{"type":"rate_limit_error"}}\n429' ;;
+  *) printf '{"endpoints":{"api":"https://FAKE.invalid"}}\n200' ;;
 esac
 "#,
         );
         let rt = crate::container_floor::Runtime { cli: runtime };
         let _lock = mutation_lock(&dir).unwrap();
-        let answer = live::post_json(
-            &rt,
-            &dir,
-            "claude",
-            "FAKE-ext",
-            "https://FAKE.invalid/token",
-            &json!({"refresh_token":"FAKE-R1"}),
-        )
-        .unwrap();
-        assert_eq!(answer["access_token"], "FAKE-answer");
+        let read = |url: &str| {
+            live::send(
+                &rt,
+                &dir,
+                "copilot",
+                "FAKE-ext",
+                &Request {
+                    url: url.into(),
+                    token: "FAKE-gho-R1".into(),
+                    headers: crate::copilot_account::USER_HEADERS.to_vec(),
+                },
+            )
+        };
+        let answer = read("https://FAKE.invalid/copilot_internal/user").unwrap();
+        assert_eq!(answer["endpoints"]["api"], "https://FAKE.invalid");
         let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
         assert!(argv.contains("--log-driver none"));
-        assert!(argv.contains("--data-binary @-"));
-        assert!(!argv.contains("FAKE-R1"));
-        // core#1011: the provider CLI's User-Agent, never curl's own.
-        assert!(argv.contains(&format!("-A {CLAUDE_USER_AGENT}")), "{argv}");
-        // A refused request names its status and error code, never the body's detail.
-        let refused = live::post_json(
-            &rt,
-            &dir,
-            "claude",
-            "FAKE-ext",
-            "https://FAKE.invalid/refused",
-            &json!({"refresh_token":"FAKE-R1"}),
-        )
-        .unwrap_err();
+        assert!(!argv.contains("FAKE-gho-R1"));
+        assert!(!argv.contains(" -A "), "{argv}");
+        let refused = read("https://FAKE.invalid/refused").unwrap_err();
         assert_eq!(refused, "the endpoint answered HTTP 429 (rate_limit_error)");
         assert_eq!(
-            serde_json::from_slice::<Value>(&std::fs::read(dir.join("request")).unwrap()).unwrap(),
-            json!({"refresh_token":"FAKE-R1"})
+            std::fs::read_to_string(dir.join("request")).unwrap(),
+            "authorization: Bearer FAKE-gho-R1\n"
         );
         drop(_lock);
         std::fs::remove_dir_all(dir).unwrap();
@@ -1718,8 +1880,12 @@ esac
     fn partial_refresh_republishes_retained_generation_before_not_due() {
         let dir =
             std::env::temp_dir().join(format!("c4-refresh-{}", uuid::Uuid::new_v4().simple()));
-        let record = serde_json::to_vec(&apply_answer("claude", &claude_record(),
-            &json!({"access_token":"FAKE-new", "refresh_token":"FAKE-rotated", "expires_in":3600}), 2_000_000_000).unwrap()).unwrap();
+        let record = serde_json::to_vec(&claude_record(
+            "FAKE-new",
+            "FAKE-rotated",
+            2_003_600_000_000,
+        ))
+        .unwrap();
         let files = crate::seat_login::extract_tokens(
             "claude",
             &[("claude/.credentials.json".into(), record.clone())],
@@ -1829,16 +1995,8 @@ esac
             ".c4-refresh-test-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        let record = serde_json::to_vec(
-            &apply_answer(
-                "claude",
-                &claude_record(),
-                &json!({"access_token":"FAKE-new", "refresh_token":"FAKE-R2", "expires_in":3600}),
-                2_000_000_000,
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let record =
+            serde_json::to_vec(&claude_record("FAKE-new", "FAKE-R2", 2_003_600_000_000)).unwrap();
         let files = crate::seat_login::extract_tokens(
             "claude",
             &[("claude/.credentials.json".into(), record.clone())],
@@ -1894,90 +2052,6 @@ esac
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn refresh_answer_rejects_invalid_rotation_and_trims_tokens() {
-        for cli in ["claude", "codex"] {
-            let record = if cli == "claude" {
-                claude_record()
-            } else {
-                codex_record()
-            };
-            for bad in ["", "   ", "FAKE token", "FAKE\nheader", "FAKE\0token"] {
-                for field in ["access_token", "refresh_token"] {
-                    let mut answer = json!({"access_token":"FAKE-valid", "expires_in":3600});
-                    answer[field] = json!(bad);
-                    assert!(apply_answer(cli, &record, &answer, 1).is_err());
-                }
-            }
-            let answer = json!({"access_token":"  FAKE-access  ","refresh_token":" FAKE-refresh ","expires_in":3600});
-            let new = apply_answer(cli, &record, &answer, 1).unwrap();
-            let pointer = if cli == "claude" {
-                "/claudeAiOauth/refreshToken"
-            } else {
-                "/tokens/refresh_token"
-            };
-            assert_eq!(new.pointer(pointer).unwrap(), "FAKE-refresh");
-        }
-    }
-
-    /// core#1011: every OAuth refresh carries its provider CLI's User-Agent (Anthropic's token
-    /// endpoint answers curl's own with `429 rate_limit_error`), and each agent string names the
-    /// version the seat image pins.
-    #[test]
-    fn oauth_refreshes_carry_the_pinned_clis_user_agent() {
-        let _env = crate::test_env::ENV_LOCK
-            .read()
-            .unwrap_or_else(|p| p.into_inner());
-        let ua = |r: Option<Request>| match r {
-            Some(Request::Post { user_agent, .. }) => user_agent,
-            other => panic!("an OAuth refresh is a POST: {other:?}"),
-        };
-        assert_eq!(
-            ua(next_refresh("claude", &claude_record(), 0, true).map(|(_, r)| r)),
-            CLAUDE_USER_AGENT
-        );
-        assert_eq!(
-            ua(next_refresh("codex", &codex_record(), 0, true).map(|(_, r)| r)),
-            CODEX_USER_AGENT
-        );
-        assert_eq!(
-            ua(entry_request("pi", &pi_record(), "anthropic")),
-            CLAUDE_USER_AGENT,
-            "pi's Anthropic sign-in renews as claude does"
-        );
-        assert_eq!(
-            ua(entry_request("pi", &pi_record(), "openai-codex")),
-            CODEX_USER_AGENT
-        );
-        #[cfg(unix)]
-        {
-            let (argv, _) = request_argv(&Request::Post {
-                url: "u".into(),
-                body: json!({}),
-                user_agent: CLAUDE_USER_AGENT,
-            })
-            .unwrap();
-            assert!(argv.windows(2).any(|w| w == ["-A", CLAUDE_USER_AGENT]));
-            assert!(!argv.iter().any(|a| a == "--fail"), "{argv:?}");
-            assert!(argv.windows(2).any(|w| w == ["-w", STATUS_FORMAT]));
-        }
-        let version = |ua: &str| {
-            ua.split('/')
-                .nth(1)
-                .and_then(|v| v.split(' ').next())
-                .unwrap()
-                .to_string()
-        };
-        assert_eq!(
-            crate::container_floor::seat_package("claude"),
-            Some(format!("@anthropic-ai/claude-code@{}", version(CLAUDE_USER_AGENT)).as_str())
-        );
-        assert_eq!(
-            crate::container_floor::seat_package("codex"),
-            Some(format!("@openai/codex@{}", version(CODEX_USER_AGENT)).as_str())
-        );
-    }
-
     /// The status line curl appends is split off the body; a refusal reports the status and the
     /// error's code only (core#1011).
     #[test]
@@ -2015,91 +2089,6 @@ esac
     }
 
     #[test]
-    fn refresh_request_is_bounded_before_runtime_spawn() {
-        assert!(encode_request(&json!({"refresh_token":"FAKE-small"})).is_ok());
-        assert!(encode_request(&json!({"refresh_token":"F".repeat(64 * 1024)})).is_err());
-    }
-
-    fn claude_record() -> Value {
-        json!({"claudeAiOauth": {
-            "accessToken": "FAKE-old-access", "refreshToken": "FAKE-old-refresh",
-            "expiresAt": 1_000_000_000_000u64, "scopes": ["user:inference", "user:profile"],
-            "subscriptionType": "max"
-        }})
-    }
-
-    fn codex_record() -> Value {
-        json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "tokens": {
-            "id_token": "FAKE.id.token", "access_token": "FAKE.access.token",
-            "refresh_token": "FAKE-old-refresh", "account_id": "acct-FAKE-1"
-        }, "last_refresh": "2026-01-01T00:00:00Z"})
-    }
-
-    #[test]
-    fn the_request_carries_the_refresh_token_client_and_scopes() {
-        let f = flow("claude").unwrap();
-        let b = request_body("claude", &claude_record(), &f).unwrap();
-        assert_eq!(b["grant_type"], "refresh_token");
-        assert_eq!(b["refresh_token"], "FAKE-old-refresh");
-        assert_eq!(b["client_id"], f.client_id);
-        assert_eq!(b["scope"], "user:inference user:profile");
-        let f = flow("codex").unwrap();
-        let b = request_body("codex", &codex_record(), &f).unwrap();
-        assert_eq!(b["refresh_token"], "FAKE-old-refresh");
-        assert_eq!(b["client_id"], "app_EMoamEEZ73f0CkXaXp7hrann");
-        // Not refreshable: an API key, a record without a refresh token, another agent.
-        assert!(request_body("codex", &json!({"auth_mode": "apikey"}), &f).is_none());
-        assert!(request_body("claude", &json!({"claudeAiOauth": {}}), &f).is_none());
-        assert!(flow("pi").is_none());
-    }
-
-    #[test]
-    fn an_answer_is_folded_into_the_record_and_a_missing_refresh_token_keeps_the_old() {
-        let now = 1_800_000_000;
-        let new = apply_answer(
-            "claude",
-            &claude_record(),
-            &json!({"access_token": "FAKE-new-access", "refresh_token": "FAKE-new-refresh", "expires_in": 3600}),
-            now,
-        )
-        .unwrap();
-        assert_eq!(new["claudeAiOauth"]["accessToken"], "FAKE-new-access");
-        assert_eq!(new["claudeAiOauth"]["refreshToken"], "FAKE-new-refresh");
-        assert_eq!(new["claudeAiOauth"]["expiresAt"], (now + 3600) * 1000);
-        assert_eq!(new["claudeAiOauth"]["subscriptionType"], "max");
-        let kept = apply_answer(
-            "codex",
-            &codex_record(),
-            &json!({"access_token": "FAKE.new.access"}),
-            now,
-        )
-        .unwrap();
-        assert_eq!(kept["tokens"]["refresh_token"], "FAKE-old-refresh");
-        assert_eq!(kept["tokens"]["access_token"], "FAKE.new.access");
-        assert_eq!(kept["tokens"]["account_id"], "acct-FAKE-1");
-        assert_eq!(kept["last_refresh"], "2027-01-15T08:00:00Z");
-        assert!(apply_answer(
-            "claude",
-            &claude_record(),
-            &json!({"error": "invalid_grant"}),
-            now
-        )
-        .is_err());
-        // The folded record is a sign-in the broker's extraction accepts.
-        let files = crate::seat_login::extract_tokens(
-            "claude",
-            &[(
-                "claude/.credentials.json".into(),
-                serde_json::to_vec(&new).unwrap(),
-            )],
-        )
-        .unwrap();
-        assert!(files
-            .iter()
-            .any(|(n, b)| n == "anthropic.token" && b == b"FAKE-new-access"));
-    }
-
-    #[test]
     fn only_a_credential_inside_the_margin_is_due() {
         let now = 1_000_000;
         assert!(due(Some(now + 60), now));
@@ -2115,7 +2104,7 @@ esac
         let failed = LastRefresh {
             ok: false,
             at: 5,
-            error: Some("the token endpoint refused the refresh (curl exit 22)".into()),
+            error: Some(CLAUDE_SIGN_IN_AGAIN.into()),
         };
         record_last(&dir, "claude", Some(&failed));
         assert_eq!(last_refresh(&dir, "claude"), Some(failed));

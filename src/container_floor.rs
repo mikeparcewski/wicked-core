@@ -1968,8 +1968,8 @@ pub(crate) fn write_seat_files(
 }
 
 /// A seat armed in the container floor: the wrapper, the argv to run after it, the runtime that
-/// armed it (by file name: `docker`, `podman`, `nerdctl`).
-#[derive(Debug)]
+/// armed it (by file name: `docker`, `podman`, `nerdctl`). Its `Debug` names the env's
+/// variables, never their values (a unit key, a claude seat's pass-through token).
 pub(crate) struct ArmedContainer {
     pub(crate) wrapper: Vec<String>,
     pub(crate) argv: Vec<String>,
@@ -1989,6 +1989,25 @@ pub(crate) struct ArmedContainer {
     /// that route (`Some(None)` = not resolved yet); `None` for every other seat. The runner
     /// gives the seat one of its models, or refuses the unit by name (OD-1).
     pub(crate) copilot_account: Option<Option<crate::copilot_account::CopilotAccount>>,
+}
+
+impl std::fmt::Debug for ArmedContainer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env: Vec<&str> = self.env.iter().map(|(k, _)| k.as_str()).collect();
+        f.debug_struct("ArmedContainer")
+            .field("wrapper", &self.wrapper)
+            .field("argv", &self.argv)
+            .field("tool", &self.tool)
+            .field("cleanup", &self.cleanup)
+            .field("env", &env)
+            .field(
+                "files",
+                &self.files.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+            )
+            .field("lease", &self.lease)
+            .field("copilot_account", &self.copilot_account)
+            .finish()
+    }
 }
 
 /// How many times a lease retries an unconfirmed revocation before quarantining the gateway.
@@ -2228,7 +2247,7 @@ pub(crate) fn arm(
                 let down = |e: String| (FloorUnarmed::GatewayUnavailable, e);
                 let gw = crate::seat_gateway::ensure_gateway(&rt, dir).map_err(down)?;
                 // The broker's one refresher runs beside this daemon's gateway (a credential that
-                // expired between runs is refreshed before the seat starts).
+                // expired between runs is renewed, by its own CLI, before the seat starts).
                 #[cfg(unix)]
                 crate::seat_refresh::start(&rt, &gw, dir);
                 // The agent's sign-in (DES §6): the user signed in once in its login container, and
@@ -2254,7 +2273,17 @@ pub(crate) fn arm(
                         .subscriptions
                         .contains(&crate::seat_credentials::Subscription::Copilot))
                 .then(|| crate::seat_gateway::copilot_account(dir));
-                let (key, env, files) = placeholder_handoff(cli, kind, run_id, &unit);
+                let oauth = cli == "claude"
+                    && kind.kind == Some(crate::seat_credentials::CredentialKind::ClaudeOauth);
+                let (key, mut env, files) = placeholder_handoff(cli, kind, run_id, &unit);
+                if oauth {
+                    // core#1024: the seat's claude passes the operator's own `claude setup-token`
+                    // token through (the gateway relays it unchanged and renews nothing). It
+                    // reaches the runtime client's environment only: `--env NAME`, never argv.
+                    let token = crate::seat_login::claude_seat_token(&rt, &gw, dir)
+                        .map_err(|e| (FloorUnarmed::AgentSignedOut, e))?;
+                    env.push(("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token));
+                }
                 let since = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs().saturating_sub(1).to_string())
@@ -2897,12 +2926,27 @@ mod tests {
     #[test]
     fn placeholder_handoff_registers_exact_file_credentials_and_separate_units() {
         use crate::seat_credentials::CredentialKind;
+        // core#1024: a claude OAuth seat keeps no record; its unit rides a header of its own and
+        // its Authorization is the operator's own token (added at arming, never here).
+        let (key, env, files) = placeholder_handoff(
+            "claude",
+            CredentialKind::ClaudeOauth,
+            "test-run",
+            "test-unit",
+        );
+        assert_eq!(
+            files,
+            vec![(PathBuf::from(".credentials.json"), "{}".to_string())]
+        );
+        assert!(env.iter().any(|(k, v)| k == "ANTHROPIC_CUSTOM_HEADERS"
+            && v == &format!("{}: {}", crate::seat_gateway::UNIT_HEADER, key.key)));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v == "http://agw:4005"));
+        assert!(!env
+            .iter()
+            .any(|(k, _)| k == "ANTHROPIC_API_KEY" || k == "CLAUDE_CODE_OAUTH_TOKEN"));
         for (cli, kind, pointer) in [
-            (
-                "claude",
-                CredentialKind::ClaudeOauth,
-                "/claudeAiOauth/accessToken",
-            ),
             (
                 "codex",
                 CredentialKind::CodexChatgpt,

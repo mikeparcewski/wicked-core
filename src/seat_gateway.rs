@@ -274,7 +274,8 @@ impl Default for GatewayConfig {
             // seat's shared DB wins over its config key, and a row another unit imported must not
             // turn this unit's requests into another unit's (codex review of #983).
             .map(|(provider, port, kind, file)| {
-                let header = (file == "opencode.token").then_some(UNIT_HEADER);
+                let header =
+                    matches!(file, "opencode.token" | "anthropic.token").then_some(UNIT_HEADER);
                 (provider, port, kind, file, header)
             })
             .chain(
@@ -354,7 +355,16 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
                     .collect(),
                 None => Vec::new(),
             };
-            let location = match (route.unit_header.as_deref(), kind) {
+            // claude's own OAuth route passes the seat's Authorization through (core#1024): it is
+            // the operator's own `claude setup-token` token, so the unit rides `x-wicked-unit`,
+            // whatever an older config says. pi's Anthropic route still swaps in the broker's.
+            let pass_through =
+                kind == CredentialKind::ClaudeOauth && route.owner() == Some("claude");
+            let unit_header = route
+                .unit_header
+                .as_deref()
+                .or(pass_through.then_some(UNIT_HEADER));
+            let location = match (unit_header, kind) {
                 (Some(header), _) => json!({"header": {"name": header}}),
                 (None, CredentialKind::ClaudeApiKey) => json!({"header": {"name": "x-api-key"}}),
                 // v1.6.0 schema/config.json: LocalAPIKeys.location / AuthorizationLocation.
@@ -381,7 +391,14 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
                     | CredentialKind::CodexChatgpt
                     | CredentialKind::ProviderKey
             );
-            if broker_bearer || route.provider == Provider::ChatGpt {
+            if pass_through {
+                // Pass-through (core#1024): the client's own Authorization goes upstream
+                // unchanged; the gateway injects nothing and stays the seat's only egress.
+                policies
+                    .as_object_mut()
+                    .expect("policies is an object")
+                    .remove("backendAuth");
+            } else if broker_bearer || route.provider == Provider::ChatGpt {
                 // Preserve Authorization as proved by the broker spike. Native Anthropic ai
                 // backends inject x-api-key; OAuth needs a plain host backend instead. For
                 // ChatGPT the broker's access token replaces the seat's placeholder bearer.
@@ -392,7 +409,7 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
             // and the literal ones it must (v1.6.0 HeaderModifier.set takes literals only).
             let mut remove: Vec<&str> = Vec::new();
             let mut set = serde_json::Map::new();
-            if let Some(header) = route.unit_header.as_deref() {
+            if let Some(header) = unit_header {
                 remove.push(header);
             }
             if kind == CredentialKind::ClaudeOauth {
@@ -932,6 +949,15 @@ pub(crate) fn seat_env_for(cli: &str, kind: CredentialKind, bearer: &str) -> Vec
         CredentialKind::ClaudeOauth | CredentialKind::CodexChatgpt
     ) {
         env.retain(|(name, _)| name != "ANTHROPIC_API_KEY" && name != "OPENAI_API_KEY");
+    }
+    // core#1024: a claude OAuth seat sends the operator's own token as its Authorization (the
+    // arming adds it as CLAUDE_CODE_OAUTH_TOKEN), so its unit rides a header of its own, which
+    // claude sends on every API request and the gateway strips before the upstream.
+    if cli == "claude" && kind == CredentialKind::ClaudeOauth {
+        env.push((
+            "ANTHROPIC_CUSTOM_HEADERS".into(),
+            format!("{UNIT_HEADER}: {bearer}"),
+        ));
     }
     // codex's ChatGPT route is its own model provider ([`seat_args_for`]), never the built-in
     // OpenAI provider's base URL (core#989).
@@ -3417,6 +3443,155 @@ esac
         assert!(!all_logs.contains("broker-secret") && !all_logs.contains(&key.key));
     }
 
+    /// LIVE (`WICKED_CONTAINER_LIVE=1`, core#1024): claude's OAuth route on the real gateway
+    /// passes the client's own Authorization (a FAKE `claude setup-token` token) through
+    /// unchanged, injects nothing from the broker (even with a token in the broker file), and
+    /// strips the unit header; an unknown unit is refused before the upstream. The route is the
+    /// one an older config persisted (no unit header named).
+    #[cfg(unix)]
+    #[test]
+    fn live_claudes_oauth_route_passes_the_clients_token_through() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        let rt = crate::container_floor::runtime().expect("a container runtime answers");
+        let image = crate::container_floor::ensure_seat_image(&rt, "claude").unwrap();
+        let temp = TempDir::new();
+        let dir = temp.0.clone();
+        let gw = Gateway::for_dir(&dir);
+        let run = |argv: &[&str]| {
+            let mut c = rt.cmd();
+            c.args(argv);
+            crate::container_floor::output_within(c, Duration::from_secs(60)).unwrap()
+        };
+        let stub = format!("{}-stub", gw.name);
+        run(&["rm", "-f", &gw.name, &stub]);
+        fs::create_dir_all(dir.join("stub")).unwrap();
+        fs::write(
+            dir.join("stub/stub.js"),
+            "require('http').createServer((q,r)=>{q.resume();q.on('end',()=>{\
+             r.setHeader('content-type','application/json');\
+             r.end(JSON.stringify({auth:q.headers['authorization']||'',\
+             key:q.headers['x-api-key']||'',unit:q.headers['x-wicked-unit']||''}))})})\
+             .listen(8080)",
+        )
+        .unwrap();
+        configure_gateway(
+            &dir,
+            &GatewayConfig {
+                units: vec![],
+                providers: vec![ModelRoute {
+                    port: 4005,
+                    provider: Provider::Anthropic,
+                    upstream_host: format!("{stub}:8080"),
+                    tls: false,
+                    credential_file: PathBuf::from("/broker/anthropic.token"),
+                    kind: Some(CredentialKind::ClaudeOauth),
+                    unit_header: None,
+                }],
+                egress_hosts: vec![],
+                hook_upstream: None,
+                mcp_upstream: None,
+                chatgpt_accounts: Default::default(),
+                copilot_hosts: Default::default(),
+                copilot_models: Default::default(),
+                legacy_chatgpt_account: None,
+            },
+        )
+        .unwrap();
+        let gw = ensure_gateway(&rt, &dir).expect("the gateway starts");
+        set_broker_credential(
+            &rt,
+            &gw,
+            &dir,
+            "claude",
+            "anthropic.token",
+            b"FAKE-broker-held",
+        )
+        .unwrap();
+        let stub_dir = format!(
+            "type=bind,src={},dst=/s,readonly",
+            dir.join("stub").display()
+        );
+        let o = run(&[
+            "run",
+            "-d",
+            "--name",
+            &stub,
+            "--network",
+            &gw.external_network,
+            "--mount",
+            &stub_dir,
+            &image,
+            "node",
+            "/s/stub.js",
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let seat_net = format!("{}-seat", gw.name);
+        run(&["network", "rm", &seat_net]);
+        assert!(run(&["network", "create", "--internal", &seat_net])
+            .status
+            .success());
+        attach(&rt, &gw, &seat_net).expect("attached as agw");
+        let key = UnitKey::new("run-live", "run-live#1", "claude");
+        register_live(&rt, &gw, &dir, key.clone()).unwrap();
+        let fake = "sk-ant-oat01-FAKE-pass-through";
+        let auth = format!("authorization: Bearer {fake}");
+        let curl = |unit: &str| {
+            let hdr = format!("{UNIT_HEADER}: {unit}");
+            let mut last = String::new();
+            for _ in 0..20 {
+                let o = run(&[
+                    "run", "--rm", "--network", &seat_net, &image, "curl", "-s", "--max-time",
+                    "4", "-w", "\n%{http_code}", "-H", &hdr, "-H",
+                    &auth, "-H",
+                    "x-api-key: FAKE-stray-key", "-H", "anthropic-version: 2023-06-01", "-H",
+                    "content-type: application/json", "-d",
+                    "{\"model\":\"stub\",\"max_tokens\":5,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+                    "http://agw:4005/v1/messages",
+                ]);
+                last = String::from_utf8_lossy(&o.stdout).to_string();
+                if last.ends_with("200") || (last.ends_with("401") && unit != key.key) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            last
+        };
+        let ok = curl(&key.key);
+        let unknown = curl("wk-FAKE-unknown");
+        let logs = run(&["logs", &gw.name]);
+        let all_logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&logs.stdout),
+            String::from_utf8_lossy(&logs.stderr)
+        );
+        deregister_live(&rt, &gw, &dir, &key.key).unwrap();
+        run(&["rm", "-f", &stub, &gw.name]);
+        run(&["network", "rm", &seat_net, &gw.external_network]);
+        let (cfg, broker) = volumes(&gw);
+        run(&["volume", "rm", &cfg, &broker]);
+        eprintln!("ok={ok:?}\nunknown={unknown:?}");
+        assert!(ok.ends_with("200"), "{ok}");
+        let body: Value = serde_json::from_str(ok.rsplit_once('\n').unwrap().0).unwrap();
+        assert_eq!(body["auth"], format!("Bearer {fake}"));
+        assert_eq!(body["key"], "", "a stray x-api-key is stripped");
+        assert_eq!(body["unit"], "", "the unit header never leaves the gateway");
+        assert!(
+            !ok.contains("FAKE-broker-held"),
+            "nothing is injected: {ok}"
+        );
+        assert!(
+            unknown.ends_with("401"),
+            "an unknown unit is refused: {unknown}"
+        );
+        assert!(!all_logs.contains("FAKE-pass-through") && !all_logs.contains(&key.key));
+    }
+
     /// Codex gw-r1 (P2): the MCP listener exists only with a reachable broker, and passes exactly
     /// crew's two unit-token routes (never a prefix: the operator's broker routes stay unreachable).
     #[test]
@@ -3661,30 +3836,59 @@ esac
         }
     }
 
+    /// core#1024: claude's own OAuth route passes the seat's Authorization (the operator's own
+    /// `claude setup-token` token) through unchanged: no broker credential is injected, the unit
+    /// is read from `x-wicked-unit` and stripped with any `x-api-key`, and the route is still a
+    /// plain host backend at Anthropic (the gateway stays the only egress). An older config
+    /// whose route names no unit header renders the same. pi's Anthropic route keeps the
+    /// spike's broker injection.
     #[test]
-    fn oauth_route_preserves_spike_broker_auth_and_strips_x_api_key() {
+    fn claudes_oauth_route_passes_the_client_auth_through_and_pis_keeps_the_broker() {
         let fixture: Value = serde_yaml::from_str(include_str!(
             "../tests/fixtures/broker/spike-broker-config.yaml"
         ))
         .unwrap();
-        let config = GatewayConfig::default();
-        let rendered = render(&config);
-        let index = config
-            .providers
-            .iter()
-            .position(|r| r.kind == Some(CredentialKind::ClaudeOauth))
-            .unwrap();
-        let policies = &rendered["binds"][index]["listeners"][0]["routes"][0]["policies"];
-        let spike = &fixture["binds"][1]["listeners"][0]["routes"][0]["policies"];
-        assert_eq!(policies["backendAuth"], spike["backendAuth"]);
-        assert_eq!(
-            policies["requestHeaderModifier"],
-            spike["requestHeaderModifier"]
-        );
-        assert_eq!(
-            rendered["binds"][index]["listeners"][0]["routes"][0]["backends"],
-            json!([{"host": "api.anthropic.com:443"}])
-        );
+        let mut config = GatewayConfig {
+            units: vec![UnitKey::new("r", "r#1", "claude")],
+            ..Default::default()
+        };
+        for older in [false, true] {
+            if older {
+                for r in &mut config.providers {
+                    if r.port == 4005 {
+                        r.unit_header = None;
+                    }
+                }
+            }
+            let rendered = render(&config);
+            let route = &bind(&rendered, 4005)["listeners"][0]["routes"][0];
+            let policies = &route["policies"];
+            assert!(policies.get("backendAuth").is_none(), "{policies}");
+            assert_eq!(
+                policies["apiKey"]["location"],
+                json!({"header": {"name": UNIT_HEADER}})
+            );
+            assert_eq!(policies["apiKey"]["keys"][0]["key"], config.units[0].key);
+            assert_eq!(
+                policies["requestHeaderModifier"],
+                json!({"remove": [UNIT_HEADER, "x-api-key"]})
+            );
+            assert_eq!(
+                route["backends"],
+                json!([{"host": "api.anthropic.com:443"}])
+            );
+            let pi = &bind(&rendered, 4006)["listeners"][0]["routes"][0]["policies"];
+            let spike = &fixture["binds"][1]["listeners"][0]["routes"][0]["policies"];
+            assert!(pi["backendAuth"]["key"]["value"]["file"].is_string());
+            assert_eq!(
+                spike["requestHeaderModifier"]["remove"],
+                json!(["x-api-key"])
+            );
+            assert_eq!(
+                pi["requestHeaderModifier"]["remove"],
+                json!([UNIT_HEADER, "x-api-key"])
+            );
+        }
     }
 
     #[test]
