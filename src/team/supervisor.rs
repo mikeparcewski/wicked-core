@@ -45,8 +45,8 @@ use super::publish::{LiveTeamRun, PublishOutcome, TeamBus, TeamConfig};
 use super::{
     cap_utf8, confirm, kind_may_change_tree, locate, parse_reply, parse_reply_for_step, AttachCtx,
     FinalPass, Finding, FindingBook, FindingStatus, LedgerMonitor, MonitorHost, MonitorScope,
-    MonitorStatus, RawFinding, Rejected, ReplyKind, Repo, Severity, TeamLedger, TeamLimits,
-    TeamPlan, UnitKey, Verdict,
+    MonitorStatus, RawFinding, Rejected, ReplyKind, Repo, RepoView, Severity, TeamLedger,
+    TeamLimits, TeamPlan, UnitKey, Verdict,
 };
 use crate::bus::BusDb;
 use crate::decision::{DecisionRequest, DecisionVerdict};
@@ -397,6 +397,9 @@ pub struct UnitTeam {
     /// The members' host runs every turn as a fresh session with no file access
     /// ([`MonitorHost::one_shot`]); read once, at summon.
     one_shot: bool,
+    /// (DES-TEAMING-002 §8.8) The members' host gives each turn a read-only view of the tree it
+    /// is about ([`MonitorHost::repo_view`]); read once, at summon.
+    repo_view: bool,
 }
 
 /// (T4, §8.7) The re-score bound of one attempt: a checkpoint re-scores only when the tree differs
@@ -473,6 +476,7 @@ impl UnitTeam {
             vault: Arc::new(super::vault::CliVault::default()),
             held: BTreeSet::new(),
             one_shot: false,
+            repo_view: false,
         }
     }
 
@@ -621,6 +625,10 @@ impl UnitTeam {
                         .as_wire()
                         .to_string()
                 }),
+                // (DES-TEAMING-002 §8.8) A seated member of a unit with a repository reads it
+                // through a read-only view of the tree each turn is about.
+                repo_view: (seat.is_some() && self.repo_view && self.ctx.repo.is_some())
+                    .then(|| super::events::REPO_VIEW_READ_ONLY.to_string()),
             }),
         };
         self.publish(&ev);
@@ -639,6 +647,7 @@ impl UnitTeam {
         }
         self.summoned = true;
         self.one_shot = host.one_shot();
+        self.repo_view = host.repo_view();
         let want = usize::from(self.ctx.plan.monitors);
         if want == 0 {
             return;
@@ -740,7 +749,12 @@ impl UnitTeam {
             .map(|r| r.workdir.display().to_string())
             .unwrap_or_default();
         // A one-shot member reads no file: the diff (or the answer) in this prompt is all it has.
-        let reach = if self.one_shot {
+        let reach = if self.one_shot && self.repo_view && self.ctx.repo.is_some() {
+            "You run in your own sealed session: your earlier turns are not available. The change \
+             is shown below, and the repository as of its tree is readable (read-only) at the \
+             path named at the end of this prompt. You cannot write anything."
+                .to_string()
+        } else if self.one_shot {
             "You run in your own sealed session with no access to the worktree: the change shown \
              below is your whole input. You cannot write anything."
                 .to_string()
@@ -1153,7 +1167,12 @@ pub fn run_job(job: &BatchJob, host: &dyn MonitorHost) -> BatchDone {
     prompt.push_str(&repo.diff(&job.from_tree, &tree, job.diff_cap));
     prompt.push_str("\n```\n");
     let started = Instant::now();
-    let reply = match host.turn(&job.pool_key, &prompt, job.budget) {
+    // (§8.8) The repository at exactly the tree this batch's diff ends at.
+    let view = RepoView {
+        repo: repo.clone(),
+        tree: tree.clone(),
+    };
+    let reply = match host.turn(&job.pool_key, &prompt, job.budget, Some(&view)) {
         Ok(r) => r,
         Err(error) => {
             let timed_out = started.elapsed() >= job.budget;
@@ -1267,7 +1286,16 @@ fn review_output(job: &BatchJob, text: &str, host: &dyn MonitorHost) -> BatchDon
 ",
     );
     let started = Instant::now();
-    let reply = match host.turn(&job.pool_key, &prompt, job.budget) {
+    // (§8.8) A bound step that changed no tree: the member may still read the settled tree.
+    let view = job
+        .repo
+        .as_ref()
+        .zip(job.final_tree.as_ref())
+        .map(|(repo, tree)| RepoView {
+            repo: repo.clone(),
+            tree: tree.clone(),
+        });
+    let reply = match host.turn(&job.pool_key, &prompt, job.budget, view.as_ref()) {
         Ok(r) => r,
         Err(error) => {
             let timed_out = started.elapsed() >= job.budget;
@@ -1443,7 +1471,7 @@ pub enum Job {
     /// An attempt's final pass (publishes its own facts, then `ledger.folded`).
     FinalPass(Box<FinalPassJob>),
     /// A member's turn answering the PA's `HELP:` question.
-    Help(HelpJob),
+    Help(Box<HelpJob>),
     /// (T4) A checkpoint's diff re-score (§8.7).
     Rescore(Arc<Mutex<UnitTeam>>),
 }
@@ -1942,23 +1970,23 @@ impl SupervisorCore {
             .chain(st.roster.iter().cloned())
             .filter(|s| *s != env.by && *s != st.pa)
             .collect();
-        let workdir = self.units.get(&uk).and_then(|u| {
-            u.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .ctx
-                .repo
-                .as_ref()
-                .map(|r| r.workdir.to_string_lossy().into_owned())
-        });
-        Some(Job::Help(HelpJob {
+        let repo = self
+            .units
+            .get(&uk)
+            .and_then(|u| u.lock().unwrap_or_else(|p| p.into_inner()).ctx.repo.clone());
+        let workdir = repo
+            .as_ref()
+            .map(|r| r.workdir.to_string_lossy().into_owned());
+        Some(Job::Help(Box::new(HelpJob {
             key: uk,
             help_id: b.help_id.clone(),
             question: b.question.clone(),
             context: b.context.clone(),
             candidates,
             read_roots: workdir.into_iter().collect(),
+            repo,
             budget: self.cfg.limits.monitor_turn_budget,
-        }))
+        })))
     }
 
     /// Forget a run: close its members' sessions.
@@ -2118,6 +2146,9 @@ pub struct HelpJob {
     context: String,
     candidates: Vec<String>,
     read_roots: Vec<String>,
+    /// (§8.8) The asking unit's worktree: the member reads it as it stands when the question is
+    /// asked, through a read-only view, on a host that gives one.
+    repo: Option<Repo>,
     budget: Duration,
 }
 
@@ -2194,9 +2225,18 @@ pub fn run_help(job: &HelpJob, host: &dyn MonitorHost, pub_: &TeamBus) {
         );
         return;
     }
-    // A one-shot member reads no file (`MonitorHost::one_shot`): it answers from the question and
-    // its context, and says so, rather than being told to read code it cannot reach.
-    let source = if host.one_shot() {
+    // A one-shot member reads no file (`MonitorHost::one_shot`) unless its host gives it a view of
+    // the repository: without one it answers from the question and its context, and says so,
+    // rather than being told to read code it cannot reach.
+    let view = if host.repo_view() {
+        RepoView::now(job.repo.as_ref())
+    } else {
+        None
+    };
+    let source = if host.one_shot() && view.is_some() {
+        "The repository as it stands is readable (read-only) at the path named at the end of \
+         this prompt: answer it from the code, concisely, with evidence"
+    } else if host.one_shot() {
         "You have no access to the repository: answer from the question and its context alone, \
          say plainly what you cannot see, and cite only what the context shows"
     } else {
@@ -2211,7 +2251,7 @@ pub fn run_help(job: &HelpJob, host: &dyn MonitorHost, pub_: &TeamBus) {
         job.question, job.context
     );
     let started = Instant::now();
-    let reply = host.turn(&pool_key, &prompt, job.budget);
+    let reply = host.turn(&pool_key, &prompt, job.budget, view.as_ref());
     // The turn's own elapsed time decides timed_out vs failed — not the close that follows.
     let elapsed = started.elapsed();
     host.close(&pool_key);
@@ -2988,7 +3028,13 @@ fn hold_round(
                 };
                 if opened {
                     let budget = clock.left().min(super::MONITOR_TURN_BUDGET);
-                    host.turn(&m.pool_key, &prompt, budget)
+                    // (§8.8) The settled tree the findings are re-confirmed against.
+                    let view = if u.repo_view {
+                        RepoView::now(u.ctx.repo.as_ref())
+                    } else {
+                        None
+                    };
+                    host.turn(&m.pool_key, &prompt, budget, view.as_ref())
                         .map(|r| super::parse_hold_lines(&r))
                         .unwrap_or_default()
                 } else {
@@ -3217,14 +3263,24 @@ fn member_answer(
     host.open(&pool_key, member, &u.scope("step")).ok()?;
     // A one-shot member keeps nothing from the turn that did the step and reads no file: it is
     // given the step's criterion and told plainly what it cannot see (codex review round 4).
-    let context = if host.one_shot() {
-        format!(
+    let view = if host.repo_view() {
+        RepoView::now(u.ctx.repo.as_ref())
+    } else {
+        None
+    };
+    let context = match (host.one_shot(), &view) {
+        (true, Some(_)) => format!(
+            "Step criterion: {}\nYou run in a sealed session: your earlier output is not \
+             available to you. The repository as it stands is readable (read-only) at the path \
+             named at the end of this prompt; judge the PA's reason against it.\n",
+            u.ctx.criterion
+        ),
+        (true, None) => format!(
             "Step criterion: {}\nYou run in a sealed session: your earlier output and the \
              repository are not available to you, so judge the PA's reason on its own terms.\n",
             u.ctx.criterion
-        )
-    } else {
-        String::new()
+        ),
+        (false, _) => String::new(),
     };
     let prompt = format!(
         "[wicked-core · team member · your step was rejected]\nThe PA rejected your output for \
@@ -3239,6 +3295,7 @@ fn member_answer(
         &pool_key,
         &prompt,
         clock.left().min(Duration::from_secs(240)),
+        view.as_ref(),
     );
     host.close(&pool_key);
     super::parse_member_step_answer(&reply.ok()?, &r.step_id)

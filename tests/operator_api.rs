@@ -125,6 +125,7 @@ mod tests {
             qe_reviewer_seats: Vec::new(),
             qe_review_session: None,
             qe_review: None,
+            read_view: None,
         }
     }
 

@@ -253,3 +253,88 @@ fn help_answers_and_change_requests_parse() {
     assert_eq!(c[0].0[0].catalog, "test_plan");
     assert_eq!(c[0].1, "no tests");
 }
+
+/// (DES-TEAMING-002 §8.8) A member turn's repository view is the checkpoint TREE, written from
+/// the object database: the snapshot's content (an uncommitted edit and an untracked file
+/// included, as the diff shows them), files read-only with the exec bit kept, a symlink as a
+/// symlink, and the worker's own index untouched. A tree past the byte cap is refused.
+#[test]
+fn a_repo_view_writes_the_checkpoint_tree_read_only() {
+    let dir = std::env::temp_dir().join(format!("wicked-team-view-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let git = |args: &[&str]| crate::worktree_guard::git(&dir, args, &[]).unwrap();
+    git(&["init", "-q"]);
+    std::fs::write(dir.join("src/lib.rs"), "fn committed() {}\n").unwrap();
+    std::fs::write(dir.join("run.sh"), "#!/bin/sh\necho hi\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::os::unix::fs::symlink("src/lib.rs", dir.join("link")).unwrap();
+    }
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.email=t@example.invalid",
+        "-c",
+        "user.name=t",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "base",
+    ]);
+    // The worker's state at the checkpoint: an edit and a new file, neither staged.
+    std::fs::write(dir.join("src/lib.rs"), "fn edited() {}\n").unwrap();
+    std::fs::write(dir.join("src/new.rs"), "fn new() {}\n").unwrap();
+    let index = std::fs::read(dir.join(".git/index")).unwrap();
+    let repo = Repo {
+        workdir: dir.clone(),
+        git_dir: dir.join(".git"),
+    };
+    let tree = repo.snapshot().unwrap();
+    // The worker keeps writing after the checkpoint: the view is the checkpoint, not the disk.
+    std::fs::write(dir.join("src/lib.rs"), "fn later() {}\n").unwrap();
+    let view = dir.with_extension("view");
+    let _ = std::fs::remove_dir_all(&view);
+    std::fs::create_dir_all(&view).unwrap();
+    repo.materialize(&tree, &view, REPO_VIEW_MAX_BYTES).unwrap();
+    let read = |p: &str| std::fs::read_to_string(view.join(p)).unwrap();
+    assert_eq!(read("src/lib.rs"), "fn edited() {}\n");
+    assert_eq!(read("src/new.rs"), "fn new() {}\n");
+    assert!(!view.join(".git").exists(), "no git metadata in the view");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &str| {
+            std::fs::symlink_metadata(view.join(p))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode("src/lib.rs"), 0o444);
+        assert_eq!(mode("run.sh"), 0o555);
+        assert_eq!(
+            std::fs::read_link(view.join("link")).unwrap(),
+            PathBuf::from("src/lib.rs")
+        );
+    }
+    assert_eq!(
+        std::fs::read(dir.join(".git/index")).unwrap(),
+        index,
+        "the worker's index is untouched"
+    );
+    // Past the cap: refused.
+    let small = dir.with_extension("small");
+    let _ = std::fs::remove_dir_all(&small);
+    std::fs::create_dir_all(&small).unwrap();
+    let e = repo.materialize(&tree, &small, 8).unwrap_err();
+    assert!(e.to_string().contains("more than 8 bytes"), "{e}");
+    for d in [&dir, &view, &small] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
