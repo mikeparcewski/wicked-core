@@ -1025,6 +1025,11 @@ pub(crate) fn inject_isolation_flags(
         // `bypassPermissions` keeps explicit deny rules; that is UNMEASURED here (see the LIMITS
         // note on `inject_isolation_flags`) and nothing below depends on it: `acceptEdits` is the
         // only mode where a worker can do its job AND is known to stay inside the boundary.
+        // (core#1029) That earlier measurement was taken with the single-slash rule form, which on
+        // 2.1.296 matches nothing — the refusal it saw is what acceptEdits' working-directory
+        // boundary produces on its own, not proof the rule bit. The rules are `//`-anchored now
+        // ([`rule_path`]) and bite on their own, inside `--add-dir` roots and behind a hook's
+        // `allow` too (`live_the_absolute_fence_bites_…_1029` in this module's tests).
         flags.push("--permission-mode".into());
         flags.push("acceptEdits".into());
     }
@@ -1157,8 +1162,10 @@ fn strip_plugin_dir(argv: &mut Vec<String>, prompt_ix: Option<usize>) -> Vec<Str
 /// file-reading tools"). Every one of them is lifted to its enforced twin here; a bare tool name
 /// of any of them (no path) is a whole-tool deny and rides as stated.
 ///
-/// Manual check against the live CLI (no automated test spawns claude): in a scratch config dir,
-/// `printf '{"permissions":{"deny":["Read(/tmp/fence/**)","Edit(/tmp/fence/**)"]}}' > s.json`,
+/// Manual check against the live CLI (the automated one is the `WICKED_CONTAINER_LIVE` test
+/// `live_the_absolute_fence_bites_…_1029`, Read + Edit in the pinned seat): in a scratch config dir,
+/// `printf '{"permissions":{"deny":["Read(//tmp/fence/**)","Edit(//tmp/fence/**)"]}}' > s.json`
+/// (`//` is the absolute anchor — a single `/` anchors at the settings file's directory, core#1029),
 /// then `claude -p --settings s.json --setting-sources "" --permission-mode acceptEdits
 /// 'use the Write tool to create /tmp/fence/probe.txt'` — expect NO `Permission deny rule` line on
 /// stderr, the write refused in the transcript, and no `/tmp/fence/probe.txt` afterwards.
@@ -1257,18 +1264,34 @@ fn argv_states(argv: &[String], names: &[&str]) -> bool {
     })
 }
 
-/// How `dir` is spelled inside a permission rule, or `None` when it has no faithful spelling.
+/// How the ABSOLUTE path `dir` is spelled inside a permission rule, or `None` when it has no
+/// faithful spelling.
 ///
-/// Two different problems, and only the first is about Windows:
+/// Three different problems:
 ///
-///  - **Separators.** A Windows path is `C:\Users\me\.claude`, and in the rule's glob syntax a
-///    backslash is the ESCAPE character, not a separator. Left alone, `Read(C:\Users\me\.claude/**)`
-///    unescapes to `C:Usersme.claude/**` and matches nothing — the fence would be listed in the
-///    settings file, look present to anyone reading it, and deny NOTHING at runtime. So on a
-///    backslash-separator OS the separators are rewritten to `/`, which the matcher accepts
-///    everywhere. The rewrite is conditioned on the OS separator because on POSIX a backslash is a
-///    legal filename byte: rewriting it there would fence off a DIFFERENT directory than the one
-///    asked for, which is the same silent-hole failure in the other direction.
+///  - **The absolute anchor (core#1029).** In Claude Code's `Read(…)`/`Edit(…)` syntax a SINGLE
+///    leading `/` is NOT the filesystem root: it anchors at the settings source (the `--settings`
+///    file's directory, `~/.claude` for user settings, the primary working directory for CLI flags
+///    such as `--disallowedTools`). An absolute path is spelled with TWO slashes:
+///    `Read(//home/u/.ssh/**)`. The engine wrote `Read(/home/u/.ssh/**)` for years, and on
+///    claude-code 2.1.296 (the seat image's pin) that rule matched nothing: measured in
+///    `wicked-seat-claude` with a stub API, a read of `/skills/accept.md` under
+///    `--disallowedTools Read(/skills/**)` went through, under `Read(//skills/**)` it was refused
+///    ("File is in a directory that is denied by your permission settings") before any
+///    PreToolUse hook ran. The fence held only where acceptEdits' working-directory boundary also
+///    refused the path, so inside an `--add-dir` root, or behind a hook answering `allow`, it was
+///    gone. Every path this function spells is therefore `//`-anchored, and a RELATIVE input has
+///    no absolute spelling and is refused (`None`) rather than anchored somewhere unintended.
+///  - **Separators and drives.** A Windows path is `C:\Users\me\.claude`, and in the rule's glob
+///    syntax a backslash is the ESCAPE character, not a separator: left alone,
+///    `Read(C:\Users\me\.claude/**)` unescapes to `C:Usersme.claude/**` and matches nothing. The
+///    CLI normalizes a Windows path to POSIX form before matching (`C:\Users\me` becomes
+///    `/c/Users/me`), so on a backslash-separator OS the separators are rewritten to `/` and the
+///    drive becomes its lowercase first segment: `//c/Users/me/.claude`. A Windows path that is
+///    not `<drive>:\…` (a UNC share, a relative path) is refused. The rewrite is conditioned on
+///    the OS separator because on POSIX a backslash is a legal filename byte: rewriting it there
+///    would fence off a DIFFERENT directory than the one asked for, which is the same silent-hole
+///    failure in the other direction.
 ///  - **Characters with no literal spelling.** After that rewrite, a surviving backslash (POSIX only,
 ///    by the above) or a comma — the character `--disallowedTools` joins its list on — still cannot be
 ///    written into a rule. Refused rather than mangled, so the caller can warn.
@@ -1289,7 +1312,23 @@ fn rule_path_sep(p: &str, os_sep: char) -> Option<String> {
     } else {
         p.to_string()
     };
-    (!p.contains('\\') && !p.contains(',')).then_some(p)
+    if p.contains('\\') || p.contains(',') {
+        return None;
+    }
+    // The path below the filesystem root, without its leading separator(s).
+    let below_root = if os_sep == '\\' {
+        // `C:/Users/me` → `c/Users/me` — the CLI's POSIX form of a drive path is `/c/Users/me`.
+        let mut chars = p.chars();
+        match (chars.next(), chars.next(), chars.next()) {
+            (Some(drive), Some(':'), Some('/')) if drive.is_ascii_alphabetic() => {
+                format!("{}/{}", drive.to_ascii_lowercase(), &p[3..])
+            }
+            _ => return None,
+        }
+    } else {
+        p.strip_prefix('/')?.to_string()
+    };
+    Some(format!("//{}", below_root.trim_start_matches('/')))
 }
 
 /// The deny rules, in Claude's permission-rule syntax. Used two ways: comma-joined as the
@@ -1753,9 +1792,12 @@ fn unspellable(dir: &Path) -> String {
                                        joins its rules on"
                 .to_string()
         }
-        Some(_) => {
+        Some(s) if std::path::MAIN_SEPARATOR == '/' && s.contains('\\') => {
             "it contains a backslash (`\\`), the permission-rule escape character".to_string()
         }
+        Some(_) => "it is not an absolute path the rule syntax can anchor (`//<path>`; on \
+                    Windows a `<drive>:\\…` path, never a UNC share or a relative path)"
+            .to_string(),
     };
     format!(
         "worker isolation cannot express a deny rule for {} ({what}); the fence is never partial \
@@ -13664,11 +13706,16 @@ mod tests {
     fn a_windows_path_is_spelled_with_separators_the_matcher_understands() {
         let got =
             rule_path_sep(r"C:\Users\me\.claude", '\\').expect("a Windows path is expressible");
-        assert_eq!(got, "C:/Users/me/.claude");
+        // core#1029: the CLI matches a Windows path in POSIX form (`/c/Users/me`), and an absolute
+        // path takes the `//` anchor.
+        assert_eq!(got, "//c/Users/me/.claude");
         assert!(
             !got.contains('\\'),
             "a surviving backslash is an escape, not a separator: {got}"
         );
+        // A UNC share or a drive-relative path has no anchored spelling: refused, never guessed.
+        assert_eq!(rule_path_sep(r"\\server\share\me", '\\'), None);
+        assert_eq!(rule_path_sep(r"Users\me", '\\'), None);
 
         // The same bytes on POSIX are a filename containing backslashes, NOT separators. Rewriting
         // them would fence off a different directory than the one asked for, so this is refused (and
@@ -13678,10 +13725,16 @@ mod tests {
             None,
             "a POSIX path with a literal backslash has no faithful rule spelling"
         );
-        // Unchanged on POSIX, and the comma refusal survives the rewrite on both.
+        // POSIX keeps its separators and takes the `//` absolute anchor (core#1029); the comma
+        // refusal survives the rewrite on both.
         assert_eq!(
             rule_path_sep("/home/me/.ssh", '/').as_deref(),
-            Some("/home/me/.ssh")
+            Some("//home/me/.ssh")
+        );
+        assert_eq!(
+            rule_path_sep("home/me/.ssh", '/'),
+            None,
+            "relative: no anchor"
         );
         assert_eq!(rule_path_sep("/home/a,b/.ssh", '/'), None);
         assert_eq!(rule_path_sep(r"C:\Users\a,b", '\\'), None);
@@ -14455,6 +14508,12 @@ mod tests {
     /// cover all file-editing tools"), and a `Write(…)` PATH rule governs nothing ("is not matched
     /// by file permission checks") — so a fence that only spelled `Write(…)` would fail these tests
     /// exactly as it fails on the CLI.
+    ///
+    /// Anchors follow the CLI too (core#1029): `path` is ABSOLUTE, and only a `//`-anchored pattern
+    /// names an absolute path (`//home/u/x` is `/home/u/x`). A single leading `/` anchors at the
+    /// settings source and a bare pattern at the working directory — neither can be resolved
+    /// here, and neither names the absolute path written after it, so such a rule denies nothing
+    /// in this evaluator, exactly as `Read(/home/u/.ssh/**)` denied nothing on claude 2.1.296.
     fn rule_denies(rule: &str, tool: &str, path: &str) -> bool {
         fn glob(p: &[u8], s: &[u8]) -> bool {
             match p {
@@ -14479,7 +14538,11 @@ mod tests {
         governs
             && rest
                 .strip_suffix(')')
-                .is_some_and(|pattern| glob(pattern.as_bytes(), path.as_bytes()))
+                .and_then(|pattern| pattern.strip_prefix("//"))
+                .is_some_and(|below_root| {
+                    path.strip_prefix('/')
+                        .is_some_and(|p| glob(below_root.as_bytes(), p.as_bytes()))
+                })
     }
 
     #[test]
@@ -14488,40 +14551,229 @@ mod tests {
         // `Write(…)` path rule covers nothing (wicked-crew#524 / F-3R2-004).
         for tool in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
             assert!(
-                rule_denies("Edit(/h/.ssh/**)", tool, "/h/.ssh/id_rsa"),
+                rule_denies("Edit(//h/.ssh/**)", tool, "/h/.ssh/id_rsa"),
                 "{tool}"
             );
             assert!(
-                !rule_denies("Write(/h/.ssh/**)", tool, "/h/.ssh/id_rsa"),
+                !rule_denies("Write(//h/.ssh/**)", tool, "/h/.ssh/id_rsa"),
                 "{tool}"
             );
         }
-        assert!(!rule_denies("Edit(/h/.ssh/**)", "Read", "/h/.ssh/id_rsa"));
-        assert!(!rule_denies("Edit(/h/.ssh/**)", "Bash", "/h/.ssh/id_rsa"));
+        assert!(!rule_denies("Edit(//h/.ssh/**)", "Read", "/h/.ssh/id_rsa"));
+        assert!(!rule_denies("Edit(//h/.ssh/**)", "Bash", "/h/.ssh/id_rsa"));
         assert!(rule_denies(
-            "Read(/h/.crew/**)",
+            "Read(//h/.crew/**)",
             "Read",
             "/h/.crew/skills/x/SKILL.md"
         ));
         assert!(!rule_denies(
-            "Read(/h/.crew/**)",
+            "Read(//h/.crew/**)",
             "Edit",
             "/h/.crew/core.db"
         ));
-        assert!(!rule_denies("Read(/h/.crew/**)", "Read", "/h/.crew"));
+        assert!(!rule_denies("Read(//h/.crew/**)", "Read", "/h/.crew"));
         assert!(rule_denies(
-            "Read(/h/.crew/core.db)",
+            "Read(//h/.crew/core.db)",
             "Read",
             "/h/.crew/core.db"
         ));
         assert!(!rule_denies(
-            "Read(/h/.crew/core.db)",
+            "Read(//h/.crew/core.db)",
             "Read",
             "/h/.crew/core.db-wal"
         ));
-        assert!(rule_denies("Read(/h/*.pdf)", "Read", "/h/a.pdf"));
-        assert!(!rule_denies("Read(/h/*)", "Read", "/h/skills/x"));
+        assert!(rule_denies("Read(//h/*.pdf)", "Read", "/h/a.pdf"));
+        assert!(!rule_denies("Read(//h/*)", "Read", "/h/skills/x"));
         assert!(!rule_denies("Bash(sudo:*)", "Read", "/h/x"));
+        // core#1029: a single leading `/` is NOT the filesystem root on the CLI (it anchors at the
+        // settings source), and a bare pattern is cwd-relative — neither names `/h/.ssh/id_rsa`.
+        assert!(!rule_denies("Read(/h/.ssh/**)", "Read", "/h/.ssh/id_rsa"));
+        assert!(!rule_denies("Edit(/h/.ssh/**)", "Edit", "/h/.ssh/id_rsa"));
+        assert!(!rule_denies("Read(h/.ssh/**)", "Read", "/h/.ssh/id_rsa"));
+    }
+
+    /// LIVE (`WICKED_CONTAINER_LIVE=1`, a container runtime), core#1029: the engine's absolute
+    /// path fence bites on the PINNED claude (the `wicked-seat-claude` image) on its own — inside
+    /// an `--add-dir` root, with a PreToolUse hook answering an explicit `allow` — and an allowed
+    /// path still works. The argv is the engine's real one: `inject_isolation_flags` with `HOME`
+    /// pinned to `/fence` (so the generated rules name `/fence/.ssh/**`, `/fence/.git-credentials`,
+    /// …) and `/fence` handed as the instructions root (`--add-dir`, so acceptEdits' own
+    /// working-directory boundary is NOT what refuses). The model is a stub on loopback inside the
+    /// container and the key is a dummy; nothing leaves the container. On main the rules were
+    /// spelled `Read(/fence/.ssh/**)` — anchored at the working directory, not the root — and the
+    /// stub read `SECRET-1029` back and planted a file under `.ssh`.
+    #[cfg(unix)]
+    #[test]
+    fn live_the_absolute_fence_bites_in_the_pinned_seat_behind_a_hook_allow_1029() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (k, v) in self.0.drain(..) {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let vars = [
+            "CLAUDE_CONFIG_DIR",
+            "WICKED_SEAT_IMAGE_CLAUDE",
+            wicked_apps_core::spawn::INHERIT_OPERATOR_CONFIG_ENV,
+        ];
+        let _restore = Restore(vars.iter().map(|k| (*k, std::env::var_os(k))).collect());
+        for k in vars {
+            std::env::remove_var(k);
+        }
+        let rt = crate::container_floor::runtime().expect("a container runtime answers");
+        let image = crate::container_floor::ensure_seat_image(&rt, "claude").unwrap();
+
+        // The engine's own launch argv for a claude worker whose home is `/fence`.
+        let inv = "claude -p --settings /work/s.json --model claude-sonnet-4-5 {PROMPT}";
+        let mut argv = build_argv(inv, "do the steps", &[]);
+        {
+            let _home = HomeGuard::pin(Path::new("/fence"));
+            super::inject_isolation_flags(
+                &mut argv,
+                inv,
+                None,
+                Some("do the steps"),
+                None,
+                Some(Path::new("/fence")),
+            )
+            .expect("the isolation flags inject");
+        }
+        let rules = flag_value(&argv, "--disallowedTools").unwrap_or_default();
+        assert!(
+            rules.contains("Read(//fence/.ssh/**)") && rules.contains("Edit(//fence/.ssh/**)"),
+            "absolute rules are `//`-anchored: {rules}"
+        );
+
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "wicked-1029-live-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Stub Anthropic API: one tool call per turn from CALLS, logging each tool result.
+        std::fs::write(
+            dir.join("stub.py"),
+            r#"import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+CALLS = [["Read", {"file_path": "/fence/.ssh/id_rsa"}],
+         ["Read", {"file_path": "/fence/.git-credentials"}],
+         ["Read", {"file_path": "/fence/open/ok.md"}],
+         ["Write", {"file_path": "/fence/.ssh/planted", "content": "W"}],
+         ["Write", {"file_path": "/fence/open/new.md", "content": "W"}]]
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self): self.reply({})
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
+        if "count_tokens" in self.path: return self.reply({"input_tokens": 1})
+        res = [c for m in body.get("messages", []) if m.get("role") == "user" and isinstance(m.get("content"), list) for c in m["content"] if c.get("type") == "tool_result"]
+        main = any(t.get("name") == "Read" for t in body.get("tools") or [])
+        if res:
+            with open("/work/stub.log", "a") as f: f.write("RESULT %d %s\n" % (len(res) - 1, json.dumps(res[-1])))
+        step = len(res)
+        if main and step < len(CALLS):
+            blocks, stop = [{"type": "tool_use", "id": "toolu_%d" % step, "name": CALLS[step][0], "input": CALLS[step][1]}], "tool_use"
+        else:
+            blocks, stop = [{"type": "text", "text": "STUB-DONE"}], "end_turn"
+        msg = {"id": "msg_%d" % step, "type": "message", "role": "assistant", "model": body.get("model", "m"), "content": blocks, "stop_reason": stop, "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 1}}
+        if not body.get("stream"): return self.reply(msg)
+        self.send_response(200); self.send_header("content-type", "text/event-stream"); self.end_headers()
+        def ev(t, d): self.wfile.write(("event: %s\ndata: %s\n\n" % (t, json.dumps(dict(type=t, **d)))).encode())
+        ev("message_start", {"message": dict(msg, content=[], stop_reason=None)})
+        for i, b in enumerate(blocks):
+            if b["type"] == "text":
+                ev("content_block_start", {"index": i, "content_block": {"type": "text", "text": ""}})
+                ev("content_block_delta", {"index": i, "delta": {"type": "text_delta", "text": b["text"]}})
+            else:
+                ev("content_block_start", {"index": i, "content_block": dict(b, input={})})
+                ev("content_block_delta", {"index": i, "delta": {"type": "input_json_delta", "partial_json": json.dumps(b["input"])}})
+            ev("content_block_stop", {"index": i})
+        ev("message_delta", {"delta": {"stop_reason": stop, "stop_sequence": None}, "usage": {"output_tokens": 1}})
+        ev("message_stop", {})
+    def reply(self, d):
+        b = json.dumps(d).encode(); self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b)
+HTTPServer(("127.0.0.1", 8999), H).serve_forever()
+"#,
+        )
+        .unwrap();
+        // The scenario: the fenced tree, a gate hook that answers an EXPLICIT allow for every call
+        // (what core#1030's container relay now answers), then the engine's argv.
+        std::fs::write(
+            dir.join("run.sh"),
+            r#"mkdir -p /work/tree /work/home /fence/.ssh /fence/open && cd /work/tree
+echo SECRET-1029 > /fence/.ssh/id_rsa; echo SECRET-1029 > /fence/.git-credentials; echo OPEN-1029 > /fence/open/ok.md
+printf '%s\n' '#!/bin/sh' 'cat > /dev/null; echo fired >> /work/hook.log' \
+  "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\",\"permissionDecisionReason\":\"stub gate allows\"}}'" > /work/hook.sh
+chmod +x /work/hook.sh
+printf '%s' '{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"/work/hook.sh"}]}]}}' > /work/s.json
+python3 /r/stub.py & sleep 1
+ANTHROPIC_BASE_URL=http://127.0.0.1:8999 ANTHROPIC_API_KEY=sk-ant-dummy-not-a-token \
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 HOME=/work/home \
+  timeout 120 "$@" > /work/claude.out 2>&1
+echo "CLAUDE_EXIT $?"; echo "HOOK_FIRED $(cat /work/hook.log 2>/dev/null | wc -l)"
+cat /work/stub.log; test -e /fence/.ssh/planted && echo PLANTED_EXISTS; test -e /fence/open/new.md && echo NEW_EXISTS
+tail -c 1500 /work/claude.out
+"#,
+        )
+        .unwrap();
+        let mut cmd = rt.cmd();
+        cmd.args(["run", "--rm", "--network", "none", "-v"])
+            .arg(format!("{}:/r:ro", dir.display()))
+            .args([image.as_str(), "sh", "/r/run.sh"])
+            .args(&argv);
+        let out = crate::container_floor::output_within(cmd, Duration::from_secs(240))
+            .expect("the seat ran");
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        eprintln!("argv={argv:?}\n{log}");
+        let result = |i: usize| {
+            log.lines()
+                .find_map(|l| l.strip_prefix(&format!("RESULT {i} ")))
+                .unwrap_or_else(|| panic!("no tool result {i}: {log}"))
+                .to_string()
+        };
+        const REFUSED: &str = "denied by your permission settings";
+        for (i, what) in [
+            (0, "a Read of a fenced directory (~/.ssh)"),
+            (1, "a Read of a fenced file (~/.git-credentials)"),
+            (3, "a Write under a fenced directory (the Edit rule)"),
+        ] {
+            let r = result(i);
+            assert!(
+                r.contains(REFUSED) && !r.contains("SECRET-1029"),
+                "{what} is refused by the rule although the hook answers allow: {r}"
+            );
+        }
+        assert!(
+            result(2).contains("OPEN-1029"),
+            "an allowed path still reads: {log}"
+        );
+        assert!(
+            result(4).contains("File created"),
+            "an allowed path still writes: {log}"
+        );
+        assert!(
+            !log.contains("PLANTED_EXISTS") && log.contains("NEW_EXISTS"),
+            "the fenced write left nothing; the allowed one landed: {log}"
+        );
+        assert!(
+            log.contains("HOOK_FIRED 2"),
+            "the hook judged exactly the two allowed calls — the deny rules refused the rest \
+             before any hook ran: {log}"
+        );
     }
 
     /// core#396 × the Read deny fence (FINDING-067), design v3.1 §1: the snapshot lives under
