@@ -3064,6 +3064,16 @@ mod tests {
         assert!(SEAT_DOCKERFILE.contains("FROM ${BASE}"));
         assert!(SEAT_DOCKERFILE.contains("wicked.seat.cli=${CLI}"));
         assert!(SEAT_DOCKERFILE.contains("ENTRYPOINT []"));
+        // core#1009: every seat image carries the wicked-ledger its QE unit is pointed at.
+        let prefix = crate::qe_acceptance::SEAT_LEDGER_PKG_DIR
+            .strip_suffix("/node_modules/wicked-ledger")
+            .expect("an npm --prefix install");
+        assert!(SEAT_DOCKERFILE.contains(&format!("--prefix {prefix} ")));
+        assert!(SEAT_DOCKERFILE.contains("ARG LEDGER_PACKAGE=wicked-ledger@"));
+        assert!(
+            prefix.starts_with("/opt/"),
+            "under a root the seat's landrun policy admits read-only"
+        );
         let mut tags = Vec::new();
         for cli in ["claude", "codex", "pi", "opencode", "copilot"] {
             let pkg = seat_package(cli).unwrap_or_else(|| panic!("{cli} has a package"));

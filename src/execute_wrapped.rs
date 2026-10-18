@@ -3281,8 +3281,19 @@ impl WrappedCliStepRunner {
             );
             stamp_run_markers(&mut cmd, &provenance);
             // (wicked-crew#951) The QE unit is handed its run's QE ledger root (outside the tree),
-            // stamped the same way: garden's `qe accept` records its verdict there.
-            stamp_run_markers(&mut cmd, &crate::qe_acceptance::ledger_env(&input.unit));
+            // stamped the same way: garden's `qe accept` records its verdict there. In a container
+            // seat it is also handed the image's own wicked-ledger to record it with (core#1009):
+            // the daemon's inherited `WICKED_LEDGER_PKG_DIR` never reaches a seat.
+            stamp_run_markers(
+                &mut cmd,
+                &crate::qe_acceptance::seat_ledger_env(
+                    &input.unit,
+                    uses_container_seat(
+                        runs_in_seat(input),
+                        crate::container_floor::container_mode(),
+                    ),
+                ),
+            );
             // D-7 (DES-L4 PR-⑦): garden's estate shim spawns `wicked-estate-mcp --readonly` by
             // default on EVERY wrapped worker — the read-only default the deleted CLI-registered MCP
             // used to carry as a process flag now rides garden's own env contract; the fence's
