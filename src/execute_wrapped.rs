@@ -2061,8 +2061,8 @@ struct OneShotScratch {
 }
 
 /// The run-id prefixes of the engine's one-shot sessions (`decision` ballots, `validator`'s
-/// `one_shot_run_id`): only a seat home named for one of them is ever removed.
-const ONE_SHOT_RUN_PREFIXES: [&str; 3] = ["council-", "validator-", "triage-"];
+/// `one_shot_run_id`, team member turns): only a seat home named for one of them is ever removed.
+const ONE_SHOT_RUN_PREFIXES: [&str; 4] = ["council-", "validator-", "triage-", "member-"];
 
 impl OneShotScratch {
     fn new(run_id: &str) -> Self {
@@ -6304,13 +6304,28 @@ const LAYOUT_PREFIX: &str =
      is relative to it; `dir/ [manifest]` marks a project root, `dir/ {…}` a container of them): ";
 
 /// Is this unit one of the engine's OWN sessions — the agent judge (`validator`), failure triage
-/// (`triage`) or a decision-council ballot under the container floor ([`is_council_ballot`]) —
-/// rather than a run's work unit? Their prompts are fully authored verdict contracts that must
+/// (`triage`), a decision-council ballot under the container floor ([`is_council_ballot`]) or a
+/// team member's turn ([`is_team_member_turn`]) — rather than a run's work unit? Their prompts are fully authored verdict contracts that must
 /// stay byte-exact ([`skill_prompt`]), they are handed the skills snapshot only when they name a
 /// skill (`WrappedCliStepRunner::exec`), and they follow the seat floor ungoverned
 /// ([`runs_in_seat`]).
 pub(crate) fn is_engine_internal(unit: &WorkUnit) -> bool {
-    matches!(unit.session_id.as_str(), "validator" | "triage") || is_council_ballot(unit)
+    matches!(unit.session_id.as_str(), "validator" | "triage")
+        || is_council_ballot(unit)
+        || is_team_member_turn(unit)
+}
+
+/// The session and unit id of a team member's turn (`acp_runner::RunnerHost`, DES-TEAMING-002
+/// §8.8): a read-only review of a step another seat is working on, run as one of the engine's
+/// own one-shot sessions so it follows the seat floor (its seat's container, the gateway as the
+/// only egress) exactly as a judge or a ballot does.
+pub(crate) const TEAM_MEMBER_SESSION: &str = "team-member";
+pub(crate) const TEAM_MEMBER_UNIT: &str = "member-turn";
+
+/// Whether `unit` is a team member's turn: session `team-member` AND the member unit id, so a run
+/// a caller named `team-member` is never read as one (its units are `<run>:<phase>`).
+pub(crate) fn is_team_member_turn(unit: &WorkUnit) -> bool {
+    unit.session_id == TEAM_MEMBER_SESSION && unit.id == TEAM_MEMBER_UNIT
 }
 
 /// The unit id of a decision-council ballot (`decision::SeatBallots`), in session `council`.
@@ -7904,6 +7919,32 @@ mod tests {
                     "{session}: no governance files are created for an ungoverned judge"
                 );
             }
+            // (DES-TEAMING-002 §8.8) A team member's turn follows the floor the same way: it
+            // takes the seat container's arming (refused here), never a host CLI.
+            let mut member = input(
+                TEAM_MEMBER_SESSION,
+                &format!("member-cf-{}", std::process::id()),
+            );
+            member.unit.id = TEAM_MEMBER_UNIT.to_string();
+            assert!(is_team_member_turn(&member.unit) && runs_in_seat(&member));
+            let out = run(&member);
+            assert_eq!(out.status, StepStatus::Failed, "member: {}", out.output);
+            assert!(
+                out.output.contains("no_container_runtime"),
+                "member: {}",
+                out.output
+            );
+            assert!(
+                !out.output.contains("ran-on-host"),
+                "member: never a host CLI under the container floor: {}",
+                out.output
+            );
+            assert!(!out.governed, "a member turn stays ungoverned");
+            // A run a caller named `team-member` is not a member turn: its units are
+            // `<run>:<phase>`.
+            let mut named = member.unit.clone();
+            named.id = "team-member:review".to_string();
+            assert!(!is_team_member_turn(&named));
             // An ordinary ungoverned unit keeps its host launch.
             let out = run(&input("s", &format!("s-cf-plain-{}", std::process::id())));
             assert_eq!(out.status, StepStatus::Ok, "{}", out.output);

@@ -887,14 +887,26 @@ impl AttachCtx {
 /// and the unit's worktree as a READ root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorScope {
+    /// The run the member serves: the host closes every member of it when the run ends
+    /// ([`MonitorHost::close_run`]).
+    pub run_id: String,
     pub cwd: PathBuf,
     pub code_graph_db: Option<String>,
     pub read_roots: Vec<String>,
 }
 
-/// The carrier a member session runs on. Production: `AcpStepRunner` (`monitor_ensure` /
-/// `monitor_turn`, judged by the chat boundary, no chat events). Tests: a fake.
+/// The carrier a member session runs on. Production: `acp_runner::RunnerHost`, which runs each
+/// member turn as one of the engine's own one-shot sessions in the member seat's container (the
+/// container floor; ACP was removed from the seats in C5). Tests: a fake.
 pub trait MonitorHost: Send + Sync {
+    /// Whether every turn is a FRESH session that keeps nothing between turns and reads no file:
+    /// the prompt is the member's whole input. The supervisor then restates the member header on
+    /// every batch and shows the diff from the unit's baseline, not from the member's last batch
+    /// (it has no memory of that batch). `false` (a warm session): the header goes once and each
+    /// batch shows only the change since the last one.
+    fn one_shot(&self) -> bool {
+        false
+    }
     /// DES §4.1 (b): the seat's `[cli.acp]` is admitted to input governance — the read-only
     /// boundary is enforced by answering `session/request_permission`, which an unadmitted
     /// adapter never sends.
@@ -907,6 +919,10 @@ pub trait MonitorHost: Send + Sync {
     fn turn(&self, pool_key: &str, prompt: &str, budget: Duration) -> Result<String, String>;
     /// Close the session.
     fn close(&self, pool_key: &str);
+    /// The run ended (`path.ended`): close every member session of it, wherever the supervisor's
+    /// own bookkeeping stands (a final pass already detached from its unit included). A warm host
+    /// whose sessions the supervisor closes one by one needs nothing more.
+    fn close_run(&self, _run_id: &str) {}
 }
 
 // ── DES-TEAMING-001 S3 (#602): monitor→worker advice over `_session/steering` ─────────────────

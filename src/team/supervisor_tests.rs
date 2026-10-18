@@ -88,6 +88,12 @@ pub(crate) struct FakeHost {
     pub turns: Mutex<Vec<(String, String)>>,
     reply: Mutex<Reply>,
     pub unadmitted: Mutex<Vec<String>>,
+    /// Plays the container floor's one-shot host ([`MonitorHost::one_shot`]).
+    pub one_shot: std::sync::atomic::AtomicBool,
+    /// Every key `close` was called with, in order.
+    pub closed: Mutex<Vec<String>>,
+    /// Every run `close_run` was called with.
+    pub closed_runs: Mutex<Vec<String>>,
 }
 
 impl FakeHost {
@@ -100,6 +106,9 @@ impl FakeHost {
             turns: Mutex::default(),
             reply: Mutex::new(Box::new(reply)),
             unadmitted: Mutex::default(),
+            one_shot: std::sync::atomic::AtomicBool::new(false),
+            closed: Mutex::default(),
+            closed_runs: Mutex::default(),
         }
     }
 
@@ -126,6 +135,9 @@ impl FakeHost {
 }
 
 impl MonitorHost for FakeHost {
+    fn one_shot(&self) -> bool {
+        self.one_shot.load(std::sync::atomic::Ordering::SeqCst)
+    }
     fn admitted(&self, seat: &str) -> Result<(), String> {
         if self.unadmitted.lock().unwrap().iter().any(|s| s == seat) {
             Err(format!("seat '{seat}' is not admitted to input governance"))
@@ -156,7 +168,11 @@ impl MonitorHost for FakeHost {
         r
     }
     fn close(&self, pool_key: &str) {
+        self.closed.lock().unwrap().push(pool_key.to_string());
         self.open_keys.lock().unwrap().remove(pool_key);
+    }
+    fn close_run(&self, run_id: &str) {
+        self.closed_runs.lock().unwrap().push(run_id.to_string());
     }
 }
 
@@ -536,6 +552,113 @@ fn t6_a2_a_burst_on_an_unchanged_tree_makes_no_turn_and_reads_start_nothing() {
         h.rows(tev::MEMBER_JOINED).is_empty(),
         "no session opened for an unchanged tree"
     );
+}
+
+/// (DES-TEAMING-002 §8.8, the container floor) A one-shot member keeps nothing between turns: every
+/// batch restates the member header (with no worktree to read) and names the files the step
+/// changed in earlier batches; the diff stays the change since its last batch (codex review
+/// round 7: a cumulative diff would crowd later edits out of the cap). A warm member gets the
+/// header once and no file list.
+#[test]
+fn a_one_shot_member_gets_the_header_every_batch_and_the_earlier_files() {
+    for one_shot in [true, false] {
+        let mut h = Harness::new(if one_shot { "oneshot" } else { "warm" });
+        h.host
+            .one_shot
+            .store(one_shot, std::sync::atomic::Ordering::SeqCst);
+        h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+        h.claim(3, 1, "claude#1");
+        h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+        h.checkpoint(3, 1, 1, "edit");
+        h.pump();
+        h.fx.write("src/other.rs", "fn c() {}\n");
+        h.checkpoint(3, 1, 2, "edit");
+        h.pump();
+        let turns: Vec<String> = h
+            .host
+            .turns
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, p)| p.clone())
+            .collect();
+        assert_eq!(turns.len(), 2, "two batches, two turns");
+        let header = "READ-ONLY reviewer";
+        let earlier = "Files this step changed earlier";
+        // Both kinds see only the new change in the second batch.
+        assert!(turns[1].contains("+fn c() {}"), "{}", turns[1]);
+        assert!(!turns[1].contains("+    let x = 2;"), "{}", turns[1]);
+        if one_shot {
+            for p in &turns {
+                assert!(
+                    p.contains(header),
+                    "every one-shot turn has the header: {p}"
+                );
+                assert!(p.contains("no access to the worktree"), "{p}");
+                assert!(!p.contains("You may Read files"), "{p}");
+            }
+            assert!(
+                !turns[0].contains(earlier),
+                "nothing earlier on the first batch"
+            );
+            assert!(
+                turns[1].contains(earlier) && turns[1].contains("- src/lib.rs"),
+                "{}",
+                turns[1]
+            );
+        } else {
+            assert!(turns[0].contains(header) && turns[0].contains("You may Read files"));
+            assert!(
+                !turns[1].contains(header),
+                "a warm member gets the header once"
+            );
+            assert!(!turns[1].contains(earlier));
+        }
+        assert_eq!(
+            h.rows(tev::MEMBER_JOINED).len(),
+            1,
+            "one member, opened once"
+        );
+        assert_eq!(h.rows(tev::MEMBER_JOINED)[0]["status"], "attached");
+    }
+}
+
+/// (codex review round 2 on #1021) A run that ends while a member's FIRST batch is in flight (its
+/// slot still `Pending`) closes that member, so the host cancels the turn instead of letting the
+/// seat run to its budget.
+#[test]
+fn a_run_ending_mid_first_batch_closes_the_member() {
+    let mut h = Harness::new("forget-inflight");
+    h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+    h.claim(3, 1, "claude#1");
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+    h.checkpoint(3, 1, 1, "edit");
+    // Apply the rows but hold the batch job (it is "in flight" on another thread).
+    let db = BusDb::shared(&h.rig.bus).unwrap();
+    let mut held = Vec::new();
+    for ev in db.poll(TEAM_FILTER, h.cursor, 1000).unwrap() {
+        h.cursor = h.cursor.max(ev.event_id);
+        let event = TeamEvent::from_payload(&ev.event_type, &ev.payload).unwrap();
+        held.extend(h.core.on_row(&TeamRow {
+            event_id: ev.event_id,
+            event,
+        }));
+    }
+    held.extend(h.core.due_batches(Instant::now()));
+    assert!(
+        held.iter().any(|j| matches!(j, Job::Batch(_))),
+        "a first batch is due"
+    );
+    assert!(h.host.closed.lock().unwrap().is_empty());
+    h.publish(&fixture_with(tev::PATH_ENDED, 0, RUN, |_| {}));
+    h.pump();
+    let closed = h.host.closed.lock().unwrap().clone();
+    assert_eq!(
+        closed.len(),
+        1,
+        "the in-flight member is closed: {closed:?}"
+    );
+    assert!(closed[0].ends_with(":m1"), "{closed:?}");
 }
 
 // ── (a) DES-001 S2 #3: confirmation ──────────────────────────────────────────────────────────────
@@ -1307,6 +1430,47 @@ fn t6_c_the_hold_round_settles_each_unaccepted_finding_once_and_silence_holds() 
     for (_, status, reason) in &by_seq[1..] {
         assert_eq!(status, "held");
         assert_eq!(reason, "no reply (counted as hold)");
+    }
+}
+
+/// (codex review) A one-shot member answers the hold round with no memory of the batch that raised
+/// its findings: the hold prompt restates the step criterion and each finding's evidence line. A
+/// warm member's hold prompt is unchanged.
+#[test]
+fn a_one_shot_members_hold_round_carries_the_criterion_and_the_evidence() {
+    for one_shot in [true, false] {
+        let mut h = Harness::new(if one_shot { "hold-1shot" } else { "hold-warm" });
+        h.host
+            .one_shot
+            .store(one_shot, std::sync::atomic::Ordering::SeqCst);
+        h.fx.write("src/lib.rs", "fn a() {\n    one();\n}\n");
+        let line = finding_line("high", "src/lib.rs", 2, "    one();", "one is wrong");
+        h.host.set_reply(move |_, p| {
+            if p.contains("hold round") {
+                Ok("DONE".into())
+            } else {
+                Ok(format!("{line}\nDONE"))
+            }
+        });
+        h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+        h.claim(3, 1, "claude#1");
+        h.checkpoint(3, 1, 1, "edit");
+        h.pump();
+        let raised = h.rows(tev::FINDING_RAISED);
+        assert_eq!(raised.len(), 1);
+        h.answer(3, 1, &raised[0], "declined", "one is fine");
+        h.complete(3, 1, "claude#1", "ok");
+        h.pump();
+        let holds = h.host.prompts_matching("hold round");
+        assert_eq!(holds.len(), 1);
+        let has = |s: &str| holds[0].contains(s);
+        assert_eq!(has("evidence: `    one();`"), one_shot, "{}", holds[0]);
+        assert_eq!(
+            has("Step criterion: the handler cancels stale fetches"),
+            one_shot,
+            "{}",
+            holds[0]
+        );
     }
 }
 

@@ -394,6 +394,9 @@ pub struct UnitTeam {
     /// (core#959) The raises this attempt already settled `held` for the operator (a carried
     /// hold): never superseded, never asked again at the hold round.
     held: BTreeSet<u32>,
+    /// The members' host runs every turn as a fresh session with no file access
+    /// ([`MonitorHost::one_shot`]); read once, at summon.
+    one_shot: bool,
 }
 
 /// (T4, §8.7) The re-score bound of one attempt: a checkpoint re-scores only when the tree differs
@@ -469,6 +472,7 @@ impl UnitTeam {
             engine: None,
             vault: Arc::new(super::vault::CliVault::default()),
             held: BTreeSet::new(),
+            one_shot: false,
         }
     }
 
@@ -631,6 +635,7 @@ impl UnitTeam {
             return;
         }
         self.summoned = true;
+        self.one_shot = host.one_shot();
         let want = usize::from(self.ctx.plan.monitors);
         if want == 0 {
             return;
@@ -716,6 +721,7 @@ impl UnitTeam {
             .as_ref()
             .map(|r| r.workdir.to_string_lossy().into_owned());
         MonitorScope {
+            run_id: self.ctx.run_id.clone(),
             cwd: crate::acp_runner::ChatScope::scratch_for(&self.pool_key(monitor_id)),
             code_graph_db: self.ctx.code_graph_db.clone(),
             read_roots: workdir.into_iter().collect(),
@@ -729,14 +735,24 @@ impl UnitTeam {
             .as_ref()
             .map(|r| r.workdir.display().to_string())
             .unwrap_or_default();
+        // A one-shot member reads no file: the diff (or the answer) in this prompt is all it has.
+        let reach = if self.one_shot {
+            "You run in your own sealed session with no access to the worktree: the change shown \
+             below is your whole input. You cannot write anything."
+                .to_string()
+        } else {
+            format!(
+                "The worktree is {workdir}. You may Read files there for context; any write is \
+                 refused."
+            )
+        };
         format!(
             "[wicked-core · team member · READ-ONLY reviewer]\n\
              You are a member of the team on a step another agent is working on right now. You \
              advise; you do not decide. The worker may refuse you with evidence, and the gate \
              decides.\n\
              Step criterion: {criterion}\nPhase: {phase}\n\
-             The worktree is {workdir}. You may Read files there for context; any write is \
-             refused.\n\
+             {reach}\n\
              Report only defects you can pin to ONE line of the change: `high` (a real bug, data \
              loss, a security hole, or a caller the change breaks) or `medium` (a real defect \
              with limited reach). No style, naming or speculation. A finding is dropped unless \
@@ -764,7 +780,8 @@ impl UnitTeam {
             pool_key: m.pool_key.clone(),
             needs_open: m.state == SlotState::Pending,
             scope: self.scope(&m.id),
-            header: (!m.primed).then(|| self.header()),
+            // A one-shot member remembers nothing: the header goes with every batch.
+            header: (!m.primed || self.one_shot).then(|| self.header()),
             titles: self.titles.clone(),
             from_tree: m.last_tree.clone(),
             baseline_tree: self.ctx.baseline_tree.clone().unwrap_or_default(),
@@ -775,6 +792,7 @@ impl UnitTeam {
             diff_cap: cap,
             step_id: self.ctx.step_id.clone(),
             output: None,
+            cumulative: self.one_shot,
         }
     }
 
@@ -1009,6 +1027,12 @@ pub struct BatchJob {
     /// (ASK-K3b, §4.6) `Some` = the OUTPUT target: the step changed no tree (or has none), so
     /// the batch reviews the worker's answer, not a diff. Set by the final pass only.
     output: Option<String>,
+    /// A one-shot member ([`MonitorHost::one_shot`]) remembers no earlier batch: beside the
+    /// change since its last batch (reviewed in full, as every batch is), it is told which files
+    /// the step has changed since the baseline, so the new change reads in context. The diff
+    /// itself stays incremental: a cumulative one would re-send the same capped prefix every
+    /// batch and crowd later edits out (codex review round 7).
+    cumulative: bool,
 }
 
 /// A confirmed, above-bar finding a batch found, before dedup.
@@ -1101,6 +1125,20 @@ pub fn run_job(job: &BatchJob, host: &dyn MonitorHost) -> BatchDone {
         },
         job.from_tree
     ));
+    // A one-shot member remembers no earlier batch: say what the step changed before this one.
+    if job.cumulative && !job.baseline_tree.is_empty() && job.from_tree != job.baseline_tree {
+        let all = repo.changed_paths(&job.baseline_tree, &tree);
+        let new = repo.changed_paths(&job.from_tree, &tree);
+        let earlier: Vec<&String> = all.iter().filter(|p| !new.contains(*p)).collect();
+        if !earlier.is_empty() {
+            prompt.push_str(
+                "Files this step changed earlier (reviewed in earlier batches, not shown):\n",
+            );
+            for p in earlier.iter().take(TITLES_PER_BATCH) {
+                prompt.push_str(&format!("- {p}\n"));
+            }
+        }
+    }
     if !job.titles.is_empty() {
         prompt.push_str("Tool calls since the last batch:\n");
         for t in job.titles.iter().rev().take(TITLES_PER_BATCH).rev() {
@@ -1930,12 +1968,16 @@ impl SupervisorCore {
             if let Some(u) = self.units.remove(&k) {
                 let u = u.lock().unwrap_or_else(|p| p.into_inner());
                 for m in &u.monitors {
-                    if m.state != SlotState::Pending {
-                        self.host.close(&m.pool_key);
-                    }
+                    // Every admitted member, whatever its slot says: a turn may run on the host
+                    // while the slot is `Pending` (a first batch in flight, or a batch overlapping
+                    // a failed one; codex review rounds 2 and 6).
+                    self.host.close(&m.pool_key);
                 }
             }
         }
+        // …and every member of the run the host still runs (a final pass in flight is no longer
+        // in `units`; codex review round 3).
+        self.host.close_run(run_id);
         self.runs.remove(run_id);
         self.unknown.remove(run_id);
     }
@@ -2131,6 +2173,7 @@ pub fn run_help(job: &HelpJob, host: &dyn MonitorHost, pub_: &TeamBus) {
         job.key.0, job.key.1, job.key.2, job.help_id
     );
     let scope = MonitorScope {
+        run_id: job.key.0.clone(),
         cwd: crate::acp_runner::ChatScope::scratch_for(&pool_key),
         code_graph_db: None,
         read_roots: job.read_roots.clone(),
@@ -2146,10 +2189,18 @@ pub fn run_help(job: &HelpJob, host: &dyn MonitorHost, pub_: &TeamBus) {
         );
         return;
     }
+    // A one-shot member reads no file (`MonitorHost::one_shot`): it answers from the question and
+    // its context, and says so, rather than being told to read code it cannot reach.
+    let source = if host.one_shot() {
+        "You have no access to the repository: answer from the question and its context alone, \
+         say plainly what you cannot see, and cite only what the context shows"
+    } else {
+        "Answer it from the code, concisely, with evidence"
+    };
     let prompt = format!(
         "[wicked-core · team member · READ-ONLY]\n\
-         The agent working this step asks the team for help. Answer it from the code, concisely, \
-         with evidence. You advise; you do not decide.\n\
+         The agent working this step asks the team for help. {source}. You advise; you do not \
+         decide.\n\
          Question: {}\nContext: {}\n\
          Reply with your answer, then one line `EVIDENCE: <path:line>` per citation, then DONE.\n",
         job.question, job.context
@@ -2300,11 +2351,12 @@ fn close_all(u: &mut UnitTeam, host: &dyn MonitorHost) {
     let key = u.key();
     let monitors = u.ledger_monitors();
     for (i, m) in u.monitors.clone().iter().enumerate() {
+        // Every admitted member is closed, whatever its slot says: a turn may still run on the
+        // host after the slot went back to `Pending` (an overlapping batch whose sibling failed;
+        // codex review round 6). A close of a key with nothing open is a no-op.
+        host.close(&m.pool_key);
         if m.state == SlotState::Pending && m.open_seq == 0 {
             continue;
-        }
-        if m.state != SlotState::Pending {
-            host.close(&m.pool_key);
         }
         if m.open_seq > 0 {
             let lm = &monitors[i];
@@ -2898,6 +2950,15 @@ fn hold_round(
                      <reason>` to stand by it or `WITHDRAW <findingId> — <reason>` to drop it, \
                      then DONE.\n",
                 );
+                // A one-shot member has no memory of the batch that raised these: it is given
+                // the step and each finding's evidence line again (codex review).
+                if u.one_shot {
+                    prompt.push_str(&format!(
+                        "You run in a sealed session: your earlier turns are not available, so \
+                         each finding below carries the line it cites.\nStep criterion: {}\n",
+                        u.ctx.criterion
+                    ));
+                }
                 for (seq, f) in &items {
                     prompt.push_str(&format!(
                         "- {} [{}] {}:{} — {} · worker: {}\n",
@@ -2908,6 +2969,12 @@ fn hold_round(
                         cap_utf8(&f.finding.claim, 512),
                         worker_position(f, deliveries, *seq)
                     ));
+                    if u.one_shot {
+                        prompt.push_str(&format!(
+                            "  evidence: `{}`\n",
+                            cap_utf8(&f.finding.evidence, super::EVIDENCE_CAP)
+                        ));
+                    }
                 }
                 let opened = if m.state == SlotState::Pending {
                     host.open(&m.pool_key, &m.seat, &u.scope(&m.id)).is_ok()
@@ -3143,11 +3210,22 @@ fn member_answer(
     let key = u.key();
     let pool_key = format!("team:{}:{}:{}:step:{}", key.0, key.1, key.2, r.step_id);
     host.open(&pool_key, member, &u.scope("step")).ok()?;
+    // A one-shot member keeps nothing from the turn that did the step and reads no file: it is
+    // given the step's criterion and told plainly what it cannot see (codex review round 4).
+    let context = if host.one_shot() {
+        format!(
+            "Step criterion: {}\nYou run in a sealed session: your earlier output and the \
+             repository are not available to you, so judge the PA's reason on its own terms.\n",
+            u.ctx.criterion
+        )
+    } else {
+        String::new()
+    };
     let prompt = format!(
         "[wicked-core · team member · your step was rejected]\nThe PA rejected your output for \
-         step `{id}` (attempt {att}): {reason}\nIf you stand by your output, reply exactly `HOLD \
-         {id} — <why it should count>`; a one-off council will decide. Otherwise reply `ACCEPT \
-         {id}` and rework it. Then DONE.\n",
+         step `{id}` (attempt {att}): {reason}\n{context}If you stand by your output, reply \
+         exactly `HOLD {id} — <why it should count>`; a one-off council will decide. Otherwise \
+         reply `ACCEPT {id}` and rework it. Then DONE.\n",
         id = r.step_id,
         att = r.reviewed_attempt,
         reason = r.reason

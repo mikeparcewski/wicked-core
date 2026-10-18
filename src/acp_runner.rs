@@ -1712,11 +1712,11 @@ impl AcpStepRunner {
     }
 }
 
-/// Team monitors were warm read-only ACP sessions on the host. ACP is removed from the seats (C5),
-/// so a monitor is refused with the reason (the supervisor reports it), as the container floor
-/// already refused them.
-const NO_MONITORS: &str = "team monitors ran over ACP, which is removed from the seats (C5); \
-     they are not available until the headless carrier hosts them";
+/// Why a member is refused on the labelled interim host floor: a member turn is an ungoverned
+/// session, and only a seat container makes it read-only (nothing of the run is mounted, and the
+/// gateway is its only egress). On the host the same CLI could write anywhere the operator can.
+const HOST_FLOOR_MEMBERS: &str = "team members run only in a seat container; the interim host \
+     floor (WICKED_SEAT_FLOOR=host) hosts none";
 
 /// (C5, codex c5-r2; core#755) Whether an `ok` turn is really a provider's refusal: no tool call,
 /// a SHORT output (a refusal is one error message; a long answer that merely quotes the phrase is
@@ -1732,33 +1732,300 @@ fn ok_turn_is_a_seat_refusal(output: &StepOutput) -> bool {
 
 /// The supervisor's view of the runner — WEAK, so the supervisor thread never keeps the runner
 /// (and through it the actor channel) alive.
-pub(crate) struct RunnerHost(pub(crate) std::sync::Weak<AcpStepRunner>);
+pub(crate) struct RunnerHost {
+    runner: std::sync::Weak<dyn StepRunner>,
+    /// Every member's state, under ONE lock so a `close` racing a `turn` either sees the turn
+    /// registered (and cancels it) or makes the turn refuse to start (codex review round 2).
+    book: Mutex<MemberBook>,
+}
+
+/// What the host knows of its members.
+#[derive(Default)]
+struct MemberBook {
+    /// The seat each open member pool key runs on (`open` records it, `close` drops it): the
+    /// supervisor's `turn` names only the pool key.
+    seats: HashMap<String, String>,
+    /// The run each pool key serves (`MonitorScope::run_id`, recorded at `open`).
+    runs: HashMap<String, String>,
+    /// The one-shot run ids of each pool key's turns in flight (a checkpoint batch and the final
+    /// pass may overlap): `close` cancels them all, so a member closed with its unit or run stops
+    /// its seat containers instead of running them to their budget.
+    in_flight: HashMap<String, Vec<String>>,
+    /// Pool keys closed for good (bounded, newest last): an `open` or `turn` racing the close
+    /// starts nothing.
+    closed: std::collections::VecDeque<String>,
+    /// Runs ended for good (bounded, newest last): no member of one opens again.
+    closed_runs: std::collections::VecDeque<String>,
+}
+
+/// How many closed member keys, and how many ended runs, are remembered.
+const CLOSED_MEMBERS_CAP: usize = 4096;
+
+/// Push `key` onto a bounded tombstone list (once).
+fn tombstone(list: &mut std::collections::VecDeque<String>, key: &str) {
+    if !list.iter().any(|k| k == key) {
+        if list.len() >= CLOSED_MEMBERS_CAP {
+            list.pop_front();
+        }
+        list.push_back(key.to_string());
+    }
+}
+
+impl MemberBook {
+    /// Whether `pool_key` (serving `run`, when known) may no longer open or turn.
+    fn is_closed(&self, pool_key: &str, run: Option<&str>) -> bool {
+        let run = run.or_else(|| self.runs.get(pool_key).map(String::as_str));
+        self.closed.iter().any(|k| k == pool_key)
+            || run.is_some_and(|r| self.closed_runs.iter().any(|k| k == r))
+    }
+
+    /// Close every key `matches` selects: drop their seats and runs and hand back their turns in
+    /// flight.
+    fn take(&mut self, matches: impl Fn(&str) -> bool) -> Vec<String> {
+        self.seats.retain(|k, _| !matches(k));
+        let keys: Vec<String> = self
+            .in_flight
+            .keys()
+            .filter(|k| matches(k))
+            .cloned()
+            .collect();
+        let live = keys
+            .iter()
+            .filter_map(|k| self.in_flight.remove(k))
+            .flatten()
+            .collect();
+        self.runs.retain(|k, _| !matches(k));
+        live
+    }
+}
 
 impl RunnerHost {
-    fn runner(&self) -> Result<Arc<AcpStepRunner>, String> {
-        self.0
+    pub(crate) fn new(runner: std::sync::Weak<dyn StepRunner>) -> Self {
+        RunnerHost {
+            runner,
+            book: Mutex::new(MemberBook::default()),
+        }
+    }
+
+    fn runner(&self) -> Result<Arc<dyn StepRunner>, String> {
+        self.runner
             .upgrade()
             .ok_or_else(|| "the engine is shutting down".to_string())
+    }
+
+    fn book(&self) -> std::sync::MutexGuard<'_, MemberBook> {
+        self.book.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn cancel(&self, run_ids: Vec<String>) {
+        if let Ok(runner) = self.runner() {
+            for run_id in run_ids {
+                runner.on_run_complete(&run_id);
+            }
+        }
     }
 }
 
 impl crate::team::MonitorHost for RunnerHost {
-    fn admitted(&self, _seat: &str) -> Result<(), String> {
-        Err(NO_MONITORS.into())
+    /// (DES-TEAMING-002 §8.8) Every member turn is a fresh session: [`member_turn`].
+    fn one_shot(&self) -> bool {
+        true
     }
+    /// A member needs the container floor and a seat whose CLI takes its prompt on argv (the
+    /// carrier hands it there, as it does a judge's and a ballot's).
+    fn admitted(&self, seat: &str) -> Result<(), String> {
+        if !crate::container_floor::container_mode() {
+            return Err(HOST_FLOOR_MEMBERS.into());
+        }
+        member_invocation(seat).map(|_| ())
+    }
+    /// Nothing to start (each turn is its own session): the member's seat is recorded for its
+    /// turns, once the engine and the seat's admission still hold.
     fn open(
         &self,
         pool_key: &str,
         seat: &str,
-        _scope: &crate::team::MonitorScope,
+        scope: &crate::team::MonitorScope,
     ) -> Result<(), String> {
         self.runner()?;
-        Err(format!("monitor '{pool_key}' on '{seat}': {NO_MONITORS}"))
+        self.admitted(seat)?;
+        let mut book = self.book();
+        if book.is_closed(pool_key, Some(&scope.run_id)) {
+            return Err(format!("member '{pool_key}' was closed"));
+        }
+        book.seats.insert(pool_key.to_string(), seat.to_string());
+        book.runs.insert(pool_key.to_string(), scope.run_id.clone());
+        Ok(())
     }
-    fn turn(&self, pool_key: &str, _prompt: &str, _budget: Duration) -> Result<String, String> {
-        Err(format!("monitor '{pool_key}': {NO_MONITORS}"))
+    fn turn(&self, pool_key: &str, prompt: &str, budget: Duration) -> Result<String, String> {
+        let runner = self.runner()?;
+        let run_id = member_run_id(pool_key);
+        let seat = {
+            let mut book = self.book();
+            if book.is_closed(pool_key, None) {
+                return Err(format!("member '{pool_key}' was closed"));
+            }
+            let seat = book
+                .seats
+                .get(pool_key)
+                .cloned()
+                .ok_or_else(|| format!("member '{pool_key}' is not open"))?;
+            book.in_flight
+                .entry(pool_key.to_string())
+                .or_default()
+                .push(run_id.clone());
+            seat
+        };
+        let out = member_turn(runner, &seat, &run_id, prompt, budget);
+        let mut book = self.book();
+        if let Some(live) = book.in_flight.get_mut(pool_key) {
+            live.retain(|r| r != &run_id);
+            if live.is_empty() {
+                book.in_flight.remove(pool_key);
+            }
+        }
+        out
     }
-    fn close(&self, _pool_key: &str) {}
+    /// Forget the member for good; its turns still in flight are cancelled (their seat
+    /// containers stop), and an `open` or `turn` that races this close starts nothing.
+    fn close(&self, pool_key: &str) {
+        let live = {
+            let mut book = self.book();
+            tombstone(&mut book.closed, pool_key);
+            book.take(|k| k == pool_key)
+        };
+        self.cancel(live);
+    }
+    /// The run ended: every member of it — a unit's watchers, a final pass, a help turn — is
+    /// closed and its turns in flight cancelled, wherever the supervisor's bookkeeping stands.
+    fn close_run(&self, run_id: &str) {
+        let live = {
+            let mut book = self.book();
+            tombstone(&mut book.closed_runs, run_id);
+            let keys: std::collections::HashSet<String> = book
+                .runs
+                .iter()
+                .filter(|(_, r)| r.as_str() == run_id)
+                .map(|(k, _)| k.clone())
+                .collect();
+            book.take(|k| keys.contains(k))
+        };
+        self.cancel(live);
+    }
+}
+
+/// The headless invocation a member turn on `seat` runs (the seat's registry record, an instance
+/// key reading its CLI's record), refused by name when the seat is unknown or reads its prompt
+/// any way but on argv.
+fn member_invocation(seat: &str) -> Result<String, String> {
+    let cli =
+        registry_record(seat).ok_or_else(|| format!("seat '{seat}' is not in the CLI registry"))?;
+    if cli.input_mode != wicked_council::types::InputMode::PromptArg {
+        return Err(format!(
+            "seat '{seat}' reads its prompt as {:?}; a member turn in a seat container is handed \
+             its prompt on the command line only",
+            cli.input_mode
+        ));
+    }
+    Ok(cli.headless_invocation)
+}
+
+/// How long a timed-out member turn's seat is given to stop after it is cancelled.
+const MEMBER_CANCEL_DRAIN: Duration = Duration::from_secs(10);
+
+/// A run id unique to ONE member turn (`member-` is a one-shot prefix the wrapped runner cleans
+/// up after, `execute_wrapped::ONE_SHOT_RUN_PREFIXES`): never reused, so a cancel of one turn can
+/// never reach another.
+fn member_run_id(pool_key: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let safe: String = pool_key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(48)
+        .collect();
+    format!(
+        "member-{safe}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// (DES-TEAMING-002 §8.8, the container floor) One member turn: the member's prompt run as one of
+/// the engine's OWN one-shot sessions (`execute_wrapped::is_team_member_turn`) through the run's
+/// step runner, so it takes the same arming as a worker, a judge and a council ballot — the
+/// seat's container, its brokered sign-in, the gateway as the only egress. It is UNGOVERNED and
+/// READ-ONLY by construction: no repository is mounted (`workdir: None`), no gate hook, no MCP
+/// channel; the diff it reviews is in its prompt. `Err` is a failed turn (the supervisor reopens
+/// the member on its next batch); a turn past `budget` cancels the seat's container.
+pub(crate) fn member_turn(
+    runner: Arc<dyn StepRunner>,
+    seat: &str,
+    run_id: &str,
+    prompt: &str,
+    budget: Duration,
+) -> Result<String, String> {
+    use crate::workflow::StepStatus;
+    let invocation = member_invocation(seat)?;
+    let run_id = run_id.to_string();
+    let mut unit = crate::domain::WorkUnit::pending(
+        crate::execute_wrapped::TEAM_MEMBER_UNIT,
+        crate::execute_wrapped::TEAM_MEMBER_SESSION,
+        1,
+        prompt,
+    );
+    unit.assigned_cli = Some(seat.to_string());
+    unit.assigned_invocation = Some(invocation);
+    let input = StepInput {
+        run_id: run_id.clone(),
+        unit_ix: 0,
+        attempt: 0,
+        unit,
+        workflow_id: "wf-team-member".to_string(),
+        entity_mode: crate::scope::EntityMode::Isolated,
+        workdir: None,
+        governance: None,
+        prior_outputs: vec![],
+        elicitation_epoch: 0,
+        process_gen: None,
+        launch_seq: 0,
+        required_skills: Vec::new(),
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = runner.clone();
+    std::thread::spawn(move || {
+        let out =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run_unit(&input)));
+        let _ = tx.send(out);
+    });
+    let out = match rx.recv_timeout(budget) {
+        Ok(Ok(out)) => out,
+        Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(format!(
+                "member turn on '{seat}' panicked in its seat runner"
+            ))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            runner.on_run_complete(&run_id);
+            let _ = rx.recv_timeout(MEMBER_CANCEL_DRAIN);
+            return Err(format!(
+                "member turn on '{seat}' exceeded {} s in its seat container",
+                budget.as_secs()
+            ));
+        }
+    };
+    match out.status {
+        StepStatus::Ok if !ok_turn_is_a_seat_refusal(&out) => Ok(out.output),
+        StepStatus::Ok => Err(format!(
+            "seat '{seat}' refused the member turn: {}",
+            out.output.trim()
+        )),
+        _ => Err(format!(
+            "member turn on '{seat}' did not finish ({:?}): {}",
+            out.status,
+            out.output.trim()
+        )),
+    }
 }
 
 impl Default for AcpStepRunner {
@@ -4034,6 +4301,354 @@ acp_input_governance = true
     }
 
     // ── crew#998: a governed unit on an admitted seat never falls back to an unchecked carrier ──
+
+    // ── DES-TEAMING-002 §8.8: team members on the container floor ──────────────────────────────
+
+    /// A runner that records the member turn it was handed and answers as told.
+    struct MemberRunner {
+        seen: Mutex<Vec<StepInput>>,
+        cancelled: Mutex<Vec<String>>,
+        answer: StepOutput,
+        delay: Duration,
+    }
+
+    impl StepRunner for MemberRunner {
+        fn run_unit(&self, input: &StepInput) -> StepOutput {
+            self.seen.lock().unwrap().push(input.clone());
+            std::thread::sleep(self.delay);
+            StepOutput {
+                run_id: input.run_id.clone(),
+                ..self.answer.clone()
+            }
+        }
+        fn on_run_complete(&self, run_id: &str) {
+            self.cancelled.lock().unwrap().push(run_id.to_string());
+        }
+    }
+
+    fn member_runner(
+        status: crate::workflow::StepStatus,
+        text: &str,
+        delay: Duration,
+    ) -> Arc<MemberRunner> {
+        Arc::new(MemberRunner {
+            seen: Mutex::new(Vec::new()),
+            cancelled: Mutex::new(Vec::new()),
+            answer: StepOutput {
+                run_id: String::new(),
+                unit_ix: 0,
+                attempt: 0,
+                output: text.to_string(),
+                status,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            },
+            delay,
+        })
+    }
+
+    /// Sets (or unsets) one variable for a test's life, restoring the old value on drop.
+    struct EnvSet(&'static str, Option<std::ffi::OsString>);
+    impl EnvSet {
+        fn new(key: &'static str, value: Option<&str>) -> Self {
+            let old = std::env::var_os(key);
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+            EnvSet(key, old)
+        }
+    }
+    impl Drop for EnvSet {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    /// A member turn is one of the engine's own one-shot sessions on the member's seat: no
+    /// repository, no governance, a fresh `member-` run id per turn, the prompt byte-exact, and
+    /// it takes the seat floor's arming (`runs_in_seat`), so under the container floor it runs in
+    /// the seat's container.
+    #[test]
+    fn a_member_turn_is_a_one_shot_seated_session_with_no_repository() {
+        let _g = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let runner = member_runner(
+            crate::workflow::StepStatus::Ok,
+            "FINDING {}\nDONE",
+            Duration::ZERO,
+        );
+        let dyn_runner: Arc<dyn StepRunner> = runner.clone();
+        let a = member_turn(
+            dyn_runner.clone(),
+            "claude",
+            &member_run_id("team:r:2:0:m1"),
+            "review this",
+            Duration::from_secs(5),
+        )
+        .expect("the member answered");
+        assert_eq!(a, "FINDING {}\nDONE");
+        member_turn(
+            dyn_runner,
+            "claude",
+            &member_run_id("team:r:2:0:m1"),
+            "and this",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let seen = runner.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        let i = &seen[0];
+        assert!(crate::execute_wrapped::is_team_member_turn(&i.unit));
+        assert!(crate::execute_wrapped::is_engine_internal(&i.unit));
+        assert!(
+            crate::execute_wrapped::runs_in_seat(i),
+            "it follows the seat floor"
+        );
+        assert_eq!(i.unit.assigned_cli.as_deref(), Some("claude"));
+        assert!(i.unit.assigned_invocation.is_some());
+        assert_eq!(
+            i.unit.description, "review this",
+            "the prompt goes through byte-exact"
+        );
+        assert!(i.workdir.is_none(), "no repository is mounted");
+        assert!(i.governance.is_none(), "a member turn is ungoverned");
+        assert!(i.run_id.starts_with("member-"), "{}", i.run_id);
+        assert_ne!(
+            seen[0].run_id, seen[1].run_id,
+            "every turn is its own session"
+        );
+    }
+
+    /// A turn past its budget cancels the seat (its container) and fails; a provider's refusal or
+    /// a failed exit is a failed turn, never an answer.
+    #[test]
+    fn a_member_turn_fails_on_timeout_refusal_or_exit() {
+        let _g = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let slow = member_runner(
+            crate::workflow::StepStatus::Ok,
+            "late",
+            Duration::from_millis(400),
+        );
+        let e = member_turn(
+            slow.clone(),
+            "claude",
+            "member-slow",
+            "p",
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(e.contains("exceeded"), "{e}");
+        let ran = slow.seen.lock().unwrap()[0].run_id.clone();
+        assert_eq!(
+            *slow.cancelled.lock().unwrap(),
+            vec![ran],
+            "the seat is cancelled"
+        );
+        let refused = member_runner(
+            crate::workflow::StepStatus::Ok,
+            "Error: You have exceeded your monthly quota",
+            Duration::ZERO,
+        );
+        let e = member_turn(refused, "claude", "k", "p", Duration::from_secs(5)).unwrap_err();
+        assert!(e.contains("refused"), "{e}");
+        let failed = member_runner(
+            crate::workflow::StepStatus::Failed,
+            "floor not armed",
+            Duration::ZERO,
+        );
+        let e = member_turn(failed, "claude", "k", "p", Duration::from_secs(5)).unwrap_err();
+        assert!(e.contains("floor not armed"), "{e}");
+        let e = member_turn(
+            member_runner(crate::workflow::StepStatus::Ok, "x", Duration::ZERO),
+            "no-such-seat-xyz",
+            "k",
+            "p",
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(e.contains("not in the CLI registry"), "{e}");
+    }
+
+    /// The host is one-shot; it admits members only under the container floor (the labelled host
+    /// floor refuses them by name), records the seat at `open` for the turns that follow, and a
+    /// turn on a key never opened fails rather than guessing a seat.
+    #[test]
+    fn the_member_host_admits_only_on_the_container_floor() {
+        use crate::team::MonitorHost;
+        let _g = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let runner: Arc<dyn StepRunner> = Arc::new(AcpStepRunner::default());
+        let host = RunnerHost::new(Arc::downgrade(&runner));
+        assert!(host.one_shot());
+        let scope = crate::team::MonitorScope {
+            run_id: "r1".into(),
+            cwd: std::env::temp_dir(),
+            code_graph_db: None,
+            read_roots: Vec::new(),
+        };
+        {
+            let _floor = EnvSet::new(crate::container_floor::SEAT_FLOOR_ENV, Some("host"));
+            let e = host.admitted("claude").unwrap_err();
+            assert!(e.contains("host floor"), "{e}");
+            assert!(host.open("k", "claude", &scope).is_err());
+        }
+        let _floor = EnvSet::new(crate::container_floor::SEAT_FLOOR_ENV, Some("container"));
+        host.admitted("claude")
+            .expect("a registry seat is admitted");
+        assert!(host.admitted("no-such-seat-xyz").is_err());
+        let e = host
+            .turn("never-opened", "p", Duration::from_secs(1))
+            .unwrap_err();
+        assert!(e.contains("not open"), "{e}");
+        host.open("k", "claude", &scope).expect("opens");
+        assert_eq!(
+            host.book().seats.get("k").map(String::as_str),
+            Some("claude")
+        );
+        host.close("k");
+        assert!(!host.book().seats.contains_key("k"));
+        assert!(host.open("k", "claude", &scope).is_err(), "closed for good");
+        host.open("k3", "claude", &scope)
+            .expect("another member opens");
+        drop(runner);
+        assert!(
+            host.open("k4", "claude", &scope).is_err(),
+            "no engine, no member"
+        );
+    }
+
+    /// (codex review round 3) Two turns of one member in flight (a checkpoint batch and the final
+    /// pass) are both cancelled by its close; a run's end cancels every member turn of that run —
+    /// a help turn and a final pass no longer tracked by the supervisor included — and no other
+    /// run's, and nothing of the ended run opens again.
+    #[test]
+    fn a_close_or_a_run_end_cancels_every_turn_in_flight() {
+        use crate::team::MonitorHost;
+        let _g = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _floor = EnvSet::new(crate::container_floor::SEAT_FLOOR_ENV, Some("container"));
+        let slow = member_runner(
+            crate::workflow::StepStatus::Ok,
+            "late",
+            Duration::from_millis(800),
+        );
+        let runner: Arc<dyn StepRunner> = slow.clone();
+        let host = Arc::new(RunnerHost::new(Arc::downgrade(&runner)));
+        let scope = crate::team::MonitorScope {
+            run_id: "r1".into(),
+            cwd: std::env::temp_dir(),
+            code_graph_db: None,
+            read_roots: Vec::new(),
+        };
+        // (codex review round 5) `r1:child` extends `r1` with a colon: a run's end is matched by
+        // the run each member recorded, never by a key prefix.
+        let keys = [
+            ("team:r1:2:0:m1", "r1"),
+            ("team:r1:2:0:m1", "r1"),
+            ("team:r1:3:0:help:h1", "r1"),
+            ("team:r1:child:2:0:m1", "r1:child"),
+        ];
+        let scope_of = |run: &str| crate::team::MonitorScope {
+            run_id: run.into(),
+            ..scope.clone()
+        };
+        for (k, run) in keys {
+            host.open(k, "claude", &scope_of(run)).unwrap();
+        }
+        let threads: Vec<_> = keys
+            .iter()
+            .map(|(k, _)| {
+                let (h, k) = (host.clone(), k.to_string());
+                std::thread::spawn(move || h.turn(&k, "p", Duration::from_secs(5)))
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while slow.seen.lock().unwrap().len() < keys.len() {
+            assert!(std::time::Instant::now() < deadline, "every turn started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        host.close("team:r1:2:0:m1");
+        assert_eq!(slow.cancelled.lock().unwrap().len(), 2, "both turns of m1");
+        host.close_run("r1");
+        assert_eq!(
+            slow.cancelled.lock().unwrap().len(),
+            3,
+            "and r1's help turn"
+        );
+        assert!(
+            host.book().in_flight.contains_key("team:r1:child:2:0:m1"),
+            "r1:child runs on"
+        );
+        assert!(host
+            .open("team:r1:4:0:m1", "claude", &scope_of("r1"))
+            .is_err());
+        host.open("team:r1:child:4:0:m1", "claude", &scope_of("r1:child"))
+            .expect("another run opens");
+        for t in threads {
+            let _ = t.join();
+        }
+    }
+
+    /// (codex review) Closing a member cancels its turn in flight — a run cancelled or folded
+    /// mid-turn stops the member's seat container instead of letting it run to its budget.
+    #[test]
+    fn closing_a_member_cancels_its_turn_in_flight() {
+        use crate::team::MonitorHost;
+        let _g = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _floor = EnvSet::new(crate::container_floor::SEAT_FLOOR_ENV, Some("container"));
+        let slow = member_runner(
+            crate::workflow::StepStatus::Ok,
+            "late",
+            Duration::from_millis(600),
+        );
+        let runner: Arc<dyn StepRunner> = slow.clone();
+        let host = Arc::new(RunnerHost::new(Arc::downgrade(&runner)));
+        let scope = crate::team::MonitorScope {
+            run_id: "r1".into(),
+            cwd: std::env::temp_dir(),
+            code_graph_db: None,
+            read_roots: Vec::new(),
+        };
+        host.open("k", "claude", &scope).expect("opens");
+        let turning = host.clone();
+        let t = std::thread::spawn(move || turning.turn("k", "p", Duration::from_secs(5)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while slow.seen.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the turn started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        host.close("k");
+        let ran = slow.seen.lock().unwrap()[0].run_id.clone();
+        assert_eq!(
+            *slow.cancelled.lock().unwrap(),
+            vec![ran],
+            "close cancels it"
+        );
+        let _ = t.join();
+        assert!(host.book().in_flight.is_empty());
+        // A closed member starts nothing more, whatever races the close.
+        assert!(host.turn("k", "p", Duration::from_secs(5)).is_err());
+        assert!(host.open("k", "claude", &scope).is_err());
+        // A finished turn leaves nothing to cancel.
+        host.open("k2", "claude", &scope).unwrap();
+        host.turn("k2", "p", Duration::from_secs(5)).unwrap();
+        host.close("k2");
+        assert_eq!(slow.cancelled.lock().unwrap().len(), 1);
+        assert_eq!(slow.seen.lock().unwrap().len(), 2);
+    }
 }
 
 /// DES-TEAMING-001 S2 (#601) through the REAL ACP turn loop: a scripted bridge drives the
