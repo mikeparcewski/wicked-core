@@ -2483,11 +2483,7 @@ fn evaluator_relation(
     }
     let builders: Vec<&crate::domain::WorkUnit> = units
         .iter()
-        .filter(|u| {
-            u.ord < unit.ord
-                && u.tool_cmd.is_none()
-                && matches!(u.stage, StageKind::Build | StageKind::Recon)
-        })
+        .filter(|u| u.ord < unit.ord && authors_work(u))
         .collect();
     if builders.is_empty() {
         return None;
@@ -2505,18 +2501,56 @@ fn evaluator_relation(
     })
 }
 
+/// Whether DISPATCHING `u` makes its seat an author of the work a later review or test checks: an
+/// agent (not Tool) unit of a Build or Recon stage — except a team member's READ step
+/// ([`is_member_read_step`]). Read by the evaluator fence (`distribute`) and the dispatch author
+/// stamp (`actor`).
+pub(crate) fn authors_by_dispatch(u: &crate::domain::WorkUnit) -> bool {
+    use crate::domain::StageKind;
+    u.tool_cmd.is_none()
+        && matches!(u.stage, StageKind::Build | StageKind::Recon)
+        && !is_member_read_step(u)
+}
+
+/// Whether `u` has an author whose seat a later review or test must avoid: every unit
+/// [`authors_by_dispatch`], and a member read step that RECORDED an author anyway (an operator's
+/// floor fix changed the tree on it; codex review round 2). The one predicate behind
+/// [`work_authors`] (the gate's `same_seat_evaluator`, the dispatch re-seat) and the evaluator
+/// relation's builders.
+pub(crate) fn authors_work(u: &crate::domain::WorkUnit) -> bool {
+    authors_by_dispatch(u)
+        || (u.tool_cmd.is_none() && is_member_read_step(u) && !u.authored_by.is_empty())
+}
+
+/// The seats that authored `u`: its recorded authors, and — unless it is a member read step,
+/// whose own seat wrote nothing — its current seat.
+fn author_seats(u: &crate::domain::WorkUnit) -> impl Iterator<Item = &String> {
+    u.assigned_cli
+        .iter()
+        .filter(|_| !is_member_read_step(u))
+        .chain(u.authored_by.iter())
+}
+
+/// (DES-TEAMING-002 §8.8, operator decision 2026-10-18) A member's READ step — `owner: team`, a
+/// recon stage, a neutral role, no code — authors nothing a review or test judges: it changes no
+/// tree (the worktree guard holds it to that), and the run's work is the PA's, the PA having
+/// accepted the member's notes. Counting its seat as an author would leave a two-seat roster no
+/// distinct evaluator for the PA's build. A member's Build step, or any step that executes code,
+/// is still an author.
+pub(crate) fn is_member_read_step(u: &crate::domain::WorkUnit) -> bool {
+    u.owner == crate::workflow::StepOwner::Team
+        && u.stage == crate::domain::StageKind::Recon
+        && u.role == crate::workflow::PhaseRole::Neutral
+        && !u.executes_code
+}
+
 /// (crew#972) Every seat that authored the work a unit at `ord` checks: each earlier Build/Recon
 /// agent unit's current seat AND every seat it was ever dispatched on
 /// ([`crate::domain::WorkUnit::authored_by`] — reassigned and failed-over creators included).
 pub(crate) fn work_authors(units: &[crate::domain::WorkUnit], ord: u32) -> Vec<String> {
-    use crate::domain::StageKind;
     let mut out: Vec<String> = Vec::new();
-    for u in units.iter().filter(|u| {
-        u.ord < ord
-            && u.tool_cmd.is_none()
-            && matches!(u.stage, StageKind::Build | StageKind::Recon)
-    }) {
-        for s in u.assigned_cli.iter().chain(u.authored_by.iter()) {
+    for u in units.iter().filter(|u| u.ord < ord && authors_work(u)) {
+        for s in author_seats(u) {
             if !out.contains(s) {
                 out.push(s.clone());
             }
@@ -2552,10 +2586,9 @@ pub(crate) fn work_author_binaries(
 /// Creator-role agent unit whatever its stage (the artifact [`creator_output_for`] selects), and
 /// every earlier unit that recorded an author (a floor fix on a Review/Test unit).
 pub(crate) fn fallback_author_unit(u: &crate::domain::WorkUnit, ord: u32) -> bool {
-    use crate::domain::StageKind;
     u.ord < ord
         && u.tool_cmd.is_none()
-        && (matches!(u.stage, StageKind::Build | StageKind::Recon)
+        && (authors_work(u)
             || u.role == crate::workflow::PhaseRole::Creator
             // (codex r7) …and any unit that recorded an author, whatever its stage or role: a floor
             // fix on a Review/Test unit authored the tree.
@@ -2568,7 +2601,7 @@ pub(crate) fn fallback_author_unit(u: &crate::domain::WorkUnit, ord: u32) -> boo
 pub(crate) fn fallback_work_authors(units: &[crate::domain::WorkUnit], ord: u32) -> Vec<String> {
     let mut out = work_authors(units, ord);
     for u in units.iter().filter(|u| fallback_author_unit(u, ord)) {
-        for s in u.assigned_cli.iter().chain(u.authored_by.iter()) {
+        for s in author_seats(u) {
             if !out.contains(s) {
                 out.push(s.clone());
             }
@@ -4559,5 +4592,66 @@ mod judge_bench_tests {
             "the bench is persisted: {:?}",
             session.benched_seats
         );
+    }
+}
+
+#[cfg(test)]
+mod member_read_step_tests {
+    use crate::domain::{StageKind, WorkUnit};
+    use crate::workflow::{PhaseRole, StepOwner};
+
+    fn unit(ord: u32, stage: StageKind, seat: &str) -> WorkUnit {
+        let mut u = WorkUnit::pending(format!("r:{ord}"), "r", ord, "x");
+        u.stage = stage;
+        u.assigned_cli = Some(seat.to_string());
+        u.authored_by = vec![seat.to_string()];
+        u
+    }
+
+    /// (codex review on #1022) A member's read step authors nothing, on EVERY path that reads
+    /// authors: the dispatch stamp, `work_authors` (the gate's `same_seat_evaluator` and the
+    /// dispatch re-seat) and the fallback judge's set. A member build, a member step that executes
+    /// code, and the PA's own recon still author.
+    #[test]
+    fn a_member_read_step_authors_nothing_on_every_path() {
+        let mut triage = unit(1, StageKind::Recon, "codex");
+        triage.owner = StepOwner::Team;
+        // The dispatch stamp records no author for it (`actor`, `authors_work`).
+        triage.authored_by.clear();
+        let mut fix = unit(2, StageKind::Build, "claude");
+        fix.role = PhaseRole::Creator;
+        let verify = unit(3, StageKind::Test, "codex");
+        assert!(super::is_member_read_step(&triage));
+        assert!(!super::authors_work(&triage));
+        let units = [triage.clone(), fix, verify.clone()];
+        assert_eq!(super::work_authors(&units, 3), vec!["claude".to_string()]);
+        assert!(!super::fallback_work_authors(&units, 3).contains(&"codex".to_string()));
+        let rel = super::evaluator_relation(&units, &verify).expect("a builder precedes it");
+        assert!(
+            !rel.on_builder_seat,
+            "codex authored nothing the test checks"
+        );
+
+        // (codex review round 2) …unless a floor fix on it recorded an author: that seat changed
+        // the tree, so it is an author on every path; the member's own seat still is not.
+        let mut fixed = triage.clone();
+        fixed.authored_by = vec!["pi".to_string()];
+        assert!(super::authors_work(&fixed) && !super::authors_by_dispatch(&fixed));
+        let with_fix = [fixed, units[1].clone(), verify.clone()];
+        assert_eq!(
+            super::work_authors(&with_fix, 3),
+            vec!["pi".to_string(), "claude".to_string()]
+        );
+        assert!(!super::fallback_work_authors(&with_fix, 3).contains(&"codex".to_string()));
+
+        let mut member_build = triage.clone();
+        member_build.stage = StageKind::Build;
+        let mut member_code = triage.clone();
+        member_code.executes_code = true;
+        let mut pa_recon = triage;
+        pa_recon.owner = StepOwner::Pa;
+        for u in [member_build, member_code, pa_recon] {
+            assert!(super::authors_by_dispatch(&u), "{u:?}");
+        }
     }
 }

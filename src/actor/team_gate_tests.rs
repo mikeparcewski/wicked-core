@@ -62,7 +62,8 @@ fn cli(key: &str) -> AgenticCli {
         key: key.into(),
         display_name: key.into(),
         binary: "unused".into(),
-        headless_invocation: "unused {PROMPT}".into(),
+        // Per seat, so a test can tell which seat's template a unit carries.
+        headless_invocation: format!("unused-{key} {{PROMPT}}"),
         category: Category::default(),
         input_mode: InputMode::default(),
         version_probe: vec![],
@@ -1941,6 +1942,17 @@ fn t6_f_a_member_step_runs_on_the_member_and_counts_once_the_pa_accepts() {
         Some("a"),
         "the PA reviews"
     );
+    // (codex review on #1022) …with the PA's own CLI: the wrapped carrier runs a unit's template
+    // before its seat key's, so the member's template must not ride the review.
+    assert_eq!(
+        runs[0].unit.assigned_invocation.as_deref(),
+        Some("unused-b {PROMPT}")
+    );
+    assert_eq!(
+        runs[1].unit.assigned_invocation.as_deref(),
+        Some("unused-a {PROMPT}"),
+        "the review runs the PA's template"
+    );
     assert!(runs[1]
         .prior_outputs
         .iter()
@@ -2013,6 +2025,21 @@ fn t6_g_reject_to_member_reworks_it_on_the_member_with_the_reason() {
         .map(|i| i.unit.assigned_cli.as_deref().unwrap())
         .collect();
     assert_eq!(seats, ["b", "a", "b", "a"], "work, review, rework, review");
+    // (codex review on #1022) Each turn runs its own seat's launch template: the rework restores
+    // the member's, which no other unit of the run carries.
+    let templates: Vec<&str> = runs
+        .iter()
+        .map(|i| i.unit.assigned_invocation.as_deref().unwrap_or("(none)"))
+        .collect();
+    assert_eq!(
+        templates,
+        [
+            "unused-b {PROMPT}",
+            "unused-a {PROMPT}",
+            "unused-b {PROMPT}",
+            "unused-a {PROMPT}"
+        ]
+    );
     let rework = &runs[2];
     assert!(rework
         .unit
@@ -2021,6 +2048,11 @@ fn t6_g_reject_to_member_reworks_it_on_the_member_with_the_reason() {
         .unwrap()
         .contains("the rollback path is missing"));
     let u = unit_view(&e, "t6g1", WRITE);
+    assert_eq!(
+        u.assigned_invocation.as_deref(),
+        Some("unused-b {PROMPT}"),
+        "the counted step is the member's, on its template"
+    );
     let ms = u.member_step.unwrap();
     assert_eq!(ms.rejections, 1);
     assert_eq!(ms.reviews.len(), 2);

@@ -14,6 +14,7 @@
   {
    "catalog": "understand",
    "id": "source-discovery",
+   "owner": "team",
    "gate_type": null,
    "instructions": "With an OpenAPI document: run the skill's openapi action against the conversion service and report every tool it yields with its class (read, write, destructive), its input schema summary and its request mapping, plus the skipped operations and why. Without one: inventory the integration surface (SDK calls, CLI, database, events) into a candidate tool list with the same columns. Do not write code in this phase.",
    "skill_ref": "wicked-garden-mcp-scaffold",

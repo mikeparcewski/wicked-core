@@ -9512,12 +9512,9 @@ fn dispatch_unit(
     // DES-TEAMING-002 §8.8 (T6): a member's step records the member seat it belongs to.
     team_changed |= team_gate::stamp_member_step(&session, &mut unit);
     // (crew#972) AUTHORS. A Build/Recon agent unit records every seat it is dispatched on, so a
-    // reassigned or failed-over creator stays one of the work's authors.
-    let builds = unit.tool_cmd.is_none()
-        && matches!(
-            unit.stage,
-            crate::domain::StageKind::Build | crate::domain::StageKind::Recon
-        );
+    // reassigned or failed-over creator stays one of the work's authors — but not a member's
+    // read step, which authors nothing (`pipeline::authors_by_dispatch`).
+    let builds = crate::pipeline::authors_by_dispatch(&unit);
     if builds {
         if let Some(seat) = unit.assigned_cli.clone() {
             // …and every binary that dispatch may run (the fallback judge never shares one).

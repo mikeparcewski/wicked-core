@@ -434,6 +434,11 @@ pub struct DisputeGate {
 pub struct MemberStepState {
     /// The member seat instance the step runs on (never the PA).
     pub member: String,
+    /// The invocation template the member's work runs (the launch roster's, stamped with the
+    /// member): restored on the unit when the step goes back to the member after the PA's review
+    /// turn carried the PA's template (codex review on core#1022). `None` = resolve by seat key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_invocation: Option<String>,
     /// The member attempt under the PA's review: the unit's NEXT dispatch is the PA's review turn
     /// (on the PA seat, read-only, no gate of its own). `None` = the next dispatch is the work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
