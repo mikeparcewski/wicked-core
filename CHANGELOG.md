@@ -39,6 +39,22 @@ Two release tracks share this file, newest entry first regardless of track:
   member's turns are cancelled when it is closed or its run ends (`MonitorHost::close_run`). The labelled host
   floor (`WICKED_SEAT_FLOOR=host`) hosts no members and says so on `member.joined`.
 
+- **A credential the platform put into a seat never leaves with the work (core#1024 follow-up).** Since core#1024
+  the claude seat holds the operator's `claude setup-token` token in its environment, so a unit's own code could
+  write it into the worktree. The new seat-secret guard (`src/seat_secret_guard.rs`) searches everything the work
+  adds (file contents, file and directory names, and commit messages, including a commit a later one "removed" it
+  from) for every credential the seat launcher injected (registered at injection in `container_floor::arm`), and
+  at delivery also for the token the broker holds now. It runs in two places:
+  - **each unit's settled diff** (objects new since the unit's dispatch baseline): a match fails the unit with
+    `SEAT-CREDENTIAL — unit N left a credential the platform put into its seat in the work: <where> holds <kind>`;
+  - **the delivery** (`deliver_lift::lift_and_reverify`, before the deliver command runs; objects new since the
+    run's base and not already on any remote-tracking ref): a match refuses it with `deliver: SEAT-CREDENTIAL — …
+    Nothing was pushed`. A scan that cannot complete refuses or fails too.
+  The search is an exact in-process substring match over the raw value and its base64 forms (every alignment,
+  both alphabets). Refusals name the file (or which commit's message) and the credential's kind; the value never
+  reaches an argv, an error, a log line, an event or a test (tests build their fake token at runtime). Nothing is
+  scanned when no seat was handed a credential.
+
 - **The seat credential broker no longer impersonates any vendor's client (core#1024).** core#1012 made the
   broker's own OAuth refresher send the pinned CLIs' User-Agents (and pi's Copilot exchange sent VS Code Copilot
   Chat's identity headers) to get past the providers' refusal of `curl`. That is gone; the broker makes no token

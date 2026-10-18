@@ -2967,6 +2967,47 @@ fn run_unit_and_judge_on(
             }
         }
     }
+    // (core#1024 follow-up) SEAT-SECRET GUARD — the unit's settled diff (everything it added since
+    // its dispatch baseline: content, names, commit messages) must not carry a credential the
+    // platform put into a seat. A match, or a scan that could not complete, FAILS the unit with a
+    // reason naming the place and the credential's kind, never its value. Nothing to look for (no
+    // seat was handed one by this process) = no scan.
+    let mut output = output;
+    if let (Some(wd), Some(baseline)) = (
+        input.workdir.as_deref(),
+        input.unit.worktree_baseline.as_ref(),
+    ) {
+        let refusal = match crate::seat_secret_guard::unit_leak(wd, baseline) {
+            Ok(None) => None,
+            Ok(Some(leak)) => {
+                eprintln!(
+                    "wicked-core: unit {} failed — {} (the value is not logged)",
+                    input.unit.ord,
+                    leak.describe()
+                );
+                Some(crate::seat_secret_guard::unit_refusal(
+                    input.unit.ord,
+                    &leak,
+                ))
+            }
+            Err(why) => Some(format!(
+                "{} — unit {} could not be checked for a credential the platform put into its seat \
+                 ({why}); the unit failed so unchecked work is not carried on. Retry it.",
+                crate::seat_secret_guard::SEAT_CREDENTIAL_MARKER,
+                input.unit.ord
+            )),
+        };
+        if let Some(text) = refusal {
+            if output.status == StepStatus::Ok {
+                output.status = StepStatus::Failed;
+            }
+            output.output = if output.output.is_empty() {
+                text
+            } else {
+                format!("{text}\n\n{}", output.output)
+            };
+        }
+    }
     // A unit that did not fold Ok fails on its own account and never reaches the gate this
     // evidence feeds — the outcome was taken (and any mutation undone) above; hand the fold
     // exactly what it used to see.
@@ -4404,6 +4445,119 @@ mod tests {
             "the evaluator's leftover file is gone"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#1024 follow-up) SEAT-SECRET GUARD at the unit's settled diff: a creator that writes the
+    /// token its seat was handed into the worktree FAILS, with a reason naming the file and the
+    /// credential's kind and never the value; the same work with nothing injected passes untouched.
+    #[test]
+    fn a_unit_that_writes_its_seats_token_into_the_work_fails_without_the_value() {
+        use crate::workflow::{StepOutput, StepRunner};
+        // Built at runtime: no bearer-looking literal in the source (core#1024's GitGuardian fix).
+        let token: String = format!(
+            "{}-{}-{}-{}",
+            "sk",
+            "ant",
+            "oat01",
+            (0..96)
+                .map(|i| (b'a' + (i * 5 % 26) as u8) as char)
+                .collect::<String>()
+        );
+        struct Leaker(String);
+        impl StepRunner for Leaker {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let wd = input.workdir.as_deref().unwrap();
+                std::fs::write(wd.join("debug.env"), format!("TOKEN={}\n", self.0)).unwrap();
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "done".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        fn sh(cwd: &std::path::Path, args: &[&str]) {
+            // spawn-audit: test-only — a git fixture building the layout under test; reads no engine state.
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+        let run = |tag: &str| {
+            let base = std::env::temp_dir().join(format!(
+                "wicked-core-seat-secret-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            let repo = base.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            sh(&repo, &["init", "-q", "."]);
+            sh(&repo, &["config", "user.email", "t@example.invalid"]);
+            sh(&repo, &["config", "user.name", "t"]);
+            sh(&repo, &["config", "commit.gpgsign", "false"]);
+            std::fs::write(repo.join("README.md"), "base\n").unwrap();
+            sh(&repo, &["add", "-A"]);
+            sh(&repo, &["commit", "-qm", "base"]);
+            let wt = base.join("wt");
+            let branch = format!("wicked/seat-secret-{tag}");
+            sh(
+                &repo,
+                &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", &branch],
+            );
+            let mut unit = crate::domain::WorkUnit::pending("r:build", "r", 4, "build");
+            unit.worktree_baseline = Some(crate::worktree_guard::snapshot(&wt, &repo).unwrap());
+            let input = StepInput {
+                run_id: "r".into(),
+                unit_ix: 3,
+                attempt: 0,
+                unit,
+                workflow_id: "wf-r".into(),
+                entity_mode: EntityMode::Isolated,
+                workdir: Some(wt.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            };
+            let noop: &DeltaSink = &|_: &str| {};
+            let runner: Arc<dyn StepRunner> = Arc::new(Leaker(token.clone()));
+            let (output, _, _) =
+                run_unit_and_judge_with_roster(&runner, &input, None, noop, &[], &[], &[]);
+            let _ = std::fs::remove_dir_all(&base);
+            output
+        };
+        // Nothing was injected by this (test-thread) process: no scan, the unit passes.
+        let clean = run("none");
+        assert_eq!(clean.status, StepStatus::Ok, "{}", clean.output);
+        assert_eq!(clean.output, "done");
+        // The launcher handed the seat this token: the unit fails, naming file and kind.
+        crate::seat_secret_guard::register(
+            crate::seat_secret_guard::SecretKind::ClaudeSetupToken,
+            &token,
+        );
+        let out = run("leak");
+        assert_eq!(out.status, StepStatus::Failed);
+        assert!(
+            out.output.starts_with("SEAT-CREDENTIAL — unit 4 "),
+            "{}",
+            out.output
+        );
+        assert!(out.output.contains("`debug.env`"), "{}", out.output);
+        assert!(out.output.contains("claude setup-token"), "{}", out.output);
+        assert!(
+            !out.output.contains(&token),
+            "the value must never be shown"
+        );
+        assert!(!out.output.contains(&token[14..60]));
     }
 
     /// C1 (self-grading in the real path): the agent judge must NOT be dispatched under the seat that

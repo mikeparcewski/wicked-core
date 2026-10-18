@@ -121,6 +121,14 @@ thread_local! {
     static GOV_DB_PATH: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
+/// The seat gateway dir of the store this actor thread serves (`<state home>/gateway`, the same
+/// spelling the wrapped runner hands `container_floor::arm`), or `None` off the actor thread / for a
+/// store with no file-backed state home. The deliver lift's seat-secret guard reads it.
+pub(crate) fn armed_gateway_dir() -> Option<std::path::PathBuf> {
+    let path = GOV_DB_PATH.with(|c| c.borrow().clone())?;
+    crate::state_home::operational_home_of_db(&path).map(|h| h.join("gateway"))
+}
+
 thread_local! {
     /// Warn ONCE per actor thread that input governance is off for a non-file store (avoids per-unit spam).
     static GOV_OFF_WARNED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(false) };

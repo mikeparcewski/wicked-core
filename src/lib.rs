@@ -114,6 +114,7 @@ mod seat_credentials;
 mod seat_gateway;
 mod seat_login;
 mod seat_refresh;
+mod seat_secret_guard;
 mod session_runner;
 mod skills_snapshot;
 mod sources;
