@@ -203,7 +203,8 @@ pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
 pub use domain::{
     all_sessions, get_session, get_unit_transcript, get_unit_transcript_at, get_work_output,
     put_node, put_nodes, session_units, AgentSession, BenchedSeat, HumanConfirm, RoutingInfo,
-    SessionStatus, SessionView, StageKind, UnitDenial, UnitStatus, UnitTranscript, WorkUnit,
+    SeatFailureMark, SessionStatus, SessionView, StageKind, UnitDenial, UnitStatus, UnitTranscript,
+    WorkUnit,
 };
 pub use domain_extraction::{
     coverage_eq_one_validator, provision_and_approve_coverage_validator, COVERAGE_CRITERION,

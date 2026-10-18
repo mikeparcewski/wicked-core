@@ -1604,6 +1604,7 @@ pub(crate) fn run(
                         // The launch bench (`distribute::launch_benched`): seats that cannot keep a
                         // per-call check on the host floor (C5), and codex on a worktree-bound run
                         // (F-EDIT-5 / F-LEARN-3).
+                        seat_failures: Vec::new(),
                         benched_seats: crate::distribute::launch_benched(
                             &spec.clis,
                             repo_ref.is_some(),
@@ -6165,6 +6166,52 @@ fn apply_step_result(
                     reason.verb(),
                     reason.as_str()
                 ),
+            }
+        } else if let Some(signature) = (unit.tool_cmd.is_none()
+            && output.status == crate::workflow::StepStatus::Failed
+            && crate::execute_wrapped::wrapped_exit_code(&output.output).is_some_and(|c| c != 0))
+        .then(|| crate::domain::failure_signature(&output.output))
+        .flatten()
+        {
+            // (core#1010) An UNCLASSIFIED worker crash (non-zero exit, no auth / quota / spawn
+            // signature) is counted per seat and error signature. The same error again, on a seat
+            // with no success in the run, benches it: a deterministic startup failure (opencode's
+            // "no compatible V2 health response", 3 of 3 units in run cdf4462a) otherwise kept the
+            // seat on the plan for every later phase.
+            let cli = unit
+                .assigned_cli
+                .clone()
+                .unwrap_or_else(|| "claude".to_string());
+            let count =
+                crate::domain::note_seat_failure(&mut session.seat_failures, &cli, &signature);
+            let why = format!("repeated_failure ({count}x: {signature})");
+            let benched = count >= crate::domain::REPEATED_FAILURE_BENCH
+                && !seats_with_a_done_unit.contains(&cli)
+                && crate::domain::bench_seat(
+                    &mut session.benched_seats,
+                    crate::domain::BenchedSeat {
+                        cli: cli.clone(),
+                        reason: why.clone(),
+                        source: "worker".to_string(),
+                        governed_only: false,
+                    },
+                );
+            put_node(store, session.to_node())?;
+            if benched {
+                eprintln!(
+                    "wicked-core: seat '{cli}' failed unit {ord} of {run_id} with the same error \
+                     {count} times ({signature}); benched for the run (core#1010)"
+                );
+                emit(
+                    subscribers,
+                    CoreEvent::SeatBenched {
+                        session: run_id.clone(),
+                        ord,
+                        cli: cli.clone(),
+                        reason: why,
+                        source: "worker".to_string(),
+                    },
+                );
             }
         }
         // Escalation requires a human in the loop. Autonomous sessions
@@ -14363,6 +14410,7 @@ mod sessions_detail_fold_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -14461,6 +14509,7 @@ mod gate_pause_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -14783,6 +14832,7 @@ mod terminal_gate_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -14933,6 +14983,7 @@ retry the deliver phase";
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -15639,6 +15690,7 @@ mod substance_gate_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -17101,6 +17153,7 @@ mod request_changes_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -17181,6 +17234,7 @@ mod request_changes_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -18417,6 +18471,7 @@ mod request_changes_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -18562,6 +18617,7 @@ mod request_changes_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -19651,6 +19707,7 @@ mod code_evidence_floor_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -20137,6 +20194,7 @@ mod deliverable_floor_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -20663,6 +20721,7 @@ mod seat_failover_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -20892,6 +20951,102 @@ mod seat_failover_tests {
         let session = crate::domain::get_session(store, run_id).unwrap().unwrap();
         let units = crate::domain::session_units(store, run_id).unwrap();
         (applied, session, units)
+    }
+
+    /// (core#1010) The same unclassified worker crash twice benches the seat for the run (run
+    /// cdf4462a: opencode exited 1 on "no compatible V2 health response" for scope, the scope
+    /// retry and triage, and plan rev 2 still seated it everywhere). The signature ignores the
+    /// port; a different error, or a seat with a successful unit, is never benched this way.
+    /// Red on 0.14.0: nothing counted such failures and the seat stayed on the roster.
+    #[test]
+    fn the_same_worker_crash_twice_benches_the_seat_for_the_run() {
+        let crash = |port: u32| {
+            format!(
+                "(cli `opencode` exited 1) WARNING: Image mount is an experimental feature\n\
+                 wicked-seat-launch: floor canary passed\n\
+                 Error: Server at http://127.0.0.1:{port} did not provide a compatible V2 health \
+                 response\n    at ~effect/Utils/internal (/$bunfs/root/chunk-ta1z2sb4.js:8:1710)\n"
+            )
+        };
+        let reseat = |store: &mut dyn GraphStore, run_id: &str| {
+            let mut u = crate::domain::session_units(store, run_id)
+                .unwrap()
+                .remove(0);
+            u.assigned_cli = Some("opencode".into());
+            u.status = UnitStatus::Distributed;
+            put_node(store, u.to_node()).unwrap();
+        };
+        for (case, done_elsewhere, second) in [
+            ("same error twice", false, crash(50111)),
+            (
+                "a different error",
+                false,
+                "(cli `opencode` exited 1) Error: model not found".into(),
+            ),
+            ("a seat with a success", true, crash(50111)),
+        ] {
+            let run_id = format!(
+                "repeated-crash-{}-{}",
+                case.replace(' ', "-"),
+                std::process::id()
+            );
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_session(
+                &mut store,
+                &run_id,
+                &["opencode", "codex", "claude"],
+                SessionStatus::Executing,
+                0,
+            );
+            seed_unit(
+                &mut store,
+                &run_id,
+                1,
+                "scope",
+                "opencode",
+                PhaseRole::Creator,
+                &[],
+                UnitStatus::Distributed,
+            );
+            if done_elsewhere {
+                seed_unit(
+                    &mut store,
+                    &run_id,
+                    2,
+                    "earlier",
+                    "opencode",
+                    PhaseRole::Creator,
+                    &[],
+                    UnitStatus::Done,
+                );
+            }
+            let (_, session, _) = fold_failed(&mut store, &run_id, &crash(49241));
+            assert!(
+                session.benched_seats.is_empty(),
+                "{case}: one crash is not a pattern: {:?}",
+                session.benched_seats
+            );
+            assert_eq!(
+                session.seat_failures.len(),
+                1,
+                "{case}: the crash is counted"
+            );
+            assert_eq!(session.seat_failures[0].count, 1);
+            reseat(&mut store, &run_id);
+            let (_, session, _) = fold_failed(&mut store, &run_id, &second);
+            let bench = session.benched_seats.iter().find(|b| b.cli == "opencode");
+            if case == "same error twice" {
+                let bench = bench.unwrap_or_else(|| panic!("{case}: benched"));
+                assert_eq!(bench.source, "worker");
+                assert_eq!(
+                    bench.reason,
+                    "repeated_failure (2x: Error: Server at http://#.#.#.#:# did not provide a \
+                     compatible V# health response)"
+                );
+            } else {
+                assert!(bench.is_none(), "{case}: {:?}", session.benched_seats);
+            }
+        }
     }
 
     /// (core#769) A seat that "completes" a unit with every command refused by a host-forced
@@ -21602,6 +21757,7 @@ mod def_gate_disclosure_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -21713,6 +21869,7 @@ mod def_gate_disclosure_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -21813,6 +21970,7 @@ mod def_gate_disclosure_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: bench,
             team: None,
             team_plan: None,
@@ -22169,6 +22327,7 @@ mod terminal_worktree_reap_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -22673,6 +22832,7 @@ mod terminal_worktree_reap_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -22849,6 +23009,7 @@ mod worker_code_graph_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -23177,6 +23338,7 @@ mod project_graph_binding_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -23929,6 +24091,7 @@ mod phase_boundary_governance_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -24395,6 +24558,7 @@ mod turn_timeout_vs_cancel_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -25179,6 +25343,7 @@ mod turn_timeout_vs_cancel_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -25243,6 +25408,7 @@ mod turn_timeout_vs_cancel_tests {
             run_branch: Some("wicked/s-fresh".into()),
             base_commit: None,
             finished_at: Some(now - 60_000),
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -25325,6 +25491,7 @@ mod turn_timeout_vs_cancel_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -26222,6 +26389,7 @@ mod dead_seat_park_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -26356,6 +26524,7 @@ mod plan_gate_confirm_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             // The gate was minted from the run's one gate counter (P1's `RunTeamState`).
             team: Some(crate::domain::RunTeamState {
@@ -26609,6 +26778,7 @@ mod catalog_alias_governance_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -26733,6 +26903,7 @@ mod consent_plan_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
@@ -27005,6 +27176,7 @@ mod work_author_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: benched
                 .iter()
                 .map(|c| BenchedSeat {
@@ -27226,6 +27398,7 @@ mod council_ballot_tests {
             run_branch: None,
             base_commit: None,
             finished_at: None,
+            seat_failures: Vec::new(),
             benched_seats: Vec::new(),
             team: None,
             team_plan: None,
