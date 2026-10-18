@@ -1967,6 +1967,7 @@ impl MemberView {
         std::fs::create_dir_all(&root)
             .map_err(|e| format!("could not create {}: {e}", root.display()))?;
         let dir = root.join(run_id);
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
