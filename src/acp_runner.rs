@@ -1831,6 +1831,11 @@ impl crate::team::MonitorHost for RunnerHost {
     fn one_shot(&self) -> bool {
         true
     }
+    /// A turn handed a view gets that tree as a read-only directory in its seat container
+    /// ([`MemberView`]).
+    fn repo_view(&self) -> bool {
+        true
+    }
     /// A member needs the container floor and a seat whose CLI takes its prompt on argv (the
     /// carrier hands it there, as it does a judge's and a ballot's).
     fn admitted(&self, seat: &str) -> Result<(), String> {
@@ -1857,9 +1862,32 @@ impl crate::team::MonitorHost for RunnerHost {
         book.runs.insert(pool_key.to_string(), scope.run_id.clone());
         Ok(())
     }
-    fn turn(&self, pool_key: &str, prompt: &str, budget: Duration) -> Result<String, String> {
+    fn turn(
+        &self,
+        pool_key: &str,
+        prompt: &str,
+        budget: Duration,
+        view: Option<&crate::team::RepoView>,
+    ) -> Result<String, String> {
         let runner = self.runner()?;
         let run_id = member_run_id(pool_key);
+        // The view first, outside the book's lock (a large tree takes a while to write): a close
+        // racing it is caught by the registration below. Its time comes out of the turn's budget.
+        let started = std::time::Instant::now();
+        let prepared = view.map(|v| (v, MemberView::prepare(v, &run_id)));
+        let prompt = match &prepared {
+            None => prompt.to_string(),
+            Some((v, Ok(mv))) => format!("{prompt}{}", v.note(&mv.dir)),
+            Some((_, Err(why))) => {
+                eprintln!("wicked-core: team: member turn {run_id} has no repository view: {why}");
+                format!("{prompt}{}", crate::team::RepoView::unavailable_note(why))
+            }
+        };
+        let view_dir = prepared
+            .as_ref()
+            .and_then(|(_, p)| p.as_ref().ok())
+            .map(|mv| mv.dir.clone());
+        let budget = budget.saturating_sub(started.elapsed());
         let seat = {
             let mut book = self.book();
             if book.is_closed(pool_key, None) {
@@ -1876,7 +1904,9 @@ impl crate::team::MonitorHost for RunnerHost {
                 .push(run_id.clone());
             seat
         };
-        let out = member_turn(runner, &seat, &run_id, prompt, budget);
+        let out = member_turn(runner, &seat, &run_id, &prompt, budget, view_dir.as_deref());
+        // The view goes with the turn (`MemberView`'s drop), after its seat has stopped.
+        drop(prepared);
         let mut book = self.book();
         if let Some(live) = book.in_flight.get_mut(pool_key) {
             live.retain(|r| r != &run_id);
@@ -1911,6 +1941,55 @@ impl crate::team::MonitorHost for RunnerHost {
             book.take(|k| keys.contains(k))
         };
         self.cancel(live);
+    }
+}
+
+/// (DES-TEAMING-002 §8.8) One member turn's READ-ONLY view of the repository: the turn's
+/// [`crate::team::RepoView`] tree written into a private directory of its own
+/// (`<temp>/wicked-core-member-view/<member run id>`, `0700`, files `0444`), never the live
+/// worktree, which the worker may still be writing. The wrapped runner mounts it read-only into
+/// the member's seat container at that same path (`container_floor::add_read_view`) and nothing
+/// else of the host; the prompt names the path. Removed when the turn ends (drop).
+pub(crate) struct MemberView {
+    pub(crate) dir: std::path::PathBuf,
+}
+
+impl MemberView {
+    /// The root every member view lives under.
+    fn root() -> std::path::PathBuf {
+        std::env::temp_dir().join("wicked-core-member-view")
+    }
+
+    /// Write `view`'s tree for the member turn `run_id` (a fresh id per turn). `Err` names why
+    /// there is no view; nothing is left behind.
+    pub(crate) fn prepare(view: &crate::team::RepoView, run_id: &str) -> Result<Self, String> {
+        let root = Self::root();
+        std::fs::create_dir_all(&root)
+            .map_err(|e| format!("could not create {}: {e}", root.display()))?;
+        let dir = root.join(run_id);
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(&dir)
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+        // Owned from here: any failure below removes it.
+        let mut mv = MemberView { dir };
+        mv.dir = mv
+            .dir
+            .canonicalize()
+            .map_err(|e| format!("could not resolve {}: {e}", mv.dir.display()))?;
+        view.repo
+            .materialize(&view.tree, &mv.dir, crate::team::REPO_VIEW_MAX_BYTES)
+            .map_err(|e| format!("could not write tree {}: {e:#}", view.tree))?;
+        Ok(mv)
+    }
+}
+
+impl Drop for MemberView {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -1955,15 +2034,18 @@ fn member_run_id(pool_key: &str) -> String {
 /// the engine's OWN one-shot sessions (`execute_wrapped::is_team_member_turn`) through the run's
 /// step runner, so it takes the same arming as a worker, a judge and a council ballot — the
 /// seat's container, its brokered sign-in, the gateway as the only egress. It is UNGOVERNED and
-/// READ-ONLY by construction: no repository is mounted (`workdir: None`), no gate hook, no MCP
-/// channel; the diff it reviews is in its prompt. `Err` is a failed turn (the supervisor reopens
-/// the member on its next batch); a turn past `budget` cancels the seat's container.
+/// READ-ONLY by construction: no worktree is mounted (`workdir: None`), no gate hook, no MCP
+/// channel; the diff it reviews is in its prompt, and `view` (a [`MemberView`] directory) is the
+/// repository at that state, mounted read-only (`WorkUnit::read_view`). `Err` is a failed turn
+/// (the supervisor reopens the member on its next batch); a turn past `budget` cancels the
+/// seat's container.
 pub(crate) fn member_turn(
     runner: Arc<dyn StepRunner>,
     seat: &str,
     run_id: &str,
     prompt: &str,
     budget: Duration,
+    view: Option<&std::path::Path>,
 ) -> Result<String, String> {
     use crate::workflow::StepStatus;
     let invocation = member_invocation(seat)?;
@@ -1976,6 +2058,7 @@ pub(crate) fn member_turn(
     );
     unit.assigned_cli = Some(seat.to_string());
     unit.assigned_invocation = Some(invocation);
+    unit.read_view = view.map(std::path::Path::to_path_buf);
     let input = StepInput {
         run_id: run_id.clone(),
         unit_ix: 0,
@@ -3249,6 +3332,7 @@ mod tests {
             qe_reviewer_seats: Vec::new(),
             qe_review_session: None,
             qe_review: None,
+            read_view: None,
         }
     }
 
@@ -4307,6 +4391,8 @@ acp_input_governance = true
     /// A runner that records the member turn it was handed and answers as told.
     struct MemberRunner {
         seen: Mutex<Vec<StepInput>>,
+        /// What the turn read at `src/lib.rs` in its repository view, while it ran.
+        viewed: Mutex<Vec<Option<String>>>,
         cancelled: Mutex<Vec<String>>,
         answer: StepOutput,
         delay: Duration,
@@ -4315,6 +4401,13 @@ acp_input_governance = true
     impl StepRunner for MemberRunner {
         fn run_unit(&self, input: &StepInput) -> StepOutput {
             self.seen.lock().unwrap().push(input.clone());
+            self.viewed.lock().unwrap().push(
+                input
+                    .unit
+                    .read_view
+                    .as_ref()
+                    .and_then(|v| std::fs::read_to_string(v.join("src/lib.rs")).ok()),
+            );
             std::thread::sleep(self.delay);
             StepOutput {
                 run_id: input.run_id.clone(),
@@ -4333,6 +4426,7 @@ acp_input_governance = true
     ) -> Arc<MemberRunner> {
         Arc::new(MemberRunner {
             seen: Mutex::new(Vec::new()),
+            viewed: Mutex::new(Vec::new()),
             cancelled: Mutex::new(Vec::new()),
             answer: StepOutput {
                 run_id: String::new(),
@@ -4391,6 +4485,7 @@ acp_input_governance = true
             &member_run_id("team:r:2:0:m1"),
             "review this",
             Duration::from_secs(5),
+            None,
         )
         .expect("the member answered");
         assert_eq!(a, "FINDING {}\nDONE");
@@ -4400,6 +4495,7 @@ acp_input_governance = true
             &member_run_id("team:r:2:0:m1"),
             "and this",
             Duration::from_secs(5),
+            None,
         )
         .unwrap();
         let seen = runner.seen.lock().unwrap();
@@ -4417,7 +4513,8 @@ acp_input_governance = true
             i.unit.description, "review this",
             "the prompt goes through byte-exact"
         );
-        assert!(i.workdir.is_none(), "no repository is mounted");
+        assert!(i.workdir.is_none(), "no worktree is mounted");
+        assert!(i.unit.read_view.is_none(), "no view was handed");
         assert!(i.governance.is_none(), "a member turn is ungoverned");
         assert!(i.run_id.starts_with("member-"), "{}", i.run_id);
         assert_ne!(
@@ -4444,6 +4541,7 @@ acp_input_governance = true
             "member-slow",
             "p",
             Duration::from_millis(50),
+            None,
         )
         .unwrap_err();
         assert!(e.contains("exceeded"), "{e}");
@@ -4458,14 +4556,14 @@ acp_input_governance = true
             "Error: You have exceeded your monthly quota",
             Duration::ZERO,
         );
-        let e = member_turn(refused, "claude", "k", "p", Duration::from_secs(5)).unwrap_err();
+        let e = member_turn(refused, "claude", "k", "p", Duration::from_secs(5), None).unwrap_err();
         assert!(e.contains("refused"), "{e}");
         let failed = member_runner(
             crate::workflow::StepStatus::Failed,
             "floor not armed",
             Duration::ZERO,
         );
-        let e = member_turn(failed, "claude", "k", "p", Duration::from_secs(5)).unwrap_err();
+        let e = member_turn(failed, "claude", "k", "p", Duration::from_secs(5), None).unwrap_err();
         assert!(e.contains("floor not armed"), "{e}");
         let e = member_turn(
             member_runner(crate::workflow::StepStatus::Ok, "x", Duration::ZERO),
@@ -4473,6 +4571,7 @@ acp_input_governance = true
             "k",
             "p",
             Duration::from_secs(5),
+            None,
         )
         .unwrap_err();
         assert!(e.contains("not in the CLI registry"), "{e}");
@@ -4507,7 +4606,7 @@ acp_input_governance = true
             .expect("a registry seat is admitted");
         assert!(host.admitted("no-such-seat-xyz").is_err());
         let e = host
-            .turn("never-opened", "p", Duration::from_secs(1))
+            .turn("never-opened", "p", Duration::from_secs(1), None)
             .unwrap_err();
         assert!(e.contains("not open"), "{e}");
         host.open("k", "claude", &scope).expect("opens");
@@ -4570,7 +4669,7 @@ acp_input_governance = true
             .iter()
             .map(|(k, _)| {
                 let (h, k) = (host.clone(), k.to_string());
-                std::thread::spawn(move || h.turn(&k, "p", Duration::from_secs(5)))
+                std::thread::spawn(move || h.turn(&k, "p", Duration::from_secs(5), None))
             })
             .collect();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -4624,7 +4723,7 @@ acp_input_governance = true
         };
         host.open("k", "claude", &scope).expect("opens");
         let turning = host.clone();
-        let t = std::thread::spawn(move || turning.turn("k", "p", Duration::from_secs(5)));
+        let t = std::thread::spawn(move || turning.turn("k", "p", Duration::from_secs(5), None));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while slow.seen.lock().unwrap().is_empty() {
             assert!(std::time::Instant::now() < deadline, "the turn started");
@@ -4640,14 +4739,102 @@ acp_input_governance = true
         let _ = t.join();
         assert!(host.book().in_flight.is_empty());
         // A closed member starts nothing more, whatever races the close.
-        assert!(host.turn("k", "p", Duration::from_secs(5)).is_err());
+        assert!(host.turn("k", "p", Duration::from_secs(5), None).is_err());
         assert!(host.open("k", "claude", &scope).is_err());
         // A finished turn leaves nothing to cancel.
         host.open("k2", "claude", &scope).unwrap();
-        host.turn("k2", "p", Duration::from_secs(5)).unwrap();
+        host.turn("k2", "p", Duration::from_secs(5), None).unwrap();
         host.close("k2");
         assert_eq!(slow.cancelled.lock().unwrap().len(), 1);
         assert_eq!(slow.seen.lock().unwrap().len(), 2);
+    }
+
+    /// (DES-TEAMING-002 §8.8) A turn handed a [`crate::team::RepoView`] runs with that tree
+    /// written into a private directory of its own (`WorkUnit::read_view`, which the wrapped
+    /// runner mounts read-only), the prompt names the directory, and the directory is gone once
+    /// the turn ends. A view that cannot be written runs the turn without one, and the prompt
+    /// says so.
+    #[test]
+    fn a_member_turn_with_a_view_reads_the_tree_from_its_own_directory() {
+        use crate::team::MonitorHost;
+        let _g = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _floor = EnvSet::new(crate::container_floor::SEAT_FLOOR_ENV, Some("container"));
+        let wt = std::env::temp_dir().join(format!("wicked-member-view-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&wt);
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        crate::worktree_guard::git(&wt, &["init", "-q"], &[]).unwrap();
+        std::fs::write(wt.join("src/lib.rs"), "fn at_checkpoint() {}\n").unwrap();
+        let repo = crate::team::Repo {
+            workdir: wt.clone(),
+            git_dir: wt.join(".git"),
+        };
+        let view = crate::team::RepoView {
+            tree: repo.snapshot().unwrap(),
+            repo,
+        };
+        std::fs::write(wt.join("src/lib.rs"), "fn after() {}\n").unwrap();
+        let runner = member_runner(crate::workflow::StepStatus::Ok, "DONE", Duration::ZERO);
+        let dyn_runner: Arc<dyn StepRunner> = runner.clone();
+        let host = RunnerHost::new(Arc::downgrade(&dyn_runner));
+        assert!(host.repo_view());
+        let scope = crate::team::MonitorScope {
+            run_id: "r1".into(),
+            cwd: std::env::temp_dir(),
+            code_graph_db: None,
+            read_roots: Vec::new(),
+        };
+        host.open("k", "claude", &scope).unwrap();
+        host.turn("k", "review", Duration::from_secs(5), Some(&view))
+            .unwrap();
+        let dir = {
+            let seen = runner.seen.lock().unwrap();
+            let unit = &seen[0].unit;
+            let dir = unit.read_view.clone().expect("the turn carries its view");
+            assert!(
+                dir.starts_with(MemberView::root().canonicalize().unwrap()),
+                "{}",
+                dir.display()
+            );
+            assert!(dir.ends_with(&seen[0].run_id), "one directory per turn");
+            assert!(
+                unit.description.starts_with("review"),
+                "{}",
+                unit.description
+            );
+            assert!(
+                unit.description
+                    .contains(crate::team::RepoView::NOTE_HEADER)
+                    && unit.description.contains(&dir.display().to_string())
+                    && unit.description.contains(&view.tree),
+                "{}",
+                unit.description
+            );
+            dir
+        };
+        assert_eq!(
+            runner.viewed.lock().unwrap()[0].as_deref(),
+            Some("fn at_checkpoint() {}\n"),
+            "the checkpoint tree, not the live worktree"
+        );
+        assert!(!dir.exists(), "the view goes with the turn");
+        // A tree that does not exist: no view, and the prompt says it could not be prepared.
+        let bad = crate::team::RepoView {
+            tree: "0".repeat(40),
+            ..view.clone()
+        };
+        host.turn("k", "again", Duration::from_secs(5), Some(&bad))
+            .unwrap();
+        let seen = runner.seen.lock().unwrap();
+        assert!(seen[1].unit.read_view.is_none());
+        assert!(
+            seen[1].unit.description.contains("could not be prepared"),
+            "{}",
+            seen[1].unit.description
+        );
+        drop(seen);
+        let _ = std::fs::remove_dir_all(&wt);
     }
 }
 

@@ -894,7 +894,7 @@ mod tests {
             ]
             .map(String::from)
             .to_vec();
-            let armed = arm(&inputs, &argv, "run-988", ord, &[], None, Some(&dir))
+            let armed = arm(&inputs, &argv, "run-988", ord, &[], None, None, Some(&dir))
                 .expect("a signed-in claude seat arms");
             let full: Vec<String> = armed.wrapper.iter().chain(&armed.argv).cloned().collect();
             let mut cmd = crate::execute_wrapped::build_worker_command(&full, None);

@@ -90,6 +90,10 @@ pub(crate) struct FakeHost {
     pub unadmitted: Mutex<Vec<String>>,
     /// Plays the container floor's one-shot host ([`MonitorHost::one_shot`]).
     pub one_shot: std::sync::atomic::AtomicBool,
+    /// Plays a host that gives each turn a read-only repository view ([`MonitorHost::repo_view`]).
+    pub repo_view: std::sync::atomic::AtomicBool,
+    /// The tree of the view each turn was handed (`None`: no view), beside its pool key.
+    pub views: Mutex<Vec<(String, Option<String>)>>,
     /// Every key `close` was called with, in order.
     pub closed: Mutex<Vec<String>>,
     /// Every run `close_run` was called with.
@@ -107,6 +111,8 @@ impl FakeHost {
             reply: Mutex::new(Box::new(reply)),
             unadmitted: Mutex::default(),
             one_shot: std::sync::atomic::AtomicBool::new(false),
+            repo_view: std::sync::atomic::AtomicBool::new(false),
+            views: Mutex::default(),
             closed: Mutex::default(),
             closed_runs: Mutex::default(),
         }
@@ -138,6 +144,9 @@ impl MonitorHost for FakeHost {
     fn one_shot(&self) -> bool {
         self.one_shot.load(std::sync::atomic::Ordering::SeqCst)
     }
+    fn repo_view(&self) -> bool {
+        self.repo_view.load(std::sync::atomic::Ordering::SeqCst)
+    }
     fn admitted(&self, seat: &str) -> Result<(), String> {
         if self.unadmitted.lock().unwrap().iter().any(|s| s == seat) {
             Err(format!("seat '{seat}' is not admitted to input governance"))
@@ -153,7 +162,17 @@ impl MonitorHost for FakeHost {
         self.open_keys.lock().unwrap().insert(pool_key.to_string());
         Ok(())
     }
-    fn turn(&self, pool_key: &str, prompt: &str, _budget: Duration) -> Result<String, String> {
+    fn turn(
+        &self,
+        pool_key: &str,
+        prompt: &str,
+        _budget: Duration,
+        view: Option<&super::RepoView>,
+    ) -> Result<String, String> {
+        self.views
+            .lock()
+            .unwrap()
+            .push((pool_key.to_string(), view.map(|v| v.tree.clone())));
         self.turns
             .lock()
             .unwrap()
@@ -621,6 +640,119 @@ fn a_one_shot_member_gets_the_header_every_batch_and_the_earlier_files() {
         );
         assert_eq!(h.rows(tev::MEMBER_JOINED)[0]["status"], "attached");
     }
+}
+
+/// (DES-TEAMING-002 §8.8) A member whose host gives it a read-only view of the repository is
+/// handed, on every batch, exactly the tree that batch's diff ends at (never the live worktree),
+/// is told in its header that the repository is readable and read-only, and its `member.joined`
+/// says so (`repo_view: "read_only"`). A host with no view keeps the sealed wording and the row
+/// carries no `repo_view`.
+#[test]
+fn a_member_with_a_repo_view_reads_each_batch_tree_and_its_join_says_so() {
+    for view in [true, false] {
+        let mut h = Harness::new(if view { "view" } else { "noview" });
+        h.host
+            .one_shot
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        h.host
+            .repo_view
+            .store(view, std::sync::atomic::Ordering::SeqCst);
+        h.start("claude#1", &["claude#1", "claude#2"], "20-39");
+        h.claim(3, 1, "claude#1");
+        h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+        h.checkpoint(3, 1, 1, "edit");
+        h.pump();
+        let first = h.fx.repo.snapshot().unwrap();
+        h.fx.write("src/other.rs", "fn c() {}\n");
+        h.checkpoint(3, 1, 2, "edit");
+        h.pump();
+        let second = h.fx.repo.snapshot().unwrap();
+        assert_ne!(first, second);
+        let views: Vec<Option<String>> = h
+            .host
+            .views
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, t)| t.clone())
+            .collect();
+        assert_eq!(
+            views,
+            vec![Some(first.clone()), Some(second.clone())],
+            "each batch hands the tree its diff ends at"
+        );
+        let turns: Vec<String> = h
+            .host
+            .turns
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, p)| p.clone())
+            .collect();
+        for p in &turns {
+            assert_eq!(p.contains("readable (read-only)"), view, "{p}");
+            assert_eq!(p.contains("no access to the worktree"), !view, "{p}");
+        }
+        let joined = h.rows(tev::MEMBER_JOINED);
+        assert_eq!(joined.len(), 1);
+        if view {
+            assert_eq!(joined[0]["repo_view"], "read_only", "{}", joined[0]);
+        } else {
+            assert!(joined[0].get("repo_view").is_none(), "{}", joined[0]);
+        }
+    }
+}
+
+/// (DES-TEAMING-002 §8.8) A help turn on a viewing host reads the asking unit's repository as it
+/// stands (a fresh snapshot), and is told so instead of "no access"; with no repository it keeps
+/// the sealed wording.
+#[test]
+fn a_help_turn_on_a_viewing_host_reads_the_repository_as_it_stands() {
+    let h = Harness::new("help-view");
+    h.host
+        .one_shot
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    h.host
+        .repo_view
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let repo = h.fx.repo.clone();
+    let job = HelpJob {
+        key: (RUN.to_string(), 3, 1),
+        help_id: "h1".into(),
+        question: "where is b defined?".into(),
+        context: "ctx".into(),
+        candidates: vec!["claude#2".into()],
+        read_roots: Vec::new(),
+        repo: Some(repo.clone()),
+        budget: Duration::from_secs(5),
+    };
+    run_help(&job, &*h.host, &h.core.publisher_bus());
+    let now = repo.snapshot().unwrap();
+    let views = h.host.views.lock().unwrap().clone();
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].1.as_deref(), Some(now.as_str()));
+    let turns = h.host.turns.lock().unwrap().clone();
+    assert!(
+        turns[0].1.contains("answer it from the code"),
+        "{}",
+        turns[0].1
+    );
+    assert!(!turns[0].1.contains("no access"), "{}", turns[0].1);
+    // No repository: no view, and the sealed wording.
+    let job = HelpJob {
+        help_id: "h2".into(),
+        repo: None,
+        ..job
+    };
+    run_help(&job, &*h.host, &h.core.publisher_bus());
+    let views = h.host.views.lock().unwrap().clone();
+    assert_eq!(views[1].1, None);
+    let turns = h.host.turns.lock().unwrap().clone();
+    assert!(
+        turns[1].1.contains("no access to the repository"),
+        "{}",
+        turns[1].1
+    );
 }
 
 /// (codex review round 2 on #1021) A run that ends while a member's FIRST batch is in flight (its

@@ -6926,6 +6926,7 @@ curl -s --max-time 8 -H "authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN" -H "$AN
                 "run-c6",
                 ord,
                 &[],
+                None,
                 Some("hello"),
                 Some(&dir),
             )
@@ -7243,6 +7244,7 @@ curl -s --max-time 8 -H "authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN" -H "$AN
                 "run-989",
                 ord,
                 &[],
+                None,
                 Some("say hi"),
                 Some(&dir),
             )

@@ -825,7 +825,17 @@ pub struct MemberJoined {
     /// without it (and re-serialise byte-identical: `None` is not written).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub governance_class: Option<String>,
+    /// (DES-TEAMING-002 §8.8) How the member reads the repository: `"read_only"`
+    /// ([`REPO_VIEW_READ_ONLY`]) when each of its turns is given the tree it is about as a
+    /// read-only directory mounted into its seat container; absent when it reads only its prompt
+    /// (no repository, a failed join, a host with no view). Older rows deserialise without it and
+    /// re-serialise byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_view: Option<String>,
 }
+
+/// `member.joined.repo_view` for a member whose turns read a read-only view of the repository.
+pub const REPO_VIEW_READ_ONLY: &str = "read_only";
 
 /// 8 — `member.left` (S).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

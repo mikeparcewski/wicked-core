@@ -1332,6 +1332,14 @@ pub struct WorkUnit {
     /// every unit that ran no reviewer (skipped on the wire).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qe_review: Option<QeReview>,
+    /// (DES-TEAMING-002 §8.8) A team member turn's READ-ONLY view of the repository: a directory
+    /// holding the checkpoint tree the member reviews, materialized for that one turn
+    /// (`acp_runner::RunnerHost`). The wrapped runner mounts it read-only into the member's seat
+    /// container and honours it ONLY on a member turn
+    /// ([`crate::execute_wrapped::is_team_member_turn`]). Runtime-only: never persisted and never
+    /// on the wire, since a member turn's unit is never stored.
+    #[serde(skip)]
+    pub read_view: Option<std::path::PathBuf>,
     /// The final unit status: `pending` → `distributed` → `done` | `rejected`.
     pub status: UnitStatus,
 }
@@ -1607,6 +1615,7 @@ impl WorkUnit {
             qe_reviewer_seats: Vec::new(),
             qe_review_session: None,
             qe_review: None,
+            read_view: None,
         }
     }
 

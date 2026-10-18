@@ -2150,12 +2150,15 @@ pub(crate) fn container_name(cli: &str, run_id: &str, ord: u32) -> String {
 /// Arm the container floor for one governed seat spawn: resolve the floor (the step-0
 /// computation), find the runtime, the seat image and the network, and render the wrapper. `Err`
 /// names why the unit cannot run in a container; the caller refuses it (fail closed).
+/// `read_view` is a team member turn's repository view, mounted read-only ([`add_read_view`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn arm(
     inp: &crate::worker_sandbox::FloorInputs,
     argv: &[String],
     run_id: &str,
     ord: u32,
     read_roots: &[PathBuf],
+    read_view: Option<&Path>,
     prompt: Option<&str>,
     gateway_dir: Option<&Path>,
 ) -> Result<ArmedContainer, (FloorUnarmed, String)> {
@@ -2216,6 +2219,10 @@ pub(crate) fn arm(
     add_read_roots(&mut mounts, read_roots);
     let mut argv = argv.to_vec();
     mount_argv_paths(&mut mounts, &mut argv, prompt);
+    // A member turn's repository view: read-only, or the seat does not start.
+    if let Some(view) = read_view {
+        add_read_view(&mut mounts, view).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
+    }
     cover_gateway_dir(&mut mounts, gateway_dir)
         .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
     // The seat image cannot move a mount (a link where one lands, a declared volume).
@@ -2630,6 +2637,51 @@ pub(crate) fn cover_gateway_dir(
     mounts.retain(|m| !m.dst().starts_with(&dir));
     mounts.push(Mount::Tmpfs { path: dir });
     Ok(())
+}
+
+/// (DES-TEAMING-002 §8.8) Mount a team member turn's repository view READ-ONLY, at its own
+/// canonical path, and nothing else: the one bind the view adds. Unlike [`add_read_roots`], which
+/// skips a path a mount already exposes, this REFUSES (`Err`, the turn does not run) whenever the
+/// view could end up writable or hidden: a writable bind at, above or below it, or a mask over
+/// it. A read-only bind already at or under the view (an argv path such as claude's `--add-dir
+/// <view>`) is replaced by the one view bind. Returns the path as mounted.
+pub(crate) fn add_read_view(mounts: &mut Vec<Mount>, view: &Path) -> Result<PathBuf, String> {
+    let p = view
+        .canonicalize()
+        .map_err(|e| format!("the repository view {} is unreadable: {e}", view.display()))?;
+    if !p.is_dir() || !mountable(&p) {
+        return Err(format!(
+            "the repository view {} cannot be mounted into a seat container",
+            p.display()
+        ));
+    }
+    for m in mounts.iter() {
+        let dst = m.dst();
+        match m {
+            Mount::Bind { rw: true, .. } if p.starts_with(dst) || dst.starts_with(&p) => {
+                return Err(format!(
+                    "the repository view {} overlaps the seat-writable {}; it would not be \
+                     read-only",
+                    p.display(),
+                    dst.display()
+                ));
+            }
+            Mount::NullFile { .. } | Mount::Tmpfs { .. } if p.starts_with(dst) => {
+                return Err(format!(
+                    "the repository view {} lies under the masked {}",
+                    p.display(),
+                    dst.display()
+                ));
+            }
+            _ => {}
+        }
+    }
+    mounts.retain(|m| !(matches!(m, Mount::Bind { rw: false, .. }) && m.dst().starts_with(&p)));
+    mounts.push(Mount::Bind {
+        path: p.clone(),
+        rw: false,
+    });
+    Ok(p)
 }
 
 pub(crate) fn add_read_roots(mounts: &mut Vec<Mount>, read_roots: &[PathBuf]) {
@@ -3390,6 +3442,118 @@ mod tests {
         assert_eq!(landrun_end(&w[1..], img), Some(w.len() - 6));
     }
 
+    /// (DES-TEAMING-002 §8.8) A member turn's repository view adds exactly ONE mount: a
+    /// read-only bind of the view at its own canonical path (rendered `readonly`, Landlock
+    /// read+exec only), leaving every other mount as it was. A read-only bind under the view (an
+    /// argv `--add-dir <view>`) folds into it.
+    #[test]
+    fn a_member_view_adds_one_read_only_bind_and_nothing_else() {
+        let base = tmp("view-spec");
+        let sandbox = base.join("sandbox");
+        let view = base.join("member-view");
+        let seat_home = base.join("home");
+        for d in [&sandbox, &view, &seat_home] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // A member turn's floor: its scratch cwd and seat home writable, nothing of any repo.
+        let before = vec![
+            Mount::Bind {
+                path: sandbox.clone(),
+                rw: true,
+            },
+            Mount::Bind {
+                path: seat_home.clone(),
+                rw: true,
+            },
+            Mount::Bind {
+                path: view.join("src"),
+                rw: false,
+            },
+        ];
+        let mut mounts = before.clone();
+        let at = add_read_view(&mut mounts, &view).expect("the view mounts");
+        assert_eq!(at, view);
+        assert_eq!(
+            mounts,
+            vec![
+                before[0].clone(),
+                before[1].clone(),
+                Mount::Bind {
+                    path: view.clone(),
+                    rw: false
+                },
+            ],
+            "one read-only bind of the view; the bind under it folded in; nothing else"
+        );
+        let argv = run_argv(&ContainerLaunch {
+            runtime: Path::new("docker"),
+            image: "seat",
+            name: "wicked-seat-x",
+            network: "none",
+            workdir: &sandbox,
+            user: "501:20",
+            mounts: &mounts,
+            floor: "floor",
+            memory: "3g",
+            gateway_ports: GATEWAY_PORTS,
+            own_ports: &[],
+        });
+        let v = view.display().to_string();
+        let views: Vec<&String> = argv.iter().filter(|a| a.contains(&v)).collect();
+        assert_eq!(
+            views,
+            vec![
+                &format!("type=bind,src={v},dst={v},readonly"),
+                &v, // landrun's path, after `--rox`
+            ],
+            "{argv:?}"
+        );
+        let rox = argv.iter().position(|a| *a == v).unwrap();
+        assert_eq!(
+            argv[rox - 1],
+            "--rox",
+            "Landlock grants it read and exec only"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The view is never mounted where it could be writable or hidden: under or over a writable
+    /// bind, or under a mask, the turn is refused (fail closed), never mounted some other way.
+    #[test]
+    fn a_member_view_that_could_be_writable_or_masked_is_refused() {
+        let base = tmp("view-refuse");
+        let rw = base.join("rw");
+        let inside = rw.join("view");
+        let masked = base.join("masked");
+        let under_mask = masked.join("view");
+        for d in [&inside, &under_mask] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let bind = |p: &PathBuf, rw: bool| Mount::Bind {
+            path: p.clone(),
+            rw,
+        };
+        let mut m = vec![bind(&rw, true)];
+        let e = add_read_view(&mut m, &inside).unwrap_err();
+        assert!(e.contains("seat-writable"), "{e}");
+        let mut m = vec![bind(&inside.join("sub"), true)];
+        std::fs::create_dir_all(inside.join("sub")).unwrap();
+        let e = add_read_view(&mut m, &inside).unwrap_err();
+        assert!(
+            e.contains("seat-writable"),
+            "a writable bind inside it: {e}"
+        );
+        let mut m = vec![Mount::Tmpfs {
+            path: masked.clone(),
+        }];
+        let e = add_read_view(&mut m, &under_mask).unwrap_err();
+        assert!(e.contains("masked"), "{e}");
+        let mut m = Vec::new();
+        assert!(add_read_view(&mut m, &base.join("absent")).is_err());
+        assert!(m.is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn the_mounts_render_the_seat_floor_in_order() {
         let base = tmp("plan");
@@ -3900,6 +4064,126 @@ mod tests {
         let mut ni = rt.cmd();
         ni.args(["network", "inspect", &name]);
         assert!(!output_within(ni, PROBE_TIMEOUT).unwrap().status.success());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// LIVE (needs a container runtime; `WICKED_CONTAINER_LIVE=1`, skipped otherwise;
+    /// DES-TEAMING-002 §8.8): a team member turn's seat container with its repository view. The
+    /// view is a real checkpoint tree written by `team::Repo::materialize`, mounted by
+    /// [`add_read_view`] into a member turn's floor (its scratch cwd and seat home writable,
+    /// nothing else). Inside: the view's files read; the kernel lists its mount `ro`; overwriting,
+    /// creating, removing and making a directory there all fail; the live worktree it was written from, and a sibling of the
+    /// view, do not exist. On the host the view's file is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn live_a_member_reads_its_repository_view_and_cannot_write_it() {
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        let rt = runtime().expect("a container runtime answers");
+        let floor = ensure_floor_image(&rt).expect("the floor image");
+        let image = ensure_seat_image(&rt, "claude").expect("the claude seat image");
+        let base = tmp("live-view");
+        let wt = base.join("wt");
+        let sandbox = base.join("sandbox");
+        let home = base.join("home");
+        let view = base.join("view");
+        let sibling = base.join("view-sibling");
+        for d in [&wt, &sandbox, &home, &view, &sibling] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(sibling.join("other"), "sibling").unwrap();
+        // The worktree's checkpoint tree, written into the view the way a member turn's is.
+        let git = |args: &[&str]| {
+            crate::worktree_guard::git(&wt, args, &[]).unwrap();
+        };
+        git(&["init", "-q"]);
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(wt.join("src/lib.rs"), "fn checkpoint() {}\n").unwrap();
+        let repo = crate::team::Repo {
+            workdir: wt.clone(),
+            git_dir: wt.join(".git"),
+        };
+        let tree = repo.snapshot().unwrap();
+        repo.materialize(&tree, &view, crate::team::REPO_VIEW_MAX_BYTES)
+            .unwrap();
+        let spec = SeatFloor {
+            profile: "member".into(),
+            tree: sandbox.clone(),
+            writable: vec![sandbox.clone(), home.clone()],
+            protected: vec![],
+            readmitted: vec![],
+            readmitted_files: vec![],
+            masks: vec![],
+            pinned: vec![],
+            net: vec![],
+        };
+        let mut mounts = mount_plan(&spec).unwrap();
+        add_read_view(&mut mounts, &view).expect("the view mounts read-only");
+        let name = container_name("claude", "liveview", 1);
+        let user = operator_user();
+        let mut w = run_argv(&ContainerLaunch {
+            runtime: &rt.cli,
+            image: &image,
+            name: &name,
+            network: "none",
+            workdir: &sandbox,
+            user: &user,
+            mounts: &mounts,
+            floor: &floor,
+            memory: "3g",
+            gateway_ports: GATEWAY_PORTS,
+            own_ports: &[],
+        });
+        let script = format!(
+            "echo READ=[$(cat {v}/src/lib.rs)]; \
+             grep -Eq \"^[^ ]+ {v} [^ ]+ ro[, ]\" /proc/self/mounts && echo MOUNT_RO || echo MOUNT_NOT_RO; \
+             (echo x > {v}/src/lib.rs) 2>/dev/null && echo OVERWROTE || echo OVERWRITE_DENIED; \
+             (echo x > {v}/new) 2>/dev/null && echo CREATED || echo CREATE_DENIED; \
+             rm -f {v}/src/lib.rs 2>/dev/null; test -e {v}/src/lib.rs && echo RM_DENIED || echo REMOVED; \
+             mkdir {v}/d 2>/dev/null && echo MKDIR_OK || echo MKDIR_DENIED; \
+             test -e {wt}/src/lib.rs && echo WORKTREE_VISIBLE || echo WORKTREE_ABSENT; \
+             test -e {s}/other && echo SIBLING_VISIBLE || echo SIBLING_ABSENT; \
+             echo ok > {sb}/note && echo SCRATCH_OK",
+            v = view.display(),
+            wt = wt.display(),
+            s = sibling.display(),
+            sb = sandbox.display(),
+        );
+        w.extend(["sh".into(), "-c".into(), script]);
+        // spawn-audit: test-only — renders the wrapper argv; spawned only by the gated live test.
+        let mut cmd = Command::new(&w[0]);
+        cmd.args(&w[1..]);
+        let out = output_within(cmd, Duration::from_secs(60)).expect("the seat ran");
+        reap(&SeatContainer {
+            runtime: rt.cli.clone(),
+            name: name.clone(),
+        });
+        let so = String::from_utf8_lossy(&out.stdout).to_string();
+        let se = String::from_utf8_lossy(&out.stderr).to_string();
+        eprintln!("--- seat stdout ---\n{so}--- seat stderr ---\n{se}");
+        assert!(out.status.success(), "{so}\n{se}");
+        for want in [
+            "READ=[fn checkpoint() {}]",
+            "MOUNT_RO",
+            "OVERWRITE_DENIED",
+            "CREATE_DENIED",
+            "RM_DENIED",
+            "MKDIR_DENIED",
+            "WORKTREE_ABSENT",
+            "SIBLING_ABSENT",
+            "SCRATCH_OK",
+        ] {
+            assert!(so.contains(want), "{want} missing:\n{so}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(view.join("src/lib.rs")).unwrap(),
+            "fn checkpoint() {}\n",
+            "the view is unchanged on the host"
+        );
+        assert!(!view.join("new").exists() && !view.join("d").exists());
+        // Files are written read-only; the dirs are the test's to remove.
         let _ = std::fs::remove_dir_all(&base);
     }
 

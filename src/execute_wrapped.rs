@@ -2431,6 +2431,23 @@ impl WrappedCliStepRunner {
         // Run in the worktree if the run targets a repo; else a per-run temp sandbox (never the
         // orchestrator's own cwd).
         let cwd = input.workdir.clone().unwrap_or_else(|| sandbox_for(input));
+        // (DES-TEAMING-002 §8.8) A team member turn's read-only repository view: honoured on a
+        // member turn only, and only in a seat container, where the mount itself is read-only
+        // (`container_floor::add_read_view`). Anywhere else the turn is refused, never run with
+        // the view on the host.
+        let member_view = member_read_view(&input.unit);
+        if member_view.is_some()
+            && !uses_container_seat(
+                runs_in_seat(input),
+                crate::container_floor::container_mode(),
+            )
+        {
+            return posture_refusal(
+                input,
+                "a team member's repository view is mounted read-only only in a seat container; \
+                 this launch would run on the host",
+            );
+        }
 
         if is_claude {
             inject_claude_stream_flags(&mut argv);
@@ -2446,8 +2463,11 @@ impl WrappedCliStepRunner {
                 Some(&prompt),
                 operational_home,
                 // The tree the unit runs in, so its `CLAUDE.md` loads (the env half is set at the
-                // spawn below).
-                Some(&cwd),
+                // spawn below). A member turn's repository view rides here instead: under
+                // `acceptEdits` claude reads only its working directories, and the env half is
+                // not set for a member turn, so the reviewed tree's own `CLAUDE.md` never
+                // instructs its reviewer.
+                Some(member_view.as_deref().unwrap_or(&cwd)),
             ) {
                 return isolation_refusal(input, &why);
             }
@@ -2558,6 +2578,12 @@ impl WrappedCliStepRunner {
             if !flags.is_empty() {
                 apply_seat_posture(&mut argv, &flags);
             }
+            // (DES-TEAMING-002 §8.8) copilot reads only its cwd and temp unless a directory is
+            // added: a member turn's repository view is (the mount keeps it read-only).
+            apply_seat_posture(
+                &mut argv,
+                &member_view_flags(seat_cli, member_view.as_deref()),
+            );
             // core#660: the seat's own MCP off-switches, so nothing ambient loads on the carriers
             // claude's `--strict-mcp-config` does not cover — copilot's `--disable-builtin-mcps`
             // (its built-in `github-mcp-server` is a GitHub write path the remote-write fence
@@ -2931,6 +2957,7 @@ impl WrappedCliStepRunner {
                     &input.run_id,
                     input.unit.ord,
                     &read_roots,
+                    member_view.as_deref(),
                     Some(prompt.as_str()),
                     gateway_dir.as_deref(),
                 ) {
@@ -3145,8 +3172,9 @@ impl WrappedCliStepRunner {
             seat_config.apply(&mut cmd);
             // The env half of the claude unit's `CLAUDE.md` (its tree rides `--add-dir`, see
             // `inject_isolation_flags`): claude reads an additional directory's instruction files
-            // only with this set.
-            if is_claude {
+            // only with this set. Never on a team member turn: its additional directory is the
+            // tree under review, whose instruction files are the worker's to write.
+            if is_claude && !is_team_member_turn(&input.unit) {
                 cmd.env(crate::acp_runner::CLAUDE_MD_ADDITIONAL_DIRS_ENV, "1");
             }
             // v3.2 §2, opencode's lever: `OPENCODE_CONFIG_CONTENT` composed WITH whatever the
@@ -6370,6 +6398,30 @@ pub(crate) fn is_team_member_turn(unit: &WorkUnit) -> bool {
     unit.session_id == TEAM_MEMBER_SESSION && unit.id == TEAM_MEMBER_UNIT
 }
 
+/// (DES-TEAMING-002 §8.8) The read-only repository view a team member turn was handed
+/// ([`WorkUnit::read_view`]); `None` for every other unit, whatever it carries.
+pub(crate) fn member_read_view(unit: &WorkUnit) -> Option<PathBuf> {
+    unit.read_view.clone().filter(|_| is_team_member_turn(unit))
+}
+
+/// The argv a seat needs to READ a member turn's view where its own permission model would
+/// otherwise refuse the path: copilot reads only its cwd and temp unless a directory is added
+/// (`--add-dir`). Nothing for the others: claude's view rides `inject_isolation_flags`
+/// (`--add-dir`, read under `acceptEdits`), codex's own sandbox is off inside the container floor
+/// (`worker_sandbox::codex_sandbox_off_under_floor`), and pi has no path rule. The view stays
+/// read-only either way: the mount is (`container_floor::add_read_view`).
+pub(crate) fn member_view_flags(
+    cli: wicked_apps_core::spawn::SeatCli,
+    view: Option<&Path>,
+) -> Vec<String> {
+    match (cli, view) {
+        (wicked_apps_core::spawn::SeatCli::Copilot, Some(v)) => {
+            vec!["--add-dir".to_string(), v.to_string_lossy().into_owned()]
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// The unit id of a decision-council ballot (`decision::SeatBallots`), in session `council`.
 pub(crate) const COUNCIL_BALLOT_UNIT: &str = "council-ballot";
 
@@ -8008,10 +8060,54 @@ mod tests {
                 out.output
             );
         }
+        // (DES-TEAMING-002 §8.8) A member turn's repository view is mounted read-only only in a
+        // seat container: on the host floor the turn is refused, never run with the view on the
+        // host.
+        let mut viewed = input(
+            TEAM_MEMBER_SESSION,
+            &format!("member-host-view-{}", std::process::id()),
+        );
+        viewed.unit.id = TEAM_MEMBER_UNIT.to_string();
+        viewed.unit.read_view = Some(dir.clone());
+        assert_eq!(member_read_view(&viewed.unit), Some(dir.clone()));
+        let out = run(&viewed);
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output.contains("only in a seat container"),
+            "{}",
+            out.output
+        );
+        assert!(!out.output.contains("ran-on-host"), "{}", out.output);
+        // A view on any other unit is not a member view, and is ignored.
+        let mut other = input("s", "x");
+        other.unit.read_view = Some(dir.clone());
+        assert_eq!(member_read_view(&other.unit), None);
         assert!(runs_in_seat(&input("validator", "x")));
         assert!(runs_in_seat(&input("triage", "x")));
         assert!(!runs_in_seat(&input("s", "x")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (DES-TEAMING-002 §8.8) Which seats need a flag to READ a member's view: copilot alone
+    /// (`--add-dir`, it reads only its cwd and temp otherwise); claude's rides its isolation
+    /// flags, codex's sandbox is off in the container, pi has no path rule. No view, no flag.
+    #[test]
+    fn only_copilot_needs_a_flag_to_read_a_member_view() {
+        use wicked_apps_core::spawn::SeatCli;
+        let v = Path::new("/private/tmp/wicked-core-member-view/member-k-1-0");
+        assert_eq!(
+            member_view_flags(SeatCli::Copilot, Some(v)),
+            vec!["--add-dir".to_string(), v.display().to_string()]
+        );
+        for cli in [
+            SeatCli::Claude,
+            SeatCli::Codex,
+            SeatCli::Pi,
+            SeatCli::Opencode,
+        ] {
+            assert!(member_view_flags(cli, Some(v)).is_empty(), "{cli:?}");
+        }
+        assert!(member_view_flags(SeatCli::Copilot, None).is_empty());
     }
 
     /// (codex council-r1/r2 on #971; core#992) A one-shot session's scratch goes when the launch ends: its

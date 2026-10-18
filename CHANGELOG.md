@@ -14,6 +14,27 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Team members read the repository, read-only (DES-TEAMING-002 §8.8).** Since core#1021 a member turn ran in its
+  seat's container with no repository mounted, so it saw only its prompt (the diff, the criterion, the evidence):
+  help answers and appeals had nothing to read. Each member turn now gets the tree it is about — a checkpoint
+  batch's snapshot (the tree its diff ends at), the settled tree at the final pass, the tree as it stands for a hold
+  round, an appeal or a help question — never the live worktree, which the worker may still be writing.
+  - The tree is written from the object database into a private per-turn directory
+    (`<temp>/wicked-core-member-view/<member run id>`, `0700`, files `0444`; no `.git`, no smudge filter or hook), and
+    removed when the turn ends. A tree over 512 MiB, or one that cannot be written, gets no view, and the prompt says
+    so.
+  - It is mounted into the member's seat container read-only at the same path (`container_floor::add_read_view`): a
+    `readonly` bind plus a Landlock read grant. A writable bind or a mask overlapping it refuses the turn; off the
+    container floor a member turn carrying a view is refused. Nothing else of the host is added, and egress stays
+    gateway-only.
+  - The prompt names the path and says it is read-only. claude reads it through `--add-dir`, and the reviewed tree's
+    own `CLAUDE.md` is not loaded into its reviewer. copilot reads it through `--add-dir`; codex's sandbox is already
+    off inside the container, and pi has no path rule. Whether opencode's own permission rules let a headless
+    `opencode run` read a path outside its working directory is unmeasured; the mount is read-only either way.
+  - `member.joined` gains `repo_view: "read_only"` (absent when the member reads only its prompt). The field is
+    additive, and older rows re-serialise byte-identical.
+  - DES-TEAMING-002 §8.8 now records the two core#1022 teaming rules as operator-approved (2026-10-18).
+
 - **A claude seat in a container runs what the gate allows (core#1027).** The relayed gate hook answered an allowed
   call with `{}`, which hands the call back to claude's own permission flow; under the engine's
   `--permission-mode acceptEdits` in a `-p` session that flow refused `node`, `env`, compound Bash and reads outside
