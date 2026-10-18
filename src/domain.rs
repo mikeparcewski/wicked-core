@@ -197,8 +197,9 @@ pub struct AgentSession {
     /// seat; rendered into `unitDistributed.degradedReason`. `#[serde(default)]` back-compat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub benched_seats: Vec<BenchedSeat>,
-    /// (core#1010) The seats' unclassified worker failures in this run, by error signature
-    /// ([`failure_signature`]): a seat whose worker exits non-zero with the SAME error
+    /// (core#1010) The seats' unclassified worker failures in this run, by failure signature
+    /// ([`failure_signature`]: exit status + last meaningful line): a seat whose worker exits
+    /// non-zero with the SAME failure
     /// [`REPEATED_FAILURE_BENCH`] times, and has no successful unit in the run, is benched
     /// (`repeated_failure`). A deterministic startup failure is not an auth or quota refusal, so
     /// the transcript classifier never benched it, and the planner kept seating the dead seat.
@@ -667,21 +668,31 @@ pub struct SeatFailureMark {
 /// success in the run: the second identical crash shows the failure does not depend on the unit.
 pub const REPEATED_FAILURE_BENCH: u32 = 2;
 
-/// (core#1010) The signature of a worker failure's transcript: its first error line (a line that
-/// starts with `error`, any case, or carries `error:`), the wrapped runner's own
-/// `` (cli `x` exited N) `` marker removed, digits folded to `#` (a port, a pid, a line number
-/// differ between two runs of the same failure) and whitespace collapsed, at most 160 chars.
-/// `None` when the transcript names no error line: such a failure is never counted.
+/// (core#1010, core#1017) The signature of a worker failure: the wrapped runner's exit status
+/// plus the transcript's LAST MEANINGFUL line (where a crashing CLI says why it stopped), not a
+/// line that happens to name "error": a Node `ECONNRESET: …`, a `TypeError: …`, a bare
+/// `Segmentation fault` or a Rust panic message count the same as an `Error: …` line. A line is
+/// meaningful when it carries a letter or digit and is not a stack frame (`at f (x.js:1:2)`), a
+/// Rust backtrace hint (`note: run with `RUST_BACKTRACE=1``) or a backtrace frame (`#: …`).
+/// Digits in the line are folded to `#` (a port, a pid, a line number differ between two runs of
+/// the same failure) and whitespace collapsed, at most 160 chars; the result reads
+/// `exit N: <line>`. `None` without the runner's `` (cli `x` exited N) `` marker (not a wrapped
+/// worker crash) or when no line is meaningful: such a failure is never counted.
 pub fn failure_signature(output: &str) -> Option<String> {
-    let text = match output.strip_prefix("(cli `") {
-        Some(rest) => rest.split_once(')').map(|(_, after)| after).unwrap_or(rest),
-        None => output,
-    };
-    let line = text.lines().map(str::trim).find(|l| {
+    let rest = output.strip_prefix("(cli `")?;
+    let (_key, rest) = rest.split_once("` exited ")?;
+    let (code, text) = rest.split_once(')')?;
+    let code: i32 = code.trim().parse().ok()?;
+    let line = text.lines().map(str::trim).rev().find(|l| {
         let lower = l.to_ascii_lowercase();
-        lower.starts_with("error") || lower.contains("error:")
+        l.chars().any(char::is_alphanumeric)
+            && !lower.starts_with("at ")
+            && !lower.starts_with("note: run with `rust_backtrace")
+            && !(lower.split_once(':').is_some_and(|(n, _)| {
+                !n.is_empty() && n.trim().chars().all(|c| c.is_ascii_digit())
+            }))
     })?;
-    let mut sig = String::new();
+    let mut folded = String::new();
     let mut last_digit = false;
     for c in line
         .split_whitespace()
@@ -691,16 +702,16 @@ pub fn failure_signature(output: &str) -> Option<String> {
     {
         if c.is_ascii_digit() {
             if !last_digit {
-                sig.push('#');
+                folded.push('#');
             }
             last_digit = true;
         } else {
-            sig.push(c);
+            folded.push(c);
             last_digit = false;
         }
     }
-    let sig: String = sig.chars().take(160).collect();
-    (!sig.is_empty()).then_some(sig)
+    let sig: String = format!("exit {code}: {folded}").chars().take(160).collect();
+    Some(sig)
 }
 
 /// (core#1010) Count one failure of `cli` with `signature` in `marks`; returns the new count.
@@ -1937,17 +1948,18 @@ pub struct SessionView {
 mod tests {
     /// (C5) A bench binding every call replaces a governed-only one for the same seat, never the
     /// reverse; a record persisted before the field reads as binding every call.
-    /// (core#1010) A crash's signature is its first error line without the runner's exit marker,
-    /// digits folded; a transcript with no error line has none.
+    /// (core#1010, core#1017) A crash's signature is the exit status plus its last meaningful
+    /// line (stack frames and backtrace hints skipped), digits folded — whether or not that line
+    /// names "error"; output without the runner's exit marker has none.
     #[test]
-    fn a_failure_signature_folds_digits_and_needs_an_error_line() {
+    fn a_failure_signature_is_the_exit_status_and_last_meaningful_line() {
         let a = failure_signature(
             "(cli `opencode` exited 1) WARNING: x\nError: Server at http://127.0.0.1:49241 \
-             failed\n  at y (z.js:8:1710)",
+             failed\n  at y (z.js:8:1710)\n",
         );
         assert_eq!(
             a.as_deref(),
-            Some("Error: Server at http://#.#.#.#:# failed")
+            Some("exit 1: Error: Server at http://#.#.#.#:# failed")
         );
         assert_eq!(
             a,
@@ -1955,12 +1967,52 @@ mod tests {
                 "(cli `opencode` exited 1)\nError: Server at http://127.0.0.1:50111 failed"
             )
         );
-        assert_eq!(
-            failure_signature("thread 'main' panicked\nfatal error: out of memory").as_deref(),
-            Some("fatal error: out of memory")
+        // core#1017: the E2E's opencode crash names no "error" and was never counted.
+        let reset = "(cli `opencode` exited 1) ECONNRESET: The socket connection was closed \
+                     unexpectedly. For more information, pass `verbose: true` in the second \
+                     argument to fetch()";
+        let sig = failure_signature(reset).unwrap();
+        assert!(
+            sig.starts_with("exit 1: ECONNRESET: The socket connection"),
+            "{sig}"
         );
-        assert_eq!(failure_signature("(cli `agy` exited 1) boom"), None);
-        let long = format!("error: {}", "x".repeat(400));
+        assert_eq!(failure_signature(reset), Some(sig.clone()));
+        // Other crash shapes the keyword match skipped.
+        for (out, want) in [
+            (
+                "(cli `x` exited 1) TypeError: a is not a function\n    at f (a.js:1:2)",
+                "exit 1: TypeError: a is not a function",
+            ),
+            (
+                "(cli `x` exited 139) Segmentation fault",
+                "exit 139: Segmentation fault",
+            ),
+            (
+                "(cli `x` exited 101) thread 'main' panicked at src/m.rs:3:5:\nboom\n\
+                 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+                "exit 101: boom",
+            ),
+            ("(cli `agy` exited 1) boom", "exit 1: boom"),
+            (
+                "(cli `x` exited 1) fatal: bad\n   0: std::backtrace\n  12: main",
+                "exit 1: fatal: bad",
+            ),
+        ] {
+            assert_eq!(failure_signature(out).as_deref(), Some(want), "{out}");
+        }
+        // The exit status is part of the signature: the same line under another code differs.
+        assert_ne!(
+            failure_signature("(cli `x` exited 1) boom"),
+            failure_signature("(cli `x` exited 2) boom")
+        );
+        // Not a wrapped worker crash, or nothing meaningful: never counted.
+        assert_eq!(failure_signature("boom"), None);
+        assert_eq!(
+            failure_signature("(cli `x` exceeded the timeout and was killed)"),
+            None
+        );
+        assert_eq!(failure_signature("(cli `x` exited 1)   \n  ---\n"), None);
+        let long = format!("(cli `x` exited 1) error: {}", "x".repeat(400));
         assert_eq!(
             failure_signature(&long).map(|s| s.chars().count()),
             Some(160)

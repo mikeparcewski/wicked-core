@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Container-floor opencode seats send their model calls through the gateway, and any repeated crash benches a seat
+  (core#1016, core#1017).** An opencode unit that named no model ran opencode's own default (OpenCode Zen at
+  `opencode.ai`) and refreshed its catalogue from `models.opencode.ai`; the gateway refused that egress and every unit
+  exited 1 on ECONNRESET. The seat's `opencode.json` now enables only the providers it routes to the gateway and pins
+  `model` / `small_model` to one of them; the seat runs with `OPENCODE_DISABLE_MODELS_FETCH=1` (the catalogue snapshot
+  bundled with 2.0.25) and `OPENCODE_DISABLE_AUTOUPDATE=1`. The repeated-failure bench signs a failure by its exit
+  status and last meaningful output line instead of an "error" line, so an `ECONNRESET: …`, `TypeError: …`, a
+  segfault or a panic counts too.
+
 - **core, core-ts: estate memory recall includes operator memories (estate#338).** wicked-estate 0.30.0 lands an operator memory at `operator:<user|local>`, a scope every project's recall includes, and a derived entity keeps its episode's facets. All estate pins move to 0.30.0.
 
 - **Every path that cleared a boundary finding now waits for the operator, and the hold is vaulted (core#959

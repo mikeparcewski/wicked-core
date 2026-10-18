@@ -215,10 +215,12 @@ pub(crate) fn seat_files(
         .map(|kind| placeholder_files(cli, kind, unit_key, gateway_url))
         .unwrap_or_default();
     if cli == "opencode" {
-        if sign_in.subscriptions.is_empty() {
-            return files;
-        }
-        return opencode_files(files, &sign_in.subscriptions, unit_key);
+        let files = if sign_in.subscriptions.is_empty() {
+            files
+        } else {
+            opencode_files(files, &sign_in.subscriptions, unit_key)
+        };
+        return opencode_pin_to_routes(files);
     }
     if cli != "pi" {
         return files;
@@ -349,6 +351,56 @@ pub(crate) fn placeholder_files(
         _ => return Vec::new(),
     };
     vec![(PathBuf::from(path), serde_json::to_string(&value).unwrap())]
+}
+
+/// (core#1016) The model each brokered opencode provider runs when the unit names none, in
+/// preference order (the subscription routes' port order, then the key route). Each is in the
+/// catalogue snapshot bundled with the pinned opencode (2.0.25), which the seat reads instead of
+/// fetching `models.opencode.ai` ([`crate::seat_gateway::seat_env_for_sign_in`]).
+pub(crate) const OPENCODE_ROUTE_MODELS: &[(&str, &str)] = &[
+    ("openai", "openai/gpt-5.5"),
+    ("github-copilot", "github-copilot/gpt-5-mini"),
+    ("anthropic", "anthropic/claude-sonnet-5"),
+];
+
+/// (core#1016) Pin an opencode seat to its brokered routes: `enabled_providers` names only the
+/// providers its `opencode.json` points at the gateway, and `model` / `small_model` default to one
+/// of them ([`OPENCODE_ROUTE_MODELS`]). Without this, a unit that names no model ran opencode's
+/// own default (its OpenCode Zen provider at `opencode.ai`, or a provider with no gateway base
+/// URL such as `api.anthropic.com`): the gateway refused that direct egress, no request reached a
+/// route, and every opencode unit exited 1 on ECONNRESET. A unit's own `-m` still wins, but only
+/// among the enabled providers. A config with no gateway provider is left as it is.
+fn opencode_pin_to_routes(mut files: Vec<(PathBuf, String)>) -> Vec<(PathBuf, String)> {
+    let Some(i) = files
+        .iter()
+        .position(|(p, _)| p == Path::new("opencode.json"))
+    else {
+        return files;
+    };
+    let Ok(mut config) = serde_json::from_str::<Value>(&files[i].1) else {
+        return files;
+    };
+    let routed: Vec<&str> = OPENCODE_ROUTE_MODELS
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| config["provider"].get(*id).is_some())
+        .collect();
+    let Some(model) = routed.first().and_then(|first| {
+        OPENCODE_ROUTE_MODELS
+            .iter()
+            .find(|(id, _)| id == first)
+            .map(|(_, m)| *m)
+    }) else {
+        return files;
+    };
+    config["enabled_providers"] = json!(routed);
+    config["model"] = json!(model);
+    config["small_model"] = json!(model);
+    // The seat's only egress is the gateway: no self-update and no session sharing upstream.
+    config["autoupdate"] = json!(false);
+    config["share"] = json!("disabled");
+    files[i].1 = config.to_string();
+    files
 }
 
 /// The opencode credential rows a seat's own server imports (`opencode auth import`), next to
@@ -692,10 +744,18 @@ mod tests {
             );
         }
         let key_only: SeatSignIn = CredentialKind::ProviderKey.into();
-        assert_eq!(
-            seat_files("opencode", &key_only, KEY, URL),
-            placeholder_files("opencode", CredentialKind::ProviderKey, KEY, URL)
+        let key_files = seat_files("opencode", &key_only, KEY, URL);
+        let placed = placeholder_files("opencode", CredentialKind::ProviderKey, KEY, URL);
+        assert_eq!(key_files.len(), 1);
+        assert_eq!(key_files[0].0, placed[0].0);
+        let (mut got, want): (Value, Value) = (
+            serde_json::from_str(&key_files[0].1).unwrap(),
+            serde_json::from_str(&placed[0].1).unwrap(),
         );
+        assert_eq!(got["provider"], want["provider"]);
+        assert_eq!(got["model"], "openai/gpt-5.5");
+        got.as_object_mut().unwrap().retain(|k, _| k == "provider");
+        assert_eq!(got, want, "the key route only gains the route pin");
         // The key route reads the unit from its header too, so a DB row (which opencode prefers
         // over the config key) can never stand in for this unit.
         let key_config: Value =
@@ -707,6 +767,84 @@ mod tests {
         let gw = crate::seat_gateway::GatewayConfig::default();
         let route = gw.providers.iter().find(|r| r.port == 4004).unwrap();
         assert_eq!(route.unit_header.as_deref(), Some(header));
+    }
+
+    /// (core#1016) An opencode seat runs only its brokered providers: `enabled_providers` names
+    /// the providers its config points at the gateway, and `model` / `small_model` default to one
+    /// of them, so a unit that names no model never runs opencode's own default (OpenCode Zen at
+    /// `opencode.ai`, or a provider with no gateway base URL). Red on 0.14.1: no model and every
+    /// provider enabled; every opencode unit died on ECONNRESET behind the gateway.
+    #[test]
+    fn an_opencode_seat_is_pinned_to_its_brokered_routes() {
+        let config = |subs: Vec<Subscription>, kind: Option<CredentialKind>| -> Value {
+            let files = seat_files(
+                "opencode",
+                &SeatSignIn {
+                    kind,
+                    subscriptions: subs,
+                },
+                KEY,
+                URL,
+            );
+            assert_eq!(files[0].0, PathBuf::from("opencode.json"));
+            serde_json::from_str(&files[0].1).unwrap()
+        };
+        for (subs, kind, enabled, model) in [
+            (
+                vec![Subscription::OpencodeAnthropicKey],
+                None,
+                json!(["anthropic"]),
+                "anthropic/claude-sonnet-5",
+            ),
+            (
+                vec![Subscription::OpencodeCopilot],
+                None,
+                json!(["github-copilot"]),
+                "github-copilot/gpt-5-mini",
+            ),
+            (
+                vec![
+                    Subscription::OpencodeAnthropicKey,
+                    Subscription::OpencodeChatgpt,
+                ],
+                None,
+                json!(["openai", "anthropic"]),
+                "openai/gpt-5.5",
+            ),
+            (
+                Vec::new(),
+                Some(CredentialKind::ProviderKey),
+                json!(["openai"]),
+                "openai/gpt-5.5",
+            ),
+        ] {
+            let c = config(subs.clone(), kind);
+            assert_eq!(c["enabled_providers"], enabled, "{subs:?}");
+            assert_eq!(c["model"], model, "{subs:?}");
+            assert_eq!(c["small_model"], model, "{subs:?}");
+            assert_eq!(c["autoupdate"], false);
+            assert_eq!(c["share"], "disabled");
+            // Every enabled provider is one the config routes to the gateway.
+            for id in c["enabled_providers"].as_array().unwrap() {
+                let options = &c["provider"][id.as_str().unwrap()]["options"];
+                assert_eq!(
+                    options["headers"][crate::seat_gateway::UNIT_HEADER],
+                    KEY,
+                    "{id}"
+                );
+            }
+        }
+        // No gateway provider (an agent with no sign-in): nothing to pin, nothing written.
+        assert!(seat_files(
+            "opencode",
+            &SeatSignIn {
+                kind: None,
+                subscriptions: Vec::new()
+            },
+            KEY,
+            URL
+        )
+        .is_empty());
     }
 
     #[test]
