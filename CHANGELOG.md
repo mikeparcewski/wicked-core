@@ -743,6 +743,12 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.0** — 2026-10-18 — minor release on main fe964d1, carrying #1021, #1022, #1023, #1024 and #1025.
+  - **Team members run again (#1021):** a member turn is a read-only one-shot session in its seat's container (brokered sign-in, gateway-only egress), not ACP.
+  - **Presets hand their read steps to the team (#1022):** bug triage, capture-learnings churn and hotspots, learn research and mcp-server source discovery run on a member seat. With no distinct signed-in seat they run on the PA, disclosed.
+  - **Container seats reach their run's estate (#1023):** a unit's MCP token carries its estate scope, `Core.resolveEstateScope` resolves it for crew's broker relay, and a seat on the gateway MCP route gets `WICKED_ESTATE_BROKER=1`.
+  - **No vendor impersonation (#1024):** the broker makes no token request of its own; codex, pi and opencode renew through their own CLI in an isolated home, and claude seats sign in with a pasted `claude setup-token`.
+  - **Seat-credential guard (#1025):** every credential injected into a seat is registered, and work whose new objects contain it (raw or base64, in contents, names or commit messages) is refused before delivery.
 - **core-ts 0.14.2** — 2026-10-18 — patch release on main e0d80f5, carrying #1019.
   - **opencode through the gateway (#1016):** an opencode seat's model is pinned to a provider the config routes to the agent gateway, and the CLI's own model-catalogue fetch and autoupdate are off, so every model call goes through its gateway route instead of dying on ECONNRESET.
   - **Any repeated crash benches (#1017):** a unit's failure signature is the runner's exit status plus its last meaningful output line, so ECONNRESET, TypeErrors, segfaults and panics bench a seat, not only lines that say "error".
