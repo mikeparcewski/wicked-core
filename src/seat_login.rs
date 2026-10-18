@@ -3861,7 +3861,9 @@ esac
 
         // Nothing pasted (the input ends): no file, and the script says so before it exits.
         let config = root.join("home-eof/claude");
+        use wicked_apps_core::HardenedCommand;
         let out = std::process::Command::new("sh")
+            .hardened()
             .args(["-c", CLAUDE_SETUP_TOKEN_LOGIN, "wicked-login"])
             .env("PATH", &path)
             .env("CLAUDE_CONFIG_DIR", &config)

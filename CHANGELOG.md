@@ -22,6 +22,7 @@ Two release tracks share this file, newest entry first regardless of track:
   …`. The script now puts the terminal back in line mode (`stty sane`) and turns bracketed paste on. It reads
   until the paste's closing bracket and skips blank lines, and it says so when the token is saved. Ingest joins the
   pasted rows. When nothing was pasted back, the error now says that, not the OAuth-record wording.
+
 - **Team members read the repository, read-only (DES-TEAMING-002 §8.8).** Since core#1021 a member turn ran in its
   seat's container with no repository mounted, so it saw only its prompt (the diff, the criterion, the evidence):
   help answers and appeals had nothing to read. Each member turn now gets the tree it is about — a checkpoint
