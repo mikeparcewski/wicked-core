@@ -904,6 +904,15 @@ export declare class Core {
    */
   static listMcpTools(requestJson: string): Promise<string>
   /**
+   * (core#1018) The estate relay's scope for a token: crew's broker relays a container seat's
+   * `mcp:estate/<tool>` calls to the host's estate and scopes them by this. `request_json` is
+   * `{ token }` — the worker's `WICKED_MCP_TOKEN`. Resolves to `{ unit: { runId, ord, attempt,
+   * phase, seat }, projectId, repoId, codeGraphDb }` (each scope field `null` when the run has
+   * none), as the carrier bound them; nothing is judged or recorded. Rejects with
+   * `invalid_token: …` or `bad_request: …`. Static, like `evaluateMcpCall`.
+   */
+  static resolveEstateScope(requestJson: string): Promise<string>
+  /**
    * The MCP policy PREVIEW (DES-MCP-TOOLS-001 §4.7, §8 `POST /mcp/policies/preview`; slice
    * S6): judge each call for each synthetic unit cell with the SAME evaluation
    * `evaluateMcpCall` runs, over this Core's policy store, and record NOTHING. `request_json`

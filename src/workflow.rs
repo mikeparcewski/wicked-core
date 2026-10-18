@@ -221,6 +221,14 @@ pub struct GovernanceContext {
     /// `DispatchedTask` from an older peer still deserializes (as `None`).
     #[serde(default)]
     pub project_id: Option<String>,
+    /// The registered repo this governed run targets (`AgentSession::repo_ref`), when it has one
+    /// (core#1018). Stamped on the worker as `WICKED_RUN_REPO`
+    /// ([`crate::execute_wrapped::estate_provenance_env`]) and carried on the unit's MCP binding so
+    /// crew's estate relay scopes a container seat's estate calls to the run's repo
+    /// ([`crate::mcp_gate::resolve_estate_scope_json`]). `None` ⇒ a repo-less run. `#[serde(default)]`
+    /// so a `DispatchedTask` from an older peer still deserializes (as `None`).
+    #[serde(default)]
+    pub repo_id: Option<String>,
     /// The run-level autonomy (`AgentSession::human_confirm`), from which the unit's MCP posture
     /// mode is read (`mcp_gate::McpMode::of`, DES-MCP-TOOLS-001 operator decision 1). Filled per
     /// unit from the session like the fields above; `#[serde(default)]` (none ⇒ autonomous) so an

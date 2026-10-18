@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core, core-ts: a container seat reaches its run's estate through crew's broker (core#1018, option A).** No host
+  store reaches a container seat (the container passes only what the carrier set, and the stores are never mounted),
+  so every estate read and capture proposal was refused there. The engine now binds each unit's MCP token to its
+  estate scope (the run's project, repo and vouched-for code graph), and the new static `Core.resolveEstateScope`
+  hands crew's estate relay that scope for a token, recording nothing. A container seat whose gateway MCP route is up
+  is stamped `WICKED_ESTATE_BROKER=1`, which garden's shim reads as "relay through the broker" and the gate hook's shim
+  rule accepts as the store pin. Every governed unit of a repo run is also stamped `WICKED_RUN_REPO`.
+
 - **Container-floor opencode seats send their model calls through the gateway, and any repeated crash benches a seat
   (core#1016, core#1017).** An opencode unit that named no model ran opencode's own default (OpenCode Zen at
   `opencode.ai`) and refreshed its catalogue from `models.opencode.ai`; the gateway refused that egress and every unit

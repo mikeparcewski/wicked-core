@@ -386,6 +386,7 @@ mod tests {
             mode: McpMode::Ask,
             decisions_path: "/unused".into(),
             db_path: String::new(),
+            estate: Default::default(),
         }
     }
     struct Fixture {

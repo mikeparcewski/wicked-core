@@ -188,6 +188,7 @@ mod tests {
             mode: McpMode::Balanced,
             decisions_path: PathBuf::from("/nonexistent"),
             db_path: String::new(),
+            estate: crate::mcp_gate::EstateScope::default(),
         }
     }
 

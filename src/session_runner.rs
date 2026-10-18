@@ -1445,6 +1445,7 @@ mod tests {
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
             project_id: None,
+            repo_id: None,
         });
         let out = runner.run_unit(&input);
         match prev {
@@ -1476,6 +1477,7 @@ mod tests {
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
                 project_id: None,
+                repo_id: None,
             })
         };
 
@@ -1586,6 +1588,7 @@ mod tests {
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
                 project_id: None,
+                repo_id: None,
             })
         };
         // (1) Governed, non-claude, refused by the posture guard: no session, no disclosure.
