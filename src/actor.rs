@@ -6174,7 +6174,8 @@ fn apply_step_result(
         .flatten()
         {
             // (core#1010) An UNCLASSIFIED worker crash (non-zero exit, no auth / quota / spawn
-            // signature) is counted per seat and error signature. The same error again, on a seat
+            // signature) is counted per seat and failure signature (exit status + last meaningful
+            // line, core#1017). The same error again, on a seat
             // with no success in the run, benches it: a deterministic startup failure (opencode's
             // "no compatible V2 health response", 3 of 3 units in run cdf4462a) otherwise kept the
             // seat on the plan for every later phase.
@@ -6199,7 +6200,7 @@ fn apply_step_result(
             put_node(store, session.to_node())?;
             if benched {
                 eprintln!(
-                    "wicked-core: seat '{cli}' failed unit {ord} of {run_id} with the same error \
+                    "wicked-core: seat '{cli}' failed unit {ord} of {run_id} the same way \
                      {count} times ({signature}); benched for the run (core#1010)"
                 );
                 emit(
@@ -20958,6 +20959,8 @@ mod seat_failover_tests {
     /// retry and triage, and plan rev 2 still seated it everywhere). The signature ignores the
     /// port; a different error, or a seat with a successful unit, is never benched this way.
     /// Red on 0.14.0: nothing counted such failures and the seat stayed on the roster.
+    /// (core#1017) A crash whose transcript names no "error" (opencode's `ECONNRESET: …` behind
+    /// the seat gateway, runs ede7c46f / 620fb2f3) counts the same way: red on 0.14.1.
     #[test]
     fn the_same_worker_crash_twice_benches_the_seat_for_the_run() {
         let crash = |port: u32| {
@@ -20976,14 +20979,20 @@ mod seat_failover_tests {
             u.status = UnitStatus::Distributed;
             put_node(store, u.to_node()).unwrap();
         };
-        for (case, done_elsewhere, second) in [
-            ("same error twice", false, crash(50111)),
+        let reset = "(cli `opencode` exited 1) ECONNRESET: The socket connection was closed \
+                     unexpectedly. For more information, pass `verbose: true` in the second \
+                     argument to fetch()"
+            .to_string();
+        for (case, done_elsewhere, first, second) in [
+            ("same error twice", false, crash(49241), crash(50111)),
+            ("same econnreset twice", false, reset.clone(), reset.clone()),
             (
                 "a different error",
                 false,
+                crash(49241),
                 "(cli `opencode` exited 1) Error: model not found".into(),
             ),
-            ("a seat with a success", true, crash(50111)),
+            ("a seat with a success", true, crash(49241), crash(50111)),
         ] {
             let run_id = format!(
                 "repeated-crash-{}-{}",
@@ -21020,7 +21029,7 @@ mod seat_failover_tests {
                     UnitStatus::Done,
                 );
             }
-            let (_, session, _) = fold_failed(&mut store, &run_id, &crash(49241));
+            let (_, session, _) = fold_failed(&mut store, &run_id, &first);
             assert!(
                 session.benched_seats.is_empty(),
                 "{case}: one crash is not a pattern: {:?}",
@@ -21040,8 +21049,17 @@ mod seat_failover_tests {
                 assert_eq!(bench.source, "worker");
                 assert_eq!(
                     bench.reason,
-                    "repeated_failure (2x: Error: Server at http://#.#.#.#:# did not provide a \
-                     compatible V# health response)"
+                    "repeated_failure (2x: exit 1: Error: Server at http://#.#.#.#:# did not \
+                     provide a compatible V# health response)"
+                );
+            } else if case == "same econnreset twice" {
+                let bench = bench.unwrap_or_else(|| panic!("{case}: benched"));
+                assert!(
+                    bench
+                        .reason
+                        .starts_with("repeated_failure (2x: exit 1: ECONNRESET: The socket"),
+                    "{case}: {}",
+                    bench.reason
                 );
             } else {
                 assert!(bench.is_none(), "{case}: {:?}", session.benched_seats);

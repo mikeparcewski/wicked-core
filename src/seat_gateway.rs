@@ -1025,8 +1025,22 @@ pub(crate) fn seat_env_for_sign_in(
             ("COPILOT_AUTO_UPDATE".to_string(), "false".to_string()),
         ]);
     }
+    if cli == "opencode" {
+        // (core#1016) The seat's only egress is the gateway, which serves model routes, not
+        // opencode's own services: read the catalogue snapshot bundled with the pinned CLI
+        // instead of fetching (and periodically refreshing) `models.opencode.ai`, and never
+        // check `opencode.ai` for an update. Its model is pinned to a brokered route in its
+        // `opencode.json` (`seat_credentials::opencode_pin_to_routes`).
+        env.extend(OPENCODE_SEAT_ENV.map(|(k, v)| (k.to_string(), v.to_string())));
+    }
     env
 }
+
+/// (core#1016) The env an opencode seat runs with so it reaches nothing but the gateway.
+pub(crate) const OPENCODE_SEAT_ENV: [(&str, &str); 2] = [
+    ("OPENCODE_DISABLE_MODELS_FETCH", "1"),
+    ("OPENCODE_DISABLE_AUTOUPDATE", "1"),
+];
 
 /// The model copilot's `--model X` / `--model=X` selects on `args`: the LAST one, as copilot
 /// takes it, never past a `--`. A copilot seat with no selection is given one of its account's
@@ -2392,6 +2406,30 @@ mod tests {
 
     /// The copilot seat's BYOK env: the Copilot route, the unit's key as the bearer (the only
     /// credential the seat holds); the wire API follows the unit's model.
+    /// (core#1016) An opencode seat never fetches `models.opencode.ai` or checks `opencode.ai`
+    /// for an update (the gateway is its only egress and serves neither); no other seat gets it.
+    #[test]
+    fn an_opencode_seat_reads_its_bundled_catalogue_and_never_self_updates() {
+        let sign_in = crate::seat_credentials::SeatSignIn {
+            kind: None,
+            subscriptions: vec![crate::seat_credentials::Subscription::OpencodeAnthropicKey],
+        };
+        let env = seat_env_for_sign_in("opencode", &sign_in, "wk-test-PLACEHOLDER");
+        for (k, v) in OPENCODE_SEAT_ENV {
+            assert!(env.iter().any(|(a, b)| a == k && b == v), "{k}: {env:?}");
+        }
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "HTTPS_PROXY" && v == "http://agw:3000"));
+        let pi = crate::seat_credentials::SeatSignIn {
+            kind: None,
+            subscriptions: vec![crate::seat_credentials::Subscription::PiAnthropic],
+        };
+        assert!(!seat_env_for_sign_in("pi", &pi, "wk-test-PLACEHOLDER")
+            .iter()
+            .any(|(k, _)| k.starts_with("OPENCODE_")));
+    }
+
     #[test]
     fn copilot_seats_run_byok_on_the_copilot_route() {
         let sign_in = crate::seat_credentials::SeatSignIn {
