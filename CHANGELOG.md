@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A claude container sign-in keeps the whole `claude setup-token` token.** claude's TUI wraps the ~108-character
+  token across two rows, so a copy of it carries a line break. The login script read one line with bracketed
+  paste off: a copy of both rows landed only the first row (a truncated token that passed the shape check), and a
+  copy that began on the blank row above landed nothing. The script then exited "no token was pasted" and the
+  window closed before the operator could read it. Ingest reported `signed out; missing claudeAiOauth.accessToken
+  …`. The script now puts the terminal back in line mode (`stty sane`) and turns bracketed paste on. It reads
+  until the paste's closing bracket and skips blank lines, and it says so when the token is saved. Ingest joins the
+  pasted rows. When nothing was pasted back, the error now says that, not the OAuth-record wording.
 - **Team members read the repository, read-only (DES-TEAMING-002 §8.8).** Since core#1021 a member turn ran in its
   seat's container with no repository mounted, so it saw only its prompt (the diff, the criterion, the evidence):
   help answers and appeals had nothing to read. Each member turn now gets the tree it is about — a checkpoint
