@@ -848,9 +848,11 @@ impl Core {
             .map(|mut cfg| {
                 // (T4) The supervisor's diff re-scores come back on the actor's channel.
                 cfg.engine = Some(tx.clone());
-                let host: std::sync::Arc<dyn crate::team::MonitorHost> = std::sync::Arc::new(
-                    crate::acp_runner::RunnerHost(std::sync::Arc::downgrade(&runner)),
-                );
+                let host: std::sync::Arc<dyn crate::team::MonitorHost> =
+                    std::sync::Arc::new(crate::acp_runner::RunnerHost::new({
+                        let r: std::sync::Arc<dyn StepRunner> = runner.clone();
+                        std::sync::Arc::downgrade(&r)
+                    }));
                 let council: std::sync::Arc<dyn crate::team::supervisor::Council> =
                     std::sync::Arc::new(crate::team::supervisor::ActorCouncil { tx: tx.clone() });
                 let live_tx = tx.clone();

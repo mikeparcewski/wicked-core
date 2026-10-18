@@ -14,6 +14,18 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Team members (monitors) run again, in their seats' containers.** Since the container seat floor (#927, opt-in
+  2026-10-13) and C5 (#950, default 2026-10-15), every member a team run's score asked for was refused before it
+  opened (`member.joined{status:"failed"}`, "team monitors ran over ACP, which is removed from the seats"): no run
+  had a member watching its steps. A member turn is now one of the engine's own one-shot sessions (session
+  `team-member`), run through the run's step runner like a judge or a council ballot, so it takes the seat floor's
+  arming: the member seat's container, its brokered sign-in, the gateway as the only egress. It is read-only by
+  construction (no repository mounted, no gate hook, no MCP channel): the diff it reviews is in its prompt. Because
+  a turn keeps nothing, every batch restates the member header and names the files the step changed in earlier
+  batches, and the hold round and a step appeal restate the criterion and evidence (`MonitorHost::one_shot`). A
+  member's turns are cancelled when it is closed or its run ends (`MonitorHost::close_run`). The labelled host
+  floor (`WICKED_SEAT_FLOOR=host`) hosts no members and says so on `member.joined`.
+
 - **The seat credential broker no longer impersonates any vendor's client (core#1024).** core#1012 made the
   broker's own OAuth refresher send the pinned CLIs' User-Agents (and pi's Copilot exchange sent VS Code Copilot
   Chat's identity headers) to get past the providers' refusal of `curl`. That is gone; the broker makes no token
