@@ -264,6 +264,35 @@ fn the_run_qe_ledger_root_is_the_evidence_roots_ledger_and_rides_only_its_unit()
     );
 }
 
+/// core#1009: on the container floor the QE unit is also handed the seat image's own wicked-ledger
+/// (the daemon's inherited `WICKED_LEDGER_PKG_DIR` never reaches a seat); on the host floor, and
+/// for any unit without a QE ledger root, nothing is added. Red on 0.14.0: the container seat's QE
+/// unit saw no `WICKED_LEDGER_PKG_DIR` and every app-change run failed QE registration.
+#[test]
+fn a_container_seats_qe_unit_is_handed_the_images_wicked_ledger() {
+    let mut u = qe_unit(4);
+    assert!(seat_ledger_env(&u, true).is_empty(), "no root, no variable");
+    u.qe_ledger_root = Some("/e/.wicked-qe".into());
+    assert_eq!(
+        seat_ledger_env(&u, false),
+        ledger_env(&u),
+        "host floor: unchanged"
+    );
+    let env = seat_ledger_env(&u, true);
+    assert!(env.contains(&(
+        "WICKED_QE_LEDGER_DIR".to_string(),
+        "/e/.wicked-qe".to_string()
+    )));
+    assert!(env.contains(&(
+        "WICKED_LEDGER_PKG_DIR".to_string(),
+        "/opt/wicked-ledger/node_modules/wicked-ledger".to_string()
+    )));
+    assert_eq!(
+        LEDGER_PKG_ENV, "WICKED_LEDGER_PKG_DIR",
+        "garden's resolver's variable"
+    );
+}
+
 /// codex r1 on core#878: the minted QE ledger root is vouched for before it widens a boundary — a
 /// plain directory directly under the evidence root is minted; a planted link in its place is
 /// refused (it would admit writes wherever it points).

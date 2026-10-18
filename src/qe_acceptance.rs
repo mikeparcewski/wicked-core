@@ -29,6 +29,19 @@ use crate::review_scale::{self as rs, ChangeSignals, Graph};
 /// reader all honour (an absolute value IS the root).
 pub(crate) const LEDGER_DIR_ENV: &str = "WICKED_QE_LEDGER_DIR";
 
+/// (core#1009) The variable garden's QE pipeline resolves wicked-ledger through first
+/// (`scripts/qe/lib/ledger-pkg.mjs`). On the host floor the daemon's own environment carries it:
+/// crew exports its bundled package dir there (crew#951) and the worker inherits it. The container
+/// floor passes a seat only what the carrier sets explicitly, and a host package dir means nothing
+/// inside the seat, so a container seat's QE unit is handed [`SEAT_LEDGER_PKG_DIR`] instead.
+pub(crate) const LEDGER_PKG_ENV: &str = "WICKED_LEDGER_PKG_DIR";
+
+/// (core#1009) The wicked-ledger package every seat image carries
+/// (`containers/seats/seat.Dockerfile`, installed with `--prefix /opt/wicked-ledger`). It is under
+/// `/opt`, which the seat's landrun policy admits read-only, and its SQLite addon is built for the
+/// image.
+pub(crate) const SEAT_LEDGER_PKG_DIR: &str = "/opt/wicked-ledger/node_modules/wicked-ledger";
+
 /// The ledger dirname under the run's evidence root — the wire contract's own name, so the run's
 /// ledger reads like any repo's (`<base>/.wicked-qe`).
 pub(crate) const LEDGER_DIRNAME: &str = ".wicked-qe";
@@ -98,6 +111,19 @@ pub(crate) fn ledger_env(unit: &WorkUnit) -> Vec<(String, String)> {
     let mut env = vec![(LEDGER_DIR_ENV.to_string(), root.clone())];
     if let Some(nonce) = unit.qe_review_session.as_ref() {
         env.push((review::REVIEW_SESSION_ENV.to_string(), nonce.clone()));
+    }
+    env
+}
+
+/// [`ledger_env`] as the unit's carrier stamps it. A unit that runs in a CONTAINER seat
+/// (`container_seat`) and carries a QE ledger root is also handed [`LEDGER_PKG_ENV`] naming the
+/// seat image's own wicked-ledger ([`SEAT_LEDGER_PKG_DIR`], core#1009). Without it, the QE unit
+/// could not resolve the package and every app-change run on the container floor failed QE
+/// registration. A host-floor unit gets [`ledger_env`] unchanged: it inherits the daemon's own value.
+pub(crate) fn seat_ledger_env(unit: &WorkUnit, container_seat: bool) -> Vec<(String, String)> {
+    let mut env = ledger_env(unit);
+    if container_seat && !env.is_empty() {
+        env.push((LEDGER_PKG_ENV.to_string(), SEAT_LEDGER_PKG_DIR.to_string()));
     }
     env
 }
