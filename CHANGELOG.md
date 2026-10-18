@@ -759,6 +759,10 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.1** — 2026-10-18 — patch release on main d588271, carrying #1030, #1031 and #1032.
+  - **A container claude seat runs what the gate hook allows (#1030):** the relayed hook answers an allowed call with an explicit PreToolUse `permissionDecision: "allow"`, so claude's own permission flow no longer refuses it in a `-p` session. Deny still denies.
+  - **A step's creator is never offered as its own monitor (#1031):** the creator is dropped from the monitor candidates before admission, so studio no longer shows "<seat> could not watch" for it.
+  - **Absolute fence rules use the `//` anchor (#1032):** claude reads a single leading `/` as relative to the settings source, so the engine's absolute Read and Edit deny rules matched nothing; they are now spelled `//abs/path`.
 - **core-ts 0.15.0** — 2026-10-18 — minor release on main fe964d1, carrying #1021, #1022, #1023, #1024 and #1025.
   - **Team members run again (#1021):** a member turn is a read-only one-shot session in its seat's container (brokered sign-in, gateway-only egress), not ACP.
   - **Presets hand their read steps to the team (#1022):** bug triage, capture-learnings churn and hotspots, learn research and mcp-server source discovery run on a member seat. With no distinct signed-in seat they run on the PA, disclosed.
