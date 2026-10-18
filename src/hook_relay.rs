@@ -17,7 +17,8 @@
 //! non-2xx answer, a timeout) denies the call.
 //!
 //! **Glue only.** The judgement, the decisions log and the store are the existing gate hook's;
-//! the relay maps its exit code to the hook's JSON answer: 0 → its own stdout (or `{}`),
+//! the relay maps its exit code to the hook's JSON answer: 0 → claude's allow decision (its own
+//! stdout's object, if any, rides along; core#1027),
 //! 2 → deny with its stderr as the reason, anything else (a crash, a timeout, an unknown token)
 //! → deny. A token is minted per unit, known only to that seat and the relay, and revoked when
 //! the unit ends.
@@ -161,7 +162,18 @@ pub(crate) fn revoke(token: &str) {
     }
 }
 
-/// claude's HTTP-hook answer for one gate-hook outcome.
+/// claude's PreToolUse hook answer for one gate-hook outcome.
+///
+/// An allowed call (exit 0) answers claude's documented allow decision
+/// (`hookSpecificOutput.permissionDecision: "allow"`), never `{}` (core#1027): a command hook
+/// that exits 0 with no decision sends the call through claude's own permission flow, and under
+/// the engine's `--permission-mode acceptEdits` in a `-p` session that flow refuses every Bash
+/// command it does not auto-approve (`node`, `env`, a compound command) and every read outside
+/// the working tree ("This command requires approval", measured on the pinned 2.1.296 seat), with
+/// nobody there to approve. The gate is the judge on this floor, so its allow is authoritative;
+/// claude's own deny rules (the `--disallowedTools` fence) still block an allowed call, and
+/// deny stays deny. A JSON object the gate hook printed rides along; a decision it already
+/// states is kept, never upgraded.
 pub(crate) fn answer(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> String {
     let deny = |reason: &str| {
         serde_json::json!({
@@ -176,15 +188,23 @@ pub(crate) fn answer(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> String 
     match code {
         Some(0) => {
             let out = String::from_utf8_lossy(stdout);
-            let out = out.trim();
-            if out.is_empty() {
-                "{}".into()
-            } else if serde_json::from_str::<serde_json::Value>(out).is_ok_and(|v| v.is_object()) {
-                out.to_string()
-            } else {
-                // A command hook's plain stdout is a transcript note, not a decision.
-                "{}".into()
+            // A command hook's plain stdout is a transcript note, not a decision.
+            let mut v = match serde_json::from_str::<serde_json::Value>(out.trim()) {
+                Ok(v @ serde_json::Value::Object(_)) => v,
+                _ => serde_json::json!({}),
+            };
+            let obj = v.as_object_mut().expect("an object");
+            let hso = obj
+                .entry("hookSpecificOutput")
+                .or_insert_with(|| serde_json::json!({}));
+            if !hso.is_object() {
+                *hso = serde_json::json!({});
             }
+            let hso = hso.as_object_mut().expect("an object");
+            hso.insert("hookEventName".into(), "PreToolUse".into());
+            hso.entry("permissionDecision")
+                .or_insert_with(|| "allow".into());
+            v.to_string()
         }
         Some(2) => {
             let why = String::from_utf8_lossy(stderr);
@@ -454,9 +474,35 @@ mod tests {
 
     #[test]
     fn the_answer_maps_the_gate_hooks_exit_to_claudes_hook_json() {
-        assert_eq!(answer(Some(0), b"", b""), "{}");
-        assert_eq!(answer(Some(0), b"{\"a\":1}", b""), "{\"a\":1}");
-        assert_eq!(answer(Some(0), b"note text", b""), "{}");
+        // core#1027: an allowed call answers claude's documented allow decision, never `{}`
+        // (which hands the call to the permission mode, and acceptEdits refuses it in `-p`).
+        let allow = serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "allow"}});
+        let json = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
+        assert_eq!(json(answer(Some(0), b"", b"")), allow);
+        assert_eq!(json(answer(Some(0), b"note text", b"")), allow);
+        assert_eq!(json(answer(Some(0), b"[1]", b"")), allow);
+        // The gate hook's own object rides along with the decision added.
+        let mut with_extra = allow.clone();
+        with_extra["a"] = 1.into();
+        assert_eq!(json(answer(Some(0), b"{\"a\":1}", b"")), with_extra);
+        let mut ctx = allow.clone();
+        ctx["hookSpecificOutput"]["additionalContext"] = "note".into();
+        assert_eq!(
+            json(answer(
+                Some(0),
+                br#"{"hookSpecificOutput":{"additionalContext":"note"}}"#,
+                b""
+            )),
+            ctx
+        );
+        // A decision the gate hook states itself is kept, never upgraded to allow.
+        let ask =
+            br#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask"}}"#;
+        assert_eq!(
+            json(answer(Some(0), ask, b""))["hookSpecificOutput"]["permissionDecision"],
+            "ask"
+        );
         for (code, err) in [
             (Some(2), "policy X denies Bash"),
             (Some(7), "boom"),
@@ -570,7 +616,10 @@ mod tests {
         };
         let allow_reg = register(&allow, ctx("allow")).expect("registered");
         let deny_reg = register(&deny, ctx("deny")).expect("registered");
-        assert_eq!(post(&allow), serde_json::json!({}));
+        assert_eq!(
+            post(&allow)["hookSpecificOutput"]["permissionDecision"],
+            "allow"
+        );
         let d = post(&deny);
         assert_eq!(d["hookSpecificOutput"]["permissionDecision"], "deny");
         assert_eq!(
@@ -602,7 +651,10 @@ mod tests {
             "POST /hook/{allow} HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
             body.len()
         );
-        assert_eq!(raw(chunked), serde_json::json!({}));
+        assert_eq!(
+            raw(chunked)["hookSpecificOutput"]["permissionDecision"],
+            "allow"
+        );
         // Dropping the registration revokes it (every exit path, a panic included).
         drop(allow_reg);
         assert_eq!(
@@ -721,7 +773,7 @@ mod tests {
              m.content.filter(c=>c.type==='tool_result'):[]);\
              const main=(j.tools||[]).some(t=>t.name==='Bash');const step=res.length;\
              console.log('UPSTREAM '+JSON.stringify({url:q.url,main,step,last:res[step-1]||null}));\
-             const cmds=['echo allowed > ALLOWED.txt','echo denied > DENIED.txt'];\
+             const cmds=['node -e \"require(\\'fs\\').writeFileSync(\\'ALLOWED.txt\\',\\'x\\')\"','echo denied > DENIED.txt'];\
              const tool=main&&step<cmds.length;\
              const content=tool?[{type:'tool_use',id:'toolu_'+step,name:'Bash',\
              input:{command:cmds[step],description:'probe'}}]:[{type:'text',text:'STUB-DONE'}];\
@@ -830,7 +882,13 @@ mod tests {
                 "--verbose",
                 "--model",
                 "claude-sonnet-4-5",
-                "--dangerously-skip-permissions",
+                // The engine's own posture (core#1027): no ambient settings and acceptEdits, NOT
+                // `--dangerously-skip-permissions`, which hid that an allow answered `{}` left
+                // the call to the mode, and acceptEdits refuses `node` in a `-p` session.
+                "--setting-sources",
+                "",
+                "--permission-mode",
+                "acceptEdits",
                 "--settings",
                 &settings,
             ]

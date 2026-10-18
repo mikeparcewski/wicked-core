@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A claude seat in a container runs what the gate allows (core#1027).** The relayed gate hook answered an allowed
+  call with `{}`, which hands the call back to claude's own permission flow; under the engine's
+  `--permission-mode acceptEdits` in a `-p` session that flow refused `node`, `env`, compound Bash and reads outside
+  the worktree ("This command requires approval"), so claude could not be a QE unit, QE reviewer or capture seat.
+  The relay now answers claude's documented `hookSpecificOutput.permissionDecision: "allow"` (a JSON object the gate
+  hook printed rides along; a decision it states is kept). Deny still denies, and claude's own deny rules still
+  block an allowed call. The live container test now runs the engine's real posture instead of
+  `--dangerously-skip-permissions`, which had hidden this.
+
 - **A step's creator is never offered as its own monitor (core#1028).** The team supervisor walked the plan's
   candidates (a pool monitor first) and recorded `member.joined{status:"failed", error:"… the creator's own seat
   instance …"}` for the unit's creator before seating a distinct one, which studio showed as "<seat> could not
