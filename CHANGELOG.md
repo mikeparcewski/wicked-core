@@ -660,6 +660,10 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.14.1** — 2026-10-17 — patch release on main 9e943d5, carrying #1012, #1013 and #1014.
+  - **Seat sign-in refresh:** the broker's refresh sends the provider CLI's User-Agent, so Anthropic refreshes stop failing (#1012).
+  - **Container QE unit:** the seat image installs wicked-ledger under `/opt/wicked-ledger`, so a container seat's QE unit resolves it (#1013).
+  - **opencode and repeated failures:** opencode seats reach their own server on loopback, and a seat that crashes repeatedly is benched (#1014).
 - **core-ts 0.14.0** — 2026-10-17 — minor release on main 8566071, carrying #994, #995, #996, #998, #999, #1000, #1001, #1002, #1003, #1004, #1005, #1006 and #1007.
   - **Container floor seats:** claude's gate hook is a relayed command hook (#994); codex's ChatGPT seat uses its own provider (#995); a copilot seat always names its model (#996), and uses its account's Copilot API host and models (#1002); `sandboxPosture` names the seat container (#1001).
   - **Review and judging:** an evaluator unit's judge rotation excludes the work's creators, with a disclosed fallback (#1003); a reduced team run may review on its creator seat (#999); each triage judgement runs under its own session id (#1000).
