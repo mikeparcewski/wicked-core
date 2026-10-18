@@ -42,17 +42,32 @@ pub(crate) const REFRESHABLE: &[&str] = &["claude", "codex", "pi", "opencode", "
 pub(crate) struct Flow {
     pub(crate) url: String,
     pub(crate) client_id: &'static str,
+    /// The User-Agent the request carries: the pinned CLI's own (core#1011). The token request
+    /// runs in a curl container, and curl's default `curl/<version>` is refused by Anthropic's
+    /// token endpoint before it reads the body (`429 rate_limit_error` on every request), so a
+    /// claude or pi sign-in was never renewed and the seat signed out when its token expired.
+    pub(crate) user_agent: &'static str,
 }
 
+/// The User-Agent of the pinned claude CLI (`@anthropic-ai/claude-code@2.1.296`, the seat
+/// image's package; a test keeps the two in step). Anthropic's flow, for claude and pi's
+/// `anthropic` entry alike.
+pub(crate) const CLAUDE_USER_AGENT: &str = "claude-cli/2.1.296 (external, cli)";
+/// The User-Agent of the pinned codex CLI (`@openai/codex@0.162.1`). OpenAI's flow, for codex
+/// and the ChatGPT entries of pi and opencode.
+pub(crate) const CODEX_USER_AGENT: &str = "codex_cli_rs/0.162.1";
+
 pub(crate) fn flow(cli: &str) -> Option<Flow> {
-    let (url, client_id) = match cli {
+    let (url, client_id, user_agent) = match cli {
         "claude" => (
             "https://platform.claude.com/v1/oauth/token",
             "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+            CLAUDE_USER_AGENT,
         ),
         "codex" => (
             "https://auth.openai.com/oauth/token",
             "app_EMoamEEZ73f0CkXaXp7hrann",
+            CODEX_USER_AGENT,
         ),
         _ => return None,
     };
@@ -61,11 +76,13 @@ pub(crate) fn flow(cli: &str) -> Option<Flow> {
         return Some(Flow {
             url: stub,
             client_id,
+            user_agent,
         });
     }
     Some(Flow {
         url: url.into(),
         client_id,
+        user_agent,
     })
 }
 
@@ -142,8 +159,13 @@ fn multi_entry(cli: &str) -> bool {
 /// One token request the refresher makes for a record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Request {
-    /// An OAuth refresh: a JSON POST to the provider's token endpoint.
-    Post { url: String, body: Value },
+    /// An OAuth refresh: a JSON POST to the provider's token endpoint, as the provider's own
+    /// CLI makes it (its User-Agent, [`Flow::user_agent`]).
+    Post {
+        url: String,
+        body: Value,
+        user_agent: &'static str,
+    },
     /// Copilot's token exchange: a GET authorized by the GitHub token (sent on stdin as a
     /// header, never on a command line), with the client's identifying headers.
     BearerGet {
@@ -189,6 +211,7 @@ pub(crate) fn next_refresh(
             Request::Post {
                 url: flow.url,
                 body,
+                user_agent: flow.user_agent,
             },
         ));
     }
@@ -250,6 +273,7 @@ pub(crate) fn entry_request(cli: &str, record: &Value, id: &str) -> Option<Reque
                 url: flow.url,
                 body: json!({"grant_type": "refresh_token", "refresh_token": refresh,
                     "client_id": flow.client_id}),
+                user_agent: flow.user_agent,
             }
         }
         "openai-codex" | "openai" => {
@@ -258,6 +282,7 @@ pub(crate) fn entry_request(cli: &str, record: &Value, id: &str) -> Option<Reque
                 url: flow.url,
                 body: json!({"grant_type": "refresh_token", "refresh_token": refresh,
                     "client_id": flow.client_id, "scope": "openid profile email"}),
+                user_agent: flow.user_agent,
             }
         }
         _ => Request::BearerGet {
@@ -834,6 +859,48 @@ pub(crate) fn repair_refresh(
     Ok(bytes)
 }
 
+/// curl's `-w` format: the answer's HTTP status on a last line of its own (curl expands the `\n`).
+const STATUS_FORMAT: &str = "\\n%{http_code}";
+
+/// Split curl's output into the answer's body and the HTTP status [`STATUS_FORMAT`] appended:
+/// a last line of exactly three digits after a newline. Output without one is all body, the
+/// status unknown (`None`).
+fn split_status(out: &[u8]) -> (&[u8], Option<u16>) {
+    match out.iter().rposition(|b| *b == b'\n') {
+        Some(nl) if out.len() - nl == 4 && out[nl + 1..].iter().all(u8::is_ascii_digit) => {
+            let code = std::str::from_utf8(&out[nl + 1..])
+                .ok()
+                .and_then(|c| c.parse().ok());
+            (&out[..nl], code)
+        }
+        _ => (out, None),
+    }
+}
+
+/// The error a refused request reports (core#1011): its HTTP status and, when the body is an
+/// OAuth or API error, the error's CODE (`invalid_grant`, `rate_limit_error`), never the body
+/// itself, its description or anything a credential could be in.
+fn refusal(status: u16, body: &[u8]) -> String {
+    let code = serde_json::from_slice::<Value>(body).ok().and_then(|v| {
+        let code = match v.get("error") {
+            Some(Value::String(c)) => c.clone(),
+            Some(e) => e.get("type")?.as_str()?.to_string(),
+            None => return None,
+        };
+        // A code is a short token; anything else (free text) is not repeated.
+        let token = !code.is_empty()
+            && code.len() <= 64
+            && code
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+        token.then_some(code)
+    });
+    match code {
+        Some(code) => format!("the endpoint answered HTTP {status} ({code})"),
+        None => format!("the endpoint answered HTTP {status}"),
+    }
+}
+
 #[cfg(unix)]
 mod live {
     use super::*;
@@ -864,21 +931,30 @@ mod live {
             &Request::Post {
                 url: url.into(),
                 body: body.clone(),
+                user_agent: CLAUDE_USER_AGENT,
             },
         )
     }
 
     /// The curl argv and stdin of `request` (pure): a POST's body and a GET's credential header
-    /// both ride stdin, so no credential is ever a command-line argument.
+    /// both ride stdin, so no credential is ever a command-line argument. The answer's HTTP
+    /// status follows its body on a last line of its own ([`STATUS_FORMAT`], read back by
+    /// [`split_status`]); no `--fail`, so a refusal names its status, not "curl exit 22".
     pub(crate) fn request_argv(request: &Request) -> Result<(Vec<String>, Vec<u8>), String> {
-        let mut argv: Vec<String> = ["-sS", "--max-time", "30", "--fail"]
+        let mut argv: Vec<String> = ["-sS", "--max-time", "30", "-w", STATUS_FORMAT]
             .into_iter()
             .map(str::to_string)
             .collect();
         let stdin = match request {
-            Request::Post { url, body } => {
+            Request::Post {
+                url,
+                body,
+                user_agent,
+            } => {
                 argv.extend(
                     [
+                        "-A",
+                        user_agent,
                         "-X",
                         "POST",
                         "-H",
@@ -957,10 +1033,14 @@ mod live {
         .chain(curl)
         .collect::<Vec<_>>();
         let out = crate::seat_gateway::mutation_helper(rt, dir, cli, &argv, &bytes, POST_TIMEOUT)?;
+        let (out, status) = split_status(&out);
+        if let Some(code) = status.filter(|c| !(200..300).contains(c)) {
+            return Err(refusal(code, out));
+        }
         if out.len() > MAX_ANSWER {
             return Err("the token answer exceeds its size limit".into());
         }
-        serde_json::from_slice(&out).map_err(|_| "the token answer is not JSON".into())
+        serde_json::from_slice(out).map_err(|_| "the token answer is not JSON".into())
     }
 
     /// Refresh `cli` when its credential is due (or `force`). One pass per gateway dir at a time.
@@ -1298,9 +1378,18 @@ mod tests {
         assert_eq!(next_refresh("pi", &record, 100, false), None, "nothing due");
         let (entry, request) = next_refresh("pi", &record, 1_000_000_000, false).unwrap();
         assert_eq!(entry.as_deref(), Some("openai-codex"));
-        let Request::Post { url, body } = request else {
+        let Request::Post {
+            url,
+            body,
+            user_agent,
+        } = request
+        else {
             panic!("an OAuth refresh is a POST")
         };
+        assert_eq!(
+            user_agent, CODEX_USER_AGENT,
+            "OpenAI's flow, as codex makes it"
+        );
         assert_eq!(url, "https://auth.openai.com/oauth/token");
         assert_eq!(body["refresh_token"], "FAKE-oai-r");
         assert_eq!(body["client_id"], "app_EMoamEEZ73f0CkXaXp7hrann");
@@ -1445,7 +1534,8 @@ mod tests {
         ]);
         assert!(due_entries("opencode", &export, 0, false).is_empty());
         assert_eq!(due_entries("opencode", &export, 0, true), vec!["openai"]);
-        let Some(Request::Post { url, body }) = entry_request("opencode", &export, "openai") else {
+        let Some(Request::Post { url, body, .. }) = entry_request("opencode", &export, "openai")
+        else {
             panic!("a POST to codex's endpoint")
         };
         assert_eq!(url, "https://auth.openai.com/oauth/token");
@@ -1488,6 +1578,7 @@ mod tests {
         let (argv, stdin) = request_argv(&Request::Post {
             url: "u".into(),
             body: json!({"refresh_token": "FAKE-r"}),
+            user_agent: CLAUDE_USER_AGENT,
         })
         .unwrap();
         assert!(!argv.iter().any(|a| a.contains("FAKE-r")));
@@ -1580,7 +1671,10 @@ if [ "$1 $2" = 'image inspect' ]; then exit 0; fi
 [ "$1" = run ] || exit 1
 printf '%s\n' "$*" > "$base/argv"
 cat > "$base/request"
-printf '{"access_token":"FAKE-answer","refresh_token":"FAKE-R2"}'
+case "$*" in
+  *refused*) printf '{"error":{"type":"rate_limit_error","message":"FAKE-detail"}}\n429' ;;
+  *) printf '{"access_token":"FAKE-answer","refresh_token":"FAKE-R2"}\n200' ;;
+esac
 "#,
         );
         let rt = crate::container_floor::Runtime { cli: runtime };
@@ -1599,6 +1693,19 @@ printf '{"access_token":"FAKE-answer","refresh_token":"FAKE-R2"}'
         assert!(argv.contains("--log-driver none"));
         assert!(argv.contains("--data-binary @-"));
         assert!(!argv.contains("FAKE-R1"));
+        // core#1011: the provider CLI's User-Agent, never curl's own.
+        assert!(argv.contains(&format!("-A {CLAUDE_USER_AGENT}")), "{argv}");
+        // A refused request names its status and error code, never the body's detail.
+        let refused = live::post_json(
+            &rt,
+            &dir,
+            "claude",
+            "FAKE-ext",
+            "https://FAKE.invalid/refused",
+            &json!({"refresh_token":"FAKE-R1"}),
+        )
+        .unwrap_err();
+        assert_eq!(refused, "the endpoint answered HTTP 429 (rate_limit_error)");
         assert_eq!(
             serde_json::from_slice::<Value>(&std::fs::read(dir.join("request")).unwrap()).unwrap(),
             json!({"refresh_token":"FAKE-R1"})
@@ -1811,6 +1918,100 @@ printf '{"access_token":"FAKE-answer","refresh_token":"FAKE-R2"}'
             };
             assert_eq!(new.pointer(pointer).unwrap(), "FAKE-refresh");
         }
+    }
+
+    /// core#1011: every OAuth refresh carries its provider CLI's User-Agent (Anthropic's token
+    /// endpoint answers curl's own with `429 rate_limit_error`), and each agent string names the
+    /// version the seat image pins.
+    #[test]
+    fn oauth_refreshes_carry_the_pinned_clis_user_agent() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let ua = |r: Option<Request>| match r {
+            Some(Request::Post { user_agent, .. }) => user_agent,
+            other => panic!("an OAuth refresh is a POST: {other:?}"),
+        };
+        assert_eq!(
+            ua(next_refresh("claude", &claude_record(), 0, true).map(|(_, r)| r)),
+            CLAUDE_USER_AGENT
+        );
+        assert_eq!(
+            ua(next_refresh("codex", &codex_record(), 0, true).map(|(_, r)| r)),
+            CODEX_USER_AGENT
+        );
+        assert_eq!(
+            ua(entry_request("pi", &pi_record(), "anthropic")),
+            CLAUDE_USER_AGENT,
+            "pi's Anthropic sign-in renews as claude does"
+        );
+        assert_eq!(
+            ua(entry_request("pi", &pi_record(), "openai-codex")),
+            CODEX_USER_AGENT
+        );
+        #[cfg(unix)]
+        {
+            let (argv, _) = request_argv(&Request::Post {
+                url: "u".into(),
+                body: json!({}),
+                user_agent: CLAUDE_USER_AGENT,
+            })
+            .unwrap();
+            assert!(argv.windows(2).any(|w| w == ["-A", CLAUDE_USER_AGENT]));
+            assert!(!argv.iter().any(|a| a == "--fail"), "{argv:?}");
+            assert!(argv.windows(2).any(|w| w == ["-w", STATUS_FORMAT]));
+        }
+        let version = |ua: &str| {
+            ua.split('/')
+                .nth(1)
+                .and_then(|v| v.split(' ').next())
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            crate::container_floor::seat_package("claude"),
+            Some(format!("@anthropic-ai/claude-code@{}", version(CLAUDE_USER_AGENT)).as_str())
+        );
+        assert_eq!(
+            crate::container_floor::seat_package("codex"),
+            Some(format!("@openai/codex@{}", version(CODEX_USER_AGENT)).as_str())
+        );
+    }
+
+    /// The status line curl appends is split off the body; a refusal reports the status and the
+    /// error's code only (core#1011).
+    #[test]
+    fn a_refused_answer_names_its_status_and_code_not_its_body() {
+        assert_eq!(
+            split_status(b"{\"a\":1}\n200"),
+            (&b"{\"a\":1}"[..], Some(200))
+        );
+        assert_eq!(split_status(b"\n429"), (&b""[..], Some(429)));
+        assert_eq!(split_status(b"{\"a\":1}"), (&b"{\"a\":1}"[..], None));
+        assert_eq!(split_status(b"{}\n20"), (&b"{}\n20"[..], None));
+        assert_eq!(
+            refusal(
+                400,
+                br#"{"error":"invalid_grant","error_description":"FAKE-secret-detail"}"#
+            ),
+            "the endpoint answered HTTP 400 (invalid_grant)"
+        );
+        assert_eq!(
+            refusal(
+                429,
+                br#"{"error":{"type":"rate_limit_error","message":"FAKE-detail"}}"#
+            ),
+            "the endpoint answered HTTP 429 (rate_limit_error)"
+        );
+        assert_eq!(
+            refusal(403, b"<html>FAKE</html>"),
+            "the endpoint answered HTTP 403"
+        );
+        assert_eq!(
+            refusal(400, br#"{"error":"bad grant; FAKE token=abc"}"#),
+            "the endpoint answered HTTP 400",
+            "free text in the code's place is not repeated"
+        );
     }
 
     #[test]
