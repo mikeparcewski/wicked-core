@@ -176,6 +176,7 @@ pub(crate) fn in_process_governance() -> Option<crate::workflow::GovernanceConte
         // Same per-RUN fill for the read mirror (core#294).
         extra_read_roots: Vec::new(),
         project_id: None,
+        repo_id: None,
     })
 }
 
@@ -10013,6 +10014,9 @@ fn dispatch_unit(
             // resume/redrive re-arms the same scope. Threaded to the worker env as
             // `WICKED_RUN_PROJECT` by `estate_provenance_env`; `None` for a repo-only run.
             project_id: session.project_id.clone(),
+            // core#1018: the run's registered repo, from the session like the project above, so the
+            // worker env carries `WICKED_RUN_REPO` and the estate relay can scope to it.
+            repo_id: session.repo_ref.clone(),
             // The run's autonomy, for the unit's MCP posture mode (DES-MCP-TOOLS-001).
             human_confirm: session.human_confirm,
             ..g
@@ -20775,6 +20779,7 @@ mod seat_failover_tests {
                 mode: crate::mcp_gate::McpMode::Ask,
                 decisions_path: "/unused".into(),
                 db_path: String::new(),
+                estate: Default::default(),
             },
             crate::AskRequest {
                 question: "pick one".into(),

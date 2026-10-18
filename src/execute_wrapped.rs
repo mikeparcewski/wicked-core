@@ -3280,6 +3280,11 @@ impl WrappedCliStepRunner {
                     .and_then(|g| g.project_id.as_deref()),
             );
             stamp_run_markers(&mut cmd, &provenance);
+            // core#1018: the run's registered repo, stamped the same way (a governed unit only).
+            stamp_run_markers(
+                &mut cmd,
+                &run_repo_env(input.governance.as_ref().and_then(|g| g.repo_id.as_deref())),
+            );
             // (wicked-crew#951) The QE unit is handed its run's QE ledger root (outside the tree),
             // stamped the same way: garden's `qe accept` records its verdict there. In a container
             // seat it is also handed the image's own wicked-ledger to record it with (core#1009):
@@ -3450,11 +3455,16 @@ impl WrappedCliStepRunner {
             cmd.envs(ask_config.env.iter().cloned());
             // A container seat reaches the broker only through its gateway's MCP route (the
             // daemon's loopback URL names the seat's own loopback); no route, no broker URL.
+            // core#1018: the same route is the seat's only estate channel. No host store is mounted
+            // into a seat, so its estate calls go to crew's estate relay, which scopes them to this
+            // unit's run; the marker tells garden's shim to relay, and pins the store for the gate
+            // hook's shim rule (`gate_hook::ESTATE_BROKER_ENV`).
             if mcp_channel.is_some() && gateway_lease.is_some() {
-                if crate::seat_gateway::mcp_route_ready() {
-                    cmd.env(crate::mcp_gate::CREW_URL_ENV, crate::seat_gateway::MCP_URL);
-                } else {
-                    cmd.env_remove(crate::mcp_gate::CREW_URL_ENV);
+                for (key, value) in container_mcp_env(crate::seat_gateway::mcp_route_ready()) {
+                    match value {
+                        Some(v) => cmd.env(key, v),
+                        None => cmd.env_remove(key),
+                    };
                 }
             }
             let cancel_token = self.register_token(input);
@@ -4151,6 +4161,36 @@ pub(crate) fn estate_provenance_env(
         env.push(("WICKED_RUN_PROJECT".to_string(), p.to_string()));
     }
     env
+}
+
+/// A CONTAINER seat's broker env, by whether its gateway's MCP route is up: the broker URL the
+/// seat can reach (`http://agw:8700`, never the daemon's loopback) and the estate relay marker
+/// (core#1018, [`crate::gate_hook::ESTATE_BROKER_ENV`]) — or, with no route, neither (`None` =
+/// remove it: the daemon's loopback URL the channel armed names the seat's own loopback).
+pub(crate) fn container_mcp_env(route_ready: bool) -> [(&'static str, Option<&'static str>); 2] {
+    let (url, relay) = if route_ready {
+        (Some(crate::seat_gateway::MCP_URL), Some("1"))
+    } else {
+        (None, None)
+    };
+    [
+        (crate::mcp_gate::CREW_URL_ENV, url),
+        (crate::gate_hook::ESTATE_BROKER_ENV, relay),
+    ]
+}
+
+/// The env var naming the registered repo a governed run targets (core#1018).
+pub(crate) const RUN_REPO_ENV: &str = "WICKED_RUN_REPO";
+
+/// `WICKED_RUN_REPO` = the run's registered repo id (core#1018), for garden's estate shim
+/// (`facets.repo` on a proposal) — or nothing for a repo-less run or a blank id. The estate relay
+/// does not trust it: crew scopes a relayed call by the unit its token is bound to
+/// ([`crate::mcp_gate::resolve_estate_scope_json`]), never by what the worker sends.
+pub(crate) fn run_repo_env(repo: Option<&str>) -> Vec<(String, String)> {
+    repo.map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(|r| vec![(RUN_REPO_ENV.to_string(), r.to_string())])
+        .unwrap_or_default()
 }
 
 /// Stamp the run markers (the [`estate_provenance_env`] pairs) on a worker `Command` — the ONE
@@ -7597,6 +7637,7 @@ mod tests {
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
                 project_id: None,
+                repo_id: None,
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
@@ -7725,6 +7766,7 @@ mod tests {
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
                 project_id: None,
+                repo_id: None,
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
@@ -8090,6 +8132,7 @@ mod tests {
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
                 project_id: None,
+                repo_id: None,
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
@@ -8283,6 +8326,7 @@ mod tests {
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
                 project_id: None,
+                repo_id: None,
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
@@ -8648,6 +8692,7 @@ mod tests {
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
             project_id: None,
+            repo_id: None,
         };
         let input = StepInput {
             run_id: format!("armtest-{}", std::process::id()),
@@ -8797,6 +8842,39 @@ mod tests {
         );
     }
 
+    /// core#1018: a run that targets a registered repo stamps `WICKED_RUN_REPO` = its id; a
+    /// repo-less run, or a blank id, stamps nothing.
+    #[test]
+    fn run_repo_env_stamps_the_repo_only_when_present_and_non_blank() {
+        assert_eq!(
+            run_repo_env(Some(" wicked-core ")),
+            vec![("WICKED_RUN_REPO".to_string(), "wicked-core".to_string())]
+        );
+        assert!(run_repo_env(None).is_empty());
+        assert!(run_repo_env(Some("  ")).is_empty());
+    }
+
+    /// core#1018: a container seat whose gateway MCP route is up is handed the broker URL it can
+    /// reach AND the estate relay marker (its only estate channel); with no route it gets neither,
+    /// and the loopback URL the channel armed is removed.
+    #[test]
+    fn a_container_seat_gets_the_estate_relay_marker_only_with_the_mcp_route() {
+        assert_eq!(
+            container_mcp_env(true),
+            [
+                (crate::mcp_gate::CREW_URL_ENV, Some("http://agw:8700")),
+                (crate::gate_hook::ESTATE_BROKER_ENV, Some("1")),
+            ]
+        );
+        assert_eq!(
+            container_mcp_env(false),
+            [
+                (crate::mcp_gate::CREW_URL_ENV, None),
+                (crate::gate_hook::ESTATE_BROKER_ENV, None),
+            ]
+        );
+    }
+
     /// BC-79: a run FILED INTO a studio project stamps `WICKED_RUN_PROJECT` = that project id, so
     /// garden's estate shim scopes the worker's proposals to the run's project instead of the
     /// state-home default. A run with NO project (a repo-only run, `None`) — or a blank/whitespace
@@ -8846,6 +8924,7 @@ mod tests {
             extra_write_roots: Vec::new(),
             extra_read_roots: Vec::new(),
             project_id: project.map(str::to_string),
+            repo_id: None,
         };
         let input = |governance: Option<crate::workflow::GovernanceContext>| {
             let mut u = WorkUnit::pending("s:u1", "s", 2, "do it");
@@ -9464,6 +9543,7 @@ mod tests {
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
                 project_id: None,
+                repo_id: None,
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
@@ -11130,6 +11210,7 @@ mod tests {
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
                 project_id: None,
+                repo_id: None,
             },
             &format!("mcptest-repo-{}", std::process::id()),
         );
@@ -11164,6 +11245,7 @@ mod tests {
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
                 project_id: None,
+                repo_id: None,
             },
             &format!("mcptest-norepo-{}", std::process::id()),
         );
@@ -11464,6 +11546,7 @@ mod tests {
                 extra_write_roots: vec![author.to_string_lossy().into_owned()],
                 extra_read_roots: Vec::new(),
                 project_id: None,
+                repo_id: None,
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
@@ -14279,6 +14362,7 @@ mod tests {
             extra_write_roots: Vec::new(),
             extra_read_roots: vec!["/srv/grounding".to_string()],
             project_id: None,
+            repo_id: None,
         };
         let input = StepInput {
             run_id: format!("skillsroot-{}", std::process::id()),
@@ -16227,6 +16311,7 @@ mod ask_config_tests {
             extra_write_roots: vec![],
             extra_read_roots: vec![],
             project_id: None,
+            repo_id: None,
         };
         let mut input = StepInput {
             run_id: format!("ask-settings-{}", uuid::Uuid::new_v4()),

@@ -261,6 +261,23 @@ pub(crate) struct McpUnit {
     pub decisions_path: PathBuf,
     /// The operational store the policies are read from (read-only).
     pub db_path: String,
+    /// What crew's estate relay scopes this unit's estate calls to (core#1018).
+    pub estate: EstateScope,
+}
+
+/// The run facts crew's estate relay scopes a unit's estate calls by (core#1018), copied from the
+/// unit's governance context when the carrier binds the token — never from anything the worker
+/// sends. Read through [`resolve_estate_scope_json`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EstateScope {
+    /// The studio project the run is filed into, or `None` for a repo-only run.
+    pub project_id: Option<String>,
+    /// The registered repo the run targets, or `None` for a repo-less run.
+    pub repo_id: Option<String>,
+    /// The code graph the engine vouched for this run (the project's graph, else the repo's own;
+    /// the same store a host seat is handed as `WICKED_ESTATE_DB`), or `None` when it has none.
+    pub code_graph_db: Option<String>,
 }
 
 impl McpUnit {
@@ -284,8 +301,24 @@ impl McpUnit {
             mode,
             decisions_path: crate::gate_hook::decisions_path_for_input(input),
             db_path: db_path.to_string(),
+            estate: input
+                .governance
+                .as_ref()
+                .map(|g| EstateScope {
+                    project_id: nonblank(g.project_id.as_deref()),
+                    repo_id: nonblank(g.repo_id.as_deref()),
+                    code_graph_db: nonblank(g.code_graph_db.as_deref()),
+                })
+                .unwrap_or_default(),
         }
     }
+}
+
+/// `Some(trimmed)` for a non-blank value, else `None`.
+fn nonblank(v: Option<&str>) -> Option<String> {
+    v.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 /// The verdict the broker acts on. `decision` is `allow` | `ask` | `deny`.
@@ -994,6 +1027,48 @@ pub fn list_mcp_tools_json(request_json: &str) -> Result<String, String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// The estate relay's scope (core#1018): which unit a token is, and what its estate calls reach
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What a token resolves to for crew's estate relay: the unit (the same reference a call record
+/// names) and the run facts its estate calls are scoped by.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EstateUnitScope {
+    pub unit: McpUnitRef,
+    #[serde(flatten)]
+    pub scope: EstateScope,
+}
+
+/// The unit `token` is bound to and its estate scope (core#1018). A container seat has no estate
+/// store of its own, so its estate calls ride the broker as `mcp:estate/<tool>`; crew relays them
+/// to the host's estate, and THIS is what the relay scopes by: the run's project, repo and code
+/// graph, as the carrier bound them — nothing the worker sends. PURE: nothing is judged or
+/// recorded (crew records the relayed call in its call log, as it does every brokered call).
+pub fn resolve_estate_scope(token: &str) -> Result<EstateUnitScope, McpCallError> {
+    let unit = resolve(token).ok_or(McpCallError::InvalidToken)?;
+    Ok(EstateUnitScope {
+        unit: unit.unit_ref(),
+        scope: unit.estate.clone(),
+    })
+}
+
+/// The JSON face of [`resolve_estate_scope`] for the core-ts binding: `{token}` in, `{unit,
+/// projectId, repoId, codeGraphDb}` out (each scope field `null` when the run has none); an error
+/// string is `<code>: <message>`.
+pub fn resolve_estate_scope_json(request_json: &str) -> Result<String, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request {
+        token: String,
+    }
+    let req: Request = serde_json::from_str(request_json)
+        .map_err(|e| McpCallError::BadRequest(format!("request: {e}")).to_string())?;
+    let scope = resolve_estate_scope(&req.token).map_err(|e| e.to_string())?;
+    serde_json::to_string(&scope).map_err(|e| format!("guard_error: {e}"))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // The policy preview (S6): the same evaluation over synthetic units, never recorded
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1074,6 +1149,7 @@ pub(crate) fn preview_unit(cell: &McpPreviewCell, db_path: &str) -> Result<McpUn
         mode,
         decisions_path: PathBuf::new(),
         db_path: db_path.to_string(),
+        estate: EstateScope::default(),
     })
 }
 
@@ -1275,6 +1351,7 @@ mod tests {
             mode,
             decisions_path: PathBuf::from("/nonexistent"),
             db_path: String::new(),
+            estate: EstateScope::default(),
         }
     }
 
@@ -2005,6 +2082,7 @@ mod tests {
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
                 project_id: None,
+                repo_id: None,
                 human_confirm: HumanConfirm::All,
             }),
             prior_outputs: vec![],
@@ -2054,6 +2132,92 @@ mod tests {
             0,
             "an ungoverned worker gets no MCP env"
         );
+    }
+
+    /// core#1018: a token resolves to its unit's ESTATE scope — the run's project, repo and code
+    /// graph as the carrier bound them (blank = none, `null` on the wire) — for exactly the unit's
+    /// lifetime; an unknown or dead token is `invalid_token`, and nothing in the request but the
+    /// token is read.
+    #[test]
+    fn a_token_resolves_to_its_units_estate_scope_while_bound() {
+        let mut u = crate::domain::WorkUnit::pending("s:u4", "s", 4, "capture learnings");
+        u.assigned_cli = Some("pi".to_string());
+        let gov = |project: Option<&str>, repo: Option<&str>, graph: Option<&str>| {
+            Some(crate::workflow::GovernanceContext {
+                db_path: "/abs/estate.db".to_string(),
+                code_graph_db: graph.map(str::to_string),
+                extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
+                project_id: project.map(str::to_string),
+                repo_id: repo.map(str::to_string),
+                human_confirm: HumanConfirm::None,
+            })
+        };
+        let mut input = crate::workflow::StepInput {
+            run_id: "run-estate-scope".to_string(),
+            unit_ix: 0,
+            attempt: 2,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(std::env::temp_dir()),
+            governance: gov(
+                Some("proj_abc"),
+                Some("wicked-core"),
+                Some("/state/repo-graphs/k1/estate.db"),
+            ),
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let url = Some("http://127.0.0.1:60786".to_string());
+        // spawn-audit: test-only — never spawned; the test reads the binding the carrier armed.
+        let mut cmd = std::process::Command::new("true");
+        let (token, binding) =
+            arm_worker_mcp_channel_at(&mut cmd, &input, url.clone()).expect("armed");
+        let req = serde_json::json!({ "token": token.value() }).to_string();
+        let got: Value = serde_json::from_str(&resolve_estate_scope_json(&req).unwrap()).unwrap();
+        assert_eq!(
+            got,
+            serde_json::json!({
+                "unit": {"runId": "run-estate-scope", "ord": 4, "attempt": 2, "phase": "unit-4", "seat": "pi"},
+                "projectId": "proj_abc",
+                "repoId": "wicked-core",
+                "codeGraphDb": "/state/repo-graphs/k1/estate.db",
+            })
+        );
+        let value = token.value().to_string();
+        drop(binding);
+        assert!(resolve_estate_scope_json(&req)
+            .unwrap_err()
+            .starts_with("invalid_token"));
+        drop(token);
+        assert!(resolve_estate_scope(&value).is_err());
+
+        // A repo-less, unfiled run with no graph (b445's shape): every scope field is null.
+        input.governance = gov(Some("  "), None, None);
+        // spawn-audit: test-only — never spawned; the test reads the binding the carrier armed.
+        let mut cmd = std::process::Command::new("true");
+        let (token, _binding) = arm_worker_mcp_channel_at(&mut cmd, &input, url).expect("armed");
+        let got: Value = serde_json::from_str(
+            &resolve_estate_scope_json(&serde_json::json!({"token": token.value()}).to_string())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            (&got["projectId"], &got["repoId"], &got["codeGraphDb"]),
+            (&Value::Null, &Value::Null, &Value::Null)
+        );
+        // Only the token is read: a worker cannot hand the relay a scope.
+        let forged = serde_json::json!({"token": token.value(), "projectId": "other"}).to_string();
+        assert!(resolve_estate_scope_json(&forged)
+            .unwrap_err()
+            .starts_with("bad_request"));
+        assert!(resolve_estate_scope_json(r#"{"token":"wmt_nope"}"#)
+            .unwrap_err()
+            .starts_with("invalid_token"));
     }
 
     /// The binding's wire shape is camelCase both ways (the broker is JS): `classOverride` is

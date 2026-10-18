@@ -611,6 +611,7 @@ mod tests {
                 mode: crate::mcp_gate::McpMode::Ask,
                 decisions_path: "/unused".into(),
                 db_path: String::new(),
+                estate: Default::default(),
             },
             crate::AskRequest {
                 question: "Continue?".into(),

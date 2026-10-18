@@ -101,17 +101,38 @@ pub const ESTATE_READONLY_ENV: &str = "WICKED_ESTATE_READONLY";
 /// §7.1). BOTH launchers re-set [`ESTATE_DB_ENV`] on a worker whose run has a vouched-for graph
 /// (`execute_wrapped::arm_worker_estate_channel`; the ACP `build_cmd`, DES-L4 PR-⑦ — the one graph
 /// hand-off since the CLI-registered estate MCP was deleted) after `hardened()` stripped it; `WICKED_HOME` /
-/// `WICKED_MEMORY_DB` pin the memory + knowledge stores garden's `mem` backend reads and reach the
-/// worker on BOTH carriers by plain inheritance (neither is in `ENGINE_INTERNAL_ENV`).
+/// `WICKED_MEMORY_DB` pin the memory + knowledge stores garden's `mem` backend reads and reach a
+/// HOST seat by plain inheritance (neither is in `ENGINE_INTERNAL_ENV`). A CONTAINER seat gets only
+/// what the carrier set explicitly (`container_floor::finalize`), so neither reaches it, and no
+/// host store is mounted in: its estate channel is crew's relay, pinned by [`ESTATE_BROKER_ENV`]
+/// (core#1018).
 pub(crate) const ESTATE_STORE_PIN_ENV: [&str; 3] =
     [ESTATE_DB_ENV, "WICKED_HOME", "WICKED_MEMORY_DB"];
 
+/// (core#1018) Set to `1` on a CONTAINER seat whose MCP channel reaches crew through the seat
+/// gateway (`execute_wrapped`, beside `WICKED_CREW_URL`): the seat's estate store is crew's estate
+/// relay (`mcp:estate/<tool>` on the broker), scoped host-side to the run, so garden's estate shim
+/// relays its calls there instead of spawning a local `wicked-estate-mcp`. The host's SQLite stores
+/// are never mounted into the seat (WAL `-shm` across the VM file share is a corruption risk), so
+/// nothing in the container can resolve the operator's stores: an unpinned estate binary inside it
+/// would open only the container's own empty defaults. That is why this marker counts as the store
+/// pin for the shim allow rule ([`estate_store_pinned_from_env`]) — it names the store the shim
+/// reads, the run's own, and it is never set on a host seat.
+pub const ESTATE_BROKER_ENV: &str = "WICKED_ESTATE_BROKER";
+
 /// The env arm of the store-pin fact — read off the hook SUBPROCESS's own environment, which is
 /// the worker's (the hook is its grandchild), exactly as [`write_posture_from_env`] reads the posture.
+/// A container seat's estate relay marker ([`ESTATE_BROKER_ENV`]) pins the store too.
 fn estate_store_pinned_from_env() -> bool {
+    estate_store_pinned_by(|k| std::env::var_os(k))
+}
+
+/// [`estate_store_pinned_from_env`] over an injected lookup, so a test never writes the env.
+fn estate_store_pinned_by(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
     ESTATE_STORE_PIN_ENV
         .iter()
-        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+        .chain(std::iter::once(&ESTATE_BROKER_ENV))
+        .any(|k| var(k).is_some_and(|v| !v.is_empty()))
 }
 
 /// The store a VALIDATOR script may reach, carried under its own name.
@@ -11955,6 +11976,35 @@ mod boundary_tests {
             assert_eq!(hit.why, why, "{denied}");
             assert_eq!(hit.segment, denied, "the hit names the offending segment");
         }
+    }
+
+    /// core#1018: a container seat's estate relay marker pins the store for the shim rule, like the
+    /// store-path variables a host seat inherits; a blank value pins nothing, and neither does an
+    /// environment with none of them (the b445 container seat: the shim was denied `no-pin`).
+    #[test]
+    fn the_container_estate_relay_marker_pins_the_store() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| std::ffi::OsString::from(v))
+            }
+        };
+        assert!(estate_store_pinned_by(env(&[(ESTATE_BROKER_ENV, "1")])));
+        assert!(estate_store_pinned_by(env(&[(
+            "WICKED_HOME",
+            "/h/.wicked"
+        )])));
+        assert!(!estate_store_pinned_by(env(&[(ESTATE_BROKER_ENV, "")])));
+        assert!(!estate_store_pinned_by(env(&[
+            ("WICKED_RUN_ID", "r1"),
+            ("WICKED_MCP_TOKEN", "wmt_x"),
+            ("WICKED_CREW_URL", "http://agw:8700"),
+        ])));
+        // The marker is not a pin variable: it never names a store PATH, so the raw-SQLite fence
+        // (which matches a mention of a pin variable) is not widened to it.
+        assert!(!ESTATE_STORE_PIN_ENV.contains(&ESTATE_BROKER_ENV));
     }
 
     /// DES-GROUNDING-001 §7.1 — the estate stdio MCP and garden's shim are ALLOWED only with BOTH
