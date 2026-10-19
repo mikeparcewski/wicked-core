@@ -303,8 +303,8 @@ pub(crate) fn login_argv(
     let command: &[&str] = match cli {
         // A long-lived token the claude CLI mints for scripts (core#1024): its seats pass it
         // through, so the broker never renews a claude sign-in. The CLI prints the token and
-        // keeps no copy; the operator pastes it back once (unechoed) and it lands in the
-        // throwaway volume, where ingest reads it.
+        // keeps no copy; the login script reads it from claude's output (or, failing that, asks
+        // for it pasted back unechoed) and it lands in the throwaway volume, where ingest reads it.
         "claude" => &["sh", "-c", CLAUDE_SETUP_TOKEN_LOGIN, "wicked-login"],
         // GitHub's device flow: copilot picks its loopback web flow unless it detects a headless
         // host, and a login container is not detected as one (its callback was unreachable).
@@ -315,12 +315,222 @@ pub(crate) fn login_argv(
     argv
 }
 
-/// Where claude's login leaves the `claude setup-token` token the operator pasted back.
+/// Where claude's login leaves the `claude setup-token` token: read from claude's own output, or
+/// pasted back by the operator when it could not be read.
 const CLAUDE_SETUP_TOKEN_PATH: &str = "claude/wicked-setup-token";
 
-/// claude's login: `claude setup-token`, then the token it printed, pasted back unechoed and
-/// written (owner-only) beside the CLI's own files for ingest. No token, no file: ingest reports
-/// the sign-in missing and the operator signs in again.
+/// What claude's login prints the moment it has the token, before anything slow: ingest (and
+/// the sign-in check) starts once the login terminal ends, and until then the operator only waits.
+macro_rules! claude_token_received {
+    () => {
+        "wicked: token received \u{2014} checking it with Claude now, this can take up to a minute; there is nothing more to type"
+    };
+}
+
+/// The python3 program that reads the `claude setup-token` token from a capture of claude's
+/// terminal output: `python3 -c PROGRAM CAPTURE "ROWS COLS" DEST`. Exit 0 with the token, and
+/// nothing else, written owner-only to DEST; any other exit leaves DEST untouched. The seat image
+/// installs python3 (containers/seats/seat.Dockerfile).
+///
+/// The capture is replayed onto a minimal screen of the terminal's size. Escape sequences are
+/// parsed as [`strip_terminal_controls`] parses them (CSI, OSC, DCS, SOS, PM, APC, SS3, two-byte;
+/// a line break ends one); only cursor moves, erases, the alternate screen and autowrap act, and
+/// every other sequence (SGR colours, modes) is dropped. A frame Ink erased and redrew so counts
+/// once, and the alternate screen is read apart from the main screen. On each screen, the first
+/// non-blank row after a row reading "Your OAuth token" must hold `sk-ant-oat` with only spaces
+/// before it and only token characters (`A-Za-z0-9-_`) from there: that column is the token's.
+/// The next row is joined only when the row before it ended exactly at the terminal width and it
+/// holds token characters alone, starting at that same column; a blank row or a row with any
+/// other character ("Store this token securely…") ends the token. A row of token characters that
+/// fails either condition, text around the token, two different tokens, or none: no token (the
+/// script then asks for the paste). The token is held to the shape [`setup_token`] checks again
+/// at ingest (one `sk-ant-oat` prefix, 20 to 4096 characters).
+macro_rules! claude_token_extractor {
+    () => {
+        r#"import os, sys
+T = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+P = "sk-ant-oat"
+def screens(s, H, W):
+    done, rows, alt = [], {}, None
+    r = c = b = 0
+    sv = (0, 0)
+    top = lambda: max(0, b - H + 1) if H else 0
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
+        i += 1
+        if ch == "\x1b":
+            k = s[i] if i < n else ""
+            if k == "[":
+                i += 1
+                j = i
+                while i < n and " " <= s[i] <= "?":
+                    i += 1
+                q = s[j:i]
+                if i >= n or not "\x40" <= s[i] <= "~":
+                    continue
+                f = s[i]
+                i += 1
+                pv = q[:1] in ("<", "=", ">", "?")
+                v = [int(x) if x.isdigit() else 0 for x in q.lstrip("<=>?").split(";")]
+                if pv:
+                    if q[:1] == "?" and f in "hl" and {47, 1047, 1049} & set(v):
+                        if f == "h" and alt is None:
+                            alt, rows, r, c, b = (rows, r, c, b, sv), {}, 0, 0, 0
+                        elif f == "l" and alt is not None:
+                            done.append(rows)
+                            rows, r, c, b, sv = alt
+                            alt = None
+                    continue
+                m = v[0] or 1
+                if W and f != "m":
+                    c = min(c, W - 1)
+                if f == "A":
+                    r = max(top(), r - m)
+                elif f in "Be":
+                    r = min(r + m, top() + H - 1) if H else r + m
+                elif f in "Ca":
+                    c = min(c + m, W - 1) if W else c + m
+                elif f == "D":
+                    c = max(0, c - m)
+                elif f == "E":
+                    r, c = (min(r + m, top() + H - 1) if H else r + m), 0
+                elif f == "F":
+                    r, c = max(top(), r - m), 0
+                elif f in "G`":
+                    c = m - 1
+                elif f in "Hf":
+                    r, c = top() + m - 1, (v[1] if len(v) > 1 and v[1] else 1) - 1
+                elif f == "d":
+                    r = top() + m - 1
+                elif f == "J":
+                    e = v[0]
+                    if e == 0:
+                        rows = {y: l if y < r else l[:c] for y, l in rows.items() if y <= r}
+                    elif e == 1:
+                        rows = {y: l if y > r or y < top() else [" "] * (c + 1) + l[c + 1:] for y, l in rows.items() if y >= r or y < top()}
+                    elif e == 2:
+                        rows = {y: l for y, l in rows.items() if y < top()}
+                    elif e == 3:
+                        rows = {y: l for y, l in rows.items() if y >= top()}
+                elif f == "K":
+                    e, l = v[0], rows.get(r, [])
+                    rows[r] = l[:c] if e == 0 else [" "] * (c + 1) + l[c + 1:] if e == 1 else []
+                elif f == "s" and not q:
+                    sv = (r, c)
+                elif f == "u" and not q:
+                    r, c = sv
+            elif k in ("]", "P", "X", "^", "_"):
+                i += 1
+                while i < n and s[i] not in "\r\n":
+                    i += 1
+                    if s[i - 1] == "\x07":
+                        break
+                    if s[i - 1] == "\x1b":
+                        if i < n and s[i] == "\\":
+                            i += 1
+                        else:
+                            i -= 1
+                        break
+            elif k == "O":
+                i += 1
+                if i < n and " " <= s[i] <= "~":
+                    i += 1
+            elif k and " " <= k <= "~":
+                i += 1
+                c = min(c, W - 1) if W else c
+                if k <= "/" and i < n:
+                    i += 1
+                if k == "7":
+                    sv = (r, c)
+                elif k == "8":
+                    r, c = sv
+                elif k in "DE":
+                    r, c = r + 1, 0 if k == "E" else c
+                elif k == "M":
+                    r = max(top(), r - 1)
+        elif ch == "\r":
+            c = 0
+        elif ch in "\n\x0b\x0c":
+            r, c = r + 1, 0
+        elif ch == "\x08":
+            c = max(0, (min(c, W - 1) if W else c) - 1)
+        elif ch == "\t":
+            c = min((c // 8 + 1) * 8, W - 1) if W else (c // 8 + 1) * 8
+        elif ch >= " " and ch != "\x7f":
+            if W and c >= W:
+                r, c = r + 1, 0
+            l = rows.setdefault(r, [])
+            l.extend(" " * (c + 1 - len(l)))
+            l[c] = ch
+            c += 1
+        b = max(b, r)
+    done.append(rows)
+    if alt is not None:
+        done.append(alt[0])
+    return [["".join(d.get(y, [])).rstrip() for y in range(max(d, default=-1) + 1)] for d in done]
+def tokens(lines, W):
+    out = set()
+    for i, line in enumerate(lines):
+        if "Your OAuth token" not in line:
+            continue
+        j = i + 1
+        while j < len(lines) and not lines[j].strip():
+            j += 1
+        row = lines[j] if j < len(lines) else ""
+        col = row.find(P)
+        if col < 0:
+            continue
+        tok = row[col:]
+        if row[:col].strip() or not set(tok) <= T:
+            return None
+        end = len(row)
+        for nxt in lines[j + 1:]:
+            body = nxt.lstrip(" ")
+            if not body or not set(body) <= T:
+                break
+            if end != W or len(nxt) - len(body) != col:
+                return None
+            tok, end = tok + body, len(nxt)
+        out.add(tok)
+    return out
+def main(path, size, dest):
+    with open(path, "rb") as f:
+        s = f.read(64 << 20).decode("utf-8", "replace")
+    d = size.split()
+    H, W = (int(d[0]), int(d[1])) if len(d) == 2 and d[0].isdigit() and d[1].isdigit() else (0, 0)
+    found = set()
+    for lines in screens(s, H, W):
+        t = tokens(lines, W)
+        if t is None:
+            return 1
+        found |= t
+    if len(found) != 1:
+        return 1
+    tok = found.pop()
+    if not (20 <= len(tok) <= 4096 and tok.startswith(P) and tok.count(P) == 1):
+        return 1
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(tok)
+    return 0
+sys.exit(main(*sys.argv[1:4]))
+"#
+    };
+}
+
+/// claude's login: `claude setup-token` runs under util-linux `script`, so claude keeps a real
+/// terminal for its own "Paste code here if prompted >" prompt (the browser's authorization code
+/// is all the operator pastes) while its output is captured to an owner-only file in a fresh
+/// `mktemp -d` directory on the login container's tmpfs `/tmp`: never in the login volume, so even
+/// a killed container leaves no capture behind. [`claude_token_extractor`] reads the token claude
+/// printed from it, at the terminal's size when claude exits (`stty size`), and writes only the
+/// token (owner-only) beside the CLI's own files for ingest. The capture is deleted as soon as it
+/// was read, and by a trap on exit, HUP, INT and TERM. The token is never printed or logged.
+///
+/// When the token cannot be read (no util-linux `script` or python3, no token row, an ambiguous
+/// one), the script says so in one line and asks for the paste as before. No token, no file:
+/// ingest reports the sign-in missing and the operator signs in again.
 ///
 /// The paste is read in line mode (`stty sane`: Enter ends a line even if the TUI left the
 /// terminal raw) with bracketed paste on. The CLI wraps the long token across two rows, so a
@@ -331,18 +541,33 @@ const CLAUDE_SETUP_TOKEN_PATH: &str = "claude/wicked-setup-token";
 /// closed, EOF inside an open paste) saves nothing. What lands is the paste as typed, line
 /// breaks and brackets included: [`setup_token`] joins and checks it.
 ///
-/// claude turns xterm mouse reporting and its keyboard modes (the kitty keyboard protocol,
-/// modifyOtherKeys, synchronized output) on, and its `setup-token` exit leaves them on (as it
+/// claude turns xterm mouse reporting and its keyboard modes on (the kitty keyboard protocol,
+/// modifyOtherKeys, synchronized output), and its `setup-token` exit leaves them on (as it
 /// leaves the terminal raw): studio's terminal then sends each click into the paste as a mouse
 /// report and a drag selects nothing, so the token cannot be copied. The script turns those
-/// modes off before its prompt. It leaves the alternate screen alone: leaving it would clear the
+/// modes off after claude exits. It leaves the alternate screen alone: leaving it would clear the
 /// token from view when claude printed it on the main screen. Whatever control sequences still
 /// reach the paste (a terminal's answer to a query claude sent, a click before the modes were
 /// off) are not token text: `bare` drops them before a line is tested, so a line of them alone
 /// counts as an empty line, and [`setup_token`] drops them from what lands. (`bare` ends a CSI
 /// at `A`-`~`: a terminal never sends one ending in `@`, and a login argv never carries an `@`.)
-const CLAUDE_SETUP_TOKEN_LOGIN: &str = "claude setup-token || exit 1; stty sane -echo 2>/dev/null; \
+///
+/// Once the token is saved, [`claude_token_received`] says the check has started and nothing is
+/// left to type. Echo stays off, so keys pressed while ingest runs are never echoed.
+const CLAUDE_SETUP_TOKEN_LOGIN: &str = concat!(
+    "td=; trap '[ -z \"$td\" ] || rm -rf \"$td\"' EXIT; trap 'exit 1' HUP INT TERM; \
+case $(script -V 2>/dev/null) in *util-linux*) td=$(umask 077 && mktemp -d) || td=;; esac; \
+if [ -n \"$td\" ]; then (umask 077 && exec script -q -e -c 'claude setup-token' \"$td/claude.out\") || exit 1; \
+else claude setup-token || exit 1; fi; stty sane -echo 2>/dev/null; \
 printf '\\033[?1000l\\033[?1002l\\033[?1003l\\033[?1005l\\033[?1006l\\033[?1015l\\033[<u\\033[=0;1u\\033[>4;0m\\033[?2026l'; \
+s=$(stty size 2>/dev/null); \
+if [ -n \"$td\" ] && mkdir -p \"$CLAUDE_CONFIG_DIR\" && python3 -c '",
+    claude_token_extractor!(),
+    "' \"$td/claude.out\" \"$s\" \"$CLAUDE_CONFIG_DIR/wicked-setup-token\" 2>/dev/null; \
+then rm -rf \"$td\"; td=; printf '\\n%s\\n' '",
+    claude_token_received!(),
+    "'; exit 0; fi; rm -rf \"$td\"; td=; \
+printf '\\n%s' \"wicked: could not read the token from claude's output; paste it instead\"; \
 e=$(printf '\\033'); b=$(printf '\\007'); \
 bare() { printf '%s\\n' \"$1\" | LC_ALL=C sed -e \"s|$e\\[[0-?]*[ -/]*[A-~]||g\" -e \"s|$e[]P_^X][^$b$e]*$b||g\" \
 -e \"s|$e[]P_^X][^$e]*$e.||g\" -e \"s|${e}O.||g\" -e \"s|$e.||g\" -e \"s|$e||g\"; }; \
@@ -353,12 +578,15 @@ case \"$p\" in *\"$o\"*) case \"$p\" in *\"$c\"*) d=1; break;; esac; continue;; 
 l=$(bare \"$l\"); \
 case \"$l\" in *[A-Za-z0-9_-]*) t=1; printf '\\r\\n%s' 'wicked: press Enter once more to finish (or paste the rest of the token): ';; \
 *) [ -z \"$t\" ] || { d=1; break; };; esac; done; \
-stty echo 2>/dev/null; printf '\\033[?2004l\\n'; \
+printf '\\033[?2004l\\n'; \
 case $(bare \"$p\") in *[A-Za-z]*) ;; *) echo 'wicked: no token was pasted; sign claude in again' >&2; exit 1;; esac; \
 [ -n \"$d\" ] || { echo 'wicked: the paste did not finish; sign claude in again' >&2; exit 1; }; \
 mkdir -p \"$CLAUDE_CONFIG_DIR\" && (umask 077 && printf '%s' \"$p\" > \"$CLAUDE_CONFIG_DIR/wicked-setup-token\") \
 || { echo 'wicked: the token could not be saved; sign claude in again' >&2; exit 1; }; \
-echo 'wicked: token received; studio checks it now'";
+printf '%s\\n' '",
+    claude_token_received!(),
+    "'"
+);
 
 /// The `claude setup-token` token pasted back at sign-in (pure): the paste's terminal control
 /// sequences dropped ([`strip_terminal_controls`]: its bracketed-paste markers, and the mouse
@@ -660,13 +888,13 @@ pub(crate) fn extract_tokens(
                     return Ok(vec![token_file("anthropic.key", key)]);
                 }
             }
-            // No pasted token and no credential record (a settings file without one does not
-            // count): the token `claude setup-token` printed was never pasted back, or the
-            // window closed first.
+            // No token and no credential record (a settings file without one does not count):
+            // the token `claude setup-token` printed was neither read from its output nor pasted
+            // back, or the window closed first.
             Err(missing(
                 cli,
-                "the `claude setup-token` token (it was never pasted back); sign claude in again \
-                 and paste the token it prints",
+                "the `claude setup-token` token (it was neither read from claude's output nor \
+                 pasted back); sign claude in again",
             ))
         }
         "codex" => {
@@ -3759,9 +3987,9 @@ esac
     fn a_claude_setup_token_sign_in_is_brokered_for_pass_through() {
         // Line mode with echo off before the prompt shows, so a paste typed at once is never
         // echoed and Enter ends the line whatever mode the TUI left the terminal in.
-        assert!(
-            CLAUDE_SETUP_TOKEN_LOGIN.starts_with("claude setup-token || exit 1; stty sane -echo")
-        );
+        assert!(CLAUDE_SETUP_TOKEN_LOGIN.contains("script -q -e -c 'claude setup-token'"));
+        assert!(CLAUDE_SETUP_TOKEN_LOGIN
+            .contains("else claude setup-token || exit 1; fi; stty sane -echo 2>/dev/null; "));
         assert!(CLAUDE_SETUP_TOKEN_LOGIN.contains("umask 077"));
         assert!(CLAUDE_SETUP_TOKEN_LOGIN.contains("> \"$CLAUDE_CONFIG_DIR/wicked-setup-token\""));
         assert_eq!(credential_paths("claude")[0], CLAUDE_SETUP_TOKEN_PATH);
@@ -3800,14 +4028,14 @@ esac
             );
         }
         // No pasted token and only a settings file without a credential record in it (claude
-        // can write one): the operator is told the token was never pasted back.
+        // can write one): the operator is told the token was neither read nor pasted back.
         let err = extract_tokens(
             "claude",
             &[file("claude/settings.json", serde_json::json!({}))],
         )
         .unwrap_err();
         assert!(
-            err.contains("signed out") && err.contains("never pasted back"),
+            err.contains("signed out") && err.contains("nor pasted back"),
             "{err}"
         );
         for bad in [
@@ -3882,7 +4110,7 @@ esac
         std::fs::remove_file(fake.dir.join("setup-token")).unwrap();
         let err = ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap_err();
         assert!(
-            err.contains("signed out") && err.contains("never pasted back"),
+            err.contains("signed out") && err.contains("nor pasted back"),
             "{err}"
         );
     }
@@ -4140,6 +4368,13 @@ esac
                 false
             };
             assert!(shown("press Enter: "), "{case}: no prompt");
+            // This stand-in prints no "Your OAuth token" screen: the script cannot read the token
+            // from claude's output, says so, and asks for the paste (the fallback).
+            assert!(
+                String::from_utf8_lossy(&seen.lock().unwrap())
+                    .contains("could not read the token from claude's output; paste it instead"),
+                "{case}: the fallback did not say why"
+            );
             // The script turned bracketed paste on with its prompt (the stand-in's own does not count).
             let out = String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
             assert!(
@@ -4204,6 +4439,360 @@ esac
         assert!(!out.status.success());
         assert!(String::from_utf8_lossy(&out.stderr).contains("no token was pasted"));
         assert!(!config.join("wicked-setup-token").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// claude 2.1.287's closing screen of `claude setup-token`, on the main screen after its TUI
+    /// exits (Ink Text rows; FAKE token): the token in yellow, wrapped at `cols` onto rows indented
+    /// to the token's own column, each row ended by `nl`.
+    #[cfg(unix)]
+    fn claude_token_screen(token: &str, cols: usize, indent: usize, nl: &str) -> String {
+        let pad = " ".repeat(indent);
+        let mut lines = vec![
+            format!("{pad}\u{1b}[32m\u{2713}\u{1b}[39m Long-lived authentication token created successfully!"),
+            String::new(),
+            format!("{pad}Your OAuth token (valid for 1 year):"),
+            String::new(),
+        ];
+        lines.extend(token.as_bytes().chunks(cols - indent).map(|row| {
+            format!(
+                "{pad}\u{1b}[33m{}\u{1b}[39m",
+                std::str::from_utf8(row).unwrap()
+            )
+        }));
+        lines.extend([
+            String::new(),
+            format!("{pad}Store this token securely. You won't be able to see it again."),
+            String::new(),
+            format!("{pad}Use this token by setting: export CLAUDE_CODE_OAUTH_TOKEN=<token>"),
+        ]);
+        lines.join(nl) + nl
+    }
+
+    /// claude's TUI before the closing screen: the alternate screen with its modes on, Ink frames
+    /// erased and redrawn by cursor moves, and its own prompt with the (FAKE) browser code typed.
+    #[cfg(unix)]
+    const CLAUDE_TUI: &str = "\u{1b}[?1049h\u{1b}[?1000h\u{1b}[?1006h\u{1b}[>1u\u{1b}[?2026h\
+        \u{1b}[2J\u{1b}[HOpening your browser to sign in\u{2026}\r\nPaste code here if prompted > \
+        \u{1b}[2K\u{1b}[1A\u{1b}[2K\u{1b}[GBrowser didn't open? Use the URL below\r\n\
+        Paste code here if prompted > FAKE-browser-code\u{1b}[?2026l\r\n\u{1b}[?1049l";
+
+    /// An Ink frame on the main screen (a spinner row, CR-redrawn) that the next frame erases the
+    /// way Ink's log-update does (`ESC [ 2K ESC [ 1A ... ESC [ G`).
+    #[cfg(unix)]
+    fn erased_frame(next: &str) -> String {
+        format!(
+            "\u{1b}[33m\u{280b}\u{1b}[39m Creating your token\u{2026}\r\u{1b}[33m\u{2819}\u{1b}[39m Creating your token\u{2026}\r\n\
+             \u{1b}[2K\u{1b}[1A\u{1b}[2K\u{1b}[G{next}"
+        )
+    }
+
+    /// The extractor run on `capture` at terminal size `size` ("ROWS COLS"): the token it wrote, or
+    /// `None` when it found none (and then it wrote nothing).
+    #[cfg(unix)]
+    fn extract_claude_token(capture: &str, size: &str) -> Option<String> {
+        use wicked_apps_core::HardenedCommand;
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-claude-extract-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (capture_file, dest) = (dir.join("claude.out"), dir.join("wicked-setup-token"));
+        std::fs::write(&capture_file, capture).unwrap();
+        let status = std::process::Command::new("python3")
+            .hardened()
+            .args(["-c", claude_token_extractor!()])
+            .arg(&capture_file)
+            .arg(size)
+            .arg(&dest)
+            .status()
+            .expect("python3 (the seat image installs it)");
+        let token = if status.success() {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "the token file is owner-only");
+            Some(std::fs::read_to_string(&dest).unwrap())
+        } else {
+            assert!(!dest.exists(), "a refusal wrote a token file");
+            None
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        token
+    }
+
+    /// The token is read from claude's own output, so the operator never pastes it.
+    /// Realistic captures (claude's layout, ANSI colours, CR/LF or LF rows, Ink frames erased by
+    /// cursor moves, the alternate screen): the exact token when it is wrapped at 80 and 100
+    /// columns or unwrapped at 140, and no token (the paste prompt) whenever it is not certain.
+    #[cfg(unix)]
+    #[test]
+    fn the_claude_token_is_read_from_claudes_own_output() {
+        let token = fake_setup_token();
+        let other = format!("{}xyz", &token[..token.len() - 3]);
+        let screen = |cols, indent| claude_token_screen(&token, cols, indent, "\r\n");
+        let reads: Vec<(&str, String, String)> = vec![
+            ("wrapped at 80", format!("{CLAUDE_TUI}{}", erased_frame(&screen(80, 0))), "30 80".into()),
+            ("wrapped at 80, indented", format!("{CLAUDE_TUI}{}", screen(80, 2)), "30 80".into()),
+            ("wrapped at 100", format!("{CLAUDE_TUI}{}", erased_frame(&screen(100, 0))), "30 100".into()),
+            ("wrapped at 100, indented", format!("{CLAUDE_TUI}{}", screen(100, 2)), "40 100".into()),
+            ("unwrapped at 140", format!("{CLAUDE_TUI}{}", erased_frame(&screen(140, 2))), "30 140".into()),
+            ("LF rows", claude_token_screen(&token, 80, 0, "\n"), "30 80".into()),
+            ("three rows at 40", claude_token_screen(&token, 40, 2, "\r\n"), "30 40".into()),
+            (
+                "the screen drawn twice (a redraw that was not erased)",
+                format!("{}{}", screen(100, 0), screen(100, 0)),
+                "30 100".into(),
+            ),
+            (
+                "the token fills its row exactly, \"Store this token\" right below",
+                format!("Your OAuth token (valid for 1 year):\r\n\r\n\u{1b}[33m{token}\u{1b}[39m\r\nStore this token securely.\r\n"),
+                format!("30 {}", token.len()),
+            ),
+            (
+                "the terminal wrapped it (autowrap, no row break)",
+                format!("Your OAuth token (valid for 1 year):\r\n\r\n\u{1b}[33m{token}\u{1b}[39m\r\n\r\nStore this token securely.\r\n"),
+                "30 80".into(),
+            ),
+        ];
+        for (case, capture, size) in &reads {
+            let read = extract_claude_token(capture, size);
+            assert_eq!(read.as_deref(), Some(token.as_str()), "{case}");
+            assert_eq!(
+                setup_token(read.unwrap().as_bytes()).unwrap(),
+                token,
+                "{case}"
+            );
+        }
+
+        let (row1, row2) = token.split_at(80);
+        let none: Vec<(&str, String, &str)> = vec![
+            ("no token on the screen", CLAUDE_TUI.into(), "30 80"),
+            ("nothing captured", String::new(), "30 80"),
+            (
+                "two different tokens",
+                format!(
+                    "{}{}",
+                    screen(140, 0),
+                    claude_token_screen(&other, 140, 0, "\r\n")
+                ),
+                "30 140",
+            ),
+            // The continuation row is only joined at the width the token was wrapped at.
+            ("a wrong terminal width", screen(80, 0), "30 120"),
+            ("no terminal size", screen(80, 0), ""),
+            (
+                "the next row starts at another column",
+                format!(
+                    "Your OAuth token (valid for 1 year):\r\n\r\n  {}\r\n{row2}\r\n",
+                    &row1[..78]
+                ),
+                "30 80",
+            ),
+            (
+                "text after the token on its row",
+                format!(
+                    "Your OAuth token (valid for 1 year):\r\n\r\n{} (copy it)\r\n",
+                    &token[..60]
+                ),
+                "30 140",
+            ),
+            (
+                "text before the token on its row",
+                format!(
+                    "Your OAuth token (valid for 1 year):\r\n\r\ntoken: {}\r\n",
+                    &token[..60]
+                ),
+                "30 140",
+            ),
+            (
+                "a row of token characters, not a token",
+                "Your OAuth token (valid for 1 year):\r\n\r\nsk-ant-oat01-short\r\n".into(),
+                "30 140",
+            ),
+        ];
+        for (case, capture, size) in &none {
+            assert_eq!(extract_claude_token(capture, size), None, "{case}");
+        }
+        // "Store this token…" is never joined, whatever the width: it is not token characters.
+        let joined = extract_claude_token(
+            &format!("Your OAuth token (valid for 1 year):\r\n\r\n{row1}\r\n{row2}\r\nStore this token securely.\r\n"),
+            "30 80",
+        );
+        assert_eq!(joined.as_deref(), Some(token.as_str()));
+    }
+
+    /// The claude login as the operator meets it: a stand-in `claude setup-token`
+    /// prints claude's closing screen in a real PTY, the login script reads the token from that
+    /// output and saves exactly it, and the capture is gone; nothing asks for a paste. When the
+    /// token cannot be read, the script says so and the paste prompt (unchanged) takes it. Under
+    /// `sh` and `dash` (the seat image's `/bin/sh`) where it exists, and util-linux `script`
+    /// (the seat image's). Where the host's `script` is BSD's (macOS), a stand-in with
+    /// util-linux's arguments runs BSD's.
+    #[cfg(unix)]
+    #[test]
+    fn the_claude_login_script_reads_the_token_from_claudes_output_in_a_pty() {
+        use portable_pty::{CommandBuilder, PtySize};
+        use std::io::{Read, Write};
+        use std::os::unix::fs::PermissionsExt;
+        use wicked_apps_core::HardenedCommand;
+        let token = fake_setup_token();
+        let root = std::env::temp_dir().join(format!(
+            "wicked-claude-autocapture-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let util_linux = std::process::Command::new("script")
+            .hardened()
+            .arg("-V")
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("util-linux"));
+        if !util_linux {
+            let bsd = std::path::Path::new("/usr/bin/script");
+            assert!(bsd.exists(), "no script(1) on this host");
+            std::fs::write(
+                bin.join("script"),
+                "#!/bin/sh\n# util-linux's `script -q -e -c CMD FILE` over BSD script (test only)\n\
+                 [ \"$1\" = -V ] && { echo 'script from util-linux (BSD stand-in)'; exit 0; }\n\
+                 exec /usr/bin/script -q \"$5\" /bin/sh -c \"$4\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(bin.join("script"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        // The stand-in prints claude's closing screen at the terminal's width (FAKE token),
+        // after a TUI on the alternate screen, and leaves the terminal raw with its modes on.
+        std::fs::write(
+            bin.join("claude-screen"),
+            claude_token_screen(&token, 100, 0, "\r\n"),
+        )
+        .unwrap();
+        std::fs::write(bin.join("claude-tui"), CLAUDE_TUI).unwrap();
+        std::fs::write(
+            bin.join("claude"),
+            "#!/bin/sh\n[ \"$1\" = setup-token ] || exit 2\nstty raw -echo\n\
+             d=$(dirname \"$0\"); cat \"$d/claude-tui\"\n\
+             if [ -n \"$GARBLED\" ]; then printf 'Your OAuth token (valid for 1 year):\\r\\n\\r\\n  %s\\r\\n%s\\r\\n' \"$ROW1\" \"$ROW2\"; \
+             else cat \"$d/claude-screen\"; fi\nprintf '\\033[?1000h\\033[?1006h\\033[>1u'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let shells: Vec<&str> = ["sh", "dash"]
+            .into_iter()
+            .filter(|sh| {
+                *sh == "sh"
+                    || ["/bin", "/usr/bin"]
+                        .iter()
+                        .any(|d| std::path::Path::new(d).join(sh).exists())
+            })
+            .collect();
+        let (row1, row2) = token.split_at(98);
+        for (n, (shell, garbled)) in shells
+            .iter()
+            .flat_map(|sh| [(*sh, false), (*sh, true)])
+            .enumerate()
+        {
+            let case = format!("{shell}, {}", if garbled { "unreadable" } else { "read" });
+            let config = root.join(format!("home-{n}/claude"));
+            let tmp = root.join(format!("tmp-{n}"));
+            std::fs::create_dir_all(&tmp).unwrap();
+            let pair = portable_pty::native_pty_system()
+                .openpty(PtySize {
+                    rows: 30,
+                    cols: 100,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            let mut cmd = CommandBuilder::new(shell);
+            cmd.args(["-c", CLAUDE_SETUP_TOKEN_LOGIN, "wicked-login"]);
+            cmd.env("PATH", &path);
+            cmd.env("CLAUDE_CONFIG_DIR", &config);
+            cmd.env("TMPDIR", &tmp);
+            if garbled {
+                cmd.env("GARBLED", "1");
+                cmd.env("ROW1", row1);
+                cmd.env("ROW2", row2);
+            }
+            let mut child = pair.slave.spawn_command(cmd).unwrap();
+            drop(pair.slave);
+            let mut reader = pair.master.try_clone_reader().unwrap();
+            let mut writer = pair.master.take_writer().unwrap();
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = seen.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    sink.lock().unwrap().extend_from_slice(&buf[..n]);
+                }
+            });
+            let text = || String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
+            let shown = |what: &str| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while std::time::Instant::now() < deadline {
+                    if text().contains(what) {
+                        return true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                false
+            };
+            if garbled {
+                assert!(shown("press Enter: "), "{case}: no paste prompt");
+                assert!(
+                    text().contains("could not read the token from claude's output"),
+                    "{case}: the fallback did not say why"
+                );
+                writer
+                    .write_all(format!("\u{1b}[200~{token}\u{1b}[201~\r").as_bytes())
+                    .unwrap();
+                writer.flush().unwrap();
+            }
+            assert!(
+                shown(claude_token_received!()),
+                "{case}: the script never finished"
+            );
+            let status = child.wait().unwrap();
+            assert!(status.success(), "{case}: {status:?}");
+            let landed = std::fs::read(config.join("wicked-setup-token")).unwrap();
+            assert_eq!(setup_token(&landed).unwrap(), token, "{case}");
+            if !garbled {
+                assert_eq!(landed, token.as_bytes(), "{case}: only the token is saved");
+                assert!(
+                    !text().contains("paste it here"),
+                    "{case}: asked for a paste"
+                );
+            }
+            // The capture never outlives the script, and the script never shows the token: the
+            // only copy on screen is claude's own.
+            assert_eq!(
+                std::fs::read_dir(&tmp).unwrap().count(),
+                0,
+                "{case}: capture left"
+            );
+            assert_eq!(
+                text().matches(&token[..60]).count(),
+                1,
+                "{case}: the token shown again"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
