@@ -350,8 +350,8 @@ o=$(printf '\\033[200~'); c=$(printf '\\033[201~'); p=; d=; t=; \
 printf '\\033[?2004h\\n%s' 'wicked: copy the token shown above, paste it here (it is not shown) and press Enter: '; \
 while IFS= read -r l; do p=\"$p$l\n\"; \
 case \"$p\" in *\"$o\"*) case \"$p\" in *\"$c\"*) d=1; break;; esac; continue;; esac; \
-l=$(bare \"$l\"); case \"$l\" in *[A-Za-z]*) t=1;; esac; \
-case \"$l\" in *[A-Za-z0-9_-]*) printf '\\r\\n%s' 'wicked: press Enter once more to finish (or paste the rest of the token): ';; \
+l=$(bare \"$l\"); \
+case \"$l\" in *[A-Za-z0-9_-]*) t=1; printf '\\r\\n%s' 'wicked: press Enter once more to finish (or paste the rest of the token): ';; \
 *) [ -z \"$t\" ] || { d=1; break; };; esac; done; \
 stty echo 2>/dev/null; printf '\\033[?2004l\\n'; \
 case $(bare \"$p\") in *[A-Za-z]*) ;; *) echo 'wicked: no token was pasted; sign claude in again' >&2; exit 1;; esac; \
@@ -423,17 +423,29 @@ fn setup_token_shape(text: &str) -> Result<(), &'static str> {
 /// the SGR mouse reports `ESC [ < b ; x ; y M|m` a click sends, a terminal's answer to a query,
 /// and a key the kitty keyboard protocol or modifyOtherKeys encodes, `ESC [ 13 u` or
 /// `ESC [ 27 ; 1 ; 13 ~`), OSC, DCS, SOS, PM and APC (`ESC ]`, `ESC P`, `ESC X`, `ESC ^`,
-/// `ESC _`, up to BEL or `ESC \`), SS3 (`ESC O` and one byte) and any other two-byte escape. A sequence the paste cuts
-/// short is dropped to its end; a byte no sequence can hold (a line break) ends it and is kept.
+/// `ESC _`, up to BEL or `ESC \`), SS3 (`ESC O` and one byte) and any other two-byte escape.
+/// A sequence the paste cuts short ends where it was cut: a line break ends any sequence and is
+/// kept (an unterminated string never swallows the token's next row), and an ESC that is not
+/// `ESC \` ends a string and starts the next sequence (a bracketed-paste marker is still counted).
 fn strip_terminal_controls(text: &str) -> (String, bool) {
     let mut out = String::with_capacity(text.len());
     let (mut opened, mut closed) = (0usize, 0usize);
     let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
+    // An ESC already read that starts the next sequence (it ended a control string that was not
+    // closed by ST).
+    let mut esc = false;
+    loop {
+        if !esc {
+            match chars.next() {
+                None => break,
+                Some('\u{1b}') => {}
+                Some(c) => {
+                    out.push(c);
+                    continue;
+                }
+            }
         }
+        esc = false;
         match chars.peek().copied() {
             Some('[') => {
                 chars.next();
@@ -457,9 +469,21 @@ fn strip_terminal_controls(text: &str) -> (String, bool) {
             }
             Some(']' | 'P' | 'X' | '^' | '_') => {
                 chars.next();
-                while let Some(c) = chars.next() {
-                    if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
-                        break;
+                while let Some(&c) = chars.peek() {
+                    match c {
+                        '\r' | '\n' => break,
+                        '\u{7}' => {
+                            chars.next();
+                            break;
+                        }
+                        '\u{1b}' => {
+                            chars.next();
+                            esc = chars.next_if_eq(&'\\').is_none();
+                            break;
+                        }
+                        _ => {
+                            chars.next();
+                        }
                     }
                 }
             }
@@ -3893,10 +3917,26 @@ esac
         ] {
             assert_eq!(setup_token(pasted.as_bytes()).unwrap(), token, "{pasted:?}");
         }
+        // A control string the paste cuts short (no BEL or ST) ends at the row break or at the
+        // next ESC: it never swallows the token's next row (a truncated first row would pass
+        // every other check) nor a bracketed-paste marker.
+        for pasted in [
+            format!("{row1}\u{1b}]11;rgb:1234\n{row2}\n\n"),
+            format!("{row1}\u{1b}P>|xterm\r{row2}\r"),
+            format!("\u{1b}]11;rgb:1e1e\u{1b}[200~{token}\u{1b}[201~\r"),
+            format!("\u{1b}[200~{row1}\u{1b}_x\r{row2}\u{1b}[201~\r"),
+        ] {
+            assert_eq!(setup_token(pasted.as_bytes()).unwrap(), token, "{pasted:?}");
+        }
         // The bracketed-paste markers are counted by the same stripper: a paste cut short is
-        // still refused when clicks surround it.
-        let e = setup_token(format!("{click}\u{1b}[200~{row1}{click}\r").as_bytes()).unwrap_err();
-        assert!(e.contains("did not finish"), "{e}");
+        // still refused when clicks or an unterminated string surround it.
+        for cut in [
+            format!("{click}\u{1b}[200~{row1}{click}\r"),
+            format!("\u{1b}]11;rgb:1e1e\u{1b}[200~{row1}\r"),
+        ] {
+            let e = setup_token(cut.as_bytes()).unwrap_err();
+            assert!(e.contains("did not finish"), "{e}");
+        }
     }
 
     /// A paste that is not one clean `claude setup-token` token is refused with the check it
@@ -3979,65 +4019,70 @@ esac
         // Each case: what the operator does at the prompt, and whether the whole token lands.
         // A terminal that does not bracket pastes ends the token with one Enter more; EOF (^D)
         // inside an open paste saves nothing.
-        let cases: [(&str, String, Option<String>); 11] = [
+        let cases: [(&str, String, Result<String, &str>); 12] = [
             (
                 "the terminal's answers to claude's queries, then a bracketed paste",
                 format!(
                     "\u{1b}[12;1R\u{1b}[?1;2c\u{1b}]11;rgb:1e1e/1e1e/1e1e\u{1b}\\\u{1b}[200~{token}\u{1b}[201~\r"
                 ),
-                Some(token.clone()),
+                Ok(token.clone()),
             ),
             (
                 "a line of clicks alone ends an unbracketed paste",
                 format!("{token}\r\u{1b}[<0;12;5M\u{1b}[<0;12;5m\r"),
-                Some(token.clone()),
+                Ok(token.clone()),
             ),
             (
                 "clicks around a bracketed paste",
                 format!(
                     "\u{1b}[<0;12;5M\u{1b}[<0;12;5m\u{1b}[200~{row1}\r {row2}\u{1b}[201~\u{1b}[<0;3;7M\r"
                 ),
-                Some(token.clone()),
+                Ok(token.clone()),
             ),
             (
                 "both rows copied, bracketed",
                 format!("\u{1b}[200~{row1}\r {row2}\u{1b}[201~\r"),
-                Some(token.clone()),
+                Ok(token.clone()),
             ),
             (
                 "a blank Enter first, then the paste",
                 format!("\r\u{1b}[200~{token}\u{1b}[201~\r"),
-                Some(token.clone()),
+                Ok(token.clone()),
             ),
             (
                 "the copy starts on the blank row above",
                 format!("\u{1b}[200~\r{row1}\r {row2}\u{1b}[201~\r"),
-                Some(token.clone()),
+                Ok(token.clone()),
             ),
             (
                 "the copy ends with a line break, then Enter",
                 format!("\u{1b}[200~{row1}\r {row2}\r\u{1b}[201~\r"),
-                Some(token.clone()),
+                Ok(token.clone()),
             ),
             (
                 "one row, unbracketed",
                 format!("{token}\r\r"),
-                Some(token.clone()),
+                Ok(token.clone()),
             ),
             (
                 "both rows copied, unbracketed",
                 format!("{row1}\r {row2}\r\r"),
-                Some(token.clone()),
+                Ok(token.clone()),
             ),
             (
                 "a middle row of digits and dashes only, unbracketed",
                 format!("{row1}\r 0123-_\r {row2}\r\r"),
-                Some(format!("{row1}0123-_{row2}")),
+                Ok(format!("{row1}0123-_{row2}")),
             ),
             (
                 "the input ends inside the paste",
                 format!("\u{1b}[200~{row1}\r\u{4}"),
-                None,
+                Err("the paste did not finish"),
+            ),
+            (
+                "a row of digits alone, then Enter, unbracketed",
+                "0123-_\r\r".to_string(),
+                Err("no token was pasted"),
             ),
         ];
         let shells: Vec<&str> = ["sh", "dash"]
@@ -4121,12 +4166,15 @@ esac
             );
             writer.write_all(paste.as_bytes()).unwrap();
             writer.flush().unwrap();
-            let Some(expected) = lands else {
-                assert!(shown("the paste did not finish"), "{case}: no refusal");
-                let status = child.wait().unwrap();
-                assert!(!status.success(), "{case}: {status:?}");
-                assert!(!config.join("wicked-setup-token").exists(), "{case}: saved");
-                continue;
+            let expected = match lands {
+                Ok(expected) => expected,
+                Err(refusal) => {
+                    assert!(shown(refusal), "{case}: no refusal");
+                    let status = child.wait().unwrap();
+                    assert!(!status.success(), "{case}: {status:?}");
+                    assert!(!config.join("wicked-setup-token").exists(), "{case}: saved");
+                    continue;
+                }
             };
             assert!(shown("token received"), "{case}: the script never finished");
             let status = child.wait().unwrap();
