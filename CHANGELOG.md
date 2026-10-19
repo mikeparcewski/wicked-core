@@ -26,7 +26,9 @@ Two release tracks share this file, newest entry first regardless of track:
   is denied by name instead, and what is not mounted does not exist in the seat. A fenced directory that is itself
   a seat-writable root refuses the launch as a configuration error. Unchanged: every other fenced directory
   (`.ssh`, `.aws`, `.claude`, `.wicked-crew`, ...), the state-home rules, the credential-file rules, the Bash verbs
-  and the whole host floor.
+  and the whole host floor. A mount that exposes more of a fenced directory than the plan names (a bind at or above
+  it, or one above the working roots) keeps the blanket. A seat's read roots (the gate hook's `WICKED_READ_ROOTS`) are
+  now mounted when the floor arms, and nowhere later, so no mount lands past the narrowed fence.
 
 - **A claude container sign-in no longer asks the operator to paste the token back.** The operator pastes only
   the browser's authorization code, into claude's own "Paste code here if prompted >" prompt. Copying the long

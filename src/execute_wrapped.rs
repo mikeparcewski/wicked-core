@@ -15326,6 +15326,60 @@ tail -c 1500 /work/claude.out
                 "finalize mounted {d:?} past the view"
             );
         }
+
+        // (codex review of #1042, round 2) The link RETARGETED between arming and spawn: armed on
+        // an unrelated plugins dir (so `.wicked` is narrowed), then pointed at `.wicked`. `finalize`
+        // re-resolves nothing and binds nothing, so `.wicked` never lands past the narrowed fence.
+        let link = home.join(".claude").join("plugins");
+        let real = home.join("plugins-real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut mounts = crate::container_floor::mount_plan(&spec).unwrap();
+        crate::container_floor::add_read_roots(&mut mounts, &roots);
+        let view = crate::container_floor::mount_view(&mounts, &working);
+        assert_eq!(
+            crate::container_floor::narrow_fenced_dir(&wicked, &view).unwrap(),
+            Some(Vec::new()),
+            "armed on the unrelated target, `.wicked` is narrowed: {view:?}"
+        );
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&wicked, &link).unwrap();
+        let wrapper = crate::container_floor::run_argv(&crate::container_floor::ContainerLaunch {
+            runtime: &rt,
+            image: "img:1",
+            name: "wicked-seat-rr2",
+            network: "none",
+            workdir: &tree,
+            user: "1:1",
+            mounts: &mounts,
+            floor: "wicked-floor:t",
+            memory: "1g",
+            gateway_ports: &[],
+            own_ports: &[],
+        });
+        // spawn-audit: test-only — never spawned; finalize only rewrites the argv.
+        let mut cmd = Command::new(&wrapper[0]);
+        cmd.args(&wrapper[1..]).args(["claude", "-p", "hi"]);
+        cmd.env(
+            crate::gate_hook::READ_ROOTS_ENV,
+            std::env::join_paths(&roots).unwrap(),
+        );
+        let out = crate::container_floor::finalize(cmd);
+        let args: Vec<String> = out
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let whole = format!("dst={}", wicked.display());
+        assert!(
+            !args.iter().any(|a| a.split(',').any(|kv| kv == whole)),
+            "the retargeted link never binds `.wicked`: {args:?}"
+        );
+        assert_eq!(
+            args.iter().filter(|a| *a == "--mount").count(),
+            mounts.len() + 1,
+            "finalize adds no mount (the floor image is the one extra): {args:?}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

@@ -26,7 +26,8 @@
 //! a read jail as well as a write floor: a sibling worktree, the operator's other CLI homes and the
 //! credential files are absent rather than denied. The unit's READ roots (its skills snapshot, the
 //! repo graph's key dir, the launch's read extras — [`crate::gate_hook::READ_ROOTS_ENV`]) and the
-//! absolute paths its argv names are mounted read-only at spawn ([`finalize`]).
+//! absolute paths its argv names are mounted read-only when the floor arms ([`add_read_roots`],
+//! [`mount_argv_paths`]); [`finalize`] adds no mount.
 //!
 //! **Landlock inside the seat.** The image's entry requires a TCP-capable Landlock ABI and checks
 //! a writable canary tmpfs before entering `landrun`, then requires an out-of-tree write to fail
@@ -1162,9 +1163,10 @@ const HOST_ONLY_ENV: &[&str] = &[
 
 /// Make a seat `cmd` (one [`run_argv`] rendered, then given its env by the carrier) complete:
 /// every variable the carrier set explicitly is passed in by NAME to both the runtime and
-/// landrun (`--env KEY`: each reads its own environment, so no value is on a command line), and the
-/// unit's read roots are mounted read-only when no mount covers them yet. Any other command is
-/// returned unchanged.
+/// landrun (`--env KEY`: each reads its own environment, so no value is on a command line). It adds
+/// NO mount: the unit's read roots are mounted when the floor arms ([`arm`], [`add_read_roots`]),
+/// where the claude seat's fence is narrowed to the mount set; a mount added here (a read-root link
+/// re-resolved after arming) would land past that fence. Any other command is returned unchanged.
 pub(crate) fn finalize(cmd: Command) -> Command {
     let args: Vec<String> = cmd
         .get_args()
@@ -1177,24 +1179,16 @@ pub(crate) fn finalize(cmd: Command) -> Command {
         return cmd;
     };
     let mut existing: Vec<PathBuf> = Vec::new();
-    // The floor's masks as rendered (a tmpfs, or /dev/null over a file): nothing at or under one
-    // is ever mounted from the host.
-    let mut masks: Vec<PathBuf> = Vec::new();
     for w in args[..img].windows(2) {
         if w[0] == "--mount" {
             if let Some(dst) = w[1].split(',').find_map(|kv| kv.strip_prefix("dst=")) {
                 existing.push(PathBuf::from(dst));
-                if w[1].starts_with("type=tmpfs,") || w[1].starts_with("type=bind,src=/dev/null,") {
-                    masks.push(PathBuf::from(dst));
-                }
             }
         }
     }
-    let covered = |p: &Path, existing: &[PathBuf]| existing.iter().any(|m| p.starts_with(m));
     let mut extra: Vec<String> = Vec::new();
     let mut land_extra: Vec<String> = Vec::new();
     let mut envs: Vec<(String, Option<std::ffi::OsString>)> = Vec::new();
-    let mut ro: Vec<PathBuf> = Vec::new();
     let mut carrier_path: Option<std::ffi::OsString> = None;
     // Only the variables the carrier set EXPLICITLY reach the seat. Nothing the daemon merely
     // inherited does — by design: a seat's model credentials come from the gateway's broker,
@@ -1206,9 +1200,6 @@ pub(crate) fn finalize(cmd: Command) -> Command {
         if key == "PATH" {
             carrier_path = Some(v.to_os_string());
         }
-        if key == crate::gate_hook::READ_ROOTS_ENV {
-            ro.extend(std::env::split_paths(v));
-        }
         if !HOST_ONLY_ENV.contains(&key.as_str()) {
             extra.push("--env".into());
             extra.push(key.clone());
@@ -1219,28 +1210,6 @@ pub(crate) fn finalize(cmd: Command) -> Command {
                 land_extra.extend(["--env".into(), key]);
             }
         }
-    }
-    for p in ro {
-        let Some(p) = crate::worker_sandbox::canon_lenient(&p) else {
-            continue;
-        };
-        if !p.exists()
-            || covered(&p, &existing)
-            || !mountable(&p)
-            || masks.iter().any(|m| p.starts_with(m))
-        {
-            continue;
-        }
-        extra.push("--mount".into());
-        extra.push(
-            Mount::Bind {
-                path: p.clone(),
-                rw: false,
-            }
-            .render(),
-        );
-        land_extra.extend(["--rox".into(), p.to_string_lossy().into_owned()]);
-        existing.push(p);
     }
     // The seat's PATH: the carrier's entries that exist inside (a mounted skills snapshot's
     // `scripts`, where garden's launcher lives), then the image's own. Host-only entries go.
@@ -4076,7 +4045,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_passes_env_by_name_and_mounts_read_roots() {
+    fn finalize_passes_env_by_name_and_adds_no_mount() {
         let base = tmp("fin");
         let tree = base.join("wt");
         let skills = base.join("skills");
@@ -4194,15 +4163,21 @@ mod tests {
             ]
         );
         let ro = |p: &Path| format!("type=bind,src={p},dst={p},readonly", p = p.display());
-        assert!(has(&["--mount", &ro(&skills)]), "{args:?}");
-        // Argv path options are mounted at arm time ([`mount_argv_paths`]), not here.
+        // Read roots and argv path options are mounted at arm time ([`add_read_roots`],
+        // [`mount_argv_paths`]), never here (#1042: past the claude seat's narrowed fence).
+        assert!(!has(&["--mount", &ro(&skills)]), "{args:?}");
         assert!(!has(&["--mount", &ro(&settings)]), "{args:?}");
         // A prompt word that happens to be a path is not a mount.
         assert!(!args.iter().any(|a| a.contains("dst=/etc/passwd")));
-        assert!(has_in(
+        assert!(!has_in(
             &args[img + 3..land_end],
             &["--rox", skills.to_str().unwrap()]
         ));
+        assert_eq!(
+            args.iter().filter(|a| *a == "--mount").count(),
+            2,
+            "the tree and the floor image only: {args:?}"
+        );
         assert_eq!(
             seat_container(&fin),
             Some(SeatContainer {
@@ -4570,8 +4545,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Codex review r1 (P1): a read path mounted late never uncovers a mask — every mask is
-    /// rendered up front, and a late path inside one is refused.
+    /// Codex review r1 (P1): a read path never uncovers a mask — every mask is rendered up front,
+    /// and a read root or argv path inside one is never bound (at arm time; `finalize` binds
+    /// nothing, #1042).
     #[test]
     fn a_late_read_path_never_uncovers_a_mask() {
         let base = tmp("mask");
@@ -4592,11 +4568,18 @@ mod tests {
             pinned: vec![],
             net: vec![],
         };
-        let mounts = mount_plan(&spec).unwrap();
+        let mut mounts = mount_plan(&spec).unwrap();
         assert!(
             mounts.contains(&Mount::Tmpfs { path: ssh.clone() }),
             "{mounts:?}"
         );
+        add_read_roots(&mut mounts, std::slice::from_ref(&home));
+        let mut argv = vec![
+            "claude".to_string(),
+            "--add-dir".to_string(),
+            ssh.to_string_lossy().into_owned(),
+        ];
+        mount_argv_paths(&mut mounts, &mut argv, None);
         let w = run_argv(&ContainerLaunch {
             runtime: Path::new("docker"),
             image: "img:1",
@@ -4612,8 +4595,7 @@ mod tests {
         });
         // spawn-audit: test-only — never spawned; inspects the finalized argv.
         let mut cmd = Command::new(&w[0]);
-        cmd.args(&w[1..])
-            .args(["claude", "--add-dir", ssh.to_str().unwrap()]);
+        cmd.args(&w[1..]).args(&argv);
         cmd.env(crate::gate_hook::READ_ROOTS_ENV, &home);
         let fin = finalize(cmd);
         let args: Vec<String> = fin
