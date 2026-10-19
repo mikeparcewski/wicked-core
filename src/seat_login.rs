@@ -332,7 +332,10 @@ macro_rules! claude_token_received {
 /// nothing else, written owner-only to DEST; any other exit leaves DEST untouched. The seat image
 /// installs python3 (containers/seats/seat.Dockerfile).
 ///
-/// The capture is replayed onto a minimal screen of the terminal's size. Escape sequences are
+/// util-linux `script` frames the capture with its own lines even under `-q` (`Script started on
+/// …]` first, `\nScript done on …]` last); they are dropped first, or the footer's line break would
+/// read as the blank row that ends a token. The capture is replayed onto a minimal screen of the
+/// terminal's size. Escape sequences are
 /// parsed as [`strip_terminal_controls`] parses them (CSI, OSC, DCS, SOS, PM, APC, SS3, two-byte;
 /// a line break ends one); only cursor moves, erases, the alternate screen and autowrap act, and
 /// every other sequence (SGR colours, modes) is dropped. A frame Ink erased and redrew so counts
@@ -509,6 +512,10 @@ def tokens(lines, W):
 def main(path, size, dest):
     with open(path, "rb") as f:
         s = f.read(64 << 20).decode("utf-8", "replace")
+    if s.startswith("Script started on "):
+        s = s[s.find("\n") + 1:]
+        e = s.rfind("\nScript done on ")
+        s = s if e < 0 else s[:e]
     d = size.split()
     if len(d) != 2 or not d[0].isdigit() or not d[1].isdigit() or int(d[1]) == 0:
         return 1
@@ -4505,6 +4512,15 @@ esac
         )
     }
 
+    /// The lines util-linux `script -q` still writes around a capture (2.41.5 in the seat image).
+    #[cfg(unix)]
+    const SCRIPT_START: &str =
+        "Script started on 2026-10-19 18:31:47+00:00 [COMMAND=\"claude setup-token\" \
+        TERM=\"xterm-256color\" TTY=\"/dev/pts/0\" COLUMNS=\"100\" LINES=\"30\"]\n";
+    #[cfg(unix)]
+    const SCRIPT_DONE: &str =
+        "\nScript done on 2026-10-19 18:31:48+00:00 [COMMAND_EXIT_CODE=\"0\"]\n";
+
     /// The extractor run on `capture` at terminal size `size` ("ROWS COLS"): the token it wrote, or
     /// `None` when it found none (and then it wrote nothing).
     #[cfg(unix)]
@@ -4561,6 +4577,11 @@ esac
             ("LF rows", claude_token_screen(&token, 80, 0, "\n"), "30 80".into()),
             ("three rows at 40", claude_token_screen(&token, 40, 2, "\r\n"), "30 40".into()),
             (
+                "framed by util-linux script's own lines",
+                format!("{SCRIPT_START}{CLAUDE_TUI}{}{SCRIPT_DONE}", screen(100, 0)),
+                "30 100".into(),
+            ),
+            (
                 "the screen drawn twice (a redraw that was not erased)",
                 format!("{}{}", screen(100, 0), screen(100, 0)),
                 "30 100".into(),
@@ -4613,6 +4634,11 @@ esac
             ),
             // After a full-width row only a blank row or a clean continuation may follow: anything
             // else is not taken to end the token (that would save a truncated one).
+            (
+                "it ends on a full-width row, then util-linux script's footer",
+                format!("{SCRIPT_START}Your OAuth token (valid for 1 year):\r\n\r\n{row1}\r\n{SCRIPT_DONE}"),
+                "30 80",
+            ),
             (
                 "the capture ends on a full-width row",
                 format!("Your OAuth token (valid for 1 year):\r\n\r\n{row1}\r\n"),
@@ -4727,6 +4753,7 @@ esac
             "#!/bin/sh\n[ \"$1\" = setup-token ] || exit 2\nstty raw -echo\n\
              d=$(dirname \"$0\"); cat \"$d/claude-tui\"\n\
              if [ -n \"$GARBLED\" ]; then printf 'Your OAuth token (valid for 1 year):\\r\\n\\r\\n  %s\\r\\n%s\\r\\n' \"$ROW1\" \"$ROW2\"; \
+             elif [ -n \"$TRUNCATED\" ]; then printf 'Your OAuth token (valid for 1 year):\\r\\n\\r\\n%s\\r\\n' \"$ROW1\"; exit 0; \
              else cat \"$d/claude-screen\"; fi\nprintf '\\033[?1000h\\033[?1006h\\033[>1u'\n",
         )
         .unwrap();
@@ -4747,12 +4774,16 @@ esac
             })
             .collect();
         let (row1, row2) = token.split_at(98);
-        for (n, (shell, garbled)) in shells
+        // "read": claude's screen; "garbled": the last row at another column; "truncated": claude
+        // stops after a full-width first row (through util-linux `script`, whose footer must not
+        // read as the blank row that ends the token).
+        for (n, (shell, mode)) in shells
             .iter()
-            .flat_map(|sh| [(*sh, false), (*sh, true)])
+            .flat_map(|sh| [(*sh, "read"), (*sh, "garbled"), (*sh, "truncated")])
             .enumerate()
         {
-            let case = format!("{shell}, {}", if garbled { "unreadable" } else { "read" });
+            let garbled = mode != "read";
+            let case = format!("{shell}, {mode}");
             let config = root.join(format!("home-{n}/claude"));
             let tmp = root.join(format!("tmp-{n}"));
             std::fs::create_dir_all(&tmp).unwrap();
@@ -4769,10 +4800,17 @@ esac
             cmd.env("PATH", &path);
             cmd.env("CLAUDE_CONFIG_DIR", &config);
             cmd.env("TMPDIR", &tmp);
-            if garbled {
-                cmd.env("GARBLED", "1");
-                cmd.env("ROW1", row1);
-                cmd.env("ROW2", row2);
+            match mode {
+                "garbled" => {
+                    cmd.env("GARBLED", "1");
+                    cmd.env("ROW1", row1);
+                    cmd.env("ROW2", row2);
+                }
+                "truncated" => {
+                    cmd.env("TRUNCATED", "1");
+                    cmd.env("ROW1", &token[..100]);
+                }
+                _ => {}
             }
             let mut child = pair.slave.spawn_command(cmd).unwrap();
             drop(pair.slave);
