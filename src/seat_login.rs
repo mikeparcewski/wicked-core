@@ -325,16 +325,21 @@ const CLAUDE_SETUP_TOKEN_PATH: &str = "claude/wicked-setup-token";
 /// The paste is read in line mode (`stty sane`: Enter ends a line even if the TUI left the
 /// terminal raw) with bracketed paste on. The CLI wraps the long token across two rows, so a
 /// copied token can carry a line break; inside the paste brackets lines keep being read until
-/// the closing bracket, and blank lines before any token are skipped. What lands is the paste
-/// as typed, line breaks and brackets included: [`setup_token`] joins and checks it.
+/// the closing bracket. A terminal that does not bracket pastes ends the token with an empty
+/// line (the script asks for one Enter more), so a wrapped row is never taken for the whole
+/// token. Blank lines before any token are skipped, and input that ends first (the window
+/// closed, EOF inside an open paste) saves nothing. What lands is the paste as typed, line
+/// breaks and brackets included: [`setup_token`] joins and checks it.
 const CLAUDE_SETUP_TOKEN_LOGIN: &str = "claude setup-token || exit 1; stty sane -echo 2>/dev/null; \
-o=$(printf '\\033[200~'); c=$(printf '\\033[201~'); p=; \
+o=$(printf '\\033[200~'); c=$(printf '\\033[201~'); p=; d=; \
 printf '\\033[?2004h\\n%s' 'wicked: copy the token shown above, paste it here (it is not shown) and press Enter: '; \
 while IFS= read -r l; do p=\"$p$l\n\"; \
-case \"$p\" in *\"$o\"*) case \"$p\" in *\"$c\"*) ;; *) continue;; esac;; esac; \
-case \"$p\" in *[A-Za-z]*) break;; esac; done; \
+case \"$p\" in *\"$o\"*) case \"$p\" in *\"$c\"*) d=1; break;; esac; continue;; esac; \
+case \"$l\" in *[A-Za-z]*) printf '\\r\\n%s' 'wicked: press Enter once more to finish (or paste the rest of the token): ';; \
+*) case \"$p\" in *[A-Za-z]*) d=1; break;; esac;; esac; done; \
 stty echo 2>/dev/null; printf '\\033[?2004l\\n'; \
 case \"$p\" in *[A-Za-z]*) ;; *) echo 'wicked: no token was pasted; sign claude in again' >&2; exit 1;; esac; \
+[ -n \"$d\" ] || { echo 'wicked: the paste did not finish; sign claude in again' >&2; exit 1; }; \
 mkdir -p \"$CLAUDE_CONFIG_DIR\" && (umask 077 && printf '%s' \"$p\" > \"$CLAUDE_CONFIG_DIR/wicked-setup-token\") \
 || { echo 'wicked: the token could not be saved; sign claude in again' >&2; exit 1; }; \
 echo 'wicked: token received; studio checks it now'";
@@ -345,9 +350,16 @@ echo 'wicked: token received; studio checks it now'";
 /// Anthropic's long-lived OAuth tokens carry. Errors never repeat it.
 fn setup_token(bytes: &[u8]) -> Result<String, String> {
     let text = std::str::from_utf8(bytes)
-        .map_err(|_| "claude: the pasted token is not text".to_string())?
-        .replace("\u{1b}[200~", "")
-        .replace("\u{1b}[201~", "");
+        .map_err(|_| "claude: the pasted token is not text".to_string())?;
+    // A paste cut short (its closing bracket never came) is a truncated token, never a token.
+    if text.matches("\u{1b}[200~").count() != text.matches("\u{1b}[201~").count() {
+        return Err(
+            "claude: the paste of the `claude setup-token` token did not finish; sign claude in \
+             again and paste the whole token it prints"
+                .into(),
+        );
+    }
+    let text = text.replace("\u{1b}[200~", "").replace("\u{1b}[201~", "");
     // Whitespace inside a line is kept (and refused below): only a row break is joined.
     let text: String = text.split(['\r', '\n']).map(str::trim).collect();
     let shaped = text.len() <= 4096
@@ -501,12 +513,10 @@ pub(crate) fn extract_tokens(
             if let Some(bytes) = input_file(cli, files, CLAUDE_SETUP_TOKEN_PATH)? {
                 return Ok(vec![token_file("anthropic.token", &setup_token(bytes)?)]);
             }
-            let mut found = false;
             for path in &credential_paths(cli)[1..] {
                 let Some(bytes) = input_file(cli, files, path)? else {
                     continue;
                 };
-                found = true;
                 let value = parse_json(cli, bytes)?;
                 if value.get("claudeAiOauth").is_some_and(|v| !v.is_null()) {
                     let access = nonempty(value.pointer("/claudeAiOauth/accessToken"))
@@ -526,18 +536,13 @@ pub(crate) fn extract_tokens(
                     return Ok(vec![token_file("anthropic.key", key)]);
                 }
             }
-            if !found {
-                // The login left nothing at all: the token `claude setup-token` printed was
-                // never pasted back (or the window closed first).
-                return Err(missing(
-                    cli,
-                    "the `claude setup-token` token (it was never pasted back); sign claude in \
-                     again and paste the token it prints",
-                ));
-            }
+            // No pasted token and no credential record (a settings file without one does not
+            // count): the token `claude setup-token` printed was never pasted back, or the
+            // window closed first.
             Err(missing(
                 cli,
-                "claudeAiOauth.accessToken or stored ANTHROPIC_API_KEY",
+                "the `claude setup-token` token (it was never pasted back); sign claude in again \
+                 and paste the token it prints",
             ))
         }
         "codex" => {
@@ -3657,6 +3662,30 @@ esac
         ] {
             assert_eq!(setup_token(pasted.as_bytes()).unwrap(), token);
         }
+        // A paste cut short (its closing bracket never came, or came alone) is refused: its
+        // first row passes every other check, so it would land as a truncated token.
+        for cut in [
+            format!("\u{1b}[200~{row1}\n"),
+            format!("{row1}\u{1b}[201~\n"),
+            format!("\u{1b}[200~{row1}\n\u{1b}[200~{row2}\u{1b}[201~\n"),
+        ] {
+            let e = setup_token(cut.as_bytes()).unwrap_err();
+            assert!(
+                e.contains("did not finish") && !e.contains(&row1[13..40]),
+                "{e}"
+            );
+        }
+        // No pasted token and only a settings file without a credential record in it (claude
+        // can write one): the operator is told the token was never pasted back.
+        let err = extract_tokens(
+            "claude",
+            &[file("claude/settings.json", serde_json::json!({}))],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("signed out") && err.contains("never pasted back"),
+            "{err}"
+        );
         for bad in [
             &b"sk-ant-api03-FAKE-not-a-setup-token"[..],
             b"sk-ant-oat01-FAKE token",
@@ -3781,23 +3810,43 @@ esac
             std::env::var("PATH").unwrap_or_default()
         );
 
-        // Each case: what the operator does at the prompt (`\0` waits for the prompt to show).
-        let cases: [(&str, String); 4] = [
+        // Each case: what the operator does at the prompt, and whether the whole token lands.
+        // A terminal that does not bracket pastes ends the token with one Enter more; EOF (^D)
+        // inside an open paste saves nothing.
+        let cases: [(&str, String, bool); 7] = [
             (
                 "both rows copied, bracketed",
                 format!("\u{1b}[200~{row1}\r {row2}\u{1b}[201~\r"),
+                true,
             ),
             (
                 "a blank Enter first, then the paste",
                 format!("\r\u{1b}[200~{token}\u{1b}[201~\r"),
+                true,
             ),
             (
                 "the copy starts on the blank row above",
                 format!("\u{1b}[200~\r{row1}\r {row2}\u{1b}[201~\r"),
+                true,
             ),
-            ("one row, unbracketed", format!("{token}\r")),
+            (
+                "the copy ends with a line break, then Enter",
+                format!("\u{1b}[200~{row1}\r {row2}\r\u{1b}[201~\r"),
+                true,
+            ),
+            ("one row, unbracketed", format!("{token}\r\r"), true),
+            (
+                "both rows copied, unbracketed",
+                format!("{row1}\r {row2}\r\r"),
+                true,
+            ),
+            (
+                "the input ends inside the paste",
+                format!("\u{1b}[200~{row1}\r\u{4}"),
+                false,
+            ),
         ];
-        for (n, (case, paste)) in cases.iter().enumerate() {
+        for (n, (case, paste, lands)) in cases.iter().enumerate() {
             let config = root.join(format!("home-{n}/claude"));
             let pair = portable_pty::native_pty_system()
                 .openpty(PtySize {
@@ -3847,6 +3896,13 @@ esac
             );
             writer.write_all(paste.as_bytes()).unwrap();
             writer.flush().unwrap();
+            if !lands {
+                assert!(shown("the paste did not finish"), "{case}: no refusal");
+                let status = child.wait().unwrap();
+                assert!(!status.success(), "{case}: {status:?}");
+                assert!(!config.join("wicked-setup-token").exists(), "{case}: saved");
+                continue;
+            }
             assert!(shown("token received"), "{case}: the script never finished");
             let status = child.wait().unwrap();
             assert!(status.success(), "{case}: {status:?}");

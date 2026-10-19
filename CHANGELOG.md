@@ -20,8 +20,11 @@ Two release tracks share this file, newest entry first regardless of track:
   copy that began on the blank row above landed nothing. The script then exited "no token was pasted" and the
   window closed before the operator could read it. Ingest reported `signed out; missing claudeAiOauth.accessToken
   …`. The script now puts the terminal back in line mode (`stty sane`) and turns bracketed paste on. It reads
-  until the paste's closing bracket and skips blank lines, and it says so when the token is saved. Ingest joins the
-  pasted rows. When nothing was pasted back, the error now says that, not the OAuth-record wording.
+  until the paste's closing bracket and skips blank lines, and it says so when the token is saved. A terminal that
+  does not bracket pastes ends the token with one Enter more (the script asks for it), so a wrapped row is never
+  taken for the whole token, and a paste whose closing bracket never came (the window closed mid-paste) saves
+  nothing and is refused at ingest. Ingest joins the pasted rows. When nothing was pasted back, the error now says
+  that, not the OAuth-record wording, even when claude left a settings file without a credential in it.
 
 - **Team members read the repository, read-only (DES-TEAMING-002 §8.8).** Since core#1021 a member turn ran in its
   seat's container with no repository mounted, so it saw only its prompt (the diff, the criterion, the evidence):
