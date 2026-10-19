@@ -1557,6 +1557,129 @@ pub(crate) fn ballot_deny_rules(operational_home: Option<&Path>) -> Result<Vec<S
     Ok(rules)
 }
 
+/// The fence `rules` of a claude unit in a SEAT CONTAINER, narrowed to what the container mounts
+/// (`view`). The host fence is built for the host. A seat container bind-mounts every host path
+/// at the same path, so a blanket rule over an ANCESTOR of the unit's own tree denied the seat its
+/// own worktree: crew registers repositories under `~/.wicked/repos`, `.wicked` is a
+/// [`DENIED_HOME_SUBDIRS`] entry, and Claude's deny beats any allow. Inside the container that
+/// rule protected nothing else, because estate's stores under `~/.wicked` are not mounted.
+///
+/// For each fenced directory of [`denied_dirs`] with a working root strictly under it
+/// ([`crate::container_floor::narrow_fenced_dir`]), its blanket `Read`/`Edit` pair is dropped
+/// and every OTHER mounted entry under it is denied by name, in the blanket's place: a directory
+/// entry as `<entry>/**`, and an entry that is itself a mount also as the file form `<entry>`.
+/// Untouched: every directory with no working root under it (`.ssh`, `.aws`, `.claude`, ...); the
+/// state-home rules (the default `~/.wicked-crew`, the engine's operational home and the handed
+/// snapshot's derived state home keep exactly what [`deny_rules`] built, registry or blanket);
+/// the credential-file rules; the Bash verbs; and every rule the template added. A rule string a
+/// template repeated verbatim is the same rule and is narrowed with it.
+/// `Err` (the launch is refused) names an unspellable path, or a fenced directory that IS a
+/// seat-writable root.
+pub(crate) fn container_fence_rules(
+    rules: &[String],
+    skills_root: Option<&Path>,
+    operational_home: Option<&Path>,
+    view: &crate::container_floor::MountView,
+) -> Result<Vec<String>, String> {
+    let mut state_homes = state_home_candidates(operational_home);
+    state_homes.extend(skills_root.and_then(crate::state_home::of_snapshot));
+    let mut out: Vec<String> = rules.to_vec();
+    for dir in denied_dirs(operational_home)? {
+        if state_homes
+            .iter()
+            .any(|sh| crate::state_home::same_dir(sh, &dir))
+        {
+            continue;
+        }
+        let Some(entries) = crate::container_floor::narrow_fenced_dir(&dir, view)? else {
+            continue;
+        };
+        let p = rule_path(&dir).ok_or_else(|| unspellable(&dir))?;
+        let blanket = [format!("Read({p}/**)"), format!("Edit({p}/**)")];
+        let mut instead: Vec<String> = Vec::new();
+        for e in &entries {
+            let ep = rule_path(e).ok_or_else(|| unspellable(e))?;
+            let leaf = view.mounted.contains(e);
+            for tool in ["Read", "Edit"] {
+                instead.push(format!("{tool}({ep}/**)"));
+                if leaf {
+                    instead.push(format!("{tool}({ep})"));
+                }
+            }
+        }
+        let at = out.iter().position(|r| blanket.contains(r));
+        out.retain(|r| !blanket.contains(r));
+        instead.retain(|r| !out.contains(r));
+        let at = at.unwrap_or(out.len()).min(out.len());
+        eprintln!(
+            "[wicked-core] fence.notice the seat container mounts the unit's working roots under \
+             the fenced {}: its blanket rule is narrowed to the {} other mounted entr{} there \
+             ({}); the host floor keeps the blanket",
+            dir.display(),
+            entries.len(),
+            if entries.len() == 1 { "y" } else { "ies" },
+            entries
+                .iter()
+                .map(|e| e.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        out.splice(at..at, instead);
+    }
+    Ok(out)
+}
+
+/// Narrow BOTH fence carriers of a claude unit armed in a seat container to the container's
+/// mounts ([`container_fence_rules`]): the engine's `--disallowedTools` value on `argv` (one
+/// comma-joined entry, [`inject_isolation_flags`]; a token equal to `prompt` is never read as the
+/// flag) and, for a governed unit, `permissions.deny` in its `settings` file
+/// ([`arm_input_governance`]), rewritten with the same O_EXCL discipline it was written with,
+/// before the container starts. Called only after the container floor armed: the host floor's
+/// rules are never narrowed. `Err` refuses the launch.
+pub(crate) fn narrow_container_fence(
+    argv: &mut [String],
+    prompt: Option<&str>,
+    settings: Option<&Path>,
+    skills_root: Option<&Path>,
+    operational_home: Option<&Path>,
+    view: &crate::container_floor::MountView,
+) -> Result<(), String> {
+    let narrow =
+        |rules: Vec<String>| container_fence_rules(&rules, skills_root, operational_home, view);
+    if let Some(i) = argv
+        .iter()
+        .position(|a| a == "--disallowedTools" && Some(a.as_str()) != prompt)
+    {
+        if let Some(v) = argv.get(i + 1).filter(|v| Some(v.as_str()) != prompt) {
+            let rules = narrow(v.split(',').map(str::to_string).collect())?;
+            argv[i + 1] = rules.join(",");
+        }
+    }
+    let Some(path) = settings else {
+        return Ok(());
+    };
+    let unreadable = |why: String| format!("the unit's settings file {} {why}", path.display());
+    let bytes = std::fs::read(path).map_err(|e| unreadable(format!("is unreadable ({e})")))?;
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| unreadable(format!("is not JSON ({e})")))?;
+    let deny = doc
+        .pointer_mut("/permissions/deny")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| unreadable("has no permissions.deny list".into()))?;
+    let rules = deny
+        .iter()
+        .map(|r| r.as_str().map(str::to_string))
+        .collect::<Option<Vec<String>>>()
+        .ok_or_else(|| unreadable("has a deny entry that is not a rule".into()))?;
+    *deny = narrow(rules)?
+        .into_iter()
+        .map(serde_json::Value::String)
+        .collect();
+    let bytes = serde_json::to_vec(&doc).map_err(|e| unreadable(e.to_string()))?;
+    write_private_exclusive(path, &bytes)
+        .map_err(|e| unreadable(format!("could not be rewritten ({e})")))
+}
+
 /// Write the shared deny fence to a SECONDARY claude instance's configuration home (core#595).
 ///
 /// `ensure_shared_worker_fence` (in `acp_runner`) writes only `<base>/claude` — the primary
@@ -2973,7 +3096,26 @@ impl WrappedCliStepRunner {
                             crate::worker_sandbox::FloorUnarmed::GateHookUnreachable,
                         );
                     }
-                    Ok(c) => {
+                    Ok(mut c) => {
+                        // A claude seat's fence reflects what its container mounts: a host
+                        // rule over an ancestor of its own tree (`~/.wicked` above
+                        // `~/.wicked/repos`) is narrowed to the other mounted entries there.
+                        if is_claude {
+                            let settings = plan.inputs.pinned.first().filter(|_| governed);
+                            if let Err(why) = narrow_container_fence(
+                                &mut c.argv,
+                                Some(prompt.as_str()),
+                                settings.map(PathBuf::as_path),
+                                handed.map(|s| s.root.as_path()),
+                                operational_home,
+                                &c.view,
+                            ) {
+                                if let Some(lease) = c.lease {
+                                    let _ = lease.release();
+                                }
+                                return isolation_refusal(input, &why);
+                            }
+                        }
                         seat_cleanup = Some(c.cleanup);
                         seat_gateway_env = c.env;
                         copilot_account = c.copilot_account;
@@ -14869,6 +15011,369 @@ tail -c 1500 /work/claude.out
             log.contains("HOOK_FIRED 2"),
             "the hook judged exactly the two allowed calls — the deny rules refused the rest \
              before any hook ran: {log}"
+        );
+    }
+
+    /// The fence of the two parked runs (core#840 run 290a7fee, core#997 run 3d3c96a8): a claude
+    /// creator in a seat container had Read and Bash denied "in a directory denied by the
+    /// permission settings" in its OWN worktree, `~/.wicked/repos/<repo>/wicked-worktrees/<run>`.
+    /// `.wicked` is fenced, crew registers repositories under it, and the container mounts each
+    /// host path at the same path. Both carriers the wrapped launch renders (the argv
+    /// `--disallowedTools` and the governed settings file) deny the tree before narrowing. After
+    /// [`narrow_container_fence`] over the container's mount plan, the tree, its git state and the
+    /// clone are open; the other mounted entry under `.wicked` (a seat dir that is no working root)
+    /// stays denied; every other fence (`.ssh`, `.aws`, `.claude`, `.wicked-crew`, ...), the
+    /// credential files and the Bash verbs are unchanged; and the host fence still carries the
+    /// `.wicked` blanket.
+    #[cfg(unix)]
+    #[test]
+    fn a_container_claude_seat_fence_opens_its_own_tree_under_a_fenced_dir() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        seed_probe_for_test(
+            &resolve_wicked_core_exe(),
+            Ok((
+                crate::gate_hook::GATE_PROTOCOL_VERSION,
+                Some(env!("CARGO_PKG_VERSION").to_string()),
+            )),
+        );
+        let home = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("wicked-sf1019-{}", uuid::Uuid::new_v4().simple()));
+        let clone = home.join(".wicked").join("repos").join("x");
+        let tree = clone.join("wicked-worktrees").join("r");
+        let git = clone.join(".git").join("worktrees").join("r");
+        let walk = home.join(".wicked").join("walkthroughs");
+        for d in [
+            &tree.join("src"),
+            &git,
+            &walk,
+            &home.join(".ssh"),
+            &home.join(".aws"),
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(tree.join("src").join("lib.rs"), "fn x() {}\n").unwrap();
+        let _home = HomeGuard::pin(&home);
+        let _cfg = VarGuard::unset("CLAUDE_CONFIG_DIR");
+        let _hatch = VarGuard::unset(wicked_apps_core::spawn::INHERIT_OPERATOR_CONFIG_ENV);
+        let _floor = VarGuard::unset(crate::container_floor::SEAT_FLOOR_ENV);
+
+        let inv = "claude -p {PROMPT}";
+        let prompt = "do the work";
+        let mut argv = build_argv(inv, prompt, &[]);
+        super::inject_isolation_flags(&mut argv, inv, None, Some(prompt), None, Some(&tree))
+            .expect("the isolation flags inject");
+        let mut u = WorkUnit::pending("s:u1", "s", 1, prompt);
+        u.assigned_cli = Some("claude".to_string());
+        let gov = crate::workflow::GovernanceContext {
+            human_confirm: Default::default(),
+            db_path: home.join("estate.db").to_string_lossy().into_owned(),
+            code_graph_db: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_id: None,
+            repo_id: None,
+        };
+        let input = StepInput {
+            run_id: format!("sf1019-{}", uuid::Uuid::new_v4().simple()),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: Some(tree.clone()),
+            governance: Some(gov.clone()),
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        arm_input_governance(&input, &gov, &mut argv, None, None, false).expect("armed");
+        let settings = PathBuf::from(flag_value(&argv, "--settings").expect("--settings"));
+        let deny_of = |p: &Path| -> Vec<String> {
+            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+            v["permissions"]["deny"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r.as_str().unwrap().to_string())
+                .collect()
+        };
+        let denies = |rules: &[String], tool: &str, p: &Path| {
+            rules
+                .iter()
+                .any(|r| rule_denies(r, tool, p.to_str().unwrap()))
+        };
+        let lib = tree.join("src").join("lib.rs");
+        let before = deny_of(&settings);
+        assert!(
+            denies(&before, "Read", &lib) && denies(&before, "Edit", &lib),
+            "the host fence denies the seat its own tree (the parked runs): {before:?}"
+        );
+
+        // The seat container's mounts for this unit, and the view the narrowing reads.
+        let spec = crate::worker_sandbox::SeatFloor {
+            profile: "governed".into(),
+            tree: tree.clone(),
+            writable: vec![tree.clone(), walk.clone()],
+            protected: vec![clone.clone()],
+            readmitted: vec![tree.clone(), git.clone()],
+            readmitted_files: vec![],
+            masks: crate::worker_sandbox::floor_mask_dirs_under(Some(&home)),
+            pinned: vec![],
+            net: vec![],
+        };
+        let mounts = crate::container_floor::mount_plan(&spec).unwrap();
+        let view = crate::container_floor::mount_view(
+            &mounts,
+            &[tree.clone(), clone.clone(), git.clone()],
+        );
+        super::narrow_container_fence(&mut argv, Some(prompt), Some(&settings), None, None, &view)
+            .expect("narrowed");
+
+        let after = deny_of(&settings);
+        let mut on_argv: Vec<String> = flag_value(&argv, "--disallowedTools")
+            .expect("--disallowedTools")
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        let mut in_file = after.clone();
+        on_argv.sort();
+        in_file.sort();
+        assert_eq!(on_argv, in_file, "one fence on both carriers");
+        for (tool, p) in [
+            ("Read", lib.clone()),
+            ("Edit", lib.clone()),
+            ("Write", tree.join("new.rs")),
+            ("Read", git.join("HEAD")),
+            ("Read", clone.join("README.md")),
+        ] {
+            assert!(!denies(&after, tool, &p), "{tool} {p:?} is open: {after:?}");
+        }
+        let wicked = rule_path(&home.join(".wicked")).unwrap();
+        assert!(
+            !after.iter().any(|r| r.ends_with(&format!("({wicked}/**)"))),
+            "the `.wicked` blanket is gone in the seat: {after:?}"
+        );
+        assert!(
+            denies(&after, "Read", &walk.join("w.md"))
+                && denies(&after, "Edit", &walk.join("w.md")),
+            "the other mounted entry under `.wicked` stays denied: {after:?}"
+        );
+        for d in [
+            ".ssh",
+            ".aws",
+            ".claude",
+            ".wicked-crew",
+            ".wicked-estate",
+            ".config/gh",
+        ] {
+            let p = rule_path(&home.join(d)).unwrap();
+            for tool in ["Read", "Edit"] {
+                assert!(
+                    after.contains(&format!("{tool}({p}/**)")),
+                    "{tool} {d} kept: {after:?}"
+                );
+            }
+        }
+        for r in before
+            .iter()
+            .filter(|r| !r.ends_with(&format!("({wicked}/**)")))
+        {
+            assert!(after.contains(r), "{r} kept: {after:?}");
+        }
+        // The host floor is unchanged: the fence a host launch builds keeps the blanket.
+        let host = super::deny_rules(None, None).unwrap();
+        assert!(
+            host.contains(&format!("Read({wicked}/**)"))
+                && host.contains(&format!("Edit({wicked}/**)")),
+            "{host:?}"
+        );
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&input.run_id));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// LIVE (`WICKED_CONTAINER_LIVE=1`, a container runtime): the parked runs' failure end to end
+    /// on the PINNED claude seat image (`wicked-seat-claude`). `HOME` is pinned to `/fence`, the
+    /// unit's tree is `/fence/.wicked/repos/x/wicked-worktrees/r`, and the argv is the engine's
+    /// real one (`inject_isolation_flags`) narrowed by [`narrow_container_fence`] to the view of a
+    /// seat whose mounts are the tree (rw), the clone (ro) and a seat dir under `.wicked` that is
+    /// no working root. The model is a stub on loopback inside the container and the key is a
+    /// dummy. claude Reads, Writes and runs Bash in its tree (all three land); a Read of the other
+    /// mounted entry under `.wicked` and of `.ssh` is refused by the rules although the gate hook
+    /// answers `allow`.
+    #[cfg(unix)]
+    #[test]
+    fn live_a_container_claude_seat_works_in_its_tree_under_a_fenced_dir() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        let _cfg = VarGuard::unset("CLAUDE_CONFIG_DIR");
+        let _img = VarGuard::unset("WICKED_SEAT_IMAGE_CLAUDE");
+        let _hatch = VarGuard::unset(wicked_apps_core::spawn::INHERIT_OPERATOR_CONFIG_ENV);
+        let rt = crate::container_floor::runtime().expect("a container runtime answers");
+        let image = crate::container_floor::ensure_seat_image(&rt, "claude").unwrap();
+
+        const TREE: &str = "/fence/.wicked/repos/x/wicked-worktrees/r";
+        let inv = "claude -p --settings /work/s.json --model claude-sonnet-4-5 {PROMPT}";
+        let prompt = "do the steps";
+        let mut argv = build_argv(inv, prompt, &[]);
+        {
+            let _home = HomeGuard::pin(Path::new("/fence"));
+            super::inject_isolation_flags(
+                &mut argv,
+                inv,
+                None,
+                Some(prompt),
+                None,
+                Some(Path::new(TREE)),
+            )
+            .expect("the isolation flags inject");
+            let host = flag_value(&argv, "--disallowedTools").unwrap_or_default();
+            assert!(host.contains("Read(//fence/.wicked/**)"), "{host}");
+            let bind = |p: &str, rw: bool| crate::container_floor::Mount::Bind {
+                path: PathBuf::from(p),
+                rw,
+            };
+            let mounts = vec![
+                bind("/fence/.wicked/repos/x", false),
+                bind(TREE, true),
+                bind("/fence/.wicked/walkthroughs", false),
+            ];
+            let view = crate::container_floor::mount_view(
+                &mounts,
+                &[PathBuf::from(TREE), PathBuf::from("/fence/.wicked/repos/x")],
+            );
+            super::narrow_container_fence(&mut argv, Some(prompt), None, None, None, &view)
+                .expect("narrowed");
+        }
+        let rules = flag_value(&argv, "--disallowedTools").unwrap_or_default();
+        assert!(
+            !rules.contains("(//fence/.wicked/**)")
+                && rules.contains("Read(//fence/.wicked/walkthroughs/**)")
+                && rules.contains("Read(//fence/.ssh/**)"),
+            "{rules}"
+        );
+
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "wicked-sf1019-live-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = r#"import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+T = "/fence/.wicked/repos/x/wicked-worktrees/r"
+CALLS = [["Read", {"file_path": T + "/ok.md"}],
+         ["Write", {"file_path": T + "/new.md", "content": "W"}],
+         ["Read", {"file_path": "/fence/.wicked/walkthroughs/w.md"}],
+         ["Read", {"file_path": "/fence/.ssh/id_rsa"}],
+         ["Bash", {"command": "cat " + T + "/ok.md", "description": "read the tree"}]]
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self): self.reply({})
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
+        if "count_tokens" in self.path: return self.reply({"input_tokens": 1})
+        res = [c for m in body.get("messages", []) if m.get("role") == "user" and isinstance(m.get("content"), list) for c in m["content"] if c.get("type") == "tool_result"]
+        main = any(t.get("name") == "Read" for t in body.get("tools") or [])
+        if res:
+            with open("/work/stub.log", "a") as f: f.write("RESULT %d %s\n" % (len(res) - 1, json.dumps(res[-1])))
+        step = len(res)
+        if main and step < len(CALLS):
+            blocks, stop = [{"type": "tool_use", "id": "toolu_%d" % step, "name": CALLS[step][0], "input": CALLS[step][1]}], "tool_use"
+        else:
+            blocks, stop = [{"type": "text", "text": "STUB-DONE"}], "end_turn"
+        msg = {"id": "msg_%d" % step, "type": "message", "role": "assistant", "model": body.get("model", "m"), "content": blocks, "stop_reason": stop, "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 1}}
+        if not body.get("stream"): return self.reply(msg)
+        self.send_response(200); self.send_header("content-type", "text/event-stream"); self.end_headers()
+        def ev(t, d): self.wfile.write(("event: %s\ndata: %s\n\n" % (t, json.dumps(dict(type=t, **d)))).encode())
+        ev("message_start", {"message": dict(msg, content=[], stop_reason=None)})
+        for i, b in enumerate(blocks):
+            if b["type"] == "text":
+                ev("content_block_start", {"index": i, "content_block": {"type": "text", "text": ""}})
+                ev("content_block_delta", {"index": i, "delta": {"type": "text_delta", "text": b["text"]}})
+            else:
+                ev("content_block_start", {"index": i, "content_block": dict(b, input={})})
+                ev("content_block_delta", {"index": i, "delta": {"type": "input_json_delta", "partial_json": json.dumps(b["input"])}})
+            ev("content_block_stop", {"index": i})
+        ev("message_delta", {"delta": {"stop_reason": stop, "stop_sequence": None}, "usage": {"output_tokens": 1}})
+        ev("message_stop", {})
+    def reply(self, d):
+        b = json.dumps(d).encode(); self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b)
+HTTPServer(("127.0.0.1", 8999), H).serve_forever()
+"#;
+        std::fs::write(dir.join("stub.py"), stub).unwrap();
+        std::fs::write(
+            dir.join("run.sh"),
+            r#"T=/fence/.wicked/repos/x/wicked-worktrees/r
+mkdir -p "$T" /fence/.wicked/walkthroughs /fence/.ssh /work/home && cd "$T"
+echo OPEN-SF1019 > ok.md; echo SECRET-SF1019 > /fence/.wicked/walkthroughs/w.md; echo SECRET-SF1019 > /fence/.ssh/id_rsa
+printf '%s\n' '#!/bin/sh' 'cat > /dev/null; echo fired >> /work/hook.log' \
+  "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"allow\",\"permissionDecisionReason\":\"stub gate allows\"}}'" > /work/hook.sh
+chmod +x /work/hook.sh
+printf '%s' '{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"/work/hook.sh"}]}]}}' > /work/s.json
+python3 /r/stub.py & sleep 1
+ANTHROPIC_BASE_URL=http://127.0.0.1:8999 ANTHROPIC_API_KEY=sk-ant-dummy-not-a-token \
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 HOME=/work/home \
+  timeout 120 "$@" > /work/claude.out 2>&1
+echo "CLAUDE_EXIT $?"; echo "HOOK_FIRED $(cat /work/hook.log 2>/dev/null | wc -l)"
+cat /work/stub.log; test -e "$T/new.md" && echo NEW_EXISTS
+tail -c 1500 /work/claude.out
+"#,
+        )
+        .unwrap();
+        let mut cmd = rt.cmd();
+        cmd.args(["run", "--rm", "--network", "none", "-v"])
+            .arg(format!("{}:/r:ro", dir.display()))
+            .args([image.as_str(), "sh", "/r/run.sh"])
+            .args(&argv);
+        let out = crate::container_floor::output_within(cmd, Duration::from_secs(240))
+            .expect("the seat ran");
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        eprintln!("argv={argv:?}\n{log}");
+        let result = |i: usize| {
+            log.lines()
+                .find_map(|l| l.strip_prefix(&format!("RESULT {i} ")))
+                .unwrap_or_else(|| panic!("no tool result {i}: {log}"))
+                .to_string()
+        };
+        const REFUSED: &str = "denied by your permission settings";
+        for (i, what) in [
+            (0, "a Read in the seat's own tree"),
+            (4, "a Bash read in the seat's own tree"),
+        ] {
+            let r = result(i);
+            assert!(
+                r.contains("OPEN-SF1019") && !r.contains(REFUSED),
+                "{what} works: {r}"
+            );
+        }
+        assert!(
+            result(1).contains("File created") && log.contains("NEW_EXISTS"),
+            "a Write in the seat's own tree lands: {log}"
+        );
+        for (i, what) in [
+            (2, "a Read of the other mounted entry under `.wicked`"),
+            (3, "a Read under `.ssh`"),
+        ] {
+            let r = result(i);
+            assert!(
+                r.contains(REFUSED) && !r.contains("SECRET-SF1019"),
+                "{what} is refused by the rule although the hook answers allow: {r}"
+            );
+        }
+        assert!(
+            log.contains("HOOK_FIRED 3"),
+            "the hook judged exactly the three allowed calls: {log}"
         );
     }
 

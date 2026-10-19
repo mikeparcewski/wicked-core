@@ -1989,6 +1989,9 @@ pub(crate) struct ArmedContainer {
     /// that route (`Some(None)` = not resolved yet); `None` for every other seat. The runner
     /// gives the seat one of its models, or refuses the unit by name (OD-1).
     pub(crate) copilot_account: Option<Option<crate::copilot_account::CopilotAccount>>,
+    /// What the seat container mounts, for narrowing a claude seat's fence to it
+    /// (`execute_wrapped::narrow_container_fence`).
+    pub(crate) view: MountView,
 }
 
 impl std::fmt::Debug for ArmedContainer {
@@ -2006,6 +2009,7 @@ impl std::fmt::Debug for ArmedContainer {
             )
             .field("lease", &self.lease)
             .field("copilot_account", &self.copilot_account)
+            .field("view", &self.view)
             .finish()
     }
 }
@@ -2225,6 +2229,17 @@ pub(crate) fn arm(
     }
     cover_gateway_dir(&mut mounts, gateway_dir)
         .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
+    // What the seat sees, for the claude fence ([`narrow_fenced_dir`]): the final mounts, and
+    // the unit's working set among them.
+    let working_set: Vec<PathBuf> = std::iter::once(spec.tree.clone())
+        .chain(spec.protected.iter().cloned())
+        .chain(spec.readmitted.iter().cloned())
+        .chain(spec.readmitted_files.iter().cloned())
+        .chain(inp.write_roots.iter().cloned())
+        .chain(read_roots.iter().cloned())
+        .chain(read_view.map(Path::to_path_buf))
+        .collect();
+    let view = mount_view(&mounts, &working_set);
     // The seat image cannot move a mount (a link where one lands, a declared volume).
     let dests: Vec<PathBuf> = mounts
         .iter()
@@ -2355,6 +2370,7 @@ pub(crate) fn arm(
         files,
         lease,
         copilot_account,
+        view,
     })
 }
 
@@ -2699,6 +2715,116 @@ pub(crate) fn add_read_roots(mounts: &mut Vec<Mount>, read_roots: &[PathBuf]) {
             mounts.push(Mount::Bind { path: p, rw: false });
         }
     }
+}
+
+/// What one seat container shows of the host, for the claude seat's file-tool fence: every
+/// mount destination as rendered, and the unit's working set among them (its tree, its git
+/// state, the repository boundary, its handed write and read roots, a member turn's view), each
+/// with whether the seat can write it. Built from the FINAL mounts, never from the host
+/// filesystem: inside the container nothing else of the host exists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MountView {
+    /// Every mount destination (binds and masks), as mounted.
+    pub(crate) mounted: Vec<PathBuf>,
+    /// The working roots a bind exposes and no mask covers: `(path as mounted, seat-writable)`.
+    pub(crate) roots: Vec<(PathBuf, bool)>,
+}
+
+/// The [`MountView`] of `mounts` for the unit whose working set is `working_set` (each path made
+/// canonical, as the mounts are). A working path no bind exposes, or one under a mask, is not a
+/// root: the seat cannot reach it. Whether a root is writable is the deepest bind over it.
+pub(crate) fn mount_view(mounts: &[Mount], working_set: &[PathBuf]) -> MountView {
+    let mut roots: Vec<(PathBuf, bool)> = Vec::new();
+    for r in working_set {
+        let Some(r) = crate::worker_sandbox::canon_lenient(r) else {
+            continue;
+        };
+        let masked = mounts
+            .iter()
+            .any(|m| !matches!(m, Mount::Bind { .. }) && r.starts_with(m.dst()));
+        let rw = mounts
+            .iter()
+            .filter_map(|m| match m {
+                Mount::Bind { path, rw } if r.starts_with(path) => {
+                    Some((path.components().count(), *rw))
+                }
+                _ => None,
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, rw)| rw);
+        if let (false, Some(rw)) = (masked, rw) {
+            if !roots.iter().any(|(p, _)| *p == r) {
+                roots.push((r, rw));
+            }
+        }
+    }
+    MountView {
+        mounted: mounts.iter().map(|m| m.dst().to_path_buf()).collect(),
+        roots,
+    }
+}
+
+/// How the claude fence over ONE denied directory reads inside a seat container, from `view`
+/// alone. Every host path is mounted at the same path, so a host deny over an ancestor of the
+/// unit's own tree (crew registers repositories under `~/.wicked/repos`, and `.wicked` is a
+/// fenced directory) denies the seat its own worktree: Claude's deny beats any allow.
+///
+/// - `Ok(None)`: keep the directory's blanket rule. No working root lies strictly under it, or a
+///   mount exposes it whole (a bind at or above it): narrowing would need the host listing.
+/// - `Ok(Some(entries))`: drop the blanket and deny `entries` instead. For every mount under the
+///   directory that is not inside a working root, the shallowest path below the directory that
+///   is not on the way to a working root. A working root and its ancestors stay open; every
+///   other mounted entry stays denied; what is not mounted does not exist in the seat.
+/// - `Err`: the directory IS a seat-writable working root. That is a configuration error, and
+///   the launch is refused rather than opening a fenced directory to the seat.
+pub(crate) fn narrow_fenced_dir(
+    dir: &Path,
+    view: &MountView,
+) -> Result<Option<Vec<PathBuf>>, String> {
+    let d = crate::worker_sandbox::canon_lenient(dir).unwrap_or_else(|| dir.to_path_buf());
+    if let Some((r, _)) = view.roots.iter().find(|(r, rw)| *rw && *r == d) {
+        return Err(format!(
+            "the fenced directory {} is the unit's seat-writable root {}; refusing the launch \
+             rather than opening it to the seat (move the repository or the write root out of \
+             the fenced directory)",
+            dir.display(),
+            r.display()
+        ));
+    }
+    if view.mounted.iter().any(|m| d.starts_with(m)) {
+        return Ok(None);
+    }
+    let opened: Vec<&PathBuf> = view
+        .roots
+        .iter()
+        .map(|(r, _)| r)
+        .filter(|r| r.starts_with(&d) && **r != d)
+        .collect();
+    if opened.is_empty() {
+        return Ok(None);
+    }
+    let on_the_way = |p: &Path| opened.iter().any(|r| r.starts_with(p));
+    let mut entries: Vec<PathBuf> = Vec::new();
+    for m in view
+        .mounted
+        .iter()
+        .filter(|m| m.starts_with(&d) && **m != d)
+    {
+        if opened.iter().any(|r| m.starts_with(r)) {
+            continue;
+        }
+        let mut p = d.clone();
+        for c in m.strip_prefix(&d).into_iter().flat_map(Path::components) {
+            p.push(c);
+            if !on_the_way(&p) {
+                if !entries.contains(&p) {
+                    entries.push(p.clone());
+                }
+                break;
+            }
+        }
+    }
+    Ok(Some(entries))
 }
 
 /// `wicked-core seat-image build [<cli>…|all]` / `seat-image status`: build the seat images
@@ -3088,6 +3214,162 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d.canonicalize().unwrap()
+    }
+
+    /// The seat layout of the two parked runs (core#840 run 290a7fee, core#997 run 3d3c96a8): a
+    /// clone registered under `<home>/.wicked/repos`, its run worktree and git state inside it,
+    /// plus two other mounted entries under `.wicked` that are no working root (a seat dir, a
+    /// masked file) and a sibling repository bound read-only.
+    #[cfg(unix)]
+    fn wicked_repos_view() -> MountView {
+        let bind = |p: &str, rw: bool| Mount::Bind {
+            path: PathBuf::from(p),
+            rw,
+        };
+        let mounts = vec![
+            bind("/h/.wicked/walkthroughs", true),
+            bind("/h/.wicked/repos/x", false),
+            bind("/h/.wicked/repos/other", false),
+            bind("/h/.wicked/repos/x/wicked-worktrees/r", true),
+            bind("/h/.wicked/repos/x/.git/worktrees/r", true),
+            Mount::NullFile {
+                path: PathBuf::from("/h/.wicked/memory.db"),
+            },
+            Mount::Tmpfs {
+                path: PathBuf::from("/h/.ssh"),
+            },
+        ];
+        let working: Vec<PathBuf> = [
+            "/h/.wicked/repos/x/wicked-worktrees/r",
+            "/h/.wicked/repos/x",
+            "/h/.wicked/repos/x/.git/worktrees/r",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        mount_view(&mounts, &working)
+    }
+
+    /// The view: every mount destination; the working roots a bind exposes, writable by the
+    /// deepest bind over each (the tree is writable inside the read-only clone); a working path
+    /// under a mask, or exposed by no bind, is not a root.
+    #[cfg(unix)]
+    #[test]
+    fn the_mount_view_is_the_mounts_and_the_working_roots_they_expose() {
+        let v = wicked_repos_view();
+        assert_eq!(v.mounted.len(), 7);
+        assert_eq!(
+            v.roots,
+            vec![
+                (PathBuf::from("/h/.wicked/repos/x/wicked-worktrees/r"), true),
+                (PathBuf::from("/h/.wicked/repos/x"), false),
+                (PathBuf::from("/h/.wicked/repos/x/.git/worktrees/r"), true),
+            ]
+        );
+        let masked = mount_view(
+            &[
+                Mount::Bind {
+                    path: PathBuf::from("/h/a"),
+                    rw: true,
+                },
+                Mount::Tmpfs {
+                    path: PathBuf::from("/h/a/hidden"),
+                },
+            ],
+            &[PathBuf::from("/h/a/hidden/t"), PathBuf::from("/h/nowhere")],
+        );
+        assert!(masked.roots.is_empty(), "{masked:?}");
+    }
+
+    /// The narrowing over a fenced ANCESTOR of the unit's tree: the blanket goes, and every other
+    /// mounted entry under it is denied by name — the seat dir and the masked file directly under
+    /// `.wicked`, and the sibling repository one level down (`repos` itself is on the way to the
+    /// tree, so it stays open). Nothing inside a working root is listed (the git state, the tree).
+    #[cfg(unix)]
+    #[test]
+    fn a_fenced_ancestor_of_the_tree_is_narrowed_to_its_other_mounted_entries() {
+        let v = wicked_repos_view();
+        let entries = narrow_fenced_dir(Path::new("/h/.wicked"), &v)
+            .unwrap()
+            .expect("narrowed");
+        assert_eq!(
+            entries,
+            vec![
+                PathBuf::from("/h/.wicked/walkthroughs"),
+                PathBuf::from("/h/.wicked/repos/other"),
+                PathBuf::from("/h/.wicked/memory.db"),
+            ]
+        );
+        // `repos` and the clone are ancestors of the tree: never denied.
+        assert!(!entries
+            .iter()
+            .any(|e| Path::new("/h/.wicked/repos/x/wicked-worktrees/r").starts_with(e)));
+        // Only mounted siblings: with nothing else mounted under `.wicked`, nothing is denied
+        // there (an unmounted entry does not exist in the seat).
+        let only_tree = mount_view(
+            &[Mount::Bind {
+                path: PathBuf::from("/h/.wicked/repos/x/wicked-worktrees/r"),
+                rw: true,
+            }],
+            &[PathBuf::from("/h/.wicked/repos/x/wicked-worktrees/r")],
+        );
+        assert_eq!(
+            narrow_fenced_dir(Path::new("/h/.wicked"), &only_tree).unwrap(),
+            Some(Vec::new())
+        );
+    }
+
+    /// A fenced directory with no working root under it keeps its blanket (`.ssh`, which is
+    /// masked; `.wicked-crew`, which is not mounted at all), and so does one a mount exposes WHOLE
+    /// (a bind at or above it: narrowing it would need the host's listing).
+    #[cfg(unix)]
+    #[test]
+    fn a_fenced_dir_with_no_working_root_under_it_keeps_its_blanket() {
+        let v = wicked_repos_view();
+        for d in [
+            "/h/.ssh",
+            "/h/.wicked-crew",
+            "/h/.claude",
+            "/h/.wicked/repos/x/src",
+        ] {
+            assert_eq!(narrow_fenced_dir(Path::new(d), &v).unwrap(), None, "{d}");
+        }
+        let whole = mount_view(
+            &[
+                Mount::Bind {
+                    path: PathBuf::from("/h"),
+                    rw: false,
+                },
+                Mount::Bind {
+                    path: PathBuf::from("/h/.wicked/repos/x/wt"),
+                    rw: true,
+                },
+            ],
+            &[PathBuf::from("/h/.wicked/repos/x/wt")],
+        );
+        assert_eq!(
+            narrow_fenced_dir(Path::new("/h/.wicked"), &whole).unwrap(),
+            None
+        );
+    }
+
+    /// A fenced directory that IS a seat-writable working root refuses the launch (a
+    /// configuration error), never opens; one that is a READ-ONLY root keeps its blanket.
+    #[cfg(unix)]
+    #[test]
+    fn a_fenced_dir_equal_to_a_writable_root_refuses_the_launch() {
+        let v = wicked_repos_view();
+        let why = narrow_fenced_dir(Path::new("/h/.wicked/repos/x/wicked-worktrees/r"), &v)
+            .expect_err("a fenced writable root is refused");
+        assert!(
+            why.contains("is the unit's seat-writable root") && why.contains("refusing"),
+            "{why}"
+        );
+        assert_eq!(
+            narrow_fenced_dir(Path::new("/h/.wicked/repos/x"), &v).unwrap(),
+            None,
+            "a read-only root keeps its deny"
+        );
     }
 
     /// C5: a product process (the CLI, crew's daemon) runs governed units in containers unless
