@@ -14,6 +14,26 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A claude container sign-in no longer asks the operator to paste the token back.** The operator pastes only
+  the browser's authorization code, into claude's own "Paste code here if prompted >" prompt. Copying the long
+  token out of studio's browser terminal and pasting it back unechoed was the step that kept failing. The login
+  script now runs `claude setup-token` under util-linux `script`, so claude still has a real terminal, and captures
+  its output to an owner-only file in a fresh `mktemp -d` directory on the login container's tmpfs `/tmp` (never
+  the login volume). A python3 reader replays the capture onto a screen of the terminal's size (`stty size` when
+  claude exits). It parses escape sequences the way ingest's stripper does; only cursor moves, erases, autowrap
+  and the alternate screen act, so Ink frames that were erased and redrawn count once. It finds the first
+  non-blank row after "Your OAuth token" holding `sk-ant-oat`. It joins a continuation row only when the row
+  before it ended at the terminal width and the next row holds token characters alone at the same column, so
+  "Store this token…" is never joined. Only the token is written to `wicked-setup-token`. The capture is deleted
+  as soon as it is read, and by a trap on exit, HUP, INT and TERM. Ingest still checks the token with
+  `setup_token()`. When the token cannot be read (no row, text around it, a continuation at another column or
+  width, two different tokens, or no util-linux `script` or python3), the script says "could not read the token
+  from claude's output" and asks for the paste exactly as before. Both paths then print "wicked: token received
+  — checking it with Claude now, this can take up to a minute; there is nothing more to type". Echo stays off, so
+  Enter pressed while ingest runs shows nothing. Ingest's missing-token error now says the token was "neither read
+  from claude's output nor pasted back". `script` (util-linux 2.41.5, bsdutils is Essential) and python3 3.13 are
+  in the built `node:22-trixie-slim` seat image.
+
 - **A claude sign-in in studio's terminal: mouse reporting left on by claude made copy select nothing and clicks
   pollute the paste.** `claude setup-token` turns xterm mouse reporting and its keyboard modes on (the kitty
   keyboard protocol, modifyOtherKeys, synchronized output) and exits without turning them off. In studio's terminal
