@@ -14,6 +14,22 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A claude seat in a container can read and edit its own worktree under `~/.wicked/repos`.** Crew registers
+  repositories under `~/.wicked/repos`, and `.wicked` is one of the directories the worker fence always denies
+  (`Read`/`Edit` over `~/.wicked/**`, for estate's stores). A seat container mounts each host path at the same
+  path, and Claude's deny beats any allow, so a governed claude creator was denied Read and Bash "in a directory
+  denied by the permission settings" in its own run worktree. Inside the container that rule protected nothing
+  else: estate's stores are not mounted there. Now, once the container floor has armed a claude unit, both fence
+  carriers (the `--disallowedTools` argv and the governed settings file) are narrowed to the container's mount
+  plan. A fenced directory with one of the unit's working roots strictly under it (the tree, its git state, the
+  repository boundary, its handed write and read roots) loses its blanket rule. Every other mounted entry under it
+  is denied by name instead, and what is not mounted does not exist in the seat. A fenced directory that is itself
+  a seat-writable root refuses the launch as a configuration error. Unchanged: every other fenced directory
+  (`.ssh`, `.aws`, `.claude`, `.wicked-crew`, ...), the state-home rules, the credential-file rules, the Bash verbs
+  and the whole host floor. A mount that exposes more of a fenced directory than the plan names (a bind at or above
+  it, or one above the working roots) keeps the blanket. A seat's read roots (the gate hook's `WICKED_READ_ROOTS`) are
+  now mounted when the floor arms, and nowhere later, so no mount lands past the narrowed fence.
+
 - **A claude container sign-in no longer asks the operator to paste the token back.** The operator pastes only
   the browser's authorization code, into claude's own "Paste code here if prompted >" prompt. Copying the long
   token out of studio's browser terminal and pasting it back unechoed was the step that kept failing. The login
