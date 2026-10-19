@@ -1949,9 +1949,15 @@ impl crate::team::MonitorHost for RunnerHost {
 /// (`<temp>/wicked-core-member-view/<member run id>`, `0700`, files `0444`), never the live
 /// worktree, which the worker may still be writing. The wrapped runner mounts it read-only into
 /// the member's seat container at that same path (`container_floor::add_read_view`) and nothing
-/// else of the host; the prompt names the path. Removed when the turn ends (drop).
+/// else of the host; the prompt names the path. Removed when the turn ends (drop); one an engine
+/// crash left behind is removed by the next engine's startup sweep ([`sweep_stale_member_views`]).
 pub(crate) struct MemberView {
     pub(crate) dir: std::path::PathBuf,
+    /// (unix) The view directory held open under a shared `flock` for the turn's life: the
+    /// startup sweep removes a view only when it can take that lock exclusively, so a live
+    /// turn's view is never swept, whichever engine owns it and however long the turn runs.
+    /// Released when the view is dropped (after the directory is removed).
+    _live: Option<std::fs::File>,
 }
 
 impl MemberView {
@@ -1975,11 +1981,18 @@ impl MemberView {
             .create(&dir)
             .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
         // Owned from here: any failure below removes it.
-        let mut mv = MemberView { dir };
+        let mut mv = MemberView { dir, _live: None };
         mv.dir = mv
             .dir
             .canonicalize()
             .map_err(|e| format!("could not resolve {}: {e}", mv.dir.display()))?;
+        #[cfg(unix)]
+        {
+            let live = std::fs::File::open(&mv.dir)
+                .and_then(|f| f.lock_shared().map(|()| f))
+                .map_err(|e| format!("could not hold {} open: {e}", mv.dir.display()))?;
+            mv._live = Some(live);
+        }
         view.repo
             .materialize(&view.tree, &mv.dir, crate::team::REPO_VIEW_MAX_BYTES)
             .map_err(|e| format!("could not write tree {}: {e:#}", view.tree))?;
@@ -1991,6 +2004,96 @@ impl Drop for MemberView {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// How old a leftover member view must be before the startup sweep considers it. A view lives
+/// one member turn (minutes: `team::MONITOR_TURN_BUDGET`, `team::FINAL_PASS_BUDGET`). On unix the
+/// age only makes a view eligible: it is removed only when no turn holds it ([`MemberView`]'s
+/// lock), and the age keeps a view being prepared (created, not yet locked) out of reach. An
+/// engine that writes views without the lock (Windows, which has no `flock`, and builds between
+/// core#1034 and this change, never released) is protected by the age alone: a turn of it that
+/// runs past 24 hours (a budget raised that far) could lose its view.
+const MEMBER_VIEW_SWEEP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// (DES-TEAMING-002 §8.8) Remove the member views an engine crash mid-turn left under
+/// `<temp>/wicked-core-member-view/`, once per process, best effort. Called at engine startup.
+pub(crate) fn sweep_stale_member_views() {
+    use std::io::Write as _;
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    SWEEP.call_once(|| {
+        let root = MemberView::root();
+        let n = sweep_member_views(&root, MEMBER_VIEW_SWEEP_AGE);
+        if n > 0 {
+            // Never a panic at startup (a closed stderr), which would poison the `Once`.
+            let _ = writeln!(
+                std::io::stderr(),
+                "wicked-core: removed {n} leftover member view(s) under {}",
+                root.display()
+            );
+        }
+    });
+}
+
+/// Remove every entry of `root` last modified at least `older_than` ago that no live turn holds;
+/// younger or held entries are kept. Nothing is swept unless `root` is a real directory (not a
+/// symlink) and, on unix, owned by this user: in a shared temp dir (sticky `/tmp`) no one else
+/// can then swap it or an entry for a link out. Removal is `remove_dir_all`, which unlinks a
+/// symlink rather than following it, at any depth. Returns how many entries were removed.
+fn sweep_member_views(root: &std::path::Path, older_than: Duration) -> usize {
+    use std::io::Write as _;
+    match std::fs::symlink_metadata(root) {
+        Ok(m) if m.is_dir() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                // SAFETY: `geteuid` takes no arguments, cannot fail and touches no memory.
+                if m.uid() != unsafe { libc::geteuid() } {
+                    return 0;
+                }
+            }
+        }
+        _ => return 0,
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= older_than);
+        if !stale {
+            continue;
+        }
+        let result = if meta.is_dir() {
+            // (unix) Held for the removal: a turn that still holds the view keeps it.
+            #[cfg(unix)]
+            let _held = match std::fs::File::open(&path).map(|f| (f.try_lock(), f)) {
+                Ok((Ok(()), f)) => f,
+                _ => continue,
+            };
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match result {
+            Ok(()) => removed += 1,
+            Err(e) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "wicked-core: could not remove the leftover member view {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+    removed
 }
 
 /// The headless invocation a member turn on `seat` runs (the seat's registry record, an instance
@@ -2287,6 +2390,163 @@ mod tests {
     use super::{
         is_transient_cli_failure, is_worker_originated_failure, ok_turn_is_a_seat_refusal,
     };
+
+    /// A fresh scratch root for one member-view sweep test (removed by the caller).
+    fn sweep_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "wicked-member-view-sweep-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Set `path`'s mtime `ago` into the past (a directory included, Windows too).
+    fn backdate(path: &std::path::Path, ago: std::time::Duration) {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_FLAG_BACKUP_SEMANTICS: required to open a directory; FILE_WRITE_ATTRIBUTES.
+            opts.custom_flags(0x0200_0000).access_mode(0x100);
+        }
+        let f = opts.open(path).unwrap();
+        f.set_modified(std::time::SystemTime::now() - ago).unwrap();
+    }
+
+    /// A view directory shaped like the one `team::Repo::materialize` writes: `0700`, its files
+    /// `0444` (unix; it sets no mode elsewhere), one in a subdirectory.
+    fn leftover_view(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        for f in [dir.join("README.md"), dir.join("src/lib.rs")] {
+            std::fs::write(&f, "x").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o444)).unwrap();
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    /// A view a crash left behind (older than the threshold, read-only files and all) is removed;
+    /// a young one — a live turn's, this engine's or another engine's on the same temp dir — is
+    /// kept untouched.
+    #[test]
+    fn the_startup_sweep_removes_a_stale_member_view_and_keeps_a_young_one() {
+        let day = super::MEMBER_VIEW_SWEEP_AGE;
+        let root = sweep_root("stale");
+        let stale = root.join("member-crashed-111-0");
+        let young = root.join("member-otherengine-222-0");
+        leftover_view(&stale);
+        leftover_view(&young);
+        backdate(&stale, day + std::time::Duration::from_secs(3600));
+
+        assert_eq!(super::sweep_member_views(&root, day), 1);
+        assert!(!stale.exists(), "the stale view is removed");
+        assert!(young.join("src/lib.rs").exists(), "the young view is kept");
+        // A root that does not exist is nothing to sweep.
+        assert_eq!(super::sweep_member_views(&root.join("absent"), day), 0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// (unix) A view a live turn holds is never swept, however old: a turn whose budget was
+    /// raised past the age threshold keeps its view. Once nothing holds it, it goes.
+    #[cfg(unix)]
+    #[test]
+    fn the_startup_sweep_never_removes_a_view_a_live_turn_holds() {
+        let day = super::MEMBER_VIEW_SWEEP_AGE;
+        let root = sweep_root("held");
+        let held = root.join("member-longturn-555-0");
+        leftover_view(&held);
+        // What `MemberView::prepare` holds for the turn's life.
+        let live = std::fs::File::open(&held).unwrap();
+        live.lock_shared().unwrap();
+        backdate(&held, day * 3);
+
+        assert_eq!(super::sweep_member_views(&root, day), 0);
+        assert!(held.join("src/lib.rs").exists(), "the held view is kept");
+        drop(live);
+        assert_eq!(super::sweep_member_views(&root, day), 1);
+        assert!(!held.exists(), "released, it is a leftover");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// (unix) `MemberView` holds its directory from `prepare` until it is dropped.
+    #[cfg(unix)]
+    #[test]
+    fn a_member_view_holds_its_directory_until_dropped() {
+        let wt = sweep_root("hold-wt");
+        crate::worktree_guard::git(&wt, &["init", "-q"], &[]).unwrap();
+        std::fs::write(wt.join("lib.rs"), "fn f() {}\n").unwrap();
+        let repo = crate::team::Repo {
+            workdir: wt.clone(),
+            git_dir: wt.join(".git"),
+        };
+        let view = crate::team::RepoView {
+            tree: repo.snapshot().unwrap(),
+            repo,
+        };
+        let id = format!("member-hold-{}-0", std::process::id());
+        let mv = super::MemberView::prepare(&view, &id).unwrap();
+        assert!(mv.dir.join("lib.rs").exists());
+        let probe = std::fs::File::open(&mv.dir).unwrap();
+        assert!(probe.try_lock().is_err(), "a prepared view is held");
+        let dir = mv.dir.clone();
+        drop(mv);
+        assert!(!dir.exists(), "dropped, the view is gone");
+        std::fs::remove_dir_all(&wt).unwrap();
+    }
+
+    /// A symlink inside a stale view is unlinked, never followed: what it points at — outside
+    /// the view root — keeps its content. A root entry that is a symlink is unlinked; a view
+    /// root that is itself a symlink is not swept at all.
+    #[cfg(unix)]
+    #[test]
+    fn the_startup_sweep_never_follows_a_symlink_out_of_the_view_root() {
+        let day = super::MEMBER_VIEW_SWEEP_AGE;
+        let old = day + std::time::Duration::from_secs(3600);
+        let base = sweep_root("symlink");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), "keep").unwrap();
+
+        let root = base.join("root");
+        let stale = root.join("member-crashed-333-0");
+        leftover_view(&stale);
+        std::os::unix::fs::symlink(&outside, stale.join("dir-link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("keep.txt"), stale.join("file-link")).unwrap();
+        // An entry of the root that is itself a symlink to outside.
+        std::os::unix::fs::symlink(&outside, root.join("member-planted-444-0")).unwrap();
+        backdate(&stale, old);
+
+        assert_eq!(
+            super::sweep_member_views(&root, std::time::Duration::ZERO),
+            2
+        );
+        assert!(!stale.exists(), "the stale view is removed");
+        assert!(
+            std::fs::symlink_metadata(root.join("member-planted-444-0")).is_err(),
+            "the planted link is unlinked"
+        );
+        let kept = outside.join("keep.txt");
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "keep");
+
+        // A root that is a symlink is not swept: the directory it names keeps its entries.
+        let linked_root = base.join("linked-root");
+        std::os::unix::fs::symlink(&outside, &linked_root).unwrap();
+        backdate(&kept, old);
+        assert_eq!(super::sweep_member_views(&linked_root, day), 0);
+        assert!(kept.exists());
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     /// (C5) An exit-0, tool-free, short provider refusal is a failed turn; real work is not.
     #[test]
