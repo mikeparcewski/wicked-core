@@ -321,24 +321,47 @@ const CLAUDE_SETUP_TOKEN_PATH: &str = "claude/wicked-setup-token";
 /// claude's login: `claude setup-token`, then the token it printed, pasted back unechoed and
 /// written (owner-only) beside the CLI's own files for ingest. No token, no file: ingest reports
 /// the sign-in missing and the operator signs in again.
-const CLAUDE_SETUP_TOKEN_LOGIN: &str = "claude setup-token || exit 1; stty -echo 2>/dev/null; \
-printf '\\033[?2004l\\n%s' 'wicked: copy the token shown above, paste it here (it is not shown) and press Enter: '; \
-IFS= read -r t; ok=$?; stty echo 2>/dev/null; printf '\\n'; \
-[ $ok -eq 0 ] && [ -n \"$t\" ] || { echo 'wicked: no token was pasted; sign claude in again' >&2; exit 1; }; \
-umask 077 && printf '%s' \"$t\" > \"$CLAUDE_CONFIG_DIR/wicked-setup-token\"";
+///
+/// The paste is read in line mode (`stty sane`: Enter ends a line even if the TUI left the
+/// terminal raw) with bracketed paste on. The CLI wraps the long token across two rows, so a
+/// copied token can carry a line break; inside the paste brackets lines keep being read until
+/// the closing bracket. A terminal that does not bracket pastes ends the token with an empty
+/// line (the script asks for one Enter more), so a wrapped row is never taken for the whole
+/// token. Blank lines before any token are skipped, and input that ends first (the window
+/// closed, EOF inside an open paste) saves nothing. What lands is the paste as typed, line
+/// breaks and brackets included: [`setup_token`] joins and checks it.
+const CLAUDE_SETUP_TOKEN_LOGIN: &str = "claude setup-token || exit 1; stty sane -echo 2>/dev/null; \
+o=$(printf '\\033[200~'); c=$(printf '\\033[201~'); p=; d=; \
+printf '\\033[?2004h\\n%s' 'wicked: copy the token shown above, paste it here (it is not shown) and press Enter: '; \
+while IFS= read -r l; do p=\"$p$l\n\"; \
+case \"$p\" in *\"$o\"*) case \"$p\" in *\"$c\"*) d=1; break;; esac; continue;; esac; \
+case \"$l\" in *[A-Za-z0-9_-]*) printf '\\r\\n%s' 'wicked: press Enter once more to finish (or paste the rest of the token): ';; \
+*) case \"$p\" in *[A-Za-z]*) d=1; break;; esac;; esac; done; \
+stty echo 2>/dev/null; printf '\\033[?2004l\\n'; \
+case \"$p\" in *[A-Za-z]*) ;; *) echo 'wicked: no token was pasted; sign claude in again' >&2; exit 1;; esac; \
+[ -n \"$d\" ] || { echo 'wicked: the paste did not finish; sign claude in again' >&2; exit 1; }; \
+mkdir -p \"$CLAUDE_CONFIG_DIR\" && (umask 077 && printf '%s' \"$p\" > \"$CLAUDE_CONFIG_DIR/wicked-setup-token\") \
+|| { echo 'wicked: the token could not be saved; sign claude in again' >&2; exit 1; }; \
+echo 'wicked: token received; studio checks it now'";
 
-/// The `claude setup-token` token pasted back at sign-in (pure): trimmed, one line of a token's
-/// characters, with the prefix Anthropic's long-lived OAuth tokens carry. Errors never repeat it.
+/// The `claude setup-token` token pasted back at sign-in (pure): the paste's bracketed-paste
+/// markers dropped and its lines (the CLI wraps the token across rows, so a copy can carry a
+/// line break) trimmed and joined, then one run of a token's characters with the prefix
+/// Anthropic's long-lived OAuth tokens carry. Errors never repeat it.
 fn setup_token(bytes: &[u8]) -> Result<String, String> {
     let text = std::str::from_utf8(bytes)
-        .map_err(|_| "claude: the pasted token is not text".to_string())?
-        .trim();
-    // A terminal still in bracketed-paste mode (the CLI's TUI turns it on) wraps a paste.
-    let text = text
-        .strip_prefix("\u{1b}[200~")
-        .and_then(|t| t.strip_suffix("\u{1b}[201~"))
-        .unwrap_or(text)
-        .trim();
+        .map_err(|_| "claude: the pasted token is not text".to_string())?;
+    // A paste cut short (its closing bracket never came) is a truncated token, never a token.
+    if text.matches("\u{1b}[200~").count() != text.matches("\u{1b}[201~").count() {
+        return Err(
+            "claude: the paste of the `claude setup-token` token did not finish; sign claude in \
+             again and paste the whole token it prints"
+                .into(),
+        );
+    }
+    let text = text.replace("\u{1b}[200~", "").replace("\u{1b}[201~", "");
+    // Whitespace inside a line is kept (and refused below): only a row break is joined.
+    let text: String = text.split(['\r', '\n']).map(str::trim).collect();
     let shaped = text.len() <= 4096
         && text
             .bytes()
@@ -350,7 +373,7 @@ fn setup_token(bytes: &[u8]) -> Result<String, String> {
                 .into(),
         );
     }
-    Ok(text.to_string())
+    Ok(text)
 }
 
 /// Each CLI's configuration-home variable and its directory under the throwaway HOME. The init
@@ -513,9 +536,13 @@ pub(crate) fn extract_tokens(
                     return Ok(vec![token_file("anthropic.key", key)]);
                 }
             }
+            // No pasted token and no credential record (a settings file without one does not
+            // count): the token `claude setup-token` printed was never pasted back, or the
+            // window closed first.
             Err(missing(
                 cli,
-                "claudeAiOauth.accessToken or stored ANTHROPIC_API_KEY",
+                "the `claude setup-token` token (it was never pasted back); sign claude in again \
+                 and paste the token it prints",
             ))
         }
         "codex" => {
@@ -3606,10 +3633,13 @@ esac
     #[cfg(unix)]
     #[test]
     fn a_claude_setup_token_sign_in_is_brokered_for_pass_through() {
-        // Echo is off before the prompt shows, so a paste typed at once is never echoed.
-        assert!(CLAUDE_SETUP_TOKEN_LOGIN.starts_with("claude setup-token || exit 1; stty -echo"));
+        // Line mode with echo off before the prompt shows, so a paste typed at once is never
+        // echoed and Enter ends the line whatever mode the TUI left the terminal in.
+        assert!(
+            CLAUDE_SETUP_TOKEN_LOGIN.starts_with("claude setup-token || exit 1; stty sane -echo")
+        );
         assert!(CLAUDE_SETUP_TOKEN_LOGIN.contains("umask 077"));
-        assert!(CLAUDE_SETUP_TOKEN_LOGIN.ends_with("> \"$CLAUDE_CONFIG_DIR/wicked-setup-token\""));
+        assert!(CLAUDE_SETUP_TOKEN_LOGIN.contains("> \"$CLAUDE_CONFIG_DIR/wicked-setup-token\""));
         assert_eq!(credential_paths("claude")[0], CLAUDE_SETUP_TOKEN_PATH);
         assert_eq!(
             setup_token(b"  sk-ant-oat01-FAKE-setup_token-0123\r\n").unwrap(),
@@ -3620,11 +3650,48 @@ esac
             "sk-ant-oat01-FAKE-setup_token-0123",
             "a bracketed paste"
         );
+        // The CLI wraps the token across two rows: a copy of both rows carries a line break
+        // (and the second row's indent), CR- or LF-terminated, with blank lines around it.
+        let token = fake_setup_token();
+        let (row1, row2) = token.split_at(98);
+        for pasted in [
+            format!("\u{1b}[200~{row1}\n {row2}\u{1b}[201~\n"),
+            format!("\u{1b}[200~ {row1}\r {row2}\u{1b}[201~\r"),
+            format!("\n\n{token}\r\n"),
+            format!("{token}\r"),
+        ] {
+            assert_eq!(setup_token(pasted.as_bytes()).unwrap(), token);
+        }
+        // A paste cut short (its closing bracket never came, or came alone) is refused: its
+        // first row passes every other check, so it would land as a truncated token.
+        for cut in [
+            format!("\u{1b}[200~{row1}\n"),
+            format!("{row1}\u{1b}[201~\n"),
+            format!("\u{1b}[200~{row1}\n\u{1b}[200~{row2}\u{1b}[201~\n"),
+        ] {
+            let e = setup_token(cut.as_bytes()).unwrap_err();
+            assert!(
+                e.contains("did not finish") && !e.contains(&row1[13..40]),
+                "{e}"
+            );
+        }
+        // No pasted token and only a settings file without a credential record in it (claude
+        // can write one): the operator is told the token was never pasted back.
+        let err = extract_tokens(
+            "claude",
+            &[file("claude/settings.json", serde_json::json!({}))],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("signed out") && err.contains("never pasted back"),
+            "{err}"
+        );
         for bad in [
             &b"sk-ant-api03-FAKE-not-a-setup-token"[..],
             b"sk-ant-oat01-FAKE token",
             b"sk-ant-oat01-FAKE\nx-evil: 1",
             b"https://claude.ai/oauth/FAKE",
+            b"\x1b[200~\x1b[201~",
             b"",
         ] {
             let e = setup_token(bad).unwrap_err();
@@ -3686,6 +3753,194 @@ esac
             std::fs::read(fake.dir.join("broker/anthropic.token")).unwrap(),
             b"sk-ant-oat01-FAKE-setup-0001"
         );
+        // Nothing pasted back (the window closed, or the script stopped): the error says so.
+        new_session(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        std::fs::remove_file(fake.dir.join("setup-token")).unwrap();
+        let err = ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap_err();
+        assert!(
+            err.contains("signed out") && err.contains("never pasted back"),
+            "{err}"
+        );
+    }
+
+    /// A fake `claude setup-token` token, built at runtime (never a literal): its shape, length
+    /// and alphabet are the real token's, so the CLI wraps it across rows the way it does.
+    fn fake_setup_token() -> String {
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let body: String = (0..94u32)
+            .map(|i| alphabet[(i * 37 % 64) as usize] as char)
+            .collect();
+        ["sk", "ant", "oat01", &body].join("-") + "AA"
+    }
+
+    /// The claude login script as the operator meets it (the sign-in that stayed signed out):
+    /// run in a real PTY, after a stand-in `claude setup-token` that prints the token wrapped
+    /// across two rows the way its TUI does and leaves the terminal raw. The paste is sent the
+    /// way studio's terminal (xterm.js) sends it: row breaks as CR, bracketed because the script
+    /// turned bracketed paste on, then Enter as CR. The whole token must land, every time.
+    #[cfg(unix)]
+    #[test]
+    fn the_claude_login_script_captures_a_wrapped_token_pasted_in_a_pty() {
+        use portable_pty::{CommandBuilder, PtySize};
+        use std::io::{Read, Write};
+        let token = fake_setup_token();
+        let (row1, row2) = token.split_at(98);
+        let root = std::env::temp_dir().join(format!(
+            "wicked-setup-token-pty-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("claude");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n[ \"$1\" = setup-token ] || exit 2\nstty raw -echo\n\
+             printf '\\033[?2004h \\033[93m%s\\r\\033[1C\\033[1B%s\\r\\n' \"$ROW1\" \"$ROW2\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        // Each case: what the operator does at the prompt, and whether the whole token lands.
+        // A terminal that does not bracket pastes ends the token with one Enter more; EOF (^D)
+        // inside an open paste saves nothing.
+        let cases: [(&str, String, Option<String>); 8] = [
+            (
+                "both rows copied, bracketed",
+                format!("\u{1b}[200~{row1}\r {row2}\u{1b}[201~\r"),
+                Some(token.clone()),
+            ),
+            (
+                "a blank Enter first, then the paste",
+                format!("\r\u{1b}[200~{token}\u{1b}[201~\r"),
+                Some(token.clone()),
+            ),
+            (
+                "the copy starts on the blank row above",
+                format!("\u{1b}[200~\r{row1}\r {row2}\u{1b}[201~\r"),
+                Some(token.clone()),
+            ),
+            (
+                "the copy ends with a line break, then Enter",
+                format!("\u{1b}[200~{row1}\r {row2}\r\u{1b}[201~\r"),
+                Some(token.clone()),
+            ),
+            (
+                "one row, unbracketed",
+                format!("{token}\r\r"),
+                Some(token.clone()),
+            ),
+            (
+                "both rows copied, unbracketed",
+                format!("{row1}\r {row2}\r\r"),
+                Some(token.clone()),
+            ),
+            (
+                "a middle row of digits and dashes only, unbracketed",
+                format!("{row1}\r 0123-_\r {row2}\r\r"),
+                Some(format!("{row1}0123-_{row2}")),
+            ),
+            (
+                "the input ends inside the paste",
+                format!("\u{1b}[200~{row1}\r\u{4}"),
+                None,
+            ),
+        ];
+        for (n, (case, paste, lands)) in cases.iter().enumerate() {
+            let config = root.join(format!("home-{n}/claude"));
+            let pair = portable_pty::native_pty_system()
+                .openpty(PtySize {
+                    rows: 30,
+                    cols: 100,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            let mut cmd = CommandBuilder::new("sh");
+            cmd.args(["-c", CLAUDE_SETUP_TOKEN_LOGIN, "wicked-login"]);
+            cmd.env("PATH", &path);
+            cmd.env("CLAUDE_CONFIG_DIR", &config);
+            cmd.env("ROW1", row1);
+            cmd.env("ROW2", row2);
+            let mut child = pair.slave.spawn_command(cmd).unwrap();
+            drop(pair.slave);
+            let mut reader = pair.master.try_clone_reader().unwrap();
+            let mut writer = pair.master.take_writer().unwrap();
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = seen.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    sink.lock().unwrap().extend_from_slice(&buf[..n]);
+                }
+            });
+            let shown = |what: &str| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while std::time::Instant::now() < deadline {
+                    if String::from_utf8_lossy(&seen.lock().unwrap()).contains(what) {
+                        return true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                false
+            };
+            assert!(shown("press Enter: "), "{case}: no prompt");
+            // The script turned bracketed paste on with its prompt (the stand-in's own does not count).
+            let out = String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
+            assert!(
+                out.contains("\u{1b}[?2004h\r\nwicked: copy"),
+                "{case}: bracketed paste off"
+            );
+            writer.write_all(paste.as_bytes()).unwrap();
+            writer.flush().unwrap();
+            let Some(expected) = lands else {
+                assert!(shown("the paste did not finish"), "{case}: no refusal");
+                let status = child.wait().unwrap();
+                assert!(!status.success(), "{case}: {status:?}");
+                assert!(!config.join("wicked-setup-token").exists(), "{case}: saved");
+                continue;
+            };
+            assert!(shown("token received"), "{case}: the script never finished");
+            let status = child.wait().unwrap();
+            assert!(status.success(), "{case}: {status:?}");
+            let landed = std::fs::read(config.join("wicked-setup-token")).unwrap();
+            assert_eq!(&setup_token(&landed).unwrap(), expected, "{case}");
+            let out = String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
+            assert!(
+                !out[out.find("press Enter: ").unwrap()..].contains(&token[13..40]),
+                "{case}: the paste was echoed"
+            );
+        }
+
+        // Nothing pasted (the input ends): no file, and the script says so before it exits.
+        let config = root.join("home-eof/claude");
+        use wicked_apps_core::HardenedCommand;
+        let out = std::process::Command::new("sh")
+            .hardened()
+            .args(["-c", CLAUDE_SETUP_TOKEN_LOGIN, "wicked-login"])
+            .env("PATH", &path)
+            .env("CLAUDE_CONFIG_DIR", &config)
+            .env("ROW1", row1)
+            .env("ROW2", row2)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("no token was pasted"));
+        assert!(!config.join("wicked-setup-token").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// core#1024: a claude record from an earlier `claude auth login` sign-in is never renewed
