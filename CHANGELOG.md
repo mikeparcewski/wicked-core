@@ -854,6 +854,9 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.4** — 2026-10-19 — patch release on main 81ca87b, carrying #1041 and #1042.
+  - **A claude container sign-in reads the token from claude's output; one paste (#1041):** the login script runs `claude setup-token` under util-linux `script`, captures its output to an owner-only file on the login container's tmpfs, and replays it to find the `sk-ant-oat` token row, so the operator pastes only the browser's authorization code. When the token cannot be read, it falls back to the paste prompt unchanged.
+  - **A claude seat in a container can work in its own worktree under `~/.wicked/repos` (#1042):** once the container floor arms a claude unit, both fence carriers are narrowed to the container's mount plan: a fenced directory with a working root strictly under it drops its blanket rule and denies every other mounted entry under it by name; the host floor, state-home, credential-file and Bash-verb rules are unchanged.
 - **core-ts 0.15.3** — 2026-10-19 — patch release on main c1b0716, carrying #1039.
   - **claude sign-in in studio's terminal survives the modes claude leaves on (#1039):** after `claude setup-token` the login script turns off mouse reporting, the kitty keyboard protocol, modifyOtherKeys and synchronized output, and strips escape sequences from what it reads, so terminal-query answers, mouse reports and escape bytes no longer pollute the pasted token. A refusal names the check that failed (by category, never any part of the paste).
 - **core-ts 0.15.2** — 2026-10-18 — patch release on main 531030a, carrying #1034, #1035 and #1036.
