@@ -335,7 +335,7 @@ o=$(printf '\\033[200~'); c=$(printf '\\033[201~'); p=; d=; \
 printf '\\033[?2004h\\n%s' 'wicked: copy the token shown above, paste it here (it is not shown) and press Enter: '; \
 while IFS= read -r l; do p=\"$p$l\n\"; \
 case \"$p\" in *\"$o\"*) case \"$p\" in *\"$c\"*) d=1; break;; esac; continue;; esac; \
-case \"$l\" in *[A-Za-z]*) printf '\\r\\n%s' 'wicked: press Enter once more to finish (or paste the rest of the token): ';; \
+case \"$l\" in *[A-Za-z0-9_-]*) printf '\\r\\n%s' 'wicked: press Enter once more to finish (or paste the rest of the token): ';; \
 *) case \"$p\" in *[A-Za-z]*) d=1; break;; esac;; esac; done; \
 stty echo 2>/dev/null; printf '\\033[?2004l\\n'; \
 case \"$p\" in *[A-Za-z]*) ;; *) echo 'wicked: no token was pasted; sign claude in again' >&2; exit 1;; esac; \
@@ -3813,37 +3813,46 @@ esac
         // Each case: what the operator does at the prompt, and whether the whole token lands.
         // A terminal that does not bracket pastes ends the token with one Enter more; EOF (^D)
         // inside an open paste saves nothing.
-        let cases: [(&str, String, bool); 7] = [
+        let cases: [(&str, String, Option<String>); 8] = [
             (
                 "both rows copied, bracketed",
                 format!("\u{1b}[200~{row1}\r {row2}\u{1b}[201~\r"),
-                true,
+                Some(token.clone()),
             ),
             (
                 "a blank Enter first, then the paste",
                 format!("\r\u{1b}[200~{token}\u{1b}[201~\r"),
-                true,
+                Some(token.clone()),
             ),
             (
                 "the copy starts on the blank row above",
                 format!("\u{1b}[200~\r{row1}\r {row2}\u{1b}[201~\r"),
-                true,
+                Some(token.clone()),
             ),
             (
                 "the copy ends with a line break, then Enter",
                 format!("\u{1b}[200~{row1}\r {row2}\r\u{1b}[201~\r"),
-                true,
+                Some(token.clone()),
             ),
-            ("one row, unbracketed", format!("{token}\r\r"), true),
+            (
+                "one row, unbracketed",
+                format!("{token}\r\r"),
+                Some(token.clone()),
+            ),
             (
                 "both rows copied, unbracketed",
                 format!("{row1}\r {row2}\r\r"),
-                true,
+                Some(token.clone()),
+            ),
+            (
+                "a middle row of digits and dashes only, unbracketed",
+                format!("{row1}\r 0123-_\r {row2}\r\r"),
+                Some(format!("{row1}0123-_{row2}")),
             ),
             (
                 "the input ends inside the paste",
                 format!("\u{1b}[200~{row1}\r\u{4}"),
-                false,
+                None,
             ),
         ];
         for (n, (case, paste, lands)) in cases.iter().enumerate() {
@@ -3896,18 +3905,18 @@ esac
             );
             writer.write_all(paste.as_bytes()).unwrap();
             writer.flush().unwrap();
-            if !lands {
+            let Some(expected) = lands else {
                 assert!(shown("the paste did not finish"), "{case}: no refusal");
                 let status = child.wait().unwrap();
                 assert!(!status.success(), "{case}: {status:?}");
                 assert!(!config.join("wicked-setup-token").exists(), "{case}: saved");
                 continue;
-            }
+            };
             assert!(shown("token received"), "{case}: the script never finished");
             let status = child.wait().unwrap();
             assert!(status.success(), "{case}: {status:?}");
             let landed = std::fs::read(config.join("wicked-setup-token")).unwrap();
-            assert_eq!(setup_token(&landed).unwrap(), token, "{case}");
+            assert_eq!(&setup_token(&landed).unwrap(), expected, "{case}");
             let out = String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
             assert!(
                 !out[out.find("press Enter: ").unwrap()..].contains(&token[13..40]),
