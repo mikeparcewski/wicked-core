@@ -3043,11 +3043,19 @@ impl WrappedCliStepRunner {
                     .map(PathBuf::from);
                 // What the unit may read beyond its tree: the launch's read roots and its
                 // skills delivery (only mounted paths exist in a container).
+                // A governed claude unit's gate-hook read roots ride too (`GovLaunch::read_roots`,
+                // the `WICKED_READ_ROOTS` it is handed): mounted here, not late in `finalize`, so the
+                // mount view its fence is narrowed to is the container's whole mount set.
                 let read_roots: Vec<PathBuf> = input
                     .governance
                     .iter()
                     .flat_map(|g| g.extra_read_roots.iter().map(PathBuf::from))
                     .chain(handed.map(|s| s.root.clone()))
+                    .chain(
+                        gov_env
+                            .iter()
+                            .flat_map(|g| g.read_roots(self.operational_home.as_deref())),
+                    )
                     .collect();
                 // A claude unit's gate hook runs on the host, reached through the gateway's hook
                 // route; without the relay (or a gateway to route it) its tool calls would run
@@ -3623,15 +3631,11 @@ impl WrappedCliStepRunner {
                 // `assemble_read_roots`. A mis-shaped `code_graph_db` — an in-tree
                 // `<repo>/.codegraph/estate.db` from a pre-core#406 record included — is NOT
                 // widened (the helper's shape check), reported here so the operator sees why.
-                let read_roots: Vec<std::ffi::OsString> = assemble_read_roots(
-                    g.code_graph_db.as_deref(),
-                    self.operational_home.as_deref(),
-                    &g.extra_read_roots,
-                    g.skills_root.as_deref(),
-                )
-                .into_iter()
-                .map(PathBuf::into_os_string)
-                .collect();
+                let read_roots: Vec<std::ffi::OsString> = g
+                    .read_roots(self.operational_home.as_deref())
+                    .into_iter()
+                    .map(PathBuf::into_os_string)
+                    .collect();
                 if let Some(db) = g.code_graph_db.as_deref() {
                     if repo_read_root(Some(db), self.operational_home.as_deref()).is_none() {
                         eprintln!(
@@ -4747,6 +4751,21 @@ fn graph_write_dir_at(code_graph_db: Option<&str>, graph_root: Option<&Path>) ->
 /// reopen the FINDING-098 pin-rewrite escape. The wrapped path env-joins these onto the
 /// subprocess (`WICKED_READ_ROOTS`); the ACP path hands them to the in-process boundary. Two
 /// assemblies would drift the first time one grew a root.
+impl GovLaunch {
+    /// The read roots this unit's gate hook is handed (`WICKED_READ_ROOTS`): ONE assembly for that
+    /// env and for the seat container's read mounts (`container_floor::arm`), so the container
+    /// never mounts a read root late (in `container_floor::finalize`) that its narrowed fence
+    /// ([`narrow_container_fence`]) did not see.
+    fn read_roots(&self, operational_home: Option<&Path>) -> Vec<PathBuf> {
+        assemble_read_roots(
+            self.code_graph_db.as_deref(),
+            operational_home,
+            &self.extra_read_roots,
+            self.skills_root.as_deref(),
+        )
+    }
+}
+
 pub(crate) fn assemble_read_roots(
     code_graph_db: Option<&str>,
     // The daemon's state home (the runner's `operational_home`), against which `code_graph_db` is
@@ -15192,6 +15211,121 @@ tail -c 1500 /work/claude.out
             "{host:?}"
         );
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&input.run_id));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// (codex review of #1042, P2) The gate hook's read roots (`WICKED_READ_ROOTS`, always
+    /// including `~/.claude/plugins`) are mounted when the container floor arms, so the view the
+    /// fence is narrowed to is the whole mount set: with `~/.claude/plugins` a link to `~/.wicked`,
+    /// the arm-time mounts bind `.wicked` whole, so its blanket STAYS (estate's stores stay
+    /// denied), and `finalize`, handed the same roots, adds no mount the view did not see.
+    #[cfg(unix)]
+    #[test]
+    fn the_gate_read_roots_are_in_the_view_and_finalize_adds_no_mount_past_it() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "wicked-sf1019-rr-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let wicked = home.join(".wicked");
+        let clone = wicked.join("repos").join("x");
+        let tree = clone.join("wicked-worktrees").join("r");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(wicked.join("memory.db"), "estate").unwrap();
+        std::os::unix::fs::symlink(&wicked, home.join(".claude").join("plugins")).unwrap();
+        let _home = HomeGuard::pin(&home);
+        let _cfg = VarGuard::unset("CLAUDE_CONFIG_DIR");
+        let roots = super::assemble_read_roots(None, None, &[], None);
+        assert!(
+            roots.contains(&home.join(".claude").join("plugins")),
+            "{roots:?}"
+        );
+
+        let spec = crate::worker_sandbox::SeatFloor {
+            profile: "governed".into(),
+            tree: tree.clone(),
+            writable: vec![tree.clone()],
+            protected: vec![clone.clone()],
+            readmitted: vec![tree.clone()],
+            readmitted_files: vec![],
+            masks: crate::worker_sandbox::floor_mask_dirs_under(Some(&home)),
+            pinned: vec![],
+            net: vec![],
+        };
+        let mut mounts = crate::container_floor::mount_plan(&spec).unwrap();
+        // Before: a view without the gate roots (they were mounted late) narrows the blanket away,
+        // and `finalize` then binds `.wicked` whole past it.
+        let early = crate::container_floor::mount_view(&mounts, &[tree.clone(), clone.clone()]);
+        assert_eq!(
+            crate::container_floor::narrow_fenced_dir(&wicked, &early).unwrap(),
+            Some(Vec::new()),
+            "the late view opened `.wicked`: {early:?}"
+        );
+        crate::container_floor::add_read_roots(&mut mounts, &roots);
+        let working: Vec<PathBuf> = [tree.clone(), clone.clone()]
+            .into_iter()
+            .chain(roots.iter().cloned())
+            .collect();
+        let view = crate::container_floor::mount_view(&mounts, &working);
+        assert!(
+            view.mounted.contains(&wicked),
+            "the link's target is mounted: {view:?}"
+        );
+        let rules = super::container_fence_rules(
+            &super::deny_rules(None, None).unwrap(),
+            None,
+            None,
+            &view,
+        )
+        .unwrap();
+        let w = rule_path(&wicked).unwrap();
+        assert!(
+            rules.contains(&format!("Read({w}/**)")) && rules.contains(&format!("Edit({w}/**)")),
+            "a mount exposing `.wicked` whole keeps its blanket: {rules:?}"
+        );
+
+        // `finalize` with the same roots in `WICKED_READ_ROOTS`: no mount beyond the view's.
+        let rt = PathBuf::from("/usr/bin/true");
+        let wrapper = crate::container_floor::run_argv(&crate::container_floor::ContainerLaunch {
+            runtime: &rt,
+            image: "img:1",
+            name: "wicked-seat-rr",
+            network: "none",
+            workdir: &tree,
+            user: "1:1",
+            mounts: &mounts,
+            floor: "wicked-floor:t",
+            memory: "1g",
+            gateway_ports: &[],
+            own_ports: &[],
+        });
+        // spawn-audit: test-only — never spawned; finalize only rewrites the argv.
+        let mut cmd = Command::new(&wrapper[0]);
+        cmd.args(&wrapper[1..]).args(["claude", "-p", "hi"]);
+        cmd.env(
+            crate::gate_hook::READ_ROOTS_ENV,
+            std::env::join_paths(&roots).unwrap(),
+        );
+        let out = crate::container_floor::finalize(cmd);
+        let dsts: Vec<PathBuf> = out
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|w| w[0] == "--mount")
+            .filter_map(|w| {
+                w[1].split(',')
+                    .find_map(|kv| kv.strip_prefix("dst=").map(PathBuf::from))
+            })
+            .filter(|d| d != Path::new("/floor"))
+            .collect();
+        for d in &dsts {
+            assert!(
+                view.mounted.contains(d),
+                "finalize mounted {d:?} past the view"
+            );
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 

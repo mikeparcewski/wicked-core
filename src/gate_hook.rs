@@ -13827,12 +13827,21 @@ mod boundary_tests {
         let launcher: String = include_str!("execute_wrapped.rs")
             .split_whitespace()
             .collect();
+        // (#1042) The assembly lives on `GovLaunch::read_roots`, used for WICKED_READ_ROOTS and
+        // for the seat container's read mounts alike (so the container's fence sees every mount).
         assert!(
             launcher.contains(
-                "assemble_read_roots(g.code_graph_db.as_deref(),self.operational_home.as_deref(),&g.extra_read_roots,g.skills_root.as_deref()"
+                "assemble_read_roots(self.code_graph_db.as_deref(),operational_home,&self.extra_read_roots,self.skills_root.as_deref()"
+            ) && launcher.contains(
+                "letread_roots:Vec<std::ffi::OsString>=g.read_roots(self.operational_home.as_deref())"
             ),
             "the wrapped launcher no longer joins the launch-declared extra_read_roots (and the \
              skills snapshot) into WICKED_READ_ROOTS (core#294, core#396)"
+        );
+        assert!(
+            launcher.contains(".flat_map(|g|g.read_roots(self.operational_home.as_deref()))"),
+            "the seat container no longer mounts the gate hook's read roots when it arms, so a \
+             late mount could slip past its narrowed fence (#1042)"
         );
         // (C5) The ACP carrier, the second assembly site, is gone with ACP: one carrier, one site.
         // The launch side must actually judge the extras — same rules as the write roots, or the

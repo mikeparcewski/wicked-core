@@ -2769,8 +2769,11 @@ pub(crate) fn mount_view(mounts: &[Mount], working_set: &[PathBuf]) -> MountView
 /// unit's own tree (crew registers repositories under `~/.wicked/repos`, and `.wicked` is a
 /// fenced directory) denies the seat its own worktree: Claude's deny beats any allow.
 ///
-/// - `Ok(None)`: keep the directory's blanket rule. No working root lies strictly under it, or a
-///   mount exposes it whole (a bind at or above it): narrowing would need the host listing.
+/// - `Ok(None)`: keep the directory's blanket rule. No working root lies strictly under it; or a
+///   mount exposes more of it than the view can name — a mount at or above the directory, or one
+///   below it on the way to a working root without being inside one (an `--add-dir` of
+///   `~/.wicked/repos` exposes every sibling repository): narrowing would need the host listing,
+///   so the fence stays closed (the seat is then denied its tree, as before, and told why).
 /// - `Ok(Some(entries))`: drop the blanket and deny `entries` instead. For every mount under the
 ///   directory that is not inside a working root, the shallowest path below the directory that
 ///   is not on the way to a working root. A working root and its ancestors stay open; every
@@ -2812,6 +2815,16 @@ pub(crate) fn narrow_fenced_dir(
     {
         if opened.iter().any(|r| m.starts_with(r)) {
             continue;
+        }
+        if on_the_way(m) {
+            eprintln!(
+                "[wicked-core] fence.notice the seat container mounts {} under the fenced {} \
+                 above the unit's working roots: it exposes entries the mount plan does not name, \
+                 so the blanket rule stays (the seat cannot read its tree there)",
+                m.display(),
+                dir.display()
+            );
+            return Ok(None);
         }
         let mut p = d.clone();
         for c in m.strip_prefix(&d).into_iter().flat_map(Path::components) {
@@ -3349,6 +3362,33 @@ mod tests {
         );
         assert_eq!(
             narrow_fenced_dir(Path::new("/h/.wicked"), &whole).unwrap(),
+            None
+        );
+    }
+
+    /// (codex review of #1042, P2) A bind BELOW the fenced directory that is on the way to a
+    /// working root without being inside one (claude's `--add-dir <home>/.wicked/repos`) exposes
+    /// entries the mount plan does not name (`repos/other/...`): the blanket stays.
+    #[cfg(unix)]
+    #[test]
+    fn a_bind_above_the_working_roots_under_a_fenced_dir_keeps_its_blanket() {
+        let bind = |p: &str, rw: bool| Mount::Bind {
+            path: PathBuf::from(p),
+            rw,
+        };
+        let v = mount_view(
+            &[
+                bind("/h/.wicked/repos", false),
+                bind("/h/.wicked/repos/x", false),
+                bind("/h/.wicked/repos/x/wicked-worktrees/r", true),
+            ],
+            &[
+                PathBuf::from("/h/.wicked/repos/x/wicked-worktrees/r"),
+                PathBuf::from("/h/.wicked/repos/x"),
+            ],
+        );
+        assert_eq!(
+            narrow_fenced_dir(Path::new("/h/.wicked"), &v).unwrap(),
             None
         );
     }
