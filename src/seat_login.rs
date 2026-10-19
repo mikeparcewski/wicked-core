@@ -339,11 +339,12 @@ macro_rules! claude_token_received {
 /// once, and the alternate screen is read apart from the main screen. On each screen, the first
 /// non-blank row after a row reading "Your OAuth token" must hold `sk-ant-oat` with only spaces
 /// before it and only token characters (`A-Za-z0-9-_`) from there: that column is the token's.
-/// The next row is joined only when the row before it ended exactly at the terminal width and it
-/// holds token characters alone, starting at that same column; a blank row or a row with any
-/// other character ("Store this token securely…") ends the token. A row of token characters that
-/// fails either condition, text around the token, two different tokens, or none: no token (the
-/// script then asks for the paste). The token is held to the shape [`setup_token`] checks again
+/// After a row that ended exactly at the terminal width, the next row is either blank (the token
+/// ends) or holds token characters alone starting at that same column (it is joined); anything
+/// else there (text around a continuation, another column) is no token, never a truncated one.
+/// After a shorter row, a blank row or a row of other text ("Store this token securely…") ends
+/// the token, and a row of token characters is no token. Text around the token, two different
+/// tokens, or none: no token (the script then asks for the paste). The token is held to the shape [`setup_token`] checks again
 /// at ingest (one `sk-ant-oat` prefix, 20 to 4096 characters).
 macro_rules! claude_token_extractor {
     () => {
@@ -487,9 +488,13 @@ def tokens(lines, W):
         end = len(row)
         for nxt in lines[j + 1:]:
             body = nxt.lstrip(" ")
-            if not body or not set(body) <= T:
+            if not body:
                 break
-            if end != W or len(nxt) - len(body) != col:
+            if end != W:
+                if set(body) <= T:
+                    return None
+                break
+            if not set(body) <= T or len(nxt) - len(body) != col:
                 return None
             tok, end = tok + body, len(nxt)
         out.add(tok)
@@ -4552,8 +4557,8 @@ esac
                 "30 100".into(),
             ),
             (
-                "the token fills its row exactly, \"Store this token\" right below",
-                format!("Your OAuth token (valid for 1 year):\r\n\r\n\u{1b}[33m{token}\u{1b}[39m\r\nStore this token securely.\r\n"),
+                "the token fills its row exactly, a blank row below",
+                format!("Your OAuth token (valid for 1 year):\r\n\r\n\u{1b}[33m{token}\u{1b}[39m\r\n\r\nStore this token securely.\r\n"),
                 format!("30 {}", token.len()),
             ),
             (
@@ -4573,6 +4578,7 @@ esac
         }
 
         let (row1, row2) = token.split_at(80);
+        let exact = format!("30 {}", token.len());
         let none: Vec<(&str, String, &str)> = vec![
             ("no token on the screen", CLAUDE_TUI.into(), "30 80"),
             ("nothing captured", String::new(), "30 80"),
@@ -4595,6 +4601,23 @@ esac
                     &row1[..78]
                 ),
                 "30 80",
+            ),
+            // After a full-width row only a blank row or a clean continuation may follow: anything
+            // else is not taken to end the token (that would save a truncated one).
+            (
+                "text after the continuation",
+                format!("Your OAuth token (valid for 1 year):\r\n\r\n{row1}\r\n{row2} (copy it)\r\n"),
+                "30 80",
+            ),
+            (
+                "text before the continuation",
+                format!("Your OAuth token (valid for 1 year):\r\n\r\n{row1}\r\ntoken: {row2}\r\n"),
+                "30 80",
+            ),
+            (
+                "a full-width row, then \"Store this token\" right below",
+                format!("Your OAuth token (valid for 1 year):\r\n\r\n{token}\r\nStore this token securely.\r\n"),
+                exact.as_str(),
             ),
             (
                 "text after the token on its row",
