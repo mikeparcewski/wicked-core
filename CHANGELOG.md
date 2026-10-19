@@ -818,6 +818,8 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.3** — 2026-10-19 — patch release on main c1b0716, carrying #1039.
+  - **claude sign-in in studio's terminal survives the modes claude leaves on (#1039):** after `claude setup-token` the login script turns off mouse reporting, the kitty keyboard protocol, modifyOtherKeys and synchronized output, and strips escape sequences from what it reads, so terminal-query answers, mouse reports and escape bytes no longer pollute the pasted token. A refusal names the check that failed (by category, never any part of the paste).
 - **core-ts 0.15.2** — 2026-10-18 — patch release on main 531030a, carrying #1034, #1035 and #1036.
   - **Team members read the repository, read-only (#1034):** each member turn gets the tree it is about, written into a private per-turn directory and mounted read-only into its seat container; `member.joined` gains `repo_view: "read_only"`.
   - **A claude container sign-in keeps the whole `claude setup-token` token (#1035):** the login script reads a bracketed paste across the wrapped rows, so a wrapped copy no longer lands a truncated token; an empty paste says so instead of the OAuth-record wording.
