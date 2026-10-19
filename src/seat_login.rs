@@ -344,7 +344,9 @@ macro_rules! claude_token_received {
 /// else there (text around a continuation, another column) is no token, never a truncated one.
 /// After a shorter row, a blank row or a row of other text ("Store this token securely…") ends
 /// the token, and a row of token characters is no token. Text around the token, two different
-/// tokens, or none: no token (the script then asks for the paste). The token is held to the shape [`setup_token`] checks again
+/// tokens, or none: no token (the script then asks for the paste). So is a full-width row the
+/// capture ends on (its continuation never came), and an unknown terminal size (`stty size`
+/// failed): wrapping cannot be checked without the width. The token is held to the shape [`setup_token`] checks again
 /// at ingest (one `sk-ant-oat` prefix, 20 to 4096 characters).
 macro_rules! claude_token_extractor {
     () => {
@@ -486,24 +488,31 @@ def tokens(lines, W):
         if row[:col].strip() or not set(tok) <= T:
             return None
         end = len(row)
+        closed = False
         for nxt in lines[j + 1:]:
             body = nxt.lstrip(" ")
             if not body:
+                closed = True
                 break
             if end != W:
                 if set(body) <= T:
                     return None
+                closed = True
                 break
             if not set(body) <= T or len(nxt) - len(body) != col:
                 return None
             tok, end = tok + body, len(nxt)
+        if end == W and not closed:
+            return None
         out.add(tok)
     return out
 def main(path, size, dest):
     with open(path, "rb") as f:
         s = f.read(64 << 20).decode("utf-8", "replace")
     d = size.split()
-    H, W = (int(d[0]), int(d[1])) if len(d) == 2 and d[0].isdigit() and d[1].isdigit() else (0, 0)
+    if len(d) != 2 or not d[0].isdigit() or not d[1].isdigit() or int(d[1]) == 0:
+        return 1
+    H, W = int(d[0]), int(d[1])
     found = set()
     for lines in screens(s, H, W):
         t = tokens(lines, W)
@@ -4604,6 +4613,16 @@ esac
             ),
             // After a full-width row only a blank row or a clean continuation may follow: anything
             // else is not taken to end the token (that would save a truncated one).
+            (
+                "the capture ends on a full-width row",
+                format!("Your OAuth token (valid for 1 year):\r\n\r\n{row1}\r\n"),
+                "30 80",
+            ),
+            (
+                "an unwrapped token with no terminal size",
+                screen(140, 0),
+                "",
+            ),
             (
                 "text after the continuation",
                 format!("Your OAuth token (valid for 1 year):\r\n\r\n{row1}\r\n{row2} (copy it)\r\n"),
