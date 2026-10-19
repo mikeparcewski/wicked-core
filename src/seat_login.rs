@@ -348,7 +348,8 @@ macro_rules! claude_token_received {
 /// After a shorter row, a blank row or a row of other text ("Store this token securely…") ends
 /// the token, and a row of token characters is no token. Text around the token, two different
 /// tokens, or none: no token (the script then asks for the paste). So is a full-width row the
-/// capture ends on (its continuation never came), and an unknown terminal size (`stty size`
+/// capture ends on (its continuation never came; blank rows at the end of a screen, such as rows
+/// a taller earlier frame left erased, do not count), and an unknown terminal size (`stty size`
 /// failed): wrapping cannot be checked without the width. The token is held to the shape [`setup_token`] checks again
 /// at ingest (one `sk-ant-oat` prefix, 20 to 4096 characters).
 macro_rules! claude_token_extractor {
@@ -474,7 +475,13 @@ def screens(s, H, W):
     done.append(rows)
     if alt is not None:
         done.append(alt[0])
-    return [["".join(d.get(y, [])).rstrip() for y in range(max(d, default=-1) + 1)] for d in done]
+    out = []
+    for d in done:
+        lines = ["".join(d.get(y, [])).rstrip() for y in range(max(d, default=-1) + 1)]
+        while lines and not lines[-1]:
+            lines.pop()
+        out.append(lines)
+    return out
 def tokens(lines, W):
     out = set()
     for i, line in enumerate(lines):
@@ -4640,6 +4647,15 @@ esac
                 "30 80",
             ),
             (
+                "it ends on a full-width row, below a taller Ink frame it erased",
+                format!(
+                    "{}{}Your OAuth token (valid for 1 year):\r\n\r\n{row1}\r\n",
+                    "Paste code here if prompted >\r\n".repeat(8),
+                    "\u{1b}[2K\u{1b}[1A".repeat(8) + "\u{1b}[2K\u{1b}[G"
+                ),
+                "30 80",
+            ),
+            (
                 "the capture ends on a full-width row",
                 format!("Your OAuth token (valid for 1 year):\r\n\r\n{row1}\r\n"),
                 "30 80",
@@ -4734,7 +4750,11 @@ esac
                 bin.join("script"),
                 "#!/bin/sh\n# util-linux's `script -q -e -c CMD FILE` over BSD script (test only)\n\
                  [ \"$1\" = -V ] && { echo 'script from util-linux (BSD stand-in)'; exit 0; }\n\
-                 exec /usr/bin/script -q \"$5\" /bin/sh -c \"$4\"\n",
+                 /usr/bin/script -q \"$5.raw\" /bin/sh -c \"$4\"; rc=$?\n\
+                 # util-linux frames the capture with its own lines even under -q: so does this.\n\
+                 { printf 'Script started on 2026-10-19 [COMMAND=\"%s\"]\\n' \"$4\"; cat \"$5.raw\"; \
+                 printf '\\nScript done on 2026-10-19 [COMMAND_EXIT_CODE=\"%s\"]\\n' \"$rc\"; } > \"$5\"\n\
+                 rm -f \"$5.raw\"; exit $rc\n",
             )
             .unwrap();
             std::fs::set_permissions(bin.join("script"), std::fs::Permissions::from_mode(0o755))
