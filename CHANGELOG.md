@@ -802,6 +802,10 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.2** — 2026-10-18 — patch release on main 531030a, carrying #1034, #1035 and #1036.
+  - **Team members read the repository, read-only (#1034):** each member turn gets the tree it is about, written into a private per-turn directory and mounted read-only into its seat container; `member.joined` gains `repo_view: "read_only"`.
+  - **A claude container sign-in keeps the whole `claude setup-token` token (#1035):** the login script reads a bracketed paste across the wrapped rows, so a wrapped copy no longer lands a truncated token; an empty paste says so instead of the OAuth-record wording.
+  - **Leftover member views are swept at startup (#1036):** engine startup removes views older than 24 hours that no live turn holds (on unix, only when it can take the view's lock exclusively).
 - **core-ts 0.15.1** — 2026-10-18 — patch release on main d588271, carrying #1030, #1031 and #1032.
   - **A container claude seat runs what the gate hook allows (#1030):** the relayed hook answers an allowed call with an explicit PreToolUse `permissionDecision: "allow"`, so claude's own permission flow no longer refuses it in a `-p` session. Deny still denies.
   - **A step's creator is never offered as its own monitor (#1031):** the creator is dropped from the monitor candidates before admission, so studio no longer shows "<seat> could not watch" for it.
