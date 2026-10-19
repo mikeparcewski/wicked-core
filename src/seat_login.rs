@@ -528,6 +528,10 @@ sys.exit(main(*sys.argv[1:4]))
 /// token (owner-only) beside the CLI's own files for ingest. The capture is deleted as soon as it
 /// was read, and by a trap on exit, HUP, INT and TERM. The token is never printed or logged.
 ///
+/// The capture needs a terminal on stdin (the login container's `-it` always has one): util-linux
+/// `script` stops reading at an input EOF without passing it on, so a CLI waiting for input
+/// would wait forever. Without one, claude runs directly and the paste is asked for.
+///
 /// When the token cannot be read (no util-linux `script` or python3, no token row, an ambiguous
 /// one), the script says so in one line and asks for the paste as before. No token, no file:
 /// ingest reports the sign-in missing and the operator signs in again.
@@ -556,7 +560,7 @@ sys.exit(main(*sys.argv[1:4]))
 /// left to type. Echo stays off, so keys pressed while ingest runs are never echoed.
 const CLAUDE_SETUP_TOKEN_LOGIN: &str = concat!(
     "td=; trap '[ -z \"$td\" ] || rm -rf \"$td\"' EXIT; trap 'exit 1' HUP INT TERM; \
-case $(script -V 2>/dev/null) in *util-linux*) td=$(umask 077 && mktemp -d) || td=;; esac; \
+[ -t 0 ] && case $(script -V 2>/dev/null) in *util-linux*) td=$(umask 077 && mktemp -d) || td=;; esac; \
 if [ -n \"$td\" ]; then (umask 077 && exec script -q -e -c 'claude setup-token' \"$td/claude.out\") || exit 1; \
 else claude setup-token || exit 1; fi; stty sane -echo 2>/dev/null; \
 printf '\\033[?1000l\\033[?1002l\\033[?1003l\\033[?1005l\\033[?1006l\\033[?1015l\\033[<u\\033[=0;1u\\033[>4;0m\\033[?2026l'; \
