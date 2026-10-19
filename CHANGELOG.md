@@ -14,6 +14,22 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A claude sign-in in studio's terminal: mouse reporting left on by claude made copy select nothing and clicks
+  pollute the paste.** `claude setup-token` turns xterm mouse reporting and its keyboard modes on (the kitty
+  keyboard protocol, modifyOtherKeys, synchronized output) and exits without turning them off. In studio's terminal
+  a drag then went to the program as clicks, so it selected nothing and Cmd+C copied nothing. Each click also sent
+  an SGR mouse report (`ESC [ < b ; x ; y M`) into the login script's input, where its letters and digits counted
+  as token text, so the script kept asking for "Enter once more". The terminal's answers to claude's queries (DA1,
+  DECRQM, OSC 11) also arrive after claude exits and land in front of the paste, even when nothing is clicked.
+  Either way the saved paste carried escape bytes and ingest refused it as "not a `claude setup-token` token". The
+  script now turns those modes off after `claude setup-token` exits (not the alternate screen, which would clear
+  the token from view). Its read loop drops escape sequences from a line before testing it, so a line of only
+  clicks or answers counts as empty. Ingest strips terminal control sequences (CSI, including mouse reports and
+  kitty or modifyOtherKeys key encodings, plus OSC, DCS, SS3 and the bracketed-paste markers) with one stripper,
+  then checks the shape. A refusal now names the check that failed: text before or after the token, a space
+  inside it, no `sk-ant-oat` token, longer than a token, the token more than once, or shorter than a token. It
+  never repeats any part of the paste.
+
 - **A claude container sign-in keeps the whole `claude setup-token` token.** claude's TUI wraps the ~108-character
   token across two rows, so a copy of it carries a line break. The login script read one line with bracketed
   paste off: a copy of both rows landed only the first row (a truncated token that passed the shape check), and a

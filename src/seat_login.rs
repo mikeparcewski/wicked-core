@@ -330,50 +330,174 @@ const CLAUDE_SETUP_TOKEN_PATH: &str = "claude/wicked-setup-token";
 /// token. Blank lines before any token are skipped, and input that ends first (the window
 /// closed, EOF inside an open paste) saves nothing. What lands is the paste as typed, line
 /// breaks and brackets included: [`setup_token`] joins and checks it.
+///
+/// claude turns xterm mouse reporting and its keyboard modes (the kitty keyboard protocol,
+/// modifyOtherKeys, synchronized output) on, and its `setup-token` exit leaves them on (as it
+/// leaves the terminal raw): studio's terminal then sends each click into the paste as a mouse
+/// report and a drag selects nothing, so the token cannot be copied. The script turns those
+/// modes off before its prompt. It leaves the alternate screen alone: leaving it would clear the
+/// token from view when claude printed it on the main screen. Whatever control sequences still
+/// reach the paste (a terminal's answer to a query claude sent, a click before the modes were
+/// off) are not token text: `bare` drops them before a line is tested, so a line of them alone
+/// counts as an empty line, and [`setup_token`] drops them from what lands. (`bare` ends a CSI
+/// at `A`-`~`: a terminal never sends one ending in `@`, and a login argv never carries an `@`.)
 const CLAUDE_SETUP_TOKEN_LOGIN: &str = "claude setup-token || exit 1; stty sane -echo 2>/dev/null; \
-o=$(printf '\\033[200~'); c=$(printf '\\033[201~'); p=; d=; \
+printf '\\033[?1000l\\033[?1002l\\033[?1003l\\033[?1005l\\033[?1006l\\033[?1015l\\033[<u\\033[=0;1u\\033[>4;0m\\033[?2026l'; \
+e=$(printf '\\033'); b=$(printf '\\007'); \
+bare() { printf '%s\\n' \"$1\" | LC_ALL=C sed -e \"s|$e\\[[0-?]*[ -/]*[A-~]||g\" -e \"s|$e[]P_^X][^$b$e]*$b||g\" \
+-e \"s|$e[]P_^X][^$e]*$e.||g\" -e \"s|${e}O.||g\" -e \"s|$e.||g\" -e \"s|$e||g\"; }; \
+o=$(printf '\\033[200~'); c=$(printf '\\033[201~'); p=; d=; t=; \
 printf '\\033[?2004h\\n%s' 'wicked: copy the token shown above, paste it here (it is not shown) and press Enter: '; \
 while IFS= read -r l; do p=\"$p$l\n\"; \
 case \"$p\" in *\"$o\"*) case \"$p\" in *\"$c\"*) d=1; break;; esac; continue;; esac; \
-case \"$l\" in *[A-Za-z0-9_-]*) printf '\\r\\n%s' 'wicked: press Enter once more to finish (or paste the rest of the token): ';; \
-*) case \"$p\" in *[A-Za-z]*) d=1; break;; esac;; esac; done; \
+l=$(bare \"$l\"); \
+case \"$l\" in *[A-Za-z0-9_-]*) t=1; printf '\\r\\n%s' 'wicked: press Enter once more to finish (or paste the rest of the token): ';; \
+*) [ -z \"$t\" ] || { d=1; break; };; esac; done; \
 stty echo 2>/dev/null; printf '\\033[?2004l\\n'; \
-case \"$p\" in *[A-Za-z]*) ;; *) echo 'wicked: no token was pasted; sign claude in again' >&2; exit 1;; esac; \
+case $(bare \"$p\") in *[A-Za-z]*) ;; *) echo 'wicked: no token was pasted; sign claude in again' >&2; exit 1;; esac; \
 [ -n \"$d\" ] || { echo 'wicked: the paste did not finish; sign claude in again' >&2; exit 1; }; \
 mkdir -p \"$CLAUDE_CONFIG_DIR\" && (umask 077 && printf '%s' \"$p\" > \"$CLAUDE_CONFIG_DIR/wicked-setup-token\") \
 || { echo 'wicked: the token could not be saved; sign claude in again' >&2; exit 1; }; \
 echo 'wicked: token received; studio checks it now'";
 
-/// The `claude setup-token` token pasted back at sign-in (pure): the paste's bracketed-paste
-/// markers dropped and its lines (the CLI wraps the token across rows, so a copy can carry a
-/// line break) trimmed and joined, then one run of a token's characters with the prefix
-/// Anthropic's long-lived OAuth tokens carry. Errors never repeat it.
+/// The `claude setup-token` token pasted back at sign-in (pure): the paste's terminal control
+/// sequences dropped ([`strip_terminal_controls`]: its bracketed-paste markers, and the mouse
+/// reports a click sends while mouse reporting is on), its lines (the CLI wraps the token across
+/// rows, so a copy can carry a line break) trimmed and joined, then one run of a token's
+/// characters with the prefix Anthropic's long-lived OAuth tokens carry. A refusal names the
+/// check that failed and never repeats any part of the paste.
 fn setup_token(bytes: &[u8]) -> Result<String, String> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| "claude: the pasted token is not text".to_string())?;
+    let (text, finished) = strip_terminal_controls(text);
     // A paste cut short (its closing bracket never came) is a truncated token, never a token.
-    if text.matches("\u{1b}[200~").count() != text.matches("\u{1b}[201~").count() {
+    if !finished {
         return Err(
             "claude: the paste of the `claude setup-token` token did not finish; sign claude in \
              again and paste the whole token it prints"
                 .into(),
         );
     }
-    let text = text.replace("\u{1b}[200~", "").replace("\u{1b}[201~", "");
     // Whitespace inside a line is kept (and refused below): only a row break is joined.
     let text: String = text.split(['\r', '\n']).map(str::trim).collect();
-    let shaped = text.len() <= 4096
-        && text
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_');
-    if !shaped || !text.starts_with("sk-ant-oat") || text.len() < 20 {
-        return Err(
-            "claude: what was pasted is not a `claude setup-token` token (sk-ant-oat…); sign \
-             claude in again and paste the token it prints"
-                .into(),
-        );
+    match setup_token_shape(&text) {
+        Ok(()) => Ok(text),
+        Err(why) => Err(format!(
+            "claude: {why}; sign claude in again and paste only the token `claude setup-token` \
+             prints"
+        )),
     }
-    Ok(text)
+}
+
+/// Which shape check a joined paste fails (pure), named by its category alone: never by any
+/// part of the paste.
+fn setup_token_shape(text: &str) -> Result<(), &'static str> {
+    const PREFIX: &str = "sk-ant-oat";
+    let token_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let token = |t: &str| t.starts_with(PREFIX) && t.chars().all(token_char);
+    if text.len() > 4096 {
+        return Err("the paste is longer than a token");
+    }
+    match text.matches(PREFIX).count() {
+        0 => return Err("the paste does not contain an sk-ant-oat… token"),
+        1 => {}
+        _ => return Err("the token appears more than once"),
+    }
+    if token(text) {
+        return if text.len() < 20 {
+            Err("the token in the paste is shorter than a token")
+        } else {
+            Ok(())
+        };
+    }
+    let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if token(&squeezed) {
+        return Err("the paste has a space inside the token");
+    }
+    Err("the paste had text before or after the token")
+}
+
+/// A paste with its terminal control sequences dropped (pure), and whether its bracketed-paste
+/// markers balance (every `ESC [ 200 ~` closed by an `ESC [ 201 ~`). Dropped: CSI (`ESC [`,
+/// parameter and intermediate bytes, one final byte; this covers the bracketed-paste markers and
+/// the SGR mouse reports `ESC [ < b ; x ; y M|m` a click sends, a terminal's answer to a query,
+/// and a key the kitty keyboard protocol or modifyOtherKeys encodes, `ESC [ 13 u` or
+/// `ESC [ 27 ; 1 ; 13 ~`), OSC, DCS, SOS, PM and APC (`ESC ]`, `ESC P`, `ESC X`, `ESC ^`,
+/// `ESC _`, up to BEL or `ESC \`), SS3 (`ESC O` and one byte) and any other two-byte escape.
+/// A sequence the paste cuts short ends where it was cut: a line break ends any sequence and is
+/// kept (an unterminated string never swallows the token's next row), and an ESC that is not
+/// `ESC \` ends a string and starts the next sequence (a bracketed-paste marker is still counted).
+fn strip_terminal_controls(text: &str) -> (String, bool) {
+    let mut out = String::with_capacity(text.len());
+    let (mut opened, mut closed) = (0usize, 0usize);
+    let mut chars = text.chars().peekable();
+    // An ESC already read that starts the next sequence (it ended a control string that was not
+    // closed by ST).
+    let mut esc = false;
+    loop {
+        if !esc {
+            match chars.next() {
+                None => break,
+                Some('\u{1b}') => {}
+                Some(c) => {
+                    out.push(c);
+                    continue;
+                }
+            }
+        }
+        esc = false;
+        match chars.peek().copied() {
+            Some('[') => {
+                chars.next();
+                let mut params = String::new();
+                while let Some(&c) = chars.peek() {
+                    match c {
+                        ' '..='?' => params.push(c),
+                        '@'..='~' => {
+                            chars.next();
+                            if c == '~' && params == "200" {
+                                opened += 1;
+                            } else if c == '~' && params == "201" {
+                                closed += 1;
+                            }
+                            break;
+                        }
+                        _ => break,
+                    }
+                    chars.next();
+                }
+            }
+            Some(']' | 'P' | 'X' | '^' | '_') => {
+                chars.next();
+                while let Some(&c) = chars.peek() {
+                    match c {
+                        '\r' | '\n' => break,
+                        '\u{7}' => {
+                            chars.next();
+                            break;
+                        }
+                        '\u{1b}' => {
+                            chars.next();
+                            esc = chars.next_if_eq(&'\\').is_none();
+                            break;
+                        }
+                        _ => {
+                            chars.next();
+                        }
+                    }
+                }
+            }
+            Some('O') => {
+                chars.next();
+                chars.next_if(|c| (' '..='~').contains(c));
+            }
+            Some(' '..='~') => {
+                chars.next();
+            }
+            _ => {}
+        }
+    }
+    (out, opened == closed)
 }
 
 /// Each CLI's configuration-home variable and its directory under the throwaway HOME. The init
@@ -3773,11 +3897,93 @@ esac
         ["sk", "ant", "oat01", &body].join("-") + "AA"
     }
 
+    /// claude leaves xterm mouse reporting on, so each click in studio's terminal sends an SGR
+    /// mouse report (`ESC [ < b ; x ; y M`, then `m` on release) into the paste: before it,
+    /// between its rows and after it. Those reports, like any other control sequence a terminal
+    /// sends or a copy carries (a colour, a window title, a hyperlink), are dropped and the clean
+    /// token remains.
+    #[test]
+    fn a_setup_token_paste_polluted_by_mouse_reports_is_the_clean_token() {
+        let token = fake_setup_token();
+        let (row1, row2) = token.split_at(98);
+        let click = "\u{1b}[<0;12;5M\u{1b}[<0;12;5m";
+        for pasted in [
+            format!("{click}{token}{click}\r"),
+            format!("{click}\u{1b}[200~{row1}\r{click} {row2}\u{1b}[201~{click}\r{click}"),
+            format!("{click}\n{row1}{click}\n{row2}\n{click}\n"),
+            format!("\u{1b}[<35;80;3M{row1}\u{1b}[<64;1;1M{row2}\u{1b}[<2;100;30m\r"),
+            format!("\u{1b}]0;claude\u{7}\u{1b}[93m{row1}\u{1b}[0m\u{1b}]8;;\u{1b}\\{row2}\r"),
+            format!("\u{1b}OA{token}\u{1b}=\r"),
+        ] {
+            assert_eq!(setup_token(pasted.as_bytes()).unwrap(), token, "{pasted:?}");
+        }
+        // A control string the paste cuts short (no BEL or ST) ends at the row break or at the
+        // next ESC: it never swallows the token's next row (a truncated first row would pass
+        // every other check) nor a bracketed-paste marker.
+        for pasted in [
+            format!("{row1}\u{1b}]11;rgb:1234\n{row2}\n\n"),
+            format!("{row1}\u{1b}P>|xterm\r{row2}\r"),
+            format!("\u{1b}]11;rgb:1e1e\u{1b}[200~{token}\u{1b}[201~\r"),
+            format!("\u{1b}[200~{row1}\u{1b}_x\r{row2}\u{1b}[201~\r"),
+        ] {
+            assert_eq!(setup_token(pasted.as_bytes()).unwrap(), token, "{pasted:?}");
+        }
+        // The bracketed-paste markers are counted by the same stripper: a paste cut short is
+        // still refused when clicks or an unterminated string surround it.
+        for cut in [
+            format!("{click}\u{1b}[200~{row1}{click}\r"),
+            format!("\u{1b}]11;rgb:1e1e\u{1b}[200~{row1}\r"),
+        ] {
+            let e = setup_token(cut.as_bytes()).unwrap_err();
+            assert!(e.contains("did not finish"), "{e}");
+        }
+    }
+
+    /// A paste that is not one clean `claude setup-token` token is refused with the check it
+    /// failed, named by category: never any part of the paste.
+    #[test]
+    fn each_setup_token_refusal_names_its_check_and_never_the_paste() {
+        let token = fake_setup_token();
+        let (row1, row2) = token.split_at(98);
+        let cases = [
+            (format!("Token: {token}"), "text before or after the token"),
+            (format!("{token}."), "text before or after the token"),
+            (format!("{row1} {row2}"), "a space inside the token"),
+            (
+                format!("sk-ant-api03-{}", &token[13..]),
+                "does not contain an sk-ant-oat",
+            ),
+            (
+                format!("{token}{}", "A".repeat(4096)),
+                "longer than a token",
+            ),
+            (format!("{token}\r\n{token}"), "appears more than once"),
+            ("sk-ant-oat01-A".to_string(), "shorter than a token"),
+            (format!("\u{1b}[200~{row1}\r"), "did not finish"),
+        ];
+        let mut messages = std::collections::HashSet::new();
+        for (pasted, check) in &cases {
+            let e = setup_token(pasted.as_bytes()).unwrap_err();
+            assert!(e.contains(check), "{check}: {e}");
+            assert!(e.contains("sign claude in again"), "{check}: {e}");
+            assert!(
+                !e.contains(&token[13..40]) && !e.contains(&row1[70..95]) && !e.contains("AAAA"),
+                "{check}: {e}"
+            );
+            messages.insert(e);
+        }
+        assert_eq!(messages.len(), cases.len() - 1, "one message per check");
+    }
+
     /// The claude login script as the operator meets it (the sign-in that stayed signed out):
     /// run in a real PTY, after a stand-in `claude setup-token` that prints the token wrapped
-    /// across two rows the way its TUI does and leaves the terminal raw. The paste is sent the
-    /// way studio's terminal (xterm.js) sends it: row breaks as CR, bracketed because the script
-    /// turned bracketed paste on, then Enter as CR. The whole token must land, every time.
+    /// across two rows the way its TUI does and leaves the terminal raw, with the modes claude
+    /// sets left on (mouse reporting, the kitty keyboard protocol, modifyOtherKeys, synchronized
+    /// output; it leaves only the alternate screen). The script turns them off after it, so a
+    /// drag selects again. The paste is sent the way studio's terminal (xterm.js) sends it: row
+    /// breaks as CR, bracketed because the script turned bracketed paste on, then Enter as CR,
+    /// with clicks and a terminal's answers to claude's queries around it. The whole token must
+    /// land, every time, under `sh` and under `dash` (the seat image's `/bin/sh`) where it exists.
     #[cfg(unix)]
     #[test]
     fn the_claude_login_script_captures_a_wrapped_token_pasted_in_a_pty() {
@@ -3799,7 +4005,7 @@ esac
         std::fs::write(
             &stub,
             "#!/bin/sh\n[ \"$1\" = setup-token ] || exit 2\nstty raw -echo\n\
-             printf '\\033[?2004h \\033[93m%s\\r\\033[1C\\033[1B%s\\r\\n' \"$ROW1\" \"$ROW2\"\n",
+             printf '\\033[?1049h\\033[?1000h\\033[?1006h\\033[>1u\\033[>4;2m\\033[?2026h\\033[?2004h \\033[93m%s\\r\\033[1C\\033[1B%s\\r\\n\\033[?1049l' \"$ROW1\" \"$ROW2\"\n",
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -3813,49 +4019,86 @@ esac
         // Each case: what the operator does at the prompt, and whether the whole token lands.
         // A terminal that does not bracket pastes ends the token with one Enter more; EOF (^D)
         // inside an open paste saves nothing.
-        let cases: [(&str, String, Option<String>); 8] = [
+        let cases: [(&str, String, Result<String, &str>); 12] = [
+            (
+                "the terminal's answers to claude's queries, then a bracketed paste",
+                format!(
+                    "\u{1b}[12;1R\u{1b}[?1;2c\u{1b}]11;rgb:1e1e/1e1e/1e1e\u{1b}\\\u{1b}[200~{token}\u{1b}[201~\r"
+                ),
+                Ok(token.clone()),
+            ),
+            (
+                "a line of clicks alone ends an unbracketed paste",
+                format!("{token}\r\u{1b}[<0;12;5M\u{1b}[<0;12;5m\r"),
+                Ok(token.clone()),
+            ),
+            (
+                "clicks around a bracketed paste",
+                format!(
+                    "\u{1b}[<0;12;5M\u{1b}[<0;12;5m\u{1b}[200~{row1}\r {row2}\u{1b}[201~\u{1b}[<0;3;7M\r"
+                ),
+                Ok(token.clone()),
+            ),
             (
                 "both rows copied, bracketed",
                 format!("\u{1b}[200~{row1}\r {row2}\u{1b}[201~\r"),
-                Some(token.clone()),
+                Ok(token.clone()),
             ),
             (
                 "a blank Enter first, then the paste",
                 format!("\r\u{1b}[200~{token}\u{1b}[201~\r"),
-                Some(token.clone()),
+                Ok(token.clone()),
             ),
             (
                 "the copy starts on the blank row above",
                 format!("\u{1b}[200~\r{row1}\r {row2}\u{1b}[201~\r"),
-                Some(token.clone()),
+                Ok(token.clone()),
             ),
             (
                 "the copy ends with a line break, then Enter",
                 format!("\u{1b}[200~{row1}\r {row2}\r\u{1b}[201~\r"),
-                Some(token.clone()),
+                Ok(token.clone()),
             ),
             (
                 "one row, unbracketed",
                 format!("{token}\r\r"),
-                Some(token.clone()),
+                Ok(token.clone()),
             ),
             (
                 "both rows copied, unbracketed",
                 format!("{row1}\r {row2}\r\r"),
-                Some(token.clone()),
+                Ok(token.clone()),
             ),
             (
                 "a middle row of digits and dashes only, unbracketed",
                 format!("{row1}\r 0123-_\r {row2}\r\r"),
-                Some(format!("{row1}0123-_{row2}")),
+                Ok(format!("{row1}0123-_{row2}")),
             ),
             (
                 "the input ends inside the paste",
                 format!("\u{1b}[200~{row1}\r\u{4}"),
-                None,
+                Err("the paste did not finish"),
+            ),
+            (
+                "a row of digits alone, then Enter, unbracketed",
+                "0123-_\r\r".to_string(),
+                Err("no token was pasted"),
             ),
         ];
-        for (n, (case, paste, lands)) in cases.iter().enumerate() {
+        let shells: Vec<&str> = ["sh", "dash"]
+            .into_iter()
+            .filter(|sh| {
+                *sh == "sh"
+                    || ["/bin", "/usr/bin"]
+                        .iter()
+                        .any(|d| std::path::Path::new(d).join(sh).exists())
+            })
+            .collect();
+        let runs = shells
+            .iter()
+            .flat_map(|sh| cases.iter().map(move |c| (*sh, c)));
+        for (n, (shell, (case, paste, lands))) in runs.enumerate() {
+            let case = format!("{shell}: {case}");
             let config = root.join(format!("home-{n}/claude"));
             let pair = portable_pty::native_pty_system()
                 .openpty(PtySize {
@@ -3865,7 +4108,7 @@ esac
                     pixel_height: 0,
                 })
                 .unwrap();
-            let mut cmd = CommandBuilder::new("sh");
+            let mut cmd = CommandBuilder::new(shell);
             cmd.args(["-c", CLAUDE_SETUP_TOKEN_LOGIN, "wicked-login"]);
             cmd.env("PATH", &path);
             cmd.env("CLAUDE_CONFIG_DIR", &config);
@@ -3903,14 +4146,35 @@ esac
                 out.contains("\u{1b}[?2004h\r\nwicked: copy"),
                 "{case}: bracketed paste off"
             );
+            // ...and turned the modes claude left on off after claude ran, before its prompt
+            // (never the alternate screen: the stand-in left it itself).
+            let mouse_off = out
+                .find(
+                    "\u{1b}[?1000l\u{1b}[?1002l\u{1b}[?1003l\u{1b}[?1005l\u{1b}[?1006l\
+                     \u{1b}[?1015l\u{1b}[<u\u{1b}[=0;1u\u{1b}[>4;0m\u{1b}[?2026l",
+                )
+                .unwrap_or_else(|| panic!("{case}: claude's terminal modes left on"));
+            assert_eq!(
+                out.matches("\u{1b}[?1049l").count(),
+                1,
+                "{case}: left the alternate screen"
+            );
+            assert!(
+                out.find(row2).unwrap() < mouse_off
+                    && mouse_off < out.find("wicked: copy").unwrap(),
+                "{case}: mouse reporting off out of order"
+            );
             writer.write_all(paste.as_bytes()).unwrap();
             writer.flush().unwrap();
-            let Some(expected) = lands else {
-                assert!(shown("the paste did not finish"), "{case}: no refusal");
-                let status = child.wait().unwrap();
-                assert!(!status.success(), "{case}: {status:?}");
-                assert!(!config.join("wicked-setup-token").exists(), "{case}: saved");
-                continue;
+            let expected = match lands {
+                Ok(expected) => expected,
+                Err(refusal) => {
+                    assert!(shown(refusal), "{case}: no refusal");
+                    let status = child.wait().unwrap();
+                    assert!(!status.success(), "{case}: {status:?}");
+                    assert!(!config.join("wicked-setup-token").exists(), "{case}: saved");
+                    continue;
+                }
             };
             assert!(shown("token received"), "{case}: the script never finished");
             let status = child.wait().unwrap();
