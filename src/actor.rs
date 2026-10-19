@@ -1047,6 +1047,11 @@ pub(crate) fn run(
             }
         }
     }
+    // (DES-TEAMING-002 §8.8) A member turn's read-only view is removed when the turn ends; one an
+    // engine crash mid-turn left behind goes here, once per process (only views past the age
+    // threshold that no live turn holds, so another engine's live views on the same temp dir
+    // are never touched).
+    crate::acp_runner::sweep_stale_member_views();
 
     // Rust↔wicked-bus bridge (DES-EXEC-001 §2.5): the launch poller `Core::spawn*` arms (when
     // `WICKED_BUS_DB` is set) on the caller's thread while this one starts, with a bounded handshake —

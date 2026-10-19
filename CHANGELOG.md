@@ -26,6 +26,16 @@ Two release tracks share this file, newest entry first regardless of track:
   nothing and is refused at ingest. Ingest joins the pasted rows. When nothing was pasted back, the error now says
   that, not the OAuth-record wording, even when claude left a settings file without a credential in it.
 
+- **A member view left behind by an engine crash is swept at startup (follow-up to core#1034).** A member turn's
+  read-only view under `<temp>/wicked-core-member-view/` is removed when the turn ends, but one a crash mid-turn left
+  behind stayed forever. Engine startup now removes, once per process, the views there that are older than 24 hours
+  and that no live turn holds: on unix a turn holds its view directory under a shared `flock` from preparation until
+  the view is dropped, and the sweep removes a view only when it can take that lock exclusively, so a live turn's view
+  is never removed, whichever engine owns it (the `:7701` and `:7721` daemons share the host's temp dir) and however
+  long its budget. Windows has no such lock, so the age alone decides there. Removal is `std::fs::remove_dir_all`,
+  which unlinks a symlink and never follows one, and nothing is swept unless the view root is a real directory owned
+  by the engine's user.
+
 - **Team members read the repository, read-only (DES-TEAMING-002 §8.8).** Since core#1021 a member turn ran in its
   seat's container with no repository mounted, so it saw only its prompt (the diff, the criterion, the evidence):
   help answers and appeals had nothing to read. Each member turn now gets the tree it is about — a checkpoint
