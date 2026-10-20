@@ -1214,12 +1214,25 @@ fn judge_roster<'a>(
 /// (rejudge) The seats a unit's last attempt's TEAM LEDGER names as authors or corroborators of a
 /// finding — the monitors its judge never is (DES-001 §6.2). Empty off the bus transport.
 pub(crate) fn unit_team_monitors(unit: &crate::domain::WorkUnit) -> Vec<String> {
-    unit.team
+    let mut out: Vec<String> = unit
+        .team
         .as_ref()
         .filter(|t| t.transport == crate::team::events::Transport::Bus)
         .and_then(|t| t.ledger.as_ref())
         .map(crate::team::runner::ledger_authors)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // …and those of the seat attempt an earlier re-judge carried: a re-judge attempt's own team
+    // snapshot is fresh, so its ledger no longer names the monitors of the work still judged.
+    for m in unit
+        .requested_rejudge
+        .iter()
+        .flat_map(|r| r.monitors.iter())
+    {
+        if !out.contains(m) {
+            out.push(m.clone());
+        }
+    }
+    out
 }
 
 /// (rejudge) The judge seats the engine's own selection would draw from NOW for `unit`'s gate, and
@@ -1261,16 +1274,30 @@ pub(crate) fn rejudge_seats(
             }
         }
     }
-    party(&mut parties, &work_author, "built this work");
-    for a in &unit.authored_by {
-        party(&mut parties, a, "built this work");
-    }
+    // The rotation anchors on the first excluded key: the pinned validator's author leads on a
+    // pinned gate, the work's author otherwise — as the judge's own `excluded` is built.
     if pinned {
         party(
             &mut parties,
             crate::validator::DETERMINISTIC_VALIDATOR_SEAT,
             "authors the pinned validator, so it never judges against it",
         );
+    }
+    party(&mut parties, &work_author, "built this work");
+    for a in &unit.authored_by {
+        party(&mut parties, a, "built this work");
+    }
+    // A seat that built the work is said to have built it, whatever else it is.
+    for (k, why) in parties.iter_mut() {
+        if *k == work_author
+            || seat_key(k) == seat_key(&work_author)
+            || unit
+                .authored_by
+                .iter()
+                .any(|a| a == k || seat_key(a) == k.as_str())
+        {
+            *why = "built this work";
+        }
     }
     for a in &unit.exclude_seats {
         party(&mut parties, a, "excluded from judging this step at launch");
@@ -2140,7 +2167,7 @@ fn run_unit_and_judge_on(
         .unit
         .requested_rejudge
         .as_ref()
-        .filter(|_| floor_rerun.is_none());
+        .filter(|j| !j.consumed && floor_rerun.is_none());
     let output = match floor_rerun {
         Some(r) => {
             engine_note(
@@ -2174,9 +2201,8 @@ fn run_unit_and_judge_on(
                 engine_note(
                     emit_delta,
                     &format!(
-                        "judge re-run: the seat does not run again; the judge re-reads attempt \
-                         {}'s output on the tree as it stands (eligible: {})",
-                        j.attempt + 1,
+                        "judge re-run: the seat does not run again; the judge re-reads the \
+                         reviewed output on the tree as it stands (eligible: {})",
                         if j.seats.is_empty() {
                             "none named".to_string()
                         } else {
@@ -5156,6 +5182,7 @@ mod tests {
             attempt: 2,
             seats: vec!["pi".into()],
             monitors: Vec::new(),
+            consumed: false,
             at: 0,
         });
         let input = StepInput {
@@ -5322,6 +5349,7 @@ mod tests {
             attempt: 2,
             seats: vec!["pi".into()],
             monitors: Vec::new(),
+            consumed: false,
             at: 0,
         });
         let judge = Arc::new(Judge::default());

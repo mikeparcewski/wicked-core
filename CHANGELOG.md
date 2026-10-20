@@ -46,8 +46,10 @@ Two release tracks share this file, newest entry first regardless of track:
   team pause, and when no judge seat is eligible now; the refusal names each missing seat and why. The new read
   `Core::rejudge_readiness` (napi `rejudgeReadiness(runId)`, JSON
   `{applies, available, ord, eligible, missing: [{seat, reason}], reason}`) answers beforehand. The
-  `judge_unavailable` gate prompt names the new arm. Any other answer at the gate voids a re-judge whose attempt
-  never folded.
+  `judge_unavailable` gate prompt names the new arm. A re-judge whose judge fails again leaves its basis on the
+  unit (the seat attempt still judged and its team monitors), so a second re-judge judges the same work with the
+  same exclusions; the basis is cleared once a seat runs again. Any other answer at the gate voids a re-judge whose
+  attempt never folded.
 
 - **The repo-checks floor no longer writes its build output into the run's worktree.** The floor's host-side checks
   (fmt, clippy, test) kept their isolated `HOME`, package caches and `CARGO_TARGET_DIR` in

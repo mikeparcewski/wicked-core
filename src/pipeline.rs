@@ -1246,6 +1246,13 @@ pub(crate) fn apply_and_finish_unit(
         .and_then(|r| r.requested_rerun.as_ref())
         .and_then(|q| q.fix.as_ref())
         .map(|f| f.seat.clone());
+    // (rejudge) Whether this attempt ran no seat on a floor re-run (no fix), read for the same
+    // reason: such an attempt keeps a consumed re-judge's basis.
+    let floor_only_rerun = unit
+        .repo_checks
+        .as_ref()
+        .and_then(|r| r.requested_rerun.as_ref())
+        .is_some_and(|q| q.fix.is_none());
     // The operator retry's re-run (`RepoChecksReport::recheck`), read BEFORE the fresh report
     // replaces the one that armed it: `(reason, the replaced outcome, the tree it judged)`.
     let recheck: Option<(String, &'static str, Option<String>)> =
@@ -1701,8 +1708,18 @@ pub(crate) fn apply_and_finish_unit(
     unit.last_attempt = Some(attempt);
     // (core#469) An operator's floor re-run is consumed by the attempt that ran it — whatever
     // this fold decided, the next dispatch is an ordinary one unless the gate arms another.
-    // …and so is an operator's re-judge: the attempt that re-read the output consumed it.
-    unit.requested_rejudge = None;
+    // …and so is an operator's re-judge: the attempt that re-read the output consumed it. It
+    // stays as the basis of a next re-judge (the same seat attempt is still the one judged, with
+    // its monitors) until an attempt runs the seat again.
+    unit.requested_rejudge = match unit.requested_rejudge.take() {
+        Some(r) if !r.consumed => Some(crate::domain::RequestedRejudge {
+            output: String::new(),
+            consumed: true,
+            ..r
+        }),
+        Some(r) if floor_only_rerun => Some(r),
+        _ => None,
+    };
     if let Some(r) = unit.repo_checks.as_mut() {
         r.requested_rerun = None;
         // …and so is an operator retry's armed re-run: ONCE, whether or not this attempt's floor
@@ -4300,6 +4317,7 @@ mod judge_bench_tests {
             attempt: 1,
             seats: vec!["b".into()],
             monitors: Vec::new(),
+            consumed: false,
             at: 0,
         });
         let evidence = crate::workflow::UnitEvidence {
@@ -4347,17 +4365,24 @@ mod judge_bench_tests {
     /// denies, and only a passing floor plus a PASS approves. Every way, the re-judge is consumed.
     #[test]
     fn a_rejudge_attempt_is_folded_deny_dominant_and_consumes_the_request() {
+        // Consumed: never honored again, its output dropped, its basis (the seat attempt judged
+        // and its monitors) kept for a next re-judge.
+        let consumed = |u: &crate::domain::WorkUnit| {
+            u.requested_rejudge
+                .as_ref()
+                .is_some_and(|r| r.consumed && r.output.is_empty() && r.attempt == 1)
+        };
         let (approved, source, u) = fold_rejudge("rejudge-floor-red", true, false);
         assert!(!approved, "a judge PASS never admits a failed floor");
         assert_eq!(source.as_deref(), Some(crate::repo_checks::DENIAL_SOURCE));
-        assert!(u.requested_rejudge.is_none());
+        assert!(consumed(&u), "{:?}", u.requested_rejudge);
         let (approved, source, u) = fold_rejudge("rejudge-reject", false, true);
         assert!(!approved, "the judge's REJECT denies");
         assert_eq!(source.as_deref(), Some("agent_validator"));
-        assert!(u.requested_rejudge.is_none());
+        assert!(consumed(&u), "{:?}", u.requested_rejudge);
         let (approved, source, u) = fold_rejudge("rejudge-pass", true, true);
         assert!(approved, "{source:?}");
-        assert!(u.requested_rejudge.is_none());
+        assert!(consumed(&u), "{:?}", u.requested_rejudge);
     }
 
     /// (DES-QE-EVERY-SEAT §3.4) The fold of one unit carrying an isolated QE reviewer's record:

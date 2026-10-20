@@ -13294,11 +13294,20 @@ fn rejudge_request(
     let output = crate::domain::get_unit_transcript(store, &cursor.id)
         .and_then(|t| t.output)
         .unwrap_or_default();
+    // A consumed re-judge on the unit is the basis: no seat ran since, so the work judged is
+    // still that seat attempt's, with its monitors (`unit_team_monitors` unions them).
+    let attempt = cursor
+        .requested_rejudge
+        .as_ref()
+        .filter(|b| b.consumed)
+        .map(|b| b.attempt)
+        .unwrap_or_else(|| cursor.last_attempt.unwrap_or(0));
     Ok(crate::domain::RequestedRejudge {
         output,
-        attempt: cursor.last_attempt.unwrap_or(0),
+        attempt,
         seats: r.eligible,
         monitors: crate::cli_runner::unit_team_monitors(cursor),
+        consumed: false,
         at: crate::interaction::now_millis(),
     })
 }
@@ -20078,6 +20087,50 @@ mod request_changes_tests {
         assert!(fix.requested_rejudge.is_none());
     }
 
+    /// (rejudge) A SECOND re-judge, after the first one's judge failed as a seat too: the basis the
+    /// first one left (the seat attempt still judged, its team monitors) carries over, although the
+    /// re-judge attempt's own team snapshot no longer names those monitors — a monitor never
+    /// judges, and the event names the seat attempt whose output is judged.
+    #[test]
+    fn a_second_rejudge_keeps_the_first_ones_basis() {
+        let run_id = format!("rejudge-twice-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_rejudge_fix(&mut store, &run_id, &["claude", "pi", "copilot"]);
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        units[2].requested_rejudge = Some(crate::domain::RequestedRejudge {
+            output: String::new(),
+            attempt: 1,
+            seats: vec!["pi".into()],
+            monitors: vec!["pi".into()],
+            consumed: true,
+            at: 0,
+        });
+        put_node(&mut store, units[2].to_node()).unwrap();
+        let r = rejudge_readiness(&store, &run_id).unwrap();
+        assert_eq!(
+            r.eligible.first().map(String::as_str),
+            Some("copilot"),
+            "{r:?}"
+        );
+        assert!(
+            r.missing
+                .iter()
+                .any(|m| m.seat == "pi" && m.reason.contains("monitored")),
+            "{r:?}"
+        );
+        let mut subs = crate::event_log::EventSink::default();
+        rejudge(&mut store, &mut subs, &run_id).unwrap();
+        let fix = &crate::domain::session_units(&store, &run_id).unwrap()[2];
+        let armed = fix.requested_rejudge.as_ref().unwrap();
+        assert!(!armed.consumed);
+        assert_eq!(
+            armed.attempt, 1,
+            "still the seat attempt judged, not the last re-judge"
+        );
+        assert_eq!(armed.monitors, ["pi"]);
+        assert!(!armed.seats.iter().any(|k| k == "pi"));
+    }
+
     /// (rejudge) Only a `judge_unavailable` gate takes it: a unit the judge RULED on (a REJECT)
     /// is refused — re-running a judge until it agrees would be verdict shopping.
     #[test]
@@ -20115,6 +20168,7 @@ mod request_changes_tests {
             attempt: 1,
             seats: vec!["pi".into()],
             monitors: Vec::new(),
+            consumed: false,
             at: 0,
         });
         put_node(&mut store, units[2].to_node()).unwrap();

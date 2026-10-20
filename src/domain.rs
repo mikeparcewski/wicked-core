@@ -941,6 +941,11 @@ pub struct RequestedRejudge {
     /// even when the re-judge attempt's own team snapshot no longer names them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub monitors: Vec<String>,
+    /// The re-judge attempt has folded: the request stays on the unit only as the BASIS of the
+    /// next re-judge (`attempt` and `monitors` — the seat attempt whose output is still the one
+    /// judged), its output dropped; the worker never honors it. Cleared once a seat runs again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub consumed: bool,
     /// When it was armed (unix millis).
     pub at: i64,
 }
