@@ -1,12 +1,14 @@
 //! The model gateway: one agentgateway container per daemon, attached as `agw` to each seat's
 //! own internal network. Its external bridge is the seats' only route out; the CONNECT listener
-//! admits only the configured SNI hostnames. Host-loopback routes belong to a later slice.
+//! admits only the SNI hostnames this daemon names in [`EGRESS_HOSTS_ENV`]. Host-loopback routes
+//! belong to a later slice.
 //!
 //! **Glue, not a runtime.** Pure functions render the v1.6.0 config and the runtime CLI argv;
 //! bounded child processes apply them. The broker's credentials stay in `/broker`, mounted only
 //! into the gateway. Seats receive random, revocable unit keys, never the provider's key.
 //!
-//! **Reload by rename.** `config/gateway.json` persists the model routes and hostname allowlist;
+//! **Reload by rename.** `config/gateway.json` persists the model routes and records the hostname
+//! allowlist (replaced from the daemon's environment whenever it provisions the gateway);
 //! `config/units.json` owns the live unit keys. Every change replaces `config/config.json` in the
 //! same directory, so agentgateway's watcher sees a complete document. A process-wide lock
 //! serializes provisioning, startup and key changes. The daemon must pass the same directory
@@ -88,6 +90,27 @@ pub(crate) const UNIT_HEADER: &str = "x-wicked-unit";
 pub(crate) const COPILOT_DEFAULT_HOST: &str = "api.githubcopilot.com";
 /// The route file of the copilot CLI's own sign-in (its GitHub token).
 pub(crate) const COPILOT_CLI_FILE: &str = "copilot.token";
+/// The hostnames (comma-separated) seats may reach through the gateway's CONNECT listener, by
+/// TLS SNI: package registries, e.g. `index.crates.io,static.crates.io` for cargo (the sparse
+/// index and the crate downloads it names; a git dependency or another registry needs its own
+/// hosts). Unset or empty = none. This daemon's value, read each time it provisions the gateway:
+/// `config/gateway.json` does not keep an earlier daemon's list. A host not named is
+/// refused at the gateway, which logs `route not found` with the host as `tls.sni`; the seat's
+/// client sees its TLS handshake cut (curl and cargo: `[35] SSL connect error ... unexpected eof`).
+pub(crate) const EGRESS_HOSTS_ENV: &str = "WICKED_SEAT_EGRESS_HOSTS";
+
+/// The CONNECT allowlist named by [`EGRESS_HOSTS_ENV`]'s value: trimmed, blanks dropped.
+fn parse_egress_hosts(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .collect()
+}
+
+/// This daemon's CONNECT allowlist ([`EGRESS_HOSTS_ENV`]).
+fn egress_hosts_from_env() -> Vec<String> {
+    parse_egress_hosts(&std::env::var(EGRESS_HOSTS_ENV).unwrap_or_default())
+}
 
 /// A seat's revocable placeholder key and the identity authenticated requests carry.
 /// Its `Debug` implementation redacts the key so diagnostics cannot print it.
@@ -293,14 +316,7 @@ impl Default for GatewayConfig {
                 unit_header: header.map(str::to_string),
             })
             .collect(),
-            // `WICKED_SEAT_EGRESS_HOSTS`: the hostnames (comma-separated) seats may reach
-            // through CONNECT, e.g. package registries. None by default.
-            egress_hosts: std::env::var("WICKED_SEAT_EGRESS_HOSTS")
-                .unwrap_or_default()
-                .split(',')
-                .map(|h| h.trim().to_string())
-                .filter(|h| !h.is_empty())
-                .collect(),
+            egress_hosts: egress_hosts_from_env(),
             hook_upstream: None,
             mcp_upstream: None,
             chatgpt_accounts: Default::default(),
@@ -2052,6 +2068,21 @@ fn reconcile_routes(config: &mut GatewayConfig) {
     }
 }
 
+/// The config this daemon provisions its gateway with, `config/gateway.json` rewritten to match:
+/// the persisted routes reconciled with the defaults, and `egress_hosts` as the CONNECT allowlist.
+/// The allowlist is replaced, never merged: the persisted one is an earlier daemon's, and keeping
+/// it froze the first daemon's (usually empty) list, so a later `WICKED_SEAT_EGRESS_HOSTS` was
+/// ignored and every allowed host was refused. A host dropped from it is refused.
+fn provision_config(dir: &Path, egress_hosts: Vec<String>) -> Result<GatewayConfig, String> {
+    let mut config = load_config(dir)?;
+    reconcile_routes(&mut config);
+    config.egress_hosts = egress_hosts;
+    let mut settings = config.clone();
+    settings.units.clear();
+    atomic_json(&dir.join("config/gateway.json"), &settings)?;
+    Ok(config)
+}
+
 // codex lg-r3 R3: login provisioning never starts or takes over a daemon gateway.
 pub(crate) fn ensure_external_bridge(rt: &Runtime, gw: &Gateway) -> Result<(), String> {
     if checked(rt, &external_network_argv(gw)).is_ok() {
@@ -2139,11 +2170,7 @@ pub(crate) fn ensure_gateway(rt: &Runtime, dir: &Path) -> Result<Gateway, String
         // probe it now; the next publish (the first unit's key) carries the fresh route.
         let _ = probe_hook(rt, &gw);
         let _ = probe_mcp(rt, &gw);
-        let mut config = load_config(dir)?;
-        reconcile_routes(&mut config);
-        let mut settings = config.clone();
-        settings.units.clear();
-        atomic_json(&dir.join("config/gateway.json"), &settings)?;
+        let mut config = provision_config(dir, egress_hosts_from_env())?;
         // Missing files only, before any publish (codex lg-r1 #11).
         init_volumes(rt, &gw, dir, &config)?;
         if !owned() && !config.units.is_empty() {
@@ -2171,11 +2198,7 @@ pub(crate) fn ensure_gateway(rt: &Runtime, dir: &Path) -> Result<Gateway, String
     ensure_external_bridge(rt, &gw)?;
     let _ = probe_hook(rt, &gw);
     let _ = probe_mcp(rt, &gw);
-    let mut config = load_config(dir)?;
-    reconcile_routes(&mut config);
-    let mut settings = config.clone();
-    settings.units.clear();
-    atomic_json(&dir.join("config/gateway.json"), &settings)?;
+    let mut config = provision_config(dir, egress_hosts_from_env())?;
     config.units.clear();
     persist_units(dir, &config)?;
     // The container that served the pending keys is gone (absent, or removed above): a fresh
@@ -3787,6 +3810,130 @@ esac
         );
     }
 
+    /// LIVE (`WICKED_CONTAINER_LIVE=1`): a seat fetches crates through the gateway's CONNECT
+    /// allowlist. The gateway's state directory was first provisioned with no egress hosts (the
+    /// regression: that persisted `[]` outlived a later `WICKED_SEAT_EGRESS_HOSTS`); the daemon now
+    /// names cargo's two hosts. A seat in its sidecar's namespace, with the engine's proxy env,
+    /// reaches `index.crates.io`, is refused `crates.io` (not named), and `cargo fetch` of a crate
+    /// with one dependency succeeds. The cargo leg needs a seat image with cargo: run with
+    /// `WICKED_SEAT_BASE_IMAGE` naming a Rust toolchain base, otherwise it is skipped and says so.
+    #[cfg(unix)]
+    #[test]
+    fn live_a_seat_fetches_crates_through_the_egress_allowlist() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        let rt = crate::container_floor::runtime().expect("a container runtime answers");
+        let image = crate::container_floor::ensure_seat_image(&rt, "claude").unwrap();
+        let temp = TempDir::new();
+        let dir = temp.0.clone();
+        let run = |argv: &[&str], limit: u64| {
+            let mut c = rt.cmd();
+            c.args(argv);
+            crate::container_floor::output_within(c, Duration::from_secs(limit)).unwrap()
+        };
+        configure_gateway(
+            &dir,
+            &GatewayConfig {
+                egress_hosts: vec![],
+                ..GatewayConfig::default()
+            },
+        )
+        .unwrap();
+        let prior = std::env::var(EGRESS_HOSTS_ENV).ok();
+        std::env::set_var(EGRESS_HOSTS_ENV, "index.crates.io,static.crates.io");
+        let gw = ensure_gateway(&rt, &dir);
+        match &prior {
+            Some(v) => std::env::set_var(EGRESS_HOSTS_ENV, v),
+            None => std::env::remove_var(EGRESS_HOSTS_ENV),
+        }
+        let gw = gw.expect("the gateway starts");
+        let seat = format!("{}-eg", gw.name);
+        let netns = crate::container_floor::netns_name(&seat);
+        run(&["rm", "-f", &netns], 60);
+        run(&["network", "rm", &seat], 60);
+        assert!(run(&["network", "create", "--internal", &seat], 60)
+            .status
+            .success());
+        attach(&rt, &gw, &seat).unwrap();
+        let ip = crate::container_floor::gateway_ip(&rt, &gw.name, &seat).unwrap();
+        crate::container_floor::start_netns_sidecar(&rt, &seat, &seat, &ip).expect("sidecar up");
+        let ns = format!("container:{netns}");
+        let mut argv: Vec<String> = [
+            "run",
+            "--rm",
+            "--network",
+            &ns,
+            "--user",
+            "65534:65534",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,exec,mode=1777,size=1g",
+            "--env",
+            "HOME=/tmp/home",
+            // A toolchain base sets CARGO_HOME in the read-only image; landrun drops it in a seat.
+            "--env",
+            "CARGO_HOME=/tmp/home/.cargo",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        // The engine's own seat env: the model routes and the proxy (`HTTPS_PROXY=http://agw:3000`).
+        for (k, v) in seat_env_all("wk-unit-PLACEHOLDER-egress") {
+            argv.extend(["--env".to_string(), format!("{k}={v}")]);
+        }
+        argv.extend([
+            image.clone(),
+            "sh".into(),
+            "-c".into(),
+            "mkdir -p \"$HOME\"; \
+             curl -sS -o /dev/null -w 'allowed=%{http_code}\\n' --max-time 20 https://index.crates.io/config.json; \
+             curl -sS -o /dev/null --max-time 10 https://crates.io/ 2>/dev/null && echo OTHER_REACHED || echo OTHER_REFUSED; \
+             if command -v cargo >/dev/null; then \
+               mkdir -p /tmp/c/src && cd /tmp/c && echo 'fn main() {}' > src/main.rs && \
+               printf '%s\\n' '[package]' 'name = \"egress-probe\"' 'version = \"0.1.0\"' 'edition = \"2021\"' \
+                 '[dependencies]' 'itoa = \"1\"' > Cargo.toml && \
+               CARGO_NET_RETRY=1 cargo fetch && echo CARGO_FETCH_OK || echo CARGO_FETCH_FAILED; \
+             else echo NO_CARGO; fi"
+                .into(),
+        ]);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let out = run(&argv, 180);
+        run(&["rm", "-f", &netns, &gw.name], 60);
+        run(&["network", "rm", &seat, &gw.external_network], 60);
+        let (cfg, broker) = volumes(&gw);
+        run(&["volume", "rm", &cfg, &broker], 60);
+        let so = String::from_utf8_lossy(&out.stdout).to_string();
+        let se = String::from_utf8_lossy(&out.stderr).to_string();
+        eprintln!("--- seat stdout ---\n{so}--- seat stderr ---\n{se}");
+        assert!(
+            so.contains("allowed=200"),
+            "a named host is reached:\n{so}\n{se}"
+        );
+        assert!(
+            so.contains("OTHER_REFUSED"),
+            "a host not named is refused:\n{so}"
+        );
+        if so.contains("NO_CARGO") {
+            eprintln!(
+                "cargo leg skipped: the seat image has no cargo (set WICKED_SEAT_BASE_IMAGE to a Rust toolchain base)"
+            );
+        } else {
+            assert!(
+                so.contains("CARGO_FETCH_OK"),
+                "cargo fetch through the gateway:\n{so}\n{se}"
+            );
+        }
+    }
+
     fn json_file(path: &Path) -> Value {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
     }
@@ -4182,6 +4329,61 @@ esac
                 "hostnames": ["registry.npmjs.org"], "backends": [{"dynamic": {}}]
             }])
         );
+    }
+
+    /// The CONNECT allowlist served is this daemon's `WICKED_SEAT_EGRESS_HOSTS`, not the list an
+    /// earlier daemon persisted. A state directory first provisioned with no hosts kept `[]` in
+    /// `gateway.json`, and a later daemon naming `index.crates.io,static.crates.io` still served
+    /// no route: every seat's cargo fetch was refused (`route not found`, a TLS error in the seat).
+    #[test]
+    fn the_served_allowlist_is_the_daemons_egress_hosts_not_the_persisted_one() {
+        let temp = TempDir::new();
+        let stale = GatewayConfig {
+            egress_hosts: vec![],
+            ..plain_config()
+        };
+        configure_gateway(&temp.0, &stale).unwrap();
+        let hosts = parse_egress_hosts(" index.crates.io, ,static.crates.io ");
+        assert_eq!(hosts, ["index.crates.io", "static.crates.io"]);
+        let config = provision_config(&temp.0, hosts.clone()).unwrap();
+        persist_units(&temp.0, &config).unwrap();
+        let served = json_file(&temp.0.join("config/config.json"));
+        assert_eq!(
+            served["tcpRoutes"],
+            json!([{
+                "name": "egress-allowlist", "gateways": "secure/public-egress",
+                "hostnames": ["index.crates.io", "static.crates.io"],
+                "backends": [{"dynamic": {}}]
+            }])
+        );
+        assert_eq!(
+            served["gateways"],
+            json!({"secure": {"port": 443, "listeners": [{
+                "name": "public-egress", "hostname": "*", "protocol": "TLS"
+            }]}})
+        );
+        assert!(served["binds"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"port": 3000, "tunnelProtocol": "connect", "listeners": []})));
+        assert_eq!(
+            load_config(&temp.0).unwrap().egress_hosts,
+            hosts,
+            "gateway.json records the served list"
+        );
+        assert_eq!(
+            load_config(&temp.0).unwrap().providers[0],
+            stale.providers[0],
+            "a persisted route override is kept"
+        );
+        // Only named hosts: one the daemon no longer names loses its route (none = no route).
+        let config = provision_config(&temp.0, parse_egress_hosts("")).unwrap();
+        persist_units(&temp.0, &config).unwrap();
+        assert_eq!(
+            json_file(&temp.0.join("config/config.json"))["tcpRoutes"],
+            json!([])
+        );
+        assert!(load_config(&temp.0).unwrap().egress_hosts.is_empty());
     }
 
     #[test]
