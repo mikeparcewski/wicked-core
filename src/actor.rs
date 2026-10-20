@@ -5675,6 +5675,12 @@ fn apply_step_result(
     if unit.status == crate::domain::UnitStatus::Done {
         return Ok(StepApplied::Stale);
     }
+    // The operator retry's armed floor re-run (`RepoChecksReport::recheck`) is CONSUMED by the
+    // attempt that just returned, on every path out of here — a worker failure, the substance and
+    // deliverable floors (which return before the gate fold), the fold itself — so no later
+    // attempt (an automatic rework, a `request_changes`) inherits it. Only the gate fold reads it
+    // (`floorRecheck`); it is handed back to the unit just before that call.
+    let operator_recheck = unit.repo_checks.as_mut().and_then(|r| r.recheck.take());
     let ord = unit.ord;
     // The FINISHING unit's OWN declared gate (Copy) — captured before the mutable borrow below so a
     // conditional human gate can be evaluated against this unit's own verdict (seam finding #3).
@@ -7134,6 +7140,9 @@ fn apply_step_result(
         CoreEvent::GateDecided { allow: true, .. } | CoreEvent::UnitDone { .. } if withhold => {}
         ev => emit(subscribers, ev),
     };
+    if let (Some(why), Some(r)) = (operator_recheck, unit.repo_checks.as_mut()) {
+        r.recheck = Some(why);
+    }
     let outcome = pipeline::apply_and_finish_unit(
         store,
         unit,
@@ -7601,7 +7610,7 @@ fn escalate_denied_unit(
     let (gate_kind, prompt) = match adjudication {
         Some(p) => (crate::review_context::REVIEW_ADJUDICATION_GATE, p),
         None => (
-            "escalation",
+            ESCALATION_GATE_KIND,
             denial_gate_prompt(unit, class, &reason, mutation, note),
         ),
     };
@@ -12210,6 +12219,16 @@ pub(crate) fn confirm_gate_as(
     )?
     .iter()
     .any(|r| r.gate_kind.as_deref() == Some(crate::review_context::REVIEW_ADJUDICATION_GATE));
+    // An ESCALATION gate is open (a denied unit's gate, `escalate_denied_unit`) — read here, from
+    // the open row, before it resolves: its plain approve is the operator retry that re-runs the
+    // unit's floor once on an unchanged tree ([`arm_operator_recheck`]).
+    let escalation_open = crate::interaction::list_interactions(
+        &*store,
+        Some(run_id),
+        Some(crate::interaction::InteractionStatus::Open),
+    )?
+    .iter()
+    .any(|r| r.gate_kind.as_deref() == Some(ESCALATION_GATE_KIND));
 
     // (core#782) An approve WITH A NOTE at a read-only phase's floor gate is a FLOOR FIX: the
     // note goes to a seat that can write, then only the floor re-runs (`floor_fix_request`) —
@@ -12535,6 +12554,9 @@ pub(crate) fn confirm_gate_as(
     // (core#782) The operator's note a floor fix hands to its seat.
     let mut floor_fix_note: Option<String> = None;
     let mut adopt_suggestion = false;
+    // The operator's plain approve (retry, with or without a note) — the one answer that arms a
+    // re-run of an escalated unit's floor on an unchanged tree.
+    let mut operator_retry = false;
     // (core#555) The approved INTENT AMENDMENT this decision carries, applied below to every unit
     // at or after the cursor (not one unit's instruction) so it reaches every later evaluator.
     let mut intent_amendment: Option<String> = None;
@@ -12555,6 +12577,7 @@ pub(crate) fn confirm_gate_as(
             (None, crate::workflow::AmendScope::Cursor, None)
         }
         crate::workflow::HumanDecision::Approve { amend, amend_scope } => {
+            operator_retry = true;
             (amend, amend_scope, None)
         }
         crate::workflow::HumanDecision::RequestChanges { note } => {
@@ -12681,6 +12704,12 @@ pub(crate) fn confirm_gate_as(
                         },
                     );
                 }
+            }
+            // The OPERATOR RETRY of an escalated unit: its floor re-runs ONCE on the next attempt
+            // even when that attempt leaves the tree unchanged (a flaky result is not sticky per
+            // tree). Automatic reworks and every other answer keep the core#544 carry-forward.
+            if operator_retry && escalation_open && floor_rerun.is_none() {
+                arm_operator_recheck(store, run_id, session.unit_ix)?;
             }
             // Optionally inject an amendment (the gate is steering) — into the unit at the cursor,
             // or (DES-L1 PR-1B, core#465 `amendScope: creator`) into the first CREATOR phase at or
@@ -13014,6 +13043,41 @@ fn floor_fix_request(
             seat,
         }),
     })
+}
+
+/// The gate kind `escalate_denied_unit` opens for a denied unit.
+const ESCALATION_GATE_KIND: &str = "escalation";
+
+/// Arm ONE re-run of the cursor unit's floor for its next attempt (`RepoChecksReport::recheck`):
+/// the operator retried an escalated unit whose last floor FAILED on a known tree. Without it the
+/// retry's unchanged tree carries that result forward (core#544, which keeps a no-change rework
+/// from admitting a failed tree), so a single flaky check blocked the step for good: the only
+/// levers left were Stop or a code change. The re-run is the one carve-out — deny-dominant like
+/// any floor (it passes only when the checks pass), consumed by the attempt's fold, never armed
+/// by an automatic rework — so a deterministic failure is re-run once per operator retry, never
+/// in a loop. A unit with no failed default-floor report on a known tree is left alone.
+fn arm_operator_recheck(
+    store: &mut dyn GraphStore,
+    run_id: &str,
+    unit_ix: usize,
+) -> anyhow::Result<()> {
+    let mut units = crate::domain::session_units(store, run_id)?;
+    let Some(cursor) = units.get_mut(unit_ix) else {
+        return Ok(());
+    };
+    if cursor.status != crate::domain::UnitStatus::Rejected || !cursor.default_floor {
+        return Ok(());
+    }
+    let Some(report) = cursor
+        .repo_checks
+        .as_mut()
+        .filter(|r| !r.passed && r.tree.is_some())
+    else {
+        return Ok(());
+    };
+    report.recheck = Some(crate::repo_checks::RECHECK_OPERATOR_RETRY.to_string());
+    put_node(store, cursor.to_node())?;
+    Ok(())
 }
 
 /// (core#469) The floor re-run `mode` asks for on `unit` — refused unless the unit's denial is a
@@ -15836,6 +15900,118 @@ mod substance_gate_tests {
             "the standard failure path emits StepFailed carrying the substance denial, \
              kinded SubstanceRejected (a core veto, not a worker failure)"
         );
+    }
+
+    /// An operator retry's armed floor re-run (`RepoChecksReport::recheck`) is consumed by the
+    /// attempt that returns, on every path: the substance floor's early rejection (which never
+    /// reaches the gate fold) clears it too, so a later `request_changes` or automatic rework
+    /// does not re-run the floor without another operator retry. On the fold path the re-run on
+    /// the SAME tree emits `floorRecheck` with both results; a re-run on another tree does not.
+    #[test]
+    fn an_armed_operator_recheck_is_consumed_on_every_path() {
+        let floor = |tree: &str, passed: bool| -> crate::repo_checks::RepoChecksReport {
+            serde_json::from_value(serde_json::json!({
+                "detected": [], "checks": [], "skipped": [], "passed": passed,
+                "sandbox_level": "none", "tree": tree
+            }))
+            .unwrap()
+        };
+        let armed = || {
+            let mut r = floor("tree-1", false);
+            r.recheck = Some(crate::repo_checks::RECHECK_OPERATOR_RETRY.to_string());
+            r
+        };
+        let rechecks = |evs: &[CoreEvent]| -> Vec<(String, String, String, bool)> {
+            evs.iter()
+                .filter_map(|ev| match ev {
+                    CoreEvent::FloorRecheck {
+                        reason,
+                        previous_outcome,
+                        outcome,
+                        passed,
+                        ..
+                    } => Some((
+                        reason.clone(),
+                        previous_outcome.clone(),
+                        outcome.clone(),
+                        *passed,
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // The substance floor rejects before the gate fold: the request is still consumed.
+        let run_id = format!("recheck-substance-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_with(&mut store, &run_id, PhaseRole::Creator, |u| {
+            u.default_floor = true;
+            u.repo_checks = Some(armed());
+        });
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let (applied, _session, unit) = fold(&mut store, &mut subs, &run_id, "done.", true);
+        assert!(matches!(applied, StepApplied::Paused));
+        assert_eq!(unit.denial_reason.as_deref(), Some(NO_SUBSTANCE));
+        let stored = unit.repo_checks.as_ref().expect("the report stays");
+        assert!(stored.recheck.is_none(), "consumed by the rejected attempt");
+        assert!(!stored.passed, "the stored result is untouched");
+        assert!(rechecks(&drain_events(&erx)).is_empty());
+
+        // The gate fold: a re-run on the SAME tree records both results and replaces the report.
+        for (tree, passed, said) in [
+            ("tree-1", true, true),
+            ("tree-1", false, true),
+            ("tree-2", true, false),
+        ] {
+            let run_id = format!("recheck-fold-{tree}-{passed}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_with(&mut store, &run_id, PhaseRole::Creator, |u| {
+                u.default_floor = true;
+                u.repo_checks = Some(armed());
+            });
+            let mut subs = crate::event_log::EventSink::default();
+            let (esub, erx) = channel();
+            subs.push(esub);
+            let (_applied, _session, unit) = fold_with_evidence(
+                &mut store,
+                &mut subs,
+                &run_id,
+                &"built the feature; the repo's checks pass on the tree. ".repeat(6),
+                crate::workflow::UnitEvidence {
+                    repo_checks: Some(floor(tree, passed)),
+                    tree_changed: Some(tree != "tree-1"),
+                    ..Default::default()
+                },
+            );
+            let r = rechecks(&drain_events(&erx));
+            if said {
+                let outcome = if passed { "passed" } else { "failed" };
+                assert_eq!(
+                    r,
+                    vec![(
+                        "operator retry".to_string(),
+                        "failed".to_string(),
+                        outcome.to_string(),
+                        passed
+                    )],
+                    "{tree}/{passed}"
+                );
+            } else {
+                assert!(
+                    r.is_empty(),
+                    "a re-run on another tree is no recheck: {r:?}"
+                );
+            }
+            let fresh = unit.repo_checks.as_ref().expect("the fresh report");
+            assert_eq!(
+                fresh.passed, passed,
+                "the fresh report replaced the stored one"
+            );
+            assert_eq!(fresh.tree.as_deref(), Some(tree));
+            assert!(fresh.recheck.is_none(), "consumed by the fold");
+        }
     }
 
     /// core#970: a chat's answer step — read-only, every output confirmed by a human at its turn

@@ -2282,6 +2282,16 @@ fn run_unit_and_judge_on(
     // tree no floor of this unit has judged yet, or whose floor the operator asked to re-run.
     let default_floor_applies =
         bound_agent && (tree_changed != Some(false) || unfloored_tree || floor_rerun.is_some());
+    // An OPERATOR RETRY of this unit's escalation gate armed ONE re-run of its floor
+    // (`RepoChecksReport::recheck`): the checks run on the tree as it stands even when this
+    // attempt left it unchanged — the single exception to the core#544 carry-forward, so a flaky
+    // result is not sticky per tree. The checks only; the judge arms exactly as before.
+    let recheck_armed = bound_agent
+        && input
+            .unit
+            .repo_checks
+            .as_ref()
+            .is_some_and(|r| r.recheck.is_some());
     // F-036 WORKTREE GUARD, first look — taken right after the seat's own work so the repo checks
     // below are never run over a tree the seat already rewrote (they would certify the wrong
     // code). This is NOT the outcome the gate sees: the FINAL comparison is taken at the very end
@@ -2799,7 +2809,7 @@ fn run_unit_and_judge_on(
     );
     let repo_checks = match input.workdir.as_deref() {
         Some(wd)
-            if (input.unit.repo_checks_floor || default_floor_applies)
+            if (input.unit.repo_checks_floor || default_floor_applies || recheck_armed)
                 && input.unit.tool_cmd.is_none()
                 && output.status == StepStatus::Ok
                 && !guard_denies =>
@@ -2811,8 +2821,10 @@ fn run_unit_and_judge_on(
                 input.unit.ord,
                 if input.unit.repo_checks_floor {
                     "F-039: the def's verified_evidence phase"
-                } else {
+                } else if default_floor_applies {
                     "F-7R2-005: the unit changed the worktree tree — default floor"
+                } else {
+                    "an operator retry re-runs the floor on the unchanged tree — once"
                 }
             );
             // core#467 / core#469: WHOSE floor this is decides the test set (targeted first at

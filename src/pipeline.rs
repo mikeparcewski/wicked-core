@@ -1224,6 +1224,9 @@ pub(crate) fn apply_and_finish_unit(
     // equals the dispatch baseline — the worker thread re-runs the checks on any other tree).
     // That verdict stands for this attempt: a `request_changes` or approve-retry that changes
     // nothing can no longer read as "no checks apply" and admit the tree the floor failed.
+    // The one exception is an operator retry of the escalated unit (`RepoChecksReport::recheck`,
+    // armed by `actor::arm_operator_recheck`): the worker thread re-ran the checks on this same
+    // tree, so `evidence.repo_checks` is fresh and nothing is carried.
     let carried: Option<crate::repo_checks::RepoChecksReport> = (evidence.repo_checks.is_none()
         && evidence.tree_changed == Some(false)
         && unit.default_floor
@@ -1243,6 +1246,14 @@ pub(crate) fn apply_and_finish_unit(
         .and_then(|r| r.requested_rerun.as_ref())
         .and_then(|q| q.fix.as_ref())
         .map(|f| f.seat.clone());
+    // The operator retry's re-run (`RepoChecksReport::recheck`), read BEFORE the fresh report
+    // replaces the one that armed it: `(reason, the replaced outcome, the tree it judged)`.
+    let recheck: Option<(String, &'static str, Option<String>)> =
+        unit.repo_checks.as_ref().and_then(|r| {
+            r.recheck
+                .clone()
+                .map(|why| (why, r.outcome(), r.tree.clone()))
+        });
     let checks_denial: Option<(&'static str, String)> =
         match &evidence.repo_checks {
             Some(report) => {
@@ -1281,6 +1292,24 @@ pub(crate) fn apply_and_finish_unit(
                     changed,
                     changed_truncated,
                 });
+                // The re-run an operator retry armed, on the SAME tree the replaced result
+                // judged: said on the wire beside the fresh frame, so the gate history holds both
+                // results. The fresh report alone decides the gate below (deny-dominant).
+                if let Some((reason, previous_outcome, tree)) = recheck
+                    .as_ref()
+                    .filter(|(_, _, t)| t.is_some() && *t == report.tree)
+                {
+                    emit(CoreEvent::FloorRecheck {
+                        session: session_id.to_string(),
+                        ord: unit.ord,
+                        attempt,
+                        reason: reason.clone(),
+                        tree: tree.clone(),
+                        previous_outcome: previous_outcome.to_string(),
+                        outcome: report.outcome().to_string(),
+                        passed: report.passed,
+                    });
+                }
                 if default_floor_refused_unsandboxed {
                     eprintln!(
                     "wicked-core: unit {} changed the worktree tree but the default repo-checks \
@@ -1674,6 +1703,9 @@ pub(crate) fn apply_and_finish_unit(
     // this fold decided, the next dispatch is an ordinary one unless the gate arms another.
     if let Some(r) = unit.repo_checks.as_mut() {
         r.requested_rerun = None;
+        // …and so is an operator retry's armed re-run: ONCE, whether or not this attempt's floor
+        // ran (a seat that failed before it), so no later automatic rework inherits it.
+        r.recheck = None;
     }
     // (DES-QE-EVERY-SEAT §3.2, codex r2 F15) A floor fix's seat changed this unit's tree: it is an
     // AUTHOR of that tree from now on, so no later reviewer or judge of it runs there.
