@@ -14,6 +14,41 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The repo-checks floor no longer writes its build output into the run's worktree.** The floor's host-side checks
+  (fmt, clippy, test) kept their isolated `HOME`, package caches and `CARGO_TARGET_DIR` in
+  `<worktree>/tmp/wicked-checks/`. A run keeps its worktree after it ends (a parked run keeps it for a retry), and
+  nothing cleaned that ignored directory: on a cargo repository it reached about 16 GB per run, and two runs took
+  the daemon's disk to 99%. The scratch now lives in the engine's cache area,
+  `<worker home>/repo-checks/<repo key>/<run key>/`, grouped per repository (the directory its run worktrees sit
+  in) with one leaf per run, keyed by the worktree and the exact run id (two runs whose ids sanitize to one
+  worktree path still get two leaves), and the OS write boundary arms that leaf as a write root. A leaf a floor
+  still holds when its run's worktree is removed is marked orphaned, never reused (the mark is checked again
+  under the floor's lease), and deleted when that floor ends or by the next cap pass. The startup reaper removes
+  every run's leaf over a worktree it reaps, since a sanitized directory name cannot spell the raw run id back. Nothing named
+  `tmp/wicked-checks` is created in a worktree any more. The one thing the floor still writes in the worktree is
+  the run base's transient source export for the baseline diff, now `tmp/wicked-floor-base/`, removed as soon as
+  its result is cached and at the start of every floor. It stays there so a base check that calls git (a
+  `build.rs` running `git rev-parse`) still finds the enclosing repository; the base's build output goes to the
+  leaf. The leaf is per run, not shared by a repository's runs:
+  cargo decides freshness by mtime, and two worktrees of one repository build into the same artifact names, so a
+  run whose files are older than another run's last build is handed that run's binaries, a false pass (the same
+  seam core#480 closed for head and base). A shared directory would also let one run's build scripts plant
+  artifacts that another run's floor executes. Every floor of a run reuses the run's leaf, so the run's builds are
+  as warm as before. The disk is bounded in three ways. Before each floor, a repository whose leaves total more
+  than `WICKED_REPO_CHECKS_CACHE_CAP_GB` (default 20) loses other runs' least recently used leaves until it fits.
+  The floor's own leaf is cleaned only when it alone is over the cap, and each removal is logged. A leaf a floor is
+  using is never removed: each floor takes a shared lock on `<run key>.lock` before the cap pass, and the cap
+  deletes a leaf only under an exclusive lock, one pass per repository at a time. A run's leaf is
+  deleted wherever the engine removes, reaps or cleans the run's worktree, including a dirty tree it keeps. The
+  0-byte lock files are kept, so a floor already waiting on one never holds a lease the cap cannot see. A
+  guarded verify or deliver checkout's leaf is deleted with the checkout. The checks, their order, their
+  environment variables and their verdicts are unchanged; only the directories the variables name moved. A
+  worktree whose `tmp` is a symlink or a file still refuses the floor (`passed: false`, the same reason), and a
+  base export the floor cannot clear, or cannot even inspect, refuses it too. Leftover
+  `tmp/wicked-checks/` directories in existing worktrees are not migrated (only a base export an older engine
+  left in one is removed, as that engine did at every floor); the existing ignored-file clean of a retained
+  worktree still drops them.
+
 - **agy signs in with a Gemini API key, and its container seat runs on it through the gateway, still benched.**
   `wicked-core seat-login argv agy` opens agy's login container. It has no network and runs a prompt that does not
   echo: the operator pastes a Gemini API key from Google AI Studio, and agy itself never runs. Ingest checks the

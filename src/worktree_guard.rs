@@ -212,8 +212,10 @@ pub enum WorktreeGuardOutcome {
 }
 
 /// The engine's in-boundary scratch directory, relative to the worktree root — where every
-/// worker's `TMPDIR` points (`execute_wrapped::redirect_scratch_into_boundary`) and where the
-/// repo checks keep their isolated `HOME`/caches. Excluded from the snapshot by construction.
+/// worker's `TMPDIR` points (`execute_wrapped::redirect_scratch_into_boundary`). Excluded from the
+/// snapshot by construction. (The repo checks' isolated `HOME`/caches used to live here too, as
+/// `tmp/wicked-checks/`; they now live in the engine's check cache, outside the worktree —
+/// `repo_checks::scratch_dir_for`.)
 pub const ENGINE_SCRATCH_DIR: &str = "tmp";
 
 /// (core#464) The NOTES ROOT a read-only unit may write to:

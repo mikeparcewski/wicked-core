@@ -1075,6 +1075,7 @@ pub(crate) fn lift_and_reverify(
         git_dir: pinned_git_dir(&ctx.worktree, &ctx.repo_root).ok(),
         claim_text: None,
         package_dir: None,
+        run_id: Some(run_id.to_string()),
     };
     // (core#417, codex r1) The deliver re-verify is a verify floor too: it runs on a clean
     // checkout of `now.tree` — the tree that ships — never the live worktree, where an ignored

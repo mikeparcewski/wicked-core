@@ -1040,6 +1040,8 @@ pub fn remove_worktree(repo_root: &str, run_id: &str) {
         );
         return;
     }
+    // The run's repo-checks scratch lives in the engine's check cache, not in the tree.
+    crate::repo_checks::remove_check_scratch(&wt, run_id);
     let wt_str = wt.to_string_lossy().to_string();
     let _ = git(repo_root, &["worktree", "remove", "--force", &wt_str]);
     // If git refused (e.g. already gone), drop the dir directly.
@@ -1057,6 +1059,9 @@ pub(crate) fn clean_ignored_in_worktree(repo_root: &str, run_id: &str) {
     if !wt.is_dir() || !may_touch_worktree(&wt, run_id) {
         return;
     }
+    // The checks' build output is the largest ignored-file cost a run has, and it lives in the
+    // engine's check cache, not in the tree: dropped here with the rest.
+    crate::repo_checks::remove_check_scratch(&wt, run_id);
     let wt_str = wt.to_string_lossy().to_string();
     match git(&wt_str, &["clean", "-fdX"]) {
         Ok((true, _, _)) => {}
@@ -1086,14 +1091,17 @@ pub(crate) fn clean_ignored_in_worktree(repo_root: &str, run_id: &str) {
 pub fn reap_worktree_if_clean(repo_root: &str, run_id: &str) -> bool {
     let wt = worktree_path(repo_root, run_id);
     if !wt.is_dir() {
-        // Nothing on disk. Drop any dangling admin entry so the path is re-usable.
+        // Nothing on disk. Drop any dangling admin entry so the path is re-usable, and the
+        // run's check scratch (no live run can hold a tree that does not exist).
+        crate::repo_checks::remove_check_scratch(&wt, run_id);
         let _ = git(repo_root, &["worktree", "prune"]);
         return true;
     }
     // The tree at the derived path may belong to a DIFFERENT raw run id that spells the same
     // worktree name (core#337, hashless colon tier). A clean live tree is exactly what the
     // non-forced remove below would take, so the ownership check has to come first. `run_id`
-    // itself never held a tree here — its reap is trivially complete.
+    // itself never held a tree here — its reap is trivially complete. (Its check scratch, keyed by
+    // its own id, core#1050, was never made; the owner's is not this reap's to touch.)
     if !may_touch_worktree(&wt, run_id) {
         eprintln!(
             "wicked-core: not reaping worktree {} for run {run_id} — it belongs to a \
@@ -1102,6 +1110,9 @@ pub fn reap_worktree_if_clean(repo_root: &str, run_id: &str) -> bool {
         );
         return true;
     }
+    // The repo-checks scratch is never the run's work (it lives in the engine's check cache), so
+    // it goes whether or not the tree is clean enough to reap.
+    crate::repo_checks::remove_check_scratch(&wt, run_id);
     let wt_str = wt.to_string_lossy().to_string();
     match git(repo_root, &["worktree", "remove", &wt_str]) {
         Ok((true, _, _)) => true,
@@ -1161,6 +1172,10 @@ pub fn reap_orphan_worktrees(
                     if live_names.contains(name) {
                         continue;
                     }
+                    // (core#1050) Every run's check scratch over this tree goes: the scratch is
+                    // keyed by the RAW run id, which a sanitized directory name cannot spell back,
+                    // and no live run maps to this path (checked just above).
+                    crate::repo_checks::remove_tree_scratch(&e.path());
                     if terminal_names.contains(name) {
                         let _ = reap_worktree_if_clean(&repo.root_path, name);
                     } else {
@@ -2607,9 +2622,16 @@ mod tests {
         let p = root.to_str().unwrap();
         let wt = create_worktree(p, "run-1").unwrap();
         assert!(is_live_worktree(&wt), "precondition: a real checkout");
+        let leaf = crate::repo_checks::scratch_dir_for(
+            &crate::repo_checks::check_cache_root().unwrap(),
+            &wt,
+            Some("run-1"),
+        );
+        std::fs::create_dir_all(leaf.join("home")).unwrap();
 
         assert!(reap_worktree_if_clean(p, "run-1"), "a clean tree reaps");
         assert!(!wt.exists(), "the checkout is gone");
+        assert!(!leaf.exists(), "and so is its check scratch");
         let (ok, branches, _) = git(p, &["branch", "--list", "wicked/run-1"]).unwrap();
         assert!(
             ok && branches.contains("wicked/run-1"),
@@ -2627,10 +2649,22 @@ mod tests {
         let p = root.to_str().unwrap();
         let wt = create_worktree(p, "run-1").unwrap();
         std::fs::write(wt.join("unlanded-artifact.txt"), "never committed\n").unwrap();
+        // The run's repo-checks scratch (build output) lives in the engine's check cache.
+        let leaf = crate::repo_checks::scratch_dir_for(
+            &crate::repo_checks::check_cache_root().unwrap(),
+            &wt,
+            Some("run-1"),
+        );
+        std::fs::create_dir_all(leaf.join("cargo-target").join("head")).unwrap();
 
         assert!(
             !reap_worktree_if_clean(p, "run-1"),
             "a dirty tree must be reported KEPT"
+        );
+        assert!(
+            !leaf.exists(),
+            "the terminal run's check scratch goes even when its tree is kept: {}",
+            leaf.display()
         );
         assert!(
             is_live_worktree(&wt),
@@ -2893,7 +2927,17 @@ mod tests {
         // The store holds RAW ids — matching happens across spellings inside the reaper.
         let live: HashSet<String> = ["camp:live:a0".to_string()].into_iter().collect();
         let terminal: HashSet<String> = ["camp:done:a0".to_string()].into_iter().collect();
+        // (core#1050) Each run's check scratch is keyed by its RAW id, which the sanitized
+        // directory name cannot spell back: the terminal run's goes, the live run's stays.
+        let cache = crate::repo_checks::check_cache_root().unwrap();
+        let leaf_done = crate::repo_checks::scratch_dir_for(&cache, &wt_done, Some("camp:done:a0"));
+        let leaf_live = crate::repo_checks::scratch_dir_for(&cache, &wt_live, Some("camp:live:a0"));
+        std::fs::create_dir_all(leaf_done.join("cargo-target")).unwrap();
+        std::fs::create_dir_all(leaf_live.join("cargo-target")).unwrap();
         reap_orphan_worktrees(std::slice::from_ref(&repo), &live, &terminal);
+        assert!(!leaf_done.exists(), "{}", leaf_done.display());
+        assert!(leaf_live.is_dir(), "a live run's check scratch is kept");
+        let _ = std::fs::remove_dir_all(&leaf_live);
 
         assert!(
             is_live_worktree(&wt_live),
