@@ -459,8 +459,10 @@ pub(crate) fn runtime() -> Result<Runtime, FloorUnarmed> {
 /// The CPUs a seat container can use: the runtime engine's (`<cli> info --format {{.NCPU}}`,
 /// docker and nerdctl), which under a VM runtime (Docker Desktop, Rancher Desktop, colima) is the
 /// VM's, not the host's. A seat container carries no CPU limit of its own ([`run_argv`] sets
-/// `--memory`, never `--cpus`). The answer is cached per runtime CLI for the process; when the
-/// runtime does not answer it (podman's template differs), the host's parallelism stands in.
+/// `--memory`, never `--cpus`). When the runtime does not answer it (podman's template differs, a
+/// probe that times out), the host's parallelism stands in. Probed once per runtime CLI for the
+/// process, whatever the answer, so a runtime that cannot answer is not asked again at every
+/// spawn; [`runtime`] itself is cached once it answers.
 pub(crate) fn seat_cpus() -> usize {
     static CACHE: Mutex<Option<(PathBuf, usize)>> = Mutex::new(None);
     let host = std::thread::available_parallelism()
@@ -483,10 +485,8 @@ pub(crate) fn seat_cpus() -> usize {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
     let n = cpus_from_info(answer.as_deref(), host);
-    if answer.is_some() {
-        if let Ok(mut g) = CACHE.lock() {
-            *g = Some((rt.cli.clone(), n));
-        }
+    if let Ok(mut g) = CACHE.lock() {
+        *g = Some((rt.cli.clone(), n));
     }
     n
 }
@@ -4907,17 +4907,21 @@ mod tests {
         let get = |env: &[(&'static str, String)], k: &str| {
             env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone())
         };
-        let ours = floor_build_env(1, |_| None);
+        let ours = floor_build_env(|| 1, |_| None);
         assert_eq!(get(&ours, "CARGO_BUILD_JOBS").as_deref(), Some("1"));
         assert_eq!(get(&ours, "CARGO_PROFILE_DEV_DEBUG").as_deref(), Some("0"));
         assert_eq!(get(&ours, "CARGO_PROFILE_TEST_DEBUG").as_deref(), Some("0"));
         assert_eq!(get(&ours, "CARGO_INCREMENTAL").as_deref(), Some("0"));
         assert_eq!(ours.len(), SEAT_TOOLCHAIN_BUILD_ENV.len());
-        let theirs = floor_build_env(8, |k| match k {
-            "CARGO_BUILD_JOBS" => Some("6".into()),
-            "CARGO_INCREMENTAL" => Some("  ".into()),
-            _ => None,
-        });
+        // An operator's jobs value means the runtime is never asked for its CPUs.
+        let theirs = floor_build_env(
+            || panic!("the CPUs are not asked for"),
+            |k| match k {
+                "CARGO_BUILD_JOBS" => Some("6".into()),
+                "CARGO_INCREMENTAL" => Some("  ".into()),
+                _ => None,
+            },
+        );
         assert_eq!(get(&theirs, "CARGO_BUILD_JOBS").as_deref(), Some("6"));
         assert_eq!(get(&theirs, "CARGO_INCREMENTAL").as_deref(), Some("0"));
         // The CPUs are the runtime's (a VM's), never the host's, when the runtime answers.
@@ -5230,7 +5234,9 @@ mod tests {
         assert!(fetched.contains("FETCH_OK"), "the fetch seat: {fetched}");
 
         // The limit under test: the engine's default, or `WICKED_LIVE_SEAT_MEMORY` to measure another.
-        let measuring = std::env::var("WICKED_LIVE_SEAT_MEMORY").ok();
+        let measuring = std::env::var("WICKED_LIVE_SEAT_MEMORY")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
         let memory = memory_from(measuring.as_deref()).to_string();
         // One offline build seat: `unset` names the variables a control removes inside the seat.
         let build = |label: &str, unset: &str| -> (String, Option<u64>, Option<u64>) {
@@ -5250,6 +5256,7 @@ mod tests {
                 &format!(
                     "{unset} echo JOBS=$CARGO_BUILD_JOBS DEBUG=$CARGO_PROFILE_DEV_DEBUG/\
                      $CARGO_PROFILE_TEST_DEBUG INCREMENTAL=$CARGO_INCREMENTAL; \
+                     echo SWAP_KB=$(awk '/^SwapTotal:/ {{print $2}}' /proc/meminfo); \
                      cd {repo_q} && cargo test --lib --no-run --locked --offline \
                      >/tmp/build.log 2>&1 && echo BUILD_OK || {{ echo BUILD_FAILED; \
                      grep -E '^error' /tmp/build.log | cut -c1-120 | tail -3; \
@@ -5334,7 +5341,14 @@ mod tests {
             seat.contains("BUILD_OK"),
             "the lib tests compile within {memory} with the seat build settings: {seat}"
         );
-        if measuring.is_none() {
+        // The red control holds where the seat has no swap to spill into (the run's runtime had
+        // none; with swap, `--memory` alone lets a seat use as much again, Docker's default).
+        let swap_kb = control
+            .lines()
+            .find_map(|l| l.strip_prefix("SWAP_KB="))
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        eprintln!("the runtime's swap: {swap_kb:?} kB");
+        if measuring.is_none() && swap_kb == Some(0) {
             assert!(
                 !control.contains("BUILD_OK")
                     && control.contains("KILLED=")

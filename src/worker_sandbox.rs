@@ -1197,21 +1197,28 @@ pub(crate) fn seat_build_jobs(cpus: usize) -> usize {
     cpus.clamp(1, SEAT_BUILD_JOBS_CAP)
 }
 
-/// The build variables a governed container seat gets ([`SEAT_TOOLCHAIN_BUILD_ENV`]) for `cpus`
-/// CPUs, each one the operator set (non-empty, read through `operator`) taking the operator's value.
+/// The build variables a governed container seat gets ([`SEAT_TOOLCHAIN_BUILD_ENV`]), each one the
+/// operator set (non-empty, read through `operator`) taking the operator's value. `cpus` is asked
+/// only for a jobs row the operator did not set (it may probe the runtime).
 pub(crate) fn floor_build_env(
-    cpus: usize,
+    cpus: impl FnOnce() -> usize,
     operator: impl Fn(&str) -> Option<String>,
 ) -> Vec<(&'static str, String)> {
+    let (mut cpus, mut counted) = (Some(cpus), None);
     SEAT_TOOLCHAIN_BUILD_ENV
         .iter()
         .map(|(_, var, value)| {
+            if let Some(theirs) = operator(var).filter(|v| !v.trim().is_empty()) {
+                return (*var, theirs);
+            }
             let ours = match value {
-                SeatBuildValue::Jobs => seat_build_jobs(cpus).to_string(),
+                SeatBuildValue::Jobs => {
+                    let n = *counted.get_or_insert_with(|| cpus.take().map_or(1, |f| f()));
+                    seat_build_jobs(n).to_string()
+                }
                 SeatBuildValue::Fixed(v) => (*v).to_string(),
             };
-            let theirs = operator(var).filter(|v| !v.trim().is_empty());
-            (*var, theirs.unwrap_or(ours))
+            (*var, ours)
         })
         .collect()
 }
@@ -1309,9 +1316,7 @@ pub(crate) fn plan_seat_floor(launch: SeatLaunch<'_>, write_roots: Vec<PathBuf>)
             trusted_git_dir: None,
         },
         env,
-        build_env: floor_build_env(crate::container_floor::seat_cpus(), |k| {
-            std::env::var(k).ok()
-        }),
+        build_env: floor_build_env(crate::container_floor::seat_cpus, |k| std::env::var(k).ok()),
     }
 }
 
