@@ -285,55 +285,63 @@ fn an_agy_seat_takes_its_stdin_from_a_pipe() {
     assert!(!stdin_must_be_a_pipe(&not_ours));
 }
 
-/// An online agy seat has no gateway credential route yet (its API-key and sign-in routes come
-/// with their sign-ins), so arming refuses it by name before it starts; an offline one arms.
-/// The refusal comes first, before the floor resolves, a runtime is probed or an image is built:
-/// an agy judge fallback must not cost a seat image build to be refused.
+/// An online agy seat has its gateway route (the Gemini API-key route); a seat whose agent has
+/// none is still refused before anything is set up.
 #[test]
-fn no_online_agy_seat_runs_until_its_gateway_route_lands() {
-    let err = gateway_route_defined("agy", true).unwrap_err();
-    assert!(err.contains("agy"), "{err}");
+fn an_online_agy_seat_has_its_gemini_route() {
+    assert!(gateway_route_defined("agy", true).is_ok());
     assert!(gateway_route_defined("agy", false).is_ok());
+    let err = gateway_route_defined("gemini", true).unwrap_err();
+    assert!(err.contains("gemini"), "{err}");
+    assert!(GATEWAY_PORTS.contains(&crate::seat_gateway::GEMINI_PORT));
     assert_eq!(SeatCli::from_binary("agy").root_name(), Some("agy"));
-    let _env = crate::test_env::ENV_LOCK
-        .read()
-        .unwrap_or_else(|p| p.into_inner());
-    if offline_seats() {
-        return;
+}
+
+/// The floor writes agy's API-key settings into the seat's own agy home, never through a link a
+/// seat planted there, and returns the canonical path it binds read-only; another sign-in kind,
+/// or a seat with no agy home, is refused.
+#[test]
+fn the_floor_writes_agys_api_key_settings_and_nothing_through_a_link() {
+    use crate::seat_credentials::CredentialKind;
+    let base = tmp("settings");
+    let home = base.join("seat");
+    let agy = home.join(".gemini/antigravity-cli");
+    std::fs::create_dir_all(&agy).unwrap();
+    let dirs = vec![home.clone(), agy.clone(), home.join(".gemini")];
+    let path = agy_floor_settings(&dirs, Some(CredentialKind::GeminiApiKey)).unwrap();
+    assert_eq!(path, agy.join("settings.json").canonicalize().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        r#"{"modelProvider":"gemini"}"#
+    );
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
-    let base = tmp("route");
-    let inputs = crate::worker_sandbox::FloorInputs {
-        cwd: base.clone(),
-        write_roots: vec![base.clone()],
-        read_only: false,
-        seat_dirs: vec![],
-        unmask: vec![],
-        pinned: vec![],
-        net: vec![],
-        home: None,
-        trusted_git_dir: None,
-    };
-    let refused = arm(
-        &inputs,
-        &s(&["agy", "-p=x"]),
-        "run",
-        1,
-        &[],
-        None,
-        Some("x"),
-        Some(&base.join("gateway")),
+    // A seat rewrote it: the floor writes its own again.
+    std::fs::write(&path, r#"{"modelProvider":"other"}"#).unwrap();
+    agy_floor_settings(&dirs, Some(CredentialKind::GeminiApiKey)).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        r#"{"modelProvider":"gemini"}"#
+    );
+    // A seat planted a link there: refused, the link's target untouched.
+    let target = base.join("host-file");
+    std::fs::write(&target, "host").unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    assert!(agy_floor_settings(&dirs, Some(CredentialKind::GeminiApiKey)).is_err());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "host");
+    assert!(agy_floor_settings(&dirs, Some(CredentialKind::ClaudeApiKey)).is_err());
+    assert!(agy_floor_settings(&dirs, None).is_err());
+    assert!(agy_floor_settings(
+        std::slice::from_ref(&home),
+        Some(CredentialKind::GeminiApiKey)
     )
-    .expect_err("an online agy seat is refused");
-    assert_eq!(refused.0, FloorUnarmed::GatewayUnavailable);
-    assert!(
-        refused.1.contains("no gateway credential route"),
-        "{}",
-        refused.1
-    );
-    assert!(
-        !base.join("gateway").exists(),
-        "refused before anything was set up"
-    );
+    .is_err());
     let _ = std::fs::remove_dir_all(&base);
 }
 

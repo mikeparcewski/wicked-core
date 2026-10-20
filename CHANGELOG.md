@@ -14,6 +14,28 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **agy signs in with a Gemini API key, and its container seat runs on it through the gateway, still benched.**
+  `wicked-core seat-login argv agy` opens agy's login container. It has no network and runs a prompt that does not
+  echo: the operator pastes a Gemini API key from Google AI Studio, and agy itself never runs. Ingest checks the
+  paste and stores it as the broker's `agy.gemini.key`; a refusal names its reason and repeats nothing of the
+  paste. Status reads it as an API-key sign-in with no expiry. Sign-out empties it, and nothing renews it.
+  - The gateway's new Gemini route listens on port 4013 and admits only agy's unit keys, read from
+    `x-goog-api-key`. It sends the broker's key in that same header to `generativelanguage.googleapis.com` over
+    TLS and passes the native wire through (agentgateway v1.6.0 `backendAuth.key.location`).
+  - The seat holds only its unit key: `GEMINI_API_KEY` is the unit's key and `GOOGLE_GEMINI_BASE_URL` points at
+    the route. No Anthropic or OpenAI variable reaches it.
+  - The floor writes `~/.gemini/antigravity-cli/settings.json` (`{"modelProvider":"gemini"}`) into the seat's
+    own home, never through a link a seat planted there, and mounts it read-only. The seat cannot point agy at
+    another provider.
+  - Egress: the API-key path needs only the route. agy's other hosts (`antigravity-unleash.goog` feature flags,
+    `play.googleapis.com` telemetry) are refused at the gateway's CONNECT listener unless
+    `WICKED_SEAT_EGRESS_HOSTS` names them, and the turn does not wait on them.
+  - An existing gateway state gains the route on its next provisioning, like any new default route.
+  agy stays `enabled_for_council = false` and `seat_eligible_for_work = false`. A new live test
+  (`WICKED_CONTAINER_LIVE=1`, FAKE keys only) runs the journey through the real gateway, the agy 1.4.2 seat and
+  the floor against a fake Gemini API: signed out and refused, the key pasted unechoed, ingest, a governed turn
+  whose upstream sees the broker's key and never the unit's, another agent's unit refused on the route, and sign
+  out.
 - **agy (Google's Antigravity CLI) has a container seat: its image, its carrier and its stream-json, still
   benched.** The seat image installs a CLI from npm or, for a CLI not published there, from its vendor's release
   tarball: agy 1.4.2 (build 4835981233356800) from Google's archives, pinned per architecture with the sha256 the

@@ -16,6 +16,9 @@ pub(crate) enum CredentialKind {
     CodexChatgpt,
     CodexApiKey,
     ProviderKey,
+    /// agy's Gemini API key (Google AI Studio): the seat sends its unit key as `x-goog-api-key`
+    /// and the gateway's Gemini route sends the broker's key in its place.
+    GeminiApiKey,
 }
 
 const ACCOUNT_ID: &str = "acct-PLACEHOLDER";

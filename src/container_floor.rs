@@ -78,7 +78,8 @@ const REAP_TIMEOUT: Duration = Duration::from_secs(20);
 const SWEEP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// The gateway's listeners a seat may connect to: CONNECT 3000, Anthropic 4000, OpenAI 4001,
 /// ChatGPT 4002, pi 4003, opencode 4004, Claude OAuth 4005, the subscription routes 4006-4012
-/// ([`crate::seat_credentials::SUBSCRIPTION_ROUTES`]), the ask MCP 8700 and the gate hook 8711
+/// ([`crate::seat_credentials::SUBSCRIPTION_ROUTES`]), agy's Gemini API key 4013
+/// ([`crate::seat_gateway::GEMINI_PORT`]), the ask MCP 8700 and the gate hook 8711
 /// ([`crate::seat_gateway`], [`crate::hook_relay`]). Each route admits only its owner agent's
 /// unit keys, so a reachable port is not a usable credential.
 pub(crate) const GATEWAY_PORTS: &[u16] = &[
@@ -96,6 +97,7 @@ pub(crate) const GATEWAY_PORTS: &[u16] = &[
     4010,
     4011,
     4012,
+    crate::seat_gateway::GEMINI_PORT,
     8700,
     crate::hook_relay::HOOK_PORT,
 ];
@@ -2268,7 +2270,12 @@ impl Drop for GatewayLease {
 /// Whether an online seat of `cli` has a gateway credential route at all (offline seats need
 /// none). Which credential it presents is the agent's sign-in, read from the broker at arm time.
 fn gateway_route_defined(cli: &str, online: bool) -> Result<(), String> {
-    if online && !matches!(cli, "claude" | "codex" | "pi" | "opencode" | "copilot") {
+    if online
+        && !matches!(
+            cli,
+            "claude" | "codex" | "pi" | "opencode" | "copilot" | "agy"
+        )
+    {
         return Err(format!(
             "no gateway credential route is defined for seat {cli}"
         ));
@@ -2456,6 +2463,27 @@ pub(crate) fn arm(
                 // requests ride its route; signed out (or expired) = refused before the seat starts.
                 let kind = crate::seat_login::seat_sign_in(&rt, &gw, dir, cli)
                     .map_err(|e| (FloorUnarmed::AgentSignedOut, e))?;
+                // agy on its Gemini API key: the settings that select it, written by the floor and
+                // mounted read-only (the seat cannot point agy at another provider).
+                if cli == "agy" {
+                    // A sign-in this floor cannot arm reads as signed out; a seat home it
+                    // cannot write, as an unresolvable root.
+                    let api_key =
+                        kind.kind == Some(crate::seat_credentials::CredentialKind::GeminiApiKey);
+                    let settings = agy_floor_settings(&inp.seat_dirs, kind.kind).map_err(|e| {
+                        let why = if api_key {
+                            FloorUnarmed::RootUnresolvable
+                        } else {
+                            FloorUnarmed::AgentSignedOut
+                        };
+                        (why, e)
+                    })?;
+                    mounts.retain(|m| m.dst() != settings.as_path());
+                    mounts.push(Mount::Bind {
+                        path: settings,
+                        rw: false,
+                    });
+                }
                 crate::seat_gateway::attach(&rt, &gw, &network).map_err(down)?;
                 // The seat's namespace: a sidecar allows output only to the gateway's own address on
                 // its ports (an internal network alone still reaches the VM host's services).
@@ -2552,6 +2580,40 @@ pub(crate) fn arm(
         copilot_account,
         view,
     })
+}
+
+/// agy's settings (`~/.gemini/antigravity-cli/settings.json`) for the sign-in its seat runs on,
+/// written by the floor into the seat's own home (found among its `seat_dirs`) before the seat
+/// starts, never through a link a seat planted there (the seat home is seat-writable and
+/// persists across a run's units), and returned for a read-only bind over it. The API-key path:
+/// `modelProvider: gemini`, which makes agy take `GEMINI_API_KEY` and `GOOGLE_GEMINI_BASE_URL`
+/// (its Google-account sign-in is the default and reads its own token instead). `Err` when the
+/// seat has no agy home, or its sign-in is not one this floor arms.
+pub(crate) fn agy_floor_settings(
+    seat_dirs: &[PathBuf],
+    kind: Option<crate::seat_credentials::CredentialKind>,
+) -> Result<PathBuf, String> {
+    let body = match kind {
+        Some(crate::seat_credentials::CredentialKind::GeminiApiKey) => {
+            serde_json::json!({ "modelProvider": "gemini" })
+        }
+        _ => return Err("agy's sign-in is not one its container seat can run on yet".into()),
+    };
+    let dir = seat_dirs
+        .iter()
+        .find(|d| d.ends_with(".gemini/antigravity-cli"))
+        .ok_or("the agy seat has no home of its own; its settings cannot be written")?;
+    let path = dir.join("settings.json");
+    if !mountable(&path) {
+        return Err(format!(
+            "agy's settings at {} cannot be mounted",
+            path.display()
+        ));
+    }
+    write_private_file(&path, body.to_string().as_bytes())?;
+    // Mounted at its canonical spelling, as every mount is.
+    path.canonicalize()
+        .map_err(|e| format!("agy's settings at {}: {e}", path.display()))
 }
 
 /// A linked worktree's `.git` file (which a full-posture seat can rewrite) and the git metadata
