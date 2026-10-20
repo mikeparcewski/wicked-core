@@ -424,8 +424,30 @@ fn the_agy_adapter_and_the_runner_hold_bounded_text() {
         a.on_line(&line);
     }
     let held = a.finish().text.join("");
-    assert!(held.len() <= AGY_HELD_TEXT, "{}", held.len());
+    assert!(
+        held.len() <= AGY_HELD_TEXT + AGY_TRUNCATED.len(),
+        "{}",
+        held.len()
+    );
     assert!(held.len() > AGY_HELD_TEXT - 4, "it keeps what fits");
+    assert!(held.ends_with(AGY_TRUNCATED), "a cut answer says so");
+    // An oversized `result.response`, through the adapter and the runner's own cap: cut, said so.
+    let mut b = AgyStreamJson::default();
+    let result = serde_json::json!({"event":"result","result":{"conversation_id":CONVERSATION,
+        "status":"SUCCESS","response":"x".repeat(9 * 1024 * 1024),"num_turns":1}})
+    .to_string();
+    b.on_line(&result);
+    let answer = b.finish().text.join("");
+    assert!(answer.ends_with(AGY_TRUNCATED));
+    let mut retained = String::new();
+    assert!(
+        push_within(&mut retained, &answer, 8 * 1024 * 1024),
+        "fits the runner's cap whole"
+    );
+    // An answer that fits is untouched.
+    let mut c = AgyStreamJson::default();
+    c.on_line(T1.lines().last().unwrap());
+    assert_eq!(c.finish().text, vec!["VERDICT: PASS two\n".to_string()]);
     let mut s = String::from("ab");
     assert!(!push_within(&mut s, "éé", 5));
     assert_eq!(s, "abé", "cut at a character boundary");
@@ -470,4 +492,100 @@ fn run_bounded_cuts_one_oversized_delta_to_the_retained_cap() {
         "{}",
         &out[out.len() - 40..]
     );
+}
+
+/// Through the real wrapped runner (host floor, an ungoverned unit, a stub named `agy`): agy's
+/// stdin is a pipe; a turn its `--print-timeout` cut off in TEXT mode fails, with the reason and
+/// without an exit meaning agy never reported (the engine settled an exit-0 run, xr-1049 P3);
+/// agy's own exit 3 is named on the record.
+#[cfg(unix)]
+#[test]
+fn the_wrapped_runner_settles_and_names_agy_exits() {
+    struct Var(&'static str, Option<std::ffi::OsString>);
+    impl Drop for Var {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+    let set = |k: &'static str, v: Option<&str>| {
+        let prev = std::env::var_os(k);
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+        Var(k, prev)
+    };
+    let _env = crate::test_env::ENV_LOCK
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
+    let _snapshot = set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, None);
+    let _floor = set(crate::container_floor::SEAT_FLOOR_ENV, Some("host"));
+    let dir = std::env::temp_dir().join(format!(
+        "wicked-agy-runner-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let agy = dir.join("agy");
+    let run = |script: &str, tag: &str| {
+        std::fs::write(&agy, format!("#!/bin/sh\n{script}\n")).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&agy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut unit = WorkUnit::pending(format!("agy-run:{tag}"), "agy-run", 1, "build");
+        unit.assigned_cli = Some("agy".to_string());
+        unit.assigned_invocation = Some(format!("{} -p {{PROMPT}}", agy.display()));
+        let input = StepInput {
+            run_id: format!("agy-runner-{tag}-{}", std::process::id()),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-agy".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: None,
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let out = WrappedCliStepRunner::with_tx(tx).run_unit(&input);
+        let _ = std::fs::remove_dir_all(sandbox_for(&input));
+        out
+    };
+    let stdin_kind = r#"if [ -p /dev/stdin ]; then echo STDIN_PIPE; else echo STDIN_NOT_PIPE; fi"#;
+    let cut = run(
+        &format!(
+            "{stdin_kind}\necho partial\n\
+             echo '[agy] print timeout after 9s with turn in progress; returning partial output' >&2\nexit 0"
+        ),
+        "cut",
+    );
+    assert_eq!(cut.status, StepStatus::Failed, "{}", cut.output);
+    assert!(cut.output.contains("STDIN_PIPE"), "{}", cut.output);
+    assert!(cut.output.contains("--print-timeout"), "{}", cut.output);
+    assert!(
+        !cut.output.contains("agy produced no response"),
+        "{}",
+        cut.output
+    );
+    let three = run("echo 'agy: model error' >&2\nexit 3", "three");
+    assert_eq!(three.status, StepStatus::Failed, "{}", three.output);
+    assert!(
+        three
+            .output
+            .starts_with("(cli `agy` exited 3) a model or agent error"),
+        "{}",
+        three.output
+    );
+    let done = run(&format!("{stdin_kind}\necho VERDICT: PASS"), "done");
+    assert_eq!(done.status, StepStatus::Ok, "{}", done.output);
+    assert!(done.output.contains("STDIN_PIPE"), "{}", done.output);
+    let _ = std::fs::remove_dir_all(&dir);
 }

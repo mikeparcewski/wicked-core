@@ -522,7 +522,10 @@ impl OutputAdapter for OpencodeJson {
 #[derive(Default)]
 pub(crate) struct AgyStreamJson {
     streamed: String,
-    response: Option<String>,
+    /// The streamed fallback was cut at [`AGY_HELD_TEXT`].
+    streamed_cut: bool,
+    /// The `result`'s answer, and whether it was cut.
+    response: Option<(String, bool)>,
     steps: Option<Usage>,
 }
 
@@ -541,9 +544,13 @@ pub(crate) fn push_within(s: &mut String, t: &str, cap: usize) -> bool {
     false
 }
 
-/// The most text [`AgyStreamJson`] holds for a turn (its streamed fallback, its answer): the
-/// runner's own retained-output cap, so a looping turn cannot grow the daemon's memory past it.
-const AGY_HELD_TEXT: usize = 8 * 1024 * 1024;
+/// The most text [`AgyStreamJson`] holds for a turn (its streamed fallback, its answer): just
+/// under the runner's own retained-output cap, so a looping turn cannot grow the daemon's memory
+/// past it and a cut answer still carries [`AGY_TRUNCATED`] inside that cap.
+const AGY_HELD_TEXT: usize = 8 * 1024 * 1024 - 1024;
+
+/// The notice a held agy answer that was cut ends with.
+const AGY_TRUNCATED: &str = "\n… (agy output truncated)";
 
 /// One agy `usage` object as the engine's [`Usage`].
 fn agy_usage(u: &serde_json::Value) -> Usage {
@@ -579,7 +586,9 @@ impl OutputAdapter for AgyStreamJson {
                 let done = step.get("state").and_then(|t| t.as_str()) == Some("DONE");
                 if kind == Some("agent_response") {
                     if let Some(t) = step.get("text_delta").and_then(|t| t.as_str()) {
-                        push_within(&mut self.streamed, t, AGY_HELD_TEXT);
+                        if !push_within(&mut self.streamed, t, AGY_HELD_TEXT) {
+                            self.streamed_cut = true;
+                        }
                     }
                 }
                 if done {
@@ -628,8 +637,8 @@ impl OutputAdapter for AgyStreamJson {
                 };
                 if let Some(t) = r.get("response").and_then(|t| t.as_str()) {
                     let mut held = String::new();
-                    push_within(&mut held, t, AGY_HELD_TEXT);
-                    self.response = Some(held);
+                    let whole = push_within(&mut held, t, AGY_HELD_TEXT);
+                    self.response = Some((held, !whole));
                 }
                 if r.get("status").and_then(|s| s.as_str()) != Some("SUCCESS") {
                     let status = r.get("status").and_then(|s| s.as_str()).unwrap_or("?");
@@ -654,11 +663,15 @@ impl OutputAdapter for AgyStreamJson {
     }
 
     fn finish(&mut self) -> AdapterOut {
-        let text = match self.response.take() {
-            Some(r) if !r.trim().is_empty() => Some(r),
+        let (text, cut) = match self.response.take() {
+            Some((r, cut)) if !r.trim().is_empty() => (Some(r), cut),
             // No `result` answer: what the turn streamed, if anything.
-            _ => Some(std::mem::take(&mut self.streamed)).filter(|t| !t.trim().is_empty()),
+            _ => (
+                Some(std::mem::take(&mut self.streamed)).filter(|t| !t.trim().is_empty()),
+                self.streamed_cut,
+            ),
         };
+        let text = text.map(|t| if cut { t + AGY_TRUNCATED } else { t });
         AdapterOut {
             text: text.into_iter().collect(),
             ..AdapterOut::default()
@@ -4044,6 +4057,8 @@ impl WrappedCliStepRunner {
                 );
             }
             let mut bounded = bounded;
+            // The process's own exit code, before any settle below rewrites it.
+            let raw_exit = bounded.as_ref().ok().map(|r| r.0);
             // agy's own --print-timeout cut the turn off (it exits 0, its stream says SUCCESS,
             // its stderr says otherwise), in any output format: not a done turn.
             let agy_cut_off = settle_agy_cut_off(seat_cli, &mut bounded);
@@ -4154,12 +4169,14 @@ impl WrappedCliStepRunner {
                         (false, _) => out,
                         _ => err,
                     };
-                    // agy documents what its exit codes mean: the record says it.
-                    let meaning = (seat_cli == wicked_apps_core::spawn::SeatCli::Agy)
-                        .then(|| agy_exit_meaning(code))
-                        .flatten()
-                        .map(|m| format!("{m}: "))
-                        .unwrap_or_default();
+                    // agy documents what its exit codes mean: the record says it, for an exit
+                    // agy itself made (a turn the engine settled as not done exited 0).
+                    let meaning = (seat_cli == wicked_apps_core::spawn::SeatCli::Agy
+                        && raw_exit == Some(code))
+                    .then(|| agy_exit_meaning(code))
+                    .flatten()
+                    .map(|m| format!("{m}: "))
+                    .unwrap_or_default();
                     (
                         StepStatus::Failed,
                         format!("(cli `{cli_key}` exited {code}) {meaning}{detail}"),
