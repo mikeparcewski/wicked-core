@@ -517,7 +517,6 @@ enum Overflowed {
 /// What `conn`'s request line shows, read within `limit` in all (the socket timeout is recomputed
 /// before every read, so a client dripping bytes cannot extend it), at most 1 KiB.
 fn request_token_within(conn: &mut TcpStream, limit: Duration) -> Overflowed {
-    const HOOK: &[u8] = b"POST /hook/";
     let deadline = Instant::now() + limit;
     let mut line = Vec::new();
     let mut buf = [0u8; 256];
@@ -541,7 +540,7 @@ fn request_token_within(conn: &mut TcpStream, limit: Duration) -> Overflowed {
     let parsed = std::str::from_utf8(head).ok().and_then(route);
     match parsed {
         Some(Route::Hook(t)) if complete => Overflowed::Hook(t),
-        _ if head.starts_with(HOOK) || HOOK.starts_with(head) => Overflowed::Unknown,
+        _ if hook_like(head) => Overflowed::Unknown,
         _ => Overflowed::Other,
     }
 }
@@ -601,6 +600,8 @@ fn tool_call(body: &[u8]) -> Option<String> {
 fn serve(conn: TcpStream) {
     let _ = conn.set_read_timeout(Some(Duration::from_secs(30)));
     let Ok(read_half) = conn.try_clone() else {
+        // Unservable (no descriptor to read with): unattributable, so every live unit fails closed.
+        fail_every_live_unit();
         return;
     };
     let mut reader = BufReader::new(read_half);
@@ -610,18 +611,19 @@ fn serve(conn: TcpStream) {
         // An oversized or unreadable request line: refused, and recorded against the live unit
         // its prefix names (the token precedes any padding), like any other hook-request failure.
         Err(prefix) => {
-            return match token_in_prefix(&prefix) {
-                Some(token) => respond(
-                    conn,
-                    "200 OK",
-                    &refuse_for(
-                        Some(&token),
-                        UNKNOWN_TOOL,
-                        "the hook request line is oversized or unreadable",
-                    ),
-                ),
-                None => respond(conn, "431 Request Header Fields Too Large", "{}"),
-            }
+            let why = "the hook request line is oversized, cut off or unreadable";
+            return match token_in_prefix(&prefix).filter(|t| unit(t).is_some()) {
+                Some(token) => {
+                    respond(conn, "200 OK", &refuse_for(Some(&token), UNKNOWN_TOOL, why))
+                }
+                None => {
+                    // Possibly a hook call whose unit cannot be told: every live unit may own it.
+                    if hook_like(&prefix) {
+                        fail_every_live_unit();
+                    }
+                    respond(conn, "431 Request Header Fields Too Large", "{}")
+                }
+            };
         }
     };
     // The route, and the token of a hook request, come from the request line alone, so a hook
@@ -751,11 +753,20 @@ fn request_line(reader: &mut impl BufRead, budget: &mut usize) -> Result<String,
     }
 }
 
-/// The hook token a request line's prefix names: `POST /hook/<hex>` followed by a space.
+/// The hook token a request line's prefix names: `POST /hook/<hex>`, ended by a space or by the
+/// end of what arrived (a line cut off right after its token).
 fn token_in_prefix(prefix: &[u8]) -> Option<String> {
     let rest = prefix.strip_prefix(b"POST /hook/")?;
     let n = rest.iter().take_while(|b| b.is_ascii_hexdigit()).count();
-    (n > 0 && rest.get(n) == Some(&b' ')).then(|| String::from_utf8_lossy(&rest[..n]).into_owned())
+    (n > 0 && matches!(rest.get(n), Some(b' ' | b'\r' | b'\n') | None))
+        .then(|| String::from_utf8_lossy(&rest[..n]).into_owned())
+}
+
+/// Whether what arrived of a request line may be a hook call: it starts `POST /hook/`, or is a
+/// prefix of that.
+fn hook_like(prefix: &[u8]) -> bool {
+    const HOOK: &[u8] = b"POST /hook/";
+    prefix.starts_with(HOOK) || HOOK.starts_with(prefix)
 }
 
 /// The live unit `token` names, if any.
@@ -1820,6 +1831,20 @@ mod tests {
             assert_eq!(rec.len(), 1, "{rec:?} / {resp}");
             assert!(rec[0].obligations[0].contains("request line"), "{rec:?}");
             assert_eq!(runs("longline"), 0);
+        }
+
+        // A request line cut off right after a live unit's token is attributed and recorded
+        // (review round 15).
+        {
+            let (t, _r16, log) = unit("cutoff");
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.write_all(format!("POST /hook/{t}").as_bytes()).unwrap();
+            s.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut resp = String::new();
+            let _ = s.read_to_string(&mut resp);
+            let rec = records(&log);
+            assert_eq!(rec.len(), 1, "{rec:?} / {resp}");
+            assert!(rec[0].obligations[0].contains("cut off"), "{rec:?}");
         }
 
         // A refusal that cannot be recorded (the unit's decisions log is unwritable) marks the
