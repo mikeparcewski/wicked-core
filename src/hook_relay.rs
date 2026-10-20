@@ -416,31 +416,83 @@ impl Drop for Slot {
     }
 }
 
-/// A connection past [`MAX_CONNS`]: closed without serving it (no thread), but when its request
-/// line names a live unit's token, within a short read, that unit is marked to fail closed at its
-/// end: its call was refused (the seat's hook sees the close and denies) and the refusal is not in
-/// its decisions log.
-fn overflow(conn: TcpStream) {
-    let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
-    let mut reader = BufReader::new(conn);
-    let mut budget = 1024;
-    let token = bounded_line(&mut reader, &mut budget).and_then(|line| match route(&line) {
+/// A connection past [`MAX_CONNS`]: never served, and never read on the accepting thread. A
+/// bounded pool of [`MAX_OVERFLOW`] short-lived workers reads its request line within one
+/// absolute deadline ([`OVERFLOW_READ`]) and, when it names a live unit's token, marks that unit
+/// to fail closed at its end: its call was refused (the seat's hook sees the close and denies) and
+/// the refusal is not in its decisions log. Past the pool the connection is closed unread (a
+/// flood that size cannot be attributed; each of its calls is still denied at the seat).
+fn overflow(mut conn: TcpStream) {
+    let Some(worker) = OverflowWorker::take() else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let _worker = worker;
+        let Some(token) = request_token_within(&mut conn, OVERFLOW_READ) else {
+            return;
+        };
+        // Marked while holding a `Call`, so the unit's end waits for the mark (or, past its wait,
+        // fails closed anyway); a unit that already ended is not live.
+        let live = unit(&token).and_then(|reg| reg.life.enter().map(|call| (reg, call)));
+        if let Some((reg, call)) = live {
+            reg.life.mark_unrecorded();
+            drop(call);
+            // Closed only once its unit is marked.
+            drop(conn);
+            eprintln!(
+                "wicked-core: the gate hook relay is at its connection limit; a call of a live \
+                 unit was refused unrecorded, and the unit will fail closed"
+            );
+        }
+    });
+}
+
+/// The overflow workers alive at once.
+const MAX_OVERFLOW: usize = 8;
+/// How long an overflow worker reads a request line, in all.
+const OVERFLOW_READ: Duration = Duration::from_millis(500);
+
+static OVERFLOW: AtomicUsize = AtomicUsize::new(0);
+
+struct OverflowWorker;
+
+impl OverflowWorker {
+    fn take() -> Option<Self> {
+        if OVERFLOW.fetch_add(1, Ordering::SeqCst) >= MAX_OVERFLOW {
+            OVERFLOW.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(OverflowWorker)
+    }
+}
+
+impl Drop for OverflowWorker {
+    fn drop(&mut self) {
+        OVERFLOW.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The hook token of `conn`'s request line, read within `limit` in all (the socket timeout is
+/// recomputed before every read, so a client dripping bytes cannot extend it), at most 1 KiB.
+fn request_token_within(conn: &mut TcpStream, limit: Duration) -> Option<String> {
+    let deadline = Instant::now() + limit;
+    let mut line = Vec::new();
+    let mut buf = [0u8; 256];
+    while !line.contains(&b'\n') {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || line.len() > 1024 {
+            return None;
+        }
+        conn.set_read_timeout(Some(left)).ok()?;
+        match conn.read(&mut buf) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => line.extend_from_slice(&buf[..n]),
+        }
+    }
+    let end = line.iter().position(|b| *b == b'\n')?;
+    match route(std::str::from_utf8(&line[..end]).ok()?) {
         Some(Route::Hook(t)) => Some(t),
         _ => None,
-    });
-    // Marked while holding a `Call`, so the unit's end waits for the mark (or, past its wait,
-    // fails closed anyway); a unit that already ended is not live.
-    let live = token
-        .as_deref()
-        .and_then(unit)
-        .and_then(|reg| reg.life.enter().map(|call| (reg, call)));
-    if let Some((reg, call)) = live {
-        reg.life.mark_unrecorded();
-        drop(call);
-        eprintln!(
-            "wicked-core: the gate hook relay is at its connection limit; a call of a live unit \
-             was refused unrecorded, and the unit will fail closed"
-        );
     }
 }
 
@@ -655,7 +707,9 @@ fn judge(reg: &Registered, call: &Call, tool: &str, body: &[u8], budget: Duratio
     let log_len = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
     let before = log.as_deref().map(log_len);
     let mut note = "";
-    let answered = match run_gate_hook(ctx, call, body, deadline) {
+    // One id for this call's runs, stamped by the gate hook into every claim it records for it.
+    let invocation = uuid::Uuid::new_v4().simple().to_string();
+    let answered = match run_gate_hook(ctx, call, &invocation, body, deadline) {
         HookRun::Killed { signal, stderr } => {
             let untouched = before.is_some() && log.as_deref().map(log_len) == before;
             let time_left = Instant::now() < deadline;
@@ -673,7 +727,7 @@ fn judge(reg: &Registered, call: &Call, tool: &str, body: &[u8], budget: Duratio
                 // both checked where it is spawned ([`run_gate_hook`]).
                 (true, true) => {
                     note = " (a first run was killed before it answered too)";
-                    run_gate_hook(ctx, call, body, deadline)
+                    run_gate_hook(ctx, call, &invocation, body, deadline)
                 }
                 (true, false) => {
                     note = "; no time was left to judge it again";
@@ -714,7 +768,7 @@ fn judge(reg: &Registered, call: &Call, tool: &str, body: &[u8], budget: Duratio
             // turn is held), not just any growth: the gate hook writes its liveness sentinel before
             // it judges, and can then fail to write its decision.
             let recorded = match (log.as_deref(), before) {
-                (Some(log), Some(from)) => records_a_deny_since(log, from),
+                (Some(log), Some(from)) => records_a_deny_since(log, from, &invocation),
                 _ => false,
             };
             if recorded {
@@ -733,9 +787,11 @@ fn judge(reg: &Registered, call: &Call, tool: &str, body: &[u8], budget: Duratio
     }
 }
 
-/// Whether `log` gained a deny claim past byte `from` (a line naming a claim id whose decision is
-/// `deny`). Unreadable = no.
-fn records_a_deny_since(log: &std::path::Path, from: u64) -> bool {
+/// Whether `log` gained, past byte `from`, a deny claim the gate hook recorded for THIS call: one
+/// whose tool-call annotation carries `invocation` ([`crate::gate_hook::HOOK_INVOCATION_KEY`]). A
+/// claim another recorder wrote meanwhile (the MCP broker's, say) is not this call's record.
+/// Unreadable = no.
+fn records_a_deny_since(log: &std::path::Path, from: u64, invocation: &str) -> bool {
     use std::io::{Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(log) else {
         return false;
@@ -744,12 +800,25 @@ fn records_a_deny_since(log: &std::path::Path, from: u64) -> bool {
     if f.seek(SeekFrom::Start(from)).is_err() || f.read_to_string(&mut tail).is_err() {
         return false;
     }
-    tail.lines().any(|line| {
-        serde_json::from_str::<serde_json::Value>(line.trim()).is_ok_and(|v| {
-            v.get("claim_id").is_some_and(serde_json::Value::is_string)
-                && v.get("decision").and_then(serde_json::Value::as_str) == Some("deny")
-        })
-    })
+    let mut ours = false;
+    for line in tail.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            ours = false;
+            continue;
+        };
+        if v.get("claim_id").is_some_and(serde_json::Value::is_string) {
+            if ours && v.get("decision").and_then(serde_json::Value::as_str) == Some("deny") {
+                return true;
+            }
+            ours = false;
+        } else if v.get(crate::gate_hook::TOOL_CALL_KEY).is_some() {
+            ours = v
+                .get(crate::gate_hook::HOOK_INVOCATION_KEY)
+                .and_then(|x| x.as_str())
+                == Some(invocation);
+        }
+    }
+    false
 }
 
 /// The value `ctx` gives `key` (non-empty), as its hook would have inherited it.
@@ -905,7 +974,13 @@ fn status_run(status: std::process::ExitStatus, stdout: Vec<u8>, stderr: Vec<u8>
 /// connection slot ([`InFlight`]) for as long as they live, so a hook whose descendants escape
 /// the group and keep the pipes open uses up the relay's slots (new calls are refused, fail
 /// closed) instead of growing the daemon's threads without bound.
-fn run_gate_hook(ctx: &HookContext, call: &Call, payload: &[u8], deadline: Instant) -> HookRun {
+fn run_gate_hook(
+    ctx: &HookContext,
+    call: &Call,
+    invocation: &str,
+    payload: &[u8],
+    deadline: Instant,
+) -> HookRun {
     let exe = crate::execute_wrapped::resolve_wicked_core_exe();
     let mut cmd = Command::new(&exe);
     cmd.hardened()
@@ -925,6 +1000,7 @@ fn run_gate_hook(ctx: &HookContext, call: &Call, payload: &[u8], deadline: Insta
             None => cmd.env_remove(k),
         };
     }
+    cmd.env(crate::gate_hook::HOOK_INVOCATION_ENV, invocation);
     if let Some(cwd) = &ctx.cwd {
         cmd.current_dir(cwd);
     }
@@ -1308,9 +1384,13 @@ mod tests {
              kill-once) [ -e \"$WICKED_TEST_DIR/killed\" ] || { : > \"$WICKED_TEST_DIR/killed\"; kill -9 $$; } ;;\n\
              kill) kill -9 $$ ;;\n\
              exit1|unwritable) exit 1 ;;\n\
-             deny) printf '%s\\n' '{\"claim_id\":\"policy-deny:unit-5\",\"scope\":\"s\",\"phase\":\"unit-5\",\"policy_ids\":[\"test-policy\"],\"decision\":\"deny\",\"obligations\":[\"denied by test policy\"],\"evaluated_context_ref\":\"sha256:p\",\"criteria\":\"c\",\"evaluator_identity\":\"wicked-governance\",\"evaluated_at\":1792454400}' >> \"$WICKED_DECISIONS_PATH\"; \
+             deny) printf '%s\\n' \"{\\\"_wicked_tool_call\\\":\\\"Bash\\\",\\\"_wicked_tool_phase\\\":\\\"unit-5\\\",\\\"_wicked_hook_invocation\\\":\\\"$WICKED_HOOK_INVOCATION\\\"}\" >> \"$WICKED_DECISIONS_PATH\"; \
+             printf '%s\\n' '{\"claim_id\":\"policy-deny:unit-5\",\"scope\":\"s\",\"phase\":\"unit-5\",\"policy_ids\":[\"test-policy\"],\"decision\":\"deny\",\"obligations\":[\"denied by test policy\"],\"evaluated_context_ref\":\"sha256:p\",\"criteria\":\"c\",\"evaluator_identity\":\"wicked-governance\",\"evaluated_at\":1792454400}' >> \"$WICKED_DECISIONS_PATH\"; \
              echo 'denied by test policy' >&2; exit 2 ;;\n\
              deny-unrecorded) echo 'DENY (could not write hook-fired sentinel)' >&2; exit 2 ;;\n\
+             foreign-deny) printf '%s\\n' '{\"_wicked_tool_call\":\"mcp__wicked__write\",\"_wicked_tool_phase\":\"unit-5\"}' \
+             '{\"claim_id\":\"mcp-deny:unit-5\",\"scope\":\"s\",\"phase\":\"unit-5\",\"policy_ids\":[\"engine:mcp\"],\"decision\":\"deny\",\"obligations\":[\"mcp\"],\"evaluated_context_ref\":\"sha256:m\",\"criteria\":\"c\",\"evaluator_identity\":\"wicked-mcp\",\"evaluated_at\":1792454400}' \
+             >> \"$WICKED_DECISIONS_PATH\"; echo 'DENY (could not record the decision)' >&2; exit 2 ;;\n\
              sentinel-only) printf '%s\\n' '{\"_wicked_hook_fired\":\"unit-5\"}' >> \"$WICKED_DECISIONS_PATH\"; \
              echo 'DENY (could not record the decision)' >&2; exit 2 ;;\n\
              esac\nexit 0\n",
@@ -1452,6 +1532,36 @@ mod tests {
             rec[0].denying_policy.as_deref(),
             Some(crate::gate_hook::INFRA_RULE_ID)
         );
+        // …and one whose only new deny is another recorder's, for another call (round 11).
+        let (t, _r4d, log) = unit("foreign-deny");
+        let d = post(&t, &payload);
+        assert!(reason(&d).contains("recorded nothing"), "{d}");
+        let rec = records(&log);
+        assert_eq!(rec.len(), 2, "{rec:?}");
+        assert_eq!(
+            rec[1].denying_policy.as_deref(),
+            Some(crate::gate_hook::INFRA_RULE_ID)
+        );
+        // Every claim the gate hook records for a relayed call carries the call's id.
+        {
+            let p = dir.join("annotated.ndjson");
+            std::env::set_var(crate::gate_hook::HOOK_INVOCATION_ENV, "inv-1");
+            crate::gate_hook::append_infra_deny_checked(
+                p.to_str().unwrap(),
+                "s",
+                "unit-5",
+                "Bash",
+                "r",
+            )
+            .unwrap();
+            std::env::remove_var(crate::gate_hook::HOOK_INVOCATION_ENV);
+            let first = std::fs::read_to_string(&p).unwrap();
+            let ann: serde_json::Value =
+                serde_json::from_str(first.lines().next().unwrap()).unwrap();
+            assert_eq!(ann[crate::gate_hook::HOOK_INVOCATION_KEY], "inv-1");
+            assert!(records_a_deny_since(&p, 0, "inv-1"));
+            assert!(!records_a_deny_since(&p, 0, "inv-2"));
+        }
         // …and so is one that wrote only its liveness sentinel before failing (round 10).
         let (t, _r4c, log) = unit("sentinel-only");
         let d = post(&t, &payload);
@@ -1719,6 +1829,26 @@ mod tests {
             ACTIVE.fetch_sub(MAX_CONNS, Ordering::SeqCst);
             assert!(rest.is_empty(), "closed unserved");
             assert!(r12.finish(), "the overflowed unit fails closed");
+            // An overflow client dripping its request line never holds up the accepting thread
+            // (core#1055 review round 11): the relay answers a ping while it drips.
+            ACTIVE.fetch_add(MAX_CONNS, Ordering::SeqCst);
+            let mut drip = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            drip.write_all(b"POST /hook/").unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            ACTIVE.fetch_sub(MAX_CONNS, Ordering::SeqCst);
+            let started = std::time::Instant::now();
+            let mut ping = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            ping.write_all(b"GET /ping HTTP/1.1\r\nhost: x\r\n\r\n")
+                .unwrap();
+            let mut pong = String::new();
+            ping.read_to_string(&mut pong).unwrap();
+            assert!(pong.contains("pong"), "{pong}");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "the ping waited {:?}",
+                started.elapsed()
+            );
+            drop(drip);
         }
 
         // An unknown token has no unit to record in: refused with its reason.

@@ -5151,7 +5151,14 @@ const HOOK_FIRED_KEY: &str = "_wicked_hook_fired";
 /// tool name in `GovernanceHookFired` events without re-running the evaluation. Written in the same
 /// single buffer as the claim (both under the advisory lock) — a write failure returns exit 2 (fail
 /// closed) and no decision is appended.
-const TOOL_CALL_KEY: &str = "_wicked_tool_call";
+pub(crate) const TOOL_CALL_KEY: &str = "_wicked_tool_call";
+/// The environment variable the container floor's hook relay sets to one id per relayed call
+/// ([`crate::hook_relay`]); every claim the hook process records for it carries the id in its
+/// tool-call annotation ([`HOOK_INVOCATION_KEY`]), so the relay can tell this call's record from
+/// any other written to the unit's log.
+pub(crate) const HOOK_INVOCATION_ENV: &str = "WICKED_HOOK_INVOCATION";
+/// The annotation key carrying [`HOOK_INVOCATION_ENV`].
+pub(crate) const HOOK_INVOCATION_KEY: &str = "_wicked_hook_invocation";
 /// Companion phase key on the tool-call annotation (pairs with `TOOL_CALL_KEY`).
 const TOOL_CALL_PHASE_KEY: &str = "_wicked_tool_phase";
 
@@ -5393,12 +5400,18 @@ pub(crate) fn append_annotated_claim_checked(
     tool: &str,
     claim: &ConformanceClaim,
 ) -> std::io::Result<()> {
-    let annotation = serde_json::json!({
+    let mut annotation = serde_json::json!({
         TOOL_CALL_KEY: audit_tool_name(tool),
         TOOL_CALL_PHASE_KEY: phase,
-    })
-    .to_string()
-        + "\n";
+    });
+    // The hook relay's per-invocation id, when it ran this hook: ties the claim to that one call.
+    if let Some(id) = std::env::var(HOOK_INVOCATION_ENV)
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        annotation[HOOK_INVOCATION_KEY] = id.into();
+    }
+    let annotation = annotation.to_string() + "\n";
     let mut claim_line = serde_json::to_string(claim).map_err(std::io::Error::other)?;
     claim_line.push('\n');
     let combined = annotation + &claim_line;
