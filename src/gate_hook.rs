@@ -5415,7 +5415,17 @@ pub(crate) fn append_annotated_claim_checked(
     })
 }
 
-fn append_infra_deny(decisions_path: &str, scope: &str, phase: &str, tool: &str, reason: &str) {
+/// Record a governance INFRA failure for one tool call: the call was refused because it could not
+/// be judged (the store would not open, the policies could not be selected, or a container seat's
+/// gate hook gave no verdict through the relay, [`crate::hook_relay`]). Unit-fatal: an un-judged
+/// call is never evidence the unit stayed in policy.
+pub(crate) fn append_infra_deny(
+    decisions_path: &str,
+    scope: &str,
+    phase: &str,
+    tool: &str,
+    reason: &str,
+) {
     let claim = ConformanceClaim {
         // Keyed on `phase` only — NOT the scope, which embeds `/` (`wicked-agent/<sess>/unit/<id>`) and
         // would make an unsafe/unbounded claim symbol (Copilot). One infra-deny node per phase is enough

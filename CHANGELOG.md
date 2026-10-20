@@ -14,6 +14,21 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A container seat's gate hook no longer refuses a call silently, and a killed gate hook is judged again.** In
+  core#997's end-to-end run a claude seat's `cargo test` loop was refused with "the gate hook failed (exit 1): ;"
+  and nothing else: no reason, no line in the daemon's log, no deny in the unit's decisions log. The host gate
+  hook had not judged the call (the decisions log has no hook-fired line for it, and the same payload is allowed
+  when run again), and the hook relay reported its death by a signal as `exit 1` with an empty reason. The relay
+  now tells the outcomes apart. The gate hook's own allow (0) and deny (2) are answered as before. A gate hook
+  ended by a signal before it answered judged nothing, so the call is judged once more within the call's one
+  60 s budget. Every other outcome is refused fail closed by the relay itself: a second signal, another exit
+  code, a gate hook that could not start or ran past the budget, an unknown token, or a payload that is not a tool
+  call. The answer names the reason (the signal included), the daemon's log gets a line, and the unit's decisions
+  log records it as an infra deny, which the fold replays as a `governanceHookFired` deny and which denies the
+  unit. A unit test runs the run's own payload against gate hooks that die once, die every time, exit 1 and
+  deny; a live test (`WICKED_CONTAINER_LIVE=1`) drives a real claude container seat through the gateway with a
+  long `cargo test`-like loop, a call whose gate hook is killed once, and one whose gate hook keeps dying.
+
 - **A container seat's cargo builds within the seat's memory limit.** A seat runs with a fixed memory limit
   (`WICKED_SEAT_MEMORY`, default 3g) and cargo's workstation defaults: one job per CPU, full debuginfo and
   incremental state. In core#997's end-to-end run a claude seat's `cargo test --lib seat_login::tests` of this

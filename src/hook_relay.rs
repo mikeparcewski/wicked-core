@@ -19,9 +19,16 @@
 //! **Glue only.** The judgement, the decisions log and the store are the existing gate hook's;
 //! the relay maps its exit code to the hook's JSON answer: 0 → claude's allow decision (its own
 //! stdout's object, if any, rides along; core#1027),
-//! 2 → deny with its stderr as the reason, anything else (a crash, a timeout, an unknown token)
-//! → deny. A token is minted per unit, known only to that seat and the relay, and revoked when
-//! the unit ends.
+//! 2 → deny with its stderr as the reason (the gate hook recorded that decision itself). Anything
+//! else is no verdict and the relay refuses the call itself: the gate hook failed (another exit
+//! code), could not start, ran past the call's budget, or the request is not one it can judge (an
+//! unknown token, a payload that is not a tool call). Every such refusal names its reason in the
+//! answer and in the daemon's log, and is recorded in the unit's decisions log as an infra deny,
+//! which the fold replays as a `governanceHookFired` deny and which denies the unit (core#997:
+//! a refusal used to read only "the gate hook failed (exit 1)", with nothing logged or recorded).
+//! A gate hook ended by a signal before it answered judged nothing, so the relay judges the call
+//! once more within the same budget; a second such ending is refused. A token is minted per unit,
+//! known only to that seat and the relay, and revoked when the unit ends.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -175,16 +182,7 @@ pub(crate) fn revoke(token: &str) {
 /// deny stays deny. A JSON object the gate hook printed rides along; a decision it already
 /// states is kept, never upgraded.
 pub(crate) fn answer(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> String {
-    let deny = |reason: &str| {
-        serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason,
-            }
-        })
-        .to_string()
-    };
+    let deny = deny_answer;
     match code {
         Some(0) => {
             let out = String::from_utf8_lossy(stdout);
@@ -216,6 +214,18 @@ pub(crate) fn answer(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> String 
         )),
         None => deny("the gate hook did not finish in time; the call is denied (fail closed)"),
     }
+}
+
+/// claude's PreToolUse deny answer with `reason`.
+fn deny_answer(reason: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    })
+    .to_string()
 }
 
 /// The token in a request line `POST /hook/<token> HTTP/1.1`, and whether it is a liveness probe.
@@ -322,12 +332,11 @@ fn read_chunked(reader: &mut impl BufRead) -> Option<Vec<u8>> {
 /// The payload is a PreToolUse tool call: a JSON object naming its tool. Anything else (an empty
 /// or non-JSON body) is never handed to the gate hook, which would judge it as no call at all
 /// (agy gw-r1 F-01: an empty body was allowed).
-fn is_tool_call(body: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| {
-        v.get("tool_name")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|t| !t.trim().is_empty())
-    })
+/// The tool it names, when it is one.
+fn tool_call(body: &[u8]) -> Option<String> {
+    let v = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let tool = v.get("tool_name")?.as_str()?.trim();
+    (!tool.is_empty()).then(|| tool.to_string())
 }
 
 fn serve(conn: TcpStream) {
@@ -368,38 +377,211 @@ fn serve(conn: TcpStream) {
         Some(Route::Hook(t)) => t,
         None => return respond(conn, "404 Not Found", "{}"),
     };
-    let deny = |conn, why: &[u8]| respond(conn, "200 OK", &answer(Some(1), b"", why));
+    // A payload error is judged against the unit the token names (when it names one), so its
+    // refusal is recorded in that unit's decisions log too.
+    let ctx = relay().and_then(|r| r.units.lock().ok().and_then(|m| m.get(&token).cloned()));
+    let refuse = |conn, why: &str, tool: &str| {
+        respond(conn, "200 OK", &refusal(ctx.as_ref(), tool, why));
+    };
     let body = if chunked {
         match read_chunked(&mut reader) {
             Some(b) => b,
-            None => return deny(conn, b"unreadable or oversized chunked hook payload"),
+            None => {
+                return refuse(
+                    conn,
+                    "unreadable or oversized chunked hook payload",
+                    UNKNOWN_TOOL,
+                )
+            }
         }
     } else {
         match length {
-            Some(n) if n > MAX_BODY => return deny(conn, b"hook payload too large"),
+            Some(n) if n > MAX_BODY => return refuse(conn, "hook payload too large", UNKNOWN_TOOL),
             Some(n) => {
                 let mut body = vec![0u8; n];
                 if reader.read_exact(&mut body).is_err() {
-                    return deny(conn, b"truncated hook payload");
+                    return refuse(conn, "truncated hook payload", UNKNOWN_TOOL);
                 }
                 body
             }
-            None => return deny(conn, b"hook payload without a length"),
+            None => return refuse(conn, "hook payload without a length", UNKNOWN_TOOL),
         }
     };
-    if !is_tool_call(&body) {
-        return deny(conn, b"the hook payload is not a tool call");
-    }
-    let ctx = relay().and_then(|r| r.units.lock().ok().and_then(|m| m.get(&token).cloned()));
-    let Some(ctx) = ctx else {
-        return deny(conn, b"unknown or revoked hook token");
+    let Some(tool) = tool_call(&body) else {
+        return refuse(conn, "the hook payload is not a tool call", UNKNOWN_TOOL);
     };
-    let (code, out, err) = run_gate_hook(&ctx, &body);
-    respond(conn, "200 OK", &answer(code, &out, &err));
+    let Some(ctx) = ctx.as_ref() else {
+        return refuse(conn, "unknown or revoked hook token", &tool);
+    };
+    let start = Instant::now();
+    let answered = match run_gate_hook(ctx, &body, HOOK_TIMEOUT) {
+        // The judge was ended from outside before it answered (core#997's run: killed on a loaded
+        // host, no verdict, nothing recorded): it judged nothing, so the call is judged once more,
+        // within what is left of the call's one budget. A second such ending is refused like any
+        // other failure.
+        HookRun::Killed { signal, stderr } => {
+            let left = HOOK_TIMEOUT.saturating_sub(start.elapsed());
+            eprintln!(
+                "wicked-core: the gate hook was killed by {} before it judged a {tool} call; {}",
+                signal_name(signal),
+                if left.is_zero() {
+                    "no time is left to judge it again"
+                } else {
+                    "judging it again"
+                }
+            );
+            if left.is_zero() {
+                HookRun::Killed { signal, stderr }
+            } else {
+                run_gate_hook(ctx, &body, left)
+            }
+        }
+        other => other,
+    };
+    let reply = match answered {
+        // Allowed (0) or denied (2) by the gate hook, which recorded its own decision.
+        HookRun::Exited {
+            code: code @ (0 | 2),
+            stdout,
+            stderr,
+        } => answer(Some(code), &stdout, &stderr),
+        failed => refusal(Some(ctx), &tool, &failed.why()),
+    };
+    respond(conn, "200 OK", &reply)
 }
 
-/// Run the host gate hook with the unit's env and `payload` on stdin, bounded.
-fn run_gate_hook(ctx: &HookContext, payload: &[u8]) -> (Option<i32>, Vec<u8>, Vec<u8>) {
+/// The tool name a refusal is recorded under when the payload names none.
+const UNKNOWN_TOOL: &str = "(unknown)";
+
+/// A call the relay refuses itself (the gate hook gave no verdict, or the request is not one it
+/// can judge): the deny answer carries the reason, the daemon's log names it, and the unit's
+/// decisions log records it as an infra deny ([`crate::gate_hook::append_infra_deny`], replayed
+/// as a `governanceHookFired` deny), so a refusal is never silent. A request whose token names no
+/// live unit has no decisions log to record in; its refusal is logged only.
+fn refusal(ctx: Option<&HookContext>, tool: &str, why: &str) -> String {
+    let reason =
+        format!("the gate hook relay refused the call: {why}; the call is denied (fail closed)");
+    eprintln!("wicked-core: {reason} (tool: {tool})");
+    if let Some(ctx) = ctx {
+        let var = |k: &str| {
+            ctx.env
+                .iter()
+                .find(|(n, _)| n.as_os_str() == k)
+                .and_then(|(_, v)| v.as_ref())
+                .map(|v| v.to_string_lossy().into_owned())
+                .filter(|v| !v.is_empty())
+        };
+        match (
+            var(crate::gate_hook::DECISIONS_PATH_ENV),
+            var(crate::gate_hook::GATE_SCOPE_ENV),
+            var(crate::gate_hook::GATE_PHASE_ENV),
+        ) {
+            (Some(log), Some(scope), Some(phase)) => {
+                crate::gate_hook::append_infra_deny(&log, &scope, &phase, tool, &reason)
+            }
+            _ => eprintln!(
+                "wicked-core: the refused call's unit names no decisions log; the refusal is \
+                 recorded here only"
+            ),
+        }
+    }
+    deny_answer(&reason)
+}
+
+/// How one run of the host gate hook ended.
+#[derive(Debug)]
+enum HookRun {
+    /// It exited with `code`: 0 = allow, 2 = deny, anything else = it failed.
+    Exited {
+        code: i32,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    /// It was ended by `signal` before it exited (no verdict).
+    Killed { signal: i32, stderr: Vec<u8> },
+    /// It could not be started, or its status could not be read (what failed).
+    Lost(String),
+    /// It ran past its limit (the call's [`HOOK_TIMEOUT`]) and was stopped.
+    TimedOut,
+}
+
+impl HookRun {
+    /// Why this run is no verdict (a refusal's reason).
+    fn why(&self) -> String {
+        let tail = |b: &[u8]| {
+            let t = String::from_utf8_lossy(b).trim().to_string();
+            if t.is_empty() {
+                "no output".to_string()
+            } else {
+                t
+            }
+        };
+        match self {
+            HookRun::Exited { code, stderr, .. } => {
+                format!("the gate hook failed (exit {code}): {}", tail(stderr))
+            }
+            HookRun::Killed { signal, stderr } => format!(
+                "the gate hook was killed by {} before it judged the call, and judging it again \
+                 gave no verdict either: {}",
+                signal_name(*signal),
+                tail(stderr)
+            ),
+            HookRun::Lost(e) => format!("the gate hook {e}"),
+            HookRun::TimedOut => format!(
+                "the gate hook did not finish within the call's {}s",
+                HOOK_TIMEOUT.as_secs()
+            ),
+        }
+    }
+}
+
+/// A signal's name for the log and the reason (`signal 9 (SIGKILL)`).
+fn signal_name(signal: i32) -> String {
+    #[cfg(unix)]
+    let name = match signal {
+        libc::SIGKILL => Some("SIGKILL"),
+        libc::SIGTERM => Some("SIGTERM"),
+        libc::SIGINT => Some("SIGINT"),
+        libc::SIGHUP => Some("SIGHUP"),
+        libc::SIGSEGV => Some("SIGSEGV"),
+        libc::SIGBUS => Some("SIGBUS"),
+        libc::SIGABRT => Some("SIGABRT"),
+        libc::SIGPIPE => Some("SIGPIPE"),
+        _ => None,
+    };
+    #[cfg(not(unix))]
+    let name: Option<&str> = None;
+    match name {
+        Some(n) => format!("signal {signal} ({n})"),
+        None => format!("signal {signal}"),
+    }
+}
+
+/// How an exit status ended: its code, or the signal that ended it.
+fn status_run(status: std::process::ExitStatus, stdout: Vec<u8>, stderr: Vec<u8>) -> HookRun {
+    if let Some(code) = status.code() {
+        return HookRun::Exited {
+            code,
+            stdout,
+            stderr,
+        };
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return HookRun::Killed { signal, stderr };
+        }
+    }
+    HookRun::Exited {
+        code: -1,
+        stdout,
+        stderr,
+    }
+}
+
+/// Run the host gate hook with the unit's env and `payload` on stdin, stopped past `limit`.
+fn run_gate_hook(ctx: &HookContext, payload: &[u8], limit: Duration) -> HookRun {
     let exe = crate::execute_wrapped::resolve_wicked_core_exe();
     let mut cmd = Command::new(&exe);
     cmd.hardened()
@@ -416,12 +598,9 @@ fn run_gate_hook(ctx: &HookContext, payload: &[u8]) -> (Option<i32>, Vec<u8>, Ve
     if let Some(cwd) = &ctx.cwd {
         cmd.current_dir(cwd);
     }
-    let Ok(mut child) = cmd.spawn() else {
-        return (
-            Some(1),
-            Vec::new(),
-            b"could not start the gate hook".to_vec(),
-        );
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return HookRun::Lost(format!("could not be started: {e}")),
     };
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(payload);
@@ -448,24 +627,26 @@ fn run_gate_hook(ctx: &HookContext, payload: &[u8]) -> (Option<i32>, Vec<u8>, Ve
             .map(|p| Box::new(p) as Box<dyn Read + Send>),
     );
     let start = Instant::now();
-    let code = loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(s)) => break s.code().or(Some(1)),
-            Ok(None) if start.elapsed() < HOOK_TIMEOUT => {
-                std::thread::sleep(Duration::from_millis(20))
-            }
-            _ => {
+            Ok(Some(s)) => break Ok(s),
+            Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(20)),
+            other => {
                 let _ = child.kill();
                 let _ = child.wait();
-                break None;
+                break Err(other.err());
             }
         }
     };
-    (
-        code,
+    let (out, err) = (
         out.join().unwrap_or_default(),
         err.join().unwrap_or_default(),
-    )
+    );
+    match status {
+        Ok(s) => status_run(s, out, err),
+        Err(None) => HookRun::TimedOut,
+        Err(Some(e)) => HookRun::Lost(format!("could not be waited for: {e}")),
+    }
 }
 
 #[cfg(test)]
@@ -674,6 +855,173 @@ mod tests {
                 .contains("unknown or revoked")
         );
         std::env::remove_var("WICKED_TEST_GONE");
+        match prev {
+            Some(v) => std::env::set_var("WICKED_CORE_EXE", v),
+            None => std::env::remove_var("WICKED_CORE_EXE"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#997's run: a claude seat's `cargo test` loop was refused with "the gate hook failed
+    /// (exit 1)" and nothing else: no reason, no line in the daemon's log, no deny in the unit's
+    /// decisions log. The gate hook had not judged the call (its log has no hook-fired line for
+    /// it); the relay read a signal death as `exit 1`. Against a host gate hook that is killed by
+    /// SIGKILL on its first run (the way it died there), the same payload is judged again and
+    /// allowed when the policy allows it. A gate hook that keeps dying, exits 1, or a payload
+    /// that is not a tool call is refused fail closed, with the reason in the answer AND as an
+    /// infra deny in the unit's decisions log (replayed as a `governanceHookFired` deny). A
+    /// policy deny (exit 2) is the gate hook's own record, never a second one from the relay.
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_gate_hook_is_judged_again_and_every_relay_refusal_is_recorded() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("wicked-relay-997-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let fake = dir.join("fake-wicked-core");
+        // MODE: `kill-once` dies by SIGKILL on its first run (a marker), `kill` always, `exit1`
+        // exits 1 with no output, `deny` is a policy deny; every run is counted.
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ncat > /dev/null\necho run >> \"$WICKED_TEST_DIR/runs-$WICKED_TEST_MODE\"\n\
+             case \"$WICKED_TEST_MODE\" in\n\
+             kill-once) [ -e \"$WICKED_TEST_DIR/killed\" ] || { : > \"$WICKED_TEST_DIR/killed\"; kill -9 $$; } ;;\n\
+             kill) kill -9 $$ ;;\n\
+             exit1) exit 1 ;;\n\
+             deny) echo 'denied by test policy' >&2; exit 2 ;;\n\
+             esac\nexit 0\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let prev = std::env::var_os("WICKED_CORE_EXE");
+        std::env::set_var("WICKED_CORE_EXE", &fake);
+        let port = port().expect("the relay listens");
+        // The call the run's seat was refused: the module-by-module `cargo test` loop.
+        let command = "cd /wt; export CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0; for m in \
+                       seat_login::tests seat_gateway::tests hook_relay::tests; do echo \"== $m\"; \
+                       timeout 280 cargo test -j2 --lib $m 2>&1 | grep -E \"^test .*FAILED|test \
+                       result|panicked\" | head -30; done";
+        let payload = serde_json::json!({
+            "session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Bash",
+            "tool_input": {"command": command, "timeout": 900000},
+        })
+        .to_string();
+        let post = |token: &str, body: &str| -> serde_json::Value {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            write!(
+                s,
+                "POST /hook/{token} HTTP/1.1\r\nhost: x\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            let mut resp = String::new();
+            s.read_to_string(&mut resp).unwrap();
+            serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+        };
+        let decision = |v: &serde_json::Value| {
+            v["hookSpecificOutput"]["permissionDecision"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let reason = |v: &serde_json::Value| {
+            v["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let runs = |mode: &str| {
+            std::fs::read_to_string(dir.join(format!("runs-{mode}")))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        // One unit per mode, each with its own decisions log, as the launcher arms it.
+        let unit = |mode: &str| {
+            let log = dir.join(format!("decisions-{mode}.ndjson"));
+            let ctx = HookContext {
+                env: vec![
+                    ("WICKED_TEST_MODE".into(), Some(mode.into())),
+                    ("WICKED_TEST_DIR".into(), Some(dir.clone().into_os_string())),
+                    (
+                        crate::gate_hook::DECISIONS_PATH_ENV.into(),
+                        Some(log.clone().into_os_string()),
+                    ),
+                    (
+                        crate::gate_hook::GATE_SCOPE_ENV.into(),
+                        Some("wicked-agent/run-997/shared".into()),
+                    ),
+                    (
+                        crate::gate_hook::GATE_PHASE_ENV.into(),
+                        Some("unit-5".into()),
+                    ),
+                ],
+                cwd: Some(dir.clone()),
+            };
+            let token = mint_token();
+            let reg = register(&token, ctx).expect("registered");
+            (token, reg, log)
+        };
+        let records =
+            |log: &std::path::Path| crate::gate_hook::collect_hook_decisions_in(log, "unit-5");
+
+        // Killed once, judged again: allowed, two runs, nothing refused or recorded by the relay.
+        let (t, _r1, log) = unit("kill-once");
+        let a = post(&t, &payload);
+        assert_eq!(decision(&a), "allow", "{a}");
+        assert_eq!(runs("kill-once"), 2);
+        assert!(records(&log).is_empty(), "{:?}", records(&log));
+
+        // Killed every time: refused, its reason names the signal, recorded as a deny.
+        let (t, _r2, log) = unit("kill");
+        let d = post(&t, &payload);
+        assert_eq!(decision(&d), "deny", "{d}");
+        assert!(reason(&d).contains("SIGKILL"), "{d}");
+        assert_eq!(runs("kill"), 2, "judged once more, then refused");
+        let rec = records(&log);
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert_eq!(rec[0].decision, "deny");
+        assert_eq!(rec[0].tool_name, "Bash");
+        assert_eq!(
+            rec[0].denying_policy.as_deref(),
+            Some(crate::gate_hook::INFRA_RULE_ID)
+        );
+        assert_eq!(rec[0].obligations.first(), Some(&reason(&d)));
+
+        // A gate hook that fails (exit 1, no output) is refused at once, and recorded.
+        let (t, _r3, log) = unit("exit1");
+        let d = post(&t, &payload);
+        assert_eq!(decision(&d), "deny", "{d}");
+        assert!(reason(&d).contains("exit 1"), "{d}");
+        assert_eq!(runs("exit1"), 1, "a failed gate hook is not run again");
+        let rec = records(&log);
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert_eq!(rec[0].obligations.first(), Some(&reason(&d)));
+
+        // A payload the relay cannot judge, on a live unit's token: refused and recorded.
+        let bad = post(&t, "{\"not\":\"a tool call\"}");
+        assert_eq!(decision(&bad), "deny");
+        assert!(reason(&bad).contains("not a tool call"), "{bad}");
+        assert_eq!(records(&log).len(), 2);
+
+        // A policy deny is the gate hook's own decision and record.
+        let (t, _r4, log) = unit("deny");
+        let d = post(&t, &payload);
+        assert_eq!(decision(&d), "deny");
+        assert_eq!(reason(&d), "denied by test policy");
+        assert!(records(&log).is_empty(), "{:?}", records(&log));
+
+        // An unknown token has no unit to record in: refused with its reason.
+        let d = post(&mint_token(), &payload);
+        assert_eq!(decision(&d), "deny");
+        assert!(reason(&d).contains("unknown or revoked"), "{d}");
+
         match prev {
             Some(v) => std::env::set_var("WICKED_CORE_EXE", v),
             None => std::env::remove_var("WICKED_CORE_EXE"),
@@ -975,5 +1323,324 @@ mod tests {
             "{}",
             tail(&revoked)
         );
+    }
+
+    /// LIVE (`WICKED_CONTAINER_LIVE=1`), core#997: the shape of the refused call in a real claude
+    /// container seat, through the real gateway's hook route and this process's relay. The model
+    /// (a stub behind the Anthropic route) asks for three Bash calls: a long `cargo test`-like
+    /// loop (child processes, thousands of output lines, ~45 s), then a call whose host gate hook
+    /// is SIGKILLed on its first run (how the run's gate hook died), then one whose gate hook dies
+    /// every time. The loop is judged and runs; the killed call is judged again and runs; the
+    /// third is refused fail closed, claude reports the relay's reason (the signal), and the
+    /// unit's decisions log holds the refusal as an infra deny for the fold to replay.
+    #[cfg(unix)]
+    #[test]
+    fn live_a_long_loop_and_a_killed_gate_hook_in_a_container_claude_seat() {
+        use crate::container_floor::{arm, finalize, output_within};
+        use crate::seat_gateway::{configure_gateway, ensure_gateway, Gateway, GatewayConfig};
+        use crate::worker_sandbox::FloorInputs;
+        use std::path::Path;
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        struct Restore(Vec<(&'static str, Option<OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (k, v) in self.0.drain(..) {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            [
+                "WICKED_WORKER_HOME",
+                "WICKED_CORE_EXE",
+                "WICKED_SEAT_IMAGE_CLAUDE",
+            ]
+            .into_iter()
+            .map(|k| (k, std::env::var_os(k)))
+            .collect(),
+        );
+        std::env::remove_var("WICKED_SEAT_IMAGE_CLAUDE");
+        let rt = crate::container_floor::runtime().expect("a container runtime answers");
+        let image = crate::container_floor::ensure_seat_image(&rt, "claude").unwrap();
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("wicked-997-live-{}", uuid::Uuid::new_v4().simple()));
+        let dir = base.join("state/gateway");
+        let worker = base.join("worker");
+        let seat_home = worker.join("seat-claude");
+        for d in [&dir, &seat_home, &base.join("stub")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::env::set_var("WICKED_WORKER_HOME", &worker);
+        // The host gate hook: records each payload; SIGKILLed on the first run of the call that
+        // writes AFTER-KILL.txt, and on every run of the one that writes FORCED.txt.
+        let calls = base.join("hook-calls.ndjson");
+        let fake = base.join("gate-hook.sh");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = gate-hook ] || exit 3\np=$(cat)\nprintf '%s\\n' \"$p\" >> '{c}'\n\
+                 case \"$p\" in\n\
+                 *AFTER-KILL.txt*) [ -e '{k}' ] || {{ : > '{k}'; kill -9 $$; }} ;;\n\
+                 *FORCED.txt*) kill -9 $$ ;;\n\
+                 esac\nexit 0\n",
+                c = calls.display(),
+                k = base.join("killed").display(),
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("WICKED_CORE_EXE", &fake);
+        let run = |argv: &[&str]| {
+            let mut c = rt.cmd();
+            c.args(argv);
+            output_within(c, Duration::from_secs(60)).unwrap()
+        };
+        let gw = Gateway::for_dir(&dir);
+        let stub = format!("{}-stub", gw.name);
+        // The `cargo test` loop of the run, with a stand-in for cargo (thousands of result lines
+        // from a child shell per module, and a wait), then the two calls whose hook is killed.
+        let cmds = [
+            "for m in seat_login::tests seat_gateway::tests hook_relay::tests; do echo \"== $m\"; \
+             sh -c 'i=0; while [ $i -lt 4000 ]; do echo \"test $0::t$i ... ok\"; i=$((i+1)); done; \
+             sleep 15; echo \"test result: ok. 4000 passed\"' \"$m\" 2>&1 | \
+             grep -E \"^test .*FAILED|test result|panicked\" | head -30; done; echo done > LONG.txt",
+            "for m in a b; do echo \"== $m\"; done; echo judged > AFTER-KILL.txt",
+            "echo forced > FORCED.txt",
+        ];
+        let cmds_json = serde_json::to_string(&cmds).unwrap();
+        std::fs::write(
+            base.join("stub/stub.js"),
+            format!(
+                "const cmds={cmds_json};\
+                 require('http').createServer((q,r)=>{{let b='';q.on('data',d=>b+=d);q.on('end',()=>{{\
+                 let j={{}};try{{j=JSON.parse(b)}}catch{{}}\
+                 const res=(j.messages||[]).flatMap(m=>Array.isArray(m.content)?\
+                 m.content.filter(c=>c.type==='tool_result'):[]);\
+                 const main=(j.tools||[]).some(t=>t.name==='Bash');const step=res.length;\
+                 console.log('UPSTREAM '+JSON.stringify({{url:q.url,main,step,last:res[step-1]||null}}));\
+                 const tool=main&&step<cmds.length;\
+                 const content=tool?[{{type:'tool_use',id:'toolu_'+step,name:'Bash',\
+                 input:{{command:cmds[step],description:'probe',timeout:300000}}}}]:\
+                 [{{type:'text',text:'STUB-DONE'}}];\
+                 const stop=tool?'tool_use':'end_turn';\
+                 const msg={{id:'msg_'+step,type:'message',role:'assistant',model:j.model||'m',\
+                 content:[],stop_reason:null,stop_sequence:null,usage:{{input_tokens:1,output_tokens:1}}}};\
+                 if(!j.stream){{r.setHeader('content-type','application/json');\
+                 return r.end(JSON.stringify({{...msg,content,stop_reason:stop}}))}}\
+                 r.setHeader('content-type','text/event-stream');\
+                 const ev=(t,d)=>r.write('event: '+t+'\\ndata: '+JSON.stringify({{type:t,...d}})+'\\n\\n');\
+                 ev('message_start',{{message:msg}});content.forEach((c,i)=>{{if(c.type==='text'){{\
+                 ev('content_block_start',{{index:i,content_block:{{type:'text',text:''}}}});\
+                 ev('content_block_delta',{{index:i,delta:{{type:'text_delta',text:c.text}}}})}}else{{\
+                 ev('content_block_start',{{index:i,content_block:{{...c,input:{{}}}}}});\
+                 ev('content_block_delta',{{index:i,delta:{{type:'input_json_delta',\
+                 partial_json:JSON.stringify(c.input)}}}})}}ev('content_block_stop',{{index:i}})}});\
+                 ev('message_delta',{{delta:{{stop_reason:stop,stop_sequence:null}},usage:{{output_tokens:1}}}});\
+                 ev('message_stop',{{}});r.end()}})}}).listen(8080)"
+            ),
+        )
+        .unwrap();
+        let mut config = GatewayConfig::default();
+        for route in &mut config.providers {
+            route.upstream_host = format!("{stub}:8080");
+            route.tls = false;
+        }
+        configure_gateway(&dir, &config).unwrap();
+        let gw = ensure_gateway(&rt, &dir).expect("the gateway starts");
+        assert!(crate::seat_gateway::hook_route_ready());
+        crate::seat_gateway::set_broker_credential(
+            &rt,
+            &gw,
+            &dir,
+            "claude",
+            "anthropic.key",
+            b"FAKE-997-broker-key",
+        )
+        .unwrap();
+        let stub_mount = format!(
+            "type=bind,src={},dst=/s,readonly",
+            base.join("stub").display()
+        );
+        let o = run(&[
+            "run",
+            "-d",
+            "--name",
+            &stub,
+            "--network",
+            &gw.external_network,
+            "--mount",
+            &stub_mount,
+            &image,
+            "node",
+            "/s/stub.js",
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let repo = base.join("repo");
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            // spawn-audit: test-only — local git over a temp repo.
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        };
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "i"]);
+        git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let pin = crate::worktree_guard::pinned_git_dir(&wt, &repo).unwrap();
+        let inputs = FloorInputs {
+            cwd: wt.clone(),
+            write_roots: vec![wt.clone()],
+            read_only: false,
+            seat_dirs: vec![seat_home.clone()],
+            unmask: vec![],
+            pinned: vec![],
+            net: vec![],
+            home: None,
+            trusted_git_dir: Some(pin),
+        };
+        let token = mint_token();
+        let settings = serde_json::json!({
+            "disableAllHooks": false,
+            "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+                crate::execute_wrapped::container_gate_hook(&token).unwrap()
+            ]}]}
+        })
+        .to_string();
+        let argv: Vec<String> = [
+            "claude",
+            "-p",
+            "run the three commands",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            "claude-sonnet-4-5",
+            "--setting-sources",
+            "",
+            "--permission-mode",
+            "acceptEdits",
+            "--settings",
+            &settings,
+        ]
+        .map(String::from)
+        .to_vec();
+        // The unit's decisions log, scope and phase, as the launcher hands them to its hook.
+        let log = base.join("decisions.ndjson");
+        let reg = register(
+            &token,
+            HookContext {
+                env: vec![
+                    (
+                        crate::gate_hook::DECISIONS_PATH_ENV.into(),
+                        Some(log.clone().into_os_string()),
+                    ),
+                    (
+                        crate::gate_hook::GATE_SCOPE_ENV.into(),
+                        Some("wicked-agent/run-997/shared".into()),
+                    ),
+                    (
+                        crate::gate_hook::GATE_PHASE_ENV.into(),
+                        Some("unit-1".into()),
+                    ),
+                ],
+                cwd: Some(wt.clone()),
+            },
+        )
+        .expect("the relay runs");
+        let armed = arm(&inputs, &argv, "run-997", 1, &[], None, None, Some(&dir))
+            .expect("a signed-in claude seat arms");
+        let full: Vec<String> = armed.wrapper.iter().chain(&armed.argv).cloned().collect();
+        let mut cmd = crate::execute_wrapped::build_worker_command(&full, None);
+        cmd.env("CLAUDE_CONFIG_DIR", &seat_home);
+        for (k, v) in &armed.env {
+            cmd.env(k, v);
+        }
+        crate::container_floor::write_unit_seat_files(&mut cmd, "claude", &armed.files)
+            .expect("placeholder files");
+        let out = output_within(finalize(cmd), Duration::from_secs(400)).expect("the seat ran");
+        if let Some(lease) = armed.lease {
+            let _ = lease.release();
+        }
+        drop(armed.cleanup);
+        drop(reg);
+        let judged = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let long = wt.join("LONG.txt").exists();
+        let after_kill = wt.join("AFTER-KILL.txt").exists();
+        let forced = wt.join("FORCED.txt").exists();
+        let judged_calls = std::fs::read_to_string(&calls).unwrap_or_default();
+        let records = crate::gate_hook::collect_hook_decisions_in(&log, "unit-1");
+        let upstream = String::from_utf8_lossy(&run(&["logs", &stub]).stdout).to_string();
+        run(&["rm", "-f", &stub, &gw.name]);
+        run(&["network", "rm", &gw.external_network]);
+        let (cfg, broker) = crate::seat_gateway::volumes(&gw);
+        run(&["volume", "rm", &cfg, &broker]);
+        let _ = std::fs::remove_dir_all(&base);
+        let tail = |s: &str| {
+            let c: Vec<char> = s.chars().collect();
+            c[c.len().saturating_sub(3000)..].iter().collect::<String>()
+        };
+        eprintln!(
+            "code={:?}\njudged={}\ncalls={}\nrecords={records:?}\nupstream={}",
+            out.status.code(),
+            tail(&judged),
+            judged_calls.lines().count(),
+            tail(&upstream)
+        );
+        assert!(
+            long,
+            "the long cargo-test loop was allowed and ran: {}",
+            tail(&judged)
+        );
+        assert!(
+            after_kill,
+            "the call whose gate hook was killed was judged again and ran: {}",
+            tail(&judged)
+        );
+        assert_eq!(
+            judged_calls.matches("AFTER-KILL.txt").count(),
+            2,
+            "killed once, judged twice"
+        );
+        assert!(!forced, "the call whose gate hook kept dying never ran");
+        assert!(
+            judged.contains("SIGKILL"),
+            "claude reports the relay's reason: {}",
+            tail(&judged)
+        );
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].decision, "deny");
+        assert_eq!(records[0].tool_name, "Bash");
+        assert!(records[0]
+            .obligations
+            .first()
+            .is_some_and(|r| r.contains("SIGKILL")));
+        assert!(judged.contains("STUB-DONE"), "{}", tail(&judged));
+        assert_eq!(out.status.code(), Some(0), "{}", tail(&judged));
     }
 }
