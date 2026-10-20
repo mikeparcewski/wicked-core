@@ -1085,28 +1085,50 @@ pub(crate) fn inherited_cli_dirs(
 }
 
 /// The per-seat cache dir every governed seat's package caches are pointed into
-/// ([`floor_cache_env`]): `<worker home>/cache/<seat root name>`. Writes to the operator's own
-/// `~/.cargo`, `~/.npm` or `~/.cache` are denied by the floor, and admitting them would let a
-/// worker poison the operator's next build (cargo does not re-verify extracted sources).
+/// ([`floor_cache_env`]): `<worker home>/cache/<seat root name>`, one per CLI, on the host. Writes
+/// to the operator's own `~/.cargo`, `~/.npm` or `~/.cache` are denied by the floor, and admitting
+/// them would let a worker poison the operator's next build (cargo does not re-verify extracted
+/// sources).
+///
+/// It is a seat dir, so both floors admit it read-write: the host floor's profile, and the
+/// container floor's bind mount at the same path ([`crate::container_floor::mount_plan`]). A
+/// container seat's `HOME` is a 512 MB tmpfs (`/home/seat`), and wicked-core's registry alone
+/// fetches to ~684 MB, so the caches must never default into `HOME`. The dir outlives every run and
+/// every container: the cargo registry is downloaded once per CLI and reused by its later seats,
+/// across runs and repos (cargo's own lock serialises concurrent seats). No run deletes it; cargo's
+/// automatic cache cleanup (1.88+) drops entries unused for months, and the operator may delete the
+/// dir at any time (the next seat fetches again).
 pub(crate) fn seat_cache_dir(cli: wicked_apps_core::spawn::SeatCli) -> Option<PathBuf> {
     let base = wicked_apps_core::spawn::worker_home_base().ok()?;
     Some(base.join("cache").join(cli.root_name().unwrap_or("other")))
 }
 
-/// The cache variables a governed seat gets under the floor, all inside `cache`: cargo's home,
-/// npm / yarn / pnpm / pip / uv / go caches and the XDG cache base (opencode, many tools).
+/// The toolchain caches a governed seat is pointed into its [`seat_cache_dir`], keyed by
+/// toolchain: `(toolchain, variable, subdir)`. One mechanism for every toolchain: a new one is a
+/// row here (the dir, the bind and the env pass-through follow). Build output is not a cache and is
+/// not here: cargo's target dir is the unit's tree (`<worktree>/target`, cargo's default, reused by
+/// the run's later units and removed with the worktree), or under a fenced posture its own scratch
+/// (`CARGO_TARGET_DIR`, [`plan_seat_floor`]), because a fenced tree is read-only.
+pub(crate) const SEAT_TOOLCHAIN_CACHES: &[(&str, &str, &str)] = &[
+    ("cargo", "CARGO_HOME", "cargo"),
+    ("npm", "npm_config_cache", "npm"),
+    ("yarn", "YARN_CACHE_FOLDER", "yarn"),
+    ("pnpm", "npm_config_store_dir", "pnpm-store"),
+    ("pip", "PIP_CACHE_DIR", "pip"),
+    ("uv", "UV_CACHE_DIR", "uv"),
+    ("go", "GOCACHE", "go-build"),
+    ("go", "GOMODCACHE", "go-mod"),
+    // The XDG cache base (opencode, many tools).
+    ("xdg", "XDG_CACHE_HOME", "xdg"),
+];
+
+/// The cache variables a governed seat gets under the floor, all inside `cache`
+/// ([`SEAT_TOOLCHAIN_CACHES`]).
 pub(crate) fn floor_cache_env(cache: &Path) -> Vec<(&'static str, PathBuf)> {
-    vec![
-        ("CARGO_HOME", cache.join("cargo")),
-        ("npm_config_cache", cache.join("npm")),
-        ("YARN_CACHE_FOLDER", cache.join("yarn")),
-        ("npm_config_store_dir", cache.join("pnpm-store")),
-        ("PIP_CACHE_DIR", cache.join("pip")),
-        ("UV_CACHE_DIR", cache.join("uv")),
-        ("GOCACHE", cache.join("go-build")),
-        ("GOMODCACHE", cache.join("go-mod")),
-        ("XDG_CACHE_HOME", cache.join("xdg")),
-    ]
+    SEAT_TOOLCHAIN_CACHES
+        .iter()
+        .map(|(_, var, sub)| (*var, cache.join(sub)))
+        .collect()
 }
 
 /// One governed seat spawn's floor, planned from the carrier's launch facts: the inputs the floor
