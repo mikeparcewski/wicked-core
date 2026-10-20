@@ -14,6 +14,21 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A container seat reaches the hosts `WICKED_SEAT_EGRESS_HOSTS` names, whatever an earlier daemon persisted.**
+  The gateway's CONNECT allowlist was read from the daemon's environment only when its state directory had no
+  `config/gateway.json` yet; after that, every daemon served the list the first one persisted. A state directory
+  first provisioned with the variable unset kept `[]`, so a daemon started later with
+  `WICKED_SEAT_EGRESS_HOSTS=index.crates.io,static.crates.io` served no egress route: the gateway logged
+  `route not found` for `tls.sni` `index.crates.io` and every seat's cargo failed with
+  `[35] SSL connect error ... unexpected eof while reading` (claude and codex seats alike). Now each provisioning
+  of the gateway (a fresh start or the takeover of a running one) replaces the allowlist with this daemon's
+  `WICKED_SEAT_EGRESS_HOSTS`; `gateway.json` only records it. The semantics are unchanged: only the named hosts, by
+  TLS SNI, and none when the variable is unset or empty. A host the daemon stops naming loses its route, including
+  one only an edited `gateway.json` named. For cargo and crates.io, `index.crates.io,static.crates.io` is the whole
+  list: the sparse index names `static.crates.io` for downloads, and the API host `crates.io` is not needed to
+  fetch. A git dependency or another registry needs its own hosts. One new live test
+  (`WICKED_CONTAINER_LIVE=1`) runs `cargo fetch` from a seat's namespace; its cargo leg needs
+  `WICKED_SEAT_BASE_IMAGE` naming a base with a Rust toolchain.
 - **A claude seat in a container can read and edit its own worktree under `~/.wicked/repos`.** Crew registers
   repositories under `~/.wicked/repos`, and `.wicked` is one of the directories the worker fence always denies
   (`Read`/`Edit` over `~/.wicked/**`, for estate's stores). A seat container mounts each host path at the same
