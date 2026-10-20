@@ -428,12 +428,19 @@ fn overflow(conn: TcpStream) {
         Some(Route::Hook(t)) => Some(t),
         _ => None,
     });
-    if let Some(reg) = token.as_deref().and_then(unit) {
+    // Marked while holding a `Call`, so the unit's end waits for the mark (or, past its wait,
+    // fails closed anyway); a unit that already ended is not live.
+    let live = token
+        .as_deref()
+        .and_then(unit)
+        .and_then(|reg| reg.life.enter().map(|call| (reg, call)));
+    if let Some((reg, call)) = live {
+        reg.life.mark_unrecorded();
+        drop(call);
         eprintln!(
             "wicked-core: the gate hook relay is at its connection limit; a call of a live unit \
              was refused unrecorded, and the unit will fail closed"
         );
-        reg.life.mark_unrecorded();
     }
 }
 
@@ -703,7 +710,13 @@ fn judge(reg: &Registered, call: &Call, tool: &str, body: &[u8], budget: Duratio
             stdout,
             stderr,
         } => {
-            let recorded = before.is_some() && log.as_deref().map(log_len) > before;
+            // A deny claim among what the log gained during this run (this call's alone: the unit's
+            // turn is held), not just any growth: the gate hook writes its liveness sentinel before
+            // it judges, and can then fail to write its decision.
+            let recorded = match (log.as_deref(), before) {
+                (Some(log), Some(from)) => records_a_deny_since(log, from),
+                _ => false,
+            };
             if recorded {
                 answer(Some(2), &stdout, &stderr)
             } else {
@@ -718,6 +731,25 @@ fn judge(reg: &Registered, call: &Call, tool: &str, body: &[u8], budget: Duratio
         HookRun::Ended => ended(tool),
         failed => refusal(Some(reg), tool, &format!("{}{note}", failed.why(budget))),
     }
+}
+
+/// Whether `log` gained a deny claim past byte `from` (a line naming a claim id whose decision is
+/// `deny`). Unreadable = no.
+fn records_a_deny_since(log: &std::path::Path, from: u64) -> bool {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(log) else {
+        return false;
+    };
+    let mut tail = String::new();
+    if f.seek(SeekFrom::Start(from)).is_err() || f.read_to_string(&mut tail).is_err() {
+        return false;
+    }
+    tail.lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line.trim()).is_ok_and(|v| {
+            v.get("claim_id").is_some_and(serde_json::Value::is_string)
+                && v.get("decision").and_then(serde_json::Value::as_str) == Some("deny")
+        })
+    })
 }
 
 /// The value `ctx` gives `key` (non-empty), as its hook would have inherited it.
@@ -1279,6 +1311,8 @@ mod tests {
              deny) printf '%s\\n' '{\"claim_id\":\"policy-deny:unit-5\",\"scope\":\"s\",\"phase\":\"unit-5\",\"policy_ids\":[\"test-policy\"],\"decision\":\"deny\",\"obligations\":[\"denied by test policy\"],\"evaluated_context_ref\":\"sha256:p\",\"criteria\":\"c\",\"evaluator_identity\":\"wicked-governance\",\"evaluated_at\":1792454400}' >> \"$WICKED_DECISIONS_PATH\"; \
              echo 'denied by test policy' >&2; exit 2 ;;\n\
              deny-unrecorded) echo 'DENY (could not write hook-fired sentinel)' >&2; exit 2 ;;\n\
+             sentinel-only) printf '%s\\n' '{\"_wicked_hook_fired\":\"unit-5\"}' >> \"$WICKED_DECISIONS_PATH\"; \
+             echo 'DENY (could not record the decision)' >&2; exit 2 ;;\n\
              esac\nexit 0\n",
         )
         .unwrap();
@@ -1418,6 +1452,13 @@ mod tests {
             rec[0].denying_policy.as_deref(),
             Some(crate::gate_hook::INFRA_RULE_ID)
         );
+        // …and so is one that wrote only its liveness sentinel before failing (round 10).
+        let (t, _r4c, log) = unit("sentinel-only");
+        let d = post(&t, &payload);
+        assert!(reason(&d).contains("recorded nothing"), "{d}");
+        let rec = records(&log);
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert_eq!(rec[0].decision, "deny");
 
         // core#1055 security review P1: a gate hook that records a deny and is then killed is
         // never run again (a second run could allow): the call is refused, and its deny stands.
