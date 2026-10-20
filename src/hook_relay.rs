@@ -227,12 +227,19 @@ impl Life {
     }
 
     fn revoke_and_wait(&self) -> bool {
+        // Every call ends by its deadline; the margin covers its refusal's record.
+        self.revoke_and_wait_within(HOOK_TIMEOUT + Duration::from_secs(10))
+    }
+
+    /// Revoke, wait up to `limit` for the calls being judged, and whether the unit must fail:
+    /// a refusal went unrecorded, or a call was still active when the wait gave up (its refusal
+    /// may still be pending, so the unit's log cannot be trusted to hold it).
+    fn revoke_and_wait_within(&self, limit: Duration) -> bool {
         let Ok(mut s) = self.state.lock() else {
             return true;
         };
         s.revoked = true;
-        // Every call ends by its deadline; the margin covers its refusal's record.
-        let until = Instant::now() + HOOK_TIMEOUT + Duration::from_secs(10);
+        let until = Instant::now() + limit;
         while s.calls > 0 {
             let left = until.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -243,7 +250,7 @@ impl Life {
                 Err(_) => return true,
             };
         }
-        s.unrecorded
+        s.unrecorded || s.calls > 0
     }
 
     fn mark_unrecorded(&self) {
@@ -1536,6 +1543,20 @@ mod tests {
                 unrecorded || reason(&d).contains("unknown or revoked"),
                 "the unit's end missed an unrecorded refusal: {d}"
             );
+        }
+
+        // A revocation that gives up waiting while a call is still active (its refusal may be
+        // blocked, e.g. on the daemon's log) fails the unit rather than reporting it clean.
+        {
+            let life = Arc::new(Life::default());
+            let call = life.enter().expect("live");
+            assert!(
+                life.revoke_and_wait_within(Duration::from_millis(100)),
+                "an active call at the wait limit fails the unit"
+            );
+            drop(call);
+            let idle = Arc::new(Life::default());
+            assert!(!idle.revoke_and_wait_within(Duration::from_millis(100)));
         }
 
         // An unknown token has no unit to record in: refused with its reason.
