@@ -12781,9 +12781,15 @@ pub(crate) fn confirm_gate_as(
                                     .to_string(),
                             },
                         );
-                    } else if cursor.requested_rejudge.is_some() {
-                        cursor.requested_rejudge = None;
-                        put_node(store, cursor.to_node())?;
+                    } else if let Some(r) = cursor.requested_rejudge.as_ref() {
+                        // A floor-only re-run (`extend` / `targeted` / `accept_partial`) runs no
+                        // seat either: a consumed basis stays, so the work judged keeps its
+                        // monitors. Every other answer runs the seat (or ends the gate).
+                        let floor_only = floor_rerun.is_some() && floor_fix_note.is_none();
+                        if !(r.consumed && floor_only) {
+                            cursor.requested_rejudge = None;
+                            put_node(store, cursor.to_node())?;
+                        }
                     }
                 }
             }
@@ -20129,6 +20135,61 @@ mod request_changes_tests {
         );
         assert_eq!(armed.monitors, ["pi"]);
         assert!(!armed.seats.iter().any(|k| k == "pi"));
+    }
+
+    /// (rejudge) A re-judge attempt whose floor then did not finish: answering it with a floor-only
+    /// re-run (`extend`) runs no seat, so the consumed basis — the seat attempt judged and its
+    /// monitors — stays on the unit for the attempt that follows.
+    #[test]
+    fn a_floor_only_answer_keeps_a_consumed_rejudge_basis() {
+        let run_id = format!("rejudge-floor-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_rejudge_fix(&mut store, &run_id, &["claude", "pi", "copilot"]);
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        units[2].denial = Some(UnitDenial::new(
+            crate::repo_checks::DENIAL_SOURCE_TIMEOUT,
+            "the floor did not finish",
+        ));
+        units[2].repo_checks = Some(
+            serde_json::from_value(serde_json::json!({
+                "detected": [], "checks": [], "skipped": [], "passed": false,
+                "sandbox_level": "none", "tree": "t1"
+            }))
+            .unwrap(),
+        );
+        units[2].requested_rejudge = Some(crate::domain::RequestedRejudge {
+            output: String::new(),
+            attempt: 1,
+            seats: vec!["copilot".into()],
+            monitors: vec!["pi".into()],
+            consumed: true,
+            at: 0,
+        });
+        put_node(&mut store, units[2].to_node()).unwrap();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut subs = crate::event_log::EventSink::default();
+        confirm_gate_as(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut HashSet::new(),
+            &run_id,
+            HumanDecision::FloorRerun(crate::repo_checks::FloorRerunMode::Extend),
+            None,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let fix = &crate::domain::session_units(&store, &run_id).unwrap()[2];
+        let kept = fix.requested_rejudge.as_ref().expect("the basis stays");
+        assert!(
+            kept.consumed && kept.attempt == 1 && kept.monitors == ["pi"],
+            "{kept:?}"
+        );
     }
 
     /// (rejudge) Only a `judge_unavailable` gate takes it: a unit the judge RULED on (a REJECT)

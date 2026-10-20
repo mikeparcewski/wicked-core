@@ -2286,9 +2286,16 @@ fn run_unit_and_judge_on(
         .and_then(|t| t.ledger.as_ref())
         .map(crate::team::runner::ledger_authors)
         .unwrap_or_default();
-    // (rejudge) …and the monitors of the attempt whose output the judge re-reads: this attempt's
-    // own ledger may not carry them (a re-dispatch stamps a fresh team snapshot).
-    for m in rejudge.map(|j| j.monitors.as_slice()).unwrap_or_default() {
+    // (rejudge) …and the monitors of the seat attempt a re-judge carried (armed, or its consumed
+    // basis on a floor-only re-run): this attempt's own ledger may not carry them (a re-dispatch
+    // stamps a fresh team snapshot).
+    for m in input
+        .unit
+        .requested_rejudge
+        .as_ref()
+        .map(|j| j.monitors.as_slice())
+        .unwrap_or_default()
+    {
         if !team_authors.contains(m) {
             team_authors.push(m.clone());
         }
@@ -5250,6 +5257,25 @@ mod tests {
         let (_, verdict, _) =
             run_unit_and_judge_with_roster(&runner, &monitored, None, noop, &roster4, &[], &[]);
         assert_eq!(judge.seen.lock().unwrap().clone().len(), 1);
+        assert_eq!(
+            verdict.expect("ruled").judge_cli.as_deref(),
+            Some("copilot")
+        );
+        // A consumed basis is never honored as a re-judge (the seat runs), but its monitors still
+        // never judge.
+        let mut basis = monitored.clone();
+        basis.unit.requested_rejudge.as_mut().unwrap().consumed = true;
+        let judge = Arc::new(Judge {
+            answer: "PASS\nok\nPASS",
+            seen: Mutex::new(Vec::new()),
+        });
+        let runner: Arc<dyn StepRunner> = judge.clone();
+        let (out, verdict, _) =
+            run_unit_and_judge_with_roster(&runner, &basis, None, noop, &roster4, &[], &[]);
+        let seen = judge.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "the seat ran, then the judge: {seen:?}");
+        assert_eq!(seen[0].1, "fix the retry", "the work unit ran");
+        assert_eq!(out.output, "PASS\nok\nPASS");
         assert_eq!(
             verdict.expect("ruled").judge_cli.as_deref(),
             Some("copilot")
