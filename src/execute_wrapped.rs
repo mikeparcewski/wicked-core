@@ -3265,6 +3265,9 @@ impl WrappedCliStepRunner {
             // opencode server password) and its container + network, removed however the unit
             // ends (held to the end of this scope).
             let mut floor_env: Vec<(&'static str, PathBuf)> = Vec::new();
+            // Container floor: the seat's toolchain build settings (cargo's jobs, debuginfo,
+            // incremental), sized for a seat's memory limit (`SEAT_TOOLCHAIN_BUILD_ENV`).
+            let mut floor_build_env: Vec<(&'static str, String)> = Vec::new();
             // Container floor: the seat's gateway env and registration.
             let mut seat_gateway_env: Vec<(String, String)> = Vec::new();
             // A copilot seat on its Copilot route: the account its sign-in may use (OD-1).
@@ -3478,6 +3481,7 @@ impl WrappedCliStepRunner {
                             }
                         }
                         floor_env = plan.env;
+                        floor_build_env = plan.build_env;
                         floor = Ok(c.tool);
                         Some(crate::validator::WorkerSandbox {
                             wrapper: c.wrapper,
@@ -3729,6 +3733,9 @@ impl WrappedCliStepRunner {
             // Container floor: the seat's caches and (fenced) temp inside dirs its floor admits,
             // and the per-spawn password of opencode's pinned server.
             for (k, v) in &floor_env {
+                cmd.env(k, v);
+            }
+            for (k, v) in &floor_build_env {
                 cmd.env(k, v);
             }
             // (core#928) The QE unit's temp is its notes root, a root its fence admits (on every

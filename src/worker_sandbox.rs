@@ -1151,14 +1151,91 @@ pub(crate) fn floor_cache_env(cache: &Path) -> Vec<(&'static str, PathBuf)> {
         .collect()
 }
 
+/// What one [`SEAT_TOOLCHAIN_BUILD_ENV`] row sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeatBuildValue {
+    /// The seat's build parallelism: its CPUs, at most [`SEAT_BUILD_JOBS_CAP`] ([`seat_build_jobs`]).
+    Jobs,
+    /// A fixed value.
+    Fixed(&'static str),
+}
+
+/// The most parallel compile jobs a container seat runs by default.
+pub(crate) const SEAT_BUILD_JOBS_CAP: usize = 2;
+
+/// The build settings a container seat's toolchains run with, keyed by toolchain:
+/// `(toolchain, variable, value)`, next to [`SEAT_TOOLCHAIN_CACHES`] and the same mechanism (a new
+/// toolchain's settings are rows here; the env and its pass-through to the runtime and landrun
+/// follow). A seat has a fixed memory limit (`WICKED_SEAT_MEMORY`, default 3g) and the runtime's
+/// CPUs, and cargo's defaults are sized for a workstation. One job per CPU, full debuginfo and
+/// incremental state together ran a seat out of memory on wicked-core's own lib tests: rustc was
+/// SIGKILLed in a 2 CPU / 5.9 GB runtime (core#997's end-to-end run). The same build with these
+/// settings finished in 4m59s. Debuginfo is the largest part of rustc's and the linker's memory on a
+/// test binary, and incremental state is written and kept for a target dir that is reused only by
+/// the run's later units.
+///
+/// The operator's own value wins: a variable set (non-empty) in the daemon's environment is passed
+/// to the seat as it is, in place of the row's value ([`floor_build_env`]).
+pub(crate) const SEAT_TOOLCHAIN_BUILD_ENV: &[(&str, &str, SeatBuildValue)] = &[
+    ("cargo", "CARGO_BUILD_JOBS", SeatBuildValue::Jobs),
+    (
+        "cargo",
+        "CARGO_PROFILE_DEV_DEBUG",
+        SeatBuildValue::Fixed("0"),
+    ),
+    (
+        "cargo",
+        "CARGO_PROFILE_TEST_DEBUG",
+        SeatBuildValue::Fixed("0"),
+    ),
+    ("cargo", "CARGO_INCREMENTAL", SeatBuildValue::Fixed("0")),
+];
+
+/// A container seat's build parallelism for `cpus` CPUs: one job per CPU, at most
+/// [`SEAT_BUILD_JOBS_CAP`], at least one.
+pub(crate) fn seat_build_jobs(cpus: usize) -> usize {
+    cpus.clamp(1, SEAT_BUILD_JOBS_CAP)
+}
+
+/// The CPUs a container seat can use. A seat container carries no CPU limit of its own
+/// ([`crate::container_floor::run_argv`] sets `--memory`, never `--cpus`), so it is at most the
+/// host's; under a VM runtime (Docker Desktop, Rancher Desktop, colima) the VM may have fewer, and
+/// the [`SEAT_BUILD_JOBS_CAP`] bounds both.
+fn seat_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+}
+
+/// The build variables a governed container seat gets ([`SEAT_TOOLCHAIN_BUILD_ENV`]) for `cpus`
+/// CPUs, each one the operator set (non-empty, read through `operator`) taking the operator's value.
+pub(crate) fn floor_build_env(
+    cpus: usize,
+    operator: impl Fn(&str) -> Option<String>,
+) -> Vec<(&'static str, String)> {
+    SEAT_TOOLCHAIN_BUILD_ENV
+        .iter()
+        .map(|(_, var, value)| {
+            let ours = match value {
+                SeatBuildValue::Jobs => seat_build_jobs(cpus).to_string(),
+                SeatBuildValue::Fixed(v) => (*v).to_string(),
+            };
+            let theirs = operator(var).filter(|v| !v.trim().is_empty());
+            (*var, theirs.unwrap_or(ours))
+        })
+        .collect()
+}
+
 /// One governed seat spawn's floor, planned from the carrier's launch facts: the inputs the floor
 /// arms from, and the environment the seat must run with under it (its caches and temp redirected
-/// into dirs the floor admits).
+/// into dirs the floor admits, and its toolchains' build settings).
 #[derive(Debug, Clone)]
 pub(crate) struct SeatFloorPlan {
     pub(crate) inputs: FloorInputs,
     /// Set on the worker command AFTER every other temp redirect, so these win.
     pub(crate) env: Vec<(&'static str, PathBuf)>,
+    /// The seat's toolchain build settings ([`SEAT_TOOLCHAIN_BUILD_ENV`]), set with [`Self::env`].
+    pub(crate) build_env: Vec<(&'static str, String)>,
 }
 
 /// The launch facts a carrier hands [`plan_seat_floor`].
@@ -1242,6 +1319,7 @@ pub(crate) fn plan_seat_floor(launch: SeatLaunch<'_>, write_roots: Vec<PathBuf>)
             trusted_git_dir: None,
         },
         env,
+        build_env: floor_build_env(seat_cpus(), |k| std::env::var(k).ok()),
     }
 }
 

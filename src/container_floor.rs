@@ -21,6 +21,11 @@
 //! are the seat's persistent cache dir on the host ([`crate::worker_sandbox::seat_cache_dir`],
 //! keyed by toolchain in [`crate::worker_sandbox::SEAT_TOOLCHAIN_CACHES`]), bound read-write like
 //! any seat dir, with each variable passed by name to the runtime and to landrun ([`finalize`]).
+//! The toolchains' build settings ride the same way, from the table beside it
+//! ([`crate::worker_sandbox::SEAT_TOOLCHAIN_BUILD_ENV`]): cargo runs one job per CPU up to two, with
+//! no debuginfo for the dev and test profiles and no incremental state, so a cargo repository's
+//! tests build within a seat's memory limit; a variable the operator sets in the daemon's
+//! environment is passed with the operator's value instead.
 //!
 //! **The mounts are the floor.** They are rendered from the step-0 [`SeatFloor`] the interim floor
 //! renders its profile from (one root computation, two renderers): the writable roots read-write,
@@ -4661,6 +4666,7 @@ mod tests {
         name: &str,
         network: &str,
         floor: &str,
+        memory: &str,
         extra_env: &[(String, String)],
         script: &str,
     ) -> (crate::worker_sandbox::SeatFloorPlan, Vec<Mount>, Command) {
@@ -4701,7 +4707,7 @@ mod tests {
             user: &operator_user(),
             mounts: &mounts,
             floor,
-            memory: "3g",
+            memory,
             gateway_ports: GATEWAY_PORTS,
             own_ports: &[],
         });
@@ -4710,6 +4716,9 @@ mod tests {
         cmd.args(&w[1..]);
         cmd.args(["sh", "-c", script]);
         for (k, v) in &plan.env {
+            cmd.env(k, v);
+        }
+        for (k, v) in &plan.build_env {
             cmd.env(k, v);
         }
         for (k, v) in extra_env {
@@ -4742,6 +4751,7 @@ mod tests {
             "wicked-seat-cargo",
             "none",
             "wicked-floor:t",
+            "3g",
             &[],
             "cargo fetch",
         );
@@ -4800,6 +4810,123 @@ mod tests {
                 .map(PathBuf::from),
             Some(cargo_home)
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A container seat's cargo runs with the seat build settings ([`SEAT_TOOLCHAIN_BUILD_ENV`],
+    /// core#997's end-to-end run): one job per CPU up to two, no debuginfo for the dev and test
+    /// profiles, no incremental state. The plan carries them, the finalized wrapper passes each by
+    /// NAME to the runtime and to landrun (a value only the runtime got would be dropped by
+    /// landrun), and no value is on the argv. A variable the operator set in the daemon's
+    /// environment is passed with the operator's value instead; a blank one is not a choice.
+    ///
+    /// [`SEAT_TOOLCHAIN_BUILD_ENV`]: crate::worker_sandbox::SEAT_TOOLCHAIN_BUILD_ENV
+    #[test]
+    fn a_container_seats_cargo_runs_with_the_seat_build_settings_and_the_operator_wins() {
+        use crate::worker_sandbox::{floor_build_env, seat_build_jobs, SEAT_TOOLCHAIN_BUILD_ENV};
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        // The jobs follow the seat's CPUs, capped at two, never zero.
+        assert_eq!(seat_build_jobs(0), 1);
+        assert_eq!(seat_build_jobs(1), 1);
+        assert_eq!(seat_build_jobs(2), 2);
+        assert_eq!(seat_build_jobs(14), 2);
+        let get = |env: &[(&'static str, String)], k: &str| {
+            env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone())
+        };
+        let ours = floor_build_env(1, |_| None);
+        assert_eq!(get(&ours, "CARGO_BUILD_JOBS").as_deref(), Some("1"));
+        assert_eq!(get(&ours, "CARGO_PROFILE_DEV_DEBUG").as_deref(), Some("0"));
+        assert_eq!(get(&ours, "CARGO_PROFILE_TEST_DEBUG").as_deref(), Some("0"));
+        assert_eq!(get(&ours, "CARGO_INCREMENTAL").as_deref(), Some("0"));
+        assert_eq!(ours.len(), SEAT_TOOLCHAIN_BUILD_ENV.len());
+        let theirs = floor_build_env(8, |k| match k {
+            "CARGO_BUILD_JOBS" => Some("6".into()),
+            "CARGO_INCREMENTAL" => Some("  ".into()),
+            _ => None,
+        });
+        assert_eq!(get(&theirs, "CARGO_BUILD_JOBS").as_deref(), Some("6"));
+        assert_eq!(get(&theirs, "CARGO_INCREMENTAL").as_deref(), Some("0"));
+
+        // Through the engine's own plan and wrapper, with an operator choice in the environment.
+        let prior: Vec<_> = ["CARGO_PROFILE_DEV_DEBUG", "CARGO_BUILD_JOBS"]
+            .into_iter()
+            .map(|k| (k, std::env::var_os(k)))
+            .collect();
+        std::env::set_var("CARGO_PROFILE_DEV_DEBUG", "line-tables-only");
+        std::env::remove_var("CARGO_BUILD_JOBS");
+        let base = tmp("cargo-build-env");
+        let tree = base.join("wt");
+        let worker = base.join("worker");
+        std::fs::create_dir_all(&tree).unwrap();
+        let (plan, _, cmd) = cargo_seat(
+            &worker,
+            &tree,
+            &[],
+            Path::new("docker"),
+            "img:1",
+            "wicked-seat-cargo-env",
+            "none",
+            "wicked-floor:t",
+            "3g",
+            &[],
+            "cargo test",
+        );
+        for (k, v) in prior {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let jobs = seat_build_jobs(
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1),
+        )
+        .to_string();
+        assert_eq!(
+            get(&plan.build_env, "CARGO_PROFILE_DEV_DEBUG").as_deref(),
+            Some("line-tables-only"),
+            "the operator's value wins: {:?}",
+            plan.build_env
+        );
+        assert_eq!(get(&plan.build_env, "CARGO_BUILD_JOBS"), Some(jobs.clone()));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let img = image_index(&args).unwrap();
+        let land = landrun_end(&args, img).unwrap();
+        let has = |range: &[String], pair: &[&str]| range.windows(2).any(|x| x == pair);
+        let set = |k: &str| {
+            cmd.get_envs()
+                .find(|(n, _)| *n == k)
+                .and_then(|(_, v)| v)
+                .map(|v| v.to_string_lossy().into_owned())
+        };
+        for (_, var, _) in SEAT_TOOLCHAIN_BUILD_ENV {
+            assert!(
+                has(&args[..img], &["--env", var]),
+                "{var} to the runtime: {args:?}"
+            );
+            assert!(
+                has(&args[img..land], &["--env", var]),
+                "{var} to landrun: {args:?}"
+            );
+            assert_eq!(
+                set(var),
+                get(&plan.build_env, var),
+                "{var} on the client's env"
+            );
+        }
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("CARGO_") && a.contains('=')),
+            "no build value on the argv: {args:?}"
+        );
+        assert_eq!(set("CARGO_INCREMENTAL").as_deref(), Some("0"));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -4886,6 +5013,7 @@ mod tests {
                 &name,
                 &format!("container:{}", netns_name(&name)),
                 &floor,
+                "3g",
                 &env,
                 &script(offline),
             );
@@ -4939,6 +5067,206 @@ mod tests {
         assert!(
             kb(&first, "CACHE_KB=") > 512 * 1024,
             "the fetch would not have fit the HOME tmpfs:\n{first}"
+        );
+    }
+
+    /// LIVE (`WICKED_CONTAINER_LIVE=1`, with `WICKED_SEAT_BASE_IMAGE` naming a Rust toolchain base;
+    /// skipped otherwise), core#997's end-to-end run: THIS repository's lib tests compile in a seat
+    /// container with a 4 GB memory limit, rendered by the engine's own path (seat floor plan, mount
+    /// plan, wrapper, finalize), with the seat build settings. A first seat fetches the lockfile
+    /// through the gateway into the seat's cargo cache; the build seats then run offline
+    /// (`--network none`). The same compile with cargo's default profile (the build settings unset
+    /// inside the seat, its own target dir) is the control: its outcome and the cgroup's peak memory
+    /// (`memory.peak`, read from outside the seat while it runs; it counts page cache too) are
+    /// printed for both, and the test asserts the seat build succeeds within the limit.
+    /// `WICKED_LIVE_SEAT_MEMORY` measures another limit. Measured on a 2 CPU / 6 GB Rancher VM: at
+    /// 4g both build (peak 3188 MiB with the settings, 3515 MiB without); at the engine's default
+    /// 3g the settings build and the default profile has rustc killed on the lib test crate.
+    #[cfg(unix)]
+    #[test]
+    fn live_a_seat_compiles_this_repos_lib_tests_within_a_4g_limit() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        let rt = runtime().expect("a container runtime answers");
+        let floor = ensure_floor_image(&rt).expect("the floor image");
+        let image = ensure_seat_image(&rt, "claude").expect("the claude seat image");
+        let base = tmp("cargo-build-live");
+        let tree = base.join("wt");
+        let worker = base.join("worker");
+        let gw_dir = base.join("gateway");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::create_dir_all(&gw_dir).unwrap();
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .unwrap();
+        let repo_q = format!("'{}'", repo.display().to_string().replace('\'', "'\\''"));
+        let run = |argv: &[&str], limit: u64| {
+            let mut c = rt.cmd();
+            c.args(argv);
+            output_within(c, Duration::from_secs(limit))
+        };
+        // The fetch seat: online through the gateway's crates.io allowlist, as in the cache test.
+        let prior = std::env::var(crate::seat_gateway::EGRESS_HOSTS_ENV).ok();
+        std::env::set_var(
+            crate::seat_gateway::EGRESS_HOSTS_ENV,
+            "index.crates.io,static.crates.io",
+        );
+        let gw = crate::seat_gateway::ensure_gateway(&rt, &gw_dir);
+        match &prior {
+            Some(v) => std::env::set_var(crate::seat_gateway::EGRESS_HOSTS_ENV, v),
+            None => std::env::remove_var(crate::seat_gateway::EGRESS_HOSTS_ENV),
+        }
+        let gw = gw.expect("the gateway starts");
+        let key = crate::seat_gateway::UnitKey::new("cargo-build-live", "1", "claude");
+        let env: Vec<(String, String)> = crate::seat_gateway::seat_env_all(&key.key)
+            .into_iter()
+            .chain([("CARGO_NET_RETRY".to_string(), "3".to_string())])
+            .collect();
+        let name = container_name("claude", "buildfetch", 0);
+        let network = ensure_seat_network(&rt, &name).expect("the seat network");
+        crate::seat_gateway::attach(&rt, &gw, &network).unwrap();
+        let ip = gateway_ip(&rt, &gw.name, &network).unwrap();
+        start_netns_sidecar(&rt, &name, &network, &ip).expect("sidecar up");
+        crate::seat_gateway::register_live(&rt, &gw, &gw_dir, key.clone())
+            .expect("the unit key is served");
+        let (_, _, cmd) = cargo_seat(
+            &worker,
+            &tree,
+            std::slice::from_ref(&repo),
+            &rt.cli,
+            &image,
+            &name,
+            &format!("container:{}", netns_name(&name)),
+            &floor,
+            "3g",
+            &env,
+            &format!(
+                "cd {repo_q} && cargo fetch --locked >/tmp/fetch.log 2>&1 && echo FETCH_OK || \
+                 {{ echo FETCH_FAILED; tail -20 /tmp/fetch.log; }}"
+            ),
+        );
+        let fetched = output_within(cmd, Duration::from_secs(900))
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        reap(&SeatContainer {
+            runtime: rt.cli.clone(),
+            name: name.clone(),
+        });
+        let _ = run(&["rm", "-f", &gw.name], 60);
+        let _ = run(&["network", "rm", &gw.external_network], 60);
+        let (cfg, broker) = crate::seat_gateway::volumes(&gw);
+        let _ = run(&["volume", "rm", &cfg, &broker], 60);
+        assert!(fetched.contains("FETCH_OK"), "the fetch seat: {fetched}");
+
+        // The limit under test: 4 GB, or `WICKED_LIVE_SEAT_MEMORY` to measure another (the engine's
+        // default seat limit is 3g, `memory_from`).
+        let memory = std::env::var("WICKED_LIVE_SEAT_MEMORY").unwrap_or_else(|_| "4g".into());
+        // One offline build seat: `unset` names the variables a control removes inside the seat.
+        let build = |label: &str, unset: &str| -> (String, Option<u64>, Option<u64>) {
+            let name = container_name("claude", label, 0);
+            let target = tree.join(format!("target-{label}"));
+            let (_, _, cmd) = cargo_seat(
+                &worker,
+                &tree,
+                std::slice::from_ref(&repo),
+                &rt.cli,
+                &image,
+                &name,
+                "none",
+                &floor,
+                &memory,
+                &[("CARGO_TARGET_DIR".to_string(), target.display().to_string())],
+                &format!(
+                    "{unset} echo JOBS=$CARGO_BUILD_JOBS DEBUG=$CARGO_PROFILE_DEV_DEBUG/\
+                     $CARGO_PROFILE_TEST_DEBUG INCREMENTAL=$CARGO_INCREMENTAL; \
+                     cd {repo_q} && cargo test --lib --no-run --locked --offline \
+                     >/tmp/build.log 2>&1 && echo BUILD_OK || {{ echo BUILD_FAILED; \
+                     grep -E '^error' /tmp/build.log | cut -c1-120 | tail -3; \
+                     echo KILLED=$(grep -c 'SIGKILL' /tmp/build.log); }}"
+                ),
+            );
+            // The cgroup's peak, read from outside while the seat runs (Landlock denies /sys inside).
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let poll = {
+                let (rt, name, done) = (rt.clone(), name.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let (mut peak, mut ooms) = (None, None);
+                    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                        let mut c = rt.cmd();
+                        c.args([
+                            "exec",
+                            &name,
+                            "cat",
+                            "/sys/fs/cgroup/memory.peak",
+                            "/sys/fs/cgroup/memory.events",
+                        ]);
+                        if let Some(o) = output_within(c, Duration::from_secs(20)) {
+                            let s = String::from_utf8_lossy(&o.stdout).to_string();
+                            let mut lines = s.lines();
+                            if let Some(p) = lines.next().and_then(|l| l.trim().parse().ok()) {
+                                peak = Some(p);
+                            }
+                            if let Some(n) = s
+                                .lines()
+                                .find_map(|l| l.strip_prefix("oom_kill "))
+                                .and_then(|v| v.trim().parse().ok())
+                            {
+                                ooms = Some(n);
+                            }
+                        }
+                        std::thread::sleep(Duration::from_secs(3));
+                    }
+                    (peak, ooms)
+                })
+            };
+            let out = output_within(cmd, Duration::from_secs(2400));
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            reap(&SeatContainer {
+                runtime: rt.cli.clone(),
+                name,
+            });
+            let (peak, ooms) = poll.join().unwrap_or((None, None));
+            let so = out
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_else(|| "the seat timed out".to_string());
+            let _ = std::fs::remove_dir_all(&target);
+            eprintln!(
+                "--- {label}: peak={:?} MiB oom_kill(last read)={ooms:?} ---\n{so}",
+                peak.map(|p| p / (1024 * 1024))
+            );
+            (so, peak, ooms)
+        };
+        let (seat, seat_peak, _) = build("seatbuild", "");
+        let (control, control_peak, control_ooms) = build(
+            "defaultbuild",
+            "unset CARGO_BUILD_JOBS CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG \
+             CARGO_INCREMENTAL;",
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        eprintln!(
+            "seat build: peak {:?} MiB; default profile: peak {:?} MiB, oom_kill {control_ooms:?}, \
+             {}",
+            seat_peak.map(|p| p / (1024 * 1024)),
+            control_peak.map(|p| p / (1024 * 1024)),
+            if control.contains("BUILD_OK") {
+                "built"
+            } else {
+                "did not build"
+            }
+        );
+        assert!(
+            seat.contains("JOBS=") && !seat.contains("JOBS= ") && seat.contains("DEBUG=0/0"),
+            "the seat carries the build settings: {seat}"
+        );
+        assert!(seat.contains("INCREMENTAL=0"), "{seat}");
+        assert!(
+            seat.contains("BUILD_OK"),
+            "the lib tests compile within 4 GB with the seat build settings: {seat}"
         );
     }
 
