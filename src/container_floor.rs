@@ -22,10 +22,10 @@
 //! keyed by toolchain in [`crate::worker_sandbox::SEAT_TOOLCHAIN_CACHES`]), bound read-write like
 //! any seat dir, with each variable passed by name to the runtime and to landrun ([`finalize`]).
 //! The toolchains' build settings ride the same way, from the table beside it
-//! ([`crate::worker_sandbox::SEAT_TOOLCHAIN_BUILD_ENV`]): cargo runs one job per CPU up to two, with
-//! no debuginfo for the dev and test profiles and no incremental state, so a cargo repository's
-//! tests build within a seat's memory limit; a variable the operator sets in the daemon's
-//! environment is passed with the operator's value instead.
+//! ([`crate::worker_sandbox::SEAT_TOOLCHAIN_BUILD_ENV`]): cargo runs one job per runtime CPU
+//! ([`seat_cpus`]) up to two, with no debuginfo for the dev and test profiles and no incremental
+//! state, so a cargo repository's tests build within a seat's memory limit; a variable the operator
+//! sets in the daemon's environment is passed with the operator's value instead.
 //!
 //! **The mounts are the floor.** They are rendered from the step-0 [`SeatFloor`] the interim floor
 //! renders its profile from (one root computation, two renderers): the writable roots read-write,
@@ -454,6 +454,49 @@ pub(crate) fn runtime() -> Result<Runtime, FloorUnarmed> {
         }
     }
     Err(FloorUnarmed::ContainerRuntimeDown)
+}
+
+/// The CPUs a seat container can use: the runtime engine's (`<cli> info --format {{.NCPU}}`,
+/// docker and nerdctl), which under a VM runtime (Docker Desktop, Rancher Desktop, colima) is the
+/// VM's, not the host's. A seat container carries no CPU limit of its own ([`run_argv`] sets
+/// `--memory`, never `--cpus`). The answer is cached per runtime CLI for the process; when the
+/// runtime does not answer it (podman's template differs), the host's parallelism stands in.
+pub(crate) fn seat_cpus() -> usize {
+    static CACHE: Mutex<Option<(PathBuf, usize)>> = Mutex::new(None);
+    let host = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    let Ok(rt) = runtime() else {
+        return host;
+    };
+    if let Some((_, n)) = CACHE
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .filter(|(cli, _)| *cli == rt.cli)
+    {
+        return n;
+    }
+    let mut probe = rt.cmd();
+    probe.args(["info", "--format", "{{.NCPU}}"]);
+    let answer = output_within(probe, PROBE_TIMEOUT)
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let n = cpus_from_info(answer.as_deref(), host);
+    if answer.is_some() {
+        if let Ok(mut g) = CACHE.lock() {
+            *g = Some((rt.cli.clone(), n));
+        }
+    }
+    n
+}
+
+/// The runtime's CPU count from its `info` answer, or `host` when it is not a positive count.
+fn cpus_from_info(answer: Option<&str>, host: usize) -> usize {
+    answer
+        .and_then(|a| a.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(host)
 }
 
 /// The package of `cli`'s seat image, when the engine ships one.
@@ -4813,6 +4856,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// The [`crate::worker_sandbox::SEAT_TOOLCHAIN_BUILD_ENV`] variables removed from this process's
+    /// environment while it lives (the plan reads an operator's value from there), restored on drop
+    /// (a panic included). The caller holds the env lock.
+    struct BuildEnvCleared(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl BuildEnvCleared {
+        fn new() -> Self {
+            let prior = crate::worker_sandbox::SEAT_TOOLCHAIN_BUILD_ENV
+                .iter()
+                .map(|(_, k, _)| (*k, std::env::var_os(k)))
+                .collect();
+            for (_, k, _) in crate::worker_sandbox::SEAT_TOOLCHAIN_BUILD_ENV {
+                std::env::remove_var(k);
+            }
+            Self(prior)
+        }
+    }
+
+    impl Drop for BuildEnvCleared {
+        fn drop(&mut self) {
+            for (k, v) in self.0.drain(..) {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
     /// A container seat's cargo runs with the seat build settings ([`SEAT_TOOLCHAIN_BUILD_ENV`],
     /// core#997's end-to-end run): one job per CPU up to two, no debuginfo for the dev and test
     /// profiles, no incremental state. The plan carries them, the finalized wrapper passes each by
@@ -4848,14 +4920,17 @@ mod tests {
         });
         assert_eq!(get(&theirs, "CARGO_BUILD_JOBS").as_deref(), Some("6"));
         assert_eq!(get(&theirs, "CARGO_INCREMENTAL").as_deref(), Some("0"));
+        // The CPUs are the runtime's (a VM's), never the host's, when the runtime answers.
+        assert_eq!(cpus_from_info(Some("1\n"), 14), 1);
+        assert_eq!(cpus_from_info(Some(" 2 "), 14), 2);
+        assert_eq!(cpus_from_info(None, 14), 14);
+        assert_eq!(cpus_from_info(Some("0"), 4), 4);
+        assert_eq!(cpus_from_info(Some("{{.NCPU}}"), 4), 4);
 
-        // Through the engine's own plan and wrapper, with an operator choice in the environment.
-        let prior: Vec<_> = ["CARGO_PROFILE_DEV_DEBUG", "CARGO_BUILD_JOBS"]
-            .into_iter()
-            .map(|k| (k, std::env::var_os(k)))
-            .collect();
+        // Through the engine's own plan and wrapper, with one operator choice in the environment
+        // and none of the other table variables inherited from the test's own.
+        let _clean = BuildEnvCleared::new();
         std::env::set_var("CARGO_PROFILE_DEV_DEBUG", "line-tables-only");
-        std::env::remove_var("CARGO_BUILD_JOBS");
         let base = tmp("cargo-build-env");
         let tree = base.join("wt");
         let worker = base.join("worker");
@@ -4873,18 +4948,7 @@ mod tests {
             &[],
             "cargo test",
         );
-        for (k, v) in prior {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-        let jobs = seat_build_jobs(
-            std::thread::available_parallelism()
-                .map(std::num::NonZeroUsize::get)
-                .unwrap_or(1),
-        )
-        .to_string();
+        let jobs = seat_build_jobs(seat_cpus()).to_string();
         assert_eq!(
             get(&plan.build_env, "CARGO_PROFILE_DEV_DEBUG").as_deref(),
             Some("line-tables-only"),
@@ -5072,19 +5136,19 @@ mod tests {
 
     /// LIVE (`WICKED_CONTAINER_LIVE=1`, with `WICKED_SEAT_BASE_IMAGE` naming a Rust toolchain base;
     /// skipped otherwise), core#997's end-to-end run: THIS repository's lib tests compile in a seat
-    /// container with a 4 GB memory limit, rendered by the engine's own path (seat floor plan, mount
-    /// plan, wrapper, finalize), with the seat build settings. A first seat fetches the lockfile
-    /// through the gateway into the seat's cargo cache; the build seats then run offline
-    /// (`--network none`). The same compile with cargo's default profile (the build settings unset
-    /// inside the seat, its own target dir) is the control: its outcome and the cgroup's peak memory
-    /// (`memory.peak`, read from outside the seat while it runs; it counts page cache too) are
-    /// printed for both, and the test asserts the seat build succeeds within the limit.
-    /// `WICKED_LIVE_SEAT_MEMORY` measures another limit. Measured on a 2 CPU / 6 GB Rancher VM: at
-    /// 4g both build (peak 3188 MiB with the settings, 3515 MiB without); at the engine's default
-    /// 3g the settings build and the default profile has rustc killed on the lib test crate.
+    /// container at the engine's default seat memory limit (3g, [`memory_from`]; the run's seat had
+    /// it), rendered by the engine's own path (seat floor plan, mount plan, wrapper, finalize), with
+    /// the seat build settings, and the same compile with cargo's default profile (the settings
+    /// unset inside the seat, its own target dir) has rustc killed. A first seat fetches the
+    /// lockfile through the gateway into the seat's cargo cache; the build seats then run offline
+    /// (`--network none`). The cgroup's peak memory (`memory.peak`, read with `exec` while the seat
+    /// runs; it counts page cache too) is printed for both. `WICKED_LIVE_SEAT_MEMORY` measures
+    /// another limit (the control is then reported, not asserted). Measured on a 2 CPU / 6 GB
+    /// Rancher VM: at 3g the settings build (peak 3072 MiB, the limit, page cache reclaimed) and the
+    /// default profile is killed on the lib test crate; at 4g both build (3188 MiB and 3515 MiB).
     #[cfg(unix)]
     #[test]
-    fn live_a_seat_compiles_this_repos_lib_tests_within_a_4g_limit() {
+    fn live_a_seat_compiles_this_repos_lib_tests_within_the_seat_memory_limit() {
         let _env = crate::test_env::ENV_LOCK
             .write()
             .unwrap_or_else(|p| p.into_inner());
@@ -5092,6 +5156,8 @@ mod tests {
             eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
             return;
         }
+        // The seat's settings are the table's, not ones this test process inherited.
+        let _clean = BuildEnvCleared::new();
         let rt = runtime().expect("a container runtime answers");
         let floor = ensure_floor_image(&rt).expect("the floor image");
         let image = ensure_seat_image(&rt, "claude").expect("the claude seat image");
@@ -5163,9 +5229,9 @@ mod tests {
         let _ = run(&["volume", "rm", &cfg, &broker], 60);
         assert!(fetched.contains("FETCH_OK"), "the fetch seat: {fetched}");
 
-        // The limit under test: 4 GB, or `WICKED_LIVE_SEAT_MEMORY` to measure another (the engine's
-        // default seat limit is 3g, `memory_from`).
-        let memory = std::env::var("WICKED_LIVE_SEAT_MEMORY").unwrap_or_else(|_| "4g".into());
+        // The limit under test: the engine's default, or `WICKED_LIVE_SEAT_MEMORY` to measure another.
+        let measuring = std::env::var("WICKED_LIVE_SEAT_MEMORY").ok();
+        let memory = memory_from(measuring.as_deref()).to_string();
         // One offline build seat: `unset` names the variables a control removes inside the seat.
         let build = |label: &str, unset: &str| -> (String, Option<u64>, Option<u64>) {
             let name = container_name("claude", label, 0);
@@ -5266,8 +5332,16 @@ mod tests {
         assert!(seat.contains("INCREMENTAL=0"), "{seat}");
         assert!(
             seat.contains("BUILD_OK"),
-            "the lib tests compile within 4 GB with the seat build settings: {seat}"
+            "the lib tests compile within {memory} with the seat build settings: {seat}"
         );
+        if measuring.is_none() {
+            assert!(
+                !control.contains("BUILD_OK")
+                    && control.contains("KILLED=")
+                    && !control.contains("KILLED=0"),
+                "cargo's default profile has rustc killed at the default {memory} limit: {control}"
+            );
+        }
     }
 
     /// LIVE (needs a container runtime; `WICKED_CONTAINER_LIVE=1`, skipped otherwise;

@@ -1167,12 +1167,12 @@ pub(crate) const SEAT_BUILD_JOBS_CAP: usize = 2;
 /// `(toolchain, variable, value)`, next to [`SEAT_TOOLCHAIN_CACHES`] and the same mechanism (a new
 /// toolchain's settings are rows here; the env and its pass-through to the runtime and landrun
 /// follow). A seat has a fixed memory limit (`WICKED_SEAT_MEMORY`, default 3g) and the runtime's
-/// CPUs, and cargo's defaults are sized for a workstation. One job per CPU, full debuginfo and
-/// incremental state together ran a seat out of memory on wicked-core's own lib tests: rustc was
-/// SIGKILLed in a 2 CPU / 5.9 GB runtime (core#997's end-to-end run). The same build with these
-/// settings finished in 4m59s. Debuginfo is the largest part of rustc's and the linker's memory on a
-/// test binary, and incremental state is written and kept for a target dir that is reused only by
-/// the run's later units.
+/// CPUs, and cargo's defaults are sized for a workstation: one job per CPU, full debuginfo and
+/// incremental state. With them, rustc was SIGKILLed for memory on wicked-core's own lib tests in a
+/// seat at the default 3g limit (core#997's end-to-end run, a 2 CPU runtime); the same build with
+/// these settings finished in 4m59s. Debuginfo is the largest part of rustc's and the linker's
+/// memory on a test binary, incremental state is written and kept for a target dir that only the
+/// run's later units reuse, and the jobs cap keeps a many-CPU runtime from multiplying the peak.
 ///
 /// The operator's own value wins: a variable set (non-empty) in the daemon's environment is passed
 /// to the seat as it is, in place of the row's value ([`floor_build_env`]).
@@ -1195,16 +1195,6 @@ pub(crate) const SEAT_TOOLCHAIN_BUILD_ENV: &[(&str, &str, SeatBuildValue)] = &[
 /// [`SEAT_BUILD_JOBS_CAP`], at least one.
 pub(crate) fn seat_build_jobs(cpus: usize) -> usize {
     cpus.clamp(1, SEAT_BUILD_JOBS_CAP)
-}
-
-/// The CPUs a container seat can use. A seat container carries no CPU limit of its own
-/// ([`crate::container_floor::run_argv`] sets `--memory`, never `--cpus`), so it is at most the
-/// host's; under a VM runtime (Docker Desktop, Rancher Desktop, colima) the VM may have fewer, and
-/// the [`SEAT_BUILD_JOBS_CAP`] bounds both.
-fn seat_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1)
 }
 
 /// The build variables a governed container seat gets ([`SEAT_TOOLCHAIN_BUILD_ENV`]) for `cpus`
@@ -1319,7 +1309,9 @@ pub(crate) fn plan_seat_floor(launch: SeatLaunch<'_>, write_roots: Vec<PathBuf>)
             trusted_git_dir: None,
         },
         env,
-        build_env: floor_build_env(seat_cpus(), |k| std::env::var(k).ok()),
+        build_env: floor_build_env(crate::container_floor::seat_cpus(), |k| {
+            std::env::var(k).ok()
+        }),
     }
 }
 

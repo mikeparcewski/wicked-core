@@ -20,13 +20,15 @@ Two release tracks share this file, newest entry first regardless of track:
   repository had rustc SIGKILLed for memory (2 CPU / 5.9 GB runtime), and the same build with two jobs, no
   debuginfo and no incremental state compiled in 4m59s. Container seats now get those settings from a table
   beside the toolchain cache table (`SEAT_TOOLCHAIN_BUILD_ENV` in `worker_sandbox`, the same mechanism: a
-  toolchain's settings are rows there): `CARGO_BUILD_JOBS` = the seat's CPUs, at most 2 (a seat container has
-  no CPU limit of its own, so its CPUs are at most the host's), `CARGO_PROFILE_DEV_DEBUG=0`,
+  toolchain's settings are rows there): `CARGO_BUILD_JOBS` = the seat's CPUs, at most 2 (the runtime engine's CPU
+  count, `info --format {{.NCPU}}`, which under a VM runtime is the VM's; the host's parallelism when the
+  runtime does not answer it), `CARGO_PROFILE_DEV_DEBUG=0`,
   `CARGO_PROFILE_TEST_DEBUG=0` and `CARGO_INCREMENTAL=0`, each passed by name to the runtime and to landrun.
   A variable the operator sets (non-empty) in the daemon's environment is passed with the operator's value
   instead. A unit test pins the plan, the by-name pass-through and the override; a live test
-  (`WICKED_CONTAINER_LIVE=1`, Rust seat base) compiles this repository's lib tests in a seat with a 4 GB limit
-  and reports the cgroup's peak memory beside a default-profile control.
+  (`WICKED_CONTAINER_LIVE=1`, Rust seat base) compiles this repository's lib tests in a seat at the default 3g
+  limit with the settings, and has cargo's default profile killed there (`WICKED_LIVE_SEAT_MEMORY` measures
+  another limit: at 4g both profiles build, peak 3188 MiB and 3515 MiB).
 
 - **The repo-checks floor no longer writes its build output into the run's worktree.** The floor's host-side checks
   (fmt, clippy, test) kept their isolated `HOME`, package caches and `CARGO_TARGET_DIR` in
