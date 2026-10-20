@@ -47,6 +47,15 @@ use std::time::{Duration, Instant};
 
 use wicked_apps_core::HardenedCommand;
 
+/// The relay's log line on the daemon's stderr, best effort: a stderr that cannot be written (a
+/// reader gone) never panics a relay thread mid-refusal (`eprintln!` would).
+macro_rules! relay_log {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 /// The gateway port the seat's gate hook posts to (not a browser-blocked port).
 pub(crate) const HOOK_PORT: u16 = 8711;
 /// How long one tool call's judgement may take before it is denied.
@@ -291,8 +300,18 @@ impl Call {
 
 impl Drop for Call {
     fn drop(&mut self) {
-        if let Ok(mut s) = self.0.state.lock() {
-            s.calls = s.calls.saturating_sub(1);
+        // A call whose thread panicked may have refused without recording: its unit fails closed.
+        let panicked = std::thread::panicking();
+        match self.0.state.lock() {
+            Ok(mut s) => {
+                s.calls = s.calls.saturating_sub(1);
+                s.unrecorded |= panicked;
+            }
+            Err(p) => {
+                let mut s = p.into_inner();
+                s.calls = s.calls.saturating_sub(1);
+                s.unrecorded = true;
+            }
         }
         self.0.idle.notify_all();
     }
@@ -450,7 +469,7 @@ fn overflow(mut conn: TcpStream) {
             drop(call);
             // Closed only once its unit is marked.
             drop(conn);
-            eprintln!(
+            relay_log!(
                 "wicked-core: the gate hook relay is at its connection limit; a call of a live \
                  unit was refused unrecorded, and the unit will fail closed"
             );
@@ -471,7 +490,7 @@ fn fail_every_live_unit() {
         }
     }
     if !live.is_empty() {
-        eprintln!(
+        relay_log!(
             "wicked-core: the gate hook relay dropped a call it could not attribute (connection \
              and overflow limits reached); every live unit ({}) will fail closed",
             live.len()
@@ -820,7 +839,7 @@ fn judge(reg: &Registered, call: &Call, tool: &str, body: &[u8], budget: Duratio
         HookRun::Killed { signal, stderr } => {
             let untouched = before.is_some() && log.as_deref().map(log_len) == before;
             let time_left = Instant::now() < deadline;
-            eprintln!(
+            relay_log!(
                 "wicked-core: the gate hook was killed by {} before it answered a {tool} call; {}",
                 signal_name(signal),
                 match (untouched, time_left) {
@@ -912,7 +931,7 @@ const UNKNOWN_TOOL: &str = "(unknown)";
 fn refusal(reg: Option<&Registered>, tool: &str, why: &str) -> String {
     let reason =
         format!("the gate hook relay refused the call: {why}; the call is denied (fail closed)");
-    eprintln!("wicked-core: {reason} (tool: {tool})");
+    relay_log!("wicked-core: {reason} (tool: {tool})");
     if let Some(reg) = reg {
         let var = |k: &str| env_of(&reg.ctx, k);
         let recorded = match (
@@ -927,11 +946,11 @@ fn refusal(reg: Option<&Registered>, tool: &str, why: &str) -> String {
             _ => Err("the unit names no decisions log".to_string()),
         };
         if let Err(e) = recorded {
-            eprintln!(
+            reg.life.mark_unrecorded();
+            relay_log!(
                 "wicked-core: the refusal could not be recorded in the unit's decisions log ({e}); \
                  the unit will fail closed"
             );
-            reg.life.mark_unrecorded();
         }
     }
     deny_answer(&reason)
@@ -1845,6 +1864,20 @@ mod tests {
             let rec = records(&log);
             assert_eq!(rec.len(), 1, "{rec:?} / {resp}");
             assert!(rec[0].obligations[0].contains("cut off"), "{rec:?}");
+        }
+
+        // A relay thread that panics while it holds a call (a log write, anything) leaves its
+        // unit failing closed (review round 16).
+        {
+            let (t, r17, _log) = unit("panicking");
+            let reg = super::unit(&t).expect("registered");
+            let joined = std::thread::spawn(move || {
+                let _call = reg.life.enter().expect("live");
+                panic!("the relay thread died mid-refusal");
+            })
+            .join();
+            assert!(joined.is_err());
+            assert!(r17.finish(), "a call that panicked fails its unit");
         }
 
         // A refusal that cannot be recorded (the unit's decisions log is unwritable) marks the
