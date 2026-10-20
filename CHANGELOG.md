@@ -47,6 +47,22 @@ Two release tracks share this file, newest entry first regardless of track:
   clears and the unit proceeds to verify; the automatic round still reuses the result), `event.rs`
   (`floorRecheck` wire shape).
 
+- **A review no longer fails on what only delivery can show; the deliver gate lists it instead.** Two governed
+  reviews (the core#840 and core#997 runs) failed acceptance items such as "CI green on ubuntu/macos/windows" and
+  "PR body says `Closes #N`": the CI run and the pull request do not exist until the deliver phase pushes, so the
+  review could never pass on its own. The reviewer's brief (`review_context`) now has a fourth item status,
+  `ITEM <n>: DEFERRED — <the delivery artifact it waits for>`, with one rule: judge only what the run's tree and
+  the floor record show before delivery. A criterion that needs CI on the opened pull request, the PR's title or
+  body, a merge or a release is DEFERRED, never PASS and never FAIL. An item that mixes the two FAILs when its
+  in-run part fails, because a deferral never lifts a failing in-run part. A DEFERRED item never fails the unit. An
+  intent may also list such checks under an `After delivery:` label: the checklist ends there, and the brief
+  numbers those checks after the in-run items for the reviewer to answer DEFERRED. The engine does not check CI or
+  the PR body after the push. So the deliver gate's card now ends with every item a counted review of the run
+  deferred (an approved verdict, or a verdict the operator landed). Each item is named with its review unit, as a
+  check for the operator to make on the opened pull request before merging. Unchanged: the `VERDICT:` line is
+  still the only thing the gate parses, and a deliver card with nothing deferred reads as before. Item lines that
+  end in a code span now keep their closing backtick.
+
 - **A claude seat in a container can read and edit its own worktree under `~/.wicked/repos`.** Crew registers
   repositories under `~/.wicked/repos`, and `.wicked` is one of the directories the worker fence always denies
   (`Read`/`Edit` over `~/.wicked/**`, for estate's stores). A seat container mounts each host path at the same

@@ -9,10 +9,13 @@
 //! rounds late, and nine of thirteen verdicts said "floor results not available" over a floor that
 //! had passed (program-2026-09 `dogfood/s15e-recon/DECISION.md` §1 P1, §3 row 1).
 //!
-//! The verdict contract this brief asks for — one `ITEM <n>: PASS | FAIL | RULED` line per
-//! checklist item above the `VERDICT:` line — gives a later round (and the operator) stable item
-//! numbers to hold a verdict to; [`parse_review_items`] reads them back when the rework cap
-//! (core#761, [`MAX_REVIEW_SENDBACKS`]) opens its `review_adjudication` gate. The `VERDICT:` line
+//! The verdict contract this brief asks for — one `ITEM <n>: PASS | FAIL | RULED | DEFERRED` line
+//! per checklist item above the `VERDICT:` line — gives a later round (and the operator) stable
+//! item numbers to hold a verdict to. DEFERRED is for a criterion only delivery can show (CI on
+//! the opened pull request, the PR body, a merge): it never fails the unit, and the deliver gate
+//! lists it ([`deferred_to_delivery`], [`delivery_checks_note`]). [`parse_review_items`] reads
+//! the lines back when the rework cap (core#761, [`MAX_REVIEW_SENDBACKS`]) opens its
+//! `review_adjudication` gate. The `VERDICT:` line
 //! is still the only thing the gate fold parses ([`crate::validator::parse_evaluator_verdict`]).
 
 use crate::domain::{IntentAmendment, WorkUnit};
@@ -21,14 +24,32 @@ use crate::domain::{IntentAmendment, WorkUnit};
 /// item lines just above the verdict line, which is last).
 const ROUND_FINDINGS_CAP: usize = 3000;
 
+/// The labels that head the in-run checklist (normalised: lowercase, `-`/`_` as spaces).
+const DONE_WHEN_HEADS: &[&str] = &["done when", "acceptance criteria", "definition of done"];
+
+/// The labels that head the intent's AFTER-DELIVERY checks: criteria whose evidence exists only
+/// once the deliver phase pushes (CI on the opened pull request, the PR body, a merge).
+const AFTER_DELIVERY_HEADS: &[&str] = &["after delivery", "post delivery"];
+
 /// The `done when` items of an intent, in order: the list under the first heading (or label line)
 /// that reads `Done when` / `Done-when` / `Acceptance criteria` / `Definition of done`, markers
 /// stripped (`-`, `*`, `+`, `1.`, `1)`, `[ ]`, `[x]`). An indented line continues the item above
-/// it; the list ends at the next heading or the next unindented prose line. A label line with
-/// text after its colon (`Done when: the build passes`) is itself an item, and a section written
-/// as one paragraph is one item. No such section → empty (the brief then asks the reviewer to
-/// number the intent's own requirements).
+/// it; the list ends at the next heading, the next section label (`After delivery:`) or the next
+/// unindented prose line. A label line with text after its colon (`Done when: the build passes`)
+/// is itself an item, and a section written as one paragraph is one item. No such section → empty
+/// (the brief then asks the reviewer to number the intent's own requirements).
 pub(crate) fn done_when_items(intent: &str) -> Vec<String> {
+    section_items(intent, DONE_WHEN_HEADS)
+}
+
+/// The intent's `After delivery` items (same list grammar as [`done_when_items`]): the checks the
+/// reviewer answers `DEFERRED` and the deliver gate lists for the operator. Empty when the intent
+/// has no such section.
+pub(crate) fn after_delivery_items(intent: &str) -> Vec<String> {
+    section_items(intent, AFTER_DELIVERY_HEADS)
+}
+
+fn section_items(intent: &str, heads: &[&str]) -> Vec<String> {
     let mut lines = intent.lines();
     let mut items: Vec<String> = Vec::new();
     // Find the section head.
@@ -36,7 +57,7 @@ pub(crate) fn done_when_items(intent: &str) -> Vec<String> {
         let Some(line) = lines.next() else {
             return items;
         };
-        if let Some(rest) = done_when_head(line) {
+        if let Some(rest) = section_head(line, heads) {
             if !rest.is_empty() {
                 items.push(rest);
             }
@@ -48,7 +69,10 @@ pub(crate) fn done_when_items(intent: &str) -> Vec<String> {
         if trimmed.is_empty() {
             continue;
         }
-        if trimmed.starts_with('#') {
+        if trimmed.starts_with('#')
+            || section_head(line, DONE_WHEN_HEADS).is_some()
+            || section_head(line, AFTER_DELIVERY_HEADS).is_some()
+        {
             break;
         }
         if let Some(item) = list_item(trimmed) {
@@ -71,8 +95,8 @@ pub(crate) fn done_when_items(intent: &str) -> Vec<String> {
     items
 }
 
-/// `Some(rest-after-colon)` when `line` heads a done-when section.
-fn done_when_head(line: &str) -> Option<String> {
+/// `Some(rest-after-colon)` when `line` heads a section labelled one of `heads`.
+fn section_head(line: &str, heads: &[&str]) -> Option<String> {
     let bare = line
         .trim()
         .trim_start_matches(['#', '*', '_', ' ', '\t'])
@@ -85,7 +109,6 @@ fn done_when_head(line: &str) -> Option<String> {
         .trim_matches(['*', '_', ' ', '\t'])
         .to_lowercase()
         .replace(['-', '_'], " ");
-    let heads = ["done when", "acceptance criteria", "definition of done"];
     if !heads.iter().any(|h| norm == *h) {
         return None;
     }
@@ -122,15 +145,20 @@ fn list_item(trimmed: &str) -> Option<&str> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReviewItem {
     pub n: u32,
-    /// `PASS` | `FAIL` | `RULED` (uppercased).
+    /// `PASS` | `FAIL` | `RULED` | `DEFERRED` (uppercased).
     pub status: String,
     /// The line as written (trimmed of decoration).
     pub line: String,
 }
 
-/// The `ITEM <n>: PASS | FAIL | RULED` lines of a verdict, in order; the LAST line for an item
-/// number wins (a reviewer restating an item). Decoration (`-`, `*`, `#`, `>`, backticks) is
-/// tolerated; a line whose status is none of the three is not an item line.
+/// The item status for a criterion whose evidence exists only after delivery — CI on the opened
+/// pull request, the PR's title or body, a merge. Neither a pass nor a fail: it never fails the
+/// unit, and the deliver gate lists it ([`delivery_checks_note`]) for the operator to check.
+pub(crate) const DEFERRED: &str = "DEFERRED";
+
+/// The `ITEM <n>: PASS | FAIL | RULED | DEFERRED` lines of a verdict, in order; the LAST line for
+/// an item number wins (a reviewer restating an item). Decoration (`-`, `*`, `#`, `>`, backticks)
+/// is tolerated; a line whose status is none of the four is not an item line.
 pub(crate) fn parse_review_items(text: &str) -> Vec<ReviewItem> {
     let mut out: Vec<ReviewItem> = Vec::new();
     for line in text.lines() {
@@ -158,10 +186,22 @@ pub(crate) fn parse_review_items(text: &str) -> Vec<ReviewItem> {
                     .to_uppercase()
             })
             .unwrap_or_default();
-        if !matches!(status.as_str(), "PASS" | "FAIL" | "RULED") {
+        if !matches!(status.as_str(), "PASS" | "FAIL" | "RULED" | DEFERRED) {
             continue;
         }
-        let line = bare.trim_matches(['*', '`']).trim().to_string();
+        // Closing decoration: the `**` of a bold line, and only as many backticks as OPENED it —
+        // an item ending in a code span (`PR body \`Closes #7\``) keeps its closing backtick.
+        let opened_ticks = line
+            .trim()
+            .chars()
+            .take_while(|c| matches!(c, '#' | '*' | '-' | '>' | '`' | ' ' | '\t'))
+            .filter(|c| *c == '`')
+            .count();
+        let mut end = bare.trim_end_matches('*');
+        for _ in 0..opened_ticks {
+            end = end.strip_suffix('`').unwrap_or(end);
+        }
+        let line = end.trim_end_matches('*').trim().to_string();
         out.retain(|i| i.n != n);
         out.push(ReviewItem { n, status, line });
     }
@@ -239,6 +279,73 @@ pub(crate) fn carried_items(verdict: &str) -> Vec<String> {
     vec![tail(verdict, ROUND_FINDINGS_CAP)]
 }
 
+/// The items the run's reviews DEFERRED to delivery, as `(evaluator ord, item line)` in item
+/// order: every Evaluator agent unit before `deliver_ord` that counted (`Done`) is read — its
+/// approved verdict (`approved_output`), or, for a review the operator landed over a NOT-PASS
+/// verdict, that verdict's words. An item number any of them deferred is listed once (the latest
+/// deferring line), even when another review judged it: a check named twice costs a glance, a
+/// dropped one ships unchecked.
+pub(crate) fn deferred_to_delivery(
+    units: &[WorkUnit],
+    deliver_ord: u32,
+    approved_output: impl Fn(&WorkUnit) -> Option<String>,
+) -> Vec<(u32, String)> {
+    let mut deferred: std::collections::BTreeMap<u32, (u32, String)> = Default::default();
+    for u in units.iter().filter(|u| {
+        u.ord < deliver_ord
+            && u.role == crate::workflow::PhaseRole::Evaluator
+            && u.tool_cmd.is_none()
+            && u.status == crate::domain::UnitStatus::Done
+    }) {
+        let verdict = approved_output(u).or_else(|| {
+            u.review_rounds
+                .iter()
+                .rev()
+                .find(|r| r.outcome.as_deref() == Some(REVIEW_LANDED))
+                .map(|r| r.findings.clone())
+        });
+        for i in verdict
+            .as_deref()
+            .map(parse_review_items)
+            .unwrap_or_default()
+        {
+            if i.status == DEFERRED {
+                deferred.insert(i.n, (u.ord, i.line));
+            }
+        }
+    }
+    deferred.into_values().collect()
+}
+
+/// The deliver gate card's post-delivery checks: the [`deferred_to_delivery`] items, said as what
+/// they are — checks the engine does NOT run after the push, for the operator to make on the
+/// opened pull request before merging. Empty when no review deferred anything.
+pub(crate) fn delivery_checks_note(deferred: &[(u32, String)]) -> String {
+    if deferred.is_empty() {
+        return String::new();
+    }
+    let lines = deferred
+        .iter()
+        .map(|(ord, line)| {
+            let line = if line.chars().count() > 240 {
+                format!("{}…", line.chars().take(240).collect::<String>())
+            } else {
+                line.clone()
+            };
+            format!("{line} (review unit {ord})")
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        " After delivery — {} check{} the review deferred to the opened pull request; the engine \
+         does not verify {} after the push, so check {} there before you merge: {lines}.",
+        deferred.len(),
+        if deferred.len() == 1 { "" } else { "s" },
+        if deferred.len() == 1 { "it" } else { "them" },
+        if deferred.len() == 1 { "it" } else { "each" },
+    )
+}
+
 /// One bounded list for the prompt: up to five lines, each ≤ 160 chars, then `(+N more)`.
 fn prompt_list(lines: &[String]) -> String {
     let mut parts: Vec<String> = lines
@@ -307,6 +414,19 @@ fn tail(s: &str, cap: usize) -> String {
     }
 }
 
+/// The deferral rule of the review contract: judge only what the run can show before delivery;
+/// a criterion that needs a delivery artifact is DEFERRED (never PASS, never FAIL) and the deliver
+/// gate lists it. Deny-dominates: deferral never lifts a failing in-run part of an item.
+pub(crate) const DEFERRAL_RULE: &str = "- DEFERRED = the item's evidence can exist only after the \
+     deliver phase pushes: CI results on the opened pull request, the pull request's title or \
+     body, a merge, a release. Judge only what the run's tree, your own runs in it and the [floor \
+     record] show before delivery. An item that mixes the two is judged on its in-run part first: \
+     FAIL when that part fails (a deferral never lifts a failing in-run part); DEFERRED, naming \
+     what waits, only when every in-run part passes. Never FAIL an item because a delivery \
+     artifact does not exist yet, and never PASS one on a promise that it will. A DEFERRED item \
+     never fails the unit; the deliver gate lists it for the operator to check on the opened \
+     pull request.\n";
+
 /// The evaluator's brief, as `(ord, label, text)` context blocks in the order they are handed:
 /// `[review checklist — unit N]` always; `[prior verdicts — unit N]` when the unit returned a
 /// NOT-PASS verdict before; `[operator rulings — unit N]` when a human note amended it or the
@@ -337,6 +457,20 @@ pub(crate) fn evaluator_brief(
             c.push_str(&format!("  {}. {it}\n", i + 1));
         }
     }
+    let after = after_delivery_items(intent);
+    if !after.is_empty() {
+        c.push_str(
+            "After delivery — the intent's checks on what the deliver phase creates; nothing in \
+             this run can show them yet, so answer each DEFERRED:\n",
+        );
+        for (i, it) in after.iter().enumerate() {
+            if items.is_empty() {
+                c.push_str(&format!("  - {it} (number it after your own items)\n"));
+            } else {
+                c.push_str(&format!("  {}. {it}\n", items.len() + i + 1));
+            }
+        }
+    }
     if !amendments.is_empty() {
         c.push_str(
             "Approved intent amendments (the operator changed the checklist; they win over the \
@@ -349,10 +483,14 @@ pub(crate) fn evaluator_brief(
     c.push_str(
         "Answer with one line per item, above your VERDICT line:\n  ITEM <n>: PASS — <the \
          evidence>\n  ITEM <n>: FAIL — <what is wrong, file:line>\n  ITEM <n>: RULED — <the \
-         operator ruling that settles it>\nRules:\n- RULED = an [operator rulings] entry settles \
-         the item. A RULED item can never fail the unit; do not re-raise it.\n- VERDICT: FAIL \
-         only when at least one item is FAIL. A concern that is not a checklist item goes under \
-         \"Follow-ups\" and never fails the unit by itself.\n",
+         operator ruling that settles it>\n  ITEM <n>: DEFERRED — <the delivery artifact it \
+         waits for>\nRules:\n- RULED = an [operator rulings] entry settles the item. A RULED \
+         item can never fail the unit; do not re-raise it.\n",
+    );
+    c.push_str(DEFERRAL_RULE);
+    c.push_str(
+        "- VERDICT: FAIL only when at least one item is FAIL. A concern that is not a checklist \
+         item goes under \"Follow-ups\" and never fails the unit by itself.\n",
     );
     if round >= 2 {
         c.push_str(
@@ -498,6 +636,19 @@ mod tests {
             vec![(1, "PASS"), (2, "FAIL"), (3, "RULED")]
         );
         assert!(items[1].line.ends_with("restated"));
+        // Closing decoration goes, a closing code span stays.
+        let v =
+            "`ITEM 1: PASS — ok`\n**ITEM 2: DEFERRED — PR body `Closes #7`**\nITEM 3: DEFERRED — \
+                 `merge`";
+        let lines: Vec<String> = parse_review_items(v).into_iter().map(|i| i.line).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "ITEM 1: PASS — ok".to_string(),
+                "ITEM 2: DEFERRED — PR body `Closes #7`".to_string(),
+                "ITEM 3: DEFERRED — `merge`".to_string()
+            ]
+        );
     }
 
     fn round(attempt: u32, findings: &str, sent_back: bool) -> crate::domain::ReviewRound {
@@ -660,5 +811,180 @@ mod tests {
         assert_eq!(brief.len(), 1, "{brief:?}");
         assert!(brief[0].2.contains("The intent names no Done-when list"));
         assert!(!brief[0].2.contains("round 2 or later"));
+    }
+
+    /// An intent split into `Done when` and `After delivery`: the checklist stops at the second
+    /// section's label (even right after its own head), and the after-delivery list reads on its
+    /// own with the same grammar.
+    #[test]
+    fn an_after_delivery_section_ends_the_checklist_and_reads_on_its_own() {
+        let intent = "Fix it.\nDONE WHEN:\n1. tests pin it\n2. CHANGELOG bullet\nAFTER DELIVERY:\n1. \
+                      CI green on ubuntu/macos/windows\n2. PR body `Closes #840`\nOUT OF SCOPE: x\n";
+        assert_eq!(
+            done_when_items(intent),
+            vec!["tests pin it".to_string(), "CHANGELOG bullet".to_string()]
+        );
+        assert_eq!(
+            after_delivery_items(intent),
+            vec![
+                "CI green on ubuntu/macos/windows".to_string(),
+                "PR body `Closes #840`".to_string()
+            ]
+        );
+        assert!(done_when_items("Done when:\nAfter delivery:\n- CI green\n").is_empty());
+        assert_eq!(
+            after_delivery_items("## Post-delivery\n- merged\n"),
+            vec!["merged".to_string()]
+        );
+        assert!(after_delivery_items("Done when:\n- a\n").is_empty());
+    }
+
+    /// `DEFERRED` is an item status; it is neither a FAIL (the adjudication tally and the carried
+    /// items ignore it) nor a PASS.
+    #[test]
+    fn deferred_item_lines_parse_and_never_count_as_fail() {
+        let v =
+            "ITEM 1: PASS — ok\n- **ITEM 2: Deferred — CI runs on the opened PR**\nITEM 3: FAIL \
+                 — no test\nVERDICT: FAIL";
+        let items = parse_review_items(v);
+        assert_eq!(
+            items
+                .iter()
+                .map(|i| (i.n, i.status.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "PASS"), (2, DEFERRED), (3, "FAIL")]
+        );
+        let t = tally_items(&[], 0, v);
+        assert_eq!(t.new, vec!["ITEM 3: FAIL — no test".to_string()]);
+        assert!(t.re_raised.is_empty() && t.ruled.is_empty());
+        assert_eq!(carried_items(v), vec!["ITEM 3: FAIL — no test".to_string()]);
+    }
+
+    /// The composed review prompt carries the deferral rule — judge only what the run shows before
+    /// delivery, DEFERRED for a delivery artifact, deny-dominates on a mixed item, DEFERRED never
+    /// fails the unit — and numbers the intent's after-delivery checks after its checklist.
+    #[test]
+    fn the_brief_carries_the_deferral_rule_and_numbers_after_delivery_checks() {
+        use crate::workflow::PhaseRole;
+        let eval = unit(3, PhaseRole::Evaluator);
+        let units = vec![unit(2, PhaseRole::Creator), eval.clone()];
+        let brief = evaluator_brief(
+            "Do it.\nDone when:\n1. tests pin it\n2. CHANGELOG bullet\nAfter delivery:\n1. CI \
+             green on the opened PR\n2. PR body `Closes #7`\n",
+            &[],
+            &units,
+            &eval,
+        );
+        let c = &brief[0].2;
+        assert!(
+            c.contains("  1. tests pin it\n  2. CHANGELOG bullet\n"),
+            "{c}"
+        );
+        assert!(
+            c.contains(
+                "answer each DEFERRED:\n  3. CI green on the opened PR\n  4. PR body `Closes #7`\n"
+            ),
+            "{c}"
+        );
+        assert!(
+            c.contains("ITEM <n>: DEFERRED — <the delivery artifact it waits for>"),
+            "{c}"
+        );
+        assert!(c.contains(DEFERRAL_RULE), "{c}");
+        for want in [
+            "CI results on the opened pull request",
+            "the pull request's title or body",
+            "a merge",
+            "FAIL when that part fails (a deferral never lifts a failing in-run part)",
+            "Never FAIL an item because a delivery artifact does not exist yet",
+            "never PASS one on a promise that it will",
+            "A DEFERRED item never fails the unit",
+            "the deliver gate lists it",
+        ] {
+            assert!(DEFERRAL_RULE.contains(want), "{want}");
+        }
+        assert!(
+            c.contains("VERDICT: FAIL only when at least one item is FAIL"),
+            "{c}"
+        );
+
+        // The rule rides every brief, with or without an after-delivery section; with no in-run
+        // list the after-delivery checks are bulleted for the reviewer to number after its own.
+        let plain = evaluator_brief(
+            "just do it\nAfter delivery:\n- merged\n",
+            &[],
+            &units,
+            &eval,
+        );
+        let c = &plain[0].2;
+        assert!(c.contains("The intent names no Done-when list"), "{c}");
+        assert!(
+            c.contains("  - merged (number it after your own items)\n"),
+            "{c}"
+        );
+        assert!(c.contains(DEFERRAL_RULE), "{c}");
+        let none = evaluator_brief("Done when:\n- a\n", &[], &units, &eval);
+        assert!(none[0].2.contains(DEFERRAL_RULE) && !none[0].2.contains("After delivery —"));
+    }
+
+    /// What the deliver gate lists: the DEFERRED items of every counted Evaluator agent unit before
+    /// the deliver unit — an approved verdict, or a landed review's verdict words — one line per
+    /// item number; a pending review, a creator, a tool step and a unit after delivery add nothing.
+    #[test]
+    fn deferred_to_delivery_reads_every_counted_review_and_the_note_names_each_check() {
+        use crate::workflow::PhaseRole;
+        let done = |ord: u32, role: PhaseRole| {
+            let mut u = unit(ord, role);
+            u.status = crate::domain::UnitStatus::Done;
+            u
+        };
+        let creator = done(1, PhaseRole::Creator);
+        let review = done(2, PhaseRole::Evaluator);
+        let mut landed = done(3, PhaseRole::Evaluator);
+        landed.review_rounds.push(crate::domain::ReviewRound {
+            attempt: 1,
+            findings: "ITEM 4: FAIL — flaky\nITEM 6: DEFERRED — merge\nVERDICT: FAIL".into(),
+            outcome: Some(REVIEW_LANDED.into()),
+        });
+        let pending = unit(4, PhaseRole::Evaluator);
+        let mut tool = done(5, PhaseRole::Evaluator);
+        tool.tool_cmd = Some(vec!["true".into()]);
+        let after = done(7, PhaseRole::Evaluator);
+        let units = vec![creator, review, landed, pending, tool, after];
+        let outputs = |u: &WorkUnit| -> Option<String> {
+            match u.ord {
+                1 => Some("ITEM 9: DEFERRED — creator words".into()),
+                2 => Some(
+                    "ITEM 1: PASS — ok\nITEM 5: DEFERRED — CI on the opened PR\nITEM 6: DEFERRED \
+                     — PR body\nVERDICT: PASS"
+                        .into(),
+                ),
+                4 | 5 | 7 => Some("ITEM 8: DEFERRED — not counted\nVERDICT: PASS".into()),
+                _ => None,
+            }
+        };
+        let d = deferred_to_delivery(&units, 6, outputs);
+        assert_eq!(
+            d,
+            vec![
+                (2, "ITEM 5: DEFERRED — CI on the opened PR".to_string()),
+                (3, "ITEM 6: DEFERRED — merge".to_string()),
+            ]
+        );
+        let note = delivery_checks_note(&d);
+        assert!(
+            note.starts_with(
+                " After delivery — 2 checks the review deferred to the opened pull request; the \
+                 engine does not verify them after the push, so check each there before you merge:"
+            ),
+            "{note}"
+        );
+        assert!(note.contains("ITEM 5: DEFERRED — CI on the opened PR (review unit 2); ITEM 6: DEFERRED — merge (review unit 3)."), "{note}");
+        assert_eq!(delivery_checks_note(&[]), "");
+        let one = delivery_checks_note(&d[..1]);
+        assert!(
+            one.contains("1 check the review deferred") && one.contains("check it there"),
+            "{one}"
+        );
     }
 }
