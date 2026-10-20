@@ -1,12 +1,13 @@
 // Fake Gemini API for the agy seat's tests (no real account, no real key): answers agy's
-// `GOOGLE_GEMINI_BASE_URL` requests on 127.0.0.1:$PORT. Derived from the agy spike's fakegemini.js. Test-only.
+// `GOOGLE_GEMINI_BASE_URL` requests on $HOST:$PORT (127.0.0.1:8089 by default). Derived from the agy spike's fakegemini.js. Test-only.
 // The main model's reply is chosen by a word in the prompt:
 //   AGY-TOOL   first turn asks for `run_command` ($FAKE_CMD), then answers after its result
 //   AGY-SLOW   waits 60 s before answering (exercises --print-timeout)
 //   AGY-FAIL   answers HTTP 500 (a model error)
 //   otherwise  answers "VERDICT: PASS" plus the newest marker after AGY-ECHO=, if any (a
 //              resumed conversation's request carries the earlier turns' too)
-// Every request is logged to $SRV_LOG as one JSON line (method, url, key header present, length,
+// Every request is logged to $SRV_LOG as one JSON line (method, url, the x-goog-api-key it carried
+// (only ever a fake), length,
 // whether it carries a tool result, and the markers it contains); `{"ready":true}` once listening.
 const http = require('http'), fs = require('fs');
 const LOG = process.env.SRV_LOG || '/tmp/fake-gemini.log';
@@ -19,7 +20,7 @@ http.createServer((req, res) => {
   req.on('end', () => {
     const hasFR = body.includes('"functionResponse"');
     const markers = (body.match(/AGY-[A-Z]+(=[A-Za-z0-9-]+)?/g) || []).filter((m, i, a) => a.indexOf(m) === i);
-    fs.appendFileSync(LOG, JSON.stringify({ m: req.method, url: req.url, key: !!req.headers['x-goog-api-key'], len: body.length, hasFR, markers }) + '\n');
+    fs.appendFileSync(LOG, JSON.stringify({ m: req.method, url: req.url, key: req.headers['x-goog-api-key'] || '', len: body.length, hasFR, markers }) + '\n');
     if (req.method === 'GET') { res.writeHead(200, { 'content-type': 'application/json' }); return res.end('{"models":[]}'); }
     if (req.url.includes('flash-lite')) return sse(res, text('Agy Seat Test'));
     const prompt = body;
@@ -30,4 +31,4 @@ http.createServer((req, res) => {
     const echo = echoes.length ? echoes[echoes.length - 1][1] : '';
     return sse(res, text('VERDICT: PASS ' + echo));
   });
-}).listen(+(process.env.PORT || 8089), '127.0.0.1', () => fs.appendFileSync(LOG, '{"ready":true}\n'));
+}).listen(+(process.env.PORT || 8089), process.env.HOST || '127.0.0.1', () => fs.appendFileSync(LOG, '{"ready":true}\n'));

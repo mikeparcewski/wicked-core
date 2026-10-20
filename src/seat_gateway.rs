@@ -180,6 +180,7 @@ impl ModelRoute {
             Provider::OpenAI => CredentialKind::CodexApiKey,
             Provider::ChatGpt => CredentialKind::CodexChatgpt,
             Provider::Copilot => CredentialKind::ProviderKey,
+            Provider::Gemini => CredentialKind::GeminiApiKey,
         })
     }
 
@@ -207,6 +208,7 @@ pub(crate) fn route_owner(file: &str) -> Option<&'static str> {
         "pi" => "pi",
         "opencode" => "opencode",
         "copilot" => "copilot",
+        "agy" => "agy",
         _ => return None,
     })
 }
@@ -219,6 +221,9 @@ pub(crate) enum Provider {
     ChatGpt,
     /// The GitHub Copilot API (an OpenAI-shaped wire at the account's plan host).
     Copilot,
+    /// The Gemini API (`generativelanguage.googleapis.com`), agy's API-key path: its native wire,
+    /// passed through, the key in `x-goog-api-key`.
+    Gemini,
 }
 
 impl Provider {
@@ -228,6 +233,7 @@ impl Provider {
             Self::OpenAI => 4001,
             Self::ChatGpt => 4002,
             Self::Copilot => 4012,
+            Self::Gemini => GEMINI_PORT,
         }
     }
 
@@ -237,6 +243,7 @@ impl Provider {
             Self::Anthropic => "anthropic",
             // ChatGPT's backend and the Copilot API speak the OpenAI wire.
             Self::OpenAI | Self::ChatGpt | Self::Copilot => "openAI",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -246,9 +253,20 @@ impl Provider {
             Self::OpenAI => "openai",
             Self::ChatGpt => "chatgpt",
             Self::Copilot => "copilot",
+            Self::Gemini => "gemini",
         }
     }
 }
+
+/// agy's Gemini API-key route: the listener its seats reach (`GOOGLE_GEMINI_BASE_URL`).
+pub(crate) const GEMINI_PORT: u16 = 4013;
+/// The broker file agy's Gemini API key is served from (the agent's sign-in, never a seat's).
+pub(crate) const GEMINI_KEY_FILE: &str = "agy.gemini.key";
+/// The Gemini API's own endpoint, the upstream of the Gemini route.
+pub(crate) const GEMINI_UPSTREAM: &str = "generativelanguage.googleapis.com:443";
+/// The header the Gemini API reads its key from: the seat's unit key arrives in it, and the
+/// gateway sets the broker's key in it upstream.
+pub(crate) const GEMINI_KEY_HEADER: &str = "x-goog-api-key";
 
 impl Default for GatewayConfig {
     fn default() -> Self {
@@ -290,6 +308,12 @@ impl Default for GatewayConfig {
                     4005,
                     CredentialKind::ClaudeOauth,
                     "anthropic.token",
+                ),
+                (
+                    Provider::Gemini,
+                    GEMINI_PORT,
+                    CredentialKind::GeminiApiKey,
+                    GEMINI_KEY_FILE,
                 ),
             ]
             .into_iter()
@@ -355,7 +379,9 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
                     "/v1/responses": "responses",
                     "*": "passthrough"
                 }),
-                Provider::ChatGpt | Provider::Copilot => json!({"*": "passthrough"}),
+                Provider::ChatGpt | Provider::Copilot | Provider::Gemini => {
+                    json!({"*": "passthrough"})
+                }
             };
             let mut provider = serde_json::Map::new();
             provider.insert(route.provider.config_key().into(), json!({}));
@@ -383,6 +409,9 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
             let location = match (unit_header, kind) {
                 (Some(header), _) => json!({"header": {"name": header}}),
                 (None, CredentialKind::ClaudeApiKey) => json!({"header": {"name": "x-api-key"}}),
+                (None, CredentialKind::GeminiApiKey) => {
+                    json!({"header": {"name": GEMINI_KEY_HEADER}})
+                }
                 // v1.6.0 schema/config.json: LocalAPIKeys.location / AuthorizationLocation.
                 // Native OpenAI clients send Authorization: Bearer <placeholder>.
                 _ => {
@@ -414,6 +443,14 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
                     .as_object_mut()
                     .expect("policies is an object")
                     .remove("backendAuth");
+            } else if kind == CredentialKind::GeminiApiKey {
+                // The Gemini API takes its key in `x-goog-api-key`, never a bearer: the broker's
+                // key replaces the unit's in that header (agentgateway v1.6.0
+                // `BackendAuth.key.location`).
+                policies["backendAuth"] = json!({"key": {
+                    "value": {"file": route.credential_file},
+                    "location": {"header": {"name": GEMINI_KEY_HEADER}}
+                }});
             } else if broker_bearer || route.provider == Provider::ChatGpt {
                 // Preserve Authorization as proved by the broker spike. Native Anthropic ai
                 // backends inject x-api-key; OAuth needs a plain host backend instead. For
@@ -466,8 +503,10 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
                     policies["backendTLS"] = json!({});
                 }
             }
-            let host_backend = matches!(route.provider, Provider::ChatGpt | Provider::Copilot)
-                || kind == CredentialKind::ClaudeOauth;
+            let host_backend = matches!(
+                route.provider,
+                Provider::ChatGpt | Provider::Copilot | Provider::Gemini
+            ) || kind == CredentialKind::ClaudeOauth;
             let backends = if host_backend {
                 let host = if route.upstream_host.is_empty() {
                     match route.provider {
@@ -480,6 +519,7 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
                                 .map(String::as_str)
                                 .unwrap_or(COPILOT_DEFAULT_HOST)
                         ),
+                        Provider::Gemini => GEMINI_UPSTREAM.to_string(),
                         _ => "api.anthropic.com:443".to_string(),
                     }
                 } else {
@@ -680,6 +720,11 @@ fn env_at_port(provider: Provider, port: u16, key: &str) -> Vec<(String, String)
             "OPENAI_BASE_URL",
             "OPENAI_API_KEY",
             format!("http://agw:{port}/backend-api/codex"),
+        ),
+        Provider::Gemini => (
+            "GOOGLE_GEMINI_BASE_URL",
+            "GEMINI_API_KEY",
+            format!("http://agw:{port}"),
         ),
         // Copilot seats are configured by their own CLI's settings, never by this env.
         Provider::Copilot => (
@@ -939,6 +984,7 @@ pub(crate) fn credential_gateway_url(cli: &str, kind: CredentialKind) -> String 
         ("pi", CredentialKind::ProviderKey) => 4003,
         ("opencode", CredentialKind::ProviderKey) => 4004,
         (_, CredentialKind::ClaudeOauth) => 4005,
+        (_, CredentialKind::GeminiApiKey) => GEMINI_PORT,
         _ => 4001,
     };
     format!("http://agw:{port}")
@@ -947,6 +993,9 @@ pub(crate) fn credential_gateway_url(cli: &str, kind: CredentialKind) -> String 
 /// OAuth/ChatGPT files select account auth; an API-key env override would change the CLI's
 /// auth mode. Keep those overrides out of the seat while still routing its model requests.
 pub(crate) fn seat_env_for(cli: &str, kind: CredentialKind, bearer: &str) -> Vec<(String, String)> {
+    if kind == CredentialKind::GeminiApiKey {
+        return gemini_seat_env(cli, bearer);
+    }
     let mut env = seat_env_all(bearer);
     let url = credential_gateway_url(cli, kind);
     for (name, value) in &mut env {
@@ -981,6 +1030,26 @@ pub(crate) fn seat_env_for(cli: &str, kind: CredentialKind, bearer: &str) -> Vec
         env.retain(|(name, _)| name != "OPENAI_BASE_URL");
     }
     env
+}
+
+/// An agy seat on its Gemini API-key route: agy takes the Gemini API when its settings say
+/// `modelProvider: gemini` (the floor writes them read-only, `container_floor::agy_floor_settings`)
+/// and reads `GEMINI_API_KEY` (the unit's key, sent as `x-goog-api-key`) and
+/// `GOOGLE_GEMINI_BASE_URL` (the route). No Anthropic or OpenAI variable reaches it. The CONNECT
+/// proxy stays: what else agy contacts (its feature flags at `antigravity-unleash.goog`, its
+/// telemetry at `play.googleapis.com`) is refused there at once unless the operator's
+/// `WICKED_SEAT_EGRESS_HOSTS` names it; the turn does not need either.
+fn gemini_seat_env(cli: &str, bearer: &str) -> Vec<(String, String)> {
+    vec![
+        ("GEMINI_API_KEY".into(), bearer.into()),
+        (
+            "GOOGLE_GEMINI_BASE_URL".into(),
+            credential_gateway_url(cli, CredentialKind::GeminiApiKey),
+        ),
+        ("HTTPS_PROXY".into(), "http://agw:3000".into()),
+        ("HTTP_PROXY".into(), "http://agw:3000".into()),
+        ("NO_PROXY".into(), SEAT_NO_PROXY.into()),
+    ]
 }
 
 /// The prefix of the model provider id a codex seat signed in with ChatGPT uses (core#989); each
@@ -1620,7 +1689,7 @@ pub(crate) fn cleanup_unsettled(rt: &Runtime, dir: &Path, scope: &str) -> Result
 pub(crate) fn cleanup_mutations(rt: &Runtime, dir: &Path) -> Result<(), String> {
     // codex lg-r3 R5: callers hold the exclusive mutation lock, so markers have dead owners.
     for scope in [
-        "claude", "codex", "pi", "opencode", "copilot", "broker", "config",
+        "claude", "codex", "pi", "opencode", "copilot", "agy", "broker", "config",
     ] {
         cleanup_unsettled(rt, dir, scope)?;
     }
@@ -3244,7 +3313,7 @@ esac
         let adopted = load_config(&temp.0).unwrap();
         assert_eq!(
             adopted.providers.len(),
-            6 + crate::seat_credentials::SUBSCRIPTION_ROUTES.len()
+            7 + crate::seat_credentials::SUBSCRIPTION_ROUTES.len()
         );
         assert_eq!(adopted.providers[0], old.providers[0]);
         let oauth = adopted.providers.iter().find(|r| r.port == 4005).unwrap();
@@ -3970,6 +4039,8 @@ esac
                 json!({"header": {"name": header}})
             } else if route.credential_kind() == CredentialKind::ClaudeApiKey {
                 json!({"header": {"name": "x-api-key"}})
+            } else if route.credential_kind() == CredentialKind::GeminiApiKey {
+                json!({"header": {"name": GEMINI_KEY_HEADER}})
             } else {
                 json!({"header": {"name": "authorization", "prefix": "Bearer "}})
             };

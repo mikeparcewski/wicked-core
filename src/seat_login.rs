@@ -18,7 +18,7 @@ use crate::seat_gateway::{volumes, Gateway};
 #[cfg(unix)]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "usage: wicked-core seat-login <argv|ingest|status|sign-out|refresh> <claude|codex|pi|opencode|copilot>\n  Set WICKED_SEAT_GATEWAY_DIR to the daemon's absolute gateway directory.";
+const USAGE: &str = "usage: wicked-core seat-login <argv|ingest|status|sign-out|refresh> <claude|codex|pi|opencode|copilot|agy>\n  Set WICKED_SEAT_GATEWAY_DIR to the daemon's absolute gateway directory.";
 const GATEWAY_DIR_ENV: &str = "WICKED_SEAT_GATEWAY_DIR";
 #[cfg(unix)]
 const TIMEOUT: Duration = Duration::from_secs(15);
@@ -26,7 +26,10 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_FILE_BYTES: usize = 1024 * 1024;
 
 fn supported_cli(cli: &str) -> bool {
-    matches!(cli, "claude" | "codex" | "pi" | "opencode" | "copilot")
+    matches!(
+        cli,
+        "claude" | "codex" | "pi" | "opencode" | "copilot" | "agy"
+    )
 }
 
 /// Per daemon (its gateway's name) and per agent: two daemons on one runtime never share a login.
@@ -309,10 +312,67 @@ pub(crate) fn login_argv(
         // GitHub's device flow: copilot picks its loopback web flow unless it detects a headless
         // host, and a login container is not detected as one (its callback was unreachable).
         "copilot" => &["copilot", "login", "--device-code"],
+        // agy's Gemini API key, pasted unechoed into the throwaway volume; agy itself never runs.
+        "agy" => &["sh", "-c", AGY_API_KEY_LOGIN, "wicked-login"],
         _ => &[],
     };
     argv.extend(command.iter().map(|s| (*s).to_string()));
     argv
+}
+
+/// Where agy's login leaves the Gemini API key the operator pasted.
+const AGY_API_KEY_PATH: &str = "agy/wicked-gemini-key";
+
+/// agy's API-key sign-in (the API-key path; its Google-account sign-in is agy's own login): the
+/// operator pastes a Gemini API key (Google AI Studio) at a prompt that does not echo it, and it
+/// lands, 0600, in the throwaway login volume, where ingest reads it. The script prints no part of
+/// the key. Echo goes off BEFORE the prompt shows (a paste that follows the prompt at once was
+/// echoed when it came first, found by the live test). It needs no network: the login container
+/// gets none.
+const AGY_API_KEY_LOGIN: &str = "trap 'stty echo 2>/dev/null' EXIT; trap 'exit 1' HUP INT TERM; \
+printf '%s\\n' 'wicked: agy signs in with a Gemini API key (Google AI Studio, API keys).'; \
+stty -echo 2>/dev/null; printf '%s' 'wicked: paste the key here (it is not shown) and press Enter: '; \
+IFS= read -r k; r=$?; stty echo 2>/dev/null; printf '\\n'; \
+[ \"$r\" -eq 0 ] && [ -n \"$k\" ] || { echo 'wicked: no key was pasted; sign agy in again' >&2; exit 1; }; \
+(umask 077 && mkdir -p \"$WICKED_LOGIN_DIR\" && printf '%s' \"$k\" > \"$WICKED_LOGIN_DIR/wicked-gemini-key\") \
+|| { echo 'wicked: the key could not be saved; sign agy in again' >&2; exit 1; }; \
+echo 'wicked: key received; there is nothing more to type'";
+
+/// The Gemini API key pasted at agy's sign-in (pure): the paste's terminal control sequences
+/// dropped, the line trimmed, then one run of a key's characters. A refusal names the check that
+/// failed and never repeats any part of the paste.
+fn gemini_api_key(bytes: &[u8]) -> Result<String, String> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| "agy: the pasted key is not text".to_string())?;
+    let (text, finished) = strip_terminal_controls(text);
+    if !finished {
+        return Err(
+            "agy: the paste of the Gemini API key did not finish; sign agy in again".into(),
+        );
+    }
+    let key = text.trim();
+    let why = if key.is_empty() {
+        Some("no key was pasted")
+    } else if key.len() > 256 {
+        Some("the paste is longer than a key")
+    } else if key.chars().any(char::is_whitespace) {
+        Some("the paste has a space or a line break inside the key")
+    } else if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        Some("the paste has characters a Gemini API key does not")
+    } else if key.len() < 20 {
+        Some("the paste is shorter than a key")
+    } else {
+        None
+    };
+    match why {
+        Some(why) => Err(format!(
+            "agy: {why}; sign agy in again and paste only the Gemini API key"
+        )),
+        None => Ok(key.to_string()),
+    }
 }
 
 /// Where claude's login leaves the `claude setup-token` token: read from claude's own output, or
@@ -771,6 +831,8 @@ fn login_homes(cli: &str) -> &'static [(&'static str, &'static str)] {
         "pi" => &[("PI_CODING_AGENT_DIR", "pi")],
         "opencode" => &[("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data")],
         "copilot" => &[("COPILOT_HOME", "copilot")],
+        // Not agy's own home (agy never runs at this sign-in): where its pasted key is saved.
+        "agy" => &[("WICKED_LOGIN_DIR", "agy")],
         _ => &[],
     }
 }
@@ -790,6 +852,7 @@ fn credential_paths(cli: &str) -> &'static [&'static str] {
         "opencode" => &["data/opencode/wicked-auth.json"],
         // Written only because the init helper seeds `storeTokenPlaintext` (no keychain here).
         "copilot" => &["copilot/config.json"],
+        "agy" => &[AGY_API_KEY_PATH],
         _ => &[],
     }
 }
@@ -834,6 +897,8 @@ fn broker_files(cli: &str) -> Result<&'static [&'static str], String> {
             crate::copilot_account::HOST_FILE,
             crate::copilot_account::MODELS_FILE,
         ]),
+        // The Gemini API key its route serves.
+        "agy" => Ok(&[crate::seat_gateway::GEMINI_KEY_FILE]),
         _ => Err("unsupported login CLI".into()),
     }
 }
@@ -965,6 +1030,18 @@ pub(crate) fn extract_tokens(
         "pi" => extract_pi(files),
         "opencode" => extract_opencode(files),
         "copilot" => extract_copilot(files),
+        "agy" => {
+            let bytes = input_file(cli, files, AGY_API_KEY_PATH)?.ok_or_else(|| {
+                missing(
+                    cli,
+                    "the Gemini API key (none was pasted); sign agy in again",
+                )
+            })?;
+            Ok(vec![token_file(
+                crate::seat_gateway::GEMINI_KEY_FILE,
+                &gemini_api_key(bytes)?,
+            )])
+        }
         _ => Err("unsupported login CLI".into()),
     }
 }
@@ -1583,6 +1660,8 @@ fn status_from_files(cli: &str, files: &[(String, Vec<u8>)], now: u64) -> Broker
         .and_then(Value::as_str);
     let active = match cli {
         "claude" => present("anthropic.token") || present("anthropic.key"),
+        // An API key: no expiry.
+        "agy" => present(crate::seat_gateway::GEMINI_KEY_FILE),
         "codex" => match codex_mode {
             Some("apikey") => present("openai.key"),
             Some("chatgpt") => present("openai.token") && present("openai.account"),
@@ -2107,6 +2186,9 @@ pub(crate) fn kind_from_files(
         }
         "pi" if present("pi.token") => Some(CredentialKind::ProviderKey),
         "opencode" if present("opencode.token") => Some(CredentialKind::ProviderKey),
+        "agy" if present(crate::seat_gateway::GEMINI_KEY_FILE) => {
+            Some(CredentialKind::GeminiApiKey)
+        }
         _ => None,
     }
 }
@@ -2974,13 +3056,13 @@ fn prepare_login_argv(
     // codex lg-r3 R3: only the daemon may take ownership and revoke stale unit keys.
     crate::seat_gateway::ensure_external_bridge(rt, gw)?;
     let volume = new_session(rt, gw, dir, cli)?;
-    Ok(login_argv(
-        &rt.cli,
-        cli,
-        image,
-        &volume,
-        &gw.external_network,
-    ))
+    // agy's API-key sign-in only reads a paste: no network at all.
+    let network = if cli == "agy" {
+        "none"
+    } else {
+        gw.external_network.as_str()
+    };
+    Ok(login_argv(&rt.cli, cli, image, &volume, network))
 }
 
 /// The host CLI's `--version`, run as the login will run (isolated environment, in the
@@ -3165,6 +3247,11 @@ pub fn seat_login_main(args: &[String]) -> i32 {
         1
     }
 }
+
+/// agy's API-key sign-in: the paste, the broker kind, the route, the seat (and LIVE, end to end).
+#[cfg(all(test, unix))]
+#[path = "seat_login_agy_tests.rs"]
+mod agy_tests;
 
 #[cfg(test)]
 mod tests {
@@ -7927,7 +8014,7 @@ curl -s --max-time 8 -H "authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN" -H "$AN
 
     /// [`login_terminal`], then, at the prompt for the token the CLI printed, paste `token`.
     #[cfg(unix)]
-    fn login_terminal_pasting(
+    pub(super) fn login_terminal_pasting(
         argv: &[String],
         answer: Option<&str>,
         token: Option<&str>,
