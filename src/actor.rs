@@ -8849,7 +8849,25 @@ fn advance_or_pause(
                     .repo_ref
                     .as_deref()
                     .map_or_else(|| "the run's repository".to_string(), |r| format!("`{r}`"));
-                (reviewing_ord, deliver_gate_prompt_for(unit, &branch, &repo))
+                // The checks the run's reviews DEFERRED to delivery (CI on the opened PR, its
+                // body, a merge) — the engine does not verify them after the push, so the card
+                // names them for the operator.
+                let deferred =
+                    crate::review_context::deferred_to_delivery(&units, unit.ord, |u, attempt| {
+                        match attempt {
+                            None => crate::domain::get_work_output(store, &u.id),
+                            Some(a) => crate::domain::get_unit_transcript_at(store, &u.id, Some(a))
+                                .and_then(|t| t.output),
+                        }
+                    });
+                (
+                    reviewing_ord,
+                    format!(
+                        "{}{}",
+                        deliver_gate_prompt_for(unit, &branch, &repo),
+                        crate::review_context::delivery_checks_note(&deferred)
+                    ),
+                )
             }
             PauseReason::ConsentBefore { reviewing_ord } => {
                 (reviewing_ord, consent_gate_prompt(unit, reviewing_ord))
@@ -14989,6 +15007,153 @@ mod terminal_gate_tests {
         assert!(
             matches!(progress, Progress::Done),
             "an Auto terminal gate must finalize (Done), never pause"
+        );
+    }
+
+    /// The deliver gate card names the checks the run's review DEFERRED to delivery (CI on the
+    /// opened PR, its body) — read from the review's approved verdict — as checks the engine does
+    /// not run after the push; a FAIL/PASS item line is not listed.
+    #[test]
+    fn the_deliver_gate_card_lists_the_items_the_review_deferred_to_delivery() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(&mut store, GateSpec::Auto);
+        let mut review = WorkUnit::pending("r:u1", "r", 1, "review it");
+        review.role = crate::workflow::PhaseRole::Evaluator;
+        review.status = UnitStatus::Done;
+        put_node(&mut store, review.to_node()).unwrap();
+        let mut out = wicked_apps_core::Node::new(
+            wicked_apps_core::synthetic_symbol(crate::execute::WORK_OUTPUT, "r:u1"),
+            wicked_apps_core::NodeKind::Other(crate::execute::WORK_OUTPUT.to_string()),
+            "r:u1".to_string(),
+            wicked_apps_core::Language::new(wicked_apps_core::SYMBOL_SCHEME),
+            wicked_apps_core::Location::new("work_output/r:u1", wicked_apps_core::Span::ZERO),
+        );
+        out.metadata.insert(
+            "output".into(),
+            serde_json::Value::String(
+                "ITEM 1: PASS — tests at src/a.rs:9\nITEM 2: DEFERRED — CI on ubuntu/macos/windows \
+                 runs on the opened PR\nITEM 3: DEFERRED — PR body `Closes #840`\nVERDICT: PASS"
+                    .into(),
+            ),
+        );
+        put_node(&mut store, out).unwrap();
+        let mut deliver = WorkUnit::pending("r:deliver", "r", 2, "deliver — push the run branch");
+        deliver.tool_cmd = Some(vec!["bash".into(), "-lc".into(), "true".into()]);
+        put_node(&mut store, deliver.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let progress = advance_or_pause(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            "r",
+            1,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(progress, Progress::Paused));
+        let prompt = std::iter::from_fn(|| erx.try_recv().ok())
+            .find_map(|ev| match ev {
+                CoreEvent::AwaitingHuman {
+                    gate_kind, prompt, ..
+                } if gate_kind == "deliver" => Some(prompt),
+                _ => None,
+            })
+            .expect("the deliver gate opened");
+        assert!(
+            prompt.starts_with("Approve delivery before unit 2 runs."),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "After delivery — 2 checks the review deferred to the opened pull request; the \
+                 engine does not verify them after the push"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("ITEM 2: DEFERRED — CI on ubuntu/macos/windows runs on the opened PR (review unit 1)")
+                && prompt.contains("ITEM 3: DEFERRED — PR body `Closes #840` (review unit 1)"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("ITEM 1"),
+            "a PASS item is not a delivery check: {prompt}"
+        );
+    }
+
+    /// A review the operator LANDED over a NOT-PASS verdict has no approved output: the card reads
+    /// the landed attempt's whole transcript, so a deferred item the bounded findings tail lost
+    /// still reaches the operator.
+    #[test]
+    fn the_deliver_gate_card_reads_a_landed_reviews_whole_transcript() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(&mut store, GateSpec::Auto);
+        let mut review = WorkUnit::pending("r:u1", "r", 1, "review it");
+        review.role = crate::workflow::PhaseRole::Evaluator;
+        review.status = UnitStatus::Done;
+        review.last_attempt = Some(1);
+        review.review_rounds.push(crate::domain::ReviewRound {
+            attempt: 1,
+            findings: "…ITEM 4: FAIL — flaky\nVERDICT: FAIL".into(),
+            outcome: Some(crate::review_context::REVIEW_LANDED.into()),
+        });
+        put_node(&mut store, review.to_node()).unwrap();
+        crate::execute::record_attempt_output(
+            &mut store,
+            &review,
+            1,
+            "ok",
+            "ITEM 2: DEFERRED — CI on every OS on the opened PR\nITEM 4: FAIL — flaky\nVERDICT: FAIL",
+        )
+        .unwrap();
+        let mut deliver = WorkUnit::pending("r:deliver", "r", 2, "deliver — push the run branch");
+        deliver.tool_cmd = Some(vec!["bash".into(), "-lc".into(), "true".into()]);
+        put_node(&mut store, deliver.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        advance_or_pause(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            "r",
+            1,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let prompt = std::iter::from_fn(|| erx.try_recv().ok())
+            .find_map(|ev| match ev {
+                CoreEvent::AwaitingHuman {
+                    gate_kind, prompt, ..
+                } if gate_kind == "deliver" => Some(prompt),
+                _ => None,
+            })
+            .expect("the deliver gate opened");
+        assert!(
+            prompt.contains(
+                "1 check the review deferred to the opened pull request; the engine does not \
+                 verify it after the push, so check it there before you merge: ITEM 2: DEFERRED — \
+                 CI on every OS on the opened PR (review unit 1)."
+            ),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("ITEM 4"),
+            "a FAIL item is not a delivery check: {prompt}"
         );
     }
 }
