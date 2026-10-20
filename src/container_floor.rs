@@ -17,6 +17,10 @@
 //! (one per seat container, named after it: seats sharing a network could reach each other) whose
 //! only egress is the model gateway attached to it. Every host path is bind-mounted at the
 //! SAME absolute path, so the unit's cwd, its argv paths and its env paths need no translation.
+//! The `HOME` tmpfs (512 MB) holds no package cache: cargo's home and the npm / pip / go caches
+//! are the seat's persistent cache dir on the host ([`crate::worker_sandbox::seat_cache_dir`],
+//! keyed by toolchain in [`crate::worker_sandbox::SEAT_TOOLCHAIN_CACHES`]), bound read-write like
+//! any seat dir, with each variable passed by name to the runtime and to landrun ([`finalize`]).
 //!
 //! **The mounts are the floor.** They are rendered from the step-0 [`SeatFloor`] the interim floor
 //! renders its profile from (one root computation, two renderers): the writable roots read-write,
@@ -4362,6 +4366,301 @@ mod tests {
         ni.args(["network", "inspect", &name]);
         assert!(!output_within(ni, PROBE_TIMEOUT).unwrap().status.success());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The seat's floor plan for a Rust-capable seat (claude here; every CLI gets the same cache
+    /// table) under a worker home at `worker`, with `tree` its writable tree: the plan, its
+    /// resolved floor's mounts, and the wrapper [`finalize`] completes from the plan's env plus
+    /// `extra_env`, running `script`. The caller holds the env lock.
+    #[allow(clippy::too_many_arguments)]
+    fn cargo_seat(
+        worker: &Path,
+        tree: &Path,
+        read_roots: &[PathBuf],
+        runtime: &Path,
+        image: &str,
+        name: &str,
+        network: &str,
+        floor: &str,
+        extra_env: &[(String, String)],
+        script: &str,
+    ) -> (crate::worker_sandbox::SeatFloorPlan, Vec<Mount>, Command) {
+        use wicked_apps_core::spawn::{SeatCli, SeatConfig, WORKER_HOME_ENV};
+        let prior = std::env::var_os(WORKER_HOME_ENV);
+        std::env::set_var(WORKER_HOME_ENV, worker);
+        let config = SeatConfig::Isolated {
+            cli: SeatCli::Claude,
+            root: None,
+            set: Vec::new(),
+            strip: Vec::new(),
+        };
+        let plan = crate::worker_sandbox::plan_seat_floor(
+            crate::worker_sandbox::SeatLaunch {
+                cwd: tree,
+                cli: SeatCli::Claude,
+                config: &config,
+                read_only: false,
+                scratch: None,
+                gov_log_dir: None,
+                own_ports: &[],
+            },
+            vec![tree.to_path_buf()],
+        );
+        match prior {
+            Some(v) => std::env::set_var(WORKER_HOME_ENV, v),
+            None => std::env::remove_var(WORKER_HOME_ENV),
+        }
+        let spec = crate::worker_sandbox::resolve_seat_floor(&plan.inputs).unwrap();
+        let mut mounts = mount_plan(&spec).unwrap();
+        add_read_roots(&mut mounts, read_roots);
+        let w = run_argv(&ContainerLaunch {
+            runtime,
+            image,
+            name,
+            network,
+            workdir: tree,
+            user: &operator_user(),
+            mounts: &mounts,
+            floor,
+            memory: "3g",
+            gateway_ports: GATEWAY_PORTS,
+            own_ports: &[],
+        });
+        // spawn-audit: test-only — renders the wrapper argv; spawned only by the gated live test.
+        let mut cmd = Command::new(&w[0]);
+        cmd.args(&w[1..]);
+        cmd.args(["sh", "-c", script]);
+        for (k, v) in &plan.env {
+            cmd.env(k, v);
+        }
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        (plan, mounts, finalize(cmd))
+    }
+
+    /// A Rust-capable seat's cargo cache is the floor's persistent per-seat cache dir on the host,
+    /// never the 512 MB tmpfs HOME: the plan points `CARGO_HOME` at `<worker home>/cache/<cli>/cargo`,
+    /// the mount plan binds that cache dir read-write at its host path, and the finalized wrapper
+    /// passes `CARGO_HOME` by name to the runtime AND to landrun, which admits the bind read-write
+    /// (landrun keeps only the variables it is told to: a value the runtime alone got would be
+    /// dropped and cargo would fall back to `$HOME/.cargo`). The value is never on the argv.
+    #[test]
+    fn a_rust_capable_seats_cargo_cache_is_a_persistent_bind_outside_the_tmpfs_home() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let base = tmp("cargo-cache");
+        let tree = base.join("wt");
+        let worker = base.join("worker");
+        std::fs::create_dir_all(&tree).unwrap();
+        let (plan, mounts, cmd) = cargo_seat(
+            &worker,
+            &tree,
+            &[],
+            Path::new("docker"),
+            "img:1",
+            "wicked-seat-cargo",
+            "none",
+            "wicked-floor:t",
+            &[],
+            "cargo fetch",
+        );
+        let cache = worker.join("cache").join("claude");
+        let cargo_home = cache.join("cargo");
+        // The table's cargo row is the plan's CARGO_HOME.
+        assert!(crate::worker_sandbox::SEAT_TOOLCHAIN_CACHES.contains(&(
+            "cargo",
+            "CARGO_HOME",
+            "cargo"
+        )));
+        assert!(
+            plan.env
+                .iter()
+                .any(|(k, v)| *k == "CARGO_HOME" && *v == cargo_home),
+            "{:?}",
+            plan.env
+        );
+        // Build output stays out of the cache: the full posture's target is the tree's own.
+        assert!(!plan.env.iter().any(|(k, _)| *k == "CARGO_TARGET_DIR"));
+        assert!(cache.is_dir(), "the cache dir exists before the bind");
+        assert!(
+            mounts.contains(&Mount::Bind {
+                path: cache.clone(),
+                rw: true,
+            }),
+            "{mounts:?}"
+        );
+        assert!(!cargo_home.starts_with("/home/seat"));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let img = image_index(&args).unwrap();
+        let land = landrun_end(&args, img).unwrap();
+        let has = |range: &[String], pair: &[&str]| range.windows(2).any(|x| x == pair);
+        assert!(has(&args[..img], &["--env", "CARGO_HOME"]), "{args:?}");
+        assert!(has(&args[img..land], &["--env", "CARGO_HOME"]), "{args:?}");
+        let cache_s = cache.to_string_lossy().into_owned();
+        assert!(has(&args[img..land], &["--rwx", &cache_s]), "{args:?}");
+        assert!(args
+            .iter()
+            .any(|a| a == &format!("type=bind,src={cache_s},dst={cache_s}")));
+        assert!(!args
+            .iter()
+            .any(|a| a.contains(&cargo_home.to_string_lossy().into_owned())));
+        // The HOME tmpfs is unchanged: the cache is not made to fit by growing it.
+        assert!(has(
+            &args[..img],
+            &["--tmpfs", "/home/seat:rw,exec,mode=1777,size=512m"]
+        ));
+        assert_eq!(
+            cmd.get_envs()
+                .find(|(k, _)| *k == "CARGO_HOME")
+                .and_then(|(_, v)| v)
+                .map(PathBuf::from),
+            Some(cargo_home)
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// LIVE (`WICKED_CONTAINER_LIVE=1`, with `WICKED_SEAT_BASE_IMAGE` naming a Rust toolchain base;
+    /// skipped otherwise): `cargo fetch --locked` of THIS repository's lockfile in a seat container
+    /// rendered by the engine's own path (seat floor plan, mount plan, wrapper, finalize) with the
+    /// 512 MB tmpfs HOME, through the gateway's egress allowlist. The fetch (~684 MB) succeeds and
+    /// lands in the host cache dir, `HOME` stays near empty, and a second seat fetches the same
+    /// lockfile offline from the cache the first one left.
+    #[cfg(unix)]
+    #[test]
+    fn live_a_seat_fetches_this_repos_lockfile_into_its_persistent_cargo_cache() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        let rt = runtime().expect("a container runtime answers");
+        let floor = ensure_floor_image(&rt).expect("the floor image");
+        let image = ensure_seat_image(&rt, "claude").expect("the claude seat image");
+        let base = tmp("cargo-live");
+        let tree = base.join("wt");
+        let worker = base.join("worker");
+        let gw_dir = base.join("gateway");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::create_dir_all(&gw_dir).unwrap();
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .unwrap();
+        let run = |argv: &[&str], limit: u64| {
+            let mut c = rt.cmd();
+            c.args(argv);
+            output_within(c, Duration::from_secs(limit)).unwrap()
+        };
+        let prior = std::env::var(crate::seat_gateway::EGRESS_HOSTS_ENV).ok();
+        std::env::set_var(
+            crate::seat_gateway::EGRESS_HOSTS_ENV,
+            "index.crates.io,static.crates.io",
+        );
+        let gw = crate::seat_gateway::ensure_gateway(&rt, &gw_dir);
+        match &prior {
+            Some(v) => std::env::set_var(crate::seat_gateway::EGRESS_HOSTS_ENV, v),
+            None => std::env::remove_var(crate::seat_gateway::EGRESS_HOSTS_ENV),
+        }
+        let gw = gw.expect("the gateway starts");
+        let key = crate::seat_gateway::UnitKey::new("cargo-live", "1", "claude");
+        let env: Vec<(String, String)> = crate::seat_gateway::seat_env_all(&key.key)
+            .into_iter()
+            .chain([("CARGO_NET_RETRY".to_string(), "3".to_string())])
+            .collect();
+        // Shell-quoted: a checkout path may hold spaces or quotes.
+        let repo_q = format!("'{}'", repo.display().to_string().replace('\'', "'\\''"));
+        let script = |offline: bool| {
+            format!(
+                "echo CARGO_HOME=$CARGO_HOME; cargo --version; cd {r} && \
+                 cargo fetch --locked {o} >/tmp/fetch.log 2>&1 && echo FETCH_OK || \
+                 {{ echo FETCH_FAILED; tail -20 /tmp/fetch.log; }}; \
+                 echo HOME_KB=$(du -sk /home/seat | cut -f1); \
+                 echo CACHE_KB=$(du -sk \"$CARGO_HOME\" | cut -f1)",
+                r = repo_q,
+                o = if offline { "--offline" } else { "" },
+            )
+        };
+        let mut outs: Vec<String> = Vec::new();
+        let mut ok = true;
+        for (i, offline) in [false, true].into_iter().enumerate() {
+            let name = container_name("claude", "cargolive", i as u32);
+            let network = ensure_seat_network(&rt, &name).expect("the seat network");
+            crate::seat_gateway::attach(&rt, &gw, &network).unwrap();
+            let ip = gateway_ip(&rt, &gw.name, &network).unwrap();
+            start_netns_sidecar(&rt, &name, &network, &ip).expect("sidecar up");
+            if i == 0 {
+                crate::seat_gateway::register_live(&rt, &gw, &gw_dir, key.clone())
+                    .expect("the unit key is served");
+            }
+            let (_, _, cmd) = cargo_seat(
+                &worker,
+                &tree,
+                std::slice::from_ref(&repo),
+                &rt.cli,
+                &image,
+                &name,
+                &format!("container:{}", netns_name(&name)),
+                &floor,
+                &env,
+                &script(offline),
+            );
+            let out = output_within(cmd, Duration::from_secs(900));
+            reap(&SeatContainer {
+                runtime: rt.cli.clone(),
+                name: name.clone(),
+            });
+            let (so, se) = out
+                .map(|o| {
+                    (
+                        String::from_utf8_lossy(&o.stdout).to_string(),
+                        String::from_utf8_lossy(&o.stderr).to_string(),
+                    )
+                })
+                .unwrap_or_else(|| (String::new(), "the seat timed out".to_string()));
+            eprintln!("--- seat {i} stdout ---\n{so}--- seat {i} stderr ---\n{se}");
+            ok &= so.contains("FETCH_OK");
+            outs.push(so);
+            if !ok {
+                break;
+            }
+        }
+        run(&["rm", "-f", &gw.name], 60);
+        run(&["network", "rm", &gw.external_network], 60);
+        let (cfg, broker) = crate::seat_gateway::volumes(&gw);
+        run(&["volume", "rm", &cfg, &broker], 60);
+        let cargo_home = worker.join("cache").join("claude").join("cargo");
+        let persisted = cargo_home.join("registry").join("cache").is_dir();
+        let _ = std::fs::remove_dir_all(&base);
+        let first = outs.first().cloned().unwrap_or_default();
+        assert!(
+            first.contains(&format!("CARGO_HOME={}", cargo_home.display())),
+            "the seat's CARGO_HOME is the host cache dir:\n{first}"
+        );
+        assert!(ok, "both fetches succeed:\n{outs:?}");
+        assert!(
+            persisted,
+            "the registry cache is on the host after the seat"
+        );
+        let kb = |s: &str, tag: &str| -> u64 {
+            s.lines()
+                .find_map(|l| l.strip_prefix(tag))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or_else(|| panic!("no number after {tag} in:\n{s}"))
+        };
+        assert!(
+            kb(&first, "HOME_KB=") < 64 * 1024,
+            "HOME stays near empty:\n{first}"
+        );
+        assert!(
+            kb(&first, "CACHE_KB=") > 512 * 1024,
+            "the fetch would not have fit the HOME tmpfs:\n{first}"
+        );
     }
 
     /// LIVE (needs a container runtime; `WICKED_CONTAINER_LIVE=1`, skipped otherwise;

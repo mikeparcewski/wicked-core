@@ -3879,7 +3879,8 @@ esac
             "/tmp:rw,exec,mode=1777,size=1g",
             "--env",
             "HOME=/tmp/home",
-            // A toolchain base sets CARGO_HOME in the read-only image; landrun drops it in a seat.
+            // This probe runs without the floor, so it names a writable CARGO_HOME itself (the
+            // base's image value is read-only). A floored seat's is its per-seat cache dir.
             "--env",
             "CARGO_HOME=/tmp/home/.cargo",
         ]

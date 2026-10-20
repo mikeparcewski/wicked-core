@@ -14,6 +14,24 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A container seat's cargo cache is pinned outside its tmpfs HOME, and proven live with this repository's
+  lockfile.** A seat's `HOME` (`/home/seat`) is a 512 MB tmpfs, and `cargo fetch` of wicked-core's lockfile writes
+  about 684 MB, so a cargo home there fails with `No space left on device (os error 28)`. The engine already
+  points `CARGO_HOME` at the seat's persistent cache dir on the host (`<worker home>/cache/<cli>/cargo`), binds
+  that dir read-write at its own path, and passes the variable by name to the runtime and to landrun. Nothing
+  tested that, and a hand-built seat container that omitted the variable was read as the engine's behaviour. Now
+  a unit test pins the plan's `CARGO_HOME`, the read-write bind, landrun's grant over it and both
+  `--env CARGO_HOME` pass-throughs. A live test (`WICKED_CONTAINER_LIVE=1`, with `WICKED_SEAT_BASE_IMAGE` naming a
+  base with a Rust toolchain) runs `cargo fetch --locked` of this repository in a seat rendered by the engine's
+  own path, through the gateway's egress allowlist: about 683 MB land in the host cache, `HOME` stays empty, and a
+  second seat fetches the same lockfile offline from that cache. Without the variable the same seat fails with
+  `No space left on device`. The cache table is now keyed by toolchain (`SEAT_TOOLCHAIN_CACHES`: cargo, npm,
+  yarn, pnpm, pip, uv, go, xdg, with the same variables and dirs as before), so another toolchain is one row.
+  The policy is unchanged. There is one cache dir per CLI, shared by its seats across runs and repos (cargo's
+  lock serialises concurrent fetches). No run deletes it; cargo's own cache cleanup drops entries unused for
+  months, and the operator may delete the dir at any time. Build output is not cached there: it goes to
+  `<worktree>/target` under the full posture, or to the unit's own scratch under a fenced posture, whose tree is
+  read-only.
 - **A container seat reaches the hosts `WICKED_SEAT_EGRESS_HOSTS` names, whatever an earlier daemon persisted.**
   The gateway's CONNECT allowlist was read from the daemon's environment only when its state directory had no
   `config/gateway.json` yet; after that, every daemon served the list the first one persisted. A state directory
