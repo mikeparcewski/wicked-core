@@ -9202,7 +9202,7 @@ mod tests {
     /// "no fence" (`Full`), so it must refuse to arm rather than run the evaluator unfenced.
     #[test]
     fn a_protocol_1_hook_refuses_now_that_an_evaluator_can_carry_deliverable_roots() {
-        assert_eq!(crate::gate_hook::GATE_PROTOCOL_VERSION, 2);
+        const { assert!(crate::gate_hook::GATE_PROTOCOL_VERSION >= 2) };
         let exe = fixture_exe("protocol-1");
         seed_probe_for_test(&exe, Ok((1, Some(env!("CARGO_PKG_VERSION").to_string()))));
         let err = check_gate_protocol(&exe).expect_err("a protocol-1 hook must refuse to arm");

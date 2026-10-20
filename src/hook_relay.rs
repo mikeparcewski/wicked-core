@@ -432,8 +432,15 @@ fn overflow(mut conn: TcpStream) {
     };
     std::thread::spawn(move || {
         let _worker = worker;
-        let Some(token) = request_token_within(&mut conn, OVERFLOW_READ) else {
-            return;
+        let token = match request_token_within(&mut conn, OVERFLOW_READ) {
+            Overflowed::Hook(token) => token,
+            Overflowed::Other => return,
+            // Possibly a hook call, not attributable: every live unit may own it.
+            Overflowed::Unknown => {
+                fail_every_live_unit();
+                drop(conn);
+                return;
+            }
         };
         // Marked while holding a `Call`, so the unit's end waits for the mark (or, past its wait,
         // fails closed anyway); a unit that already ended is not live.
@@ -497,27 +504,45 @@ impl Drop for OverflowWorker {
     }
 }
 
-/// The hook token of `conn`'s request line, read within `limit` in all (the socket timeout is
-/// recomputed before every read, so a client dripping bytes cannot extend it), at most 1 KiB.
-fn request_token_within(conn: &mut TcpStream, limit: Duration) -> Option<String> {
+/// What an overflowed connection's request line shows.
+enum Overflowed {
+    /// A hook call with this token.
+    Hook(String),
+    /// Not a hook call (a ping, another route).
+    Other,
+    /// Possibly a hook call (`POST /hook/` or a prefix of it), but no complete token arrived.
+    Unknown,
+}
+
+/// What `conn`'s request line shows, read within `limit` in all (the socket timeout is recomputed
+/// before every read, so a client dripping bytes cannot extend it), at most 1 KiB.
+fn request_token_within(conn: &mut TcpStream, limit: Duration) -> Overflowed {
+    const HOOK: &[u8] = b"POST /hook/";
     let deadline = Instant::now() + limit;
     let mut line = Vec::new();
     let mut buf = [0u8; 256];
-    while !line.contains(&b'\n') {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() || line.len() > 1024 {
-            return None;
+    let mut complete = false;
+    while line.len() <= 1024 {
+        if line.contains(&b'\n') {
+            complete = true;
+            break;
         }
-        conn.set_read_timeout(Some(left)).ok()?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || conn.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
         match conn.read(&mut buf) {
-            Ok(0) | Err(_) => return None,
+            Ok(0) | Err(_) => break,
             Ok(n) => line.extend_from_slice(&buf[..n]),
         }
     }
-    let end = line.iter().position(|b| *b == b'\n')?;
-    match route(std::str::from_utf8(&line[..end]).ok()?) {
-        Some(Route::Hook(t)) => Some(t),
-        _ => None,
+    let end = line.iter().position(|b| *b == b'\n').unwrap_or(line.len());
+    let head = &line[..end];
+    let parsed = std::str::from_utf8(head).ok().and_then(route);
+    match parsed {
+        Some(Route::Hook(t)) if complete => Overflowed::Hook(t),
+        _ if head.starts_with(HOOK) || HOOK.starts_with(head) => Overflowed::Unknown,
+        _ => Overflowed::Other,
     }
 }
 
@@ -732,7 +757,9 @@ fn judge(reg: &Registered, call: &Call, tool: &str, body: &[u8], budget: Duratio
     let log_len = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
     let before = log.as_deref().map(log_len);
     let mut note = "";
-    // One id for this call's runs, stamped by the gate hook into every claim it records for it.
+    // One id for this call's runs: it tells the gate hook it is relayed (so it exits
+    // `UNRECORDED_DENY_EXIT` when it cannot record its decision), and it is stamped into every
+    // claim it records for the call (audit correlation).
     let invocation = uuid::Uuid::new_v4().simple().to_string();
     let answered = match run_gate_hook(ctx, call, &invocation, body, deadline) {
         HookRun::Killed { signal, stderr } => {
@@ -781,69 +808,30 @@ fn judge(reg: &Registered, call: &Call, tool: &str, body: &[u8], budget: Duratio
             Some(None) => refusal(Some(reg), tool, &HookRun::TimedOut.why(budget)),
             None => ended(tool),
         },
-        // Denied (2) by the gate hook. Deny stays deny; when the gate hook recorded nothing (it
-        // denies when it cannot write its own record), the relay records the refusal itself, or
-        // marks the unit when it cannot either.
+        // Denied (2) by the gate hook, which recorded its decision: deny stays deny.
         HookRun::Exited {
             code: 2,
             stdout,
             stderr,
+        } => answer(Some(2), &stdout, &stderr),
+        // Denied by a gate hook that could not record its decision (a relayed hook exits
+        // `UNRECORDED_DENY_EXIT` when any record write failed or it recorded none): the relay
+        // records the refusal itself, or marks the unit when it cannot either.
+        HookRun::Exited {
+            code: crate::gate_hook::UNRECORDED_DENY_EXIT,
+            stderr,
+            ..
         } => {
-            // A deny claim among what the log gained during this run (this call's alone: the unit's
-            // turn is held), not just any growth: the gate hook writes its liveness sentinel before
-            // it judges, and can then fail to write its decision.
-            let recorded = match (log.as_deref(), before) {
-                (Some(log), Some(from)) => records_a_deny_since(log, from, &invocation),
-                _ => false,
-            };
-            if recorded {
-                answer(Some(2), &stdout, &stderr)
-            } else {
-                let why = String::from_utf8_lossy(&stderr).trim().to_string();
-                refusal(
-                    Some(reg),
-                    tool,
-                    &format!("the gate hook denied the call but recorded nothing: {why}"),
-                )
-            }
+            let why = String::from_utf8_lossy(&stderr).trim().to_string();
+            refusal(
+                Some(reg),
+                tool,
+                &format!("the gate hook denied the call but could not record it: {why}"),
+            )
         }
         HookRun::Ended => ended(tool),
         failed => refusal(Some(reg), tool, &format!("{}{note}", failed.why(budget))),
     }
-}
-
-/// Whether `log` gained, past byte `from`, a deny claim the gate hook recorded for THIS call: one
-/// whose tool-call annotation carries `invocation` ([`crate::gate_hook::HOOK_INVOCATION_KEY`]). A
-/// claim another recorder wrote meanwhile (the MCP broker's, say) is not this call's record.
-/// Unreadable = no.
-fn records_a_deny_since(log: &std::path::Path, from: u64, invocation: &str) -> bool {
-    use std::io::{Seek, SeekFrom};
-    let Ok(mut f) = std::fs::File::open(log) else {
-        return false;
-    };
-    let mut tail = String::new();
-    if f.seek(SeekFrom::Start(from)).is_err() || f.read_to_string(&mut tail).is_err() {
-        return false;
-    }
-    let mut ours = false;
-    for line in tail.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            ours = false;
-            continue;
-        };
-        if v.get("claim_id").is_some_and(serde_json::Value::is_string) {
-            if ours && v.get("decision").and_then(serde_json::Value::as_str) == Some("deny") {
-                return true;
-            }
-            ours = false;
-        } else if v.get(crate::gate_hook::TOOL_CALL_KEY).is_some() {
-            ours = v
-                .get(crate::gate_hook::HOOK_INVOCATION_KEY)
-                .and_then(|x| x.as_str())
-                == Some(invocation);
-        }
-    }
-    false
 }
 
 /// The value `ctx` gives `key` (non-empty), as its hook would have inherited it.
@@ -1412,12 +1400,12 @@ mod tests {
              deny) printf '%s\\n' \"{\\\"_wicked_tool_call\\\":\\\"Bash\\\",\\\"_wicked_tool_phase\\\":\\\"unit-5\\\",\\\"_wicked_hook_invocation\\\":\\\"$WICKED_HOOK_INVOCATION\\\"}\" >> \"$WICKED_DECISIONS_PATH\"; \
              printf '%s\\n' '{\"claim_id\":\"policy-deny:unit-5\",\"scope\":\"s\",\"phase\":\"unit-5\",\"policy_ids\":[\"test-policy\"],\"decision\":\"deny\",\"obligations\":[\"denied by test policy\"],\"evaluated_context_ref\":\"sha256:p\",\"criteria\":\"c\",\"evaluator_identity\":\"wicked-governance\",\"evaluated_at\":1792454400}' >> \"$WICKED_DECISIONS_PATH\"; \
              echo 'denied by test policy' >&2; exit 2 ;;\n\
-             deny-unrecorded) echo 'DENY (could not write hook-fired sentinel)' >&2; exit 2 ;;\n\
+             deny-unrecorded) echo 'DENY (could not write hook-fired sentinel)' >&2; exit 3 ;;\n\
              foreign-deny) printf '%s\\n' '{\"_wicked_tool_call\":\"mcp__wicked__write\",\"_wicked_tool_phase\":\"unit-5\"}' \
              '{\"claim_id\":\"mcp-deny:unit-5\",\"scope\":\"s\",\"phase\":\"unit-5\",\"policy_ids\":[\"engine:mcp\"],\"decision\":\"deny\",\"obligations\":[\"mcp\"],\"evaluated_context_ref\":\"sha256:m\",\"criteria\":\"c\",\"evaluator_identity\":\"wicked-mcp\",\"evaluated_at\":1792454400}' \
-             >> \"$WICKED_DECISIONS_PATH\"; echo 'DENY (could not record the decision)' >&2; exit 2 ;;\n\
+             >> \"$WICKED_DECISIONS_PATH\"; echo 'DENY (could not record the decision)' >&2; exit 3 ;;\n\
              sentinel-only) printf '%s\\n' '{\"_wicked_hook_fired\":\"unit-5\"}' >> \"$WICKED_DECISIONS_PATH\"; \
-             echo 'DENY (could not record the decision)' >&2; exit 2 ;;\n\
+             echo 'DENY (could not record the decision)' >&2; exit 3 ;;\n\
              esac\nexit 0\n",
         )
         .unwrap();
@@ -1549,7 +1537,7 @@ mod tests {
         let (t, _r4b, log) = unit("deny-unrecorded");
         let d = post(&t, &payload);
         assert_eq!(decision(&d), "deny");
-        assert!(reason(&d).contains("recorded nothing"), "{d}");
+        assert!(reason(&d).contains("could not record it"), "{d}");
         assert!(reason(&d).contains("could not write"), "{d}");
         let rec = records(&log);
         assert_eq!(rec.len(), 1, "{rec:?}");
@@ -1560,7 +1548,7 @@ mod tests {
         // …and one whose only new deny is another recorder's, for another call (round 11).
         let (t, _r4d, log) = unit("foreign-deny");
         let d = post(&t, &payload);
-        assert!(reason(&d).contains("recorded nothing"), "{d}");
+        assert!(reason(&d).contains("could not record it"), "{d}");
         let rec = records(&log);
         assert_eq!(rec.len(), 2, "{rec:?}");
         assert_eq!(
@@ -1584,13 +1572,11 @@ mod tests {
             let ann: serde_json::Value =
                 serde_json::from_str(first.lines().next().unwrap()).unwrap();
             assert_eq!(ann[crate::gate_hook::HOOK_INVOCATION_KEY], "inv-1");
-            assert!(records_a_deny_since(&p, 0, "inv-1"));
-            assert!(!records_a_deny_since(&p, 0, "inv-2"));
         }
         // …and so is one that wrote only its liveness sentinel before failing (round 10).
         let (t, _r4c, log) = unit("sentinel-only");
         let d = post(&t, &payload);
-        assert!(reason(&d).contains("recorded nothing"), "{d}");
+        assert!(reason(&d).contains("could not record it"), "{d}");
         let rec = records(&log);
         assert_eq!(rec.len(), 1, "{rec:?}");
         assert_eq!(rec[0].decision, "deny");
@@ -1874,6 +1860,19 @@ mod tests {
                 started.elapsed()
             );
             drop(drip);
+            // An overflowed hook request whose line never completes (its read deadline passes)
+            // cannot be attributed, so every live unit fails closed (review round 13).
+            let (_t, r14, _log) = unit("partial");
+            ACTIVE.fetch_add(MAX_CONNS, Ordering::SeqCst);
+            let mut partial = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            partial.write_all(b"POST /hook/abc").unwrap();
+            let mut rest = Vec::new();
+            let _ = partial.read_to_end(&mut rest);
+            ACTIVE.fetch_sub(MAX_CONNS, Ordering::SeqCst);
+            assert!(
+                r14.finish(),
+                "an unattributable partial hook request fails live units"
+            );
             // Both pools exhausted: the dropped call cannot be attributed, so every live unit
             // fails closed (core#1055 review round 12).
             let (_t, r13, _log) = unit("exhausted");

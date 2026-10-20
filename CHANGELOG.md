@@ -35,9 +35,10 @@ Two release tracks share this file, newest entry first regardless of track:
   at a time (so what its log gains during a run is that run's), a deny the gate hook could not record itself is
   recorded by the relay, the relay's I/O threads are capped apart from its connections, and a call past the
   connection limit marks its unit to fail closed (read by a bounded worker within one absolute deadline, never on
-  the accepting thread; past that pool every live unit fails closed). The relay hands each call an id the gate hook stamps into its claims'
-  annotations (every recorder builds its annotation through one function), and an exit-2 deny counts as recorded
-  only with a deny claim carrying that id.
+  the accepting thread; past that pool, or when an overflowed line never completes, every live unit fails closed).
+  The relay hands each call an id (stamped into every claim annotation, through one builder); a hook that sees it
+  exits 3 when any record write failed or it recorded no decision, and the relay records that refusal itself. The
+  gate protocol is now 3, so a hook binary without that exit is refused before a seat launches.
   Every other outcome is refused fail closed by the relay itself: a kill that may have left a decision, a second
   kill, another exit code, a gate hook that could not start or did not answer by the deadline, an unknown token,
   a payload that is not a tool call, or a hook request whose headers are oversized, too many or unreadable (now
