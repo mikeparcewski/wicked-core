@@ -630,8 +630,12 @@ fn status_run(status: std::process::ExitStatus, stdout: Vec<u8>, stderr: Vec<u8>
 /// Run the host gate hook with the unit's env and `payload` on stdin, ending it at `deadline`:
 /// the payload is written from its own thread (a hook that never reads a payload larger than the
 /// pipe cannot block the relay), and its output is collected only until the deadline (a
-/// descendant holding the pipes cannot either). A run whose output is not in by the deadline is
-/// [`HookRun::TimedOut`], whatever its exit.
+/// descendant holding the pipes cannot either). Whatever it did, a run that has not answered
+/// (exited and handed over its output) by the deadline is [`HookRun::TimedOut`]; its process group
+/// is then killed, which closes the pipes its descendants held. The I/O threads hold a
+/// connection slot ([`InFlight`]) for as long as they live, so a hook whose descendants escape
+/// the group and keep the pipes open uses up the relay's slots (new calls are refused, fail
+/// closed) instead of growing the daemon's threads without bound.
 fn run_gate_hook(ctx: &HookContext, payload: &[u8], deadline: Instant) -> HookRun {
     let exe = crate::execute_wrapped::resolve_wicked_core_exe();
     let mut cmd = Command::new(&exe);
@@ -640,6 +644,12 @@ fn run_gate_hook(ctx: &HookContext, payload: &[u8], deadline: Instant) -> HookRu
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Its own group, so the deadline ends its descendants too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     for (k, v) in &ctx.env {
         match v {
             Some(v) => cmd.env(k, v),
@@ -653,16 +663,22 @@ fn run_gate_hook(ctx: &HookContext, payload: &[u8], deadline: Instant) -> HookRu
         Ok(c) => c,
         Err(e) => return HookRun::Lost(format!("could not be started: {e}")),
     };
+    #[cfg(unix)]
+    let group = child.id();
     if let Some(mut stdin) = child.stdin.take() {
         let payload = payload.to_vec();
+        let held = InFlight::new();
         // Ends when the hook reads it all, exits, or is killed (the write then fails).
         std::thread::spawn(move || {
+            let _held = held;
             let _ = stdin.write_all(&payload);
         });
     }
     let drain = |p: Option<Box<dyn Read + Send>>| {
         let (tx, rx) = std::sync::mpsc::channel();
+        let held = InFlight::new();
         std::thread::spawn(move || {
+            let _held = held;
             let mut b = Vec::new();
             if let Some(mut p) = p {
                 let _ = p.read_to_end(&mut b);
@@ -683,11 +699,19 @@ fn run_gate_hook(ctx: &HookContext, payload: &[u8], deadline: Instant) -> HookRu
             .take()
             .map(|p| Box::new(p) as Box<dyn Read + Send>),
     );
+    let end_group = || {
+        #[cfg(unix)]
+        // SAFETY: plain integers; the group is the one this child leads (`process_group(0)`).
+        unsafe {
+            libc::killpg(group as libc::pid_t, libc::SIGKILL);
+        }
+    };
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break Ok(s),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             other => {
+                end_group();
                 let _ = child.kill();
                 let _ = child.wait();
                 break Err(other.err());
@@ -703,9 +727,31 @@ fn run_gate_hook(ctx: &HookContext, payload: &[u8], deadline: Instant) -> HookRu
         Err(None) => return HookRun::TimedOut,
         Err(Some(e)) => return HookRun::Lost(format!("could not be waited for: {e}")),
     };
-    match (collect(out), collect(err)) {
-        (Some(out), Some(err)) => status_run(status, out, err),
-        _ => HookRun::TimedOut,
+    let (out, err) = (collect(out), collect(err));
+    // An answer is one given by the deadline: a run that exited across it, or whose output came
+    // in only after it, is a timeout like any other.
+    match (out, err) {
+        (Some(out), Some(err)) if Instant::now() < deadline => status_run(status, out, err),
+        _ => {
+            end_group();
+            HookRun::TimedOut
+        }
+    }
+}
+
+/// One relay I/O thread still running, counted against [`MAX_CONNS`] like a connection.
+struct InFlight;
+
+impl InFlight {
+    fn new() -> Self {
+        ACTIVE.fetch_add(1, Ordering::SeqCst);
+        InFlight
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        ACTIVE.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -952,7 +998,7 @@ mod tests {
             "#!/bin/sh\n[ \"$WICKED_TEST_MODE\" = stall ] && exec sleep 8\n\
              cat > /dev/null\necho run >> \"$WICKED_TEST_DIR/runs-$WICKED_TEST_MODE\"\n\
              case \"$WICKED_TEST_MODE\" in\n\
-             linger) sleep 8 & exit 0 ;;\n\
+             linger) sleep 8 & echo $! > \"$WICKED_TEST_DIR/linger.pid\"; exit 0 ;;\n\
              deny-then-kill) [ -e \"$WICKED_TEST_DIR/recorded\" ] || { : > \"$WICKED_TEST_DIR/recorded\"; \
              printf '%s\\n' '{\"claim_id\":\"infra-deny:unit-5\",\"scope\":\"s\",\"phase\":\"unit-5\",\"policy_ids\":[\"engine:governance-infra\"],\"decision\":\"deny\",\"obligations\":[\"store\"],\"evaluated_context_ref\":\"sha256:infra\",\"criteria\":\"c\",\"evaluator_identity\":\"wicked-governance-infra\",\"evaluated_at\":1792454400}' \
              >> \"$WICKED_DECISIONS_PATH\"; kill -9 $$; } ;;\n\
@@ -1110,7 +1156,15 @@ mod tests {
             "tool_input": {"file_path": "/wt/big.txt", "content": "x".repeat(1 << 20)},
         })
         .to_string();
-        for mode in ["stall", "linger"] {
+        let baseline = ACTIVE.load(Ordering::SeqCst);
+        let settles = |what: &dyn Fn() -> bool| {
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            while !what() && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            what()
+        };
+        for mode in ["stall", "linger", "late"] {
             let (_t, _r, log) = unit(mode);
             let ctx = HookContext {
                 env: vec![
@@ -1132,19 +1186,40 @@ mod tests {
                 cwd: Some(dir.clone()),
             };
             let started = std::time::Instant::now();
-            let a: serde_json::Value = serde_json::from_str(&judge(
-                &ctx,
-                "Write",
-                big.as_bytes(),
-                Duration::from_secs(2),
-            ))
-            .unwrap();
+            // `late` is a hook that allows at once, on a budget already spent: an answer after
+            // the deadline is a timeout too, never an allow.
+            let budget = if mode == "late" {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(2)
+            };
+            let a: serde_json::Value =
+                serde_json::from_str(&judge(&ctx, "Write", big.as_bytes(), budget)).unwrap();
             let took = started.elapsed();
             assert_eq!(decision(&a), "deny", "{mode}: {a}");
             assert!(reason(&a).contains("did not answer within"), "{mode}: {a}");
             assert!(took < Duration::from_secs(5), "{mode}: refused in {took:?}");
             assert_eq!(records(&log).len(), 1, "{mode}: {:?}", records(&log));
+            // Nothing of the run outlives its refusal: its group (the lingering child included)
+            // is killed, and its I/O threads end and give their slots back.
+            assert!(
+                settles(&|| ACTIVE.load(Ordering::SeqCst) <= baseline),
+                "{mode}: relay I/O threads still running"
+            );
         }
+        let lingering = std::fs::read_to_string(dir.join("linger.pid")).unwrap();
+        let alive = || {
+            // spawn-audit: test-only — probes a pid.
+            std::process::Command::new("kill")
+                .args(["-0", lingering.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        assert!(
+            settles(&|| !alive()),
+            "the hook's lingering child was killed"
+        );
 
         // P2: a hook request on a live unit's token whose headers fail is a recorded refusal.
         let (t, _r6, log) = unit("headers");
