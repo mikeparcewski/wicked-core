@@ -4573,6 +4573,8 @@ mod tests {
             .into_iter()
             .chain([("CARGO_NET_RETRY".to_string(), "3".to_string())])
             .collect();
+        // Shell-quoted: a checkout path may hold spaces or quotes.
+        let repo_q = format!("'{}'", repo.display().to_string().replace('\'', "'\\''"));
         let script = |offline: bool| {
             format!(
                 "echo CARGO_HOME=$CARGO_HOME; cargo --version; cd {r} && \
@@ -4580,7 +4582,7 @@ mod tests {
                  {{ echo FETCH_FAILED; tail -20 /tmp/fetch.log; }}; \
                  echo HOME_KB=$(du -sk /home/seat | cut -f1); \
                  echo CACHE_KB=$(du -sk \"$CARGO_HOME\" | cut -f1)",
-                r = repo.display(),
+                r = repo_q,
                 o = if offline { "--offline" } else { "" },
             )
         };
@@ -4649,7 +4651,7 @@ mod tests {
             s.lines()
                 .find_map(|l| l.strip_prefix(tag))
                 .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(u64::MAX)
+                .unwrap_or_else(|| panic!("no number after {tag} in:\n{s}"))
         };
         assert!(
             kb(&first, "HOME_KB=") < 64 * 1024,
