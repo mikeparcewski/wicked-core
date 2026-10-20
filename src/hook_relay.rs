@@ -420,10 +420,14 @@ impl Drop for Slot {
 /// bounded pool of [`MAX_OVERFLOW`] short-lived workers reads its request line within one
 /// absolute deadline ([`OVERFLOW_READ`]) and, when it names a live unit's token, marks that unit
 /// to fail closed at its end: its call was refused (the seat's hook sees the close and denies) and
-/// the refusal is not in its decisions log. Past the pool the connection is closed unread (a
-/// flood that size cannot be attributed; each of its calls is still denied at the seat).
+/// the refusal is not in its decisions log. Past the pool the connection is closed unread and,
+/// since it cannot be attributed, every live unit is marked to fail closed.
 fn overflow(mut conn: TcpStream) {
     let Some(worker) = OverflowWorker::take() else {
+        // Unattributable: any live unit may own this refused call, so every one fails closed.
+        // Marked before the close, so no unit ends clean between the two.
+        fail_every_live_unit();
+        drop(conn);
         return;
     };
     std::thread::spawn(move || {
@@ -445,6 +449,27 @@ fn overflow(mut conn: TcpStream) {
             );
         }
     });
+}
+
+/// Mark every live unit to fail closed (an overflowed call that could not be attributed), each
+/// while holding a `Call` so a unit ending meanwhile waits for its mark.
+fn fail_every_live_unit() {
+    let live: Vec<Registered> = relay()
+        .and_then(|r| r.units.lock().ok().map(|m| m.values().cloned().collect()))
+        .unwrap_or_default();
+    for reg in &live {
+        if let Some(call) = reg.life.enter() {
+            reg.life.mark_unrecorded();
+            drop(call);
+        }
+    }
+    if !live.is_empty() {
+        eprintln!(
+            "wicked-core: the gate hook relay dropped a call it could not attribute (connection \
+             and overflow limits reached); every live unit ({}) will fail closed",
+            live.len()
+        );
+    }
 }
 
 /// The overflow workers alive at once.
@@ -1849,6 +1874,21 @@ mod tests {
                 started.elapsed()
             );
             drop(drip);
+            // Both pools exhausted: the dropped call cannot be attributed, so every live unit
+            // fails closed (core#1055 review round 12).
+            let (_t, r13, _log) = unit("exhausted");
+            ACTIVE.fetch_add(MAX_CONNS, Ordering::SeqCst);
+            OVERFLOW.fetch_add(MAX_OVERFLOW, Ordering::SeqCst);
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let _ = s.write_all(b"POST /hook/abc HTTP/1.1\r\n");
+            let mut rest = Vec::new();
+            let _ = s.read_to_end(&mut rest);
+            OVERFLOW.fetch_sub(MAX_OVERFLOW, Ordering::SeqCst);
+            ACTIVE.fetch_sub(MAX_CONNS, Ordering::SeqCst);
+            assert!(
+                r13.finish(),
+                "an unattributable dropped call fails every live unit"
+            );
         }
 
         // An unknown token has no unit to record in: refused with its reason.

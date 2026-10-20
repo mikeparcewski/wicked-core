@@ -4858,12 +4858,7 @@ pub(crate) fn evaluate_tool_call(
     // atomic on both POSIX (`O_APPEND`) and Windows (`FILE_APPEND_DATA`) — no concurrent hook
     // subprocess can interleave between the annotation and the claim (Copilot).
     {
-        let annotation_json = serde_json::json!({
-            TOOL_CALL_KEY: audit_tool_name(tool),
-            TOOL_CALL_PHASE_KEY: phase,
-        })
-        .to_string()
-            + "\n";
+        let annotation_json = tool_call_annotation(tool, phase);
         let claim_line = match serde_json::to_string(&claim) {
             Ok(mut s) => {
                 s.push('\n');
@@ -5394,24 +5389,31 @@ fn append_annotated_claim(decisions_path: &str, phase: &str, tool: &str, claim: 
 
 /// [`append_annotated_claim`] that reports a failed write, for a recorder that must refuse the call
 /// it cannot record (the MCP broker's D-3, `mcp_gate::evaluate_mcp_call`).
-pub(crate) fn append_annotated_claim_checked(
-    decisions_path: &str,
-    phase: &str,
-    tool: &str,
-    claim: &ConformanceClaim,
-) -> std::io::Result<()> {
+/// The tool-call annotation line (newline included) every recorder writes in the same buffer as
+/// its claim: the tool, the phase, and, when the hook relay ran this hook, the relayed call's id
+/// ([`HOOK_INVOCATION_KEY`]), which ties the claim to that one call. One builder, so no recorder
+/// can write an annotation without it.
+fn tool_call_annotation(tool: &str, phase: &str) -> String {
     let mut annotation = serde_json::json!({
         TOOL_CALL_KEY: audit_tool_name(tool),
         TOOL_CALL_PHASE_KEY: phase,
     });
-    // The hook relay's per-invocation id, when it ran this hook: ties the claim to that one call.
     if let Some(id) = std::env::var(HOOK_INVOCATION_ENV)
         .ok()
         .filter(|v| !v.is_empty())
     {
         annotation[HOOK_INVOCATION_KEY] = id.into();
     }
-    let annotation = annotation.to_string() + "\n";
+    annotation.to_string() + "\n"
+}
+
+pub(crate) fn append_annotated_claim_checked(
+    decisions_path: &str,
+    phase: &str,
+    tool: &str,
+    claim: &ConformanceClaim,
+) -> std::io::Result<()> {
+    let annotation = tool_call_annotation(tool, phase);
     let mut claim_line = serde_json::to_string(claim).map_err(std::io::Error::other)?;
     claim_line.push('\n');
     let combined = annotation + &claim_line;
@@ -5780,12 +5782,7 @@ fn append_estate_deny(
     // Annotation + claim as ONE buffer under the advisory lock — the same atomicity argument the
     // policy path makes in `evaluate_tool_call`: a single `write_all` of a small buffer cannot be
     // interleaved by a concurrent hook subprocess even if the lock degrades.
-    let annotation = serde_json::json!({
-        TOOL_CALL_KEY: audit_tool_name(tool),
-        TOOL_CALL_PHASE_KEY: phase,
-    })
-    .to_string()
-        + "\n";
+    let annotation = tool_call_annotation(tool, phase);
     let Ok(mut claim_line) = serde_json::to_string(&claim) else {
         return;
     };
@@ -6842,6 +6839,53 @@ pub(crate) fn legacy_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// core#1055 review round 12: a relayed hook's every record carries the relayed call's id in
+    /// its tool-call annotation (`WICKED_HOOK_INVOCATION`), whichever recorder writes it, so the
+    /// relay can tell the call's own deny (an advisory estate refusal included) from any other.
+    #[test]
+    fn every_recorder_stamps_the_relayed_calls_id_into_its_annotation() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("wicked-inv-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("decisions.ndjson");
+        let log_s = log.to_str().unwrap();
+        std::env::set_var(HOOK_INVOCATION_ENV, "inv-42");
+        append_estate_deny(
+            log_s,
+            "s",
+            "unit-1",
+            "Bash",
+            "estate-deny fence: r",
+            "wicked-estate index .",
+            false,
+        );
+        append_boundary_deny(log_s, "s", "unit-1", "Read", "outside", false);
+        append_remote_write_deny(log_s, "s", "unit-1", "remote write", "git push");
+        append_mcp_deny(log_s, "s", "unit-1", "mcp__x__y", "mcp");
+        append_infra_deny(log_s, "s", "unit-1", "Bash", "infra");
+        std::env::remove_var(HOOK_INVOCATION_ENV);
+        let raw = std::fs::read_to_string(&log).unwrap();
+        let annotations: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get(TOOL_CALL_KEY).is_some())
+            .collect();
+        assert_eq!(annotations.len(), 5, "{raw}");
+        for a in &annotations {
+            assert_eq!(a[HOOK_INVOCATION_KEY], "inv-42", "{a}");
+        }
+        // Without the relay, no id.
+        append_infra_deny(log_s, "s", "unit-1", "Bash", "infra");
+        let last = std::fs::read_to_string(&log).unwrap();
+        let ann: serde_json::Value =
+            serde_json::from_str(last.lines().rev().nth(1).unwrap()).unwrap();
+        assert!(ann.get(HOOK_INVOCATION_KEY).is_none(), "{ann}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// R7 / R7b / R8 (DES-L4 PR-②; core #483, F-RC1-080, F-RC1-092): `Bash` is judged by its WRITE
     /// TARGETS under a fenced posture with the SAME admission a path-bearing tool gets. Read-only:
