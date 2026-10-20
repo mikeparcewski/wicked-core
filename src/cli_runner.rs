@@ -2855,6 +2855,7 @@ fn run_unit_and_judge_on(
                 claim_text: (stage == crate::repo_checks::FloorStage::Creator)
                     .then(|| output.output.clone()),
                 package_dir: None,
+                run_id: Some(input.run_id.clone()),
             };
             // crew #581 (F-BM-010): the floor runs on THIS thread after the runner returned, so
             // the unit's live-output stream went silent for its whole duration (run 8: crew's

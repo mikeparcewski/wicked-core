@@ -116,13 +116,13 @@
 //! ungoverned worker: inside the OS write boundary the worker sandbox provides
 //! ([`crate::validator::detect_worker_sandbox`] — macOS `sandbox-exec`, Linux `bwrap`; writes
 //! confined to the worktree, the curated secret directories unreadable, network open because
-//! installs need it), with an ISOLATED `HOME` and package caches under the worktree's engine
-//! scratch (`<worktree>/tmp/wicked-checks/…` — `HOME`, `npm_config_cache`, `CARGO_HOME`,
-//! `CARGO_TARGET_DIR`, `XDG_*`), so no check reads the operator's `~/.npmrc`,
-//! `~/.cargo/config.toml` or credentials, nothing it writes lands outside the tree, and its build
-//! artifacts (`target/`, a generated `package-lock.json` — `--no-package-lock` when the repo ships
-//! none) never land in the reviewed tree either, where the worktree guard would deny them. `RUSTUP_HOME` is preserved so the toolchain
-//! proxies still resolve. When NO write boundary can be armed — no `sandbox-exec`/`bwrap` on the
+//! installs need it), with an ISOLATED `HOME` and package caches in the floor's CHECK SCRATCH
+//! (`HOME`, `npm_config_cache`, `CARGO_HOME`, `CARGO_TARGET_DIR`, `XDG_*` — see "Where the check
+//! scratch lives" below), so no check reads the operator's `~/.npmrc`, `~/.cargo/config.toml` or
+//! credentials, nothing it writes lands outside the boundary's roots, and its build artifacts
+//! (`target/`, a generated `package-lock.json` — `--no-package-lock` when the repo ships none)
+//! never land in the reviewed tree, where the worktree guard would deny them. `RUSTUP_HOME` is
+//! preserved so the toolchain proxies still resolve. When NO write boundary can be armed — no `sandbox-exec`/`bwrap` on the
 //! host (all of Windows), or the worktree root failing to canonicalize — the floor does NOT run
 //! the checks: repo-controlled scripts never execute unsandboxed (codex review on #414). The
 //! report FAILS with the probe's reason (`sandbox_error`, `sandbox_level: "best-effort"`), which
@@ -155,13 +155,44 @@
 //! A floor that ran here also says nothing about the platforms a repository's own CI gates: the
 //! checks ran on the daemon's OS alone.
 //!
-//! Two leaves are special. `TMPDIR` (with `TMP`/`TEMP`) is NOT under the worktree: it is a short
+//! Two leaves are special. `TMPDIR` (with `TMP`/`TEMP`) is NOT a scratch leaf: it is a short
 //! random per-floor directory (`<system temp>/wc-<6 hex>`, mode 0700), armed as the boundary's
 //! second write root and reaped with the floor — a `TMPDIR` under a deep worktree overflowed the
 //! Unix-socket `sun_path` limit (104 bytes on macOS) and manufactured `listen EINVAL` failures the
 //! code did not have (core#489). `CARGO_TARGET_DIR` is split `cargo-target/head` vs
 //! `cargo-target/base`, so cargo's freshness check can never hand a head check the base run's test
 //! binaries through one shared target dir (core#480).
+//!
+//! ## Where the check scratch lives
+//!
+//! OUTSIDE the tree the floor checks, in the engine's own cache area, grouped per repository:
+//! `<worker home>/repo-checks/<repo key>/<run key>/` ([`scratch_dir_for`]). The repo key names
+//! the directory the run worktrees sit in (`<repo>/wicked-worktrees`), the run key the worktree
+//! itself. The scratch used to be `<worktree>/tmp/wicked-checks/`, and a run keeps its worktree
+//! after it ends (a parked run keeps it for a retry): a cargo repo left about 16 GB of build
+//! output in each run's worktree, and two runs filled the daemon's disk. Now:
+//!
+//! - **One leaf per run, not one per repository.** A target dir SHARED between runs is not safe:
+//!   cargo decides freshness by mtime, and two worktrees of one repo build into the same artifact
+//!   names, so a run whose files are older than another run's last build is handed that run's
+//!   binaries — a false pass (reproduced with two crates and one `CARGO_TARGET_DIR`). It is the
+//!   seam core#480 closed for head vs base. A shared dir would also let one run's
+//!   repo-controlled build script plant artifacts that another run's floor executes. Inside a run
+//!   every floor reuses the leaf, warm, as before; a guarded verify checkout
+//!   ([`checkout_guarded_tree`]) is a tree of its own, and its leaf is removed with it.
+//! - **A per-repository cap.** Before a floor runs, the repository's group is measured; over
+//!   [`CHECK_CACHE_CAP_ENV`] GB (default [`DEFAULT_CHECK_CACHE_CAP_GB`]) the least recently used
+//!   leaves are deleted until it fits, the floor's own last, and each removal is logged. A leaf a
+//!   floor is using is never removed: every floor holds a SHARED lock on `<run key>.lock` for its
+//!   life, and the cap removes a leaf only under an EXCLUSIVE one. Concurrent floors of ONE run
+//!   share the leaf as they shared the worktree scratch, and cargo's own build-directory lock
+//!   serializes their builds.
+//! - **Reaped when the run ends.** [`remove_check_scratch`] runs wherever the engine removes,
+//!   reaps or cleans a terminal run's worktree (`crate::repo`), so the leaf goes even when the
+//!   tree is kept. Its 0-byte `<run key>.lock` is kept, so a floor already waiting on it never
+//!   holds a lease the cap cannot see. No `tmp/wicked-checks` is created in the worktree; the
+//!   one thing the floor still writes there is the run base's transient SOURCE export
+//!   (`tmp/` [`BASE_EXPORT_SUBDIR`], see [`BaseTree`]), removed as soon as its result is cached.
 //!
 //! ## Minimal environment
 //!
@@ -223,9 +254,16 @@ pub const LOAD_FACTOR_CAP: f64 = 3.0;
 pub const TAIL_BYTES: usize = 4096;
 /// The most failure identifiers the streaming scanner keeps per check.
 pub const MAX_FAILURE_IDS: usize = 1000;
-/// Where the checks' isolated `HOME` and caches live: under the worktree's engine scratch, which
-/// the worktree guard excludes from its snapshot by construction and the OS boundary contains.
-pub const SCRATCH_SUBDIR: &str = "wicked-checks";
+/// Where the checks' isolated `HOME`, caches and build output live: `<worker home>/repo-checks/`,
+/// the engine's own cache area — never inside the tree a floor checks (see "Where the check
+/// scratch lives" in the module docs). The OS boundary arms the floor's leaf as a write root.
+pub const CHECK_CACHE_SUBDIR: &str = "repo-checks";
+/// The per-repository size cap on the check scratch, in GB (10^9 bytes). Over it, the least
+/// recently used run leaves of that repository are deleted before the next floor runs. A value
+/// that does not parse as a whole number keeps the default.
+pub const CHECK_CACHE_CAP_ENV: &str = "WICKED_REPO_CHECKS_CACHE_CAP_GB";
+/// The default of [`CHECK_CACHE_CAP_ENV`]: one large cargo workspace's head + base targets.
+pub const DEFAULT_CHECK_CACHE_CAP_GB: u64 = 20;
 /// The optional per-repo check configuration, relative to the worktree root.
 pub const CONFIG_PATH: &str = ".wicked/checks.json";
 /// (core#767) The check-name prefix of a configured journey (`journey-<name>`).
@@ -416,6 +454,11 @@ pub struct FloorContext {
     /// root through the pinned git dir and made package-relative — so `{files}`, `{base}` and a
     /// derived targeted command work in the package as at the root.
     pub package_dir: Option<String>,
+    /// (core#1050) The run this floor belongs to. Its check scratch is keyed by the run AND the
+    /// tree, so two runs whose worktree paths collide (two ids that sanitize to one worktree
+    /// name) never share a leaf, and never each other's build output. `None` (a floor built
+    /// without a run: tests) keys by the tree alone.
+    pub run_id: Option<String>,
 }
 
 /// The evidence of one check having run.
@@ -2156,13 +2199,30 @@ const CHECK_ENV_PASSTHROUGH: &[&str] = &[
     "NUMBER_OF_PROCESSORS",
 ];
 
-/// The isolated homes the checks run with, all under the worktree's engine scratch.
+/// The isolated homes the checks run with, all in the run's leaf of the engine's check cache
+/// (`<worker home>/repo-checks/<repo key>/<run key>/`, [`scratch_dir_for`]).
 #[derive(Debug)]
 pub(crate) struct CheckScratch {
     root: PathBuf,
     /// The checks' `TMPDIR`: `<system temp>/wc-<6 hex>`, private (0700), drawn fresh per floor and
     /// reaped with it (core#489 — a socket path must stay short; the worktree may not be).
     tmp: PrivateTmp,
+    /// The SHARED lock on `<run key>.lock`, held for the floor's life: the size cap removes a leaf
+    /// only under an exclusive lock, so it never deletes the scratch a floor is building into.
+    /// `Option` only so [`Drop`] can release it before retiring an orphaned leaf.
+    lease: Option<std::fs::File>,
+}
+
+impl Drop for CheckScratch {
+    /// (core#1050) The run's worktree was removed while this floor held the leaf (the reap
+    /// marked it orphaned instead of deleting it): the last floor out deletes it, so it is never
+    /// left behind. The cap pass removes any orphan this could not take.
+    fn drop(&mut self) {
+        if orphan_path(&self.root).exists() {
+            drop(self.lease.take());
+            retire_leaf(&self.root);
+        }
+    }
 }
 
 /// A private, writable temp dir for ONE floor or ONE validator run: `<system temp>/wc-<6 hex>`
@@ -2211,8 +2271,8 @@ impl Tree {
     }
 }
 
-/// The scratch leaves under `<worktree>/tmp/wicked-checks/`. No `tmp` leaf: the checks' `TMPDIR`
-/// lives under the system temp dir (see [`CheckScratch::tmp`]).
+/// The scratch leaves under the run's check-cache leaf. No `tmp` leaf: the checks' `TMPDIR` lives
+/// under the system temp dir (see [`CheckScratch::tmp`]).
 const SCRATCH_LEAVES: &[&str] = &[
     "home",
     "npm-cache",
@@ -2222,6 +2282,7 @@ const SCRATCH_LEAVES: &[&str] = &[
     "cargo-target/base",
     "xdg-config",
     "xdg-cache",
+    "base-cache",
 ];
 
 /// Bounded attempts at an unused random name under the system temp dir before giving up.
@@ -2266,35 +2327,113 @@ fn create_private_tmp(base: &Path, mut draw: impl FnMut() -> String) -> std::io:
 }
 
 impl CheckScratch {
+    /// The scratch for a floor over `worktree`: its leaf of the engine's check cache, the cache
+    /// first held to the repository's size cap, a shared lease taken, the leaves made.
+    #[cfg(test)]
     pub(crate) fn prepare(worktree: &Path) -> std::io::Result<Self> {
-        // The engine scratch root is repo-adjacent territory: a checkout could ship `tmp` as a
-        // SYMLINK pointing outside the worktree, and `create_dir_all` would follow it. Refuse a
-        // link at either level (adversarial review on #414) — lstat, never follow.
-        let scratch_root = worktree.join(crate::worktree_guard::ENGINE_SCRATCH_DIR);
-        for dir in [&scratch_root, &scratch_root.join(SCRATCH_SUBDIR)] {
-            match std::fs::symlink_metadata(dir) {
-                Ok(m) if m.file_type().is_symlink() => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "`{}` is a symlink — the checks' scratch must be a real directory \
-                             inside the worktree (refused, never followed)",
-                            dir.display()
-                        ),
-                    ))
-                }
-                Ok(m) if !m.is_dir() => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("`{}` exists and is not a directory", dir.display()),
-                    ))
-                }
-                _ => {}
+        Self::prepare_for(worktree, None)
+    }
+
+    /// [`Self::prepare`] for the run `run_id` (keyed by run and tree, [`scratch_dir_for`]).
+    pub(crate) fn prepare_for(worktree: &Path, run_id: Option<&str>) -> std::io::Result<Self> {
+        Self::prepare_in(
+            &check_cache_root()?,
+            worktree,
+            run_id,
+            check_cache_cap_bytes(),
+        )
+    }
+
+    /// [`Self::prepare_for`] against an explicit cache root and cap — the seam the cap tests use.
+    pub(crate) fn prepare_in(
+        cache: &Path,
+        worktree: &Path,
+        run_id: Option<&str>,
+        cap: u64,
+    ) -> std::io::Result<Self> {
+        // (core#1050) The worktree's engine scratch root is still checked FIRST, exactly as when
+        // the whole scratch lived under it: the floor writes the run base's export there, and a
+        // checkout that ships `tmp` as a SYMLINK (or as a file) refuses the floor, fail-closed,
+        // with the same reason it always had — never a logged warning beside a passing check.
+        let engine_tmp = worktree.join(crate::worktree_guard::ENGINE_SCRATCH_DIR);
+        match std::fs::symlink_metadata(&engine_tmp) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "`{}` is a symlink — the checks' scratch must be a real directory \
+                         inside the worktree (refused, never followed)",
+                        engine_tmp.display()
+                    ),
+                ))
             }
+            Ok(m) if !m.is_dir() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("`{}` exists and is not a directory", engine_tmp.display()),
+                ))
+            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("`{}` cannot be inspected: {e}", engine_tmp.display()),
+                ))
+            }
+            _ => {}
         }
-        let root = scratch_root.join(SCRATCH_SUBDIR);
+        let root = scratch_dir_for(cache, worktree, run_id);
+        let group = root
+            .parent()
+            .ok_or_else(|| std::io::Error::other("the check scratch has no repository group"))?;
+        wicked_apps_core::spawn::ensure_private_dir(group).map_err(std::io::Error::other)?;
+        // An orphaned leaf (its run's worktree was removed while a floor held it) is never
+        // reused: retired first, or the floor is refused while another floor still holds it.
+        if orphan_path(&root).exists() && !retire_leaf(&root) {
+            return Err(std::io::Error::other(format!(
+                "the check scratch `{}` was orphaned (its worktree was removed) and is still in \
+                 use — it is never reused",
+                root.display()
+            )));
+        }
+        // The lease FIRST: a floor starting beside this one never evicts this run's leaf.
+        let mut lease = take_orphan_free_lease(&root)?;
+        if enforce_check_cache_cap(group, &root, cap).1 {
+            // This run's own scratch alone outgrew the cap: clean it before the checks, unless
+            // another floor of the run is building into it (then it is that floor's, for now).
+            drop(lease);
+            if let Ok(Some(_held)) = lock_leaf(&root, true) {
+                match remove_leaf_dir(&root) {
+                    Ok(()) => eprintln!(
+                        "wicked-core: repo checks floor — this run's check scratch {} alone was \
+                         over the {:.1} GB cap ({CHECK_CACHE_CAP_ENV}); removed it before the checks",
+                        root.display(),
+                        cap as f64 / 1e9
+                    ),
+                    Err(e) => eprintln!(
+                        "wicked-core: repo checks floor — could not remove the over-cap check \
+                         scratch {}: {e}",
+                        root.display()
+                    ),
+                }
+            }
+            lease = take_orphan_free_lease(&root)?;
+        }
+        match std::fs::symlink_metadata(&root) {
+            Ok(m) if m.file_type().is_symlink() || !m.is_dir() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "`{}` is not a real directory — the checks' scratch is never written \
+                         through a link (refused, never followed)",
+                        root.display()
+                    ),
+                ))
+            }
+            _ => {}
+        }
         // The leaves too (adversarial review on #414, LOW): `create_dir_all` would follow a
-        // committed symlink-to-directory at a leaf. Refuse a link at any leaf before creating.
+        // symlink-to-directory at a leaf — one an earlier floor's repo-controlled check, which can
+        // write the leaf, left behind. Refuse a link at any leaf before creating.
         for sub in SCRATCH_LEAVES {
             if let Ok(m) = std::fs::symlink_metadata(root.join(sub)) {
                 if m.file_type().is_symlink() {
@@ -2315,7 +2454,16 @@ impl CheckScratch {
         // The checks' `TMPDIR` lives OUTSIDE the worktree, short (core#489) — drawn last, so a
         // refusal above leaves nothing behind under the system temp dir.
         let tmp = PrivateTmp::create()?;
-        Ok(Self { root, tmp })
+        Ok(Self {
+            root,
+            tmp,
+            lease: Some(lease),
+        })
+    }
+
+    /// The scratch's leaf directory — the boundary's third write root.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
 
     fn home(&self) -> PathBuf {
@@ -2430,6 +2578,400 @@ impl CheckScratch {
     }
 }
 
+/// The engine's check cache: `<worker home>/repo-checks` ([`CHECK_CACHE_SUBDIR`]). In this crate's
+/// own tests it is the test binary's hermetic worker home, resolved once — never the
+/// operator's, and immune to a test re-aiming `WICKED_WORKER_HOME` mid-run.
+pub(crate) fn check_cache_root() -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    let base: anyhow::Result<PathBuf> = Ok(wicked_apps_core::spawn::hermetic_test_worker_home());
+    #[cfg(not(test))]
+    let base = wicked_apps_core::spawn::worker_home_base();
+    base.map(|b| b.join(CHECK_CACHE_SUBDIR))
+        .map_err(|e| std::io::Error::other(format!("no worker home for the check cache: {e}")))
+}
+
+/// [`CHECK_CACHE_CAP_ENV`] in bytes, [`DEFAULT_CHECK_CACHE_CAP_GB`] when unset or unparsable.
+fn check_cache_cap_bytes() -> u64 {
+    std::env::var(CHECK_CACHE_CAP_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CHECK_CACHE_CAP_GB)
+        .saturating_mul(1_000_000_000)
+}
+
+/// 12 hex of `sha256(bytes)`.
+fn hex12(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(bytes);
+    digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
+}
+
+/// `<label>-<12 hex of sha256(path)>`: readable, and injective in the path (two worktrees that
+/// share a name never share a leaf).
+fn cache_key(label: &std::ffi::OsStr, path: &Path) -> String {
+    let label: String = label
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(48)
+        .collect();
+    format!("{label}-{}", hex12(path.as_os_str().as_encoded_bytes()))
+}
+
+/// The check-scratch leaf of run `run_id` over the tree at `worktree`:
+/// `<cache>/<repo key>/<run key>`. The repo key is the directory the worktree sits in —
+/// `<repo>/wicked-worktrees` for every run of one registered repository, so a repository's runs
+/// are one group the cap measures — labelled with the repository's own name. The run key is the
+/// worktree AND the exact run id (`<tree key>-r<12 hex of sha256(run id)>`, core#1050): two runs
+/// whose ids sanitize to one worktree path still get two leaves. Spelled through the canonical
+/// PARENT (which outlives the worktree), so the reaper derives the same leaf after the tree is
+/// gone.
+pub(crate) fn scratch_dir_for(cache: &Path, worktree: &Path, run_id: Option<&str>) -> PathBuf {
+    let (group, prefix) = tree_scratch_prefix(cache, worktree);
+    group.join(format!(
+        "{prefix}{}",
+        hex12(run_id.unwrap_or_default().as_bytes())
+    ))
+}
+
+/// The repository group of the tree at `worktree` and the name prefix every run leaf of that tree
+/// carries (`<tree key>-r`).
+fn tree_scratch_prefix(cache: &Path, worktree: &Path) -> (PathBuf, String) {
+    let name = worktree.file_name().unwrap_or(worktree.as_os_str());
+    let parent = worktree
+        .parent()
+        .map(|p| crate::worker_sandbox::canon_lenient(p).unwrap_or_else(|| p.to_path_buf()))
+        .unwrap_or_default();
+    let tree = parent.join(name);
+    // The repository's name: the first ancestor that is not the worktrees layout itself
+    // (`wicked-worktrees`, the pre-crew#276 `.wicked/worktrees`).
+    let label = parent
+        .ancestors()
+        .filter_map(Path::file_name)
+        .find(|n| {
+            !matches!(
+                n.to_str(),
+                Some("wicked-worktrees" | "worktrees" | ".wicked")
+            )
+        })
+        .unwrap_or(std::ffi::OsStr::new("root"));
+    (
+        cache.join(cache_key(label, &parent)),
+        format!("{}-r", cache_key(name, &tree)),
+    )
+}
+
+/// Open `<leaf>.lock` and lock it — SHARED for a floor, EXCLUSIVE (non-blocking) for a removal.
+/// `Ok(None)` only for an exclusive lock some floor holds.
+fn lock_leaf(leaf: &Path, exclusive: bool) -> std::io::Result<Option<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lease_path(leaf))?;
+    if exclusive {
+        // A few short retries: a child another thread is forking holds a copy of a floor's
+        // descriptor (and so its `flock`) until its `exec` closes it, so a lease just released can
+        // read as held for a moment. A floor that really holds the lease holds it for minutes.
+        for attempt in 0..LEASE_ATTEMPTS {
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(file)),
+                Err(std::fs::TryLockError::WouldBlock) if attempt + 1 < LEASE_ATTEMPTS => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            }
+        }
+        return Ok(None);
+    }
+    file.lock_shared()?;
+    // The lease's mtime is the leaf's last use: the cap evicts the least recently used first.
+    let _ = file.set_modified(std::time::SystemTime::now());
+    Ok(Some(file))
+}
+
+/// How many times a removal tries the exclusive lock on a leaf before leaving it (see
+/// [`lock_leaf`]).
+const LEASE_ATTEMPTS: u32 = 8;
+
+/// `<leaf>.lock` — a sibling of the leaf, so removing the leaf never removes the lock a waiting
+/// floor holds a descriptor to.
+fn lease_path(leaf: &Path) -> PathBuf {
+    let mut path = leaf.as_os_str().to_owned();
+    path.push(".lock");
+    PathBuf::from(path)
+}
+
+/// A floor's shared lease on `leaf` ([`CheckScratch::lease`]).
+fn take_lease(leaf: &Path) -> std::io::Result<std::fs::File> {
+    lock_leaf(leaf, false)?.ok_or_else(|| std::io::Error::other("the lease could not be taken"))
+}
+
+/// [`take_lease`], then the orphan mark checked AGAIN under the lease (codex on #1050): a reap can
+/// mark the leaf between a floor's first look and its lease, and an orphaned leaf is never
+/// reused. A marked leaf is released and retired, and the lease taken on the fresh one; while
+/// another floor still holds the orphan, the floor is refused.
+fn take_orphan_free_lease(leaf: &Path) -> std::io::Result<std::fs::File> {
+    for _ in 0..3 {
+        let lease = take_lease(leaf)?;
+        if !orphan_path(leaf).exists() {
+            return Ok(lease);
+        }
+        drop(lease);
+        if !retire_leaf(leaf) {
+            break;
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "the check scratch `{}` was orphaned (its worktree was removed) and is still in use — it \
+         is never reused",
+        leaf.display()
+    )))
+}
+
+/// The apparent size of everything under `dir`, never following a link.
+fn tree_bytes(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let Ok(m) = e.path().symlink_metadata() else {
+                continue;
+            };
+            if m.is_dir() {
+                stack.push(e.path());
+            } else {
+                total = total.saturating_add(m.len());
+            }
+        }
+    }
+    total
+}
+
+/// Remove a leaf directory (a link at its path is removed, never followed).
+fn remove_leaf_dir(leaf: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(leaf) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(leaf),
+        Ok(_) => std::fs::remove_file(leaf),
+    }
+}
+
+/// The cap pass's lock, `<group>/.cap.lock`: one pass per repository at a time, so two floors
+/// starting together never scan and evict against each other (one would read a leaf the other is
+/// mid-way through deleting as "in use" and evict more than the cap needs).
+const CAP_PASS_LOCK: &str = ".cap.lock";
+
+/// Hold the repository group `group` to `cap` bytes before a floor runs over `own` (the floor
+/// already holds `own`'s lease). Orphaned leaves ([`orphan_path`]) no floor holds go first,
+/// whatever the cap. Over the cap, the OTHER run leaves go least recently used first
+/// until it fits, skipping any leaf a floor holds a lease on. The floor's own leaf is never
+/// removed here; the second value says whether it ALONE is over the cap (one run outgrew it),
+/// which [`CheckScratch::prepare_in`] then cleans. A leaf is never removed because another
+/// active run is large. Every removal is logged; best-effort, never fails the floor.
+pub(crate) fn enforce_check_cache_cap(group: &Path, own: &Path, cap: u64) -> (Vec<PathBuf>, bool) {
+    let mut removed = Vec::new();
+    let pass = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(group.join(CAP_PASS_LOCK));
+    let Ok(_pass) = pass.and_then(|f| f.lock().map(|()| f)) else {
+        return (removed, false);
+    };
+    let Ok(entries) = std::fs::read_dir(group) else {
+        return (removed, false);
+    };
+    let mut own_bytes = 0u64;
+    let mut others: Vec<(std::time::SystemTime, PathBuf, u64)> = Vec::new();
+    for e in entries.flatten() {
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let leaf = e.path();
+        // (core#1050) An orphaned leaf goes whatever the cap, once no floor holds it.
+        if leaf != own && orphan_path(&leaf).exists() {
+            if retire_leaf(&leaf) {
+                eprintln!(
+                    "wicked-core: repo checks floor — removed the orphaned check scratch {} \
+                     (its run's worktree is gone)",
+                    leaf.display()
+                );
+                removed.push(leaf);
+            }
+            continue;
+        }
+        let bytes = tree_bytes(&leaf);
+        if leaf == own {
+            own_bytes = bytes;
+            continue;
+        }
+        let used = std::fs::metadata(lease_path(&leaf))
+            .or_else(|_| leaf.symlink_metadata())
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        others.push((used, leaf, bytes));
+    }
+    let mut total: u64 = own_bytes + others.iter().map(|l| l.2).sum::<u64>();
+    if total <= cap {
+        return (removed, false);
+    }
+    others.sort_by_key(|l| l.0);
+    let gb = |b: u64| b as f64 / 1e9;
+    for (_, leaf, bytes) in others {
+        if total <= cap {
+            break;
+        }
+        match lock_leaf(&leaf, true) {
+            // Gone since the scan (a run's reap): nothing to remove, nothing to log.
+            Ok(Some(_held)) if std::fs::symlink_metadata(&leaf).is_err() => {
+                total = total.saturating_sub(bytes);
+            }
+            Ok(Some(_held)) => match remove_leaf_dir(&leaf) {
+                Ok(()) => {
+                    eprintln!(
+                        "wicked-core: repo checks floor — the check cache {} was {:.1} GB, over \
+                         its {:.1} GB cap ({CHECK_CACHE_CAP_ENV}); removed {} ({:.1} GB)",
+                        group.display(),
+                        gb(total),
+                        gb(cap),
+                        leaf.display(),
+                        gb(bytes)
+                    );
+                    total = total.saturating_sub(bytes);
+                    removed.push(leaf);
+                }
+                Err(e) => eprintln!(
+                    "wicked-core: repo checks floor — could not remove the over-cap check \
+                     scratch {}: {e}",
+                    leaf.display()
+                ),
+            },
+            // A floor is building into it right now: it is not this cap's to take.
+            Ok(None) => {}
+            Err(e) => eprintln!(
+                "wicked-core: repo checks floor — could not lock the check scratch {}: {e}",
+                leaf.display()
+            ),
+        }
+    }
+    if total > cap && own_bytes <= cap {
+        eprintln!(
+            "wicked-core: repo checks floor — the check cache {} is {:.1} GB, over its {:.1} GB \
+             cap ({CHECK_CACHE_CAP_ENV}), held by runs whose floors are running",
+            group.display(),
+            gb(total),
+            gb(cap)
+        );
+    }
+    (removed, own_bytes > cap)
+}
+
+/// `<leaf>.orphan`: the leaf's run lost its worktree while a floor held the leaf. It is never
+/// reused; the floor holding it ([`CheckScratch`]'s `Drop`), the next prepare of that run, or the
+/// next cap pass deletes it.
+fn orphan_path(leaf: &Path) -> PathBuf {
+    let mut path = leaf.as_os_str().to_owned();
+    path.push(".orphan");
+    PathBuf::from(path)
+}
+
+/// Delete `leaf` under its exclusive lock, and its orphan mark. When a floor still holds the
+/// lease, the leaf is MARKED orphaned instead (and logged) and `false` returned. The 0-byte lock
+/// file is KEPT, as the cap keeps it: a floor may already have it open, waiting in
+/// `lock_shared`, and unlinking it would hand that floor a lease on an inode no later lock sees.
+fn retire_leaf(leaf: &Path) -> bool {
+    let mark = orphan_path(leaf);
+    if std::fs::symlink_metadata(lease_path(leaf)).is_err()
+        && std::fs::symlink_metadata(leaf).is_err()
+    {
+        let _ = std::fs::remove_file(&mark);
+        return true;
+    }
+    match lock_leaf(leaf, true) {
+        Ok(Some(_held)) => match remove_leaf_dir(leaf) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&mark);
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "wicked-core: could not remove the check scratch {}: {e}",
+                    leaf.display()
+                );
+                let _ = std::fs::write(&mark, b"");
+                false
+            }
+        },
+        Ok(None) => {
+            let _ = std::fs::write(&mark, b"");
+            eprintln!(
+                "wicked-core: the check scratch {} is in use by a floor; marked orphaned (never \
+                 reused, removed when that floor ends or by the next cap pass)",
+                leaf.display()
+            );
+            false
+        }
+        Err(e) => {
+            let _ = std::fs::write(&mark, b"");
+            eprintln!(
+                "wicked-core: could not lock the check scratch {}: {e}; marked orphaned",
+                leaf.display()
+            );
+            false
+        }
+    }
+}
+
+/// Remove the check-scratch leaf of run `run_id` over the tree at `worktree` — the run ended or
+/// its worktree is being removed. Never touches the worktree.
+pub(crate) fn remove_check_scratch(worktree: &Path, run_id: &str) {
+    let Ok(cache) = check_cache_root() else {
+        return;
+    };
+    remove_check_scratch_in(&cache, worktree, Some(run_id));
+}
+
+/// [`remove_check_scratch`] against an explicit cache root. Returns whether the leaf is gone.
+pub(crate) fn remove_check_scratch_in(cache: &Path, worktree: &Path, run_id: Option<&str>) -> bool {
+    retire_leaf(&scratch_dir_for(cache, worktree, run_id))
+}
+
+/// Remove EVERY run's check-scratch leaf of the tree at `dir` — a guarded floor checkout, whose
+/// path is unique to it (a nonce), dropped.
+pub(crate) fn remove_tree_scratch(dir: &Path) {
+    let Ok(cache) = check_cache_root() else {
+        return;
+    };
+    remove_tree_scratch_in(&cache, dir);
+}
+
+/// [`remove_tree_scratch`] against an explicit cache root.
+pub(crate) fn remove_tree_scratch_in(cache: &Path, dir: &Path) {
+    let (group, prefix) = tree_scratch_prefix(cache, dir);
+    let Ok(entries) = std::fs::read_dir(&group) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && e.file_type().is_ok_and(|t| t.is_dir()) {
+            retire_leaf(&e.path());
+        }
+    }
+}
+
 /// [`run_floor`] as the historical verify floor — no known base (no baseline diff, no
 /// `{files}`/`{base}`), no claim. Test-only since core#467: every production caller names its
 /// [`FloorContext`].
@@ -2456,7 +2998,7 @@ pub fn run_floor_rerun(
     // write root (core#489), and the launcher needs it to exist before the probe — bwrap `--bind`s
     // a directory, the SBPL profile canonicalizes it. A scratch that cannot be prepared is the
     // same fail-closed detection error as before, reported against a worktree-only probe.
-    let scratch = match CheckScratch::prepare(worktree) {
+    let scratch = match CheckScratch::prepare_for(worktree, ctx.run_id.as_deref()) {
         Ok(s) => s,
         Err(e) => {
             let sandbox = crate::validator::detect_worker_sandbox(&[worktree.to_path_buf()]);
@@ -2466,6 +3008,7 @@ pub fn run_floor_rerun(
     let sandbox = crate::validator::detect_worker_sandbox(&[
         worktree.to_path_buf(),
         scratch.tmp.path().to_path_buf(),
+        scratch.root().to_path_buf(),
     ]);
     let sandbox = arm_probed(sandbox, floor_probe());
     let mut report = run_with_sandbox_ctx(worktree, sandbox, ctx, scratch, rerun);
@@ -2542,8 +3085,8 @@ pub(crate) fn run_with_sandbox(worktree: &Path, sandbox: WorkerSandbox) -> RepoC
     }
 }
 
-/// The fail-closed report for a scratch that could not be prepared (a symlinked `tmp`, an
-/// unwritable temp dir): detection is still reported so the record says what WOULD have run.
+/// The fail-closed report for a scratch that could not be prepared (a linked leaf, no worker home,
+/// an unwritable temp dir): detection is still reported so the record says what WOULD have run.
 fn scratch_refused(
     worktree: &Path,
     ctx: &FloorContext,
@@ -2556,8 +3099,7 @@ fn scratch_refused(
         skipped: Vec::new(),
         passed: false,
         detect_error: Some(format!(
-            "the checks' isolated scratch under `{}/{SCRATCH_SUBDIR}` could not be created: {e}",
-            crate::worktree_guard::ENGINE_SCRATCH_DIR
+            "the checks' isolated scratch could not be prepared: {e}"
         )),
         sandbox_level: sandbox.level.as_wire().to_string(),
         sandbox_note: sandbox.downgrade_reason.clone(),
@@ -2737,11 +3279,14 @@ pub(crate) fn run_with_sandbox_ctx(
     let mut failed = false;
     // (F-RC2-009) Never run a HEAD check beside a copy of the base — a crash mid-floor could have
     // left one; the export lives only between its creation and the caching of its result.
-    if let Err(e) = remove_base_export(&scratch) {
-        eprintln!("wicked-core: repo checks floor — {e}");
-    }
+    // (core#1050) A base export that cannot be cleared (a linked or non-directory `tmp`, a link
+    // at the export path) REFUSES the floor, fail-closed: no check runs, and none may pass beside
+    // a scratch the floor could not make safe.
+    let mut scratch_error = remove_base_export(worktree, &scratch)
+        .err()
+        .map(|e| format!("the checks' scratch could not be made safe: {e}"));
     for check in &detected {
-        if failed {
+        if failed || scratch_error.is_some() {
             skipped.push(check.name.clone());
             continue;
         }
@@ -2784,8 +3329,11 @@ pub(crate) fn run_with_sandbox_ctx(
                                     error: Some(e),
                                 },
                             };
-                            if let Err(e) = remove_base_export(&scratch) {
-                                eprintln!("wicked-core: repo checks floor — {e}");
+                            if let Err(e) = remove_base_export(worktree, &scratch) {
+                                scratch_error = Some(format!(
+                                    "the base export could not be removed before the next \
+                                     check: {e}"
+                                ));
                             }
                             base_run
                         }
@@ -2838,12 +3386,15 @@ pub(crate) fn run_with_sandbox_ctx(
     .flatten()
     .collect();
     let coverage_note = (!notes.is_empty()).then(|| notes.join("; "));
+    if let Some(e) = &scratch_error {
+        eprintln!("wicked-core: repo checks floor — refused: {e}");
+    }
     RepoChecksReport {
-        passed: !failed,
+        passed: !failed && scratch_error.is_none(),
         detected,
         checks,
         skipped,
-        detect_error: None,
+        detect_error: scratch_error,
         sandbox_level,
         sandbox_note,
         sandbox_error: None,
@@ -3058,6 +3609,9 @@ pub(crate) struct FloorCheckout {
 
 impl Drop for FloorCheckout {
     fn drop(&mut self) {
+        // The checkout's check scratch is its own (core#417: a guarded floor never builds on the
+        // live worktree's artifacts) and dies with it.
+        remove_tree_scratch(&self.dir);
         let env: [(&str, &Path); 1] = [("GIT_DIR", self.git_dir.as_path())];
         let dir = self.dir.to_string_lossy().into_owned();
         let _ = crate::worktree_guard::git(
@@ -3425,26 +3979,74 @@ pub(crate) fn guarded_checkout_refused(
 /// The run base, exported into the checks' scratch for the baseline diff — plain files, no git
 /// metadata, no nested worktree: `git read-tree` into a scratch index + `git checkout-index
 /// --prefix`, both through the PINNED git dir (never the worktree's own `.git` file, which the
-/// seat could have redirected). Lives under `<worktree>/tmp/wicked-checks/base` — inside the OS
+/// seat could have redirected). Lives at `<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`] — inside the OS
 /// write boundary, outside the guard's snapshot — so the sandbox wrapper armed for the worktree
-/// covers the base run too. REMOVED as soon as its check result is cached ([`remove_base_export`]):
-/// the export is a full copy of the repo tree inside the worktree, and a HEAD check that globs from
-/// the worktree root (vitest's default include, a broad `tsconfig`, eslint without ignores) would
-/// otherwise run over the base's files too. The run pays for a base check once through the
-/// `base-cache`, never through a persisted export.
+/// covers the base run too. It stays INSIDE the worktree when the rest of the check scratch moved
+/// to the engine's check cache: a base check that calls git (a `build.rs` running `git rev-parse`)
+/// discovers the enclosing worktree's repository from there, exactly as it did from
+/// `tmp/wicked-checks/base`; from the cache it found none and failed before its tests ran, a head
+/// failure the base did not share, read as a regression (codex on #1050). The export is SOURCE
+/// only (the base's build output goes to the check scratch's `cargo-target/base`) and it is
+/// REMOVED as soon as its check result is cached ([`remove_base_export`]), and at the start of
+/// every floor: it is a full copy of the repo tree inside the worktree, and a HEAD check that
+/// globs from the worktree root (vitest's default include, a broad `tsconfig`, eslint without
+/// ignores) would otherwise run over the base's files too. The run pays for a base check once
+/// through the `base-cache` (in the check scratch), never through a persisted export.
 struct BaseTree {
     dir: PathBuf,
     head: String,
 }
 
-/// Remove the base export (`<scratch>/base` and its scratch index) if present. A symlink at the
-/// export path is refused, never followed. Called before an export and as soon as a base check's
-/// result is cached, so no HEAD check ever runs beside a copy of the base.
-fn remove_base_export(scratch: &CheckScratch) -> Result<(), String> {
-    let dir = scratch.root.join("base");
+/// The base export's directory name under the worktree's engine scratch (`tmp/`).
+pub const BASE_EXPORT_SUBDIR: &str = "wicked-floor-base";
+/// Where the whole check scratch lived before it moved to the engine's check cache
+/// (`tmp/wicked-checks`). Nothing is written there; [`remove_base_export`] still removes a base
+/// export an older engine left in it.
+const LEGACY_SCRATCH_SUBDIR: &str = "wicked-checks";
+
+/// `<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`]. The engine scratch root is repo-adjacent territory:
+/// a checkout or a seat could make `tmp` a SYMLINK out of the worktree, and the export (written by
+/// the engine, outside any sandbox) would follow it — so a `tmp` that is a link, or not a
+/// directory, is refused (adversarial review on #414), never followed.
+fn base_export_dir(worktree: &Path) -> Result<PathBuf, String> {
+    let tmp = worktree.join(crate::worktree_guard::ENGINE_SCRATCH_DIR);
+    match std::fs::symlink_metadata(&tmp) {
+        Ok(m) if m.file_type().is_symlink() || !m.is_dir() => Err(format!(
+            "`{}` is not a real directory — the base export is never written through a link",
+            tmp.display()
+        )),
+        Ok(_) => Ok(tmp.join(BASE_EXPORT_SUBDIR)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(tmp.join(BASE_EXPORT_SUBDIR)),
+        Err(e) => Err(format!("`{}` cannot be inspected: {e}", tmp.display())),
+    }
+}
+
+/// Remove the base export (`<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`] and its scratch index) if
+/// present. A symlink at the export path is refused, never followed. Called at the start of every
+/// floor, before an export and as soon as a base check's result is cached, so no HEAD check ever
+/// runs beside a copy of the base.
+fn remove_base_export(worktree: &Path, scratch: &CheckScratch) -> Result<(), String> {
     let _ = std::fs::remove_file(scratch.root.join("base.idx"));
+    let dir = base_export_dir(worktree)?;
+    // (codex on #1050) An engine from before the scratch moved left its export at
+    // `tmp/wicked-checks/base` when it died mid-baseline; it removed that at every floor's start,
+    // and so does this one — or a HEAD check globbing from the root runs over the old base. Only
+    // that export: the rest of a legacy `tmp/wicked-checks` is not this floor's to judge. Never
+    // through a link (`tmp` was checked above; `wicked-checks` here; `base` is unlinked, not
+    // followed).
+    // Only "not found" is absence (codex on #1050): any other error inspecting a path (a `tmp`
+    // without search permission) is an export the floor could not clear, and refuses it.
+    let legacy = dir.with_file_name(LEGACY_SCRATCH_SUBDIR);
+    match std::fs::symlink_metadata(&legacy) {
+        Ok(m) if m.is_dir() => remove_leaf_dir(&legacy.join("base"))
+            .map_err(|e| format!("the legacy base export could not be removed: {e}"))?,
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("`{}` cannot be inspected: {e}", legacy.display())),
+    }
     match std::fs::symlink_metadata(&dir) {
-        Err(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("`{}` cannot be inspected: {e}", dir.display())),
         Ok(m) if m.file_type().is_symlink() => Err(format!(
             "`{}` is a symlink (the base export is never written through a link)",
             dir.display()
@@ -3497,9 +4099,9 @@ impl BaseTree {
         git_dir: &Path,
         head: &str,
     ) -> Result<Self, String> {
-        let dir = scratch.root.join("base");
+        let dir = base_export_dir(worktree)?;
         // Always a fresh export: a stale one is removed, a link refused — never followed.
-        remove_base_export(scratch)?;
+        remove_base_export(worktree, scratch)?;
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("the base export directory could not be created: {e}"))?;
         let idx = scratch.root.join("base.idx");
@@ -5080,8 +5682,29 @@ mod tests {
         dir
     }
 
+    /// The tree's check-scratch leaf in this test binary's (hermetic) check cache.
+    fn leaf_of(wt: &Path) -> PathBuf {
+        scratch_dir_for(&check_cache_root().unwrap(), wt, None)
+    }
+
+    /// The floor created nothing named `tmp/wicked-checks` (the pre-fix scratch) in the tree.
+    fn assert_no_worktree_scratch(wt: &Path) {
+        let old = wt
+            .join(crate::worktree_guard::ENGINE_SCRATCH_DIR)
+            .join("wicked-checks");
+        assert!(
+            std::fs::symlink_metadata(&old).is_err(),
+            "the floor wrote its scratch into the worktree: {}",
+            old.display()
+        );
+    }
+
+    /// The boundary a test floor arms: the worktree and the tree's check-scratch leaf (which
+    /// lives in the engine's check cache, outside the worktree).
     fn sandbox_for(wt: &Path) -> WorkerSandbox {
-        crate::validator::detect_worker_sandbox(&[wt.to_path_buf()])
+        let leaf = scratch_dir_for(&check_cache_root().unwrap(), wt, None);
+        std::fs::create_dir_all(&leaf).unwrap();
+        crate::validator::detect_worker_sandbox(&[wt.to_path_buf(), leaf])
     }
 
     #[test]
@@ -5460,11 +6083,12 @@ mod tests {
             denial.contains("cargo-test: exit") && denial.contains(CRITERION),
             "the denial names the check and the criterion: {denial}"
         );
-        // The isolated homes AND the build artifacts live under the engine scratch, never in the
-        // reviewed tree (Copilot on #414: `./target` would trip the worktree guard).
-        let scratch = wt
-            .join(crate::worktree_guard::ENGINE_SCRATCH_DIR)
-            .join(SCRATCH_SUBDIR);
+        // The isolated homes AND the build artifacts live in the engine's check cache, never in
+        // the reviewed tree (Copilot on #414: `./target` would trip the worktree guard; the
+        // 2026-10-20 disk incident: `tmp/wicked-checks` held 16 GB in each kept worktree).
+        let scratch = leaf_of(&wt);
+        assert!(!scratch.starts_with(&wt), "{}", scratch.display());
+        assert_no_worktree_scratch(&wt);
         assert!(scratch.join("cargo-home").is_dir());
         assert!(
             scratch
@@ -5897,7 +6521,10 @@ mod tests {
             !out.lines().any(|l| l.starts_with("WICKED_")),
             "no WICKED_* variable reaches a check:\n{out}"
         );
-        // The allow-list and the isolation overrides ARE there.
+        // The allow-list and the isolation overrides ARE there — all in the tree's leaf of the
+        // engine's check cache, outside the worktree.
+        assert_eq!(scratch.root(), leaf_of(&wt));
+        assert!(!scratch.root().starts_with(&wt));
         let home_line = format!("HOME={}", scratch.home().display());
         assert!(out.lines().any(|l| l == home_line), "{out}");
         assert!(out.lines().any(|l| l == "CI=1"), "{out}");
@@ -6006,12 +6633,9 @@ mod tests {
             "the private TMPDIR is reaped with the floor: {}",
             env.tmpdir
         );
-        // And the worktree scratch carries no `tmp` leaf any more.
-        assert!(!wt
-            .join(crate::worktree_guard::ENGINE_SCRATCH_DIR)
-            .join(SCRATCH_SUBDIR)
-            .join("tmp")
-            .exists());
+        // And the check scratch carries no `tmp` leaf any more — nor is it in the worktree.
+        assert!(!leaf_of(&wt).join("tmp").exists());
+        assert_no_worktree_scratch(&wt);
     }
 
     /// The private `TMPDIR` refuses an existing path at the drawn name — a directory or a SYMLINK
@@ -6169,7 +6793,9 @@ mod tests {
     }
 
     /// Adversarial review on #414: a checkout that ships `tmp` as a SYMLINK must not have the
-    /// checks' scratch created through it.
+    /// checks' scratch created through it — the floor is refused (core#1050: still, though most
+    /// of the scratch moved to the engine's check cache; the base export lives under `tmp`). A
+    /// link at a scratch LEAF (an earlier floor's check can write the leaf) is refused too.
     #[cfg(unix)]
     #[test]
     fn a_symlinked_scratch_root_is_refused_not_followed() {
@@ -6184,7 +6810,19 @@ mod tests {
         assert!(err.to_string().contains("symlink"), "{err}");
         assert!(
             std::fs::read_dir(&outside).unwrap().next().is_none(),
-            "nothing was created through the link"
+            "nothing was created through the worktree's `tmp` link"
+        );
+        std::fs::remove_file(wt.join(crate::worktree_guard::ENGINE_SCRATCH_DIR)).unwrap();
+        drop(CheckScratch::prepare(&wt).unwrap());
+        // A link planted at a leaf of the check scratch itself.
+        let leaf = leaf_of(&wt);
+        std::fs::remove_dir_all(leaf.join("home")).unwrap();
+        std::os::unix::fs::symlink(&outside, leaf.join("home")).unwrap();
+        let err = CheckScratch::prepare(&wt).expect_err("a symlinked leaf is refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "nothing was created through the leaf's link"
         );
         // The floor reports the refusal as a detection error, fail-closed — with a boundary
         // injected so the scratch step is reached on every host (no tool ⇒ the earlier
@@ -6205,6 +6843,482 @@ mod tests {
                 .is_some_and(|e| e.contains("symlink")),
             "{report:?}"
         );
+        std::fs::remove_file(leaf.join("home")).unwrap();
+        assert!(remove_check_scratch_in(
+            &check_cache_root().unwrap(),
+            &wt,
+            None
+        ));
+    }
+
+    /// (2026-10-20 disk incident) The check scratch lives OUTSIDE the worktree, in the engine's
+    /// check cache: grouped by repository (the directory its run worktrees sit in, labelled with
+    /// the repository's name), one leaf per run tree, and the same leaf is derived after the tree
+    /// is gone (the reaper's view).
+    #[test]
+    fn the_check_scratch_lives_outside_the_worktree_keyed_by_repository() {
+        let base = scratch("cache-key");
+        let cache = base.join("cache");
+        let a = base.join("myrepo").join("wicked-worktrees").join("run-a");
+        let b = base.join("myrepo").join("wicked-worktrees").join("run-b");
+        let other = base.join("other").join("wicked-worktrees").join("run-a");
+        for d in [&a, &b, &other] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let (la, lb, lo) = (
+            scratch_dir_for(&cache, &a, None),
+            scratch_dir_for(&cache, &b, None),
+            scratch_dir_for(&cache, &other, None),
+        );
+        assert!(la.starts_with(&cache), "{}", la.display());
+        assert!(!la.starts_with(base.join("myrepo")), "{}", la.display());
+        assert_eq!(la.parent(), lb.parent(), "one group per repository");
+        assert_ne!(la, lb, "one leaf per run tree");
+        assert_ne!(
+            la.parent(),
+            lo.parent(),
+            "another repository is another group"
+        );
+        let name = |p: &Path| p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name(la.parent().unwrap()).starts_with("myrepo-"),
+            "{}",
+            la.display()
+        );
+        assert!(name(&la).starts_with("run-a-"), "{}", la.display());
+        std::fs::remove_dir_all(&a).unwrap();
+        assert_eq!(
+            scratch_dir_for(&cache, &a, None),
+            la,
+            "derivable once the tree is gone"
+        );
+        // Preparing makes every leaf there and writes nothing into the worktree.
+        let prepared = CheckScratch::prepare_in(&cache, &b, None, u64::MAX).unwrap();
+        assert_eq!(prepared.root(), lb);
+        for sub in SCRATCH_LEAVES {
+            assert!(lb.join(sub).is_dir(), "{sub}");
+        }
+        assert!(
+            std::fs::read_dir(&b).unwrap().next().is_none(),
+            "nothing is written into the worktree"
+        );
+        drop(prepared);
+        assert!(remove_check_scratch_in(&cache, &b, None));
+        assert!(!lb.exists());
+        assert!(lease_path(&lb).is_file(), "the 0-byte lock file is kept");
+        assert!(b.is_dir(), "the worktree itself is never touched");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The per-repository cap: over it, the least recently used OTHER run leaves go first, a
+    /// leaf a floor holds a lease on is never taken (two floors starting together never evict
+    /// each other), and the floor's own leaf is cleaned only when it alone is over the cap —
+    /// then re-made empty for the floor about to run.
+    #[test]
+    fn the_cap_removes_least_recently_used_leaves_first_and_never_a_leased_one() {
+        let base = scratch("cache-cap");
+        let cache = base.join("cache");
+        let wts = base.join("repo").join("wicked-worktrees");
+        let ago = |s: u64| std::time::SystemTime::now() - std::time::Duration::from_secs(s);
+        let fill = |name: &str, bytes: usize, age_s: u64| {
+            let wt = wts.join(name);
+            std::fs::create_dir_all(&wt).unwrap();
+            let leaf = scratch_dir_for(&cache, &wt, None);
+            std::fs::create_dir_all(leaf.join("cargo-target").join("head")).unwrap();
+            std::fs::write(leaf.join("cargo-target/head/blob"), vec![0u8; bytes]).unwrap();
+            let lock = std::fs::File::create(lease_path(&leaf)).unwrap();
+            lock.set_modified(ago(age_s)).unwrap();
+            (wt, leaf)
+        };
+        let (_, old) = fill("old", 600, 300);
+        let (_, newer) = fill("newer", 600, 100);
+        let (_, busy) = fill("busy", 600, 50);
+        let (own_wt, own) = fill("own", 0, 10);
+        // A floor of the `busy` run is mid-build; it is also the least recently used.
+        let held = lock_leaf(&busy, false).unwrap().unwrap();
+        held.set_modified(ago(400)).unwrap();
+        let group = own.parent().unwrap().to_path_buf();
+        assert_eq!(
+            enforce_check_cache_cap(&group, &own, 10_000),
+            (vec![], false),
+            "under the cap"
+        );
+        // Two active floors (`busy` and this one) over the cap together: neither leaf is taken
+        // for the other, and this floor's own leaf (under the cap alone) is not cleaned.
+        let own_lease = lock_leaf(&own, false).unwrap().unwrap();
+        own_lease.set_modified(ago(10)).unwrap();
+        let (removed, own_over) = enforce_check_cache_cap(&group, &own, 1000);
+        assert!(!own_over);
+        assert_eq!(
+            removed,
+            vec![old.clone(), newer.clone()],
+            "LRU first, the leased one skipped"
+        );
+        assert!(
+            busy.join("cargo-target/head/blob").is_file(),
+            "a leased leaf is never removed"
+        );
+        assert!(own.is_dir(), "the group fits once the others are gone");
+        drop(own_lease);
+        drop(held);
+        // The floor's own leaf alone is over the cap: the others go, then its own — and the
+        // floor gets a fresh, empty scratch.
+        std::fs::write(own.join("cargo-target/head/blob"), vec![0u8; 1500]).unwrap();
+        let prepared = CheckScratch::prepare_in(&cache, &own_wt, None, 1000).unwrap();
+        assert!(
+            !busy.exists(),
+            "an unleased leaf goes before the floor's own"
+        );
+        assert!(
+            !own.join("cargo-target/head/blob").exists(),
+            "the own leaf was cleaned"
+        );
+        assert!(
+            own.join("cargo-target/head").is_dir(),
+            "and re-made for this floor"
+        );
+        assert_eq!(prepared.root(), own);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#1050) A checkout whose `tmp` is a SYMLINK or a regular FILE refuses the floor —
+    /// `passed: false` with main's reason — even though every check would pass; it is never a
+    /// logged warning beside a green floor.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_or_file_tmp_refuses_the_floor_even_when_every_check_passes() {
+        for (kind, plant) in [("symlink", true), ("not a directory", false)] {
+            let base = scratch(&format!("tmp-refuse-{}", plant));
+            let wt = base.join("wt");
+            let outside = base.join("outside");
+            std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(
+                wt.join(".wicked/checks.json"),
+                serde_json::json!({ "test": ["sh", "-c", "exit 0"] }).to_string(),
+            )
+            .unwrap();
+            let tmp = wt.join(crate::worktree_guard::ENGINE_SCRATCH_DIR);
+            if plant {
+                std::os::unix::fs::symlink(&outside, &tmp).unwrap();
+            } else {
+                std::fs::write(&tmp, "a file").unwrap();
+            }
+            let report = run_floor(&wt, &FloorContext::default());
+            assert!(!report.passed, "{kind}: {report:?}");
+            assert!(report.checks.is_empty(), "{kind}: no check ran: {report:?}");
+            let why = report.detect_error.as_deref().unwrap_or_default();
+            assert!(why.contains(kind), "{kind}: {why}");
+            assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// (codex on #1050) Only "not found" is absence: a stale base export the floor cannot even
+    /// inspect (its `tmp` has no search permission) refuses the floor, never a pass beside it.
+    #[cfg(unix)]
+    #[test]
+    fn an_uninspectable_base_export_refuses_the_floor() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("tmp-noperm");
+        let wt = base.join("wt");
+        std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+        std::fs::write(
+            wt.join(".wicked/checks.json"),
+            serde_json::json!({ "test": ["sh", "-c", "exit 0"] }).to_string(),
+        )
+        .unwrap();
+        let tmp = wt.join(crate::worktree_guard::ENGINE_SCRATCH_DIR);
+        std::fs::create_dir_all(tmp.join(BASE_EXPORT_SUBDIR)).unwrap();
+        std::fs::write(tmp.join(BASE_EXPORT_SUBDIR).join("stale.ts"), "old").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::symlink_metadata(tmp.join(BASE_EXPORT_SUBDIR)).is_ok() {
+            // Running as root: permissions do not bind, nothing to prove here.
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        // A boundary injected, so the refusal is reached whatever sandbox tool the host has.
+        let report = run_with_sandbox(
+            &wt,
+            WorkerSandbox {
+                wrapper: vec!["true".to_string()],
+                level: SandboxLevel::Sandboxed,
+                downgrade_reason: None,
+            },
+        );
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!report.passed, "{report:?}");
+        assert!(
+            report
+                .detect_error
+                .as_deref()
+                .is_some_and(|e| e.contains("cannot be inspected")),
+            "{report:?}"
+        );
+        assert!(report.checks.is_empty(), "no check ran: {report:?}");
+        let _ = remove_check_scratch_in(&check_cache_root().unwrap(), &wt, None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (codex on #1050) The orphan mark is checked again UNDER the lease: a reap that marks the
+    /// leaf between a floor's first look and its lease never hands that floor the orphan — it is
+    /// refused while another floor holds the orphan, and gets a fresh leaf once it is free.
+    #[test]
+    fn an_orphan_marked_before_the_lease_is_never_reused() {
+        let base = scratch("cache-orphan-race");
+        let leaf = base.join("cache").join("repo-x").join("run-x");
+        std::fs::create_dir_all(leaf.join("cargo-target")).unwrap();
+        std::fs::write(leaf.join("cargo-target/old-binary"), "old").unwrap();
+        let holder = lock_leaf(&leaf, false).unwrap().unwrap();
+        std::fs::write(orphan_path(&leaf), b"").unwrap();
+        let err = take_orphan_free_lease(&leaf).expect_err("held orphan: refused");
+        assert!(err.to_string().contains("orphaned"), "{err}");
+        assert!(leaf.join("cargo-target/old-binary").is_file());
+        drop(holder);
+        let lease = take_orphan_free_lease(&leaf).expect("a free orphan is retired, then leased");
+        assert!(
+            !leaf.join("cargo-target/old-binary").exists(),
+            "never reused"
+        );
+        assert!(!orphan_path(&leaf).exists());
+        drop(lease);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#1050) Two runs whose ids sanitize to ONE worktree path never share a check-scratch
+    /// leaf: the first run's leaf, held by its floor when its worktree is removed, is marked
+    /// orphaned rather than left reusable, the second run starts on its own empty leaf, and the
+    /// orphan goes when the first floor ends (or, failing that, at the next cap pass).
+    #[test]
+    fn colliding_run_ids_never_share_a_check_scratch() {
+        let base = scratch("cache-collide");
+        let cache = base.join("cache");
+        let wt = base.join("repo").join("wicked-worktrees").join("a-b_c_a0");
+        std::fs::create_dir_all(&wt).unwrap();
+        let (run_a, run_b) = ("a-b:c:a0", "a:b-c:a0");
+        let leaf_a = scratch_dir_for(&cache, &wt, Some(run_a));
+        let leaf_b = scratch_dir_for(&cache, &wt, Some(run_b));
+        assert_ne!(leaf_a, leaf_b, "one tree, two runs, two leaves");
+        assert_eq!(leaf_a.parent(), leaf_b.parent(), "one repository group");
+        // Run A's floor is building when A is cancelled and its worktree removed.
+        let floor_a = CheckScratch::prepare_in(&cache, &wt, Some(run_a), u64::MAX).unwrap();
+        std::fs::write(leaf_a.join("cargo-target/head/a-binary"), "A").unwrap();
+        assert!(
+            !remove_check_scratch_in(&cache, &wt, Some(run_a)),
+            "held: not removed"
+        );
+        assert!(orphan_path(&leaf_a).exists(), "marked orphaned instead");
+        // Run B, a distinct run on the same path, never sees A's output.
+        let floor_b = CheckScratch::prepare_in(&cache, &wt, Some(run_b), u64::MAX).unwrap();
+        assert_eq!(floor_b.root(), leaf_b);
+        assert!(!leaf_b.join("cargo-target/head/a-binary").exists());
+        // A's floor ends: its orphaned leaf goes with it.
+        drop(floor_a);
+        assert!(!leaf_a.exists() && !orphan_path(&leaf_a).exists());
+        // An orphan no floor could retire is removed by the next cap pass, whatever the cap.
+        std::fs::create_dir_all(leaf_a.join("home")).unwrap();
+        std::fs::write(orphan_path(&leaf_a), b"").unwrap();
+        let (removed, _) = enforce_check_cache_cap(leaf_b.parent().unwrap(), &leaf_b, u64::MAX);
+        assert_eq!(removed, vec![leaf_a.clone()]);
+        assert!(!leaf_a.exists() && leaf_b.is_dir());
+        drop(floor_b);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (codex on #1050) The run's terminal reap keeps the leaf's lock file: a floor of a resumed
+    /// run that already opened it and then takes its lease holds a lock the next eviction sees,
+    /// so the eviction never removes the scratch that floor is building into.
+    #[test]
+    fn a_reap_overlapping_a_floors_lease_never_lets_the_cap_take_its_scratch() {
+        let base = scratch("cache-reap-race");
+        let cache = base.join("cache");
+        let wts = base.join("repo").join("wicked-worktrees");
+        let (wt, other) = (wts.join("run-a"), wts.join("run-b"));
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        drop(CheckScratch::prepare_in(&cache, &wt, None, u64::MAX).unwrap());
+        let leaf = scratch_dir_for(&cache, &wt, None);
+        // The resumed run's floor has the lock file open, about to take its lease.
+        let waiting = std::fs::OpenOptions::new()
+            .write(true)
+            .open(lease_path(&leaf))
+            .unwrap();
+        assert!(
+            remove_check_scratch_in(&cache, &wt, None),
+            "the terminal reap"
+        );
+        assert!(!leaf.exists());
+        waiting.lock_shared().unwrap();
+        std::fs::create_dir_all(leaf.join("cargo-target").join("head")).unwrap();
+        std::fs::write(leaf.join("cargo-target/head/blob"), vec![0u8; 64]).unwrap();
+        let own = scratch_dir_for(&cache, &other, None);
+        let (removed, _) = enforce_check_cache_cap(leaf.parent().unwrap(), &own, 0);
+        assert!(removed.is_empty(), "{removed:?}");
+        assert!(
+            leaf.join("cargo-target/head/blob").is_file(),
+            "the leased scratch survives"
+        );
+        drop(waiting);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (codex on #1050) The base export stays in the worktree's engine scratch, so a base check
+    /// that calls git still finds the enclosing repository (as from `tmp/wicked-checks/base`).
+    /// From the check cache it would find none, fail before printing its failure ids, and turn
+    /// the head's pre-existing failure into a "regression".
+    #[cfg(unix)]
+    #[test]
+    fn a_git_dependent_base_check_still_finds_its_repository() {
+        let repo = scratch("base-git");
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
+        let script = "git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo NOGIT; \
+                      exit 2; }; echo 'test t::shared ... FAILED'; exit 101";
+        std::fs::write(
+            repo.join(".wicked/checks.json"),
+            serde_json::json!({ "test": ["sh", "-c", script] }).to_string(),
+        )
+        .unwrap();
+        let base = git_repo_with_commit(&repo);
+        let ctx = FloorContext {
+            stage: FloorStage::Verify,
+            base_head: Some(base),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        let report = run_floor(&repo, &ctx);
+        if report.sandbox_error.is_some() {
+            eprintln!("repo_checks: no sandbox tool here — the baseline diff cannot run");
+            return;
+        }
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "test")
+            .expect("test ran");
+        let b = c
+            .base
+            .as_ref()
+            .and_then(|b| b.run.as_ref())
+            .expect("the base ran");
+        assert!(!b.stdout_tail.contains("NOGIT"), "{b:?}");
+        assert_eq!(
+            c.classification.as_deref(),
+            Some(PRE_EXISTING_IN_SANDBOX),
+            "{c:#?}"
+        );
+        assert!(report.passed, "{report:?}");
+        assert_no_worktree_scratch(&repo);
+        assert!(!repo.join("tmp").join(BASE_EXPORT_SUBDIR).exists());
+        assert!(remove_check_scratch_in(
+            &check_cache_root().unwrap(),
+            &repo,
+            None
+        ));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// (codex on #1050) A base export an older engine left at `tmp/wicked-checks/base` (it died
+    /// mid-baseline) is removed before HEAD checks, as that engine itself did — and only that: the
+    /// rest of the legacy dir stays, and a linked `wicked-checks` is never followed.
+    #[test]
+    fn a_legacy_base_export_is_removed_before_head_checks() {
+        let base = scratch("legacy-base");
+        let wt = base.join("wt");
+        let legacy = wt.join("tmp").join("wicked-checks");
+        std::fs::create_dir_all(legacy.join("base").join("src")).unwrap();
+        std::fs::write(legacy.join("base/src/old.test.ts"), "fails").unwrap();
+        std::fs::create_dir_all(legacy.join("home")).unwrap();
+        std::fs::write(legacy.join("home/keep"), "x").unwrap();
+        let scratch_dir = CheckScratch::prepare(&wt).unwrap();
+        remove_base_export(&wt, &scratch_dir).unwrap();
+        assert!(!legacy.join("base").exists(), "the legacy export is gone");
+        assert!(
+            legacy.join("home/keep").is_file(),
+            "the rest of the legacy dir is not touched"
+        );
+        // A linked `wicked-checks` is not followed.
+        #[cfg(unix)]
+        {
+            let outside = base.join("outside");
+            std::fs::create_dir_all(outside.join("base")).unwrap();
+            std::fs::remove_dir_all(&legacy).unwrap();
+            std::os::unix::fs::symlink(&outside, &legacy).unwrap();
+            remove_base_export(&wt, &scratch_dir).unwrap();
+            assert!(
+                outside.join("base").is_dir(),
+                "nothing removed through the link"
+            );
+        }
+        drop(scratch_dir);
+        assert!(remove_check_scratch_in(
+            &check_cache_root().unwrap(),
+            &wt,
+            None
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Two consecutive floors over one run's tree reuse its leaf (warm, as when the scratch lived
+    /// in the worktree); another run of the SAME repository gets its own leaf and never sees
+    /// the first run's build output (a shared target dir hands one run another's binaries by
+    /// mtime — a false pass); neither floor creates `tmp/wicked-checks` in its tree; the reap
+    /// removes the leaf and leaves the tree's files alone.
+    #[test]
+    fn consecutive_floors_on_one_run_reuse_its_scratch_and_another_run_never_sees_it() {
+        let base = scratch("cache-reuse");
+        let wts = base.join("repo").join("wicked-worktrees");
+        let probe = "if test -f \"$CARGO_TARGET_DIR/warm\"; then echo SCRATCH=WARM; else echo \
+                     SCRATCH=COLD; fi; touch \"$CARGO_TARGET_DIR/warm\"";
+        let tree = |name: &str| {
+            let wt = wts.join(name);
+            std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+            std::fs::write(
+                wt.join(".wicked/checks.json"),
+                serde_json::json!({ "test": ["sh", "-c", probe] }).to_string(),
+            )
+            .unwrap();
+            wt
+        };
+        let (a, b) = (tree("run-a"), tree("run-b"));
+        let said = |wt: &Path| {
+            let r = run_floor(wt, &FloorContext::default());
+            assert_no_worktree_scratch(wt);
+            if r.sandbox_error.is_some() {
+                return None;
+            }
+            let c = r
+                .checks
+                .iter()
+                .find(|c| c.name == "test")
+                .expect("test ran");
+            assert!(c.passed(), "{c:?}");
+            Some(c.stdout_tail.contains("SCRATCH=WARM"))
+        };
+        let Some(first) = said(&a) else {
+            eprintln!("repo_checks: no sandbox tool here — the reuse test cannot run the floor");
+            return;
+        };
+        assert!(!first, "a run's first floor starts cold");
+        assert_eq!(
+            said(&a),
+            Some(true),
+            "the run's next floor reuses its scratch"
+        );
+        assert_eq!(
+            said(&b),
+            Some(false),
+            "another run never sees the first run's output"
+        );
+        let cache = check_cache_root().unwrap();
+        assert!(remove_check_scratch_in(&cache, &a, None));
+        assert!(!leaf_of(&a).exists());
+        assert!(
+            a.join(".wicked/checks.json").is_file(),
+            "the tree's files are untouched"
+        );
+        assert!(remove_check_scratch_in(&cache, &b, None));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// `cargo test --locked` when the repo ships a lockfile (the check must not rewrite it);
@@ -6446,8 +7560,25 @@ mod tests {
                 .is_some_and(|e| e.contains("app.txt")),
             "{ok:?}"
         );
+        // The guarded checkout's check scratch is its own leaf, never the live tree's
+        // (core#417), and it goes with the checkout; the live tree's stays for the run.
+        let (live_leaf, guarded_leaf) = (leaf_of(&wt), leaf_of(&dir));
+        assert_ne!(live_leaf, guarded_leaf);
+        assert!(guarded_leaf.is_dir() && live_leaf.is_dir());
+        assert_no_worktree_scratch(&dir);
         drop(checkout);
         assert!(!dir.exists(), "the checkout is removed when dropped");
+        assert!(
+            !guarded_leaf.exists(),
+            "the checkout's check scratch is removed with it: {}",
+            guarded_leaf.display()
+        );
+        assert!(live_leaf.is_dir());
+        assert!(remove_check_scratch_in(
+            &check_cache_root().unwrap(),
+            &wt,
+            None
+        ));
         let listed = git(&wt, &["worktree", "list", "--porcelain"]);
         assert!(!listed.contains("wicked-core-floor"), "{listed}");
         let _ = std::fs::remove_dir_all(&wt);
@@ -6574,8 +7705,8 @@ mod tests {
         // The creator, with a known base ⇒ targeted, `{base}` and `{files}` substituted (the
         // untracked file the change added is a touched path; the engine scratch never is).
         std::fs::write(wt.join("src.ts"), "changed\n").unwrap();
-        std::fs::create_dir_all(wt.join("tmp/wicked-checks")).unwrap();
-        std::fs::write(wt.join("tmp/wicked-checks/x"), "scratch").unwrap();
+        std::fs::create_dir_all(wt.join("tmp/worker")).unwrap();
+        std::fs::write(wt.join("tmp/worker/x"), "scratch").unwrap();
         let ctx = FloorContext {
             stage: FloorStage::Creator,
             base_head: Some(base.clone()),
@@ -7106,11 +8237,13 @@ mod tests {
             .as_ref()
             .expect("the floor's env is on the record");
         assert!(env.home.ends_with("home") && env.network == "open" && !env.path.is_empty());
-        let scratch_root = repo
-            .join(crate::worktree_guard::ENGINE_SCRATCH_DIR)
-            .join(SCRATCH_SUBDIR);
+        let scratch_root = leaf_of(&repo);
+        assert_no_worktree_scratch(&repo);
         assert!(
-            !scratch_root.join("base").exists(),
+            !repo
+                .join(crate::worktree_guard::ENGINE_SCRATCH_DIR)
+                .join(BASE_EXPORT_SUBDIR)
+                .exists(),
             "the base export is removed as soon as its result is cached — a HEAD check never \
              runs beside a copy of the base"
         );
