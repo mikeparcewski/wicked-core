@@ -937,6 +937,10 @@ pub struct RequestedRejudge {
     pub attempt: u32,
     /// The judge seats eligible when it was armed (rotation order).
     pub seats: Vec<String>,
+    /// The team monitors of the reviewed attempt (its ledger's finding authors): never its judge,
+    /// even when the re-judge attempt's own team snapshot no longer names them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub monitors: Vec<String>,
     /// When it was armed (unix millis).
     pub at: i64,
 }

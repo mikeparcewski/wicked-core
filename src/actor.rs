@@ -12267,6 +12267,9 @@ pub(crate) fn confirm_gate_as(
             .get(session.unit_ix)
             .is_some_and(floor_fix_applies);
 
+    // (rejudge) The re-judge this answer arms — decided ONCE, here, before the row resolves: a
+    // second read after it could refuse an answer whose row is already answered.
+    let mut armed_rejudge: Option<crate::domain::RequestedRejudge> = None;
     // (DES-L1 PR-1B, review-L1-517 M3) REFUSE BEFORE RESOLVING: the two arms that can be refused
     // are checked here, before the durable prompt below is marked `answered` — a refused answer
     // must leave the gate row OPEN (the run stays paused and re-answerable, and the prompts surface
@@ -12365,7 +12368,7 @@ pub(crate) fn confirm_gate_as(
             // (rejudge) Refused unless the cursor unit's gate is a `judge_unavailable` denial AND
             // the engine's judge selection names a seat now — the row stays open otherwise.
             crate::workflow::HumanDecision::Rejudge => {
-                rejudge_request(&*store, run_id)?;
+                armed_rejudge = Some(rejudge_request(&*store, run_id)?);
             }
             // (core#555) An amendment with no text amends nothing: refuse HERE, before the row
             // resolves, so the gate stays open and re-answerable rather than resolving as an
@@ -12753,8 +12756,7 @@ pub(crate) fn confirm_gate_as(
             {
                 let mut units = crate::domain::session_units(store, run_id)?;
                 if let Some(cursor) = units.get_mut(session.unit_ix) {
-                    if rejudge {
-                        let request = rejudge_request(&*store, run_id)?;
+                    if let Some(request) = armed_rejudge.take().filter(|_| rejudge) {
                         let ord = cursor.ord;
                         let previous_reason = cursor.denial_reason.clone().unwrap_or_default();
                         let from_attempt = request.attempt;
@@ -13225,7 +13227,9 @@ pub(crate) fn rejudge_readiness(
             cursor.ord
         )));
     }
+    // The same context the dispatch hands the judge (`dispatch_unit`).
     let work_authors = pipeline::fallback_work_authors(&units, cursor.ord);
+    let author_binaries = pipeline::work_author_binaries(&units, cursor.ord);
     let (roster, registry) = judge_registries();
     let pool = crate::cli_runner::judge_fallback_pool(&registry);
     let (eligible, missing) = crate::cli_runner::rejudge_seats(
@@ -13234,6 +13238,7 @@ pub(crate) fn rejudge_readiness(
         &session.clis,
         &session.benched_seats,
         &work_authors,
+        author_binaries.as_deref(),
         &pool,
         &registry,
     );
@@ -13293,6 +13298,7 @@ fn rejudge_request(
         output,
         attempt: cursor.last_attempt.unwrap_or(0),
         seats: r.eligible,
+        monitors: crate::cli_runner::unit_team_monitors(cursor),
         at: crate::interaction::now_millis(),
     })
 }
@@ -20108,6 +20114,7 @@ mod request_changes_tests {
             output: "stale".into(),
             attempt: 1,
             seats: vec!["pi".into()],
+            monitors: Vec::new(),
             at: 0,
         });
         put_node(&mut store, units[2].to_node()).unwrap();

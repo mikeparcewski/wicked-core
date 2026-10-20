@@ -471,11 +471,12 @@ pub enum HumanDecision {
     ConsentChoice { choice: String },
     /// Re-run the JUDGE of a unit denied `judge_unavailable` (no judge seat could rule), wire
     /// token `rejudge`. The judge is drawn again by the engine's own selection from the run's
-    /// roster as it stands now (never the work's authors, never the pinned validator's author, never
-    /// a benched seat), on the same tree. The seat does not run again: the reviewed output is
-    /// judged as it was captured, the floor's last result on that tree stands (core#544), and the
-    /// result goes through the ordinary gate fold, so a REJECT, a failed floor or another seatless
-    /// judge denies again (deny-dominates). Refused at any other gate, and when no judge seat is
+    /// roster as it stands now (never the work's authors, the pinned validator's author, the reviewed
+    /// attempt's team monitors or a benched seat), on the same tree. The seat does not run again: the reviewed output is
+    /// judged as it was captured, the default floor's last result on that tree stands (core#544; a
+    /// declared verify floor re-runs its checks, as on every attempt), and the result goes through
+    /// the ordinary gate fold, so a REJECT, a failed floor or another seatless judge denies again
+    /// (deny-dominates). Refused at any other gate, and when no judge seat is
     /// eligible now ([`crate::RejudgeReadiness`]). Recorded as `judgeRerunRequested`.
     Rejudge,
 }
@@ -497,8 +498,7 @@ pub const INTENT_AMENDMENT_PREFIX: &str = " ||| APPROVED INTENT AMENDMENT (overr
 impl HumanDecision {
     /// (core#469 / core#467) The escalation arm a gate decision's wire `action` names — `extend` |
     /// `targeted` | `accept_partial` | `accept_suggestion` | `rejudge` — or `None` for any other
-    /// token. The
-    /// ONE parser every door (napi, bus) routes these tokens through.
+    /// token. The ONE parser every door (napi, bus) routes these tokens through.
     pub fn escalation_action(token: &str) -> Option<Self> {
         use crate::repo_checks::FloorRerunMode as Mode;
         Some(match token {

@@ -1211,6 +1211,17 @@ fn judge_roster<'a>(
     }
 }
 
+/// (rejudge) The seats a unit's last attempt's TEAM LEDGER names as authors or corroborators of a
+/// finding — the monitors its judge never is (DES-001 §6.2). Empty off the bus transport.
+pub(crate) fn unit_team_monitors(unit: &crate::domain::WorkUnit) -> Vec<String> {
+    unit.team
+        .as_ref()
+        .filter(|t| t.transport == crate::team::events::Transport::Bus)
+        .and_then(|t| t.ledger.as_ref())
+        .map(crate::team::runner::ledger_authors)
+        .unwrap_or_default()
+}
+
 /// (rejudge) The judge seats the engine's own selection would draw from NOW for `unit`'s gate, and
 /// every run seat it would not, with why — the readiness of a [`crate::workflow::HumanDecision::Rejudge`].
 /// The same exclusions the judge applies ([`run_unit_and_judge_on`]): the work's authors and the
@@ -1222,12 +1233,14 @@ fn judge_roster<'a>(
 /// they follow it (a preferred judge that fails as a seat falls back to them). Pure over its
 /// inputs: `roster` is [`crate::registry_roster`], `pool` / `registry` the fallback context
 /// ([`judge_fallback_pool`] / [`full_registry`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rejudge_seats(
     unit: &crate::domain::WorkUnit,
     roster: &[crate::AgenticCli],
     run_roster: &[String],
     bench: &[crate::domain::BenchedSeat],
     work_authors: &[String],
+    author_binaries: Option<&[String]>,
     pool: &[crate::AgenticCli],
     registry: &[crate::AgenticCli],
 ) -> (Vec<String>, Vec<crate::MissingJudgeSeat>) {
@@ -1262,14 +1275,7 @@ pub(crate) fn rejudge_seats(
     for a in &unit.exclude_seats {
         party(&mut parties, a, "excluded from judging this step at launch");
     }
-    let team_authors: Vec<String> = unit
-        .team
-        .as_ref()
-        .filter(|t| t.transport == crate::team::events::Transport::Bus)
-        .and_then(|t| t.ledger.as_ref())
-        .map(crate::team::runner::ledger_authors)
-        .unwrap_or_default();
-    for a in &team_authors {
+    for a in &unit_team_monitors(unit) {
         party(
             &mut parties,
             a,
@@ -1277,11 +1283,19 @@ pub(crate) fn rejudge_seats(
         );
     }
     let base_len = parties.len();
-    if unit.role == crate::workflow::PhaseRole::Evaluator {
+    // (core#954) An evaluator unit's judge excludes the work's creators — and the binaries they
+    // ran — unless that leaves no preferred seat; then the rotation re-admits them.
+    let evaluator = unit.role == crate::workflow::PhaseRole::Evaluator;
+    if evaluator {
         for a in work_authors {
             party(&mut parties, a, "created the work this review reads");
         }
     }
+    let creator_bins: Vec<String> = if evaluator && parties.len() > base_len {
+        author_binaries.map(<[String]>::to_vec).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let unbenched: Vec<crate::AgenticCli> = judge_pool(roster, run_roster)
         .into_iter()
         .filter(|c| c.health.as_ref().is_none_or(|h| h.usable))
@@ -1292,9 +1306,12 @@ pub(crate) fn rejudge_seats(
         .filter(|c| !benched.iter().any(|b| b == &c.key))
         .cloned()
         .collect();
-    let draw = |parties: &[(String, &'static str)]| {
+    // The preferred judges (the run's own seats, bench applied), the distinct seats the bench took
+    // out, and the authors' identities — as the rotation computes them.
+    let preferred_for = |parties: &[(String, &'static str)], bins: &[String]| {
         let excluded: Vec<&str> = parties.iter().map(|(p, _)| p.as_str()).collect();
-        let ids = author_identities(&excluded, roster);
+        let mut ids = author_identities(&excluded, roster);
+        ids.extend(bins.iter().cloned());
         let preferred = crate::validator::distinct_judge_keys(
             &excluded,
             &without_author_binaries(&eligible_pool, &excluded, &ids),
@@ -1306,29 +1323,40 @@ pub(crate) fn rejudge_seats(
         .into_iter()
         .filter(|k| !preferred.contains(k))
         .collect();
-        let fallback: Vec<String> = if preferred.is_empty() && lost.is_empty() {
-            // No distinct seat ever existed: the judge is skipped, never a fallback.
-            Vec::new()
-        } else {
-            // A fallback judge is distinct from every author of the run's work too.
-            let parties = fallback_parties(&excluded, work_authors);
-            fallback_candidates(pool, registry, &parties, &ids, &benched, &[])
+        (preferred, lost, ids)
+    };
+    let (mut preferred, mut lost, mut ids) = preferred_for(&parties, &creator_bins);
+    if preferred.is_empty() && parties.len() > base_len {
+        parties.truncate(base_len);
+        (preferred, lost, ids) = preferred_for(&parties, &[]);
+    }
+    // A FALLBACK judge stands in when the preferred ones are benched or fail as seats — never when
+    // no distinct seat ever existed (the judge is skipped), and never when an author's binary is
+    // unknown (`fallback_ids` in the rotation: no seat can be shown distinct from it).
+    let fallback: Vec<String> = match author_binaries {
+        Some(bins)
+            if !(preferred.is_empty() && lost.is_empty())
+                && crate::pipeline::author_binaries_known(unit) =>
+        {
+            let excluded: Vec<&str> = parties.iter().map(|(p, _)| p.as_str()).collect();
+            let mut fids = ids.clone();
+            fids.extend(bins.iter().cloned());
+            fids.extend(unit.authored_binaries.iter().cloned());
+            if let Some(k) = unit.assigned_cli.as_deref() {
+                fids.push(launched_identity(k, unit.assigned_invocation.clone()));
+            }
+            let fparties = fallback_parties(&excluded, work_authors);
+            fallback_candidates(pool, registry, &fparties, &fids, &benched, &[])
                 .unwrap_or_default()
                 .into_iter()
                 .map(|c| c.key)
                 .filter(|k| !preferred.contains(k))
                 .collect()
-        };
-        let mut seats = preferred;
-        seats.extend(fallback);
-        seats
+        }
+        _ => Vec::new(),
     };
-    let mut seats = draw(&parties);
-    if seats.is_empty() && parties.len() > base_len {
-        // (core#954) The rotation re-admits an evaluator's creators when nothing else is left.
-        parties.truncate(base_len);
-        seats = draw(&parties);
-    }
+    let mut seats = preferred;
+    seats.extend(fallback);
     let missing = run_roster
         .iter()
         .filter(|k| !seats.contains(k))
@@ -2105,8 +2133,9 @@ fn run_unit_and_judge_on(
     let input = fixed.as_ref().map(|(i, _)| i).unwrap_or(input);
     // (rejudge) The operator RE-ARMED the judge at this unit's `judge_unavailable` gate: the seat
     // does NOT run again — the output its reviewed attempt captured is handed to the judge, drawn
-    // afresh from the run's roster as it stands, on the same tree. The floor is not re-run for it
-    // (its last result on this tree stands, core#544); the fold judges the attempt like any other.
+    // afresh from the run's roster as it stands, on the same tree. The default floor is not re-run
+    // for it (its last result on this tree stands, core#544; a declared verify floor re-runs its
+    // checks, as on every attempt); the fold judges the attempt like any other.
     let rejudge = input
         .unit
         .requested_rejudge
@@ -2225,12 +2254,19 @@ fn run_unit_and_judge_on(
     }
     // The seats the team's ledger names as authors/corroborators of a finding (DES-001 §6.2): a
     // monitor never grades its own finding. Computed from the ledger alone, never supplied.
-    let team_authors: Vec<String> = team_snapshot
+    let mut team_authors: Vec<String> = team_snapshot
         .as_ref()
         .filter(|t| t.transport == crate::team::events::Transport::Bus)
         .and_then(|t| t.ledger.as_ref())
         .map(crate::team::runner::ledger_authors)
         .unwrap_or_default();
+    // (rejudge) …and the monitors of the attempt whose output the judge re-reads: this attempt's
+    // own ledger may not carry them (a re-dispatch stamps a fresh team snapshot).
+    for m in rejudge.map(|j| j.monitors.as_slice()).unwrap_or_default() {
+        if !team_authors.contains(m) {
+            team_authors.push(m.clone());
+        }
+    }
     // Instance AND cli key: excluding `claude#2` excludes a `claude` seat too.
     let mut team_excluded: Vec<String> = Vec::new();
     // (EP-K3) The launch's judge exclusion is UNIONED in (never replaces): it can only narrow.
@@ -5119,6 +5155,7 @@ mod tests {
             output: "Fixed the retry: callers pass an empty head.".into(),
             attempt: 2,
             seats: vec!["pi".into()],
+            monitors: Vec::new(),
             at: 0,
         });
         let input = StepInput {
@@ -5172,6 +5209,24 @@ mod tests {
             assert_eq!(v.pass, pass, "{v:?}");
             assert_eq!(v.judge_cli.as_deref(), Some("pi"));
         }
+        // The reviewed attempt's team monitors never judge it, even when this attempt's own team
+        // snapshot no longer names them: with pi a monitor, copilot judges.
+        let mut monitored = input.clone();
+        monitored.unit.requested_rejudge.as_mut().unwrap().monitors = vec!["pi".into()];
+        let judge = Arc::new(Judge {
+            answer: "PASS\nok\nPASS",
+            seen: Mutex::new(Vec::new()),
+        });
+        let runner: Arc<dyn StepRunner> = judge.clone();
+        let mut roster4 = roster.clone();
+        roster4.push(seat("copilot", "copilot -p {PROMPT}"));
+        let (_, verdict, _) =
+            run_unit_and_judge_with_roster(&runner, &monitored, None, noop, &roster4, &[], &[]);
+        assert_eq!(judge.seen.lock().unwrap().clone().len(), 1);
+        assert_eq!(
+            verdict.expect("ruled").judge_cli.as_deref(),
+            Some("copilot")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5266,6 +5321,7 @@ mod tests {
             output: "I changed a.txt to the fix.".into(),
             attempt: 2,
             seats: vec!["pi".into()],
+            monitors: Vec::new(),
             at: 0,
         });
         let judge = Arc::new(Judge::default());
@@ -5327,7 +5383,8 @@ mod tests {
             source: "judge".into(),
             governed_only: false,
         }];
-        let (eligible, missing) = rejudge_seats(&unit, &roster, &run, &bench, &[], &[], &roster);
+        let (eligible, missing) =
+            rejudge_seats(&unit, &roster, &run, &bench, &[], Some(&[]), &[], &roster);
         assert_eq!(eligible, ["pi"]);
         let why = |k: &str| {
             missing
@@ -5349,10 +5406,56 @@ mod tests {
             &["claude".to_string(), "agy".to_string()],
             &bench,
             &[],
+            Some(&[]),
             &[],
             &roster,
         );
         assert!(none.is_empty(), "{none:?}");
+
+        // (core#954) An evaluator's creators are excluded unless that leaves no preferred seat —
+        // then the rotation re-admits them, before any fallback judge.
+        let mut review = crate::domain::WorkUnit::pending("r:u5", "r", 5, "review the fix");
+        review.role = crate::workflow::PhaseRole::Evaluator;
+        review.assigned_cli = Some("agy".into());
+        let fallback = vec![seat("claude", "claude -p {PROMPT}")];
+        let run2: Vec<String> = ["agy", "pi"].iter().map(|s| s.to_string()).collect();
+        let (seats, missing) = rejudge_seats(
+            &review,
+            &roster,
+            &run2,
+            &[],
+            &["pi".to_string()],
+            Some(&[]),
+            &fallback,
+            &roster,
+        );
+        assert_eq!(
+            seats.first().map(String::as_str),
+            Some("pi"),
+            "{seats:?} {missing:?}"
+        );
+        // Every preferred judge benched, and an author whose binary is unknown: no fallback judge
+        // can be shown distinct from it, so none is eligible.
+        let all_benched: Vec<crate::domain::BenchedSeat> = ["pi", "opencode"]
+            .iter()
+            .map(|k| crate::domain::BenchedSeat {
+                cli: (*k).into(),
+                reason: "signed out".into(),
+                source: "judge".into(),
+                governed_only: false,
+            })
+            .collect();
+        let (unknown, _) = rejudge_seats(
+            &unit,
+            &roster,
+            &run,
+            &all_benched,
+            &[],
+            None,
+            &fallback,
+            &roster,
+        );
+        assert!(unknown.is_empty(), "{unknown:?}");
     }
 
     /// (#539) When the pinned-validator path skips the judge (no distinct seat), the DEFAULT floor

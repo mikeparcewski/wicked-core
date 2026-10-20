@@ -4299,6 +4299,7 @@ mod judge_bench_tests {
             output: "the reviewed output".into(),
             attempt: 1,
             seats: vec!["b".into()],
+            monitors: Vec::new(),
             at: 0,
         });
         let evidence = crate::workflow::UnitEvidence {

@@ -37,8 +37,9 @@ Two release tracks share this file, newest entry first regardless of track:
   `confirmGate(run, true, undefined, "rejudge")`) re-arms the judge on the same work: the unit is re-dispatched at
   the next attempt without running its seat, the judge reads the output the reviewed attempt captured, drawn by the
   engine's own selection from the run's roster as it stands (never the work's authors, the pinned validator's
-  author, a team monitor of the step or a benched seat; a fallback judge as before). The floor is not re-run: its
-  last result on the unchanged tree stands (core#544). The attempt goes through the ordinary fold, so a REJECT, a
+  author, a team monitor of the reviewed attempt or a benched seat; a fallback judge as before). The default floor
+  is not re-run: its last result on the unchanged tree stands (core#544); a declared verify floor re-runs its
+  checks, as on every attempt. The attempt goes through the ordinary fold, so a REJECT, a
   failed floor or another seatless judge denies again. It is recorded as the new event `judgeRerunRequested`
   `{session, ord, attempt, fromAttempt, seats, previousReason, by}` before `resumed`, and it is never an operator
   judgment. It is refused, with the gate left open, at any other gate (a judge that ruled is never re-asked), at a
