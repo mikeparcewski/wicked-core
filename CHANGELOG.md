@@ -14,6 +14,41 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A container seat's gate hook no longer refuses a call silently, and a killed gate hook is judged again.** In
+  core#997's end-to-end run a claude seat's `cargo test` loop was refused with "the gate hook failed (exit 1): ;"
+  and nothing else: no reason, no line in the daemon's log, no deny in the unit's decisions log. The host gate
+  hook had not judged the call (the decisions log has no hook-fired line for it, and the same payload is allowed
+  when run again), and the hook relay reported its death by a signal as `exit 1` with an empty reason. The relay
+  now tells the outcomes apart. The gate hook's own allow (0) and deny (2) are answered as before. A gate hook
+  ended by a signal before it answered is run once more, but only when it demonstrably left no verdict: the
+  unit's decisions log did not change while it ran (a deny it recorded before it was killed is never turned into
+  an allow by a second run). One 60 s deadline per call covers every run's payload write, wait and output
+  collection, so a hook that never reads its payload, or a descendant that holds its pipes, cannot stretch it; an
+  answer that lands after the deadline is a timeout, and the gate hook runs in its own process group, killed at
+  the deadline (its exit is observed without reaping it, so the group id cannot be reused before the kill).
+  Relay I/O threads still running count against the relay's connection limit. A hook token is resolved when it
+  is used, so a call whose unit ended while its request was still arriving is refused, never judged, and a unit
+  that ends while its call is judged gets neither a second run nor an allow: revoking a unit's token waits for its
+  calls being judged, and a run starts, and an allow is committed, only while the unit is live and before the
+  deadline, both decided under the unit's lifecycle lock. A refusal the relay cannot record in the unit's decisions
+  log (an unwritable log) fails the unit at its end instead of leaving it able to pass. A unit's calls are judged one
+  at a time (so what its log gains during a run is that run's), a deny the gate hook could not record itself is
+  recorded by the relay, the relay's I/O threads are capped apart from its connections, and a call past the
+  connection limit marks its unit to fail closed (read by a bounded worker within one absolute deadline, never on
+  the accepting thread; past that pool, or when an overflowed line never completes, every live unit fails closed).
+  The relay hands each call an id (stamped into every claim annotation, through one builder); a hook that sees it
+  exits 3 when any record write failed or it recorded no decision, and the relay records that refusal itself. The
+  gate protocol is now 3, so a hook binary without that exit is refused before a seat launches.
+  Every other outcome is refused fail closed by the relay itself: a kill that may have left a decision, a second
+  kill, another exit code, a gate hook that could not start or did not answer by the deadline, an unknown token,
+  a payload that is not a tool call, or a hook request whose headers are oversized, too many or unreadable (now
+  attributed to the unit its token names). The answer names the reason (the signal included), the daemon's log gets a line, and the unit's decisions
+  log records it as an infra deny, which the fold replays as a `governanceHookFired` deny and which denies the
+  unit. Unit tests run the run's own payload against gate hooks that die once, die every time, record a deny and
+  then die, exit 1, deny, never read a payload larger than the pipe, or exit while a child holds their output,
+  and send a live unit's token with 101 headers; a live test (`WICKED_CONTAINER_LIVE=1`) drives a real claude container seat through the gateway with a
+  long `cargo test`-like loop, a call whose gate hook is killed once, and one whose gate hook keeps dying.
+
 - **A container seat's cargo builds within the seat's memory limit.** A seat runs with a fixed memory limit
   (`WICKED_SEAT_MEMORY`, default 3g) and cargo's workstation defaults: one job per CPU, full debuginfo and
   incremental state. In core#997's end-to-end run a claude seat's `cargo test --lib seat_login::tests` of this

@@ -4491,15 +4491,16 @@ pub fn run_gate_hook(
     // ever arms a file-backed store (`in_process_governance` filters `:memory:`/`postgres://`), so this
     // arm is unreachable in-run — it only fires for a mis-invoked STANDALONE `gate-hook`, where no fold
     // consumes the log. So there is no in-run audit hole (Copilot).
+    RECORD_FAILED.store(false, std::sync::atomic::Ordering::SeqCst);
     if let Some(reason) = store_unavailable(db) {
         eprintln!("wicked-governance: DENY ({reason})");
-        return 2;
+        return relayed_exit(2, true);
     }
     let mut raw = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
         // An unreadable (e.g. non-UTF-8) tool call is UN-EVALUABLE — fail closed, never allow.
         eprintln!("wicked-governance: DENY (could not read tool call for evaluation: {e})");
-        return 2;
+        return relayed_exit(2, true);
     }
     let (context, tool) = claude_pretool_context(&raw, scope, phase);
 
@@ -4510,7 +4511,7 @@ pub fn run_gate_hook(
             eprintln!(
                 "wicked-governance: DENY ({DECISIONS_PATH_ENV} unset — cannot record decision)"
             );
-            return 2;
+            return relayed_exit(2, true);
         }
     };
 
@@ -4518,7 +4519,7 @@ pub fn run_gate_hook(
     // durable claim, and the allow/deny answer. Only the step above — turning a wire payload into
     // `(context, tool)` — differs between carriers. Split out so the ACP path can enforce the SAME
     // policy and write the SAME audit trail instead of running ungoverned (FINDING-062).
-    evaluate_tool_call(
+    let code = evaluate_tool_call(
         scope,
         phase,
         phase_alias,
@@ -4529,7 +4530,38 @@ pub fn run_gate_hook(
         &tool,
         // Hook-subprocess carrier: the launcher armed the boundary on OUR env (core#260).
         None,
+    );
+    relayed_exit(
+        code,
+        RECORD_FAILED.load(std::sync::atomic::Ordering::SeqCst),
     )
+}
+
+/// A record this hook process had to write could not be written (or nothing was recorded at all),
+/// set by every recorder's failure path ([`note_record_failed`]) and read once, at exit.
+static RECORD_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Note that a record could not be written.
+fn note_record_failed() {
+    RECORD_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The exit code a hook relayed by the container floor's relay ([`HOOK_INVOCATION_ENV`] set)
+/// returns when it could not record its decision: the relay records the refusal itself, so the
+/// call's deny is never lost (core#1055). Only the relay sees it; claude's own command hook
+/// (the wrapped host carrier) still gets 2.
+pub(crate) const UNRECORDED_DENY_EXIT: i32 = 3;
+
+/// `code`, or [`UNRECORDED_DENY_EXIT`] when this run was relayed and `unrecorded` (a record write
+/// failed, or the hook returned before recording any decision).
+fn relayed_exit(code: i32, unrecorded: bool) -> i32 {
+    let relayed = std::env::var(HOOK_INVOCATION_ENV).is_ok_and(|v| !v.is_empty());
+    if relayed && unrecorded {
+        eprintln!("wicked-governance: the decision for this call could not be recorded");
+        UNRECORDED_DENY_EXIT
+    } else {
+        code
+    }
 }
 
 /// Evaluate one tool call against the run's policies, record it durably, and answer allow/deny.
@@ -4858,12 +4890,7 @@ pub(crate) fn evaluate_tool_call(
     // atomic on both POSIX (`O_APPEND`) and Windows (`FILE_APPEND_DATA`) — no concurrent hook
     // subprocess can interleave between the annotation and the claim (Copilot).
     {
-        let annotation_json = serde_json::json!({
-            TOOL_CALL_KEY: audit_tool_name(tool),
-            TOOL_CALL_PHASE_KEY: phase,
-        })
-        .to_string()
-            + "\n";
+        let annotation_json = tool_call_annotation(tool, phase);
         let claim_line = match serde_json::to_string(&claim) {
             Ok(mut s) => {
                 s.push('\n');
@@ -4871,6 +4898,7 @@ pub(crate) fn evaluate_tool_call(
             }
             Err(e) => {
                 eprintln!("wicked-governance: DENY (could not serialise claim: {e})");
+                note_record_failed();
                 return 2;
             }
         };
@@ -4884,6 +4912,7 @@ pub(crate) fn evaluate_tool_call(
             f.write_all(combined.as_bytes())
         }) {
             eprintln!("wicked-governance: DENY (could not append decision: {e})");
+            note_record_failed();
             return 2;
         }
     }
@@ -5151,7 +5180,14 @@ const HOOK_FIRED_KEY: &str = "_wicked_hook_fired";
 /// tool name in `GovernanceHookFired` events without re-running the evaluation. Written in the same
 /// single buffer as the claim (both under the advisory lock) — a write failure returns exit 2 (fail
 /// closed) and no decision is appended.
-const TOOL_CALL_KEY: &str = "_wicked_tool_call";
+pub(crate) const TOOL_CALL_KEY: &str = "_wicked_tool_call";
+/// The environment variable the container floor's hook relay sets to one id per relayed call
+/// ([`crate::hook_relay`]); every claim the hook process records for it carries the id in its
+/// tool-call annotation ([`HOOK_INVOCATION_KEY`]), so the relay can tell this call's record from
+/// any other written to the unit's log.
+pub(crate) const HOOK_INVOCATION_ENV: &str = "WICKED_HOOK_INVOCATION";
+/// The annotation key carrying [`HOOK_INVOCATION_ENV`].
+pub(crate) const HOOK_INVOCATION_KEY: &str = "_wicked_hook_invocation";
 /// Companion phase key on the tool-call annotation (pairs with `TOOL_CALL_KEY`).
 const TOOL_CALL_PHASE_KEY: &str = "_wicked_tool_phase";
 
@@ -5387,24 +5423,39 @@ fn append_annotated_claim(decisions_path: &str, phase: &str, tool: &str, claim: 
 
 /// [`append_annotated_claim`] that reports a failed write, for a recorder that must refuse the call
 /// it cannot record (the MCP broker's D-3, `mcp_gate::evaluate_mcp_call`).
+/// The tool-call annotation line (newline included) every recorder writes in the same buffer as
+/// its claim: the tool, the phase, and, when the hook relay ran this hook, the relayed call's id
+/// ([`HOOK_INVOCATION_KEY`]), which ties the claim to that one call. One builder, so no recorder
+/// can write an annotation without it.
+fn tool_call_annotation(tool: &str, phase: &str) -> String {
+    let mut annotation = serde_json::json!({
+        TOOL_CALL_KEY: audit_tool_name(tool),
+        TOOL_CALL_PHASE_KEY: phase,
+    });
+    if let Some(id) = std::env::var(HOOK_INVOCATION_ENV)
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        annotation[HOOK_INVOCATION_KEY] = id.into();
+    }
+    annotation.to_string() + "\n"
+}
+
 pub(crate) fn append_annotated_claim_checked(
     decisions_path: &str,
     phase: &str,
     tool: &str,
     claim: &ConformanceClaim,
 ) -> std::io::Result<()> {
-    let annotation = serde_json::json!({
-        TOOL_CALL_KEY: audit_tool_name(tool),
-        TOOL_CALL_PHASE_KEY: phase,
-    })
-    .to_string()
-        + "\n";
-    let mut claim_line = serde_json::to_string(claim).map_err(std::io::Error::other)?;
+    let annotation = tool_call_annotation(tool, phase);
+    let mut claim_line = serde_json::to_string(claim)
+        .map_err(std::io::Error::other)
+        .inspect_err(|_| note_record_failed())?;
     claim_line.push('\n');
     let combined = annotation + &claim_line;
     let path = Path::new(decisions_path);
     if let Some(parent) = path.parent() {
-        create_dir_all_private(parent)?;
+        create_dir_all_private(parent).inspect_err(|_| note_record_failed())?;
     }
     with_append_lock(path, || {
         let mut f = std::fs::OpenOptions::new()
@@ -5413,9 +5464,32 @@ pub(crate) fn append_annotated_claim_checked(
             .open(path)?;
         f.write_all(combined.as_bytes())
     })
+    .inspect_err(|_| note_record_failed())
 }
 
-fn append_infra_deny(decisions_path: &str, scope: &str, phase: &str, tool: &str, reason: &str) {
+/// Record a governance INFRA failure for one tool call: the call was refused because it could not
+/// be judged (the store would not open, the policies could not be selected, or a container seat's
+/// gate hook gave no verdict through the relay, [`crate::hook_relay`]). Unit-fatal: an un-judged
+/// call is never evidence the unit stayed in policy.
+pub(crate) fn append_infra_deny(
+    decisions_path: &str,
+    scope: &str,
+    phase: &str,
+    tool: &str,
+    reason: &str,
+) {
+    let _ = append_infra_deny_checked(decisions_path, scope, phase, tool, reason);
+}
+
+/// [`append_infra_deny`] that reports a failed write, for a recorder that must make the unit fail
+/// another way when its deny cannot be recorded (the hook relay, [`crate::hook_relay`]).
+pub(crate) fn append_infra_deny_checked(
+    decisions_path: &str,
+    scope: &str,
+    phase: &str,
+    tool: &str,
+    reason: &str,
+) -> std::io::Result<()> {
     let claim = ConformanceClaim {
         // Keyed on `phase` only — NOT the scope, which embeds `/` (`wicked-agent/<sess>/unit/<id>`) and
         // would make an unsafe/unbounded claim symbol (Copilot). One infra-deny node per phase is enough
@@ -5431,7 +5505,7 @@ fn append_infra_deny(decisions_path: &str, scope: &str, phase: &str, tool: &str,
         evaluator_identity: "wicked-governance-infra".to_string(),
         evaluated_at: crate::clock::eval_now(),
     };
-    append_annotated_claim(decisions_path, phase, tool, &claim);
+    append_annotated_claim_checked(decisions_path, phase, tool, &claim)
 }
 
 /// Record a BOUNDARY refusal — a tool call that reached outside the unit's worktree.
@@ -5633,8 +5707,10 @@ fn write_hook_fired_sentinel(decisions_path: &str, phase: &str) -> Result<(), St
     // standalone / test invocation it may not. Create it here so the sentinel write never fails
     // with a spurious DENY on a missing parent directory.
     if let Some(parent) = sentinel_path.parent() {
-        create_dir_all_private(parent)
-            .map_err(|e| format!("could not create governance dir: {e}"))?;
+        create_dir_all_private(parent).map_err(|e| {
+            note_record_failed();
+            format!("could not create governance dir: {e}")
+        })?;
     }
     with_append_lock(sentinel_path, || {
         let mut f = std::fs::OpenOptions::new()
@@ -5643,7 +5719,10 @@ fn write_hook_fired_sentinel(decisions_path: &str, phase: &str) -> Result<(), St
             .open(decisions_path)?;
         f.write_all(sentinel_line.as_bytes())
     })
-    .map_err(|e| format!("could not write hook-fired sentinel: {e}"))
+    .map_err(|e| {
+        note_record_failed();
+        format!("could not write hook-fired sentinel: {e}")
+    })
 }
 
 /// Record an MCP refusal (core#657) under [`MCP_DENY_PREFIX`] — advisory by the allowlist,
@@ -5745,13 +5824,9 @@ fn append_estate_deny(
     // Annotation + claim as ONE buffer under the advisory lock — the same atomicity argument the
     // policy path makes in `evaluate_tool_call`: a single `write_all` of a small buffer cannot be
     // interleaved by a concurrent hook subprocess even if the lock degrades.
-    let annotation = serde_json::json!({
-        TOOL_CALL_KEY: audit_tool_name(tool),
-        TOOL_CALL_PHASE_KEY: phase,
-    })
-    .to_string()
-        + "\n";
+    let annotation = tool_call_annotation(tool, phase);
     let Ok(mut claim_line) = serde_json::to_string(&claim) else {
+        note_record_failed();
         return;
     };
     claim_line.push('\n');
@@ -5760,13 +5835,17 @@ fn append_estate_deny(
     if let Some(parent) = path.parent() {
         let _ = create_dir_all_private(parent);
     }
-    let _ = with_append_lock(path, || {
+    if with_append_lock(path, || {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?;
         f.write_all(combined.as_bytes())
-    });
+    })
+    .is_err()
+    {
+        note_record_failed();
+    }
 }
 
 fn append_boundary_deny(
@@ -6807,6 +6886,89 @@ pub(crate) fn legacy_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// core#1055 review round 13: a hook run by the container floor's relay exits
+    /// `UNRECORDED_DENY_EXIT` (the relay then records the refusal itself) when a record write failed
+    /// or it returned before recording any decision, an allow included; a hook claude runs itself
+    /// keeps 2. A failed sentinel write is such a failure.
+    #[test]
+    fn a_relayed_hook_that_could_not_record_exits_unrecorded() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var(HOOK_INVOCATION_ENV);
+        assert_eq!(
+            relayed_exit(2, true),
+            2,
+            "claude's own hook keeps its blocking code"
+        );
+        std::env::set_var(HOOK_INVOCATION_ENV, "inv-7");
+        assert_eq!(relayed_exit(2, true), UNRECORDED_DENY_EXIT);
+        assert_eq!(
+            relayed_exit(0, true),
+            UNRECORDED_DENY_EXIT,
+            "an unrecorded allow too"
+        );
+        assert_eq!(relayed_exit(2, false), 2);
+        assert_eq!(relayed_exit(0, false), 0);
+        std::env::remove_var(HOOK_INVOCATION_ENV);
+        RECORD_FAILED.store(false, std::sync::atomic::Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("wicked-unrec-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&dir, "a file, so the log's parent cannot be a directory").unwrap();
+        let log = dir.join("decisions.ndjson");
+        assert!(write_hook_fired_sentinel(log.to_str().unwrap(), "unit-1").is_err());
+        assert!(RECORD_FAILED.load(std::sync::atomic::Ordering::SeqCst));
+        RECORD_FAILED.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// core#1055 review round 12: a relayed hook's every record carries the relayed call's id in
+    /// its tool-call annotation (`WICKED_HOOK_INVOCATION`), whichever recorder writes it, so the
+    /// relay can tell the call's own deny (an advisory estate refusal included) from any other.
+    #[test]
+    fn every_recorder_stamps_the_relayed_calls_id_into_its_annotation() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("wicked-inv-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("decisions.ndjson");
+        let log_s = log.to_str().unwrap();
+        std::env::set_var(HOOK_INVOCATION_ENV, "inv-42");
+        append_estate_deny(
+            log_s,
+            "s",
+            "unit-1",
+            "Bash",
+            "estate-deny fence: r",
+            "wicked-estate index .",
+            false,
+        );
+        append_boundary_deny(log_s, "s", "unit-1", "Read", "outside", false);
+        append_remote_write_deny(log_s, "s", "unit-1", "remote write", "git push");
+        append_mcp_deny(log_s, "s", "unit-1", "mcp__x__y", "mcp");
+        append_infra_deny(log_s, "s", "unit-1", "Bash", "infra");
+        std::env::remove_var(HOOK_INVOCATION_ENV);
+        let raw = std::fs::read_to_string(&log).unwrap();
+        let annotations: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get(TOOL_CALL_KEY).is_some())
+            .collect();
+        assert_eq!(annotations.len(), 5, "{raw}");
+        for a in &annotations {
+            assert_eq!(a[HOOK_INVOCATION_KEY], "inv-42", "{a}");
+        }
+        // Without the relay, no id.
+        append_infra_deny(log_s, "s", "unit-1", "Bash", "infra");
+        let last = std::fs::read_to_string(&log).unwrap();
+        let ann: serde_json::Value =
+            serde_json::from_str(last.lines().rev().nth(1).unwrap()).unwrap();
+        assert!(ann.get(HOOK_INVOCATION_KEY).is_none(), "{ann}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// R7 / R7b / R8 (DES-L4 PR-②; core #483, F-RC1-080, F-RC1-092): `Bash` is judged by its WRITE
     /// TARGETS under a fenced posture with the SAME admission a path-bearing tool gets. Read-only:
@@ -10093,8 +10255,11 @@ mod tests {
 ///
 /// History: 2 (WT-C1) — an EVALUATOR (the walkthrough author) may now carry the
 /// `deliverable-roots` posture spelling, which a protocol-1 hook parses as "no fence"; the bump
-/// makes such a hook refuse to arm rather than run that evaluator unfenced.
-pub const GATE_PROTOCOL_VERSION: u32 = 2;
+/// makes such a hook refuse to arm rather than run that evaluator unfenced. 3 (core#1055) — a
+/// hook relayed by the container floor's relay exits [`UNRECORDED_DENY_EXIT`] when it could not
+/// record its decision, which the relay records instead; a protocol-2 hook has no such exit, so
+/// its unrecorded denies would be lost.
+pub const GATE_PROTOCOL_VERSION: u32 = 3;
 
 /// The line `gate-hook --protocol-version` prints. Parsed by the launcher; keep it one stable line.
 ///
