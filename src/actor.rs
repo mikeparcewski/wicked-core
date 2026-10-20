@@ -7601,7 +7601,7 @@ fn escalate_denied_unit(
     let (gate_kind, prompt) = match adjudication {
         Some(p) => (crate::review_context::REVIEW_ADJUDICATION_GATE, p),
         None => (
-            "escalation",
+            ESCALATION_GATE_KIND,
             denial_gate_prompt(unit, class, &reason, mutation, note),
         ),
     };
@@ -12210,6 +12210,16 @@ pub(crate) fn confirm_gate_as(
     )?
     .iter()
     .any(|r| r.gate_kind.as_deref() == Some(crate::review_context::REVIEW_ADJUDICATION_GATE));
+    // An ESCALATION gate is open (a denied unit's gate, `escalate_denied_unit`) — read here, from
+    // the open row, before it resolves: its plain approve is the operator retry that re-runs the
+    // unit's floor once on an unchanged tree ([`arm_operator_recheck`]).
+    let escalation_open = crate::interaction::list_interactions(
+        &*store,
+        Some(run_id),
+        Some(crate::interaction::InteractionStatus::Open),
+    )?
+    .iter()
+    .any(|r| r.gate_kind.as_deref() == Some(ESCALATION_GATE_KIND));
 
     // (core#782) An approve WITH A NOTE at a read-only phase's floor gate is a FLOOR FIX: the
     // note goes to a seat that can write, then only the floor re-runs (`floor_fix_request`) —
@@ -12535,6 +12545,9 @@ pub(crate) fn confirm_gate_as(
     // (core#782) The operator's note a floor fix hands to its seat.
     let mut floor_fix_note: Option<String> = None;
     let mut adopt_suggestion = false;
+    // The operator's plain approve (retry, with or without a note) — the one answer that arms a
+    // re-run of an escalated unit's floor on an unchanged tree.
+    let mut operator_retry = false;
     // (core#555) The approved INTENT AMENDMENT this decision carries, applied below to every unit
     // at or after the cursor (not one unit's instruction) so it reaches every later evaluator.
     let mut intent_amendment: Option<String> = None;
@@ -12555,6 +12568,7 @@ pub(crate) fn confirm_gate_as(
             (None, crate::workflow::AmendScope::Cursor, None)
         }
         crate::workflow::HumanDecision::Approve { amend, amend_scope } => {
+            operator_retry = true;
             (amend, amend_scope, None)
         }
         crate::workflow::HumanDecision::RequestChanges { note } => {
@@ -12681,6 +12695,12 @@ pub(crate) fn confirm_gate_as(
                         },
                     );
                 }
+            }
+            // The OPERATOR RETRY of an escalated unit: its floor re-runs ONCE on the next attempt
+            // even when that attempt leaves the tree unchanged (a flaky result is not sticky per
+            // tree). Automatic reworks and every other answer keep the core#544 carry-forward.
+            if operator_retry && escalation_open && floor_rerun.is_none() {
+                arm_operator_recheck(store, run_id, session.unit_ix)?;
             }
             // Optionally inject an amendment (the gate is steering) — into the unit at the cursor,
             // or (DES-L1 PR-1B, core#465 `amendScope: creator`) into the first CREATOR phase at or
@@ -13014,6 +13034,41 @@ fn floor_fix_request(
             seat,
         }),
     })
+}
+
+/// The gate kind `escalate_denied_unit` opens for a denied unit.
+const ESCALATION_GATE_KIND: &str = "escalation";
+
+/// Arm ONE re-run of the cursor unit's floor for its next attempt (`RepoChecksReport::recheck`):
+/// the operator retried an escalated unit whose last floor FAILED on a known tree. Without it the
+/// retry's unchanged tree carries that result forward (core#544, which keeps a no-change rework
+/// from admitting a failed tree), so a single flaky check blocked the step for good: the only
+/// levers left were Stop or a code change. The re-run is the one carve-out — deny-dominant like
+/// any floor (it passes only when the checks pass), consumed by the attempt's fold, never armed
+/// by an automatic rework — so a deterministic failure is re-run once per operator retry, never
+/// in a loop. A unit with no failed default-floor report on a known tree is left alone.
+fn arm_operator_recheck(
+    store: &mut dyn GraphStore,
+    run_id: &str,
+    unit_ix: usize,
+) -> anyhow::Result<()> {
+    let mut units = crate::domain::session_units(store, run_id)?;
+    let Some(cursor) = units.get_mut(unit_ix) else {
+        return Ok(());
+    };
+    if cursor.status != crate::domain::UnitStatus::Rejected || !cursor.default_floor {
+        return Ok(());
+    }
+    let Some(report) = cursor
+        .repo_checks
+        .as_mut()
+        .filter(|r| !r.passed && r.tree.is_some())
+    else {
+        return Ok(());
+    };
+    report.recheck = Some(crate::repo_checks::RECHECK_OPERATOR_RETRY.to_string());
+    put_node(store, cursor.to_node())?;
+    Ok(())
 }
 
 /// (core#469) The floor re-run `mode` asks for on `unit` — refused unless the unit's denial is a

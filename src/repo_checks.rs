@@ -276,6 +276,10 @@ pub const CLAIM_UNVERIFIED: &str = "unverified";
 
 /// Denial sources the fold uses for this floor.
 pub const DENIAL_SOURCE: &str = "repo_checks";
+
+/// The reason an operator retry records when it arms a re-run of a unit's floor on an unchanged
+/// tree (`RepoChecksReport::recheck`, the `floorRecheck` event's `reason`).
+pub const RECHECK_OPERATOR_RETRY: &str = "operator retry";
 /// A floor that did not FINISH (a check hit its bound) — never "checks failed".
 pub const DENIAL_SOURCE_TIMEOUT: &str = "repo_checks_timeout";
 
@@ -668,6 +672,14 @@ pub struct RepoChecksReport {
     /// answers). Consumed there: the re-run's own report replaces this one on the unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_rerun: Option<FloorRerun>,
+    /// An OPERATOR RETRY of this unit's escalation gate ("Retry this step with a note" — a plain
+    /// approve of the escalated unit) armed ONE re-run of these checks on the unit's next attempt,
+    /// even when that attempt leaves the tree unchanged — the single exception to core#544's
+    /// carry-forward, so a flaky result is not sticky per tree. The reason
+    /// ([`RECHECK_OPERATOR_RETRY`]). Consumed by the attempt's fold (the fresh report replaces this
+    /// one); an automatic rework never arms it, so a deterministic failure is not re-run forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recheck: Option<String>,
     /// (core#432 F-3R2-023) A VERIFY floor whose change touches end-to-end files while no `e2e`
     /// or journey check ran says so here — the gate's `floorNote` then states that the floor did
     /// not run them, instead of a green floor implying it did ([`e2e_coverage_note`]).
@@ -2557,6 +2569,7 @@ fn scratch_refused(
         rerun: None,
         waived: Vec::new(),
         requested_rerun: None,
+        recheck: None,
         coverage_note: None,
     }
 }
@@ -2655,6 +2668,7 @@ pub(crate) fn run_with_sandbox_ctx(
                     rerun: None,
                     waived: Vec::new(),
                     requested_rerun: None,
+                    recheck: None,
                     coverage_note: None,
                 };
             }
@@ -2679,6 +2693,7 @@ pub(crate) fn run_with_sandbox_ctx(
                 rerun: None,
                 waived: Vec::new(),
                 requested_rerun: None,
+                recheck: None,
                 coverage_note: None,
             }
         }
@@ -2703,6 +2718,7 @@ pub(crate) fn run_with_sandbox_ctx(
                     rerun: None,
                     waived: Vec::new(),
                     requested_rerun: None,
+                    recheck: None,
                     coverage_note: None,
                 }
             }
@@ -2838,6 +2854,7 @@ pub(crate) fn run_with_sandbox_ctx(
         rerun: None,
         waived,
         requested_rerun: None,
+        recheck: None,
         coverage_note,
     }
 }
@@ -3400,6 +3417,7 @@ pub(crate) fn guarded_checkout_refused(
         rerun: None,
         waived: Vec::new(),
         requested_rerun: None,
+        recheck: None,
         coverage_note: None,
     }
 }
@@ -5248,6 +5266,7 @@ mod tests {
             rerun: None,
             waived: Vec::new(),
             requested_rerun: None,
+            recheck: None,
             coverage_note: None,
         };
         let reason = report.denial_reason();
@@ -6268,6 +6287,7 @@ mod tests {
             rerun: None,
             waived: Vec::new(),
             requested_rerun: None,
+            recheck: None,
             coverage_note: None,
         };
         let denial = report.denial_reason();
@@ -6498,6 +6518,7 @@ mod tests {
             rerun: None,
             waived: Vec::new(),
             requested_rerun: None,
+            recheck: None,
             coverage_note: None,
         };
         assert!(report.timed_out());
@@ -7538,6 +7559,7 @@ mod tests {
             rerun: None,
             waived: Vec::new(),
             requested_rerun: None,
+            recheck: None,
             coverage_note: None,
         }
     }

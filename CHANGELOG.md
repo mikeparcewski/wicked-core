@@ -29,6 +29,24 @@ Two release tracks share this file, newest entry first regardless of track:
   fetch. A git dependency or another registry needs its own hosts. One new live test
   (`WICKED_CONTAINER_LIVE=1`) runs `cargo fetch` from a seat's namespace; its cargo leg needs
   `WICKED_SEAT_BASE_IMAGE` naming a base with a Rust toolchain.
+
+- **An operator retry re-runs a unit's failed floor once, even on an unchanged tree.** core#544 made a rework that
+  leaves the tree unchanged carry the unit's last floor result forward ("this unit's last floor result on this tree
+  stands"), so a no-change rework could not admit a tree the floor had failed. That also made one flaky check
+  permanent: the automatic floor round changed nothing and carried the failure, and the operator's "Retry this step
+  with a note" did the same, so the only answers left were Stop or a code change. Now a plain approve at the
+  escalated unit's gate (retry, with or without a note) arms ONE re-run of that unit's floor
+  (`RepoChecksReport.recheck`) when its last floor failed on a known tree. The next attempt runs the repository's
+  checks on the tree as it stands even when it changed nothing. The fresh report replaces the stored one and alone
+  decides the gate: it passes only when the checks pass, and a second failure escalates as before. A new
+  `floorRecheck` event (`reason: "operator retry"`, `tree`, `previousOutcome`, `outcome`, `passed`) follows the fresh
+  `repoChecksEvaluated`, so the gate history shows both results. The fold consumes the request, so the re-run happens
+  once per operator retry. The automatic floor round, `request_changes`, and every other re-entry keep the
+  carry-forward, so a deterministic failure is never re-run in a loop. Tests: `tests/floor_gate_actions.rs`
+  (approve-retry on an unchanged tree re-runs once and escalates again on a deterministic failure; a flaky failure
+  clears and the unit proceeds to verify; the automatic round still reuses the result), `event.rs`
+  (`floorRecheck` wire shape).
+
 - **A claude seat in a container can read and edit its own worktree under `~/.wicked/repos`.** Crew registers
   repositories under `~/.wicked/repos`, and `.wicked` is one of the directories the worker fence always denies
   (`Read`/`Edit` over `~/.wicked/**`, for estate's stores). A seat container mounts each host path at the same

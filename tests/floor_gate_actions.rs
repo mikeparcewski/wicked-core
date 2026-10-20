@@ -5,7 +5,10 @@
 //!   gone from `criterion`) — the rework re-baselined the tree and "unchanged" read as "nothing to
 //!   check". The failed result now stands for the unchanged tree: the gate denies with
 //!   `source: repo_checks` and a `floorNote` naming the carried-forward result. A rework that DOES
-//!   change the tree re-runs the floor (unchanged behaviour).
+//!   change the tree re-runs the floor (unchanged behaviour). The one exception: an OPERATOR
+//!   RETRY (a plain approve) at the escalated unit's gate re-runs the floor ONCE on the unchanged
+//!   tree (`floorRecheck`, reason `operator retry`) — so a flaky result is not sticky per tree —
+//!   while the automatic rework and `request_changes` keep the carry-forward.
 //! * core#469: a floor that did not FINISH (`repo_checks_timeout`) offers `extend`, `targeted` and
 //!   `accept_partial` at its gate; each re-runs the checks on the tree as it stands (the seat does
 //!   not run again) and the result goes through the ordinary gate fold.
@@ -404,17 +407,140 @@ fn a_request_changes_rework_that_changes_nothing_keeps_the_floor_denial() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// core#544 (b): the same through the approve-retry path.
+/// The `floorRecheck` frames of `ord`: `(attempt, reason, previous outcome, outcome, passed)`.
+type Recheck = (u32, String, String, String, bool);
+fn rechecks(evs: &[CoreEvent], want: u32) -> Vec<Recheck> {
+    evs.iter()
+        .filter_map(|ev| match ev {
+            CoreEvent::FloorRecheck {
+                ord,
+                attempt,
+                reason,
+                tree,
+                previous_outcome,
+                outcome,
+                passed,
+                ..
+            } if *ord == want => {
+                assert!(
+                    tree.is_some(),
+                    "a recheck names the tree both results judged"
+                );
+                Some((
+                    *attempt,
+                    reason.clone(),
+                    previous_outcome.clone(),
+                    outcome.clone(),
+                    *passed,
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The first settle of every floor-failed fix: attempt 0's floor failed, the ONE automatic
+/// rework (core#651) changed nothing, and its gate CARRIED the failure — no second floor ran and
+/// no recheck was armed (an automatic rework keeps the core#544 reuse).
+fn automatic_rework_reused_the_floor(first: &[CoreEvent]) {
+    let f = floors(first, 3);
+    assert_eq!(f.len(), 1, "one floor before the gate (attempt 0): {f:?}");
+    assert_eq!(f[0].0, 0);
+    assert!(
+        rechecks(first, 3).is_empty(),
+        "an automatic rework never re-runs the floor on an unchanged tree"
+    );
+    let (_, _, _, _, note) = gate(first, 3).expect("the automatic rework's gateEvaluated");
+    assert!(
+        note.as_deref()
+            .is_some_and(|n| n.contains("made no change")),
+        "the automatic rework carried the failed result: {note:?}"
+    );
+}
+
+/// core#544 (b), with the operator-retry carve-out: an approve-retry whose attempt changes nothing
+/// re-runs the floor ONCE on the same tree. A deterministic failure fails again — the gate denies
+/// under `repo_checks` and the unit escalates as before — and `floorRecheck` records both results.
 #[test]
-fn an_approve_retry_that_changes_nothing_keeps_the_floor_denial() {
+fn an_approve_retry_that_changes_nothing_re_runs_the_floor_once() {
     let repo = make_repo("ap-nochange", TEST_FAILS_ON_BROKEN, 60, &[".break-in-fix"]);
-    let (core, _ran) = core_for("ap-nochange", Rework::ChangesNothing);
+    let (core, ran) = core_for("ap-nochange", Rework::ChangesNothing);
     let sid = "fg-ap-nochange";
     let events = launch(&core, "ap-nochange", &repo, sid);
     let first = until_settled(&events, sid);
     if !fix_floor_denied(&first, "repo_checks") {
         return;
     }
+    automatic_rework_reused_the_floor(&first);
+    core.confirm_gate(
+        sid,
+        HumanDecision::Approve {
+            amend: Some("the failure looks flaky; retry".into()),
+            amend_scope: Default::default(),
+        },
+    )
+    .expect("approve the retry");
+    let second = until_settled(&events, sid);
+    no_session_failed(&second);
+    let reruns = floors(&second, 3);
+    assert_eq!(
+        reruns.len(),
+        1,
+        "the retry re-ran the floor once: {reruns:?}"
+    );
+    assert_eq!(reruns[0].1, "failed");
+    let r = rechecks(&second, 3);
+    assert_eq!(r.len(), 1, "one floorRecheck: {r:?}");
+    assert_eq!(
+        r[0].0, reruns[0].0,
+        "the recheck names the attempt that ran it"
+    );
+    assert_eq!(r[0].1, "operator retry");
+    assert_eq!(
+        (r[0].2.as_str(), r[0].3.as_str(), r[0].4),
+        ("failed", "failed", false)
+    );
+    let (_, det_pass, combined, source, note) = gate(&second, 3).expect("gateEvaluated");
+    assert!(!combined && !det_pass, "a re-run that fails still denies");
+    assert_eq!(source.as_deref(), Some("repo_checks"));
+    assert!(
+        !note
+            .as_deref()
+            .is_some_and(|n| n.contains("made no change")),
+        "the verdict is the fresh floor's, not a carried one: {note:?}"
+    );
+    assert!(
+        matches!(second.last(), Some(CoreEvent::AwaitingHuman { .. })),
+        "the unit escalates again: {:?}",
+        second.last()
+    );
+    assert!(
+        !ran.lock().unwrap().iter().any(|(p, _)| p == "verify"),
+        "the failed tree never reaches verify"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// The fix's `test` check of a FLAKY repo: fails its first run, passes every later one (a marker
+/// under the checks' own HOME, which persists in the run's scratch).
+const TEST_FAILS_ONCE: &str = r#"["sh", "-c", "test -f \"$HOME/.failed-once\" && exit 0; : > \"$HOME/.failed-once\"; exit 1"]"#;
+
+/// The flaky shape (run a74f51ac): the floor failed once on a tree, the automatic rework changed
+/// nothing and carried it, so no retry could ever clear it. Now the operator's retry re-runs the
+/// floor on the same tree; the checks pass, the fresh result replaces the failed one and the unit
+/// proceeds to verify.
+#[test]
+fn an_operator_retry_clears_a_flaky_floor_on_an_unchanged_tree() {
+    let repo = make_repo("ap-flaky", TEST_FAILS_ONCE, 60, &[]);
+    let (core, ran) = core_for("ap-flaky", Rework::ChangesNothing);
+    let sid = "fg-ap-flaky";
+    let events = launch(&core, "ap-flaky", &repo, sid);
+    let first = until_settled(&events, sid);
+    no_session_failed(&first);
+    if !fix_floor_denied(&first, "repo_checks") {
+        return;
+    }
+    automatic_rework_reused_the_floor(&first);
     core.confirm_gate(
         sid,
         HumanDecision::Approve {
@@ -425,10 +551,28 @@ fn an_approve_retry_that_changes_nothing_keeps_the_floor_denial() {
     .expect("approve the retry");
     let second = until_settled(&events, sid);
     no_session_failed(&second);
-    let (_, det_pass, combined, source, note) = gate(&second, 3).expect("gateEvaluated");
-    assert!(!combined && !det_pass);
-    assert_eq!(source.as_deref(), Some("repo_checks"));
-    assert!(note.is_some_and(|n| n.contains("made no change")));
+    let reruns = floors(&second, 3);
+    assert_eq!(
+        reruns.len(),
+        1,
+        "the retry re-ran the floor once: {reruns:?}"
+    );
+    assert_eq!(reruns[0].1, "passed");
+    let r = rechecks(&second, 3);
+    assert_eq!(r.len(), 1, "one floorRecheck: {r:?}");
+    assert_eq!(r[0].1, "operator retry");
+    assert_eq!(
+        (r[0].2.as_str(), r[0].3.as_str(), r[0].4),
+        ("failed", "passed", true)
+    );
+    let (_, det_pass, _, source, _) = gate(&second, 3).expect("gateEvaluated");
+    assert!(det_pass, "the fresh floor passed");
+    assert_ne!(source.as_deref(), Some("repo_checks"));
+    assert!(
+        ran.lock().unwrap().iter().any(|(p, _)| p == "verify"),
+        "the unit proceeds: {:?}",
+        ran.lock().unwrap()
+    );
     let _ = std::fs::remove_dir_all(&repo);
 }
 

@@ -198,6 +198,10 @@ const HAND_AUTHORED = `${BEGIN}
  * entry (reason \`qe_waived_by_score\` | \`qe_skipped_by_operator\`, detail = the words). New event
  * \`qeAcceptanceDecided\` {session, ord, qe}: the run's QE unit scored its diff (waived only when
  * every dimension is in its lowest band, score <= threshold), or a creator after a waiver revoked it.
+ * Operator recheck (additive, new event): \`floorRecheck\` {session, ord, attempt, reason, tree,
+ * previousOutcome, outcome, passed} — an operator retry (a plain approve at an escalated unit's
+ * gate) re-ran the unit's failed floor once on the SAME tree its last floor judged; it follows the
+ * fresh repoChecksEvaluated, \`reason\` is \`'operator retry'\`.
  */
 export interface CoreEventJson {
   type: string

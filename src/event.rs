@@ -1135,6 +1135,28 @@ pub enum CoreEvent {
         /// (TR-W1b, additive) `true` when `changed` was cut at the cap.
         changed_truncated: bool,
     },
+    /// An operator retry re-ran a unit's floor on the SAME tree its last floor judged — the one
+    /// exception to core#544's carry-forward (`RepoChecksReport::recheck`). Emitted right after
+    /// the fresh `repoChecksEvaluated` it explains, so the gate history holds both results: the
+    /// earlier frame (`previousOutcome`) and the re-run (`outcome` / `passed`), which replaces it on
+    /// the unit and alone decides the gate (deny-dominant like any floor). `reason` is
+    /// `operator retry`. Additive: a new frame, no existing shape changes.
+    FloorRecheck {
+        session: String,
+        ord: u32,
+        /// The attempt whose fold ran the re-run.
+        attempt: u32,
+        /// Why the floor re-ran on an unchanged tree (`operator retry`).
+        reason: String,
+        /// The tree both results were taken on (`RepoChecksReport::tree`).
+        tree: Option<String>,
+        /// The replaced result's `outcome` (`failed` | `timed_out` | `not_run` | `passed`).
+        previous_outcome: String,
+        /// The re-run's `outcome`.
+        outcome: String,
+        /// The re-run's `passed`.
+        passed: bool,
+    },
     /// (EVT-001) A structured workflow def was selected for this session — the authoritative
     /// decomposition signal. Fires once per session, after `SessionStarted` and before the first
     /// `UnitPlanned`. Only emitted when a `--workflow` id was resolved (not for free-text runs).
@@ -2524,6 +2546,26 @@ impl CoreEvent {
                 }
                 v
             }
+            CoreEvent::FloorRecheck {
+                session,
+                ord,
+                attempt,
+                reason,
+                tree,
+                previous_outcome,
+                outcome,
+                passed,
+            } => json!({
+                "type": "floorRecheck",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "reason": reason,
+                "tree": tree,
+                "previousOutcome": previous_outcome,
+                "outcome": outcome,
+                "passed": passed,
+            }),
             // P2 decisions-full wave (EVT-001, EVT-012, EVT-013).
             CoreEvent::WorkflowSelected {
                 session,
@@ -3045,6 +3087,32 @@ mod tests {
                 "fix the bug (operator amendment: Implement X)"
             );
         }
+    }
+
+    /// `floorRecheck` carries both results of an operator retry's re-run on one tree — the
+    /// replaced outcome and the fresh one — with the reason and the tree, every key present.
+    #[test]
+    fn floor_recheck_to_json_carries_both_results_and_the_reason() {
+        let j = CoreEvent::FloorRecheck {
+            session: "run-1".into(),
+            ord: 5,
+            attempt: 3,
+            reason: crate::repo_checks::RECHECK_OPERATOR_RETRY.into(),
+            tree: Some("abc123".into()),
+            previous_outcome: "failed".into(),
+            outcome: "passed".into(),
+            passed: true,
+        }
+        .to_json();
+        assert_eq!(j["type"], "floorRecheck");
+        assert_eq!(j["session"], "run-1");
+        assert_eq!(j["ord"], 5);
+        assert_eq!(j["attempt"], 3);
+        assert_eq!(j["reason"], "operator retry");
+        assert_eq!(j["tree"], "abc123");
+        assert_eq!(j["previousOutcome"], "failed");
+        assert_eq!(j["outcome"], "passed");
+        assert_eq!(j["passed"], true);
     }
 
     /// core#431 (F-3R2-007): `gateEvaluated` names the judge — `judgeCli` + `judgeDistinct` ride
