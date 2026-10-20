@@ -352,16 +352,19 @@ fn serve(conn: TcpStream) {
     let Some(line) = bounded_line(&mut reader, &mut budget) else {
         return respond(conn, "431 Request Header Fields Too Large", "{}");
     };
-    // The route, and the unit a hook token names, come from the request line alone, so a hook
+    // The route, and the token of a hook request, come from the request line alone, so a hook
     // request whose headers fail is a refusal like any other: answered with its reason, logged,
-    // and recorded in that unit's decisions log.
+    // and recorded in the decisions log of the unit its token names. The unit is looked up when it
+    // is needed (a refusal, the judgement), never held from here: a token revoked while the
+    // request was still arriving names no unit.
     let route = route(&line);
-    let ctx = match &route {
-        Some(Route::Hook(t)) => unit(t),
+    let token = match &route {
+        Some(Route::Hook(t)) => Some(t.clone()),
         _ => None,
     };
     let refuse = |conn, why: &str, tool: &str| {
-        respond(conn, "200 OK", &refusal(ctx.as_ref(), tool, why));
+        let live = token.as_deref().and_then(unit);
+        respond(conn, "200 OK", &refusal(live.as_ref(), tool, why));
     };
     let bad_headers = |conn, why: &str| match &route {
         Some(Route::Hook(_)) => refuse(conn, why, UNKNOWN_TOOL),
@@ -425,10 +428,10 @@ fn serve(conn: TcpStream) {
     let Some(tool) = tool_call(&body) else {
         return refuse(conn, "the hook payload is not a tool call", UNKNOWN_TOOL);
     };
-    let Some(ctx) = ctx.as_ref() else {
+    let Some(ctx) = token.as_deref().and_then(unit) else {
         return refuse(conn, "unknown or revoked hook token", &tool);
     };
-    respond(conn, "200 OK", &judge(ctx, &tool, &body, HOOK_TIMEOUT))
+    respond(conn, "200 OK", &judge(&ctx, &tool, &body, HOOK_TIMEOUT))
 }
 
 /// The live unit `token` names, if any.
@@ -701,15 +704,19 @@ fn run_gate_hook(ctx: &HookContext, payload: &[u8], deadline: Instant) -> HookRu
     );
     let end_group = || {
         #[cfg(unix)]
-        // SAFETY: plain integers; the group is the one this child leads (`process_group(0)`).
+        // SAFETY: plain integers. The group is the one this child leads (`process_group(0)`), and
+        // the child is never reaped before this runs (its pid, so its group id, stays reserved).
         unsafe {
             libc::killpg(group as libc::pid_t, libc::SIGKILL);
         }
     };
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break Ok(s),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+    // Exit is observed WITHOUT reaping (`has_exited_unreaped`): the leader stays a zombie until
+    // the `wait` below, so ending its group at any point before that can never reach a stranger
+    // that reused the pid.
+    let exited = loop {
+        match crate::validator::has_exited_unreaped(&mut child) {
+            Ok(true) => break Ok(()),
+            Ok(false) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             other => {
                 end_group();
                 let _ = child.kill();
@@ -718,24 +725,29 @@ fn run_gate_hook(ctx: &HookContext, payload: &[u8], deadline: Instant) -> HookRu
             }
         }
     };
+    match exited {
+        Ok(()) => {}
+        Err(None) => return HookRun::TimedOut,
+        Err(Some(e)) => return HookRun::Lost(format!("could not be waited for: {e}")),
+    }
     let collect = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
         rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .ok()
     };
-    let status = match status {
-        Ok(s) => s,
-        Err(None) => return HookRun::TimedOut,
-        Err(Some(e)) => return HookRun::Lost(format!("could not be waited for: {e}")),
-    };
     let (out, err) = (collect(out), collect(err));
     // An answer is one given by the deadline: a run that exited across it, or whose output came
-    // in only after it, is a timeout like any other.
+    // in only after it (a descendant held the pipes), is a timeout like any other.
+    let in_time = out.is_some() && err.is_some() && Instant::now() < deadline;
+    if !in_time {
+        end_group();
+    }
+    let status = match child.wait() {
+        Ok(s) => s,
+        Err(e) => return HookRun::Lost(format!("could not be waited for: {e}")),
+    };
     match (out, err) {
-        (Some(out), Some(err)) if Instant::now() < deadline => status_run(status, out, err),
-        _ => {
-            end_group();
-            HookRun::TimedOut
-        }
+        (Some(out), Some(err)) if in_time => status_run(status, out, err),
+        _ => HookRun::TimedOut,
     }
 }
 
@@ -1241,6 +1253,30 @@ mod tests {
             h[0].obligations
         );
         assert_eq!(runs("headers"), 0, "the gate hook never ran");
+
+        // A token revoked while its request is still arriving names no unit when the call is
+        // judged: refused, its gate hook never runs, and nothing is appended to the ended unit's log.
+        let (t, r7, log) = unit("revoked");
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(format!("POST /hook/{t} HTTP/1.1\r\n").as_bytes())
+            .unwrap();
+        // The relay reads the request line before the unit ends.
+        std::thread::sleep(Duration::from_millis(300));
+        drop(r7);
+        write!(
+            s,
+            "host: x\r\ncontent-length: {}\r\n\r\n{payload}",
+            payload.len()
+        )
+        .unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(decision(&v), "deny", "{v}");
+        assert!(reason(&v).contains("unknown or revoked"), "{v}");
+        assert_eq!(runs("revoked"), 0, "the gate hook never ran");
+        assert!(records(&log).is_empty(), "{:?}", records(&log));
 
         // An unknown token has no unit to record in: refused with its reason.
         let d = post(&mint_token(), &payload);
