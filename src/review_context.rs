@@ -279,42 +279,46 @@ pub(crate) fn carried_items(verdict: &str) -> Vec<String> {
     vec![tail(verdict, ROUND_FINDINGS_CAP)]
 }
 
-/// The items the run's reviews DEFERRED to delivery, as `(evaluator ord, item line)` in item
-/// order: every Evaluator agent unit before `deliver_ord` that counted (`Done`) is read — its
-/// approved verdict (`approved_output`), or, for a review the operator landed over a NOT-PASS
-/// verdict, that verdict's words. An item number any of them deferred is listed once (the latest
-/// deferring line), even when another review judged it: a check named twice costs a glance, a
-/// dropped one ships unchecked.
+/// The items the run's reviews DEFERRED to delivery, as `(evaluator ord, item line)`, in unit
+/// then item order. Every Evaluator agent unit before `deliver_ord` that counted (`Done`) is read
+/// through `verdict_of`: `verdict_of(u, None)` is its approved verdict; for a review the operator
+/// LANDED over a NOT-PASS verdict, `verdict_of(u, Some(attempt))` is that attempt's whole
+/// transcript (its round's `findings` — a bounded tail — only when the transcript is gone).
+/// Nothing is merged across units: item numbers are not guaranteed to name the same criterion in
+/// two verdicts (a reviewer numbers the intent itself when it has no Done-when list), so two
+/// reviews deferring the same check list it twice — a check named twice costs a glance, a dropped
+/// one ships unchecked.
 pub(crate) fn deferred_to_delivery(
     units: &[WorkUnit],
     deliver_ord: u32,
-    approved_output: impl Fn(&WorkUnit) -> Option<String>,
+    verdict_of: impl Fn(&WorkUnit, Option<u32>) -> Option<String>,
 ) -> Vec<(u32, String)> {
-    let mut deferred: std::collections::BTreeMap<u32, (u32, String)> = Default::default();
+    let mut deferred = Vec::new();
     for u in units.iter().filter(|u| {
         u.ord < deliver_ord
             && u.role == crate::workflow::PhaseRole::Evaluator
             && u.tool_cmd.is_none()
             && u.status == crate::domain::UnitStatus::Done
     }) {
-        let verdict = approved_output(u).or_else(|| {
-            u.review_rounds
+        let verdict = verdict_of(u, None).or_else(|| {
+            let landed = u
+                .review_rounds
                 .iter()
                 .rev()
-                .find(|r| r.outcome.as_deref() == Some(REVIEW_LANDED))
-                .map(|r| r.findings.clone())
+                .find(|r| r.outcome.as_deref() == Some(REVIEW_LANDED))?;
+            verdict_of(u, Some(landed.attempt)).or_else(|| Some(landed.findings.clone()))
         });
-        for i in verdict
-            .as_deref()
-            .map(parse_review_items)
-            .unwrap_or_default()
-        {
-            if i.status == DEFERRED {
-                deferred.insert(i.n, (u.ord, i.line));
-            }
-        }
+        deferred.extend(
+            verdict
+                .as_deref()
+                .map(parse_review_items)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|i| i.status == DEFERRED)
+                .map(|i| (u.ord, i.line)),
+        );
     }
-    deferred.into_values().collect()
+    deferred
 }
 
 /// The deliver gate card's post-delivery checks: the [`deferred_to_delivery`] items, said as what
@@ -951,15 +955,21 @@ mod tests {
         tool.tool_cmd = Some(vec!["true".into()]);
         let after = done(7, PhaseRole::Evaluator);
         let units = vec![creator, review, landed, pending, tool, after];
-        let outputs = |u: &WorkUnit| -> Option<String> {
-            match u.ord {
-                1 => Some("ITEM 9: DEFERRED — creator words".into()),
-                2 => Some(
+        let outputs = |u: &WorkUnit, attempt: Option<u32>| -> Option<String> {
+            match (u.ord, attempt) {
+                (1, _) => Some("ITEM 9: DEFERRED — creator words".into()),
+                (2, None) => Some(
                     "ITEM 1: PASS — ok\nITEM 5: DEFERRED — CI on the opened PR\nITEM 6: DEFERRED \
                      — PR body\nVERDICT: PASS"
                         .into(),
                 ),
-                4 | 5 | 7 => Some("ITEM 8: DEFERRED — not counted\nVERDICT: PASS".into()),
+                // The landed attempt's WHOLE transcript: an item the bounded findings tail lost.
+                (3, Some(1)) => Some(
+                    "ITEM 1: DEFERRED — CI on the opened PR\n…long findings…\nITEM 4: FAIL — flaky\n\
+                     ITEM 6: DEFERRED — merge\nVERDICT: FAIL"
+                        .into(),
+                ),
+                (4 | 5 | 7, _) => Some("ITEM 8: DEFERRED — not counted\nVERDICT: PASS".into()),
                 _ => None,
             }
         };
@@ -968,18 +978,38 @@ mod tests {
             d,
             vec![
                 (2, "ITEM 5: DEFERRED — CI on the opened PR".to_string()),
+                (2, "ITEM 6: DEFERRED — PR body".to_string()),
+                (3, "ITEM 1: DEFERRED — CI on the opened PR".to_string()),
                 (3, "ITEM 6: DEFERRED — merge".to_string()),
-            ]
+            ],
+            "per unit, never merged by item number"
         );
+        // The landed transcript gone: the round's findings stand in.
+        let tail_only = |u: &WorkUnit, attempt: Option<u32>| match (u.ord, attempt) {
+            (3, None) | (3, Some(_)) => None,
+            _ => outputs(u, attempt),
+        };
+        assert_eq!(
+            deferred_to_delivery(&units, 6, tail_only)[2..],
+            [(3, "ITEM 6: DEFERRED — merge".to_string())]
+        );
+        let d = deferred_to_delivery(&units, 6, outputs);
         let note = delivery_checks_note(&d);
         assert!(
             note.starts_with(
-                " After delivery — 2 checks the review deferred to the opened pull request; the \
+                " After delivery — 4 checks the review deferred to the opened pull request; the \
                  engine does not verify them after the push, so check each there before you merge:"
             ),
             "{note}"
         );
-        assert!(note.contains("ITEM 5: DEFERRED — CI on the opened PR (review unit 2); ITEM 6: DEFERRED — merge (review unit 3)."), "{note}");
+        assert!(
+            note.contains(
+                "ITEM 5: DEFERRED — CI on the opened PR (review unit 2); ITEM 6: DEFERRED — PR body \
+                 (review unit 2); ITEM 1: DEFERRED — CI on the opened PR (review unit 3); ITEM 6: \
+                 DEFERRED — merge (review unit 3)."
+            ),
+            "{note}"
+        );
         assert_eq!(delivery_checks_note(&[]), "");
         let one = delivery_checks_note(&d[..1]);
         assert!(
