@@ -20,13 +20,18 @@ Two release tracks share this file, newest entry first regardless of track:
   hook had not judged the call (the decisions log has no hook-fired line for it, and the same payload is allowed
   when run again), and the hook relay reported its death by a signal as `exit 1` with an empty reason. The relay
   now tells the outcomes apart. The gate hook's own allow (0) and deny (2) are answered as before. A gate hook
-  ended by a signal before it answered judged nothing, so the call is judged once more within the call's one
-  60 s budget. Every other outcome is refused fail closed by the relay itself: a second signal, another exit
-  code, a gate hook that could not start or ran past the budget, an unknown token, or a payload that is not a tool
-  call. The answer names the reason (the signal included), the daemon's log gets a line, and the unit's decisions
+  ended by a signal before it answered is run once more, but only when it demonstrably left no verdict: the
+  unit's decisions log did not change while it ran (a deny it recorded before it was killed is never turned into
+  an allow by a second run). One 60 s deadline per call covers every run's payload write, wait and output
+  collection, so a hook that never reads its payload, or a descendant that holds its pipes, cannot stretch it.
+  Every other outcome is refused fail closed by the relay itself: a kill that may have left a decision, a second
+  kill, another exit code, a gate hook that could not start or did not answer by the deadline, an unknown token,
+  a payload that is not a tool call, or a hook request whose headers are oversized, too many or unreadable (now
+  attributed to the unit its token names). The answer names the reason (the signal included), the daemon's log gets a line, and the unit's decisions
   log records it as an infra deny, which the fold replays as a `governanceHookFired` deny and which denies the
-  unit. A unit test runs the run's own payload against gate hooks that die once, die every time, exit 1 and
-  deny; a live test (`WICKED_CONTAINER_LIVE=1`) drives a real claude container seat through the gateway with a
+  unit. Unit tests run the run's own payload against gate hooks that die once, die every time, record a deny and
+  then die, exit 1, deny, never read a payload larger than the pipe, or exit while a child holds their output,
+  and send a live unit's token with 101 headers; a live test (`WICKED_CONTAINER_LIVE=1`) drives a real claude container seat through the gateway with a
   long `cargo test`-like loop, a call whose gate hook is killed once, and one whose gate hook keeps dying.
 
 - **A container seat's cargo builds within the seat's memory limit.** A seat runs with a fixed memory limit

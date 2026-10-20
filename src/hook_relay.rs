@@ -26,8 +26,11 @@
 //! answer and in the daemon's log, and is recorded in the unit's decisions log as an infra deny,
 //! which the fold replays as a `governanceHookFired` deny and which denies the unit (core#997:
 //! a refusal used to read only "the gate hook failed (exit 1)", with nothing logged or recorded).
-//! A gate hook ended by a signal before it answered judged nothing, so the relay judges the call
-//! once more within the same budget; a second such ending is refused. A token is minted per unit,
+//! A gate hook ended by a signal before it answered is run once more, but only when it
+//! demonstrably left no verdict (the unit's decisions log did not change while it ran); one that
+//! may have recorded a decision, or a second such ending, is refused. One deadline per call covers
+//! every run's payload write, wait and output collection ([`judge`]). A hook request whose headers
+//! fail is refused and recorded against the unit its token names. A token is minted per unit,
 //! known only to that seat and the relay, and revoked when the unit ends.
 
 use std::collections::HashMap;
@@ -349,19 +352,37 @@ fn serve(conn: TcpStream) {
     let Some(line) = bounded_line(&mut reader, &mut budget) else {
         return respond(conn, "431 Request Header Fields Too Large", "{}");
     };
+    // The route, and the unit a hook token names, come from the request line alone, so a hook
+    // request whose headers fail is a refusal like any other: answered with its reason, logged,
+    // and recorded in that unit's decisions log.
+    let route = route(&line);
+    let ctx = match &route {
+        Some(Route::Hook(t)) => unit(t),
+        _ => None,
+    };
+    let refuse = |conn, why: &str, tool: &str| {
+        respond(conn, "200 OK", &refusal(ctx.as_ref(), tool, why));
+    };
+    let bad_headers = |conn, why: &str| match &route {
+        Some(Route::Hook(_)) => refuse(conn, why, UNKNOWN_TOOL),
+        _ => respond(conn, "431 Request Header Fields Too Large", "{}"),
+    };
     let mut length: Option<usize> = None;
     let mut chunked = false;
     let mut headers = 0;
     loop {
         let Some(h) = bounded_line(&mut reader, &mut budget) else {
-            return respond(conn, "431 Request Header Fields Too Large", "{}");
+            return bad_headers(
+                conn,
+                "the hook request's headers are oversized or unreadable",
+            );
         };
         if h == "\r\n" || h.is_empty() {
             break;
         }
         headers += 1;
         if headers > MAX_HEADERS {
-            return respond(conn, "431 Request Header Fields Too Large", "{}");
+            return bad_headers(conn, "the hook request has too many headers");
         }
         if let Some((k, v)) = h.split_once(':') {
             let k = k.trim();
@@ -372,17 +393,11 @@ fn serve(conn: TcpStream) {
             }
         }
     }
-    let token = match route(&line) {
+    match route {
         Some(Route::Ping) => return respond(conn, "200 OK", "{\"pong\":true}"),
-        Some(Route::Hook(t)) => t,
+        Some(Route::Hook(_)) => {}
         None => return respond(conn, "404 Not Found", "{}"),
-    };
-    // A payload error is judged against the unit the token names (when it names one), so its
-    // refusal is recorded in that unit's decisions log too.
-    let ctx = relay().and_then(|r| r.units.lock().ok().and_then(|m| m.get(&token).cloned()));
-    let refuse = |conn, why: &str, tool: &str| {
-        respond(conn, "200 OK", &refusal(ctx.as_ref(), tool, why));
-    };
+    }
     let body = if chunked {
         match read_chunked(&mut reader) {
             Some(b) => b,
@@ -413,41 +428,79 @@ fn serve(conn: TcpStream) {
     let Some(ctx) = ctx.as_ref() else {
         return refuse(conn, "unknown or revoked hook token", &tool);
     };
-    let start = Instant::now();
-    let answered = match run_gate_hook(ctx, &body, HOOK_TIMEOUT) {
-        // The judge was ended from outside before it answered (core#997's run: killed on a loaded
-        // host, no verdict, nothing recorded): it judged nothing, so the call is judged once more,
-        // within what is left of the call's one budget. A second such ending is refused like any
-        // other failure.
+    respond(conn, "200 OK", &judge(ctx, &tool, &body, HOOK_TIMEOUT))
+}
+
+/// The live unit `token` names, if any.
+fn unit(token: &str) -> Option<HookContext> {
+    relay().and_then(|r| r.units.lock().ok().and_then(|m| m.get(token).cloned()))
+}
+
+/// Judge one `tool` call of `ctx`'s unit with the host gate hook, within ONE `budget` that covers
+/// every run's payload write, wait and output collection: the answer for claude.
+///
+/// The gate hook's own allow (0) and deny (2) are answered as they are. A gate hook ended by a
+/// signal before it answered (core#997's run) is run once more within what is left of the budget,
+/// but only when it demonstrably left no verdict: the unit's decisions log is exactly as long as
+/// before it ran. A run that wrote anything there may have recorded a decision for the call (a
+/// deny it recorded before it was killed must not become an allow), and a unit whose log the relay
+/// cannot read cannot show that; both are refused. Everything else is refused ([`refusal`]).
+fn judge(ctx: &HookContext, tool: &str, body: &[u8], budget: Duration) -> String {
+    let deadline = Instant::now() + budget;
+    let log = env_of(ctx, crate::gate_hook::DECISIONS_PATH_ENV).map(std::path::PathBuf::from);
+    let log_len = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let before = log.as_deref().map(log_len);
+    let mut note = "";
+    let answered = match run_gate_hook(ctx, body, deadline) {
         HookRun::Killed { signal, stderr } => {
-            let left = HOOK_TIMEOUT.saturating_sub(start.elapsed());
+            let untouched = before.is_some() && log.as_deref().map(log_len) == before;
+            let time_left = Instant::now() < deadline;
             eprintln!(
-                "wicked-core: the gate hook was killed by {} before it judged a {tool} call; {}",
+                "wicked-core: the gate hook was killed by {} before it answered a {tool} call; {}",
                 signal_name(signal),
-                if left.is_zero() {
-                    "no time is left to judge it again"
-                } else {
-                    "judging it again"
+                match (untouched, time_left) {
+                    (true, true) => "judging it again",
+                    (true, false) => "no time is left to judge it again",
+                    (false, _) => "it may have recorded a decision, so it is not judged again",
                 }
             );
-            if left.is_zero() {
-                HookRun::Killed { signal, stderr }
-            } else {
-                run_gate_hook(ctx, &body, left)
+            match (untouched, time_left) {
+                (true, true) => {
+                    note = " (a first run was killed before it answered too)";
+                    run_gate_hook(ctx, body, deadline)
+                }
+                (true, false) => {
+                    note = "; no time was left to judge it again";
+                    HookRun::Killed { signal, stderr }
+                }
+                (false, _) => {
+                    note = "; it may have recorded a decision for the call, so it is not judged \
+                            again";
+                    HookRun::Killed { signal, stderr }
+                }
             }
         }
         other => other,
     };
-    let reply = match answered {
+    match answered {
         // Allowed (0) or denied (2) by the gate hook, which recorded its own decision.
         HookRun::Exited {
             code: code @ (0 | 2),
             stdout,
             stderr,
         } => answer(Some(code), &stdout, &stderr),
-        failed => refusal(Some(ctx), &tool, &failed.why()),
-    };
-    respond(conn, "200 OK", &reply)
+        failed => refusal(Some(ctx), tool, &format!("{}{note}", failed.why(budget))),
+    }
+}
+
+/// The value `ctx` gives `key` (non-empty), as its hook would have inherited it.
+fn env_of(ctx: &HookContext, key: &str) -> Option<String> {
+    ctx.env
+        .iter()
+        .find(|(n, _)| n.as_os_str() == key)
+        .and_then(|(_, v)| v.as_ref())
+        .map(|v| v.to_string_lossy().into_owned())
+        .filter(|v| !v.is_empty())
 }
 
 /// The tool name a refusal is recorded under when the payload names none.
@@ -463,14 +516,7 @@ fn refusal(ctx: Option<&HookContext>, tool: &str, why: &str) -> String {
         format!("the gate hook relay refused the call: {why}; the call is denied (fail closed)");
     eprintln!("wicked-core: {reason} (tool: {tool})");
     if let Some(ctx) = ctx {
-        let var = |k: &str| {
-            ctx.env
-                .iter()
-                .find(|(n, _)| n.as_os_str() == k)
-                .and_then(|(_, v)| v.as_ref())
-                .map(|v| v.to_string_lossy().into_owned())
-                .filter(|v| !v.is_empty())
-        };
+        let var = |k: &str| env_of(ctx, k);
         match (
             var(crate::gate_hook::DECISIONS_PATH_ENV),
             var(crate::gate_hook::GATE_SCOPE_ENV),
@@ -503,13 +549,13 @@ enum HookRun {
     Killed { signal: i32, stderr: Vec<u8> },
     /// It could not be started, or its status could not be read (what failed).
     Lost(String),
-    /// It ran past its limit (the call's [`HOOK_TIMEOUT`]) and was stopped.
+    /// It did not answer (exit and hand over its output) by the call's deadline; it was stopped.
     TimedOut,
 }
 
 impl HookRun {
     /// Why this run is no verdict (a refusal's reason).
-    fn why(&self) -> String {
+    fn why(&self, budget: Duration) -> String {
         let tail = |b: &[u8]| {
             let t = String::from_utf8_lossy(b).trim().to_string();
             if t.is_empty() {
@@ -523,15 +569,14 @@ impl HookRun {
                 format!("the gate hook failed (exit {code}): {}", tail(stderr))
             }
             HookRun::Killed { signal, stderr } => format!(
-                "the gate hook was killed by {} before it judged the call, and judging it again \
-                 gave no verdict either: {}",
+                "the gate hook was killed by {} before it answered: {}",
                 signal_name(*signal),
                 tail(stderr)
             ),
             HookRun::Lost(e) => format!("the gate hook {e}"),
             HookRun::TimedOut => format!(
-                "the gate hook did not finish within the call's {}s",
-                HOOK_TIMEOUT.as_secs()
+                "the gate hook did not answer within the call's {}s",
+                budget.as_secs_f32()
             ),
         }
     }
@@ -582,8 +627,12 @@ fn status_run(status: std::process::ExitStatus, stdout: Vec<u8>, stderr: Vec<u8>
     }
 }
 
-/// Run the host gate hook with the unit's env and `payload` on stdin, stopped past `limit`.
-fn run_gate_hook(ctx: &HookContext, payload: &[u8], limit: Duration) -> HookRun {
+/// Run the host gate hook with the unit's env and `payload` on stdin, ending it at `deadline`:
+/// the payload is written from its own thread (a hook that never reads a payload larger than the
+/// pipe cannot block the relay), and its output is collected only until the deadline (a
+/// descendant holding the pipes cannot either). A run whose output is not in by the deadline is
+/// [`HookRun::TimedOut`], whatever its exit.
+fn run_gate_hook(ctx: &HookContext, payload: &[u8], deadline: Instant) -> HookRun {
     let exe = crate::execute_wrapped::resolve_wicked_core_exe();
     let mut cmd = Command::new(&exe);
     cmd.hardened()
@@ -605,16 +654,22 @@ fn run_gate_hook(ctx: &HookContext, payload: &[u8], limit: Duration) -> HookRun 
         Err(e) => return HookRun::Lost(format!("could not be started: {e}")),
     };
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(payload);
+        let payload = payload.to_vec();
+        // Ends when the hook reads it all, exits, or is killed (the write then fails).
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&payload);
+        });
     }
     let drain = |p: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut b = Vec::new();
             if let Some(mut p) = p {
                 let _ = p.read_to_end(&mut b);
             }
-            b
-        })
+            let _ = tx.send(b);
+        });
+        rx
     };
     let out = drain(
         child
@@ -628,11 +683,10 @@ fn run_gate_hook(ctx: &HookContext, payload: &[u8], limit: Duration) -> HookRun 
             .take()
             .map(|p| Box::new(p) as Box<dyn Read + Send>),
     );
-    let start = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break Ok(s),
-            Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             other => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -640,14 +694,18 @@ fn run_gate_hook(ctx: &HookContext, payload: &[u8], limit: Duration) -> HookRun 
             }
         }
     };
-    let (out, err) = (
-        out.join().unwrap_or_default(),
-        err.join().unwrap_or_default(),
-    );
-    match status {
-        Ok(s) => status_run(s, out, err),
-        Err(None) => HookRun::TimedOut,
-        Err(Some(e)) => HookRun::Lost(format!("could not be waited for: {e}")),
+    let collect = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()
+    };
+    let status = match status {
+        Ok(s) => s,
+        Err(None) => return HookRun::TimedOut,
+        Err(Some(e)) => return HookRun::Lost(format!("could not be waited for: {e}")),
+    };
+    match (collect(out), collect(err)) {
+        (Some(out), Some(err)) => status_run(status, out, err),
+        _ => HookRun::TimedOut,
     }
 }
 
@@ -885,11 +943,19 @@ mod tests {
         let dir = dir.canonicalize().unwrap();
         let fake = dir.join("fake-wicked-core");
         // MODE: `kill-once` dies by SIGKILL on its first run (a marker), `kill` always, `exit1`
-        // exits 1 with no output, `deny` is a policy deny; every run is counted.
+        // exits 1 with no output, `deny` is a policy deny, `deny-then-kill` appends a deny claim
+        // to the unit's decisions log and dies on its first run (allows after), `stall` never
+        // reads its payload, `linger` exits 0 while a child holds its output; every run that
+        // reads its payload is counted.
         std::fs::write(
             &fake,
-            "#!/bin/sh\ncat > /dev/null\necho run >> \"$WICKED_TEST_DIR/runs-$WICKED_TEST_MODE\"\n\
+            "#!/bin/sh\n[ \"$WICKED_TEST_MODE\" = stall ] && exec sleep 8\n\
+             cat > /dev/null\necho run >> \"$WICKED_TEST_DIR/runs-$WICKED_TEST_MODE\"\n\
              case \"$WICKED_TEST_MODE\" in\n\
+             linger) sleep 8 & exit 0 ;;\n\
+             deny-then-kill) [ -e \"$WICKED_TEST_DIR/recorded\" ] || { : > \"$WICKED_TEST_DIR/recorded\"; \
+             printf '%s\\n' '{\"claim_id\":\"infra-deny:unit-5\",\"scope\":\"s\",\"phase\":\"unit-5\",\"policy_ids\":[\"engine:governance-infra\"],\"decision\":\"deny\",\"obligations\":[\"store\"],\"evaluated_context_ref\":\"sha256:infra\",\"criteria\":\"c\",\"evaluator_identity\":\"wicked-governance-infra\",\"evaluated_at\":1792454400}' \
+             >> \"$WICKED_DECISIONS_PATH\"; kill -9 $$; } ;;\n\
              kill-once) [ -e \"$WICKED_TEST_DIR/killed\" ] || { : > \"$WICKED_TEST_DIR/killed\"; kill -9 $$; } ;;\n\
              kill) kill -9 $$ ;;\n\
              exit1) exit 1 ;;\n\
@@ -1018,6 +1084,88 @@ mod tests {
         assert_eq!(decision(&d), "deny");
         assert_eq!(reason(&d), "denied by test policy");
         assert!(records(&log).is_empty(), "{:?}", records(&log));
+
+        // core#1055 security review P1: a gate hook that records a deny and is then killed is
+        // never run again (a second run could allow): the call is refused, and its deny stands.
+        let (t, _r5, log) = unit("deny-then-kill");
+        let d = post(&t, &payload);
+        assert_eq!(decision(&d), "deny", "{d}");
+        assert_eq!(
+            runs("deny-then-kill"),
+            1,
+            "not judged again once it wrote a decision"
+        );
+        assert!(reason(&d).contains("may have recorded a decision"), "{d}");
+        let rec = records(&log);
+        assert!(
+            rec.iter().all(|r| r.decision == "deny") && rec.len() == 2,
+            "its own deny and the relay's: {rec:?}"
+        );
+
+        // P2: one deadline per call, across the payload write, the wait and the output. A hook
+        // that never reads a payload larger than the pipe, and one that exits while a child still
+        // holds its output, are both refused within the budget.
+        let big = serde_json::json!({
+            "hook_event_name": "PreToolUse", "tool_name": "Write",
+            "tool_input": {"file_path": "/wt/big.txt", "content": "x".repeat(1 << 20)},
+        })
+        .to_string();
+        for mode in ["stall", "linger"] {
+            let (_t, _r, log) = unit(mode);
+            let ctx = HookContext {
+                env: vec![
+                    ("WICKED_TEST_MODE".into(), Some(mode.into())),
+                    ("WICKED_TEST_DIR".into(), Some(dir.clone().into_os_string())),
+                    (
+                        crate::gate_hook::DECISIONS_PATH_ENV.into(),
+                        Some(log.clone().into_os_string()),
+                    ),
+                    (
+                        crate::gate_hook::GATE_SCOPE_ENV.into(),
+                        Some("wicked-agent/run-997/shared".into()),
+                    ),
+                    (
+                        crate::gate_hook::GATE_PHASE_ENV.into(),
+                        Some("unit-5".into()),
+                    ),
+                ],
+                cwd: Some(dir.clone()),
+            };
+            let started = std::time::Instant::now();
+            let a: serde_json::Value = serde_json::from_str(&judge(
+                &ctx,
+                "Write",
+                big.as_bytes(),
+                Duration::from_secs(2),
+            ))
+            .unwrap();
+            let took = started.elapsed();
+            assert_eq!(decision(&a), "deny", "{mode}: {a}");
+            assert!(reason(&a).contains("did not answer within"), "{mode}: {a}");
+            assert!(took < Duration::from_secs(5), "{mode}: refused in {took:?}");
+            assert_eq!(records(&log).len(), 1, "{mode}: {:?}", records(&log));
+        }
+
+        // P2: a hook request on a live unit's token whose headers fail is a recorded refusal.
+        let (t, _r6, log) = unit("headers");
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut req = format!("POST /hook/{t} HTTP/1.1\r\n");
+        for i in 0..=MAX_HEADERS {
+            req.push_str(&format!("x-h{i}: v\r\n"));
+        }
+        req.push_str("content-length: 2\r\n\r\n{}");
+        s.write_all(req.as_bytes()).unwrap();
+        let mut resp = String::new();
+        let _ = s.read_to_string(&mut resp);
+        let h = records(&log);
+        assert_eq!(h.len(), 1, "{h:?} / {resp}");
+        assert_eq!(h[0].decision, "deny");
+        assert!(
+            h[0].obligations[0].contains("too many headers"),
+            "{:?}",
+            h[0].obligations
+        );
+        assert_eq!(runs("headers"), 0, "the gate hook never ran");
 
         // An unknown token has no unit to record in: refused with its reason.
         let d = post(&mint_token(), &payload);
