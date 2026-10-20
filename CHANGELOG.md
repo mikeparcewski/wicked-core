@@ -14,6 +14,40 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **agy (Google's Antigravity CLI) has a container seat: its image, its carrier and its stream-json, still
+  benched.** The seat image installs a CLI from npm or, for a CLI not published there, from its vendor's release
+  tarball: agy 1.4.2 (build 4835981233356800) from Google's archives, pinned per architecture with the sha256 the
+  Homebrew cask publishes for the release (their sha512 match Google's update manifest; Google signs nothing). The
+  build checks the sha256 before it unpacks anything, fetches over https only, and installs the one binary
+  root-owned and read-only at `/usr/local/bin/agy`, so agy skips its self-update. The pin (version, build and both
+  checksums) is in the image tag. Every seat image's tag changes with this release, because the seat Dockerfile
+  changed: each rebuilds once on first use. On the container floor an agy unit runs as
+  `agy --dangerously-skip-permissions --print-timeout <budget> --output-format stream-json -p=<prompt>`:
+  - The prompt is glued to its flag, after every engine flag. agy refuses `-p -- <prompt>` and any `-p` value
+    that starts with `--`, glued or not (exit 2), so a prompt that starts with `-` rides with one leading space.
+  - `--print-timeout` is nine tenths of the unit's deadline, so agy ends a long turn itself. A turn it cuts off
+    still exits 0 with a `SUCCESS` result; the carrier reads agy's stderr notice and settles the turn as not done.
+  - The permission flag mirrors codex's sandbox-off under the floor. Headless agy soft-denies every shell
+    command and exits 0. Inside the container the floor is the boundary: a fenced unit's tree is mounted
+    read-only, Landlock holds, and the only egress is the gateway. Never on the host floor.
+  - stdin is a pipe closed at once. On `/dev/null`, agy waits out its 60 s sign-in prompt whatever
+    `--print-timeout` says.
+  - agy's home is its configuration home, so the seat runs with the carrier's engine-owned seat home (a
+    writable mount) in place of the tmpfs `HOME`. Its conversations survive into the next unit's container, which
+    resumes them with `--conversation <id>`, read off the stream's `init`.
+  - Its Landlock policy alone also admits `/dev/ptmx` and `/dev/pts`: agy's shell tool runs each command on a
+    pseudo-terminal, and without them no command runs.
+  - The adapter reads the unit's text from the `result`'s `response`. Its usage is summed over the process's own
+    steps (fresh plus cache-read in; output with thinking), never the `result`'s total, which is cumulative over a
+    resumed conversation. Tools come from the tool steps, and files from their `TargetFile` and `AbsolutePath`. A
+    non-`SUCCESS` result puts its `error` in the text.
+  - Exit codes 1, 2 and 3 are named on the unit's record: no response, a usage error, an error after a partial
+    response.
+  agy stays `enabled_for_council = false` and `seat_eligible_for_work = false`, and an online agy seat is still
+  refused at arming: it has no gateway credential route until its API-key and sign-in paths land. One live test
+  (`WICKED_CONTAINER_LIVE=1`) builds the image and runs agy seats through the real floor against a fake Gemini API
+  (no account, a fake key). It covers the PTY grant, the stream, a resumed conversation from the seat home, a `--`
+  prompt and a cut-off turn.
 - **A container seat's cargo cache is pinned outside its tmpfs HOME, and proven live with this repository's
   lockfile.** A seat's `HOME` (`/home/seat`) is a 512 MB tmpfs, and `cargo fetch` of wicked-core's lockfile writes
   about 684 MB, so a cargo home there fails with `No space left on device (os error 28)`. The engine already

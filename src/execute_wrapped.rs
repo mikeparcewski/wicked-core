@@ -501,6 +501,150 @@ impl OutputAdapter for OpencodeJson {
     }
 }
 
+/// The `agy -p … --output-format stream-json` NDJSON adapter (Antigravity CLI 1.4.2). The stream is
+/// one `init` (the `conversation_id`), `step_update`s (`user_input`, `agent_response` with its
+/// `text_delta` fragments, `tool` with `tool_name`/`tool_info`, `checkpoint`, ...; each `ACTIVE`
+/// then `DONE`) and one terminal `result` (`status`, `response`, `error`, cumulative `usage`).
+/// * Text: the `result`'s `response` — agy's own final answer, what `--output-format text` prints —
+///   emitted when stdout closes (as [`CodexJsonl`] keeps codex's), so every verdict / refusal /
+///   floor reader sees the answer and nothing else; a stream cut off before its `result` falls back
+///   to the `agent_response` text it did stream. A `result` that is not `SUCCESS` puts its `error`
+///   in the text at once, so a refusal (auth, quota, a model error) reaches the classifiers.
+/// * Usage: summed over THIS process's `DONE` steps (`input_tokens` fresh, `cache_read_tokens`,
+///   `output_tokens` with thinking included). The `result`'s usage is cumulative over the whole
+///   conversation, so a resumed unit (`--conversation`) would re-count every earlier turn; it is
+///   used only when no step carried usage and the conversation has one turn.
+///   `input_tokens` is fresh + cache-read, as [`ClaudeStreamJson`] counts it; agy reports no cost.
+/// * Tools: each `DONE` tool step's `tool_name`; files: its `TargetFile` (writes) or `AbsolutePath`
+///   (reads) parameter.
+///
+/// A line that is not JSON passes through as one text delta (fail-safe, never a panic).
+#[derive(Default)]
+pub(crate) struct AgyStreamJson {
+    streamed: String,
+    response: Option<String>,
+    steps: Option<Usage>,
+}
+
+/// One agy `usage` object as the engine's [`Usage`].
+fn agy_usage(u: &serde_json::Value) -> Usage {
+    let field = |k: &str| u.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+    let cache_read = field("cache_read_tokens");
+    Usage {
+        input_tokens: field("input_tokens").saturating_add(cache_read),
+        output_tokens: field("output_tokens"),
+        cache_read_tokens: cache_read,
+        cache_creation_tokens: 0,
+        cost_usd: None,
+    }
+}
+
+impl OutputAdapter for AgyStreamJson {
+    fn on_line(&mut self, line: &str) -> AdapterOut {
+        if line.trim().is_empty() {
+            return AdapterOut::default();
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return AdapterOut {
+                text: vec![line.to_string()],
+                ..AdapterOut::default()
+            };
+        };
+        let mut out = AdapterOut::default();
+        match v.get("event").and_then(|e| e.as_str()) {
+            Some("step_update") => {
+                let Some(step) = v.get("step_update") else {
+                    return out;
+                };
+                let kind = step.get("step_type").and_then(|t| t.as_str());
+                let done = step.get("state").and_then(|t| t.as_str()) == Some("DONE");
+                if kind == Some("agent_response") {
+                    if let Some(t) = step.get("text_delta").and_then(|t| t.as_str()) {
+                        self.streamed.push_str(t);
+                    }
+                }
+                if done {
+                    if let Some(u) = step.get("usage") {
+                        let u = agy_usage(u);
+                        let total = match self.steps.take() {
+                            None => u,
+                            Some(t) => Usage {
+                                input_tokens: t.input_tokens.saturating_add(u.input_tokens),
+                                output_tokens: t.output_tokens.saturating_add(u.output_tokens),
+                                cache_read_tokens: t
+                                    .cache_read_tokens
+                                    .saturating_add(u.cache_read_tokens),
+                                cache_creation_tokens: 0,
+                                cost_usd: None,
+                            },
+                        };
+                        self.steps = Some(total.clone());
+                        out.usage = Some(total);
+                    }
+                    if kind == Some("tool") {
+                        let name = step
+                            .get("tool_name")
+                            .or_else(|| step.pointer("/tool_info/name"))
+                            .and_then(|n| n.as_str())
+                            .filter(|n| !n.is_empty());
+                        if let Some(name) = name {
+                            out.tools.push(name.to_string());
+                        }
+                        let params = step.pointer("/tool_info/parameters");
+                        for key in ["TargetFile", "AbsolutePath"] {
+                            if let Some(f) = params
+                                .and_then(|p| p.get(key))
+                                .and_then(|f| f.as_str())
+                                .filter(|f| !f.is_empty())
+                            {
+                                out.files.push(f.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Some("result") => {
+                let Some(r) = v.get("result") else {
+                    return out;
+                };
+                if let Some(t) = r.get("response").and_then(|t| t.as_str()) {
+                    self.response = Some(t.to_string());
+                }
+                if r.get("status").and_then(|s| s.as_str()) != Some("SUCCESS") {
+                    let status = r.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+                    let error = r.get("error").and_then(|e| e.as_str()).unwrap_or("");
+                    out.text
+                        .push(format!("agy: {status}: {error}").trim_end().to_string());
+                }
+                let one_turn = r.get("num_turns").and_then(|n| n.as_u64()).unwrap_or(0) <= 1;
+                if self.steps.is_none() && one_turn {
+                    if let Some(u) = r.get("usage") {
+                        let u = agy_usage(u);
+                        // An all-zero usage is no usage (a refused run), never a 0-token row.
+                        if u.input_tokens > 0 || u.output_tokens > 0 {
+                            out.usage = Some(u);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn finish(&mut self) -> AdapterOut {
+        let text = match self.response.take() {
+            Some(r) if !r.trim().is_empty() => Some(r),
+            // No `result` answer: what the turn streamed, if anything.
+            _ => Some(std::mem::take(&mut self.streamed)).filter(|t| !t.trim().is_empty()),
+        };
+        AdapterOut {
+            text: text.into_iter().collect(),
+            ..AdapterOut::default()
+        }
+    }
+}
+
 /// The message of an opencode `--format json` `error` event (`error.data.message`, else
 /// `error.message`, else `error.name`); `None` for any other line.
 pub(crate) fn opencode_error(line: &str) -> Option<String> {
@@ -538,6 +682,86 @@ pub(crate) fn inject_opencode_json_format(argv: &mut Vec<String>) -> bool {
     true
 }
 
+/// The `--print-timeout` an agy unit runs with: inside the engine's own deadline (nine tenths of
+/// it, at least one second), so agy ends the turn itself and reports it, before the engine has to
+/// kill the seat. agy's own default is unlimited.
+pub(crate) fn agy_print_timeout(timeout: Duration) -> String {
+    format!("{}s", (timeout.as_secs() * 9 / 10).max(1))
+}
+
+/// The `-p=<prompt>` an agy launch carries: a prompt that starts with `-` gets one leading space,
+/// the only spelling agy 1.4.2 takes for one (it refuses `-p=--…`, `--print=--…` and `-p -- …`).
+fn agy_prompt_flag(prompt: &str) -> String {
+    if prompt.starts_with('-') {
+        format!("-p= {prompt}")
+    } else {
+        format!("-p={prompt}")
+    }
+}
+
+/// (agy seat, container carrier) Put an `agy -p` launch in headless stream-json: the prompt glued
+/// to its flag (`-p=<prompt>`), then `--output-format stream-json` and `--print-timeout`
+/// ([`agy_print_timeout`]) right after the binary, unless the template chose either. Every flag
+/// goes BEFORE the prompt, so no prompt text can be read as one. agy refuses `-p -- <prompt>` and
+/// any `-p` value that starts with `--`, glued or not ("-p took … as its prompt", exit 2; measured
+/// on 1.4.2), so a prompt that starts with `-` rides with one leading space ([`agy_prompt_flag`]).
+/// Returns whether the launch streams JSON, which decides the [`AgyStreamJson`] adapter: a template
+/// with another `--output-format`, or with no `-p` prompt, keeps the passthrough.
+pub(crate) fn inject_agy_headless(argv: &mut Vec<String>, prompt: &str, timeout: Duration) -> bool {
+    if SeatCli::from_binary(argv.first().map(String::as_str).unwrap_or("")) != SeatCli::Agy {
+        return false;
+    }
+    // The prompt's slot: `-p <prompt>` / `--print <prompt>` / `--prompt <prompt>`, or already
+    // glued (`-p=<prompt>`). The prompt token is matched by value, never parsed as a flag.
+    let flagged = |f: &str| matches!(f, "-p" | "--print" | "--prompt");
+    let mut slot = None;
+    for i in 1..argv.len() {
+        if flagged(&argv[i]) && argv.get(i + 1).map(String::as_str) == Some(prompt) {
+            argv.splice(i..i + 2, [agy_prompt_flag(prompt)]);
+            slot = Some(i);
+            break;
+        }
+        if argv[i]
+            .split_once('=')
+            .is_some_and(|(f, v)| flagged(f) && v == prompt)
+        {
+            argv[i] = agy_prompt_flag(prompt);
+            slot = Some(i);
+            break;
+        }
+    }
+    let Some(slot) = slot else {
+        return false;
+    };
+    let flags: Vec<String> = argv[1..]
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i + 1 != slot)
+        .map(|(_, a)| a.clone())
+        .collect();
+    let named = |name: &str| {
+        flags
+            .iter()
+            .position(|a| a == name || a.starts_with(&format!("{name}=")))
+    };
+    let stream = match named("--output-format") {
+        Some(i) => {
+            let a = flags[i].as_str();
+            a == "--output-format=stream-json"
+                || (a == "--output-format"
+                    && flags.get(i + 1).map(String::as_str) == Some("stream-json"))
+        }
+        None => {
+            argv.splice(1..1, ["--output-format".into(), "stream-json".into()]);
+            true
+        }
+    };
+    if named("--print-timeout").is_none() {
+        argv.splice(1..1, ["--print-timeout".into(), agy_print_timeout(timeout)]);
+    }
+    stream
+}
+
 /// Whether a claude argv streams JSON (`--output-format stream-json`): a template may keep its
 /// own `--output-format text` (codex hl-r2), which has no `result` event to judge.
 fn claude_stream_mode(argv: &[String]) -> bool {
@@ -565,6 +789,14 @@ fn opencode_json_mode(binary: &str, argv: &[String]) -> bool {
 /// qualifies for claude/codex/pi; opencode carries `sessionID` on every part's envelope.
 pub(crate) fn headless_session_id(cli: SeatCli, line: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    // agy names its events `event`, and the conversation on its opening `init`.
+    if cli == SeatCli::Agy {
+        return (v.get("event").and_then(|e| e.as_str()) == Some("init"))
+            .then(|| v.get("conversation_id").and_then(|id| id.as_str()))
+            .flatten()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+    }
     let event = v.get("type").and_then(|t| t.as_str());
     let key = match cli {
         SeatCli::Claude
@@ -588,6 +820,9 @@ pub(crate) fn headless_session_id(cli: SeatCli, line: &str) -> Option<String> {
 /// ended without completion; `None` means the CLI has no known terminal event (opencode uses
 /// the process exit code). Invalid JSON and unrelated events never count as completion.
 pub(crate) fn headless_turn_completed(cli: SeatCli, lines: &[&str]) -> Option<bool> {
+    if cli == SeatCli::Agy {
+        return Some(lines.iter().any(|line| agy_turn_succeeded(line)));
+    }
     let terminal = match cli {
         SeatCli::Claude => "result",
         SeatCli::Codex => "turn.completed",
@@ -609,6 +844,13 @@ pub(crate) fn headless_turn_completed(cli: SeatCli, lines: &[&str]) -> Option<bo
 /// terminal event).
 pub(crate) fn headless_turn_event(cli: SeatCli, line: &str) -> Option<bool> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if cli == SeatCli::Agy {
+        return match v.get("event").and_then(|e| e.as_str())? {
+            "init" => Some(false),
+            "result" => Some(agy_turn_succeeded(line)),
+            _ => None,
+        };
+    }
     let t = v.get("type").and_then(|t| t.as_str())?;
     let start = match cli {
         SeatCli::Claude => {
@@ -624,6 +866,40 @@ pub(crate) fn headless_turn_event(cli: SeatCli, line: &str) -> Option<bool> {
     headless_turn_completed(cli, &[line])
         .filter(|&done| done)
         .or_else(|| (cli == SeatCli::Pi && t == "agent_end").then_some(false))
+}
+
+/// Whether `line` is agy's terminal `result` of a turn that ended `SUCCESS`. Any other status
+/// (`ERROR`, `CANCELED`, `INTERRUPTED`, `INVALID`, `WAITING`, `RUNNING`) is a turn that did not
+/// complete. A `SUCCESS` cut off by `--print-timeout` is told apart by agy's stderr notice
+/// ([`agy_print_timed_out`]), which the stream does not carry.
+fn agy_turn_succeeded(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .is_some_and(|v| {
+            v.get("event").and_then(|e| e.as_str()) == Some("result")
+                && v.pointer("/result/status").and_then(|s| s.as_str()) == Some("SUCCESS")
+        })
+}
+
+/// Whether agy's stderr says its `--print-timeout` cut the turn off. agy then still exits 0 with a
+/// `SUCCESS` result carrying whatever partial output it had (measured on 1.4.2: `[agy] print
+/// timeout after 5s with turn in progress; returning partial output`), which is not a done turn.
+pub(crate) fn agy_print_timed_out(stderr: &str) -> bool {
+    stderr.contains("print timeout after") && stderr.contains("turn in progress")
+}
+
+/// What an agy exit code means (Antigravity CLI headless mode, 1.4.2): 0 a response (judged by its
+/// `result`), 1 no response (authentication, model selection, a refused run), 2 agy refused its
+/// own input (an argument or a stream message it does not take), 3 a model or agent error ended
+/// the turn after a partial response (agy prints an `AGY_ERROR:` line). `None` for 0 and any code
+/// agy does not document.
+pub(crate) fn agy_exit_meaning(code: i32) -> Option<&'static str> {
+    match code {
+        1 => Some("agy produced no response (authentication, model selection or a refused run)"),
+        2 => Some("agy refused its own command line or input (a usage error)"),
+        3 => Some("a model or agent error ended the agy turn after a partial response"),
+        _ => None,
+    }
 }
 
 /// pi's `agent_end` also closes a failed turn (codex hl-r1): it counts as done only when no
@@ -2551,6 +2827,14 @@ impl WrappedCliStepRunner {
         if container && seat_cli == wicked_apps_core::spawn::SeatCli::Opencode {
             inject_opencode_json_format(&mut argv);
         }
+        // agy's headless stream-json, like opencode's JSON mode, is the container carrier's only.
+        let agy_json = container
+            && seat_cli == wicked_apps_core::spawn::SeatCli::Agy
+            && inject_agy_headless(
+                &mut argv,
+                &prompt,
+                crate::workflow::effective_timeout(self.timeout, input.unit.budget_secs),
+            );
         // Run in the worktree if the run targets a repo; else a per-run temp sandbox (never the
         // orchestrator's own cwd).
         let cwd = input.workdir.clone().unwrap_or_else(|| sandbox_for(input));
@@ -2904,6 +3188,8 @@ impl WrappedCliStepRunner {
                 Box::<PiJson>::default()
             } else if container && opencode_json_mode(&binary, &argv) {
                 Box::<OpencodeJson>::default()
+            } else if agy_json {
+                Box::<AgyStreamJson>::default()
             } else {
                 Box::new(Passthrough)
             };
@@ -2913,7 +3199,8 @@ impl WrappedCliStepRunner {
             let structured = (is_claude && claude_stream_mode(&argv))
                 || codex_json
                 || pi_json
-                || (container && opencode_json_mode(&binary, &argv));
+                || (container && opencode_json_mode(&binary, &argv))
+                || agy_json;
             // Boundary 1 is deliberately layered below the existing Claude gate-hook, ACP
             // admission, and wrapped deny fence. It is WRITE containment only — not a read jail
             // or exfiltration/DLP protection; worker model egress remains open.
@@ -3133,6 +3420,7 @@ impl WrappedCliStepRunner {
                         // Each CLI's own sandbox off inside ours (codex's cannot run in a
                         // container: it needs user namespaces).
                         crate::worker_sandbox::codex_sandbox_off_under_floor(&mut argv);
+                        crate::worker_sandbox::agy_permissions_under_floor(&mut argv);
                         if let Some(port) = opencode_port {
                             if let Some(pinned) =
                                 crate::worker_sandbox::opencode_pinned_server_argv(&argv, port)
@@ -3722,7 +4010,14 @@ impl WrappedCliStepRunner {
             }
             let mut bounded = bounded;
             if let Some((turn, engine_id, seen)) = headless {
-                let seen = seen.lock().map(|g| g.clone()).unwrap_or_default();
+                let mut seen = seen.lock().map(|g| g.clone()).unwrap_or_default();
+                // agy's own --print-timeout cut the turn off: its stream still says SUCCESS, its
+                // stderr says otherwise. Not a done turn, so its conversation is not resumed.
+                let agy_cut_off = seat_cli == wicked_apps_core::spawn::SeatCli::Agy
+                    && matches!(&bounded, Ok((_, _, err, ..)) if agy_print_timed_out(err));
+                if agy_cut_off {
+                    seen.completed = Some(false);
+                }
                 let next = match &bounded {
                     Ok((0, ..)) => {
                         crate::headless::session_after_turn(seat_cli, engine_id.as_deref(), &seen)
@@ -3732,7 +4027,11 @@ impl WrappedCliStepRunner {
                 if let Some(turn) = turn {
                     self.sessions.finish(turn, next);
                 }
-                if let Ok((code, out, ..)) = &mut bounded {
+                if let Ok((code, out, err, ..)) = &mut bounded {
+                    // The cut-off turn's own reason first; the generic one then sees a failed exit.
+                    if agy_cut_off {
+                        crate::headless::settle_agy_print_timeout(err, code, out);
+                    }
                     crate::headless::settle_cut_off_turn(&seen, code, out, &cli_key);
                 }
             }
@@ -3824,9 +4123,15 @@ impl WrappedCliStepRunner {
                         (false, _) => out,
                         _ => err,
                     };
+                    // agy documents what its exit codes mean: the record says it.
+                    let meaning = (seat_cli == wicked_apps_core::spawn::SeatCli::Agy)
+                        .then(|| agy_exit_meaning(code))
+                        .flatten()
+                        .map(|m| format!("{m}: "))
+                        .unwrap_or_default();
                     (
                         StepStatus::Failed,
-                        format!("(cli `{cli_key}` exited {code}) {detail}"),
+                        format!("(cli `{cli_key}` exited {code}) {meaning}{detail}"),
                         None,
                         Vec::new(),
                         tools,
@@ -6182,7 +6487,7 @@ pub(crate) fn wrapped_exit_code(output: &str) -> Option<i32> {
     code.trim().parse().ok()
 }
 
-fn run_bounded(
+pub(crate) fn run_bounded(
     cmd: Command,
     timeout: Duration,
     emit: &DeltaSink,
@@ -6214,9 +6519,15 @@ fn run_bounded(
     let mut cmd = crate::container_floor::finalize(cmd);
     let seat_container = crate::container_floor::seat_container(&cmd);
     let _reap = crate::container_floor::ReapOnDrop(seat_container.clone());
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    // agy: a pipe, closed below at once (EOF), never `/dev/null` (see the predicate).
+    let piped_stdin = crate::container_floor::stdin_must_be_a_pipe(&cmd);
+    cmd.stdin(if piped_stdin {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -6228,6 +6539,7 @@ fn run_bounded(
         cmd.process_group(0);
     }
     let mut child = cmd.spawn()?;
+    drop(child.stdin.take());
     let so = child.stdout.take().expect("piped stdout");
     let se = child.stderr.take().expect("piped stderr");
     let child_ref = &mut child;
@@ -6923,6 +7235,11 @@ pub(crate) fn build_argv(invocation: &str, prompt: &str, skills: &[String]) -> V
     }
     argv
 }
+
+/// The agy seat's headless carrier (argv, adapter, conversation, turn, exit codes).
+#[cfg(test)]
+#[path = "execute_wrapped_agy_tests.rs"]
+mod agy_tests;
 
 #[cfg(test)]
 mod tests {

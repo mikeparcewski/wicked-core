@@ -114,21 +114,113 @@ const CANARY_FILE: &str = "/wicked-canary/probe";
 /// launcher refuses a policy that grants it).
 pub(crate) const CANARY_PORT: u16 = 47913;
 
-/// The one seat Dockerfile; each CLI is its published package ([`SEAT_PACKAGES`]).
+/// The one seat Dockerfile; each CLI is its published package or its vendor tarball
+/// ([`SEAT_PACKAGES`]).
 const SEAT_DOCKERFILE: &str = include_str!("../containers/seats/seat.Dockerfile");
 /// The floor image: static busybox, static landrun and the launcher, never run as a container.
 const FLOOR_DOCKERFILE: &str = include_str!("../containers/floor.Dockerfile");
 
-/// The CLIs the engine ships a seat image for (the registry's seat keys), each with the npm
-/// package at the version the engine is verified against.
-const SEAT_PACKAGES: &[(&str, &str)] = &[
+/// How a seat image installs its CLI, at the version the engine is verified against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeatPackage {
+    /// The CLI's published npm package (`<name>@<x.y.z>`).
+    Npm(&'static str),
+    /// A CLI not published to npm: its vendor's release tarball, pinned per architecture.
+    Tarball(&'static SeatTarball),
+}
+
+/// One vendor release of a tarball-installed CLI. The vendor signs nothing, so the pinned sha256
+/// IS the trust: the image build refuses any other bytes before unpacking them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeatTarball {
+    /// The CLI's own version (`agy --version`).
+    pub(crate) version: &'static str,
+    /// The vendor's build id, part of the release path.
+    pub(crate) build: &'static str,
+    /// The one file the image installs from the archive (as `/usr/local/bin/<cli>`).
+    pub(crate) member: &'static str,
+    /// `(url, sha256)` of the linux x86-64 archive.
+    pub(crate) amd64: (&'static str, &'static str),
+    /// `(url, sha256)` of the linux arm64 archive.
+    pub(crate) arm64: (&'static str, &'static str),
+}
+
+/// Google's Antigravity CLI 1.4.2 (build 4835981233356800): the archives Google publishes for the
+/// release (`storage.googleapis.com/antigravity-public/antigravity-cli/<ver>-<build>/…`), whose
+/// sha256 are the Homebrew cask's for the same release and whose sha512 match Google's own update
+/// manifest (`…/manifests/linux_{amd64,arm64}.json`). Each archive holds one static-ish Go binary,
+/// `antigravity` (glibc >= 2.26).
+const AGY_TARBALL: SeatTarball = SeatTarball {
+    version: "1.4.2",
+    build: "4835981233356800",
+    member: "antigravity",
+    amd64: (
+        "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.4.2-4835981233356800/linux-x64/cli_linux_x64.tar.gz",
+        "6395837ac0e193dd3fe50f1228e1c4aea345ca99636d54404ab7e74397d4091c",
+    ),
+    arm64: (
+        "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.4.2-4835981233356800/linux-arm/cli_linux_arm64.tar.gz",
+        "08dd4a2ca52d531fef1dfae4ec2fbafcd56342bfa694c8193a60da2b26fb1898",
+    ),
+};
+
+impl SeatPackage {
+    /// The CLI version the image pins.
+    pub(crate) fn version(&self) -> Option<&'static str> {
+        match self {
+            SeatPackage::Npm(p) => p.rsplit_once('@').map(|(_, v)| v),
+            SeatPackage::Tarball(t) => Some(t.version),
+        }
+    }
+
+    /// Everything that identifies the installed bytes: part of the image tag and its label, so a
+    /// new version, build or checksum is a new image, never a stale one.
+    pub(crate) fn pin(&self) -> String {
+        match self {
+            SeatPackage::Npm(p) => (*p).to_string(),
+            SeatPackage::Tarball(t) => format!(
+                "{}-{} {} amd64:{} arm64:{}",
+                t.version, t.build, t.member, t.amd64.1, t.arm64.1
+            ),
+        }
+    }
+
+    /// The seat Dockerfile's build arguments that install this CLI.
+    fn build_args(&self) -> Vec<String> {
+        let mut out = vec![format!("CLI_PIN={}", self.pin())];
+        match self {
+            SeatPackage::Npm(p) => out.push(format!("CLI_PACKAGE={p}")),
+            SeatPackage::Tarball(t) => out.extend([
+                format!("CLI_TARBALL_MEMBER={}", t.member),
+                format!("CLI_TARBALL_URL_AMD64={}", t.amd64.0),
+                format!("CLI_TARBALL_SHA256_AMD64={}", t.amd64.1),
+                format!("CLI_TARBALL_URL_ARM64={}", t.arm64.0),
+                format!("CLI_TARBALL_SHA256_ARM64={}", t.arm64.1),
+            ]),
+        }
+        out
+    }
+}
+
+/// The CLIs the engine ships a seat image for (the registry's seat keys), each with the package
+/// at the version the engine is verified against.
+const SEAT_PACKAGES: &[(&str, SeatPackage)] = &[
     // 2.1.295+: a hook honours `onFailure: "block"` (the gate hook fails closed; core#988 probed
     // the command hook's exit 1 and timeout on 2.1.296).
-    ("claude", "@anthropic-ai/claude-code@2.1.296"),
-    ("codex", "@openai/codex@0.162.1"),
-    ("pi", "@earendil-works/pi-coding-agent@1.1.0"),
-    ("opencode", "@opencode/cli@2.0.25"),
-    ("copilot", "@github/copilot@1.0.96"),
+    (
+        "claude",
+        SeatPackage::Npm("@anthropic-ai/claude-code@2.1.296"),
+    ),
+    ("codex", SeatPackage::Npm("@openai/codex@0.162.1")),
+    (
+        "pi",
+        SeatPackage::Npm("@earendil-works/pi-coding-agent@1.1.0"),
+    ),
+    ("opencode", SeatPackage::Npm("@opencode/cli@2.0.25")),
+    ("copilot", SeatPackage::Npm("@github/copilot@1.0.96")),
+    // Not on npm. Benched until its timed ballot (the registry's enabled flags); an online agy
+    // seat has no gateway credential route yet ([`gateway_route_defined`]), so none runs online.
+    ("agy", SeatPackage::Tarball(&AGY_TARBALL)),
 ];
 
 /// The seat floor a PRODUCT process (the `wicked-core` CLI; crew's daemon does the same) runs
@@ -357,8 +449,8 @@ pub(crate) fn runtime() -> Result<Runtime, FloorUnarmed> {
     Err(FloorUnarmed::ContainerRuntimeDown)
 }
 
-/// The npm package of `cli`'s seat image, when the engine ships one.
-pub(crate) fn seat_package(cli: &str) -> Option<&'static str> {
+/// The package of `cli`'s seat image, when the engine ships one.
+pub(crate) fn seat_package(cli: &str) -> Option<SeatPackage> {
     SEAT_PACKAGES
         .iter()
         .find(|(k, _)| *k == cli)
@@ -399,7 +491,7 @@ pub(crate) fn seat_image_tag(cli: &str, base: &str) -> Option<String> {
     let package = seat_package(cli)?;
     Some(format!(
         "wicked-seat-{cli}:{}",
-        content_tag(&[SEAT_DOCKERFILE, package, base])
+        content_tag(&[SEAT_DOCKERFILE, &package.pin(), base])
     ))
 }
 
@@ -445,16 +537,9 @@ pub(crate) fn build_seat_image(rt: &Runtime, cli: &str) -> Result<String, String
         seat_package(cli).ok_or_else(|| format!("no seat image is defined for `{cli}`"))?;
     let base = base_image();
     let tag = seat_image_tag(cli, &base).expect("package exists");
-    build_image(
-        rt,
-        SEAT_DOCKERFILE,
-        &tag,
-        &[
-            format!("BASE={base}"),
-            format!("CLI={cli}"),
-            format!("CLI_PACKAGE={package}"),
-        ],
-    )
+    let mut args = vec![format!("BASE={base}"), format!("CLI={cli}")];
+    args.extend(package.build_args());
+    build_image(rt, SEAT_DOCKERFILE, &tag, &args)
 }
 
 /// The floor image ([`FLOOR_DOCKERFILE`]), built on first use (one build at a time).
@@ -1021,7 +1106,7 @@ pub(crate) fn run_argv(l: &ContainerLaunch<'_>) -> Vec<String> {
         "--workdir".into(),
         l.workdir.to_string_lossy().into_owned(),
         "--env".into(),
-        "HOME=/home/seat".into(),
+        SEAT_HOME_ENV.into(),
         "--env".into(),
         "TMPDIR=/tmp".into(),
         "--env".into(),
@@ -1165,6 +1250,26 @@ const HOST_ONLY_ENV: &[&str] = &[
     "DYLD_INSERT_LIBRARIES",
 ];
 
+/// Whether `cmd` runs agy — on the host, or as the CLI of a seat container [`run_argv`] rendered
+/// — and so must get its stdin as a pipe the engine closes at once, never `/dev/null`: headless
+/// agy with `/dev/null` on stdin waits out its 60 s sign-in prompt whatever `--print-timeout`
+/// says, while on a pipe it fails fast ("authentication required", exit 1) or runs (measured on
+/// 1.4.2). A seat container's runtime client passes its own stdin through (`--interactive`).
+pub(crate) fn stdin_must_be_a_pipe(cmd: &Command) -> bool {
+    let is_agy = |b: &str| home_is_config_home(b);
+    if is_agy(&cmd.get_program().to_string_lossy()) {
+        return true;
+    }
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    image_index(&args)
+        .and_then(|img| landrun_end(&args, img))
+        .and_then(|end| args.get(end + 5))
+        .is_some_and(|cli| is_agy(cli))
+}
+
 /// Make a seat `cmd` (one [`run_argv`] rendered, then given its env by the carrier) complete:
 /// every variable the carrier set explicitly is passed in by NAME to both the runtime and
 /// landrun (`--env KEY`: each reads its own environment, so no value is on a command line). It adds
@@ -1221,10 +1326,17 @@ pub(crate) fn finalize(cmd: Command) -> Command {
         extra.push("--env".into());
         extra.push(format!("PATH={}", container_path(p, &existing)));
     }
+    // A CLI whose configuration home IS its home (agy) runs with the carrier's seat home.
+    let mut head = args[..img].to_vec();
+    if let Some(home) = carrier_home(&args, img, land_end, &envs, &existing) {
+        if let Some(h) = head.iter_mut().find(|a| *a == SEAT_HOME_ENV) {
+            *h = format!("HOME={home}");
+        }
+    }
     // The seat command was hardened where the carrier built it; re-harden the rebuilt one too.
     let mut out = Command::new(cmd.get_program());
     out.hardened();
-    out.args(&args[..img]);
+    out.args(&head);
     out.args(&extra);
     out.args(&args[img..land_end]);
     out.args(&land_extra);
@@ -1236,6 +1348,13 @@ pub(crate) fn finalize(cmd: Command) -> Command {
         out.current_dir(dir);
     }
     for (k, v) in envs {
+        // A carrier's `HOME` names the seat's home inside the container (rendered on the wrapper
+        // above, never passed by name); the runtime client keeps the daemon's own, where its
+        // configuration and context live (with the seat's, Rancher Desktop's client lost its
+        // socket: "failed to connect to the docker API at unix:///var/run/docker.sock").
+        if k == "HOME" {
+            continue;
+        }
         match v {
             Some(v) => {
                 out.env(k, canonical_spelling(&v, &existing));
@@ -1246,6 +1365,85 @@ pub(crate) fn finalize(cmd: Command) -> Command {
         }
     }
     out
+}
+
+/// The seat's default home: a tmpfs ([`run_argv`]).
+const SEAT_HOME_ENV: &str = "HOME=/home/seat";
+
+/// Whether `cli`'s configuration home IS its process home: agy publishes no configuration-home
+/// variable (its `~/.gemini` and `~/.config/antigravity` are its whole state, conversations
+/// included), so its seat home is its `HOME`. Every other CLI keeps the tmpfs home and names its
+/// configuration home with its own variable.
+fn home_is_config_home(cli: &str) -> bool {
+    wicked_apps_core::spawn::SeatCli::from_binary(cli) == wicked_apps_core::spawn::SeatCli::Agy
+}
+
+/// The `HOME` a seat of a CLI whose home is its configuration home ([`home_is_config_home`]) runs
+/// with: the one the carrier set (the engine-owned seat home of the run and posture, at its
+/// mounted spelling), only when the deepest mount over it is a WRITABLE bind. `None` keeps the
+/// tmpfs home: another CLI, no carrier home, or a home the container does not mount writable (it
+/// would not exist, a mask or read-only bind covers it, or agy could not write its state there).
+fn carrier_home(
+    args: &[String],
+    img: usize,
+    land_end: usize,
+    envs: &[(String, Option<std::ffi::OsString>)],
+    mounts: &[PathBuf],
+) -> Option<String> {
+    let cli = args.get(land_end + 5)?;
+    if !home_is_config_home(cli) {
+        return None;
+    }
+    let home = envs
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "HOME")
+        .and_then(|(_, v)| v.as_ref())?;
+    let home = PathBuf::from(canonical_spelling(home, mounts));
+    // The deepest mount over the home decides (a deeper read-only bind or a mask wins).
+    let deepest = args[..img]
+        .windows(2)
+        .filter(|w| w[0] == "--mount")
+        .filter_map(|w| {
+            let dst = w[1].split(',').find_map(|kv| kv.strip_prefix("dst="))?;
+            home.starts_with(dst)
+                .then(|| (Path::new(dst).components().count(), w[1].as_str()))
+        })
+        .max_by_key(|(depth, _)| *depth);
+    let writable =
+        deepest.is_some_and(|(_, m)| m.starts_with("type=bind,") && !m.ends_with(",readonly"));
+    (home.is_absolute() && writable && mountable(&home))
+        .then(|| home.to_string_lossy().into_owned())
+}
+
+/// The devices a seat's CLI must open read-write beyond `/dev/null`: agy's shell tool runs every
+/// command on a pseudo-terminal, so it needs `/dev/ptmx` and `/dev/pts` (without them every
+/// command fails "failed to create PTY: open /dev/ptmx: permission denied", agy spike). Every
+/// other CLI gets none: the grant is agy's alone.
+fn seat_devices(cli: &str) -> &'static [&'static str] {
+    match wicked_apps_core::spawn::SeatCli::from_binary(cli) {
+        wicked_apps_core::spawn::SeatCli::Agy => &["/dev/ptmx", "/dev/pts"],
+        _ => &[],
+    }
+}
+
+/// Add `cli`'s [`seat_devices`] to the Landlock policy of a wrapper [`run_argv`] rendered, among
+/// landrun's own options (before its `--`). `Err` when `wrapper` is not one of ours.
+pub(crate) fn grant_seat_devices(wrapper: &mut Vec<String>, cli: &str) -> Result<(), String> {
+    let devices = seat_devices(cli);
+    if devices.is_empty() {
+        return Ok(());
+    }
+    let args = wrapper.get(1..).unwrap_or_default();
+    let end = image_index(args)
+        .and_then(|img| landrun_end(args, img))
+        .ok_or("the seat wrapper is not the engine's; no device grant")?;
+    // `end` indexes `args` (the wrapper minus the runtime): landrun's `--` sits at `end + 1`.
+    let at = end + 1;
+    for d in devices.iter().rev() {
+        wrapper.splice(at..at, ["--rw".to_string(), (*d).to_string()]);
+    }
+    Ok(())
 }
 
 /// `v` (a path or a path list) with each absolute entry whose canonical form is mounted
@@ -1529,6 +1727,10 @@ fn config_home_env(cli: &str) -> Option<&'static str> {
         "pi" => Some("PI_CODING_AGENT_DIR"),
         "opencode" => Some("XDG_CONFIG_HOME"),
         "copilot" => Some("COPILOT_HOME"),
+        // agy publishes no configuration-home variable: its home IS its configuration home
+        // (`~/.gemini`, `~/.config/antigravity`), so the carrier's `HOME` names the seat home
+        // ([`carrier_home`] carries it into the container).
+        "agy" => Some("HOME"),
         _ => None,
     }
 }
@@ -2153,6 +2355,10 @@ pub(crate) fn arm(
                 ),
             )
         })?;
+    // An online seat whose agent has no gateway credential route cannot run: refused before any
+    // image is built (an agy judge fallback must not cost a seat image build to be refused).
+    gateway_route_defined(cli, gateway_dir.is_some() && !offline_seats())
+        .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
     // The worktree's git pointer and metadata are seat-writable: verify them against the git dir
     // the engine pinned from the registered repository before anything resolves (or creates)
     // the git dirs they name.
@@ -2321,7 +2527,7 @@ pub(crate) fn arm(
     } else {
         format!("container:{}", netns_name(&name))
     };
-    let wrapper = run_argv(&ContainerLaunch {
+    let mut wrapper = run_argv(&ContainerLaunch {
         runtime: &rt.cli,
         image: &image,
         name: &name,
@@ -2334,6 +2540,7 @@ pub(crate) fn arm(
         gateway_ports: GATEWAY_PORTS,
         own_ports: &own_ports,
     });
+    grant_seat_devices(&mut wrapper, cli).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     Ok(ArmedContainer {
         wrapper,
         argv: with_seat_args(image_argv(&argv, cli), seat_args),
@@ -2890,6 +3097,11 @@ mod windows_tests {
         ));
     }
 }
+
+// The agy seat's carrier: its tarball image, its devices, its home, its stdin, its live run.
+#[cfg(all(test, unix))]
+#[path = "container_floor_agy_tests.rs"]
+mod agy_tests;
 
 // The container floor runs on Unix hosts only (native Windows is refused: `windows_tests`); its
 // tests use Unix paths, links and tools throughout.
@@ -3472,11 +3684,15 @@ mod tests {
             "under a root the seat's landrun policy admits read-only"
         );
         let mut tags = Vec::new();
-        for cli in ["claude", "codex", "pi", "opencode", "copilot"] {
+        for cli in ["claude", "codex", "pi", "opencode", "copilot", "agy"] {
             let pkg = seat_package(cli).unwrap_or_else(|| panic!("{cli} has a package"));
-            assert!(pkg
-                .rsplit_once('@')
-                .is_some_and(|(n, v)| !n.is_empty() && !v.is_empty()));
+            match pkg {
+                SeatPackage::Npm(p) => assert!(p
+                    .rsplit_once('@')
+                    .is_some_and(|(n, v)| !n.is_empty() && !v.is_empty())),
+                SeatPackage::Tarball(_) => assert_eq!(cli, "agy", "only agy is not on npm"),
+            }
+            assert!(pkg.version().is_some_and(|v| !v.is_empty()), "{cli}");
             let a = seat_image_tag(cli, DEFAULT_BASE).unwrap();
             assert_eq!(a, seat_image_tag(cli, DEFAULT_BASE).unwrap());
             assert!(a.starts_with(&format!("wicked-seat-{cli}:")), "{a}");
@@ -3487,9 +3703,10 @@ mod tests {
             );
             tags.push(a.split_once(':').unwrap().1.to_string());
         }
+        tags.sort();
         tags.dedup();
-        assert_eq!(tags.len(), 5, "the package is in the tag");
-        assert!(seat_package("agy").is_none());
+        assert_eq!(tags.len(), 6, "the package is in the tag");
+        assert!(seat_package("gemini").is_none());
     }
 
     /// The floor image is static and never runs as a container: the trusted launcher, a static

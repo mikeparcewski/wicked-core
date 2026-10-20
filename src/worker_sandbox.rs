@@ -867,6 +867,26 @@ fn program_stem(argv: &[String]) -> Option<&str> {
         .and_then(|s| s.to_str())
 }
 
+/// agy's own permission prompts OFF, because the floor is on (`--dangerously-skip-permissions`,
+/// right after the binary, unless the argv already carries it). Headless agy auto-allows reads and
+/// writes inside its workspace but SOFT-DENIES every action whose default is Ask — a shell command
+/// first of all — and exits 0 as if done (agy 1.4.2 headless docs; reproduced against the fake
+/// API: `denied_actions: [command]`), so without the grant an agy unit could never run its tests.
+/// Inside a seat container the boundary is the floor itself, as for codex below: a fenced unit's
+/// tree is mounted read-only, writes land only where the container mounts writable, Landlock holds
+/// inside, and the only egress is the gateway. Only for a launch the floor wraps (never the host
+/// floor, never the host council dispatcher); `false` (nothing changed) when `argv` is not agy.
+pub(crate) fn agy_permissions_under_floor(argv: &mut Vec<String>) -> bool {
+    const GRANT: &str = "--dangerously-skip-permissions";
+    if program_stem(argv) != Some("agy") {
+        return false;
+    }
+    if !argv.iter().any(|a| a == GRANT) {
+        argv.insert(1, GRANT.to_string());
+    }
+    true
+}
+
 /// codex's own sandbox OFF, because ours is on: every `--sandbox <mode>` / `-s <mode>` /
 /// `--sandbox=<mode>` becomes `danger-full-access`, `--full-auto` (which implies
 /// `workspace-write`) and any `-c sandbox_mode=…` are dropped, and the mode is added when the
