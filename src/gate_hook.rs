@@ -5426,6 +5426,18 @@ pub(crate) fn append_infra_deny(
     tool: &str,
     reason: &str,
 ) {
+    let _ = append_infra_deny_checked(decisions_path, scope, phase, tool, reason);
+}
+
+/// [`append_infra_deny`] that reports a failed write, for a recorder that must make the unit fail
+/// another way when its deny cannot be recorded (the hook relay, [`crate::hook_relay`]).
+pub(crate) fn append_infra_deny_checked(
+    decisions_path: &str,
+    scope: &str,
+    phase: &str,
+    tool: &str,
+    reason: &str,
+) -> std::io::Result<()> {
     let claim = ConformanceClaim {
         // Keyed on `phase` only — NOT the scope, which embeds `/` (`wicked-agent/<sess>/unit/<id>`) and
         // would make an unsafe/unbounded claim symbol (Copilot). One infra-deny node per phase is enough
@@ -5441,7 +5453,7 @@ pub(crate) fn append_infra_deny(
         evaluator_identity: "wicked-governance-infra".to_string(),
         evaluated_at: crate::clock::eval_now(),
     };
-    append_annotated_claim(decisions_path, phase, tool, &claim);
+    append_annotated_claim_checked(decisions_path, phase, tool, &claim)
 }
 
 /// Record a BOUNDARY refusal — a tool call that reached outside the unit's worktree.

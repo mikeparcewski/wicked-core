@@ -4044,7 +4044,9 @@ impl WrappedCliStepRunner {
                     crate::hook_relay::register(t, crate::hook_relay::HookContext { env, cwd })
                 });
             let bounded = run_bounded(cmd, timeout, emit, adapter, Some(cancel_token.clone()));
-            drop(hook_registration);
+            // Revoking waits for the unit's calls still being judged, so its decisions log is
+            // complete here; a refusal the relay could not record in it fails the unit (below).
+            let unrecorded_refusal = hook_registration.is_some_and(|r| r.finish());
             self.unregister_token(input, &cancel_token);
             // The seat ran (and `run_bounded` reaped it); release the arm-time guards now.
             drop(seat_cleanup.take());
@@ -4064,6 +4066,7 @@ impl WrappedCliStepRunner {
                 );
             }
             let mut bounded = bounded;
+            fail_closed_on_unrecorded_refusal(&mut bounded, unrecorded_refusal);
             // The process's own exit code, before any settle below rewrites it.
             let raw_exit = bounded.as_ref().ok().map(|r| r.0);
             // agy's own --print-timeout cut the turn off (it exits 0, its stream says SUCCESS,
@@ -6508,6 +6511,25 @@ pub(crate) fn retain_tools_capped(tools: &mut Vec<String>, names: Vec<String>) {
 /// The outcome of a bounded run: `(exit_code, stdout, stderr, usage, files, tools)`.
 pub(crate) type BoundedRun = (i32, String, String, Option<Usage>, Vec<String>, Vec<String>);
 
+/// A unit for which the gate-hook relay refused a call it could not record in the unit's
+/// decisions log ([`crate::hook_relay::HookRegistration::finish`]) does not pass, whatever its log
+/// shows: a successful exit becomes a failure, and the reason is added to its output and logged.
+fn fail_closed_on_unrecorded_refusal(bounded: &mut std::io::Result<BoundedRun>, unrecorded: bool) {
+    if !unrecorded {
+        return;
+    }
+    let why = "wicked-core: the gate hook relay refused a call it could not record in this \
+               unit's decisions log; the unit fails closed";
+    eprintln!("{why}");
+    if let Ok(run) = bounded {
+        if run.0 == 0 {
+            run.0 = 1;
+        }
+        run.1.push('\n');
+        run.1.push_str(why);
+    }
+}
+
 /// Run `cmd` bounded by `timeout`, draining stdout+stderr CONCURRENTLY (no pipe-buffer deadlock). Each
 /// raw stdout line is routed through `adapter`, whose READABLE text deltas are streamed through `emit`
 /// (live output) exactly as raw lines were before (for passthrough) while its structured signals (usage,
@@ -7892,6 +7914,28 @@ mod tests {
                  path are no longer merely defensive"
             );
         }
+    }
+
+    /// core#1055: a unit whose gate-hook relay refused a call it could not record in the unit's
+    /// decisions log does not pass: a successful exit becomes a failure with the reason; a failed
+    /// one stays failed; a unit with nothing unrecorded is untouched.
+    #[test]
+    fn an_unrecorded_relay_refusal_fails_the_unit() {
+        let run = |code: i32| -> std::io::Result<BoundedRun> {
+            Ok((code, "out".into(), String::new(), None, vec![], vec![]))
+        };
+        let mut ok = run(0);
+        fail_closed_on_unrecorded_refusal(&mut ok, true);
+        let (code, out, ..) = ok.unwrap();
+        assert_eq!(code, 1);
+        assert!(out.contains("could not record"), "{out}");
+        let mut failed = run(3);
+        fail_closed_on_unrecorded_refusal(&mut failed, true);
+        assert_eq!(failed.unwrap().0, 3);
+        let mut clean = run(0);
+        fail_closed_on_unrecorded_refusal(&mut clean, false);
+        let (code, out, ..) = clean.unwrap();
+        assert_eq!((code, out.as_str()), (0, "out"));
     }
 
     /// crew#277 — a flipped cancel token kills the child promptly instead of letting it run to

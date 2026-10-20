@@ -31,7 +31,10 @@
 //! may have recorded a decision, or a second such ending, is refused. One deadline per call covers
 //! every run's payload write, wait and output collection ([`judge`]). A hook request whose headers
 //! fail is refused and recorded against the unit its token names. A token is minted per unit,
-//! known only to that seat and the relay, and revoked when the unit ends.
+//! known only to that seat and the relay, and revoked when the unit ends; revocation waits for the
+//! unit's calls still being judged, a gate-hook run starts and an allow is committed only while the
+//! unit is live and before the call's deadline (both decided under the unit's lifecycle lock), and
+//! a refusal that cannot be recorded in the unit's decisions log fails the unit at its end.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -39,7 +42,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use wicked_apps_core::HardenedCommand;
@@ -53,7 +56,7 @@ const MAX_BODY: usize = 8 * 1024 * 1024;
 
 struct Relay {
     port: u16,
-    units: Mutex<HashMap<String, HookContext>>,
+    units: Mutex<HashMap<String, Registered>>,
 }
 
 static RELAY: OnceLock<Option<Relay>> = OnceLock::new();
@@ -145,13 +148,26 @@ pub(crate) struct HookContext {
 }
 
 /// A live registration: dropping it revokes the token, on every exit path (an early refusal, a
-/// panic while the seat runs), so a token never outlives its unit.
+/// panic while the seat runs), so a token never outlives its unit. Revoking waits for the unit's
+/// calls still being judged ([`Call`], each bounded by its deadline), so no gate-hook run of the
+/// unit is in flight, or appends to its decisions log, once revocation returns.
 #[derive(Debug)]
 pub(crate) struct HookRegistration(String);
 
+impl HookRegistration {
+    /// Revoke the token now (the unit ended), and whether a refusal the relay made for the unit
+    /// could not be recorded in its decisions log: a unit with one must not pass, whatever its
+    /// log shows.
+    pub(crate) fn finish(mut self) -> bool {
+        revoke(&std::mem::take(&mut self.0))
+    }
+}
+
 impl Drop for HookRegistration {
     fn drop(&mut self) {
-        revoke(&self.0);
+        if !self.0.is_empty() {
+            revoke(&self.0);
+        }
     }
 }
 
@@ -159,16 +175,102 @@ impl Drop for HookRegistration {
 pub(crate) fn register(token: &str, ctx: HookContext) -> Option<HookRegistration> {
     let r = relay()?;
     let mut m = r.units.lock().ok()?;
-    m.insert(token.to_string(), ctx);
+    m.insert(
+        token.to_string(),
+        Registered {
+            ctx,
+            life: Arc::new(Life::default()),
+        },
+    );
     Some(HookRegistration(token.to_string()))
 }
 
-/// Revoke `token` (the unit ended).
-pub(crate) fn revoke(token: &str) {
-    if let Some(r) = relay() {
-        if let Ok(mut m) = r.units.lock() {
-            m.remove(token);
+/// Revoke `token` (the unit ended): no new call of it is judged, and this waits (bounded) for the
+/// calls already being judged. Returns whether a refusal for the unit went unrecorded.
+pub(crate) fn revoke(token: &str) -> bool {
+    let reg = relay().and_then(|r| r.units.lock().ok().and_then(|mut m| m.remove(token)));
+    reg.is_some_and(|reg| reg.life.revoke_and_wait())
+}
+
+/// One registered unit: its hook context and its lifecycle.
+#[derive(Clone)]
+struct Registered {
+    ctx: HookContext,
+    life: Arc<Life>,
+}
+
+/// A registered unit's lifecycle, shared by its calls and its revocation.
+#[derive(Default)]
+struct Life {
+    state: Mutex<LifeState>,
+    idle: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct LifeState {
+    revoked: bool,
+    /// Calls of the unit being judged now.
+    calls: usize,
+    /// A relay refusal for the unit could not be recorded in its decisions log.
+    unrecorded: bool,
+}
+
+impl Life {
+    /// Start judging one call of a live unit; `None` once it is revoked.
+    fn enter(self: &Arc<Self>) -> Option<Call> {
+        let mut s = self.state.lock().ok()?;
+        if s.revoked {
+            return None;
         }
+        s.calls += 1;
+        Some(Call(self.clone()))
+    }
+
+    fn revoke_and_wait(&self) -> bool {
+        let Ok(mut s) = self.state.lock() else {
+            return true;
+        };
+        s.revoked = true;
+        // Every call ends by its deadline; the margin covers its refusal's record.
+        let until = Instant::now() + HOOK_TIMEOUT + Duration::from_secs(10);
+        while s.calls > 0 {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            s = match self.idle.wait_timeout(s, left) {
+                Ok((s, _)) => s,
+                Err(_) => return true,
+            };
+        }
+        s.unrecorded
+    }
+
+    fn mark_unrecorded(&self) {
+        if let Ok(mut s) = self.state.lock() {
+            s.unrecorded = true;
+        }
+    }
+}
+
+/// One call being judged: it holds off its unit's revocation until it is answered.
+struct Call(Arc<Life>);
+
+impl Call {
+    /// `f`'s answer while the unit is still live, decided under its lifecycle lock (so the unit is
+    /// not revoked between the check and the decision); `None` once it is revoked.
+    fn while_live<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
+        let s = self.0.state.lock().ok()?;
+        (!s.revoked).then(f)
+    }
+}
+
+impl Drop for Call {
+    fn drop(&mut self) {
+        if let Ok(mut s) = self.0.state.lock() {
+            s.calls = s.calls.saturating_sub(1);
+        }
+        self.0.idle.notify_all();
     }
 }
 
@@ -428,19 +530,21 @@ fn serve(conn: TcpStream) {
     let Some(tool) = tool_call(&body) else {
         return refuse(conn, "the hook payload is not a tool call", UNKNOWN_TOOL);
     };
-    let Some(ctx) = token.as_deref().and_then(unit) else {
+    // The call holds off its unit's revocation until it is answered (`Call`).
+    let live = token.as_deref().and_then(unit);
+    let Some((reg, call)) = live.and_then(|reg| reg.life.enter().map(|call| (reg, call))) else {
         return refuse(conn, "unknown or revoked hook token", &tool);
     };
-    let token = token.as_deref().unwrap_or_default();
     respond(
         conn,
         "200 OK",
-        &judge(&ctx, token, &tool, &body, HOOK_TIMEOUT),
-    )
+        &judge(&reg, &call, &tool, &body, HOOK_TIMEOUT),
+    );
+    drop(call);
 }
 
 /// The live unit `token` names, if any.
-fn unit(token: &str) -> Option<HookContext> {
+fn unit(token: &str) -> Option<Registered> {
     relay().and_then(|r| r.units.lock().ok().and_then(|m| m.get(token).cloned()))
 }
 
@@ -454,13 +558,11 @@ fn unit(token: &str) -> Option<HookContext> {
 /// deny it recorded before it was killed must not become an allow), and a unit whose log the relay
 /// cannot read cannot show that; both are refused. Everything else is refused ([`refusal`]).
 /// A unit whose token was revoked while its call was judged gets neither a second run nor an
-/// allow.
-fn judge(ctx: &HookContext, token: &str, tool: &str, body: &[u8], budget: Duration) -> String {
+/// allow, and an allow is committed only before the deadline, checked after every step that can
+/// block (the run's spawn and the commit both under the unit's lifecycle lock).
+fn judge(reg: &Registered, call: &Call, tool: &str, body: &[u8], budget: Duration) -> String {
+    let ctx = &reg.ctx;
     let deadline = Instant::now() + budget;
-    // The unit is still live: its token is still registered. Checked before a second run and
-    // before an allow is answered, so a unit that ended while its call was judged gets no verdict
-    // from a run it no longer owns.
-    let live = || unit(token).is_some();
     let ended = |tool: &str| {
         refusal(
             None,
@@ -472,26 +574,25 @@ fn judge(ctx: &HookContext, token: &str, tool: &str, body: &[u8], budget: Durati
     let log_len = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
     let before = log.as_deref().map(log_len);
     let mut note = "";
-    let answered = match run_gate_hook(ctx, body, deadline) {
+    let answered = match run_gate_hook(ctx, call, body, deadline) {
         HookRun::Killed { signal, stderr } => {
             let untouched = before.is_some() && log.as_deref().map(log_len) == before;
             let time_left = Instant::now() < deadline;
-            if !live() {
-                return ended(tool);
-            }
             eprintln!(
                 "wicked-core: the gate hook was killed by {} before it answered a {tool} call; {}",
                 signal_name(signal),
                 match (untouched, time_left) {
-                    (true, true) => "judging it again",
+                    (true, true) => "judging it again if its unit is still live",
                     (true, false) => "no time is left to judge it again",
                     (false, _) => "it may have recorded a decision, so it is not judged again",
                 }
             );
             match (untouched, time_left) {
+                // The second run starts only while the unit is live and before the deadline,
+                // both checked where it is spawned ([`run_gate_hook`]).
                 (true, true) => {
                     note = " (a first run was killed before it answered too)";
-                    run_gate_hook(ctx, body, deadline)
+                    run_gate_hook(ctx, call, body, deadline)
                 }
                 (true, false) => {
                     note = "; no time was left to judge it again";
@@ -507,25 +608,27 @@ fn judge(ctx: &HookContext, token: &str, tool: &str, body: &[u8], budget: Durati
         other => other,
     };
     match answered {
-        // Allowed (0) by the gate hook, for a unit that is still live.
+        // Allowed (0) by the gate hook: committed only while the unit is live and before the
+        // deadline, both checked under its lifecycle lock, after every step that can block.
         HookRun::Exited {
             code: 0,
             stdout,
             stderr,
-        } => {
-            if live() {
-                answer(Some(0), &stdout, &stderr)
-            } else {
-                ended(tool)
-            }
-        }
+        } => match call
+            .while_live(|| (Instant::now() < deadline).then(|| answer(Some(0), &stdout, &stderr)))
+        {
+            Some(Some(allow)) => allow,
+            Some(None) => refusal(Some(reg), tool, &HookRun::TimedOut.why(budget)),
+            None => ended(tool),
+        },
         // Denied (2) by the gate hook, which recorded its own decision: deny stays deny.
         HookRun::Exited {
             code: 2,
             stdout,
             stderr,
         } => answer(Some(2), &stdout, &stderr),
-        failed => refusal(Some(ctx), tool, &format!("{}{note}", failed.why(budget))),
+        HookRun::Ended => ended(tool),
+        failed => refusal(Some(reg), tool, &format!("{}{note}", failed.why(budget))),
     }
 }
 
@@ -544,27 +647,34 @@ const UNKNOWN_TOOL: &str = "(unknown)";
 
 /// A call the relay refuses itself (the gate hook gave no verdict, or the request is not one it
 /// can judge): the deny answer carries the reason, the daemon's log names it, and the unit's
-/// decisions log records it as an infra deny ([`crate::gate_hook::append_infra_deny`], replayed
-/// as a `governanceHookFired` deny), so a refusal is never silent. A request whose token names no
-/// live unit has no decisions log to record in; its refusal is logged only.
-fn refusal(ctx: Option<&HookContext>, tool: &str, why: &str) -> String {
+/// decisions log records it as an infra deny ([`crate::gate_hook::append_infra_deny_checked`],
+/// replayed as a `governanceHookFired` deny), so a refusal is never silent. When it cannot be
+/// recorded there (the log is unwritable, or the unit names none), the unit is marked so its end
+/// fails it ([`HookRegistration::finish`]): an unrecorded refusal never leaves a unit able to pass.
+/// A request whose token names no live unit has no decisions log; its refusal is logged only.
+fn refusal(reg: Option<&Registered>, tool: &str, why: &str) -> String {
     let reason =
         format!("the gate hook relay refused the call: {why}; the call is denied (fail closed)");
     eprintln!("wicked-core: {reason} (tool: {tool})");
-    if let Some(ctx) = ctx {
-        let var = |k: &str| env_of(ctx, k);
-        match (
+    if let Some(reg) = reg {
+        let var = |k: &str| env_of(&reg.ctx, k);
+        let recorded = match (
             var(crate::gate_hook::DECISIONS_PATH_ENV),
             var(crate::gate_hook::GATE_SCOPE_ENV),
             var(crate::gate_hook::GATE_PHASE_ENV),
         ) {
             (Some(log), Some(scope), Some(phase)) => {
-                crate::gate_hook::append_infra_deny(&log, &scope, &phase, tool, &reason)
+                crate::gate_hook::append_infra_deny_checked(&log, &scope, &phase, tool, &reason)
+                    .map_err(|e| e.to_string())
             }
-            _ => eprintln!(
-                "wicked-core: the refused call's unit names no decisions log; the refusal is \
-                 recorded here only"
-            ),
+            _ => Err("the unit names no decisions log".to_string()),
+        };
+        if let Err(e) = recorded {
+            eprintln!(
+                "wicked-core: the refusal could not be recorded in the unit's decisions log ({e}); \
+                 the unit will fail closed"
+            );
+            reg.life.mark_unrecorded();
         }
     }
     deny_answer(&reason)
@@ -585,6 +695,8 @@ enum HookRun {
     Killed { signal: i32, stderr: Vec<u8> },
     /// It could not be started, or its status could not be read (what failed).
     Lost(String),
+    /// It was not started: the unit ended (its token was revoked) first.
+    Ended,
     /// It did not answer (exit and hand over its output) by the call's deadline; it was stopped.
     TimedOut,
 }
@@ -610,6 +722,7 @@ impl HookRun {
                 tail(stderr)
             ),
             HookRun::Lost(e) => format!("the gate hook {e}"),
+            HookRun::Ended => "the gate hook was not run: the unit ended".to_string(),
             HookRun::TimedOut => format!(
                 "the gate hook did not answer within the call's {}s",
                 budget.as_secs_f32()
@@ -672,7 +785,7 @@ fn status_run(status: std::process::ExitStatus, stdout: Vec<u8>, stderr: Vec<u8>
 /// connection slot ([`InFlight`]) for as long as they live, so a hook whose descendants escape
 /// the group and keep the pipes open uses up the relay's slots (new calls are refused, fail
 /// closed) instead of growing the daemon's threads without bound.
-fn run_gate_hook(ctx: &HookContext, payload: &[u8], deadline: Instant) -> HookRun {
+fn run_gate_hook(ctx: &HookContext, call: &Call, payload: &[u8], deadline: Instant) -> HookRun {
     let exe = crate::execute_wrapped::resolve_wicked_core_exe();
     let mut cmd = Command::new(&exe);
     cmd.hardened()
@@ -695,9 +808,13 @@ fn run_gate_hook(ctx: &HookContext, payload: &[u8], deadline: Instant) -> HookRu
     if let Some(cwd) = &ctx.cwd {
         cmd.current_dir(cwd);
     }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return HookRun::Lost(format!("could not be started: {e}")),
+    // Started only while the unit is live and before the deadline, decided under its lifecycle
+    // lock: no run of a revoked unit ever starts.
+    let mut child = match call.while_live(|| (Instant::now() < deadline).then(|| cmd.spawn())) {
+        Some(Some(Ok(c))) => c,
+        Some(Some(Err(e))) => return HookRun::Lost(format!("could not be started: {e}")),
+        Some(None) => return HookRun::TimedOut,
+        None => return HookRun::Ended,
     };
     #[cfg(unix)]
     let group = child.id();
@@ -1051,7 +1168,7 @@ mod tests {
              >> \"$WICKED_DECISIONS_PATH\"; kill -9 $$; } ;;\n\
              kill-once) [ -e \"$WICKED_TEST_DIR/killed\" ] || { : > \"$WICKED_TEST_DIR/killed\"; kill -9 $$; } ;;\n\
              kill) kill -9 $$ ;;\n\
-             exit1) exit 1 ;;\n\
+             exit1|unwritable) exit 1 ;;\n\
              deny) echo 'denied by test policy' >&2; exit 2 ;;\n\
              esac\nexit 0\n",
         )
@@ -1213,25 +1330,8 @@ mod tests {
         };
         for mode in ["stall", "linger", "late"] {
             let (t, _r, log) = unit(mode);
-            let ctx = HookContext {
-                env: vec![
-                    ("WICKED_TEST_MODE".into(), Some(mode.into())),
-                    ("WICKED_TEST_DIR".into(), Some(dir.clone().into_os_string())),
-                    (
-                        crate::gate_hook::DECISIONS_PATH_ENV.into(),
-                        Some(log.clone().into_os_string()),
-                    ),
-                    (
-                        crate::gate_hook::GATE_SCOPE_ENV.into(),
-                        Some("wicked-agent/run-997/shared".into()),
-                    ),
-                    (
-                        crate::gate_hook::GATE_PHASE_ENV.into(),
-                        Some("unit-5".into()),
-                    ),
-                ],
-                cwd: Some(dir.clone()),
-            };
+            let reg = super::unit(&t).expect("registered");
+            let call = reg.life.enter().expect("live");
             let started = std::time::Instant::now();
             // `late` is a hook that allows at once, on a budget already spent: an answer after
             // the deadline is a timeout too, never an allow.
@@ -1241,18 +1341,46 @@ mod tests {
                 Duration::from_secs(2)
             };
             let a: serde_json::Value =
-                serde_json::from_str(&judge(&ctx, &t, "Write", big.as_bytes(), budget)).unwrap();
+                serde_json::from_str(&judge(&reg, &call, "Write", big.as_bytes(), budget)).unwrap();
             let took = started.elapsed();
             assert_eq!(decision(&a), "deny", "{mode}: {a}");
             assert!(reason(&a).contains("did not answer within"), "{mode}: {a}");
             assert!(took < Duration::from_secs(5), "{mode}: refused in {took:?}");
             assert_eq!(records(&log).len(), 1, "{mode}: {:?}", records(&log));
+            drop(call);
             // Nothing of the run outlives its refusal: its group (the lingering child included)
             // is killed, and its I/O threads end and give their slots back.
             assert!(
                 settles(&|| ACTIVE.load(Ordering::SeqCst) <= baseline),
                 "{mode}: relay I/O threads still running"
             );
+        }
+        // The unit's lifecycle lock held past the deadline (a contended registry): an allow
+        // the gate hook would give is not committed after the deadline.
+        {
+            let (t, _r, log) = unit("held");
+            let reg = super::unit(&t).expect("registered");
+            let call = reg.life.enter().expect("live");
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let life = reg.life.clone();
+            let holder = std::thread::spawn(move || {
+                let _held = life.state.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(1500));
+            });
+            locked_rx.recv().unwrap();
+            let a: serde_json::Value = serde_json::from_str(&judge(
+                &reg,
+                &call,
+                "Bash",
+                payload.as_bytes(),
+                Duration::from_secs(1),
+            ))
+            .unwrap();
+            holder.join().unwrap();
+            assert_eq!(decision(&a), "deny", "{a}");
+            assert!(reason(&a).contains("did not answer within"), "{a}");
+            assert_eq!(records(&log).len(), 1, "{:?}", records(&log));
         }
         let lingering = std::fs::read_to_string(dir.join("linger.pid")).unwrap();
         let alive = || {
@@ -1320,14 +1448,42 @@ mod tests {
             let h = sc.spawn(|| post(&t, &payload));
             let started = dir.join("started");
             assert!(settles(&|| started.exists()), "the gate hook started");
-            drop(r8);
+            // Revocation waits for the call being judged, so it ends from its own thread.
+            let revoking = sc.spawn(move || r8.finish());
+            assert!(
+                settles(&|| super::unit(&t).is_none()),
+                "the token is revoked at once"
+            );
             std::fs::write(dir.join("revoked"), "").unwrap();
-            h.join().unwrap()
+            let answered = h.join().unwrap();
+            assert!(!revoking.join().unwrap(), "nothing went unrecorded");
+            answered
         });
         assert_eq!(decision(&answered), "deny", "{answered}");
         assert!(reason(&answered).contains("unit ended"), "{answered}");
         assert_eq!(runs("revoke-during"), 1, "never judged again");
         assert!(records(&log).is_empty(), "{:?}", records(&log));
+
+        // A refusal that cannot be recorded (the unit's decisions log is unwritable) marks the
+        // unit, and its end reports it, so the unit fails closed (`execute_wrapped`); a unit
+        // whose refusals were recorded reports nothing.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let (t, r9, log) = unit("unwritable");
+            std::fs::write(&log, "").unwrap();
+            std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o444)).unwrap();
+            let d = post(&t, &payload);
+            assert_eq!(decision(&d), "deny", "{d}");
+            assert!(records(&log).is_empty());
+            assert!(
+                r9.finish(),
+                "the unrecorded refusal is reported at the unit's end"
+            );
+            std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let (t, r10, _log) = unit("exit1");
+            let _ = post(&t, &payload);
+            assert!(!r10.finish(), "a recorded refusal is not reported");
+        }
 
         // An unknown token has no unit to record in: refused with its reason.
         let d = post(&mint_token(), &payload);

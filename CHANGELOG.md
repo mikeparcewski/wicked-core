@@ -28,7 +28,10 @@ Two release tracks share this file, newest entry first regardless of track:
   the deadline (its exit is observed without reaping it, so the group id cannot be reused before the kill).
   Relay I/O threads still running count against the relay's connection limit. A hook token is resolved when it
   is used, so a call whose unit ended while its request was still arriving is refused, never judged, and a unit
-  that ends while its call is judged gets neither a second run nor an allow.
+  that ends while its call is judged gets neither a second run nor an allow: revoking a unit's token waits for its
+  calls being judged, and a run starts, and an allow is committed, only while the unit is live and before the
+  deadline, both decided under the unit's lifecycle lock. A refusal the relay cannot record in the unit's decisions
+  log (an unwritable log) fails the unit at its end instead of leaving it able to pass.
   Every other outcome is refused fail closed by the relay itself: a kill that may have left a decision, a second
   kill, another exit code, a gate hook that could not start or did not answer by the deadline, an unknown token,
   a payload that is not a tool call, or a hook request whose headers are oversized, too many or unreadable (now
