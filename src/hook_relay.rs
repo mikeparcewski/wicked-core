@@ -497,7 +497,9 @@ enum HookRun {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     },
-    /// It was ended by `signal` before it exited (no verdict).
+    /// It was ended by `signal` before it exited (no verdict). Unix only: elsewhere an exit
+    /// status always carries a code.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Killed { signal: i32, stderr: Vec<u8> },
     /// It could not be started, or its status could not be read (what failed).
     Lost(String),
