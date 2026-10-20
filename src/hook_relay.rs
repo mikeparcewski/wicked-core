@@ -510,23 +510,25 @@ fn spawn_or_fail_closed(conn: TcpStream, name: &str, f: impl FnOnce(TcpStream) +
 #[cfg(test)]
 static FAIL_SPAWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Mark every live unit to fail closed (an overflowed call that could not be attributed), each
-/// while holding a `Call` so a unit ending meanwhile waits for its mark.
+/// Mark every live unit to fail closed (a refused call that could not be attributed).
 fn fail_every_live_unit() {
-    let live: Vec<Registered> = relay()
-        .and_then(|r| r.units.lock().ok().map(|m| m.values().cloned().collect()))
-        .unwrap_or_default();
-    for reg in &live {
-        if let Some(call) = reg.life.enter() {
-            reg.life.mark_unrecorded();
-            drop(call);
-        }
-    }
-    if !live.is_empty() {
+    // Marked while the registry is locked: a unit's end removes it from the registry before it
+    // reads its mark ([`revoke`]), so every unit still registered here sees the mark, and none can
+    // end between being counted and being marked.
+    let marked = relay()
+        .and_then(|r| {
+            r.units.lock().ok().map(|m| {
+                for reg in m.values() {
+                    reg.life.mark_unrecorded();
+                }
+                m.len()
+            })
+        })
+        .unwrap_or(0);
+    if marked > 0 {
         relay_log!(
-            "wicked-core: the gate hook relay dropped a call it could not attribute (connection \
-             and overflow limits reached); every live unit ({}) will fail closed",
-            live.len()
+            "wicked-core: the gate hook relay refused a call it could not attribute; every live \
+             unit ({marked}) will fail closed"
         );
     }
 }
@@ -1935,6 +1937,16 @@ mod tests {
             let mut pong = String::new();
             ping.read_to_string(&mut pong).unwrap();
             assert!(pong.contains("pong"), "the relay still accepts: {pong}");
+        }
+
+        // Bulk marking reaches every unit still registered (done under the registry lock, which
+        // a unit's end takes to remove itself before it reads its mark; review round 18).
+        {
+            let (_ta, ra, _l) = unit("bulk-a");
+            let (_tb, rb, _l) = unit("bulk-b");
+            fail_every_live_unit();
+            assert!(ra.finish(), "A is marked");
+            assert!(rb.finish(), "B is marked");
         }
 
         // A refusal that cannot be recorded (the unit's decisions log is unwritable) marks the
