@@ -77,6 +77,7 @@ fn relay() -> Option<&'static Relay> {
                     for conn in listener.incoming().flatten() {
                         // Bounded: a flood of connections is closed, never a thread each.
                         let Some(slot) = Slot::take() else {
+                            overflow(conn);
                             continue;
                         };
                         std::thread::spawn(move || {
@@ -204,6 +205,8 @@ struct Registered {
 struct Life {
     state: Mutex<LifeState>,
     idle: std::sync::Condvar,
+    /// Held by the one judgement (or refusal record) of the unit in progress.
+    judging: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -251,6 +254,20 @@ impl Life {
             };
         }
         s.unrecorded || s.calls > 0
+    }
+
+    /// The unit's judging turn, waited for until `deadline`; `None` past it.
+    fn turn(&self, deadline: Instant) -> Option<std::sync::MutexGuard<'_, ()>> {
+        loop {
+            match self.judging.try_lock() {
+                Ok(g) => return Some(g),
+                Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+            }
+        }
     }
 
     fn mark_unrecorded(&self) {
@@ -399,6 +416,27 @@ impl Drop for Slot {
     }
 }
 
+/// A connection past [`MAX_CONNS`]: closed without serving it (no thread), but when its request
+/// line names a live unit's token, within a short read, that unit is marked to fail closed at its
+/// end: its call was refused (the seat's hook sees the close and denies) and the refusal is not in
+/// its decisions log.
+fn overflow(conn: TcpStream) {
+    let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
+    let mut reader = BufReader::new(conn);
+    let mut budget = 1024;
+    let token = bounded_line(&mut reader, &mut budget).and_then(|line| match route(&line) {
+        Some(Route::Hook(t)) => Some(t),
+        _ => None,
+    });
+    if let Some(reg) = token.as_deref().and_then(unit) {
+        eprintln!(
+            "wicked-core: the gate hook relay is at its connection limit; a call of a live unit \
+             was refused unrecorded, and the unit will fail closed"
+        );
+        reg.life.mark_unrecorded();
+    }
+}
+
 /// Read one CRLF line of at most `budget` bytes; `None` past the budget or on a read error.
 fn bounded_line(reader: &mut impl BufRead, budget: &mut usize) -> Option<String> {
     let mut line = Vec::new();
@@ -479,7 +517,16 @@ fn serve(conn: TcpStream) {
             .as_deref()
             .and_then(unit)
             .and_then(|reg| reg.life.enter().map(|call| (reg, call)));
-        let reply = refusal(live.as_ref().map(|(reg, _)| reg), tool, why);
+        let reply = match &live {
+            Some((reg, _)) => match reg.life.turn(Instant::now() + HOOK_TIMEOUT) {
+                Some(_turn) => refusal(Some(reg), tool, why),
+                None => {
+                    reg.life.mark_unrecorded();
+                    refusal(None, tool, why)
+                }
+            },
+            None => refusal(None, tool, why),
+        };
         drop(live);
         respond(conn, "200 OK", &reply);
     };
@@ -578,6 +625,16 @@ fn unit(token: &str) -> Option<Registered> {
 fn judge(reg: &Registered, call: &Call, tool: &str, body: &[u8], budget: Duration) -> String {
     let ctx = &reg.ctx;
     let deadline = Instant::now() + budget;
+    // One judgement of the unit at a time, so what its decisions log gains while this one runs is
+    // this call's alone (the checks below read it); waiting for the turn counts against the call.
+    let Some(_turn) = reg.life.turn(deadline) else {
+        reg.life.mark_unrecorded();
+        return refusal(
+            None,
+            tool,
+            "the unit's earlier calls were still being judged at the call's deadline",
+        );
+    };
     // Recorded under the unit (this call still holds off its end): a call refused because the
     // unit ended while it was judged is an unjudged call, and the unit's fold must deny it.
     let ended = |tool: &str| {
@@ -638,12 +695,26 @@ fn judge(reg: &Registered, call: &Call, tool: &str, body: &[u8], budget: Duratio
             Some(None) => refusal(Some(reg), tool, &HookRun::TimedOut.why(budget)),
             None => ended(tool),
         },
-        // Denied (2) by the gate hook, which recorded its own decision: deny stays deny.
+        // Denied (2) by the gate hook. Deny stays deny; when the gate hook recorded nothing (it
+        // denies when it cannot write its own record), the relay records the refusal itself, or
+        // marks the unit when it cannot either.
         HookRun::Exited {
             code: 2,
             stdout,
             stderr,
-        } => answer(Some(2), &stdout, &stderr),
+        } => {
+            let recorded = before.is_some() && log.as_deref().map(log_len) > before;
+            if recorded {
+                answer(Some(2), &stdout, &stderr)
+            } else {
+                let why = String::from_utf8_lossy(&stderr).trim().to_string();
+                refusal(
+                    Some(reg),
+                    tool,
+                    &format!("the gate hook denied the call but recorded nothing: {why}"),
+                )
+            }
+        }
         HookRun::Ended => ended(tool),
         failed => refusal(Some(reg), tool, &format!("{}{note}", failed.why(budget))),
     }
@@ -825,6 +896,12 @@ fn run_gate_hook(ctx: &HookContext, call: &Call, payload: &[u8], deadline: Insta
     if let Some(cwd) = &ctx.cwd {
         cmd.current_dir(cwd);
     }
+    if IO_ACTIVE.load(Ordering::SeqCst) + 3 > MAX_IO {
+        return HookRun::Lost(
+            "could not be started: earlier gate-hook runs still hold the relay's I/O threads"
+                .into(),
+        );
+    }
     // Started only while the unit is live and before the deadline, decided under its lifecycle
     // lock: no run of a revoked unit ever starts.
     let mut child = match call.while_live(|| (Instant::now() < deadline).then(|| cmd.spawn())) {
@@ -918,19 +995,26 @@ fn run_gate_hook(ctx: &HookContext, call: &Call, payload: &[u8], deadline: Insta
     }
 }
 
-/// One relay I/O thread still running, counted against [`MAX_CONNS`] like a connection.
+/// One relay I/O thread still running (a gate-hook run's stdin writer or output reader),
+/// counted apart from connections: a run is not started while [`MAX_IO`] are, so descendants that
+/// keep pipes open bound the threads instead of growing them, and never take connection slots.
 struct InFlight;
+
+/// The most relay I/O threads alive at once (three per gate-hook run).
+const MAX_IO: usize = 96;
+
+static IO_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 impl InFlight {
     fn new() -> Self {
-        ACTIVE.fetch_add(1, Ordering::SeqCst);
+        IO_ACTIVE.fetch_add(1, Ordering::SeqCst);
         InFlight
     }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        IO_ACTIVE.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1088,9 +1172,14 @@ mod tests {
         );
         let d = post(&deny);
         assert_eq!(d["hookSpecificOutput"]["permissionDecision"], "deny");
-        assert_eq!(
-            d["hookSpecificOutput"]["permissionDecisionReason"],
-            "denied by test policy"
+        // Its unit names no decisions log, so the relay cannot see the deny recorded and refuses
+        // the call itself, with the gate hook's reason.
+        assert!(
+            d["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("denied by test policy"),
+            "{d}"
         );
         // agy gw-r1 F-01: a payload that is not a tool call (empty, no length, not JSON) is
         // denied without running the hook; a chunked one is decoded and judged.
@@ -1187,7 +1276,9 @@ mod tests {
              kill-once) [ -e \"$WICKED_TEST_DIR/killed\" ] || { : > \"$WICKED_TEST_DIR/killed\"; kill -9 $$; } ;;\n\
              kill) kill -9 $$ ;;\n\
              exit1|unwritable) exit 1 ;;\n\
-             deny) echo 'denied by test policy' >&2; exit 2 ;;\n\
+             deny) printf '%s\\n' '{\"claim_id\":\"policy-deny:unit-5\",\"scope\":\"s\",\"phase\":\"unit-5\",\"policy_ids\":[\"test-policy\"],\"decision\":\"deny\",\"obligations\":[\"denied by test policy\"],\"evaluated_context_ref\":\"sha256:p\",\"criteria\":\"c\",\"evaluator_identity\":\"wicked-governance\",\"evaluated_at\":1792454400}' >> \"$WICKED_DECISIONS_PATH\"; \
+             echo 'denied by test policy' >&2; exit 2 ;;\n\
+             deny-unrecorded) echo 'DENY (could not write hook-fired sentinel)' >&2; exit 2 ;;\n\
              esac\nexit 0\n",
         )
         .unwrap();
@@ -1306,12 +1397,27 @@ mod tests {
         assert!(reason(&bad).contains("not a tool call"), "{bad}");
         assert_eq!(records(&log).len(), 2);
 
-        // A policy deny is the gate hook's own decision and record.
+        // A policy deny is the gate hook's own decision and record: no second one from the relay.
         let (t, _r4, log) = unit("deny");
         let d = post(&t, &payload);
         assert_eq!(decision(&d), "deny");
         assert_eq!(reason(&d), "denied by test policy");
-        assert!(records(&log).is_empty(), "{:?}", records(&log));
+        let rec = records(&log);
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert_eq!(rec[0].claim_id, "policy-deny:unit-5");
+        // A deny the gate hook could not record (it denies when its own write fails, exit 2) is
+        // recorded by the relay (core#1055 review round 9).
+        let (t, _r4b, log) = unit("deny-unrecorded");
+        let d = post(&t, &payload);
+        assert_eq!(decision(&d), "deny");
+        assert!(reason(&d).contains("recorded nothing"), "{d}");
+        assert!(reason(&d).contains("could not write"), "{d}");
+        let rec = records(&log);
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert_eq!(
+            rec[0].denying_policy.as_deref(),
+            Some(crate::gate_hook::INFRA_RULE_ID)
+        );
 
         // core#1055 security review P1: a gate hook that records a deny and is then killed is
         // never run again (a second run could allow): the call is refused, and its deny stands.
@@ -1338,7 +1444,7 @@ mod tests {
             "tool_input": {"file_path": "/wt/big.txt", "content": "x".repeat(1 << 20)},
         })
         .to_string();
-        let baseline = ACTIVE.load(Ordering::SeqCst);
+        let baseline = IO_ACTIVE.load(Ordering::SeqCst);
         let settles = |what: &dyn Fn() -> bool| {
             let until = std::time::Instant::now() + Duration::from_secs(5);
             while !what() && std::time::Instant::now() < until {
@@ -1373,7 +1479,7 @@ mod tests {
             // Nothing of the run outlives its refusal: its group (the lingering child included)
             // is killed, and its I/O threads end and give their slots back.
             assert!(
-                settles(&|| ACTIVE.load(Ordering::SeqCst) <= baseline),
+                settles(&|| IO_ACTIVE.load(Ordering::SeqCst) <= baseline),
                 "{mode}: relay I/O threads still running"
             );
         }
@@ -1557,6 +1663,21 @@ mod tests {
             drop(call);
             let idle = Arc::new(Life::default());
             assert!(!idle.revoke_and_wait_within(Duration::from_millis(100)));
+        }
+
+        // A call past the relay's connection limit is closed unserved; the live unit its request
+        // line names is marked, so its end fails it (core#1055 review round 9).
+        {
+            let (t, r12, _log) = unit("overflow");
+            ACTIVE.fetch_add(MAX_CONNS, Ordering::SeqCst);
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.write_all(format!("POST /hook/{t} HTTP/1.1\r\n").as_bytes())
+                .unwrap();
+            let mut rest = Vec::new();
+            let _ = s.read_to_end(&mut rest);
+            ACTIVE.fetch_sub(MAX_CONNS, Ordering::SeqCst);
+            assert!(rest.is_empty(), "closed unserved");
+            assert!(r12.finish(), "the overflowed unit fails closed");
         }
 
         // An unknown token has no unit to record in: refused with its reason.
