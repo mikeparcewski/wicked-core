@@ -3811,9 +3811,9 @@ esac
     }
 
     /// LIVE (`WICKED_CONTAINER_LIVE=1`): a seat fetches crates through the gateway's CONNECT
-    /// allowlist. The gateway's state directory was first provisioned with no egress hosts (the
+    /// allowlist. The gateway was first provisioned, and is running, with no egress hosts (the
     /// regression: that persisted `[]` outlived a later `WICKED_SEAT_EGRESS_HOSTS`); the daemon now
-    /// names cargo's two hosts. A seat in its sidecar's namespace, with the engine's proxy env,
+    /// names cargo's two hosts and provisions the running gateway again. A seat in its sidecar's namespace, with the engine's proxy env,
     /// reaches `index.crates.io`, is refused `crates.io` (not named), and `cargo fetch` of a crate
     /// with one dependency succeeds. The cargo leg needs a seat image with cargo: run with
     /// `WICKED_SEAT_BASE_IMAGE` naming a Rust toolchain base, otherwise it is skipped and says so.
@@ -3836,17 +3836,14 @@ esac
             c.args(argv);
             crate::container_floor::output_within(c, Duration::from_secs(limit)).unwrap()
         };
-        configure_gateway(
-            &dir,
-            &GatewayConfig {
-                egress_hosts: vec![],
-                ..GatewayConfig::default()
-            },
-        )
-        .unwrap();
+        // The regression's state: the gateway first provisioned, and running, with no egress
+        // hosts (`[]` persisted); then a daemon naming cargo's hosts provisions it again (the
+        // running-gateway branch, as a restarted daemon's first seat does).
         let prior = std::env::var(EGRESS_HOSTS_ENV).ok();
+        std::env::remove_var(EGRESS_HOSTS_ENV);
+        let first = ensure_gateway(&rt, &dir);
         std::env::set_var(EGRESS_HOSTS_ENV, "index.crates.io,static.crates.io");
-        let gw = ensure_gateway(&rt, &dir);
+        let gw = first.and_then(|_| ensure_gateway(&rt, &dir));
         match &prior {
             Some(v) => std::env::set_var(EGRESS_HOSTS_ENV, v),
             None => std::env::remove_var(EGRESS_HOSTS_ENV),
@@ -3862,6 +3859,9 @@ esac
         attach(&rt, &gw, &seat).unwrap();
         let ip = crate::container_floor::gateway_ip(&rt, &gw.name, &seat).unwrap();
         crate::container_floor::start_netns_sidecar(&rt, &seat, &seat, &ip).expect("sidecar up");
+        // As a seat arm does: a unit key the gateway is seen to accept, so the served config
+        // (the route included) is the one this probe runs against.
+        register_live(&rt, &gw, &dir, unit("egress")).expect("the unit key is served");
         let ns = format!("container:{netns}");
         let mut argv: Vec<String> = [
             "run",
