@@ -571,9 +571,11 @@ fn unit(token: &str) -> Option<Registered> {
 fn judge(reg: &Registered, call: &Call, tool: &str, body: &[u8], budget: Duration) -> String {
     let ctx = &reg.ctx;
     let deadline = Instant::now() + budget;
+    // Recorded under the unit (this call still holds off its end): a call refused because the
+    // unit ended while it was judged is an unjudged call, and the unit's fold must deny it.
     let ended = |tool: &str| {
         refusal(
-            None,
+            Some(reg),
             tool,
             "the unit ended while its call was being judged (its hook token was revoked)",
         )
@@ -1166,9 +1168,10 @@ mod tests {
         std::fs::write(
             &fake,
             "#!/bin/sh\n[ \"$WICKED_TEST_MODE\" = stall ] && exec sleep 8\n\
+             [ \"$WICKED_TEST_MODE\" = linger ] && { sleep 8 & echo $! > \"$WICKED_TEST_DIR/linger.pid\"; \
+             cat > /dev/null; exit 0; }\n\
              cat > /dev/null\necho run >> \"$WICKED_TEST_DIR/runs-$WICKED_TEST_MODE\"\n\
              case \"$WICKED_TEST_MODE\" in\n\
-             linger) sleep 8 & echo $! > \"$WICKED_TEST_DIR/linger.pid\"; exit 0 ;;\n\
              revoke-during) [ -e \"$WICKED_TEST_DIR/started\" ] && exit 0; : > \"$WICKED_TEST_DIR/started\"; \
              while [ ! -e \"$WICKED_TEST_DIR/revoked\" ]; do sleep 0.1; done; kill -9 $$ ;;\n\
              deny-then-kill) [ -e \"$WICKED_TEST_DIR/recorded\" ] || { : > \"$WICKED_TEST_DIR/recorded\"; \
@@ -1353,7 +1356,11 @@ mod tests {
             let took = started.elapsed();
             assert_eq!(decision(&a), "deny", "{mode}: {a}");
             assert!(reason(&a).contains("did not answer within"), "{mode}: {a}");
-            assert!(took < Duration::from_secs(5), "{mode}: refused in {took:?}");
+            // The budget plus a loaded host's scheduling slack, far under the 8 s the hook holds.
+            assert!(
+                took < budget + Duration::from_secs(4),
+                "{mode}: refused in {took:?}"
+            );
             assert_eq!(records(&log).len(), 1, "{mode}: {:?}", records(&log));
             drop(call);
             // Nothing of the run outlives its refusal: its group (the lingering child included)
@@ -1450,7 +1457,8 @@ mod tests {
         assert!(records(&log).is_empty(), "{:?}", records(&log));
 
         // A unit that ends while its gate hook is running (here the hook is then killed, leaving
-        // no decision, and a second run would allow) gets neither a second run nor an allow.
+        // no decision, and a second run would allow) gets neither a second run nor an allow, and
+        // the refused call is recorded as a deny in its log before its end returns.
         let (t, r8, log) = unit("revoke-during");
         let answered = std::thread::scope(|sc| {
             let h = sc.spawn(|| post(&t, &payload));
@@ -1464,13 +1472,21 @@ mod tests {
             );
             std::fs::write(dir.join("revoked"), "").unwrap();
             let answered = h.join().unwrap();
-            assert!(!revoking.join().unwrap(), "nothing went unrecorded");
+            assert!(!revoking.join().unwrap(), "the refusal was recorded");
             answered
         });
         assert_eq!(decision(&answered), "deny", "{answered}");
         assert!(reason(&answered).contains("unit ended"), "{answered}");
         assert_eq!(runs("revoke-during"), 1, "never judged again");
-        assert!(records(&log).is_empty(), "{:?}", records(&log));
+        // The unjudged call is recorded as a deny before the unit's end returns, so its fold denies.
+        let rec = records(&log);
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert_eq!(rec[0].decision, "deny");
+        assert_eq!(
+            rec[0].denying_policy.as_deref(),
+            Some(crate::gate_hook::INFRA_RULE_ID)
+        );
+        assert!(rec[0].obligations[0].contains("unit ended"), "{rec:?}");
 
         // A refusal that cannot be recorded (the unit's decisions log is unwritable) marks the
         // unit, and its end reports it, so the unit fails closed (`execute_wrapped`); a unit
