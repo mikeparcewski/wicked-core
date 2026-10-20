@@ -526,6 +526,25 @@ pub(crate) struct AgyStreamJson {
     steps: Option<Usage>,
 }
 
+/// Append `t` to `s` within `cap` bytes, cut at a UTF-8 boundary: `true` when all of it fit.
+pub(crate) fn push_within(s: &mut String, t: &str, cap: usize) -> bool {
+    let room = cap.saturating_sub(s.len());
+    if t.len() <= room {
+        s.push_str(t);
+        return true;
+    }
+    let mut cut = room;
+    while !t.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.push_str(&t[..cut]);
+    false
+}
+
+/// The most text [`AgyStreamJson`] holds for a turn (its streamed fallback, its answer): the
+/// runner's own retained-output cap, so a looping turn cannot grow the daemon's memory past it.
+const AGY_HELD_TEXT: usize = 8 * 1024 * 1024;
+
 /// One agy `usage` object as the engine's [`Usage`].
 fn agy_usage(u: &serde_json::Value) -> Usage {
     let field = |k: &str| u.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
@@ -560,7 +579,7 @@ impl OutputAdapter for AgyStreamJson {
                 let done = step.get("state").and_then(|t| t.as_str()) == Some("DONE");
                 if kind == Some("agent_response") {
                     if let Some(t) = step.get("text_delta").and_then(|t| t.as_str()) {
-                        self.streamed.push_str(t);
+                        push_within(&mut self.streamed, t, AGY_HELD_TEXT);
                     }
                 }
                 if done {
@@ -608,7 +627,9 @@ impl OutputAdapter for AgyStreamJson {
                     return out;
                 };
                 if let Some(t) = r.get("response").and_then(|t| t.as_str()) {
-                    self.response = Some(t.to_string());
+                    let mut held = String::new();
+                    push_within(&mut held, t, AGY_HELD_TEXT);
+                    self.response = Some(held);
                 }
                 if r.get("status").and_then(|s| s.as_str()) != Some("SUCCESS") {
                     let status = r.get("status").and_then(|s| s.as_str()).unwrap_or("?");
@@ -886,6 +907,20 @@ fn agy_turn_succeeded(line: &str) -> bool {
 /// timeout after 5s with turn in progress; returning partial output`), which is not a done turn.
 pub(crate) fn agy_print_timed_out(stderr: &str) -> bool {
     stderr.contains("print timeout after") && stderr.contains("turn in progress")
+}
+
+/// Settle an agy run its own `--print-timeout` cut off ([`agy_print_timed_out`]) as not done
+/// (exit 1, with the reason), whatever its output format; `true` when it was. A no-op for every
+/// other CLI, a failed exit and a run that did not finish.
+pub(crate) fn settle_agy_cut_off(cli: SeatCli, run: &mut std::io::Result<BoundedRun>) -> bool {
+    let Ok((code, out, err, ..)) = run else {
+        return false;
+    };
+    let cut = cli == SeatCli::Agy && *code == 0 && agy_print_timed_out(err);
+    if cut {
+        crate::headless::settle_agy_print_timeout(err, code, out);
+    }
+    cut
 }
 
 /// What an agy exit code means (Antigravity CLI headless mode, 1.4.2): 0 a response (judged by its
@@ -4009,12 +4044,12 @@ impl WrappedCliStepRunner {
                 );
             }
             let mut bounded = bounded;
+            // agy's own --print-timeout cut the turn off (it exits 0, its stream says SUCCESS,
+            // its stderr says otherwise), in any output format: not a done turn.
+            let agy_cut_off = settle_agy_cut_off(seat_cli, &mut bounded);
             if let Some((turn, engine_id, seen)) = headless {
                 let mut seen = seen.lock().map(|g| g.clone()).unwrap_or_default();
-                // agy's own --print-timeout cut the turn off: its stream still says SUCCESS, its
-                // stderr says otherwise. Not a done turn, so its conversation is not resumed.
-                let agy_cut_off = seat_cli == wicked_apps_core::spawn::SeatCli::Agy
-                    && matches!(&bounded, Ok((_, _, err, ..)) if agy_print_timed_out(err));
+                // …and its conversation is not resumed.
                 if agy_cut_off {
                     seen.completed = Some(false);
                 }
@@ -4027,11 +4062,7 @@ impl WrappedCliStepRunner {
                 if let Some(turn) = turn {
                     self.sessions.finish(turn, next);
                 }
-                if let Ok((code, out, err, ..)) = &mut bounded {
-                    // The cut-off turn's own reason first; the generic one then sees a failed exit.
-                    if agy_cut_off {
-                        crate::headless::settle_agy_print_timeout(err, code, out);
-                    }
+                if let Ok((code, out, ..)) = &mut bounded {
                     crate::headless::settle_cut_off_turn(&seen, code, out, &cli_key);
                 }
             }
@@ -6451,7 +6482,7 @@ pub(crate) fn retain_tools_capped(tools: &mut Vec<String>, names: Vec<String>) {
 }
 
 /// The outcome of a bounded run: `(exit_code, stdout, stderr, usage, files, tools)`.
-type BoundedRun = (i32, String, String, Option<Usage>, Vec<String>, Vec<String>);
+pub(crate) type BoundedRun = (i32, String, String, Option<Usage>, Vec<String>, Vec<String>);
 
 /// Run `cmd` bounded by `timeout`, draining stdout+stderr CONCURRENTLY (no pipe-buffer deadlock). Each
 /// raw stdout line is routed through `adapter`, whose READABLE text deltas are streamed through `emit`
@@ -6561,8 +6592,9 @@ pub(crate) fn run_bounded(
             let mut absorb = |ao: AdapterOut, s: &mut String, capped: &mut bool| {
                 for t in ao.text {
                     emit(&t);
-                    if s.len() < MAX_OUT {
-                        s.push_str(&t);
+                    // One oversized delta (an adapter's held answer) is cut to the room left,
+                    // never let through whole because the buffer was still under the cap.
+                    if s.len() < MAX_OUT && push_within(s, &t, MAX_OUT) {
                         s.push('\n');
                     } else if !*capped {
                         s.push_str("\n… (output truncated)\n");

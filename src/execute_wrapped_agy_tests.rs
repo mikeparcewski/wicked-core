@@ -371,3 +371,103 @@ fn agy_exit_codes_are_named_on_the_record() {
     );
     assert_eq!(wrapped_exit_code(&line), Some(3));
 }
+
+/// codex xr-1049 P2: a cut-off turn is settled in ANY output format (a template's
+/// `--output-format text` gets agy's `--print-timeout` too, but no stream to judge), and only
+/// agy's, only on exit 0.
+#[test]
+fn an_agy_print_timeout_is_settled_whatever_the_output_format() {
+    let notice = "[agy] print timeout after 9s with turn in progress; returning partial output\n";
+    let run = |code: i32, err: &str| -> std::io::Result<BoundedRun> {
+        Ok((
+            code,
+            "partial".into(),
+            err.into(),
+            None,
+            Vec::new(),
+            Vec::new(),
+        ))
+    };
+    // Text mode: no headless state at all, still settled.
+    let mut text = run(0, notice);
+    assert!(settle_agy_cut_off(SeatCli::Agy, &mut text));
+    let (code, out, ..) = text.unwrap();
+    assert_eq!(code, 1);
+    assert!(
+        out.starts_with("partial") && out.contains("--print-timeout"),
+        "{out}"
+    );
+    for (cli, code, err) in [
+        (SeatCli::Agy, 0, ""),
+        (SeatCli::Agy, 3, notice),
+        (SeatCli::Claude, 0, notice),
+    ] {
+        let mut r = run(code, err);
+        assert!(!settle_agy_cut_off(cli, &mut r), "{cli:?} {code}");
+        assert_eq!(r.unwrap().0, code);
+    }
+    let mut failed: std::io::Result<BoundedRun> = Err(std::io::ErrorKind::NotFound.into());
+    assert!(!settle_agy_cut_off(SeatCli::Agy, &mut failed));
+}
+
+/// codex xr-1049 P2: the adapter holds at most [`AGY_HELD_TEXT`] of a turn's text however much
+/// it streams, and the runner cuts one oversized delta to the room left (at a UTF-8 boundary).
+#[test]
+fn the_agy_adapter_and_the_runner_hold_bounded_text() {
+    let mut a = AgyStreamJson::default();
+    let chunk = "é".repeat(512 * 1024); // 1 MiB of two-byte characters per line
+    let line = serde_json::json!({"event":"step_update","step_update":{
+        "conversation_id":CONVERSATION,"step_index":1,"state":"ACTIVE",
+        "step_type":"agent_response","text_delta":chunk}})
+    .to_string();
+    for _ in 0..12 {
+        a.on_line(&line);
+    }
+    let held = a.finish().text.join("");
+    assert!(held.len() <= AGY_HELD_TEXT, "{}", held.len());
+    assert!(held.len() > AGY_HELD_TEXT - 4, "it keeps what fits");
+    let mut s = String::from("ab");
+    assert!(!push_within(&mut s, "éé", 5));
+    assert_eq!(s, "abé", "cut at a character boundary");
+    assert!(push_within(&mut s, "", 5));
+    assert!(push_within(&mut String::new(), "xyz", 3));
+}
+
+/// codex xr-1049 P2, the runner's side: an adapter that hands back one delta bigger than the
+/// retained-output cap (a held answer) is cut to the room left, never retained whole.
+#[cfg(unix)]
+#[test]
+fn run_bounded_cuts_one_oversized_delta_to_the_retained_cap() {
+    #[derive(Default)]
+    struct HoldAll(String);
+    impl OutputAdapter for HoldAll {
+        fn on_line(&mut self, line: &str) -> AdapterOut {
+            self.0.push_str(line);
+            AdapterOut::default()
+        }
+        fn finish(&mut self) -> AdapterOut {
+            AdapterOut {
+                text: vec![std::mem::take(&mut self.0)],
+                ..AdapterOut::default()
+            }
+        }
+    }
+    // spawn-audit: test-only — a fixture that prints 10 MiB on one line.
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "head -c 10485760 /dev/zero | tr '\\0' a; echo"]);
+    let (code, out, ..) = run_bounded(
+        cmd,
+        Duration::from_secs(60),
+        &|_| {},
+        Box::<HoldAll>::default(),
+        None,
+    )
+    .expect("ran");
+    assert_eq!(code, 0);
+    assert!(out.len() <= 8 * 1024 * 1024 + 64, "{}", out.len());
+    assert!(
+        out.ends_with("(output truncated)\n"),
+        "{}",
+        &out[out.len() - 40..]
+    );
+}
