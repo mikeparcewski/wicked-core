@@ -89,7 +89,7 @@ fn relay() -> Option<&'static Relay> {
                             overflow(conn);
                             continue;
                         };
-                        std::thread::spawn(move || {
+                        spawn_or_fail_closed(conn, "wicked-hook-call", move |conn| {
                             let _slot = slot;
                             serve(conn)
                         });
@@ -441,7 +441,7 @@ impl Drop for Slot {
 /// to fail closed at its end: its call was refused (the seat's hook sees the close and denies) and
 /// the refusal is not in its decisions log. Past the pool the connection is closed unread and,
 /// since it cannot be attributed, every live unit is marked to fail closed.
-fn overflow(mut conn: TcpStream) {
+fn overflow(conn: TcpStream) {
     let Some(worker) = OverflowWorker::take() else {
         // Unattributable: any live unit may own this refused call, so every one fails closed.
         // Marked before the close, so no unit ends clean between the two.
@@ -449,7 +449,7 @@ fn overflow(mut conn: TcpStream) {
         drop(conn);
         return;
     };
-    std::thread::spawn(move || {
+    spawn_or_fail_closed(conn, "wicked-hook-overflow", move |mut conn| {
         let _worker = worker;
         let token = match request_token_within(&mut conn, OVERFLOW_READ) {
             Overflowed::Hook(token) => token,
@@ -476,6 +476,39 @@ fn overflow(mut conn: TcpStream) {
         }
     });
 }
+
+/// Serve `conn` on a thread of its own running `f`; when the thread cannot be made (the OS
+/// refuses one), the call is refused unattributed: every live unit is marked to fail closed before
+/// the connection closes, and the accepting loop goes on.
+fn spawn_or_fail_closed(conn: TcpStream, name: &str, f: impl FnOnce(TcpStream) + Send + 'static) {
+    // Held so the connection outlives a failed spawn until the units are marked.
+    let Ok(keeper) = conn.try_clone() else {
+        fail_every_live_unit();
+        return;
+    };
+    #[cfg(test)]
+    let injected = FAIL_SPAWN.load(Ordering::SeqCst);
+    #[cfg(not(test))]
+    let injected = false;
+    let spawned = if injected {
+        drop(conn);
+        Err(std::io::Error::other("injected spawn failure"))
+    } else {
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || f(conn))
+            .map(drop)
+    };
+    if let Err(e) = spawned {
+        fail_every_live_unit();
+        relay_log!("wicked-core: the gate hook relay could not start a thread ({e}); refused");
+    }
+    drop(keeper);
+}
+
+/// Test-only: make [`spawn_or_fail_closed`] fail as if the OS refused a thread.
+#[cfg(test)]
+static FAIL_SPAWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Mark every live unit to fail closed (an overflowed call that could not be attributed), each
 /// while holding a `Call` so a unit ending meanwhile waits for its mark.
@@ -1878,6 +1911,30 @@ mod tests {
             .join();
             assert!(joined.is_err());
             assert!(r17.finish(), "a call that panicked fails its unit");
+        }
+
+        // A call the relay cannot start a thread for is refused, its unit fails closed, and the
+        // relay keeps accepting (review round 17).
+        {
+            let (t, r18, _log) = unit("spawnfail");
+            FAIL_SPAWN.store(true, Ordering::SeqCst);
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let _ = write!(
+                s,
+                "POST /hook/{t} HTTP/1.1\r\ncontent-length: {}\r\n\r\n{payload}",
+                payload.len()
+            );
+            let mut rest = Vec::new();
+            let _ = s.read_to_end(&mut rest);
+            FAIL_SPAWN.store(false, Ordering::SeqCst);
+            assert!(rest.is_empty(), "refused unserved");
+            assert!(r18.finish(), "the refused call's unit fails closed");
+            let mut ping = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            ping.write_all(b"GET /ping HTTP/1.1\r\nhost: x\r\n\r\n")
+                .unwrap();
+            let mut pong = String::new();
+            ping.read_to_string(&mut pong).unwrap();
+            assert!(pong.contains("pong"), "the relay still accepts: {pong}");
         }
 
         // A refusal that cannot be recorded (the unit's decisions log is unwritable) marks the
