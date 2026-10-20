@@ -203,9 +203,9 @@ pub use decision::{DecisionRequest, DecisionVerdict};
 pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
 pub use domain::{
     all_sessions, get_session, get_unit_transcript, get_unit_transcript_at, get_work_output,
-    put_node, put_nodes, session_units, AgentSession, BenchedSeat, HumanConfirm, RoutingInfo,
-    SeatFailureMark, SessionStatus, SessionView, StageKind, UnitDenial, UnitStatus, UnitTranscript,
-    WorkUnit,
+    put_node, put_nodes, session_units, AgentSession, BenchedSeat, HumanConfirm, MissingJudgeSeat,
+    RejudgeReadiness, RoutingInfo, SeatFailureMark, SessionStatus, SessionView, StageKind,
+    UnitDenial, UnitStatus, UnitTranscript, WorkUnit,
 };
 pub use domain_extraction::{
     coverage_eq_one_validator, provision_and_approve_coverage_validator, COVERAGE_CRITERION,
@@ -1071,6 +1071,22 @@ impl Core {
                 run_id: run_id.to_string(),
                 decision,
                 actor,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (rejudge) Whether `run_id`'s open gate can RE-RUN ITS JUDGE now
+    /// ([`HumanDecision::Rejudge`], wire action `rejudge`): it applies to a unit denied
+    /// `judge_unavailable`, and is available when the engine's own judge selection names a seat as
+    /// the run's roster, bench and the registry stand now. Read-only.
+    pub fn rejudge_readiness(&self, run_id: &str) -> anyhow::Result<RejudgeReadiness> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::RejudgeReadiness {
+                run_id: run_id.to_string(),
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;

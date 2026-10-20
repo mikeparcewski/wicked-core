@@ -469,7 +469,19 @@ pub enum HumanDecision {
     /// gated unit and handed to its Tool command as `WICKED_CONSENT_CHOICE`; a plain approve takes
     /// the plan's default. Refused at any other gate and for a choice the plan does not offer.
     ConsentChoice { choice: String },
+    /// Re-run the JUDGE of a unit denied `judge_unavailable` (no judge seat could rule), wire
+    /// token `rejudge`. The judge is drawn again by the engine's own selection from the run's
+    /// roster as it stands now (never the work's authors, never the pinned validator's author, never
+    /// a benched seat), on the same tree. The seat does not run again: the reviewed output is
+    /// judged as it was captured, the floor's last result on that tree stands (core#544), and the
+    /// result goes through the ordinary gate fold, so a REJECT, a failed floor or another seatless
+    /// judge denies again (deny-dominates). Refused at any other gate, and when no judge seat is
+    /// eligible now ([`crate::RejudgeReadiness`]). Recorded as `judgeRerunRequested`.
+    Rejudge,
 }
+
+/// The wire token of [`HumanDecision::Rejudge`].
+pub const REJUDGE_ACTION: &str = "rejudge";
 
 /// (core#555) The sentence an approved intent amendment rides into every later unit's prompt. It
 /// names the amendment as APPROVED and states that it OVERRIDES the corresponding launch-intent
@@ -484,7 +496,8 @@ pub const INTENT_AMENDMENT_PREFIX: &str = " ||| APPROVED INTENT AMENDMENT (overr
 
 impl HumanDecision {
     /// (core#469 / core#467) The escalation arm a gate decision's wire `action` names — `extend` |
-    /// `targeted` | `accept_partial` | `accept_suggestion` — or `None` for any other token. The
+    /// `targeted` | `accept_partial` | `accept_suggestion` | `rejudge` — or `None` for any other
+    /// token. The
     /// ONE parser every door (napi, bus) routes these tokens through.
     pub fn escalation_action(token: &str) -> Option<Self> {
         use crate::repo_checks::FloorRerunMode as Mode;
@@ -493,6 +506,7 @@ impl HumanDecision {
             "targeted" => Self::FloorRerun(Mode::Targeted),
             "accept_partial" => Self::FloorRerun(Mode::AcceptPartial),
             "accept_suggestion" => Self::AcceptSuggestion,
+            REJUDGE_ACTION => Self::Rejudge,
             t if t.starts_with(crate::consent_plan::CHOICE_PREFIX)
                 && t.len() > crate::consent_plan::CHOICE_PREFIX.len() =>
             {
@@ -2655,12 +2669,17 @@ mod escalation_action_tests {
             HumanDecision::escalation_action("accept_suggestion"),
             Some(HumanDecision::AcceptSuggestion)
         ));
+        assert!(matches!(
+            HumanDecision::escalation_action("rejudge"),
+            Some(HumanDecision::Rejudge)
+        ));
         for other in [
             "approve",
             "reject",
             "request_changes",
             "edit_plan",
             "Extend",
+            "Rejudge",
             "",
         ] {
             assert!(HumanDecision::escalation_action(other).is_none(), "{other}");

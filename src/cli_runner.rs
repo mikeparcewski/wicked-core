@@ -1211,6 +1211,161 @@ fn judge_roster<'a>(
     }
 }
 
+/// (rejudge) The judge seats the engine's own selection would draw from NOW for `unit`'s gate, and
+/// every run seat it would not, with why — the readiness of a [`crate::workflow::HumanDecision::Rejudge`].
+/// The same exclusions the judge applies ([`run_unit_and_judge_on`]): the work's authors and the
+/// launch exclusion, the team monitors its ledger names, the pinned validator's author on a pinned
+/// gate, an evaluator unit's creators (re-admitted only when nothing else is left, as the rotation
+/// does), seats that share an author's binary, the run's bench and seats the launcher found
+/// unusable. When every distinct preferred seat is benched, the fallback seats that may judge in
+/// their place ([`fallback_candidates`]) are the eligible ones; when a preferred seat is eligible
+/// they follow it (a preferred judge that fails as a seat falls back to them). Pure over its
+/// inputs: `roster` is [`crate::registry_roster`], `pool` / `registry` the fallback context
+/// ([`judge_fallback_pool`] / [`full_registry`]).
+pub(crate) fn rejudge_seats(
+    unit: &crate::domain::WorkUnit,
+    roster: &[crate::AgenticCli],
+    run_roster: &[String],
+    bench: &[crate::domain::BenchedSeat],
+    work_authors: &[String],
+    pool: &[crate::AgenticCli],
+    registry: &[crate::AgenticCli],
+) -> (Vec<String>, Vec<crate::MissingJudgeSeat>) {
+    use crate::team::runner::seat_key;
+    let bench = crate::domain::ungoverned_bench(bench);
+    let benched: Vec<String> = bench.iter().map(|b| b.cli.clone()).collect();
+    let pinned = unit.validator.as_ref().is_some_and(|v| v.approved);
+    let work_author = unit
+        .assigned_cli
+        .clone()
+        .unwrap_or_else(|| crate::validator::DETERMINISTIC_VALIDATOR_SEAT.to_string());
+    // (party, why) — instance and cli key, first reason wins.
+    let mut parties: Vec<(String, &'static str)> = Vec::new();
+    fn party(parties: &mut Vec<(String, &'static str)>, k: &str, why: &'static str) {
+        for key in [k, crate::team::runner::seat_key(k)] {
+            if !key.is_empty() && !parties.iter().any(|(p, _)| p == key) {
+                parties.push((key.to_string(), why));
+            }
+        }
+    }
+    party(&mut parties, &work_author, "built this work");
+    for a in &unit.authored_by {
+        party(&mut parties, a, "built this work");
+    }
+    if pinned {
+        party(
+            &mut parties,
+            crate::validator::DETERMINISTIC_VALIDATOR_SEAT,
+            "authors the pinned validator, so it never judges against it",
+        );
+    }
+    for a in &unit.exclude_seats {
+        party(&mut parties, a, "excluded from judging this step at launch");
+    }
+    let team_authors: Vec<String> = unit
+        .team
+        .as_ref()
+        .filter(|t| t.transport == crate::team::events::Transport::Bus)
+        .and_then(|t| t.ledger.as_ref())
+        .map(crate::team::runner::ledger_authors)
+        .unwrap_or_default();
+    for a in &team_authors {
+        party(
+            &mut parties,
+            a,
+            "monitored this step for the team, so it never grades its own findings",
+        );
+    }
+    let base_len = parties.len();
+    if unit.role == crate::workflow::PhaseRole::Evaluator {
+        for a in work_authors {
+            party(&mut parties, a, "created the work this review reads");
+        }
+    }
+    let unbenched: Vec<crate::AgenticCli> = judge_pool(roster, run_roster)
+        .into_iter()
+        .filter(|c| c.health.as_ref().is_none_or(|h| h.usable))
+        .cloned()
+        .collect();
+    let eligible_pool: Vec<crate::AgenticCli> = unbenched
+        .iter()
+        .filter(|c| !benched.iter().any(|b| b == &c.key))
+        .cloned()
+        .collect();
+    let draw = |parties: &[(String, &'static str)]| {
+        let excluded: Vec<&str> = parties.iter().map(|(p, _)| p.as_str()).collect();
+        let ids = author_identities(&excluded, roster);
+        let preferred = crate::validator::distinct_judge_keys(
+            &excluded,
+            &without_author_binaries(&eligible_pool, &excluded, &ids),
+        );
+        let lost: Vec<String> = crate::validator::distinct_judge_keys(
+            &excluded,
+            &without_author_binaries(&unbenched, &excluded, &ids),
+        )
+        .into_iter()
+        .filter(|k| !preferred.contains(k))
+        .collect();
+        let fallback: Vec<String> = if preferred.is_empty() && lost.is_empty() {
+            // No distinct seat ever existed: the judge is skipped, never a fallback.
+            Vec::new()
+        } else {
+            // A fallback judge is distinct from every author of the run's work too.
+            let parties = fallback_parties(&excluded, work_authors);
+            fallback_candidates(pool, registry, &parties, &ids, &benched, &[])
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| c.key)
+                .filter(|k| !preferred.contains(k))
+                .collect()
+        };
+        let mut seats = preferred;
+        seats.extend(fallback);
+        seats
+    };
+    let mut seats = draw(&parties);
+    if seats.is_empty() && parties.len() > base_len {
+        // (core#954) The rotation re-admits an evaluator's creators when nothing else is left.
+        parties.truncate(base_len);
+        seats = draw(&parties);
+    }
+    let missing = run_roster
+        .iter()
+        .filter(|k| !seats.contains(k))
+        .map(|k| {
+            let reason = if let Some((_, why)) = parties
+                .iter()
+                .find(|(p, _)| p == k || p.as_str() == seat_key(k))
+            {
+                (*why).to_string()
+            } else if let Some(why) = bench_reason(&bench, k) {
+                format!("benched for this run: {}", short_reason(why))
+            } else if let Some(h) = roster
+                .iter()
+                .find(|c| c.key == *k || c.key == seat_key(k))
+                .and_then(|c| c.health.as_ref())
+                .filter(|h| !h.usable)
+            {
+                format!(
+                    "not usable now: {}",
+                    h.reason
+                        .as_deref()
+                        .unwrap_or("the launcher found it unusable")
+                )
+            } else if !roster.iter().any(|c| c.key == *k || c.key == seat_key(k)) {
+                "not a judge seat on this computer (no registry record)".to_string()
+            } else {
+                "runs the same CLI as a party to this work".to_string()
+            };
+            crate::MissingJudgeSeat {
+                seat: k.clone(),
+                reason,
+            }
+        })
+        .collect();
+    (seats, missing)
+}
+
 /// (core#772) When NO identity-distinct judge remains on the run's unbenched roster but one
 /// WOULD exist without the run's bench, the judge is unavailable because of SEAT FAILURES earlier
 /// in the run (a quota / sign-in / empty answer while judging) — not because the run never had
@@ -1948,6 +2103,15 @@ fn run_unit_and_judge_on(
         .and_then(|r| r.fix.as_ref())
         .map(|fix| run_floor_fix(runner, input, fix, emit_delta));
     let input = fixed.as_ref().map(|(i, _)| i).unwrap_or(input);
+    // (rejudge) The operator RE-ARMED the judge at this unit's `judge_unavailable` gate: the seat
+    // does NOT run again — the output its reviewed attempt captured is handed to the judge, drawn
+    // afresh from the run's roster as it stands, on the same tree. The floor is not re-run for it
+    // (its last result on this tree stands, core#544); the fold judges the attempt like any other.
+    let rejudge = input
+        .unit
+        .requested_rejudge
+        .as_ref()
+        .filter(|_| floor_rerun.is_none());
     let output = match floor_rerun {
         Some(r) => {
             engine_note(
@@ -1976,7 +2140,35 @@ fn run_unit_and_judge_on(
                 governed,
             }
         }
-        None => runner.run_unit_streaming(advised.as_ref().unwrap_or(input), emit_delta),
+        None => match rejudge {
+            Some(j) => {
+                engine_note(
+                    emit_delta,
+                    &format!(
+                        "judge re-run: the seat does not run again; the judge re-reads attempt \
+                         {}'s output on the tree as it stands (eligible: {})",
+                        j.attempt + 1,
+                        if j.seats.is_empty() {
+                            "none named".to_string()
+                        } else {
+                            j.seats.join(", ")
+                        }
+                    ),
+                );
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: j.output.clone(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+            None => runner.run_unit_streaming(advised.as_ref().unwrap_or(input), emit_delta),
+        },
     };
     // (DES-QE-EVERY-SEAT) THE ISOLATED QE REVIEWER. For the run's QE unit with a `required`
     // decision, the turn above was the EXECUTOR (writer + executor, no QE verdict); the engine now
@@ -1987,6 +2179,10 @@ fn run_unit_and_judge_on(
     // invalidates the last record.
     let qe_review = match floor_rerun {
         Some(r) => crate::qe_acceptance::review::on_floor_rerun(&input.unit, r.fix.is_some()),
+        // (rejudge) Nor does a judge re-run: the seat did not run, the tree is the reviewed one.
+        None if rejudge.is_some() => {
+            crate::qe_acceptance::review::on_floor_rerun(&input.unit, false)
+        }
         None => {
             crate::qe_acceptance::review::run(runner, input, &output, qe_not_before, emit_delta)
         }
@@ -2003,7 +2199,10 @@ fn run_unit_and_judge_on(
         crate::team::runner::Attempt::Claimed(c) => Some(crate::team::runner::complete_with(
             c,
             &output,
-            boundary_read && floor_rerun.is_none() && output.status == StepStatus::Ok,
+            boundary_read
+                && floor_rerun.is_none()
+                && rejudge.is_none()
+                && output.status == StepStatus::Ok,
         )),
     };
     // DES-002 §8.8: the PA's review of a member's step is team evidence, never the gate — the
@@ -2282,6 +2481,9 @@ fn run_unit_and_judge_on(
     // tree no floor of this unit has judged yet, or whose floor the operator asked to re-run.
     let default_floor_applies =
         bound_agent && (tree_changed != Some(false) || unfloored_tree || floor_rerun.is_some());
+    // (rejudge) The DEFAULT judge re-runs on a re-judge even though the tree is the one its floor
+    // already judged — the judge is what the operator asked for; the checks are not re-run.
+    let default_judge_applies = default_floor_applies || (bound_agent && rejudge.is_some());
     // An OPERATOR RETRY of this unit's escalation gate armed ONE re-run of its floor
     // (`RepoChecksReport::recheck`): the checks run on the tree as it stands even when this
     // attempt left it unchanged — the single exception to the core#544 carry-forward, so a flaky
@@ -2315,7 +2517,7 @@ fn run_unit_and_judge_on(
     // same conditions as the `agent_verdict` block below — so ordinary units pay no git spawns.
     let will_judge = output.status == StepStatus::Ok
         && input.workdir.is_some()
-        && (input.unit.validator.as_ref().is_some_and(|v| v.approved) || default_floor_applies);
+        && (input.unit.validator.as_ref().is_some_and(|v| v.approved) || default_judge_applies);
     let work_owned = match will_judge
         .then_some(input.workdir.as_deref())
         .flatten()
@@ -2613,7 +2815,7 @@ fn run_unit_and_judge_on(
         };
         if pinned.is_some() {
             pinned
-        } else if default_floor_applies && judge_skipped.is_none() {
+        } else if default_judge_applies && judge_skipped.is_none() {
             // (F-7R2-005) The DEFAULT judge: no pinned validator gated this unit, but it changed
             // the tree — so a seat DISTINCT from the creator judges the change against the
             // engine-authored default criterion. Never the single-runner fallback (that would be
@@ -4869,6 +5071,288 @@ mod tests {
             "evidence.judge_skipped must name the reason when the judge is skipped (#539)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (rejudge) An armed re-judge runs the JUDGE ONLY: the unit's seat never runs (no call carries
+    /// the work unit), the reviewed output is what the attempt folds (`governed: false` — no seat
+    /// turn to govern), and the judge is drawn by the ordinary selection — a seat distinct from
+    /// the work's author AND the pinned validator's author. Its REJECT comes back as a REJECT: the
+    /// fold denies on it like on any judge (deny-dominates).
+    #[test]
+    fn a_rejudge_runs_only_the_judge_on_the_reviewed_output() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::sync::Mutex;
+        struct Judge {
+            answer: &'static str,
+            seen: Mutex<Vec<(Option<String>, String)>>,
+        }
+        impl StepRunner for Judge {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                self.seen.lock().unwrap().push((
+                    input.unit.assigned_cli.clone(),
+                    input.unit.description.clone(),
+                ));
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: self.answer.into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: true,
+                }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("wicked-core-rejudge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut unit = crate::domain::WorkUnit::pending("r:u4", "r", 4, "fix the retry");
+        unit.assigned_cli = Some("agy".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "the work is correct".into(),
+            script: "true".into(),
+            approved: true,
+        });
+        unit.requested_rejudge = Some(crate::domain::RequestedRejudge {
+            output: "Fixed the retry: callers pass an empty head.".into(),
+            attempt: 2,
+            seats: vec!["pi".into()],
+            at: 0,
+        });
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 3,
+            attempt: 3,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("agy", "agy run {PROMPT}"),
+            seat("pi", "pi ask {PROMPT}"),
+        ];
+        let noop: &DeltaSink = &|_: &str| {};
+        for (answer, pass) in [
+            ("PASS\nthe fix is right\nPASS", true),
+            ("REJECT: the error path is unhandled", false),
+        ] {
+            let judge = Arc::new(Judge {
+                answer,
+                seen: Mutex::new(Vec::new()),
+            });
+            let runner: Arc<dyn StepRunner> = judge.clone();
+            let (out, verdict, _evidence) =
+                run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster, &[], &[]);
+            let seen = judge.seen.lock().unwrap().clone();
+            assert_eq!(
+                seen.len(),
+                1,
+                "one call — the judge's, never the seat's: {seen:?}"
+            );
+            assert_eq!(
+                seen[0].0.as_deref(),
+                Some("pi"),
+                "distinct from agy and claude"
+            );
+            assert_ne!(seen[0].1, "fix the retry", "the work unit did not run");
+            assert_eq!(out.status, StepStatus::Ok);
+            assert_eq!(out.output, "Fixed the retry: callers pass an empty head.");
+            assert!(!out.governed, "no seat turn ran this attempt");
+            let v = verdict.expect("the judge ruled");
+            assert_eq!(v.pass, pass, "{v:?}");
+            assert_eq!(v.judge_cli.as_deref(), Some("pi"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (rejudge) The DEFAULT judge (no pinned validator) re-runs on a re-judge although the tree is
+    /// the one its floor already judged — and the floor is NOT re-run for it (its last result on
+    /// that tree stands, core#544). The same unit without the re-judge convenes no judge at all.
+    #[test]
+    fn a_rejudge_convenes_the_default_judge_on_an_unchanged_tree_without_the_floor() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::sync::Mutex;
+        #[derive(Default)]
+        struct Judge {
+            seen: Mutex<Vec<Option<String>>>,
+        }
+        impl StepRunner for Judge {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(input.unit.assigned_cli.clone());
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS\nthe change is right\nPASS".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            // spawn-audit: test-only — a git fixture building the layout under test; reads no engine state.
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?}");
+        };
+        let repo = std::env::temp_dir().join(format!(
+            "wicked-core-rejudge-default-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "."]);
+        git(&repo, &["config", "user.email", "t@example.invalid"]);
+        git(&repo, &["config", "user.name", "t"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        std::fs::write(repo.join("a.txt"), "the fix\n").unwrap();
+        let baseline = crate::worktree_guard::snapshot(&repo, &repo).unwrap();
+        let mut unit = crate::domain::WorkUnit::pending("r:u4", "r", 4, "fix the retry");
+        unit.role = crate::workflow::PhaseRole::Creator;
+        unit.assigned_cli = Some("agy".into());
+        unit.default_floor = true;
+        unit.worktree_baseline = Some(baseline.clone());
+        unit.repo_checks = Some(
+            serde_json::from_value(serde_json::json!({
+                "detected": [], "checks": [], "skipped": [], "passed": true,
+                "sandbox_level": "none", "tree": baseline.tree,
+            }))
+            .unwrap(),
+        );
+        let mut input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 3,
+            attempt: 3,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(repo.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let roster = vec![
+            seat("agy", "agy run {PROMPT}"),
+            seat("pi", "pi ask {PROMPT}"),
+        ];
+        let noop: &DeltaSink = &|_: &str| {};
+
+        input.unit.requested_rejudge = Some(crate::domain::RequestedRejudge {
+            output: "I changed a.txt to the fix.".into(),
+            attempt: 2,
+            seats: vec!["pi".into()],
+            at: 0,
+        });
+        let judge = Arc::new(Judge::default());
+        let runner: Arc<dyn StepRunner> = judge.clone();
+        let (out, verdict, evidence) =
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster, &[], &[]);
+        assert_eq!(judge.seen.lock().unwrap().clone(), [Some("pi".to_string())]);
+        assert_eq!(out.output, "I changed a.txt to the fix.");
+        assert!(verdict.expect("the default judge ruled").pass);
+        assert_eq!(evidence.tree_changed, Some(false), "the same tree");
+        assert!(evidence.repo_checks.is_none(), "the floor is not re-run");
+
+        input.unit.requested_rejudge = None;
+        let judge = Arc::new(Judge::default());
+        let runner: Arc<dyn StepRunner> = judge.clone();
+        let (_, verdict, _) =
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster, &[], &[]);
+        assert_eq!(
+            judge.seen.lock().unwrap().clone(),
+            [Some("agy".to_string())],
+            "without it the seat runs, and an unchanged floored tree convenes no judge"
+        );
+        assert!(verdict.is_none());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// (rejudge) The readiness the gate serves is the judge's own selection: the work's author,
+    /// the pinned validator's author, a benched seat and an unusable one are each named missing
+    /// with why, and the seat the rotation would ask is eligible. With every other seat out, no
+    /// seat is eligible.
+    #[test]
+    fn rejudge_seats_name_the_eligible_judge_and_why_the_rest_cannot() {
+        let mut unit = crate::domain::WorkUnit::pending("r:u4", "r", 4, "fix the retry");
+        unit.assigned_cli = Some("agy".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "c".into(),
+            script: "true".into(),
+            approved: true,
+        });
+        let mut copilot = seat("copilot", "copilot -p {PROMPT}");
+        copilot.health = Some(wicked_council::types::SeatHealth {
+            usable: false,
+            reason: Some("signed out".into()),
+        });
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("agy", "agy run {PROMPT}"),
+            seat("pi", "pi ask {PROMPT}"),
+            seat("opencode", "opencode run {PROMPT}"),
+            copilot,
+        ];
+        let run: Vec<String> = ["claude", "agy", "pi", "opencode", "copilot"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let bench = vec![crate::domain::BenchedSeat {
+            cli: "opencode".into(),
+            reason: "quota_exhausted (no success in the run)".into(),
+            source: "judge".into(),
+            governed_only: false,
+        }];
+        let (eligible, missing) = rejudge_seats(&unit, &roster, &run, &bench, &[], &[], &roster);
+        assert_eq!(eligible, ["pi"]);
+        let why = |k: &str| {
+            missing
+                .iter()
+                .find(|m| m.seat == k)
+                .map(|m| m.reason.clone())
+                .unwrap_or_else(|| panic!("{k} missing: {missing:?}"))
+        };
+        assert_eq!(why("agy"), "built this work");
+        assert!(why("claude").contains("pinned validator"), "{missing:?}");
+        assert!(
+            why("opencode").starts_with("benched for this run: quota_exhausted"),
+            "{missing:?}"
+        );
+        assert_eq!(why("copilot"), "not usable now: signed out");
+        let (none, _) = rejudge_seats(
+            &unit,
+            &roster,
+            &["claude".to_string(), "agy".to_string()],
+            &bench,
+            &[],
+            &[],
+            &roster,
+        );
+        assert!(none.is_empty(), "{none:?}");
     }
 
     /// (#539) When the pinned-validator path skips the judge (no distinct seat), the DEFAULT floor

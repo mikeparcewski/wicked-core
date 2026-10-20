@@ -1701,6 +1701,8 @@ pub(crate) fn apply_and_finish_unit(
     unit.last_attempt = Some(attempt);
     // (core#469) An operator's floor re-run is consumed by the attempt that ran it — whatever
     // this fold decided, the next dispatch is an ordinary one unless the gate arms another.
+    // …and so is an operator's re-judge: the attempt that re-read the output consumed it.
+    unit.requested_rejudge = None;
     if let Some(r) = unit.repo_checks.as_mut() {
         r.requested_rerun = None;
         // …and so is an operator retry's armed re-run: ONCE, whether or not this attempt's floor
@@ -4236,6 +4238,125 @@ mod judge_bench_tests {
             "the receipt is persisted on the unit"
         );
         (outcome.approved, outcome.denial.map(|d| d.source), receipt)
+    }
+
+    /// (rejudge) The fold of a RE-JUDGE attempt: one unit whose last floor FAILED on tree `t1`, the
+    /// re-judge armed, the seat not run (tree unchanged, no fresh floor report) and the judge's
+    /// `verdict`. Returns the approval, the winning denial source and the persisted unit.
+    fn fold_rejudge(
+        sid: &str,
+        judge_pass: bool,
+        floor_passed: bool,
+    ) -> (bool, Option<String>, crate::domain::WorkUnit) {
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let mut sink = |_e: CoreEvent| {};
+        let Planned {
+            mut units,
+            workflow_id,
+            cli_keys,
+            ..
+        } = plan_and_distribute(
+            &mut store,
+            &[cli("a"), cli("b")],
+            "Do step one.",
+            EntityMode::Shared,
+            sid,
+            crate::domain::HumanConfirm::None,
+            false,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            &mut sink,
+            None,
+            false,
+            false,
+            Vec::new(),
+            None,
+            true,
+            &crate::assurance::QeOverride::Auto,
+        )
+        .expect("plan");
+        let unit = &mut units[0];
+        unit.default_floor = true;
+        unit.worktree_baseline = Some(
+            serde_json::from_value(
+                serde_json::json!({"head": "h1", "tree": "t1", "taken_at_ms": 0}),
+            )
+            .unwrap(),
+        );
+        unit.repo_checks = Some(
+            serde_json::from_value(serde_json::json!({
+                "detected": [], "checks": [], "skipped": [], "passed": floor_passed,
+                "sandbox_level": "none", "tree": "t1"
+            }))
+            .unwrap(),
+        );
+        unit.requested_rejudge = Some(crate::domain::RequestedRejudge {
+            output: "the reviewed output".into(),
+            attempt: 1,
+            seats: vec!["b".into()],
+            at: 0,
+        });
+        let evidence = crate::workflow::UnitEvidence {
+            tree_changed: Some(false),
+            ..Default::default()
+        };
+        let verdict = crate::validator::AgentVerdict {
+            pass: judge_pass,
+            reasoning: if judge_pass {
+                "PASS".into()
+            } else {
+                "REJECT: wrong".into()
+            },
+            judge_cli: Some("b".into()),
+            judge_distinct: Some(true),
+            seat_failure: None,
+            judge_fallback: None,
+        };
+        let outcome = apply_and_finish_unit(
+            &mut store,
+            unit,
+            "the reviewed output",
+            &workflow_id,
+            EntityMode::Shared,
+            sid,
+            2,
+            false,
+            false,
+            &cli_keys,
+            Some(&verdict),
+            &evidence,
+            &mut |_| {},
+            None,
+        )
+        .expect("apply");
+        (
+            outcome.approved,
+            outcome.denial.map(|d| d.source),
+            units[0].clone(),
+        )
+    }
+
+    /// (rejudge) Deny-dominates holds on a re-judge attempt: the judge's PASS does not admit a
+    /// tree whose floor failed (the floor's last result on the unchanged tree stands), a REJECT
+    /// denies, and only a passing floor plus a PASS approves. Every way, the re-judge is consumed.
+    #[test]
+    fn a_rejudge_attempt_is_folded_deny_dominant_and_consumes_the_request() {
+        let (approved, source, u) = fold_rejudge("rejudge-floor-red", true, false);
+        assert!(!approved, "a judge PASS never admits a failed floor");
+        assert_eq!(source.as_deref(), Some(crate::repo_checks::DENIAL_SOURCE));
+        assert!(u.requested_rejudge.is_none());
+        let (approved, source, u) = fold_rejudge("rejudge-reject", false, true);
+        assert!(!approved, "the judge's REJECT denies");
+        assert_eq!(source.as_deref(), Some("agent_validator"));
+        assert!(u.requested_rejudge.is_none());
+        let (approved, source, u) = fold_rejudge("rejudge-pass", true, true);
+        assert!(approved, "{source:?}");
+        assert!(u.requested_rejudge.is_none());
     }
 
     /// (DES-QE-EVERY-SEAT §3.4) The fold of one unit carrying an isolated QE reviewer's record:

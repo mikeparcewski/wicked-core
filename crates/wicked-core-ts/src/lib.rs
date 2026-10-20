@@ -1383,7 +1383,10 @@ impl Core {
                 // (core#469) The timed-out floor's escalation arms; (core#467) adopt the
                 // evaluator's pinned edit. All approve-shaped, none takes an amendment.
                 (
-                    Some(a @ ("extend" | "targeted" | "accept_partial" | "accept_suggestion")),
+                    Some(
+                        a @ ("extend" | "targeted" | "accept_partial" | "accept_suggestion"
+                        | "rejudge"),
+                    ),
                     true,
                 ) => {
                     if amend.as_deref().is_some_and(|t| !t.trim().is_empty())
@@ -1411,20 +1414,21 @@ impl Core {
                 (
                     Some(
                         a @ ("approve" | "reject" | "request_changes" | "extend" | "targeted"
-                        | "accept_partial" | "accept_suggestion" | "amend_intent"),
+                        | "accept_partial" | "accept_suggestion" | "amend_intent" | "rejudge"),
                     ),
                     _,
                 ) => {
                     return Err(err(anyhow::anyhow!(
                         "action `{a}` disagrees with approve={approve} (request_changes and \
                          reject require approve=false; approve, extend, targeted, accept_partial, \
-                         accept_suggestion and amend_intent require approve=true)"
+                         accept_suggestion, amend_intent and rejudge require approve=true)"
                     )))
                 }
                 (Some(other), _) => {
                     return Err(err(anyhow::anyhow!(
                         "unknown action `{other}` (expected approve | request_changes | reject | \
-                         extend | targeted | accept_partial | accept_suggestion | amend_intent)"
+                         extend | targeted | accept_partial | accept_suggestion | amend_intent | \
+                         rejudge)"
                     )))
                 }
             };
@@ -1679,6 +1683,21 @@ impl Core {
             };
             let entry = core.register_repo(spec).map_err(err)?;
             serde_json::to_string(&entry).map_err(err)
+        })
+    }
+
+    /// (rejudge) Whether the run's open gate can RE-RUN ITS JUDGE now, as a JSON
+    /// `RejudgeReadiness` object: `{applies, available, ord, eligible, missing: [{seat, reason}],
+    /// reason}`. `applies` — the gate is a unit's `judge_unavailable` denial; `available` — the
+    /// engine's judge selection names a seat now (`eligible`), so `confirmGate(run, true,
+    /// undefined, "rejudge")` re-runs the judge on the same tree without re-running the seat.
+    /// Read-only.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn rejudge_readiness(&self, run_id: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let r = core.rejudge_readiness(&run_id).map_err(err)?;
+            serde_json::to_string(&r).map_err(err)
         })
     }
 

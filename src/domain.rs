@@ -926,6 +926,47 @@ pub struct OperatorRuling {
     pub at: i64,
 }
 
+/// A re-judge the operator armed ([`WorkUnit::requested_rejudge`]): the output the judge reads
+/// (the reviewed attempt's, as captured), the attempt it came from, and the judge seats the
+/// engine's selection named eligible when it was armed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestedRejudge {
+    /// The reviewed attempt's captured output, judged again as it stands.
+    pub output: String,
+    /// The attempt whose output it is.
+    pub attempt: u32,
+    /// The judge seats eligible when it was armed (rotation order).
+    pub seats: Vec<String>,
+    /// When it was armed (unix millis).
+    pub at: i64,
+}
+
+/// One run seat the judge would not be drawn from now, and why ([`RejudgeReadiness::missing`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingJudgeSeat {
+    pub seat: String,
+    /// In plain words: `built this work`, `benched for this run: …`, `not usable now: …`.
+    pub reason: String,
+}
+
+/// Whether a run's open gate can RE-RUN ITS JUDGE now ([`crate::workflow::HumanDecision::Rejudge`]):
+/// `applies` when the gate is a unit's `judge_unavailable` denial (the gate a re-judge answers);
+/// `available` when the engine's judge selection names at least one seat now (`eligible`, rotation
+/// order, fallback seats last). `missing` names every other seat of the run with why it cannot
+/// judge this work. `reason` is the last judge's failure, or why a re-judge does not apply.
+/// camelCase on the wire (napi `rejudgeReadiness`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RejudgeReadiness {
+    pub applies: bool,
+    pub available: bool,
+    /// The gated unit's ord; `None` when the run has no unit at its cursor.
+    pub ord: Option<u32>,
+    pub eligible: Vec<String>,
+    pub missing: Vec<MissingJudgeSeat>,
+    pub reason: Option<String>,
+}
+
 /// serde `skip_serializing_if` for a counter that is absent while zero.
 fn is_zero_u32(n: &u32) -> bool {
     *n == 0
@@ -1283,6 +1324,12 @@ pub struct WorkUnit {
     /// evaluator that reviews it. Skipped on the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operator_rulings: Vec<OperatorRuling>,
+    /// The operator's RE-JUDGE of this unit, armed at its `judge_unavailable` gate
+    /// ([`crate::workflow::HumanDecision::Rejudge`]) and consumed by the next attempt's fold: that
+    /// attempt does not run the seat; it hands the reviewed output to the judge again. `None`
+    /// otherwise (skipped on the wire).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_rejudge: Option<RequestedRejudge>,
     /// (core#761) The FAIL items an operator LANDED this (Evaluator) unit over at its
     /// `review_adjudication` gate — the review's open items carried forward with the work, for
     /// the run record and the PR body. Skipped on the wire when empty.
@@ -1603,6 +1650,7 @@ impl WorkUnit {
             rework_amendment: None,
             review_rounds: Vec::new(),
             operator_rulings: Vec::new(),
+            requested_rejudge: None,
             carried_items: Vec::new(),
             floor_auto_retries: 0,
             instructions: None,

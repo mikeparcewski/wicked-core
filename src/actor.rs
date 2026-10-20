@@ -2441,6 +2441,9 @@ pub(crate) fn run(
             Command::ListRepos { reply } => {
                 let _ = reply.send(crate::repo::list_repos(&store));
             }
+            Command::RejudgeReadiness { run_id, reply } => {
+                let _ = reply.send(rejudge_readiness(&store, &run_id));
+            }
             Command::RegisterDenyPolicy {
                 phase,
                 trigger,
@@ -7805,8 +7808,9 @@ fn denial_gate_prompt(
         "judge_unavailable" => format!(
             "Unit {ord} could not be judged — no eligible judge seat remained: {}. The work was \
              not rejected. Approve to judge it yourself (it counts, labelled \"judged by \
-             operator\"), request changes to send it back for rework, or reject to cancel the \
-             run{note}",
+             operator\"), re-run the judge on the same work once a judge seat can rule (action \
+             `rejudge`; the step does not run again), request changes to send it back for \
+             rework, or reject to cancel the run{note}",
             reason_head(reason)
         ),
         // (DES-L1 PR-1A) The generic verdict gate names its THREE arms — retry, request changes
@@ -11623,9 +11627,10 @@ fn confirm_plan_gate(
         HumanDecision::FloorRerun(_)
         | HumanDecision::AcceptSuggestion
         | HumanDecision::AmendIntent { .. }
-        | HumanDecision::ConsentChoice { .. } => anyhow::bail!(
-            "a plan_approval gate reviews a plan, not a floor, an evaluator's edit or an intent \
-             amendment — approve, approve with an edited plan, or reject"
+        | HumanDecision::ConsentChoice { .. }
+        | HumanDecision::Rejudge => anyhow::bail!(
+            "a plan_approval gate reviews a plan, not a floor, an evaluator's edit, an intent \
+             amendment or a judge re-run — approve, approve with an edited plan, or reject"
         ),
     }
     let answer = match &decision {
@@ -12300,6 +12305,7 @@ pub(crate) fn confirm_gate_as(
             crate::workflow::HumanDecision::FloorRerun(_)
             | crate::workflow::HumanDecision::AcceptSuggestion
             | crate::workflow::HumanDecision::AmendIntent { .. }
+            | crate::workflow::HumanDecision::Rejudge
                 if adjudication_open =>
             {
                 anyhow::bail!(
@@ -12347,13 +12353,19 @@ pub(crate) fn confirm_gate_as(
             crate::workflow::HumanDecision::FloorRerun(_)
             | crate::workflow::HumanDecision::AcceptSuggestion
             | crate::workflow::HumanDecision::AmendIntent { .. }
+            | crate::workflow::HumanDecision::Rejudge
                 if team_gate::transport_gate_open(&session)
                     || team_gate::dispute_gate_open(&session) =>
             {
                 anyhow::bail!(
                     "a team pause takes approve, request changes or reject — not a floor re-run, \
-                     an evaluator's edit or an intent amendment"
+                     an evaluator's edit, an intent amendment or a judge re-run"
                 );
+            }
+            // (rejudge) Refused unless the cursor unit's gate is a `judge_unavailable` denial AND
+            // the engine's judge selection names a seat now — the row stays open otherwise.
+            crate::workflow::HumanDecision::Rejudge => {
+                rejudge_request(&*store, run_id)?;
             }
             // (core#555) An amendment with no text amends nothing: refuse HERE, before the row
             // resolves, so the gate stays open and re-answerable rather than resolving as an
@@ -12427,6 +12439,10 @@ pub(crate) fn confirm_gate_as(
             .to_string(),
             crate::workflow::HumanDecision::AcceptSuggestion => serde_json::json!({
                 "approve": true, "action": "accept_suggestion", "amend": null,
+            })
+            .to_string(),
+            crate::workflow::HumanDecision::Rejudge => serde_json::json!({
+                "approve": true, "action": crate::workflow::REJUDGE_ACTION, "amend": null,
             })
             .to_string(),
             // (core#555) The amendment text rides `amend` so the durable prompt's answer carries
@@ -12572,6 +12588,8 @@ pub(crate) fn confirm_gate_as(
     // (core#782) The operator's note a floor fix hands to its seat.
     let mut floor_fix_note: Option<String> = None;
     let mut adopt_suggestion = false;
+    // (rejudge) The operator re-armed the judge of the cursor unit's `judge_unavailable` gate.
+    let mut rejudge = false;
     // The operator's plain approve (retry, with or without a note) — the one answer that arms a
     // re-run of an escalated unit's floor on an unchanged tree.
     let mut operator_retry = false;
@@ -12623,6 +12641,12 @@ pub(crate) fn confirm_gate_as(
         }
         // (core#820) A consent choice is an approve; the choice is already on the unit.
         crate::workflow::HumanDecision::ConsentChoice { .. } => {
+            (None, crate::workflow::AmendScope::Cursor, None)
+        }
+        // (rejudge) A re-dispatch of the cursor unit whose attempt runs only the judge (armed
+        // below, after the boundary check).
+        crate::workflow::HumanDecision::Rejudge => {
+            rejudge = true;
             (None, crate::workflow::AmendScope::Cursor, None)
         }
     };
@@ -12721,6 +12745,44 @@ pub(crate) fn confirm_gate_as(
                                 .to_string(),
                         },
                     );
+                }
+            }
+            // (rejudge) Arm the judge re-run on the cursor unit — the seat does not run on the next
+            // attempt — and say so on the record before the run resumes. Any other answer voids a
+            // re-judge left armed by an attempt that never folded: that answer runs the seat.
+            {
+                let mut units = crate::domain::session_units(store, run_id)?;
+                if let Some(cursor) = units.get_mut(session.unit_ix) {
+                    if rejudge {
+                        let request = rejudge_request(&*store, run_id)?;
+                        let ord = cursor.ord;
+                        let previous_reason = cursor.denial_reason.clone().unwrap_or_default();
+                        let from_attempt = request.attempt;
+                        let seats = request.seats.clone();
+                        cursor.requested_rejudge = Some(request);
+                        put_node(store, cursor.to_node())?;
+                        emit(
+                            subscribers,
+                            CoreEvent::JudgeRerunRequested {
+                                session: run_id.to_string(),
+                                ord,
+                                // The re-dispatch below bumps the attempt (the cursor ran).
+                                attempt: session.attempt.saturating_add(1),
+                                from_attempt,
+                                seats,
+                                previous_reason,
+                                by: actor
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|a| !a.is_empty())
+                                    .unwrap_or("operator")
+                                    .to_string(),
+                            },
+                        );
+                    } else if cursor.requested_rejudge.is_some() {
+                        cursor.requested_rejudge = None;
+                        put_node(store, cursor.to_node())?;
+                    }
                 }
             }
             // The OPERATOR RETRY of an escalated unit: its floor re-runs ONCE on the next attempt
@@ -13098,6 +13160,143 @@ fn arm_operator_recheck(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests pin the judge registries [`rejudge_readiness`] reads (`(roster, full registry)`); the
+    /// live ones are the host's.
+    static REJUDGE_REGISTRY: std::cell::RefCell<Option<(Vec<crate::AgenticCli>, Vec<crate::AgenticCli>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The registries a judge is drawn from: [`crate::registry_roster`] and the full registry.
+fn judge_registries() -> (Vec<crate::AgenticCli>, Vec<crate::AgenticCli>) {
+    #[cfg(test)]
+    if let Some(r) = REJUDGE_REGISTRY.with(|c| c.borrow().clone()) {
+        return r;
+    }
+    (crate::registry_roster(), crate::cli_runner::full_registry())
+}
+
+/// (rejudge) Whether `run_id`'s open gate can re-run its judge now: the cursor unit is denied
+/// `judge_unavailable` (no judge seat could rule — never a seat that RULED, a QE reviewer, a team
+/// member's step or a team pause), and which seats the engine's own judge selection would draw
+/// from as the run's roster, bench and the registry stand now
+/// ([`crate::cli_runner::rejudge_seats`]). Reads only; the gate API serves it beside the gate.
+pub(crate) fn rejudge_readiness(
+    store: &dyn GraphStore,
+    run_id: &str,
+) -> anyhow::Result<crate::domain::RejudgeReadiness> {
+    let session = crate::domain::get_session(store, run_id)?
+        .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+    let units = crate::domain::session_units(store, run_id)?;
+    let cursor = units.get(session.unit_ix);
+    let no = |why: String| crate::domain::RejudgeReadiness {
+        applies: false,
+        available: false,
+        ord: cursor.map(|u| u.ord),
+        eligible: Vec::new(),
+        missing: Vec::new(),
+        reason: Some(why),
+    };
+    let Some(cursor) = cursor else {
+        return Ok(no(format!("run {run_id} has no unit at its cursor")));
+    };
+    let source = cursor.denial.as_ref().map(|d| d.source.as_str());
+    if session.status != SessionStatus::AwaitingHuman
+        || cursor.status != crate::domain::UnitStatus::Rejected
+        || source != Some(crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE)
+    {
+        return Ok(no(format!(
+            "`{}` answers the gate of a unit no judge could rule on (denial source `{}`); unit {} \
+             is {:?}, denied by `{}`",
+            crate::workflow::REJUDGE_ACTION,
+            crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE,
+            cursor.ord,
+            cursor.status,
+            source.unwrap_or("nothing")
+        )));
+    }
+    if cursor.member_step.is_some()
+        || team_gate::transport_gate_open(&session)
+        || team_gate::dispute_gate_open(&session)
+    {
+        return Ok(no(format!(
+            "unit {} is held by its team — a team pause takes approve, request changes or reject",
+            cursor.ord
+        )));
+    }
+    let work_authors = pipeline::fallback_work_authors(&units, cursor.ord);
+    let (roster, registry) = judge_registries();
+    let pool = crate::cli_runner::judge_fallback_pool(&registry);
+    let (eligible, missing) = crate::cli_runner::rejudge_seats(
+        cursor,
+        &roster,
+        &session.clis,
+        &session.benched_seats,
+        &work_authors,
+        &pool,
+        &registry,
+    );
+    Ok(crate::domain::RejudgeReadiness {
+        applies: true,
+        available: !eligible.is_empty(),
+        ord: Some(cursor.ord),
+        eligible,
+        missing,
+        reason: cursor.denial_reason.clone(),
+    })
+}
+
+/// (rejudge) The re-judge to arm on `run_id`'s cursor unit — refused (the gate stays open) unless
+/// [`rejudge_readiness`] applies AND names an eligible seat; the refusal names every missing seat
+/// and why. Carries the reviewed attempt's transcript: the seat does not run again.
+fn rejudge_request(
+    store: &dyn GraphStore,
+    run_id: &str,
+) -> anyhow::Result<crate::domain::RequestedRejudge> {
+    let r = rejudge_readiness(store, run_id)?;
+    if !r.applies {
+        anyhow::bail!(
+            "{} — approve (judge it yourself), request changes, or reject",
+            r.reason.unwrap_or_default()
+        );
+    }
+    if !r.available {
+        let missing = r
+            .missing
+            .iter()
+            .map(|m| format!("{} ({})", m.seat, m.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!(
+            "no judge seat can rule on unit {} now — {} — sign a seat distinct from the work's \
+             authors in, then re-run the judge; or approve (judge it yourself), request changes, \
+             or reject",
+            r.ord.unwrap_or(0),
+            if missing.is_empty() {
+                "the run has no other seat".to_string()
+            } else {
+                missing
+            }
+        );
+    }
+    let session = crate::domain::get_session(store, run_id)?
+        .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+    let units = crate::domain::session_units(store, run_id)?;
+    let cursor = units
+        .get(session.unit_ix)
+        .ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor"))?;
+    let output = crate::domain::get_unit_transcript(store, &cursor.id)
+        .and_then(|t| t.output)
+        .unwrap_or_default();
+    Ok(crate::domain::RequestedRejudge {
+        output,
+        attempt: cursor.last_attempt.unwrap_or(0),
+        seats: r.eligible,
+        at: crate::interaction::now_millis(),
+    })
+}
+
 /// (core#469) The floor re-run `mode` asks for on `unit` — refused unless the unit's denial is a
 /// floor that did not FINISH (`repo_checks_timeout`) with its report on the unit, and, for
 /// `accept_partial`, unless that report names a check to waive. The request carries the reviewed
@@ -13310,6 +13509,7 @@ fn judge_by_operator(
     u.status = crate::domain::UnitStatus::Done;
     u.denial = None;
     u.denial_reason = None;
+    u.requested_rejudge = None;
     // (codex r1 on #907) The judged output becomes the unit's APPROVED output, so a later
     // evaluator and context injection read it (`get_work_output`), with the judgment's provenance.
     let wo_id = wicked_apps_core::synthetic_symbol(crate::execute::WORK_OUTPUT, &u.id);
@@ -13833,6 +14033,8 @@ fn rewind_to_creator_scoped(
         u.worktree_mutation = None;
         u.denial = None;
         u.denial_reason = None;
+        // A rework runs the seat: a re-judge left armed (its attempt never folded) is void.
+        u.requested_rejudge = None;
         if ix == target_ix {
             u.status = crate::domain::UnitStatus::Distributed;
             u.rework_of = Some(review_ord);
@@ -19666,9 +19868,275 @@ mod request_changes_tests {
         let p = denial_gate_prompt(&u, "judge_unavailable", reason, None, "");
         assert!(p.contains("Approve to judge it yourself"), "{p}");
         assert!(!p.contains("approve to re-run"), "{p}");
+        assert!(
+            p.contains("re-run the judge") && p.contains("`rejudge`"),
+            "{p}"
+        );
         u.member_step = Some(Default::default());
         let p = denial_gate_prompt(&u, "judge_unavailable", reason, None, "");
         assert!(p.contains("approve to re-run the phase"), "{p}");
+    }
+
+    /// (rejudge) A FIX step (creator, claude) whose gate held `judge_unavailable` on attempt 2:
+    /// the judge seats failed as seats (their images would not build). Its captured output is on
+    /// the record, and the judge registries are pinned to the built-ins (the live ones are the
+    /// host's).
+    fn seed_rejudge_fix(store: &mut dyn GraphStore, run_id: &str, clis: &[&str]) {
+        seed_bug_with_deliver(store, run_id);
+        let mut session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        session.unit_ix = 2;
+        session.attempt = 2;
+        session.clis = clis.iter().map(|c| c.to_string()).collect();
+        session.assurance = crate::assurance::RunAssurance::new(None, false);
+        put_node(store, session.to_node()).unwrap();
+        let mut units = crate::domain::session_units(store, run_id).unwrap();
+        let fix = &mut units[2];
+        fix.status = UnitStatus::Rejected;
+        fix.last_attempt = Some(2);
+        fix.authored_by = vec!["claude".into()];
+        let why =
+            "agent judge could not run — every eligible judge seat failed: pi (no_seat_image)";
+        fix.denial = Some(UnitDenial::new(
+            crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE,
+            why,
+        ));
+        fix.denial_reason = Some(why.into());
+        put_node(store, fix.to_node()).unwrap();
+        let fix = fix.clone();
+        persist_rejected_transcript(
+            store,
+            &session,
+            &fix,
+            "Fixed the retry: callers pass an empty head.",
+        );
+        let builtin = wicked_council::registry::builtin();
+        REJUDGE_REGISTRY.with(|c| *c.borrow_mut() = Some((builtin.clone(), builtin)));
+    }
+
+    fn rejudge(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+    ) -> anyhow::Result<SessionStatus> {
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        confirm_gate_as(
+            store,
+            subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            run_id,
+            HumanDecision::Rejudge,
+            Some("coordinator-agent".into()),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+    }
+
+    /// (rejudge) Once a judge seat can rule again, `rejudge` RE-ARMS THE JUDGE on the same work:
+    /// the fix step is re-dispatched at the next attempt carrying the reviewed output (so its seat
+    /// does not run), the eligible seats come from the engine's own selection (pi — never claude,
+    /// which built the work and authors the default validator), it is on the record as
+    /// `judgeRerunRequested` before `resumed`, and nothing is judged by the operator.
+    #[test]
+    fn rejudge_re_arms_the_judge_on_the_same_work_and_says_so() {
+        let run_id = format!("rejudge-arm-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_rejudge_fix(&mut store, &run_id, &["claude", "pi"]);
+        let r = rejudge_readiness(&store, &run_id).unwrap();
+        assert!(r.applies && r.available, "{r:?}");
+        // The run's own distinct seat first; a fallback judge (agy) after it, never the creator.
+        assert_eq!(r.eligible.first().map(String::as_str), Some("pi"), "{r:?}");
+        assert!(!r.eligible.iter().any(|k| k == "claude"), "{r:?}");
+        assert!(
+            r.missing
+                .iter()
+                .any(|m| m.seat == "claude" && m.reason == "built this work"),
+            "{r:?}"
+        );
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let status = rejudge(&mut store, &mut subs, &run_id).unwrap();
+        assert_eq!(status, SessionStatus::Executing);
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.unit_ix, 2, "the same step, not the next one");
+        assert_eq!(session.attempt, 3, "a fresh attempt");
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let fix = &units[2];
+        let armed = fix
+            .requested_rejudge
+            .as_ref()
+            .expect("the re-judge is armed");
+        assert_eq!(armed.output, "Fixed the retry: callers pass an empty head.");
+        assert_eq!(armed.attempt, 2);
+        assert_eq!(armed.seats, r.eligible);
+        assert!(
+            fix.assurance
+                .as_ref()
+                .is_none_or(|a| a.operator_judges.is_empty()),
+            "a re-judge is never the operator's judgment"
+        );
+        let evs = drain(&erx);
+        let at = evs
+            .iter()
+            .position(|e| matches!(e, CoreEvent::JudgeRerunRequested { .. }))
+            .expect("judgeRerunRequested");
+        match &evs[at] {
+            CoreEvent::JudgeRerunRequested {
+                ord,
+                attempt,
+                from_attempt,
+                seats,
+                by,
+                previous_reason,
+                ..
+            } => {
+                assert_eq!((*ord, *attempt, *from_attempt), (3, 3, 2));
+                assert_eq!(seats, &r.eligible);
+                assert_eq!(by, "coordinator-agent");
+                assert!(
+                    previous_reason.contains("no_seat_image"),
+                    "{previous_reason}"
+                );
+            }
+            _ => unreachable!(),
+        }
+        let resumed = evs
+            .iter()
+            .position(|e| matches!(e, CoreEvent::Resumed { .. }))
+            .expect("resumed");
+        assert!(at < resumed, "the record says it before the run moves");
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, CoreEvent::UnitReworkAmended { .. })),
+            "no rework: the creator is not sent anything"
+        );
+    }
+
+    /// (rejudge) With no seat that can judge — the only other seat built the work, or is benched —
+    /// `rejudge` is REFUSED with every missing seat and why, and the gate stays open exactly as
+    /// it was: nothing armed, nothing judged, the run still waiting.
+    #[test]
+    fn rejudge_is_refused_with_the_missing_seats_when_no_judge_is_eligible() {
+        let run_id = format!("rejudge-none-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_rejudge_fix(&mut store, &run_id, &["claude", "pi"]);
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        session.benched_seats = vec![crate::domain::BenchedSeat {
+            cli: "pi".into(),
+            reason: "quota_exhausted (no success in the run)".into(),
+            source: "judge".into(),
+            governed_only: false,
+        }];
+        put_node(&mut store, session.to_node()).unwrap();
+        // The fallback judges (claude, agy) are no way out here: claude built the work, and agy is
+        // not in the pinned registry.
+        let builtin: Vec<crate::AgenticCli> = wicked_council::registry::builtin()
+            .into_iter()
+            .filter(|c| c.key != "agy")
+            .collect();
+        REJUDGE_REGISTRY.with(|c| *c.borrow_mut() = Some((builtin.clone(), builtin)));
+        let r = rejudge_readiness(&store, &run_id).unwrap();
+        assert!(r.applies && !r.available, "{r:?}");
+        assert!(
+            r.missing.iter().any(|m| m.seat == "pi"
+                && m.reason
+                    .starts_with("benched for this run: quota_exhausted")),
+            "{r:?}"
+        );
+        let mut subs = crate::event_log::EventSink::default();
+        let err = rejudge(&mut store, &mut subs, &run_id)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no judge seat can rule on unit 3 now"),
+            "{err}"
+        );
+        assert!(err.contains("pi (benched for this run"), "{err}");
+        assert!(err.contains("claude (built this work)"), "{err}");
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+        let fix = &crate::domain::session_units(&store, &run_id).unwrap()[2];
+        assert_eq!(fix.status, UnitStatus::Rejected);
+        assert!(fix.requested_rejudge.is_none());
+    }
+
+    /// (rejudge) Only a `judge_unavailable` gate takes it: a unit the judge RULED on (a REJECT)
+    /// is refused — re-running a judge until it agrees would be verdict shopping.
+    #[test]
+    fn rejudge_answers_only_a_judge_unavailable_gate() {
+        let run_id = format!("rejudge-reject-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_rejudge_fix(&mut store, &run_id, &["claude", "pi"]);
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        units[2].denial = Some(UnitDenial::new(
+            "agent_validator",
+            "REJECT: the fix is wrong",
+        ));
+        put_node(&mut store, units[2].to_node()).unwrap();
+        let r = rejudge_readiness(&store, &run_id).unwrap();
+        assert!(!r.applies && !r.available, "{r:?}");
+        let mut subs = crate::event_log::EventSink::default();
+        let err = rejudge(&mut store, &mut subs, &run_id)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("agent_validator"), "{err}");
+        let fix = &crate::domain::session_units(&store, &run_id).unwrap()[2];
+        assert!(fix.requested_rejudge.is_none());
+    }
+
+    /// (rejudge) A re-judge left armed by an attempt that never folded is void the moment the
+    /// operator answers anything else: a send-back runs the creator's seat, never a re-read.
+    #[test]
+    fn any_other_answer_voids_a_stale_rejudge() {
+        let run_id = format!("rejudge-void-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_rejudge_fix(&mut store, &run_id, &["claude", "pi"]);
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        units[2].requested_rejudge = Some(crate::domain::RequestedRejudge {
+            output: "stale".into(),
+            attempt: 1,
+            seats: vec!["pi".into()],
+            at: 0,
+        });
+        put_node(&mut store, units[2].to_node()).unwrap();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut subs = crate::event_log::EventSink::default();
+        confirm_gate_as(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut HashSet::new(),
+            &run_id,
+            HumanDecision::RequestChanges {
+                note: Some("handle the error path".into()),
+            },
+            None,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let fix = &crate::domain::session_units(&store, &run_id).unwrap()[2];
+        assert!(
+            fix.requested_rejudge.is_none(),
+            "{:?}",
+            fix.requested_rejudge
+        );
     }
 
     /// core#929: the NO CHANGE NEEDED declaration opens its line, decorated or followed by a reason;
