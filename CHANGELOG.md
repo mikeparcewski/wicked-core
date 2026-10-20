@@ -30,6 +30,27 @@ Two release tracks share this file, newest entry first regardless of track:
   limit with the settings, and has cargo's default profile killed there (`WICKED_LIVE_SEAT_MEMORY` measures
   another limit: at 4g both profiles build, peak 3188 MiB and 3515 MiB).
 
+- **A `judge_unavailable` gate can re-run its judge (`rejudge`).** When no judge seat could rule on a unit (every
+  eligible seat failed as a seat, for example its container image would not build), the gate offered approve, which
+  records the operator's own judgment ("judged by operator"), request changes, or reject. Nothing re-ran the judge
+  once a seat could judge again. The new gate action `rejudge` (`HumanDecision::Rejudge`, napi
+  `confirmGate(run, true, undefined, "rejudge")`) re-arms the judge on the same work: the unit is re-dispatched at
+  the next attempt without running its seat, the judge reads the output the reviewed attempt captured, drawn by the
+  engine's own selection from the run's roster as it stands (never the work's authors, the pinned validator's
+  author, a team monitor of the reviewed attempt or a benched seat; a fallback judge as before). The default floor
+  is not re-run: its last result on the unchanged tree stands (core#544); a declared verify floor re-runs its
+  checks, as on every attempt. The attempt goes through the ordinary fold, so a REJECT, a
+  failed floor or another seatless judge denies again. It is recorded as the new event `judgeRerunRequested`
+  `{session, ord, attempt, fromAttempt, seats, previousReason, by}` before `resumed`, and it is never an operator
+  judgment. It is refused, with the gate left open, at any other gate (a judge that ruled is never re-asked), at a
+  team pause, and when no judge seat is eligible now; the refusal names each missing seat and why. The new read
+  `Core::rejudge_readiness` (napi `rejudgeReadiness(runId)`, JSON
+  `{applies, available, ord, eligible, missing: [{seat, reason}], reason}`) answers beforehand. The
+  `judge_unavailable` gate prompt names the new arm. A re-judge whose judge fails again leaves its basis on the
+  unit (the seat attempt still judged and its team monitors), so a second re-judge judges the same work with the
+  same exclusions; the basis is cleared once a seat runs again. Any other answer at the gate voids a re-judge whose
+  attempt never folded.
+
 - **The repo-checks floor no longer writes its build output into the run's worktree.** The floor's host-side checks
   (fmt, clippy, test) kept their isolated `HOME`, package caches and `CARGO_TARGET_DIR` in
   `<worktree>/tmp/wicked-checks/`. A run keeps its worktree after it ends (a parked run keeps it for a retry), and

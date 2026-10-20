@@ -863,6 +863,7 @@ mod tests {
             rework_amendment: None,
             review_rounds: Vec::new(),
             operator_rulings: Vec::new(),
+            requested_rejudge: None,
             carried_items: Vec::new(),
             floor_auto_retries: 0,
             instructions: None,

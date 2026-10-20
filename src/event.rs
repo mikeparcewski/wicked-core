@@ -1157,6 +1157,26 @@ pub enum CoreEvent {
         /// The re-run's `passed`.
         passed: bool,
     },
+    /// The operator re-armed the JUDGE of a unit denied `judge_unavailable`
+    /// ([`crate::workflow::HumanDecision::Rejudge`]): the next attempt (`attempt`) does not run
+    /// the seat; it hands the output captured on `fromAttempt` to the judge again, drawn by the
+    /// engine's own selection (`seats`: the eligible judge seats when it was armed, rotation
+    /// order), on the same tree. Emitted before `resumed`; the attempt's `gateEvaluated` says
+    /// what the judge ruled, and a denial there escalates again. Additive: a new frame.
+    JudgeRerunRequested {
+        session: String,
+        ord: u32,
+        /// The attempt that re-runs the judge.
+        attempt: u32,
+        /// The attempt whose captured output the judge reads.
+        from_attempt: u32,
+        /// The judge seats eligible when it was armed.
+        seats: Vec<String>,
+        /// Why the last judge could not rule (the gate's denial reason).
+        previous_reason: String,
+        /// Who asked for it, as the gate API recorded them (`operator` when unnamed).
+        by: String,
+    },
     /// (EVT-001) A structured workflow def was selected for this session — the authoritative
     /// decomposition signal. Fires once per session, after `SessionStarted` and before the first
     /// `UnitPlanned`. Only emitted when a `--workflow` id was resolved (not for free-text runs).
@@ -2566,6 +2586,24 @@ impl CoreEvent {
                 "outcome": outcome,
                 "passed": passed,
             }),
+            CoreEvent::JudgeRerunRequested {
+                session,
+                ord,
+                attempt,
+                from_attempt,
+                seats,
+                previous_reason,
+                by,
+            } => json!({
+                "type": "judgeRerunRequested",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "fromAttempt": from_attempt,
+                "seats": seats,
+                "previousReason": previous_reason,
+                "by": by,
+            }),
             // P2 decisions-full wave (EVT-001, EVT-012, EVT-013).
             CoreEvent::WorkflowSelected {
                 session,
@@ -3113,6 +3151,30 @@ mod tests {
         assert_eq!(j["previousOutcome"], "failed");
         assert_eq!(j["outcome"], "passed");
         assert_eq!(j["passed"], true);
+    }
+
+    /// `judgeRerunRequested` names the attempt that re-judges, the attempt whose output it reads,
+    /// the eligible seats and who asked — every key present.
+    #[test]
+    fn judge_rerun_requested_to_json_carries_every_key() {
+        let j = CoreEvent::JudgeRerunRequested {
+            session: "run-1".into(),
+            ord: 4,
+            attempt: 3,
+            from_attempt: 2,
+            seats: vec!["pi".into(), "copilot".into()],
+            previous_reason: "every eligible judge seat failed".into(),
+            by: "operator".into(),
+        }
+        .to_json();
+        assert_eq!(j["type"], "judgeRerunRequested");
+        assert_eq!(j["session"], "run-1");
+        assert_eq!(j["ord"], 4);
+        assert_eq!(j["attempt"], 3);
+        assert_eq!(j["fromAttempt"], 2);
+        assert_eq!(j["seats"], serde_json::json!(["pi", "copilot"]));
+        assert_eq!(j["previousReason"], "every eligible judge seat failed");
+        assert_eq!(j["by"], "operator");
     }
 
     /// core#431 (F-3R2-007): `gateEvaluated` names the judge — `judgeCli` + `judgeDistinct` ride

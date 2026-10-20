@@ -95,6 +95,12 @@ pub(crate) enum Command {
         actor: Option<String>,
         reply: Sender<anyhow::Result<SessionStatus>>,
     },
+    /// (rejudge) Whether the run's open gate can re-run its judge now, and from which seats —
+    /// read-only ([`crate::domain::RejudgeReadiness`]).
+    RejudgeReadiness {
+        run_id: String,
+        reply: Sender<anyhow::Result<crate::domain::RejudgeReadiness>>,
+    },
     /// Cancel a run — mark it terminally `Cancelled` and stop dispatching. (Real subprocess kill of an
     /// in-flight worker lands with the wrapped-CLI backend in P4a; for now the cursor stops advancing
     /// and any late worker result is ignored by the idempotency guard.)

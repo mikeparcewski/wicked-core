@@ -202,6 +202,10 @@ const HAND_AUTHORED = `${BEGIN}
  * previousOutcome, outcome, passed} — an operator retry (a plain approve at an escalated unit's
  * gate) re-ran the unit's failed floor once on the SAME tree its last floor judged; it follows the
  * fresh repoChecksEvaluated, \`reason\` is \`'operator retry'\`.
+ * Judge re-run (additive, new event): \`judgeRerunRequested\` {session, ord, attempt, fromAttempt,
+ * seats, previousReason, by} — the operator answered a \`judge_unavailable\` gate with action
+ * \`rejudge\`: attempt \`attempt\` re-reads attempt \`fromAttempt\`'s captured output with a judge drawn
+ * from \`seats\` (the eligible judge seats when it was armed); the seat does not run again.
  */
 export interface CoreEventJson {
   type: string

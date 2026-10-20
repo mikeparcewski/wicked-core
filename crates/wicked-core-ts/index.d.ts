@@ -478,6 +478,15 @@ export declare class Core {
    * ≥1 commit; resolves to the persisted `RepoEntry` as a JSON object.
    */
   registerRepo(name: string, rootPath: string): Promise<string>
+  /**
+   * (rejudge) Whether the run's open gate can RE-RUN ITS JUDGE now, as a JSON
+   * `RejudgeReadiness` object: `{applies, available, ord, eligible, missing: [{seat, reason}],
+   * reason}`. `applies` — the gate is a unit's `judge_unavailable` denial; `available` — the
+   * engine's judge selection names a seat now (`eligible`), so `confirmGate(run, true,
+   * undefined, "rejudge")` re-runs the judge on the same tree without re-running the seat.
+   * Read-only.
+   */
+  rejudgeReadiness(runId: string): Promise<string>
   /** List every registered repository, as a JSON array of `RepoEntry` objects. */
   listRepos(): Promise<string>
   /**
@@ -1221,6 +1230,10 @@ export declare class Subscription {
  * previousOutcome, outcome, passed} — an operator retry (a plain approve at an escalated unit's
  * gate) re-ran the unit's failed floor once on the SAME tree its last floor judged; it follows the
  * fresh repoChecksEvaluated, `reason` is `'operator retry'`.
+ * Judge re-run (additive, new event): `judgeRerunRequested` {session, ord, attempt, fromAttempt,
+ * seats, previousReason, by} — the operator answered a `judge_unavailable` gate with action
+ * `rejudge`: attempt `attempt` re-reads attempt `fromAttempt`'s captured output with a judge drawn
+ * from `seats` (the eligible judge seats when it was armed); the seat does not run again.
  */
 export interface CoreEventJson {
   type: string
