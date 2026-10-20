@@ -464,9 +464,17 @@ fn serve(conn: TcpStream) {
         Some(Route::Hook(t)) => Some(t.clone()),
         _ => None,
     };
+    // A refusal on a live unit's token is recorded while it holds a `Call`, so the unit's end
+    // (`HookRegistration::finish`) waits for the record and sees it if it failed; a token revoked
+    // first names no unit (logged only).
     let refuse = |conn, why: &str, tool: &str| {
-        let live = token.as_deref().and_then(unit);
-        respond(conn, "200 OK", &refusal(live.as_ref(), tool, why));
+        let live = token
+            .as_deref()
+            .and_then(unit)
+            .and_then(|reg| reg.life.enter().map(|call| (reg, call)));
+        let reply = refusal(live.as_ref().map(|(reg, _)| reg), tool, why);
+        drop(live);
+        respond(conn, "200 OK", &reply);
     };
     let bad_headers = |conn, why: &str| match &route {
         Some(Route::Hook(_)) => refuse(conn, why, UNKNOWN_TOOL),
@@ -1483,6 +1491,35 @@ mod tests {
             let (t, r10, _log) = unit("exit1");
             let _ = post(&t, &payload);
             assert!(!r10.finish(), "a recorded refusal is not reported");
+        }
+
+        // A malformed request's refusal being recorded when the unit ends: the end waits for the
+        // record, so a failed append is reported (core#1055 review round 6). Its decisions log is
+        // read-only and its append lock held, so the recorder sits in its lock wait.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let (t, r11, log) = unit("overlap");
+            std::fs::write(&log, "").unwrap();
+            std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o444)).unwrap();
+            let lock = log.with_extension("lock");
+            std::fs::write(&lock, "").unwrap();
+            let answered = std::thread::scope(|sc| {
+                let h = sc.spawn(|| post(&t, "{}"));
+                // The relay reads the request and enters the recorder's (~200 ms) lock wait.
+                std::thread::sleep(Duration::from_millis(60));
+                let finished = r11.finish();
+                (h.join().unwrap(), finished)
+            });
+            let (d, unrecorded) = answered;
+            let _ = std::fs::remove_file(&lock);
+            std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(decision(&d), "deny", "{d}");
+            // Either the refusal was in flight (the end waited and saw its failed record), or the
+            // unit ended first and the request named no live unit: never a missed failure.
+            assert!(
+                unrecorded || reason(&d).contains("unknown or revoked"),
+                "the unit's end missed an unrecorded refusal: {d}"
+            );
         }
 
         // An unknown token has no unit to record in: refused with its reason.
