@@ -431,7 +431,12 @@ fn serve(conn: TcpStream) {
     let Some(ctx) = token.as_deref().and_then(unit) else {
         return refuse(conn, "unknown or revoked hook token", &tool);
     };
-    respond(conn, "200 OK", &judge(&ctx, &tool, &body, HOOK_TIMEOUT))
+    let token = token.as_deref().unwrap_or_default();
+    respond(
+        conn,
+        "200 OK",
+        &judge(&ctx, token, &tool, &body, HOOK_TIMEOUT),
+    )
 }
 
 /// The live unit `token` names, if any.
@@ -448,8 +453,21 @@ fn unit(token: &str) -> Option<HookContext> {
 /// before it ran. A run that wrote anything there may have recorded a decision for the call (a
 /// deny it recorded before it was killed must not become an allow), and a unit whose log the relay
 /// cannot read cannot show that; both are refused. Everything else is refused ([`refusal`]).
-fn judge(ctx: &HookContext, tool: &str, body: &[u8], budget: Duration) -> String {
+/// A unit whose token was revoked while its call was judged gets neither a second run nor an
+/// allow.
+fn judge(ctx: &HookContext, token: &str, tool: &str, body: &[u8], budget: Duration) -> String {
     let deadline = Instant::now() + budget;
+    // The unit is still live: its token is still registered. Checked before a second run and
+    // before an allow is answered, so a unit that ended while its call was judged gets no verdict
+    // from a run it no longer owns.
+    let live = || unit(token).is_some();
+    let ended = |tool: &str| {
+        refusal(
+            None,
+            tool,
+            "the unit ended while its call was being judged (its hook token was revoked)",
+        )
+    };
     let log = env_of(ctx, crate::gate_hook::DECISIONS_PATH_ENV).map(std::path::PathBuf::from);
     let log_len = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
     let before = log.as_deref().map(log_len);
@@ -458,6 +476,9 @@ fn judge(ctx: &HookContext, tool: &str, body: &[u8], budget: Duration) -> String
         HookRun::Killed { signal, stderr } => {
             let untouched = before.is_some() && log.as_deref().map(log_len) == before;
             let time_left = Instant::now() < deadline;
+            if !live() {
+                return ended(tool);
+            }
             eprintln!(
                 "wicked-core: the gate hook was killed by {} before it answered a {tool} call; {}",
                 signal_name(signal),
@@ -486,12 +507,24 @@ fn judge(ctx: &HookContext, tool: &str, body: &[u8], budget: Duration) -> String
         other => other,
     };
     match answered {
-        // Allowed (0) or denied (2) by the gate hook, which recorded its own decision.
+        // Allowed (0) by the gate hook, for a unit that is still live.
         HookRun::Exited {
-            code: code @ (0 | 2),
+            code: 0,
             stdout,
             stderr,
-        } => answer(Some(code), &stdout, &stderr),
+        } => {
+            if live() {
+                answer(Some(0), &stdout, &stderr)
+            } else {
+                ended(tool)
+            }
+        }
+        // Denied (2) by the gate hook, which recorded its own decision: deny stays deny.
+        HookRun::Exited {
+            code: 2,
+            stdout,
+            stderr,
+        } => answer(Some(2), &stdout, &stderr),
         failed => refusal(Some(ctx), tool, &format!("{}{note}", failed.why(budget))),
     }
 }
@@ -1011,6 +1044,8 @@ mod tests {
              cat > /dev/null\necho run >> \"$WICKED_TEST_DIR/runs-$WICKED_TEST_MODE\"\n\
              case \"$WICKED_TEST_MODE\" in\n\
              linger) sleep 8 & echo $! > \"$WICKED_TEST_DIR/linger.pid\"; exit 0 ;;\n\
+             revoke-during) [ -e \"$WICKED_TEST_DIR/started\" ] && exit 0; : > \"$WICKED_TEST_DIR/started\"; \
+             while [ ! -e \"$WICKED_TEST_DIR/revoked\" ]; do sleep 0.1; done; kill -9 $$ ;;\n\
              deny-then-kill) [ -e \"$WICKED_TEST_DIR/recorded\" ] || { : > \"$WICKED_TEST_DIR/recorded\"; \
              printf '%s\\n' '{\"claim_id\":\"infra-deny:unit-5\",\"scope\":\"s\",\"phase\":\"unit-5\",\"policy_ids\":[\"engine:governance-infra\"],\"decision\":\"deny\",\"obligations\":[\"store\"],\"evaluated_context_ref\":\"sha256:infra\",\"criteria\":\"c\",\"evaluator_identity\":\"wicked-governance-infra\",\"evaluated_at\":1792454400}' \
              >> \"$WICKED_DECISIONS_PATH\"; kill -9 $$; } ;;\n\
@@ -1177,7 +1212,7 @@ mod tests {
             what()
         };
         for mode in ["stall", "linger", "late"] {
-            let (_t, _r, log) = unit(mode);
+            let (t, _r, log) = unit(mode);
             let ctx = HookContext {
                 env: vec![
                     ("WICKED_TEST_MODE".into(), Some(mode.into())),
@@ -1206,7 +1241,7 @@ mod tests {
                 Duration::from_secs(2)
             };
             let a: serde_json::Value =
-                serde_json::from_str(&judge(&ctx, "Write", big.as_bytes(), budget)).unwrap();
+                serde_json::from_str(&judge(&ctx, &t, "Write", big.as_bytes(), budget)).unwrap();
             let took = started.elapsed();
             assert_eq!(decision(&a), "deny", "{mode}: {a}");
             assert!(reason(&a).contains("did not answer within"), "{mode}: {a}");
@@ -1276,6 +1311,22 @@ mod tests {
         assert_eq!(decision(&v), "deny", "{v}");
         assert!(reason(&v).contains("unknown or revoked"), "{v}");
         assert_eq!(runs("revoked"), 0, "the gate hook never ran");
+        assert!(records(&log).is_empty(), "{:?}", records(&log));
+
+        // A unit that ends while its gate hook is running (here the hook is then killed, leaving
+        // no decision, and a second run would allow) gets neither a second run nor an allow.
+        let (t, r8, log) = unit("revoke-during");
+        let answered = std::thread::scope(|sc| {
+            let h = sc.spawn(|| post(&t, &payload));
+            let started = dir.join("started");
+            assert!(settles(&|| started.exists()), "the gate hook started");
+            drop(r8);
+            std::fs::write(dir.join("revoked"), "").unwrap();
+            h.join().unwrap()
+        });
+        assert_eq!(decision(&answered), "deny", "{answered}");
+        assert!(reason(&answered).contains("unit ended"), "{answered}");
+        assert_eq!(runs("revoke-during"), 1, "never judged again");
         assert!(records(&log).is_empty(), "{:?}", records(&log));
 
         // An unknown token has no unit to record in: refused with its reason.
