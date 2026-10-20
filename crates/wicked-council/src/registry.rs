@@ -205,7 +205,12 @@ pub fn builtin() -> Vec<AgenticCli> {
             display_name: "Antigravity".into(),
             binary: "agy".into(),
             // `agy -p` is the documented non-interactive mode; `agy run` spawns the
-            // bubbletea TUI and dies headless ("could not open TTY").
+            // bubbletea TUI and dies headless ("could not open TTY"). On the container floor the
+            // engine's carrier runs it as `agy --dangerously-skip-permissions --print-timeout
+            // <budget> --output-format stream-json -p=<prompt>` (wicked-core
+            // `execute_wrapped::inject_agy_headless`, `worker_sandbox::agy_permissions_under_floor`):
+            // the prompt glued to `-p` (agy refuses `-p --` and a `-p` value that starts with `--`),
+            // stdin a closed pipe (on `/dev/null` agy waits out its 60 s sign-in prompt).
             headless_invocation: "agy -p \"{PROMPT}\"".into(),
             category: Category::AgenticCoder,
             input_mode: InputMode::PromptArg,

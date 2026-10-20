@@ -146,7 +146,10 @@ impl Sessions {
 /// session).
 pub(crate) fn valid_session_id(cli: SeatCli, id: &str) -> bool {
     match cli {
-        SeatCli::Claude | SeatCli::Codex | SeatCli::Pi => uuid::Uuid::parse_str(id).is_ok(),
+        // agy's `conversation_id` is a UUID too.
+        SeatCli::Claude | SeatCli::Codex | SeatCli::Pi | SeatCli::Agy => {
+            uuid::Uuid::parse_str(id).is_ok()
+        }
         SeatCli::Opencode => id
             .strip_prefix("ses_")
             .is_some_and(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_alphanumeric())),
@@ -155,7 +158,7 @@ pub(crate) fn valid_session_id(cli: SeatCli, id: &str) -> bool {
 }
 
 /// A fresh engine-chosen session id in the spelling `cli` accepts, or `None` when the CLI picks
-/// its own (codex).
+/// its own (codex; agy, whose `--conversation` resumes only a conversation it created).
 pub(crate) fn fresh_id(cli: SeatCli) -> Option<String> {
     let u = uuid::Uuid::new_v4();
     match cli {
@@ -192,11 +195,16 @@ fn names_a_session(cli: SeatCli, argv: &[String]) -> bool {
     let short: &[&str] = match cli {
         SeatCli::Codex => &[],
         SeatCli::Opencode => &["-c", "-s"],
+        // agy's `-c` is `--continue`; it has no `-r`.
+        SeatCli::Agy => &["-c"],
         _ => &["-c", "-r"],
     };
     flags.iter().any(|a| {
         let f = a.split('=').next().unwrap_or(a);
-        matches!(f, "--session-id" | "--resume" | "--continue" | "--session") || short.contains(&f)
+        matches!(
+            f,
+            "--session-id" | "--resume" | "--continue" | "--session" | "--conversation"
+        ) || short.contains(&f)
     })
 }
 
@@ -241,6 +249,14 @@ pub(crate) fn inject_session(
             }
             let id = prior.or(fresh)?;
             insert_flag(argv, "--session", id);
+            Some(id.to_string())
+        }
+        SeatCli::Agy => {
+            // agy picks the conversation id (its `init` event names it); a later turn resumes it
+            // with `--conversation <id>`, right after the binary like every engine flag on an agy
+            // argv (never after the glued `-p=<prompt>`, `execute_wrapped::inject_agy_headless`).
+            let id = prior?;
+            argv.splice(1..1, ["--conversation".to_string(), id.to_string()]);
             Some(id.to_string())
         }
         SeatCli::Codex => {
@@ -346,11 +362,11 @@ pub(crate) fn session_after_turn(
     if seen.completed == Some(false) {
         return None;
     }
-    // Only codex picks its own id; for the others an id the engine did not inject is never
-    // adopted from the stream (agy hl-r1).
+    // Only codex and agy pick their own ids; for the others an id the engine did not inject is
+    // never adopted from the stream (agy hl-r1).
     let id = match (engine_id, cli) {
         (Some(e), _) => e.to_string(),
-        (None, SeatCli::Codex) => seen.id.clone()?,
+        (None, SeatCli::Codex | SeatCli::Agy) => seen.id.clone()?,
         (None, _) => return None,
     };
     valid_session_id(cli, &id).then_some(id)
@@ -363,6 +379,19 @@ pub(crate) fn settle_cut_off_turn(seen: &TurnSession, code: &mut i32, out: &mut 
             "\nwicked-core: the {cli} turn ended without completing (no end-of-turn event, or an \
              error event: cancelled, cut off or failed); it is not counted as done"
         ));
+    }
+}
+
+/// An agy turn its own `--print-timeout` cut off: agy still exits 0 with a `SUCCESS` result, so
+/// only its stderr notice says the turn did not finish ([`crate::execute_wrapped::agy_print_timed_out`]).
+/// Such a turn is not done: exit 1, with the reason.
+pub(crate) fn settle_agy_print_timeout(stderr: &str, code: &mut i32, out: &mut String) {
+    if *code == 0 && crate::execute_wrapped::agy_print_timed_out(stderr) {
+        *code = 1;
+        out.push_str(
+            "\nwicked-core: the agy turn reached its --print-timeout before it finished (agy \
+             returned its partial output); it is not counted as done",
+        );
     }
 }
 

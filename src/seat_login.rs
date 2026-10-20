@@ -187,7 +187,7 @@ fn parse_version(text: &str) -> Option<String> {
 
 /// The version the seat image pins for `cli` (`@scope/pkg@x.y.z`).
 fn pinned_version(cli: &str) -> Option<&'static str> {
-    crate::container_floor::seat_package(cli).and_then(|p| p.rsplit_once('@').map(|(_, v)| v))
+    crate::container_floor::seat_package(cli).and_then(|p| p.version())
 }
 
 /// The banner of a host login: what runs, where the credential goes, the version check, and the
