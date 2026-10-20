@@ -605,8 +605,24 @@ fn serve(conn: TcpStream) {
     };
     let mut reader = BufReader::new(read_half);
     let mut budget = MAX_HEAD;
-    let Some(line) = bounded_line(&mut reader, &mut budget) else {
-        return respond(conn, "431 Request Header Fields Too Large", "{}");
+    let line = match request_line(&mut reader, &mut budget) {
+        Ok(line) => line,
+        // An oversized or unreadable request line: refused, and recorded against the live unit
+        // its prefix names (the token precedes any padding), like any other hook-request failure.
+        Err(prefix) => {
+            return match token_in_prefix(&prefix) {
+                Some(token) => respond(
+                    conn,
+                    "200 OK",
+                    &refuse_for(
+                        Some(&token),
+                        UNKNOWN_TOOL,
+                        "the hook request line is oversized or unreadable",
+                    ),
+                ),
+                None => respond(conn, "431 Request Header Fields Too Large", "{}"),
+            }
+        }
     };
     // The route, and the token of a hook request, come from the request line alone, so a hook
     // request whose headers fail is a refusal like any other: answered with its reason, logged,
@@ -622,22 +638,7 @@ fn serve(conn: TcpStream) {
     // (`HookRegistration::finish`) waits for the record and sees it if it failed; a token revoked
     // first names no unit (logged only).
     let refuse = |conn, why: &str, tool: &str| {
-        let live = token
-            .as_deref()
-            .and_then(unit)
-            .and_then(|reg| reg.life.enter().map(|call| (reg, call)));
-        let reply = match &live {
-            Some((reg, _)) => match reg.life.turn(Instant::now() + HOOK_TIMEOUT) {
-                Some(_turn) => refusal(Some(reg), tool, why),
-                None => {
-                    reg.life.mark_unrecorded();
-                    refusal(None, tool, why)
-                }
-            },
-            None => refusal(None, tool, why),
-        };
-        drop(live);
-        respond(conn, "200 OK", &reply);
+        respond(conn, "200 OK", &refuse_for(token.as_deref(), tool, why));
     };
     let bad_headers = |conn, why: &str| match &route {
         Some(Route::Hook(_)) => refuse(conn, why, UNKNOWN_TOOL),
@@ -712,6 +713,49 @@ fn serve(conn: TcpStream) {
         &judge(&reg, &call, &tool, &body, HOOK_TIMEOUT),
     );
     drop(call);
+}
+
+/// A refusal for a request on `token` that is not judged (a malformed request): recorded in the
+/// live unit's decisions log while it holds a `Call` and the unit's judging turn, so the unit's
+/// end (`HookRegistration::finish`) waits for the record and sees it if it failed; a token that
+/// names no live unit is logged only.
+fn refuse_for(token: Option<&str>, tool: &str, why: &str) -> String {
+    let live = token
+        .and_then(unit)
+        .and_then(|reg| reg.life.enter().map(|call| (reg, call)));
+    let reply = match &live {
+        Some((reg, _)) => match reg.life.turn(Instant::now() + HOOK_TIMEOUT) {
+            Some(_turn) => refusal(Some(reg), tool, why),
+            None => {
+                reg.life.mark_unrecorded();
+                refusal(None, tool, why)
+            }
+        },
+        None => refusal(None, tool, why),
+    };
+    drop(live);
+    reply
+}
+
+/// The request line, at most `budget` bytes (deducted); `Err` with what arrived of it when it is
+/// longer, unreadable or cut off.
+fn request_line(reader: &mut impl BufRead, budget: &mut usize) -> Result<String, Vec<u8>> {
+    let mut line = Vec::new();
+    let read = reader.take(*budget as u64 + 1).read_until(b'\n', &mut line);
+    match read {
+        Ok(n) if n <= *budget && line.ends_with(b"\n") => {
+            *budget -= n;
+            String::from_utf8(line).map_err(|e| e.into_bytes())
+        }
+        _ => Err(line),
+    }
+}
+
+/// The hook token a request line's prefix names: `POST /hook/<hex>` followed by a space.
+fn token_in_prefix(prefix: &[u8]) -> Option<String> {
+    let rest = prefix.strip_prefix(b"POST /hook/")?;
+    let n = rest.iter().take_while(|b| b.is_ascii_hexdigit()).count();
+    (n > 0 && rest.get(n) == Some(&b' ')).then(|| String::from_utf8_lossy(&rest[..n]).into_owned())
 }
 
 /// The live unit `token` names, if any.
@@ -1762,6 +1806,21 @@ mod tests {
             Some(crate::gate_hook::INFRA_RULE_ID)
         );
         assert!(rec[0].obligations[0].contains("unit ended"), "{rec:?}");
+
+        // An oversized request line on a live unit's token is a recorded refusal too (review
+        // round 14): the token precedes the padding.
+        {
+            let (t, _r15, log) = unit("longline");
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let pad = "x".repeat(MAX_HEAD + 16);
+            let _ = s.write_all(format!("POST /hook/{t} HTTP/1.1{pad}\r\n\r\n").as_bytes());
+            let mut resp = String::new();
+            let _ = s.read_to_string(&mut resp);
+            let rec = records(&log);
+            assert_eq!(rec.len(), 1, "{rec:?} / {resp}");
+            assert!(rec[0].obligations[0].contains("request line"), "{rec:?}");
+            assert_eq!(runs("longline"), 0);
+        }
 
         // A refusal that cannot be recorded (the unit's decisions log is unwritable) marks the
         // unit, and its end reports it, so the unit fails closed (`execute_wrapped`); a unit
