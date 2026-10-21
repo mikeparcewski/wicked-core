@@ -1684,7 +1684,15 @@ pub fn run_validator_reporting_with_env(
 /// file system`; bwrap has no "mask if present" form). `build` yields a launcher with a fresh mask
 /// list, `run` spawns under it and returns its result plus the child's stderr head. The retry
 /// fires only when the head's first line is exactly that diagnostic for a mask the launcher
-/// recorded; the last pair is returned, never a third attempt.
+/// recorded AND that mask is gone from the host now; the last pair is returned, never a third
+/// attempt.
+///
+/// The host-side check is what makes the diagnostic trustworthy: the captured stderr is shared
+/// with the jailed command, which could print the same line itself and fail to earn a second run
+/// of an already-executed check (codex on #1059). The masks are `/run`, `/var/run`, the socket dirs
+/// directly under the temp dirs and `SSH_AUTH_SOCK`'s dir; outside the write roots `/` is
+/// read-only inside the jail, so jailed code cannot make one vanish. A mask that still exists
+/// means the line did not come from a vanished mount point, and nothing reruns.
 pub(crate) fn spawn_jailed<T>(
     build: &dyn Fn() -> SandboxLauncher,
     run: &mut dyn FnMut(&SandboxLauncher) -> (T, String),
@@ -1692,10 +1700,10 @@ pub(crate) fn spawn_jailed<T>(
     let launcher = build();
     let (out, head) = run(&launcher);
     let first = head.lines().next().unwrap_or("").trim_end();
-    let vanished = launcher
-        .socket_masks
-        .iter()
-        .any(|m| first == format!("bwrap: Can't mkdir {}: Read-only file system", m.display()));
+    let vanished = launcher.socket_masks.iter().any(|m| {
+        first == format!("bwrap: Can't mkdir {}: Read-only file system", m.display())
+            && std::fs::symlink_metadata(m).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    });
     if !vanished {
         return (out, launcher);
     }
@@ -5029,6 +5037,28 @@ mod tests {
             &mut |_| ((), mask_line.clone()),
         );
         assert_eq!(n.get(), 1);
+        // (codex on #1059) The jailed command itself prints the exact line for a recorded mask
+        // that still EXISTS on the host, and fails: bwrap did not die on a vanished mount point,
+        // so the check ran once and its failure stands (no second roll of an executed check).
+        let present = std::env::temp_dir();
+        assert!(present.exists());
+        let forged = format!(
+            "bwrap: Can't mkdir {}: Read-only file system",
+            present.display()
+        );
+        let (n, runs) = (Cell::new(0u32), Cell::new(0u32));
+        let (outcome, _) = spawn_jailed(
+            &|| {
+                n.set(n.get() + 1);
+                launcher_with_masks(vec![present.clone()])
+            },
+            &mut |_| {
+                runs.set(runs.get() + 1);
+                (ValidatorOutcome::Failed, forged.clone())
+            },
+        );
+        assert_eq!((n.get(), runs.get()), (1, 1));
+        assert_eq!(outcome, ValidatorOutcome::Failed);
         // The same mask line twice stops after attempt two and reads as Unrunnable.
         let n = Cell::new(0u32);
         let (outcome, launcher) = spawn_jailed(
