@@ -10686,15 +10686,11 @@ fn run_walkthrough_record(
                     .into_owned(),
                 ));
             }
-            let (out, st, killed, stderr_head) = run_tool_cmd_jailed(
-                cmd,
-                workdir,
-                &env,
-                Some(&launcher.wrapper),
-                stop,
-                on_spawn,
-                on_done,
-            );
+            // (core#840) The wrapper plus the inner shell that marks the command's start, so a
+            // vanished-mask line the command printed itself never reads as bwrap's.
+            let wrapper = crate::validator::jailed_argv_prefix(launcher);
+            let (out, st, killed, stderr_head) =
+                run_tool_cmd_jailed(cmd, workdir, &env, Some(&wrapper), stop, on_spawn, on_done);
             // A cancelled or successful take has no launcher failure to classify, so it never retries.
             let head = if matches!(st, StepStatus::Cancelled | StepStatus::Ok) {
                 String::new()
@@ -11086,14 +11082,15 @@ fn run_tool_cmd_jailed(
     // Pass pid (== pgid on unix) so deregister_tool_child can compare-and-remove (core#500).
     on_done(pid);
     let mut combined = String::from_utf8_lossy(&stdout_b).into_owned();
-    let stderr = String::from_utf8_lossy(&stderr_b);
-    // (core#840) The child's pre-merge stderr, for the caller's jail-launcher classification.
-    let stderr_head = stderr.to_string();
+    let stderr_head = String::from_utf8_lossy(&stderr_b).into_owned();
+    // (core#840) The RAW stderr goes back for the caller's jail-launcher classification; the
+    // output shows what the command printed, past the jail's started marker.
+    let stderr = crate::validator::after_started_line(&stderr_head);
     if !stderr.is_empty() {
         if !combined.is_empty() {
             combined.push('\n');
         }
-        combined.push_str(&stderr);
+        combined.push_str(stderr);
     }
     match exit {
         ToolExit::Exited(Some(st)) if st.success() => (combined, StepStatus::Ok, None, stderr_head),
@@ -26664,6 +26661,38 @@ mod walkthrough_record_tests {
         assert!(out.contains("[exit 1]"), "{out}");
         assert!(!marker.exists());
         assert_eq!(built.get(), 1);
+
+        // (codex on #1059) A jail that exec'd (pass-through wrapper, masks recorded) and a command
+        // that prints bwrap's line for the mask itself and fails: the started marker came first,
+        // so it ran once, and the output shows what it printed without the marker.
+        built.set(0);
+        let jail = |_: &[&std::path::Path]| {
+            built.set(built.get() + 1);
+            sandboxed(
+                vec!["sh".into(), "-c".into(), "exec \"$0\" \"$@\"".into()],
+                vec![m.clone()],
+            )
+        };
+        let forging = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("echo \"{line}\" >&2; exit 1"),
+        ];
+        let (out, st, _) = run_walkthrough_record(
+            &forging,
+            None,
+            &launch(&proof),
+            Ok(None),
+            2,
+            &jail,
+            &never,
+            &noop,
+            &noop,
+        );
+        assert_eq!(st, StepStatus::Failed, "{out}");
+        assert_eq!(built.get(), 1, "an executed take is never rerun: {out}");
+        assert!(out.contains(&line), "{out}");
+        assert!(!out.contains(crate::validator::JAIL_STARTED_LINE), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

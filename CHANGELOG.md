@@ -18,12 +18,13 @@ Two release tracks share this file, newest entry first regardless of track:
   command (core#840).** A network-restricting bwrap jail masks the socket dirs it enumerated (`ssh-*`, `tmux-*`,
   `.X11-unix`, `.ICE-unix`, `SSH_AUTH_SOCK`'s dir) with `--tmpfs`; one removed before the mount died with
   `bwrap: Can't mkdir <dir>: Read-only file system` before exec. `spawn_jailed` now rebuilds the launcher (a fresh
-  mask list) and reruns once, only when the failed run's first stderr line is exactly that line for a recorded mask
-  that is gone from the host. The pinned validator offers only a run it classified `Unrunnable` (never a timeout or
-  a criterion failure); the walkthrough recorder only a `Failed` take. Only masks spelled canonically and outside
-  every write root are recorded: the stderr is shared with the jailed command, which can neither remove such a dir
-  nor unlink a symlink on its path, so a printed copy of the line never earns a second run. The worker sandbox and
-  the repo-checks floor use `NetworkPolicy::Allow`, which emits no socket masks.
+  mask list) and reruns once, only when the failed run's first stderr line is exactly that line for a mask the
+  launcher recorded. A jail with recorded masks runs its command behind an inner `/bin/sh` that first writes
+  `wicked-jail: started` to stderr, so a command that ran can never put bwrap's line first: an executed check is
+  never rerun, whatever it printed. The marker is stripped before classification and from the recorder's output.
+  The pinned validator offers only a run it classified `Unrunnable` (never a timeout or a criterion failure); the
+  walkthrough recorder only a `Failed` take. The worker sandbox and the repo-checks floor use
+  `NetworkPolicy::Allow`, which emits no socket masks.
 
 - **A container seat's gate hook no longer refuses a call silently, and a killed gate hook is judged again.** In
   core#997's end-to-end run a claude seat's `cargo test` loop was refused with "the gate hook failed (exit 1): ;"

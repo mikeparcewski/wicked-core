@@ -438,9 +438,8 @@ pub(crate) struct SandboxLauncher {
     pub(crate) wrapper: Vec<String>,
     pub(crate) level: SandboxLevel,
     /// (core#840) The socket-directory `--tmpfs` masks the bwrap leg emitted (never the credential
-    /// dirs) that lie outside every write root: the destinations whose vanishing between
-    /// enumeration and mount fails bwrap before exec, and that jailed code cannot remove itself
-    /// (see [`retry_eligible_masks`]). Empty on every other leg.
+    /// dirs): the destinations whose vanishing between enumeration and mount fails bwrap before exec.
+    /// Empty on every other leg.
     pub(crate) socket_masks: Vec<PathBuf>,
 }
 
@@ -915,16 +914,15 @@ fn launcher_for_roots_masking(
             // loopback-only — hides the usual socket directories and `SSH_AUTH_SOCK`'s own dir
             // behind an empty tmpfs; the write roots, bound below, still win. Both `/tmp` and
             // the system temp dir are scanned (one when `TMPDIR` is unset).
-            let mut emitted: Vec<PathBuf> = Vec::new();
+            let mut socket_masks: Vec<PathBuf> = Vec::new();
             if network.restricts() {
                 let tmp = std::env::temp_dir();
                 for dir in loopback_socket_masks(&roots, &[Path::new("/tmp"), tmp.as_path()]) {
                     w.push("--tmpfs".to_string());
                     w.push(dir.to_string_lossy().to_string());
-                    emitted.push(dir);
+                    socket_masks.push(dir);
                 }
             }
-            let socket_masks = retry_eligible_masks(emitted, &roots);
             // P8 #9 / core#217: rw-bind the coverage store's dir (outside the run dir) so opening its
             // WAL-mode SQLite db can create -wal/-shm/journal there. `--ro-bind / /` above makes it
             // READABLE but not writable; SQLite needs write access to the db's DIRECTORY to open it.
@@ -1562,7 +1560,7 @@ pub fn run_validator_reporting_with_env(
     let (outcome, launcher) = spawn_jailed(
         &|| detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Deny),
         &mut |launcher: &SandboxLauncher| {
-            let mut argv = launcher.wrapper.clone();
+            let mut argv = jailed_argv_prefix(launcher);
             argv.push("sh".to_string());
             argv.push("-c".to_string());
             argv.push(v.script.clone());
@@ -1663,11 +1661,13 @@ pub fn run_validator_reporting_with_env(
             // The child's stderr is captured for classification (teed — it reaches the daemon log as
             // before) so a jail that died before exec reads as `Unrunnable`, never as the criterion's
             // `Failed` (core#460).
+            // The classification reads the head past the started marker (core#840), exactly what
+            // the command printed; `spawn_jailed` is handed the RAW head, marker included.
             let (res, stderr_head) = run_bounded_status_capturing_stderr(cmd, VALIDATOR_TIMEOUT);
             let outcome = classify_launcher_exit(
                 ValidatorOutcome::from_bounded(res),
                 &launcher.wrapper,
-                &stderr_head,
+                after_started_line(&stderr_head),
             );
             // Only a run classified as the LAUNCHER's failure offers its head: a pass, a criterion
             // failure or a timeout never retries, whatever it printed.
@@ -1682,35 +1682,47 @@ pub fn run_validator_reporting_with_env(
     Ok((outcome, launcher.level))
 }
 
-/// (core#840) The emitted socket masks a vanished-mask retry may key on: those already spelled
-/// canonically (no symlink anywhere in the path) and outside every write root (`roots` are
-/// canonical, and they are every read-write bind the jail makes). Then no ancestor of the mask is
-/// writable inside the jail, so jailed code can neither remove it nor unlink a symlink on its
-/// path to make the spelled path vanish, and then print bwrap's mkdir line to earn a second run
-/// of an executed check (codex on #1059). A mask beneath a root hides nothing anyway (the root's
-/// bind covers it). An ineligible mask still fails closed if it vanishes; it is never retried.
-fn retry_eligible_masks(masks: Vec<PathBuf>, roots: &[PathBuf]) -> Vec<PathBuf> {
-    masks
-        .into_iter()
-        .filter(|m| m.canonicalize().is_ok_and(|real| real == *m))
-        .filter(|m| !roots.iter().any(|r| m.starts_with(r)))
-        .collect()
+/// (core#840) The line the jail's inner wrapper ([`jailed_argv_prefix`]) writes to stderr just
+/// before it execs the jailed command.
+pub(crate) const JAIL_STARTED_LINE: &str = "wicked-jail: started";
+
+/// (core#840) The argv to append a jailed command to: the launcher's wrapper, plus, when it
+/// recorded socket masks, an inner `/bin/sh` that writes [`JAIL_STARTED_LINE`] to stderr and then
+/// execs the command. bwrap's own pre-exec diagnostics can only come BEFORE the marker and the
+/// command's output only after it, so a first stderr line other than the marker is the
+/// launcher's: the jailed command cannot forge the vanished-mask diagnostic [`spawn_jailed`] keys
+/// on (codex on #1059). The inner shell refuses to run the command (exit 125) if the marker
+/// cannot be written. A launcher without masks (sandbox-exec, the floor, `Allow`) is unchanged.
+pub(crate) fn jailed_argv_prefix(launcher: &SandboxLauncher) -> Vec<String> {
+    let mut argv = launcher.wrapper.clone();
+    if !launcher.socket_masks.is_empty() {
+        argv.extend([
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf '%s\\n' \"$0\" >&2 || exit 125; exec \"$@\"".to_string(),
+            JAIL_STARTED_LINE.to_string(),
+        ]);
+    }
+    argv
+}
+
+/// `stderr` past a leading [`JAIL_STARTED_LINE`], when it has one: what the jailed command itself
+/// printed, for classification and for the output a caller shows.
+pub(crate) fn after_started_line(stderr: &str) -> &str {
+    stderr
+        .strip_prefix(JAIL_STARTED_LINE)
+        .and_then(|rest| rest.strip_prefix('\n'))
+        .unwrap_or(stderr)
 }
 
 /// (core#840) Run a jailed spawn, retrying ONCE when bwrap died before exec because a socket-dir
 /// mask it was handed vanished between enumeration and mount (`bwrap: Can't mkdir <m>: Read-only
 /// file system`; bwrap has no "mask if present" form). `build` yields a launcher with a fresh mask
-/// list, `run` spawns under it and returns its result plus the child's stderr head. The retry
-/// fires only when the head's first line is exactly that diagnostic for a mask the launcher
-/// recorded AND that mask is gone from the host now; the last pair is returned, never a third
-/// attempt. The launcher records only masks outside its write roots ([`retry_eligible_masks`]).
-///
-/// The host-side check is what makes the diagnostic trustworthy: the captured stderr is shared
-/// with the jailed command, which could print the same line itself and fail to earn a second run
-/// of an already-executed check (codex on #1059). The masks are `/run`, `/var/run`, the socket dirs
-/// directly under the temp dirs and `SSH_AUTH_SOCK`'s dir, recorded only outside the write roots,
-/// where `/` is read-only inside the jail, so jailed code cannot make one vanish. A mask that still
-/// exists means the line did not come from a vanished mount point, and nothing reruns.
+/// list, `run` spawns its command after [`jailed_argv_prefix`] and returns its result plus the
+/// child's RAW stderr head. The retry fires only when the head's first line is exactly that
+/// diagnostic for a mask the launcher recorded; the last pair is returned, never a third attempt.
+/// A command that started put [`JAIL_STARTED_LINE`] first, so it never matches: an executed check
+/// is never rerun, whatever it printed or whatever the host did meanwhile.
 pub(crate) fn spawn_jailed<T>(
     build: &dyn Fn() -> SandboxLauncher,
     run: &mut dyn FnMut(&SandboxLauncher) -> (T, String),
@@ -1718,10 +1730,10 @@ pub(crate) fn spawn_jailed<T>(
     let launcher = build();
     let (out, head) = run(&launcher);
     let first = head.lines().next().unwrap_or("").trim_end();
-    let vanished = launcher.socket_masks.iter().any(|m| {
-        first == format!("bwrap: Can't mkdir {}: Read-only file system", m.display())
-            && std::fs::symlink_metadata(m).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-    });
+    let vanished = launcher
+        .socket_masks
+        .iter()
+        .any(|m| first == format!("bwrap: Can't mkdir {}: Read-only file system", m.display()));
     if !vanished {
         return (out, launcher);
     }
@@ -5055,28 +5067,9 @@ mod tests {
             &mut |_| ((), mask_line.clone()),
         );
         assert_eq!(n.get(), 1);
-        // (codex on #1059) The jailed command itself prints the exact line for a recorded mask
-        // that still EXISTS on the host, and fails: bwrap did not die on a vanished mount point,
-        // so the check ran once and its failure stands (no second roll of an executed check).
-        let present = std::env::temp_dir();
-        assert!(present.exists());
-        let forged = format!(
-            "bwrap: Can't mkdir {}: Read-only file system",
-            present.display()
-        );
-        let (n, runs) = (Cell::new(0u32), Cell::new(0u32));
-        let (outcome, _) = spawn_jailed(
-            &|| {
-                n.set(n.get() + 1);
-                launcher_with_masks(vec![present.clone()])
-            },
-            &mut |_| {
-                runs.set(runs.get() + 1);
-                (ValidatorOutcome::Failed, forged.clone())
-            },
-        );
-        assert_eq!((n.get(), runs.get()), (1, 1));
-        assert_eq!(outcome, ValidatorOutcome::Failed);
+        // (codex on #1059) A command that started wrote the marker first, so its own copy of the
+        // line is never the head's first line: no rerun of an executed check.
+        assert_eq!(builds_for(&format!("{JAIL_STARTED_LINE}\n{mask_line}")), 1);
         // The same mask line twice stops after attempt two and reads as Unrunnable.
         let n = Cell::new(0u32);
         let (outcome, launcher) = spawn_jailed(
@@ -5099,63 +5092,63 @@ mod tests {
         assert_eq!(launcher.socket_masks, vec![m]);
     }
 
-    /// (codex on #1059) A mask beneath a write root is the host dir itself inside the jail (the root
-    /// is bound read-write after the masks), so it is never retry-eligible: the executed command
-    /// removes it, prints bwrap's mkdir line for it and fails, and that one failure stands.
+    /// (codex on #1059) The started marker on a real process: a launcher with recorded masks runs
+    /// its command after the inner `/bin/sh`, which writes [`JAIL_STARTED_LINE`] first. A command
+    /// that prints bwrap's vanished-mask line itself and fails therefore runs ONCE, and the head
+    /// past the marker is exactly what it printed. A launcher without masks is unchanged.
+    #[cfg(unix)]
     #[test]
-    fn a_mask_beneath_a_write_root_never_earns_a_rerun_840() {
+    fn a_started_command_that_forges_the_mask_line_runs_once_840() {
         use std::cell::Cell;
-        // A canonical base: on macOS the temp dir is reached through a symlink.
-        let base = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("wicked-val-840-elig-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let root = base.join("root");
-        let inside = root.join("agent-dir");
-        let outside = base.join("agent-store").join("session");
-        std::fs::create_dir_all(&inside).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        let roots = vec![root.clone()];
-        let mut masks = vec![inside.clone(), outside.clone(), base.join("never-created")];
-        // (round 3) A symlink inside the root pointing outside it: the mask's canonical target is
-        // outside, but jailed code could unlink the link and make the spelled path vanish.
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(base.join("agent-store"), root.join("agent-link")).unwrap();
-            masks.push(root.join("agent-link").join("session"));
-            assert!(root.join("agent-link").join("session").is_dir());
-        }
-        // A non-canonical spelling of an eligible dir (a `..` hop) is not eligible either.
-        masks.push(
-            base.join("root")
-                .join("..")
-                .join("agent-store")
-                .join("session"),
-        );
-        // Only the canonically spelled, existing mask outside every root is retry-eligible.
-        assert_eq!(retry_eligible_masks(masks, &roots), vec![outside]);
-        let line = format!(
-            "bwrap: Can't mkdir {}: Read-only file system",
-            inside.display()
-        );
+        let m = PathBuf::from("/tmp/ssh-gone-840");
+        let line = format!("bwrap: Can't mkdir {}: Read-only file system", m.display());
+        let unmasked = launcher_with_masks(Vec::new());
+        assert_eq!(jailed_argv_prefix(&unmasked), unmasked.wrapper);
         let (builds, runs) = (Cell::new(0u32), Cell::new(0u32));
-        let (outcome, launcher) = spawn_jailed(
+        let (out, launcher) = spawn_jailed(
             &|| {
                 builds.set(builds.get() + 1);
-                launcher_with_masks(retry_eligible_masks(vec![inside.clone()], &roots))
+                // An empty wrapper stands in for an armed jail that exec'd: the inner shell runs.
+                SandboxLauncher {
+                    wrapper: Vec::new(),
+                    level: SandboxLevel::Sandboxed,
+                    socket_masks: vec![m.clone()],
+                }
             },
-            &mut |_| {
+            &mut |l| {
                 runs.set(runs.get() + 1);
-                let _ = std::fs::remove_dir_all(&inside);
-                (ValidatorOutcome::Failed, line.clone())
+                let mut argv = jailed_argv_prefix(l);
+                argv.extend([
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("echo \"{line}\" >&2; echo said; exit 1"),
+                ]);
+                // spawn-audit: test-only — the inner marker shell under the floor's cleared env.
+                let mut cmd = Command::new(&argv[0]);
+                cmd.args(&argv[1..]);
+                apply_minimal_env(&mut cmd);
+                let (status, head) =
+                    run_bounded_status_capturing_stderr(cmd, Duration::from_secs(20));
+                (
+                    (status.ok().flatten().and_then(|s| s.code()), head.clone()),
+                    head,
+                )
             },
         );
-        assert!(!inside.exists(), "the executed command removed the mask");
-        assert!(launcher.socket_masks.is_empty());
         assert_eq!((builds.get(), runs.get()), (1, 1));
-        assert_eq!(outcome, ValidatorOutcome::Failed);
-        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(launcher.socket_masks, vec![m]);
+        let (code, head) = out;
+        assert_eq!(
+            code,
+            Some(1),
+            "the command's own exit status passes through"
+        );
+        assert_eq!(head.lines().next(), Some(JAIL_STARTED_LINE), "{head:?}");
+        assert_eq!(
+            after_started_line(&head).lines().next(),
+            Some(line.as_str())
+        );
+        assert_eq!(after_started_line("no marker\n"), "no marker\n");
     }
 
     /// core#840 on real bwrap: a mask handed to the first launcher that never existed (the dir
@@ -5194,7 +5187,7 @@ mod tests {
         let mut seen: Vec<Vec<String>> = Vec::new();
         let (outcome, launcher) = spawn_jailed(&build, &mut |l| {
             seen.push(l.wrapper.clone());
-            let mut argv = l.wrapper.clone();
+            let mut argv = jailed_argv_prefix(l);
             argv.push("/bin/true".to_string());
             // spawn-audit: test-only — the wrapper probe under the floor's cleared env.
             let mut cmd = Command::new(&argv[0]);
@@ -5213,6 +5206,46 @@ mod tests {
         let ms = m.to_string_lossy().into_owned();
         assert!(seen[0].contains(&ms) && !seen[1].contains(&ms), "{seen:?}");
         assert!(!m.exists(), "the test must not create the mask dir");
+        // (codex on #1059) The production launcher's own masks, a command that forges bwrap's
+        // line for one of them and fails: the marker came first, so it runs once.
+        if let Some(real) = launcher.socket_masks.first().cloned() {
+            let forged = format!(
+                "bwrap: Can't mkdir {}: Read-only file system",
+                real.display()
+            );
+            let builds = Cell::new(0u32);
+            let (head, _) = spawn_jailed(
+                &|| {
+                    builds.set(builds.get() + 1);
+                    detect_sandbox_launcher_for_roots(&[base.as_path()], NetworkPolicy::Deny)
+                },
+                &mut |l| {
+                    let mut argv = jailed_argv_prefix(l);
+                    argv.extend([
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!("echo \"{forged}\" >&2; exit 1"),
+                    ]);
+                    // spawn-audit: test-only — the forged diagnostic under the real jail.
+                    let mut cmd = Command::new(&argv[0]);
+                    cmd.args(&argv[1..]).current_dir(&base);
+                    apply_minimal_env(&mut cmd);
+                    let (_, head) =
+                        run_bounded_status_capturing_stderr(cmd, Duration::from_secs(20));
+                    (head.clone(), head)
+                },
+            );
+            assert_eq!(
+                builds.get(),
+                1,
+                "an executed check is never rerun: {head:?}"
+            );
+            assert_eq!(head.lines().next(), Some(JAIL_STARTED_LINE), "{head:?}");
+            assert_eq!(
+                after_started_line(&head).lines().next(),
+                Some(forged.as_str())
+            );
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
