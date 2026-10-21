@@ -19,9 +19,10 @@ Two release tracks share this file, newest entry first regardless of track:
   `.X11-unix`, `.ICE-unix`, `SSH_AUTH_SOCK`'s dir) with `--tmpfs`; one removed before the mount died with
   `bwrap: Can't mkdir <dir>: Read-only file system` before exec. `spawn_jailed` now rebuilds the launcher (a fresh
   mask list) and reruns once, only when the failed run's first stderr line is exactly that line for a mask the
-  launcher recorded. A jail with recorded masks runs its command behind an inner `/bin/sh` that first writes
-  `wicked-jail: started` to stderr, so a command that ran can never put bwrap's line first: an executed check is
-  never rerun, whatever it printed. The marker is stripped before classification and from the recorder's output.
+  launcher recorded. In a jail with recorded masks the command first writes `wicked-jail: started` to stderr (the
+  validator's `sh -c` script as its first command, the recorder's command through an inner `/bin/sh`), so a command
+  that ran can never put bwrap's line first: an executed check is never rerun, whatever it printed. The marker is
+  stripped, only where it was installed, before classification and from the recorder's output.
   The pinned validator offers only a run it classified `Unrunnable` (never a timeout or a criterion failure); the
   walkthrough recorder only a `Failed` take. The worker sandbox and the repo-checks floor use
   `NetworkPolicy::Allow`, which emits no socket masks.

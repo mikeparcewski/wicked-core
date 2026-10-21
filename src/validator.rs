@@ -1560,10 +1560,7 @@ pub fn run_validator_reporting_with_env(
     let (outcome, launcher) = spawn_jailed(
         &|| detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Deny),
         &mut |launcher: &SandboxLauncher| {
-            let mut argv = jailed_argv_prefix(launcher);
-            argv.push("sh".to_string());
-            argv.push("-c".to_string());
-            argv.push(v.script.clone());
+            let argv = validator_argv(launcher, &v.script);
 
             let mut cmd = Command::new(&argv[0]);
             // `apply_minimal_env` below is strictly stronger than the chokepoint (it `env_clear`s and passes
@@ -1664,10 +1661,15 @@ pub fn run_validator_reporting_with_env(
             // The classification reads the head past the started marker (core#840), exactly what
             // the command printed; `spawn_jailed` is handed the RAW head, marker included.
             let (res, stderr_head) = run_bounded_status_capturing_stderr(cmd, VALIDATOR_TIMEOUT);
+            let shown = if launcher.socket_masks.is_empty() {
+                stderr_head.as_str()
+            } else {
+                after_started_line(&stderr_head)
+            };
             let outcome = classify_launcher_exit(
                 ValidatorOutcome::from_bounded(res),
                 &launcher.wrapper,
-                after_started_line(&stderr_head),
+                shown,
             );
             // Only a run classified as the LAUNCHER's failure offers its head: a pass, a criterion
             // failure or a timeout never retries, whatever it printed.
@@ -1686,13 +1688,15 @@ pub fn run_validator_reporting_with_env(
 /// before it execs the jailed command.
 pub(crate) const JAIL_STARTED_LINE: &str = "wicked-jail: started";
 
-/// (core#840) The argv to append a jailed command to: the launcher's wrapper, plus, when it
-/// recorded socket masks, an inner `/bin/sh` that writes [`JAIL_STARTED_LINE`] to stderr and then
-/// execs the command. bwrap's own pre-exec diagnostics can only come BEFORE the marker and the
-/// command's output only after it, so a first stderr line other than the marker is the
-/// launcher's: the jailed command cannot forge the vanished-mask diagnostic [`spawn_jailed`] keys
-/// on (codex on #1059). The inner shell refuses to run the command (exit 125) if the marker
-/// cannot be written. A launcher without masks (sandbox-exec, the floor, `Allow`) is unchanged.
+/// (core#840) The argv to append a jailed ARBITRARY command to (the walkthrough recorder's): the
+/// launcher's wrapper, plus, when it recorded socket masks, an inner `/bin/sh` that writes
+/// [`JAIL_STARTED_LINE`] to stderr and then execs the command. bwrap's own pre-exec diagnostics
+/// can only come BEFORE the marker and the command's output only after it, so a first stderr line
+/// other than the marker is the launcher's: the jailed command cannot forge the vanished-mask
+/// diagnostic [`spawn_jailed`] keys on (codex on #1059). The inner shell refuses to run the
+/// command (exit 125) if the marker cannot be written. A launcher without masks (sandbox-exec,
+/// the floor, `Allow`) is unchanged. The validator, whose command is already `sh -c`, uses
+/// [`validator_argv`] instead.
 pub(crate) fn jailed_argv_prefix(launcher: &SandboxLauncher) -> Vec<String> {
     let mut argv = launcher.wrapper.clone();
     if !launcher.socket_masks.is_empty() {
@@ -1706,8 +1710,28 @@ pub(crate) fn jailed_argv_prefix(launcher: &SandboxLauncher) -> Vec<String> {
     argv
 }
 
+/// (core#840) The pinned validator's argv: the wrapper execs `sh -c <script>` ITSELF, so a shell
+/// that cannot be exec'd stays bwrap's own diagnostic (`Unrunnable`, core#460; codex on #1059)
+/// rather than an inner shell's exit 127. With recorded socket masks the script's FIRST command
+/// writes [`JAIL_STARTED_LINE`] to stderr (exit 125 if it cannot), the same forgery guard
+/// [`jailed_argv_prefix`] gives an arbitrary command; without masks the argv is unchanged.
+fn validator_argv(launcher: &SandboxLauncher, script: &str) -> Vec<String> {
+    let mut argv = launcher.wrapper.clone();
+    argv.push("sh".to_string());
+    argv.push("-c".to_string());
+    if launcher.socket_masks.is_empty() {
+        argv.push(script.to_string());
+    } else {
+        argv.push(format!(
+            "printf '%s\\n' '{JAIL_STARTED_LINE}' >&2 || exit 125\n{script}"
+        ));
+    }
+    argv
+}
+
 /// `stderr` past a leading [`JAIL_STARTED_LINE`], when it has one: what the jailed command itself
-/// printed, for classification and for the output a caller shows.
+/// printed, for classification and for the output a caller shows. Only for a spawn that installed
+/// the marker: an unmarked command's own stderr is never trimmed.
 pub(crate) fn after_started_line(stderr: &str) -> &str {
     stderr
         .strip_prefix(JAIL_STARTED_LINE)
@@ -5092,23 +5116,36 @@ mod tests {
         assert_eq!(launcher.socket_masks, vec![m]);
     }
 
-    /// (codex on #1059) The started marker on a real process: a launcher with recorded masks runs
-    /// its command after the inner `/bin/sh`, which writes [`JAIL_STARTED_LINE`] first. A command
-    /// that prints bwrap's vanished-mask line itself and fails therefore runs ONCE, and the head
-    /// past the marker is exactly what it printed. A launcher without masks is unchanged.
+    /// (codex on #1059) The started marker on a real process. The validator's argv keeps the wrapper
+    /// exec'ing `sh -c` itself (no inner shell), with the marker as the script's first command when
+    /// masks are recorded; a launcher without masks gets the unchanged argv. A script that prints
+    /// bwrap's vanished-mask line itself and fails runs ONCE, and the head past the marker is
+    /// exactly what it printed.
     #[cfg(unix)]
     #[test]
     fn a_started_command_that_forges_the_mask_line_runs_once_840() {
         use std::cell::Cell;
         let m = PathBuf::from("/tmp/ssh-gone-840");
         let line = format!("bwrap: Can't mkdir {}: Read-only file system", m.display());
+        let script = format!("echo \"{line}\" >&2; echo said; exit 1");
         let unmasked = launcher_with_masks(Vec::new());
+        let plain = validator_argv(&unmasked, &script);
+        assert_eq!(plain[..2], unmasked.wrapper[..]);
+        assert_eq!(plain[2..], ["sh", "-c", script.as_str()]);
         assert_eq!(jailed_argv_prefix(&unmasked), unmasked.wrapper);
+        let masked = launcher_with_masks(vec![m.clone()]);
+        let marked = validator_argv(&masked, &script);
+        assert_eq!(
+            marked[..4],
+            ["/usr/bin/bwrap", "--", "sh", "-c"],
+            "no inner shell"
+        );
+        assert!(marked[4].ends_with(&format!("\n{script}")), "{marked:?}");
         let (builds, runs) = (Cell::new(0u32), Cell::new(0u32));
         let (out, launcher) = spawn_jailed(
             &|| {
                 builds.set(builds.get() + 1);
-                // An empty wrapper stands in for an armed jail that exec'd: the inner shell runs.
+                // An empty wrapper stands in for an armed jail that exec'd the shell.
                 SandboxLauncher {
                     wrapper: Vec::new(),
                     level: SandboxLevel::Sandboxed,
@@ -5117,13 +5154,8 @@ mod tests {
             },
             &mut |l| {
                 runs.set(runs.get() + 1);
-                let mut argv = jailed_argv_prefix(l);
-                argv.extend([
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("echo \"{line}\" >&2; echo said; exit 1"),
-                ]);
-                // spawn-audit: test-only — the inner marker shell under the floor's cleared env.
+                let argv = validator_argv(l, &script);
+                // spawn-audit: test-only — the marked validator script under the floor's cleared env.
                 let mut cmd = Command::new(&argv[0]);
                 cmd.args(&argv[1..]);
                 apply_minimal_env(&mut cmd);
@@ -5138,11 +5170,7 @@ mod tests {
         assert_eq!((builds.get(), runs.get()), (1, 1));
         assert_eq!(launcher.socket_masks, vec![m]);
         let (code, head) = out;
-        assert_eq!(
-            code,
-            Some(1),
-            "the command's own exit status passes through"
-        );
+        assert_eq!(code, Some(1), "the script's own exit status passes through");
         assert_eq!(head.lines().next(), Some(JAIL_STARTED_LINE), "{head:?}");
         assert_eq!(
             after_started_line(&head).lines().next(),
@@ -5220,12 +5248,7 @@ mod tests {
                     detect_sandbox_launcher_for_roots(&[base.as_path()], NetworkPolicy::Deny)
                 },
                 &mut |l| {
-                    let mut argv = jailed_argv_prefix(l);
-                    argv.extend([
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        format!("echo \"{forged}\" >&2; exit 1"),
-                    ]);
+                    let argv = validator_argv(l, &format!("echo \"{forged}\" >&2; exit 1"));
                     // spawn-audit: test-only — the forged diagnostic under the real jail.
                     let mut cmd = Command::new(&argv[0]);
                     cmd.args(&argv[1..]).current_dir(&base);
@@ -5244,6 +5267,26 @@ mod tests {
             assert_eq!(
                 after_started_line(&head).lines().next(),
                 Some(forged.as_str())
+            );
+            // (codex on #1059) A shell the jail cannot exec stays bwrap's own diagnostic, so the
+            // validator still reads `Unrunnable`, never the criterion's `Failed`.
+            let l = detect_sandbox_launcher_for_roots(&[base.as_path()], NetworkPolicy::Deny);
+            let argv = validator_argv(&l, "exit 0");
+            // spawn-audit: test-only — `sh` absent from the jailed PATH.
+            let mut cmd = Command::new(&argv[0]);
+            cmd.args(&argv[1..]).current_dir(&base);
+            apply_minimal_env(&mut cmd);
+            cmd.env("PATH", "/nonexistent-840");
+            let (status, head) = run_bounded_status_capturing_stderr(cmd, Duration::from_secs(20));
+            let outcome = classify_launcher_exit(
+                ValidatorOutcome::from_bounded(status),
+                &l.wrapper,
+                after_started_line(&head),
+            );
+            assert!(head.starts_with("bwrap:"), "{head:?}");
+            assert!(
+                matches!(outcome, ValidatorOutcome::Unrunnable(_)),
+                "{outcome:?} {head:?}"
             );
         }
         let _ = std::fs::remove_dir_all(&base);

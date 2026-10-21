@@ -11084,8 +11084,14 @@ fn run_tool_cmd_jailed(
     let mut combined = String::from_utf8_lossy(&stdout_b).into_owned();
     let stderr_head = String::from_utf8_lossy(&stderr_b).into_owned();
     // (core#840) The RAW stderr goes back for the caller's jail-launcher classification; the
-    // output shows what the command printed, past the jail's started marker.
-    let stderr = crate::validator::after_started_line(&stderr_head);
+    // output shows what the command printed, past the jail's started marker when THIS spawn's
+    // wrapper installed one (an unjailed or unmarked command's stderr is never trimmed).
+    let marked = jail.is_some_and(|w| w.iter().any(|a| a == crate::validator::JAIL_STARTED_LINE));
+    let stderr = if marked {
+        crate::validator::after_started_line(&stderr_head)
+    } else {
+        stderr_head.as_str()
+    };
     if !stderr.is_empty() {
         if !combined.is_empty() {
             combined.push('\n');
@@ -27064,6 +27070,20 @@ mod tool_cmd_tests {
         assert_eq!(out, "x\n[exit 3]");
         assert_eq!(st, StepStatus::Failed);
         assert!(k.is_none());
+        // (core#840, codex on #1059) An unjailed command's own stderr that starts with the jail's
+        // marker text is kept: only a spawn that installed the marker strips it.
+        let (out, _, _) = run_tool_cmd(
+            &sh(&format!(
+                "printf '%s\\n' '{}' >&2",
+                crate::validator::JAIL_STARTED_LINE
+            )),
+            None,
+            &[],
+            &never,
+            &noop_spawn,
+            &noop_done,
+        );
+        assert_eq!(out, format!("{}\n", crate::validator::JAIL_STARTED_LINE));
         // silent success: empty output.
         let (out, st, _) = run_tool_cmd(&sh("exit 0"), None, &[], &never, &noop_spawn, &noop_done);
         assert_eq!(out, "");
