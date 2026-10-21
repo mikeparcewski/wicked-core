@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Jail spawn: a socket dir that vanished between mask enumeration and bwrap's mount no longer fails the jailed
+  command (core#840).** A network-restricting bwrap jail masks the socket dirs it enumerated (`ssh-*`, `tmux-*`,
+  `.X11-unix`, `.ICE-unix`, `SSH_AUTH_SOCK`'s dir) with `--tmpfs`; one removed before the mount died with
+  `bwrap: Can't mkdir <dir>: Read-only file system` before exec. `spawn_jailed` now rebuilds the launcher (a fresh
+  mask list) and reruns once, only on that exact first stderr line for a mask the launcher recorded. Wired into the
+  pinned validator's spawn and the walkthrough recorder; the worker sandbox and the repo-checks floor use
+  `NetworkPolicy::Allow`, which emits no socket masks.
+
 - **A container seat's gate hook no longer refuses a call silently, and a killed gate hook is judged again.** In
   core#997's end-to-end run a claude seat's `cargo test` loop was refused with "the gate hook failed (exit 1): ;"
   and nothing else: no reason, no line in the daemon's log, no deny in the unit's decisions log. The host gate

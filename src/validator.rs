@@ -63,7 +63,7 @@ use crate::domain::WorkUnit;
 use crate::scope::EntityMode;
 use crate::workflow::{StepInput, StepRunner, StepStatus};
 use crate::AgenticCli;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 use wicked_apps_core::HardenedCommand;
@@ -437,6 +437,10 @@ pub(crate) fn find_on_path(bin: &str) -> Option<std::path::PathBuf> {
 pub(crate) struct SandboxLauncher {
     pub(crate) wrapper: Vec<String>,
     pub(crate) level: SandboxLevel,
+    /// (core#840) The socket-directory `--tmpfs` masks the bwrap leg emitted (never the credential
+    /// dirs): the destinations whose vanishing between enumeration and mount fails bwrap before exec.
+    /// Empty on every other leg.
+    pub(crate) socket_masks: Vec<PathBuf>,
 }
 
 /// Whether the sandbox profile denies network. Validator scripts retain their historical network
@@ -835,6 +839,7 @@ fn launcher_for_roots_masking(
     let floor = SandboxLauncher {
         wrapper: Vec::new(),
         level: SandboxLevel::BestEffort,
+        socket_masks: Vec::new(),
     };
     if let Some(tool) = find_on_path("sandbox-exec") {
         if let Some(profile) = macos_sandbox_profile_for_roots(write_roots, network) {
@@ -845,6 +850,7 @@ fn launcher_for_roots_masking(
                     profile,
                 ],
                 level: SandboxLevel::Sandboxed,
+                socket_masks: Vec::new(),
             };
         }
     }
@@ -908,11 +914,13 @@ fn launcher_for_roots_masking(
             // loopback-only — hides the usual socket directories and `SSH_AUTH_SOCK`'s own dir
             // behind an empty tmpfs; the write roots, bound below, still win. Both `/tmp` and
             // the system temp dir are scanned (one when `TMPDIR` is unset).
+            let mut socket_masks: Vec<PathBuf> = Vec::new();
             if network.restricts() {
                 let tmp = std::env::temp_dir();
                 for dir in loopback_socket_masks(&roots, &[Path::new("/tmp"), tmp.as_path()]) {
                     w.push("--tmpfs".to_string());
                     w.push(dir.to_string_lossy().to_string());
+                    socket_masks.push(dir);
                 }
             }
             // P8 #9 / core#217: rw-bind the coverage store's dir (outside the run dir) so opening its
@@ -962,6 +970,7 @@ fn launcher_for_roots_masking(
             return SandboxLauncher {
                 wrapper: w,
                 level: SandboxLevel::Sandboxed,
+                socket_masks,
             };
         }
     }
@@ -979,6 +988,7 @@ fn launcher_for_roots_masking(
                 "--net=none".to_string(),
             ],
             level: SandboxLevel::NetworkOnly,
+            socket_masks: Vec::new(),
         };
     }
     floor
@@ -1545,115 +1555,153 @@ pub fn run_validator_reporting_with_env(
         }
     };
     roots.push(tmp.path());
-    let launcher = detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Deny);
-    let mut argv = launcher.wrapper.clone();
-    argv.push("sh".to_string());
-    argv.push("-c".to_string());
-    argv.push(v.script.clone());
+    // (core#840) A socket-dir mask that vanished between enumeration and bwrap's mount fails the
+    // jail before exec; `spawn_jailed` rebuilds the launcher (fresh mask list) and reruns once.
+    let (outcome, launcher) = spawn_jailed(
+        &|| detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Deny),
+        &mut |launcher: &SandboxLauncher| {
+            let mut argv = launcher.wrapper.clone();
+            argv.push("sh".to_string());
+            argv.push("-c".to_string());
+            argv.push(v.script.clone());
 
-    let mut cmd = Command::new(&argv[0]);
-    // `apply_minimal_env` below is strictly stronger than the chokepoint (it `env_clear`s and passes
-    // through an allowlist), so this call strips nothing today. It is here because the rule has no
-    // exceptions (see `wicked_apps_core::spawn`): if the minimal-env floor is ever weakened or reordered,
-    // the engine-internal variables still cannot reach a validator script by inheritance.
-    cmd.hardened();
-    cmd.args(&argv[1..]).current_dir(cwd);
-    apply_minimal_env(&mut cmd);
-    // The isolation override on top of the allow-list (the allow-list itself is unchanged): the
-    // daemon's `TMPDIR` passes through, but the script must see the private dir the jail can write.
-    cmd.env("TMPDIR", tmp.path())
-        .env("TMP", tmp.path())
-        .env("TEMP", tmp.path());
-    for (k, val) in extra_env {
-        cmd.env(k, val);
-    }
-    // Inject WICKED_CORE_EXE so scripts can call `${WICKED_CORE_EXE:-wicked-core} coverage` without
-    // relying on PATH — essential in CI where the binary is invoked by absolute path.
-    //
-    // FINDING-093. This was `std::env::current_exe()`, which is the NODE binary whenever the engine
-    // runs as a napi addon inside wicked-crew's daemon — i.e. in production, always. The script then
-    // ran `node coverage`, node looked for a module named `coverage`, and the gate denied with
-    // "no coverage report was produced". The deterministic half of the dual gate never executed on
-    // any real run.
-    //
-    // Note the shape: the script ALREADY had the correct fallback (`${WICKED_CORE_EXE:-wicked-core}`,
-    // and PATH survives `apply_minimal_env`). Injecting a wrong value is what defeated it. A bad
-    // value is worse than no value — this is the same lesson as the resolver in crew's test support,
-    // where an explicit override that silently fell through answered about the wrong artifact.
-    //
-    // `resolve_wicked_core_exe_opt` is the resolver the GATE-HOOK path has used all along
-    // (`execute_wrapped.rs`), written precisely because `current_exe()` is node under napi. It was
-    // never applied here — the third instance this campaign has found of a fix landing on one path
-    // and not its sibling (FINDING-069/091, 071/089).
-    match decide_core_exe(
-        crate::execute_wrapped::resolve_wicked_core_exe_opt().as_deref(),
-        &v.script,
-    ) {
-        CoreExeDecision::Inject(exe) => {
-            cmd.env(crate::gate_hook::WICKED_CORE_EXE_ENV, exe);
-        }
-        CoreExeDecision::RefuseUnmeasurable => {
-            // The script asks for the engine CLI and this host has none: not on PATH, not
-            // `current_exe()`, no override. Running it anyway produces a denial whose stated cause
-            // ("no coverage report was produced") describes a symptom and blames the work.
+            let mut cmd = Command::new(&argv[0]);
+            // `apply_minimal_env` below is strictly stronger than the chokepoint (it `env_clear`s and passes
+            // through an allowlist), so this call strips nothing today. It is here because the rule has no
+            // exceptions (see `wicked_apps_core::spawn`): if the minimal-env floor is ever weakened or reordered,
+            // the engine-internal variables still cannot reach a validator script by inheritance.
+            cmd.hardened();
+            cmd.args(&argv[1..]).current_dir(cwd);
+            apply_minimal_env(&mut cmd);
+            // The isolation override on top of the allow-list (the allow-list itself is unchanged): the
+            // daemon's `TMPDIR` passes through, but the script must see the private dir the jail can write.
+            cmd.env("TMPDIR", tmp.path())
+                .env("TMP", tmp.path())
+                .env("TEMP", tmp.path());
+            for (k, val) in extra_env {
+                cmd.env(k, val);
+            }
+            // Inject WICKED_CORE_EXE so scripts can call `${WICKED_CORE_EXE:-wicked-core} coverage` without
+            // relying on PATH — essential in CI where the binary is invoked by absolute path.
             //
-            // Refuse instead, and say so. A floor that cannot run must not be silently inert —
-            // Unrunnable already means "no verdict on the criterion", which is exactly true here.
-            let env = crate::gate_hook::WICKED_CORE_EXE_ENV;
-            return Ok((
-                ValidatorOutcome::Unrunnable(format!(
-                    "the validator script uses ${env} but no wicked-core binary \
-                     could be located on this host: ${env} is unset, the engine's own \
-                     executable is not wicked-core (it is the node interpreter whenever the engine \
-                     runs as a napi addon), and `wicked-core` is not on PATH. The deterministic floor cannot be \
-                     measured, so this gate denies without judging the work. Install wicked-core \
-                     (see scripts/install-local.py) or set ${env}."
-                )),
-                launcher.level,
-            ));
-        }
-        CoreExeDecision::LeaveUnset => {
-            // No CLI, but this script never asked for one. Leave the variable unset rather than
-            // denying a validator that has no use for it.
-        }
-    }
-    // Carry the store a validator script may reach under ITS OWN name, and strip the operational
-    // one. The three controls on validator scripts (approval-gated, denylist-screened, minimal env)
-    // are all AUTHORIZATION controls — none constrains what an approved script does with a handle it
-    // already holds, and FINDING-067 needed no malice, just a tool defaulting to $WICKED_ESTATE_DB.
-    // Removing the name is what closes the channel; not-using it is not the same thing (core#166).
-    cmd.env_remove(crate::gate_hook::ESTATE_DB_ENV);
-    // Explicit injection (not a passthrough), so it never leaks other env secrets.
-    // Skip :memory: and URL-based backends — wicked-core coverage can't use them.
-    // Make relative paths absolute before injecting: the child's cwd is the worktree,
-    // so a relative path like "wicked-estate.db" would mis-resolve there.
-    // (No fs::canonicalize — that prepends \\?\ UNC prefix on Windows, breaking sh/bash.)
-    if let Some(db) = db_path {
-        if !db.is_empty() && db != ":memory:" && !db.contains("://") {
-            let p = std::path::Path::new(db);
-            let abs = if p.is_absolute() {
-                db.to_string()
-            } else {
-                std::env::current_dir()
-                    .map(|d| d.join(p).to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| db.to_string())
-            };
-            cmd.env(crate::gate_hook::COVERAGE_DB_ENV, abs);
-        }
-    }
+            // FINDING-093. This was `std::env::current_exe()`, which is the NODE binary whenever the engine
+            // runs as a napi addon inside wicked-crew's daemon — i.e. in production, always. The script then
+            // ran `node coverage`, node looked for a module named `coverage`, and the gate denied with
+            // "no coverage report was produced". The deterministic half of the dual gate never executed on
+            // any real run.
+            //
+            // Note the shape: the script ALREADY had the correct fallback (`${WICKED_CORE_EXE:-wicked-core}`,
+            // and PATH survives `apply_minimal_env`). Injecting a wrong value is what defeated it. A bad
+            // value is worse than no value — this is the same lesson as the resolver in crew's test support,
+            // where an explicit override that silently fell through answered about the wrong artifact.
+            //
+            // `resolve_wicked_core_exe_opt` is the resolver the GATE-HOOK path has used all along
+            // (`execute_wrapped.rs`), written precisely because `current_exe()` is node under napi. It was
+            // never applied here — the third instance this campaign has found of a fix landing on one path
+            // and not its sibling (FINDING-069/091, 071/089).
+            match decide_core_exe(
+                crate::execute_wrapped::resolve_wicked_core_exe_opt().as_deref(),
+                &v.script,
+            ) {
+                CoreExeDecision::Inject(exe) => {
+                    cmd.env(crate::gate_hook::WICKED_CORE_EXE_ENV, exe);
+                }
+                CoreExeDecision::RefuseUnmeasurable => {
+                    // The script asks for the engine CLI and this host has none: not on PATH, not
+                    // `current_exe()`, no override. Running it anyway produces a denial whose stated cause
+                    // ("no coverage report was produced") describes a symptom and blames the work.
+                    //
+                    // Refuse instead, and say so. A floor that cannot run must not be silently inert —
+                    // Unrunnable already means "no verdict on the criterion", which is exactly true here.
+                    let env = crate::gate_hook::WICKED_CORE_EXE_ENV;
+                    return (
+                    ValidatorOutcome::Unrunnable(format!(
+                        "the validator script uses ${env} but no wicked-core binary \
+                         could be located on this host: ${env} is unset, the engine's own \
+                         executable is not wicked-core (it is the node interpreter whenever the engine \
+                         runs as a napi addon), and `wicked-core` is not on PATH. The deterministic floor cannot be \
+                         measured, so this gate denies without judging the work. Install wicked-core \
+                         (see scripts/install-local.py) or set ${env}."
+                    )),
+                    String::new(),
+                );
+                }
+                CoreExeDecision::LeaveUnset => {
+                    // No CLI, but this script never asked for one. Leave the variable unset rather than
+                    // denying a validator that has no use for it.
+                }
+            }
+            // Carry the store a validator script may reach under ITS OWN name, and strip the operational
+            // one. The three controls on validator scripts (approval-gated, denylist-screened, minimal env)
+            // are all AUTHORIZATION controls — none constrains what an approved script does with a handle it
+            // already holds, and FINDING-067 needed no malice, just a tool defaulting to $WICKED_ESTATE_DB.
+            // Removing the name is what closes the channel; not-using it is not the same thing (core#166).
+            cmd.env_remove(crate::gate_hook::ESTATE_DB_ENV);
+            // Explicit injection (not a passthrough), so it never leaks other env secrets.
+            // Skip :memory: and URL-based backends — wicked-core coverage can't use them.
+            // Make relative paths absolute before injecting: the child's cwd is the worktree,
+            // so a relative path like "wicked-estate.db" would mis-resolve there.
+            // (No fs::canonicalize — that prepends \\?\ UNC prefix on Windows, breaking sh/bash.)
+            if let Some(db) = db_path {
+                if !db.is_empty() && db != ":memory:" && !db.contains("://") {
+                    let p = std::path::Path::new(db);
+                    let abs = if p.is_absolute() {
+                        db.to_string()
+                    } else {
+                        std::env::current_dir()
+                            .map(|d| d.join(p).to_string_lossy().into_owned())
+                            .unwrap_or_else(|_| db.to_string())
+                    };
+                    cmd.env(crate::gate_hook::COVERAGE_DB_ENV, abs);
+                }
+            }
 
-    // Every non-Passed outcome denies, exactly as before; the variant only records WHY, so the gate can
-    // say "the shell could not be spawned" instead of attributing that to the operator's worktree.
-    // The child's stderr is captured for classification (teed — it reaches the daemon log as
-    // before) so a jail that died before exec reads as `Unrunnable`, never as the criterion's
-    // `Failed` (core#460).
-    let (res, stderr_head) = run_bounded_status_capturing_stderr(cmd, VALIDATOR_TIMEOUT);
-    let outcome = classify_launcher_exit(
-        ValidatorOutcome::from_bounded(res),
-        &launcher.wrapper,
-        &stderr_head,
+            // Every non-Passed outcome denies, exactly as before; the variant only records WHY, so the gate can
+            // say "the shell could not be spawned" instead of attributing that to the operator's worktree.
+            // The child's stderr is captured for classification (teed — it reaches the daemon log as
+            // before) so a jail that died before exec reads as `Unrunnable`, never as the criterion's
+            // `Failed` (core#460).
+            let (res, stderr_head) = run_bounded_status_capturing_stderr(cmd, VALIDATOR_TIMEOUT);
+            let outcome = classify_launcher_exit(
+                ValidatorOutcome::from_bounded(res),
+                &launcher.wrapper,
+                &stderr_head,
+            );
+            // A passing exit never retries, whatever it printed: only a failed run's head is offered.
+            let head = if matches!(outcome, ValidatorOutcome::Passed) {
+                String::new()
+            } else {
+                stderr_head
+            };
+            (outcome, head)
+        },
     );
     Ok((outcome, launcher.level))
+}
+
+/// (core#840) Run a jailed spawn, retrying ONCE when bwrap died before exec because a socket-dir
+/// mask it was handed vanished between enumeration and mount (`bwrap: Can't mkdir <m>: Read-only
+/// file system`; bwrap has no "mask if present" form). `build` yields a launcher with a fresh mask
+/// list, `run` spawns under it and returns its result plus the child's stderr head. The retry
+/// fires only when the head's first line is exactly that diagnostic for a mask the launcher
+/// recorded; the last pair is returned, never a third attempt.
+pub(crate) fn spawn_jailed<T>(
+    build: &dyn Fn() -> SandboxLauncher,
+    run: &mut dyn FnMut(&SandboxLauncher) -> (T, String),
+) -> (T, SandboxLauncher) {
+    let launcher = build();
+    let (out, head) = run(&launcher);
+    let first = head.lines().next().unwrap_or("").trim_end();
+    let vanished = launcher
+        .socket_masks
+        .iter()
+        .any(|m| first == format!("bwrap: Can't mkdir {}: Read-only file system", m.display()));
+    if !vanished {
+        return (out, launcher);
+    }
+    let launcher = build();
+    let (out, _) = run(&launcher);
+    (out, launcher)
 }
 
 /// A `Failed` whose first stderr line is the LAUNCHER's own diagnostic is
@@ -4924,6 +4972,141 @@ mod tests {
             classify_launcher_exit(ValidatorOutcome::TimedOut, &armed, bwrap_line),
             ValidatorOutcome::TimedOut
         );
+    }
+
+    fn launcher_with_masks(masks: Vec<PathBuf>) -> SandboxLauncher {
+        SandboxLauncher {
+            wrapper: vec!["/usr/bin/bwrap".to_string(), "--".to_string()],
+            level: SandboxLevel::Sandboxed,
+            socket_masks: masks,
+        }
+    }
+
+    /// core#840: `spawn_jailed` rebuilds and reruns ONCE, only on bwrap's exact mkdir diagnostic for
+    /// a mask the launcher recorded; every other first line, and success, is a single build.
+    #[test]
+    fn spawn_jailed_retries_once_on_exactly_a_vanished_recorded_mask_840() {
+        use std::cell::Cell;
+        let m = PathBuf::from("/tmp/ssh-gone-840");
+        let mask_line = format!("bwrap: Can't mkdir {}: Read-only file system", m.display());
+        let builds_for = |head: &str| {
+            let n = Cell::new(0u32);
+            let _ = spawn_jailed(
+                &|| {
+                    n.set(n.get() + 1);
+                    launcher_with_masks(vec![m.clone()])
+                },
+                &mut |_| ((), head.to_string()),
+            );
+            n.get()
+        };
+        assert_eq!(builds_for(&mask_line), 2);
+        assert_eq!(builds_for(&format!("{mask_line}\n")), 2);
+        // A successful run reports an empty head (the callers suppress it): one build, no rerun.
+        assert_eq!(builds_for(""), 1);
+        assert_eq!(
+            builds_for(&format!("{mask_line}\nmore")),
+            2,
+            "only the first line counts"
+        );
+        for head in [
+            "bwrap: Can't mkdir /tmp/other: Read-only file system",
+            "bwrap: execvp x: No such file or directory",
+            "sandbox-exec: sandbox_apply: Operation not permitted",
+            "",
+            &format!("{mask_line} extra"),
+            &format!("x {mask_line}"),
+        ] {
+            assert_eq!(builds_for(head), 1, "{head:?}");
+        }
+        // A launcher with no recorded masks is never retried.
+        let n = Cell::new(0u32);
+        let _ = spawn_jailed(
+            &|| {
+                n.set(n.get() + 1);
+                launcher_with_masks(Vec::new())
+            },
+            &mut |_| ((), mask_line.clone()),
+        );
+        assert_eq!(n.get(), 1);
+        // The same mask line twice stops after attempt two and reads as Unrunnable.
+        let n = Cell::new(0u32);
+        let (outcome, launcher) = spawn_jailed(
+            &|| {
+                n.set(n.get() + 1);
+                launcher_with_masks(vec![m.clone()])
+            },
+            &mut |l| {
+                (
+                    classify_launcher_exit(ValidatorOutcome::Failed, &l.wrapper, &mask_line),
+                    mask_line.clone(),
+                )
+            },
+        );
+        assert_eq!(n.get(), 2);
+        assert!(
+            matches!(outcome, ValidatorOutcome::Unrunnable(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(launcher.socket_masks, vec![m]);
+    }
+
+    /// core#840 on real bwrap: a mask handed to the first launcher that never existed (the dir
+    /// "vanished") fails the jail before exec; the rebuilt launcher runs. The path is never
+    /// created or removed here — creating a mask-pattern dir inside the parallel test binary is
+    /// the trigger core#832 removed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_vanished_socket_mask_is_rebuilt_once_on_real_bwrap_840() {
+        use std::cell::Cell;
+        if find_on_path("bwrap").is_none() {
+            eprintln!("SKIP: bwrap not on PATH — the core#840 race regression cannot run here");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("wicked-val-840-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let m = std::env::temp_dir().join(format!("ssh-wicked840-{}", std::process::id()));
+        assert!(!m.exists(), "the mask path must never exist");
+        let calls = Cell::new(0u32);
+        // Both builds go through the validator's production builder (the real credential and
+        // socket masks); only the first gets the never-created mask spliced in.
+        let build = || {
+            calls.set(calls.get() + 1);
+            let mut l = detect_sandbox_launcher_for_roots(&[base.as_path()], NetworkPolicy::Deny);
+            if calls.get() == 1 && l.level == SandboxLevel::Sandboxed {
+                let at = l.wrapper.iter().rposition(|a| a == "--").unwrap();
+                l.wrapper.splice(
+                    at..at,
+                    ["--tmpfs".to_string(), m.to_string_lossy().into_owned()],
+                );
+                l.socket_masks.push(m.clone());
+            }
+            l
+        };
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        let (outcome, launcher) = spawn_jailed(&build, &mut |l| {
+            seen.push(l.wrapper.clone());
+            let mut argv = l.wrapper.clone();
+            argv.push("/bin/true".to_string());
+            // spawn-audit: test-only — the wrapper probe under the floor's cleared env.
+            let mut cmd = Command::new(&argv[0]);
+            cmd.args(&argv[1..]).current_dir(&base);
+            apply_minimal_env(&mut cmd);
+            let (status, head) = run_bounded_status_capturing_stderr(cmd, Duration::from_secs(20));
+            (matches!(status, Ok(Some(s)) if s.success()), head)
+        });
+        if launcher.level != SandboxLevel::Sandboxed {
+            eprintln!("SKIP: bwrap present but not armed here");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        assert!(outcome, "the rebuilt jail must run: {seen:?}");
+        assert_eq!(calls.get(), 2, "one rebuild");
+        let ms = m.to_string_lossy().into_owned();
+        assert!(seen[0].contains(&ms) && !seen[1].contains(&ms), "{seen:?}");
+        assert!(!m.exists(), "the test must not create the mask dir");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The captured-stderr run keeps the child's FIRST line for classification while the bytes

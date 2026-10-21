@@ -10622,71 +10622,87 @@ fn run_walkthrough_record(
             )
         }
     };
-    let launcher = jail(&[proof_root.as_path(), tmp.path()]);
-    if launcher.level != crate::validator::SandboxLevel::Sandboxed || launcher.wrapper.is_empty() {
-        let reason = format!(
-            "this host has no OS jail for the walkthrough recorder (sandbox level {}): a \
-             walkthrough never runs unjailed. Run it on macOS (sandbox-exec) or on Linux with \
-             bwrap installed",
-            launcher.level.as_wire()
-        );
-        let body = wt::inconclusive_result(wt::UNJAILED_HOST, &reason);
-        return match std::fs::write(proof_root.join(wt::RESULT_FILE), body) {
-            Ok(()) => (
-                format!("walkthrough_review: {}: {reason}", wt::UNJAILED_HOST),
-                StepStatus::Ok,
-                None,
-            ),
-            Err(e) => refused(
-                wt::UNJAILED_HOST,
-                format!(
-                    "{reason}; and {} could not be written: {e}",
-                    wt::RESULT_FILE
-                ),
-            ),
-        };
-    }
-    let tmp_s = tmp.path().to_string_lossy().into_owned();
-    let mut env: Vec<(String, String)> = ["TMPDIR", "TMP", "TEMP"]
-        .iter()
-        .map(|k| ((*k).to_string(), tmp_s.clone()))
-        .collect();
-    env.extend(rec.env.iter().cloned());
-    // (core#798) Tell the recorder it is jailed, and by what: only reached with a `Sandboxed`
-    // launcher armed above, so the variable is never set on an unjailed run.
-    // The launcher by NAME — past a `sh` prefix that opens the seccomp program (core#703).
-    let kind = launcher
-        .wrapper
-        .iter()
-        .filter_map(|a| std::path::Path::new(a).file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .find(|n| n == "bwrap" || n == "sandbox-exec")
-        .unwrap_or_else(|| launcher.wrapper[0].clone());
-    env.push((wt::JAIL_ENV.to_string(), kind));
-    if let Some(root) = garden_root {
-        env.push((
-            crate::skills_snapshot::GARDEN_ROOT_ENV.to_string(),
-            root.to_string_lossy().into_owned(),
-        ));
-        env.push((
-            "PATH".to_string(),
-            crate::skills_snapshot::prepend_path_entry(
-                &root.join(crate::skills_snapshot::SCRIPTS_DIR),
-                std::env::var_os("PATH").as_deref(),
-                crate::skills_snapshot::PATH_LIST_SEPARATOR,
-            )
-            .to_string_lossy()
-            .into_owned(),
-        ));
-    }
-    let out = run_tool_cmd_jailed(
-        cmd,
-        workdir,
-        &env,
-        Some(&launcher.wrapper),
-        stop,
-        on_spawn,
-        on_done,
+    // (core#840) A socket-dir mask that vanished between enumeration and bwrap's mount kills the
+    // jail before exec; `spawn_jailed` rebuilds the launcher (fresh masks) and reruns once.
+    let (out, _) = crate::validator::spawn_jailed(
+        &|| jail(&[proof_root.as_path(), tmp.path()]),
+        &mut |launcher: &crate::validator::SandboxLauncher| {
+            if launcher.level != crate::validator::SandboxLevel::Sandboxed
+                || launcher.wrapper.is_empty()
+            {
+                let reason = format!(
+                    "this host has no OS jail for the walkthrough recorder (sandbox level {}): a \
+                 walkthrough never runs unjailed. Run it on macOS (sandbox-exec) or on Linux with \
+                 bwrap installed",
+                    launcher.level.as_wire()
+                );
+                let body = wt::inconclusive_result(wt::UNJAILED_HOST, &reason);
+                let out = match std::fs::write(proof_root.join(wt::RESULT_FILE), body) {
+                    Ok(()) => (
+                        format!("walkthrough_review: {}: {reason}", wt::UNJAILED_HOST),
+                        StepStatus::Ok,
+                        None,
+                    ),
+                    Err(e) => refused(
+                        wt::UNJAILED_HOST,
+                        format!(
+                            "{reason}; and {} could not be written: {e}",
+                            wt::RESULT_FILE
+                        ),
+                    ),
+                };
+                return (out, String::new());
+            }
+            let tmp_s = tmp.path().to_string_lossy().into_owned();
+            let mut env: Vec<(String, String)> = ["TMPDIR", "TMP", "TEMP"]
+                .iter()
+                .map(|k| ((*k).to_string(), tmp_s.clone()))
+                .collect();
+            env.extend(rec.env.iter().cloned());
+            // (core#798) Tell the recorder it is jailed, and by what: only reached with a `Sandboxed`
+            // launcher armed above, so the variable is never set on an unjailed run.
+            // The launcher by NAME — past a `sh` prefix that opens the seccomp program (core#703).
+            let kind = launcher
+                .wrapper
+                .iter()
+                .filter_map(|a| std::path::Path::new(a).file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .find(|n| n == "bwrap" || n == "sandbox-exec")
+                .unwrap_or_else(|| launcher.wrapper[0].clone());
+            env.push((wt::JAIL_ENV.to_string(), kind));
+            if let Some(root) = garden_root {
+                env.push((
+                    crate::skills_snapshot::GARDEN_ROOT_ENV.to_string(),
+                    root.to_string_lossy().into_owned(),
+                ));
+                env.push((
+                    "PATH".to_string(),
+                    crate::skills_snapshot::prepend_path_entry(
+                        &root.join(crate::skills_snapshot::SCRIPTS_DIR),
+                        std::env::var_os("PATH").as_deref(),
+                        crate::skills_snapshot::PATH_LIST_SEPARATOR,
+                    )
+                    .to_string_lossy()
+                    .into_owned(),
+                ));
+            }
+            let (out, st, killed, stderr_head) = run_tool_cmd_jailed(
+                cmd,
+                workdir,
+                &env,
+                Some(&launcher.wrapper),
+                stop,
+                on_spawn,
+                on_done,
+            );
+            // A cancelled or successful take has no launcher failure to classify, so it never retries.
+            let head = if matches!(st, StepStatus::Cancelled | StepStatus::Ok) {
+                String::new()
+            } else {
+                stderr_head
+            };
+            ((out, st, killed), head)
+        },
     );
     drop(tmp);
     out
@@ -10904,7 +10920,9 @@ fn run_tool_cmd(
     on_spawn: &dyn Fn(u32),
     on_done: &dyn Fn(u32),
 ) -> (String, crate::workflow::StepStatus, Option<ToolKilled>) {
-    run_tool_cmd_jailed(cmd, workdir, extra_env, None, stop, on_spawn, on_done)
+    let (out, st, killed, _) =
+        run_tool_cmd_jailed(cmd, workdir, extra_env, None, stop, on_spawn, on_done);
+    (out, st, killed)
 }
 
 /// [`run_tool_cmd`], optionally inside an OS jail (WT-C2): with `jail = Some(wrapper)` the argv is
@@ -10919,7 +10937,12 @@ fn run_tool_cmd_jailed(
     stop: &dyn Fn() -> Option<&'static str>,
     on_spawn: &dyn Fn(u32),
     on_done: &dyn Fn(u32),
-) -> (String, crate::workflow::StepStatus, Option<ToolKilled>) {
+) -> (
+    String,
+    crate::workflow::StepStatus,
+    Option<ToolKilled>,
+    String,
+) {
     use crate::workflow::StepStatus;
     use std::process::{Command, Stdio};
     let Some(bin) = cmd.first() else {
@@ -10927,6 +10950,7 @@ fn run_tool_cmd_jailed(
             "tool phase has empty cmd".to_string(),
             StepStatus::Failed,
             None,
+            String::new(),
         );
     };
     // `cmd` is an arbitrary argv straight out of a `WorkflowDef` — workflows are data, so this runs
@@ -10986,6 +11010,7 @@ fn run_tool_cmd_jailed(
                 reason,
                 ran_ms: 0,
             }),
+            String::new(),
         );
     }
     let mut child = match proc.spawn() {
@@ -10995,6 +11020,7 @@ fn run_tool_cmd_jailed(
                 format!("failed to spawn {:?}: {e}", bin),
                 StepStatus::Failed,
                 None,
+                String::new(),
             )
         }
     };
@@ -11061,6 +11087,8 @@ fn run_tool_cmd_jailed(
     on_done(pid);
     let mut combined = String::from_utf8_lossy(&stdout_b).into_owned();
     let stderr = String::from_utf8_lossy(&stderr_b);
+    // (core#840) The child's pre-merge stderr, for the caller's jail-launcher classification.
+    let stderr_head = stderr.to_string();
     if !stderr.is_empty() {
         if !combined.is_empty() {
             combined.push('\n');
@@ -11068,11 +11096,11 @@ fn run_tool_cmd_jailed(
         combined.push_str(&stderr);
     }
     match exit {
-        ToolExit::Exited(Some(st)) if st.success() => (combined, StepStatus::Ok, None),
+        ToolExit::Exited(Some(st)) if st.success() => (combined, StepStatus::Ok, None, stderr_head),
         ToolExit::Exited(st) => {
             let code = st.and_then(|s| s.code()).unwrap_or(-1);
             combined.push_str(&format!("\n[exit {}]", code));
-            (combined, StepStatus::Failed, None)
+            (combined, StepStatus::Failed, None, stderr_head)
         }
         ToolExit::Killed(reason) => {
             combined.push_str(&format!("\n[killed: {reason}]"));
@@ -11084,11 +11112,12 @@ fn run_tool_cmd_jailed(
                     reason,
                     ran_ms: started.elapsed().as_millis() as u64,
                 }),
+                stderr_head,
             )
         }
         ToolExit::WaitFailed(e) => {
             combined.push_str(&format!("\n[wait failed: {e}]"));
-            (combined, StepStatus::Failed, None)
+            (combined, StepStatus::Failed, None, stderr_head)
         }
     }
 }
@@ -26547,6 +26576,97 @@ mod walkthrough_record_tests {
         }
     }
 
+    /// (core#840) A mask the launcher recorded vanished before bwrap mounted it: the recorder
+    /// rebuilds the jail once and the second launcher runs the command. A launcher with no recorded
+    /// masks is never retried — its `[exit 1]` stands.
+    #[cfg(unix)]
+    #[test]
+    fn a_vanished_socket_mask_rebuilds_the_recorder_jail_once() {
+        use std::cell::Cell;
+        let dir = scratch("mask-retry");
+        let marker = dir.join("ran.txt");
+        let m = dir.join("ssh-gone-840");
+        let line = format!("bwrap: Can't mkdir {}: Read-only file system", m.display());
+        let sandboxed = |wrapper: Vec<String>, masks: Vec<std::path::PathBuf>| {
+            crate::validator::SandboxLauncher {
+                wrapper,
+                level: crate::validator::SandboxLevel::Sandboxed,
+                socket_masks: masks,
+            }
+        };
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("echo ran > '{}'", marker.display()),
+        ];
+        let built = Cell::new(0u32);
+        let (spawned, done) = (Cell::new(0u32), Cell::new(0u32));
+        let jail = |_: &[&std::path::Path]| {
+            built.set(built.get() + 1);
+            if built.get() == 1 {
+                sandboxed(
+                    vec![
+                        "sh".into(),
+                        "-c".into(),
+                        format!("echo \"{line}\" >&2; exit 1"),
+                    ],
+                    vec![m.clone()],
+                )
+            } else {
+                sandboxed(
+                    vec!["sh".into(), "-c".into(), "exec \"$0\" \"$@\"".into()],
+                    Vec::new(),
+                )
+            }
+        };
+        let proof = dir.join("wr");
+        let (out, st, _) = run_walkthrough_record(
+            &cmd,
+            None,
+            &launch(&proof),
+            Ok(None),
+            0,
+            &jail,
+            &never,
+            &|_| spawned.set(spawned.get() + 1),
+            &|_| done.set(done.get() + 1),
+        );
+        assert_eq!(st, StepStatus::Ok, "{out}");
+        assert!(marker.exists(), "the rebuilt jail ran the command: {out}");
+        assert_eq!((built.get(), spawned.get(), done.get()), (2, 2, 2));
+
+        // No recorded masks ⇒ the same stderr is not a mask failure: no rebuild.
+        let _ = std::fs::remove_file(&marker);
+        built.set(0);
+        let jail = |_: &[&std::path::Path]| {
+            built.set(built.get() + 1);
+            sandboxed(
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!("echo \"{line}\" >&2; exit 1"),
+                ],
+                Vec::new(),
+            )
+        };
+        let (out, st, _) = run_walkthrough_record(
+            &cmd,
+            None,
+            &launch(&proof),
+            Ok(None),
+            1,
+            &jail,
+            &never,
+            &noop,
+            &noop,
+        );
+        assert_eq!(st, StepStatus::Failed, "{out}");
+        assert!(out.contains("[exit 1]"), "{out}");
+        assert!(!marker.exists());
+        assert_eq!(built.get(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The recorder runs in the REAL loopback jail (sandbox-exec on macOS, bwrap on the Linux CI
     /// leg): its environment is exactly the allowlist plus the declared variables, a loopback bind
     /// and connect succeed, a connect to a public address fails, and a write outside the proof root
@@ -26586,9 +26706,11 @@ except OSError as e:
         // (Copilot on #697): unreachable from the jail (macOS: the profile's network deny;
         // Linux: bwrap masks the socket directories).
         let sock_dir = std::path::PathBuf::from(format!("/tmp/ssh-wtc2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&sock_dir);
+        // core#832/#840: the directory is KEPT (never removed): a concurrent jail enumerating
+        // `ssh-*` masks must never see it vanish. Only the socket is replaced and removed.
         std::fs::create_dir_all(&sock_dir).unwrap();
         let sock = sock_dir.join("agent.sock");
+        let _ = std::fs::remove_file(&sock);
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let net = net.replace("UNIX_PATH", &format!("{:?}", sock.to_string_lossy()));
         let script = format!(
@@ -26625,7 +26747,7 @@ except OSError as e:
             net.contains("unix refused"),
             "a host unix socket must be unreachable: {net}"
         );
-        let _ = std::fs::remove_dir_all(&sock_dir);
+        let _ = std::fs::remove_file(&sock);
         assert!(
             !worktree.join("escaped.txt").exists(),
             "the worktree is not writable"
@@ -26696,6 +26818,7 @@ except OSError as e:
         let no_jail = |_: &[&std::path::Path]| crate::validator::SandboxLauncher {
             wrapper: Vec::new(),
             level: crate::validator::SandboxLevel::BestEffort,
+            socket_masks: Vec::new(),
         };
         let (out, st, _) = run_walkthrough_record(
             &cmd,
@@ -26730,6 +26853,7 @@ except OSError as e:
         let no_jail = |_: &[&std::path::Path]| crate::validator::SandboxLauncher {
             wrapper: Vec::new(),
             level: crate::validator::SandboxLevel::BestEffort,
+            socket_masks: Vec::new(),
         };
         let (_, st, _) = run_walkthrough_record(
             &["true".to_string()],
