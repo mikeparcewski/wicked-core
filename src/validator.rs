@@ -1669,11 +1669,12 @@ pub fn run_validator_reporting_with_env(
                 &launcher.wrapper,
                 &stderr_head,
             );
-            // A passing exit never retries, whatever it printed: only a failed run's head is offered.
-            let head = if matches!(outcome, ValidatorOutcome::Passed) {
-                String::new()
-            } else {
+            // Only a run classified as the LAUNCHER's failure offers its head: a pass, a criterion
+            // failure or a timeout never retries, whatever it printed.
+            let head = if matches!(outcome, ValidatorOutcome::Unrunnable(_)) {
                 stderr_head
+            } else {
+                String::new()
             };
             (outcome, head)
         },
@@ -1681,19 +1682,18 @@ pub fn run_validator_reporting_with_env(
     Ok((outcome, launcher.level))
 }
 
-/// (core#840) The emitted socket masks a vanished-mask retry may key on: those outside every
-/// write root, compared on canonical paths (`roots` are canonical; a mask that no longer
-/// resolves is compared as spelled). The write roots are bound read-write AFTER the masks, so a
-/// mask beneath one is the host directory itself inside the jail: jailed code could remove it and
-/// print bwrap's mkdir line to earn a second run (codex on #1059). Such a mask hides nothing
-/// (the root's bind covers it) and is never retried; it still fails closed if it vanishes.
+/// (core#840) The emitted socket masks a vanished-mask retry may key on: those already spelled
+/// canonically (no symlink anywhere in the path) and outside every write root (`roots` are
+/// canonical, and they are every read-write bind the jail makes). Then no ancestor of the mask is
+/// writable inside the jail, so jailed code can neither remove it nor unlink a symlink on its
+/// path to make the spelled path vanish, and then print bwrap's mkdir line to earn a second run
+/// of an executed check (codex on #1059). A mask beneath a root hides nothing anyway (the root's
+/// bind covers it). An ineligible mask still fails closed if it vanishes; it is never retried.
 fn retry_eligible_masks(masks: Vec<PathBuf>, roots: &[PathBuf]) -> Vec<PathBuf> {
     masks
         .into_iter()
-        .filter(|m| {
-            let real = m.canonicalize().unwrap_or_else(|_| m.clone());
-            !roots.iter().any(|r| real.starts_with(r))
-        })
+        .filter(|m| m.canonicalize().is_ok_and(|real| real == *m))
+        .filter(|m| !roots.iter().any(|r| m.starts_with(r)))
         .collect()
 }
 
@@ -5105,19 +5105,36 @@ mod tests {
     #[test]
     fn a_mask_beneath_a_write_root_never_earns_a_rerun_840() {
         use std::cell::Cell;
-        let root = std::env::temp_dir().join(format!("wicked-val-840-root-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        // A canonical base: on macOS the temp dir is reached through a symlink.
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("wicked-val-840-elig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("root");
         let inside = root.join("agent-dir");
+        let outside = base.join("agent-store").join("session");
         std::fs::create_dir_all(&inside).unwrap();
-        let outside =
-            std::env::temp_dir().join(format!("wicked-val-840-out-{}", std::process::id()));
-        assert!(!outside.exists());
-        let roots = vec![root.canonicalize().unwrap()];
-        // Spelled as found (on macOS the temp dir is reached through a symlink), compared canonically.
-        assert_eq!(
-            retry_eligible_masks(vec![inside.clone(), outside.clone()], &roots),
-            vec![outside]
+        std::fs::create_dir_all(&outside).unwrap();
+        let roots = vec![root.clone()];
+        let mut masks = vec![inside.clone(), outside.clone(), base.join("never-created")];
+        // (round 3) A symlink inside the root pointing outside it: the mask's canonical target is
+        // outside, but jailed code could unlink the link and make the spelled path vanish.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(base.join("agent-store"), root.join("agent-link")).unwrap();
+            masks.push(root.join("agent-link").join("session"));
+            assert!(root.join("agent-link").join("session").is_dir());
+        }
+        // A non-canonical spelling of an eligible dir (a `..` hop) is not eligible either.
+        masks.push(
+            base.join("root")
+                .join("..")
+                .join("agent-store")
+                .join("session"),
         );
+        // Only the canonically spelled, existing mask outside every root is retry-eligible.
+        assert_eq!(retry_eligible_masks(masks, &roots), vec![outside]);
         let line = format!(
             "bwrap: Can't mkdir {}: Read-only file system",
             inside.display()
@@ -5138,7 +5155,7 @@ mod tests {
         assert!(launcher.socket_masks.is_empty());
         assert_eq!((builds.get(), runs.get()), (1, 1));
         assert_eq!(outcome, ValidatorOutcome::Failed);
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// core#840 on real bwrap: a mask handed to the first launcher that never existed (the dir
