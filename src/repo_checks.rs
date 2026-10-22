@@ -5458,7 +5458,11 @@ impl LineScan {
         };
         if self.closed && !s.is_empty() {
             // After a binary's result line libtest prints the next binary's header and nothing
-            // else: anything first means the "result" was not the binary's own.
+            // else — save rustdoc's merged-doctest timing footer (Rust 2024, codex on #1060):
+            // anything else first means the "result" was not the binary's own.
+            if s.starts_with("all doctests ran in ") {
+                return;
+            }
             self.anomaly |= header.is_none();
             self.closed = false;
         }
@@ -5472,10 +5476,13 @@ impl LineScan {
                 return;
             }
             if self.open {
-                // The binary before died without its result line: a failing binary.
+                // The binary before died without its result line: a failing binary — but one
+                // whose verdict is INFERRED, which must not certify the alignment (an early
+                // close plus a truncated child can fake exactly this, codex on #1060).
                 if let Some(b) = self.blocks.last_mut() {
                     *b = true;
                 }
+                self.anomaly = true;
             }
             self.blocks.push(false);
             self.open = true;
@@ -9500,8 +9507,8 @@ mod tests {
             ]
         );
 
-        // A binary that died without its result line (a crash) is still one failing binary:
-        // the next binary's header closes it, and cargo's list agrees, so the ids keep targets.
+        // A binary that died without its result line (a crash): its verdict is only inferred, so
+        // it certifies nothing — every id of the run is `[?]` (codex on #1060).
         let crashed = "\nrunning 2 tests\ntest a::x ... FAILED\n\nrunning 1 test\ntest y ... \
             FAILED\n\nfailures:\n\n---- y stdout ----\nz\n\nfailures:\n    y\n\ntest result: \
             FAILED. 0 passed; 1 failed\n";
@@ -9509,9 +9516,20 @@ mod tests {
             to rerun pass `-p c --lib`\n     Running tests/it.rs (target/debug/deps/it-2)\nerror: \
             test failed, to rerun pass `-p c --test it`\n";
         let (ids, _, _, _) = qualify(scan_of(crashed), scan_of(two));
+        assert_eq!(ids, vec!["test a::x [?]", "test y [?]"]);
+
+        // Rust 2024's merged doctests end with a timing footer after their result line: still
+        // aligned (codex on #1060).
+        let merged = "\nrunning 1 test\ntest tests::pre ... FAILED\n\nfailures:\n    tests::pre\n\n\
+            test result: FAILED. 0 passed; 1 failed\n\nrunning 1 test\ntest src/lib.rs - f (line 1) \
+            ... ok\n\ntest result: ok. 1 passed; 0 failed\n\nall doctests ran in 0.12s; merged \
+            doctests compilation took 0.34s\n";
+        let lib_doc =
+            "     Running unittests src/lib.rs (target/debug/deps/c-1)\nerror: test failed, \
+            to rerun pass `-p c --lib`\n   Doc-tests c\n";
         assert_eq!(
-            ids,
-            vec!["test a::x [-p c --lib]", "test y [-p c --test it]"]
+            qualify(scan_of(merged), scan_of(lib_doc)).0,
+            vec!["test tests::pre [-p c --lib]"]
         );
 
         // A run cut off inside its last binary (the check's bound): cargo printed no selector
@@ -9622,6 +9640,17 @@ mod tests {
         assert!(head
             .regressions
             .contains(&"test shared [--test b]".to_string()));
+        // (codex on #1060) The same, but the truncated child prints no failure line and `b` dies
+        // before its own summary, then `c` passes: the block `c`'s header closes has only an
+        // inferred verdict, so nothing is certified — `[?]`, never `[--test a]`.
+        let died = format!(
+            "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
+             child 2:{headless}\nrunning 1 test\n\nrunning 1 test\ntest c ... ok\n\ntest result: ok. \
+             1 passed; 0 failed\n"
+        );
+        let abc = format!("{stderr}     Running tests/c.rs (target/debug/deps/c-3)\n");
+        let (ids, _, _, _) = qualify(scan_of(&died), scan_of(&abc));
+        assert_eq!(ids, vec!["test shared [?]"]);
         // A truncated child of ANOTHER test cannot borrow the binary's listing: unresolved, `[?]`.
         let other = format!(
             "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\

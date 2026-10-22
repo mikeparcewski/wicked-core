@@ -42,7 +42,7 @@ Two release tracks share this file, newest entry first regardless of track:
   met the base's qualified ids: pre-existing 0, every base failure a regression. Ids are now qualified only when
   the two streams describe the same binaries one for one: stdout's top-level `running N tests` blocks (a run inside a
   test's captured output is a nested run on a counted stack; a binary closes only on its own result line, whose
-  counts and preceding `failures:` listing match it) and cargo's `Running` / `Doc-tests` lines with their
+  counts and preceding `failures:` listing match it; a binary that died without one certifies nothing) and cargo's `Running` / `Doc-tests` lines with their
   selectors (ANSI colours stripped). Any disagreement or structural anomaly makes every libtest id of a
   multi-binary run `test x [?]` (unknown binary), which never matches and is not re-run alone; failures read in
   captured output are then reported too, so a misread costs a qualifier, never a failure. Head and base ids are compared on (test name,
