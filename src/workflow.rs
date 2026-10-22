@@ -489,8 +489,13 @@ pub enum HumanDecision {
     /// on the gate receipt with the floor result it overrode, labelled "floor overridden by
     /// operator" on the run, the gate and the delivery. It answers the floor ONLY: refused when
     /// any other layer of the same gate also denied (deny-dominates), at a team pause, on a team
-    /// member's step, on a tool or deliver step, and at every other gate. QE acceptance is never
-    /// waived by it.
+    /// member's step, on a tool or deliver step, and at every other gate. (operator ruling
+    /// 2026-10-20) The one exception is the judge's `judge_unavailable` no-verdict hold — no judge
+    /// seat produced a verdict, which a person already answers at that gate of its own: the same
+    /// judgment then also stands in for the judge, recorded as the judge layer's own
+    /// `operatorJudges[]` entry (`judgeStandIn`, "judge: operator (no judge seat available)").
+    /// A judge that RULED still refuses it. QE acceptance is never waived by it, and no later
+    /// gate is pre-approved.
     OperatorJudgment { rationale: String },
 }
 

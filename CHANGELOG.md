@@ -14,6 +14,21 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The floor override is also offered when the judge could not rule either.** core#1061's operator judgment
+  over a failed repo-checks floor was refused whenever anything else stood behind the floor, and that included
+  the judge's `judge_unavailable` no-verdict hold. So when the judge seats were benched (run 2ebd9da2, attempt
+  9: copilot and opencode `quota_exhausted`) the two gates deadlocked. The floor override was refused because
+  the judge was absent, and the judge never ran because the floor failed. A person standing in for a missing
+  judge is already allowed at a `judge_unavailable` gate of its own (operator ruling 2026-10-20). Now the same
+  judgment covers that hold: offered and taken when the only denial behind the floor is exactly the
+  no-verdict record (`judge_unavailable` with no claim, rule, tool, phase or trimmed findings,
+  `pipeline::judge_absent_behind_floor`). A judge that ruled (`agent_validator`), any other denial, and an
+  unknown record still refuse it. The gate receipt, the run (`RunAssurance.floorOverrides`) and the delivery
+  receipt carry both layers: the floor override, and the judge layer's own `operatorJudges[]` entry
+  (`judgeStandIn`: source, the floor result id, the label "judge: operator (no judge seat available)"). The
+  receipt's judge is `operator:<who>`. QE acceptance stays required, and later gates still run. The floor
+  gate's offer clause is byte-identical; a sentence after the options names the judge's part.
+
 - **A failed repo-checks floor's gate takes the operator's own judgment (action `operator_judgment`).** When a
   unit's repository checks failed, its escalation gate offered only retry, send back, reassign or stop, and a
   floor that kept failing on load flakes in untouched files or misread pre-existing reds left the run looping

@@ -2495,6 +2495,25 @@ fn fold_record(
     out
 }
 
+/// (operator ruling 2026-10-20, core#1061 follow-on) Whether `d`, a denial a gate fold recorded
+/// behind a failed repo-checks floor ([`crate::domain::WorkUnit::denials_behind`]), is the judge
+/// layer's NO-VERDICT hold — the one other denial the operator's judgment over that floor also
+/// answers, because a person already stands in for a missing judge at a `judge_unavailable` gate
+/// of its own. Matched on the record's representation, never its prose: source
+/// [`crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE`] with nothing else set, exactly as the fold
+/// builds it ([`agent_verdict_denial`]'s seat-failure arms and the required judge's hold,
+/// both `UnitDenial::new`, the phase stripped by [`fold_record`]). A judge that RULED is
+/// `agent_validator`; that, every other source, and a `judge_unavailable` record carrying a claim,
+/// a rule, a refused tool, a phase or trimmed findings are not this shape (fail-closed).
+pub(crate) fn judge_absent_behind_floor(d: &crate::domain::UnitDenial) -> bool {
+    d.source == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE
+        && d.claim_id.is_none()
+        && d.rule_ids.is_empty()
+        && d.denied_tool.is_none()
+        && d.phase.is_none()
+        && !d.findings_trimmed
+}
+
 /// (operator ruling 2026-10-21, xreview r1-r5) What a unit's previous gate fold recorded, read
 /// before this fold replaces it: every layer but the floor that denied (`None`: unknown), and the
 /// tree its floor judged.
@@ -5274,5 +5293,152 @@ mod fold_record_tests {
         assert!(
             fold_record(Some(UnitDenial::new("repo_checks", "x")), None, Vec::new()).is_empty()
         );
+    }
+}
+
+/// (operator ruling 2026-10-20, core#1061 follow-on) Which denial behind a failed floor the
+/// operator's judgment over that floor also answers: the judge's no-verdict hold, exactly as the
+/// fold records it — and nothing else (fail-closed).
+#[cfg(test)]
+mod judge_absent_behind_floor_tests {
+    use super::{
+        agent_verdict_denial, denials_behind_after_fold, fold_record, judge_absent_behind_floor,
+        FoldRefresh, PriorFold,
+    };
+    use crate::domain::{UnitDenial, DENIAL_SOURCE_JUDGE_UNAVAILABLE};
+
+    fn verdict(pass: bool, seat_failure: Option<&str>) -> crate::validator::AgentVerdict {
+        crate::validator::AgentVerdict {
+            pass,
+            reasoning: "agent validator could not run".into(),
+            judge_cli: None,
+            judge_distinct: None,
+            seat_failure: seat_failure.map(str::to_string),
+            judge_fallback: None,
+        }
+    }
+    /// What the fold records behind a floor that won, from the judge's own word.
+    fn recorded(v: &crate::validator::AgentVerdict) -> Vec<UnitDenial> {
+        let (source, reason) = agent_verdict_denial(Some(v)).expect("a denial");
+        let floor = UnitDenial::new(crate::repo_checks::DENIAL_SOURCE, "checks failed");
+        fold_record(
+            Some(UnitDenial {
+                phase: Some("unit-6".into()),
+                ..floor.clone()
+            }),
+            Some(floor),
+            vec![UnitDenial::new(source, reason)],
+        )
+    }
+
+    /// Run 2ebd9da2's shape: every eligible judge seat benched on quota, so no seat produced a
+    /// verdict — the fold records `judge_unavailable` behind the floor, which is coverable. So is
+    /// a judge that answered without a verdict, and the required judge's hold (no distinct seat).
+    #[test]
+    fn a_judge_no_verdict_behind_the_floor_is_coverable() {
+        let benched = verdict(
+            false,
+            Some("copilot (benched for this run: recent quota_exhausted)"),
+        );
+        let rec = recorded(&benched);
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert_eq!(rec[0].source, DENIAL_SOURCE_JUDGE_UNAVAILABLE);
+        assert!(judge_absent_behind_floor(&rec[0]), "{rec:?}");
+        let no_verdict = verdict(
+            false,
+            Some(&format!("agy ({})", crate::validator::JUDGE_NO_VERDICT)),
+        );
+        let rec = recorded(&no_verdict);
+        assert!(judge_absent_behind_floor(&rec[0]), "{rec:?}");
+        // The required judge's hold is built the same way (`UnitDenial::new`, same source).
+        assert!(judge_absent_behind_floor(&UnitDenial::new(
+            DENIAL_SOURCE_JUDGE_UNAVAILABLE,
+            "the run requires a judge (judge) and none could run: no distinct seat",
+        )));
+        // A retry that did not re-ask the judge keeps the hold, still coverable.
+        let kept = denials_behind_after_fold(
+            Vec::new(),
+            PriorFold {
+                behind: Some(rec.clone()),
+                tree: Some("t1".into()),
+            },
+            FoldRefresh {
+                floor_carried: false,
+                tree: Some("t1".into()),
+                judge: false,
+                qe: false,
+                seat: false,
+            },
+        )
+        .expect("known");
+        assert_eq!(kept, rec);
+        assert!(kept.iter().all(judge_absent_behind_floor));
+    }
+
+    /// A judge that RULED REJECT is `agent_validator`, never coverable — however its reasoning reads.
+    #[test]
+    fn a_judge_reject_with_a_verdict_is_never_coverable() {
+        let mut reject = verdict(false, None);
+        reject.reasoning = "no eligible seat produced a verdict (judge_unavailable)".into();
+        let rec = recorded(&reject);
+        assert_eq!(rec[0].source, "agent_validator");
+        assert!(!judge_absent_behind_floor(&rec[0]), "{rec:?}");
+    }
+
+    /// Every other source, and a `judge_unavailable` record in any other shape (a claim, a rule, a
+    /// refused tool, a phase, trimmed findings — not what the fold records), is not coverable.
+    #[test]
+    fn every_other_denial_and_any_other_shape_is_not_coverable() {
+        for source in [
+            "agent_validator",
+            "evaluator",
+            "evaluator_verdict",
+            "distinct_evaluator",
+            "governance",
+            "input_governance",
+            "pinned_validator",
+            "substance",
+            "deliverables",
+            "worktree_guard",
+            "elicitation",
+            "dead_seat",
+            "consent",
+            crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEW,
+            crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE,
+            crate::repo_checks::DENIAL_SOURCE,
+            "",
+            "JUDGE_UNAVAILABLE",
+            "judge_unavailable ",
+        ] {
+            assert!(
+                !judge_absent_behind_floor(&UnitDenial::new(source, "denied")),
+                "{source:?}"
+            );
+        }
+        let hold = UnitDenial::new(DENIAL_SOURCE_JUDGE_UNAVAILABLE, "no verdict");
+        for other in [
+            UnitDenial {
+                claim_id: Some("boundary-deny:unit-6".into()),
+                ..hold.clone()
+            },
+            UnitDenial {
+                rule_ids: vec!["engine:pre-build-scope".into()],
+                ..hold.clone()
+            },
+            UnitDenial {
+                denied_tool: Some("Bash".into()),
+                ..hold.clone()
+            },
+            UnitDenial {
+                phase: Some("unit-6".into()),
+                ..hold.clone()
+            },
+            UnitDenial {
+                findings_trimmed: true,
+                ..hold.clone()
+            },
+        ] {
+            assert!(!judge_absent_behind_floor(&other), "{other:?}");
+        }
     }
 }
