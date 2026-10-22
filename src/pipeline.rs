@@ -2544,9 +2544,10 @@ fn denials_behind_after_fold(
     let mut out = fresh;
     let earlier = match prior.behind {
         Some(behind) => behind,
-        // A previous fold left no record of what denied (a gate from before the record existed):
-        // unless this fold asked every layer again, it cannot know either.
-        None if prior.tree.is_some() && !every_layer_refreshed => return None,
+        // No record of what denied before (a unit persisted before the record existed — a new
+        // unit starts known-empty): unless this fold asked every layer again, it cannot know
+        // either, whatever its tree (xreview r6: a guarded step's report carries none).
+        None if !every_layer_refreshed => return None,
         None => Vec::new(),
     };
     for d in earlier {
@@ -5170,6 +5171,24 @@ mod denials_behind_unknown_tests {
         assert_eq!(
             denials_behind_after_fold(Vec::new(), unknown(), at("t1", false)),
             None
+        );
+        // xreview r6: a legacy record whose floor named no tree stays unknown too.
+        let no_tree = PriorFold {
+            behind: None,
+            tree: None,
+        };
+        let floor_only = FoldRefresh {
+            seat: false,
+            ..at("t1", false)
+        };
+        assert_eq!(
+            denials_behind_after_fold(Vec::new(), no_tree, floor_only),
+            None
+        );
+        // A new unit starts with a known, empty record.
+        assert_eq!(
+            crate::domain::WorkUnit::pending("r:u", "r", 1, "u").denials_behind,
+            Some(Vec::new())
         );
         assert_eq!(
             denials_behind_after_fold(Vec::new(), unknown(), at("t2", true)),

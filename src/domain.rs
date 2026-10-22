@@ -1625,7 +1625,8 @@ impl WorkUnit {
             routing: None,
             denial_reason: None,
             denial: None,
-            denials_behind: None,
+            // A new unit has a known, empty record; `None` is a unit persisted before it existed.
+            denials_behind: Some(Vec::new()),
             phase_ref: None,
             conformance_ref: None,
             phase_status: None,
