@@ -45,9 +45,11 @@ Two release tracks share this file, newest entry first regardless of track:
   check. Running each target separately changed what cargo ran: `-p` re-resolves features, and doctest-only
   libraries were skipped. So the floor no longer qualifies libtest ids at all. The check runs its own argv once,
   and every `test x ... FAILED` line anywhere in its output is a failure, recorded as `test x`. The id is read from
-  the first `test ` on the line, and libtest's `--quiet` line `x --- FAILED` is read too. Each line is read raw,
-  stripped of complete escape sequences, and with every ESC, `ESC[` and `ESC]` deleted; the ids are unioned, so an
-  escape written onto a failure line cannot hide it. A libtest id never matches the base. Evidence of a failure
+  the first `test ` on the line, and libtest's `--quiet` line `x --- FAILED` is read too. Each line is read raw and
+  stripped of complete escape sequences, and the ids are unioned. A line carrying an ESC that mentions a failure
+  token (`FAILED`, `FAIL `, `ERROR`, `--- FAIL`, `Couldn't compile`, `could not compile`, `test result: FAILED`,
+  `failed, to rerun pass`) yet yields no id adds `unattributed failure: an escaped failure line`, so an escape
+  written onto a failure line cannot hide it. A libtest id never matches the base. Evidence of a failure
   that names no test adds an `unattributed failure: <kind>` id, which never matches and is never re-run alone:
   - from the floor's own argv and exit code, with no text, a failed `cargo test` (`cargo test exited <code>`);
   - cargo's `process didn't exit successfully:` (a crashed or non-101 test binary);
@@ -56,7 +58,9 @@ Two release tracks share this file, newest entry first regardless of track:
   - a pytest `ERROR ` line;
   - a `FAIL <file>` line with no ` > ` (vitest's file-level failure, jest's file header).
   **The cost: any Rust test failure the base shares now denies, and so does any failed cargo run or any check with
-  a crashed binary, a compile error, a pytest ERROR or a file-level FAIL.** A non-cargo confirmation (vitest re-runs
+  a crashed binary, a compile error, a pytest ERROR or a file-level FAIL.** Colour-escaped failure output on a
+  failing check cannot be pre-existing either; the floor runs checks without a TTY, so runners do not colour by
+  default. A non-cargo confirmation (vitest re-runs
   the whole check) cannot pass while the base already has a vitest failure: a fail-closed false denial, and the
   operator override covers it. A
   shared failure is listed as `ambiguous`, the denial says so, and the operator's floor override (core#1061) is the
@@ -79,8 +83,8 @@ Two release tracks share this file, newest entry first regardless of track:
   left. For libtest it is the check's argv with `-- --skip <name> … --exact`; other runners (vitest) re-run the whole
   check, and the vitest load-class re-run gets the same confirmation. A cargo check is re-run alone or confirmed
   only when every argv element is allowlisted: package, feature, profile, target, lockfile, `-j`, `--no-fail-fast`
-  and `--color` flags before `--`, and `--test-threads`, `--nocapture`, `--show-output`, `--color` and `-q` after
-  it. A positional TESTNAME (`cargo test foo`, where `--exact` would select 0 tests and exit 0), a `--skip`,
+  and `--color` flags before `--`, and `--test-threads`, `--nocapture`, `--show-output` and `--color` after it
+  (`-q` is not: a quiet re-run never prints the `ok` witness, so a quiet check is never re-run). A positional TESTNAME (`cargo test foo`, where `--exact` would select 0 tests and exit 0), a `--skip`,
   `--exact` or `--ignored` of its own, an unknown flag or a second `--` means neither, and the check stays a
   regression. One re-run attempt per check, from any path: once any re-run ran, no other path starts. A truncated
   failure set (past `MAX_FAILURE_IDS`) is never re-run or confirmed. The clean exit
@@ -101,7 +105,8 @@ Two release tracks share this file, newest entry first regardless of track:
   `a_flake_beside_a_crash_under_a_cargo_testname_filter_denies_1060` (real cargo),
   `an_escape_before_any_failure_line_cannot_hide_it_1060`, `a_wrapped_cargo_failure_is_never_pre_existing_1060`,
   `a_quiet_cargo_failure_beside_a_shared_child_id_denies_1060` (real cargo),
-  `a_flake_beside_the_cargo_exit_id_is_still_flaky_1060`,
+  `a_flake_beside_the_cargo_exit_id_is_still_flaky_1060`, `an_escaped_failure_line_becomes_a_sentinel_1060`,
+  `a_coloured_flaky_libtest_line_still_recovers_1060`, `a_quiet_cargo_check_is_never_rerun_1060`,
   `baseline_diff_never_excuses_a_libtest_failure` (real
   `cargo test`), `a_libtest_failure_the_base_shares_is_still_denied` (end to end),
   `a_failure_that_passes_alone_is_flaky_and_does_not_block`,

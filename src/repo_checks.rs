@@ -274,6 +274,22 @@ pub const UNATTRIBUTED_FAILURE: &str = "unattributed failure: ";
 pub const NO_CLEAN_RUN: &str =
     "unattributed failure: the check did not run clean with its flaky tests skipped";
 
+/// A line with an ESC that mentions a failure token ([`ESCAPED_FAILURE_TOKENS`]) but yielded no
+/// id in either reading, raw or stripped (core#1060): an escape may have hidden the failure's name,
+/// so it is a failure the floor cannot name. Add-only; a clean confirmation answers for it.
+pub const ESCAPED_FAILURE_LINE: &str = "unattributed failure: an escaped failure line";
+/// The failure tokens of [`ESCAPED_FAILURE_LINE`], matched anywhere in the line, case-sensitive.
+const ESCAPED_FAILURE_TOKENS: &[&str] = &[
+    "FAILED",
+    "FAIL ",
+    "ERROR",
+    "--- FAIL",
+    "Couldn't compile",
+    "could not compile",
+    "test result: FAILED",
+    "failed, to rerun pass",
+];
+
 /// The `source` of a check's confirmation run ([`recheck_alone`], [`rerun_load_class`]).
 const CONFIRMATION_SOURCE: &str = "confirmation run (core#1060)";
 
@@ -4406,8 +4422,9 @@ fn understood_cargo_test(argv: &[String]) -> Option<(&[String], &[String])> {
         "--jobs",
         "--color",
     ];
-    /// After `--`: thread count, output capture and colour.
-    const TEST_BARE: &[&str] = &["--nocapture", "--show-output", "-q", "--quiet"];
+    /// After `--`: thread count, output capture and colour. (`-q`/`--quiet` is not on it: a quiet
+    /// re-run never prints `test X ... ok`, the witness an isolated re-run needs.)
+    const TEST_BARE: &[&str] = &["--nocapture", "--show-output"];
     const TEST_VALUED: &[&str] = &["--test-threads", "--color"];
     fn allowed(args: &[String], bare: &[&str], valued: &[&str]) -> bool {
         let mut i = 0;
@@ -5092,6 +5109,7 @@ fn rerun_load_class(
             };
         }
         run.classification = Some(FLAKY_UNDER_LOAD.to_string());
+        run.not_rechecked = 0;
     }
     true
 }
@@ -5501,27 +5519,38 @@ impl LineScan {
                 }
             }
         }
-        // (core#1060) Ids and markers are read off the raw line and the de-introduced one (every
-        // ESC, `ESC [` and `ESC ]` deleted) as well as the stripped one: a second reading can only
-        // ADD ids, so an escape written onto a failure line (`\x1b[31test new ... FAILED`, where
-        // the stripper takes the `t` as the sequence's final byte) cannot hide it.
-        let extra: Vec<String> = if raw.contains('\u{1b}') {
-            vec![raw.to_string(), de_introduced(raw)]
-        } else {
-            Vec::new()
-        };
-        for other in &extra {
-            let o = other.trim();
-            if let Some(kind) = unattributed_failure_of_line(o) {
+        // (core#1060) Ids and markers are read off the raw line as well as the stripped one — a
+        // second reading can only ADD ids (`\x1b[31test new ... FAILED`: the stripper takes the
+        // `t` as the sequence's final byte). A line carrying an ESC that mentions a failure token
+        // yet yielded no id is itself a failure the floor cannot name.
+        let escaped = raw.contains('\u{1b}');
+        let mut yielded = false;
+        if escaped {
+            if let Some(kind) = unattributed_failure_of_line(raw.trim()) {
                 self.add(format!("{UNATTRIBUTED_FAILURE}{kind}"));
+                yielded = true;
             }
             let mut eslint = None;
-            if let Some(id) = failure_id_of_line(other, &mut eslint) {
+            if let Some(id) = failure_id_of_line(raw, &mut eslint) {
                 self.add(id);
+                yielded = true;
             }
         }
         if let Some(kind) = unattributed_failure_of_line(s) {
             self.add(format!("{UNATTRIBUTED_FAILURE}{kind}"));
+            yielded = true;
+        }
+        if let Some(id) = failure_id_of_line(line, &mut self.eslint_file) {
+            self.add(id);
+            yielded = true;
+        }
+        if escaped
+            && !yielded
+            && [raw, line]
+                .iter()
+                .any(|t| ESCAPED_FAILURE_TOKENS.iter().any(|k| t.contains(k)))
+        {
+            self.add(ESCAPED_FAILURE_LINE.to_string());
         }
         if !self.watch.is_empty() {
             if let Some(name) = s
@@ -5532,11 +5561,9 @@ impl LineScan {
                 if self.watch.iter().any(|w| w == name) && !self.passed.iter().any(|p| p == name) {
                     self.passed.push(name.to_string());
                 }
-                return;
-            }
-            // (core#766) A watched vitest id passes when its FILE's check-mark line is printed.
-            // (core#790) A watched `file:<path>` passes on that file's own check-mark line.
-            if s.starts_with('✓') {
+            } else if s.starts_with('✓') {
+                // (core#766) A watched vitest id passes when its FILE's check-mark line is printed.
+                // (core#790) A watched `file:<path>` passes on that file's own check-mark line.
                 for w in &self.watch {
                     let hit = match w.strip_prefix(FILE_WATCH) {
                         Some(file) => vitest_file_pass_line(s, file),
@@ -5546,11 +5573,7 @@ impl LineScan {
                         self.passed.push(w.clone());
                     }
                 }
-                return;
             }
-        }
-        if let Some(id) = failure_id_of_line(line, &mut self.eslint_file) {
-            self.add(id);
         }
     }
 
@@ -5588,23 +5611,6 @@ fn strip_ansi(line: &str) -> std::borrow::Cow<'_, str> {
         i += 1;
     }
     std::borrow::Cow::Owned(out)
-}
-
-/// `line` with every ESC deleted, and the `[` or `]` that introduces a sequence after it — a
-/// second reading of a line whose escapes do not parse ([`LineScan::line`]).
-fn de_introduced(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut it = line.chars().peekable();
-    while let Some(c) = it.next() {
-        if c == '\u{1b}' {
-            if matches!(it.peek(), Some('[') | Some(']')) {
-                it.next();
-            }
-            continue;
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// The index just past the complete escape sequence that starts at `c[i]` (an ESC), or `None`.
@@ -11049,6 +11055,8 @@ mod tests {
             s(&["cargo", "test", "--", "--nocapture", "--", "x"]),
             s(&["cargo", "test", "--lib"]),
             s(&["cargo", "test", "-q"]),
+            s(&["cargo", "test", "--", "-q"]),
+            s(&["cargo", "test", "--", "--quiet"]),
             s(&["cargo", "test", "--target-dir", "t"]),
             s(&["cargo", "test", "-p"]),
             s(&["cargo", "test", "-p", "--lib"]),
@@ -11098,8 +11106,6 @@ mod tests {
             "--nocapture",
             "--show-output",
             "--color=always",
-            "-q",
-            "--quiet",
         ]);
         let mut want = every.clone();
         want.extend(s(&["--exact", "a"]));
@@ -11494,5 +11500,96 @@ mod tests {
         );
         assert_eq!(run.regressions, vec![exit, NO_CLEAN_RUN.to_string()]);
         assert!(run.denies());
+    }
+
+    /// codex / agy round 19: a parameterised partial CSI or OSC before a failure token (`\x1b[31ERROR`,
+    /// `\x1b[0m\x1b]8;;FAILED …\x07`) defeats every prefix-anchored reading. A line with an ESC that
+    /// mentions a failure token yet yields no id is an unattributed failure: beside a failure the
+    /// base shares, every shape denies.
+    #[test]
+    fn an_escaped_failure_line_becomes_a_sentinel_1060() {
+        let shared = "FAILED tests/t.py::test_old - red\n";
+        for line in [
+            "\u{1b}[31ERROR tests/test_new.py - ImportError",
+            "\u{1b}[31FAILED tests/t.py::test_new - red",
+            "\u{1b}[31FAIL a.test.ts > s > new",
+            "\u{1b}[0m\u{1b}[FAILED tests/t.py::test_new - red",
+            "\u{1b}[0m\u{1b}]8;;FAILED tests/t.py::test_new - red\u{7}",
+            "\u{1b}[31--- FAIL: TestNew (0.00s)",
+            "\u{1b}[1mcould not compile `x`",
+        ] {
+            let (ids, _, _) = qualify(scan_of(&format!("{line}\n")), LineScan::default());
+            assert!(
+                ids.contains(&ESCAPED_FAILURE_LINE.to_string())
+                    || ids.iter().any(|i| !never_matched(i)),
+                "{line:?}: {ids:?}"
+            );
+            let run = scanned_head((&format!("{shared}{line}\n"), ""), (shared, ""));
+            assert_eq!(
+                run.classification.as_deref(),
+                Some(REGRESSION),
+                "{line:?}: {run:?}"
+            );
+            assert!(run.denies(), "{line:?}");
+        }
+        // A plain line, or an escaped line with no failure token, adds nothing.
+        let (ids, _, _) = qualify(
+            scan_of("\u{1b}[32mtest ok ... ok\u{1b}[0m\nall good\n"),
+            LineScan::default(),
+        );
+        assert!(ids.is_empty(), "{ids:?}");
+    }
+
+    /// agy round 19: a coloured libtest failure line yields its plain id and no junk (the deleted
+    /// de-introduced reading turned SGR into ids like `test new0m`), so a coloured flake still
+    /// recovers after a clean confirmation.
+    #[test]
+    fn a_coloured_flaky_libtest_line_still_recovers_1060() {
+        let (ids, _, _) = qualify(
+            scan_of(
+                "test new ... \u{1b}[31mFAILED\u{1b}[0m\n\u{1b}[1mtest new ... \
+                 \u{1b}[31mFAILED\u{1b}[0m\n",
+            ),
+            LineScan::default(),
+        );
+        assert_eq!(ids, vec!["test new"]);
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let (check, mut run) = regression_run(&refs);
+        let mut argvs = Vec::new();
+        recheck_alone(
+            &check,
+            &mut run,
+            None,
+            Duration::from_secs(FLAKE_RERUN_BUDGET_S),
+            &mut confirming_rerun(0, &mut argvs),
+        );
+        assert_eq!(
+            run.classification.as_deref(),
+            Some(FLAKY_UNDER_LOAD),
+            "{run:?}"
+        );
+        assert!(!run.denies());
+    }
+
+    /// codex / agy round 19: a `-q`/`--quiet` re-run never prints `test X ... ok`, so its witness
+    /// cannot pass — a quiet cargo check is never re-run, and a flake in it stays a regression.
+    #[test]
+    fn a_quiet_cargo_check_is_never_rerun_1060() {
+        for quiet in ["-q", "--quiet"] {
+            let (mut check, mut run) = regression_run(&["test t::flaky"]);
+            check.argv = s(&["cargo", "test", "--", quiet]);
+            let mut argvs = Vec::new();
+            recheck_alone(
+                &check,
+                &mut run,
+                None,
+                Duration::from_secs(FLAKE_RERUN_BUDGET_S),
+                &mut confirming_rerun(0, &mut argvs),
+            );
+            assert!(argvs.is_empty(), "{argvs:?}");
+            assert_eq!(run.not_rechecked, 1);
+            assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+            assert!(run.denies());
+        }
     }
 }
