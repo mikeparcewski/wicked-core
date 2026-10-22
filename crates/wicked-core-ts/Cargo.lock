@@ -2807,7 +2807,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-core-ts"
-version = "0.15.6"
+version = "0.15.7"
 dependencies = [
  "anyhow",
  "napi",
