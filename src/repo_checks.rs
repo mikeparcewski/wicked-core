@@ -5446,6 +5446,8 @@ struct LineScan {
     /// More failure ids than [`MAX_FAILURE_IDS`] were seen: [`qualify`] adds
     /// [`FAILURE_IDS_TRUNCATED`].
     truncated: bool,
+    /// More set-aside ids than [`MAX_FAILURE_IDS`]: counts only when [`qualify`] reports them.
+    nested_truncated: bool,
     /// libtest: the test whose captured output (`---- name stdout ----`) is being read.
     section: Option<String>,
     /// Failure ids in order of first sight; libtest ids carry their binary's ordinal.
@@ -5483,6 +5485,17 @@ impl LineScan {
         Self {
             watch: watch.to_vec(),
             ..Self::default()
+        }
+    }
+
+    /// Set a failure id read inside captured output aside ([`Self::nested_ids`]).
+    fn set_aside(&mut self, id: String) {
+        if !self.nested_ids.contains(&id) {
+            if self.nested_ids.len() < MAX_FAILURE_IDS {
+                self.nested_ids.push(id);
+            } else {
+                self.nested_truncated = true;
+            }
         }
     }
 
@@ -5645,13 +5658,7 @@ impl LineScan {
                         bounded(names, listing_name(&id), &mut self.anomaly);
                     }
                 }
-                if !self.nested_ids.contains(&id) {
-                    if self.nested_ids.len() < MAX_FAILURE_IDS {
-                        self.nested_ids.push(id);
-                    } else {
-                        self.truncated = true;
-                    }
-                }
+                self.set_aside(id);
             }
             return;
         }
@@ -5701,12 +5708,16 @@ impl LineScan {
         }
         let block = self.blocks.len().checked_sub(1);
         if let Some(name) = self.section.clone() {
-            // A test's captured output: only the launcher signature is read here — a nested
-            // runner's own `test x ... FAILED` inside it is not a failure of THIS suite.
+            // A test's captured output: its launcher signature is read, and a failure line in it
+            // (a child's — or this suite's own, behind framing a test printed to raw stdout, agy
+            // on #1060) is set aside like a nested run's: never dropped.
             if launcher_signature(s).is_some()
                 && !self.env.iter().any(|(n, b)| n == &name && *b == block)
             {
                 bounded(&mut self.env, (name, block), &mut self.anomaly);
+            }
+            if let Some(id) = failure_id_of_line(line, &mut self.eslint_file) {
+                self.set_aside(id);
             }
             return;
         }
@@ -5753,13 +5764,7 @@ impl LineScan {
                 // libtest prints its `test x ... FAILED` lines before `failures:`: one after it
                 // is captured output (a child's, once its section's own state was lost) — set
                 // aside like a nested run's (agy on #1060).
-                if !self.nested_ids.contains(&id) {
-                    if self.nested_ids.len() < MAX_FAILURE_IDS {
-                        self.nested_ids.push(id);
-                    } else {
-                        self.truncated = true;
-                    }
-                }
+                self.set_aside(id);
                 return;
             }
             if libtest && self.open {
@@ -5980,7 +5985,12 @@ fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<Strin
     };
     let mut ids: Vec<String> = Vec::new();
     let mut env: Vec<String> = Vec::new();
-    let mut truncated = out.truncated || err.truncated;
+    // Set-aside ids are reported (and their overflow counts) only when the structure did not
+    // verify (agy on #1060: a verified run's child failures are not this suite's).
+    let mut truncated = out.truncated
+        || err.truncated
+        || (!lined_up && out.nested_truncated)
+        || err.nested_truncated;
     let mut keep = |ids: &mut Vec<String>, q: String| {
         if !ids.contains(&q) {
             if ids.len() < MAX_FAILURE_IDS {
@@ -12065,6 +12075,87 @@ error: 2 targets failed:
         assert_eq!(run.classification.as_deref(), Some(REGRESSION));
         assert_eq!(run.regressions, vec!["test y [?]"]);
         assert!(run.denies());
+    }
+
+    /// agy on #1060 (round 10): the creator controls the test code, so a test can print libtest
+    /// framing to raw stdout — `failures:` then `---- x stdout ----` while its binary is still
+    /// running. The real `test y ... FAILED` after them must never be dropped: it is set aside
+    /// and, with the binary's own result line not adding up (1 failed, 0 read), the structure
+    /// fails closed and reports it `[?]`. In a check that also prints a pre-existing non-libtest
+    /// failure, a dropped `y` left only that shared id: a regression read as pre-existing.
+    #[test]
+    fn raw_libtest_framing_from_a_test_drops_no_failure_1060() {
+        let head = adj_text(&[
+            "running 2 tests",
+            "test a ... ok",
+            "failures:",
+            "---- x stdout ----",
+            "test y ... FAILED",
+            "",
+            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]);
+        let err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n\
+            error: test failed, to rerun pass `-p a --lib`\n";
+        assert_eq!(
+            qualify(scan_of(&head), scan_of(err)).0,
+            vec!["test y [?]".to_string()]
+        );
+        // (1) The base fails y in the same binary: a regression (unattributed), never matched.
+        let base = adj_text(&[
+            "running 2 tests",
+            "test a ... ok",
+            "test y ... FAILED",
+            "",
+            "failures:",
+            "    y",
+            "",
+            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]);
+        let run = adj_head(&head, err, &base, err);
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(run.regressions, vec!["test y [?]"]);
+        // (2) A mixed check (pytest + cargo): the pytest failure is pre-existing, y is new.
+        let old = "FAILED tests/t.py::test_old - red\n";
+        let base_ok = adj_text(&[
+            "running 2 tests",
+            "test a ... ok",
+            "test y ... ok",
+            "",
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]);
+        let base_err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n";
+        let run = adj_head(
+            &format!("{old}{head}"),
+            err,
+            &format!("{old}{base_ok}"),
+            base_err,
+        );
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(run.regressions, vec!["test y [?]"]);
+        assert!(run.denies());
+    }
+
+    /// agy on #1060 (round 10, P3): child failures set aside in a VERIFIED run are not this
+    /// suite's, so their overflow adds no truncation marker (a pre-existing failure stays one).
+    #[test]
+    fn set_aside_overflow_in_a_verified_run_adds_no_marker_1060() {
+        let mut out =
+            String::from("running 1 test\ntest t ... FAILED\n\nfailures:\n\n---- t stdout ----\n");
+        for i in 0..MAX_FAILURE_IDS + 5 {
+            out.push_str(&format!("test child{i} ... FAILED\n"));
+        }
+        out.push_str(
+            "\nfailures:\n    t\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; \
+             0 filtered out\n",
+        );
+        let err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n\
+            error: test failed, to rerun pass `-p a --lib`\n";
+        let scan = scan_of(&out);
+        assert!(scan.nested_truncated && !scan.anomaly);
+        assert_eq!(
+            qualify(scan, scan_of(err)).0,
+            vec!["test t [-p a --lib]".to_string()]
+        );
     }
 
     /// agy a1b2 #1: a LAST binary that crashed after printing a failure (real cargo: the block
