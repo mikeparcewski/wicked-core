@@ -454,6 +454,22 @@ enum NetworkPolicy {
     LoopbackOnly,
 }
 
+/// Whether the jail may allocate pseudo-terminals. Only the repo-checks floor asks for `Own`: a
+/// repository's PTY and tmux tests need a terminal, and under the deny-writes profile opening
+/// `/dev/ptmx` (or a slave) for read-write is refused, so every such test was a head-only
+/// failure the floor could never run. `Own` grants write access to exactly two device classes
+/// on macOS: `/dev/ptmx` (opening it ALLOCATES a new pair; it reaches no existing terminal) and a
+/// `/dev/ttysN` slave only with the `com.apple.sandbox.pty` extension, which the kernel issues to
+/// the process that allocated that pair — the operator's own terminals stay unwritable, and
+/// `/dev/tty` stays denied. No path, no other device and no network rule changes. Linux bwrap's
+/// `--dev /dev` already mounts a PRIVATE devpts instance (the host's ptys are not in it), so
+/// the policy changes nothing there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PtyPolicy {
+    Deny,
+    Own,
+}
+
 impl NetworkPolicy {
     /// Whether the jail must cut the network (all of it, or all but loopback).
     fn restricts(self) -> bool {
@@ -529,6 +545,7 @@ fn sbpl_quote(p: &Path) -> String {
 fn macos_sandbox_profile_for_roots(
     write_roots: &[&Path],
     network: NetworkPolicy,
+    pty: PtyPolicy,
 ) -> Option<String> {
     let primary = write_roots.first()?.canonicalize().ok()?;
     let mut p = String::from("(version 1)\n(allow default)\n");
@@ -603,6 +620,15 @@ fn macos_sandbox_profile_for_roots(
     p.push_str("(allow file-write-data (literal \"/dev/null\"))\n");
     p.push_str("(allow file-write-data (literal \"/dev/stdout\"))\n");
     p.push_str("(allow file-write-data (literal \"/dev/stderr\"))\n");
+    if pty == PtyPolicy::Own {
+        // See [`PtyPolicy`]: a NEW pair through the multiplexer, and only the slaves this jail
+        // allocated (the kernel's per-allocation extension) — never an existing terminal.
+        p.push_str("(allow file-write-data (literal \"/dev/ptmx\"))\n");
+        p.push_str(
+            "(allow file-write-data (require-all (regex #\"^/dev/ttys[0-9]+$\") \
+             (extension \"com.apple.sandbox.pty\")))\n",
+        );
+    }
     Some(p)
 }
 
@@ -612,7 +638,7 @@ fn macos_sandbox_profile(cwd: &Path, extra_write: Option<&Path>) -> Option<Strin
     if let Some(extra) = extra_write {
         roots.push(extra);
     }
-    macos_sandbox_profile_for_roots(&roots, NetworkPolicy::Deny)
+    macos_sandbox_profile_for_roots(&roots, NetworkPolicy::Deny, PtyPolicy::Deny)
 }
 
 /// Resolve the OS-sandbox wrapper for `cwd`, or the floor (`BestEffort`, empty wrapper) when none is
@@ -620,8 +646,9 @@ fn macos_sandbox_profile(cwd: &Path, extra_write: Option<&Path>) -> Option<Strin
 fn detect_sandbox_launcher_for_roots(
     write_roots: &[&Path],
     network: NetworkPolicy,
+    pty: PtyPolicy,
 ) -> SandboxLauncher {
-    launcher_for_roots_masking(write_roots, network, secret_read_block_dirs())
+    launcher_for_roots_masking(write_roots, network, secret_read_block_dirs(), pty)
 }
 
 /// (WT-C2, core#515) The directories a network-restricting jail masks so a validator or the
@@ -709,7 +736,7 @@ fn socket_dir_masks(
 /// to loopback only, the curated secret dirs unreadable. Only a `Sandboxed` launcher jails it — a
 /// network-only `firejail` contains no writes — so the caller treats any other level as "no jail".
 pub(crate) fn loopback_jail(write_roots: &[&Path]) -> SandboxLauncher {
-    detect_sandbox_launcher_for_roots(write_roots, NetworkPolicy::LoopbackOnly)
+    detect_sandbox_launcher_for_roots(write_roots, NetworkPolicy::LoopbackOnly, PtyPolicy::Deny)
 }
 
 /// [`detect_sandbox_launcher_for_roots`] with the secret dirs to mask handed in — the seam the
@@ -831,13 +858,14 @@ fn launcher_for_roots_masking(
     write_roots: &[&Path],
     network: NetworkPolicy,
     secret_dirs: Vec<std::path::PathBuf>,
+    pty: PtyPolicy,
 ) -> SandboxLauncher {
     let floor = SandboxLauncher {
         wrapper: Vec::new(),
         level: SandboxLevel::BestEffort,
     };
     if let Some(tool) = find_on_path("sandbox-exec") {
-        if let Some(profile) = macos_sandbox_profile_for_roots(write_roots, network) {
+        if let Some(profile) = macos_sandbox_profile_for_roots(write_roots, network, pty) {
             return SandboxLauncher {
                 wrapper: vec![
                     tool.to_string_lossy().into_owned(),
@@ -990,7 +1018,7 @@ fn detect_sandbox_launcher(cwd: &Path, extra_write: Option<&Path>) -> SandboxLau
     if let Some(extra) = extra_write {
         roots.push(extra);
     }
-    detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Deny)
+    detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Deny, PtyPolicy::Deny)
 }
 
 /// A probed worker OS sandbox: the prependable wrapper argv (EMPTY ⇒ no wrap, the floor), the level
@@ -1018,11 +1046,22 @@ pub(crate) struct WorkerSandbox {
 /// running), mirroring the `GovernanceUnenforced` "loud, never silent" precedent. It NEVER claims
 /// `Sandboxed` when the wrapper did not actually arm.
 pub(crate) fn detect_worker_sandbox(write_roots: &[std::path::PathBuf]) -> WorkerSandbox {
+    detect_worker_sandbox_with(write_roots, PtyPolicy::Deny)
+}
+
+/// The repo-checks floor's boundary: [`detect_worker_sandbox`] plus pseudo-terminal allocation
+/// ([`PtyPolicy::Own`]), so a repository's PTY / tmux tests run on the floor. The same write
+/// roots, secret masks and network posture as a worker.
+pub(crate) fn detect_floor_sandbox(write_roots: &[std::path::PathBuf]) -> WorkerSandbox {
+    detect_worker_sandbox_with(write_roots, PtyPolicy::Own)
+}
+
+fn detect_worker_sandbox_with(write_roots: &[std::path::PathBuf], pty: PtyPolicy) -> WorkerSandbox {
     let roots: Vec<&Path> = write_roots
         .iter()
         .map(std::path::PathBuf::as_path)
         .collect();
-    let launcher = detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Allow);
+    let launcher = detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Allow, pty);
     if launcher.level == SandboxLevel::Sandboxed {
         return WorkerSandbox {
             wrapper: launcher.wrapper,
@@ -1534,7 +1573,9 @@ pub fn run_validator_reporting_with_env(
     let tmp = match crate::repo_checks::PrivateTmp::create() {
         Ok(t) => t,
         Err(e) => {
-            let level = detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Deny).level;
+            let level =
+                detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Deny, PtyPolicy::Deny)
+                    .level;
             return Ok((
                 ValidatorOutcome::Unrunnable(format!(
                     "the validator's private TMPDIR could not be created under the system temp \
@@ -1545,7 +1586,7 @@ pub fn run_validator_reporting_with_env(
         }
     };
     roots.push(tmp.path());
-    let launcher = detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Deny);
+    let launcher = detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Deny, PtyPolicy::Deny);
     let mut argv = launcher.wrapper.clone();
     argv.push("sh".to_string());
     argv.push("-c".to_string());
@@ -4806,7 +4847,12 @@ mod tests {
         std::fs::create_dir_all(&wt).unwrap();
         let secrets = secret_read_block_dirs_under(Some(&home));
         assert_eq!(secrets.len(), 12, "{secrets:?}");
-        let sandbox = launcher_for_roots_masking(&[wt.as_path()], NetworkPolicy::Allow, secrets);
+        let sandbox = launcher_for_roots_masking(
+            &[wt.as_path()],
+            NetworkPolicy::Allow,
+            secrets,
+            PtyPolicy::Deny,
+        );
         assert_eq!(sandbox.level, SandboxLevel::Sandboxed, "{sandbox:?}");
         let masked = |rel: &str| {
             let s = home.join(rel).to_string_lossy().to_string();
@@ -6055,13 +6101,140 @@ mod core_exe_tests {
 mod worker_sandbox_tests {
     use super::*;
 
+    /// The repo-checks floor's profile is the worker's plus exactly two write rules — `/dev/ptmx`
+    /// and the slaves carrying the kernel's per-allocation pty extension — appended at the end:
+    /// no other path, device or network rule differs.
+    #[test]
+    fn the_floor_profile_adds_only_its_own_pty_devices() {
+        let root = std::env::temp_dir().join(format!("wicked-floor-pty-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let worker = macos_sandbox_profile_for_roots(
+            &[root.as_path()],
+            NetworkPolicy::Allow,
+            PtyPolicy::Deny,
+        )
+        .unwrap();
+        let floor = macos_sandbox_profile_for_roots(
+            &[root.as_path()],
+            NetworkPolicy::Allow,
+            PtyPolicy::Own,
+        )
+        .unwrap();
+        assert!(floor.starts_with(&worker), "{floor}");
+        assert_eq!(
+            &floor[worker.len()..],
+            "(allow file-write-data (literal \"/dev/ptmx\"))\n(allow file-write-data \
+             (require-all (regex #\"^/dev/ttys[0-9]+$\") (extension \"com.apple.sandbox.pty\")))\n"
+        );
+        assert!(!worker.contains("ptmx") && !worker.contains("ttys"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Run `argv` inside `sandbox`'s wrapper in `dir`, stdin closed.
+    #[cfg(target_os = "macos")]
+    fn jailed(sandbox: &WorkerSandbox, dir: &Path, argv: &[&str]) -> std::process::Output {
+        // spawn-audit: hardened — the jail under test around a fixed probe command.
+        std::process::Command::new(&sandbox.wrapper[0])
+            .hardened()
+            .args(&sandbox.wrapper[1..])
+            .args(argv)
+            .current_dir(dir)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    /// A PTY opens inside the repo-checks floor's sandbox (`script(1)` allocates one and runs
+    /// `tty` on it); the worker's sandbox, without the grant, still refuses one; and a terminal
+    /// that already exists outside the jail — a pty this test allocates, standing in for the
+    /// operator's — is NOT writable from inside it, though it is from outside.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_pty_opens_inside_the_floor_sandbox_and_no_existing_terminal_is_reachable() {
+        let dir = std::env::temp_dir().join(format!("wicked-floor-ptyrun-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let floor = detect_floor_sandbox(std::slice::from_ref(&dir));
+        let worker = detect_worker_sandbox(std::slice::from_ref(&dir));
+        if floor.level != SandboxLevel::Sandboxed || floor.wrapper.is_empty() {
+            eprintln!("no sandbox-exec here — the floor's PTY grant is not exercised");
+            return;
+        }
+        let probe = ["/usr/bin/script", "-q", "/dev/null", "/bin/sh", "-c", "tty"];
+        let out = jailed(&floor, &dir, &probe);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("/dev/ttys"),
+            "a pty inside the floor's jail: {out:?}"
+        );
+        let out = jailed(&worker, &dir, &probe);
+        assert!(
+            !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("openpty"),
+            "the worker's jail has no pty grant: {out:?}"
+        );
+
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: openpty writes two fds into the out-params; the null name/termios/winsize are
+        // documented as "not wanted".
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty outside the jail");
+        // CLOCAL: an open of the slave does not wait for carrier (without it a blocking open can
+        // sit in the tty driver for minutes before any permission answer comes back).
+        // SAFETY: `slave` is an open tty fd and `tio` a plain-data struct tcgetattr fills.
+        unsafe {
+            let mut tio: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave, &mut tio), 0);
+            tio.c_cflag |= libc::CLOCAL;
+            assert_eq!(libc::tcsetattr(slave, libc::TCSANOW, &tio), 0);
+        }
+        // SAFETY: `slave` is an open tty fd; ttyname returns a static NUL-terminated name.
+        let name = unsafe { std::ffi::CStr::from_ptr(libc::ttyname(slave)) }
+            .to_string_lossy()
+            .into_owned();
+        let write = ["/bin/sh", "-c", "printf x > \"$0\"", name.as_str()];
+        let inside = jailed(&floor, &dir, &write);
+        // spawn-audit: hardened — the unjailed control of the same write.
+        let outside = std::process::Command::new(write[0])
+            .hardened()
+            .args(&write[1..])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        // SAFETY: both fds were opened above and are closed once.
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
+        assert!(
+            outside.status.success(),
+            "control: {name} is writable outside: {outside:?}"
+        );
+        assert!(
+            !inside.status.success(),
+            "an existing terminal ({name}) must stay unwritable inside the floor's jail: {inside:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn worker_profile_keeps_network_open_but_validator_profile_denies_it() {
         let root =
             std::env::temp_dir().join(format!("wicked-worker-profile-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let worker = macos_sandbox_profile_for_roots(&[root.as_path()], NetworkPolicy::Allow)
-            .expect("existing worktree canonicalizes");
+        let worker = macos_sandbox_profile_for_roots(
+            &[root.as_path()],
+            NetworkPolicy::Allow,
+            PtyPolicy::Deny,
+        )
+        .expect("existing worktree canonicalizes");
         let validator = macos_sandbox_profile(&root, None).expect("existing run dir canonicalizes");
         assert!(
             !worker.contains("(deny network*)"),

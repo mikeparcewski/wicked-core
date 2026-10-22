@@ -1124,11 +1124,16 @@ export declare class Subscription {
  * 'pre_existing_in_sandbox' | 'floor_env_mismatch' | null` (only a regression denies), `preExisting`,
  * `regressions` and `base: {head, cached, run, error} | null` (the same check run on the run base).
  * core#481/#546/#553 (additive): `classification` gains `'env_cannot_run'` (every failure carries the
- * nested-sandbox launcher signature on both trees) and `'flaky_under_load'` (a head-only set of ≤ 2
+ * nested-sandbox launcher signature on both trees) and `'flaky_under_load'` (each head-only failure, ≤ 50,
  * that passed an isolated re-run) — neither denies; equal failure sets are now
  * `'pre_existing_in_sandbox'` (`'floor_env_mismatch'` is no longer produced); libtest ids are
  * qualified by binary (`test t::name [-p crate --lib]`); every `checks[]` entry carries
  * `envCannotRun: string[]` and `reruns: CheckRun[]` (each re-run's `boundNote` carries the host load).
+ * Floor fix 2026-10-22 (additive): every `checks[]` entry carries `flaky: string[]` (head-only failures
+ * that passed re-run alone — not denials), `notRechecked: number` (head-only failures not re-run: over
+ * 50, past the 900 s re-run budget, or a runner the floor cannot narrow), `ambiguous: string[]` (head
+ * failures not matched to a same-named base failure because one side's binary is unknown — kept as
+ * regressions) and `matchedByName: string[]` (matched by test name alone, one candidate).
  * core#810 (additive): unitDistributed.pool (UnitPoolSeatingJson | null — a phase's worker pool,
  * one creator plus monitors, with any shortfall disclosed as requested/seated/missing).
  * core#461/#591 (additive): unitDistributed.distinctnessFallback ('creator_seat' |

@@ -34,6 +34,34 @@ Two release tracks share this file, newest entry first regardless of track:
   exactly where the engine would take it. Wire: `confirmGate(..., action: "operator_judgment")` with the
   rationale in `amend`.
 
+- **The repo-checks floor keeps every libtest id qualified, runs PTY and tmux tests, and re-checks each
+  head-only failure alone (pipeline-blocker plain PR, operator-approved).** Run 2ebd9da2 could not pass its floor
+  for three reasons. (1) A re-exec test harness printed its child's run in a panic message, so a binary's captured
+  output carried a second `test result: FAILED` line (17 such lines for 9 failing binaries). The floor dropped the
+  `[-p <crate> --test <target>]` qualifier from every id whenever the two counts differed, so the head ids never
+  met the base's qualified ids: pre-existing 0, every base failure a regression. A result line now closes a binary
+  only when its `N failed` equals the failing tests read since the last one, and a binary that died without a
+  result line is closed by the next `running N tests` header. Head and base ids are compared on (test name,
+  target): a bare id meets a qualified one only when exactly one pairing is possible, and listed as
+  `matchedByName`; with several candidates it stays a regression, listed as `ambiguous`, and the denial says so.
+  Ids qualified with different targets never meet. (2) The floor's macOS sandbox refused `/dev/ptmx`, so no PTY or
+  tmux test could run on it. The repo-checks floor (only it, not workers or validators) may now open `/dev/ptmx`
+  and write to the `/dev/ttysN` slaves the kernel's `com.apple.sandbox.pty` extension marks as its own; no other
+  path, device or network rule changes, and the operator's terminals and `/dev/tty` stay unwritable. Linux bwrap
+  already gave the jail a private devpts. A PTY refusal is still not `env_cannot_run` (only nested-sandbox launcher
+  signatures are). (3) At most 2 head-only failures were re-run, and a loaded host produced 21-27. On an
+  oversubscribed host each head-only failure is now re-run once, alone and serially, up to `MAX_FLAKE_RERUN` = 50
+  failures and `FLAKE_RERUN_BUDGET_S` = 900 s in total. One that passes alone is "flaky (passed alone)" and does
+  not deny (`flaky`); one that fails again stays a regression. Failures over the cap, past the budget or under a
+  runner the floor cannot narrow stay regressions, counted in `notRechecked`. Wire (additive, `checks[]`):
+  `flaky`, `notRechecked`, `ambiguous`, `matchedByName`. Tests:
+  `a_childs_result_line_in_captured_output_keeps_every_id_qualified` and
+  `head_and_base_ids_match_across_qualified_and_bare_forms` (both fail on the previous main),
+  `the_same_test_name_in_two_crates_stays_distinct`, `a_failure_that_passes_alone_is_flaky_and_does_not_block`,
+  `a_failure_that_fails_again_alone_stays_a_regression`,
+  `a_spent_rerun_budget_is_reported_and_the_rest_stay_regressions`,
+  `the_floor_profile_adds_only_its_own_pty_devices` and
+  `a_pty_opens_inside_the_floor_sandbox_and_no_existing_terminal_is_reachable`.
 - **A container seat's gate hook no longer refuses a call silently, and a killed gate hook is judged again.** In
   core#997's end-to-end run a claude seat's `cargo test` loop was refused with "the gate hook failed (exit 1): ;"
   and nothing else: no reason, no line in the daemon's log, no deny in the unit's decisions log. The host gate

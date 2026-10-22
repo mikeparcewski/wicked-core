@@ -74,12 +74,17 @@
 //! on the gate's `floorNote` — external CI is the test gate for them), and a head-only failure
 //! with the signature still denies with an advisory naming the likely cause. A head-only set of
 //! at most [`MAX_FLAKE_RERUN`] libtest or vitest ids, read on an oversubscribed host (1-min load
-//! above the CPU count — the evidence it was load), is re-run ONCE, each alone (core#553): a
+//! above the CPU count — the evidence it was load), is re-run ONCE, each alone and serially,
+//! within [`FLAKE_RERUN_BUDGET_S`] (core#553): a
 //! libtest id by its `--exact` name, a vitest id as its test FILE alone (core#766 — a 5 s
 //! filesystem-walk `it` that hit vitest's default timeout under load 45-80 was denied twice as a
-//! regression; vitest was not re-run because only `cargo test` was). If every one passes it is
-//! `flaky_under_load` (never denies; both attempts and the load at each are on the record), else
-//! a `regression`. A base that cannot be run or compared leaves the
+//! regression; vitest was not re-run because only `cargo test` was). A failure that passes alone
+//! is "flaky (passed alone)" (`flaky`, never denies); one that fails again, or that the cap or the
+//! budget does not reach (`not_rechecked`), stays a `regression`. If every one passes the check is
+//! `flaky_under_load` (never denies; both attempts and the load at each are on the record). The
+//! head and base ids are compared on (test name, binary); a bare id meets a qualified one only
+//! when one pairing is possible, else it stays a regression listed as `ambiguous`. A base that
+//! cannot be run or compared leaves the
 //! check denying as before (fail-closed). `baseline_diff: false` in the repo config opts out. A
 //! creator transcript that CLAIMS a failure is pre-existing is annotated against that comparison
 //! ([`ClaimCheck`]: `claim_rejected` when the base is green).
@@ -114,9 +119,10 @@
 //!
 //! A `test` script is arbitrary code the repository chose. It runs the way the engine runs an
 //! ungoverned worker: inside the OS write boundary the worker sandbox provides
-//! ([`crate::validator::detect_worker_sandbox`] — macOS `sandbox-exec`, Linux `bwrap`; writes
+//! ([`crate::validator::detect_floor_sandbox`] — macOS `sandbox-exec`, Linux `bwrap`; writes
 //! confined to the worktree, the curated secret directories unreadable, network open because
-//! installs need it), with an ISOLATED `HOME` and package caches in the floor's CHECK SCRATCH
+//! installs need it; the one addition over a worker's is pseudo-terminal allocation, its own
+//! ptys only, so PTY and tmux tests run — [`crate::validator::PtyPolicy`]), with an ISOLATED `HOME` and package caches in the floor's CHECK SCRATCH
 //! (`HOME`, `npm_config_cache`, `CARGO_HOME`, `CARGO_TARGET_DIR`, `XDG_*` — see "Where the check
 //! scratch lives" below), so no check reads the operator's `~/.npmrc`, `~/.cargo/config.toml` or
 //! credentials, nothing it writes lands outside the boundary's roots, and its build artifacts
@@ -291,9 +297,17 @@ pub const ENV_CANNOT_RUN: &str = "env_cannot_run";
 /// same worktree: a host-load flake, not a regression — never denies, named on the gate's
 /// `floorNote`; both attempts (and the load at each) are on the record (`reruns`).
 pub const FLAKY_UNDER_LOAD: &str = "flaky_under_load";
-/// The largest head-only failure set the floor re-runs in isolation before calling it a
-/// regression (core#553). Larger sets are regressions as before.
-pub const MAX_FLAKE_RERUN: usize = 2;
+/// The largest head-only failure set the floor re-checks, each failure alone (core#553). 50 is
+/// about twice the 21-27 head-only load flakes a floor saw at 1-min load 30-45 (run 2ebd9da2,
+/// floors 5 and 7, which the old bound of 2 never re-checked). A larger set is not load noise worth
+/// isolating: none of it is re-run, and all of it stays a regression.
+pub const MAX_FLAKE_RERUN: usize = 50;
+/// The wall clock (seconds) one check's isolated re-runs may take in total, run serially. 900 s
+/// is about half of a loaded floor (a full `cargo test --workspace` took ~30 min at load 30-45),
+/// enough for 50 single-test re-runs of an already-built binary. The budget is checked before
+/// each re-run and each re-run's base bound is cut to what is left; failures it does not reach
+/// stay regressions, counted in `not_rechecked`.
+pub const FLAKE_RERUN_BUDGET_S: u64 = 900;
 /// Both base and head fail with NO parseable failure identifiers (unknown runner output format,
 /// e.g. node:test without a TAP-aware parser). Cannot determine if pre-existing or a regression —
 /// fail-closed: always denies (#538).
@@ -461,6 +475,10 @@ pub struct FloorContext {
     pub run_id: Option<String>,
 }
 
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
 /// The evidence of one check having run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckRun {
@@ -506,9 +524,27 @@ pub struct CheckRun {
     /// tests this host cannot run under the floor, whatever the change.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_cannot_run: Vec<String>,
-    /// (core#553) The isolated re-runs of a small head-only failure set, one per id, in order.
+    /// (core#553) The isolated re-runs of the head-only failure set, one per id, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reruns: Vec<CheckRun>,
+    /// Head-only failures that PASSED their isolated re-run on an oversubscribed host: "flaky
+    /// (passed alone)", never denials. When every head-only failure did, the check is
+    /// `flaky_under_load` and `regressions` still names them (as before); otherwise
+    /// `regressions` holds only the failures that still deny.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flaky: Vec<String>,
+    /// Head-only failures the floor did NOT re-check alone — over [`MAX_FLAKE_RERUN`], past
+    /// [`FLAKE_RERUN_BUDGET_S`], or a runner it cannot filter to one test. They stay regressions.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub not_rechecked: usize,
+    /// Head failures with a same-named base failure the floor could not tell apart (one side's
+    /// binary unknown, several candidates) — kept as regressions rather than guessed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ambiguous: Vec<String>,
+    /// Head failures matched to the base by test name alone (one side's binary unknown, exactly
+    /// one candidate) — counted pre-existing, and said so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_by_name: Vec<String>,
     /// (core#789/#790) Environment signals the scan read off the check's own output, at most
     /// [`MAX_ENV_SIGNALS`], each prefixed by its class: `load: <line>` (a vitest pool worker that
     /// never started — `Failed to start forks worker` / `Timeout waiting for worker to respond` —
@@ -856,6 +892,10 @@ impl RepoChecksReport {
                 ));
             }
         }
+        // What the re-checks and the head/base matching established beyond the verdict.
+        for c in &self.checks {
+            notes.extend(match_notes(c));
+        }
         // (core#432 F-3R2-023) An end-to-end change the floor did not run, on a pass too.
         if let Some(n) = &self.coverage_note {
             notes.push(n.clone());
@@ -953,7 +993,16 @@ impl RepoChecksReport {
                     }
                     _ => String::new(),
                 };
-                let line = format!("{line}{base_note}{}", cached_base_load_note(c));
+                let matched = match_notes(c);
+                let line = format!(
+                    "{line}{base_note}{}{}",
+                    cached_base_load_note(c),
+                    if matched.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; {}", matched.join("; "))
+                    }
+                );
                 // A failed INSTALL is an environmental finding about provisioning the worktree,
                 // not a verdict on the work (F-E2E-029): say so, and say what was being provisioned
                 // (`source` = the lockfile and why the install ran), so the operator reads
@@ -3001,11 +3050,11 @@ pub fn run_floor_rerun(
     let scratch = match CheckScratch::prepare_for(worktree, ctx.run_id.as_deref()) {
         Ok(s) => s,
         Err(e) => {
-            let sandbox = crate::validator::detect_worker_sandbox(&[worktree.to_path_buf()]);
+            let sandbox = crate::validator::detect_floor_sandbox(&[worktree.to_path_buf()]);
             return scratch_refused(worktree, ctx, &sandbox, &e);
         }
     };
-    let sandbox = crate::validator::detect_worker_sandbox(&[
+    let sandbox = crate::validator::detect_floor_sandbox(&[
         worktree.to_path_buf(),
         scratch.tmp.path().to_path_buf(),
         scratch.root().to_path_buf(),
@@ -3047,7 +3096,7 @@ pub(crate) fn floor_probe() -> Result<&'static str, crate::worker_sandbox::Floor
         let dir = std::env::temp_dir().join(format!("wicked-floor-probe-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let armed = dir.canonicalize().ok().is_some_and(|d| {
-            let sandbox = crate::validator::detect_worker_sandbox(std::slice::from_ref(&d));
+            let sandbox = crate::validator::detect_floor_sandbox(std::slice::from_ref(&d));
             if sandbox.level != crate::validator::SandboxLevel::Sandboxed
                 || sandbox.wrapper.is_empty()
             {
@@ -3951,7 +4000,7 @@ pub(crate) fn guarded_checkout_refused(
     ctx: &FloorContext,
     why: &str,
 ) -> RepoChecksReport {
-    let sandbox = crate::validator::detect_worker_sandbox(&[worktree.to_path_buf()]);
+    let sandbox = crate::validator::detect_floor_sandbox(&[worktree.to_path_buf()]);
     RepoChecksReport {
         detected: detect_with(worktree, ctx).unwrap_or_default(),
         checks: Vec::new(),
@@ -4225,17 +4274,20 @@ fn classify(head: &mut CheckRun, base: BaseRun) {
                 // cannot determine if pre-existing or a regression. Fail closed.
                 (true, true) => Some(UNCLASSIFIED_RED_BASE),
                 (false, false) => {
-                    head.pre_existing = head_ids
-                        .intersection(&base_ids)
-                        .map(|s| s.to_string())
-                        .collect();
+                    let m = match_base(&head_ids, &base_ids);
+                    head.pre_existing = m.pairs.iter().map(|(h, _)| h.to_string()).collect();
                     head.regressions = head_ids
-                        .difference(&base_ids)
+                        .iter()
+                        .filter(|h| !m.pairs.iter().any(|(p, _)| p == *h))
                         .map(|s| s.to_string())
                         .collect();
+                    head.ambiguous = m.ambiguous.iter().map(|s| s.to_string()).collect();
+                    head.matched_by_name = m.by_name.iter().map(|s| s.to_string()).collect();
                     let env_on_both = |id: &str| {
                         head.env_cannot_run.iter().any(|e| e == id)
-                            && b.env_cannot_run.iter().any(|e| e == id)
+                            && m.pairs.iter().any(|(h, base_id)| {
+                                *h == id && b.env_cannot_run.iter().any(|e| e == base_id)
+                            })
                     };
                     if !head.regressions.is_empty() {
                         Some(REGRESSION)
@@ -4251,6 +4303,68 @@ fn classify(head: &mut CheckRun, base: BaseRun) {
     };
     head.classification = verdict.map(str::to_string);
     head.base = Some(Box::new(base));
+}
+
+/// How the head's failure ids met the base's ([`match_base`]).
+#[derive(Debug, Default)]
+struct BaseMatch<'a> {
+    /// (head id, the base id it is) — the head failures the base shares.
+    pairs: Vec<(&'a str, &'a str)>,
+    /// Head ids with a same-named base failure that cannot be told apart (one side unqualified,
+    /// more than one candidate binary): NOT matched — they stay regressions, and say why.
+    ambiguous: Vec<&'a str>,
+    /// Head ids matched by test name alone (one side unqualified, exactly one candidate).
+    by_name: Vec<&'a str>,
+}
+
+/// Match head failure ids to base failure ids on the normalised key (test name, target).
+///
+/// Equal strings match. A libtest id qualified on both sides matches only the SAME target
+/// (`[-p a --lib]` never meets `[-p b --lib]`). A bare id (its run's qualification fell back)
+/// meets a qualified id of the same name on the other side only when that is the one pairing
+/// possible: one candidate on the other side not already matched exactly, and the candidate
+/// itself has no other same-named candidate here. Several candidates are not guessed between:
+/// the head id stays a regression (fail-closed) and is listed as ambiguous.
+fn match_base<'a>(
+    head: &std::collections::BTreeSet<&'a str>,
+    base: &std::collections::BTreeSet<&'a str>,
+) -> BaseMatch<'a> {
+    // The same-named ids of `other` an id could be in the other form, minus those `other` id
+    // already met exactly.
+    fn cross<'a>(
+        id: &str,
+        other: &std::collections::BTreeSet<&'a str>,
+        mine: &std::collections::BTreeSet<&'a str>,
+    ) -> Vec<&'a str> {
+        let Some((name, target)) = libtest_parts(id) else {
+            return Vec::new();
+        };
+        other
+            .iter()
+            .copied()
+            .filter(|o| !mine.contains(o))
+            .filter(|o| {
+                libtest_parts(o).is_some_and(|(n, t)| n == name && t.is_some() != target.is_some())
+            })
+            .collect()
+    }
+    let mut m = BaseMatch::default();
+    for &h in head {
+        if base.contains(h) {
+            m.pairs.push((h, h));
+            continue;
+        }
+        let candidates = cross(h, base, head);
+        match candidates.as_slice() {
+            [] => {}
+            [b] if cross(b, head, base) == [h] => {
+                m.pairs.push((h, b));
+                m.by_name.push(h);
+            }
+            _ => m.ambiguous.push(h),
+        }
+    }
+    m
 }
 
 /// (core#553) The argv that re-runs ONE libtest id alone: the check's own `cargo test` with the
@@ -4464,11 +4578,10 @@ pub(crate) fn oversubscribed(load1: Option<f64>, cpus: usize) -> bool {
     matches!(load1, Some(l) if l.is_finite() && cpus > 0 && l > cpus as f64)
 }
 
-/// (core#553) Re-run each head-only failure of a small `regression` set ONCE, alone, in the same
-/// worktree; when every one PASSES (exit 0 and libtest printed `test <name> ... ok` — a filter
-/// that matched nothing is not a pass) the check is `flaky_under_load`. Each re-run's own
-/// `bound_note` carries the host load at that attempt, beside the first attempt's. Anything else —
-/// a larger set, a runner the floor cannot filter, a re-run that fails — leaves `regression`.
+/// (core#553) Re-check each head-only failure of a `regression` ONCE, alone, serially, in the same
+/// worktree, when the host is oversubscribed as the failure is read ([`recheck_alone`]). On a host
+/// with headroom a failure that passes alone is as likely an order-dependent regression the
+/// change introduced — it stays a regression, and nothing is re-run.
 fn rerun_flakes(
     worktree: &Path,
     check: &RepoCheck,
@@ -4476,15 +4589,9 @@ fn rerun_flakes(
     sandbox: &WorkerSandbox,
     scratch: &CheckScratch,
 ) {
-    if run.classification.as_deref() != Some(REGRESSION)
-        || run.regressions.is_empty()
-        || run.regressions.len() > MAX_FLAKE_RERUN
-    {
+    if run.classification.as_deref() != Some(REGRESSION) || run.regressions.is_empty() {
         return;
     }
-    // The evidence that it was LOAD: the host is oversubscribed as the failure is read. On a host
-    // with headroom a failure that passes alone is as likely an order-dependent regression the
-    // change introduced — it stays a regression, and nothing is re-run.
     let (load1, cpus) = host_load();
     if !oversubscribed(load1, cpus) {
         return;
@@ -4492,59 +4599,105 @@ fn rerun_flakes(
     // (core#781) `npm run test` hides its runner behind a script: when the script is a plain
     // `vitest …` command the re-run goes through that runner (`npx --no-install vitest …`).
     let runner_argv = script_runner_argv(&worktree.join(&check.dir), &check.argv);
-    let plans: Option<Vec<(Vec<String>, String)>> = run
-        .regressions
-        .iter()
-        .map(|id| {
-            isolated_rerun_argv(&check.argv, id).or_else(|| {
-                runner_argv
-                    .as_deref()
-                    .and_then(|a| isolated_rerun_argv(a, id))
-            })
-        })
-        .collect();
-    let Some(plans) = plans else {
+    recheck_alone(
+        check,
+        run,
+        runner_argv.as_deref(),
+        Duration::from_secs(FLAKE_RERUN_BUDGET_S),
+        &mut |one, names| run_one_watching(worktree, one, sandbox, scratch, Tree::Head, names),
+    );
+}
+
+/// One isolated re-run: the narrowed check and the names it must print passing → the run and
+/// the watched names it printed passing.
+type IsolatedRerun<'a> = dyn FnMut(&RepoCheck, &[String]) -> (CheckRun, Vec<String>) + 'a;
+
+/// The re-checks themselves, with the re-run injected (the seam the tests drive). Each head-only
+/// failure is re-run once, alone: a libtest id by its `--exact` name in its own binary, a vitest
+/// id as its FILE (two ids of one file share one re-run). A failure PASSES alone only when the
+/// re-run exits 0 AND the runner printed it passing (a filter that matched nothing is not a
+/// pass): it is "flaky (passed alone)" and does not deny (`flaky`). One that fails again stays a
+/// regression. At most [`MAX_FLAKE_RERUN`] failures and [`FLAKE_RERUN_BUDGET_S`] of re-runs (the
+/// sum of their recorded durations); a set over the cap, failures the budget does not reach and
+/// ids the runner cannot narrow stay regressions, counted in `not_rechecked`. When EVERY
+/// head-only failure passed alone the check is `flaky_under_load`.
+fn recheck_alone(
+    check: &RepoCheck,
+    run: &mut CheckRun,
+    runner_argv: Option<&[String]>,
+    budget: Duration,
+    rerun: &mut IsolatedRerun<'_>,
+) {
+    let head_only = run.regressions.clone();
+    if head_only.len() > MAX_FLAKE_RERUN {
+        run.not_rechecked = head_only.len();
+        eprintln!(
+            "wicked-core: repo checks floor — {} head-only failures exceed the {MAX_FLAKE_RERUN} \
+             the floor re-checks alone; none re-run, all stay regressions",
+            head_only.len()
+        );
         return;
-    };
-    // (core#766) Two vitest ids in one file share one re-run argv — run the file once, witness
-    // both; libtest ids each carry their own `--exact` name and never group.
-    let mut groups: Vec<(Vec<String>, Vec<String>)> = Vec::new();
-    for (argv, name) in plans {
-        match groups.iter_mut().find(|(a, _)| *a == argv) {
-            Some((_, names)) => names.push(name),
-            None => groups.push((argv, vec![name])),
+    }
+    // (argv, the names the runner must print passing, the ids they stand for), in order.
+    let mut groups: Vec<(Vec<String>, Vec<String>, Vec<String>)> = Vec::new();
+    let mut not_rechecked = 0usize;
+    for id in &head_only {
+        let plan = isolated_rerun_argv(&check.argv, id)
+            .or_else(|| runner_argv.and_then(|a| isolated_rerun_argv(a, id)));
+        match plan {
+            Some((argv, name)) => match groups.iter_mut().find(|(a, _, _)| *a == argv) {
+                Some((_, names, ids)) => {
+                    names.push(name);
+                    ids.push(id.clone());
+                }
+                None => groups.push((argv, vec![name], vec![id.clone()])),
+            },
+            None => not_rechecked += 1,
         }
     }
-    let mut all_passed = true;
-    for (argv, names) in groups {
+    let mut spent = Duration::ZERO;
+    let mut flaky: Vec<String> = Vec::new();
+    for (argv, names, ids) in groups {
+        let Some(left) = budget.checked_sub(spent).filter(|d| !d.is_zero()) else {
+            not_rechecked += ids.len();
+            continue;
+        };
         let label = names.join("`, `");
         let one = RepoCheck {
             name: check.name.clone(),
             argv,
             source: format!("isolated re-run of `{label}` (core#553)"),
-            timeout_s: check.timeout_s,
+            timeout_s: Some(check.base_timeout().min(left).as_secs().max(1)),
             dir: check.dir.clone(),
         };
-        let (r, passed) = run_one_watching(worktree, &one, sandbox, scratch, Tree::Head, &names);
+        let (r, passed) = rerun(&one, &names);
+        spent += Duration::from_millis(r.duration_ms);
         let ok = r.passed() && names.iter().all(|n| passed.iter().any(|p| p == n));
         eprintln!(
             "wicked-core: repo checks floor — isolated re-run of `{label}` {} ({:.1}s{})",
-            if ok { "passed" } else { "did not pass" },
+            if ok {
+                "passed: flaky (passed alone)"
+            } else {
+                "failed again: a regression"
+            },
             r.duration_ms as f64 / 1000.0,
             r.bound_note
                 .as_deref()
                 .map(|n| format!(", bound {n}"))
                 .unwrap_or_default()
         );
-        all_passed &= ok;
         run.reruns.push(r);
-        if !all_passed {
-            break;
+        if ok {
+            flaky.extend(ids);
         }
     }
-    if all_passed {
+    run.not_rechecked = not_rechecked;
+    if flaky.len() == head_only.len() {
         run.classification = Some(FLAKY_UNDER_LOAD.to_string());
+    } else {
+        run.regressions.retain(|id| !flaky.contains(id));
     }
+    run.flaky = flaky;
 }
 
 /// (core#790) The watch prefix that asks [`LineScan`] for a whole FILE's check-mark line.
@@ -5038,6 +5191,52 @@ pub(crate) fn load_band(load1: Option<f64>, cpus: usize) -> Option<u32> {
     }
 }
 
+/// What one check's re-checks and head/base matching established beyond its verdict, one line
+/// each: head-only failures that passed alone while others still deny, how many were not
+/// re-checked, head ids not matched because a same-named base failure was ambiguous, and head ids
+/// matched by test name alone. Empty when there is nothing of the kind.
+fn match_notes(c: &CheckRun) -> Vec<String> {
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let mut out = Vec::new();
+    if !c.flaky.is_empty() && c.classification.as_deref() != Some(FLAKY_UNDER_LOAD) {
+        out.push(format!(
+            "`{}`: {} head-only failure{} passed re-run alone on an oversubscribed host — flaky \
+             (passed alone), not counted: {}",
+            c.name,
+            c.flaky.len(),
+            plural(c.flaky.len()),
+            c.flaky.join(", ")
+        ));
+    }
+    if c.not_rechecked > 0 {
+        out.push(format!(
+            "`{}`: {} head-only failure{} not re-checked alone (more than {MAX_FLAKE_RERUN}, past \
+             the {FLAKE_RERUN_BUDGET_S}s re-run budget, or a runner the floor cannot narrow to one \
+             test) — still regressions",
+            c.name,
+            c.not_rechecked,
+            plural(c.not_rechecked)
+        ));
+    }
+    if !c.ambiguous.is_empty() {
+        out.push(format!(
+            "`{}`: {} could not be told apart from a same-named base failure (one side's test \
+             binary is unknown and more than one fits) — kept as regressions, not guessed",
+            c.name,
+            c.ambiguous.join(", ")
+        ));
+    }
+    if !c.matched_by_name.is_empty() {
+        out.push(format!(
+            "`{}`: {} matched the base's failure by test name alone (one side's test binary is \
+             unknown; one candidate)",
+            c.name,
+            c.matched_by_name.join(", ")
+        ));
+    }
+    out
+}
+
 /// (core#781) The base result was read from this run's cache — run by an earlier floor, under
 /// another host load — and its load band differs from the head's: head and base were not compared
 /// under like load, so the denial says so (a 5 s vitest timeout at 7× load against a base that ran
@@ -5145,13 +5344,25 @@ pub(crate) fn launcher_signature(line: &str) -> Option<&'static str> {
 /// FAILING test binary it came from (the count of `test result: FAILED` lines seen before it), and
 /// collects cargo's per-binary `to rerun pass `-p b --test common`` lines (stderr) in order: the
 /// k-th failing binary is the k-th such line, so [`qualify`] can name the target exactly — and
-/// falls back to the bare id when the two counts disagree (a binary that crashed without a result
-/// line, a custom harness).
+/// falls back to the bare id when the two counts disagree (a custom harness).
+///
+/// A `test result:` line is a binary's boundary only when it closes what the binary printed: its
+/// `N failed` equals the failing tests read since the last boundary. A re-exec harness that
+/// prints its CHILD's run inside a test's captured output prints a second result line there (17
+/// result lines for 9 failing binaries, run 2ebd9da2 attempt 4); that line either does not match
+/// (and is ignored) or closes the block early (and the binary's own line then matches nothing),
+/// so each binary counts once. A binary that died without a result line is closed by the next
+/// binary's `running N tests` header.
 #[derive(Debug, Default)]
 struct LineScan {
     eslint_file: Option<String>,
-    /// libtest: `test result: FAILED` lines seen so far.
+    /// libtest: failing test binaries closed so far (see the boundary rule above).
     failed_blocks: usize,
+    /// libtest: top-level `test x ... FAILED` lines read since the last boundary (every one,
+    /// whether or not the id cap kept it).
+    block_failures: usize,
+    /// libtest: a binary's `running N tests` header was read and its boundary not yet.
+    open: bool,
     /// libtest: the test whose captured output (`---- name stdout ----`) is being read.
     section: Option<String>,
     /// Failure ids in order of first sight; libtest ids carry their failing-binary index.
@@ -5188,9 +5399,29 @@ impl LineScan {
                 }
             }
         }
-        if s.starts_with("test result: FAILED") {
-            self.failed_blocks += 1;
+        if let Some(rest) = s.strip_prefix("test result: ") {
+            let count = libtest_failed_count(rest);
+            if !rest.starts_with("FAILED") {
+                // `ok` closes the open binary only when it read no failure (a nested child's
+                // `ok` inside a failing binary's captured output closes nothing).
+                self.open &= self.block_failures != 0;
+            } else if !matches!(count, Some(n) if n != self.block_failures) {
+                // `N failed` matches what was read (or the line has no count: as before).
+                self.failed_blocks += 1;
+                self.block_failures = 0;
+                self.open = false;
+            }
             self.section = None;
+            return;
+        }
+        if self.section.is_none() && libtest_running_header(s) {
+            // A binary still open here died without its result line: cargo still printed its
+            // `to rerun pass` selector, so it is one failing binary.
+            if self.open {
+                self.failed_blocks += 1;
+                self.block_failures = 0;
+            }
+            self.open = true;
             return;
         }
         if let Some(name) = s
@@ -5249,6 +5480,7 @@ impl LineScan {
         }
         if let Some(id) = failure_id_of_line(line, &mut self.eslint_file) {
             let block = id.starts_with("test ").then_some(self.failed_blocks);
+            self.block_failures += usize::from(block.is_some());
             if self.ids.len() < MAX_FAILURE_IDS
                 && !self.ids.iter().any(|(i, b)| i == &id && *b == block)
             {
@@ -5267,6 +5499,26 @@ fn rerun_target_of_line(s: &str) -> Option<String> {
     let end = inner.find(q)?;
     let target = inner[..end].trim();
     (!target.is_empty()).then(|| target.to_string())
+}
+
+/// libtest's result line, after `test result: `: `FAILED. 1 passed; 2 failed; 0 ignored` → 2.
+/// `None` when it carries no `N failed` count.
+fn libtest_failed_count(rest: &str) -> Option<usize> {
+    let words: Vec<&str> = rest
+        .split(|c: char| c.is_whitespace() || c == ';' || c == ',')
+        .filter(|w| !w.is_empty())
+        .collect();
+    words
+        .windows(2)
+        .find(|w| w[1] == "failed")
+        .and_then(|w| w[0].parse().ok())
+}
+
+/// libtest's per-binary header: `running 1 test` / `running 12 tests`.
+fn libtest_running_header(s: &str) -> bool {
+    s.strip_prefix("running ")
+        .and_then(|r| r.strip_suffix(" tests").or_else(|| r.strip_suffix(" test")))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// A libtest id qualified by its test binary: `test t::shared [-p b --lib]` (core#481).
@@ -5296,11 +5548,14 @@ fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<Strin
         .chain(err.targets.iter())
         .cloned()
         .collect();
+    // The k-th failing binary is the k-th selector. A binary still open at the end died (cargo
+    // printed its selector) or was cut off by the check's bound (cargo printed none, so its ids
+    // stay bare): either count lines the binaries up.
     let label = |scan: &LineScan, block: Option<usize>| -> Option<String> {
         let b = block?;
-        (scan.failed_blocks == targets.len())
-            .then(|| targets.get(b).cloned())
-            .flatten()
+        let lined_up = scan.failed_blocks == targets.len()
+            || (scan.open && scan.failed_blocks + 1 == targets.len());
+        lined_up.then(|| targets.get(b).cloned()).flatten()
     };
     let mut ids: Vec<String> = Vec::new();
     let mut env: Vec<String> = Vec::new();
@@ -5545,6 +5800,10 @@ fn run_one_watching(
         base: None,
         env_cannot_run: Vec::new(),
         reruns: Vec::new(),
+        flaky: Vec::new(),
+        not_rechecked: 0,
+        ambiguous: Vec::new(),
+        matched_by_name: Vec::new(),
         env_signals: Vec::new(),
         load_band: None,
     };
@@ -5704,7 +5963,7 @@ mod tests {
     fn sandbox_for(wt: &Path) -> WorkerSandbox {
         let leaf = scratch_dir_for(&check_cache_root().unwrap(), wt, None);
         std::fs::create_dir_all(&leaf).unwrap();
-        crate::validator::detect_worker_sandbox(&[wt.to_path_buf(), leaf])
+        crate::validator::detect_floor_sandbox(&[wt.to_path_buf(), leaf])
     }
 
     #[test]
@@ -5873,6 +6132,10 @@ mod tests {
                 base: None,
                 env_cannot_run: Vec::new(),
                 reruns: Vec::new(),
+                flaky: Vec::new(),
+                not_rechecked: 0,
+                ambiguous: Vec::new(),
+                matched_by_name: Vec::new(),
                 env_signals: Vec::new(),
                 load_band: None,
             }],
@@ -7950,6 +8213,10 @@ mod tests {
             base: None,
             env_cannot_run: Vec::new(),
             reruns: Vec::new(),
+            flaky: Vec::new(),
+            not_rechecked: 0,
+            ambiguous: Vec::new(),
+            matched_by_name: Vec::new(),
             env_signals: Vec::new(),
             load_band: None,
         };
@@ -8669,6 +8936,10 @@ mod tests {
             base: None,
             env_cannot_run: Vec::new(),
             reruns: Vec::new(),
+            flaky: Vec::new(),
+            not_rechecked: 0,
+            ambiguous: Vec::new(),
+            matched_by_name: Vec::new(),
             env_signals: Vec::new(),
             load_band: None,
         }
@@ -8857,6 +9128,341 @@ mod tests {
         );
     }
 
+    /// The child run a re-exec harness prints in its panic message (`tmux_live_tests.rs` asserted
+    /// its child's success with the child's stdout): a whole libtest run, result line included.
+    const CHILD_RUN: &str = "\nrunning 1 test\ntest terminal::live::attach ... FAILED\n\n\
+        failures:\n\n---- terminal::live::attach stdout ----\nthread 'terminal::live::attach' \
+        panicked at src/terminal/live.rs:478:9:\nno attach\n\n\nfailures:\n    \
+        terminal::live::attach\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 \
+        measured; 2294 filtered out; finished in 5.01s\n";
+
+    /// Attempt 4 of run 2ebd9da2 (17 `test result: FAILED` lines for 9 failing targets): a
+    /// child's result line inside a test's captured output is not a test binary's result, so it
+    /// cannot strip the `[-p … ]` qualifier from every id of the run. Binary 1 fails two tests
+    /// (the child's `1 failed` does not close it); binary 2 fails one test, the harness itself
+    /// (the child's line closes it early, the binary's own result line is then not a second
+    /// block); binary 3 is an ordinary failure.
+    #[test]
+    fn a_childs_result_line_in_captured_output_keeps_every_id_qualified() {
+        let stdout = format!(
+            "\nrunning 3 tests\ntest t::ok ... ok\ntest terminal::live::attach ... FAILED\n\
+             test t::red ... FAILED\n\nfailures:\n\n---- terminal::live::attach stdout ----\n\
+             thread 'terminal::live::attach' panicked at src/terminal/live.rs:92:9:\nchild \
+             failed: {CHILD_RUN}\n---- t::red stdout ----\nboom\n\n\nfailures:\n    \
+             terminal::live::attach\n    t::red\n\ntest result: FAILED. 1 passed; 2 failed; 0 \
+             ignored\n\nrunning 1 test\ntest live::resize ... FAILED\n\nfailures:\n\n---- \
+             live::resize stdout ----\nchild failed: {CHILD_RUN}\n\nfailures:\n    \
+             live::resize\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n\nrunning 2 \
+             tests\ntest a_check_the_base_fails ... FAILED\ntest b ... ok\n\nfailures:\n\n---- \
+             a_check_the_base_fails stdout ----\nx\n\nfailures:\n    a_check_the_base_fails\n\n\
+             test result: FAILED. 1 passed; 1 failed; 0 ignored\n"
+        );
+        let stderr = "     Running unittests src/lib.rs (target/debug/deps/core-1)\n\
+            error: test failed, to rerun pass `-p core --lib`\n     Running tests/live.rs \
+            (target/debug/deps/live-2)\nerror: test failed, to rerun pass `-p core --test \
+            live`\n     Running tests/guard.rs (target/debug/deps/guard-3)\nerror: test failed, \
+            to rerun pass `-p core --test guard`\nerror: 3 targets failed:\n    `-p core --lib`\n";
+        let (ids, _, _, _) = qualify(scan_of(&stdout), scan_of(stderr));
+        assert_eq!(
+            ids,
+            vec![
+                "test terminal::live::attach [-p core --lib]".to_string(),
+                "test t::red [-p core --lib]".to_string(),
+                "test live::resize [-p core --test live]".to_string(),
+                "test a_check_the_base_fails [-p core --test guard]".to_string(),
+            ]
+        );
+
+        // A binary that died without its result line (a crash) is still one failing binary:
+        // the next binary's `running` header closes it, so the later ids keep their target.
+        let crashed = "\nrunning 2 tests\ntest a::x ... FAILED\n\nrunning 1 test\ntest y ... \
+            FAILED\n\nfailures:\n\n---- y stdout ----\nz\n\nfailures:\n    y\n\ntest result: \
+            FAILED. 0 passed; 1 failed\n";
+        let two = "error: test failed, to rerun pass `-p c --lib`\nerror: test failed, to rerun \
+            pass `-p c --test it`\n";
+        let (ids, _, _, _) = qualify(scan_of(crashed), scan_of(two));
+        assert_eq!(
+            ids,
+            vec!["test a::x [-p c --lib]", "test y [-p c --test it]"]
+        );
+
+        // A run cut off inside its last binary (the check's bound): cargo printed no selector
+        // for it, so its id stays bare and the finished binary before it keeps its target.
+        let cut = "\nrunning 1 test\ntest y ... FAILED\n\nfailures:\n    y\n\ntest result: \
+            FAILED. 0 passed; 1 failed\n\nrunning 3 tests\ntest late ... FAILED\n";
+        let one = "error: test failed, to rerun pass `-p c --test it`\n";
+        let (ids, _, _, _) = qualify(scan_of(cut), scan_of(one));
+        assert_eq!(ids, vec!["test y [-p c --test it]", "test late"]);
+
+        assert_eq!(
+            libtest_failed_count("FAILED. 1 passed; 2 failed; 0 ignored"),
+            Some(2)
+        );
+        assert_eq!(libtest_failed_count("ok. 3 passed; 0 failed"), Some(0));
+        assert_eq!(libtest_failed_count("FAILED"), None);
+        assert!(
+            libtest_running_header("running 1 test") && libtest_running_header("running 12 tests")
+        );
+        assert!(!libtest_running_header("running tests") && !libtest_running_header("running 1"));
+    }
+
+    /// Head and base are compared on (target, test name): a bare id on one side matches the
+    /// qualified id of the same name on the other when that name has exactly one candidate
+    /// target — the form of an id is not its identity.
+    #[test]
+    fn head_and_base_ids_match_across_qualified_and_bare_forms() {
+        // Head bare (its qualification fell back), base qualified: the shared failure is
+        // pre-existing, the head-only one a regression.
+        let mut head = failed_run(&["test a::x", "test a::new"], &[]);
+        classify(
+            &mut head,
+            base_of(failed_run(&["test a::x [-p core --lib]"], &[])),
+        );
+        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(head.pre_existing, vec!["test a::x"]);
+        assert_eq!(head.regressions, vec!["test a::new"]);
+        assert_eq!(
+            head.matched_by_name,
+            vec!["test a::x"],
+            "a name-only match is said"
+        );
+        assert!(head.ambiguous.is_empty());
+
+        // Head qualified, base bare (a base cached by an engine whose qualification fell back).
+        let mut head = failed_run(&["test a::x [-p core --lib]"], &[]);
+        classify(&mut head, base_of(failed_run(&["test a::x"], &[])));
+        assert_eq!(
+            head.classification.as_deref(),
+            Some(PRE_EXISTING_IN_SANDBOX),
+            "{head:#?}"
+        );
+        assert_eq!(head.pre_existing, vec!["test a::x [-p core --lib]"]);
+        assert!(!head.denies());
+
+        // The env class follows the matched pair, whatever form each side wrote it in.
+        let mut head = failed_run(&["test sb [-p core --lib]"], &["test sb [-p core --lib]"]);
+        classify(&mut head, base_of(failed_run(&["test sb"], &["test sb"])));
+        assert_eq!(head.classification.as_deref(), Some(ENV_CANNOT_RUN));
+    }
+
+    /// The same test name in two crates stays two failures: qualified ids of different binaries
+    /// never meet, and a bare id with more than one candidate binary is not guessed between — it
+    /// stays a regression, listed as ambiguous, and the denial says so.
+    #[test]
+    fn the_same_test_name_in_two_crates_stays_distinct() {
+        let mut head = failed_run(&["test shared [-p a --lib]"], &[]);
+        classify(
+            &mut head,
+            base_of(failed_run(&["test shared [-p b --lib]"], &[])),
+        );
+        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(head.regressions, vec!["test shared [-p a --lib]"]);
+        assert!(head.ambiguous.is_empty() && head.matched_by_name.is_empty());
+
+        // Bare head id; the base fails that name in two crates. Which one is it? Not guessed.
+        let mut head = failed_run(&["test shared"], &[]);
+        classify(
+            &mut head,
+            base_of(failed_run(
+                &["test shared [-p a --lib]", "test shared [-p b --lib]"],
+                &[],
+            )),
+        );
+        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
+        assert!(head.pre_existing.is_empty(), "{head:#?}");
+        assert_eq!(head.regressions, vec!["test shared"]);
+        assert_eq!(head.ambiguous, vec!["test shared"]);
+        let denial = report_of(vec![head], &[]).denial_reason();
+        assert!(
+            denial.contains("could not be told apart") && denial.contains("not guessed"),
+            "{denial}"
+        );
+
+        // Head red in two crates by that name, base bare: either could be the base's one.
+        let mut head = failed_run(
+            &["test shared [-p a --lib]", "test shared [-p b --lib]"],
+            &[],
+        );
+        classify(&mut head, base_of(failed_run(&["test shared"], &[])));
+        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(head.regressions.len(), 2, "{head:#?}");
+        assert_eq!(head.ambiguous.len(), 2);
+
+        // A bare head id beside its crate-A twin that the base shares exactly: the bare one is a
+        // second, different failure — a regression, with nothing left to match it to.
+        let mut head = failed_run(&["test shared [-p a --lib]", "test shared"], &[]);
+        classify(
+            &mut head,
+            base_of(failed_run(&["test shared [-p a --lib]"], &[])),
+        );
+        assert_eq!(head.pre_existing, vec!["test shared [-p a --lib]"]);
+        assert_eq!(head.regressions, vec!["test shared"]);
+        assert!(head.ambiguous.is_empty());
+    }
+
+    /// A `cargo test --workspace` check whose head-only failures are `ids`, as classify leaves it.
+    fn regression_run(ids: &[&str]) -> (RepoCheck, CheckRun) {
+        let check = RepoCheck {
+            name: "cargo-test".to_string(),
+            argv: s(&["cargo", "test", "--workspace", "--no-fail-fast"]),
+            source: "Cargo.toml".to_string(),
+            timeout_s: Some(1200),
+            dir: String::new(),
+        };
+        let mut run = failed_run(ids, &[]);
+        run.regressions = run.failure_ids.clone();
+        run.classification = Some(REGRESSION.to_string());
+        (check, run)
+    }
+
+    /// A stand-in re-run: `pass(name)` decides whether the one test passes alone; each takes
+    /// `secs`. Records the base bound each re-run was handed.
+    fn fake_rerun<'a>(
+        pass: &'a dyn Fn(&str) -> bool,
+        secs: u64,
+        bounds: &'a mut Vec<u64>,
+    ) -> impl FnMut(&RepoCheck, &[String]) -> (CheckRun, Vec<String>) + 'a {
+        move |one, names| {
+            bounds.push(one.timeout_s.unwrap());
+            let ok = names.iter().all(|n| pass(n));
+            let mut r = failed_run(&[], &[]);
+            r.argv = one.argv.clone();
+            r.exit_code = Some(if ok { 0 } else { 101 });
+            r.duration_ms = secs * 1000;
+            (r, if ok { names.to_vec() } else { Vec::new() })
+        }
+    }
+
+    /// Each head-only failure is re-run once, alone, serially: one that passes alone is "flaky
+    /// (passed alone)" and does not deny; when every one does, the check is `flaky_under_load`.
+    #[test]
+    fn a_failure_that_passes_alone_is_flaky_and_does_not_block() {
+        let ids: Vec<String> = (0..27)
+            .map(|i| format!("test t::load{i} [-p core --lib]"))
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let (check, mut run) = regression_run(&refs);
+        let mut bounds = Vec::new();
+        let pass = |_: &str| true;
+        recheck_alone(
+            &check,
+            &mut run,
+            None,
+            Duration::from_secs(FLAKE_RERUN_BUDGET_S),
+            &mut fake_rerun(&pass, 10, &mut bounds),
+        );
+        assert_eq!(run.classification.as_deref(), Some(FLAKY_UNDER_LOAD));
+        assert!(!run.denies());
+        assert_eq!(
+            run.reruns.len(),
+            27,
+            "27 head-only failures, 27 re-runs (the old bound was 2)"
+        );
+        assert_eq!(run.flaky, ids);
+        assert_eq!(run.not_rechecked, 0);
+        assert!(run.reruns[0]
+            .argv
+            .ends_with(&s(&["-p", "core", "--lib", "--", "--exact", "t::load0"])));
+    }
+
+    /// One that fails again stays a regression (and denies); the ones beside it that passed alone
+    /// are flaky, are not counted, and the denial names both.
+    #[test]
+    fn a_failure_that_fails_again_alone_stays_a_regression() {
+        let (check, mut run) = regression_run(&[
+            "test t::flaky [-p core --lib]",
+            "test t::broken [-p core --lib]",
+            "test t::flaky2 [-p core --lib]",
+        ]);
+        let mut bounds = Vec::new();
+        let pass = |n: &str| n != "t::broken";
+        recheck_alone(
+            &check,
+            &mut run,
+            None,
+            Duration::from_secs(FLAKE_RERUN_BUDGET_S),
+            &mut fake_rerun(&pass, 10, &mut bounds),
+        );
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert!(run.denies());
+        assert_eq!(
+            run.reruns.len(),
+            3,
+            "a failure again does not stop the others' re-checks"
+        );
+        assert_eq!(run.regressions, vec!["test t::broken [-p core --lib]"]);
+        assert_eq!(
+            run.flaky,
+            vec![
+                "test t::flaky [-p core --lib]",
+                "test t::flaky2 [-p core --lib]"
+            ]
+        );
+        let denial = report_of(vec![run], &[]).denial_reason();
+        assert!(
+            denial.contains("2 head-only failures passed re-run alone")
+                && denial.contains("flaky (passed alone)")
+                && !denial.contains("t::broken [-p core --lib], test t::flaky"),
+            "{denial}"
+        );
+    }
+
+    /// The re-checks stop at the budget: failures it does not reach stay regressions, and the
+    /// result says how many were not re-checked; each re-run's bound is cut to what is left. Over
+    /// the cap, nothing is re-run and every failure is counted.
+    #[test]
+    fn a_spent_rerun_budget_is_reported_and_the_rest_stay_regressions() {
+        let (check, mut run) = regression_run(&[
+            "test t::a [-p core --lib]",
+            "test t::b [-p core --lib]",
+            "test t::c [-p core --lib]",
+            "test t::d [-p core --lib]",
+        ]);
+        let mut bounds = Vec::new();
+        let pass = |_: &str| true;
+        recheck_alone(
+            &check,
+            &mut run,
+            None,
+            Duration::from_secs(900),
+            &mut fake_rerun(&pass, 400, &mut bounds),
+        );
+        assert_eq!(
+            bounds,
+            vec![900, 500, 100],
+            "each bound is what the budget has left"
+        );
+        assert_eq!(run.reruns.len(), 3);
+        assert_eq!(run.not_rechecked, 1);
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(run.regressions, vec!["test t::d [-p core --lib]"]);
+        assert_eq!(run.flaky.len(), 3);
+        let denial = report_of(vec![run], &[]).denial_reason();
+        assert!(
+            denial.contains("1 head-only failure not re-checked alone")
+                && denial.contains("re-run budget"),
+            "{denial}"
+        );
+
+        let ids: Vec<String> = (0..=MAX_FLAKE_RERUN)
+            .map(|i| format!("test t::n{i} [-p core --lib]"))
+            .collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let (check, mut run) = regression_run(&refs);
+        let mut bounds = Vec::new();
+        recheck_alone(
+            &check,
+            &mut run,
+            None,
+            Duration::from_secs(FLAKE_RERUN_BUDGET_S),
+            &mut fake_rerun(&pass, 1, &mut bounds),
+        );
+        assert!(run.reruns.is_empty() && bounds.is_empty());
+        assert_eq!(run.not_rechecked, MAX_FLAKE_RERUN + 1);
+        assert_eq!(run.regressions.len(), MAX_FLAKE_RERUN + 1);
+        assert!(run.denies());
+    }
+
     fn failed_run(ids: &[&str], env: &[&str]) -> CheckRun {
         CheckRun {
             name: "cargo-test".to_string(),
@@ -8877,6 +9483,10 @@ mod tests {
             base: None,
             env_cannot_run: env.iter().map(|x| x.to_string()).collect(),
             reruns: Vec::new(),
+            flaky: Vec::new(),
+            not_rechecked: 0,
+            ambiguous: Vec::new(),
+            matched_by_name: Vec::new(),
             env_signals: Vec::new(),
             load_band: None,
         }
