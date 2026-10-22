@@ -2484,8 +2484,9 @@ struct FoldRefresh {
 /// checks only; a carried floor runs nothing), the QE reviewer's when none ran. Deny-dominates:
 /// an attempt that never re-asked a layer cannot clear it, so the operator's judgment over the
 /// floor cannot count work another layer refused. The repo-checks floor itself is never "behind".
-/// A carried floor with no record of last time keeps none now (`None`, fail-closed); an unknown
-/// tree counts as the same tree.
+/// With no record of what else denied last time, a carried floor, or a same-tree attempt that did
+/// not re-ask every layer, keeps none now (`None`, fail-closed); an unknown tree counts as the
+/// same tree.
 fn denials_behind_after_fold(
     fresh: Vec<crate::domain::UnitDenial>,
     prior: PriorFold,
@@ -2528,10 +2529,14 @@ fn denials_behind_after_fold(
             .clone()
             .map(|b| merge(earlier(b), &|s| !refreshed(s)))
     } else if same_tree {
-        Some(merge(
-            earlier(prior.behind.clone().unwrap_or_default()),
-            &stale,
-        ))
+        match prior.behind.clone() {
+            Some(behind) => Some(merge(earlier(behind), &stale)),
+            // (xreview r3) The last fold DENIED with no record of what else denied (a gate from
+            // before the record existed): an attempt that did not re-ask every layer cannot know
+            // either, so it stays unknown — never a known-empty list.
+            None if prior.winner.is_some() && (!now.judge || !now.qe) => None,
+            None => Some(merge(earlier(Vec::new()), &stale)),
+        }
     } else {
         Some(fresh)
     }
@@ -5071,5 +5076,47 @@ mod denials_behind_tests {
             refresh(false, "t2", false, false),
         );
         assert_eq!(sources(&out), Some(vec![]));
+    }
+}
+
+#[cfg(test)]
+mod denials_behind_unknown_tests {
+    use super::{denials_behind_after_fold, FoldRefresh, PriorFold};
+    use crate::domain::UnitDenial;
+
+    /// xreview r3: a gate from before the record existed (the floor won, nothing recorded behind
+    /// it) stays UNKNOWN through a floor-only retry on the same tree — the judge was not asked
+    /// again — so the override stays refused. A fold on a changed tree, or a unit whose last fold
+    /// passed, knows its own layers.
+    #[test]
+    fn unknown_history_stays_unknown_through_a_retry_that_does_not_re_ask_the_judge() {
+        let unknown = || PriorFold {
+            behind: None,
+            winner: Some(UnitDenial::new("repo_checks", "checks failed")),
+            tree: Some("t1".into()),
+        };
+        let at = |tree: &str, judge: bool| FoldRefresh {
+            floor_carried: false,
+            tree: Some(tree.into()),
+            judge,
+            qe: false,
+        };
+        assert_eq!(
+            denials_behind_after_fold(Vec::new(), unknown(), at("t1", false)),
+            None
+        );
+        assert_eq!(
+            denials_behind_after_fold(Vec::new(), unknown(), at("t2", true)),
+            Some(Vec::new())
+        );
+        let passed_last = PriorFold {
+            behind: None,
+            winner: None,
+            tree: Some("t1".into()),
+        };
+        assert_eq!(
+            denials_behind_after_fold(Vec::new(), passed_last, at("t1", false)),
+            Some(Vec::new())
+        );
     }
 }

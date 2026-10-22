@@ -13615,7 +13615,9 @@ fn floor_override_for(
     match u.denials_behind.as_deref() {
         None => anyhow::bail!(
             "unit {}'s gate did not record whether any other layer denied it (a denial from \
-             before that record existed) — approve (retry) so the gate folds again, then decide",
+             before that record existed, or a retry on the same tree that did not ask every \
+             layer again) — the override needs that record: request changes (the step reworks \
+             and every layer runs again) or reject",
             u.ord
         ),
         Some(behind) if !behind.is_empty() => {
