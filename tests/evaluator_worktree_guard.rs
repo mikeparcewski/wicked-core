@@ -1166,17 +1166,14 @@ fn a_regression_the_creator_introduces_is_denied_at_the_creator_gate_before_veri
     assert_eq!(frame.2["changedTruncated"], false);
     // The formatter runs first and is clean here; the regression is in the test set (core#551) —
     // at the creator floor of this unconfigured repo, the set derived from the touched crate
-    // (core#482), its ids qualified by their binary (core#481).
+    // (core#482), its libtest id plain (core#1060: no binary qualifier).
     assert_eq!(checks[0].name, "cargo-fmt-check");
     let c = &checks[1];
     assert_eq!(c.name, "test_targeted");
     assert_eq!(c.exit_code, Some(101));
     assert_eq!(c.outcome(), "failed");
     assert_eq!(c.classification.as_deref(), Some("regression"));
-    assert_eq!(
-        c.regressions,
-        vec!["test t::boom [-p wtguard_fixture --lib]".to_string()]
-    );
+    assert_eq!(c.regressions, vec!["test t::boom".to_string()]);
     // core#553: a single head-only failure is re-run once, alone, but only on an oversubscribed
     // host (the evidence of load); on a host with headroom it is not re-run. Either way the
     // always-red test stays a regression.
@@ -1833,14 +1830,14 @@ fn a_read_only_phase_writing_under_its_notes_root_never_trips_the_guard() {
     }
 }
 
-/// F-RC2-009 — BASELINE-DIFF: the fixture's base ALREADY fails `cargo test` and the fix changes
-/// nothing about that. The floor's sandbox reports the failure on the head, runs the same check
-/// on the base, finds the failure sets IDENTICAL ⇒ `pre_existing_in_sandbox` (core#481 — the fact,
-/// not an inferred environment cause): recorded on both the creator's floor (the derived targeted
-/// set, core#482) and the evaluator's (the full suite), denying neither — the run COMPLETES and
-/// the shared failure is listed.
+/// F-RC2-009 / core#1060 — BASELINE-DIFF with libtest: the fixture's base ALREADY fails `cargo
+/// test` and the fix changes nothing about that. A libtest failure never matches the base (its id
+/// names no test binary, and nothing the floor reads may say otherwise — core#1060), so the
+/// creator's floor DENIES it as a regression and lists the shared name as ambiguous: the accepted
+/// cost, with the operator's floor override as the escape. The run PAUSES at the escalation gate
+/// on the fix unit, the base comparison on the record.
 #[test]
-fn a_check_the_base_fails_identically_is_recorded_not_denied() {
+fn a_libtest_failure_the_base_shares_is_still_denied() {
     let repo = make_git_repo("shared-failure", Some(false));
     let (core, _ran) = core_for("shared-failure", VerifyBehaviour::LeavesTreeAlone);
     let entry = core
@@ -1853,13 +1850,14 @@ fn a_check_the_base_fails_identically_is_recorded_not_denied() {
     let events = core.subscribe();
     core.launch_run(bug_run("r-shared", &entry.id))
         .expect("launch");
-    if !wait_status(&core, "r-shared", SessionStatus::Completed) {
-        // No OS boundary: nothing ran, the verify floor fails closed and escalates.
-        assert!(
-            wait_status(&core, "r-shared", SessionStatus::AwaitingHuman),
-            "a failure the base shares completes the run (sandboxed) or fails closed at verify"
-        );
-        let evs = drain(&events);
+    assert!(
+        wait_status(&core, "r-shared", SessionStatus::AwaitingHuman),
+        "a libtest failure the base shares denies at the creator gate (sandboxed) or fails \
+         closed at verify — either way the run PAUSES at a gate"
+    );
+    let evs = drain(&events);
+    if gate_for(&evs, 3).denial_source.as_deref() != Some("repo_checks") {
+        // No OS boundary: the creator's default floor is disclosed, the verify floor fails closed.
         let verify = gate_for(&evs, 4);
         assert!(
             checks_refused_without_a_boundary(&verify),
@@ -1870,43 +1868,23 @@ fn a_check_the_base_fails_identically_is_recorded_not_denied() {
         let _ = std::fs::remove_dir_all(&repo);
         return;
     }
-    let evs = drain(&events);
-    for (ord, want_floor) in [(3u32, "creator"), (4, "verify")] {
-        let g = gate_for(&evs, ord);
-        assert!(
-            g.combined && g.deterministic_pass,
-            "ord {ord}: a failure the base shares denies nothing: {:?}",
-            g.denial_reason
-        );
-        let (floor, outcome, passed, checks) = checks_for(&evs, ord);
-        assert_eq!(floor, want_floor);
-        assert_eq!(outcome, "passed");
-        assert!(passed);
-        // `cargo-fmt-check` is first and clean; the shared failure is in the test set (core#551):
-        // the derived targeted set at the creator (core#482), the full suite at verify.
-        let c = &checks[1];
-        let (want_name, want_id) = if ord == 3 {
-            ("test_targeted", "test t::boom [-p wtguard_fixture --lib]")
-        } else {
-            ("cargo-test", "test t::boom [--lib]")
-        };
-        assert_eq!(c.name, want_name);
-        assert_eq!(
-            c.exit_code,
-            Some(101),
-            "ord {ord}: the head DID fail the check"
-        );
-        assert_eq!(c.outcome(), "failed");
-        assert_eq!(
-            c.classification.as_deref(),
-            Some("pre_existing_in_sandbox"),
-            "ord {ord}: {c:?}"
-        );
-        assert_eq!(c.pre_existing, vec![want_id.to_string()]);
-        assert!(c.regressions.is_empty());
-        let base = c.base.as_deref().expect("the base run rides the check");
-        assert!(base.run.as_ref().is_some_and(|b| !b.passed()));
-    }
+    let g = escalation_for(&evs, 3);
+    assert_eq!(g.condition, "floor_failed");
+    assert_eq!(g.denial_source, "repo_checks");
+    let (floor, outcome, passed, checks) = checks_for(&evs, 3);
+    assert_eq!(floor, "creator");
+    assert_eq!(outcome, "failed");
+    assert!(!passed);
+    // `cargo-fmt-check` is first and clean; the shared failure is in the derived targeted set.
+    let c = &checks[1];
+    assert_eq!(c.name, "test_targeted");
+    assert_eq!(c.exit_code, Some(101), "the head DID fail the check");
+    assert_eq!(c.classification.as_deref(), Some("regression"), "{c:?}");
+    assert_eq!(c.regressions, vec!["test t::boom".to_string()]);
+    assert_eq!(c.ambiguous, vec!["test t::boom".to_string()]);
+    assert!(c.pre_existing.is_empty());
+    let base = c.base.as_deref().expect("the base run rides the check");
+    assert!(base.run.as_ref().is_some_and(|b| !b.passed()));
     let _ = std::fs::remove_dir_all(&repo);
 }
 

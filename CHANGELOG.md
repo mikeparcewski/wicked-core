@@ -34,47 +34,41 @@ Two release tracks share this file, newest entry first regardless of track:
   exactly where the engine would take it. Wire: `confirmGate(..., action: "operator_judgment")` with the
   rationale in `amend`.
 
-- **The repo-checks floor keeps every libtest id qualified, runs PTY and tmux tests, and re-checks each
-  head-only failure alone (pipeline-blocker plain PR, operator-approved).** Run 2ebd9da2 could not pass its floor
+- **The repo-checks floor no longer excuses a Rust test failure because the base fails it too, runs PTY and
+  tmux tests, and re-checks each head-only failure alone (pipeline-blocker plain PR, operator-approved).** Run 2ebd9da2 could not pass its floor
   for three reasons. (1) A re-exec test harness printed its child's run in a panic message, so a binary's captured
   output carried a second `test result: FAILED` line (17 such lines for 9 failing binaries). The floor dropped the
   `[-p <crate> --test <target>]` qualifier from every id whenever the two counts differed, so the head ids never
-  met the base's qualified ids: pre-existing 0, every base failure a regression. The qualifier now comes from the
-  argv the floor itself chose, never from output text (core#1063): 13 review rounds forged the text it was read
-  from (stdout/stderr framing, cargo selectors, doctest footers), and the creator's tests write that text. A plain
-  `cargo test` check runs cargo's own list first (`--no-run --message-format=json-render-diagnostics`, which also
-  builds every target, so a compile error still fails the check). Then it runs one process per test target
-  (`-p <pkg> --lib`, `--bin`/`--test`/`--example`/`--bench <n>`, `--doc`), serially, against the check's one
-  bound, passing the check's feature, profile and test arguments through. Every `test x ... FAILED` line of a
-  target's output is `test x [-p <pkg> <target>]`, so a forged line can only add a failure, never remove or move
-  one. A target that fails without naming a test, or dies other than libtest's exit 101, also carries
-  `[<target>] exited <how>`. A cargo check the floor cannot split (a wrapper script, explicit targets) runs as one
-  process, and its libtest ids are `test x [?]`: never matched and never re-run alone, so they deny (the
-  operator's floor override covers it). Ids past `MAX_FAILURE_IDS` add an id nothing matches, and a cached base
-  run is reused only under the same floor policy version. Head and base ids are compared on (test name, target).
-  Ids qualified with different targets never meet, and an unqualified or `[?]` libtest id meets nothing, because
-  failing ids alone cannot show which binary such an id came from: it stays a regression, listed as `ambiguous`,
-  and the denial says so rather than guessing. (2) The floor's macOS sandbox refused `/dev/ptmx`, so no PTY or
+  met the base's qualified ids: pre-existing 0, every base failure a regression. Telling which test binary a
+  libtest failure came from cannot be done safely. 13 review rounds forged the output text the qualifier was read
+  from (stdout/stderr framing, cargo selectors, doctest footers), and that text is written by the very tests under
+  check. Running each target separately changed what cargo ran: `-p` re-resolves features, and doctest-only
+  libraries were skipped. So the floor no longer qualifies libtest ids at all. The check runs its own argv once,
+  and every `test x ... FAILED` line anywhere in its output is a failure, recorded as `test x`. A libtest id never
+  matches the base. **The cost: any Rust test failure the base shares now denies.** It is listed as `ambiguous`,
+  the denial says so, and the operator's floor override (core#1061) is the escape. core#546's nested-sandbox
+  `env_cannot_run` class for libtest failures goes with it. Other runners' ids (pytest, vitest, go: they name
+  their file) still match the base by equality. Ids past `MAX_FAILURE_IDS` add an id nothing matches, and a cached
+  base run is reused only under the same floor policy version (3). core#1063 (per-target execution) is superseded
+  by this. (2) The floor's macOS sandbox refused `/dev/ptmx`, so no PTY or
   tmux test could run on it. The repo-checks floor (only it, not workers or validators) may now open `/dev/ptmx`
   and write to the `/dev/ttysN` slaves the kernel's `com.apple.sandbox.pty` extension marks as its own. The jail
   may not issue that extension class itself (file, generic, mach and iokit issuance are refused), so a check cannot
   mint it for an outside terminal. No other path, device or network rule changes, and the operator's terminals and
   `/dev/tty` stay unwritable. Linux bwrap
-  already gave the jail a private devpts. A PTY refusal is still not `env_cannot_run` (only nested-sandbox launcher
-  signatures are). (3) At most 2 head-only failures were re-run, and a loaded host produced 21-27. On an
+  already gave the jail a private devpts. A PTY refusal is not `env_cannot_run`. (3) At most 2 head-only failures were re-run, and a loaded host produced 21-27. On an
   oversubscribed host each head-only failure is now re-run once, alone and serially, up to `MAX_FLAKE_RERUN` = 50
-  failures and `FLAKE_RERUN_BUDGET_S` = 900 s in total. One that passes alone is "flaky (passed alone)" and does
+  failures and `FLAKE_RERUN_BUDGET_S` = 900 s in total. A libtest failure re-runs as the check's own argv plus
+  `-- --exact <name>`, which runs that name in every binary. One that exits 0 and prints the name `ok` is "flaky (passed alone)" and does
   not deny (`flaky`); one that fails again stays a regression. Failures over the cap, past the budget or under a
   runner the floor cannot narrow stay regressions, counted in `notRechecked`. Wire (additive, `checks[]`):
   `flaky`, `notRechecked`, `ambiguous`. Each re-run is hard-bounded by what the budget has left (the load
   factor that stretches other checks' bounds does not apply past it). Tests:
-  `cargo_plan_splits_only_a_plain_cargo_test_1063`, `cargo_targets_come_from_cargos_own_artifacts_1063`,
-  `forged_stdout_framing_cannot_drop_a_failure_1063`, `a_forged_cargo_selector_cannot_move_a_failure_1063`,
-  `doc_tests_of_two_crates_never_share_a_qualifier_1063` (the round 12 and 13 forgeries, each a regression),
-  `a_target_that_dies_is_its_own_failure_1063`, `an_unsplit_run_never_matches_a_libtest_id_1063`,
-  `baseline_diff_denies_only_regressions` (real `cargo test`, qualified per target),
-  `head_and_base_ids_match_across_qualified_and_bare_forms`,
-  `the_same_test_name_in_two_crates_stays_distinct`, `a_failure_that_passes_alone_is_flaky_and_does_not_block`,
+  `no_forged_output_lets_a_libtest_failure_read_as_pre_existing_1060` (every forgery of review rounds 8 to 14,
+  each a denial), `a_libtest_id_never_matches_a_base_id_1060`, `the_flake_rerun_is_the_checks_own_argv_with_exact_1060`,
+  `failure_ids_past_the_cap_never_read_as_pre_existing_1060`, `baseline_diff_never_excuses_a_libtest_failure` (real
+  `cargo test`), `a_libtest_failure_the_base_shares_is_still_denied` (end to end),
+  `a_failure_that_passes_alone_is_flaky_and_does_not_block`,
   `a_failure_that_fails_again_alone_stays_a_regression`,
   `a_spent_rerun_budget_is_reported_and_the_rest_stay_regressions`,
   `the_floor_profile_adds_only_its_own_pty_devices`,

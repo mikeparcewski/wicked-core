@@ -65,14 +65,13 @@
 //! off the runner's output — `test x ... FAILED`, ` FAIL  file > name`, `path(l,c): error TS…`,
 //! `FAILED tests/x.py::y`, `--- FAIL: TestX`, eslint stylish): failures that also fail on the base
 //! — a subset or the identical set — are `pre_existing_in_sandbox` and never deny; only head-only
-//! failures are `regression`s and deny. libtest ids are QUALIFIED by their test binary
-//! (`test t::x [-p b --lib]`, from cargo's per-binary `to rerun pass` line — core#481), so the
-//! same test name red in crate A on the base cannot mask a regression in crate B; the
-//! auto-detected `cargo test` runs `--no-fail-fast` for the same reason. Positive evidence of the
-//! environment is its own class (core#546): failures whose captured output carries a
-//! nested-sandbox launcher signature on both trees are `env_cannot_run` (never deny; the count is
-//! on the gate's `floorNote` — external CI is the test gate for them), and a head-only failure
-//! with the signature still denies with an advisory naming the likely cause. A head-only set of
+//! failures are `regression`s and deny. A libtest id (`test t::x`) never matches a base id
+//! (core#1060): its text names no test binary, so the same test name red in crate A on the base
+//! cannot mask a regression in crate B, and no line of output — all of it text the change's tests
+//! can print — is read to say otherwise. Any libtest failure on the head is therefore a
+//! regression unless its isolated re-run clears it (below); the operator's floor override is the
+//! escape for a red the base shares. The auto-detected `cargo test` runs `--no-fail-fast` so every
+//! failing binary is reported. A head-only set of
 //! at most [`MAX_FLAKE_RERUN`] libtest or vitest ids, read on an oversubscribed host (1-min load
 //! above the CPU count — the evidence it was load), is re-run ONCE, each alone and serially,
 //! within [`FLAKE_RERUN_BUDGET_S`] (core#553): a
@@ -81,10 +80,9 @@
 //! regression; vitest was not re-run because only `cargo test` was). A failure that passes alone
 //! is "flaky (passed alone)" (`flaky`, never denies); one that fails again, or that the cap or the
 //! budget does not reach (`not_rechecked`), stays a `regression`. If every one passes the check is
-//! `flaky_under_load` (never denies; both attempts and the load at each are on the record). The
-//! head and base ids are compared on (test name, binary); a libtest id the floor cannot qualify
-//! with its binary (`[?]`) never meets a base id: it stays a regression, listed as `ambiguous`. A base that
-//! cannot be run or compared leaves the
+//! `flaky_under_load` (never denies; both attempts and the load at each are on the record). Other
+//! runners' ids (path-qualified) are compared by equality; a libtest id the base fails too is
+//! listed as `ambiguous`. A base that cannot be run or compared leaves the
 //! check denying as before (fail-closed). `baseline_diff: false` in the repo config opts out. A
 //! creator transcript that CLAIMS a failure is pre-existing is annotated against that comparison
 //! ([`ClaimCheck`]: `claim_rejected` when the base is green).
@@ -264,14 +262,10 @@ pub const MAX_FAILURE_IDS: usize = 1000;
 /// The failure id that stands for every id past [`MAX_FAILURE_IDS`]: a dropped id could have been
 /// the head's only regression, so this one is never matched to a base id — the check denies.
 pub const FAILURE_IDS_TRUNCATED: &str = "(more failure ids than the floor keeps)";
-/// The most test targets a split `cargo test` run takes from cargo's list ([`run_cargo_targets`]);
-/// past it the check is not split (one process, every libtest id `[?]`).
-const MAX_SCAN_ENTRIES: usize = 4 * MAX_FAILURE_IDS;
 /// The version of the floor's check policy (its sandbox and its failure-id format) a cached base
 /// run was recorded under. A record of another — or no — version is a cache miss: core#1060
-/// opened `/dev/ptmx` to the checks and qualifies libtest ids by the target the floor ran (3), so
-/// a base result from before it could make a head failure read as pre-existing. Bump it whenever
-/// either changes.
+/// opened `/dev/ptmx` to the checks and stopped matching libtest ids (3), so a base result from
+/// before it could make a head failure read as pre-existing. Bump it whenever either changes.
 const FLOOR_POLICY_VERSION: u32 = 3;
 /// Where the checks' isolated `HOME`, caches and build output live: `<worker home>/repo-checks/`,
 /// the engine's own cache area — never inside the tree a floor checks (see "Where the check
@@ -300,10 +294,9 @@ pub const PRE_EXISTING_IN_SANDBOX: &str = "pre_existing_in_sandbox";
 /// positive-evidence environment case is [`ENV_CANNOT_RUN`]. Kept so a stored record still reads
 /// as non-denying.
 pub const FLOOR_ENV_MISMATCH: &str = "floor_env_mismatch";
-/// (core#546) Every head failure is a test the floor's host CANNOT run — its captured output
-/// carries a nested-sandbox launcher signature ([`LAUNCHER_SIGNATURES`]) on BOTH trees. Positive
-/// evidence of the environment, never denies, and the count is on the card: external CI is the
-/// test gate for those ids.
+/// The check's tool could not run on this host: it crashed with the same environment error on
+/// the head, the base and a re-run (core#789). Never denies; external CI is its gate. (A stored
+/// record may carry core#546's nested-sandbox class, which the floor no longer produces.)
 pub const ENV_CANNOT_RUN: &str = "env_cannot_run";
 /// (core#553) Every head-only failure (at most [`MAX_FLAKE_RERUN`]) of a floor that ran on an
 /// OVERSUBSCRIBED host (1-min load above the CPU count) PASSED when re-run once, alone, in the
@@ -639,11 +632,6 @@ impl CheckRun {
                 " [env_cannot_run: the tool crashed on head, base and a re-run — {}]",
                 self.env_cannot_run.join(", ")
             ),
-            Some(ENV_CANNOT_RUN) if !self.passed() => format!(
-                " [env_cannot_run: {} tests cannot run under the floor's nested sandbox on this \
-                 host]",
-                self.env_cannot_run.len()
-            ),
             Some(FLAKY_UNDER_LOAD) if !self.passed() => format!(
                 " [flaky_under_load: {} passed re-run alone]",
                 self.regressions.join(", ")
@@ -836,9 +824,6 @@ impl RepoChecksReport {
             }));
         }
         for c in &self.checks {
-            if c.env_cannot_run.is_empty() {
-                continue;
-            }
             // (core#789) A tool that crashed opening a dependency file on both trees and again on
             // its re-run: the check did not run here; external CI is its gate.
             if c.env_crash() {
@@ -848,38 +833,6 @@ impl RepoChecksReport {
                      checks; external CI is the gate for it",
                     c.name,
                     c.env_cannot_run.join(", ")
-                ));
-                continue;
-            }
-            let head_only: Vec<&String> = c
-                .env_cannot_run
-                .iter()
-                .filter(|id| c.regressions.contains(id))
-                .collect();
-            let shared = c.env_cannot_run.len() - head_only.len();
-            if head_only.is_empty() || !c.denies() {
-                notes.push(format!(
-                    "`{}`: the floor could not run {} test{} on this host (the nested OS sandbox \
-                     refused to arm inside the floor's own); external CI is the test gate for \
-                     them",
-                    c.name,
-                    c.env_cannot_run.len(),
-                    if c.env_cannot_run.len() == 1 { "" } else { "s" }
-                ));
-            } else {
-                notes.push(format!(
-                    "`{}`: head-only failure{} {} carr{} the nested-sandbox launcher signature — \
-                     the same env class as {shared} pre-existing id{}; likely the floor's nested \
-                     sandbox, not the change (still denied, fail-closed)",
-                    c.name,
-                    if head_only.len() == 1 { "" } else { "s" },
-                    head_only
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    if head_only.len() == 1 { "ies" } else { "y" },
-                    if shared == 1 { "" } else { "s" }
                 ));
             }
         }
@@ -4278,11 +4231,10 @@ impl BaseTree {
 ///
 /// * base passed ⇒ `regression` (every head failure is head-only);
 /// * base did not finish or could not run ⇒ no classification (denies, fail-closed);
-/// * both failed with identifiers on both sides ⇒ set arithmetic over binary-QUALIFIED ids
-///   (core#481): any head-only identifier ⇒ `regression` (the shared ones listed as
-///   `pre_existing`); otherwise (head ⊆ base, equal sets included) ⇒ `env_cannot_run` when every
-///   head failure carries the nested-sandbox launcher signature on both trees (core#546, positive
-///   evidence), else `pre_existing_in_sandbox` (the fact the comparison establishes);
+/// * both failed with identifiers on both sides ⇒ set arithmetic over the ids ([`match_base`]: a
+///   libtest id never matches): any head-only identifier ⇒ `regression` (the shared ones listed
+///   as `pre_existing`); otherwise (head ⊆ base, equal sets included) ⇒ `pre_existing_in_sandbox`
+///   (the fact the comparison establishes);
 /// * both failed with NO identifiers on either side ⇒ `unclassified_red_base` (denies, #538);
 /// * identifiers on ONE side only ⇒ `regression` (cannot be compared — fail-closed).
 fn classify(head: &mut CheckRun, base: BaseRun) {
@@ -4310,16 +4262,8 @@ fn classify(head: &mut CheckRun, base: BaseRun) {
                         .map(|s| s.to_string())
                         .collect();
                     head.ambiguous = m.ambiguous.iter().map(|s| s.to_string()).collect();
-                    let env_on_both = |id: &str| {
-                        head.env_cannot_run.iter().any(|e| e == id)
-                            && m.pairs.iter().any(|(h, base_id)| {
-                                *h == id && b.env_cannot_run.iter().any(|e| e == base_id)
-                            })
-                    };
                     if !head.regressions.is_empty() {
                         Some(REGRESSION)
-                    } else if head_ids.iter().all(|id| env_on_both(id)) {
-                        Some(ENV_CANNOT_RUN)
                     } else {
                         Some(PRE_EXISTING_IN_SANDBOX)
                     }
@@ -4337,52 +4281,42 @@ fn classify(head: &mut CheckRun, base: BaseRun) {
 struct BaseMatch<'a> {
     /// (head id, the base id it is) — the head failures the base shares.
     pairs: Vec<(&'a str, &'a str)>,
-    /// Head ids whose test name the base also fails, where one side's binary is unknown: never
-    /// matched — they stay regressions, and say why.
+    /// Head libtest ids whose test name the base also fails: never matched (a libtest id names no
+    /// test binary) — they stay regressions, and say why.
     ambiguous: Vec<&'a str>,
 }
 
-/// Match head failure ids to base failure ids on the normalised key (test name, target).
-///
-/// Non-libtest ids match on equality; libtest ids only when qualified with the SAME target
-/// (`[-p a --lib]` never meets `[-p b --lib]`). A libtest id whose binary is unknown — `[?]`, or
-/// bare (a record from a floor that still kept unqualified ids) — never meets anything: failing
-/// ids alone are no evidence of which binary such an id came from — the same name may fail in
-/// crate B on one side and in crate A on the other (codex on #1060). The head id stays a
-/// regression (fail-closed) and, when the base fails that name too, is listed as ambiguous:
-/// said, not guessed.
+/// Match head failure ids to base failure ids. Other runners' ids (path-qualified) match on
+/// equality. A libtest id NEVER matches (core#1060): `test shared` red in crate A on the base and
+/// in crate B on the head are the same string, and nothing the floor can read — every line of
+/// the output is text the change's tests can print — says which binary either came from. The head
+/// id stays a regression (fail-closed) and, when the base fails that name too, is listed as
+/// ambiguous: said, not guessed. [`FAILURE_IDS_TRUNCATED`] never matches either.
 fn match_base<'a>(
     head: &std::collections::BTreeSet<&'a str>,
     base: &std::collections::BTreeSet<&'a str>,
 ) -> BaseMatch<'a> {
-    let unknown = |t: Option<&str>| t.is_none_or(|t| t == UNKNOWN_TARGET);
     let mut m = BaseMatch::default();
     for &h in head {
         if h == FAILURE_IDS_TRUNCATED {
             continue;
         }
-        let parts = libtest_parts(h);
-        let h_unknown = parts.is_some_and(|(_, t)| unknown(t));
-        if !h_unknown && base.contains(h) {
-            m.pairs.push((h, h));
-            continue;
-        }
-        let Some((name, _)) = parts else {
-            continue;
-        };
-        let undecidable = base
-            .iter()
-            .any(|b| libtest_parts(b).is_some_and(|(n, t)| n == name && (h_unknown || unknown(t))));
-        if undecidable {
-            m.ambiguous.push(h);
+        match libtest_name(h) {
+            Some(name) => {
+                if base.iter().any(|b| libtest_name(b) == Some(name)) {
+                    m.ambiguous.push(h);
+                }
+            }
+            None if base.contains(h) => m.pairs.push((h, h)),
+            None => {}
         }
     }
     m
 }
 
-/// (core#553) The argv that re-runs ONE libtest id alone: the check's own `cargo test` with the
-/// workspace/target selection replaced by the id's binary (`-p b --test common`, when the id is
-/// qualified) and `-- --exact <name>`. (core#766) A vitest id (`FAIL <file> > suite > name`)
+/// (core#553) The argv that re-runs ONE libtest id alone: the check's own `cargo test`, unchanged,
+/// plus `-- --exact <name>` (after any test arguments it already passes) — it runs every test of
+/// that name in every binary, so the id clears only when ALL of them pass. (core#766) A vitest id (`FAIL <file> > suite > name`)
 /// re-runs as its FILE alone — the check's own `vitest` invocation (through `npx`, `pnpm exec`,
 /// `yarn`, or the binary) cut back to `vitest run <file>` plus any `--config`/`--root` it carried;
 /// a vitest test name is not addressable by exact match, the file is, and the issue asks for
@@ -4395,13 +4329,7 @@ fn isolated_rerun_argv(argv: &[String], id: &str) -> Option<(Vec<String>, String
         }
         return vitest_file_rerun_argv(argv, file).map(|a| (a, id.to_string()));
     }
-    let (name, target) = libtest_parts(id)?;
-    // An id of an unknown binary cannot be re-run ALONE (a workspace-wide `--exact` run may run
-    // a different test of that name, outside the harness that failed — agy on #1060): it is
-    // not re-checked and stays a regression.
-    if target == Some(UNKNOWN_TARGET) {
-        return None;
-    }
+    let name = libtest_name(id)?;
     let bin = argv.first()?;
     let is_cargo = Path::new(bin)
         .file_name()
@@ -4416,48 +4344,7 @@ fn isolated_rerun_argv(argv: &[String], id: &str) -> Option<(Vec<String>, String
     }
     let split = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
     let (cargo_args, test_args) = (&argv[..split], argv.get(split + 1..).unwrap_or(&[]));
-    let mut out: Vec<String> = Vec::new();
-    let mut skip_value = false;
-    for a in cargo_args {
-        if skip_value {
-            skip_value = false;
-            continue;
-        }
-        if target.is_some() {
-            // The id names its binary: every selection of the original command gives way to it.
-            if matches!(
-                a.as_str(),
-                "-p" | "--package" | "--test" | "--bin" | "--example" | "--bench" | "--exclude"
-            ) {
-                skip_value = true;
-                continue;
-            }
-            if matches!(
-                a.as_str(),
-                "--workspace"
-                    | "--all"
-                    | "--lib"
-                    | "--bins"
-                    | "--tests"
-                    | "--doc"
-                    | "--examples"
-                    | "--benches"
-                    | "--all-targets"
-                    | "--no-fail-fast"
-            ) || a.starts_with("--package=")
-                || a.starts_with("--test=")
-                || a.starts_with("--bin=")
-                || a.starts_with("--exclude=")
-                || (a.starts_with("-p") && a.len() > 2)
-            {
-                continue;
-            }
-        }
-        out.push(a.clone());
-    }
-    if let Some(t) = target {
-        out.extend(t.split_whitespace().map(String::from));
-    }
+    let mut out: Vec<String> = cargo_args.to_vec();
     out.push("--".into());
     out.extend(test_args.iter().cloned());
     out.push("--exact".into());
@@ -5184,6 +5071,17 @@ fn judge_claim(ctx: &FloorContext, checks: &[CheckRun]) -> Option<ClaimCheck> {
     let phrase = detect_claim(ctx.claim_text.as_deref()?)?;
     let failing = checks.iter().find(|c| !c.passed() && c.name != "install")?;
     let verdict = match failing.classification.as_deref() {
+        // Every regression a libtest name the base fails too (core#1060: never matched): the
+        // floor can neither confirm the claim nor reject it.
+        Some(REGRESSION)
+            if !failing.regressions.is_empty()
+                && failing
+                    .regressions
+                    .iter()
+                    .all(|r| failing.ambiguous.contains(r)) =>
+        {
+            CLAIM_UNVERIFIED
+        }
         Some(REGRESSION) => CLAIM_REJECTED,
         Some(PRE_EXISTING_IN_SANDBOX) | Some(FLOOR_ENV_MISMATCH) | Some(ENV_CANNOT_RUN) => {
             CLAIM_CONFIRMED
@@ -5256,8 +5154,9 @@ fn match_notes(c: &CheckRun) -> Vec<String> {
     }
     if !c.ambiguous.is_empty() {
         out.push(format!(
-            "`{}`: {} could not be told apart from a same-named base failure (one side's test \
-             binary is unknown) — kept as regressions, not guessed",
+            "`{}`: {} could not be told apart from a same-named base failure (a libtest \
+             failure names no test binary) — kept as regressions, not guessed; the operator's \
+             floor override is the escape for a red the base shares",
             c.name,
             c.ambiguous.join(", ")
         ));
@@ -5360,35 +5259,14 @@ impl Drain {
     }
 }
 
-/// The launcher signatures a test's own captured output carries when the test tried to arm an OS
-/// sandbox INSIDE the floor's sandbox (core#546): macOS cannot nest `sandbox-exec`, and an
-/// unprivileged `bwrap` inside `bwrap` cannot create its namespaces. A fact about the host, not
-/// about the change.
-const LAUNCHER_SIGNATURES: &[&str] = &[
-    "sandbox-exec: sandbox_apply: Operation not permitted",
-    "bwrap: No permissions to create",
-    "bwrap: Creating new namespace failed",
-    "bwrap: setting up uid map",
-    "bwrap: loopback: Failed RTM_NEWADDR",
-];
-
-/// Does `line` carry a nested-sandbox launcher signature ([`LAUNCHER_SIGNATURES`])?
-pub(crate) fn launcher_signature(line: &str) -> Option<&'static str> {
-    LAUNCHER_SIGNATURES
-        .iter()
-        .copied()
-        .find(|sig| line.contains(sig))
-}
-
 /// The line-level state of one output stream's failure scan: failure ids in order of first sight,
-/// whether a nested-sandbox launcher signature was printed, the watched names seen passing, the
-/// environment signals and — for step 0 of a per-target cargo run — the test targets cargo built.
+/// the watched names seen passing and the environment signals.
 ///
-/// No line is read as STRUCTURE: libtest's framing (`running N tests`, `failures:`, sections,
-/// result lines) and cargo's (`Running …`, `to rerun pass …`) are text the creator's tests can
-/// print, so they attribute nothing (13 review rounds forged them, core#1060). Which test binary
-/// a libtest id came from is the target the floor itself ran ([`run_cargo_targets`]); every
-/// `test x ... FAILED` line of that process counts, and none is ever dropped.
+/// No line is read as STRUCTURE (core#1060): libtest's framing (`running N tests`, `failures:`,
+/// sections, result lines) and cargo's (`Running …`, `to rerun pass …`) are text the creator's
+/// tests can print, and 13 review rounds forged them. Every `test x ... FAILED` line anywhere in
+/// the output is a failure, recorded as plain `test x`: none is dropped, and none names a binary
+/// ([`match_base`] never matches a libtest id).
 #[derive(Debug, Default)]
 struct LineScan {
     eslint_file: Option<String>,
@@ -5397,87 +5275,11 @@ struct LineScan {
     /// More failure ids than [`MAX_FAILURE_IDS`] were seen: [`qualify`] adds
     /// [`FAILURE_IDS_TRUNCATED`].
     truncated: bool,
-    /// (core#546) A nested-sandbox launcher signature was printed.
-    launcher: bool,
     /// libtest names seen PASSING (`test name ... ok`) among `watch` — the isolated re-run's witness.
     passed: Vec<String>,
     watch: Vec<String>,
     /// (core#789/#790) Environment signals in order of sight ([`env_signal_of_line`]).
     signals: Vec<String>,
-    /// Step 0 of a per-target cargo run: read cargo's `compiler-artifact` lines.
-    collect_targets: bool,
-    /// The test artifacts cargo built, at most [`MAX_SCAN_ENTRIES`].
-    artifacts: Vec<CargoArtifact>,
-    /// More artifacts than [`MAX_SCAN_ENTRIES`]: the check is not split.
-    artifacts_overflow: bool,
-}
-
-/// One `compiler-artifact` of `cargo test --no-run --message-format=json…`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CargoArtifact {
-    /// The package's `[package] name`, read from the artifact's `manifest_path`.
-    package: String,
-    /// The target selector when the artifact is a test executable: `--lib`, `--test it`, …
-    selector: Option<String>,
-    /// A library whose doc tests `cargo test` runs.
-    doc: bool,
-}
-
-/// The [`CargoArtifact`] one line of cargo's JSON messages describes, or `None`.
-fn cargo_artifact_of_line(s: &str) -> Option<CargoArtifact> {
-    let v: serde_json::Value = serde_json::from_str(s).ok()?;
-    if v.get("reason")?.as_str()? != "compiler-artifact" {
-        return None;
-    }
-    let target = v.get("target")?;
-    let strings = |key: &str| -> Vec<String> {
-        target
-            .get(key)
-            .and_then(|k| k.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let (kinds, crate_types) = (strings("kind"), strings("crate_types"));
-    let name = target.get("name")?.as_str()?;
-    let manifest = v.get("manifest_path")?.as_str()?;
-    let package = cargo_package_name(&std::fs::read_to_string(manifest).ok()?)?;
-    // A name is an argument the floor passes: never one that reads as a flag.
-    if package.starts_with('-') || name.starts_with('-') || name.contains(char::is_whitespace) {
-        return None;
-    }
-    const LIB_KINDS: &[&str] = &["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
-    let lib = kinds.iter().any(|k| LIB_KINDS.contains(&k.as_str()));
-    let is_test = v
-        .get("profile")
-        .and_then(|p| p.get("test"))
-        .and_then(|t| t.as_bool())
-        .unwrap_or(false);
-    let selector = is_test
-        .then(|| {
-            if lib {
-                Some("--lib".to_string())
-            } else {
-                kinds
-                    .iter()
-                    .find(|k| matches!(k.as_str(), "bin" | "test" | "example" | "bench"))
-                    .map(|k| format!("--{k} {name}"))
-            }
-        })
-        .flatten();
-    let doc = lib
-        && target.get("doctest").and_then(|d| d.as_bool()) == Some(true)
-        && crate_types
-            .iter()
-            .any(|c| matches!(c.as_str(), "lib" | "rlib" | "proc-macro"));
-    Some(CargoArtifact {
-        package,
-        selector,
-        doc,
-    })
 }
 
 impl LineScan {
@@ -5503,20 +5305,6 @@ impl LineScan {
                 }
             }
         }
-        if self.collect_targets && s.starts_with('{') {
-            // A forged line can only ADD a target (one cargo cannot run fails, and denies).
-            if let Some(a) = cargo_artifact_of_line(s) {
-                if !self.artifacts.contains(&a) {
-                    if self.artifacts.len() < MAX_SCAN_ENTRIES {
-                        self.artifacts.push(a);
-                    } else {
-                        self.artifacts_overflow = true;
-                    }
-                }
-            }
-            return;
-        }
-        self.launcher |= launcher_signature(s).is_some();
         if !self.watch.is_empty() {
             if let Some(name) = s
                 .strip_prefix("test ")
@@ -5592,49 +5380,27 @@ fn strip_ansi(line: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
-/// The target a libtest id carries when the floor did not run its test binary alone: `test
-/// shared [?]`. [`match_base`] never matches it — not even to itself.
-const UNKNOWN_TARGET: &str = "?";
-
-/// A libtest id qualified by its test binary: `test t::shared [-p b --lib]` (core#481).
-fn qualified(id: &str, target: Option<&str>) -> String {
-    match target {
-        Some(t) => format!("{id} [{t}]"),
-        None => id.to_string(),
-    }
-}
-
-/// Split a (possibly qualified) libtest id into its test name and cargo target selector.
-fn libtest_parts(id: &str) -> Option<(&str, Option<&str>)> {
+/// A libtest id's test name: `test a::b` → `a::b` (a ` [...]` suffix a stored record of an earlier
+/// floor carries is dropped). `None` for any other runner's id.
+fn libtest_name(id: &str) -> Option<&str> {
     let rest = id.strip_prefix("test ")?;
-    match rest.strip_suffix(']').and_then(|r| r.rsplit_once(" [")) {
-        Some((name, target)) => Some((name, Some(target))),
-        None => Some((rest, None)),
-    }
+    Some(
+        rest.strip_suffix(']')
+            .and_then(|r| r.rsplit_once(" ["))
+            .map_or(rest, |(name, _)| name),
+    )
 }
 
-/// The scanned ids of ONE process, qualified: the failure ids (stdout first, then stderr), the
-/// failing libtest ids that are env candidates (a launcher signature in the process's output,
-/// core#546), the watched names seen passing, and the environment signals. A libtest id carries
-/// `target` — the selector the floor passed to this process — or `[?]` when the floor did not
-/// run one target alone: no output text can say which binary it came from.
-fn qualify(
-    out: LineScan,
-    err: LineScan,
-    target: Option<&str>,
-) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-    let target = target.unwrap_or(UNKNOWN_TARGET);
+/// The scanned ids of one check run: the failure ids (stdout first, then stderr, at most
+/// [`MAX_FAILURE_IDS`] plus [`FAILURE_IDS_TRUNCATED`] past it), the watched names seen passing,
+/// and the environment signals.
+fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut truncated = out.truncated || err.truncated;
     let mut ids: Vec<String> = Vec::new();
-    for id in out.ids.iter().chain(&err.ids) {
-        let q = if id.starts_with("test ") {
-            qualified(id, Some(target))
-        } else {
-            id.clone()
-        };
-        if !ids.contains(&q) {
+    for id in out.ids.into_iter().chain(err.ids) {
+        if !ids.contains(&id) {
             if ids.len() < MAX_FAILURE_IDS {
-                ids.push(q);
+                ids.push(id);
             } else {
                 truncated = true;
             }
@@ -5644,14 +5410,6 @@ fn qualify(
     if truncated {
         ids.push(FAILURE_IDS_TRUNCATED.to_string());
     }
-    let env = if out.launcher || err.launcher {
-        ids.iter()
-            .filter(|i| i.starts_with("test "))
-            .cloned()
-            .collect()
-    } else {
-        Vec::new()
-    };
     let mut passed = out.passed;
     for p in err.passed {
         if !passed.contains(&p) {
@@ -5659,13 +5417,7 @@ fn qualify(
         }
     }
     let mut signals = out.signals;
-    merge_signals(&mut signals, err.signals);
-    (ids, env, passed, signals)
-}
-
-/// Append `more` environment signals, de-duplicating crash lines, at most [`MAX_ENV_SIGNALS`].
-fn merge_signals(signals: &mut Vec<String>, more: Vec<String>) {
-    for sig in more {
+    for sig in err.signals {
         if signals.len() >= MAX_ENV_SIGNALS {
             if signals.last().map(String::as_str) != Some(SIGNALS_TRUNCATED) {
                 *signals.last_mut().expect("cap > 0") = SIGNALS_TRUNCATED.to_string();
@@ -5676,154 +5428,7 @@ fn merge_signals(signals: &mut Vec<String>, more: Vec<String>) {
             signals.push(sig);
         }
     }
-}
-
-/// A `cargo test` check the floor runs one target at a time (core#1063): the qualifier of every
-/// libtest id is then the selector the floor chose, never a line of output.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CargoPlan {
-    /// `cargo [+toolchain] test`.
-    head: Vec<String>,
-    /// The check's own arguments before `--` (step 0 runs them as given).
-    args: Vec<String>,
-    /// `args` without package selection: what every target's run passes through.
-    common: Vec<String>,
-    /// The arguments after `--`, passed to every target's test binary.
-    test_args: Vec<String>,
-}
-
-/// The [`CargoPlan`] of `argv`, or `None` when the floor cannot split it: not `cargo test`, or one
-/// that already selects targets (`--lib`, `--test x`, … — an isolated re-run among them), runs
-/// nothing (`--no-run`) or sets its own `--message-format`. Such a check runs as one process and
-/// its libtest ids are `[?]`.
-fn cargo_plan(argv: &[String]) -> Option<CargoPlan> {
-    let file = Path::new(argv.first()?).file_name()?.to_str()?;
-    if file != "cargo" && file != "cargo.exe" {
-        return None;
-    }
-    let sub = if argv.get(1)?.starts_with('+') { 2 } else { 1 };
-    if argv.get(sub)? != "test" {
-        return None;
-    }
-    let split = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
-    let args = argv.get(sub + 1..split)?.to_vec();
-    let test_args = argv.get(split + 1..).unwrap_or(&[]).to_vec();
-    const NOT_SPLIT: &[&str] = &[
-        "--lib",
-        "--bin",
-        "--bins",
-        "--test",
-        "--tests",
-        "--example",
-        "--examples",
-        "--bench",
-        "--benches",
-        "--all-targets",
-        "--doc",
-        "--no-run",
-        "--message-format",
-    ];
-    let mut common = Vec::new();
-    let mut skip = false;
-    for a in &args {
-        if skip {
-            skip = false;
-            continue;
-        }
-        if NOT_SPLIT.contains(&a.split('=').next().unwrap_or(a)) {
-            return None;
-        }
-        if matches!(a.as_str(), "-p" | "--package" | "--exclude") {
-            skip = true;
-            continue;
-        }
-        if matches!(a.as_str(), "--workspace" | "--all")
-            || a.starts_with("--package=")
-            || a.starts_with("--exclude=")
-            || (a.starts_with("-p") && a.len() > 2)
-        {
-            continue;
-        }
-        common.push(a.clone());
-    }
-    if skip {
-        return None;
-    }
-    Some(CargoPlan {
-        head: argv[..=sub].to_vec(),
-        args,
-        common,
-        test_args,
-    })
-}
-
-impl CargoPlan {
-    /// Step 0: cargo's own list of the test targets, built (a compile error fails the check here).
-    fn list_argv(&self) -> Vec<String> {
-        let mut v = self.head.clone();
-        v.extend(self.args.iter().cloned());
-        v.extend(s(&["--no-run", "--message-format=json-render-diagnostics"]));
-        v
-    }
-
-    /// One target's run: `cargo test <common…> -p <package> <selector> [-- <test args…>]`.
-    fn target_argv(&self, package: &str, selector: &str) -> Vec<String> {
-        let mut v = self.head.clone();
-        v.extend(self.common.iter().cloned());
-        v.extend(["-p".to_string(), package.to_string()]);
-        v.extend(selector.split_whitespace().map(String::from));
-        if !self.test_args.is_empty() {
-            v.push("--".into());
-            v.extend(self.test_args.iter().cloned());
-        }
-        v
-    }
-}
-
-/// The (package, selector) runs step 0's artifacts call for, in cargo's order: each test
-/// executable, then the doc tests of every tested package whose library has them.
-fn cargo_targets(artifacts: &[CargoArtifact]) -> Vec<(String, String)> {
-    let mut runs: Vec<(String, String)> = Vec::new();
-    for a in artifacts {
-        if let Some(sel) = &a.selector {
-            let run = (a.package.clone(), sel.clone());
-            if !runs.contains(&run) {
-                runs.push(run);
-            }
-        }
-    }
-    let tested: Vec<String> = runs.iter().map(|(p, _)| p.clone()).collect();
-    for a in artifacts
-        .iter()
-        .filter(|a| a.doc && tested.contains(&a.package))
-    {
-        let run = (a.package.clone(), "--doc".to_string());
-        if !runs.contains(&run) {
-            runs.push(run);
-        }
-    }
-    runs
-}
-
-/// One target process's failure ids ([`qualify`] with its selector), plus — when it exited
-/// non-zero without naming a failing test, or other than libtest's 101 (a crash, a signal, a
-/// harness of its own) — `[<selector>] exited <how>`, matched to the base by equality.
-fn target_ids(
-    selector: &str,
-    exit: Option<i32>,
-    out: LineScan,
-    err: LineScan,
-) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-    let (mut ids, env, passed, signals) = qualify(out, err, Some(selector));
-    let named = ids.iter().any(|i| i.starts_with("test "));
-    if exit != Some(0) && (exit != Some(101) || !named) {
-        let how = match exit {
-            Some(c) => format!("with code {c}"),
-            None => "by a signal".to_string(),
-        };
-        ids.push(format!("[{selector}] exited {how}"));
-    }
-    (ids, env, passed, signals)
+    (ids, passed, signals)
 }
 
 /// The failure identifier one complete output line carries, for the runners the floor knows —
@@ -5928,16 +5533,9 @@ pub(crate) fn failure_id_of_line(line: &str, eslint_file: &mut Option<String>) -
     None
 }
 
-fn drain_tail<R: Read + Send + 'static>(
-    mut r: R,
-    watch: &[String],
-    collect_targets: bool,
-) -> Drain {
+fn drain_tail<R: Read + Send + 'static>(mut r: R, watch: &[String]) -> Drain {
     let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(TAIL_BYTES * 2)));
-    let scan = std::sync::Arc::new(std::sync::Mutex::new(LineScan {
-        collect_targets,
-        ..LineScan::watching(watch)
-    }));
+    let scan = std::sync::Arc::new(std::sync::Mutex::new(LineScan::watching(watch)));
     let (done_tx, done) = std::sync::mpsc::channel();
     let shared = std::sync::Arc::clone(&buf);
     let shared_scan = std::sync::Arc::clone(&scan);
@@ -6018,8 +5616,6 @@ fn run_one_watching(
 }
 
 /// [`run_one_watching`] whose bound is held to `cap` whatever the host load ([`bound_under`]).
-/// A `cargo test` check the floor can split ([`cargo_plan`]) runs one target at a time
-/// ([`run_cargo_targets`]); any other check runs as one process.
 fn run_one_capped(
     worktree: &Path,
     check: &RepoCheck,
@@ -6058,8 +5654,7 @@ fn run_one_capped(
     let (load1, cpus) = host_load();
     result.load_band = load_band(load1, cpus);
     // LOAD-AWARE BOUND (core#469): base × clamp(load1/ncpu, 1, 3), recorded on the run and
-    // logged before the check starts so the observed duration can be read against it. ONE
-    // deadline for the whole check, however many processes it takes.
+    // logged before the check starts so the observed duration can be read against it.
     let (timeout, bound_note) = bound_under(check.base_timeout(), load1, cpus, cap);
     result.bound_s = timeout.as_secs();
     result.bound_note = bound_note;
@@ -6074,191 +5669,21 @@ fn run_one_capped(
             .unwrap_or_default(),
         worktree.display()
     );
-    let deadline = started + timeout;
-    let run = |argv: &[String], watch: &[String], collect: bool| {
-        spawn_scanned(
-            worktree, check, argv, sandbox, scratch, tree, watch, deadline, collect,
-        )
-    };
-    let passed = match cargo_plan(&check.argv) {
-        Some(plan) => run_cargo_targets(&plan, &run, watch, &mut result),
-        None => {
-            let p = run(&check.argv, watch, false);
-            let (ids, env, passed, signals) = qualify(p.out, p.err, None);
-            result.exit_code = p.exit_code;
-            result.timed_out = p.timed_out;
-            result.spawn_error = p.spawn_error;
-            result.stdout_tail = p.out_tail;
-            result.stderr_tail = p.err_tail;
-            result.failure_ids = ids;
-            result.env_cannot_run = env;
-            result.env_signals = signals;
-            passed
-        }
-    };
-    result.duration_ms = started.elapsed().as_millis() as u64;
-    (result, passed)
-}
-
-/// How [`run_cargo_targets`] runs one process: `(argv, watch, collect_targets)`.
-type Spawn<'a> = dyn Fn(&[String], &[String], bool) -> Spawned + 'a;
-
-/// One process of a check: its exit and its two streams' tails and scans.
-#[derive(Debug, Default)]
-struct Spawned {
-    exit_code: Option<i32>,
-    timed_out: bool,
-    spawn_error: Option<String>,
-    out_tail: String,
-    err_tail: String,
-    out: LineScan,
-    err: LineScan,
-}
-
-/// (core#1063) Run a splittable `cargo test` check one target at a time. Step 0 is cargo's own
-/// list of the targets (`--no-run`, which also builds them: a compile error fails the check right
-/// there); then each target runs alone, serially, against the check's one deadline, and every
-/// `test x ... FAILED` line of its output is qualified with the selector the floor passed. The
-/// check fails when step 0 or any target does; the first timeout or spawn error ends it.
-/// Returns the watched names seen passing.
-fn run_cargo_targets(
-    plan: &CargoPlan,
-    run: &Spawn<'_>,
-    watch: &[String],
-    result: &mut CheckRun,
-) -> Vec<String> {
-    let list = run(&plan.list_argv(), &[], true);
-    if list.exit_code != Some(0) || list.timed_out || list.spawn_error.is_some() {
-        let (ids, env, passed, signals) = qualify(list.out, list.err, None);
-        result.exit_code = list.exit_code;
-        result.timed_out = list.timed_out;
-        result.spawn_error = list.spawn_error;
-        result.stdout_tail = list.out_tail;
-        result.stderr_tail = list.err_tail;
-        result.failure_ids = ids;
-        result.env_cannot_run = env;
-        result.env_signals = signals;
-        return passed;
-    }
-    if list.out.artifacts_overflow {
-        // More targets than the scan keeps: not split — one process, every libtest id `[?]`.
-        let p = run(&result.argv.clone(), watch, false);
-        let (ids, env, passed, signals) = qualify(p.out, p.err, None);
-        result.exit_code = p.exit_code;
-        result.timed_out = p.timed_out;
-        result.spawn_error = p.spawn_error;
-        result.stdout_tail = p.out_tail;
-        result.stderr_tail = p.err_tail;
-        result.failure_ids = ids;
-        result.env_cannot_run = env;
-        result.env_signals = signals;
-        return passed;
-    }
-    let (mut out_tail, mut err_tail) = (list.out_tail, list.err_tail);
-    let mut signals = list.out.signals;
-    merge_signals(&mut signals, list.err.signals);
-    let (mut ids, mut env, mut passed): (Vec<String>, Vec<String>, Vec<String>) =
-        Default::default();
-    let mut truncated = false;
-    let mut exit = Some(0);
-    for (package, selector) in cargo_targets(&list.out.artifacts) {
-        let argv = plan.target_argv(&package, &selector);
-        let p = run(&argv, watch, false);
-        let header = format!("\n$ {}\n", argv.join(" "));
-        out_tail = keep_tail(out_tail + &header + &p.out_tail);
-        err_tail = keep_tail(err_tail + &header + &p.err_tail);
-        if p.spawn_error.is_some() || p.timed_out {
-            result.spawn_error = p.spawn_error;
-            result.timed_out = p.timed_out;
-            exit = None;
-            break;
-        }
-        if p.exit_code != Some(0) && exit == Some(0) {
-            exit = p.exit_code.or(Some(101));
-        }
-        let target = format!("-p {package} {selector}");
-        let (t_ids, t_env, t_passed, t_signals) = target_ids(&target, p.exit_code, p.out, p.err);
-        for id in t_ids {
-            if id == FAILURE_IDS_TRUNCATED {
-                truncated = true;
-            } else if !ids.contains(&id) {
-                if ids.len() < MAX_FAILURE_IDS {
-                    ids.push(id);
-                } else {
-                    truncated = true;
-                }
-            }
-        }
-        env.extend(
-            t_env
-                .into_iter()
-                .filter(|e| !env.contains(e))
-                .collect::<Vec<_>>(),
-        );
-        passed.extend(
-            t_passed
-                .into_iter()
-                .filter(|n| !passed.contains(n))
-                .collect::<Vec<_>>(),
-        );
-        merge_signals(&mut signals, t_signals);
-    }
-    if truncated {
-        ids.push(FAILURE_IDS_TRUNCATED.to_string());
-    }
-    result.exit_code = exit;
-    result.stdout_tail = out_tail;
-    result.stderr_tail = err_tail;
-    result.failure_ids = ids;
-    result.env_cannot_run = env;
-    result.env_signals = signals;
-    passed
-}
-
-/// The last [`TAIL_BYTES`] of `s`, cut on a character boundary.
-fn keep_tail(s: String) -> String {
-    if s.len() <= TAIL_BYTES {
-        return s;
-    }
-    let mut cut = s.len() - TAIL_BYTES;
-    while !s.is_char_boundary(cut) {
-        cut += 1;
-    }
-    s[cut..].to_string()
-}
-
-/// Spawn ONE process of `check` (`argv`) in `worktree`, inside `sandbox`'s write boundary with
-/// the isolated `scratch` homes (`tree` picks the cargo target leaf), until it exits or the
-/// `deadline` passes; capture its exit code and both streams' tails and scans. A LAUNCHER that
-/// fails to arm (`bwrap: …` / `sandbox-exec: …` as the first stderr line, non-zero exit) is a
-/// spawn error, never the check's own failure (core#493).
-#[allow(clippy::too_many_arguments)]
-fn spawn_scanned(
-    worktree: &Path,
-    check: &RepoCheck,
-    argv: &[String],
-    sandbox: &WorkerSandbox,
-    scratch: &CheckScratch,
-    tree: Tree,
-    watch: &[String],
-    deadline: Instant,
-    collect_targets: bool,
-) -> Spawned {
-    let mut r = Spawned::default();
-    let Some(bin) = argv.first() else {
-        r.spawn_error = Some("empty argv".into());
-        return r;
+    let Some(bin) = check.argv.first() else {
+        result.spawn_error = Some("empty argv".into());
+        return (result, Vec::new());
     };
     // Resolve on PATH the way `Command::new` will, so "not installed" is a legible spawn error
     // rather than a bare OS code.
     let Some(exe) = crate::validator::find_on_path(bin) else {
-        r.spawn_error = Some(format!("`{bin}` is not on PATH"));
-        return r;
+        result.spawn_error = Some(format!("`{bin}` is not on PATH"));
+        result.duration_ms = started.elapsed().as_millis() as u64;
+        return (result, Vec::new());
     };
     // `[<sandbox wrapper…>] <exe> <args…>` — an empty wrapper is the disclosed best-effort floor.
     let mut full: Vec<String> = sandbox.wrapper.clone();
     full.push(exe.to_string_lossy().into_owned());
-    full.extend(argv[1..].iter().cloned());
+    full.extend(check.argv[1..].iter().cloned());
     // spawn-audit: hardened — the repository's own check command, run in the run's worktree.
     let mut cmd = Command::new(&full[0]);
     cmd.hardened()
@@ -6278,15 +5703,13 @@ fn spawn_scanned(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            r.spawn_error = Some(e.to_string());
-            return r;
+            result.spawn_error = Some(e.to_string());
+            result.duration_ms = started.elapsed().as_millis() as u64;
+            return (result, Vec::new());
         }
     };
-    let out_h = child
-        .stdout
-        .take()
-        .map(|o| drain_tail(o, watch, collect_targets));
-    let err_h = child.stderr.take().map(|e| drain_tail(e, watch, false));
+    let out_h = child.stdout.take().map(|r| drain_tail(r, watch));
+    let err_h = child.stderr.take().map(|r| drain_tail(r, watch));
     let status = loop {
         match crate::validator::has_exited_unreaped(&mut child) {
             Ok(true) => {
@@ -6297,10 +5720,10 @@ fn spawn_scanned(
                 crate::validator::kill_child_tree(&mut child);
                 break child.wait().ok();
             }
-            Ok(false) if Instant::now() >= deadline => {
+            Ok(false) if started.elapsed() >= timeout => {
                 crate::validator::kill_child_tree(&mut child);
                 crate::validator::reap_bounded(&mut child);
-                r.timed_out = true;
+                result.timed_out = true;
                 break None;
             }
             Ok(false) => std::thread::sleep(Duration::from_millis(50)),
@@ -6310,34 +5733,39 @@ fn spawn_scanned(
                 // (Copilot on #414). Kill the group, reap bounded, then report the failure.
                 crate::validator::kill_child_tree(&mut child);
                 crate::validator::reap_bounded(&mut child);
-                r.spawn_error = Some(format!("wait failed: {e}"));
+                result.spawn_error = Some(format!("wait failed: {e}"));
                 break None;
             }
         }
     };
-    r.exit_code = status.and_then(|st| st.code());
+    result.exit_code = status.and_then(|st| st.code());
     // BOUNDED: the group is dead, but a detached descendant may still hold the pipe — take what
     // was read and move on rather than wait for an EOF that may never come.
-    let (out_tail, out) = out_h.map(|d| d.finish(DRAIN_CAP)).unwrap_or_default();
-    let (err_tail, err) = err_h.map(|d| d.finish(DRAIN_CAP)).unwrap_or_default();
-    r.out_tail = lossy(out_tail);
-    r.err_tail = lossy(err_tail);
-    (r.out, r.err) = (out, err);
+    let (out_tail, out_scan) = out_h.map(|d| d.finish(DRAIN_CAP)).unwrap_or_default();
+    let (err_tail, err_scan) = err_h.map(|d| d.finish(DRAIN_CAP)).unwrap_or_default();
+    result.stdout_tail = lossy(out_tail);
+    result.stderr_tail = lossy(err_tail);
     // The launcher's exit is not the repository's (core#493): bwrap that cannot `mkdir` a `--tmpfs`
     // destination dies BEFORE exec with `bwrap: Can't mkdir …` and exit 1 (so does a launcher
     // whose `execvp` of the check's binary fails) — the check never ran, so recording
     // `exit_code: 1` as its `failed` blames the repo for the jail. The ONE predicate
     // (`validator::launcher_failure`) reads the first stderr line; a hit is `could_not_run`
     // (denies, fail-closed, attribution honest). Never applied to a passing exit or a timeout.
-    if !r.timed_out && r.exit_code != Some(0) {
+    if !result.timed_out && result.exit_code != Some(0) {
         if let Some(msg) = crate::validator::launcher_failure(
             &sandbox.wrapper,
-            r.err_tail.lines().next().unwrap_or(""),
+            result.stderr_tail.lines().next().unwrap_or(""),
         ) {
-            r.spawn_error = Some(msg);
+            result.spawn_error = Some(msg);
         }
     }
-    r
+    // Identifiers from both streams (cargo prints its per-test lines on stdout, vitest on
+    // stderr), de-duplicated, in order of first sight; libtest ids qualified by their binary.
+    let (ids, passed, signals) = qualify(out_scan, err_scan);
+    result.failure_ids = ids;
+    result.env_signals = signals;
+    result.duration_ms = started.elapsed().as_millis() as u64;
+    (result, passed)
 }
 
 #[cfg(test)]
@@ -8806,8 +8234,10 @@ mod tests {
         assert!(denial.contains("cargo-fmt-check"), "{denial}");
     }
 
+    /// The baseline diff with real `cargo test` (core#1060): a libtest failure is never excused by
+    /// the base, whatever it shares; the comparison is still run, cached and disclosed.
     #[test]
-    fn baseline_diff_denies_only_regressions() {
+    fn baseline_diff_never_excuses_a_libtest_failure() {
         let repo = scratch("basediff");
         std::fs::create_dir_all(repo.join("src")).unwrap();
         std::fs::write(
@@ -8846,7 +8276,8 @@ mod tests {
             ..FloorContext::default()
         };
 
-        // (1) REGRESSION: `stable` newly fails beside the two shared failures.
+        // (1) `stable` newly fails beside the two failures the base shares. A libtest id never
+        // matches the base (core#1060): all three are regressions, the shared two ambiguous.
         std::fs::write(repo.join("src/lib.rs"), body(false, false, false)).unwrap();
         let report = run_floor(&repo, &ctx);
         if report.sandbox_error.is_some() {
@@ -8867,15 +8298,10 @@ mod tests {
         assert_eq!(c.classification.as_deref(), Some(REGRESSION), "{c:?}");
         assert_eq!(
             c.regressions,
-            vec!["test t::stable [-p basediff_fixture --lib]".to_string()]
+            vec!["test t::other", "test t::shared", "test t::stable"]
         );
-        assert_eq!(
-            c.pre_existing,
-            vec![
-                "test t::other [-p basediff_fixture --lib]".to_string(),
-                "test t::shared [-p basediff_fixture --lib]".to_string()
-            ]
-        );
+        assert_eq!(c.ambiguous, vec!["test t::other", "test t::shared"]);
+        assert!(c.pre_existing.is_empty());
         let b = c.base.as_deref().expect("the base run is attached");
         assert_eq!(b.head, base);
         assert!(!b.cached, "first comparison of this base: run, not cached");
@@ -8888,13 +8314,7 @@ mod tests {
         // reported in either order (the macOS CI runner reports `shared` first) — compare sorted.
         let mut base_ids = br.failure_ids.clone();
         base_ids.sort();
-        assert_eq!(
-            base_ids,
-            vec![
-                "test t::other [-p basediff_fixture --lib]".to_string(),
-                "test t::shared [-p basediff_fixture --lib]".to_string()
-            ]
-        );
+        assert_eq!(base_ids, vec!["test t::other", "test t::shared"]);
         assert_eq!(
             report.claim.as_ref().map(|c| c.verdict.as_str()),
             Some(CLAIM_REJECTED),
@@ -8908,8 +8328,9 @@ mod tests {
         let denial = report.denial_reason();
         assert!(
             denial.contains("[regression]")
-                && denial.contains("head-only failures test t::stable [-p basediff_fixture --lib]")
-                && denial.contains("also failing on the base: test t::other [-p basediff_fixture --lib], test t::shared [-p basediff_fixture --lib]")
+                && denial
+                    .contains("head-only failures test t::other, test t::shared, test t::stable")
+                && denial.contains("test t::other, test t::shared could not be told apart")
                 && denial.contains("REJECTED"),
             "{denial}"
         );
@@ -8936,54 +8357,42 @@ mod tests {
             "the base run is cached by base sha + check name"
         );
 
-        // (2) Identical failure sets: the FACT is that the base fails them too (core#481 —
-        // `pre_existing_in_sandbox`, never the inferred `floor_env_mismatch`) ⇒ the floor passes,
-        // the shared failures are listed. The tree equals the base, so no file is touched and the
-        // full `cargo-test` runs (no derived set to narrow to).
+        // (2) Identical libtest failure sets STILL deny (core#1060, the accepted cost: a Rust
+        // test the base fails too is never excused — the operator's floor override is the
+        // escape). The creator's "pre-existing" claim is neither confirmed nor rejected. The tree
+        // equals the base, so the full `cargo-test` runs (no derived set to narrow to).
         std::fs::write(repo.join("src/lib.rs"), body(false, false, true)).unwrap();
         let report = run_floor(&repo, &ctx);
-        assert!(report.passed, "{:?}", report.checks[1]);
-        assert_eq!(report.outcome(), "passed");
+        assert!(!report.passed, "{:?}", report.checks[1]);
         let c = &report.checks[1];
-        assert!(!c.passed() && !c.denies());
-        assert_eq!(c.outcome(), "failed");
-        assert_eq!(c.classification.as_deref(), Some(PRE_EXISTING_IN_SANDBOX));
-        assert_eq!(
-            c.pre_existing,
-            vec![
-                "test t::other [-p basediff_fixture --lib]".to_string(),
-                "test t::shared [-p basediff_fixture --lib]".to_string()
-            ]
-        );
         assert_eq!(c.name, "cargo-test");
-        assert!(c.regressions.is_empty());
+        assert_eq!(c.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(c.regressions, vec!["test t::other", "test t::shared"]);
+        assert_eq!(c.ambiguous, c.regressions);
+        assert!(c.pre_existing.is_empty() && c.denies());
         assert!(!report.env_mismatch());
         assert_eq!(
             report.claim.as_ref().map(|c| c.verdict.as_str()),
-            Some(CLAIM_CONFIRMED)
+            Some(CLAIM_UNVERIFIED)
         );
         assert!(
-            c.summary().contains("[pre_existing_in_sandbox]"),
+            report.denial_reason().contains("floor override"),
             "{}",
-            c.summary()
+            report.denial_reason()
         );
 
-        // (3) PRE_EXISTING_IN_SANDBOX: the head fixes `other`, breaks nothing ⇒ passes.
+        // (3) The head fixes `other` and breaks nothing: `shared` still denies, against the base
+        // run paid for once per run.
         std::fs::write(repo.join("src/lib.rs"), body(false, true, true)).unwrap();
         let report = run_floor(&repo, &ctx);
-        assert!(report.passed, "{:?}", report.checks[1]);
+        assert!(!report.passed, "{:?}", report.checks[1]);
         let c = &report.checks[1];
-        assert_eq!(c.classification.as_deref(), Some(PRE_EXISTING_IN_SANDBOX));
-        assert_eq!(
-            c.pre_existing,
-            vec!["test t::shared [-p basediff_fixture --lib]".to_string()]
-        );
-        assert!(c.regressions.is_empty() && !c.denies());
+        assert_eq!(c.regressions, vec!["test t::shared"]);
+        assert_eq!(c.ambiguous, vec!["test t::shared"]);
         assert!(
             c.base.as_deref().is_some_and(|b| b.cached),
             "the base run is paid for once per run"
         );
-        assert!(!report.env_mismatch());
 
         // (4) Opt-out: the plain denial, with the reason the base was not compared.
         std::fs::create_dir_all(repo.join(".wicked")).unwrap();
@@ -9492,21 +8901,32 @@ mod tests {
         scan
     }
 
-    /// Head and base ids are compared on (test name, target): qualified ids of the same target
-    /// match. A bare libtest id (a record from a floor that still kept them) cannot say which
-    /// binary it came from — against a qualified id OR another bare one — so it is never counted
-    /// pre-existing: it stays a regression, listed as ambiguous, and the denial says so (codex on
-    /// #1060 — the same name may fail in crate B on the base and in crate A on the head).
+    /// core#1060: a libtest id never matches the base — plain, a stored record's qualified form,
+    /// or `[?]`: `test shared` red in crate A on the base and in crate B on the head is the same
+    /// string. It stays a regression, listed as ambiguous when the base fails that name, and the
+    /// denial says so. Other runners' ids (path-qualified) still match by equality: an identical
+    /// set is the FACT `pre_existing_in_sandbox`, never the inference `floor_env_mismatch`.
     #[test]
-    fn head_and_base_ids_match_across_qualified_and_bare_forms() {
-        // Head bare (its qualification fell back), base qualified.
+    fn a_libtest_id_never_matches_a_base_id_1060() {
+        for (head_id, base_id) in [
+            ("test shared", "test shared"),
+            ("test shared", "test shared [-p a --lib]"),
+            ("test shared [-p a --lib]", "test shared [-p a --lib]"),
+            ("test shared [?]", "test shared [?]"),
+        ] {
+            let mut head = failed_run(&[head_id], &[head_id]);
+            classify(&mut head, base_of(failed_run(&[base_id], &[base_id])));
+            assert_eq!(
+                head.classification.as_deref(),
+                Some(REGRESSION),
+                "{head_id}"
+            );
+            assert!(head.pre_existing.is_empty(), "{head_id}");
+            assert_eq!(head.ambiguous, vec![head_id]);
+            assert!(head.denies());
+        }
         let mut head = failed_run(&["test a::x", "test a::new"], &[]);
-        classify(
-            &mut head,
-            base_of(failed_run(&["test a::x [-p core --lib]"], &[])),
-        );
-        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
-        assert!(head.pre_existing.is_empty(), "{head:#?}");
+        classify(&mut head, base_of(failed_run(&["test a::x"], &[])));
         assert_eq!(head.regressions, vec!["test a::new", "test a::x"]);
         assert_eq!(
             head.ambiguous,
@@ -9515,89 +8935,28 @@ mod tests {
         );
         let denial = report_of(vec![head], &[]).denial_reason();
         assert!(
-            denial.contains("test a::x could not be told apart") && denial.contains("not guessed"),
+            denial.contains("test a::x could not be told apart")
+                && denial.contains("not guessed")
+                && denial.contains("floor override"),
             "{denial}"
         );
-
-        // Head qualified, base bare: a new failure in crate A does not hide behind a bare base
-        // failure of the same name (which may have been crate B's).
-        let mut head = failed_run(&["test shared [-p a --lib]"], &[]);
-        classify(&mut head, base_of(failed_run(&["test shared"], &[])));
-        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(head.ambiguous, vec!["test shared [-p a --lib]"]);
-        assert!(head.denies());
-
-        // The same form on both sides still matches, and the env class follows the pair.
-        let mut head = failed_run(&["test sb [-p core --lib]"], &["test sb [-p core --lib]"]);
-        classify(
-            &mut head,
-            base_of(failed_run(
-                &["test sb [-p core --lib]"],
-                &["test sb [-p core --lib]"],
-            )),
+        // Path-qualified ids of other runners match: identical sets pass, a shared pytest red
+        // beside a libtest red still denies on the libtest one.
+        let py = ["FAILED tests/a.py::test_x", "FAILED tests/b.py::test_y"];
+        let mut head = failed_run(&py, &[]);
+        classify(&mut head, base_of(failed_run(&py, &[])));
+        assert_eq!(
+            head.classification.as_deref(),
+            Some(PRE_EXISTING_IN_SANDBOX)
         );
-        assert_eq!(head.classification.as_deref(), Some(ENV_CANNOT_RUN));
-        // Bare on both sides is no identity either: never matched.
-        let mut head = failed_run(&["test sb"], &["test sb"]);
-        classify(&mut head, base_of(failed_run(&["test sb"], &["test sb"])));
-        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(head.ambiguous, vec!["test sb"]);
-        assert!(head.denies());
-    }
-
-    /// The same test name in two crates stays two failures: qualified ids of different binaries
-    /// never meet, and a bare id is not guessed onto either crate's — it stays a regression,
-    /// listed as ambiguous, and the denial says so.
-    #[test]
-    fn the_same_test_name_in_two_crates_stays_distinct() {
-        let mut head = failed_run(&["test shared [-p a --lib]"], &[]);
-        classify(
-            &mut head,
-            base_of(failed_run(&["test shared [-p b --lib]"], &[])),
-        );
-        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(head.regressions, vec!["test shared [-p a --lib]"]);
-        assert!(head.ambiguous.is_empty());
-
-        // Bare head id; the base fails that name in two crates. Which one is it? Not guessed.
-        let mut head = failed_run(&["test shared"], &[]);
-        classify(
-            &mut head,
-            base_of(failed_run(
-                &["test shared [-p a --lib]", "test shared [-p b --lib]"],
-                &[],
-            )),
-        );
-        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
-        assert!(head.pre_existing.is_empty(), "{head:#?}");
+        assert!(!head.denies());
+        assert!(!report_of(vec![head], &[]).env_mismatch());
+        let mixed = ["FAILED tests/a.py::test_x", "test shared"];
+        let mut head = failed_run(&mixed, &[]);
+        classify(&mut head, base_of(failed_run(&mixed, &[])));
+        assert_eq!(head.pre_existing, vec!["FAILED tests/a.py::test_x"]);
         assert_eq!(head.regressions, vec!["test shared"]);
-        assert_eq!(head.ambiguous, vec!["test shared"]);
-        let denial = report_of(vec![head], &[]).denial_reason();
-        assert!(
-            denial.contains("could not be told apart") && denial.contains("not guessed"),
-            "{denial}"
-        );
-
-        // Head red in two crates by that name, base bare: either could be the base's one.
-        let mut head = failed_run(
-            &["test shared [-p a --lib]", "test shared [-p b --lib]"],
-            &[],
-        );
-        classify(&mut head, base_of(failed_run(&["test shared"], &[])));
-        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(head.regressions.len(), 2, "{head:#?}");
-        assert_eq!(head.ambiguous.len(), 2);
-
-        // A bare head id beside its crate-A twin that the base shares exactly: the twin matches,
-        // the bare one is a second failure that stays a regression.
-        let mut head = failed_run(&["test shared [-p a --lib]", "test shared"], &[]);
-        classify(
-            &mut head,
-            base_of(failed_run(&["test shared [-p a --lib]"], &[])),
-        );
-        assert_eq!(head.pre_existing, vec!["test shared [-p a --lib]"]);
-        assert_eq!(head.regressions, vec!["test shared"]);
-        assert_eq!(head.ambiguous, vec!["test shared"]);
+        assert!(head.denies());
     }
 
     /// A `cargo test --workspace` check whose head-only failures are `ids`, as classify leaves it.
@@ -9642,9 +9001,7 @@ mod tests {
     /// (passed alone)" and does not deny; when every one does, the check is `flaky_under_load`.
     #[test]
     fn a_failure_that_passes_alone_is_flaky_and_does_not_block() {
-        let ids: Vec<String> = (0..27)
-            .map(|i| format!("test t::load{i} [-p core --lib]"))
-            .collect();
+        let ids: Vec<String> = (0..27).map(|i| format!("test t::load{i}")).collect();
         let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
         let (check, mut run) = regression_run(&refs);
         let mut bounds = Vec::new();
@@ -9667,11 +9024,11 @@ mod tests {
         assert_eq!(run.not_rechecked, 0);
         assert!(run.reruns[0]
             .argv
-            .ends_with(&s(&["-p", "core", "--lib", "--", "--exact", "t::load0"])));
+            .ends_with(&s(&["--no-fail-fast", "--", "--exact", "t::load0"])));
 
         // A failure kept as ambiguous (one side's binary unknown) that passes alone is flaky,
         // not "kept as a regression" too.
-        let (check, mut run) = regression_run(&["test t::x [-p core --lib]"]);
+        let (check, mut run) = regression_run(&["test t::x"]);
         run.ambiguous = run.regressions.clone();
         let mut bounds = Vec::new();
         recheck_alone(
@@ -9911,124 +9268,20 @@ mod tests {
         assert_eq!(load_band(Some(f64::NAN), 14), None);
     }
 
-    /// core#481: a regression in crate B is not masked by the same-named red test in crate A,
-    /// and an identical failure set is the FACT `pre_existing_in_sandbox` — never the inference
-    /// `floor_env_mismatch`.
-    #[test]
-    fn a_same_named_failure_in_another_crate_is_a_regression_481() {
-        let mut head = failed_run(&["test t::shared [-p b --lib]"], &[]);
-        classify(
-            &mut head,
-            base_of(failed_run(&["test t::shared [-p a --lib]"], &[])),
-        );
-        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(head.regressions, vec!["test t::shared [-p b --lib]"]);
-        assert!(head.denies());
-
-        let mut head = failed_run(&["test t::shared [-p a --lib]"], &[]);
-        classify(
-            &mut head,
-            base_of(failed_run(&["test t::shared [-p a --lib]"], &[])),
-        );
-        assert_eq!(
-            head.classification.as_deref(),
-            Some(PRE_EXISTING_IN_SANDBOX)
-        );
-        assert!(!head.denies());
-        let report = report_of(vec![head], &[]);
-        assert!(
-            !report.env_mismatch(),
-            "equal sets assert no environment cause"
-        );
-    }
-
-    /// core#546: failures carrying the nested-sandbox launcher signature on BOTH trees are
-    /// `env_cannot_run` (non-denying, counted on the card); a head-only failure with the same
-    /// signature still denies but the floor note names the likely cause.
-    #[test]
-    fn a_launcher_signature_failure_is_env_cannot_run_546() {
-        let ids = [
-            "test validator::jail [-p wicked-core --lib]",
-            "test r::s [-p wicked-core --lib]",
-        ];
-        let mut head = failed_run(&ids, &ids);
-        classify(&mut head, base_of(failed_run(&ids, &ids)));
-        assert_eq!(head.classification.as_deref(), Some(ENV_CANNOT_RUN));
-        assert!(!head.denies());
-        assert!(
-            head.summary()
-                .contains("[env_cannot_run: 2 tests cannot run under the floor's nested sandbox"),
-            "{}",
-            head.summary()
-        );
-        let report = report_of(vec![head], &[]);
-        assert!(report.passed && report.env_mismatch());
-        let note = report
-            .classification_note()
-            .expect("the env count is on the note");
-        assert!(
-            note.contains("could not run 2 tests on this host")
-                && note.contains("external CI is the test gate"),
-            "{note}"
-        );
-
-        // Mixed: one genuinely pre-existing failure beside the env class ⇒ pre-existing, env
-        // still counted.
-        let mixed = ["test a::real [--lib]", "test a::jail [--lib]"];
-        let mut head = failed_run(&mixed, &["test a::jail [--lib]"]);
-        classify(
-            &mut head,
-            base_of(failed_run(&mixed, &["test a::jail [--lib]"])),
-        );
-        assert_eq!(
-            head.classification.as_deref(),
-            Some(PRE_EXISTING_IN_SANDBOX)
-        );
-
-        // A NEW sandbox-spawning test: head-only, signature on the head ⇒ still a regression.
-        let mut head = failed_run(
-            &["test a::jail [--lib]", "test a::new_jail [--lib]"],
-            &["test a::jail [--lib]", "test a::new_jail [--lib]"],
-        );
-        classify(
-            &mut head,
-            base_of(failed_run(
-                &["test a::jail [--lib]"],
-                &["test a::jail [--lib]"],
-            )),
-        );
-        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
-        assert!(head.denies());
-        let report = report_of(vec![head], &[]);
-        let note = report
-            .classification_note()
-            .expect("the advisory rides the note");
-        assert!(
-            note.contains("test a::new_jail [--lib]")
-                && note.contains("same env class as 1 pre-existing id;")
-                && note.contains("still denied"),
-            "{note}"
-        );
-        assert!(report_of(vec![failed_run(&["test x"], &[])], &[])
-            .classification_note()
-            .is_none());
-    }
-
-    /// core#553: the isolated re-run is the check's own `cargo test`, narrowed to the id's binary
-    /// and `--exact` name; any other runner is not re-run.
+    /// core#553: the isolated re-run is the check's own `cargo test`, unchanged, plus `--exact`
+    /// and the name (core#1060: no binary to narrow to); any other runner is not re-run.
     #[test]
     fn an_isolated_rerun_narrows_cargo_test_to_the_one_id_553() {
         let argv = s(&["cargo", "test", "--locked", "--workspace", "--no-fail-fast"]);
         assert_eq!(
-            isolated_rerun_argv(&argv, "test actor::t::a_stop [-p wicked-core --lib]"),
+            isolated_rerun_argv(&argv, "test actor::t::a_stop"),
             Some((
                 s(&[
                     "cargo",
                     "test",
                     "--locked",
-                    "-p",
-                    "wicked-core",
-                    "--lib",
+                    "--workspace",
+                    "--no-fail-fast",
                     "--",
                     "--exact",
                     "actor::t::a_stop"
@@ -10053,7 +9306,7 @@ mod tests {
                 "--exact",
                 "t::y"
             ])),
-            "an unqualified id keeps the command's own selection"
+            "the command's own selection and test arguments stay"
         );
         assert!(isolated_rerun_argv(&s(&["npm", "run", "test"]), "test t::y").is_none());
         assert!(
@@ -10329,19 +9582,15 @@ mod tests {
             "{c:#?}"
         );
         assert!(report.passed, "{report:#?}");
-        assert_eq!(
-            c.regressions,
-            vec!["test t::flaky [-p flake_fixture --lib]".to_string()]
-        );
+        assert_eq!(c.regressions, vec!["test t::flaky".to_string()]);
         assert_eq!(c.reruns.len(), 1);
         assert!(c.reruns[0].passed(), "{:?}", c.reruns[0]);
         assert!(c.reruns[0]
             .argv
-            .ends_with(&s(&["--lib", "--", "--exact", "t::flaky"])));
+            .ends_with(&s(&["--no-fail-fast", "--", "--exact", "t::flaky"])));
         let note = report.classification_note().expect("a flake is disclosed");
         assert!(
-            note.contains("test t::flaky [-p flake_fixture --lib]")
-                && note.contains("flaky_under_load"),
+            note.contains("test t::flaky") && note.contains("flaky_under_load"),
             "{note}"
         );
 
@@ -10874,9 +10123,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
-    // ---- core#1063 (folded into #1060): the libtest qualifier is the target the floor ran, never
-    // a line of output. 13 review rounds forged the text-read qualifier; the forgeries replay
-    // here through the per-target path and every one stays a regression.
+    // ---- core#1060 round 14: no libtest qualification. Every forgery the review rounds found (8 to
+    // 13) and codex's three round-14 fixtures replay here as faked outputs; each one denies.
 
     fn adj_text(v: &[&str]) -> String {
         let mut t = v.join("\n");
@@ -10884,211 +10132,40 @@ mod tests {
         t
     }
 
-    /// A split cargo check with every process faked: `targets` is cargo's list (package,
-    /// selector — `--doc` for a library's doc tests), `outputs` each target's `-p <package>
-    /// <selector>` with its exit and two streams. An unexpected run fails the test.
-    fn split_run(
-        targets: &[(&str, &str)],
-        outputs: &[(&str, Option<i32>, &str, &str)],
-    ) -> CheckRun {
-        let plan = cargo_plan(&s(&["cargo", "test", "--locked", "--no-fail-fast"])).unwrap();
-        let fake = |argv: &[String], _: &[String], collect: bool| -> Spawned {
-            if collect {
-                assert_eq!(argv, plan.list_argv().as_slice());
-                let artifacts = targets
-                    .iter()
-                    .map(|(p, sel)| CargoArtifact {
-                        package: p.to_string(),
-                        selector: (*sel != "--doc").then(|| sel.to_string()),
-                        doc: *sel == "--doc",
-                    })
-                    .collect();
-                return Spawned {
-                    exit_code: Some(0),
-                    out: LineScan {
-                        artifacts,
-                        ..LineScan::default()
-                    },
-                    ..Spawned::default()
-                };
-            }
-            let joined = argv.join(" ");
-            let (_, exit, out, err) = outputs
-                .iter()
-                .find(|(t, ..)| joined == format!("cargo test --locked --no-fail-fast {t}"))
-                .unwrap_or_else(|| panic!("unexpected run: {joined}"));
-            Spawned {
-                exit_code: *exit,
-                out: scan_of(out),
-                err: scan_of(err),
-                ..Spawned::default()
-            }
-        };
+    /// The head's scanned ids classified against the base's, both read the way the floor reads a
+    /// check's two streams.
+    fn scanned_head(head: (&str, &str), base: (&str, &str)) -> CheckRun {
+        fn ids(out: &str, err: &str) -> Vec<String> {
+            qualify(scan_of(out), scan_of(err)).0
+        }
+        let (h, b) = (ids(head.0, head.1), ids(base.0, base.1));
+        let v = |x: &[String]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut run = failed_run(&[], &[]);
-        run.argv = s(&["cargo", "test", "--locked", "--no-fail-fast"]);
-        run_cargo_targets(&plan, &fake, &[], &mut run);
+        run.failure_ids = v(&h);
+        let mut base_run = failed_run(&[], &[]);
+        base_run.failure_ids = v(&b);
+        classify(&mut run, base_of(base_run));
         run
     }
 
-    /// The head split run classified against the base's.
-    fn split_head(head: CheckRun, base: CheckRun) -> CheckRun {
-        let mut head = head;
-        classify(&mut head, base_of(base));
-        head
-    }
-
+    /// Rounds 8 to 14 of the #1060 reviews, each a way text the change's tests can print (or a
+    /// per-target split) hid a real libtest regression behind a same-named base failure. With no
+    /// libtest qualification at all, the head's failure is read (never dropped) and never matched:
+    /// every case denies.
     #[test]
-    fn cargo_plan_splits_only_a_plain_cargo_test_1063() {
-        let plan = cargo_plan(&s(&["cargo", "test", "--locked", "--no-fail-fast"])).unwrap();
-        assert_eq!(
-            plan.list_argv(),
-            s(&[
-                "cargo",
-                "test",
-                "--locked",
-                "--no-fail-fast",
-                "--no-run",
-                "--message-format=json-render-diagnostics"
-            ])
-        );
-        assert_eq!(
-            plan.target_argv("b", "--test common"),
-            s(&[
-                "cargo",
-                "test",
-                "--locked",
-                "--no-fail-fast",
-                "-p",
-                "b",
-                "--test",
-                "common"
-            ])
-        );
-        // Package selection is cargo's (step 0); features, toolchain and test args pass through.
-        let plan = cargo_plan(&s(&[
-            "cargo",
-            "+nightly",
-            "test",
-            "--workspace",
-            "--exclude",
-            "x",
-            "-p",
-            "a",
-            "--package=c",
-            "-pd",
-            "--features",
-            "f",
-            "--",
-            "--nocapture",
-        ]))
-        .unwrap();
-        assert_eq!(
-            plan.target_argv("a", "--lib"),
-            s(&[
-                "cargo",
-                "+nightly",
-                "test",
-                "--features",
-                "f",
-                "-p",
-                "a",
-                "--lib",
-                "--",
-                "--nocapture"
-            ])
-        );
-        assert!(plan.list_argv().contains(&"--exclude".to_string()));
-        assert!(!plan.list_argv().contains(&"--nocapture".to_string()));
-        // Not split: not `cargo test`, targets already chosen (the isolated re-run among them),
-        // a dangling `-p`, or a message format of its own.
-        for argv in [
-            s(&["sh", "-c", "cargo test"]),
-            s(&["cargo", "build"]),
-            s(&["cargo", "test", "--lib"]),
-            s(&["cargo", "test", "--test=it"]),
-            s(&["cargo", "test", "--doc"]),
-            s(&["cargo", "test", "-p"]),
-            s(&["cargo", "test", "--message-format=json"]),
-            isolated_rerun_argv(&s(&["cargo", "test", "--workspace"]), "test x [-p a --lib]")
-                .unwrap()
-                .0,
-        ] {
-            assert!(cargo_plan(&argv).is_none(), "{argv:?}");
-        }
-    }
-
-    /// Cargo's own artifact list names the targets — real `cargo test --no-run
-    /// --message-format=json` lines (cargo 1.99): a library's unit tests and doc tests, an
-    /// integration test; a dependency's library (not tested) runs nothing; a forged line can only
-    /// add a run, never one that reads as a flag.
-    #[test]
-    fn cargo_targets_come_from_cargos_own_artifacts_1063() {
-        let dir = scratch("artifacts");
-        for (pkg, name) in [("a", "a"), ("b", "b"), ("c", "c"), ("evil", "--lib")] {
-            std::fs::create_dir_all(dir.join(pkg)).unwrap();
-            std::fs::write(
-                dir.join(pkg).join("Cargo.toml"),
-                format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+    fn no_forged_output_lets_a_libtest_failure_read_as_pre_existing_1060() {
+        let fail = |name: &str| {
+            format!(
+                "running 2 tests\ntest {name} ... FAILED\ntest other ... ok\n\nfailures:\n    \
+                 {name}\n\ntest result: FAILED. 1 passed; 1 failed\n"
             )
-            .unwrap();
-        }
-        let line = |pkg: &str, kind: &str, name: &str, doctest: bool, test: bool| {
-            serde_json::json!({
-                "reason": "compiler-artifact",
-                "package_id": format!("path+file:///w/{pkg}#0.1.0"),
-                "manifest_path": dir.join(pkg).join("Cargo.toml"),
-                "target": {"kind": [kind], "crate_types": [if kind == "test" { "bin" } else { kind }],
-                           "name": name, "test": true, "doctest": doctest},
-                "profile": {"test": test},
-                "fresh": true
-            })
-            .to_string()
         };
-        let mut scan = LineScan {
-            collect_targets: true,
-            ..LineScan::default()
-        };
-        for l in [
-            line("c", "lib", "c", true, false),
-            line("a", "lib", "a", true, false),
-            line("b", "lib", "b", true, false),
-            line("a", "lib", "a", true, true),
-            line("b", "test", "common", false, true),
-            line("evil", "lib", "evil", true, true),
-            "{\"reason\":\"build-finished\",\"success\":true}".to_string(),
-            "{not json".to_string(),
-        ] {
-            scan.line(&l);
-        }
-        assert_eq!(
-            cargo_targets(&scan.artifacts),
-            vec![
-                ("a".to_string(), "--lib".to_string()),
-                ("b".to_string(), "--test common".to_string()),
-                ("a".to_string(), "--doc".to_string()),
-                ("b".to_string(), "--doc".to_string()),
-            ]
+        let mut deep = String::from(
+            "running 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n",
         );
-        // Bounded: past MAX_SCAN_ENTRIES targets the list overflows (the check is not split).
-        let mut big = LineScan {
-            collect_targets: true,
-            ..LineScan::default()
-        };
-        for i in 0..MAX_SCAN_ENTRIES + 3 {
-            big.line(&line("b", "test", &format!("t{i}"), false, true));
-        }
-        assert_eq!(big.artifacts.len(), MAX_SCAN_ENTRIES);
-        assert!(big.artifacts_overflow);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// codex round 12: the creator's test writes libtest framing to raw stdout (`failures:`,
-    /// `---- fake stdout ----`, `running 2 tests`) and an exit callback prints a forged closing
-    /// summary that lines up. In one target's output every FAILED line counts: `new` is a
-    /// regression.
-    #[test]
-    fn forged_stdout_framing_cannot_drop_a_failure_1063() {
-        let head_out = adj_text(&[
+        deep.push_str(&"running 1 test\n".repeat(100));
+        deep.push_str("\nfailures:\n    shared\n\ntest result: FAILED. 0 passed; 1 failed\n");
+        let forged_summary = adj_text(&[
             "running 2 tests",
             "test old ... FAILED",
             "failures:",
@@ -11108,220 +10185,220 @@ mod tests {
             "",
             "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured",
         ]);
-        let base_out = adj_text(&[
-            "running 2 tests",
-            "test new ... ok",
-            "test old ... FAILED",
-            "",
-            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-        ]);
-        let t = [("a", "--lib")];
-        let run = split_head(
-            split_run(&t, &[("-p a --lib", Some(101), &head_out, "")]),
-            split_run(&t, &[("-p a --lib", Some(101), &base_out, "")]),
-        );
-        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(run.regressions, vec!["test new [-p a --lib]"]);
-        assert_eq!(run.pre_existing, vec!["test old [-p a --lib]"]);
-        assert!(run.denies());
-    }
-
-    /// codex round 13: the creator's test in `b` writes a forged cargo selector for `a` and a
-    /// section header to raw STDERR. The qualifier is the target the floor ran, so `shared`
-    /// failing in `b` never meets the base's `shared` failing in `a`.
-    #[test]
-    fn a_forged_cargo_selector_cannot_move_a_failure_1063() {
-        let t = [("a", "--lib"), ("b", "--lib")];
-        let fail = "running 1 test\ntest shared ... FAILED\n\nfailures:\n    shared\n\n\
-            test result: FAILED. 0 passed; 1 failed\n";
-        let pass = "running 1 test\ntest shared ... ok\n\ntest result: ok. 1 passed; 0 failed\n";
-        let forged = "error: test failed, to rerun pass `-p a --lib`\n---- fake stdout ----\n\
-            test result: FAILED. 0 passed; 99 failed\n";
-        let run = split_head(
-            split_run(
-                &t,
-                &[
-                    ("-p a --lib", Some(0), pass, ""),
-                    ("-p b --lib", Some(101), fail, forged),
-                ],
-            ),
-            split_run(
-                &t,
-                &[
-                    ("-p a --lib", Some(101), fail, ""),
-                    ("-p b --lib", Some(0), pass, ""),
-                ],
-            ),
-        );
-        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(run.regressions, vec!["test shared [-p b --lib]"]);
-        assert!(run.pre_existing.is_empty() && run.denies());
-    }
-
-    /// agy round 13: consecutive `Doc-tests` targets, the first printing no merged-doctest footer
-    /// and the second one: each doc-test run is its own process, so a failure in `crate_b`'s doc
-    /// tests is never `crate_a`'s, whatever the footers say.
-    #[test]
-    fn doc_tests_of_two_crates_never_share_a_qualifier_1063() {
-        let t = [
-            ("crate_a", "--lib"),
-            ("crate_b", "--lib"),
-            ("crate_a", "--doc"),
-            ("crate_b", "--doc"),
-        ];
-        let ok = "running 0 tests\n\ntest result: ok. 0 passed; 0 failed\n";
-        let doc_fail = "running 1 test\ntest src/lib.rs - f (line 1) ... FAILED\n\nfailures:\n    \
+        let doc = "running 1 test\ntest src/lib.rs - f (line 1) ... FAILED\n\nfailures:\n    \
             src/lib.rs - f (line 1)\n\ntest result: FAILED. 0 passed; 1 failed\n\n\
             all doctests ran in 0.4s; merged doctests compilation took 0.3s\n";
-        let doc_ok = "running 1 test\ntest src/lib.rs - f (line 1) ... ok\n\n\
-            test result: ok. 1 passed; 0 failed\n\nall doctests ran in 0.4s\n";
-        let run = split_head(
-            split_run(
-                &t,
-                &[
-                    ("-p crate_a --lib", Some(0), ok, ""),
-                    ("-p crate_b --lib", Some(0), ok, ""),
-                    ("-p crate_a --doc", Some(0), ok, ""),
-                    ("-p crate_b --doc", Some(101), doc_fail, ""),
-                ],
+        // (label, head (stdout, stderr), base (stdout, stderr), the id that must deny)
+        type Streams = (String, String);
+        let cases: Vec<(&str, Streams, Streams, &str)> = vec![
+            (
+                "r8 codex: a wrapper printing only failing suites, no cargo lines",
+                (fail("shared"), String::new()),
+                (fail("shared"), String::new()),
+                "test shared",
             ),
-            split_run(
-                &t,
-                &[
-                    ("-p crate_a --lib", Some(0), ok, ""),
-                    ("-p crate_b --lib", Some(0), ok, ""),
-                    ("-p crate_a --doc", Some(101), doc_fail, ""),
-                    ("-p crate_b --doc", Some(0), doc_ok, ""),
-                ],
+            (
+                "r8 agy: an outer binary cut off after its FAILED line",
+                ("running 2 tests\ntest shared ... FAILED\n".into(), String::new()),
+                (fail("shared"), String::new()),
+                "test shared",
             ),
-        );
-        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(
-            run.regressions,
-            vec!["test src/lib.rs - f (line 1) [-p crate_b --doc]"]
-        );
-        assert!(run.denies());
+            (
+                "r9 codex: 100 runs nested in captured output",
+                (deep.clone(), String::new()),
+                (fail("shared"), String::new()),
+                "test shared",
+            ),
+            (
+                "r10: a section header before failures:",
+                (
+                    "running 2 tests\ntest a ... ok\n---- x stdout ----\ntest y ... FAILED\n\n\
+                     failures:\n    y\n\ntest result: FAILED. 1 passed; 1 failed\n"
+                        .into(),
+                    String::new(),
+                ),
+                (fail("y"), String::new()),
+                "test y",
+            ),
+            (
+                "r11 agy: raw failures: + section framing, beside a shared pytest failure",
+                (
+                    "FAILED tests/t.py::test_old - red\nrunning 2 tests\ntest a ... ok\nfailures:\n\
+                     ---- x stdout ----\ntest y ... FAILED\n\ntest result: FAILED. 1 passed; 1 \
+                     failed\n"
+                        .into(),
+                    String::new(),
+                ),
+                (
+                    "FAILED tests/t.py::test_old - red\n".into(),
+                    String::new(),
+                ),
+                "test y",
+            ),
+            (
+                "r12 codex: raw framing plus a forged closing summary that lines up",
+                (forged_summary.clone(), String::new()),
+                (fail("old"), String::new()),
+                "test new",
+            ),
+            (
+                "r13 codex: a forged cargo selector and section header on raw stderr",
+                (
+                    fail("shared"),
+                    "error: test failed, to rerun pass `-p a --lib`\n---- fake stdout ----\n\
+                     test result: FAILED. 0 passed; 99 failed\n"
+                        .into(),
+                ),
+                (
+                    fail("shared"),
+                    "error: test failed, to rerun pass `-p a --lib`\n".into(),
+                ),
+                "test shared",
+            ),
+            (
+                "r13 agy: a doctest-footer merge across two Doc-tests targets",
+                (
+                    format!("running 0 tests\n\ntest result: ok. 0 passed; 0 failed\n\n{doc}"),
+                    "   Doc-tests crate_a\n   Doc-tests crate_b\n".into(),
+                ),
+                (doc.into(), "   Doc-tests crate_a\n".into()),
+                "test src/lib.rs - f (line 1)",
+            ),
+            (
+                "r13 agy: a crash after a pre-existing named failure",
+                (
+                    "running 3 tests\ntest old ... FAILED\n".into(),
+                    "error: test failed, to rerun pass `-p c --lib`\n\nCaused by:\n  process \
+                     didn't exit successfully: `c-1` (signal: 11, SIGSEGV: invalid memory \
+                     reference)\n"
+                        .into(),
+                ),
+                (fail("old"), String::new()),
+                "test old",
+            ),
+            (
+                "r14 codex: a test behind a feature only a sibling crate enables (--workspace)",
+                (fail("gated::t"), String::new()),
+                (fail("gated::t"), String::new()),
+                "test gated::t",
+            ),
+            (
+                "r14 codex: a package named with single quotes",
+                (fail("quoted::t"), String::new()),
+                (fail("quoted::t"), String::new()),
+                "test quoted::t",
+            ),
+            (
+                "r13 agy: a nested-sandbox launcher signature (the env class is gone: it denies)",
+                (
+                    "running 1 test\ntest jail ... FAILED\n\nfailures:\n\n---- jail stdout \
+                     ----\nsandbox-exec: sandbox_apply: Operation not permitted\n"
+                        .into(),
+                    String::new(),
+                ),
+                (
+                    "running 1 test\ntest jail ... FAILED\n\nfailures:\n\n---- jail stdout \
+                     ----\nsandbox-exec: sandbox_apply: Operation not permitted\n"
+                        .into(),
+                    String::new(),
+                ),
+                "test jail",
+            ),
+            (
+                "r14 codex: a doctest-only library (`[lib] test = false`)",
+                (doc.into(), String::new()),
+                (doc.into(), String::new()),
+                "test src/lib.rs - f (line 1)",
+            ),
+        ];
+        for (label, head, base, must) in cases {
+            let run = scanned_head((&head.0, &head.1), (&base.0, &base.1));
+            assert!(
+                run.failure_ids.iter().any(|i| i == must),
+                "{label}: {must} was read: {:?}",
+                run.failure_ids
+            );
+            assert_eq!(
+                run.classification.as_deref(),
+                Some(REGRESSION),
+                "{label}: {run:?}"
+            );
+            assert!(run.regressions.iter().any(|r| r == must), "{label}");
+            assert!(run.pre_existing.iter().all(|p| !p.starts_with("test ")));
+            assert!(run.denies(), "{label}");
+        }
     }
 
-    /// A target that fails without naming a test (a harness of its own, a compile-time panic) or
-    /// dies other than libtest's 101 (a crash, a signal) carries `[<target>] exited <how>`: the
-    /// base's same exit matches it, a new one is a regression, and it is never re-run alone. A
-    /// launcher signature in a target's output makes its failures env candidates.
+    /// The isolated flake re-run is the check's own argv plus `-- --exact <name>` (after any test
+    /// arguments it already passes): it runs every test of that name in every binary, so the id
+    /// clears only when that run exits 0 AND prints the name `ok` ([`recheck_alone`]).
     #[test]
-    fn a_target_that_dies_is_its_own_failure_1063() {
-        let t = [("b", "--test harness"), ("c", "--lib")];
-        let crash = "running 2 tests\ntest t::bad ... FAILED\n";
-        let run = split_run(
-            &t,
-            &[
-                (
-                    "-p b --test harness",
-                    Some(1),
-                    "custom harness: 1 failure\n",
-                    "",
-                ),
-                ("-p c --lib", None, crash, ""),
-            ],
-        );
+    fn the_flake_rerun_is_the_checks_own_argv_with_exact_1060() {
+        let argv = s(&["cargo", "test", "--locked", "--no-fail-fast", "-p", "core"]);
         assert_eq!(
-            run.failure_ids,
-            vec![
-                "[-p b --test harness] exited with code 1",
-                "test t::bad [-p c --lib]",
-                "[-p c --lib] exited by a signal",
-            ]
+            isolated_rerun_argv(&argv, "test a::b"),
+            Some((
+                s(&[
+                    "cargo",
+                    "test",
+                    "--locked",
+                    "--no-fail-fast",
+                    "-p",
+                    "core",
+                    "--",
+                    "--exact",
+                    "a::b"
+                ]),
+                "a::b".to_string()
+            ))
         );
-        assert!(!run.passed());
-        let base = split_run(
-            &t,
-            &[
-                (
-                    "-p b --test harness",
-                    Some(1),
-                    "custom harness: 1 failure\n",
-                    "",
-                ),
-                ("-p c --lib", Some(101), "test t::bad ... FAILED\n", ""),
-            ],
-        );
-        let head = split_head(run, base);
-        assert_eq!(head.regressions, vec!["[-p c --lib] exited by a signal"]);
-        assert!(
-            isolated_rerun_argv(&s(&["cargo", "test"]), "[-p c --lib] exited by a signal")
-                .is_none()
-        );
-        // Env: the launcher signature marks THAT target's failures, on both trees.
-        let t = [("c", "--lib")];
-        let jailed = "test sb ... FAILED\nsandbox-exec: sandbox_apply: Operation not permitted\n";
-        let env_run = || split_run(&t, &[("-p c --lib", Some(101), jailed, "")]);
-        assert_eq!(env_run().env_cannot_run, vec!["test sb [-p c --lib]"]);
-        let head = split_head(env_run(), env_run());
-        assert_eq!(head.classification.as_deref(), Some(ENV_CANNOT_RUN));
-    }
-
-    /// A cargo check the floor cannot split (a wrapper, explicit targets) runs as one process:
-    /// its libtest ids are `[?]`, never matched and never re-run alone — a wrapper that prints
-    /// only its failing suites (codex round 8) cannot pass a moved failure off as pre-existing.
-    /// Colored output reads as plain.
-    #[test]
-    fn an_unsplit_run_never_matches_a_libtest_id_1063() {
-        let colored = "\u{1b}[1mtest shared ... \u{1b}[31mFAILED\u{1b}[0m\n";
-        let (ids, _, _, _) = qualify(scan_of(colored), LineScan::default(), None);
-        assert_eq!(ids, vec!["test shared [?]"]);
+        let with_args = s(&["cargo", "+nightly", "test", "--", "--nocapture"]);
         assert_eq!(
-            strip_ansi("\u{1b}]8;;http://x\u{7}link\u{1b}]8;;\u{7} ok"),
-            "link ok"
+            isolated_rerun_argv(&with_args, "test a::b").map(|r| r.0),
+            Some(s(&[
+                "cargo",
+                "+nightly",
+                "test",
+                "--",
+                "--nocapture",
+                "--exact",
+                "a::b"
+            ]))
         );
-        let mut head = failed_run(&["test shared [?]"], &[]);
-        classify(&mut head, base_of(failed_run(&["test shared [?]"], &[])));
-        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(head.ambiguous, vec!["test shared [?]"]);
-        assert!(head.denies());
-        let mut head = failed_run(&["test shared [-p b --lib]"], &[]);
-        classify(&mut head, base_of(failed_run(&["test shared [?]"], &[])));
-        assert_eq!(head.ambiguous, vec!["test shared [-p b --lib]"]);
-        assert!(
-            isolated_rerun_argv(&s(&["cargo", "test", "--workspace"]), "test shared [?]").is_none()
+        // A stored record of an earlier floor carried a qualifier: the name is what re-runs.
+        assert_eq!(
+            isolated_rerun_argv(&argv, "test a::b [-p x --lib]").map(|r| r.1),
+            Some("a::b".to_string())
         );
+        assert!(isolated_rerun_argv(&s(&["sh", "-c", "cargo test"]), "test a::b").is_none());
+        assert!(isolated_rerun_argv(&argv, "FAILED tests/t.py::x").is_none());
     }
 
     /// Past [`MAX_FAILURE_IDS`] the dropped ids could hide the head's one new failure behind a
     /// base that shares every kept one: the check carries [`FAILURE_IDS_TRUNCATED`], which
-    /// nothing matches (not even the base's own marker) — one process or many.
+    /// nothing matches (not even the base's own marker).
     #[test]
-    fn failure_ids_past_the_cap_never_read_as_pre_existing_1063() {
+    fn failure_ids_past_the_cap_never_read_as_pre_existing_1060() {
         let shared: String = (0..MAX_FAILURE_IDS)
             .map(|i| format!("FAILED tests/t.py::test_{i} - red\n"))
             .collect();
         let head = format!("{shared}FAILED tests/t.py::test_new - red\n");
         let base = format!("{shared}FAILED tests/t.py::test_other - red\n");
-        let (ids, _, _, _) = qualify(scan_of(&head), LineScan::default(), None);
+        let (ids, _, _) = qualify(scan_of(&head), LineScan::default());
         assert_eq!(ids.len(), MAX_FAILURE_IDS + 1);
         assert_eq!(ids.last().map(String::as_str), Some(FAILURE_IDS_TRUNCATED));
-        let (b_ids, _, _, _) = qualify(scan_of(&base), LineScan::default(), None);
-        fn v(x: &[String]) -> Vec<&str> {
-            x.iter().map(String::as_str).collect()
-        }
-        let mut run = failed_run(&v(&ids), &[]);
-        classify(&mut run, base_of(failed_run(&v(&b_ids), &[])));
+        let run = scanned_head((&head, ""), (&base, ""));
         assert_eq!(run.regressions, vec![FAILURE_IDS_TRUNCATED]);
         assert!(run.denies());
-        // Across targets: each one's cap, and the check's.
-        let t = [("a", "--lib"), ("b", "--lib")];
-        let many: String = (0..MAX_FAILURE_IDS)
-            .map(|i| format!("test t{i} ... FAILED\n"))
-            .collect();
-        let run = split_run(
-            &t,
-            &[
-                ("-p a --lib", Some(101), &many, ""),
-                ("-p b --lib", Some(101), "test late ... FAILED\n", ""),
-            ],
-        );
-        assert_eq!(run.failure_ids.len(), MAX_FAILURE_IDS + 1);
+        // Colored output reads as plain, and an OSC hyperlink is stripped.
+        let colored = "\u{1b}[1mtest shared ... \u{1b}[31mFAILED\u{1b}[0m\n";
         assert_eq!(
-            run.failure_ids.last().map(String::as_str),
-            Some(FAILURE_IDS_TRUNCATED)
+            qualify(scan_of(colored), LineScan::default()).0,
+            vec!["test shared"]
+        );
+        assert_eq!(
+            strip_ansi("\u{1b}]8;;http://x\u{7}link\u{1b}]8;;\u{7} ok"),
+            "link ok"
         );
     }
 }
