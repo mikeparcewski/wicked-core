@@ -274,21 +274,20 @@ pub const UNATTRIBUTED_FAILURE: &str = "unattributed failure: ";
 pub const NO_CLEAN_RUN: &str =
     "unattributed failure: the check did not run clean with its flaky tests skipped";
 
-/// A line with an ESC that mentions a failure token ([`ESCAPED_FAILURE_TOKENS`]) but yielded no
-/// id in either reading, raw or stripped (core#1060): an escape may have hidden the failure's name,
-/// so it is a failure the floor cannot name. Add-only; a clean confirmation answers for it.
-pub const ESCAPED_FAILURE_LINE: &str = "unattributed failure: an escaped failure line";
-/// The failure tokens of [`ESCAPED_FAILURE_LINE`], matched anywhere in the line, case-sensitive.
-const ESCAPED_FAILURE_TOKENS: &[&str] = &[
-    "FAILED",
-    "FAIL ",
-    "ERROR",
-    "--- FAIL",
-    "Couldn't compile",
-    "could not compile",
-    "test result: FAILED",
-    "failed, to rerun pass",
-];
+/// A line of the check's output carries a control character other than tab — an ESC, a CR
+/// before its end, a backspace, a BEL, any other C0 or C1 character (core#1060). Such bytes can
+/// redraw or hide the text a failure id is read from, and no token list covers every runner
+/// (eslint, tsc, …): the line is a failure the floor cannot name. Add-only; a clean confirmation
+/// answers for it. The floor runs checks without a TTY, so honest runners emit none.
+pub const CONTROL_CHARACTERS: &str = "unattributed failure: control characters in the output";
+// (U+FFFD, an undecodable byte, counts as one: see [`LineScan::line`].)
+
+/// The `cargo test` run's own unattributed ids — its exit (from the floor's argv) and libtest's
+/// verdict lines — expected on ANY failed cargo run, so they say nothing about a claim.
+fn cargo_run_sentinel(id: &str) -> bool {
+    id.strip_prefix(UNATTRIBUTED_FAILURE)
+        .is_some_and(|k| k.starts_with("cargo test "))
+}
 
 /// The `source` of a check's confirmation run ([`recheck_alone`], [`rerun_load_class`]).
 const CONFIRMATION_SOURCE: &str = "confirmation run (core#1060)";
@@ -5284,14 +5283,16 @@ fn judge_claim(ctx: &FloorContext, checks: &[CheckRun]) -> Option<ClaimCheck> {
     let phrase = detect_claim(ctx.claim_text.as_deref()?)?;
     let failing = checks.iter().find(|c| !c.passed() && c.name != "install")?;
     let verdict = match failing.classification.as_deref() {
-        // Every NAMED regression a libtest name the base fails too (core#1060: never matched; the
-        // unattributed ids name nothing): the floor can neither confirm the claim nor reject it.
+        // Every regression a libtest name the base fails too (core#1060: never matched), beside
+        // only the failed cargo run's own ids: the floor can neither confirm the claim nor reject
+        // it. Any other head-only id (a crash, a compile error, a truncated set, control
+        // characters) rejects it.
         Some(REGRESSION)
             if failing.regressions.iter().any(|r| !never_matched(r))
                 && failing
                     .regressions
                     .iter()
-                    .filter(|r| !never_matched(r))
+                    .filter(|r| !cargo_run_sentinel(r))
                     .all(|r| failing.ambiguous.contains(r)) =>
         {
             CLAIM_UNVERIFIED
@@ -5519,38 +5520,23 @@ impl LineScan {
                 }
             }
         }
-        // (core#1060) Ids and markers are read off the raw line as well as the stripped one — a
-        // second reading can only ADD ids (`\x1b[31test new ... FAILED`: the stripper takes the
-        // `t` as the sequence's final byte). A line carrying an ESC that mentions a failure token
-        // yet yielded no id is itself a failure the floor cannot name.
-        let escaped = raw.contains('\u{1b}');
-        let mut yielded = false;
-        if escaped {
-            if let Some(kind) = unattributed_failure_of_line(raw.trim()) {
-                self.add(format!("{UNATTRIBUTED_FAILURE}{kind}"));
-                yielded = true;
-            }
-            let mut eslint = None;
-            if let Some(id) = failure_id_of_line(raw, &mut eslint) {
-                self.add(id);
-                yielded = true;
-            }
+        // (core#1060) A control character other than tab (a CRLF line's final CR excepted, so
+        // Windows output reads clean) makes the line a failure the floor cannot name — whatever
+        // its tokens, whatever it yielded. U+FFFD counts too: the drain decodes lossily, so a raw
+        // 8-bit C1 byte (0x9B, the one-byte CSI) arrives as it. Ids are read from the stripped
+        // reading only, so no id ever carries an escape.
+        let body = raw.strip_suffix('\r').unwrap_or(raw);
+        if body
+            .chars()
+            .any(|c| (c.is_control() && c != '\t') || c == '\u{fffd}')
+        {
+            self.add(CONTROL_CHARACTERS.to_string());
         }
         if let Some(kind) = unattributed_failure_of_line(s) {
             self.add(format!("{UNATTRIBUTED_FAILURE}{kind}"));
-            yielded = true;
         }
         if let Some(id) = failure_id_of_line(line, &mut self.eslint_file) {
             self.add(id);
-            yielded = true;
-        }
-        if escaped
-            && !yielded
-            && [raw, line]
-                .iter()
-                .any(|t| ESCAPED_FAILURE_TOKENS.iter().any(|k| t.contains(k)))
-        {
-            self.add(ESCAPED_FAILURE_LINE.to_string());
         }
         if !self.watch.is_empty() {
             if let Some(name) = s
@@ -10739,11 +10725,12 @@ mod tests {
         let run = scanned_head((&head, ""), (&base, ""));
         assert_eq!(run.regressions, vec![FAILURE_IDS_TRUNCATED]);
         assert!(run.denies());
-        // Colored output reads as plain, and an OSC hyperlink is stripped.
+        // Colored output reads as plain (and its control characters are their own failure id),
+        // and an OSC hyperlink is stripped.
         let colored = "\u{1b}[1mtest shared ... \u{1b}[31mFAILED\u{1b}[0m\n";
         assert_eq!(
             qualify(scan_of(colored), LineScan::default()).0,
-            vec!["test shared"]
+            vec![CONTROL_CHARACTERS.to_string(), "test shared".to_string()]
         );
         assert_eq!(
             strip_ansi("\u{1b}]8;;http://x\u{7}link\u{1b}]8;;\u{7} ok"),
@@ -10993,7 +10980,13 @@ mod tests {
             "progress 40%test new ... FAILED",
         ] {
             let (ids, _, _) = qualify(scan_of(raw), LineScan::default());
-            assert_eq!(ids, vec!["test new"], "{raw:?}");
+            let named: Vec<&String> = ids.iter().filter(|i| !never_matched(i)).collect();
+            assert_eq!(named, vec!["test new"], "{raw:?}");
+            assert_eq!(
+                ids.contains(&CONTROL_CHARACTERS.to_string()),
+                raw.contains('\u{1b}'),
+                "{raw:?}"
+            );
         }
         assert_eq!(
             strip_ansi("\u{1b}]8;;test new ... FAILED"),
@@ -11006,7 +10999,10 @@ mod tests {
             (&format!("{shared}\u{1b}]8;;test new ... FAILED\n"), ""),
             (shared, ""),
         );
-        assert_eq!(run.regressions, vec!["test new"]);
+        assert_eq!(
+            run.regressions,
+            vec!["test new".to_string(), CONTROL_CHARACTERS.to_string()]
+        );
         assert!(run.denies());
         // Forged names: never re-run, never excused.
         let argv = s(&["cargo", "test", "--workspace"]);
@@ -11520,8 +11516,7 @@ mod tests {
         ] {
             let (ids, _, _) = qualify(scan_of(&format!("{line}\n")), LineScan::default());
             assert!(
-                ids.contains(&ESCAPED_FAILURE_LINE.to_string())
-                    || ids.iter().any(|i| !never_matched(i)),
+                ids.contains(&CONTROL_CHARACTERS.to_string()),
                 "{line:?}: {ids:?}"
             );
             let run = scanned_head((&format!("{shared}{line}\n"), ""), (shared, ""));
@@ -11532,9 +11527,9 @@ mod tests {
             );
             assert!(run.denies(), "{line:?}");
         }
-        // A plain line, or an escaped line with no failure token, adds nothing.
+        // A plain line, a tab, a CRLF line ending: nothing.
         let (ids, _, _) = qualify(
-            scan_of("\u{1b}[32mtest ok ... ok\u{1b}[0m\nall good\n"),
+            scan_of("test ok ... ok\nall\tgood\r\nfine\n"),
             LineScan::default(),
         );
         assert!(ids.is_empty(), "{ids:?}");
@@ -11552,7 +11547,10 @@ mod tests {
             ),
             LineScan::default(),
         );
-        assert_eq!(ids, vec!["test new"]);
+        assert_eq!(
+            ids,
+            vec![CONTROL_CHARACTERS.to_string(), "test new".to_string()]
+        );
         let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
         let (check, mut run) = regression_run(&refs);
         let mut argvs = Vec::new();
@@ -11590,6 +11588,118 @@ mod tests {
             assert_eq!(run.not_rechecked, 1);
             assert_eq!(run.classification.as_deref(), Some(REGRESSION));
             assert!(run.denies());
+        }
+    }
+
+    /// agy round 20: a token list always misses a runner (eslint's lowercase `error`, a file
+    /// header `\x1b[/repo/b.js`, tsc's `error TS` inside an OSC), and a shared id on the same line
+    /// once suppressed it. Any control character other than tab is now a failure the floor cannot
+    /// name, whatever the line yields: beside a shared failure, every shape denies.
+    #[test]
+    fn a_control_character_in_the_output_is_an_unattributed_failure_1060() {
+        let shared = "FAILED tests/t.py::test_old - red\n";
+        for extra in [
+            "\u{1b}[/repo/b.js\n\u{1b}[1:2  error  Unexpected  no-undef\n",
+            "\u{1b}]8;;src/a.ts(1,2): error TS2322: bad\u{7}\n",
+            "FAILED tests/t.py::test_old - red \u{1b}[31mFAILED tests/t.py::test_new - red\n",
+            "x\rFAILED tests/t.py::test_new - red\n",
+            "abc\u{8}\u{8}\u{8}FAILED tests/t.py::test_new - red\n",
+            "\u{9b}31mFAILED tests/t.py::test_new - red\n",
+            "\u{fffd}31mFAILED tests/t.py::test_new - red\n",
+        ] {
+            let run = scanned_head((&format!("{shared}{extra}"), ""), (shared, ""));
+            assert_eq!(
+                run.classification.as_deref(),
+                Some(REGRESSION),
+                "{extra:?}: {run:?}"
+            );
+            assert!(
+                run.regressions.contains(&CONTROL_CHARACTERS.to_string()),
+                "{extra:?}"
+            );
+            assert!(run.denies(), "{extra:?}");
+        }
+        // CRLF output (Windows): the final CR is a line ending, not a control character — a
+        // failure the base shares is still pre-existing.
+        let crlf = "FAILED tests/t.py::test_old - red\r\n1 failed, 3 passed in 0.12s\r\n";
+        let run = scanned_head((crlf, ""), (crlf, ""));
+        assert_eq!(
+            run.classification.as_deref(),
+            Some(PRE_EXISTING_IN_SANDBOX),
+            "{run:?}"
+        );
+        assert_eq!(run.pre_existing, vec!["FAILED tests/t.py::test_old"]);
+    }
+
+    /// agy round 20: ids come from the stripped reading only, so a `--color=always` libtest
+    /// flake carries clean ids — re-runnable, with the control-character and cargo ids answered
+    /// for by the clean confirmation run.
+    #[test]
+    fn a_color_always_libtest_flake_recovers_with_clean_ids_1060() {
+        let out = "test t::flaky ... \u{1b}[31mFAILED\u{1b}[0m\n\u{1b}[1mtest result:\u{1b}[0m \
+                   \u{1b}[31mFAILED\u{1b}[0m. 1 passed; 1 failed\n";
+        let (ids, _, _) = qualify(scan_of(out), LineScan::default());
+        assert!(ids.iter().all(|i| !i.contains('\u{1b}')), "{ids:?}");
+        assert!(ids.contains(&"test t::flaky".to_string()), "{ids:?}");
+        assert!(ids.contains(&CONTROL_CHARACTERS.to_string()), "{ids:?}");
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let (mut check, mut run) = regression_run(&refs);
+        check.argv = s(&["cargo", "test", "--workspace", "--", "--color", "always"]);
+        let mut argvs = Vec::new();
+        recheck_alone(
+            &check,
+            &mut run,
+            None,
+            Duration::from_secs(FLAKE_RERUN_BUDGET_S),
+            &mut confirming_rerun(0, &mut argvs),
+        );
+        assert_eq!(
+            run.classification.as_deref(),
+            Some(FLAKY_UNDER_LOAD),
+            "{run:?}"
+        );
+        assert_eq!(run.regressions, vec!["test t::flaky"]);
+        assert!(
+            argvs[0].ends_with(&s(&["--exact", "t::flaky"])),
+            "{argvs:?}"
+        );
+    }
+
+    /// agy round 20 (P3): a creator's "pre-existing" claim is unverified only when every regression
+    /// is a libtest name the base fails too, beside nothing but the failed cargo run's own ids. A
+    /// head-only crash (or any other unattributed failure) rejects it.
+    #[test]
+    fn a_head_only_crash_rejects_a_pre_existing_claim_1060() {
+        let ctx = FloorContext {
+            stage: FloorStage::Creator,
+            claim_text: Some(
+                "Done. The failing test is pre-existing on main and unrelated to my change."
+                    .to_string(),
+            ),
+            ..FloorContext::default()
+        };
+        let claim = |extra: &str| {
+            let mut c = failed_run(&["test x", extra], &[]);
+            c.classification = Some(REGRESSION.to_string());
+            c.regressions = c.failure_ids.clone();
+            c.ambiguous = vec!["test x".to_string()];
+            judge_claim(&ctx, &[c]).map(|v| v.verdict)
+        };
+        assert_eq!(
+            claim(&format!("{UNATTRIBUTED_FAILURE}cargo test exited 101")).as_deref(),
+            Some(CLAIM_UNVERIFIED)
+        );
+        assert_eq!(
+            claim(&format!("{UNATTRIBUTED_FAILURE}cargo test failed")).as_deref(),
+            Some(CLAIM_UNVERIFIED)
+        );
+        for other in [
+            format!("{UNATTRIBUTED_FAILURE}a test process exited abnormally"),
+            format!("{UNATTRIBUTED_FAILURE}a crate did not compile"),
+            CONTROL_CHARACTERS.to_string(),
+            FAILURE_IDS_TRUNCATED.to_string(),
+        ] {
+            assert_eq!(claim(&other).as_deref(), Some(CLAIM_REJECTED), "{other}");
         }
     }
 }
