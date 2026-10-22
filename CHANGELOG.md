@@ -40,16 +40,15 @@ Two release tracks share this file, newest entry first regardless of track:
   output carried a second `test result: FAILED` line (17 such lines for 9 failing binaries). The floor dropped the
   `[-p <crate> --test <target>]` qualifier from every id whenever the two counts differed, so the head ids never
   met the base's qualified ids: pre-existing 0, every base failure a regression. Ids are now qualified only when
-  the two streams describe the same binaries one for one. stdout gives one block per top-level `running N tests`
-  header; a run printed inside a test's captured output is nested, not a binary, and a result line closes the
-  binary only when its counts match the binary's header and failures. stderr gives one entry per cargo `Running` /
-  `Doc-tests` line with its selector. The lists must agree in length and on which binaries failed, with no
-  structural anomaly; otherwise every libtest id stays bare (a silent custom harness can no longer shift a
-  qualifier), and failures read inside nested runs are reported too, so a misread costs a qualifier, never a
-  failure. Head and base ids are compared on (test name,
-  target). Ids qualified with different targets never meet. A bare id never meets a qualified one, because failing
-  ids alone cannot show which binary a bare id came from: it stays a regression, listed as `ambiguous`, and the
-  denial says so rather than guessing. (2) The floor's macOS sandbox refused `/dev/ptmx`, so no PTY or
+  the two streams describe the same binaries one for one: stdout's top-level `running N tests` blocks (a run inside a
+  test's captured output is a nested run on a counted stack; a binary closes only on its own result line, whose
+  counts and preceding `failures:` listing match it) and cargo's `Running` / `Doc-tests` lines with their
+  selectors (ANSI colours stripped). Any disagreement or structural anomaly makes every libtest id of a
+  multi-binary run `test x [?]` (unknown binary), which never matches and is not re-run alone; failures read in
+  captured output are then reported too, so a misread costs a qualifier, never a failure. Head and base ids are compared on (test name,
+  target). Ids qualified with different targets never meet. A bare id never meets a qualified one, and a `[?]` id
+  meets nothing, because failing ids alone cannot show which binary such an id came from: it stays a regression,
+  listed as `ambiguous`, and the denial says so rather than guessing. (2) The floor's macOS sandbox refused `/dev/ptmx`, so no PTY or
   tmux test could run on it. The repo-checks floor (only it, not workers or validators) may now open `/dev/ptmx`
   and write to the `/dev/ttysN` slaves the kernel's `com.apple.sandbox.pty` extension marks as its own. The jail
   may not issue that extension class itself (file, generic, mach and iokit issuance are refused), so a check cannot
@@ -65,6 +64,7 @@ Two release tracks share this file, newest entry first regardless of track:
   factor that stretches other checks' bounds does not apply past it). Tests:
   `a_childs_result_line_in_captured_output_keeps_every_id_qualified` (fails on the previous main: every id bare),
   `a_silent_harness_and_nested_runs_cannot_shift_a_qualifier`,
+  `colored_or_quiet_cargo_output_never_lets_a_moved_failure_match`,
   `head_and_base_ids_match_across_qualified_and_bare_forms`,
   `the_same_test_name_in_two_crates_stays_distinct`, `a_failure_that_passes_alone_is_flaky_and_does_not_block`,
   `a_failure_that_fails_again_alone_stays_a_regression`,

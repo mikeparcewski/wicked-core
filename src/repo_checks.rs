@@ -5365,7 +5365,9 @@ pub(crate) fn launcher_signature(line: &str) -> Option<&'static str> {
 /// in its panic message — 17 result lines for 9 failing binaries, run 2ebd9da2 attempt 4) is
 /// nested, not a binary: a `running N tests` header after the binary's `failures:` line opens a
 /// nested run its own result line closes. A result line closes the binary only when its ran and
-/// failed counts equal the binary's header and its top-level failures. Anything the structure
+/// failed counts equal the binary's header and its top-level failures, and the `failures:`
+/// listing just before it names exactly the binary's own failing tests; after a close only blank
+/// lines may precede the next header (agy on #1060). Anything the structure
 /// cannot explain — a result line with no binary open, the binary's own result rejected, the
 /// block and binary lists disagreeing on length or on which binaries failed (a silent custom
 /// harness, codex on #1060) — leaves EVERY libtest id bare (fail-closed): aggregate counts that
@@ -5388,8 +5390,17 @@ struct LineScan {
     /// libtest: the open binary printed its `failures:` / `successes:` line — its captured
     /// output, where a nested run can appear, follows.
     capture: bool,
-    /// libtest: the depth of nested runs being read inside captured output.
-    depth: usize,
+    /// libtest: the open binary's top-level failing test names, as its `failures:` listing
+    /// prints them.
+    block_names: Vec<String>,
+    /// libtest: the names listed since the open binary's last `failures:` line (`None` once any
+    /// other line breaks the listing).
+    listed: Option<Vec<String>>,
+    /// libtest: a binary just closed — until the next header only blank lines may follow.
+    closed: bool,
+    /// libtest: the nested runs being read inside captured output, innermost last — each one's
+    /// `running N tests` count and its own failing test names.
+    nested: Vec<(usize, Vec<String>)>,
     /// libtest: the captured section a nested run was printed in, restored when it ends.
     outer: Option<String>,
     /// Failure ids read INSIDE nested runs: a child's, not this suite's — unless the structure
@@ -5439,19 +5450,25 @@ impl LineScan {
         }
         // Inside captured output a nested run's header may follow a panic message's own text on
         // the same line (`child failed: running 1 test`, agy on #1060).
-        let in_capture = self.depth > 0 || (self.open && self.capture);
+        let in_capture = !self.nested.is_empty() || (self.open && self.capture);
         let header = if in_capture {
             libtest_running_header_suffix(s)
         } else {
             libtest_running_header(s)
         };
+        if self.closed && !s.is_empty() {
+            // After a binary's result line libtest prints the next binary's header and nothing
+            // else: anything first means the "result" was not the binary's own.
+            self.anomaly |= header.is_none();
+            self.closed = false;
+        }
         if let Some(n) = header {
             if in_capture {
                 // A run printed inside a test's captured output.
-                if self.depth == 0 {
+                if self.nested.is_empty() {
                     self.outer = self.section.clone();
                 }
-                self.depth += 1;
+                self.nested.push((n, Vec::new()));
                 return;
             }
             if self.open {
@@ -5464,44 +5481,84 @@ impl LineScan {
             self.open = true;
             self.header_n = n;
             self.block_failures = 0;
+            self.block_names.clear();
+            self.listed = None;
             self.capture = false;
             self.section = None;
             return;
         }
         if let Some(rest) = s.strip_prefix("test result: ") {
-            if self.depth > 0 {
-                self.depth -= 1;
-                if self.depth == 0 {
-                    // Back in the captured section the nested run was printed in.
-                    self.section = self.outer.take();
+            let counts = libtest_counts(rest);
+            let listed_own = |listed: &Option<Vec<String>>, own: &[String]| {
+                listed.as_ref().is_some_and(|l| {
+                    let (mut l, mut own) = (l.clone(), own.to_vec());
+                    l.sort();
+                    own.sort();
+                    l == own
+                })
+            };
+            // The binary's own result: its header's count, its top-level failures, and (when it
+            // failed) a `failures:` listing of exactly them just before.
+            let own = self.open
+                && matches!(counts, Some((ran, failed))
+                    if ran == self.header_n
+                        && failed == self.block_failures
+                        && (failed == 0 || listed_own(&self.listed, &self.block_names)));
+            if let Some((inner_n, inner_names)) = self.nested.last() {
+                // The innermost nested run's own result: its header's count and, when it
+                // failed, a listing of its own failures (a child cut short listed none).
+                let inner_own = matches!(counts, Some((ran, failed))
+                    if ran == *inner_n && (failed == 0 || listed_own(&self.listed, inner_names)));
+                if inner_own {
+                    // The innermost nested run's own result.
+                    self.nested.pop();
+                    if self.nested.is_empty() {
+                        // Back in the captured section the nested run was printed in.
+                        self.section = self.outer.take();
+                    }
+                    return;
                 }
-                return;
-            } else if !self.open {
+                if !own {
+                    return; // a stray line inside a nested run's output
+                }
+                // The binary's own result with a nested run never closed (a child that crashed or
+                // was cut short in a panic message): the nested runs end here (agy on #1060).
+                self.nested.clear();
+                self.outer = None;
+            }
+            if !self.open {
                 // Nothing open to close: something closed the binary early.
                 self.anomaly |= !self.blocks.is_empty();
-            } else {
-                match libtest_counts(rest) {
-                    Some((ran, failed))
-                        if ran == self.header_n && failed == self.block_failures =>
-                    {
-                        if let Some(b) = self.blocks.last_mut() {
-                            *b = failed > 0 || rest.starts_with("FAILED");
-                        }
-                        self.open = false;
-                        self.capture = false;
-                    }
-                    // Inside captured output a stray result line is the output's, not the
-                    // binary's (the section it was printed in goes on); outside it, the binary's
-                    // own line did not add up.
-                    _ if self.capture => return,
-                    _ => self.anomaly = true,
+            } else if own {
+                if let Some(b) = self.blocks.last_mut() {
+                    *b = counts.is_some_and(|(_, failed)| failed > 0) || rest.starts_with("FAILED");
                 }
+                self.open = false;
+                self.capture = false;
+                self.listed = None;
+                self.closed = true;
+            } else if self.capture {
+                // Inside captured output a stray result line is the output's, not the binary's
+                // (the section it was printed in goes on).
+                return;
+            } else {
+                // Outside it, the binary's own line did not add up.
+                self.anomaly = true;
             }
             self.section = None;
             return;
         }
-        if self.depth > 0 {
-            // A nested run's line: captured output of the test it was printed in.
+        if !self.nested.is_empty() {
+            // A nested run's line: captured output of the test it was printed in. Its listing
+            // lines still count, in case the binary's own listing follows a run never closed.
+            if s == "failures:" {
+                self.listed = Some(Vec::new());
+            } else if !s.is_empty() {
+                match self.listed.as_mut() {
+                    Some(names) if line.starts_with("    ") => names.push(s.to_string()),
+                    _ => self.listed = None,
+                }
+            }
             if let (Some(name), Some(_)) = (self.outer.clone(), launcher_signature(s)) {
                 let block = self.blocks.len().checked_sub(1);
                 if !self.env.iter().any(|(n, b)| n == &name && *b == block) {
@@ -5509,6 +5566,11 @@ impl LineScan {
                 }
             }
             if let Some(id) = failure_id_of_line(line, &mut self.eslint_file) {
+                if id.starts_with("test ") {
+                    if let Some((_, names)) = self.nested.last_mut() {
+                        names.push(listing_name(&id));
+                    }
+                }
                 if self.nested_ids.len() < MAX_FAILURE_IDS && !self.nested_ids.contains(&id) {
                     self.nested_ids.push(id);
                 }
@@ -5523,13 +5585,26 @@ impl LineScan {
             .strip_prefix("---- ")
             .and_then(|r| r.strip_suffix(" stdout ----"))
         {
+            // Captured output belongs to an open binary.
+            self.anomaly |= !self.open && !self.blocks.is_empty();
+            self.listed = None;
             self.section = Some(name.to_string());
             return;
         }
         if s == "failures:" || s == "successes:" {
-            self.capture |= self.open && self.depth == 0;
+            self.capture |= self.open && self.nested.is_empty();
+            if self.open {
+                self.listed = Some(Vec::new());
+            }
             self.section = None;
             return;
+        }
+        if self.open && self.capture && !s.is_empty() {
+            // The `failures:` listing: four-space-indented names, nothing else.
+            match self.listed.as_mut() {
+                Some(names) if line.starts_with("    ") => names.push(s.to_string()),
+                _ => self.listed = None,
+            }
         }
         let block = self.blocks.len().checked_sub(1);
         if let Some(name) = self.section.clone() {
@@ -5590,6 +5665,7 @@ impl LineScan {
             }
             if libtest && self.open {
                 self.block_failures += 1;
+                self.block_names.push(listing_name(&id));
             }
             if self.ids.len() < MAX_FAILURE_IDS
                 && !self.ids.iter().any(|(i, b)| i == &id && *b == block)
@@ -5631,6 +5707,16 @@ fn libtest_counts(rest: &str) -> Option<(usize, usize)> {
         + count("ignored").unwrap_or(0)
         + count("measured").unwrap_or(0);
     Some((ran, failed))
+}
+
+/// The name libtest's `failures:` listing prints for a failure id: `test x - should panic` → `x`.
+fn listing_name(id: &str) -> String {
+    let name = id.strip_prefix("test ").unwrap_or(id);
+    [" - should panic", " - compile fail", " - compile"]
+        .iter()
+        .find_map(|m| name.strip_suffix(m))
+        .unwrap_or(name)
+        .to_string()
 }
 
 /// A nested run's header at the END of a captured line, after a panic message's own text
@@ -5748,20 +5834,20 @@ fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<Strin
     let n = blocks.len();
     // A nested run still open at the end, or a binary cut off inside its captured output, is a
     // structure that did not resolve.
-    let unresolved = out.depth > 0 || (out.open && out.capture);
+    let unresolved = !out.nested.is_empty() || (out.open && out.capture);
     let lined_up = !out.anomaly
         && !unresolved
         && !err.anomaly
         && n > 0
-        // Cargo announced one more binary that printed nothing yet: every stdout block ended.
+            // Cargo announced one more binary that printed nothing yet: every stdout block ended.
         && (n == bins.len() || (n + 1 == bins.len() && bins[n].is_none() && !out.open))
-        // The last block still open at the end (a crash or the bound) may carry either verdict;
-        // every other block's must match cargo's (agy on #1060).
+        // Every block's verdict matches cargo's: a block still open at the end (cut off by the
+        // bound) has none and cargo printed no selector for it; a crashed LAST binary does not
+        // line up and its ids are `[?]` (agy on #1060).
         && blocks
             .iter()
             .zip(bins)
-            .enumerate()
-            .all(|(j, (failing, sel))| *failing == sel.is_some() || (out.open && j + 1 == n));
+            .all(|(failing, sel)| *failing == sel.is_some());
     // With one binary in the run a bare libtest id is unambiguous (and the base runs the same
     // command). With several, an id the alignment could not attribute is `[?]` (codex on #1060:
     // two bare ids from different crates must not meet as one failure).
@@ -9509,6 +9595,88 @@ mod tests {
         );
         let (ids, _, _, _) = qualify(scan_of(&after), scan_of(stderr_b));
         assert_eq!(ids, vec!["test shared [--test b]"]);
+
+        // (agy on #1060) The header-less child closes `b` early, then a truncated child of the
+        // SAME test opens a block the binary's own listing and result line close: with the
+        // silent harness the lists line up and `b`'s failure reads `[--test a]` — but the
+        // truncated child's block carries `b`'s target, so the failure in `b` is still on the
+        // record and still a regression against a base where only `a`'s `shared` fails.
+        let truncated = "\nrunning 1 test\ntest shared ... FAILED\n";
+        let shifted = format!(
+            "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
+             child 2:{headless}{truncated}\nfailures:\n    shared\n\ntest result: FAILED. 0 passed; \
+             1 failed; 0 ignored\n"
+        );
+        let (ids, _, _, _) = qualify(scan_of(&shifted), scan_of(stderr));
+        assert!(
+            ids.contains(&"test shared [--test b]".to_string()),
+            "{ids:?}"
+        );
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut head = failed_run(&refs, &[]);
+        classify(
+            &mut head,
+            base_of(failed_run(&["test shared [--test a]"], &[])),
+        );
+        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
+        assert!(head
+            .regressions
+            .contains(&"test shared [--test b]".to_string()));
+        // A truncated child of ANOTHER test cannot borrow the binary's listing: unresolved, `[?]`.
+        let other = format!(
+            "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
+             child 2:{headless}\nrunning 1 test\ntest inner ... FAILED\n\nfailures:\n    shared\n\n\
+             test result: FAILED. 0 passed; 1 failed; 0 ignored\n"
+        );
+        let (ids, _, _, _) = qualify(scan_of(&other), scan_of(stderr));
+        assert!(ids.iter().all(|i| i.ends_with("[?]")), "{ids:?}");
+        // (agy on #1060) A child cut short in a panic message (its header, no result line) does
+        // not swallow the binary's own result line or the binaries after it.
+        let cut_child =
+            "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
+             child: \nrunning 1 test\ntest inner ... \n\nfailures:\n    shared\n\ntest result: \
+             FAILED. 0 passed; 1 failed; 0 ignored\n\nrunning 2 tests\ntest later ... FAILED\ntest \
+             ok ... ok\n\nfailures:\n    later\n\ntest result: FAILED. 1 passed; 1 failed\n";
+        let a_and_c = "     Running tests/b.rs (target/debug/deps/b-2)\nerror: test failed, to rerun \
+            pass `--test b`\n     Running tests/c.rs (target/debug/deps/c-3)\nerror: test failed, to \
+            rerun pass `--test c`\n";
+        assert_eq!(
+            qualify(scan_of(cut_child), scan_of(a_and_c)).0,
+            vec!["test shared [--test b]", "test later [--test c]"]
+        );
+        // Text between a binary's result line and the next header: the result was not its own.
+        let between =
+            "\nrunning 1 test\ntest y ... FAILED\n\nfailures:\n    y\n\ntest result: FAILED. \
+            0 passed; 1 failed\nstray text\n\nrunning 1 test\ntest z ... ok\n\ntest result: ok. 1 \
+            passed; 0 failed\n";
+        let two_bins =
+            "     Running tests/y.rs (target/debug/deps/y-1)\nerror: test failed, to rerun \
+            pass `--test y`\n     Running tests/z.rs (target/debug/deps/z-2)\n";
+        assert_eq!(
+            qualify(scan_of(between), scan_of(two_bins)).0,
+            vec!["test y [?]"]
+        );
+        // A listing that does not name the binary's own failures does not close it.
+        let unlisted =
+            "\nrunning 1 test\ntest y ... FAILED\n\nfailures:\n    q\n\ntest result: FAILED. 0 \
+            passed; 1 failed\n";
+        let one_bin =
+            "     Running tests/y.rs (target/debug/deps/y-1)\nerror: test failed, to rerun pass \
+            `--test y`\n";
+        assert_eq!(
+            qualify(scan_of(unlisted), scan_of(one_bin)).0,
+            vec!["test y"]
+        );
+        assert!(
+            scan_of(unlisted).open,
+            "still open: its result line was not its own"
+        );
+        let sp = "\nrunning 1 test\ntest y - should panic ... FAILED\n\nfailures:\n    y\n\ntest \
+            result: FAILED. 0 passed; 1 failed\n";
+        assert_eq!(
+            qualify(scan_of(sp), scan_of(one_bin)).0,
+            vec!["test y - should panic [--test y]"]
+        );
     }
 
     /// Head and base ids are compared on (test name, target). Ids of one form match on equality;
