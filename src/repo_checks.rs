@@ -274,13 +274,14 @@ pub const UNATTRIBUTED_FAILURE: &str = "unattributed failure: ";
 pub const NO_CLEAN_RUN: &str =
     "unattributed failure: the check did not run clean with its flaky tests skipped";
 
-/// The `source` of a check's confirmation run ([`recheck_alone`], [`rerun_load_class`]): a check
-/// confirms at most once — after one ran, no later path re-confirms or reclassifies it.
+/// The `source` of a check's confirmation run ([`recheck_alone`], [`rerun_load_class`]).
 const CONFIRMATION_SOURCE: &str = "confirmation run (core#1060)";
 
-/// A confirmation run is already on the check's record.
-fn confirmed_once(run: &CheckRun) -> bool {
-    run.reruns.iter().any(|r| r.source == CONFIRMATION_SOURCE)
+/// (core#1060) No re-run path may start: the check already re-ran (from ANY path — whichever re-ran
+/// first decides, no second path gets to try), or its failure set was truncated
+/// ([`FAILURE_IDS_TRUNCATED`]: failures the floor never saw cannot be re-checked or answered for).
+fn rerun_refused(run: &CheckRun) -> bool {
+    !run.reruns.is_empty() || run.failure_ids.iter().any(|i| i == FAILURE_IDS_TRUNCATED)
 }
 
 /// Never matched to a base id, never re-run alone: the truncation marker and every
@@ -4640,8 +4641,8 @@ fn recheck_alone(
     budget: Duration,
     rerun: &mut IsolatedRerun<'_>,
 ) {
-    // One confirmation per check: after one ran (and failed), nothing re-confirms (agy on #1060).
-    if confirmed_once(run) {
+    // One re-run attempt per check, from any path; never for a truncated set (agy on #1060).
+    if rerun_refused(run) {
         return;
     }
     let head_only = run.regressions.clone();
@@ -4946,7 +4947,7 @@ fn rerun_load_class(
     scratch: &CheckScratch,
 ) -> bool {
     use std::collections::BTreeSet;
-    if confirmed_once(run)
+    if rerun_refused(run)
         || !matches!(
             run.classification.as_deref(),
             Some(REGRESSION) | Some(UNCLASSIFIED_RED_BASE)
@@ -5117,7 +5118,7 @@ fn rerun_env_crash(
             .find(|s| s.starts_with("crash: "))
             .cloned()
     };
-    if confirmed_once(run) || run.classification.as_deref() != Some(UNCLASSIFIED_RED_BASE) {
+    if rerun_refused(run) || run.classification.as_deref() != Some(UNCLASSIFIED_RED_BASE) {
         return false;
     }
     let base_crash = run
@@ -11117,14 +11118,15 @@ mod tests {
         );
     }
 
-    /// agy round 16: a check confirms ONCE. After a confirmation ran (and failed), no later path
-    /// re-confirms or reclassifies it — the isolated re-runs do not even start.
+    /// (core#1060) One re-run attempt per check, from ANY path: once a check re-ran — an isolated
+    /// re-run, a load-class re-run, a crash re-run or a confirmation — no other path starts. The
+    /// flake path, the load-class path and the crash path each return untouched.
     #[test]
-    fn a_check_confirms_once_1060() {
+    fn one_rerun_attempt_per_check_from_any_path_1060() {
         let (check, mut run) = regression_run(&["test t::flaky"]);
-        let mut failed = failed_run(&[], &[]);
-        failed.source = CONFIRMATION_SOURCE.into();
-        run.reruns.push(failed);
+        let mut earlier = failed_run(&[], &[]);
+        earlier.source = "load-class re-run of 1 file (core#790)".into();
+        run.reruns.push(earlier);
         let mut argvs = Vec::new();
         recheck_alone(
             &check,
@@ -11135,6 +11137,50 @@ mod tests {
         );
         assert!(argvs.is_empty(), "{argvs:?}");
         assert_eq!(run.reruns.len(), 1);
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert!(run.denies());
+        // The other two paths refuse the same check before touching anything.
+        let wt = scratch("one-rerun");
+        let sandbox = sandbox_for(&wt);
+        let scratch_dir = CheckScratch::prepare(&wt).unwrap();
+        run.env_signals = vec![
+            "load: [vitest-pool]: Failed to start forks worker for test files /w/a.test.ts.".into(),
+        ];
+        assert!(!rerun_load_class(
+            &wt,
+            &check,
+            &mut run,
+            &sandbox,
+            &scratch_dir
+        ));
+        run.classification = Some(UNCLASSIFIED_RED_BASE.to_string());
+        assert!(!rerun_env_crash(
+            &wt,
+            &check,
+            &mut run,
+            &sandbox,
+            &scratch_dir
+        ));
+        assert_eq!(run.reruns.len(), 1);
+        drop(scratch_dir);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    /// (core#1060) A truncated failure set (more ids than [`MAX_FAILURE_IDS`]) is never re-run or
+    /// confirmed: failures the floor never saw cannot be answered for. It stays a regression.
+    #[test]
+    fn a_truncated_failure_set_is_never_rerun_1060() {
+        let (check, mut run) = regression_run(&["test t::flaky", FAILURE_IDS_TRUNCATED]);
+        let mut argvs = Vec::new();
+        recheck_alone(
+            &check,
+            &mut run,
+            None,
+            Duration::from_secs(FLAKE_RERUN_BUDGET_S),
+            &mut confirming_rerun(0, &mut argvs),
+        );
+        assert!(argvs.is_empty(), "{argvs:?}");
+        assert!(run.reruns.is_empty() && run.flaky.is_empty());
         assert_eq!(run.classification.as_deref(), Some(REGRESSION));
         assert!(run.denies());
     }

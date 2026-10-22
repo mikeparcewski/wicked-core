@@ -56,7 +56,9 @@ Two release tracks share this file, newest entry first regardless of track:
   - a pytest `ERROR ` line;
   - a `FAIL <file>` line with no ` > ` (vitest's file-level failure, jest's file header).
   **The cost: any Rust test failure the base shares now denies, and so does any failed cargo run or any check with
-  a crashed binary, a compile error, a pytest ERROR or a file-level FAIL.** A
+  a crashed binary, a compile error, a pytest ERROR or a file-level FAIL.** A non-cargo confirmation (vitest re-runs
+  the whole check) cannot pass while the base already has a vitest failure: a fail-closed false denial, and the
+  operator override covers it. A
   shared failure is listed as `ambiguous`, the denial says so, and the operator's floor override (core#1061) is the
   escape. core#546's nested-sandbox
   `env_cannot_run` class for libtest failures goes with it. Other runners' ids (pytest, vitest, go: they name
@@ -80,7 +82,8 @@ Two release tracks share this file, newest entry first regardless of track:
   and `--color` flags before `--`, and `--test-threads`, `--nocapture`, `--show-output`, `--color` and `-q` after
   it. A positional TESTNAME (`cargo test foo`, where `--exact` would select 0 tests and exit 0), a `--skip`,
   `--exact` or `--ignored` of its own, an unknown flag or a second `--` means neither, and the check stays a
-  regression. A check confirms once; after one confirmation ran, no later path re-confirms it. The clean exit
+  regression. One re-run attempt per check, from any path: once any re-run ran, no other path starts. A truncated
+  failure set (past `MAX_FAILURE_IDS`) is never re-run or confirmed. The clean exit
   answers for the unattributed ids, which then leave the record; without it the check stays a regression.
   One that exits 0 and prints the name `ok` is "flaky (passed alone)" and does
   not deny (`flaky`); one that fails again stays a regression. Failures over the cap, past the budget or under a
