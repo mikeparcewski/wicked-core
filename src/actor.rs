@@ -13732,7 +13732,8 @@ fn judge_by_operator(
     u.status = crate::domain::UnitStatus::Done;
     u.denial = None;
     u.denial_reason = None;
-    u.denials_behind = None;
+    // A judged unit's record is known: nothing stands behind it now.
+    u.denials_behind = Some(Vec::new());
     u.requested_rejudge = None;
     // (codex r1 on #907) The judged output becomes the unit's APPROVED output, so a later
     // evaluator and context injection read it (`get_work_output`), with the judgment's provenance.
@@ -20029,7 +20030,12 @@ mod request_changes_tests {
         let units = crate::domain::session_units(&store, &run_id).unwrap();
         let fix = &units[2];
         assert_eq!(fix.status, UnitStatus::Done);
-        assert!(fix.denial.is_none() && fix.denials_behind.is_none());
+        assert!(fix.denial.is_none());
+        assert_eq!(
+            fix.denials_behind,
+            Some(Vec::new()),
+            "a judged unit is a known record"
+        );
         let receipt = fix.assurance.as_ref().expect("a gate receipt");
         assert!(receipt
             .ran
