@@ -5889,8 +5889,17 @@ fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<Strin
     // A libtest id the alignment cannot attribute is `[?]` (unknown binary, never matched) —
     // plain bare only when the run carried no target identity at all (no cargo binary line, no
     // selector) and printed at most one block (codex on #1060: one block on each tree does not
-    // make them the same binary).
-    let unknown = n > 1 || !bins.is_empty() || err.saw_selector || out.saw_selector;
+    // make them the same binary) on EITHER stream, in a structure that resolved: a binary read
+    // as captured output is no block, so an unresolved or contradicted structure cannot vouch
+    // for "one binary" (agy on #1060).
+    let shaky = |s: &LineScan| s.anomaly || !s.nested.is_empty() || (s.open && s.capture);
+    let unknown = n + err.blocks.len() > 1
+        || !bins.is_empty()
+        || !out.binaries.is_empty()
+        || err.saw_selector
+        || out.saw_selector
+        || shaky(&out)
+        || shaky(&err);
     let target_of = |scan: &LineScan, id: &str, block: Option<usize>| -> Option<String> {
         if !id.starts_with("test ") {
             return None;
@@ -11358,5 +11367,447 @@ error: 2 targets failed:
         let err = detect_with(&repo, &FloorContext::default()).unwrap_err();
         assert!(err.contains("not a journey name"), "{err}");
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    // ---- Review round 7 (agy on #1060): each finding fed through the real scanner, qualifier
+    // and classifier. The gate question for every one: can a head-only failure be classified
+    // pre-existing, flaky or env_cannot_run? Shapes follow real cargo 1.99 / edition-2024 output.
+
+    fn adj_text(v: &[&str]) -> String {
+        let mut t = v.join("\n");
+        t.push('\n');
+        t
+    }
+
+    /// The head run qualified from its two streams and classified against the base run's.
+    fn adj_head(out: &str, err: &str, base_out: &str, base_err: &str) -> CheckRun {
+        let (ids, env, _, _) = qualify(scan_of(out), scan_of(err));
+        let (b_ids, b_env, _, _) = qualify(scan_of(base_out), scan_of(base_err));
+        eprintln!("head ids {ids:?} env {env:?}\nbase ids {b_ids:?} env {b_env:?}");
+        fn v(x: &[String]) -> Vec<&str> {
+            x.iter().map(String::as_str).collect()
+        }
+        let mut head = failed_run(&v(&ids), &v(&env));
+        classify(&mut head, base_of(failed_run(&v(&b_ids), &v(&b_env))));
+        eprintln!(
+            "classification {:?} regressions {:?}",
+            head.classification, head.regressions
+        );
+        head
+    }
+
+    const ADJ_COMMON_ERR: &str =
+        "     Running tests/common.rs (target/debug/deps/common-fe420048d3d48ef9)\n\
+        error: test failed, to rerun pass `-p b --test common`\n";
+
+    /// agy a1b1 #1: a re-exec child cut off after its header (real libtest output: the child
+    /// aborted) leaves a nested run open, so the NEXT test's section is read as captured output
+    /// and its launcher signature is credited to the first test. The ids stay intact and
+    /// qualified, so the misattribution can only move a shared failure between two non-denying
+    /// classes; a head-only failure stays a regression.
+    #[test]
+    fn unclosed_child_run_keeps_ids_and_regressions_1060() {
+        let head = adj_text(&[
+            "",
+            "running 2 tests",
+            "test test_a ... FAILED",
+            "test test_b ... FAILED",
+            "",
+            "failures:",
+            "",
+            "---- test_a stdout ----",
+            "",
+            "thread 'test_a' (3419791) panicked at b/tests/common.rs:14:5:",
+            "child failed: ",
+            "running 1 test",
+            "test test_a ... ",
+            "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+            "",
+            "---- test_b stdout ----",
+            "sandbox-exec: sandbox_apply: Operation not permitted",
+            "",
+            "thread 'test_b' (3419807) panicked at b/tests/common.rs:20:5:",
+            "b env",
+            "",
+            "",
+            "failures:",
+            "    test_a",
+            "    test_b",
+            "",
+            "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; \
+             finished in 0.06s",
+        ]);
+        let (ids, _, _, _) = qualify(scan_of(&head), scan_of(ADJ_COMMON_ERR));
+        assert_eq!(
+            ids,
+            vec![
+                "test test_a [-p b --test common]".to_string(),
+                "test test_b [-p b --test common]".to_string(),
+            ]
+        );
+        // Base: only test_b fails (the env case); head adds test_a — a regression.
+        let base = adj_text(&[
+            "running 2 tests",
+            "test test_a ... ok",
+            "test test_b ... FAILED",
+            "",
+            "failures:",
+            "",
+            "---- test_b stdout ----",
+            "sandbox-exec: sandbox_apply: Operation not permitted",
+            "",
+            "failures:",
+            "    test_b",
+            "",
+            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]);
+        let run = adj_head(&head, ADJ_COMMON_ERR, &base, ADJ_COMMON_ERR);
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(run.regressions, vec!["test test_a [-p b --test common]"]);
+        assert!(run.denies());
+    }
+
+    const ADJ_TWO_LIBS_ERR: &str =
+        "     Running unittests src/lib.rs (target/debug/deps/a-e9fdb13badb08122)\n\
+        error: test failed, to rerun pass `-p a --lib`\n     Running unittests src/lib.rs \
+        (target/debug/deps/b-a915afd4d70f2df2)\nerror: 1 target failed:\n    `-p a --lib`\n";
+
+    /// agy a1b1 #2 (first half): a child cargo's `Running …` line inside a test's captured
+    /// stdout. Only the STDERR scan's binary list is aligned, so the stdout entry it adds changes
+    /// no qualifier.
+    #[test]
+    fn child_cargo_line_in_captured_stdout_changes_no_qualifier_1060() {
+        let head = adj_text(&[
+            "running 1 test",
+            "test t ... FAILED",
+            "",
+            "failures:",
+            "",
+            "---- t stdout ----",
+            "child stderr:",
+            "     Running unittests src/lib.rs (target/debug/deps/child-1)",
+            "error: test failed, to rerun pass `-p child --lib`",
+            "",
+            "thread 't' panicked at a/src/lib.rs:1:1:",
+            "boom",
+            "",
+            "failures:",
+            "    t",
+            "",
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+            "",
+            "running 1 test",
+            "test u ... ok",
+            "",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]);
+        let scan = scan_of(&head);
+        let (ids, _, _, _) = qualify(scan, scan_of(ADJ_TWO_LIBS_ERR));
+        assert_eq!(ids, vec!["test t [-p a --lib]".to_string()]);
+    }
+
+    /// agy a1b1 #2 (second half): a bare `failures:` line inside captured stdout ends the
+    /// section early. What follows in that test's output then reads as top-level text: a child's
+    /// selector there is an anomaly (every id becomes `[?]`, never matched), a child's
+    /// `test x ... FAILED` is set aside (libtest prints its own before `failures:`), and a lost
+    /// launcher signature only withholds `env_cannot_run`. Fail-closed either way.
+    #[test]
+    fn bare_failures_line_in_captured_stdout_fails_closed_1060() {
+        let body = |selector: bool| {
+            let mut v = vec![
+                "running 2 tests",
+                "test t ... FAILED",
+                "test u ... FAILED",
+                "",
+                "failures:",
+                "",
+                "---- t stdout ----",
+                "expected libtest output:",
+                "failures:",
+                "    inner",
+                "test inner ... FAILED",
+                "sandbox-exec: sandbox_apply: Operation not permitted",
+            ];
+            if selector {
+                v.push("error: test failed, to rerun pass `-p child --lib`");
+            }
+            v.extend([
+                "",
+                "---- u stdout ----",
+                "boom",
+                "",
+                "failures:",
+                "    t",
+                "    u",
+                "",
+                "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out",
+            ]);
+            adj_text(&v)
+        };
+        let err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n\
+            error: test failed, to rerun pass `-p a --lib`\n";
+        let base = adj_text(&[
+            "running 2 tests",
+            "test t ... ok",
+            "test u ... FAILED",
+            "",
+            "failures:",
+            "    u",
+            "",
+            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]);
+        for selector in [false, true] {
+            let run = adj_head(&body(selector), err, &base, err);
+            assert_eq!(
+                run.classification.as_deref(),
+                Some(REGRESSION),
+                "{selector}"
+            );
+            assert!(
+                run.regressions.iter().any(|r| r.starts_with("test t ")),
+                "{selector}: {:?}",
+                run.regressions
+            );
+            assert!(run.denies());
+        }
+    }
+
+    /// agy a1b1 #3: a FAILING child whose captured output prints a stray `0 failed` result line
+    /// closes the child early (no `failed == names` check), and the child's own result then
+    /// closes the outer binary. Whatever the outer binary prints next is an anomaly: every id is
+    /// `[?]` and stays a regression.
+    #[test]
+    fn child_closed_early_by_a_stray_ok_line_fails_closed_1060() {
+        let head = adj_text(&[
+            "running 1 test",
+            "test t ... FAILED",
+            "",
+            "failures:",
+            "",
+            "---- t stdout ----",
+            "child output:",
+            "running 1 test",
+            "test t ... FAILED",
+            "",
+            "failures:",
+            "",
+            "---- t stdout ----",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+            "",
+            "failures:",
+            "    t",
+            "",
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+            "",
+            "thread 't' panicked at a/src/lib.rs:1:1:",
+            "child failed",
+            "",
+            "failures:",
+            "    t",
+            "",
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]);
+        let err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n\
+            error: test failed, to rerun pass `-p a --lib`\n";
+        let base = adj_text(&[
+            "running 1 test",
+            "test t ... ok",
+            "",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]);
+        // The base fails a same-named test in ANOTHER binary only (b): head t must not match it.
+        let base = format!(
+            "{base}\n{}",
+            adj_text(&[
+                "running 1 test",
+                "test t ... FAILED",
+                "",
+                "failures:",
+                "    t",
+                "",
+                "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+            ])
+        );
+        let base_err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n     \
+            Running unittests src/lib.rs (target/debug/deps/b-2)\n\
+            error: test failed, to rerun pass `-p b --lib`\n";
+        let run = adj_head(&head, err, &base, base_err);
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert!(run.denies());
+    }
+
+    /// agy a1b1 #4 and #5, and agy a1b2 #2: a child run that never closes (its captured
+    /// `test foo ... FAILED` spoils its own listing), or a passing binary whose own result line
+    /// a child run consumes, or a binary whose own result line does not add up, leaves the
+    /// structure unresolved and SWALLOWS the next binary as captured output. With cargo's
+    /// identity on stderr the swallowed failure is reported `[?]` (a regression). The case that
+    /// leaked: no target identity at all (stderr not captured) — the swallowed binary did not
+    /// count as a block, so the run looked like ONE binary and its id stayed bare, matching a
+    /// same-named base failure in another binary.
+    #[test]
+    fn a_swallowed_binary_never_stays_bare_1060() {
+        // Binary a passes with --show-output; a1's output holds a child run cut off after its
+        // header, counting as many tests as a itself — the child "closes" on a's own result.
+        let head = adj_text(&[
+            "running 2 tests",
+            "test a1 ... ok",
+            "test a2 ... ok",
+            "",
+            "successes:",
+            "",
+            "---- a1 stdout ----",
+            "child: running 2 tests",
+            "test c1 ... ok",
+            "",
+            "",
+            "successes:",
+            "    a1",
+            "    a2",
+            "",
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+            "",
+            "running 1 test",
+            "test shared ... FAILED",
+            "",
+            "failures:",
+            "",
+            "---- shared stdout ----",
+            "b boom",
+            "",
+            "failures:",
+            "    shared",
+            "",
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]);
+        // Base: binary a fails `shared` and fail-fast stops there.
+        let base = adj_text(&[
+            "running 3 tests",
+            "test a1 ... ok",
+            "test a2 ... ok",
+            "test shared ... FAILED",
+            "",
+            "failures:",
+            "    shared",
+            "",
+            "test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]);
+        // With cargo's stderr: the swallowed failure is `[?]`.
+        let err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n     \
+            Running unittests src/lib.rs (target/debug/deps/b-2)\n\
+            error: test failed, to rerun pass `-p b --lib`\n";
+        let base_err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n\
+            error: test failed, to rerun pass `-p a --lib`\n";
+        let run = adj_head(&head, err, &base, base_err);
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        // Without it (`cargo test 2>/dev/null`, a wrapper): still never bare.
+        let run = adj_head(&head, "", &base, "");
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(run.regressions, vec!["test shared [?]"]);
+        assert!(run.denies());
+
+        // a1b1 #5: a binary whose own result line does not add up (2 tests announced, 3
+        // counted) while its captured output is open swallows the next binary the same way.
+        let head = adj_text(&[
+            "running 2 tests",
+            "test a1 ... ok",
+            "test a2 ... ok",
+            "",
+            "successes:",
+            "    a1",
+            "    a2",
+            "",
+            "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+            "",
+            "running 1 test",
+            "test shared ... FAILED",
+            "",
+            "failures:",
+            "    shared",
+            "",
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]);
+        for (e, b) in [(err, base_err), ("", "")] {
+            let run = adj_head(&head, e, &base, b);
+            assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+            assert!(run.denies());
+        }
+    }
+
+    /// agy a1b2 #2: libtest routed to stderr (`./a 1>&2; ./b 1>&2`, no cargo) prints several
+    /// blocks on the stream the alignment does not count: one binary per run must hold across
+    /// BOTH streams before an id stays bare.
+    #[test]
+    fn blocks_on_stderr_count_as_binaries_1060() {
+        let pass_a = adj_text(&[
+            "running 1 test",
+            "test a1 ... ok",
+            "",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]);
+        let fail = |name: &str| {
+            adj_text(&[
+                "running 1 test",
+                &format!("test {name} ... FAILED"),
+                "",
+                "failures:",
+                &format!("    {name}"),
+                "",
+                "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+            ])
+        };
+        // Head: a passes, b newly fails `shared`; base: a fails `shared` (the run stops).
+        let head_err = format!("{pass_a}\n{}", fail("shared"));
+        let run = adj_head("", &head_err, "", &fail("shared"));
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert!(run.denies());
+    }
+
+    /// agy a1b2 #1: a LAST binary that crashed after printing a failure (real cargo: the block
+    /// stays open on stdout, cargo prints the selector and `signal: 6`). The open block's
+    /// verdict is never `failed`, so a selector for it breaks the walk, and with no selector its
+    /// cargo entry carries no target — either way the id is `[?]`. Rust 2024's doctest pair cut
+    /// off in its standalone run leaves one block no cargo line owns.
+    #[test]
+    fn a_crashed_last_binary_is_unknown_1060() {
+        let passing = adj_text(&[
+            "running 2 tests",
+            "test t::fine ... ok",
+            "test t::shared ... ok",
+            "",
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+            "",
+        ]);
+        let head = format!(
+            "{passing}{}",
+            adj_text(&["running 2 tests", "test t::bad ... FAILED"])
+        );
+        let running =
+            "     Running unittests src/lib.rs (target/debug/deps/a-e9fdb13badb08122)\n     \
+            Running unittests src/lib.rs (target/debug/deps/c-a7e017f12a8667bb)\n";
+        let with_sel = format!(
+            "{running}error: test failed, to rerun pass `-p c --lib`\n\nCaused by:\n  process \
+             didn't exit successfully: `target/debug/deps/c-a7e017f12a8667bb` (signal: 6, \
+             SIGABRT: process abort signal)\n"
+        );
+        for err in [with_sel.as_str(), running] {
+            let (ids, _, _, _) = qualify(scan_of(&head), scan_of(err));
+            assert_eq!(ids, vec!["test t::bad [?]".to_string()], "{err}");
+        }
+        // Doc-tests: the merged block failed and closed, the standalone block crashed open.
+        let doc = adj_text(&[
+            "running 1 test",
+            "test b/src/lib.rs - ok (line 1) ... FAILED",
+            "",
+            "failures:",
+            "    b/src/lib.rs - ok (line 1)",
+            "",
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+            "",
+            "running 2 tests",
+            "test b/src/lib.rs - ok2 (line 5) ... FAILED",
+        ]);
+        let doc_err = "   Doc-tests b\nerror: doctest failed, to rerun pass `-p b --doc`\n";
+        let (ids, _, _, _) = qualify(scan_of(&doc), scan_of(doc_err));
+        assert!(ids.iter().all(|i| i.ends_with(" [?]")), "{ids:?}");
     }
 }
