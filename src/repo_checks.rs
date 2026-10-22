@@ -5418,6 +5418,14 @@ struct LineScan {
     /// cargo: one entry per test binary it announced, with its `to rerun pass` selector when it
     /// failed.
     binaries: Vec<Option<String>>,
+    /// cargo: which of `binaries` are a crate's doc-tests (`Doc-tests a`) — Rust 2024's rustdoc
+    /// prints a merged and a standalone run (two blocks) under one such line.
+    doc: Vec<bool>,
+    /// cargo printed a `to rerun pass` selector: the run carried target identity, so an id it
+    /// cannot attribute is unknown (`[?]`), never bare.
+    saw_selector: bool,
+    /// libtest: per block, whether rustdoc's `all doctests ran in …` footer followed it.
+    footers: Vec<bool>,
     /// libtest names seen PASSING (`test name ... ok`) among `watch` — the isolated re-run's witness.
     passed: Vec<String>,
     watch: Vec<String>,
@@ -5461,6 +5469,9 @@ impl LineScan {
             // else — save rustdoc's merged-doctest timing footer (Rust 2024, codex on #1060):
             // anything else first means the "result" was not the binary's own.
             if s.starts_with("all doctests ran in ") {
+                if let Some(f) = self.footers.last_mut() {
+                    *f = true;
+                }
                 return;
             }
             self.anomaly |= header.is_none();
@@ -5485,6 +5496,7 @@ impl LineScan {
                 self.anomaly = true;
             }
             self.blocks.push(false);
+            self.footers.push(false);
             self.open = true;
             self.header_n = n;
             self.block_failures = 0;
@@ -5586,6 +5598,7 @@ impl LineScan {
         }
         if cargo_binary_line(s) {
             self.binaries.push(None);
+            self.doc.push(s.starts_with("Doc-tests "));
             return;
         }
         if let Some(name) = s
@@ -5626,8 +5639,11 @@ impl LineScan {
         }
         if let Some(target) = rerun_target_of_line(s) {
             // cargo prints a failing binary's selector after its `Running` line.
+            self.saw_selector = true;
             match self.binaries.last_mut() {
-                Some(slot @ None) => *slot = Some(target),
+                Some(slot @ None) => {
+                    *slot = Some(target);
+                }
                 _ => self.anomaly = true,
             }
             return;
@@ -5842,31 +5858,48 @@ fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<Strin
     // A nested run still open at the end, or a binary cut off inside its captured output, is a
     // structure that did not resolve.
     let unresolved = !out.nested.is_empty() || (out.open && out.capture);
-    let lined_up = !out.anomaly
-        && !unresolved
-        && !err.anomaly
-        && n > 0
-            // Cargo announced one more binary that printed nothing yet: every stdout block ended.
-        && (n == bins.len() || (n + 1 == bins.len() && bins[n].is_none() && !out.open))
-        // Every block's verdict matches cargo's: a block still open at the end (cut off by the
-        // bound) has none and cargo printed no selector for it; a crashed LAST binary does not
-        // line up and its ids are `[?]` (agy on #1060).
-        && blocks
-            .iter()
-            .zip(bins)
-            .all(|(failing, sel)| *failing == sel.is_some());
-    // With one binary in the run a bare libtest id is unambiguous (and the base runs the same
-    // command). With several, an id the alignment could not attribute is `[?]` (codex on #1060:
-    // two bare ids from different crates must not meet as one failure).
-    let multi = n > 1 || bins.len() > 1;
+    // Walk both lists: each cargo binary owns one stdout block — a `Doc-tests` line owns two when
+    // only the second is followed by rustdoc's footer (Rust 2024's merged + standalone runs,
+    // codex on #1060) — and its selector must match its blocks' verdict.
+    let mut owner: Vec<usize> = Vec::with_capacity(n);
+    let mut walk_ok = !out.anomaly && !unresolved && !err.anomaly && n > 0;
+    let (mut i, mut j) = (0, 0);
+    while walk_ok && i < n {
+        let Some(sel) = bins.get(j) else {
+            walk_ok = false;
+            break;
+        };
+        let footer = |k: usize| out.footers.get(k).copied().unwrap_or(false);
+        let take =
+            if err.doc.get(j).copied().unwrap_or(false) && i + 1 < n && footer(i + 1) && !footer(i)
+            {
+                2
+            } else {
+                1
+            };
+        walk_ok = blocks[i..i + take].iter().any(|f| *f) == sel.is_some();
+        owner.extend(std::iter::repeat_n(j, take));
+        i += take;
+        j += 1;
+    }
+    // Every cargo binary accounted for — or cargo announced one more that printed nothing yet
+    // (every stdout block ended). A crashed LAST binary does not line up: its ids are `[?]`.
+    let lined_up =
+        walk_ok && (j == bins.len() || (j + 1 == bins.len() && bins[j].is_none() && !out.open));
+    // A libtest id the alignment cannot attribute is `[?]` (unknown binary, never matched) —
+    // plain bare only when the run carried no target identity at all (no cargo binary line, no
+    // selector) and printed at most one block (codex on #1060: one block on each tree does not
+    // make them the same binary).
+    let unknown = n > 1 || !bins.is_empty() || err.saw_selector || out.saw_selector;
     let target_of = |scan: &LineScan, id: &str, block: Option<usize>| -> Option<String> {
         if !id.starts_with("test ") {
             return None;
         }
         block
             .filter(|_| lined_up && std::ptr::eq(scan, &out))
-            .and_then(|j| bins.get(j).cloned().flatten())
-            .or_else(|| multi.then(|| UNKNOWN_TARGET.to_string()))
+            .and_then(|b| owner.get(b))
+            .and_then(|&j| bins.get(j).cloned().flatten())
+            .or_else(|| unknown.then(|| UNKNOWN_TARGET.to_string()))
     };
     let mut ids: Vec<String> = Vec::new();
     let mut env: Vec<String> = Vec::new();
@@ -9594,7 +9627,11 @@ mod tests {
         let stderr_b = "     Running tests/b.rs (target/debug/deps/b-2)\nerror: test failed, to \
             rerun pass `--test b`\n";
         let (ids, _, _, _) = qualify(scan_of(&stdout), scan_of(stderr_b));
-        assert_eq!(ids, vec!["test shared", "test terminal::live::attach"]);
+        assert_eq!(
+            ids,
+            vec!["test shared [?]", "test terminal::live::attach [?]"],
+            "one block is no identity: cargo named a binary, so unverified ids are unknown"
+        );
         // Without it, the same binary is qualified: the nested child with its header is not one.
         let clean = format!(
             "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
@@ -9694,7 +9731,7 @@ mod tests {
             `--test y`\n";
         assert_eq!(
             qualify(scan_of(unlisted), scan_of(one_bin)).0,
-            vec!["test y"]
+            vec!["test y [?]"]
         );
         assert!(
             scan_of(unlisted).open,
@@ -10137,6 +10174,164 @@ mod tests {
             Some(1)
         );
         assert_eq!(libtest_running_header_suffix("not_running 1 test"), None);
+    }
+
+    /// Real `cargo test --no-fail-fast` output of an edition-2024 crate (rustdoc's merged and
+    /// standalone doctest runs under one `Doc-tests` line, then its timing footer): a failing unit
+    /// test and passing doctests.
+    const ED24_OUT: &str = r#"
+running 2 tests
+test tests::fine ... ok
+test tests::base_failure ... FAILED
+
+failures:
+
+---- tests::base_failure stdout ----
+
+thread 'tests::base_failure' (2312872) panicked at src/lib.rs:10:41:
+red
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::base_failure
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test src/lib.rs - one (line 1) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 1 test
+test src/lib.rs - one (line 5) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+all doctests ran in 1.42s; merged doctests compilation took 0.84s
+"#;
+    const ED24_ERR: &str = r#"     Running unittests src/lib.rs (target/debug/deps/ed24-852391415fd9f493)
+error: test failed, to rerun pass `--lib`
+   Doc-tests ed24
+error: 1 target failed:
+    `--lib`
+"#;
+    /// The same crate with both doctests failing too (`--doc` selector).
+    const ED24_DOC_OUT: &str = r#"
+running 2 tests
+test tests::fine ... ok
+test tests::base_failure ... FAILED
+
+failures:
+
+---- tests::base_failure stdout ----
+
+thread 'tests::base_failure' (2315717) panicked at src/lib.rs:10:41:
+red
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::base_failure
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test src/lib.rs - one (line 1) ... FAILED
+
+failures:
+
+---- src/lib.rs - one (line 1) stdout ----
+Test executable failed (exit status: 101).
+
+stderr:
+
+thread 'main' (2316020) panicked at /var/folders/4c/rvzl16px0yx907_m1rx6mwrw0000gp/T/rustdoctestF1NyNn/doctest_bundle_2024.rs:6:1:
+assertion `left == right` failed
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+
+failures:
+    src/lib.rs - one (line 1)
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+
+running 1 test
+test src/lib.rs - one (line 5) - compile fail ... FAILED
+
+failures:
+
+---- src/lib.rs - one (line 5) stdout ----
+Test compiled successfully, but it's marked `compile_fail`.
+
+failures:
+    src/lib.rs - one (line 5)
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+all doctests ran in 0.95s; merged doctests compilation took 0.43s
+"#;
+    const ED24_DOC_ERR: &str = r#"     Running unittests src/lib.rs (target/debug/deps/ed24-852391415fd9f493)
+error: test failed, to rerun pass `--lib`
+   Doc-tests ed24
+error: doctest failed, to rerun pass `--doc`
+error: 2 targets failed:
+    `--lib`
+    `--doc`
+"#;
+
+    /// (codex on #1060) Rust 2024 doctests: one `Doc-tests` line, two stdout blocks and a footer
+    /// — the unit failure keeps `[--lib]` and failing doctests get `[--doc]`. And one block per
+    /// tree is no proof of one binary: a `--quiet` run's failure with a selector but no `Running`
+    /// line is `[?]`, so `shared` failing in `-p a` on the base and `-p b` on the head never meet.
+    #[test]
+    fn rust_2024_doctests_line_up_and_a_lone_block_is_not_an_identity() {
+        assert_eq!(
+            qualify(scan_of(ED24_OUT), scan_of(ED24_ERR)).0,
+            vec!["test tests::base_failure [--lib]"]
+        );
+        assert_eq!(
+            qualify(scan_of(ED24_DOC_OUT), scan_of(ED24_DOC_ERR)).0,
+            vec![
+                "test tests::base_failure [--lib]",
+                "test src/lib.rs - one (line 1) [--doc]",
+                "test src/lib.rs - one (line 5) - compile fail [--doc]",
+            ]
+        );
+        let quiet =
+            "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n    shared\n\ntest result: \
+            FAILED. 0 passed; 1 failed\n";
+        let base = qualify(
+            scan_of(quiet),
+            scan_of("error: test failed, to rerun pass `-p a --lib`\n"),
+        )
+        .0;
+        let head = qualify(
+            scan_of(quiet),
+            scan_of("error: test failed, to rerun pass `-p b --lib`\n"),
+        )
+        .0;
+        assert_eq!(head, vec!["test shared [?]"]);
+        let refs = |v: &[String]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut h = failed_run(&[], &[]);
+        h.failure_ids = refs(&head);
+        let mut b = failed_run(&[], &[]);
+        b.failure_ids = refs(&base);
+        classify(&mut h, base_of(b));
+        assert_eq!(h.classification.as_deref(), Some(REGRESSION));
+        assert!(h.pre_existing.is_empty());
+        // No cargo identity at all (a lone libtest binary run directly): bare, as before.
+        assert_eq!(
+            qualify(scan_of(quiet), LineScan::default()).0,
+            vec!["test shared"]
+        );
     }
 
     fn failed_run(ids: &[&str], env: &[&str]) -> CheckRun {
