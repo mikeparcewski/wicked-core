@@ -1131,9 +1131,9 @@ export declare class Subscription {
  * `envCannotRun: string[]` and `reruns: CheckRun[]` (each re-run's `boundNote` carries the host load).
  * Floor fix 2026-10-22 (additive): every `checks[]` entry carries `flaky: string[]` (head-only failures
  * that passed re-run alone — not denials), `notRechecked: number` (head-only failures not re-run: over
- * 50, past the 900 s re-run budget, or a runner the floor cannot narrow), `ambiguous: string[]` (head
- * failures not matched to a same-named base failure because one side's binary is unknown — kept as
- * regressions) and `matchedByName: string[]` (matched by test name alone, one candidate).
+ * 50, past the 900 s re-run budget, or a runner the floor cannot narrow) and `ambiguous: string[]`
+ * (head failures not matched to a same-named base failure because one side's binary is unknown —
+ * kept as regressions).
  * core#810 (additive): unitDistributed.pool (UnitPoolSeatingJson | null — a phase's worker pool,
  * one creator plus monitors, with any shortfall disclosed as requested/seated/missing).
  * core#461/#591 (additive): unitDistributed.distinctnessFallback ('creator_seat' |

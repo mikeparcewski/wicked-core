@@ -42,9 +42,9 @@ Two release tracks share this file, newest entry first regardless of track:
   met the base's qualified ids: pre-existing 0, every base failure a regression. A result line now closes a binary
   only when its `N failed` equals the failing tests read since the last one, and a binary that died without a
   result line is closed by the next `running N tests` header. Head and base ids are compared on (test name,
-  target): a bare id meets a qualified one only when exactly one pairing is possible, and listed as
-  `matchedByName`; with several candidates it stays a regression, listed as `ambiguous`, and the denial says so.
-  Ids qualified with different targets never meet. (2) The floor's macOS sandbox refused `/dev/ptmx`, so no PTY or
+  target). Ids qualified with different targets never meet. A bare id never meets a qualified one, because failing
+  ids alone cannot show which binary a bare id came from: it stays a regression, listed as `ambiguous`, and the
+  denial says so rather than guessing. (2) The floor's macOS sandbox refused `/dev/ptmx`, so no PTY or
   tmux test could run on it. The repo-checks floor (only it, not workers or validators) may now open `/dev/ptmx`
   and write to the `/dev/ttysN` slaves the kernel's `com.apple.sandbox.pty` extension marks as its own; no other
   path, device or network rule changes, and the operator's terminals and `/dev/tty` stay unwritable. Linux bwrap
@@ -54,9 +54,10 @@ Two release tracks share this file, newest entry first regardless of track:
   failures and `FLAKE_RERUN_BUDGET_S` = 900 s in total. One that passes alone is "flaky (passed alone)" and does
   not deny (`flaky`); one that fails again stays a regression. Failures over the cap, past the budget or under a
   runner the floor cannot narrow stay regressions, counted in `notRechecked`. Wire (additive, `checks[]`):
-  `flaky`, `notRechecked`, `ambiguous`, `matchedByName`. Tests:
-  `a_childs_result_line_in_captured_output_keeps_every_id_qualified` and
-  `head_and_base_ids_match_across_qualified_and_bare_forms` (both fail on the previous main),
+  `flaky`, `notRechecked`, `ambiguous`. Each re-run is hard-bounded by what the budget has left (the load
+  factor that stretches other checks' bounds does not apply past it). Tests:
+  `a_childs_result_line_in_captured_output_keeps_every_id_qualified` (fails on the previous main: every id bare),
+  `head_and_base_ids_match_across_qualified_and_bare_forms`,
   `the_same_test_name_in_two_crates_stays_distinct`, `a_failure_that_passes_alone_is_flaky_and_does_not_block`,
   `a_failure_that_fails_again_alone_stays_a_regression`,
   `a_spent_rerun_budget_is_reported_and_the_rest_stay_regressions`,

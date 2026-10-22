@@ -1444,11 +1444,11 @@ fn check_run_json(c: &crate::repo_checks::CheckRun) -> serde_json::Value {
         "envCannotRun": c.env_cannot_run,
         "reruns": c.reruns.iter().map(check_run_json).collect::<Vec<_>>(),
         // Floor fix 2026-10-22 (additive): head-only failures that passed re-run alone, how many
-        // were not re-run, and the head ids whose base match was ambiguous / by test name only.
+        // were not re-run, and the head ids a same-named base failure in the other form left
+        // unmatched (kept as regressions).
         "flaky": c.flaky,
         "notRechecked": c.not_rechecked,
         "ambiguous": c.ambiguous,
-        "matchedByName": c.matched_by_name,
     })
 }
 

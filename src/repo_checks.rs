@@ -82,8 +82,8 @@
 //! is "flaky (passed alone)" (`flaky`, never denies); one that fails again, or that the cap or the
 //! budget does not reach (`not_rechecked`), stays a `regression`. If every one passes the check is
 //! `flaky_under_load` (never denies; both attempts and the load at each are on the record). The
-//! head and base ids are compared on (test name, binary); a bare id meets a qualified one only
-//! when one pairing is possible, else it stays a regression listed as `ambiguous`. A base that
+//! head and base ids are compared on (test name, binary); a bare id never meets a qualified one
+//! (which binary it came from is unknown): it stays a regression, listed as `ambiguous`. A base that
 //! cannot be run or compared leaves the
 //! check denying as before (fail-closed). `baseline_diff: false` in the repo config opts out. A
 //! creator transcript that CLAIMS a failure is pre-existing is annotated against that comparison
@@ -305,8 +305,9 @@ pub const MAX_FLAKE_RERUN: usize = 50;
 /// The wall clock (seconds) one check's isolated re-runs may take in total, run serially. 900 s
 /// is about half of a loaded floor (a full `cargo test --workspace` took ~30 min at load 30-45),
 /// enough for 50 single-test re-runs of an already-built binary. The budget is checked before
-/// each re-run and each re-run's base bound is cut to what is left; failures it does not reach
-/// stay regressions, counted in `not_rechecked`.
+/// each re-run and each re-run is hard-bounded by what is left (the load factor that stretches
+/// every other check's bound does not apply past it); failures it does not reach stay
+/// regressions, counted in `not_rechecked`.
 pub const FLAKE_RERUN_BUDGET_S: u64 = 900;
 /// Both base and head fail with NO parseable failure identifiers (unknown runner output format,
 /// e.g. node:test without a TAP-aware parser). Cannot determine if pre-existing or a regression —
@@ -537,14 +538,11 @@ pub struct CheckRun {
     /// [`FLAKE_RERUN_BUDGET_S`], or a runner it cannot filter to one test. They stay regressions.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub not_rechecked: usize,
-    /// Head failures with a same-named base failure the floor could not tell apart (one side's
-    /// binary unknown, several candidates) — kept as regressions rather than guessed.
+    /// Head failures whose test name the base also fails, with one side's binary unknown (a bare
+    /// id against a qualified one): which binary it is cannot be told, so they are kept as
+    /// regressions, not guessed — and listed here so the denial says why.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ambiguous: Vec<String>,
-    /// Head failures matched to the base by test name alone (one side's binary unknown, exactly
-    /// one candidate) — counted pre-existing, and said so.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub matched_by_name: Vec<String>,
     /// (core#789/#790) Environment signals the scan read off the check's own output, at most
     /// [`MAX_ENV_SIGNALS`], each prefixed by its class: `load: <line>` (a vitest pool worker that
     /// never started — `Failed to start forks worker` / `Timeout waiting for worker to respond` —
@@ -4282,7 +4280,6 @@ fn classify(head: &mut CheckRun, base: BaseRun) {
                         .map(|s| s.to_string())
                         .collect();
                     head.ambiguous = m.ambiguous.iter().map(|s| s.to_string()).collect();
-                    head.matched_by_name = m.by_name.iter().map(|s| s.to_string()).collect();
                     let env_on_both = |id: &str| {
                         head.env_cannot_run.iter().any(|e| e == id)
                             && m.pairs.iter().any(|(h, base_id)| {
@@ -4310,58 +4307,37 @@ fn classify(head: &mut CheckRun, base: BaseRun) {
 struct BaseMatch<'a> {
     /// (head id, the base id it is) — the head failures the base shares.
     pairs: Vec<(&'a str, &'a str)>,
-    /// Head ids with a same-named base failure that cannot be told apart (one side unqualified,
-    /// more than one candidate binary): NOT matched — they stay regressions, and say why.
+    /// Head ids whose test name the base also fails, but in the OTHER form (one side's binary is
+    /// unknown): never matched — they stay regressions, and say why.
     ambiguous: Vec<&'a str>,
-    /// Head ids matched by test name alone (one side unqualified, exactly one candidate).
-    by_name: Vec<&'a str>,
 }
 
 /// Match head failure ids to base failure ids on the normalised key (test name, target).
 ///
-/// Equal strings match. A libtest id qualified on both sides matches only the SAME target
-/// (`[-p a --lib]` never meets `[-p b --lib]`). A bare id (its run's qualification fell back)
-/// meets a qualified id of the same name on the other side only when that is the one pairing
-/// possible: one candidate on the other side not already matched exactly, and the candidate
-/// itself has no other same-named candidate here. Several candidates are not guessed between:
-/// the head id stays a regression (fail-closed) and is listed as ambiguous.
+/// Ids of the same form match on equality: qualified ids only for the SAME target
+/// (`[-p a --lib]` never meets `[-p b --lib]`), bare ids (a runner without cargo's selectors on
+/// both sides, as before) by name. A bare id never meets a qualified one: failing ids alone are
+/// no evidence of which binary a bare id came from (the same name may fail in crate B on one
+/// side and in crate A on the other — codex on #1060), so the head id stays a regression
+/// (fail-closed) and is listed as ambiguous: said, not guessed.
 fn match_base<'a>(
     head: &std::collections::BTreeSet<&'a str>,
     base: &std::collections::BTreeSet<&'a str>,
 ) -> BaseMatch<'a> {
-    // The same-named ids of `other` an id could be in the other form, minus those `other` id
-    // already met exactly.
-    fn cross<'a>(
-        id: &str,
-        other: &std::collections::BTreeSet<&'a str>,
-        mine: &std::collections::BTreeSet<&'a str>,
-    ) -> Vec<&'a str> {
-        let Some((name, target)) = libtest_parts(id) else {
-            return Vec::new();
-        };
-        other
-            .iter()
-            .copied()
-            .filter(|o| !mine.contains(o))
-            .filter(|o| {
-                libtest_parts(o).is_some_and(|(n, t)| n == name && t.is_some() != target.is_some())
-            })
-            .collect()
-    }
     let mut m = BaseMatch::default();
     for &h in head {
         if base.contains(h) {
             m.pairs.push((h, h));
             continue;
         }
-        let candidates = cross(h, base, head);
-        match candidates.as_slice() {
-            [] => {}
-            [b] if cross(b, head, base) == [h] => {
-                m.pairs.push((h, b));
-                m.by_name.push(h);
-            }
-            _ => m.ambiguous.push(h),
+        let Some((name, target)) = libtest_parts(h) else {
+            continue;
+        };
+        let other_form = base.iter().any(|b| {
+            libtest_parts(b).is_some_and(|(n, t)| n == name && t.is_some() != target.is_some())
+        });
+        if other_form {
+            m.ambiguous.push(h);
         }
     }
     m
@@ -4604,13 +4580,24 @@ fn rerun_flakes(
         run,
         runner_argv.as_deref(),
         Duration::from_secs(FLAKE_RERUN_BUDGET_S),
-        &mut |one, names| run_one_watching(worktree, one, sandbox, scratch, Tree::Head, names),
+        &mut |one, names, cap| {
+            run_one_capped(
+                worktree,
+                one,
+                sandbox,
+                scratch,
+                Tree::Head,
+                names,
+                Some(cap),
+            )
+        },
     );
 }
 
-/// One isolated re-run: the narrowed check and the names it must print passing → the run and
-/// the watched names it printed passing.
-type IsolatedRerun<'a> = dyn FnMut(&RepoCheck, &[String]) -> (CheckRun, Vec<String>) + 'a;
+/// One isolated re-run: the narrowed check, the names it must print passing and the HARD bound
+/// it runs under (what the budget has left, never stretched by load) → the run and the watched
+/// names it printed passing.
+type IsolatedRerun<'a> = dyn FnMut(&RepoCheck, &[String], Duration) -> (CheckRun, Vec<String>) + 'a;
 
 /// The re-checks themselves, with the re-run injected (the seam the tests drive). Each head-only
 /// failure is re-run once, alone: a libtest id by its `--exact` name in its own binary, a vitest
@@ -4618,7 +4605,8 @@ type IsolatedRerun<'a> = dyn FnMut(&RepoCheck, &[String]) -> (CheckRun, Vec<Stri
 /// re-run exits 0 AND the runner printed it passing (a filter that matched nothing is not a
 /// pass): it is "flaky (passed alone)" and does not deny (`flaky`). One that fails again stays a
 /// regression. At most [`MAX_FLAKE_RERUN`] failures and [`FLAKE_RERUN_BUDGET_S`] of re-runs (the
-/// sum of their recorded durations); a set over the cap, failures the budget does not reach and
+/// sum of their recorded durations; each re-run is HARD-bounded by what is left, the load factor
+/// cannot stretch it); a set over the cap, failures the budget does not reach and
 /// ids the runner cannot narrow stay regressions, counted in `not_rechecked`. When EVERY
 /// head-only failure passed alone the check is `flaky_under_load`.
 fn recheck_alone(
@@ -4670,7 +4658,7 @@ fn recheck_alone(
             timeout_s: Some(check.base_timeout().min(left).as_secs().max(1)),
             dir: check.dir.clone(),
         };
-        let (r, passed) = rerun(&one, &names);
+        let (r, passed) = rerun(&one, &names, left);
         spent += Duration::from_millis(r.duration_ms);
         let ok = r.passed() && names.iter().all(|n| passed.iter().any(|p| p == n));
         eprintln!(
@@ -5193,8 +5181,8 @@ pub(crate) fn load_band(load1: Option<f64>, cpus: usize) -> Option<u32> {
 
 /// What one check's re-checks and head/base matching established beyond its verdict, one line
 /// each: head-only failures that passed alone while others still deny, how many were not
-/// re-checked, head ids not matched because a same-named base failure was ambiguous, and head ids
-/// matched by test name alone. Empty when there is nothing of the kind.
+/// re-checked, and head ids not matched because a same-named base failure was in the other form.
+/// Empty when there is nothing of the kind.
 fn match_notes(c: &CheckRun) -> Vec<String> {
     let plural = |n: usize| if n == 1 { "" } else { "s" };
     let mut out = Vec::new();
@@ -5221,17 +5209,9 @@ fn match_notes(c: &CheckRun) -> Vec<String> {
     if !c.ambiguous.is_empty() {
         out.push(format!(
             "`{}`: {} could not be told apart from a same-named base failure (one side's test \
-             binary is unknown and more than one fits) — kept as regressions, not guessed",
+             binary is unknown) — kept as regressions, not guessed",
             c.name,
             c.ambiguous.join(", ")
-        ));
-    }
-    if !c.matched_by_name.is_empty() {
-        out.push(format!(
-            "`{}`: {} matched the base's failure by test name alone (one side's test binary is \
-             unknown; one candidate)",
-            c.name,
-            c.matched_by_name.join(", ")
         ));
     }
     out
@@ -5271,19 +5251,34 @@ pub(crate) fn load_factor(load1: Option<f64>, cpus: usize) -> f64 {
     }
 }
 
-/// The effective bound for `check` right now, with the note that explains it.
-fn effective_bound(check: &RepoCheck) -> (Duration, Option<String>) {
-    let base = check.base_timeout();
-    let (load1, cpus) = host_load();
+/// The effective bound for a check right now: `base` × the load factor, with the note that
+/// explains it — then held to `cap` when one is given — a HARD ceiling the load
+/// factor cannot stretch (the isolated re-runs' remaining budget, [`FLAKE_RERUN_BUDGET_S`]).
+fn bound_under(
+    base: Duration,
+    load1: Option<f64>,
+    cpus: usize,
+    cap: Option<Duration>,
+) -> (Duration, Option<String>) {
     let factor = load_factor(load1, cpus);
-    let bound = Duration::from_secs_f64(base.as_secs_f64() * factor);
+    let scaled = Duration::from_secs_f64(base.as_secs_f64() * factor);
     let note = load1.map(|l| {
         format!(
             "{}s × {factor:.2} (1-min load {l:.1} / {cpus} cpus)",
             base.as_secs()
         )
     });
-    (bound, note)
+    match cap {
+        Some(c) if scaled > c => (
+            c,
+            Some(format!(
+                "{}, held to {}s by the re-run budget",
+                note.unwrap_or_else(|| format!("{}s", base.as_secs())),
+                c.as_secs()
+            )),
+        ),
+        _ => (scaled, note),
+    }
 }
 
 /// A bounded tail buffer: keeps the last [`TAIL_BYTES`] bytes of a stream.
@@ -5780,6 +5775,19 @@ fn run_one_watching(
     tree: Tree,
     watch: &[String],
 ) -> (CheckRun, Vec<String>) {
+    run_one_capped(worktree, check, sandbox, scratch, tree, watch, None)
+}
+
+/// [`run_one_watching`] whose bound is held to `cap` whatever the host load ([`bound_under`]).
+fn run_one_capped(
+    worktree: &Path,
+    check: &RepoCheck,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+    tree: Tree,
+    watch: &[String],
+    cap: Option<Duration>,
+) -> (CheckRun, Vec<String>) {
     let started = Instant::now();
     let mut result = CheckRun {
         name: check.name.clone(),
@@ -5803,7 +5811,6 @@ fn run_one_watching(
         flaky: Vec::new(),
         not_rechecked: 0,
         ambiguous: Vec::new(),
-        matched_by_name: Vec::new(),
         env_signals: Vec::new(),
         load_band: None,
     };
@@ -5811,7 +5818,7 @@ fn run_one_watching(
     result.load_band = load_band(load1, cpus);
     // LOAD-AWARE BOUND (core#469): base × clamp(load1/ncpu, 1, 3), recorded on the run and
     // logged before the check starts so the observed duration can be read against it.
-    let (timeout, bound_note) = effective_bound(check);
+    let (timeout, bound_note) = bound_under(check.base_timeout(), load1, cpus, cap);
     result.bound_s = timeout.as_secs();
     result.bound_note = bound_note;
     eprintln!(
@@ -6135,7 +6142,6 @@ mod tests {
                 flaky: Vec::new(),
                 not_rechecked: 0,
                 ambiguous: Vec::new(),
-                matched_by_name: Vec::new(),
                 env_signals: Vec::new(),
                 load_band: None,
             }],
@@ -8068,7 +8074,8 @@ mod tests {
             timeout_s: Some(100),
             dir: String::new(),
         };
-        let (bound, note) = effective_bound(&check);
+        let (load1, cpus) = host_load();
+        let (bound, note) = bound_under(check.base_timeout(), load1, cpus, None);
         assert!(
             bound >= Duration::from_secs(100) && bound <= Duration::from_secs(300),
             "{bound:?} ({note:?})"
@@ -8216,7 +8223,6 @@ mod tests {
             flaky: Vec::new(),
             not_rechecked: 0,
             ambiguous: Vec::new(),
-            matched_by_name: Vec::new(),
             env_signals: Vec::new(),
             load_band: None,
         };
@@ -8939,7 +8945,6 @@ mod tests {
             flaky: Vec::new(),
             not_rechecked: 0,
             ambiguous: Vec::new(),
-            matched_by_name: Vec::new(),
             env_signals: Vec::new(),
             load_band: None,
         }
@@ -9206,48 +9211,63 @@ mod tests {
         assert!(!libtest_running_header("running tests") && !libtest_running_header("running 1"));
     }
 
-    /// Head and base are compared on (target, test name): a bare id on one side matches the
-    /// qualified id of the same name on the other when that name has exactly one candidate
-    /// target — the form of an id is not its identity.
+    /// Head and base ids are compared on (test name, target). Ids of one form match on equality;
+    /// a bare id against a qualified one of the same name cannot say which binary it came from, so
+    /// it is never counted pre-existing: it stays a regression, listed as ambiguous, and the
+    /// denial says so (codex on #1060 — the same name may fail in crate B on the base and in crate
+    /// A on the head).
     #[test]
     fn head_and_base_ids_match_across_qualified_and_bare_forms() {
-        // Head bare (its qualification fell back), base qualified: the shared failure is
-        // pre-existing, the head-only one a regression.
+        // Head bare (its qualification fell back), base qualified.
         let mut head = failed_run(&["test a::x", "test a::new"], &[]);
         classify(
             &mut head,
             base_of(failed_run(&["test a::x [-p core --lib]"], &[])),
         );
         assert_eq!(head.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(head.pre_existing, vec!["test a::x"]);
-        assert_eq!(head.regressions, vec!["test a::new"]);
+        assert!(head.pre_existing.is_empty(), "{head:#?}");
+        assert_eq!(head.regressions, vec!["test a::new", "test a::x"]);
         assert_eq!(
-            head.matched_by_name,
+            head.ambiguous,
             vec!["test a::x"],
-            "a name-only match is said"
+            "the name-only coincidence is said"
         );
-        assert!(head.ambiguous.is_empty());
+        let denial = report_of(vec![head], &[]).denial_reason();
+        assert!(
+            denial.contains("test a::x could not be told apart") && denial.contains("not guessed"),
+            "{denial}"
+        );
 
-        // Head qualified, base bare (a base cached by an engine whose qualification fell back).
-        let mut head = failed_run(&["test a::x [-p core --lib]"], &[]);
-        classify(&mut head, base_of(failed_run(&["test a::x"], &[])));
+        // Head qualified, base bare: a new failure in crate A does not hide behind a bare base
+        // failure of the same name (which may have been crate B's).
+        let mut head = failed_run(&["test shared [-p a --lib]"], &[]);
+        classify(&mut head, base_of(failed_run(&["test shared"], &[])));
+        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(head.ambiguous, vec!["test shared [-p a --lib]"]);
+        assert!(head.denies());
+
+        // The same form on both sides still matches, and the env class follows the pair.
+        let mut head = failed_run(&["test sb [-p core --lib]"], &["test sb [-p core --lib]"]);
+        classify(
+            &mut head,
+            base_of(failed_run(
+                &["test sb [-p core --lib]"],
+                &["test sb [-p core --lib]"],
+            )),
+        );
+        assert_eq!(head.classification.as_deref(), Some(ENV_CANNOT_RUN));
+        let mut head = failed_run(&["test sb"], &[]);
+        classify(&mut head, base_of(failed_run(&["test sb"], &[])));
         assert_eq!(
             head.classification.as_deref(),
-            Some(PRE_EXISTING_IN_SANDBOX),
-            "{head:#?}"
+            Some(PRE_EXISTING_IN_SANDBOX)
         );
-        assert_eq!(head.pre_existing, vec!["test a::x [-p core --lib]"]);
-        assert!(!head.denies());
-
-        // The env class follows the matched pair, whatever form each side wrote it in.
-        let mut head = failed_run(&["test sb [-p core --lib]"], &["test sb [-p core --lib]"]);
-        classify(&mut head, base_of(failed_run(&["test sb"], &["test sb"])));
-        assert_eq!(head.classification.as_deref(), Some(ENV_CANNOT_RUN));
+        assert!(head.ambiguous.is_empty());
     }
 
     /// The same test name in two crates stays two failures: qualified ids of different binaries
-    /// never meet, and a bare id with more than one candidate binary is not guessed between — it
-    /// stays a regression, listed as ambiguous, and the denial says so.
+    /// never meet, and a bare id is not guessed onto either crate's — it stays a regression,
+    /// listed as ambiguous, and the denial says so.
     #[test]
     fn the_same_test_name_in_two_crates_stays_distinct() {
         let mut head = failed_run(&["test shared [-p a --lib]"], &[]);
@@ -9257,7 +9277,7 @@ mod tests {
         );
         assert_eq!(head.classification.as_deref(), Some(REGRESSION));
         assert_eq!(head.regressions, vec!["test shared [-p a --lib]"]);
-        assert!(head.ambiguous.is_empty() && head.matched_by_name.is_empty());
+        assert!(head.ambiguous.is_empty());
 
         // Bare head id; the base fails that name in two crates. Which one is it? Not guessed.
         let mut head = failed_run(&["test shared"], &[]);
@@ -9288,8 +9308,8 @@ mod tests {
         assert_eq!(head.regressions.len(), 2, "{head:#?}");
         assert_eq!(head.ambiguous.len(), 2);
 
-        // A bare head id beside its crate-A twin that the base shares exactly: the bare one is a
-        // second, different failure — a regression, with nothing left to match it to.
+        // A bare head id beside its crate-A twin that the base shares exactly: the twin matches,
+        // the bare one is a second failure that stays a regression.
         let mut head = failed_run(&["test shared [-p a --lib]", "test shared"], &[]);
         classify(
             &mut head,
@@ -9297,7 +9317,7 @@ mod tests {
         );
         assert_eq!(head.pre_existing, vec!["test shared [-p a --lib]"]);
         assert_eq!(head.regressions, vec!["test shared"]);
-        assert!(head.ambiguous.is_empty());
+        assert_eq!(head.ambiguous, vec!["test shared"]);
     }
 
     /// A `cargo test --workspace` check whose head-only failures are `ids`, as classify leaves it.
@@ -9321,9 +9341,14 @@ mod tests {
         pass: &'a dyn Fn(&str) -> bool,
         secs: u64,
         bounds: &'a mut Vec<u64>,
-    ) -> impl FnMut(&RepoCheck, &[String]) -> (CheckRun, Vec<String>) + 'a {
-        move |one, names| {
-            bounds.push(one.timeout_s.unwrap());
+    ) -> impl FnMut(&RepoCheck, &[String], Duration) -> (CheckRun, Vec<String>) + 'a {
+        move |one, names, cap| {
+            assert_eq!(
+                one.timeout_s,
+                Some(cap.as_secs().min(1200)),
+                "base bound within the cap"
+            );
+            bounds.push(cap.as_secs());
             let ok = names.iter().all(|n| pass(n));
             let mut r = failed_run(&[], &[]);
             r.argv = one.argv.clone();
@@ -9430,7 +9455,34 @@ mod tests {
         assert_eq!(
             bounds,
             vec![900, 500, 100],
-            "each bound is what the budget has left"
+            "each hard bound is what the budget has left"
+        );
+        // The hard bound holds under load: 900 s left at load 42 on 14 cpus is 900 s, not the
+        // 2700 s the load factor alone would give (codex on #1060).
+        let (b, note) = bound_under(
+            Duration::from_secs(900),
+            Some(42.0),
+            14,
+            Some(Duration::from_secs(900)),
+        );
+        assert_eq!(b, Duration::from_secs(900), "{note:?}");
+        assert!(note.unwrap().contains("held to 900s by the re-run budget"));
+        let (b, _) = bound_under(Duration::from_secs(900), Some(42.0), 14, None);
+        assert_eq!(
+            b,
+            Duration::from_secs(2700),
+            "an ordinary check still scales with load"
+        );
+        let (b, _) = bound_under(
+            Duration::from_secs(100),
+            Some(42.0),
+            14,
+            Some(Duration::from_secs(900)),
+        );
+        assert_eq!(
+            b,
+            Duration::from_secs(300),
+            "under the cap the load factor applies"
         );
         assert_eq!(run.reruns.len(), 3);
         assert_eq!(run.not_rechecked, 1);
@@ -9486,7 +9538,6 @@ mod tests {
             flaky: Vec::new(),
             not_rechecked: 0,
             ambiguous: Vec::new(),
-            matched_by_name: Vec::new(),
             env_signals: Vec::new(),
             load_band: None,
         }
