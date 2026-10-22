@@ -44,14 +44,19 @@ Two release tracks share this file, newest entry first regardless of track:
   from (stdout/stderr framing, cargo selectors, doctest footers), and that text is written by the very tests under
   check. Running each target separately changed what cargo ran: `-p` re-resolves features, and doctest-only
   libraries were skipped. So the floor no longer qualifies libtest ids at all. The check runs its own argv once,
-  and every `test x ... FAILED` line anywhere in its output is a failure, recorded as `test x` (read from the first
-  `test ` on the line, so text a test writes onto it cannot hide it). A libtest id never matches the base. A line
-  that proves a failure without naming it adds an `unattributed failure: <kind>` id that never matches and is never
-  re-run alone. The lines are cargo's `process didn't exit successfully:` (a crashed or non-101 test binary),
-  `error: could not compile`, rustdoc's `Couldn't compile the test.`, a pytest `ERROR ` line, and a `FAIL <file>`
-  line with no ` > ` (vitest's file-level failure, jest's file header). `strip_ansi` strips only complete escape
-  sequences; an unterminated one keeps the rest of the line. **The cost: any Rust test failure the base shares now
-  denies, and so does any check with a crashed binary, a compile error, a pytest ERROR or a file-level FAIL.** A
+  and every `test x ... FAILED` line anywhere in its output is a failure, recorded as `test x`. The id is read from
+  the first `test ` on the line, and libtest's `--quiet` line `x --- FAILED` is read too. Each line is read raw,
+  stripped of complete escape sequences, and with every ESC, `ESC[` and `ESC]` deleted; the ids are unioned, so an
+  escape written onto a failure line cannot hide it. A libtest id never matches the base. Evidence of a failure
+  that names no test adds an `unattributed failure: <kind>` id, which never matches and is never re-run alone:
+  - from the floor's own argv and exit code, with no text, a failed `cargo test` (`cargo test exited <code>`);
+  - cargo's `process didn't exit successfully:` (a crashed or non-101 test binary);
+  - `error: could not compile` and rustdoc's `Couldn't compile the test.`;
+  - for a wrapper that runs cargo inside, `test result: FAILED`, `… failed, to rerun pass` and the quiet line;
+  - a pytest `ERROR ` line;
+  - a `FAIL <file>` line with no ` > ` (vitest's file-level failure, jest's file header).
+  **The cost: any Rust test failure the base shares now denies, and so does any failed cargo run or any check with
+  a crashed binary, a compile error, a pytest ERROR or a file-level FAIL.** A
   shared failure is listed as `ambiguous`, the denial says so, and the operator's floor override (core#1061) is the
   escape. core#546's nested-sandbox
   `env_cannot_run` class for libtest failures goes with it. Other runners' ids (pytest, vitest, go: they name
@@ -91,6 +96,9 @@ Two release tracks share this file, newest entry first regardless of track:
   `only_an_understood_cargo_argv_is_rerun_or_confirmed_1060`, `a_check_confirms_once_1060`,
   `the_confirmation_runs_under_the_checks_own_bound_1060`,
   `a_flake_beside_a_crash_under_a_cargo_testname_filter_denies_1060` (real cargo),
+  `an_escape_before_any_failure_line_cannot_hide_it_1060`, `a_wrapped_cargo_failure_is_never_pre_existing_1060`,
+  `a_quiet_cargo_failure_beside_a_shared_child_id_denies_1060` (real cargo),
+  `a_flake_beside_the_cargo_exit_id_is_still_flaky_1060`,
   `baseline_diff_never_excuses_a_libtest_failure` (real
   `cargo test`), `a_libtest_failure_the_base_shares_is_still_denied` (end to end),
   `a_failure_that_passes_alone_is_flaky_and_does_not_block`,

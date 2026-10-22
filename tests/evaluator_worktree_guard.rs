@@ -1173,7 +1173,13 @@ fn a_regression_the_creator_introduces_is_denied_at_the_creator_gate_before_veri
     assert_eq!(c.exit_code, Some(101));
     assert_eq!(c.outcome(), "failed");
     assert_eq!(c.classification.as_deref(), Some("regression"));
-    assert_eq!(c.regressions, vec!["test t::boom".to_string()]);
+    // The named failure, plus the failed cargo run's own id (core#1060: an exit code, not text).
+    assert_eq!(c.regressions[0], "test t::boom");
+    assert!(c
+        .regressions
+        .iter()
+        .skip(1)
+        .all(|r| r.starts_with("unattributed failure: ")));
     // core#553: a single head-only failure is re-run once, alone, but only on an oversubscribed
     // host (the evidence of load); on a host with headroom it is not re-run. Either way the
     // always-red test stays a regression.
@@ -1880,7 +1886,10 @@ fn a_libtest_failure_the_base_shares_is_still_denied() {
     assert_eq!(c.name, "test_targeted");
     assert_eq!(c.exit_code, Some(101), "the head DID fail the check");
     assert_eq!(c.classification.as_deref(), Some("regression"), "{c:?}");
-    assert_eq!(c.regressions, vec!["test t::boom".to_string()]);
+    assert_eq!(c.regressions[0], "test t::boom");
+    assert!(c
+        .regressions
+        .contains(&"unattributed failure: cargo test exited 101".to_string()));
     assert_eq!(c.ambiguous, vec!["test t::boom".to_string()]);
     assert!(c.pre_existing.is_empty());
     let base = c.base.as_deref().expect("the base run rides the check");

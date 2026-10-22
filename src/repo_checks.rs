@@ -570,9 +570,9 @@ pub struct CheckRun {
     /// [`FLAKE_RERUN_BUDGET_S`], or a runner it cannot filter to one test. They stay regressions.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub not_rechecked: usize,
-    /// Head failures whose test name the base also fails, with a binary that cannot be told on one
-    /// side (an unattributed `[?]` id): kept as
-    /// regressions, not guessed — and listed here so the denial says why.
+    /// Head libtest failures whose test name the base also fails: never matched (a libtest id names
+    /// no test binary, core#1060) — kept as regressions, not guessed, and listed here so the denial
+    /// says why.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ambiguous: Vec<String>,
     /// (core#789/#790) Environment signals the scan read off the check's own output, at most
@@ -4379,6 +4379,7 @@ fn isolated_rerun_argv(argv: &[String], id: &str) -> Option<(Vec<String>, String
 /// `--include-ignored`, an unknown flag, a second `--` — could make that select something else.
 /// The check then stays a regression.
 fn understood_cargo_test(argv: &[String]) -> Option<(&[String], &[String])> {
+    let sub = cargo_test_sub(argv)?;
     /// Before `--`: package selection, features, profile, target, lockfile, jobs, fail-fast and
     /// colour flags.
     const CARGO_BARE: &[&str] = &[
@@ -4434,19 +4435,21 @@ fn understood_cargo_test(argv: &[String]) -> Option<(&[String], &[String])> {
         }
         true
     }
-    let file = Path::new(argv.first()?).file_name()?.to_str()?;
-    if file != "cargo" && file != "cargo.exe" {
-        return None;
-    }
-    let sub = if argv.get(1)?.starts_with('+') { 2 } else { 1 };
-    if argv.get(sub)? != "test" {
-        return None;
-    }
     let split = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
     let (cargo_args, test_args) = (&argv[..split], argv.get(split + 1..).unwrap_or(&[]));
     (allowed(&cargo_args[sub + 1..], CARGO_BARE, CARGO_VALUED)
         && allowed(test_args, TEST_BARE, TEST_VALUED))
     .then_some((cargo_args, test_args))
+}
+
+/// The index of `test` in a `cargo [+toolchain] test …` argv, or `None` when it is not one.
+fn cargo_test_sub(argv: &[String]) -> Option<usize> {
+    let file = Path::new(argv.first()?).file_name()?.to_str()?;
+    if file != "cargo" && file != "cargo.exe" {
+        return None;
+    }
+    let sub = if argv.get(1)?.starts_with('+') { 2 } else { 1 };
+    (argv.get(sub)? == "test").then_some(sub)
 }
 
 /// (core#781) The runner behind a package-manager script check — `npm test`, `npm run <s>`,
@@ -5262,13 +5265,14 @@ fn judge_claim(ctx: &FloorContext, checks: &[CheckRun]) -> Option<ClaimCheck> {
     let phrase = detect_claim(ctx.claim_text.as_deref()?)?;
     let failing = checks.iter().find(|c| !c.passed() && c.name != "install")?;
     let verdict = match failing.classification.as_deref() {
-        // Every regression a libtest name the base fails too (core#1060: never matched): the
-        // floor can neither confirm the claim nor reject it.
+        // Every NAMED regression a libtest name the base fails too (core#1060: never matched; the
+        // unattributed ids name nothing): the floor can neither confirm the claim nor reject it.
         Some(REGRESSION)
-            if !failing.regressions.is_empty()
+            if failing.regressions.iter().any(|r| !never_matched(r))
                 && failing
                     .regressions
                     .iter()
+                    .filter(|r| !never_matched(r))
                     .all(|r| failing.ambiguous.contains(r)) =>
         {
             CLAIM_UNVERIFIED
@@ -5318,7 +5322,7 @@ pub(crate) fn load_band(load1: Option<f64>, cpus: usize) -> Option<u32> {
 
 /// What one check's re-checks and head/base matching established beyond its verdict, one line
 /// each: head-only failures that passed alone while others still deny, how many were not
-/// re-checked, and head ids not matched because a same-named base failure was in the other form.
+/// re-checked, and head libtest ids the base fails by name too (never matched, core#1060).
 /// Empty when there is nothing of the kind.
 fn match_notes(c: &CheckRun) -> Vec<String> {
     let plural = |n: usize| if n == 1 { "" } else { "s" };
@@ -5496,6 +5500,25 @@ impl LineScan {
                 }
             }
         }
+        // (core#1060) Ids and markers are read off the raw line and the de-introduced one (every
+        // ESC, `ESC [` and `ESC ]` deleted) as well as the stripped one: a second reading can only
+        // ADD ids, so an escape written onto a failure line (`\x1b[31test new ... FAILED`, where
+        // the stripper takes the `t` as the sequence's final byte) cannot hide it.
+        let extra: Vec<String> = if raw.contains('\u{1b}') {
+            vec![raw.to_string(), de_introduced(raw)]
+        } else {
+            Vec::new()
+        };
+        for other in &extra {
+            let o = other.trim();
+            if let Some(kind) = unattributed_failure_of_line(o) {
+                self.add(format!("{UNATTRIBUTED_FAILURE}{kind}"));
+            }
+            let mut eslint = None;
+            if let Some(id) = failure_id_of_line(other, &mut eslint) {
+                self.add(id);
+            }
+        }
         if let Some(kind) = unattributed_failure_of_line(s) {
             self.add(format!("{UNATTRIBUTED_FAILURE}{kind}"));
         }
@@ -5566,6 +5589,23 @@ fn strip_ansi(line: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// `line` with every ESC deleted, and the `[` or `]` that introduces a sequence after it — a
+/// second reading of a line whose escapes do not parse ([`LineScan::line`]).
+fn de_introduced(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut it = line.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\u{1b}' {
+            if matches!(it.peek(), Some('[') | Some(']')) {
+                it.next();
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// The index just past the complete escape sequence that starts at `c[i]` (an ESC), or `None`.
 fn escape_end(c: &[char], i: usize) -> Option<usize> {
     let within = |j: usize, lo: char, hi: char| c.get(j).is_some_and(|x| (lo..=hi).contains(x));
@@ -5625,6 +5665,14 @@ fn unattributed_failure_of_line(s: &str) -> Option<&'static str> {
     }
     if s.starts_with("ERROR ") {
         return Some("pytest reported an error");
+    }
+    // A cargo run inside a wrapper (`sh -c 'cargo test'`): libtest's verdict, cargo's per-target
+    // selector, libtest's `--quiet` failure line.
+    if s.starts_with("test result: FAILED")
+        || s.contains("failed, to rerun pass ")
+        || s.ends_with(" --- FAILED")
+    {
+        return Some("cargo test failed");
     }
     if let Some(rest) = s.strip_prefix("FAIL ") {
         if !rest.trim().is_empty() && !rest.contains(" > ") {
@@ -5692,6 +5740,13 @@ pub(crate) fn failure_id_of_line(line: &str, eslint_file: &mut Option<String>) -
         .and_then(|r| r.find("test ").map(|i| &r[i + 5..]))
     {
         return Some(format!("test {}", name.trim()));
+    }
+    // libtest `--quiet`: `path::name --- FAILED`
+    if let Some(name) = s.strip_suffix(" --- FAILED") {
+        let name = name.trim();
+        if !name.is_empty() && !name.contains(char::is_whitespace) {
+            return Some(format!("test {name}"));
+        }
     }
     // pytest: `FAILED tests/x.py::test_y - AssertionError: …`
     if let Some(rest) = s.strip_prefix("FAILED ") {
@@ -6010,6 +6065,19 @@ fn run_one_capped(
     let (ids, passed, signals) = qualify(out_scan, err_scan);
     result.failure_ids = ids;
     result.env_signals = signals;
+    // (core#1060) A failed `cargo test` is a failure whatever its output says — the floor's own
+    // argv and exit code, no text: only a clean confirmation run's exit can answer for it.
+    if !result.passed() && result.spawn_error.is_none() && cargo_test_sub(&check.argv).is_some() {
+        let how = match result.exit_code {
+            Some(c) => format!("exited {c}"),
+            None if result.timed_out => "timed out".to_string(),
+            None => "was killed by a signal".to_string(),
+        };
+        let id = format!("{UNATTRIBUTED_FAILURE}cargo test {how}");
+        if !result.failure_ids.contains(&id) {
+            result.failure_ids.push(id);
+        }
+    }
     result.duration_ms = started.elapsed().as_millis() as u64;
     (result, passed)
 }
@@ -8542,10 +8610,20 @@ mod tests {
         assert_eq!(c.name, "test_targeted");
         assert_eq!(c.source, DERIVED_TARGETED_SOURCE);
         assert_eq!(c.classification.as_deref(), Some(REGRESSION), "{c:?}");
+        // Every regression named, plus the failed cargo run's own ids (core#1060).
+        let named = |v: &[String]| {
+            v.iter()
+                .filter(|i| !never_matched(i))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            c.regressions,
+            named(&c.regressions),
             vec!["test t::other", "test t::shared", "test t::stable"]
         );
+        assert!(c
+            .regressions
+            .contains(&format!("{UNATTRIBUTED_FAILURE}cargo test exited 101")));
         assert_eq!(c.ambiguous, vec!["test t::other", "test t::shared"]);
         assert!(c.pre_existing.is_empty());
         let b = c.base.as_deref().expect("the base run is attached");
@@ -8558,7 +8636,7 @@ mod tests {
         );
         // First-seen order: cargo runs tests on several threads, so the two failures may be
         // reported in either order (the macOS CI runner reports `shared` first) — compare sorted.
-        let mut base_ids = br.failure_ids.clone();
+        let mut base_ids = named(&br.failure_ids);
         base_ids.sort();
         assert_eq!(base_ids, vec!["test t::other", "test t::shared"]);
         assert_eq!(
@@ -8613,8 +8691,11 @@ mod tests {
         let c = &report.checks[1];
         assert_eq!(c.name, "cargo-test");
         assert_eq!(c.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(c.regressions, vec!["test t::other", "test t::shared"]);
-        assert_eq!(c.ambiguous, c.regressions);
+        assert_eq!(
+            named(&c.regressions),
+            vec!["test t::other", "test t::shared"]
+        );
+        assert_eq!(c.ambiguous, named(&c.regressions));
         assert!(c.pre_existing.is_empty() && c.denies());
         assert!(!report.env_mismatch());
         assert_eq!(
@@ -8633,7 +8714,7 @@ mod tests {
         let report = run_floor(&repo, &ctx);
         assert!(!report.passed, "{:?}", report.checks[1]);
         let c = &report.checks[1];
-        assert_eq!(c.regressions, vec!["test t::shared"]);
+        assert_eq!(named(&c.regressions), vec!["test t::shared"]);
         assert_eq!(c.ambiguous, vec!["test t::shared"]);
         assert!(
             c.base.as_deref().is_some_and(|b| b.cached),
@@ -11189,5 +11270,183 @@ mod tests {
         );
         drop(scratch_dir);
         let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    /// agy round 17: an escape written onto a failure line — `\x1b[31` before `test new`, where
+    /// the stripper takes the `t` as the sequence's final byte, or a bare `\x1b` / `\x1b[` before
+    /// `FAILED`, `FAIL`, `ERROR`, `Couldn't` — once lost the id. The line is now read raw,
+    /// stripped and de-introduced, and the union kept: beside a pytest failure the base shares,
+    /// every one denies.
+    #[test]
+    fn an_escape_before_any_failure_line_cannot_hide_it_1060() {
+        let shared = "FAILED tests/t.py::test_old - red\n";
+        for line in [
+            "\u{1b}[31test new ... FAILED",
+            "\u{1b}[test new ... FAILED",
+            "\u{1b}FAILED tests/t.py::test_new - red",
+            "\u{1b}[FAILED tests/t.py::test_new - red",
+            "\u{1b}]FAILED tests/t.py::test_new - red",
+            "\u{1b}FAIL a.test.ts > s > new",
+            "\u{1b}[FAIL a.test.ts > s > new",
+            "\u{1b}ERROR tests/test_new.py - ImportError",
+            "\u{1b}[ERROR tests/test_new.py - ImportError",
+            "\u{1b}[Couldn't compile the test.",
+        ] {
+            let run = scanned_head((&format!("{shared}{line}\n"), ""), (shared, ""));
+            assert_eq!(
+                run.classification.as_deref(),
+                Some(REGRESSION),
+                "{line:?}: {run:?}"
+            );
+            assert!(!run.regressions.is_empty() && run.denies(), "{line:?}");
+        }
+    }
+
+    /// The ruling of round 17, for a cargo run the floor sees only as text (a wrapper:
+    /// `sh -c 'cargo test'`): libtest's `test result: FAILED`, cargo's `… failed, to rerun pass`
+    /// and libtest's `--quiet` line `name --- FAILED` each add an unattributed id (the quiet line
+    /// names its test too) — so a wrapper's failed run is never pre-existing beside a shared
+    /// pytest failure.
+    #[test]
+    fn a_wrapped_cargo_failure_is_never_pre_existing_1060() {
+        let shared = "FAILED tests/t.py::test_old - red\n";
+        for line in [
+            "error: test failed, to rerun pass `--lib`",
+            "error: doctest failed, to rerun pass `-p a --doc`",
+            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+            "t::new --- FAILED",
+        ] {
+            let run = scanned_head((shared, &format!("{line}\n")), (shared, ""));
+            assert_eq!(
+                run.classification.as_deref(),
+                Some(REGRESSION),
+                "{line:?}: {run:?}"
+            );
+            assert!(run
+                .regressions
+                .iter()
+                .any(|r| r == &format!("{UNATTRIBUTED_FAILURE}cargo test failed")));
+            assert!(run.denies());
+        }
+        let (ids, _, _) = qualify(scan_of("t::new --- FAILED\n"), LineScan::default());
+        assert!(ids.contains(&"test t::new".to_string()), "{ids:?}");
+    }
+
+    /// codex round 17, with real cargo: `cargo test -- --quiet` prints `name --- FAILED`, not
+    /// `test name ... FAILED`, and exits 101 with no other marker. The base fails `old_failure`,
+    /// the head also fails `new_regression`, and both print a pytest-shaped line into their
+    /// captured output that the two trees share. The argv-based id (a failed `cargo test` is a
+    /// failure whatever its text says) and the quiet line keep the check a regression.
+    #[cfg(unix)]
+    #[test]
+    fn a_quiet_cargo_failure_beside_a_shared_child_id_denies_1060() {
+        let root = scratch("quiet1060");
+        let crate_at = |dir: &Path, new_regression: bool| {
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(
+                dir.join("Cargo.toml"),
+                "[package]\nname = \"quiet_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+                 [lib]\npath = \"src/lib.rs\"\n[workspace]\n",
+            )
+            .unwrap();
+            let body = |name: &str, fails: bool| {
+                format!(
+                    "    #[test]\n    fn {name}() {{\n        println!(\"FAILED \
+                     tests/test_child.py::test_shared - child\");\n        assert!(!{fails});\n    \
+                     }}\n"
+                )
+            };
+            std::fs::write(
+                dir.join("src/lib.rs"),
+                format!(
+                    "#[cfg(test)]\nmod t {{\n{}{}}}\n",
+                    body("old_failure", true),
+                    body("new_regression", new_regression)
+                ),
+            )
+            .unwrap();
+        };
+        let (base_dir, head_dir) = (root.join("base"), root.join("head"));
+        crate_at(&base_dir, false);
+        crate_at(&head_dir, true);
+        let check = RepoCheck {
+            name: "test".into(),
+            argv: s(&["cargo", "test", "--", "--quiet"]),
+            source: "fixture".into(),
+            timeout_s: Some(600),
+            dir: String::new(),
+        };
+        let run_in = |dir: &Path| {
+            let sandbox = sandbox_for(dir);
+            if sandbox.level != SandboxLevel::Sandboxed {
+                return None;
+            }
+            let scratch_dir = CheckScratch::prepare(dir).unwrap();
+            Some(run_one(dir, &check, &sandbox, &scratch_dir, Tree::Head))
+        };
+        let (Some(base), Some(mut head)) = (run_in(&base_dir), run_in(&head_dir)) else {
+            eprintln!("repo_checks: no sandbox tool here — the cargo fixture cannot run");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        };
+        assert!(!base.passed() && !head.passed(), "{base:?} {head:?}");
+        assert!(
+            head.failure_ids
+                .contains(&"FAILED tests/test_child.py::test_shared".to_string()),
+            "the shared child id is read on the head: {:?} {}",
+            head.failure_ids,
+            head.stdout_tail
+        );
+        assert!(
+            head.failure_ids
+                .contains(&format!("{UNATTRIBUTED_FAILURE}cargo test exited 101")),
+            "{:?}",
+            head.failure_ids
+        );
+        classify(&mut head, base_of(base));
+        assert_eq!(head.classification.as_deref(), Some(REGRESSION), "{head:?}");
+        assert!(
+            head.regressions
+                .contains(&"test t::new_regression".to_string()),
+            "the quiet line names it: {:?}",
+            head.regressions
+        );
+        assert!(head.denies());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The argv-based id of a failed `cargo test` is answered for by the clean confirmation run
+    /// like every other unattributed id: a real flake beside it is still `flaky_under_load`.
+    #[test]
+    fn a_flake_beside_the_cargo_exit_id_is_still_flaky_1060() {
+        let exit = format!("{UNATTRIBUTED_FAILURE}cargo test exited 101");
+        let (check, mut run) = regression_run(&["test t::flaky", &exit]);
+        let mut argvs = Vec::new();
+        recheck_alone(
+            &check,
+            &mut run,
+            None,
+            Duration::from_secs(FLAKE_RERUN_BUDGET_S),
+            &mut confirming_rerun(0, &mut argvs),
+        );
+        assert_eq!(
+            run.classification.as_deref(),
+            Some(FLAKY_UNDER_LOAD),
+            "{run:?}"
+        );
+        assert_eq!(run.regressions, vec!["test t::flaky"]);
+        assert!(!run.denies());
+        // The same run with a failing confirmation: a regression, the exit id kept.
+        let (check, mut run) = regression_run(&["test t::flaky", &exit]);
+        let mut argvs = Vec::new();
+        recheck_alone(
+            &check,
+            &mut run,
+            None,
+            Duration::from_secs(FLAKE_RERUN_BUDGET_S),
+            &mut confirming_rerun(101, &mut argvs),
+        );
+        assert_eq!(run.regressions, vec![exit, NO_CLEAN_RUN.to_string()]);
+        assert!(run.denies());
     }
 }
