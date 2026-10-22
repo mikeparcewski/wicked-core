@@ -5670,6 +5670,14 @@ impl LineScan {
         {
             // Captured output belongs to an open binary.
             self.anomaly |= !self.open && !self.blocks.is_empty();
+            if self.open && !self.capture {
+                // libtest prints its sections after `failures:` / `successes:`: one before it is
+                // the output's own line (a raw stdout write). An anomaly, and NOT a section —
+                // the binary's `test y ... FAILED` lines after it are still its own (agy/codex
+                // on #1060).
+                self.anomaly = true;
+                return;
+            }
             self.listed = None;
             self.section = Some(name.to_string());
             return;
@@ -12015,6 +12023,47 @@ error: 2 targets failed:
         let run = adj_head(&head, "", &base, "");
         assert_eq!(run.classification.as_deref(), Some(REGRESSION));
         assert_eq!(run.regressions, vec![FAILURE_IDS_TRUNCATED]);
+        assert!(run.denies());
+    }
+
+    /// (#1060 round 10) A raw `---- x stdout ----` line while a binary is still printing its
+    /// results (before `failures:`) is an anomaly, not a section: the `test y ... FAILED` after it
+    /// is still read — never dropped — and, with the structure failed closed, is `[?]`.
+    #[test]
+    fn a_section_header_before_failures_drops_no_failure_1060() {
+        let head = adj_text(&[
+            "running 2 tests",
+            "test a ... ok",
+            "---- x stdout ----",
+            "test y ... FAILED",
+            "",
+            "failures:",
+            "    y",
+            "",
+            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]);
+        let scan = scan_of(&head);
+        assert!(scan.anomaly && scan.section.is_none());
+        let err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n\
+            error: test failed, to rerun pass `-p a --lib`\n";
+        assert_eq!(
+            qualify(scan_of(&head), scan_of(err)).0,
+            vec!["test y [?]".to_string()]
+        );
+        // The base fails y qualified in the same binary: still a regression (unattributed).
+        let base = adj_text(&[
+            "running 2 tests",
+            "test a ... ok",
+            "test y ... FAILED",
+            "",
+            "failures:",
+            "    y",
+            "",
+            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]);
+        let run = adj_head(&head, err, &base, err);
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(run.regressions, vec!["test y [?]"]);
         assert!(run.denies());
     }
 
