@@ -114,7 +114,7 @@
 //!
 //! A `test` script is arbitrary code the repository chose. It runs the way the engine runs an
 //! ungoverned worker: inside the OS write boundary the worker sandbox provides
-//! ([`crate::validator::detect_worker_sandbox`] — macOS `sandbox-exec`, Linux `bwrap`; writes
+//! ([`crate::validator::detect_floor_sandbox`] — macOS `sandbox-exec`, Linux `bwrap`; writes
 //! confined to the worktree, the curated secret directories unreadable, network open because
 //! installs need it), with an ISOLATED `HOME` and package caches in the floor's CHECK SCRATCH
 //! (`HOME`, `npm_config_cache`, `CARGO_HOME`, `CARGO_TARGET_DIR`, `XDG_*` — see "Where the check
@@ -3001,11 +3001,11 @@ pub fn run_floor_rerun(
     let scratch = match CheckScratch::prepare_for(worktree, ctx.run_id.as_deref()) {
         Ok(s) => s,
         Err(e) => {
-            let sandbox = crate::validator::detect_worker_sandbox(&[worktree.to_path_buf()]);
+            let sandbox = crate::validator::detect_floor_sandbox(&[worktree.to_path_buf()]);
             return scratch_refused(worktree, ctx, &sandbox, &e);
         }
     };
-    let sandbox = crate::validator::detect_worker_sandbox(&[
+    let sandbox = crate::validator::detect_floor_sandbox(&[
         worktree.to_path_buf(),
         scratch.tmp.path().to_path_buf(),
         scratch.root().to_path_buf(),
@@ -3047,7 +3047,7 @@ pub(crate) fn floor_probe() -> Result<&'static str, crate::worker_sandbox::Floor
         let dir = std::env::temp_dir().join(format!("wicked-floor-probe-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let armed = dir.canonicalize().ok().is_some_and(|d| {
-            let sandbox = crate::validator::detect_worker_sandbox(std::slice::from_ref(&d));
+            let sandbox = crate::validator::detect_floor_sandbox(std::slice::from_ref(&d));
             if sandbox.level != crate::validator::SandboxLevel::Sandboxed
                 || sandbox.wrapper.is_empty()
             {
@@ -3951,7 +3951,7 @@ pub(crate) fn guarded_checkout_refused(
     ctx: &FloorContext,
     why: &str,
 ) -> RepoChecksReport {
-    let sandbox = crate::validator::detect_worker_sandbox(&[worktree.to_path_buf()]);
+    let sandbox = crate::validator::detect_floor_sandbox(&[worktree.to_path_buf()]);
     RepoChecksReport {
         detected: detect_with(worktree, ctx).unwrap_or_default(),
         checks: Vec::new(),
@@ -5704,7 +5704,7 @@ mod tests {
     fn sandbox_for(wt: &Path) -> WorkerSandbox {
         let leaf = scratch_dir_for(&check_cache_root().unwrap(), wt, None);
         std::fs::create_dir_all(&leaf).unwrap();
-        crate::validator::detect_worker_sandbox(&[wt.to_path_buf(), leaf])
+        crate::validator::detect_floor_sandbox(&[wt.to_path_buf(), leaf])
     }
 
     #[test]
