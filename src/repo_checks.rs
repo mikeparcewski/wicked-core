@@ -274,6 +274,15 @@ pub const UNATTRIBUTED_FAILURE: &str = "unattributed failure: ";
 pub const NO_CLEAN_RUN: &str =
     "unattributed failure: the check did not run clean with its flaky tests skipped";
 
+/// The `source` of a check's confirmation run ([`recheck_alone`], [`rerun_load_class`]): a check
+/// confirms at most once — after one ran, no later path re-confirms or reclassifies it.
+const CONFIRMATION_SOURCE: &str = "confirmation run (core#1060)";
+
+/// A confirmation run is already on the check's record.
+fn confirmed_once(run: &CheckRun) -> bool {
+    run.reruns.iter().any(|r| r.source == CONFIRMATION_SOURCE)
+}
+
 /// Never matched to a base id, never re-run alone: the truncation marker and every
 /// [`UNATTRIBUTED_FAILURE`].
 fn never_matched(id: &str) -> bool {
@@ -4353,26 +4362,91 @@ fn isolated_rerun_argv(argv: &[String], id: &str) -> Option<(Vec<String>, String
     if !rerunnable_name(name) {
         return None;
     }
-    let bin = argv.first()?;
-    let is_cargo = Path::new(bin)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n == "cargo" || n == "cargo.exe");
-    let sub = match argv.get(1) {
-        Some(t) if t.starts_with('+') => 2,
-        _ => 1,
-    };
-    if !is_cargo || argv.get(sub).map(String::as_str) != Some("test") {
-        return None;
-    }
-    let split = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
-    let (cargo_args, test_args) = (&argv[..split], argv.get(split + 1..).unwrap_or(&[]));
+    let (cargo_args, test_args) = understood_cargo_test(argv)?;
     let mut out: Vec<String> = cargo_args.to_vec();
     out.push("--".into());
     out.extend(test_args.iter().cloned());
     out.push("--exact".into());
     out.push(name.to_string());
     Some((out, name.to_string()))
+}
+
+/// (core#1060) A `cargo [+toolchain] test` argv the floor understands element by element, split
+/// at `--` into (cargo arguments, test-binary arguments), or `None`. Only such a check is re-run
+/// alone or confirmed: the floor appends `--exact` (and `--skip`), and anything it does not know —
+/// a positional TESTNAME (`cargo test foo`: `--exact` turns it into a name no test has, and a
+/// confirmation of 0 tests exits 0), a `--skip` or `--exact` of its own, `--ignored` /
+/// `--include-ignored`, an unknown flag, a second `--` — could make that select something else.
+/// The check then stays a regression.
+fn understood_cargo_test(argv: &[String]) -> Option<(&[String], &[String])> {
+    /// Before `--`: package selection, features, profile, target, lockfile, jobs, fail-fast and
+    /// colour flags.
+    const CARGO_BARE: &[&str] = &[
+        "--workspace",
+        "--all",
+        "--all-features",
+        "--no-default-features",
+        "--release",
+        "--locked",
+        "--frozen",
+        "--offline",
+        "--no-fail-fast",
+    ];
+    const CARGO_VALUED: &[&str] = &[
+        "-p",
+        "--package",
+        "--exclude",
+        "-F",
+        "--features",
+        "--profile",
+        "--target",
+        "-j",
+        "--jobs",
+        "--color",
+    ];
+    /// After `--`: thread count, output capture and colour.
+    const TEST_BARE: &[&str] = &["--nocapture", "--show-output", "-q", "--quiet"];
+    const TEST_VALUED: &[&str] = &["--test-threads", "--color"];
+    fn allowed(args: &[String], bare: &[&str], valued: &[&str]) -> bool {
+        let mut i = 0;
+        while let Some(a) = args.get(i).map(String::as_str) {
+            i += 1;
+            if bare.contains(&a) {
+                continue;
+            }
+            if valued.contains(&a) {
+                match args.get(i) {
+                    Some(v) if !v.is_empty() && !v.starts_with('-') => i += 1,
+                    _ => return false,
+                }
+                continue;
+            }
+            let joined = a
+                .split_once('=')
+                .is_some_and(|(k, v)| k.starts_with("--") && valued.contains(&k) && !v.is_empty());
+            // `-pfoo`, `-Ffeat`, `-j8`: a short valued flag with its value attached.
+            let short = a.len() > 2
+                && !a.starts_with("--")
+                && valued.iter().any(|f| f.len() == 2 && a.starts_with(f));
+            if !joined && !short {
+                return false;
+            }
+        }
+        true
+    }
+    let file = Path::new(argv.first()?).file_name()?.to_str()?;
+    if file != "cargo" && file != "cargo.exe" {
+        return None;
+    }
+    let sub = if argv.get(1)?.starts_with('+') { 2 } else { 1 };
+    if argv.get(sub)? != "test" {
+        return None;
+    }
+    let split = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    let (cargo_args, test_args) = (&argv[..split], argv.get(split + 1..).unwrap_or(&[]));
+    (allowed(&cargo_args[sub + 1..], CARGO_BARE, CARGO_VALUED)
+        && allowed(test_args, TEST_BARE, TEST_VALUED))
+    .then_some((cargo_args, test_args))
 }
 
 /// (core#781) The runner behind a package-manager script check — `npm test`, `npm run <s>`,
@@ -4534,26 +4608,20 @@ fn rerun_flakes(
         runner_argv.as_deref(),
         Duration::from_secs(FLAKE_RERUN_BUDGET_S),
         &mut |one, names, cap| {
-            run_one_capped(
-                worktree,
-                one,
-                sandbox,
-                scratch,
-                Tree::Head,
-                names,
-                Some(cap),
-            )
+            run_one_capped(worktree, one, sandbox, scratch, Tree::Head, names, cap)
         },
     );
 }
 
-/// One isolated re-run: the narrowed check, the names it must print passing and the HARD bound
-/// it runs under (what the budget has left, never stretched by load) → the run and the watched
-/// names it printed passing.
-type IsolatedRerun<'a> = dyn FnMut(&RepoCheck, &[String], Duration) -> (CheckRun, Vec<String>) + 'a;
+/// One re-run: the check to run, the names it must print passing and its HARD bound — what the
+/// isolated re-run budget has left, never stretched by load — or `None` for the check's own
+/// load-scaled bound (the confirmation run, core#1060) → the run and the watched names it printed
+/// passing.
+type IsolatedRerun<'a> =
+    dyn FnMut(&RepoCheck, &[String], Option<Duration>) -> (CheckRun, Vec<String>) + 'a;
 
 /// The re-checks themselves, with the re-run injected (the seam the tests drive). Each head-only
-/// failure is re-run once, alone: a libtest id by its `--exact` name in its own binary, a vitest
+/// failure is re-run once, alone: a libtest id by its `--exact` name (in every binary), a vitest
 /// id as its FILE (two ids of one file share one re-run). A failure PASSES alone only when the
 /// re-run exits 0 AND the runner printed it passing (a filter that matched nothing is not a
 /// pass): it is "flaky (passed alone)" and does not deny (`flaky`). One that fails again stays a
@@ -4569,6 +4637,10 @@ fn recheck_alone(
     budget: Duration,
     rerun: &mut IsolatedRerun<'_>,
 ) {
+    // One confirmation per check: after one ran (and failed), nothing re-confirms (agy on #1060).
+    if confirmed_once(run) {
+        return;
+    }
     let head_only = run.regressions.clone();
     // A failure the output proves but does not name cannot be re-run alone: only the
     // confirmation run below answers for it (core#1060).
@@ -4621,7 +4693,7 @@ fn recheck_alone(
             timeout_s: check.timeout_s,
             dir: check.dir.clone(),
         };
-        let (r, passed) = rerun(&one, &names, left);
+        let (r, passed) = rerun(&one, &names, Some(left));
         spent += Duration::from_millis(r.duration_ms);
         let ok = r.passed() && names.iter().all(|n| passed.iter().any(|p| p == n));
         eprintln!(
@@ -4649,20 +4721,18 @@ fn recheck_alone(
     if all_passed {
         // (core#1060) Names passing alone say nothing of what the output never named (a binary
         // that crashed, a doctest the `--exact` filter never compiled): the check itself, its
-        // flaky tests skipped, must exit 0 — the ground truth that nothing else failed.
-        let left = budget
-            .checked_sub(spent)
-            .filter(|d| *d >= Duration::from_secs(1));
-        let confirmed = match (left, confirmation_argv(&check.argv, &flaky)) {
-            (Some(left), Some(argv)) => {
+        // flaky tests skipped, must exit 0 — the ground truth that nothing else failed. It runs
+        // under the check's own load-scaled bound, not what the isolated re-runs left.
+        let confirmed = match confirmation_argv(&check.argv, &flaky) {
+            Some(argv) => {
                 let one = RepoCheck {
                     name: check.name.clone(),
                     argv,
-                    source: "confirmation run, its flaky tests skipped (core#1060)".into(),
+                    source: CONFIRMATION_SOURCE.into(),
                     timeout_s: check.timeout_s,
                     dir: check.dir.clone(),
                 };
-                let (r, _) = rerun(&one, &[], left);
+                let (r, _) = rerun(&one, &[], None);
                 let clean = r.passed();
                 eprintln!(
                     "wicked-core: repo checks floor — confirmation run with the flaky tests \
@@ -4677,9 +4747,11 @@ fn recheck_alone(
                 run.reruns.push(r);
                 clean
             }
-            _ => false,
+            None => false,
         };
         if confirmed {
+            // The clean run answered for the unattributed ids: the record names the flakes only.
+            run.regressions.retain(|id| !never_matched(id));
             run.classification = Some(FLAKY_UNDER_LOAD.to_string());
             run.flaky = flaky;
             return;
@@ -4694,44 +4766,22 @@ fn recheck_alone(
 
 /// (core#1060) The confirmation run of a check whose named head-only failures all passed alone:
 /// the check's own `cargo test` with each libtest name skipped exactly (`-- --skip <n> --exact`;
-/// libtest applies `--exact` to `--skip`), or — for any other runner, which has no skip form here
-/// (vitest) — the check itself, unchanged. `None` when the cargo command already passes its own
-/// test-name filters (`--exact` would change what they select): not confirmable.
+/// libtest applies `--exact` to `--skip`) — only for an argv the floor understands element by
+/// element ([`understood_cargo_test`]) — or, for any other runner, which has no skip form here
+/// (vitest, pytest), the check itself, unchanged. `None`: not confirmable, a regression.
 fn confirmation_argv(argv: &[String], flaky: &[String]) -> Option<Vec<String>> {
     let names: Vec<&str> = flaky.iter().filter_map(|id| libtest_name(id)).collect();
     if names.len() != flaky.len() || names.is_empty() {
         return Some(argv.to_vec());
     }
-    let split = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
-    let (cargo_args, test_args) = (&argv[..split], argv.get(split + 1..).unwrap_or(&[]));
-    const VALUE_FLAGS: &[&str] = &[
-        "--test-threads",
-        "--color",
-        "--format",
-        "--logfile",
-        "--skip",
-        "-Z",
-        "--shuffle-seed",
-    ];
-    let mut value = false;
-    for a in test_args {
-        if value {
-            value = false;
-        } else if VALUE_FLAGS.contains(&a.as_str()) {
-            value = true;
-        } else if !a.starts_with('-') {
-            return None;
-        }
-    }
+    let (cargo_args, test_args) = understood_cargo_test(argv)?;
     let mut out = cargo_args.to_vec();
     out.push("--".into());
     out.extend(test_args.iter().cloned());
     for n in names {
         out.extend(["--skip".to_string(), n.to_string()]);
     }
-    if !test_args.iter().any(|a| a == "--exact") {
-        out.push("--exact".into());
-    }
+    out.push("--exact".into());
     Some(out)
 }
 
@@ -4893,10 +4943,12 @@ fn rerun_load_class(
     scratch: &CheckScratch,
 ) -> bool {
     use std::collections::BTreeSet;
-    if !matches!(
-        run.classification.as_deref(),
-        Some(REGRESSION) | Some(UNCLASSIFIED_RED_BASE)
-    ) || run.env_signals.iter().any(|s| s == SIGNALS_TRUNCATED)
+    if confirmed_once(run)
+        || !matches!(
+            run.classification.as_deref(),
+            Some(REGRESSION) | Some(UNCLASSIFIED_RED_BASE)
+        )
+        || run.env_signals.iter().any(|s| s == SIGNALS_TRUNCATED)
     {
         return false;
     }
@@ -5003,7 +5055,11 @@ fn rerun_load_class(
     // (core#1060) The files passing say nothing of a failure the output never named: the check
     // itself (vitest has no skip form) must run clean once more.
     let ok = ok && {
-        let (c, _) = run_one_watching(worktree, check, sandbox, scratch, Tree::Head, &[]);
+        let confirm = RepoCheck {
+            source: CONFIRMATION_SOURCE.into(),
+            ..check.clone()
+        };
+        let (c, _) = run_one_watching(worktree, &confirm, sandbox, scratch, Tree::Head, &[]);
         let clean = c.passed();
         eprintln!(
             "wicked-core: repo checks floor — confirmation run of `{}` {}",
@@ -5018,11 +5074,17 @@ fn rerun_load_class(
         clean
     };
     if ok {
+        // The clean run answered for the unattributed ids: the record names the files' failures.
+        run.regressions.retain(|id| !never_matched(id));
         if run.regressions.is_empty() {
-            run.regressions = if head_only.is_empty() {
+            let named: Vec<String> = head_only
+                .into_iter()
+                .filter(|id| !never_matched(id))
+                .collect();
+            run.regressions = if named.is_empty() {
                 files.iter().map(|f| format!("FAIL {f} [ {f} ]")).collect()
             } else {
-                head_only
+                named
             };
         }
         run.classification = Some(FLAKY_UNDER_LOAD.to_string());
@@ -5052,7 +5114,7 @@ fn rerun_env_crash(
             .find(|s| s.starts_with("crash: "))
             .cloned()
     };
-    if run.classification.as_deref() != Some(UNCLASSIFIED_RED_BASE) {
+    if confirmed_once(run) || run.classification.as_deref() != Some(UNCLASSIFIED_RED_BASE) {
         return false;
     }
     let base_crash = run
@@ -5944,7 +6006,7 @@ fn run_one_capped(
         }
     }
     // Identifiers from both streams (cargo prints its per-test lines on stdout, vitest on
-    // stderr), de-duplicated, in order of first sight; libtest ids qualified by their binary.
+    // stderr), de-duplicated, in order of first sight; libtest ids plain (core#1060).
     let (ids, passed, signals) = qualify(out_scan, err_scan);
     result.failure_ids = ids;
     result.env_signals = signals;
@@ -9163,14 +9225,17 @@ mod tests {
         pass: &'a dyn Fn(&str) -> bool,
         secs: u64,
         bounds: &'a mut Vec<u64>,
-    ) -> impl FnMut(&RepoCheck, &[String], Duration) -> (CheckRun, Vec<String>) + 'a {
+    ) -> impl FnMut(&RepoCheck, &[String], Option<Duration>) -> (CheckRun, Vec<String>) + 'a {
         move |one, names, cap| {
             assert_eq!(
                 one.timeout_s,
                 Some(1200),
                 "the check's own base bound, capped separately"
             );
-            bounds.push(cap.as_secs());
+            // An isolated re-run is hard-bounded by the budget; the confirmation run is not.
+            if let Some(cap) = cap {
+                bounds.push(cap.as_secs());
+            }
             let ok = names.iter().all(|n| pass(n));
             let mut r = failed_run(&[], &[]);
             r.argv = one.argv.clone();
@@ -10688,8 +10753,11 @@ mod tests {
     fn confirming_rerun<'a>(
         confirm: i32,
         argvs: &'a mut Vec<Vec<String>>,
-    ) -> impl FnMut(&RepoCheck, &[String], Duration) -> (CheckRun, Vec<String>) + 'a {
-        move |one, names, _cap| {
+    ) -> impl FnMut(&RepoCheck, &[String], Option<Duration>) -> (CheckRun, Vec<String>) + 'a {
+        move |one, names, cap| {
+            // The confirmation (no names) runs under the check's own load-scaled bound; an
+            // isolated re-run under what the budget has left.
+            assert_eq!(cap.is_none(), names.is_empty(), "{:?}", one.argv);
             argvs.push(one.argv.clone());
             let mut r = failed_run(&[], &[]);
             r.argv = one.argv.clone();
@@ -10876,5 +10944,250 @@ mod tests {
         );
         assert_eq!(run.not_rechecked, 1);
         assert!(run.reruns.is_empty() && run.denies());
+    }
+
+    /// codex/agy round 16: the floor appends `--exact` (and `--skip`), so it re-runs alone or
+    /// confirms ONLY a `cargo test` argv it understands element by element. Every other shape —
+    /// a positional TESTNAME (`cargo test foo`: `--exact` makes it match no test, and a
+    /// confirmation of 0 tests exits 0), a `--skip` or `--exact` of its own, `--ignored`, an
+    /// unknown flag, a second `--` — is neither, and the check stays a regression.
+    #[test]
+    fn only_an_understood_cargo_argv_is_rerun_or_confirmed_1060() {
+        let flaky = ["test a".to_string()];
+        for argv in [
+            s(&["cargo", "test", "foo", "--", "--test-threads=1"]),
+            s(&["cargo", "test", "--no-fail-fast", "foo"]),
+            s(&["cargo", "test", "--", "--skip", "x"]),
+            s(&["cargo", "test", "--", "--skip=x"]),
+            s(&["cargo", "test", "--", "--exact"]),
+            s(&["cargo", "test", "--", "--ignored"]),
+            s(&["cargo", "test", "--", "--include-ignored"]),
+            s(&["cargo", "test", "--", "x"]),
+            s(&["cargo", "test", "--unknown-flag"]),
+            s(&["cargo", "test", "--", "--nocapture", "--", "x"]),
+            s(&["cargo", "test", "--lib"]),
+            s(&["cargo", "test", "-q"]),
+            s(&["cargo", "test", "--target-dir", "t"]),
+            s(&["cargo", "test", "-p"]),
+            s(&["cargo", "test", "-p", "--lib"]),
+            s(&["cargo", "test", "--", "--test-threads"]),
+            s(&["cargo", "test", "--features="]),
+            s(&["cargo", "build"]),
+            s(&["sh", "-c", "cargo test"]),
+        ] {
+            assert!(isolated_rerun_argv(&argv, "test a").is_none(), "{argv:?}");
+            assert!(confirmation_argv(&argv, &flaky).is_none(), "{argv:?}");
+        }
+        let every = s(&[
+            "cargo",
+            "+nightly",
+            "test",
+            "--workspace",
+            "--exclude",
+            "x",
+            "-p",
+            "a",
+            "--package=b",
+            "-pc",
+            "-F",
+            "f",
+            "--features=g",
+            "--all-features",
+            "--no-default-features",
+            "--release",
+            "--profile",
+            "ci",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--locked",
+            "--frozen",
+            "--offline",
+            "-j",
+            "8",
+            "-j8",
+            "--jobs=2",
+            "--no-fail-fast",
+            "--color",
+            "never",
+            "--",
+            "--test-threads=4",
+            "--test-threads",
+            "2",
+            "--nocapture",
+            "--show-output",
+            "--color=always",
+            "-q",
+            "--quiet",
+        ]);
+        let mut want = every.clone();
+        want.extend(s(&["--exact", "a"]));
+        assert_eq!(
+            isolated_rerun_argv(&every, "test a").map(|r| r.0),
+            Some(want)
+        );
+        let mut want = every.clone();
+        want.extend(s(&["--skip", "a", "--exact"]));
+        assert_eq!(confirmation_argv(&every, &flaky), Some(want));
+        // Not cargo (vitest, pytest): no `--exact` is appended — the check re-runs as itself.
+        let npm = s(&["npm", "test"]);
+        assert_eq!(
+            confirmation_argv(&npm, &["FAIL tests/a.test.ts > s > x".to_string()]),
+            Some(npm.clone())
+        );
+    }
+
+    /// agy round 16: a check confirms ONCE. After a confirmation ran (and failed), no later path
+    /// re-confirms or reclassifies it — the isolated re-runs do not even start.
+    #[test]
+    fn a_check_confirms_once_1060() {
+        let (check, mut run) = regression_run(&["test t::flaky"]);
+        let mut failed = failed_run(&[], &[]);
+        failed.source = CONFIRMATION_SOURCE.into();
+        run.reruns.push(failed);
+        let mut argvs = Vec::new();
+        recheck_alone(
+            &check,
+            &mut run,
+            None,
+            Duration::from_secs(FLAKE_RERUN_BUDGET_S),
+            &mut confirming_rerun(0, &mut argvs),
+        );
+        assert!(argvs.is_empty(), "{argvs:?}");
+        assert_eq!(run.reruns.len(), 1);
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert!(run.denies());
+    }
+
+    /// agy round 16: the confirmation runs under the check's own load-scaled bound — not what
+    /// the isolated re-runs left of their budget (a full workspace run under load needs it). Here
+    /// the isolated re-run spends the whole budget and the confirmation still runs; an allowlisted
+    /// argv confirms flaky, and the clean run answers for the marker, which leaves the record.
+    #[test]
+    fn the_confirmation_runs_under_the_checks_own_bound_1060() {
+        let crash = format!("{UNATTRIBUTED_FAILURE}a test process exited abnormally");
+        let (mut check, mut run) = regression_run(&["test t::flaky", &crash]);
+        check.argv = s(&[
+            "cargo",
+            "test",
+            "--workspace",
+            "--no-fail-fast",
+            "--",
+            "--test-threads=4",
+        ]);
+        let mut argvs = Vec::new();
+        recheck_alone(
+            &check,
+            &mut run,
+            None,
+            Duration::from_secs(1),
+            &mut confirming_rerun(0, &mut argvs),
+        );
+        assert_eq!(
+            run.classification.as_deref(),
+            Some(FLAKY_UNDER_LOAD),
+            "{run:?}"
+        );
+        assert_eq!(run.regressions, vec!["test t::flaky"]);
+        assert_eq!(
+            argvs.last().unwrap(),
+            &s(&[
+                "cargo",
+                "test",
+                "--workspace",
+                "--no-fail-fast",
+                "--",
+                "--test-threads=4",
+                "--skip",
+                "t::flaky",
+                "--exact"
+            ])
+        );
+    }
+
+    /// codex round 16, with real cargo: a load flake beside a test that always crashes, under a
+    /// check that passes cargo a TESTNAME (`cargo test foo`). The floor does not re-run or
+    /// confirm an argv it does not understand, so the check denies. What it no longer does: the
+    /// old confirmation argv (`foo` made exact) selects 0 tests and exits 0.
+    #[cfg(unix)]
+    #[test]
+    fn a_flake_beside_a_crash_under_a_cargo_testname_filter_denies_1060() {
+        let wt = scratch("testname1060");
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(
+            wt.join("Cargo.toml"),
+            "[package]\nname = \"tn_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+             [lib]\npath = \"src/lib.rs\"\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wt.join("src/lib.rs"),
+            "#[cfg(test)]\nmod t {\n    #[test]\n    fn foo_aflaky() {\n        let mark = \
+             concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/flaked\");\n        if \
+             std::fs::metadata(mark).is_err() {\n            std::fs::write(mark, \"\").unwrap();\
+             \n            panic!(\"flaked\");\n        }\n    }\n    #[test]\n    fn \
+             foo_zcrash() {\n        std::process::abort();\n    }\n}\n",
+        )
+        .unwrap();
+        let sandbox = sandbox_for(&wt);
+        if sandbox.level != SandboxLevel::Sandboxed {
+            eprintln!("repo_checks: no sandbox tool here — the cargo fixture cannot run");
+            let _ = std::fs::remove_dir_all(&wt);
+            return;
+        }
+        let scratch_dir = CheckScratch::prepare(&wt).unwrap();
+        let check = RepoCheck {
+            name: "test".into(),
+            argv: s(&["cargo", "test", "foo", "--", "--test-threads=1"]),
+            source: "fixture".into(),
+            timeout_s: Some(600),
+            dir: String::new(),
+        };
+        let mut run = run_one(&wt, &check, &sandbox, &scratch_dir, Tree::Head);
+        assert!(!run.passed(), "{run:?}");
+        assert!(
+            run.failure_ids.iter().any(|i| i == "test t::foo_aflaky")
+                && run
+                    .failure_ids
+                    .iter()
+                    .any(|i| i.starts_with(UNATTRIBUTED_FAILURE)),
+            "the flake is named, the crash is a marker: {:?} {}",
+            run.failure_ids,
+            run.stderr_tail
+        );
+        // The head-only set of a regression (a base where both pass).
+        run.regressions = run.failure_ids.clone();
+        run.classification = Some(REGRESSION.to_string());
+        recheck_alone(
+            &check,
+            &mut run,
+            None,
+            Duration::from_secs(FLAKE_RERUN_BUDGET_S),
+            &mut |one, names, cap| {
+                run_one_capped(&wt, one, &sandbox, &scratch_dir, Tree::Head, names, cap)
+            },
+        );
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION), "{run:?}");
+        assert!(run.reruns.is_empty(), "not re-run alone: {:?}", run.reruns);
+        assert!(run.denies());
+        let zero = RepoCheck {
+            argv: s(&[
+                "cargo",
+                "test",
+                "foo",
+                "--",
+                "--test-threads=1",
+                "--skip",
+                "t::foo_aflaky",
+                "--exact",
+            ]),
+            ..check.clone()
+        };
+        let z = run_one(&wt, &zero, &sandbox, &scratch_dir, Tree::Head);
+        assert!(
+            z.passed() && z.stdout_tail.contains("running 0 tests"),
+            "codex's repro: {z:?}"
+        );
+        drop(scratch_dir);
+        let _ = std::fs::remove_dir_all(&wt);
     }
 }

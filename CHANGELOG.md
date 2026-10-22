@@ -68,9 +68,15 @@ Two release tracks share this file, newest entry first regardless of track:
   failures and `FLAKE_RERUN_BUDGET_S` = 900 s in total. A libtest failure re-runs as the check's own argv plus
   `-- --exact <name>`, which runs that name in every binary. A name with a leading `-`, whitespace or a control
   character is never re-run. The check is `flaky_under_load` only when every named head-only failure passed alone
-  AND one confirmation run, within the budget, exits 0. For libtest that run is the check's argv with
-  `-- --skip <name> … --exact`; other runners (vitest) re-run the whole check, and the vitest load-class re-run gets
-  the same confirmation. The clean exit answers for the unattributed ids; without it the check stays a regression.
+  AND one confirmation run exits 0. That run uses the check's own load-scaled bound, not what the re-run budget
+  left. For libtest it is the check's argv with `-- --skip <name> … --exact`; other runners (vitest) re-run the whole
+  check, and the vitest load-class re-run gets the same confirmation. A cargo check is re-run alone or confirmed
+  only when every argv element is allowlisted: package, feature, profile, target, lockfile, `-j`, `--no-fail-fast`
+  and `--color` flags before `--`, and `--test-threads`, `--nocapture`, `--show-output`, `--color` and `-q` after
+  it. A positional TESTNAME (`cargo test foo`, where `--exact` would select 0 tests and exit 0), a `--skip`,
+  `--exact` or `--ignored` of its own, an unknown flag or a second `--` means neither, and the check stays a
+  regression. A check confirms once; after one confirmation ran, no later path re-confirms it. The clean exit
+  answers for the unattributed ids, which then leave the record; without it the check stays a regression.
   One that exits 0 and prints the name `ok` is "flaky (passed alone)" and does
   not deny (`flaky`); one that fails again stays a regression. Failures over the cap, past the budget or under a
   runner the floor cannot narrow stay regressions, counted in `notRechecked`. Wire (additive, `checks[]`):
@@ -81,7 +87,11 @@ Two release tracks share this file, newest entry first regardless of track:
   `failure_ids_past_the_cap_never_read_as_pre_existing_1060`,
   `a_failure_without_a_name_adds_a_marker_that_never_matches_1060`,
   `flaky_under_load_needs_a_clean_run_with_the_flakes_skipped_1060`,
-  `an_escape_or_a_forged_name_cannot_hide_or_clear_a_failure_1060`, `baseline_diff_never_excuses_a_libtest_failure` (real
+  `an_escape_or_a_forged_name_cannot_hide_or_clear_a_failure_1060`,
+  `only_an_understood_cargo_argv_is_rerun_or_confirmed_1060`, `a_check_confirms_once_1060`,
+  `the_confirmation_runs_under_the_checks_own_bound_1060`,
+  `a_flake_beside_a_crash_under_a_cargo_testname_filter_denies_1060` (real cargo),
+  `baseline_diff_never_excuses_a_libtest_failure` (real
   `cargo test`), `a_libtest_failure_the_base_shares_is_still_denied` (end to end),
   `a_failure_that_passes_alone_is_flaky_and_does_not_block`,
   `a_failure_that_fails_again_alone_stays_a_regression`,
