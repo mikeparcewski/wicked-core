@@ -1020,6 +1020,14 @@ pub struct WorkUnit {
     /// existed and on approved units; skip-if-none keeps the wire byte-identical for those.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denial: Option<UnitDenial>,
+    /// (operator ruling 2026-10-21) Every OTHER layer that also denied this unit's last gate fold,
+    /// in deny-dominance order, behind the one [`Self::denial`] names — what keeps deny-dominates
+    /// whole when an answer overrides one layer (the operator's judgment over a failed repo-checks
+    /// floor is refused while any of these stands). `Some(empty)`: no other layer denied. `None`:
+    /// the denial never reached the gate fold (a worker failure, the substance or deliverables
+    /// floor) or was persisted before this field — read as unknown (fail-closed), never as none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denials_behind: Option<Vec<UnitDenial>>,
     /// The orchestration phase id backing this unit (set in execute).
     #[serde(default)]
     pub phase_ref: Option<String>,
@@ -1615,6 +1623,7 @@ impl WorkUnit {
             routing: None,
             denial_reason: None,
             denial: None,
+            denials_behind: None,
             phase_ref: None,
             conformance_ref: None,
             phase_status: None,

@@ -428,6 +428,9 @@ impl Campaign {
                     | HumanDecision::AcceptSuggestion
                     | HumanDecision::ConsentChoice { .. }
                     | HumanDecision::Rejudge => None,
+                    // (operator ruling 2026-10-21) The rationale is the record, not a unit
+                    // instruction — mirrored like an intent amendment's text.
+                    HumanDecision::OperatorJudgment { rationale } => Some(rationale.clone()),
                     // (core#555) A campaign step's amendment is the run's acceptance list, not
                     // a unit instruction — the persisted mirror carries the text either way.
                     HumanDecision::AmendIntent { text } => Some(text.clone()),

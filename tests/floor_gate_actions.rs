@@ -832,3 +832,155 @@ fn accept_suggestion_applies_the_evaluators_edit_and_reworks_the_creator() {
     );
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+/// (operator ruling 2026-10-21) "Approve as your own judgment" at a FAILED repo-checks floor:
+/// `operator_judgment` with a blank rationale is refused and the gate stays open; with one, the fix
+/// counts as it stands (the seat does not run again), its receipt records the operator judgment
+/// that overrode the floor (the rationale, the floor result id, the label), and the run carries
+/// the label. It overrides THAT floor only: QE acceptance stays required, and the verify phase's
+/// own floor — over the same still-failing tree — denies again (deny-dominates downstream).
+#[test]
+fn operator_judgment_overrides_a_failed_floor_only_with_a_rationale_and_keeps_qe_required() {
+    let repo = make_repo("opjudge", TEST_FAILS_ON_BROKEN, 60, &[".break-in-fix"]);
+    let (core, ran) = core_for("opjudge", Rework::ChangesNothing);
+    let sid = "fg-opjudge";
+    let events = launch(&core, "opjudge", &repo, sid);
+    let first = until_settled(&events, sid);
+    no_session_failed(&first);
+    if !fix_floor_denied(&first, "repo_checks") {
+        return;
+    }
+    // The gate's prompt offers the arm, consequence first (a client reads it as the offer).
+    let prompt = first
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            CoreEvent::AwaitingHuman {
+                session, prompt, ..
+            } if session == sid => Some(prompt.clone()),
+            _ => None,
+        })
+        .expect("the escalation's prompt");
+    assert!(prompt.contains("action `operator_judgment`"), "{prompt}");
+    assert!(
+        prompt.contains("QE acceptance is still required"),
+        "{prompt}"
+    );
+    for blank in ["", "   \n"] {
+        let err = core
+            .confirm_gate(
+                sid,
+                HumanDecision::OperatorJudgment {
+                    rationale: blank.into(),
+                },
+            )
+            .expect_err("a blank rationale is refused");
+        assert!(
+            err.to_string().contains("needs a written rationale"),
+            "{err}"
+        );
+    }
+    let views = core.sessions_detail().expect("sessions");
+    let s = views.iter().find(|v| v.session.id == sid).expect("run");
+    assert_eq!(
+        s.session.status,
+        SessionStatus::AwaitingHuman,
+        "still paused"
+    );
+    assert_eq!(
+        s.units[2].status,
+        wicked_core::UnitStatus::Rejected,
+        "nothing counted"
+    );
+
+    let why = "the one failing test is a load flake: it passes alone on this tree";
+    // The engine's own automatic rework may already have re-run the fix once before escalating;
+    // what matters is that the override runs nothing of it again.
+    let fix_runs_before = ran
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(p, _)| p == "fix")
+        .count();
+    core.confirm_gate_as(
+        sid,
+        HumanDecision::OperatorJudgment {
+            rationale: why.into(),
+        },
+        Some("operator-under-test".into()),
+    )
+    .expect("the operator's judgment over the failed floor");
+    let second = until_settled(&events, sid);
+    no_session_failed(&second);
+    assert_eq!(
+        ran.lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p == "fix")
+            .count(),
+        fix_runs_before,
+        "the fix did not run again: {:?}",
+        ran.lock().unwrap()
+    );
+    let views = core.sessions_detail().expect("sessions");
+    let s = views.iter().find(|v| v.session.id == sid).expect("run");
+    let fix = &s.units[2];
+    assert_eq!(fix.status, wicked_core::UnitStatus::Done, "the fix counts");
+    let r = fix.assurance.as_ref().expect("the fix's gate receipt");
+    assert!(r.ran.iter().any(|i| i == "operator_judge"), "{r:?}");
+    assert_eq!(r.operator_judges.len(), 1, "{r:?}");
+    let j = &r.operator_judges[0];
+    assert_eq!(j.by, "operator-under-test");
+    assert_eq!(j.note.as_deref(), Some(why), "the rationale is the record");
+    let over = j
+        .floor_override
+        .as_ref()
+        .expect("recorded as a floor override");
+    assert_eq!(over.label, "floor overridden by operator");
+    assert_eq!(over.layer, "repo_checks");
+    assert_eq!(over.ord, 3);
+    assert_eq!(
+        Some(over.attempt),
+        fix.last_attempt,
+        "the attempt the floor denied"
+    );
+    assert_eq!(
+        over.result_id,
+        format!("{sid}:unit-3:attempt-{}:repo_checks", over.attempt)
+    );
+    assert!(
+        !r.judge
+            .as_deref()
+            .is_some_and(|j| j.starts_with("operator:")),
+        "the floor override does not stand in for the judge: {r:?}"
+    );
+    // The run's own label.
+    assert_eq!(s.session.assurance.floor_overrides.len(), 1);
+    assert_eq!(
+        s.session.assurance.floor_overrides[0]
+            .floor_override
+            .as_ref()
+            .map(|o| o.label.as_str()),
+        Some("floor overridden by operator")
+    );
+    // QE acceptance is untouched: still required, never skipped or waived by the override.
+    let qe = s
+        .session
+        .assurance
+        .qe
+        .as_ref()
+        .expect("the run requires QE");
+    assert_eq!(qe.status, "required", "{qe:?}");
+    assert!(s.session.assurance.enforces("qe_acceptance"));
+    assert!(
+        !second.iter().any(
+            |e| matches!(e, CoreEvent::QeAcceptanceDecided { qe, .. } if qe.status != "required")
+        ),
+        "no QE decision but required: {second:?}"
+    );
+    // Deny-dominates downstream: the verify phase checks the same failing tree and denies.
+    let (_, _, combined, source, _) = gate(&second, 4).expect("verify's gate");
+    assert!(!combined, "verify's floor still denies the failing tree");
+    assert_eq!(source.as_deref(), Some("repo_checks"));
+    let _ = std::fs::remove_dir_all(&repo);
+}

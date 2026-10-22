@@ -1665,25 +1665,33 @@ pub(crate) fn apply_and_finish_unit(
         }
         other => (None, other),
     };
-    let validator_denial = guard_denial
-        .map(|r| crate::domain::UnitDenial::new("worktree_guard", r))
-        .or(same_seat_denial)
-        .or(det_denial.map(|r| crate::domain::UnitDenial::new("pinned_validator", r)))
-        .or(checks_denial.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
-        .or(capture_denial)
-        .or(evaluator_verdict_denial)
-        .or(qe_veto)
-        .or(judged.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
-        .or(evaluator_denial)
-        .or(hook_denial)
+    // The FIRST layer that denied names the gate; (operator ruling 2026-10-21) every layer
+    // after it is kept too (`WorkUnit::denials_behind`), so an answer that overrides ONE layer —
+    // the operator's judgment over a failed repo-checks floor — can see the rest still deny.
+    let mut layers = [
+        guard_denial.map(|r| crate::domain::UnitDenial::new("worktree_guard", r)),
+        same_seat_denial,
+        det_denial.map(|r| crate::domain::UnitDenial::new("pinned_validator", r)),
+        checks_denial.map(|(source, r)| crate::domain::UnitDenial::new(source, r)),
+        capture_denial,
+        evaluator_verdict_denial,
+        qe_veto,
+        judged.map(|(source, r)| crate::domain::UnitDenial::new(source, r)),
+        evaluator_denial,
+        hook_denial,
         // (operator ruling 2026-10-11, codex r1 on #907) A judge that could not rule wins only when
         // NO other layer denied — the operator's judgment at its gate then answers the one open
         // question, never a governance veto hidden behind it. (core#969, codex r1) That holds for
         // the REQUIRED judge's hold too (`judge_hold`, same source): it used to rank above the
         // evaluator's and the hook's denials, so an approve there could count a vetoed unit.
-        .or(judge_hold)
-        .or(unavailable.map(|(source, r)| crate::domain::UnitDenial::new(source, r)))
-        .or(qe_unavailable);
+        judge_hold,
+        unavailable.map(|(source, r)| crate::domain::UnitDenial::new(source, r)),
+        qe_unavailable,
+    ]
+    .into_iter()
+    .flatten();
+    let validator_denial = layers.next();
+    let denials_behind: Vec<crate::domain::UnitDenial> = layers.collect();
 
     // Resolve the governance gate WITH the pre-computed deny folded in: a validator/evaluator deny
     // drives the phase Rejected + suppresses the work_output write (see `execute::apply_unit`).
@@ -1752,6 +1760,9 @@ pub(crate) fn apply_and_finish_unit(
     unit.collection_scope = Some(outcome.collection_scope.clone());
     unit.denial_reason = outcome.denial_reason.clone();
     unit.denial = outcome.denial.clone();
+    // Recorded on every fold — empty when one layer (or none) denied — and only by this fold, so
+    // a denial that never reached it (a worker failure, the substance floor) carries `None`.
+    unit.denials_behind = (!outcome.approved).then_some(denials_behind);
     unit.status = if outcome.approved {
         UnitStatus::Done
     } else {

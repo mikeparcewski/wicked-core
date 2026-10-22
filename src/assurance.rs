@@ -52,9 +52,46 @@ pub struct OperatorJudgment {
     /// The operator's note, if any.
     #[serde(default)]
     pub note: Option<String>,
-    /// Why the judge could not rule (the gate's denial reason).
+    /// Why the judge could not rule (the gate's denial reason) — or, on a floor override, why the
+    /// floor denied.
     #[serde(default)]
     pub reason: Option<String>,
+    /// (operator ruling 2026-10-21) Set when this judgment OVERRODE a failed repo-checks floor at
+    /// its escalation gate (action [`crate::workflow::OPERATOR_JUDGMENT_ACTION`]): which floor
+    /// result it overrode, labelled [`FLOOR_OVERRIDE_LABEL`]. `note` is then the operator's
+    /// written rationale, never empty. Absent on a judge-unavailable judgment.
+    #[serde(
+        default,
+        rename = "floorOverride",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub floor_override: Option<FloorOverride>,
+}
+
+/// (operator ruling 2026-10-21) The label every surface shows for a floor the operator overrode:
+/// the run, the gate and the delivery.
+pub const FLOOR_OVERRIDE_LABEL: &str = "floor overridden by operator";
+
+/// (operator ruling 2026-10-21) The failed floor result an operator's judgment overrode. The
+/// override answers the deterministic repo-checks floor ONLY: every other layer of the gate still
+/// denies (deny-dominates), and QE acceptance is untouched — it stays required where the run
+/// requires it, and the delivery still needs its PASS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FloorOverride {
+    /// The floor layer that denied (`repo_checks` | `repo_checks_timeout`).
+    pub layer: String,
+    /// The floor result overridden: `<run>:unit-<ord>:attempt-<n>:<layer>` — the unit's
+    /// `repoChecksEvaluated` frame for that attempt (or the carried result it stood on).
+    pub result_id: String,
+    /// The unit whose gate it was, and the attempt the floor denied.
+    pub ord: u32,
+    pub attempt: u32,
+    /// The worktree tree the overridden checks ran on, when the report names it.
+    #[serde(default)]
+    pub tree: Option<String>,
+    /// [`FLOOR_OVERRIDE_LABEL`], verbatim — the line to show as-is.
+    pub label: String,
 }
 
 /// (operator ruling 2026-10-14) A judge seated IN PLACE of the run's preferred judge, because
@@ -269,6 +306,15 @@ pub struct RunAssurance {
     /// session from before the decision reads back `None`, which enforces it: fail-closed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qe: Option<QeAcceptance>,
+    /// (operator ruling 2026-10-21) Every failed floor the operator overrode on this run, with who,
+    /// when and why ([`OperatorJudgment::floor_override`] set) — the run's own
+    /// "floor overridden by operator" label. Absent when none (the routine case).
+    #[serde(
+        default,
+        rename = "floorOverrides",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub floor_overrides: Vec<OperatorJudgment>,
 }
 
 impl Default for RunAssurance {
@@ -308,6 +354,7 @@ impl RunAssurance {
             mode: if reduced { MODE_REDUCED } else { MODE_FULL }.to_string(),
             required,
             qe,
+            floor_overrides: Vec::new(),
         }
     }
 
