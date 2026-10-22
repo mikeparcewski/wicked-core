@@ -2142,7 +2142,8 @@ pub(super) fn answer_dispute_gate(
         | crate::workflow::HumanDecision::AcceptSuggestion
         | crate::workflow::HumanDecision::AmendIntent { .. }
         | crate::workflow::HumanDecision::ConsentChoice { .. }
-        | crate::workflow::HumanDecision::Rejudge => {
+        | crate::workflow::HumanDecision::Rejudge
+        | crate::workflow::HumanDecision::OperatorJudgment { .. } => {
             anyhow::bail!("run {run_id} is paused team_dispute: approve, request changes or reject")
         }
     };
@@ -3581,6 +3582,9 @@ pub(super) fn revise_units(
                 k.routing = o.routing.clone();
                 k.denial_reason = o.denial_reason.clone();
                 k.denial = o.denial.clone();
+                // (operator ruling 2026-10-21, xreview r8) …and what else denied it, so a
+                // revision never turns a standing veto or an unknown record into "none".
+                k.denials_behind = o.denials_behind.clone();
                 k.phase_status = o.phase_status.clone();
                 // Execution provenance the pipeline writes after a unit ran (its phase, claim
                 // and collection links; the seats it excluded) — codex review of #738 round 6.

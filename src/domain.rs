@@ -1020,6 +1020,16 @@ pub struct WorkUnit {
     /// existed and on approved units; skip-if-none keeps the wire byte-identical for those.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denial: Option<UnitDenial>,
+    /// (operator ruling 2026-10-21) Every layer OTHER THAN the repo-checks floor that denied this
+    /// unit's last gate fold — the winner too when it is not the floor — in deny-dominance order,
+    /// plus any earlier denial over the same tree whose layer that fold did not ask again
+    /// (`pipeline::denials_behind_after_fold`). What keeps deny-dominates whole when an answer
+    /// overrides one layer: the operator's judgment over a failed repo-checks floor is refused
+    /// while any of these stands. `Some(empty)`: known — nothing but the floor (or nothing) denied.
+    /// `None`: unknown (a unit persisted before this field, or a same-tree attempt that could not
+    /// establish it) — read as unknown (fail-closed), never as none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denials_behind: Option<Vec<UnitDenial>>,
     /// The orchestration phase id backing this unit (set in execute).
     #[serde(default)]
     pub phase_ref: Option<String>,
@@ -1615,6 +1625,8 @@ impl WorkUnit {
             routing: None,
             denial_reason: None,
             denial: None,
+            // A new unit has a known, empty record; `None` is a unit persisted before it existed.
+            denials_behind: Some(Vec::new()),
             phase_ref: None,
             conformance_ref: None,
             phase_status: None,

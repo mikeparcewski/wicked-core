@@ -14,6 +14,26 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A failed repo-checks floor's gate takes the operator's own judgment (action `operator_judgment`).** When a
+  unit's repository checks failed, its escalation gate offered only retry, send back, reassign or stop, and a
+  floor that kept failing on load flakes in untouched files or misread pre-existing reds left the run looping
+  (run 2ebd9da2 parked after 8 attempts). The operator now has a recorded way on: the operator judgment a
+  `judge_unavailable` gate already takes (`judge_by_operator`, the same `operatorJudges` record and
+  `operator_judge` instrument), behind its own token, `HumanDecision::OperatorJudgment { rationale }`, because a
+  plain approve at a floor gate is a retry. The written rationale is required: a blank one is refused before
+  the gate row resolves, and the gate stays open. The gate receipt records an operator judgment overriding the
+  floor (`operatorJudges[].floorOverride`: the layer, the floor result id
+  `<run>:unit-<ord>:attempt-<n>:<layer>`, the tree, the label "floor overridden by operator"; the rationale is
+  its `note`). The run carries it on its contract (`RunAssurance.floorOverrides`) and the delivery receipt
+  aggregates it. It answers the floor only. The gate fold now keeps every layer that denied behind the winning
+  one (`WorkUnit::denials_behind`), and the override is refused while any of them stands, when the fold left no
+  such record (fail-closed), on a team member's step, on a tool or deliver step, and at every other gate
+  (substance, deliverables and pinned-validator floors included). It never stands in for the judge, and QE
+  acceptance is untouched: a required decision stays required (a judge-unavailable approve's QE skip does not
+  apply), so the delivery still needs its PASS. The floor gate's prompt names the arm, consequence first,
+  exactly where the engine would take it. Wire: `confirmGate(..., action: "operator_judgment")` with the
+  rationale in `amend`.
+
 - **A container seat's gate hook no longer refuses a call silently, and a killed gate hook is judged again.** In
   core#997's end-to-end run a claude seat's `cargo test` loop was refused with "the gate hook failed (exit 1): ;"
   and nothing else: no reason, no line in the daemon's log, no deny in the unit's decisions log. The host gate

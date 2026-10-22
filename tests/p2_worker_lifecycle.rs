@@ -86,6 +86,7 @@ mod tests {
             routing: None,
             denial_reason: None,
             denial: None,
+            denials_behind: None,
             phase_ref: None,
             conformance_ref: None,
             phase_status: None,

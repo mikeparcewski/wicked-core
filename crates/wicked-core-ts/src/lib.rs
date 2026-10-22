@@ -1380,6 +1380,24 @@ impl Core {
                     };
                     HumanDecision::AmendIntent { text }
                 }
+                // (operator ruling 2026-10-21) "Approve as your own judgment" at a failed
+                // repo-checks floor's gate: the rationale rides `amend` and is required; the
+                // engine refuses it at any other gate, and while any other layer denies.
+                (Some("operator_judgment"), true) => {
+                    if amend_scope.is_some() {
+                        return Err(err(anyhow::anyhow!(
+                            "action `operator_judgment` takes no amendScope — it answers the \
+                             failed floor of the gated unit"
+                        )));
+                    }
+                    let Some(rationale) = amend.filter(|t| !t.trim().is_empty()) else {
+                        return Err(err(anyhow::anyhow!(
+                            "action `operator_judgment` needs a written rationale in `amend` — \
+                             why the failed floor is not the work's"
+                        )));
+                    };
+                    HumanDecision::OperatorJudgment { rationale }
+                }
                 // (core#469) The timed-out floor's escalation arms; (core#467) adopt the
                 // evaluator's pinned edit. All approve-shaped, none takes an amendment.
                 (
@@ -1414,21 +1432,23 @@ impl Core {
                 (
                     Some(
                         a @ ("approve" | "reject" | "request_changes" | "extend" | "targeted"
-                        | "accept_partial" | "accept_suggestion" | "amend_intent" | "rejudge"),
+                        | "accept_partial" | "accept_suggestion" | "amend_intent" | "rejudge"
+                        | "operator_judgment"),
                     ),
                     _,
                 ) => {
                     return Err(err(anyhow::anyhow!(
                         "action `{a}` disagrees with approve={approve} (request_changes and \
                          reject require approve=false; approve, extend, targeted, accept_partial, \
-                         accept_suggestion, amend_intent and rejudge require approve=true)"
+                         accept_suggestion, amend_intent, rejudge and operator_judgment require \
+                         approve=true)"
                     )))
                 }
                 (Some(other), _) => {
                     return Err(err(anyhow::anyhow!(
                         "unknown action `{other}` (expected approve | request_changes | reject | \
                          extend | targeted | accept_partial | accept_suggestion | amend_intent | \
-                         rejudge)"
+                         rejudge | operator_judgment)"
                     )))
                 }
             };

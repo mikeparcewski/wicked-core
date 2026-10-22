@@ -7516,6 +7516,29 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
     }
 }
 
+/// (operator ruling 2026-10-21) The floor gate's prompt clause offering the operator's judgment
+/// (action `operator_judgment`), exactly where [`floor_override_for`] would take it (bar the
+/// rationale): a repo-checks floor on an agent step that is not a team member's, whose gate fold
+/// recorded that no other layer denied — consequence first; empty for every other gate. A client
+/// reads the clause as the offer, so it never shows a choice the engine refuses.
+fn floor_override_offer(unit: &crate::domain::WorkUnit, source: &str) -> &'static str {
+    let repo_floor = source == crate::repo_checks::DENIAL_SOURCE
+        || source == crate::repo_checks::DENIAL_SOURCE_TIMEOUT;
+    if repo_floor
+        && unit.member_step.is_none()
+        && unit.tool_cmd.is_none()
+        && !crate::deliver_lift::is_deliver_unit(unit)
+        && unit.denials_behind.as_ref().is_some_and(Vec::is_empty)
+    {
+        " judge it yourself with a written rationale when the evidence shows the failures are \
+         not the work's (action `operator_judgment`: it overrides the failed floor, labelled \
+         \"floor overridden by operator\" on the run and the delivery; every other layer still \
+         denies and QE acceptance is still required),"
+    } else {
+        ""
+    }
+}
+
 /// (core#464, FINDING-023's sibling) The disclosure an ENGINE-authored denial gate appends under
 /// run-level `human_confirm: none`: the run was launched unattended, so the operator is told the
 /// pause is the engine's deny contract — not a run-level policy the launch could have silenced.
@@ -7754,14 +7777,16 @@ fn denial_gate_prompt(
         "floor_failed" if floor_fix_applies(unit) => format!(
             "Unit {ord} failed its deterministic floor ({source}): {} — confirm to retry the \
              phase, approve with a note to have a seat other than this read-only phase's make \
-             that fix in the worktree and re-run only the floor, or reject to cancel the \
+             that fix in the worktree and re-run only the floor,{} or reject to cancel the \
              run{note}",
-            reason_head(reason)
+            reason_head(reason),
+            floor_override_offer(unit, source)
         ),
         "floor_failed" => format!(
             "Unit {ord} failed its deterministic floor ({source}): {} — confirm to retry the \
-             phase, or reject to cancel the run{note}",
-            reason_head(reason)
+             phase,{} or reject to cancel the run{note}",
+            reason_head(reason),
+            floor_override_offer(unit, source)
         ),
         // (core#461) The lever is REASSIGN: the seat is dead for this work and no eligible seat
         // remains, so a plain retry re-runs the same refusal.
@@ -11628,7 +11653,8 @@ fn confirm_plan_gate(
         | HumanDecision::AcceptSuggestion
         | HumanDecision::AmendIntent { .. }
         | HumanDecision::ConsentChoice { .. }
-        | HumanDecision::Rejudge => anyhow::bail!(
+        | HumanDecision::Rejudge
+        | HumanDecision::OperatorJudgment { .. } => anyhow::bail!(
             "a plan_approval gate reviews a plan, not a floor, an evaluator's edit, an intent \
              amendment or a judge re-run — approve, approve with an edited plan, or reject"
         ),
@@ -12370,6 +12396,12 @@ pub(crate) fn confirm_gate_as(
             crate::workflow::HumanDecision::Rejudge => {
                 armed_rejudge = Some(rejudge_request(&*store, run_id)?);
             }
+            // (operator ruling 2026-10-21) The operator's judgment over a failed repo-checks
+            // floor: refused HERE, before the row resolves, unless it applies — the gate stays
+            // open and re-answerable otherwise.
+            crate::workflow::HumanDecision::OperatorJudgment { rationale } => {
+                floor_override_for(&session, cursor, rationale, adjudication_open, run_id)?;
+            }
             // (core#555) An amendment with no text amends nothing: refuse HERE, before the row
             // resolves, so the gate stays open and re-answerable rather than resolving as an
             // approve that silently changed no acceptance list.
@@ -12446,6 +12478,14 @@ pub(crate) fn confirm_gate_as(
             .to_string(),
             crate::workflow::HumanDecision::Rejudge => serde_json::json!({
                 "approve": true, "action": crate::workflow::REJUDGE_ACTION, "amend": null,
+            })
+            .to_string(),
+            // (operator ruling 2026-10-21) The rationale rides `amend`, so the durable prompt's
+            // answer carries WHY the floor was overridden.
+            crate::workflow::HumanDecision::OperatorJudgment { rationale } => serde_json::json!({
+                "approve": true,
+                "action": crate::workflow::OPERATOR_JUDGMENT_ACTION,
+                "amend": rationale,
             })
             .to_string(),
             // (core#555) The amendment text rides `amend` so the durable prompt's answer carries
@@ -12546,6 +12586,36 @@ pub(crate) fn confirm_gate_as(
     let team_unit = crate::domain::session_units(store, run_id)?
         .get(session.unit_ix)
         .is_some_and(|u| u.member_step.is_some());
+    // (operator ruling 2026-10-21) OPERATOR JUDGMENT OVER A FAILED FLOOR: the same judgment, the
+    // same record, at a gate whose plain approve is a retry — so only its own action reaches it.
+    // Re-derived from the unit as persisted (the pre-check above refused every gate it does not
+    // answer before the row resolved).
+    if let crate::workflow::HumanDecision::OperatorJudgment { rationale } = &decision {
+        let units = crate::domain::session_units(store, run_id)?;
+        let over = floor_override_for(
+            &session,
+            units.get(session.unit_ix),
+            rationale,
+            adjudication_open,
+            run_id,
+        )?;
+        return judge_by_operator(
+            store,
+            subscribers,
+            runner,
+            self_tx,
+            in_flight,
+            session,
+            run_id,
+            actor,
+            Some(rationale.clone()),
+            Some(over),
+            lifecycle_maps,
+            actor_maps,
+            process_gen,
+            is_acp,
+        );
+    }
     if judge_unavailable_gate && !adjudication_open && !team_unit {
         if let crate::workflow::HumanDecision::Approve { amend, .. } = &decision {
             return judge_by_operator(
@@ -12558,6 +12628,7 @@ pub(crate) fn confirm_gate_as(
                 run_id,
                 actor,
                 amend.clone(),
+                None,
                 lifecycle_maps,
                 actor_maps,
                 process_gen,
@@ -12651,6 +12722,10 @@ pub(crate) fn confirm_gate_as(
         crate::workflow::HumanDecision::Rejudge => {
             rejudge = true;
             (None, crate::workflow::AmendScope::Cursor, None)
+        }
+        // Answered above (`judge_by_operator`), never a re-dispatch.
+        crate::workflow::HumanDecision::OperatorJudgment { .. } => {
+            anyhow::bail!("run {run_id}: an operator judgment is answered before any re-dispatch")
         }
     };
     {
@@ -13468,6 +13543,109 @@ fn apply_suggestion(
     ))
 }
 
+/// (operator ruling 2026-10-21) The floor result an operator's judgment
+/// ([`crate::workflow::HumanDecision::OperatorJudgment`]) overrides at `session`'s open gate —
+/// refused, naming why, unless ALL of these hold: the rationale is not blank; no review
+/// adjudication or team pause is open; the cursor unit is denied by the repo-checks floor
+/// (`repo_checks` | `repo_checks_timeout`) and the run waits on its escalation gate; the unit is an
+/// agent step (never a tool or deliver step, whose floor checks what it runs or ships) and not a
+/// team member's step (its team answers its gate); and its gate fold recorded that NO OTHER layer
+/// denied it ([`crate::domain::WorkUnit::denials_behind`] is `Some(empty)` — an unknown is
+/// refused). The override answers the floor only: deny-dominates holds for every other layer.
+fn floor_override_for(
+    session: &crate::domain::AgentSession,
+    cursor: Option<&crate::domain::WorkUnit>,
+    rationale: &str,
+    adjudication_open: bool,
+    run_id: &str,
+) -> anyhow::Result<crate::assurance::FloorOverride> {
+    let action = crate::workflow::OPERATOR_JUDGMENT_ACTION;
+    if rationale.trim().is_empty() {
+        anyhow::bail!(
+            "action `{action}` needs a written rationale in `amend` — why the failed floor is not \
+             the work's (load flakes, pre-existing failures); an empty one is refused"
+        );
+    }
+    if adjudication_open {
+        anyhow::bail!(
+            "a review_adjudication gate takes approve (land with carried items), request changes \
+             (one more round) or reject (stop) — not `{action}`"
+        );
+    }
+    if team_gate::transport_gate_open(session) || team_gate::dispute_gate_open(session) {
+        anyhow::bail!(
+            "a team pause takes approve, request changes or reject — not `{action}`, which \
+             answers a failed floor"
+        );
+    }
+    let u = cursor.ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor"))?;
+    let source = u.denial.as_ref().map(|d| d.source.as_str());
+    let layer = match source {
+        Some(
+            s @ (crate::repo_checks::DENIAL_SOURCE | crate::repo_checks::DENIAL_SOURCE_TIMEOUT),
+        ) if session.status == SessionStatus::AwaitingHuman
+            && u.status == crate::domain::UnitStatus::Rejected =>
+        {
+            s.to_string()
+        }
+        _ => anyhow::bail!(
+            "`{action}` answers the escalation gate of a failed repo-checks floor (denial source \
+             `{}` or `{}`); unit {} is {:?}, denied by `{}`",
+            crate::repo_checks::DENIAL_SOURCE,
+            crate::repo_checks::DENIAL_SOURCE_TIMEOUT,
+            u.ord,
+            u.status,
+            source.unwrap_or("nothing")
+        ),
+    };
+    if u.member_step.is_some() {
+        anyhow::bail!(
+            "unit {} is a team member's step: its team answers its gate (approve re-runs it), \
+             not `{action}`",
+            u.ord
+        );
+    }
+    if u.tool_cmd.is_some() || crate::deliver_lift::is_deliver_unit(u) {
+        anyhow::bail!(
+            "unit {} is a tool step: its floor checks what it runs or ships, and `{action}` \
+             overrides an agent step's floor only — approve (retry) or reject",
+            u.ord
+        );
+    }
+    match u.denials_behind.as_deref() {
+        None => anyhow::bail!(
+            "unit {}'s gate did not record whether any other layer denied it (a denial from \
+             before that record existed, or a retry on the same tree that did not ask every \
+             layer again) — the override needs that record: request changes (the step reworks \
+             and every layer runs again) or reject",
+            u.ord
+        ),
+        Some(behind) if !behind.is_empty() => {
+            let layers = behind
+                .iter()
+                .map(|d| format!("`{}` ({})", d.source, reason_head(&d.reason)))
+                .collect::<Vec<_>>()
+                .join("; ");
+            anyhow::bail!(
+                "unit {}'s gate was ALSO denied by {layers} — `{action}` overrides the failed \
+                 floor only, and every other layer still denies (deny-dominates): approve \
+                 (retry), request changes, or reject",
+                u.ord
+            )
+        }
+        Some(_) => {}
+    }
+    let attempt = u.last_attempt.unwrap_or(0);
+    Ok(crate::assurance::FloorOverride {
+        result_id: format!("{run_id}:unit-{}:attempt-{attempt}:{layer}", u.ord),
+        layer,
+        ord: u.ord,
+        attempt,
+        tree: u.repo_checks.as_ref().and_then(|r| r.tree.clone()),
+        label: crate::assurance::FLOOR_OVERRIDE_LABEL.to_string(),
+    })
+}
+
 /// (operator ruling 2026-10-11) An approve at a `judge_unavailable` escalation: the operator's
 /// judgment. The cursor unit counts (Done), its receipt records `operatorJudges` (who / when / the
 /// note) and `operator_judge` among the instruments that ran, and the run advances — the
@@ -13483,6 +13661,7 @@ fn judge_by_operator(
     run_id: &str,
     actor: Option<String>,
     note: Option<String>,
+    floor_override: Option<crate::assurance::FloorOverride>,
     lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     process_gen: uuid::Uuid,
@@ -13507,29 +13686,54 @@ fn judge_by_operator(
         .map(|a| a.trim().to_string())
         .filter(|a| !a.is_empty())
         .unwrap_or_else(|| "operator".to_string());
-    let note = note.filter(|n| !n.trim().is_empty());
+    let note = note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+    // (operator ruling 2026-10-21) A floor override's rationale is its record: never without one
+    // (`floor_override_for` refused an empty one before the gate row resolved; re-checked here).
+    if floor_override.is_some() && note.is_none() {
+        anyhow::bail!(
+            "action `{}` needs a written rationale — why the failed floor is not the work's",
+            crate::workflow::OPERATOR_JUDGMENT_ACTION
+        );
+    }
+    let overrides_floor = floor_override.is_some();
     let judgment = crate::assurance::OperatorJudgment {
         by: by.clone(),
         at,
         note: note.clone(),
         reason: u.denial_reason.clone(),
+        floor_override,
     };
     let mut receipt = u.assurance.clone().unwrap_or_else(|| {
         crate::assurance::AssuranceReceipt::for_run(&session.assurance, attempt)
     });
     receipt.ran(crate::assurance::OPERATOR_JUDGE);
-    receipt.judge = Some(format!("operator:{by}"));
-    receipt.operator_judges.push(judgment);
+    // A floor override judges the FLOOR, not the work: the gate's own judge (the seat that ruled,
+    // when one did) stays its judge. Only a judge-unavailable judgment stands in for the judge.
+    if !overrides_floor {
+        receipt.judge = Some(format!("operator:{by}"));
+    }
+    receipt.operator_judges.push(judgment.clone());
     u.assurance = Some(receipt);
     u.operator_rulings.push(crate::domain::OperatorRuling {
-        action: "judge".to_string(),
-        text: note.unwrap_or_else(|| format!("judged by operator ({by})")),
+        action: if overrides_floor {
+            crate::workflow::OPERATOR_JUDGMENT_ACTION
+        } else {
+            "judge"
+        }
+        .to_string(),
+        text: match (&note, overrides_floor) {
+            (Some(n), true) => format!("{} ({by}): {n}", crate::assurance::FLOOR_OVERRIDE_LABEL),
+            (Some(n), false) => n.clone(),
+            (None, _) => format!("judged by operator ({by})"),
+        },
         attempt,
         at,
     });
     u.status = crate::domain::UnitStatus::Done;
     u.denial = None;
     u.denial_reason = None;
+    // A judged unit's record is known: nothing stands behind it now.
+    u.denials_behind = Some(Vec::new());
     u.requested_rejudge = None;
     // (codex r1 on #907) The judged output becomes the unit's APPROVED output, so a later
     // evaluator and context injection read it (`get_work_output`), with the judgment's provenance.
@@ -13554,6 +13758,11 @@ fn judge_by_operator(
     }
     let ord = u.ord;
     let mut s = session;
+    // (operator ruling 2026-10-21) The run's own label: every floor the operator overrode, on the
+    // session's assurance contract (`RunAssurance::floor_overrides`).
+    if overrides_floor {
+        s.assurance.floor_overrides.push(judgment);
+    }
     // (core#969, codex r1) A PA step's `PLAN` / `PLAN+` lines ride its ACCEPTED output: the fold
     // records them only on a pass (`team_gate::record_plan_lines`), and the operator's judgment is
     // the acceptance here, so they are recorded from the output it accepted (resolved above).
@@ -13575,7 +13784,10 @@ fn judge_by_operator(
     // PERSISTED evidence, not only the gate's winning source: when no isolated QE reviewer could
     // run, the run's QE decision becomes the operator's — a labelled bypass of automated QE (crew's
     // delivery honours `skipped` + `operator` and shows this reason), never a ledger PASS.
+    // (operator ruling 2026-10-21) Never on a floor override: it answers the floor only, and QE
+    // acceptance stays exactly as the run decided it (required stays required).
     let qe_judged = crate::qe_acceptance::review::operator_judged(&u, &by)
+        .filter(|_| !overrides_floor)
         .filter(|_| s.assurance.qe.as_ref().is_some_and(|q| q.required()));
     if let Some(d) = qe_judged.clone() {
         s.assurance.qe = Some(d);
@@ -13623,10 +13835,17 @@ fn judge_by_operator(
     s.attempt = units.get(ix + 1).map(next_attempt).unwrap_or(0);
     s.status = SessionStatus::Executing;
     crate::domain::put_nodes(store, &[u.to_node(), s.to_node()])?;
-    eprintln!(
-        "wicked-core: unit {ord} of run {run_id} judged by operator `{by}` at its \
-         judge_unavailable gate"
-    );
+    if overrides_floor {
+        eprintln!(
+            "wicked-core: unit {ord} of run {run_id}: {} (`{by}`) at its floor_failed gate",
+            crate::assurance::FLOOR_OVERRIDE_LABEL
+        );
+    } else {
+        eprintln!(
+            "wicked-core: unit {ord} of run {run_id} judged by operator `{by}` at its \
+             judge_unavailable gate"
+        );
+    }
     if let Some(d) = qe_judged {
         emit(
             subscribers,
@@ -19714,6 +19933,324 @@ mod request_changes_tests {
                 ..
             }
         )));
+    }
+
+    /// (operator ruling 2026-10-21) The fix unit (ord 3) of a seeded bug run, denied by the
+    /// repo-checks floor, the run waiting at its escalation gate; `behind` is what the fold
+    /// recorded about the gate's other layers.
+    fn seed_floor_failed_fix(
+        store: &mut dyn GraphStore,
+        run_id: &str,
+        behind: Option<Vec<UnitDenial>>,
+    ) {
+        seed_bug_with_deliver(store, run_id);
+        let mut session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        session.unit_ix = 2;
+        put_node(store, session.to_node()).unwrap();
+        let mut units = crate::domain::session_units(store, run_id).unwrap();
+        let fix = &mut units[2];
+        let why = "repo checks failed: test (1 failing, head-only)";
+        fix.status = UnitStatus::Rejected;
+        fix.denial = Some(UnitDenial::new(crate::repo_checks::DENIAL_SOURCE, why));
+        fix.denial_reason = Some(why.into());
+        fix.denials_behind = behind;
+        put_node(store, fix.to_node()).unwrap();
+    }
+
+    fn operator_judgment(
+        store: &mut dyn GraphStore,
+        run_id: &str,
+        rationale: &str,
+    ) -> (anyhow::Result<SessionStatus>, Vec<CoreEvent>) {
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        let r = confirm_gate_as(
+            store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            run_id,
+            HumanDecision::OperatorJudgment {
+                rationale: rationale.into(),
+            },
+            Some("coordinator-agent".into()),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        );
+        (r, drain(&erx))
+    }
+
+    /// (operator ruling 2026-10-21) The override needs a written rationale: a blank one is refused
+    /// and nothing changes — the unit stays denied, the run stays at its gate.
+    #[test]
+    fn a_floor_override_without_a_rationale_is_refused() {
+        let run_id = format!("floor-over-blank-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_floor_failed_fix(&mut store, &run_id, Some(Vec::new()));
+        for blank in ["", "  ", "\n\t"] {
+            let (r, _) = operator_judgment(&mut store, &run_id, blank);
+            let e = r.expect_err("a blank rationale is refused").to_string();
+            assert!(e.contains("needs a written rationale"), "{e}");
+        }
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.unit_ix, 2, "the run did not move");
+        assert!(session.assurance.floor_overrides.is_empty());
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(units[2].status, UnitStatus::Rejected, "nothing counted");
+        assert!(units[2]
+            .assurance
+            .as_ref()
+            .is_none_or(|r| r.operator_judges.is_empty()));
+    }
+
+    /// (operator ruling 2026-10-21) With a rationale the unit counts, and the gate receipt records
+    /// an operator judgment OVERRIDING THE FLOOR (who, the rationale, the floor result id, the
+    /// label); the run's contract and the delivery receipt carry "floor overridden by operator".
+    #[test]
+    fn a_floor_override_is_recorded_on_the_receipt_the_run_and_the_delivery() {
+        let run_id = format!("floor-over-ok-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_floor_failed_fix(&mut store, &run_id, Some(Vec::new()));
+        let why = "27 head-only failures are load flakes in untouched files; each passes alone";
+        let (r, evs) = operator_judgment(&mut store, &run_id, why);
+        r.expect("the override applies");
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.unit_ix, 3, "the run moved on to verify");
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let fix = &units[2];
+        assert_eq!(fix.status, UnitStatus::Done);
+        assert!(fix.denial.is_none());
+        assert_eq!(
+            fix.denials_behind,
+            Some(Vec::new()),
+            "a judged unit is a known record"
+        );
+        let receipt = fix.assurance.as_ref().expect("a gate receipt");
+        assert!(receipt
+            .ran
+            .iter()
+            .any(|i| i == crate::assurance::OPERATOR_JUDGE));
+        assert_eq!(receipt.operator_judges.len(), 1);
+        let j = &receipt.operator_judges[0];
+        assert_eq!(j.by, "coordinator-agent");
+        assert_eq!(j.note.as_deref(), Some(why));
+        assert_eq!(
+            j.reason.as_deref(),
+            Some("repo checks failed: test (1 failing, head-only)")
+        );
+        let over = j.floor_override.as_ref().expect("a floor override");
+        assert_eq!(over.label, crate::assurance::FLOOR_OVERRIDE_LABEL);
+        assert_eq!(over.label, "floor overridden by operator");
+        assert_eq!(over.layer, "repo_checks");
+        assert_eq!(
+            over.result_id,
+            format!("{run_id}:unit-3:attempt-0:repo_checks")
+        );
+        assert!(
+            !receipt
+                .judge
+                .as_deref()
+                .is_some_and(|j| j.starts_with("operator:")),
+            "a floor override is not the judge: {receipt:?}"
+        );
+        assert_eq!(
+            fix.operator_rulings.last().map(|r| r.action.as_str()),
+            Some(crate::workflow::OPERATOR_JUDGMENT_ACTION)
+        );
+        // The run's own label…
+        assert_eq!(session.assurance.floor_overrides, vec![j.clone()]);
+        // …the delivery's…
+        let delivery = crate::deliver_lift::delivery_receipt(&session, &units);
+        assert_eq!(
+            delivery
+                .operator_judges
+                .iter()
+                .filter_map(|j| j.floor_override.as_ref())
+                .map(|o| o.label.as_str())
+                .collect::<Vec<_>>(),
+            ["floor overridden by operator"]
+        );
+        // …and it survives a later rework of the unit, whose fresh gate receipt has no judgment:
+        // the run's own record keeps it on the delivery (once, never twice).
+        let mut reworked = units.clone();
+        reworked[2].assurance = Some(crate::assurance::AssuranceReceipt::for_run(
+            &session.assurance,
+            1,
+        ));
+        let after = crate::deliver_lift::delivery_receipt(&session, &reworked);
+        assert_eq!(after.operator_judges, vec![j.clone()]);
+        assert!(after
+            .ran
+            .iter()
+            .any(|i| i == crate::assurance::OPERATOR_JUDGE));
+        assert_eq!(delivery.operator_judges.len(), 1, "never twice");
+        // …and on the wire, camelCase.
+        let wire = serde_json::to_value(&delivery).unwrap();
+        assert_eq!(
+            wire["operatorJudges"][0]["floorOverride"]["label"],
+            "floor overridden by operator"
+        );
+        assert_eq!(
+            wire["operatorJudges"][0]["floorOverride"]["resultId"],
+            format!("{run_id}:unit-3:attempt-0:repo_checks")
+        );
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            CoreEvent::GateDecided {
+                ord: 3,
+                allow: true,
+                ..
+            }
+        )));
+    }
+
+    /// (operator ruling 2026-10-21) QE acceptance is NOT waived: on a run that requires it, the
+    /// decision stays `required` after the override — even when the unit's last QE reviewer record
+    /// says no isolated reviewer could run, which a judge-unavailable approve would turn into an
+    /// operator skip — and the delivery receipt still requires it.
+    #[test]
+    fn a_floor_override_keeps_qe_acceptance_required() {
+        let run_id = format!("floor-over-qe-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_floor_failed_fix(&mut store, &run_id, Some(Vec::new()));
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        let declared = vec![
+            crate::assurance::JUDGE.to_string(),
+            crate::assurance::QE_ACCEPTANCE.to_string(),
+        ];
+        session.assurance = crate::assurance::RunAssurance::new(Some(&declared), false);
+        put_node(&mut store, session.to_node()).unwrap();
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        units[2].qe_review = Some(crate::domain::QeReview {
+            outcome: crate::qe_acceptance::review::OUTCOME_UNAVAILABLE.into(),
+            reason: "no run seat could review in isolation".into(),
+            evidence_dir: None,
+            qe_run_id: None,
+            tree: None,
+            verdict: None,
+            attempts: Vec::new(),
+        });
+        put_node(&mut store, units[2].to_node()).unwrap();
+        let (r, evs) = operator_judgment(&mut store, &run_id, "flakes under load 40");
+        r.expect("the override applies");
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        let qe = session.assurance.qe.as_ref().expect("QE decision");
+        assert_eq!(qe.status, crate::assurance::QE_REQUIRED, "{qe:?}");
+        assert!(session.assurance.enforces(crate::assurance::QE_ACCEPTANCE));
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, CoreEvent::QeAcceptanceDecided { .. })),
+            "the override decides nothing about QE: {evs:?}"
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let delivery = crate::deliver_lift::delivery_receipt(&session, &units);
+        assert_eq!(
+            delivery.qe.as_ref().map(|q| q.status.as_str()),
+            Some(crate::assurance::QE_REQUIRED)
+        );
+        assert!(!delivery
+            .skipped
+            .iter()
+            .any(|k| k.instrument == crate::assurance::QE_ACCEPTANCE));
+    }
+
+    /// (operator ruling 2026-10-21) Deny-dominates for every other layer: the override is refused
+    /// while any other layer of the same gate also denied, and when the fold left no record of the
+    /// other layers (fail-closed); it answers only a repo-checks floor, never another gate.
+    #[test]
+    fn a_floor_override_is_refused_while_another_layer_denies_or_at_another_gate() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = format!("floor-over-behind-{}", std::process::id());
+        seed_floor_failed_fix(
+            &mut store,
+            &run_id,
+            Some(vec![UnitDenial::new(
+                "agent_validator",
+                "agent validator REJECT: the fix does not address the bug",
+            )]),
+        );
+        let (r, _) = operator_judgment(&mut store, &run_id, "flakes");
+        let e = r.expect_err("another layer denies").to_string();
+        assert!(e.contains("ALSO denied by `agent_validator`"), "{e}");
+        assert!(e.contains("deny-dominates"), "{e}");
+
+        let run_id = format!("floor-over-unknown-{}", std::process::id());
+        seed_floor_failed_fix(&mut store, &run_id, None);
+        let (r, _) = operator_judgment(&mut store, &run_id, "flakes");
+        let e = r.expect_err("no record of the other layers").to_string();
+        assert!(e.contains("did not record whether any other layer"), "{e}");
+
+        for source in [
+            crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE,
+            "substance",
+            "pinned_validator",
+            "evaluator_verdict",
+        ] {
+            let run_id = format!("floor-over-{source}-{}", std::process::id());
+            seed_floor_failed_fix(&mut store, &run_id, Some(Vec::new()));
+            let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+            units[2].denial = Some(UnitDenial::new(source, "denied"));
+            put_node(&mut store, units[2].to_node()).unwrap();
+            let (r, _) = operator_judgment(&mut store, &run_id, "flakes");
+            let e = r.expect_err("not a repo-checks floor").to_string();
+            assert!(
+                e.contains("answers the escalation gate of a failed repo-checks floor"),
+                "{source}: {e}"
+            );
+            let units = crate::domain::session_units(&store, &run_id).unwrap();
+            assert_eq!(units[2].status, UnitStatus::Rejected, "{source}");
+        }
+    }
+
+    /// (operator ruling 2026-10-21) The floor gate's prompt offers the override, consequence
+    /// first, only where it applies.
+    #[test]
+    fn the_repo_checks_floor_prompt_offers_the_operator_judgment() {
+        let mut u = WorkUnit::pending("r:fix", "r", 3, "fix");
+        u.role = PhaseRole::Creator;
+        u.denial = Some(UnitDenial::new(
+            crate::repo_checks::DENIAL_SOURCE,
+            "checks failed",
+        ));
+        u.denials_behind = Some(Vec::new());
+        let p = denial_gate_prompt(&u, "floor_failed", "checks failed", None, "");
+        assert!(p.contains("action `operator_judgment`"), "{p}");
+        assert!(p.contains("floor overridden by operator"), "{p}");
+        assert!(p.contains("QE acceptance is still required"), "{p}");
+        // Not offered where the engine would refuse it: another layer denied too, or no record.
+        u.denials_behind = Some(vec![UnitDenial::new("agent_validator", "REJECT")]);
+        let p = denial_gate_prompt(&u, "floor_failed", "checks failed", None, "");
+        assert!(!p.contains("operator_judgment"), "{p}");
+        u.denials_behind = None;
+        let p = denial_gate_prompt(&u, "floor_failed", "checks failed", None, "");
+        assert!(!p.contains("operator_judgment"), "{p}");
+        u.denials_behind = Some(Vec::new());
+        // A floor that did not finish is the same floor class, and takes the same offer.
+        u.denial = Some(UnitDenial::new(
+            crate::repo_checks::DENIAL_SOURCE_TIMEOUT,
+            "test timed out",
+        ));
+        assert_eq!(denial_class(u.denial.as_ref(), false), "floor_failed");
+        let p = denial_gate_prompt(&u, "floor_failed", "test timed out", None, "");
+        assert!(p.contains("action `operator_judgment`"), "{p}");
+        u.denial = Some(UnitDenial::new("substance", "no change"));
+        let p = denial_gate_prompt(&u, "floor_failed", "no change", None, "");
+        assert!(!p.contains("operator_judgment"), "{p}");
     }
 
     /// core#969, run 24590a4b: on a TEAMED run every non-evaluator step the team does not own is

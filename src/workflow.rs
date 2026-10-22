@@ -479,10 +479,27 @@ pub enum HumanDecision {
     /// (deny-dominates). Refused at any other gate, and when no judge seat is
     /// eligible now ([`crate::RejudgeReadiness`]). Recorded as `judgeRerunRequested`.
     Rejudge,
+    /// (operator ruling 2026-10-21) "Approve as your own judgment" at the escalation gate of a
+    /// FAILED REPO-CHECKS FLOOR (denial source `repo_checks` | `repo_checks_timeout`), wire token
+    /// [`OPERATOR_JUDGMENT_ACTION`]: the operator judges, from the evidence, that the failures are
+    /// not the work's (load flakes, pre-existing reds the floor misclassified) and the unit counts
+    /// as it stands. It is the judge-unavailable gate's operator judgment (the same record,
+    /// `operatorJudges`, `operator_judge`), on a gate whose plain approve is a retry — so it needs
+    /// its own token. `rationale` is the operator's written why: required, never empty. Recorded
+    /// on the gate receipt with the floor result it overrode, labelled "floor overridden by
+    /// operator" on the run, the gate and the delivery. It answers the floor ONLY: refused when
+    /// any other layer of the same gate also denied (deny-dominates), at a team pause, on a team
+    /// member's step, on a tool or deliver step, and at every other gate. QE acceptance is never
+    /// waived by it.
+    OperatorJudgment { rationale: String },
 }
 
 /// The wire token of [`HumanDecision::Rejudge`].
 pub const REJUDGE_ACTION: &str = "rejudge";
+
+/// The wire token of [`HumanDecision::OperatorJudgment`]. Its rationale rides the gate body's
+/// `amend`, like `amend_intent`'s text.
+pub const OPERATOR_JUDGMENT_ACTION: &str = "operator_judgment";
 
 /// (core#555) The sentence an approved intent amendment rides into every later unit's prompt. It
 /// names the amendment as APPROVED and states that it OVERRIDES the corresponding launch-intent
