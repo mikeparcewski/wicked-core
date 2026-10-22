@@ -44,9 +44,16 @@ Two release tracks share this file, newest entry first regardless of track:
   from (stdout/stderr framing, cargo selectors, doctest footers), and that text is written by the very tests under
   check. Running each target separately changed what cargo ran: `-p` re-resolves features, and doctest-only
   libraries were skipped. So the floor no longer qualifies libtest ids at all. The check runs its own argv once,
-  and every `test x ... FAILED` line anywhere in its output is a failure, recorded as `test x`. A libtest id never
-  matches the base. **The cost: any Rust test failure the base shares now denies.** It is listed as `ambiguous`,
-  the denial says so, and the operator's floor override (core#1061) is the escape. core#546's nested-sandbox
+  and every `test x ... FAILED` line anywhere in its output is a failure, recorded as `test x` (read from the first
+  `test ` on the line, so text a test writes onto it cannot hide it). A libtest id never matches the base. A line
+  that proves a failure without naming it adds an `unattributed failure: <kind>` id that never matches and is never
+  re-run alone. The lines are cargo's `process didn't exit successfully:` (a crashed or non-101 test binary),
+  `error: could not compile`, rustdoc's `Couldn't compile the test.`, a pytest `ERROR ` line, and a `FAIL <file>`
+  line with no ` > ` (vitest's file-level failure, jest's file header). `strip_ansi` strips only complete escape
+  sequences; an unterminated one keeps the rest of the line. **The cost: any Rust test failure the base shares now
+  denies, and so does any check with a crashed binary, a compile error, a pytest ERROR or a file-level FAIL.** A
+  shared failure is listed as `ambiguous`, the denial says so, and the operator's floor override (core#1061) is the
+  escape. core#546's nested-sandbox
   `env_cannot_run` class for libtest failures goes with it. Other runners' ids (pytest, vitest, go: they name
   their file) still match the base by equality. Ids past `MAX_FAILURE_IDS` add an id nothing matches, and a cached
   base run is reused only under the same floor policy version (3). core#1063 (per-target execution) is superseded
@@ -59,14 +66,22 @@ Two release tracks share this file, newest entry first regardless of track:
   already gave the jail a private devpts. A PTY refusal is not `env_cannot_run`. (3) At most 2 head-only failures were re-run, and a loaded host produced 21-27. On an
   oversubscribed host each head-only failure is now re-run once, alone and serially, up to `MAX_FLAKE_RERUN` = 50
   failures and `FLAKE_RERUN_BUDGET_S` = 900 s in total. A libtest failure re-runs as the check's own argv plus
-  `-- --exact <name>`, which runs that name in every binary. One that exits 0 and prints the name `ok` is "flaky (passed alone)" and does
+  `-- --exact <name>`, which runs that name in every binary. A name with a leading `-`, whitespace or a control
+  character is never re-run. The check is `flaky_under_load` only when every named head-only failure passed alone
+  AND one confirmation run, within the budget, exits 0. For libtest that run is the check's argv with
+  `-- --skip <name> … --exact`; other runners (vitest) re-run the whole check, and the vitest load-class re-run gets
+  the same confirmation. The clean exit answers for the unattributed ids; without it the check stays a regression.
+  One that exits 0 and prints the name `ok` is "flaky (passed alone)" and does
   not deny (`flaky`); one that fails again stays a regression. Failures over the cap, past the budget or under a
   runner the floor cannot narrow stay regressions, counted in `notRechecked`. Wire (additive, `checks[]`):
   `flaky`, `notRechecked`, `ambiguous`. Each re-run is hard-bounded by what the budget has left (the load
   factor that stretches other checks' bounds does not apply past it). Tests:
   `no_forged_output_lets_a_libtest_failure_read_as_pre_existing_1060` (every forgery of review rounds 8 to 14,
   each a denial), `a_libtest_id_never_matches_a_base_id_1060`, `the_flake_rerun_is_the_checks_own_argv_with_exact_1060`,
-  `failure_ids_past_the_cap_never_read_as_pre_existing_1060`, `baseline_diff_never_excuses_a_libtest_failure` (real
+  `failure_ids_past_the_cap_never_read_as_pre_existing_1060`,
+  `a_failure_without_a_name_adds_a_marker_that_never_matches_1060`,
+  `flaky_under_load_needs_a_clean_run_with_the_flakes_skipped_1060`,
+  `an_escape_or_a_forged_name_cannot_hide_or_clear_a_failure_1060`, `baseline_diff_never_excuses_a_libtest_failure` (real
   `cargo test`), `a_libtest_failure_the_base_shares_is_still_denied` (end to end),
   `a_failure_that_passes_alone_is_flaky_and_does_not_block`,
   `a_failure_that_fails_again_alone_stays_a_regression`,

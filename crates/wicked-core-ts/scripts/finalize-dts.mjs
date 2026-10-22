@@ -95,17 +95,22 @@ const HAND_AUTHORED = `${BEGIN}
  * entry carries \`outcome\`, \`boundS\`, \`boundNote\`, \`failureIds\`, \`classification: 'regression' |
  * 'pre_existing_in_sandbox' | 'floor_env_mismatch' | null\` (only a regression denies), \`preExisting\`,
  * \`regressions\` and \`base: {head, cached, run, error} | null\` (the same check run on the run base).
- * core#481/#546/#553 (additive): \`classification\` gains \`'env_cannot_run'\` (every failure carries the
- * nested-sandbox launcher signature on both trees) and \`'flaky_under_load'\` (each head-only failure, ≤ 50,
- * that passed an isolated re-run) — neither denies; equal failure sets are now
- * \`'pre_existing_in_sandbox'\` (\`'floor_env_mismatch'\` is no longer produced); libtest ids are
- * qualified by binary (\`test t::name [-p crate --lib]\`); every \`checks[]\` entry carries
- * \`envCannotRun: string[]\` and \`reruns: CheckRun[]\` (each re-run's \`boundNote\` carries the host load).
+ * core#481/#546/#553/#789/#1060 (additive): \`classification\` gains \`'env_cannot_run'\` (the check's tool
+ * crashed with the same environment error on head, base and a re-run; core#546's nested-sandbox class is
+ * no longer produced) and \`'flaky_under_load'\` (every named head-only failure, ≤ 50, passed an isolated
+ * re-run AND the check ran clean with them skipped) — neither denies; equal failure sets are
+ * \`'pre_existing_in_sandbox'\` (\`'floor_env_mismatch'\` is no longer produced). libtest ids are plain
+ * (\`test t::name\`) and NEVER match the base (core#1060: no output text can say which binary a failure
+ * came from), so a Rust failure the base shares denies unless a confirmed flake re-run clears it; a
+ * failure the output proves but does not name (a crashed test binary, a crate or doctest that did not
+ * compile, a pytest \`ERROR\`, a file-level \`FAIL\`) is \`'unattributed failure: <kind>'\`, which never
+ * matches either. Every \`checks[]\` entry carries \`envCannotRun: string[]\` and \`reruns: CheckRun[]\`
+ * (each re-run's \`boundNote\` carries the host load).
  * Floor fix 2026-10-22 (additive): every \`checks[]\` entry carries \`flaky: string[]\` (head-only failures
  * that passed re-run alone — not denials), \`notRechecked: number\` (head-only failures not re-run: over
  * 50, past the 900 s re-run budget, or a runner the floor cannot narrow) and \`ambiguous: string[]\`
- * (head failures not matched to a same-named base failure because one side's binary is unknown —
- * kept as regressions).
+ * (head libtest failures the base also fails by name — never matched, kept as regressions; the
+ * operator's floor override is the escape).
  * core#810 (additive): unitDistributed.pool (UnitPoolSeatingJson | null — a phase's worker pool,
  * one creator plus monitors, with any shortfall disclosed as requested/seated/missing).
  * core#461/#591 (additive): unitDistributed.distinctnessFallback ('creator_seat' |

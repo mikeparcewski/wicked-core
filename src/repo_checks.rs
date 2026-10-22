@@ -262,6 +262,23 @@ pub const MAX_FAILURE_IDS: usize = 1000;
 /// The failure id that stands for every id past [`MAX_FAILURE_IDS`]: a dropped id could have been
 /// the head's only regression, so this one is never matched to a base id — the check denies.
 pub const FAILURE_IDS_TRUNCATED: &str = "(more failure ids than the floor keeps)";
+/// The prefix of a failure id that stands for a failure the output PROVES but does not name: a
+/// test process that died (cargo's `process didn't exit successfully`), a crate or doctest that
+/// did not compile, a pytest `ERROR`, a test file that failed as a whole (`FAIL <file>` with no
+/// ` > `) — `unattributed failure: <kind>`. Like [`FAILURE_IDS_TRUNCATED`] it never matches a
+/// base id and is never re-run alone. A line can only ADD one: a forged one costs the change, a
+/// real one always denies — unless a clean confirmation run answers for it (core#1060).
+pub const UNATTRIBUTED_FAILURE: &str = "unattributed failure: ";
+/// A check whose named head-only failures all passed alone but that did not run clean with them
+/// skipped (or could not be confirmed within the re-run budget): the denial's own reason.
+pub const NO_CLEAN_RUN: &str =
+    "unattributed failure: the check did not run clean with its flaky tests skipped";
+
+/// Never matched to a base id, never re-run alone: the truncation marker and every
+/// [`UNATTRIBUTED_FAILURE`].
+fn never_matched(id: &str) -> bool {
+    id == FAILURE_IDS_TRUNCATED || id.starts_with(UNATTRIBUTED_FAILURE)
+}
 /// The version of the floor's check policy (its sandbox and its failure-id format) a cached base
 /// run was recorded under. A record of another — or no — version is a cache miss: core#1060
 /// opened `/dev/ptmx` to the checks and stopped matching libtest ids (3), so a base result from
@@ -4291,14 +4308,15 @@ struct BaseMatch<'a> {
 /// in crate B on the head are the same string, and nothing the floor can read — every line of
 /// the output is text the change's tests can print — says which binary either came from. The head
 /// id stays a regression (fail-closed) and, when the base fails that name too, is listed as
-/// ambiguous: said, not guessed. [`FAILURE_IDS_TRUNCATED`] never matches either.
+/// ambiguous: said, not guessed. [`FAILURE_IDS_TRUNCATED`] and every [`UNATTRIBUTED_FAILURE`]
+/// never match either.
 fn match_base<'a>(
     head: &std::collections::BTreeSet<&'a str>,
     base: &std::collections::BTreeSet<&'a str>,
 ) -> BaseMatch<'a> {
     let mut m = BaseMatch::default();
     for &h in head {
-        if h == FAILURE_IDS_TRUNCATED {
+        if never_matched(h) {
             continue;
         }
         match libtest_name(h) {
@@ -4330,6 +4348,11 @@ fn isolated_rerun_argv(argv: &[String], id: &str) -> Option<(Vec<String>, String
         return vitest_file_rerun_argv(argv, file).map(|a| (a, id.to_string()));
     }
     let name = libtest_name(id)?;
+    // A name that reads as a libtest flag (`--nocapture` drops the filter), or carries whitespace
+    // or a control character, is no `--exact` filter: not re-run, it stays a regression.
+    if !rerunnable_name(name) {
+        return None;
+    }
     let bin = argv.first()?;
     let is_cargo = Path::new(bin)
         .file_name()
@@ -4547,19 +4570,26 @@ fn recheck_alone(
     rerun: &mut IsolatedRerun<'_>,
 ) {
     let head_only = run.regressions.clone();
-    if head_only.len() > MAX_FLAKE_RERUN {
-        run.not_rechecked = head_only.len();
+    // A failure the output proves but does not name cannot be re-run alone: only the
+    // confirmation run below answers for it (core#1060).
+    let named: Vec<String> = head_only
+        .iter()
+        .filter(|id| !never_matched(id))
+        .cloned()
+        .collect();
+    if named.len() > MAX_FLAKE_RERUN {
+        run.not_rechecked = named.len();
         eprintln!(
             "wicked-core: repo checks floor — {} head-only failures exceed the {MAX_FLAKE_RERUN} \
              the floor re-checks alone; none re-run, all stay regressions",
-            head_only.len()
+            named.len()
         );
         return;
     }
     // (argv, the names the runner must print passing, the ids they stand for), in order.
     let mut groups: Vec<(Vec<String>, Vec<String>, Vec<String>)> = Vec::new();
     let mut not_rechecked = 0usize;
-    for id in &head_only {
+    for id in &named {
         let plan = isolated_rerun_argv(&check.argv, id)
             .or_else(|| runner_argv.and_then(|a| isolated_rerun_argv(a, id)));
         match plan {
@@ -4615,12 +4645,94 @@ fn recheck_alone(
     run.not_rechecked = not_rechecked;
     // A failure that passed alone is no longer kept as a regression, ambiguous or not.
     run.ambiguous.retain(|id| !flaky.contains(id));
-    if flaky.len() == head_only.len() {
-        run.classification = Some(FLAKY_UNDER_LOAD.to_string());
-    } else {
-        run.regressions.retain(|id| !flaky.contains(id));
+    let all_passed = !flaky.is_empty() && flaky.len() == named.len();
+    if all_passed {
+        // (core#1060) Names passing alone say nothing of what the output never named (a binary
+        // that crashed, a doctest the `--exact` filter never compiled): the check itself, its
+        // flaky tests skipped, must exit 0 — the ground truth that nothing else failed.
+        let left = budget
+            .checked_sub(spent)
+            .filter(|d| *d >= Duration::from_secs(1));
+        let confirmed = match (left, confirmation_argv(&check.argv, &flaky)) {
+            (Some(left), Some(argv)) => {
+                let one = RepoCheck {
+                    name: check.name.clone(),
+                    argv,
+                    source: "confirmation run, its flaky tests skipped (core#1060)".into(),
+                    timeout_s: check.timeout_s,
+                    dir: check.dir.clone(),
+                };
+                let (r, _) = rerun(&one, &[], left);
+                let clean = r.passed();
+                eprintln!(
+                    "wicked-core: repo checks floor — confirmation run with the flaky tests \
+                     skipped {} ({:.1}s)",
+                    if clean {
+                        "passed"
+                    } else {
+                        "did not pass: a regression"
+                    },
+                    r.duration_ms as f64 / 1000.0
+                );
+                run.reruns.push(r);
+                clean
+            }
+            _ => false,
+        };
+        if confirmed {
+            run.classification = Some(FLAKY_UNDER_LOAD.to_string());
+            run.flaky = flaky;
+            return;
+        }
+    }
+    run.regressions.retain(|id| !flaky.contains(id));
+    if all_passed && !run.regressions.iter().any(|r| r == NO_CLEAN_RUN) {
+        run.regressions.push(NO_CLEAN_RUN.to_string());
     }
     run.flaky = flaky;
+}
+
+/// (core#1060) The confirmation run of a check whose named head-only failures all passed alone:
+/// the check's own `cargo test` with each libtest name skipped exactly (`-- --skip <n> --exact`;
+/// libtest applies `--exact` to `--skip`), or — for any other runner, which has no skip form here
+/// (vitest) — the check itself, unchanged. `None` when the cargo command already passes its own
+/// test-name filters (`--exact` would change what they select): not confirmable.
+fn confirmation_argv(argv: &[String], flaky: &[String]) -> Option<Vec<String>> {
+    let names: Vec<&str> = flaky.iter().filter_map(|id| libtest_name(id)).collect();
+    if names.len() != flaky.len() || names.is_empty() {
+        return Some(argv.to_vec());
+    }
+    let split = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    let (cargo_args, test_args) = (&argv[..split], argv.get(split + 1..).unwrap_or(&[]));
+    const VALUE_FLAGS: &[&str] = &[
+        "--test-threads",
+        "--color",
+        "--format",
+        "--logfile",
+        "--skip",
+        "-Z",
+        "--shuffle-seed",
+    ];
+    let mut value = false;
+    for a in test_args {
+        if value {
+            value = false;
+        } else if VALUE_FLAGS.contains(&a.as_str()) {
+            value = true;
+        } else if !a.starts_with('-') {
+            return None;
+        }
+    }
+    let mut out = cargo_args.to_vec();
+    out.push("--".into());
+    out.extend(test_args.iter().cloned());
+    for n in names {
+        out.extend(["--skip".to_string(), n.to_string()]);
+    }
+    if !test_args.iter().any(|a| a == "--exact") {
+        out.push("--exact".into());
+    }
+    Some(out)
 }
 
 /// (core#790) The watch prefix that asks [`LineScan`] for a whole FILE's check-mark line.
@@ -4833,7 +4945,7 @@ fn rerun_load_class(
         run.regressions.clone()
     };
     let mut files: Vec<String> = Vec::new();
-    for id in &head_only {
+    for id in head_only.iter().filter(|id| !never_matched(id)) {
         let Some(f) = vitest_any_file_of(id).filter(|f| rerun_file_ok(f)) else {
             return false;
         };
@@ -4888,6 +5000,23 @@ fn rerun_load_class(
         r.duration_ms as f64 / 1000.0
     );
     run.reruns.push(r);
+    // (core#1060) The files passing say nothing of a failure the output never named: the check
+    // itself (vitest has no skip form) must run clean once more.
+    let ok = ok && {
+        let (c, _) = run_one_watching(worktree, check, sandbox, scratch, Tree::Head, &[]);
+        let clean = c.passed();
+        eprintln!(
+            "wicked-core: repo checks floor — confirmation run of `{}` {}",
+            check.name,
+            if clean {
+                "passed"
+            } else {
+                "did not pass: a regression"
+            }
+        );
+        run.reruns.push(c);
+        clean
+    };
     if ok {
         if run.regressions.is_empty() {
             run.regressions = if head_only.is_empty() {
@@ -5305,6 +5434,9 @@ impl LineScan {
                 }
             }
         }
+        if let Some(kind) = unattributed_failure_of_line(s) {
+            self.add(format!("{UNATTRIBUTED_FAILURE}{kind}"));
+        }
         if !self.watch.is_empty() {
             if let Some(name) = s
                 .strip_prefix("test ")
@@ -5332,63 +5464,112 @@ impl LineScan {
             }
         }
         if let Some(id) = failure_id_of_line(line, &mut self.eslint_file) {
-            if !self.ids.contains(&id) {
-                if self.ids.len() < MAX_FAILURE_IDS {
-                    self.ids.push(id);
-                } else {
-                    self.truncated = true;
-                }
+            self.add(id);
+        }
+    }
+
+    /// Keep a failure id (once), at most [`MAX_FAILURE_IDS`].
+    fn add(&mut self, id: String) {
+        if !self.ids.contains(&id) {
+            if self.ids.len() < MAX_FAILURE_IDS {
+                self.ids.push(id);
+            } else {
+                self.truncated = true;
             }
         }
     }
 }
 
-/// `line` without ANSI escape sequences: CSI (`ESC [ … final byte`), OSC (`ESC ] … BEL` or
-/// `ESC \`) and two-byte `ESC x`.
+/// `line` without its COMPLETE ANSI escape sequences: CSI (`ESC [`, parameter bytes 0x30–0x3F,
+/// intermediate bytes 0x20–0x2F, one final byte 0x40–0x7E), OSC (`ESC ]` … ended by BEL or `ESC \`)
+/// and a two-byte `ESC <0x40–0x5F>`. An unterminated or malformed sequence is kept verbatim, with
+/// the rest of the line (agy on #1060: swallowing to the end of the line dropped a FAILED line).
 fn strip_ansi(line: &str) -> std::borrow::Cow<'_, str> {
     if !line.contains('\u{1b}') {
         return std::borrow::Cow::Borrowed(line);
     }
+    let c: Vec<char> = line.chars().collect();
     let mut out = String::with_capacity(line.len());
-    let mut it = line.chars();
-    while let Some(c) = it.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match it.next() {
-            Some('[') => {
-                for d in it.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&d) {
-                        break;
-                    }
-                }
+    let mut i = 0;
+    while i < c.len() {
+        if c[i] == '\u{1b}' {
+            if let Some(end) = escape_end(&c, i) {
+                i = end;
+                continue;
             }
-            Some(']') => loop {
-                match it.next() {
-                    Some('\u{7}') | None => break,
-                    Some('\u{1b}') => {
-                        it.next();
-                        break;
-                    }
-                    Some(_) => {}
-                }
-            },
-            _ => {}
         }
+        out.push(c[i]);
+        i += 1;
     }
     std::borrow::Cow::Owned(out)
 }
 
-/// A libtest id's test name: `test a::b` → `a::b` (a ` [...]` suffix a stored record of an earlier
-/// floor carries is dropped). `None` for any other runner's id.
+/// The index just past the complete escape sequence that starts at `c[i]` (an ESC), or `None`.
+fn escape_end(c: &[char], i: usize) -> Option<usize> {
+    let within = |j: usize, lo: char, hi: char| c.get(j).is_some_and(|x| (lo..=hi).contains(x));
+    match c.get(i + 1)? {
+        '[' => {
+            let mut j = i + 2;
+            while within(j, '\u{30}', '\u{3f}') {
+                j += 1;
+            }
+            while within(j, '\u{20}', '\u{2f}') {
+                j += 1;
+            }
+            within(j, '\u{40}', '\u{7e}').then_some(j + 1)
+        }
+        ']' => {
+            let mut j = i + 2;
+            loop {
+                match c.get(j)? {
+                    '\u{7}' => return Some(j + 1),
+                    '\u{1b}' => return (c.get(j + 1) == Some(&'\\')).then_some(j + 2),
+                    _ => j += 1,
+                }
+            }
+        }
+        x if ('\u{40}'..='\u{5f}').contains(x) => Some(i + 2),
+        _ => None,
+    }
+}
+
+/// A libtest id's test name: `test a::b` → `a::b`. `None` for any other runner's id.
 fn libtest_name(id: &str) -> Option<&str> {
-    let rest = id.strip_prefix("test ")?;
-    Some(
-        rest.strip_suffix(']')
-            .and_then(|r| r.rsplit_once(" ["))
-            .map_or(rest, |(name, _)| name),
-    )
+    id.strip_prefix("test ")
+}
+
+/// A test name an `--exact` / `--skip` argument can carry: not empty, no leading `-` (it would
+/// read as a libtest flag), no whitespace or control character.
+fn rerunnable_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// The kind of failure a line PROVES without naming it ([`UNATTRIBUTED_FAILURE`]), or `None`:
+/// cargo's `process didn't exit successfully:` (a test binary killed by a signal or exiting other
+/// than 101), cargo's `error: could not compile`, rustdoc's `Couldn't compile the test.`, a pytest
+/// `ERROR` summary line (a collection or setup error), and a `FAIL <file>` line with no ` > `
+/// (vitest's file-level failure — an import error — and jest's failing-file header).
+fn unattributed_failure_of_line(s: &str) -> Option<&'static str> {
+    if s.contains("process didn't exit successfully:") {
+        return Some("a test process exited abnormally");
+    }
+    if s.starts_with("error: could not compile ") {
+        return Some("a crate did not compile");
+    }
+    if s.starts_with("Couldn't compile the test.") {
+        return Some("a doctest did not compile");
+    }
+    if s.starts_with("ERROR ") {
+        return Some("pytest reported an error");
+    }
+    if let Some(rest) = s.strip_prefix("FAIL ") {
+        if !rest.trim().is_empty() && !rest.contains(" > ") {
+            return Some("a test file failed as a whole");
+        }
+    }
+    None
 }
 
 /// The scanned ids of one check run: the failure ids (stdout first, then stderr, at most
@@ -5441,11 +5622,14 @@ pub(crate) fn failure_id_of_line(line: &str, eslint_file: &mut Option<String>) -
     if s.is_empty() {
         return None;
     }
-    // cargo / libtest: `test path::name ... FAILED`
-    if let Some(rest) = s.strip_prefix("test ") {
-        if let Some(name) = rest.strip_suffix(" ... FAILED") {
-            return Some(format!("test {}", name.trim()));
-        }
+    // cargo / libtest: `test path::name ... FAILED` — read from the FIRST `test ` on the line, so
+    // text a test wrote to the same line without a newline (or an unterminated escape, kept
+    // verbatim) can misname the id but never hide it (core#1060).
+    if let Some(name) = s
+        .strip_suffix(" ... FAILED")
+        .and_then(|r| r.find("test ").map(|i| &r[i + 5..]))
+    {
+        return Some(format!("test {}", name.trim()));
     }
     // pytest: `FAILED tests/x.py::test_y - AssertionError: …`
     if let Some(rest) = s.strip_prefix("FAILED ") {
@@ -8910,7 +9094,6 @@ mod tests {
     fn a_libtest_id_never_matches_a_base_id_1060() {
         for (head_id, base_id) in [
             ("test shared", "test shared"),
-            ("test shared", "test shared [-p a --lib]"),
             ("test shared [-p a --lib]", "test shared [-p a --lib]"),
             ("test shared [?]", "test shared [?]"),
         ] {
@@ -9017,8 +9200,8 @@ mod tests {
         assert!(!run.denies());
         assert_eq!(
             run.reruns.len(),
-            27,
-            "27 head-only failures, 27 re-runs (the old bound was 2)"
+            28,
+            "27 head-only failures, 27 re-runs (the old bound was 2), then one confirmation run"
         );
         assert_eq!(run.flaky, ids);
         assert_eq!(run.not_rechecked, 0);
@@ -9047,11 +9230,8 @@ mod tests {
     /// are flaky, are not counted, and the denial names both.
     #[test]
     fn a_failure_that_fails_again_alone_stays_a_regression() {
-        let (check, mut run) = regression_run(&[
-            "test t::flaky [-p core --lib]",
-            "test t::broken [-p core --lib]",
-            "test t::flaky2 [-p core --lib]",
-        ]);
+        let (check, mut run) =
+            regression_run(&["test t::flaky", "test t::broken", "test t::flaky2"]);
         let mut bounds = Vec::new();
         let pass = |n: &str| n != "t::broken";
         recheck_alone(
@@ -9068,19 +9248,13 @@ mod tests {
             3,
             "a failure again does not stop the others' re-checks"
         );
-        assert_eq!(run.regressions, vec!["test t::broken [-p core --lib]"]);
-        assert_eq!(
-            run.flaky,
-            vec![
-                "test t::flaky [-p core --lib]",
-                "test t::flaky2 [-p core --lib]"
-            ]
-        );
+        assert_eq!(run.regressions, vec!["test t::broken"]);
+        assert_eq!(run.flaky, vec!["test t::flaky", "test t::flaky2"]);
         let denial = report_of(vec![run], &[]).denial_reason();
         assert!(
             denial.contains("2 head-only failures passed re-run alone")
                 && denial.contains("flaky (passed alone)")
-                && !denial.contains("t::broken [-p core --lib], test t::flaky"),
+                && !denial.contains("t::broken, test t::flaky"),
             "{denial}"
         );
     }
@@ -9090,12 +9264,8 @@ mod tests {
     /// the cap, nothing is re-run and every failure is counted.
     #[test]
     fn a_spent_rerun_budget_is_reported_and_the_rest_stay_regressions() {
-        let (check, mut run) = regression_run(&[
-            "test t::a [-p core --lib]",
-            "test t::b [-p core --lib]",
-            "test t::c [-p core --lib]",
-            "test t::d [-p core --lib]",
-        ]);
+        let (check, mut run) =
+            regression_run(&["test t::a", "test t::b", "test t::c", "test t::d"]);
         let mut bounds = Vec::new();
         let pass = |_: &str| true;
         recheck_alone(
@@ -9141,7 +9311,7 @@ mod tests {
         assert_eq!(run.reruns.len(), 3);
         assert_eq!(run.not_rechecked, 1);
         assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(run.regressions, vec!["test t::d [-p core --lib]"]);
+        assert_eq!(run.regressions, vec!["test t::d"]);
         assert_eq!(run.flaky.len(), 3);
         let denial = report_of(vec![run], &[]).denial_reason();
         assert!(
@@ -9151,7 +9321,7 @@ mod tests {
         );
 
         let ids: Vec<String> = (0..=MAX_FLAKE_RERUN)
-            .map(|i| format!("test t::n{i} [-p core --lib]"))
+            .map(|i| format!("test t::n{i}"))
             .collect();
         let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
         let (check, mut run) = regression_run(&refs);
@@ -9168,8 +9338,7 @@ mod tests {
         assert_eq!(run.regressions.len(), MAX_FLAKE_RERUN + 1);
         assert!(run.denies());
         // Less than a second left is not a re-run: the failure is counted as not re-checked.
-        let (check, mut run) =
-            regression_run(&["test t::a [-p core --lib]", "test t::b [-p core --lib]"]);
+        let (check, mut run) = regression_run(&["test t::a", "test t::b"]);
         let mut bounds = Vec::new();
         recheck_alone(
             &check,
@@ -9184,7 +9353,7 @@ mod tests {
             "one re-run with the 1.5 s budget's whole second"
         );
         assert_eq!(run.not_rechecked, 1);
-        assert_eq!(run.regressions, vec!["test t::b [-p core --lib]"]);
+        assert_eq!(run.regressions, vec!["test t::b"]);
     }
 
     fn failed_run(ids: &[&str], env: &[&str]) -> CheckRun {
@@ -9583,8 +9752,15 @@ mod tests {
         );
         assert!(report.passed, "{report:#?}");
         assert_eq!(c.regressions, vec!["test t::flaky".to_string()]);
-        assert_eq!(c.reruns.len(), 1);
-        assert!(c.reruns[0].passed(), "{:?}", c.reruns[0]);
+        assert_eq!(
+            c.reruns.len(),
+            2,
+            "the isolated re-run, then the confirmation run"
+        );
+        assert!(c.reruns.iter().all(|r| r.passed()), "{:?}", c.reruns);
+        assert!(c.reruns[1]
+            .argv
+            .ends_with(&s(&["--", "--skip", "t::flaky", "--exact"])));
         assert!(c.reruns[0]
             .argv
             .ends_with(&s(&["--no-fail-fast", "--", "--exact", "t::flaky"])));
@@ -10027,17 +10203,25 @@ mod tests {
             r#"{"test":["sh","vt/vitest","run"],"timeout_s":45}"#,
         )
         .unwrap();
-        let script = |fail_id: &str, never: &str, errors: usize| {
+        // `heal`: after its first full run the suite runs clean (a load flake; the confirmation
+        // run is that clean run, core#1060) — a marker file in the check's isolated HOME.
+        let script = |fail_id: &str, never: &str, errors: usize, heal: &str| {
             format!(
                 "if [ \"$1\" = run ] && [ -n \"$2\" ]; then shift; for f in \"$@\"; do case \"$f\" in \
                  *.ts) echo \" ✓ $f (1 test) 1ms\";; esac; done; exit 0; fi\n\
+                 if [ -n '{heal}' ]; then if [ -e \"$HOME/{heal}\" ]; then exit 0; fi; \
+                 touch \"$HOME/{heal}\"; fi\n\
                  echo ' FAIL  {fail_id} > s > n'\n\
                  echo \"[vitest-pool]: Failed to start forks worker for test files $PWD/{never}.\"\n\
                  echo ' Errors  {errors} error'\n\
                  exit 1\n"
             )
         };
-        std::fs::write(repo.join("vt/vitest"), script("c.test.ts", "d.test.ts", 1)).unwrap();
+        std::fs::write(
+            repo.join("vt/vitest"),
+            script("c.test.ts", "d.test.ts", 1, ""),
+        )
+        .unwrap();
         let base = git_repo_with_commit(&repo);
         let ctx = FloorContext {
             stage: FloorStage::Verify,
@@ -10045,7 +10229,11 @@ mod tests {
             git_dir: Some(repo.join(".git")),
             ..FloorContext::default()
         };
-        std::fs::write(repo.join("vt/vitest"), script("a.test.ts", "b.test.ts", 1)).unwrap();
+        std::fs::write(
+            repo.join("vt/vitest"),
+            script("a.test.ts", "b.test.ts", 1, "healed790"),
+        )
+        .unwrap();
         let report = run_floor(&repo, &ctx);
         if report.sandbox_error.is_some() {
             eprintln!("repo_checks: no sandbox tool here — the load floor cannot run");
@@ -10057,7 +10245,13 @@ mod tests {
             Some(FLAKY_UNDER_LOAD),
             "{test:?}"
         );
-        assert_eq!(test.reruns.len(), 1, "{test:?}");
+        assert_eq!(
+            test.reruns.len(),
+            2,
+            "the files, then the confirmation run: {test:?}"
+        );
+        assert_eq!(test.reruns[1].argv, s(&["sh", "vt/vitest", "run"]));
+        assert!(test.reruns[1].passed());
         assert_eq!(
             test.reruns[0].argv,
             s(&[
@@ -10073,7 +10267,11 @@ mod tests {
 
         // More errors than worker-start failures: not explained by load — no load-class re-run
         // (the never-started file is not re-run; core#553/#766's own one-file rule may still).
-        std::fs::write(repo.join("vt/vitest"), script("a.test.ts", "b.test.ts", 5)).unwrap();
+        std::fs::write(
+            repo.join("vt/vitest"),
+            script("a.test.ts", "b.test.ts", 5, ""),
+        )
+        .unwrap();
         let report = run_floor(&repo, &ctx);
         let test = &report.checks[0];
         assert!(
@@ -10365,11 +10563,9 @@ mod tests {
                 "a::b"
             ]))
         );
-        // A stored record of an earlier floor carried a qualifier: the name is what re-runs.
-        assert_eq!(
-            isolated_rerun_argv(&argv, "test a::b [-p x --lib]").map(|r| r.1),
-            Some("a::b".to_string())
-        );
+        // A bracketed name (a stored qualifier, or a parameterised harness's case) is no
+        // `--exact` filter: never re-run (agy on #1060 — `foo [bad_case]` would re-run `foo`).
+        assert!(isolated_rerun_argv(&argv, "test a::b [-p x --lib]").is_none());
         assert!(isolated_rerun_argv(&s(&["sh", "-c", "cargo test"]), "test a::b").is_none());
         assert!(isolated_rerun_argv(&argv, "FAILED tests/t.py::x").is_none());
     }
@@ -10400,5 +10596,285 @@ mod tests {
             strip_ansi("\u{1b}]8;;http://x\u{7}link\u{1b}]8;;\u{7} ok"),
             "link ok"
         );
+    }
+
+    /// core#1060 round 15: a failure the output PROVES but does not name adds an
+    /// `unattributed failure: <kind>` id (real cargo 1.99 / rustdoc lines; pytest's and vitest's
+    /// documented ones). It never matches the base and is never re-run alone, so a shared named
+    /// failure beside it can no longer make the check pre-existing.
+    #[test]
+    fn a_failure_without_a_name_adds_a_marker_that_never_matches_1060() {
+        let marked = |line: &str| qualify(scan_of(line), LineScan::default()).0;
+        let m = |kind: &str| format!("{UNATTRIBUTED_FAILURE}{kind}");
+        assert_eq!(
+            marked(
+                "  process didn't exit successfully: `/w/target/debug/deps/fx15-0` (signal: 6, \
+                 SIGABRT: process abort signal)\n"
+            ),
+            vec![m("a test process exited abnormally")]
+        );
+        assert_eq!(
+            marked("error: could not compile `fx15` (test \"bad\") due to 1 previous error\n"),
+            vec![m("a crate did not compile")]
+        );
+        assert_eq!(
+            marked(
+                "test src/lib.rs - f (line 1) ... FAILED\nerror[E0308]: mismatched types\n\
+                 Couldn't compile the test.\n"
+            ),
+            vec![
+                "test src/lib.rs - f (line 1)".to_string(),
+                m("a doctest did not compile")
+            ]
+        );
+        assert_eq!(
+            marked("ERROR tests/test_new.py - ModuleNotFoundError: No module named 'nope'\n"),
+            vec![m("pytest reported an error")]
+        );
+        assert_eq!(
+            marked(" FAIL  tests/b.test.ts [ tests/b.test.ts ]\n"),
+            vec![
+                m("a test file failed as a whole"),
+                "FAIL tests/b.test.ts [ tests/b.test.ts ]".to_string()
+            ]
+        );
+        assert_eq!(
+            marked(" FAIL  tests/a.test.ts > s > x\n"),
+            vec!["FAIL tests/a.test.ts > s > x".to_string()],
+            "a named vitest failure is no marker"
+        );
+        assert!(isolated_rerun_argv(
+            &s(&["cargo", "test"]),
+            &m("a test process exited abnormally")
+        )
+        .is_none());
+        // Each must deny beside a failure the base shares, on a host with headroom.
+        let shared = "FAILED tests/t.py::test_old - red\n";
+        for (label, extra) in [
+            (
+                "pytest collection error",
+                "ERROR tests/test_new.py - ModuleNotFoundError: No module named 'nope'\n",
+            ),
+            (
+                "vitest import failure",
+                " FAIL  tests/b.test.ts [ tests/b.test.ts ]\n",
+            ),
+            (
+                "a crashed test binary",
+                "  process didn't exit successfully: `/w/deps/a-1` (signal: 11, SIGSEGV)\n",
+            ),
+        ] {
+            let head = format!("{shared}{extra}");
+            for base in [shared.to_string(), head.clone()] {
+                let run = scanned_head((&head, ""), (&base, ""));
+                assert_eq!(
+                    run.classification.as_deref(),
+                    Some(REGRESSION),
+                    "{label}: {run:?}"
+                );
+                assert!(
+                    run.regressions
+                        .iter()
+                        .any(|r| r.starts_with(UNATTRIBUTED_FAILURE)),
+                    "{label}"
+                );
+                assert!(run.denies(), "{label}");
+            }
+        }
+    }
+
+    /// A stand-in re-run for the confirmation tests: an isolated re-run (it names what it
+    /// watches) passes; the confirmation run (no names) exits `confirm`.
+    fn confirming_rerun<'a>(
+        confirm: i32,
+        argvs: &'a mut Vec<Vec<String>>,
+    ) -> impl FnMut(&RepoCheck, &[String], Duration) -> (CheckRun, Vec<String>) + 'a {
+        move |one, names, _cap| {
+            argvs.push(one.argv.clone());
+            let mut r = failed_run(&[], &[]);
+            r.argv = one.argv.clone();
+            r.exit_code = Some(if names.is_empty() { confirm } else { 0 });
+            r.duration_ms = 1000;
+            (r, names.to_vec())
+        }
+    }
+
+    /// agy round 14: under load a named flake passes alone while the run's REAL failure has no
+    /// name — a crashed test binary, a doctest the `--exact` filter never compiled. Flaky needs
+    /// the check itself, the flaky tests skipped, to exit 0: here it does not, and the check
+    /// denies. A clean confirmation keeps the flaky path alive, and answers for the markers.
+    #[test]
+    fn flaky_under_load_needs_a_clean_run_with_the_flakes_skipped_1060() {
+        let crash = format!("{UNATTRIBUTED_FAILURE}a test process exited abnormally");
+        let doc = format!("{UNATTRIBUTED_FAILURE}a doctest did not compile");
+        for marker in [&crash, &doc] {
+            let (check, mut run) = regression_run(&["test t::flaky", marker]);
+            let mut argvs = Vec::new();
+            recheck_alone(
+                &check,
+                &mut run,
+                None,
+                Duration::from_secs(FLAKE_RERUN_BUDGET_S),
+                &mut confirming_rerun(101, &mut argvs),
+            );
+            assert_eq!(run.classification.as_deref(), Some(REGRESSION), "{run:?}");
+            assert_eq!(run.flaky, vec!["test t::flaky"]);
+            assert_eq!(
+                run.regressions,
+                vec![marker.to_string(), NO_CLEAN_RUN.into()]
+            );
+            assert_eq!(
+                run.not_rechecked, 0,
+                "a marker is not a name left unchecked"
+            );
+            assert!(run.denies());
+            assert_eq!(
+                argvs.last().unwrap(),
+                &s(&[
+                    "cargo",
+                    "test",
+                    "--workspace",
+                    "--no-fail-fast",
+                    "--",
+                    "--skip",
+                    "t::flaky",
+                    "--exact"
+                ])
+            );
+        }
+        // A real rustdoc compile failure also names the doctest — which is no `--exact` name.
+        let scanned = qualify(
+            scan_of(
+                "test t::flaky ... FAILED\ntest src/lib.rs - f (line 1) ... FAILED\n\
+                 Couldn't compile the test.\n",
+            ),
+            LineScan::default(),
+        )
+        .0;
+        let refs: Vec<&str> = scanned.iter().map(String::as_str).collect();
+        let (check, mut run) = regression_run(&refs);
+        let mut argvs = Vec::new();
+        recheck_alone(
+            &check,
+            &mut run,
+            None,
+            Duration::from_secs(FLAKE_RERUN_BUDGET_S),
+            &mut confirming_rerun(0, &mut argvs),
+        );
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert!(run.denies());
+        // A real flake, a clean confirmation: still flaky_under_load (and the marker of a test
+        // binary that crashed only under load is answered for by the clean run).
+        for ids in [vec!["test t::flaky"], vec!["test t::flaky", crash.as_str()]] {
+            let (check, mut run) = regression_run(&ids);
+            let mut argvs = Vec::new();
+            recheck_alone(
+                &check,
+                &mut run,
+                None,
+                Duration::from_secs(FLAKE_RERUN_BUDGET_S),
+                &mut confirming_rerun(0, &mut argvs),
+            );
+            assert_eq!(
+                run.classification.as_deref(),
+                Some(FLAKY_UNDER_LOAD),
+                "{run:?}"
+            );
+            assert!(!run.denies());
+            assert_eq!(
+                run.reruns.len(),
+                2,
+                "the isolated re-run and the confirmation"
+            );
+        }
+        // The confirmation's argv: libtest skips exactly; a command with its own test-name
+        // filter is not confirmable; any other runner re-runs as itself (vitest has no skip).
+        assert_eq!(
+            confirmation_argv(
+                &s(&["cargo", "test", "--", "--test-threads", "1"]),
+                &["test a".to_string(), "test b".to_string()]
+            ),
+            Some(s(&[
+                "cargo",
+                "test",
+                "--",
+                "--test-threads",
+                "1",
+                "--skip",
+                "a",
+                "--skip",
+                "b",
+                "--exact"
+            ]))
+        );
+        assert!(confirmation_argv(
+            &s(&["cargo", "test", "--", "some_filter"]),
+            &["test a".to_string()]
+        )
+        .is_none());
+        let npm = s(&["npm", "test"]);
+        assert_eq!(
+            confirmation_argv(&npm, &["FAIL tests/a.test.ts > s > x".to_string()]),
+            Some(npm.clone())
+        );
+    }
+
+    /// agy round 14: `strip_ansi` strips only COMPLETE sequences; an unterminated or malformed one
+    /// keeps the rest of the line, and the libtest id is read from the first `test ` on it — so a
+    /// test that writes an escape (or any text) onto libtest's line cannot hide its FAILED line.
+    /// A forged name that reads as a libtest flag, or carries a bracket suffix, is no `--exact`
+    /// filter: not re-run, never matched, a regression.
+    #[test]
+    fn an_escape_or_a_forged_name_cannot_hide_or_clear_a_failure_1060() {
+        assert_eq!(
+            strip_ansi("\u{1b}[1;31mFAILED\u{1b}[0m \u{1b}]8;;http://x\u{1b}\\link\u{1b}]8;;\u{7}"),
+            "FAILED link"
+        );
+        for raw in [
+            "\u{1b}]8;;test new ... FAILED",
+            "\u{1b}[31\u{1}test new ... FAILED",
+            "\u{1b}]8;;\u{1b}[1mtest new ... \u{1b}[31mFAILED\u{1b}[0m",
+            "progress 40%test new ... FAILED",
+        ] {
+            let (ids, _, _) = qualify(scan_of(raw), LineScan::default());
+            assert_eq!(ids, vec!["test new"], "{raw:?}");
+        }
+        assert_eq!(
+            strip_ansi("\u{1b}]8;;test new ... FAILED"),
+            "\u{1b}]8;;test new ... FAILED",
+            "an unterminated OSC is kept verbatim"
+        );
+        // Beside a pytest failure the base shares, the escaped libtest line still denies.
+        let shared = "FAILED tests/t.py::test_old - red\n";
+        let run = scanned_head(
+            (&format!("{shared}\u{1b}]8;;test new ... FAILED\n"), ""),
+            (shared, ""),
+        );
+        assert_eq!(run.regressions, vec!["test new"]);
+        assert!(run.denies());
+        // Forged names: never re-run, never excused.
+        let argv = s(&["cargo", "test", "--workspace"]);
+        for id in [
+            "test --nocapture",
+            "test foo [bad_case]",
+            "test a b",
+            "test x\u{7}",
+        ] {
+            assert!(isolated_rerun_argv(&argv, id).is_none(), "{id:?}");
+            let mut head = failed_run(&[id], &[]);
+            classify(&mut head, base_of(failed_run(&[id], &[])));
+            assert_eq!(head.classification.as_deref(), Some(REGRESSION), "{id:?}");
+        }
+        assert_eq!(libtest_name("test foo [bad_case]"), Some("foo [bad_case]"));
+        let (check, mut run) = regression_run(&["test --nocapture"]);
+        recheck_alone(
+            &check,
+            &mut run,
+            None,
+            Duration::from_secs(FLAKE_RERUN_BUDGET_S),
+            &mut confirming_rerun(0, &mut Vec::new()),
+        );
+        assert_eq!(run.not_rechecked, 1);
+        assert!(run.reruns.is_empty() && run.denies());
     }
 }
