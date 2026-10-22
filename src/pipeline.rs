@@ -1267,6 +1267,12 @@ pub(crate) fn apply_and_finish_unit(
     // that denied behind the floor last time still stand — read before this fold replaces them.
     let mut floor_carried = false;
     let prior_denials_behind = unit.denials_behind.clone();
+    // …and the layer that WON it (a judge's REJECT that named the gate while the floor passed).
+    let prior_denial = unit.denial.clone();
+    // (xreview r2) The tree the unit's LAST floor result judged, read before a fresh report
+    // replaces it: an attempt on the same tree that did not re-ask a layer (an operator retry
+    // re-runs the checks, never the default judge) leaves that layer's last word standing.
+    let prior_floor_tree = unit.repo_checks.as_ref().and_then(|r| r.tree.clone());
     let checks_denial: Option<(&'static str, String)> =
         match &evidence.repo_checks {
             Some(report) => {
@@ -1771,20 +1777,26 @@ pub(crate) fn apply_and_finish_unit(
     // a denial that never reached it (a worker failure, the substance floor) carries `None`.
     // A carried floor keeps what denied behind it last time (deny-dominates: the judge's REJECT
     // or hold over the same tree is not cleared by an attempt that never asked the judge again);
-    // with no record of last time, there is no record now (fail-closed).
+    // with no record of last time, there is no record now (fail-closed). (xreview r2) So does a
+    // fresh floor run on the SAME tree (an operator retry) for each layer this attempt did not
+    // refresh: the judge when no judge answered or was skipped, the QE reviewer when none ran.
     unit.denials_behind = if outcome.approved {
         None
-    } else if floor_carried {
-        prior_denials_behind.map(|mut prior| {
-            for d in denials_behind {
-                if !prior.contains(&d) {
-                    prior.push(d);
-                }
-            }
-            prior
-        })
     } else {
-        Some(denials_behind)
+        denials_behind_after_fold(
+            denials_behind,
+            PriorFold {
+                behind: prior_denials_behind,
+                winner: prior_denial,
+                tree: prior_floor_tree,
+            },
+            FoldRefresh {
+                floor_carried,
+                tree: evidence.repo_checks.as_ref().and_then(|r| r.tree.clone()),
+                judge: agent_verdict.is_some() || evidence.judge_skipped.is_some(),
+                qe: evidence.qe_review.is_some(),
+            },
+        )
     };
     unit.status = if outcome.approved {
         UnitStatus::Done
@@ -2447,6 +2459,84 @@ fn denial_for_outcome(
 /// [`crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE`] when NO seat judged because every eligible
 /// judge seat failed as a seat (`AgentVerdict::seat_failure`) — still a deny (fail-closed), but
 /// the record and the gate say the judge could not run, never that the work was rejected.
+/// (operator ruling 2026-10-21, xreview r1/r2) What a unit's previous gate fold recorded, read
+/// before this fold replaces it: the layers that denied behind the winner, the winner, and the
+/// tree its floor judged.
+struct PriorFold {
+    behind: Option<Vec<crate::domain::UnitDenial>>,
+    winner: Option<crate::domain::UnitDenial>,
+    tree: Option<String>,
+}
+
+/// Which layers THIS fold asked again: whether its floor result was carried from the last one
+/// onto an unchanged tree, the tree a fresh floor ran on, and whether the judge (a verdict or a
+/// recorded skip) and the isolated QE reviewer produced a fresh word.
+struct FoldRefresh {
+    floor_carried: bool,
+    tree: Option<String>,
+    judge: bool,
+    qe: bool,
+}
+
+/// [`crate::domain::WorkUnit::denials_behind`] after a DENYING fold: the layers that denied behind
+/// this fold's winner (`fresh`), plus every earlier denial over the SAME tree that this attempt
+/// did not ask again — a judge's REJECT or hold when no judge ran (an operator retry re-runs the
+/// checks only; a carried floor runs nothing), the QE reviewer's when none ran. Deny-dominates:
+/// an attempt that never re-asked a layer cannot clear it, so the operator's judgment over the
+/// floor cannot count work another layer refused. The repo-checks floor itself is never "behind".
+/// A carried floor with no record of last time keeps none now (`None`, fail-closed); an unknown
+/// tree counts as the same tree.
+fn denials_behind_after_fold(
+    fresh: Vec<crate::domain::UnitDenial>,
+    prior: PriorFold,
+    now: FoldRefresh,
+) -> Option<Vec<crate::domain::UnitDenial>> {
+    let judge_layer =
+        |s: &str| s == "agent_validator" || s == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE;
+    let qe_layer = |s: &str| {
+        s == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEW
+            || s == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE
+    };
+    let floor = |s: &str| {
+        s == crate::repo_checks::DENIAL_SOURCE || s == crate::repo_checks::DENIAL_SOURCE_TIMEOUT
+    };
+    let refreshed = |s: &str| (judge_layer(s) && now.judge) || (qe_layer(s) && now.qe);
+    let stale = |s: &str| (judge_layer(s) && !now.judge) || (qe_layer(s) && !now.qe);
+    let same_tree =
+        now.floor_carried || now.tree.is_none() || prior.tree.is_none() || now.tree == prior.tree;
+    let merge = |earlier: Vec<crate::domain::UnitDenial>, keep: &dyn Fn(&str) -> bool| {
+        let mut out = fresh.clone();
+        for d in earlier
+            .into_iter()
+            .filter(|d| !floor(&d.source) && keep(&d.source))
+        {
+            if !out.contains(&d) {
+                out.push(d);
+            }
+        }
+        out
+    };
+    let earlier = |behind: Vec<crate::domain::UnitDenial>| {
+        let mut all = behind;
+        all.extend(prior.winner.clone());
+        all
+    };
+    if now.floor_carried {
+        // Nothing but the floor's carry happened: every earlier layer stands unless re-asked.
+        prior
+            .behind
+            .clone()
+            .map(|b| merge(earlier(b), &|s| !refreshed(s)))
+    } else if same_tree {
+        Some(merge(
+            earlier(prior.behind.clone().unwrap_or_default()),
+            &stale,
+        ))
+    } else {
+        Some(fresh)
+    }
+}
+
 fn agent_verdict_denial(
     agent: Option<&crate::validator::AgentVerdict>,
 ) -> Option<(&'static str, String)> {
@@ -4866,5 +4956,120 @@ mod member_read_step_tests {
         for u in [member_build, member_code, pa_recon] {
             assert!(super::authors_by_dispatch(&u), "{u:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod denials_behind_tests {
+    use super::{denials_behind_after_fold, FoldRefresh, PriorFold};
+    use crate::domain::UnitDenial;
+
+    fn d(source: &str) -> UnitDenial {
+        UnitDenial::new(source, format!("{source} denied"))
+    }
+    fn sources(v: &Option<Vec<UnitDenial>>) -> Option<Vec<&str>> {
+        v.as_ref()
+            .map(|v| v.iter().map(|d| d.source.as_str()).collect())
+    }
+    fn refresh(floor_carried: bool, tree: &str, judge: bool, qe: bool) -> FoldRefresh {
+        FoldRefresh {
+            floor_carried,
+            tree: Some(tree.into()),
+            judge,
+            qe,
+        }
+    }
+    fn prior(behind: Option<Vec<UnitDenial>>, winner: &str, tree: &str) -> PriorFold {
+        PriorFold {
+            behind,
+            winner: Some(d(winner)),
+            tree: Some(tree.into()),
+        }
+    }
+
+    /// xreview r2: the judge REJECTED with the floor; an operator retry re-runs the checks on the
+    /// same tree but never the judge. Its REJECT still stands behind the floor.
+    #[test]
+    fn a_retry_that_does_not_re_ask_the_judge_keeps_its_reject() {
+        let out = denials_behind_after_fold(
+            Vec::new(),
+            prior(Some(vec![d("agent_validator")]), "repo_checks", "t1"),
+            refresh(false, "t1", false, false),
+        );
+        assert_eq!(sources(&out), Some(vec!["agent_validator"]));
+    }
+
+    /// The judge's REJECT WON the last fold (the floor passed then); a retry on the same tree whose
+    /// flaky checks now fail keeps it — the floor itself is never carried "behind".
+    #[test]
+    fn a_reject_that_named_the_last_gate_is_kept_too_and_the_floor_is_never_behind() {
+        let out = denials_behind_after_fold(
+            Vec::new(),
+            prior(Some(Vec::new()), "agent_validator", "t1"),
+            refresh(false, "t1", false, false),
+        );
+        assert_eq!(sources(&out), Some(vec!["agent_validator"]));
+        let out = denials_behind_after_fold(
+            Vec::new(),
+            prior(Some(vec![d("repo_checks_timeout")]), "repo_checks", "t1"),
+            refresh(false, "t1", false, false),
+        );
+        assert_eq!(sources(&out), Some(vec![]));
+    }
+
+    /// A layer this fold DID ask again speaks for itself: a judge that ran now (and passed) clears
+    /// its earlier REJECT; a QE reviewer that did not run keeps its earlier veto.
+    #[test]
+    fn a_re_asked_layer_replaces_its_earlier_word_and_an_unasked_one_keeps_it() {
+        let earlier = Some(vec![d("agent_validator"), d("qe_review")]);
+        let out = denials_behind_after_fold(
+            Vec::new(),
+            prior(earlier.clone(), "repo_checks", "t1"),
+            refresh(false, "t1", true, false),
+        );
+        assert_eq!(sources(&out), Some(vec!["qe_review"]));
+        // The same on a carried floor.
+        let out = denials_behind_after_fold(
+            Vec::new(),
+            prior(earlier, "repo_checks", "t1"),
+            refresh(true, "t1", true, false),
+        );
+        assert_eq!(sources(&out), Some(vec!["qe_review"]));
+    }
+
+    /// xreview r1: a carried floor (nothing re-ran) keeps every earlier layer; with no record of
+    /// the last fold it keeps none (fail-closed: the override is refused).
+    #[test]
+    fn a_carried_floor_keeps_every_earlier_layer_or_records_unknown() {
+        let out = denials_behind_after_fold(
+            vec![d("input_governance")],
+            prior(Some(vec![d("agent_validator")]), "repo_checks", "t1"),
+            refresh(true, "t1", false, false),
+        );
+        assert_eq!(
+            sources(&out),
+            Some(vec!["input_governance", "agent_validator"])
+        );
+        let out = denials_behind_after_fold(
+            Vec::new(),
+            PriorFold {
+                behind: None,
+                winner: Some(d("repo_checks")),
+                tree: Some("t1".into()),
+            },
+            refresh(true, "t1", false, false),
+        );
+        assert_eq!(out, None);
+    }
+
+    /// A changed tree is new work: only this fold's own layers count.
+    #[test]
+    fn a_changed_tree_counts_only_this_fold() {
+        let out = denials_behind_after_fold(
+            Vec::new(),
+            prior(Some(vec![d("agent_validator")]), "agent_validator", "t1"),
+            refresh(false, "t2", false, false),
+        );
+        assert_eq!(sources(&out), Some(vec![]));
     }
 }
