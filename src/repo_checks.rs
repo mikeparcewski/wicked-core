@@ -4646,7 +4646,10 @@ fn recheck_alone(
     let mut spent = Duration::ZERO;
     let mut flaky: Vec<String> = Vec::new();
     for (argv, names, ids) in groups {
-        let Some(left) = budget.checked_sub(spent).filter(|d| !d.is_zero()) else {
+        let Some(left) = budget
+            .checked_sub(spent)
+            .filter(|d| *d >= Duration::from_secs(1))
+        else {
             not_rechecked += ids.len();
             continue;
         };
@@ -4655,7 +4658,7 @@ fn recheck_alone(
             name: check.name.clone(),
             argv,
             source: format!("isolated re-run of `{label}` (core#553)"),
-            timeout_s: Some(check.base_timeout().min(left).as_secs().max(1)),
+            timeout_s: check.timeout_s,
             dir: check.dir.clone(),
         };
         let (r, passed) = rerun(&one, &names, left);
@@ -4680,6 +4683,8 @@ fn recheck_alone(
         }
     }
     run.not_rechecked = not_rechecked;
+    // A failure that passed alone is no longer kept as a regression, ambiguous or not.
+    run.ambiguous.retain(|id| !flaky.contains(id));
     if flaky.len() == head_only.len() {
         run.classification = Some(FLAKY_UNDER_LOAD.to_string());
     } else {
@@ -5335,38 +5340,61 @@ pub(crate) fn launcher_signature(line: &str) -> Option<&'static str> {
 /// The line-level state of one output stream's failure scan.
 ///
 /// libtest ids are not qualified by binary (core#481): `test shared ... FAILED` from crate A and
-/// from crate B are the same string. The scan therefore tags each libtest id with the index of the
-/// FAILING test binary it came from (the count of `test result: FAILED` lines seen before it), and
-/// collects cargo's per-binary `to rerun pass `-p b --test common`` lines (stderr) in order: the
-/// k-th failing binary is the k-th such line, so [`qualify`] can name the target exactly — and
-/// falls back to the bare id when the two counts disagree (a custom harness).
+/// from crate B are the same string. The scan therefore tags each libtest id with the ordinal of
+/// the test binary it came from, and [`qualify`] names that binary's target only when the two
+/// streams describe the SAME binaries, one for one:
 ///
-/// A `test result:` line is a binary's boundary only when it closes what the binary printed: its
-/// `N failed` equals the failing tests read since the last boundary. A re-exec harness that
-/// prints its CHILD's run inside a test's captured output prints a second result line there (17
-/// result lines for 9 failing binaries, run 2ebd9da2 attempt 4); that line either does not match
-/// (and is ignored) or closes the block early (and the binary's own line then matches nothing),
-/// so each binary counts once. A binary that died without a result line is closed by the next
-/// binary's `running N tests` header.
+/// * stdout (libtest): one block per top-level `running N tests` header, marked failing when its
+///   own result line says so or it died before printing one;
+/// * stderr (cargo): one entry per `Running …` / `Doc-tests …` line, carrying the
+///   `to rerun pass `-p b --test common`` selector cargo printed after it when it failed.
+///
+/// A run printed INSIDE a test's captured output (a re-exec harness that puts its child's stdout
+/// in its panic message — 17 result lines for 9 failing binaries, run 2ebd9da2 attempt 4) is
+/// nested, not a binary: a `running N tests` header after the binary's `failures:` line opens a
+/// nested run its own result line closes. A result line closes the binary only when its ran and
+/// failed counts equal the binary's header and its top-level failures. Anything the structure
+/// cannot explain — a result line with no binary open, the binary's own result rejected, the
+/// block and binary lists disagreeing on length or on which binaries failed (a silent custom
+/// harness, codex on #1060) — leaves EVERY libtest id bare (fail-closed): aggregate counts that
+/// happen to agree are no evidence of which target an id belongs to. Lines inside a nested run
+/// are captured output (only a launcher signature is read, for the test it was printed in); the
+/// failure ids among them are set aside and reported, bare, whenever the structure does not
+/// verify — a misread structure can cost a qualifier, never a failure.
 #[derive(Debug, Default)]
 struct LineScan {
     eslint_file: Option<String>,
-    /// libtest: failing test binaries closed so far (see the boundary rule above).
-    failed_blocks: usize,
-    /// libtest: top-level `test x ... FAILED` lines read since the last boundary (every one,
-    /// whether or not the id cap kept it).
-    block_failures: usize,
-    /// libtest: a binary's `running N tests` header was read and its boundary not yet.
+    /// libtest: one entry per top-level test binary in order of its header — whether it failed.
+    blocks: Vec<bool>,
+    /// libtest: the last binary's header was read and its result line not yet.
     open: bool,
+    /// libtest: the open binary's `running N tests` count.
+    header_n: usize,
+    /// libtest: the open binary's top-level `test x ... FAILED` lines (every one, whether or not
+    /// the id cap kept it).
+    block_failures: usize,
+    /// libtest: the open binary printed its `failures:` / `successes:` line — its captured
+    /// output, where a nested run can appear, follows.
+    capture: bool,
+    /// libtest: the depth of nested runs being read inside captured output.
+    depth: usize,
+    /// libtest: the captured section a nested run was printed in, restored when it ends.
+    outer: Option<String>,
+    /// Failure ids read INSIDE nested runs: a child's, not this suite's — unless the structure
+    /// does not verify, when [`qualify`] reports them too (bare) rather than lose a failure.
+    nested_ids: Vec<String>,
+    /// The structure contradicted itself (see above): no libtest id is qualified.
+    anomaly: bool,
     /// libtest: the test whose captured output (`---- name stdout ----`) is being read.
     section: Option<String>,
-    /// Failure ids in order of first sight; libtest ids carry their failing-binary index.
+    /// Failure ids in order of first sight; libtest ids carry their binary's ordinal.
     ids: Vec<(String, Option<usize>)>,
     /// libtest tests whose captured output carries a launcher signature (core#546), with their
-    /// failing-binary index.
-    env: Vec<(String, usize)>,
-    /// cargo's `to rerun pass `…`` target selectors, one per failing test binary, in order.
-    targets: Vec<String>,
+    /// binary's ordinal.
+    env: Vec<(String, Option<usize>)>,
+    /// cargo: one entry per test binary it announced, with its `to rerun pass` selector when it
+    /// failed.
+    binaries: Vec<Option<String>>,
     /// libtest names seen PASSING (`test name ... ok`) among `watch` — the isolated re-run's witness.
     passed: Vec<String>,
     watch: Vec<String>,
@@ -5394,29 +5422,81 @@ impl LineScan {
                 }
             }
         }
+        if let Some(n) = libtest_running_header(s) {
+            if self.depth > 0 || (self.open && self.capture) {
+                // A run printed inside a test's captured output.
+                if self.depth == 0 {
+                    self.outer = self.section.clone();
+                }
+                self.depth += 1;
+                return;
+            }
+            if self.open {
+                // The binary before died without its result line: a failing binary.
+                if let Some(b) = self.blocks.last_mut() {
+                    *b = true;
+                }
+            }
+            self.blocks.push(false);
+            self.open = true;
+            self.header_n = n;
+            self.block_failures = 0;
+            self.capture = false;
+            self.section = None;
+            return;
+        }
         if let Some(rest) = s.strip_prefix("test result: ") {
-            let count = libtest_failed_count(rest);
-            if !rest.starts_with("FAILED") {
-                // `ok` closes the open binary only when it read no failure (a nested child's
-                // `ok` inside a failing binary's captured output closes nothing).
-                self.open &= self.block_failures != 0;
-            } else if !matches!(count, Some(n) if n != self.block_failures) {
-                // `N failed` matches what was read (or the line has no count: as before).
-                self.failed_blocks += 1;
-                self.block_failures = 0;
-                self.open = false;
+            if self.depth > 0 {
+                self.depth -= 1;
+                if self.depth == 0 {
+                    // Back in the captured section the nested run was printed in.
+                    self.section = self.outer.take();
+                }
+                return;
+            } else if !self.open {
+                // Nothing open to close: something closed the binary early.
+                self.anomaly |= !self.blocks.is_empty();
+            } else {
+                match libtest_counts(rest) {
+                    Some((ran, failed))
+                        if ran == self.header_n && failed == self.block_failures =>
+                    {
+                        if let Some(b) = self.blocks.last_mut() {
+                            *b = failed > 0 || rest.starts_with("FAILED");
+                        }
+                        self.open = false;
+                        self.capture = false;
+                    }
+                    // Inside captured output a stray result line is the output's, not the
+                    // binary's (the section it was printed in goes on); outside it, the binary's
+                    // own line did not add up.
+                    _ if self.capture => return,
+                    _ => self.anomaly = true,
+                }
             }
             self.section = None;
             return;
         }
-        if self.section.is_none() && libtest_running_header(s) {
-            // A binary still open here died without its result line: cargo still printed its
-            // `to rerun pass` selector, so it is one failing binary.
-            if self.open {
-                self.failed_blocks += 1;
-                self.block_failures = 0;
+        if self.depth > 0 {
+            // A nested run's line: captured output of the test it was printed in.
+            if let (Some(name), Some(_)) = (self.outer.clone(), launcher_signature(s)) {
+                let block = self.blocks.len().checked_sub(1);
+                if !self.env.iter().any(|(n, b)| n == &name && *b == block) {
+                    self.env.push((name, block));
+                }
             }
-            self.open = true;
+            if let Some(id) = failure_id_of_line(line, &mut self.eslint_file) {
+                if self.nested_ids.len() < MAX_FAILURE_IDS && !self.nested_ids.contains(&id) {
+                    self.nested_ids.push(id);
+                }
+            }
+            return;
+        }
+        // cargo's per-binary line (`Running unittests src/lib.rs (…)`, `Doc-tests a`); a verbose
+        // build's ``Running `rustc …` `` command line is not a test binary.
+        if (s.starts_with("Running ") && !s.starts_with("Running `")) || s.starts_with("Doc-tests ")
+        {
+            self.binaries.push(None);
             return;
         }
         if let Some(name) = s
@@ -5426,25 +5506,28 @@ impl LineScan {
             self.section = Some(name.to_string());
             return;
         }
-        if s == "failures:" {
+        if s == "failures:" || s == "successes:" {
+            self.capture |= self.open && self.depth == 0;
             self.section = None;
             return;
         }
+        let block = self.blocks.len().checked_sub(1);
         if let Some(name) = self.section.clone() {
             // A test's captured output: only the launcher signature is read here — a nested
             // runner's own `test x ... FAILED` inside it is not a failure of THIS suite.
             if launcher_signature(s).is_some()
-                && !self
-                    .env
-                    .iter()
-                    .any(|(n, b)| n == &name && *b == self.failed_blocks)
+                && !self.env.iter().any(|(n, b)| n == &name && *b == block)
             {
-                self.env.push((name, self.failed_blocks));
+                self.env.push((name, block));
             }
             return;
         }
         if let Some(target) = rerun_target_of_line(s) {
-            self.targets.push(target);
+            // cargo prints a failing binary's selector after its `Running` line.
+            match self.binaries.last_mut() {
+                Some(slot @ None) => *slot = Some(target),
+                _ => self.anomaly = true,
+            }
             return;
         }
         if !self.watch.is_empty() {
@@ -5474,8 +5557,11 @@ impl LineScan {
             }
         }
         if let Some(id) = failure_id_of_line(line, &mut self.eslint_file) {
-            let block = id.starts_with("test ").then_some(self.failed_blocks);
-            self.block_failures += usize::from(block.is_some());
+            let libtest = id.starts_with("test ");
+            let block = block.filter(|_| libtest);
+            if libtest && self.open && !self.capture && self.depth == 0 {
+                self.block_failures += 1;
+            }
             if self.ids.len() < MAX_FAILURE_IDS
                 && !self.ids.iter().any(|(i, b)| i == &id && *b == block)
             {
@@ -5496,24 +5582,34 @@ fn rerun_target_of_line(s: &str) -> Option<String> {
     (!target.is_empty()).then(|| target.to_string())
 }
 
-/// libtest's result line, after `test result: `: `FAILED. 1 passed; 2 failed; 0 ignored` → 2.
+/// libtest's result line, after `test result: `: `FAILED. 1 passed; 2 failed; 0 ignored; 0
+/// measured; 9 filtered out` → (ran = passed + failed + ignored + measured = 3, failed = 2).
 /// `None` when it carries no `N failed` count.
-fn libtest_failed_count(rest: &str) -> Option<usize> {
+fn libtest_counts(rest: &str) -> Option<(usize, usize)> {
     let words: Vec<&str> = rest
-        .split(|c: char| c.is_whitespace() || c == ';' || c == ',')
+        .split(|c: char| c.is_whitespace() || c == ';' || c == ',' || c == '.')
         .filter(|w| !w.is_empty())
         .collect();
-    words
-        .windows(2)
-        .find(|w| w[1] == "failed")
-        .and_then(|w| w[0].parse().ok())
+    let count = |what: &str| {
+        words
+            .windows(2)
+            .find(|w| w[1] == what)
+            .and_then(|w| w[0].parse::<usize>().ok())
+    };
+    let failed = count("failed")?;
+    let ran = failed
+        + count("passed").unwrap_or(0)
+        + count("ignored").unwrap_or(0)
+        + count("measured").unwrap_or(0);
+    Some((ran, failed))
 }
 
-/// libtest's per-binary header: `running 1 test` / `running 12 tests`.
-fn libtest_running_header(s: &str) -> bool {
+/// libtest's per-binary header: `running 1 test` / `running 12 tests` → the count.
+fn libtest_running_header(s: &str) -> Option<usize> {
     s.strip_prefix("running ")
         .and_then(|r| r.strip_suffix(" tests").or_else(|| r.strip_suffix(" test")))
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|n| n.parse().ok())
 }
 
 /// A libtest id qualified by its test binary: `test t::shared [-p b --lib]` (core#481).
@@ -5536,21 +5632,28 @@ fn libtest_parts(id: &str) -> Option<(&str, Option<&str>)> {
 /// The scanned ids of one check run, qualified: the failure ids (stdout first, then stderr), the
 /// ids whose captured output carries a launcher signature, and the watched names seen passing.
 fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-    // cargo prints the per-binary selector on stderr, libtest its results on stdout.
-    let targets: Vec<String> = out
-        .targets
-        .iter()
-        .chain(err.targets.iter())
-        .cloned()
-        .collect();
-    // The k-th failing binary is the k-th selector. A binary still open at the end died (cargo
-    // printed its selector) or was cut off by the check's bound (cargo printed none, so its ids
-    // stay bare): either count lines the binaries up.
+    // libtest prints its results on stdout, cargo its binaries and selectors on stderr. The
+    // j-th stdout binary is the j-th cargo binary only when the lists match one for one: the same
+    // length (or cargo's last binary cut off before it printed anything) and the same binaries
+    // failing (the last block may be cut off before its verdict), with no structural anomaly.
+    let (blocks, bins) = (&out.blocks, &err.binaries);
+    let n = blocks.len();
+    // A nested run still open at the end, or a binary cut off inside its captured output, is a
+    // structure that did not resolve.
+    let unresolved = out.depth > 0 || (out.open && out.capture);
+    let lined_up = !out.anomaly
+        && !unresolved
+        && !err.anomaly
+        && n > 0
+        && (n == bins.len() || (n + 1 == bins.len() && bins[n].is_none()))
+        && blocks
+            .iter()
+            .zip(bins)
+            .enumerate()
+            .all(|(j, (failing, sel))| *failing == sel.is_some() || (out.open && j + 1 == n));
     let label = |scan: &LineScan, block: Option<usize>| -> Option<String> {
-        let b = block?;
-        let lined_up = scan.failed_blocks == targets.len()
-            || (scan.open && scan.failed_blocks + 1 == targets.len());
-        lined_up.then(|| targets.get(b).cloned()).flatten()
+        let j = block.filter(|_| lined_up && std::ptr::eq(scan, &out))?;
+        bins.get(j).cloned().flatten()
     };
     let mut ids: Vec<String> = Vec::new();
     let mut env: Vec<String> = Vec::new();
@@ -5561,11 +5664,17 @@ fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<Strin
                 ids.push(q);
             }
         }
+        // Set aside as a child's only when the structure verified: otherwise a misread could
+        // have hidden one of this suite's own failures there.
+        if !lined_up || !std::ptr::eq(scan, &out) {
+            for id in &scan.nested_ids {
+                if !ids.contains(id) && ids.len() < MAX_FAILURE_IDS {
+                    ids.push(id.clone());
+                }
+            }
+        }
         for (name, block) in &scan.env {
-            let q = qualified(
-                &format!("test {name}"),
-                label(scan, Some(*block)).as_deref(),
-            );
+            let q = qualified(&format!("test {name}"), label(scan, *block).as_deref());
             if !env.contains(&q) {
                 env.push(q);
             }
@@ -9118,7 +9227,9 @@ mod tests {
         );
         assert_eq!(env, vec!["test shared [-p b --test common]".to_string()]);
         // The summary block's trailing "`-p a --lib`" list line is not a second selector.
-        assert_eq!(scan_of(WS_STDERR).targets.len(), 3);
+        let bins = scan_of(WS_STDERR).binaries;
+        assert_eq!(bins.len(), 4, "a, b, common and the doc-tests: {bins:?}");
+        assert_eq!(bins.iter().flatten().count(), 3);
         // No selectors (another runner wrapped cargo, or the stderr was lost): bare, de-duplicated.
         let (ids, env, _, _) = qualify(scan_of(WS_STDOUT), LineScan::default());
         assert_eq!(
@@ -9142,25 +9253,24 @@ mod tests {
         measured; 2294 filtered out; finished in 5.01s\n";
 
     /// Attempt 4 of run 2ebd9da2 (17 `test result: FAILED` lines for 9 failing targets): a
-    /// child's result line inside a test's captured output is not a test binary's result, so it
-    /// cannot strip the `[-p … ]` qualifier from every id of the run. Binary 1 fails two tests
-    /// (the child's `1 failed` does not close it); binary 2 fails one test, the harness itself
-    /// (the child's line closes it early, the binary's own result line is then not a second
-    /// block); binary 3 is an ordinary failure.
+    /// child's run inside a test's captured output is nested, not a test binary, so it cannot
+    /// strip the `[-p … ]` qualifier from every id. Binary 1 fails two tests, one carrying a whole
+    /// child run and the other a stray header-less result line; binary 2's only failure is the
+    /// harness itself; binary 3 is an ordinary failure.
     #[test]
     fn a_childs_result_line_in_captured_output_keeps_every_id_qualified() {
         let stdout = format!(
             "\nrunning 3 tests\ntest t::ok ... ok\ntest terminal::live::attach ... FAILED\n\
              test t::red ... FAILED\n\nfailures:\n\n---- terminal::live::attach stdout ----\n\
              thread 'terminal::live::attach' panicked at src/terminal/live.rs:92:9:\nchild \
-             failed: {CHILD_RUN}\n---- t::red stdout ----\nboom\n\n\nfailures:\n    \
-             terminal::live::attach\n    t::red\n\ntest result: FAILED. 1 passed; 2 failed; 0 \
-             ignored\n\nrunning 1 test\ntest live::resize ... FAILED\n\nfailures:\n\n---- \
-             live::resize stdout ----\nchild failed: {CHILD_RUN}\n\nfailures:\n    \
-             live::resize\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n\nrunning 2 \
-             tests\ntest a_check_the_base_fails ... FAILED\ntest b ... ok\n\nfailures:\n\n---- \
-             a_check_the_base_fails stdout ----\nx\n\nfailures:\n    a_check_the_base_fails\n\n\
-             test result: FAILED. 1 passed; 1 failed; 0 ignored\n"
+             failed: {CHILD_RUN}\n---- t::red stdout ----\nboom\ntest result: FAILED. 0 passed; 1 \
+             failed\n\n\nfailures:\n    terminal::live::attach\n    t::red\n\ntest result: \
+             FAILED. 1 passed; 2 failed; 0 ignored\n\nrunning 1 test\ntest live::resize ... \
+             FAILED\n\nfailures:\n\n---- live::resize stdout ----\nchild failed: {CHILD_RUN}\n\n\
+             failures:\n    live::resize\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n\n\
+             running 2 tests\ntest a_check_the_base_fails ... FAILED\ntest b ... ok\n\n\
+             failures:\n\n---- a_check_the_base_fails stdout ----\nx\n\nfailures:\n    \
+             a_check_the_base_fails\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n"
         );
         let stderr = "     Running unittests src/lib.rs (target/debug/deps/core-1)\n\
             error: test failed, to rerun pass `-p core --lib`\n     Running tests/live.rs \
@@ -9179,12 +9289,13 @@ mod tests {
         );
 
         // A binary that died without its result line (a crash) is still one failing binary:
-        // the next binary's `running` header closes it, so the later ids keep their target.
+        // the next binary's header closes it, and cargo's list agrees, so the ids keep targets.
         let crashed = "\nrunning 2 tests\ntest a::x ... FAILED\n\nrunning 1 test\ntest y ... \
             FAILED\n\nfailures:\n\n---- y stdout ----\nz\n\nfailures:\n    y\n\ntest result: \
             FAILED. 0 passed; 1 failed\n";
-        let two = "error: test failed, to rerun pass `-p c --lib`\nerror: test failed, to rerun \
-            pass `-p c --test it`\n";
+        let two = "     Running unittests src/lib.rs (target/debug/deps/c-1)\nerror: test failed, \
+            to rerun pass `-p c --lib`\n     Running tests/it.rs (target/debug/deps/it-2)\nerror: \
+            test failed, to rerun pass `-p c --test it`\n";
         let (ids, _, _, _) = qualify(scan_of(crashed), scan_of(two));
         assert_eq!(
             ids,
@@ -9195,20 +9306,80 @@ mod tests {
         // for it, so its id stays bare and the finished binary before it keeps its target.
         let cut = "\nrunning 1 test\ntest y ... FAILED\n\nfailures:\n    y\n\ntest result: \
             FAILED. 0 passed; 1 failed\n\nrunning 3 tests\ntest late ... FAILED\n";
-        let one = "error: test failed, to rerun pass `-p c --test it`\n";
+        let one =
+            "     Running tests/it.rs (target/debug/deps/it-2)\nerror: test failed, to rerun \
+            pass `-p c --test it`\n     Running tests/late.rs (target/debug/deps/late-3)\n";
         let (ids, _, _, _) = qualify(scan_of(cut), scan_of(one));
         assert_eq!(ids, vec!["test y [-p c --test it]", "test late"]);
 
         assert_eq!(
-            libtest_failed_count("FAILED. 1 passed; 2 failed; 0 ignored"),
-            Some(2)
+            libtest_counts("FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 9 filtered out"),
+            Some((3, 2))
         );
-        assert_eq!(libtest_failed_count("ok. 3 passed; 0 failed"), Some(0));
-        assert_eq!(libtest_failed_count("FAILED"), None);
-        assert!(
-            libtest_running_header("running 1 test") && libtest_running_header("running 12 tests")
+        assert_eq!(libtest_counts("ok. 3 passed; 0 failed"), Some((3, 0)));
+        assert_eq!(libtest_counts("FAILED"), None);
+        assert_eq!(libtest_running_header("running 1 test"), Some(1));
+        assert_eq!(libtest_running_header("running 12 tests"), Some(12));
+        assert_eq!(libtest_running_header("running tests"), None);
+        assert_eq!(libtest_running_header("running 1"), None);
+    }
+
+    /// (codex on #1060) Counts that happen to agree are no evidence of which target an id belongs
+    /// to. Target `a` is a custom harness that fails silently (cargo's `Running` line and
+    /// selector, no libtest output); target `b`'s failing `shared` carries two child runs, the
+    /// second without its header, so its result line closes `b` early. Aligned by counts alone,
+    /// `b`'s failure took `a`'s qualifier and met a base where `a`'s `shared` fails: a new
+    /// regression read as pre-existing. Now the lists disagree and the id stays bare — a
+    /// regression against that base, said to be ambiguous.
+    #[test]
+    fn a_silent_harness_and_nested_runs_cannot_shift_a_qualifier() {
+        let headless =
+            "\nchild 2:\nF\nfailures:\n\n---- shared stdout ----\nboom\n\nfailures:\n    \
+            shared\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n";
+        let stdout = format!(
+            "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
+             child 1: {CHILD_RUN}{headless}\nfailures:\n    shared\n\ntest result: FAILED. 0 \
+             passed; 1 failed; 0 ignored\n"
         );
-        assert!(!libtest_running_header("running tests") && !libtest_running_header("running 1"));
+        let stderr = "     Running tests/a.rs (target/debug/deps/a-1)\nerror: test failed, to \
+            rerun pass `--test a`\n     Running tests/b.rs (target/debug/deps/b-2)\nerror: test \
+            failed, to rerun pass `--test b`\n";
+        let (ids, _, _, _) = qualify(scan_of(&stdout), scan_of(stderr));
+        // Never `[--test a]`; and with the structure unverified, the failure read inside the
+        // nested run is reported too (bare) rather than set aside as a child's.
+        assert_eq!(ids, vec!["test shared", "test terminal::live::attach"]);
+        let mut head = failed_run(&["test shared"], &[]);
+        classify(
+            &mut head,
+            base_of(failed_run(&["test shared [--test a]"], &[])),
+        );
+        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(head.ambiguous, vec!["test shared"]);
+
+        // The header-less child alone, no silent harness: the lists agree in length, but the
+        // binary's own result line arriving after the early close is an anomaly — bare.
+        let stderr_b = "     Running tests/b.rs (target/debug/deps/b-2)\nerror: test failed, to \
+            rerun pass `--test b`\n";
+        let (ids, _, _, _) = qualify(scan_of(&stdout), scan_of(stderr_b));
+        assert_eq!(ids, vec!["test shared", "test terminal::live::attach"]);
+        // Without it, the same binary is qualified: the nested child with its header is not one.
+        let clean = format!(
+            "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
+             child 1: {CHILD_RUN}\nfailures:\n    shared\n\ntest result: FAILED. 0 passed; 1 \
+             failed; 0 ignored\n"
+        );
+        let (ids, _, _, _) = qualify(scan_of(&clean), scan_of(stderr_b));
+        assert_eq!(ids, vec!["test shared [--test b]"]);
+
+        // After a nested run the captured section it was printed in goes on: a `test x ...
+        // FAILED` line later in that section is still the output's, not a failure of the suite.
+        let after = format!(
+            "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
+             child 1: {CHILD_RUN}test echoed ... FAILED\n\nfailures:\n    shared\n\ntest result: \
+             FAILED. 0 passed; 1 failed; 0 ignored\n"
+        );
+        let (ids, _, _, _) = qualify(scan_of(&after), scan_of(stderr_b));
+        assert_eq!(ids, vec!["test shared [--test b]"]);
     }
 
     /// Head and base ids are compared on (test name, target). Ids of one form match on equality;
@@ -9345,8 +9516,8 @@ mod tests {
         move |one, names, cap| {
             assert_eq!(
                 one.timeout_s,
-                Some(cap.as_secs().min(1200)),
-                "base bound within the cap"
+                Some(1200),
+                "the check's own base bound, capped separately"
             );
             bounds.push(cap.as_secs());
             let ok = names.iter().all(|n| pass(n));
@@ -9388,6 +9559,22 @@ mod tests {
         assert!(run.reruns[0]
             .argv
             .ends_with(&s(&["-p", "core", "--lib", "--", "--exact", "t::load0"])));
+
+        // A failure kept as ambiguous (one side's binary unknown) that passes alone is flaky,
+        // not "kept as a regression" too.
+        let (check, mut run) = regression_run(&["test t::x [-p core --lib]"]);
+        run.ambiguous = run.regressions.clone();
+        let mut bounds = Vec::new();
+        recheck_alone(
+            &check,
+            &mut run,
+            None,
+            Duration::from_secs(FLAKE_RERUN_BUDGET_S),
+            &mut fake_rerun(&pass, 10, &mut bounds),
+        );
+        assert_eq!(run.classification.as_deref(), Some(FLAKY_UNDER_LOAD));
+        assert!(run.ambiguous.is_empty(), "{run:#?}");
+        assert!(match_notes(&run).iter().all(|n| !n.contains("not guessed")));
     }
 
     /// One that fails again stays a regression (and denies); the ones beside it that passed alone
@@ -9484,6 +9671,7 @@ mod tests {
             Duration::from_secs(300),
             "under the cap the load factor applies"
         );
+
         assert_eq!(run.reruns.len(), 3);
         assert_eq!(run.not_rechecked, 1);
         assert_eq!(run.classification.as_deref(), Some(REGRESSION));
@@ -9513,6 +9701,24 @@ mod tests {
         assert_eq!(run.not_rechecked, MAX_FLAKE_RERUN + 1);
         assert_eq!(run.regressions.len(), MAX_FLAKE_RERUN + 1);
         assert!(run.denies());
+        // Less than a second left is not a re-run: the failure is counted as not re-checked.
+        let (check, mut run) =
+            regression_run(&["test t::a [-p core --lib]", "test t::b [-p core --lib]"]);
+        let mut bounds = Vec::new();
+        recheck_alone(
+            &check,
+            &mut run,
+            None,
+            Duration::from_millis(1500),
+            &mut fake_rerun(&pass, 1, &mut bounds),
+        );
+        assert_eq!(
+            bounds,
+            vec![1],
+            "one re-run with the 1.5 s budget's whole second"
+        );
+        assert_eq!(run.not_rechecked, 1);
+        assert_eq!(run.regressions, vec!["test t::b [-p core --lib]"]);
     }
 
     fn failed_run(ids: &[&str], env: &[&str]) -> CheckRun {
