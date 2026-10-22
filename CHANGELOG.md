@@ -39,17 +39,18 @@ Two release tracks share this file, newest entry first regardless of track:
   for three reasons. (1) A re-exec test harness printed its child's run in a panic message, so a binary's captured
   output carried a second `test result: FAILED` line (17 such lines for 9 failing binaries). The floor dropped the
   `[-p <crate> --test <target>]` qualifier from every id whenever the two counts differed, so the head ids never
-  met the base's qualified ids: pre-existing 0, every base failure a regression. Ids are now qualified only when
-  the two streams describe the same binaries one for one: stdout's top-level `running N tests` blocks (a run inside a
-  test's captured output is a nested run on a counted stack; a binary closes only on its own result line, whose
-  counts and preceding `failures:` listing match it; a binary that died without one certifies nothing) and cargo's `Running` / `Doc-tests` lines with their
-  selectors (ANSI colours stripped). Any disagreement or structural anomaly, or a run with no cargo identity at
-  all, makes a libtest id `test x [?]` (unknown binary), which never matches and is not re-run alone. Failure
-  lines read inside captured output (a child's run, or framing a test printed to raw stdout) are always reported,
-  `[?]`. Every frame is text the creator's test can print, including a forged closing summary whose counts line
-  up, so alignment never deletes a `FAILED` line. The accepted cost: a pre-existing failing test whose captured
-  output carries a child's `FAILED` lines denies, and the operator's floor override covers it. The scan's lists
-  are bounded (an overflow is an anomaly; ids past `MAX_FAILURE_IDS` add an id nothing matches), and a cached base
+  met the base's qualified ids: pre-existing 0, every base failure a regression. The qualifier now comes from the
+  argv the floor itself chose, never from output text (core#1063): 13 review rounds forged the text it was read
+  from (stdout/stderr framing, cargo selectors, doctest footers), and the creator's tests write that text. A plain
+  `cargo test` check runs cargo's own list first (`--no-run --message-format=json-render-diagnostics`, which also
+  builds every target, so a compile error still fails the check). Then it runs one process per test target
+  (`-p <pkg> --lib`, `--bin`/`--test`/`--example`/`--bench <n>`, `--doc`), serially, against the check's one
+  bound, passing the check's feature, profile and test arguments through. Every `test x ... FAILED` line of a
+  target's output is `test x [-p <pkg> <target>]`, so a forged line can only add a failure, never remove or move
+  one. A target that fails without naming a test, or dies other than libtest's exit 101, also carries
+  `[<target>] exited <how>`. A cargo check the floor cannot split (a wrapper script, explicit targets) runs as one
+  process, and its libtest ids are `test x [?]`: never matched and never re-run alone, so they deny (the
+  operator's floor override covers it). Ids past `MAX_FAILURE_IDS` add an id nothing matches, and a cached base
   run is reused only under the same floor policy version. Head and base ids are compared on (test name, target).
   Ids qualified with different targets never meet, and an unqualified or `[?]` libtest id meets nothing, because
   failing ids alone cannot show which binary such an id came from: it stays a regression, listed as `ambiguous`,
@@ -67,9 +68,11 @@ Two release tracks share this file, newest entry first regardless of track:
   runner the floor cannot narrow stay regressions, counted in `notRechecked`. Wire (additive, `checks[]`):
   `flaky`, `notRechecked`, `ambiguous`. Each re-run is hard-bounded by what the budget has left (the load
   factor that stretches other checks' bounds does not apply past it). Tests:
-  `a_childs_result_line_in_captured_output_keeps_every_id_qualified` (fails on the previous main: every id bare),
-  `a_silent_harness_and_nested_runs_cannot_shift_a_qualifier`,
-  `colored_or_quiet_cargo_output_never_lets_a_moved_failure_match`,
+  `cargo_plan_splits_only_a_plain_cargo_test_1063`, `cargo_targets_come_from_cargos_own_artifacts_1063`,
+  `forged_stdout_framing_cannot_drop_a_failure_1063`, `a_forged_cargo_selector_cannot_move_a_failure_1063`,
+  `doc_tests_of_two_crates_never_share_a_qualifier_1063` (the round 12 and 13 forgeries, each a regression),
+  `a_target_that_dies_is_its_own_failure_1063`, `an_unsplit_run_never_matches_a_libtest_id_1063`,
+  `baseline_diff_denies_only_regressions` (real `cargo test`, qualified per target),
   `head_and_base_ids_match_across_qualified_and_bare_forms`,
   `the_same_test_name_in_two_crates_stays_distinct`, `a_failure_that_passes_alone_is_flaky_and_does_not_block`,
   `a_failure_that_fails_again_alone_stays_a_regression`,

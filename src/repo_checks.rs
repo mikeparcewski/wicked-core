@@ -264,18 +264,15 @@ pub const MAX_FAILURE_IDS: usize = 1000;
 /// The failure id that stands for every id past [`MAX_FAILURE_IDS`]: a dropped id could have been
 /// the head's only regression, so this one is never matched to a base id — the check denies.
 pub const FAILURE_IDS_TRUNCATED: &str = "(more failure ids than the floor keeps)";
-/// The most entries any one list of the libtest scan holds (test binaries, cargo binaries, failing
-/// test names, listing lines, launcher-signature tests): past it the output is not read as
-/// structure — an anomaly, so every libtest id is `[?]`.
+/// The most test targets a split `cargo test` run takes from cargo's list ([`run_cargo_targets`]);
+/// past it the check is not split (one process, every libtest id `[?]`).
 const MAX_SCAN_ENTRIES: usize = 4 * MAX_FAILURE_IDS;
-/// The deepest stack of runs printed inside runs the libtest scan follows; a deeper one is an
-/// anomaly.
-const MAX_NESTED_DEPTH: usize = 8;
 /// The version of the floor's check policy (its sandbox and its failure-id format) a cached base
 /// run was recorded under. A record of another — or no — version is a cache miss: core#1060
-/// opened `/dev/ptmx` to the checks and qualifies libtest ids, so a base result from before it
-/// could make a head PTY-test failure read as pre-existing. Bump it whenever either changes.
-const FLOOR_POLICY_VERSION: u32 = 2;
+/// opened `/dev/ptmx` to the checks and qualifies libtest ids by the target the floor ran (3), so
+/// a base result from before it could make a head failure read as pre-existing. Bump it whenever
+/// either changes.
+const FLOOR_POLICY_VERSION: u32 = 3;
 /// Where the checks' isolated `HOME`, caches and build output live: `<worker home>/repo-checks/`,
 /// the engine's own cache area — never inside the tree a floor checks (see "Where the check
 /// scratch lives" in the module docs). The OS boundary arms the floor's leaf as a write root.
@@ -5383,100 +5380,104 @@ pub(crate) fn launcher_signature(line: &str) -> Option<&'static str> {
         .find(|sig| line.contains(sig))
 }
 
-/// The line-level state of one output stream's failure scan.
+/// The line-level state of one output stream's failure scan: failure ids in order of first sight,
+/// whether a nested-sandbox launcher signature was printed, the watched names seen passing, the
+/// environment signals and — for step 0 of a per-target cargo run — the test targets cargo built.
 ///
-/// libtest ids are not qualified by binary (core#481): `test shared ... FAILED` from crate A and
-/// from crate B are the same string. The scan therefore tags each libtest id with the ordinal of
-/// the test binary it came from, and [`qualify`] names that binary's target only when the two
-/// streams describe the SAME binaries, one for one:
-///
-/// * stdout (libtest): one block per top-level `running N tests` header, marked failing when its
-///   own result line says so or it died before printing one;
-/// * stderr (cargo): one entry per `Running …` / `Doc-tests …` line, carrying the
-///   `to rerun pass `-p b --test common`` selector cargo printed after it when it failed.
-///
-/// A run printed INSIDE a test's captured output (a re-exec harness that puts its child's stdout
-/// in its panic message — 17 result lines for 9 failing binaries, run 2ebd9da2 attempt 4) is
-/// nested, not a binary: a `running N tests` header after the binary's `failures:` line opens a
-/// nested run its own result line closes. A result line closes the binary only when its ran and
-/// failed counts equal the binary's header and its top-level failures, and the `failures:`
-/// listing just before it names exactly the binary's own failing tests; after a close only blank
-/// lines may precede the next header (agy on #1060). Anything the structure
-/// cannot explain — a result line with no binary open, the binary's own result rejected, the
-/// block and binary lists disagreeing on length or on which binaries failed (a silent custom
-/// harness, codex on #1060) — leaves EVERY libtest id unknown (`[?]`, fail-closed): aggregate counts that
-/// happen to agree are no evidence of which target an id belongs to. Lines inside a nested run
-/// are captured output (only a launcher signature is read, for the test it was printed in); the
-/// failure ids among them — and in any captured section — are set aside and ALWAYS reported,
-/// `[?]`: every frame is text the creator's test can print (a forged closing summary lines up,
-/// codex on #1060), so alignment never authorizes deleting a failure line.
+/// No line is read as STRUCTURE: libtest's framing (`running N tests`, `failures:`, sections,
+/// result lines) and cargo's (`Running …`, `to rerun pass …`) are text the creator's tests can
+/// print, so they attribute nothing (13 review rounds forged them, core#1060). Which test binary
+/// a libtest id came from is the target the floor itself ran ([`run_cargo_targets`]); every
+/// `test x ... FAILED` line of that process counts, and none is ever dropped.
 #[derive(Debug, Default)]
 struct LineScan {
     eslint_file: Option<String>,
-    /// libtest: one entry per top-level test binary in order of its header — whether it failed.
-    blocks: Vec<bool>,
-    /// libtest: the last binary's header was read and its result line not yet.
-    open: bool,
-    /// libtest: the open binary's `running N tests` count.
-    header_n: usize,
-    /// libtest: the open binary's top-level `test x ... FAILED` lines (every one, whether or not
-    /// the id cap kept it).
-    block_failures: usize,
-    /// libtest: the open binary printed its `failures:` / `successes:` line — its captured
-    /// output, where a nested run can appear, follows.
-    capture: bool,
-    /// libtest: the open binary's top-level failing test names, as its `failures:` listing
-    /// prints them.
-    block_names: Vec<String>,
-    /// libtest: the names listed since the open binary's last `failures:` line (`None` once any
-    /// other line breaks the listing).
-    listed: Option<Vec<String>>,
-    /// libtest: a binary just closed — until the next header only blank lines may follow.
-    closed: bool,
-    /// libtest: the nested runs being read inside captured output, innermost last — each one's
-    /// `running N tests` count and its own failing test names.
-    nested: Vec<(usize, Vec<String>)>,
-    /// libtest: the captured section a nested run was printed in, restored when it ends.
-    outer: Option<String>,
-    /// Failure ids read inside captured output (nested runs, sections): perhaps a child's, perhaps
-    /// this suite's behind forged framing — [`qualify`] always reports them, `[?]`.
-    nested_ids: Vec<String>,
-    /// The structure contradicted itself (see above), or outgrew [`MAX_SCAN_ENTRIES`] /
-    /// [`MAX_NESTED_DEPTH`]: no libtest id is qualified.
-    anomaly: bool,
+    /// Failure ids in order of first sight, at most [`MAX_FAILURE_IDS`].
+    ids: Vec<String>,
     /// More failure ids than [`MAX_FAILURE_IDS`] were seen: [`qualify`] adds
     /// [`FAILURE_IDS_TRUNCATED`].
     truncated: bool,
-    /// libtest: the test whose captured output (`---- name stdout ----`) is being read.
-    section: Option<String>,
-    /// Failure ids in order of first sight; libtest ids carry their binary's ordinal.
-    ids: Vec<(String, Option<usize>)>,
-    /// libtest tests whose captured output carries a launcher signature (core#546), with their
-    /// binary's ordinal.
-    env: Vec<(String, Option<usize>)>,
-    /// cargo: one entry per test binary it announced, with its `to rerun pass` selector when it
-    /// failed.
-    binaries: Vec<Option<String>>,
-    /// cargo: which of `binaries` are a crate's doc-tests (`Doc-tests a`) — Rust 2024's rustdoc
-    /// prints a merged and a standalone run (two blocks) under one such line.
-    doc: Vec<bool>,
-    /// libtest: per block, whether rustdoc's `all doctests ran in …` footer followed it.
-    footers: Vec<bool>,
+    /// (core#546) A nested-sandbox launcher signature was printed.
+    launcher: bool,
     /// libtest names seen PASSING (`test name ... ok`) among `watch` — the isolated re-run's witness.
     passed: Vec<String>,
     watch: Vec<String>,
     /// (core#789/#790) Environment signals in order of sight ([`env_signal_of_line`]).
     signals: Vec<String>,
+    /// Step 0 of a per-target cargo run: read cargo's `compiler-artifact` lines.
+    collect_targets: bool,
+    /// The test artifacts cargo built, at most [`MAX_SCAN_ENTRIES`].
+    artifacts: Vec<CargoArtifact>,
+    /// More artifacts than [`MAX_SCAN_ENTRIES`]: the check is not split.
+    artifacts_overflow: bool,
 }
 
-/// Push onto one of the libtest scan's lists; past [`MAX_SCAN_ENTRIES`] the item is not kept and
-/// the structure is an anomaly (fail-closed: no libtest id is qualified, none is lost).
-fn bounded<T>(list: &mut Vec<T>, item: T, anomaly: &mut bool) {
-    if list.len() < MAX_SCAN_ENTRIES {
-        list.push(item);
-    } else {
-        *anomaly = true;
+/// One `compiler-artifact` of `cargo test --no-run --message-format=json…`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CargoArtifact {
+    /// The package's `[package] name`, read from the artifact's `manifest_path`.
+    package: String,
+    /// The target selector when the artifact is a test executable: `--lib`, `--test it`, …
+    selector: Option<String>,
+    /// A library whose doc tests `cargo test` runs.
+    doc: bool,
+}
+
+/// The [`CargoArtifact`] one line of cargo's JSON messages describes, or `None`.
+fn cargo_artifact_of_line(s: &str) -> Option<CargoArtifact> {
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    if v.get("reason")?.as_str()? != "compiler-artifact" {
+        return None;
     }
+    let target = v.get("target")?;
+    let strings = |key: &str| -> Vec<String> {
+        target
+            .get(key)
+            .and_then(|k| k.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let (kinds, crate_types) = (strings("kind"), strings("crate_types"));
+    let name = target.get("name")?.as_str()?;
+    let manifest = v.get("manifest_path")?.as_str()?;
+    let package = cargo_package_name(&std::fs::read_to_string(manifest).ok()?)?;
+    // A name is an argument the floor passes: never one that reads as a flag.
+    if package.starts_with('-') || name.starts_with('-') || name.contains(char::is_whitespace) {
+        return None;
+    }
+    const LIB_KINDS: &[&str] = &["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
+    let lib = kinds.iter().any(|k| LIB_KINDS.contains(&k.as_str()));
+    let is_test = v
+        .get("profile")
+        .and_then(|p| p.get("test"))
+        .and_then(|t| t.as_bool())
+        .unwrap_or(false);
+    let selector = is_test
+        .then(|| {
+            if lib {
+                Some("--lib".to_string())
+            } else {
+                kinds
+                    .iter()
+                    .find(|k| matches!(k.as_str(), "bin" | "test" | "example" | "bench"))
+                    .map(|k| format!("--{k} {name}"))
+            }
+        })
+        .flatten();
+    let doc = lib
+        && target.get("doctest").and_then(|d| d.as_bool()) == Some(true)
+        && crate_types
+            .iter()
+            .any(|c| matches!(c.as_str(), "lib" | "rlib" | "proc-macro"));
+    Some(CargoArtifact {
+        package,
+        selector,
+        doc,
+    })
 }
 
 impl LineScan {
@@ -5484,17 +5485,6 @@ impl LineScan {
         Self {
             watch: watch.to_vec(),
             ..Self::default()
-        }
-    }
-
-    /// Set a failure id read inside captured output aside ([`Self::nested_ids`]).
-    fn set_aside(&mut self, id: String) {
-        if !self.nested_ids.contains(&id) {
-            if self.nested_ids.len() < MAX_FAILURE_IDS {
-                self.nested_ids.push(id);
-            } else {
-                self.truncated = true;
-            }
         }
     }
 
@@ -5513,223 +5503,20 @@ impl LineScan {
                 }
             }
         }
-        // Inside captured output a nested run's header may follow a panic message's own text on
-        // the same line (`child failed: running 1 test`, agy on #1060).
-        let in_capture = !self.nested.is_empty() || (self.open && self.capture);
-        let header = if in_capture {
-            libtest_running_header_suffix(s)
-        } else {
-            libtest_running_header(s)
-        };
-        if self.closed && !s.is_empty() {
-            // After a binary's result line libtest prints the next binary's header and nothing
-            // else — save rustdoc's merged-doctest timing footer (Rust 2024, codex on #1060):
-            // anything else first means the "result" was not the binary's own.
-            if s.starts_with("all doctests ran in ") {
-                if let Some(f) = self.footers.last_mut() {
-                    *f = true;
-                }
-                return;
-            }
-            self.anomaly |= header.is_none();
-            self.closed = false;
-        }
-        if let Some(n) = header {
-            if in_capture {
-                // A run printed inside a test's captured output.
-                if self.nested.is_empty() {
-                    self.outer = self.section.clone();
-                }
-                if self.nested.len() < MAX_NESTED_DEPTH {
-                    self.nested.push((n, Vec::new()));
-                } else {
-                    self.anomaly = true;
-                }
-                return;
-            }
-            if self.open {
-                // The binary before died without its result line: a failing binary — but one
-                // whose verdict is INFERRED, which must not certify the alignment (an early
-                // close plus a truncated child can fake exactly this, codex on #1060).
-                if let Some(b) = self.blocks.last_mut() {
-                    *b = true;
-                }
-                self.anomaly = true;
-            }
-            if self.blocks.len() < MAX_SCAN_ENTRIES {
-                self.blocks.push(false);
-                self.footers.push(false);
-            } else {
-                self.anomaly = true;
-            }
-            self.open = true;
-            self.header_n = n;
-            self.block_failures = 0;
-            self.block_names.clear();
-            self.listed = None;
-            self.capture = false;
-            self.section = None;
-            return;
-        }
-        if let Some(rest) = s.strip_prefix("test result: ") {
-            let counts = libtest_counts(rest);
-            let listed_own = |listed: &Option<Vec<String>>, own: &[String]| {
-                listed.as_ref().is_some_and(|l| {
-                    let (mut l, mut own) = (l.clone(), own.to_vec());
-                    l.sort();
-                    own.sort();
-                    l == own
-                })
-            };
-            // The binary's own result: its header's count, its top-level failures, and (when it
-            // failed) a `failures:` listing of exactly them just before.
-            let own = self.open
-                && matches!(counts, Some((ran, failed))
-                    if ran == self.header_n
-                        && failed == self.block_failures
-                        && (failed == 0 || listed_own(&self.listed, &self.block_names)));
-            if let Some((inner_n, inner_names)) = self.nested.last() {
-                // The innermost nested run's own result: its header's count and, when it
-                // failed, a listing of its own failures (a child cut short listed none).
-                let inner_own = matches!(counts, Some((ran, failed))
-                    if ran == *inner_n && (failed == 0 || listed_own(&self.listed, inner_names)));
-                if inner_own {
-                    // The innermost nested run's own result.
-                    self.nested.pop();
-                    if self.nested.is_empty() {
-                        // Back in the captured section the nested run was printed in.
-                        self.section = self.outer.take();
-                    }
-                    return;
-                }
-                if !own {
-                    return; // a stray line inside a nested run's output
-                }
-                // The binary's own result with a nested run never closed (a child that crashed or
-                // was cut short in a panic message): the nested runs end here (agy on #1060).
-                self.nested.clear();
-                self.outer = None;
-            }
-            if !self.open {
-                // Nothing open to close: something closed the binary early.
-                self.anomaly |= !self.blocks.is_empty();
-            } else if own {
-                if let Some(b) = self.blocks.last_mut() {
-                    *b = counts.is_some_and(|(_, failed)| failed > 0) || rest.starts_with("FAILED");
-                }
-                self.open = false;
-                self.capture = false;
-                self.listed = None;
-                self.closed = true;
-            } else if self.capture {
-                // Inside captured output a stray result line is the output's, not the binary's
-                // (the section it was printed in goes on).
-                return;
-            } else {
-                // Outside it, the binary's own line did not add up.
-                self.anomaly = true;
-            }
-            self.section = None;
-            return;
-        }
-        if !self.nested.is_empty() {
-            // A nested run's line: captured output of the test it was printed in. Its listing
-            // lines still count, in case the binary's own listing follows a run never closed.
-            if s == "failures:" {
-                self.listed = Some(Vec::new());
-            } else if !s.is_empty() {
-                match self.listed.as_mut() {
-                    Some(names) if line.starts_with("    ") => {
-                        bounded(names, s.to_string(), &mut self.anomaly)
-                    }
-                    _ => self.listed = None,
-                }
-            }
-            if let (Some(name), Some(_)) = (self.outer.clone(), launcher_signature(s)) {
-                let block = self.blocks.len().checked_sub(1);
-                if !self.env.iter().any(|(n, b)| n == &name && *b == block) {
-                    bounded(&mut self.env, (name, block), &mut self.anomaly);
-                }
-            }
-            if let Some(id) = failure_id_of_line(line, &mut self.eslint_file) {
-                if id.starts_with("test ") {
-                    if let Some((_, names)) = self.nested.last_mut() {
-                        bounded(names, listing_name(&id), &mut self.anomaly);
+        if self.collect_targets && s.starts_with('{') {
+            // A forged line can only ADD a target (one cargo cannot run fails, and denies).
+            if let Some(a) = cargo_artifact_of_line(s) {
+                if !self.artifacts.contains(&a) {
+                    if self.artifacts.len() < MAX_SCAN_ENTRIES {
+                        self.artifacts.push(a);
+                    } else {
+                        self.artifacts_overflow = true;
                     }
                 }
-                self.set_aside(id);
             }
             return;
         }
-        if cargo_binary_line(s) {
-            if self.binaries.len() < MAX_SCAN_ENTRIES {
-                self.binaries.push(None);
-                self.doc.push(s.starts_with("Doc-tests "));
-            } else {
-                self.anomaly = true;
-            }
-            return;
-        }
-        if let Some(name) = s
-            .strip_prefix("---- ")
-            .and_then(|r| r.strip_suffix(" stdout ----"))
-        {
-            // Captured output belongs to an open binary.
-            self.anomaly |= !self.open && !self.blocks.is_empty();
-            if self.open && !self.capture {
-                // libtest prints its sections after `failures:` / `successes:`: one before it is
-                // the output's own line (a raw stdout write). An anomaly, and NOT a section —
-                // the binary's `test y ... FAILED` lines after it are still its own (agy/codex
-                // on #1060).
-                self.anomaly = true;
-                return;
-            }
-            self.listed = None;
-            self.section = Some(name.to_string());
-            return;
-        }
-        if s == "failures:" || s == "successes:" {
-            self.capture |= self.open && self.nested.is_empty();
-            if self.open {
-                self.listed = Some(Vec::new());
-            }
-            self.section = None;
-            return;
-        }
-        if self.open && self.capture && !s.is_empty() {
-            // The `failures:` listing: four-space-indented names, nothing else.
-            match self.listed.as_mut() {
-                Some(names) if line.starts_with("    ") => {
-                    bounded(names, s.to_string(), &mut self.anomaly)
-                }
-                _ => self.listed = None,
-            }
-        }
-        let block = self.blocks.len().checked_sub(1);
-        if let Some(name) = self.section.clone() {
-            // A test's captured output: its launcher signature is read, and a failure line in it
-            // (a child's — or this suite's own, behind framing a test printed to raw stdout, agy
-            // on #1060) is set aside like a nested run's: never dropped.
-            if launcher_signature(s).is_some()
-                && !self.env.iter().any(|(n, b)| n == &name && *b == block)
-            {
-                bounded(&mut self.env, (name, block), &mut self.anomaly);
-            }
-            if let Some(id) = failure_id_of_line(line, &mut self.eslint_file) {
-                self.set_aside(id);
-            }
-            return;
-        }
-        if let Some(target) = rerun_target_of_line(s) {
-            // cargo prints a failing binary's selector after its `Running` line.
-            match self.binaries.last_mut() {
-                Some(slot @ None) => {
-                    *slot = Some(target);
-                }
-                _ => self.anomaly = true,
-            }
-            return;
-        }
+        self.launcher |= launcher_signature(s).is_some();
         if !self.watch.is_empty() {
             if let Some(name) = s
                 .strip_prefix("test ")
@@ -5757,117 +5544,15 @@ impl LineScan {
             }
         }
         if let Some(id) = failure_id_of_line(line, &mut self.eslint_file) {
-            let libtest = id.starts_with("test ");
-            let block = block.filter(|_| libtest);
-            if libtest && self.open && self.capture {
-                // libtest prints its `test x ... FAILED` lines before `failures:`: one after it
-                // is captured output (a child's, once its section's own state was lost) — set
-                // aside like a nested run's (agy on #1060).
-                self.set_aside(id);
-                return;
-            }
-            if libtest && self.open {
-                self.block_failures += 1;
-                bounded(&mut self.block_names, listing_name(&id), &mut self.anomaly);
-            }
-            if !self.ids.iter().any(|(i, b)| i == &id && *b == block) {
+            if !self.ids.contains(&id) {
                 if self.ids.len() < MAX_FAILURE_IDS {
-                    self.ids.push((id, block));
+                    self.ids.push(id);
                 } else {
                     self.truncated = true;
                 }
             }
         }
     }
-}
-
-/// cargo's per-failing-binary selector: `error: test failed, to rerun pass `-p b --test common``
-/// (older cargo quotes with `'`) → `-p b --test common`.
-fn rerun_target_of_line(s: &str) -> Option<String> {
-    let (_, rest) = s.split_once("to rerun pass ")?;
-    let q = rest.chars().next().filter(|c| *c == '`' || *c == '\'')?;
-    let inner = &rest[1..];
-    let end = inner.find(q)?;
-    let target = inner[..end].trim();
-    (!target.is_empty()).then(|| target.to_string())
-}
-
-/// libtest's result line, after `test result: `: `FAILED. 1 passed; 2 failed; 0 ignored; 0
-/// measured; 9 filtered out` → (ran = passed + failed + ignored + measured = 3, failed = 2).
-/// `None` when it carries no `N failed` count.
-fn libtest_counts(rest: &str) -> Option<(usize, usize)> {
-    let words: Vec<&str> = rest
-        .split(|c: char| c.is_whitespace() || c == ';' || c == ',' || c == '.')
-        .filter(|w| !w.is_empty())
-        .collect();
-    let count = |what: &str| {
-        words
-            .windows(2)
-            .find(|w| w[1] == what)
-            .and_then(|w| w[0].parse::<usize>().ok())
-    };
-    let failed = count("failed")?;
-    let ran = failed
-        + count("passed").unwrap_or(0)
-        + count("ignored").unwrap_or(0)
-        + count("measured").unwrap_or(0);
-    Some((ran, failed))
-}
-
-/// The name libtest's `failures:` listing prints for a failure id: `test x - should panic` → `x`.
-fn listing_name(id: &str) -> String {
-    let name = id.strip_prefix("test ").unwrap_or(id);
-    [" - should panic", " - compile fail", " - compile"]
-        .iter()
-        .find_map(|m| name.strip_suffix(m))
-        .unwrap_or(name)
-        .to_string()
-}
-
-/// A nested run's header at the END of a captured line, after a panic message's own text
-/// (`child failed: running 1 test`) or alone.
-fn libtest_running_header_suffix(s: &str) -> Option<usize> {
-    let at = s.rfind("running ")?;
-    let before = s[..at].chars().next_back();
-    if before.is_some_and(|c| !c.is_whitespace() && c != ':') {
-        return None;
-    }
-    libtest_running_header(&s[at..])
-}
-
-/// cargo's per-binary line on stderr: `Running unittests src/lib.rs (target/debug/deps/a-1)`,
-/// `Running tests/it.rs (target/debug/deps/it-2)`, `Doc-tests a`, or a verbose run's
-/// ``Running `…/deps/it-2 …` ``. A compiler invocation (``Running `rustc …` ``, `rustdoc`, a
-/// build script) and any other text starting with `Running` (a test's own stderr) are not.
-fn cargo_binary_line(s: &str) -> bool {
-    if let Some(cmd) = s.strip_prefix("Running `") {
-        let exe = cmd
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_end_matches('`');
-        let file = Path::new(exe)
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("");
-        let compiler = file.starts_with("rustc")
-            || file.starts_with("rustdoc")
-            || file.contains("build-script");
-        return !compiler && (exe.contains("/deps/") || exe.contains("\\deps\\"));
-    }
-    if let Some(rest) = s.strip_prefix("Running ") {
-        return rest.ends_with(')') && rest.contains(" (");
-    }
-    s.strip_prefix("Doc-tests ")
-        .is_some_and(|c| !c.is_empty() && !c.contains(char::is_whitespace))
-}
-
-/// libtest's per-binary header: `running 1 test` / `running 12 tests` → the count.
-fn libtest_running_header(s: &str) -> Option<usize> {
-    s.strip_prefix("running ")
-        .and_then(|r| r.strip_suffix(" tests").or_else(|| r.strip_suffix(" test")))
-        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-        .and_then(|n| n.parse().ok())
 }
 
 /// `line` without ANSI escape sequences: CSI (`ESC [ … final byte`), OSC (`ESC ] … BEL` or
@@ -5907,8 +5592,8 @@ fn strip_ansi(line: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
-/// The target a libtest id carries when the floor could not tell which test binary it came from:
-/// `test shared [?]`. [`match_base`] never matches it — not even to itself.
+/// The target a libtest id carries when the floor did not run its test binary alone: `test
+/// shared [?]`. [`match_base`] never matches it — not even to itself.
 const UNKNOWN_TARGET: &str = "?";
 
 /// A libtest id qualified by its test binary: `test t::shared [-p b --lib]` (core#481).
@@ -5928,64 +5613,25 @@ fn libtest_parts(id: &str) -> Option<(&str, Option<&str>)> {
     }
 }
 
-/// The scanned ids of one check run, qualified: the failure ids (stdout first, then stderr), the
-/// ids whose captured output carries a launcher signature, and the watched names seen passing.
-fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-    // libtest prints its results on stdout, cargo its binaries and selectors on stderr. The
-    // j-th stdout binary is the j-th cargo binary only when the lists match one for one: the same
-    // length (or cargo's last binary cut off before it printed anything) and the same binaries
-    // failing (the last block may be cut off before its verdict), with no structural anomaly.
-    let (blocks, bins) = (&out.blocks, &err.binaries);
-    let n = blocks.len();
-    // A nested run still open at the end, or a binary cut off inside its captured output, is a
-    // structure that did not resolve.
-    let unresolved = !out.nested.is_empty() || (out.open && out.capture);
-    // Walk both lists: each cargo binary owns one stdout block — a `Doc-tests` line owns two when
-    // only the second is followed by rustdoc's footer (Rust 2024's merged + standalone runs,
-    // codex on #1060) — and its selector must match its blocks' verdict.
-    let mut owner: Vec<usize> = Vec::with_capacity(n);
-    let mut walk_ok = !out.anomaly && !unresolved && !err.anomaly && n > 0;
-    let (mut i, mut j) = (0, 0);
-    while walk_ok && i < n {
-        let Some(sel) = bins.get(j) else {
-            walk_ok = false;
-            break;
-        };
-        let footer = |k: usize| out.footers.get(k).copied().unwrap_or(false);
-        let take =
-            if err.doc.get(j).copied().unwrap_or(false) && i + 1 < n && footer(i + 1) && !footer(i)
-            {
-                2
-            } else {
-                1
-            };
-        walk_ok = blocks[i..i + take].iter().any(|f| *f) == sel.is_some();
-        owner.extend(std::iter::repeat_n(j, take));
-        i += take;
-        j += 1;
-    }
-    // Every cargo binary accounted for — or cargo announced one more that printed nothing yet
-    // (every stdout block ended). A crashed LAST binary does not line up: its ids are `[?]`.
-    let lined_up =
-        walk_ok && (j == bins.len() || (j + 1 == bins.len() && bins[j].is_none() && !out.open));
-    // A libtest id the alignment cannot attribute is `[?]`, whatever the run looked like: no
-    // shape of the output proves which binary it came from (a wrapper that prints only the
-    // failing suites hides every passing binary, codex on #1060), so it never matches a base id
-    // and stays a regression.
-    let target_of = |scan: &LineScan, id: &str, block: Option<usize>| -> Option<String> {
-        if !id.starts_with("test ") {
-            return None;
-        }
-        block
-            .filter(|_| lined_up && std::ptr::eq(scan, &out))
-            .and_then(|b| owner.get(b))
-            .and_then(|&j| bins.get(j).cloned().flatten())
-            .or_else(|| Some(UNKNOWN_TARGET.to_string()))
-    };
-    let mut ids: Vec<String> = Vec::new();
-    let mut env: Vec<String> = Vec::new();
+/// The scanned ids of ONE process, qualified: the failure ids (stdout first, then stderr), the
+/// failing libtest ids that are env candidates (a launcher signature in the process's output,
+/// core#546), the watched names seen passing, and the environment signals. A libtest id carries
+/// `target` — the selector the floor passed to this process — or `[?]` when the floor did not
+/// run one target alone: no output text can say which binary it came from.
+fn qualify(
+    out: LineScan,
+    err: LineScan,
+    target: Option<&str>,
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let target = target.unwrap_or(UNKNOWN_TARGET);
     let mut truncated = out.truncated || err.truncated;
-    let mut keep = |ids: &mut Vec<String>, q: String| {
+    let mut ids: Vec<String> = Vec::new();
+    for id in out.ids.iter().chain(&err.ids) {
+        let q = if id.starts_with("test ") {
+            qualified(id, Some(target))
+        } else {
+            id.clone()
+        };
         if !ids.contains(&q) {
             if ids.len() < MAX_FAILURE_IDS {
                 ids.push(q);
@@ -5993,36 +5639,19 @@ fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<Strin
                 truncated = true;
             }
         }
-    };
-    for scan in [&out, &err] {
-        for (id, block) in &scan.ids {
-            keep(
-                &mut ids,
-                qualified(id, target_of(scan, id, *block).as_deref()),
-            );
-        }
-        // Failures read in captured output: always reported, never attributed (codex on #1060 —
-        // a forged summary makes any structure "verify").
-        for id in &scan.nested_ids {
-            keep(
-                &mut ids,
-                qualified(id, target_of(scan, id, None).as_deref()),
-            );
-        }
-        for (name, block) in &scan.env {
-            let id = format!("test {name}");
-            let q = qualified(&id, target_of(scan, &id, *block).as_deref());
-            if !env.contains(&q) {
-                env.push(q);
-            }
-        }
     }
     // A dropped id could have been the only regression: the check carries one nothing matches.
     if truncated {
         ids.push(FAILURE_IDS_TRUNCATED.to_string());
     }
-    // Only a FAILING test is in the env class.
-    env.retain(|e| ids.contains(e));
+    let env = if out.launcher || err.launcher {
+        ids.iter()
+            .filter(|i| i.starts_with("test "))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut passed = out.passed;
     for p in err.passed {
         if !passed.contains(&p) {
@@ -6030,7 +5659,13 @@ fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<Strin
         }
     }
     let mut signals = out.signals;
-    for sig in err.signals {
+    merge_signals(&mut signals, err.signals);
+    (ids, env, passed, signals)
+}
+
+/// Append `more` environment signals, de-duplicating crash lines, at most [`MAX_ENV_SIGNALS`].
+fn merge_signals(signals: &mut Vec<String>, more: Vec<String>) {
+    for sig in more {
         if signals.len() >= MAX_ENV_SIGNALS {
             if signals.last().map(String::as_str) != Some(SIGNALS_TRUNCATED) {
                 *signals.last_mut().expect("cap > 0") = SIGNALS_TRUNCATED.to_string();
@@ -6040,6 +5675,153 @@ fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<Strin
         if !(sig.starts_with("crash: ") && signals.contains(&sig)) {
             signals.push(sig);
         }
+    }
+}
+
+/// A `cargo test` check the floor runs one target at a time (core#1063): the qualifier of every
+/// libtest id is then the selector the floor chose, never a line of output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CargoPlan {
+    /// `cargo [+toolchain] test`.
+    head: Vec<String>,
+    /// The check's own arguments before `--` (step 0 runs them as given).
+    args: Vec<String>,
+    /// `args` without package selection: what every target's run passes through.
+    common: Vec<String>,
+    /// The arguments after `--`, passed to every target's test binary.
+    test_args: Vec<String>,
+}
+
+/// The [`CargoPlan`] of `argv`, or `None` when the floor cannot split it: not `cargo test`, or one
+/// that already selects targets (`--lib`, `--test x`, … — an isolated re-run among them), runs
+/// nothing (`--no-run`) or sets its own `--message-format`. Such a check runs as one process and
+/// its libtest ids are `[?]`.
+fn cargo_plan(argv: &[String]) -> Option<CargoPlan> {
+    let file = Path::new(argv.first()?).file_name()?.to_str()?;
+    if file != "cargo" && file != "cargo.exe" {
+        return None;
+    }
+    let sub = if argv.get(1)?.starts_with('+') { 2 } else { 1 };
+    if argv.get(sub)? != "test" {
+        return None;
+    }
+    let split = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    let args = argv.get(sub + 1..split)?.to_vec();
+    let test_args = argv.get(split + 1..).unwrap_or(&[]).to_vec();
+    const NOT_SPLIT: &[&str] = &[
+        "--lib",
+        "--bin",
+        "--bins",
+        "--test",
+        "--tests",
+        "--example",
+        "--examples",
+        "--bench",
+        "--benches",
+        "--all-targets",
+        "--doc",
+        "--no-run",
+        "--message-format",
+    ];
+    let mut common = Vec::new();
+    let mut skip = false;
+    for a in &args {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if NOT_SPLIT.contains(&a.split('=').next().unwrap_or(a)) {
+            return None;
+        }
+        if matches!(a.as_str(), "-p" | "--package" | "--exclude") {
+            skip = true;
+            continue;
+        }
+        if matches!(a.as_str(), "--workspace" | "--all")
+            || a.starts_with("--package=")
+            || a.starts_with("--exclude=")
+            || (a.starts_with("-p") && a.len() > 2)
+        {
+            continue;
+        }
+        common.push(a.clone());
+    }
+    if skip {
+        return None;
+    }
+    Some(CargoPlan {
+        head: argv[..=sub].to_vec(),
+        args,
+        common,
+        test_args,
+    })
+}
+
+impl CargoPlan {
+    /// Step 0: cargo's own list of the test targets, built (a compile error fails the check here).
+    fn list_argv(&self) -> Vec<String> {
+        let mut v = self.head.clone();
+        v.extend(self.args.iter().cloned());
+        v.extend(s(&["--no-run", "--message-format=json-render-diagnostics"]));
+        v
+    }
+
+    /// One target's run: `cargo test <common…> -p <package> <selector> [-- <test args…>]`.
+    fn target_argv(&self, package: &str, selector: &str) -> Vec<String> {
+        let mut v = self.head.clone();
+        v.extend(self.common.iter().cloned());
+        v.extend(["-p".to_string(), package.to_string()]);
+        v.extend(selector.split_whitespace().map(String::from));
+        if !self.test_args.is_empty() {
+            v.push("--".into());
+            v.extend(self.test_args.iter().cloned());
+        }
+        v
+    }
+}
+
+/// The (package, selector) runs step 0's artifacts call for, in cargo's order: each test
+/// executable, then the doc tests of every tested package whose library has them.
+fn cargo_targets(artifacts: &[CargoArtifact]) -> Vec<(String, String)> {
+    let mut runs: Vec<(String, String)> = Vec::new();
+    for a in artifacts {
+        if let Some(sel) = &a.selector {
+            let run = (a.package.clone(), sel.clone());
+            if !runs.contains(&run) {
+                runs.push(run);
+            }
+        }
+    }
+    let tested: Vec<String> = runs.iter().map(|(p, _)| p.clone()).collect();
+    for a in artifacts
+        .iter()
+        .filter(|a| a.doc && tested.contains(&a.package))
+    {
+        let run = (a.package.clone(), "--doc".to_string());
+        if !runs.contains(&run) {
+            runs.push(run);
+        }
+    }
+    runs
+}
+
+/// One target process's failure ids ([`qualify`] with its selector), plus — when it exited
+/// non-zero without naming a failing test, or other than libtest's 101 (a crash, a signal, a
+/// harness of its own) — `[<selector>] exited <how>`, matched to the base by equality.
+fn target_ids(
+    selector: &str,
+    exit: Option<i32>,
+    out: LineScan,
+    err: LineScan,
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let (mut ids, env, passed, signals) = qualify(out, err, Some(selector));
+    let named = ids.iter().any(|i| i.starts_with("test "));
+    if exit != Some(0) && (exit != Some(101) || !named) {
+        let how = match exit {
+            Some(c) => format!("with code {c}"),
+            None => "by a signal".to_string(),
+        };
+        ids.push(format!("[{selector}] exited {how}"));
     }
     (ids, env, passed, signals)
 }
@@ -6146,9 +5928,16 @@ pub(crate) fn failure_id_of_line(line: &str, eslint_file: &mut Option<String>) -
     None
 }
 
-fn drain_tail<R: Read + Send + 'static>(mut r: R, watch: &[String]) -> Drain {
+fn drain_tail<R: Read + Send + 'static>(
+    mut r: R,
+    watch: &[String],
+    collect_targets: bool,
+) -> Drain {
     let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(TAIL_BYTES * 2)));
-    let scan = std::sync::Arc::new(std::sync::Mutex::new(LineScan::watching(watch)));
+    let scan = std::sync::Arc::new(std::sync::Mutex::new(LineScan {
+        collect_targets,
+        ..LineScan::watching(watch)
+    }));
     let (done_tx, done) = std::sync::mpsc::channel();
     let shared = std::sync::Arc::clone(&buf);
     let shared_scan = std::sync::Arc::clone(&scan);
@@ -6229,6 +6018,8 @@ fn run_one_watching(
 }
 
 /// [`run_one_watching`] whose bound is held to `cap` whatever the host load ([`bound_under`]).
+/// A `cargo test` check the floor can split ([`cargo_plan`]) runs one target at a time
+/// ([`run_cargo_targets`]); any other check runs as one process.
 fn run_one_capped(
     worktree: &Path,
     check: &RepoCheck,
@@ -6267,7 +6058,8 @@ fn run_one_capped(
     let (load1, cpus) = host_load();
     result.load_band = load_band(load1, cpus);
     // LOAD-AWARE BOUND (core#469): base × clamp(load1/ncpu, 1, 3), recorded on the run and
-    // logged before the check starts so the observed duration can be read against it.
+    // logged before the check starts so the observed duration can be read against it. ONE
+    // deadline for the whole check, however many processes it takes.
     let (timeout, bound_note) = bound_under(check.base_timeout(), load1, cpus, cap);
     result.bound_s = timeout.as_secs();
     result.bound_note = bound_note;
@@ -6282,21 +6074,191 @@ fn run_one_capped(
             .unwrap_or_default(),
         worktree.display()
     );
-    let Some(bin) = check.argv.first() else {
-        result.spawn_error = Some("empty argv".into());
-        return (result, Vec::new());
+    let deadline = started + timeout;
+    let run = |argv: &[String], watch: &[String], collect: bool| {
+        spawn_scanned(
+            worktree, check, argv, sandbox, scratch, tree, watch, deadline, collect,
+        )
+    };
+    let passed = match cargo_plan(&check.argv) {
+        Some(plan) => run_cargo_targets(&plan, &run, watch, &mut result),
+        None => {
+            let p = run(&check.argv, watch, false);
+            let (ids, env, passed, signals) = qualify(p.out, p.err, None);
+            result.exit_code = p.exit_code;
+            result.timed_out = p.timed_out;
+            result.spawn_error = p.spawn_error;
+            result.stdout_tail = p.out_tail;
+            result.stderr_tail = p.err_tail;
+            result.failure_ids = ids;
+            result.env_cannot_run = env;
+            result.env_signals = signals;
+            passed
+        }
+    };
+    result.duration_ms = started.elapsed().as_millis() as u64;
+    (result, passed)
+}
+
+/// How [`run_cargo_targets`] runs one process: `(argv, watch, collect_targets)`.
+type Spawn<'a> = dyn Fn(&[String], &[String], bool) -> Spawned + 'a;
+
+/// One process of a check: its exit and its two streams' tails and scans.
+#[derive(Debug, Default)]
+struct Spawned {
+    exit_code: Option<i32>,
+    timed_out: bool,
+    spawn_error: Option<String>,
+    out_tail: String,
+    err_tail: String,
+    out: LineScan,
+    err: LineScan,
+}
+
+/// (core#1063) Run a splittable `cargo test` check one target at a time. Step 0 is cargo's own
+/// list of the targets (`--no-run`, which also builds them: a compile error fails the check right
+/// there); then each target runs alone, serially, against the check's one deadline, and every
+/// `test x ... FAILED` line of its output is qualified with the selector the floor passed. The
+/// check fails when step 0 or any target does; the first timeout or spawn error ends it.
+/// Returns the watched names seen passing.
+fn run_cargo_targets(
+    plan: &CargoPlan,
+    run: &Spawn<'_>,
+    watch: &[String],
+    result: &mut CheckRun,
+) -> Vec<String> {
+    let list = run(&plan.list_argv(), &[], true);
+    if list.exit_code != Some(0) || list.timed_out || list.spawn_error.is_some() {
+        let (ids, env, passed, signals) = qualify(list.out, list.err, None);
+        result.exit_code = list.exit_code;
+        result.timed_out = list.timed_out;
+        result.spawn_error = list.spawn_error;
+        result.stdout_tail = list.out_tail;
+        result.stderr_tail = list.err_tail;
+        result.failure_ids = ids;
+        result.env_cannot_run = env;
+        result.env_signals = signals;
+        return passed;
+    }
+    if list.out.artifacts_overflow {
+        // More targets than the scan keeps: not split — one process, every libtest id `[?]`.
+        let p = run(&result.argv.clone(), watch, false);
+        let (ids, env, passed, signals) = qualify(p.out, p.err, None);
+        result.exit_code = p.exit_code;
+        result.timed_out = p.timed_out;
+        result.spawn_error = p.spawn_error;
+        result.stdout_tail = p.out_tail;
+        result.stderr_tail = p.err_tail;
+        result.failure_ids = ids;
+        result.env_cannot_run = env;
+        result.env_signals = signals;
+        return passed;
+    }
+    let (mut out_tail, mut err_tail) = (list.out_tail, list.err_tail);
+    let mut signals = list.out.signals;
+    merge_signals(&mut signals, list.err.signals);
+    let (mut ids, mut env, mut passed): (Vec<String>, Vec<String>, Vec<String>) =
+        Default::default();
+    let mut truncated = false;
+    let mut exit = Some(0);
+    for (package, selector) in cargo_targets(&list.out.artifacts) {
+        let argv = plan.target_argv(&package, &selector);
+        let p = run(&argv, watch, false);
+        let header = format!("\n$ {}\n", argv.join(" "));
+        out_tail = keep_tail(out_tail + &header + &p.out_tail);
+        err_tail = keep_tail(err_tail + &header + &p.err_tail);
+        if p.spawn_error.is_some() || p.timed_out {
+            result.spawn_error = p.spawn_error;
+            result.timed_out = p.timed_out;
+            exit = None;
+            break;
+        }
+        if p.exit_code != Some(0) && exit == Some(0) {
+            exit = p.exit_code.or(Some(101));
+        }
+        let target = format!("-p {package} {selector}");
+        let (t_ids, t_env, t_passed, t_signals) = target_ids(&target, p.exit_code, p.out, p.err);
+        for id in t_ids {
+            if id == FAILURE_IDS_TRUNCATED {
+                truncated = true;
+            } else if !ids.contains(&id) {
+                if ids.len() < MAX_FAILURE_IDS {
+                    ids.push(id);
+                } else {
+                    truncated = true;
+                }
+            }
+        }
+        env.extend(
+            t_env
+                .into_iter()
+                .filter(|e| !env.contains(e))
+                .collect::<Vec<_>>(),
+        );
+        passed.extend(
+            t_passed
+                .into_iter()
+                .filter(|n| !passed.contains(n))
+                .collect::<Vec<_>>(),
+        );
+        merge_signals(&mut signals, t_signals);
+    }
+    if truncated {
+        ids.push(FAILURE_IDS_TRUNCATED.to_string());
+    }
+    result.exit_code = exit;
+    result.stdout_tail = out_tail;
+    result.stderr_tail = err_tail;
+    result.failure_ids = ids;
+    result.env_cannot_run = env;
+    result.env_signals = signals;
+    passed
+}
+
+/// The last [`TAIL_BYTES`] of `s`, cut on a character boundary.
+fn keep_tail(s: String) -> String {
+    if s.len() <= TAIL_BYTES {
+        return s;
+    }
+    let mut cut = s.len() - TAIL_BYTES;
+    while !s.is_char_boundary(cut) {
+        cut += 1;
+    }
+    s[cut..].to_string()
+}
+
+/// Spawn ONE process of `check` (`argv`) in `worktree`, inside `sandbox`'s write boundary with
+/// the isolated `scratch` homes (`tree` picks the cargo target leaf), until it exits or the
+/// `deadline` passes; capture its exit code and both streams' tails and scans. A LAUNCHER that
+/// fails to arm (`bwrap: …` / `sandbox-exec: …` as the first stderr line, non-zero exit) is a
+/// spawn error, never the check's own failure (core#493).
+#[allow(clippy::too_many_arguments)]
+fn spawn_scanned(
+    worktree: &Path,
+    check: &RepoCheck,
+    argv: &[String],
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+    tree: Tree,
+    watch: &[String],
+    deadline: Instant,
+    collect_targets: bool,
+) -> Spawned {
+    let mut r = Spawned::default();
+    let Some(bin) = argv.first() else {
+        r.spawn_error = Some("empty argv".into());
+        return r;
     };
     // Resolve on PATH the way `Command::new` will, so "not installed" is a legible spawn error
     // rather than a bare OS code.
     let Some(exe) = crate::validator::find_on_path(bin) else {
-        result.spawn_error = Some(format!("`{bin}` is not on PATH"));
-        result.duration_ms = started.elapsed().as_millis() as u64;
-        return (result, Vec::new());
+        r.spawn_error = Some(format!("`{bin}` is not on PATH"));
+        return r;
     };
     // `[<sandbox wrapper…>] <exe> <args…>` — an empty wrapper is the disclosed best-effort floor.
     let mut full: Vec<String> = sandbox.wrapper.clone();
     full.push(exe.to_string_lossy().into_owned());
-    full.extend(check.argv[1..].iter().cloned());
+    full.extend(argv[1..].iter().cloned());
     // spawn-audit: hardened — the repository's own check command, run in the run's worktree.
     let mut cmd = Command::new(&full[0]);
     cmd.hardened()
@@ -6316,13 +6278,15 @@ fn run_one_capped(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            result.spawn_error = Some(e.to_string());
-            result.duration_ms = started.elapsed().as_millis() as u64;
-            return (result, Vec::new());
+            r.spawn_error = Some(e.to_string());
+            return r;
         }
     };
-    let out_h = child.stdout.take().map(|r| drain_tail(r, watch));
-    let err_h = child.stderr.take().map(|r| drain_tail(r, watch));
+    let out_h = child
+        .stdout
+        .take()
+        .map(|o| drain_tail(o, watch, collect_targets));
+    let err_h = child.stderr.take().map(|e| drain_tail(e, watch, false));
     let status = loop {
         match crate::validator::has_exited_unreaped(&mut child) {
             Ok(true) => {
@@ -6333,10 +6297,10 @@ fn run_one_capped(
                 crate::validator::kill_child_tree(&mut child);
                 break child.wait().ok();
             }
-            Ok(false) if started.elapsed() >= timeout => {
+            Ok(false) if Instant::now() >= deadline => {
                 crate::validator::kill_child_tree(&mut child);
                 crate::validator::reap_bounded(&mut child);
-                result.timed_out = true;
+                r.timed_out = true;
                 break None;
             }
             Ok(false) => std::thread::sleep(Duration::from_millis(50)),
@@ -6346,40 +6310,34 @@ fn run_one_capped(
                 // (Copilot on #414). Kill the group, reap bounded, then report the failure.
                 crate::validator::kill_child_tree(&mut child);
                 crate::validator::reap_bounded(&mut child);
-                result.spawn_error = Some(format!("wait failed: {e}"));
+                r.spawn_error = Some(format!("wait failed: {e}"));
                 break None;
             }
         }
     };
-    result.exit_code = status.and_then(|st| st.code());
+    r.exit_code = status.and_then(|st| st.code());
     // BOUNDED: the group is dead, but a detached descendant may still hold the pipe — take what
     // was read and move on rather than wait for an EOF that may never come.
-    let (out_tail, out_scan) = out_h.map(|d| d.finish(DRAIN_CAP)).unwrap_or_default();
-    let (err_tail, err_scan) = err_h.map(|d| d.finish(DRAIN_CAP)).unwrap_or_default();
-    result.stdout_tail = lossy(out_tail);
-    result.stderr_tail = lossy(err_tail);
+    let (out_tail, out) = out_h.map(|d| d.finish(DRAIN_CAP)).unwrap_or_default();
+    let (err_tail, err) = err_h.map(|d| d.finish(DRAIN_CAP)).unwrap_or_default();
+    r.out_tail = lossy(out_tail);
+    r.err_tail = lossy(err_tail);
+    (r.out, r.err) = (out, err);
     // The launcher's exit is not the repository's (core#493): bwrap that cannot `mkdir` a `--tmpfs`
     // destination dies BEFORE exec with `bwrap: Can't mkdir …` and exit 1 (so does a launcher
     // whose `execvp` of the check's binary fails) — the check never ran, so recording
     // `exit_code: 1` as its `failed` blames the repo for the jail. The ONE predicate
     // (`validator::launcher_failure`) reads the first stderr line; a hit is `could_not_run`
     // (denies, fail-closed, attribution honest). Never applied to a passing exit or a timeout.
-    if !result.timed_out && result.exit_code != Some(0) {
+    if !r.timed_out && r.exit_code != Some(0) {
         if let Some(msg) = crate::validator::launcher_failure(
             &sandbox.wrapper,
-            result.stderr_tail.lines().next().unwrap_or(""),
+            r.err_tail.lines().next().unwrap_or(""),
         ) {
-            result.spawn_error = Some(msg);
+            r.spawn_error = Some(msg);
         }
     }
-    // Identifiers from both streams (cargo prints its per-test lines on stdout, vitest on
-    // stderr), de-duplicated, in order of first sight; libtest ids qualified by their binary.
-    let (ids, env, passed, signals) = qualify(out_scan, err_scan);
-    result.failure_ids = ids;
-    result.env_cannot_run = env;
-    result.env_signals = signals;
-    result.duration_ms = started.elapsed().as_millis() as u64;
-    (result, passed)
+    r
 }
 
 #[cfg(test)]
@@ -8993,8 +8951,8 @@ mod tests {
         assert_eq!(
             c.pre_existing,
             vec![
-                "test t::other [--lib]".to_string(),
-                "test t::shared [--lib]".to_string()
+                "test t::other [-p basediff_fixture --lib]".to_string(),
+                "test t::shared [-p basediff_fixture --lib]".to_string()
             ]
         );
         assert_eq!(c.name, "cargo-test");
@@ -9526,330 +9484,12 @@ mod tests {
 
     // ─── core#481 / core#546 / core#553 / core#482 ──────────────────────────────────────────────
 
-    /// A two-crate workspace's `cargo test --no-fail-fast` output, as cargo splits it: libtest's
-    /// results on stdout, cargo's `Running` / `to rerun pass` lines on stderr.
-    const WS_STDOUT: &str = "\nrunning 2 tests\ntest t::ok ... ok\ntest t::shared ... FAILED\n\n\
-        failures:\n\n---- t::shared stdout ----\n\nthread 't::shared' panicked at a/src/lib.rs:1:44:\n\
-        boom\n\n\nfailures:\n    t::shared\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n\n\
-        running 2 tests\ntest t::ok ... ok\ntest t::shared ... FAILED\n\nfailures:\n\n\
-        ---- t::shared stdout ----\n\nthread 't::shared' panicked at b/src/lib.rs:1:44:\nboom\n\n\n\
-        failures:\n    t::shared\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n\n\
-        running 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
-        sandbox-exec: sandbox_apply: Operation not permitted\n\nthread 'shared' panicked at \
-        b/tests/common.rs:1:90:\nx\n\n\nfailures:\n    shared\n\ntest result: FAILED. 0 passed; 1 \
-        failed\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed\n";
-    const WS_STDERR: &str = "     Running unittests src/lib.rs (target/debug/deps/a-e4ae93d41f55510e)\n\
-        error: test failed, to rerun pass `-p a --lib`\n     Running unittests src/lib.rs \
-        (target/debug/deps/b-351d690dff5449db)\nerror: test failed, to rerun pass `-p b --lib`\n     \
-        Running tests/common.rs (target/debug/deps/common-8e62653fc2487ac4)\nerror: test failed, to \
-        rerun pass `-p b --test common`\n   Doc-tests a\nerror: 3 targets failed:\n    `-p a --lib`\n";
-
     fn scan_of(text: &str) -> LineScan {
         let mut scan = LineScan::default();
         for line in text.lines() {
             scan.line(line);
         }
         scan
-    }
-
-    /// core#481: a libtest id names its test binary, so the same test name failing in two crates
-    /// is two ids; and a nested sandbox's launcher line in a test's captured output marks that id
-    /// (core#546). With cargo's selectors missing, the ids stay bare (the historical form).
-    #[test]
-    fn libtest_ids_are_qualified_by_their_binary_481() {
-        let (ids, env, _, _) = qualify(scan_of(WS_STDOUT), scan_of(WS_STDERR));
-        assert_eq!(
-            ids,
-            vec![
-                "test t::shared [-p a --lib]".to_string(),
-                "test t::shared [-p b --lib]".to_string(),
-                "test shared [-p b --test common]".to_string(),
-            ]
-        );
-        assert_eq!(env, vec!["test shared [-p b --test common]".to_string()]);
-        // The summary block's trailing "`-p a --lib`" list line is not a second selector.
-        let bins = scan_of(WS_STDERR).binaries;
-        assert_eq!(bins.len(), 4, "a, b, common and the doc-tests: {bins:?}");
-        assert_eq!(bins.iter().flatten().count(), 3);
-        // No selectors (another runner wrapped cargo, or the stderr was lost): bare, de-duplicated.
-        // With several binaries and no selectors, a libtest id's binary is unknown: `[?]`.
-        let (ids, env, _, _) = qualify(scan_of(WS_STDOUT), LineScan::default());
-        assert_eq!(
-            ids,
-            vec![
-                "test t::shared [?]".to_string(),
-                "test shared [?]".to_string()
-            ]
-        );
-        assert_eq!(env, vec!["test shared [?]".to_string()]);
-        assert_eq!(
-            rerun_target_of_line("error: test failed, to rerun pass '--lib'").as_deref(),
-            Some("--lib"),
-            "older cargo quotes with '"
-        );
-    }
-
-    /// The child run a re-exec harness prints in its panic message (`tmux_live_tests.rs` asserted
-    /// its child's success with the child's stdout): a whole libtest run, result line included.
-    const CHILD_RUN: &str = "\nrunning 1 test\ntest terminal::live::attach ... FAILED\n\n\
-        failures:\n\n---- terminal::live::attach stdout ----\nthread 'terminal::live::attach' \
-        panicked at src/terminal/live.rs:478:9:\nno attach\n\n\nfailures:\n    \
-        terminal::live::attach\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 \
-        measured; 2294 filtered out; finished in 5.01s\n";
-
-    /// Attempt 4 of run 2ebd9da2 (17 `test result: FAILED` lines for 9 failing targets): a
-    /// child's run inside a test's captured output is nested, not a test binary, so it cannot
-    /// strip the `[-p … ]` qualifier from every id. Binary 1 fails two tests, one carrying a whole
-    /// child run and the other a stray header-less result line; binary 2's only failure is the
-    /// harness itself; binary 3 is an ordinary failure. The child's own failure, read in captured
-    /// output, is reported too — `[?]`, never attributed (#1060 round 12).
-    #[test]
-    fn a_childs_result_line_in_captured_output_keeps_every_id_qualified() {
-        let stdout = format!(
-            "\nrunning 3 tests\ntest t::ok ... ok\ntest terminal::live::attach ... FAILED\n\
-             test t::red ... FAILED\n\nfailures:\n\n---- terminal::live::attach stdout ----\n\
-             thread 'terminal::live::attach' panicked at src/terminal/live.rs:92:9:\nchild \
-             failed: {CHILD_RUN}\n---- t::red stdout ----\nboom\ntest result: FAILED. 0 passed; 1 \
-             failed\n\n\nfailures:\n    terminal::live::attach\n    t::red\n\ntest result: \
-             FAILED. 1 passed; 2 failed; 0 ignored\n\nrunning 1 test\ntest live::resize ... \
-             FAILED\n\nfailures:\n\n---- live::resize stdout ----\nchild failed: {CHILD_RUN}\n\n\
-             failures:\n    live::resize\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n\n\
-             running 2 tests\ntest a_check_the_base_fails ... FAILED\ntest b ... ok\n\n\
-             failures:\n\n---- a_check_the_base_fails stdout ----\nx\n\nfailures:\n    \
-             a_check_the_base_fails\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n"
-        );
-        let stderr = "     Running unittests src/lib.rs (target/debug/deps/core-1)\n\
-            error: test failed, to rerun pass `-p core --lib`\n     Running tests/live.rs \
-            (target/debug/deps/live-2)\nerror: test failed, to rerun pass `-p core --test \
-            live`\n     Running tests/guard.rs (target/debug/deps/guard-3)\nerror: test failed, \
-            to rerun pass `-p core --test guard`\nerror: 3 targets failed:\n    `-p core --lib`\n";
-        let (ids, _, _, _) = qualify(scan_of(&stdout), scan_of(stderr));
-        assert_eq!(
-            ids,
-            vec![
-                "test terminal::live::attach [-p core --lib]".to_string(),
-                "test t::red [-p core --lib]".to_string(),
-                "test live::resize [-p core --test live]".to_string(),
-                "test a_check_the_base_fails [-p core --test guard]".to_string(),
-                "test terminal::live::attach [?]".to_string(),
-            ]
-        );
-
-        // A binary that died without its result line (a crash): its verdict is only inferred, so
-        // it certifies nothing — every id of the run is `[?]` (codex on #1060).
-        let crashed = "\nrunning 2 tests\ntest a::x ... FAILED\n\nrunning 1 test\ntest y ... \
-            FAILED\n\nfailures:\n\n---- y stdout ----\nz\n\nfailures:\n    y\n\ntest result: \
-            FAILED. 0 passed; 1 failed\n";
-        let two = "     Running unittests src/lib.rs (target/debug/deps/c-1)\nerror: test failed, \
-            to rerun pass `-p c --lib`\n     Running tests/it.rs (target/debug/deps/it-2)\nerror: \
-            test failed, to rerun pass `-p c --test it`\n";
-        let (ids, _, _, _) = qualify(scan_of(crashed), scan_of(two));
-        assert_eq!(ids, vec!["test a::x [?]", "test y [?]"]);
-
-        // Rust 2024's merged doctests end with a timing footer after their result line: still
-        // aligned (codex on #1060).
-        let merged = "\nrunning 1 test\ntest tests::pre ... FAILED\n\nfailures:\n    tests::pre\n\n\
-            test result: FAILED. 0 passed; 1 failed\n\nrunning 1 test\ntest src/lib.rs - f (line 1) \
-            ... ok\n\ntest result: ok. 1 passed; 0 failed\n\nall doctests ran in 0.12s; merged \
-            doctests compilation took 0.34s\n";
-        let lib_doc =
-            "     Running unittests src/lib.rs (target/debug/deps/c-1)\nerror: test failed, \
-            to rerun pass `-p c --lib`\n   Doc-tests c\n";
-        assert_eq!(
-            qualify(scan_of(merged), scan_of(lib_doc)).0,
-            vec!["test tests::pre [-p c --lib]"]
-        );
-
-        // A run cut off inside its last binary (the check's bound): cargo printed no selector
-        // for it, so its id is `[?]` and the finished binary before it keeps its target.
-        let cut = "\nrunning 1 test\ntest y ... FAILED\n\nfailures:\n    y\n\ntest result: \
-            FAILED. 0 passed; 1 failed\n\nrunning 3 tests\ntest late ... FAILED\n";
-        let one =
-            "     Running tests/it.rs (target/debug/deps/it-2)\nerror: test failed, to rerun \
-            pass `-p c --test it`\n     Running tests/late.rs (target/debug/deps/late-3)\n";
-        let (ids, _, _, _) = qualify(scan_of(cut), scan_of(one));
-        assert_eq!(ids, vec!["test y [-p c --test it]", "test late [?]"]);
-
-        assert_eq!(
-            libtest_counts("FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 9 filtered out"),
-            Some((3, 2))
-        );
-        assert_eq!(libtest_counts("ok. 3 passed; 0 failed"), Some((3, 0)));
-        assert_eq!(libtest_counts("FAILED"), None);
-        assert_eq!(libtest_running_header("running 1 test"), Some(1));
-        assert_eq!(libtest_running_header("running 12 tests"), Some(12));
-        assert_eq!(libtest_running_header("running tests"), None);
-        assert_eq!(libtest_running_header("running 1"), None);
-    }
-
-    /// (codex on #1060) Counts that happen to agree are no evidence of which target an id belongs
-    /// to. Target `a` is a custom harness that fails silently (cargo's `Running` line and
-    /// selector, no libtest output); target `b`'s failing `shared` carries two child runs, the
-    /// second without its header, so its result line closes `b` early. Aligned by counts alone,
-    /// `b`'s failure took `a`'s qualifier and met a base where `a`'s `shared` fails: a new
-    /// regression read as pre-existing. Now the lists disagree and the id is `[?]` — a
-    /// regression against that base, said to be ambiguous.
-    #[test]
-    fn a_silent_harness_and_nested_runs_cannot_shift_a_qualifier() {
-        let headless =
-            "\nchild 2:\nF\nfailures:\n\n---- shared stdout ----\nboom\n\nfailures:\n    \
-            shared\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n";
-        let stdout = format!(
-            "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
-             child 1: {CHILD_RUN}{headless}\nfailures:\n    shared\n\ntest result: FAILED. 0 \
-             passed; 1 failed; 0 ignored\n"
-        );
-        let stderr = "     Running tests/a.rs (target/debug/deps/a-1)\nerror: test failed, to \
-            rerun pass `--test a`\n     Running tests/b.rs (target/debug/deps/b-2)\nerror: test \
-            failed, to rerun pass `--test b`\n";
-        let (ids, _, _, _) = qualify(scan_of(&stdout), scan_of(stderr));
-        // Never `[--test a]`: unknown (`[?]`); and with the structure unverified, the failure
-        // read inside the nested run is reported too rather than set aside as a child's.
-        assert_eq!(
-            ids,
-            vec!["test shared [?]", "test terminal::live::attach [?]"]
-        );
-        let mut head = failed_run(&["test shared [?]"], &[]);
-        classify(
-            &mut head,
-            base_of(failed_run(&["test shared [--test a]"], &[])),
-        );
-        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(head.ambiguous, vec!["test shared [?]"]);
-
-        // The header-less child alone, no silent harness: the lists agree in length, but the
-        // binary's own result line arriving after the early close is an anomaly — bare.
-        let stderr_b = "     Running tests/b.rs (target/debug/deps/b-2)\nerror: test failed, to \
-            rerun pass `--test b`\n";
-        let (ids, _, _, _) = qualify(scan_of(&stdout), scan_of(stderr_b));
-        assert_eq!(
-            ids,
-            vec!["test shared [?]", "test terminal::live::attach [?]"],
-            "one block is no identity: cargo named a binary, so unverified ids are unknown"
-        );
-        // Without it, the same binary is qualified: the nested child with its header is not one
-        // (its failure is reported, `[?]`).
-        let clean = format!(
-            "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
-             child 1: {CHILD_RUN}\nfailures:\n    shared\n\ntest result: FAILED. 0 passed; 1 \
-             failed; 0 ignored\n"
-        );
-        let (ids, _, _, _) = qualify(scan_of(&clean), scan_of(stderr_b));
-        assert_eq!(
-            ids,
-            vec!["test shared [--test b]", "test terminal::live::attach [?]"]
-        );
-
-        // After a nested run the captured section it was printed in goes on: a `test x ...
-        // FAILED` line later in that section is the output's — never the suite's binary's — and
-        // is reported `[?]`, never dropped.
-        let after = format!(
-            "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
-             child 1: {CHILD_RUN}test echoed ... FAILED\n\nfailures:\n    shared\n\ntest result: \
-             FAILED. 0 passed; 1 failed; 0 ignored\n"
-        );
-        let (ids, _, _, _) = qualify(scan_of(&after), scan_of(stderr_b));
-        assert_eq!(
-            ids,
-            vec![
-                "test shared [--test b]",
-                "test terminal::live::attach [?]",
-                "test echoed [?]"
-            ]
-        );
-
-        // (agy on #1060) The header-less child closes `b` early, then a truncated child of the
-        // SAME test opens a block the binary's own listing and result line close: with the
-        // silent harness the lists line up and `b`'s failure reads `[--test a]` — but the
-        // truncated child's block carries `b`'s target, so the failure in `b` is still on the
-        // record and still a regression against a base where only `a`'s `shared` fails.
-        let truncated = "\nrunning 1 test\ntest shared ... FAILED\n";
-        let shifted = format!(
-            "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
-             child 2:{headless}{truncated}\nfailures:\n    shared\n\ntest result: FAILED. 0 passed; \
-             1 failed; 0 ignored\n"
-        );
-        let (ids, _, _, _) = qualify(scan_of(&shifted), scan_of(stderr));
-        assert!(
-            ids.contains(&"test shared [--test b]".to_string()),
-            "{ids:?}"
-        );
-        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-        let mut head = failed_run(&refs, &[]);
-        classify(
-            &mut head,
-            base_of(failed_run(&["test shared [--test a]"], &[])),
-        );
-        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
-        assert!(head
-            .regressions
-            .contains(&"test shared [--test b]".to_string()));
-        // (codex on #1060) The same, but the truncated child prints no failure line and `b` dies
-        // before its own summary, then `c` passes: the block `c`'s header closes has only an
-        // inferred verdict, so nothing is certified — `[?]`, never `[--test a]`.
-        let died = format!(
-            "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
-             child 2:{headless}\nrunning 1 test\n\nrunning 1 test\ntest c ... ok\n\ntest result: ok. \
-             1 passed; 0 failed\n"
-        );
-        let abc = format!("{stderr}     Running tests/c.rs (target/debug/deps/c-3)\n");
-        let (ids, _, _, _) = qualify(scan_of(&died), scan_of(&abc));
-        assert_eq!(ids, vec!["test shared [?]"]);
-        // A truncated child of ANOTHER test cannot borrow the binary's listing: unresolved, `[?]`.
-        let other = format!(
-            "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
-             child 2:{headless}\nrunning 1 test\ntest inner ... FAILED\n\nfailures:\n    shared\n\n\
-             test result: FAILED. 0 passed; 1 failed; 0 ignored\n"
-        );
-        let (ids, _, _, _) = qualify(scan_of(&other), scan_of(stderr));
-        assert!(ids.iter().all(|i| i.ends_with("[?]")), "{ids:?}");
-        // (agy on #1060) A child cut short in a panic message (its header, no result line) does
-        // not swallow the binary's own result line or the binaries after it.
-        let cut_child =
-            "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
-             child: \nrunning 1 test\ntest inner ... \n\nfailures:\n    shared\n\ntest result: \
-             FAILED. 0 passed; 1 failed; 0 ignored\n\nrunning 2 tests\ntest later ... FAILED\ntest \
-             ok ... ok\n\nfailures:\n    later\n\ntest result: FAILED. 1 passed; 1 failed\n";
-        let a_and_c = "     Running tests/b.rs (target/debug/deps/b-2)\nerror: test failed, to rerun \
-            pass `--test b`\n     Running tests/c.rs (target/debug/deps/c-3)\nerror: test failed, to \
-            rerun pass `--test c`\n";
-        assert_eq!(
-            qualify(scan_of(cut_child), scan_of(a_and_c)).0,
-            vec!["test shared [--test b]", "test later [--test c]"]
-        );
-        // Text between a binary's result line and the next header: the result was not its own.
-        let between =
-            "\nrunning 1 test\ntest y ... FAILED\n\nfailures:\n    y\n\ntest result: FAILED. \
-            0 passed; 1 failed\nstray text\n\nrunning 1 test\ntest z ... ok\n\ntest result: ok. 1 \
-            passed; 0 failed\n";
-        let two_bins =
-            "     Running tests/y.rs (target/debug/deps/y-1)\nerror: test failed, to rerun \
-            pass `--test y`\n     Running tests/z.rs (target/debug/deps/z-2)\n";
-        assert_eq!(
-            qualify(scan_of(between), scan_of(two_bins)).0,
-            vec!["test y [?]"]
-        );
-        // A listing that does not name the binary's own failures does not close it.
-        let unlisted =
-            "\nrunning 1 test\ntest y ... FAILED\n\nfailures:\n    q\n\ntest result: FAILED. 0 \
-            passed; 1 failed\n";
-        let one_bin =
-            "     Running tests/y.rs (target/debug/deps/y-1)\nerror: test failed, to rerun pass \
-            `--test y`\n";
-        assert_eq!(
-            qualify(scan_of(unlisted), scan_of(one_bin)).0,
-            vec!["test y [?]"]
-        );
-        assert!(
-            scan_of(unlisted).open,
-            "still open: its result line was not its own"
-        );
-        let sp = "\nrunning 1 test\ntest y - should panic ... FAILED\n\nfailures:\n    y\n\ntest \
-            result: FAILED. 0 passed; 1 failed\n";
-        assert_eq!(
-            qualify(scan_of(sp), scan_of(one_bin)).0,
-            vec!["test y - should panic [--test y]"]
-        );
     }
 
     /// Head and base ids are compared on (test name, target): qualified ids of the same target
@@ -10188,256 +9828,6 @@ mod tests {
         );
         assert_eq!(run.not_rechecked, 1);
         assert_eq!(run.regressions, vec!["test t::b [-p core --lib]"]);
-    }
-
-    /// (codex on #1060) Colored cargo output is read as plain; and where cargo printed no binary
-    /// list (`--quiet`), an id's binary is unknown (`[?]`), so a failure that moved from crate A
-    /// on the base to crate B on the head is never matched to itself — a regression, ambiguous.
-    #[test]
-    fn colored_or_quiet_cargo_output_never_lets_a_moved_failure_match() {
-        let colored: String = WS_STDERR
-            .lines()
-            .map(|l| {
-                let l = l.replacen("Running", "\u{1b}[1m\u{1b}[32mRunning\u{1b}[0m", 1);
-                let l = l.replacen("Doc-tests", "\u{1b}[1m\u{1b}[32mDoc-tests\u{1b}[0m", 1);
-                format!(
-                    "{}\n",
-                    l.replacen("error", "\u{1b}[1m\u{1b}[31merror\u{1b}[0m", 1)
-                )
-            })
-            .collect();
-        assert!(colored.contains('\u{1b}'));
-        assert_eq!(
-            qualify(scan_of(WS_STDOUT), scan_of(&colored)).0,
-            qualify(scan_of(WS_STDOUT), scan_of(WS_STDERR)).0,
-            "colors change nothing"
-        );
-        assert_eq!(
-            strip_ansi("\u{1b}]8;;http://x\u{7}link\u{1b}]8;;\u{7} ok"),
-            "link ok"
-        );
-
-        // `cargo test --quiet`: selectors without `Running` lines — no binary list to align.
-        let quiet_stdout = "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n    shared\n\n\
-            test result: FAILED. 0 passed; 1 failed\n\nrunning 1 test\ntest other ... ok\n\n\
-            test result: ok. 1 passed; 0 failed\n";
-        let quiet_stderr = "error: test failed, to rerun pass `-p b --lib`\n";
-        let (ids, _, _, _) = qualify(scan_of(quiet_stdout), scan_of(quiet_stderr));
-        assert_eq!(ids, vec!["test shared [?]"]);
-        let mut head = failed_run(&["test shared [?]"], &[]);
-        classify(&mut head, base_of(failed_run(&["test shared [?]"], &[])));
-        assert_eq!(
-            head.classification.as_deref(),
-            Some(REGRESSION),
-            "{head:#?}"
-        );
-        assert!(head.pre_existing.is_empty());
-        assert_eq!(head.ambiguous, vec!["test shared [?]"]);
-        assert!(head.denies());
-        // A known binary against an unknown one is no match either.
-        let mut head = failed_run(&["test shared [-p b --lib]"], &[]);
-        classify(&mut head, base_of(failed_run(&["test shared [?]"], &[])));
-        assert_eq!(head.ambiguous, vec!["test shared [-p b --lib]"]);
-        // An id of an unknown binary is not re-run alone: not re-checked, still a regression.
-        let argv = s(&["cargo", "test", "--workspace"]);
-        assert!(isolated_rerun_argv(&argv, "test shared [?]").is_none());
-        let (check, mut run) = regression_run(&["test shared [?]"]);
-        let mut bounds = Vec::new();
-        let pass = |_: &str| true;
-        recheck_alone(
-            &check,
-            &mut run,
-            None,
-            Duration::from_secs(FLAKE_RERUN_BUDGET_S),
-            &mut fake_rerun(&pass, 1, &mut bounds),
-        );
-        assert!(bounds.is_empty() && run.flaky.is_empty());
-        assert_eq!(run.not_rechecked, 1);
-        assert!(run.denies());
-
-        // Only cargo's own binary lines count: a test's stderr `Running migrations` is not one,
-        // a verbose run's test binary is, its compiler and build-script lines are not.
-        assert!(cargo_binary_line(
-            "Running unittests src/lib.rs (target/debug/deps/a-1)"
-        ));
-        assert!(cargo_binary_line(
-            "Running tests\\it.rs (target\\debug\\deps\\it-2.exe)"
-        ));
-        assert!(cargo_binary_line("Doc-tests a"));
-        assert!(cargo_binary_line(
-            "Running `/w/target/debug/deps/it-2ab --quiet`"
-        ));
-        assert!(!cargo_binary_line("Running migrations"));
-        assert!(!cargo_binary_line(
-            "Running `rustc --crate-name a src/lib.rs`"
-        ));
-        assert!(!cargo_binary_line(
-            "Running `/w/target/debug/build/a-1/build-script-build`"
-        ));
-        assert!(!cargo_binary_line("Doc-tests for the crate"));
-        assert_eq!(
-            libtest_running_header_suffix("child failed: running 1 test"),
-            Some(1)
-        );
-        assert_eq!(libtest_running_header_suffix("not_running 1 test"), None);
-    }
-
-    /// Real `cargo test --no-fail-fast` output of an edition-2024 crate (rustdoc's merged and
-    /// standalone doctest runs under one `Doc-tests` line, then its timing footer): a failing unit
-    /// test and passing doctests.
-    const ED24_OUT: &str = r#"
-running 2 tests
-test tests::fine ... ok
-test tests::base_failure ... FAILED
-
-failures:
-
----- tests::base_failure stdout ----
-
-thread 'tests::base_failure' (2312872) panicked at src/lib.rs:10:41:
-red
-note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-
-
-failures:
-    tests::base_failure
-
-test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-
-
-running 1 test
-test src/lib.rs - one (line 1) ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
-
-
-running 1 test
-test src/lib.rs - one (line 5) - compile fail ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
-
-all doctests ran in 1.42s; merged doctests compilation took 0.84s
-"#;
-    const ED24_ERR: &str = r#"     Running unittests src/lib.rs (target/debug/deps/ed24-852391415fd9f493)
-error: test failed, to rerun pass `--lib`
-   Doc-tests ed24
-error: 1 target failed:
-    `--lib`
-"#;
-    /// The same crate with both doctests failing too (`--doc` selector).
-    const ED24_DOC_OUT: &str = r#"
-running 2 tests
-test tests::fine ... ok
-test tests::base_failure ... FAILED
-
-failures:
-
----- tests::base_failure stdout ----
-
-thread 'tests::base_failure' (2315717) panicked at src/lib.rs:10:41:
-red
-note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-
-
-failures:
-    tests::base_failure
-
-test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-
-
-running 1 test
-test src/lib.rs - one (line 1) ... FAILED
-
-failures:
-
----- src/lib.rs - one (line 1) stdout ----
-Test executable failed (exit status: 101).
-
-stderr:
-
-thread 'main' (2316020) panicked at /var/folders/4c/rvzl16px0yx907_m1rx6mwrw0000gp/T/rustdoctestF1NyNn/doctest_bundle_2024.rs:6:1:
-assertion `left == right` failed
-  left: 1
- right: 2
-note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-
-
-
-failures:
-    src/lib.rs - one (line 1)
-
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
-
-
-running 1 test
-test src/lib.rs - one (line 5) - compile fail ... FAILED
-
-failures:
-
----- src/lib.rs - one (line 5) stdout ----
-Test compiled successfully, but it's marked `compile_fail`.
-
-failures:
-    src/lib.rs - one (line 5)
-
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
-
-all doctests ran in 0.95s; merged doctests compilation took 0.43s
-"#;
-    const ED24_DOC_ERR: &str = r#"     Running unittests src/lib.rs (target/debug/deps/ed24-852391415fd9f493)
-error: test failed, to rerun pass `--lib`
-   Doc-tests ed24
-error: doctest failed, to rerun pass `--doc`
-error: 2 targets failed:
-    `--lib`
-    `--doc`
-"#;
-
-    /// (codex on #1060) Rust 2024 doctests: one `Doc-tests` line, two stdout blocks and a footer
-    /// — the unit failure keeps `[--lib]` and failing doctests get `[--doc]`. And one block per
-    /// tree is no proof of one binary: a `--quiet` run's failure with a selector but no `Running`
-    /// line is `[?]`, so `shared` failing in `-p a` on the base and `-p b` on the head never meet.
-    #[test]
-    fn rust_2024_doctests_line_up_and_a_lone_block_is_not_an_identity() {
-        assert_eq!(
-            qualify(scan_of(ED24_OUT), scan_of(ED24_ERR)).0,
-            vec!["test tests::base_failure [--lib]"]
-        );
-        assert_eq!(
-            qualify(scan_of(ED24_DOC_OUT), scan_of(ED24_DOC_ERR)).0,
-            vec![
-                "test tests::base_failure [--lib]",
-                "test src/lib.rs - one (line 1) [--doc]",
-                "test src/lib.rs - one (line 5) - compile fail [--doc]",
-            ]
-        );
-        let quiet =
-            "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n    shared\n\ntest result: \
-            FAILED. 0 passed; 1 failed\n";
-        let base = qualify(
-            scan_of(quiet),
-            scan_of("error: test failed, to rerun pass `-p a --lib`\n"),
-        )
-        .0;
-        let head = qualify(
-            scan_of(quiet),
-            scan_of("error: test failed, to rerun pass `-p b --lib`\n"),
-        )
-        .0;
-        assert_eq!(head, vec!["test shared [?]"]);
-        let refs = |v: &[String]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let mut h = failed_run(&[], &[]);
-        h.failure_ids = refs(&head);
-        let mut b = failed_run(&[], &[]);
-        b.failure_ids = refs(&base);
-        classify(&mut h, base_of(b));
-        assert_eq!(h.classification.as_deref(), Some(REGRESSION));
-        assert!(h.pre_existing.is_empty());
-        // No cargo identity at all (a lone libtest binary run directly): unknown too.
-        assert_eq!(
-            qualify(scan_of(quiet), LineScan::default()).0,
-            vec!["test shared [?]"]
-        );
     }
 
     fn failed_run(ids: &[&str], env: &[&str]) -> CheckRun {
@@ -10939,7 +10329,10 @@ error: 2 targets failed:
             "{c:#?}"
         );
         assert!(report.passed, "{report:#?}");
-        assert_eq!(c.regressions, vec!["test t::flaky [--lib]".to_string()]);
+        assert_eq!(
+            c.regressions,
+            vec!["test t::flaky [-p flake_fixture --lib]".to_string()]
+        );
         assert_eq!(c.reruns.len(), 1);
         assert!(c.reruns[0].passed(), "{:?}", c.reruns[0]);
         assert!(c.reruns[0]
@@ -10947,7 +10340,8 @@ error: 2 targets failed:
             .ends_with(&s(&["--lib", "--", "--exact", "t::flaky"])));
         let note = report.classification_note().expect("a flake is disclosed");
         assert!(
-            note.contains("test t::flaky [--lib]") && note.contains("flaky_under_load"),
+            note.contains("test t::flaky [-p flake_fixture --lib]")
+                && note.contains("flaky_under_load"),
             "{note}"
         );
 
@@ -11480,9 +10874,9 @@ error: 2 targets failed:
         let _ = std::fs::remove_dir_all(&repo);
     }
 
-    // ---- Review round 7 (agy on #1060): each finding fed through the real scanner, qualifier
-    // and classifier. The gate question for every one: can a head-only failure be classified
-    // pre-existing, flaky or env_cannot_run? Shapes follow real cargo 1.99 / edition-2024 output.
+    // ---- core#1063 (folded into #1060): the libtest qualifier is the target the floor ran, never
+    // a line of output. 13 review rounds forged the text-read qualifier; the forgeries replay
+    // here through the per-target path and every one stays a regression.
 
     fn adj_text(v: &[&str]) -> String {
         let mut t = v.join("\n");
@@ -11490,692 +10884,211 @@ error: 2 targets failed:
         t
     }
 
-    /// The head run qualified from its two streams and classified against the base run's.
-    fn adj_head(out: &str, err: &str, base_out: &str, base_err: &str) -> CheckRun {
-        let (ids, env, _, _) = qualify(scan_of(out), scan_of(err));
-        let (b_ids, b_env, _, _) = qualify(scan_of(base_out), scan_of(base_err));
-        eprintln!("head ids {ids:?} env {env:?}\nbase ids {b_ids:?} env {b_env:?}");
-        fn v(x: &[String]) -> Vec<&str> {
-            x.iter().map(String::as_str).collect()
-        }
-        let mut head = failed_run(&v(&ids), &v(&env));
-        classify(&mut head, base_of(failed_run(&v(&b_ids), &v(&b_env))));
-        eprintln!(
-            "classification {:?} regressions {:?}",
-            head.classification, head.regressions
-        );
+    /// A split cargo check with every process faked: `targets` is cargo's list (package,
+    /// selector — `--doc` for a library's doc tests), `outputs` each target's `-p <package>
+    /// <selector>` with its exit and two streams. An unexpected run fails the test.
+    fn split_run(
+        targets: &[(&str, &str)],
+        outputs: &[(&str, Option<i32>, &str, &str)],
+    ) -> CheckRun {
+        let plan = cargo_plan(&s(&["cargo", "test", "--locked", "--no-fail-fast"])).unwrap();
+        let fake = |argv: &[String], _: &[String], collect: bool| -> Spawned {
+            if collect {
+                assert_eq!(argv, plan.list_argv().as_slice());
+                let artifacts = targets
+                    .iter()
+                    .map(|(p, sel)| CargoArtifact {
+                        package: p.to_string(),
+                        selector: (*sel != "--doc").then(|| sel.to_string()),
+                        doc: *sel == "--doc",
+                    })
+                    .collect();
+                return Spawned {
+                    exit_code: Some(0),
+                    out: LineScan {
+                        artifacts,
+                        ..LineScan::default()
+                    },
+                    ..Spawned::default()
+                };
+            }
+            let joined = argv.join(" ");
+            let (_, exit, out, err) = outputs
+                .iter()
+                .find(|(t, ..)| joined == format!("cargo test --locked --no-fail-fast {t}"))
+                .unwrap_or_else(|| panic!("unexpected run: {joined}"));
+            Spawned {
+                exit_code: *exit,
+                out: scan_of(out),
+                err: scan_of(err),
+                ..Spawned::default()
+            }
+        };
+        let mut run = failed_run(&[], &[]);
+        run.argv = s(&["cargo", "test", "--locked", "--no-fail-fast"]);
+        run_cargo_targets(&plan, &fake, &[], &mut run);
+        run
+    }
+
+    /// The head split run classified against the base's.
+    fn split_head(head: CheckRun, base: CheckRun) -> CheckRun {
+        let mut head = head;
+        classify(&mut head, base_of(base));
         head
     }
 
-    const ADJ_COMMON_ERR: &str =
-        "     Running tests/common.rs (target/debug/deps/common-fe420048d3d48ef9)\n\
-        error: test failed, to rerun pass `-p b --test common`\n";
-
-    /// agy a1b1 #1: a re-exec child cut off after its header (real libtest output: the child
-    /// aborted) leaves a nested run open, so the NEXT test's section is read as captured output
-    /// and its launcher signature is credited to the first test. The ids stay intact and
-    /// qualified, so the misattribution can only move a shared failure between two non-denying
-    /// classes; a head-only failure stays a regression.
     #[test]
-    fn unclosed_child_run_keeps_ids_and_regressions_1060() {
-        let head = adj_text(&[
-            "",
-            "running 2 tests",
-            "test test_a ... FAILED",
-            "test test_b ... FAILED",
-            "",
-            "failures:",
-            "",
-            "---- test_a stdout ----",
-            "",
-            "thread 'test_a' (3419791) panicked at b/tests/common.rs:14:5:",
-            "child failed: ",
-            "running 1 test",
-            "test test_a ... ",
-            "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
-            "",
-            "---- test_b stdout ----",
-            "sandbox-exec: sandbox_apply: Operation not permitted",
-            "",
-            "thread 'test_b' (3419807) panicked at b/tests/common.rs:20:5:",
-            "b env",
-            "",
-            "",
-            "failures:",
-            "    test_a",
-            "    test_b",
-            "",
-            "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; \
-             finished in 0.06s",
-        ]);
-        let (ids, _, _, _) = qualify(scan_of(&head), scan_of(ADJ_COMMON_ERR));
+    fn cargo_plan_splits_only_a_plain_cargo_test_1063() {
+        let plan = cargo_plan(&s(&["cargo", "test", "--locked", "--no-fail-fast"])).unwrap();
         assert_eq!(
-            ids,
+            plan.list_argv(),
+            s(&[
+                "cargo",
+                "test",
+                "--locked",
+                "--no-fail-fast",
+                "--no-run",
+                "--message-format=json-render-diagnostics"
+            ])
+        );
+        assert_eq!(
+            plan.target_argv("b", "--test common"),
+            s(&[
+                "cargo",
+                "test",
+                "--locked",
+                "--no-fail-fast",
+                "-p",
+                "b",
+                "--test",
+                "common"
+            ])
+        );
+        // Package selection is cargo's (step 0); features, toolchain and test args pass through.
+        let plan = cargo_plan(&s(&[
+            "cargo",
+            "+nightly",
+            "test",
+            "--workspace",
+            "--exclude",
+            "x",
+            "-p",
+            "a",
+            "--package=c",
+            "-pd",
+            "--features",
+            "f",
+            "--",
+            "--nocapture",
+        ]))
+        .unwrap();
+        assert_eq!(
+            plan.target_argv("a", "--lib"),
+            s(&[
+                "cargo",
+                "+nightly",
+                "test",
+                "--features",
+                "f",
+                "-p",
+                "a",
+                "--lib",
+                "--",
+                "--nocapture"
+            ])
+        );
+        assert!(plan.list_argv().contains(&"--exclude".to_string()));
+        assert!(!plan.list_argv().contains(&"--nocapture".to_string()));
+        // Not split: not `cargo test`, targets already chosen (the isolated re-run among them),
+        // a dangling `-p`, or a message format of its own.
+        for argv in [
+            s(&["sh", "-c", "cargo test"]),
+            s(&["cargo", "build"]),
+            s(&["cargo", "test", "--lib"]),
+            s(&["cargo", "test", "--test=it"]),
+            s(&["cargo", "test", "--doc"]),
+            s(&["cargo", "test", "-p"]),
+            s(&["cargo", "test", "--message-format=json"]),
+            isolated_rerun_argv(&s(&["cargo", "test", "--workspace"]), "test x [-p a --lib]")
+                .unwrap()
+                .0,
+        ] {
+            assert!(cargo_plan(&argv).is_none(), "{argv:?}");
+        }
+    }
+
+    /// Cargo's own artifact list names the targets — real `cargo test --no-run
+    /// --message-format=json` lines (cargo 1.99): a library's unit tests and doc tests, an
+    /// integration test; a dependency's library (not tested) runs nothing; a forged line can only
+    /// add a run, never one that reads as a flag.
+    #[test]
+    fn cargo_targets_come_from_cargos_own_artifacts_1063() {
+        let dir = scratch("artifacts");
+        for (pkg, name) in [("a", "a"), ("b", "b"), ("c", "c"), ("evil", "--lib")] {
+            std::fs::create_dir_all(dir.join(pkg)).unwrap();
+            std::fs::write(
+                dir.join(pkg).join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+            )
+            .unwrap();
+        }
+        let line = |pkg: &str, kind: &str, name: &str, doctest: bool, test: bool| {
+            serde_json::json!({
+                "reason": "compiler-artifact",
+                "package_id": format!("path+file:///w/{pkg}#0.1.0"),
+                "manifest_path": dir.join(pkg).join("Cargo.toml"),
+                "target": {"kind": [kind], "crate_types": [if kind == "test" { "bin" } else { kind }],
+                           "name": name, "test": true, "doctest": doctest},
+                "profile": {"test": test},
+                "fresh": true
+            })
+            .to_string()
+        };
+        let mut scan = LineScan {
+            collect_targets: true,
+            ..LineScan::default()
+        };
+        for l in [
+            line("c", "lib", "c", true, false),
+            line("a", "lib", "a", true, false),
+            line("b", "lib", "b", true, false),
+            line("a", "lib", "a", true, true),
+            line("b", "test", "common", false, true),
+            line("evil", "lib", "evil", true, true),
+            "{\"reason\":\"build-finished\",\"success\":true}".to_string(),
+            "{not json".to_string(),
+        ] {
+            scan.line(&l);
+        }
+        assert_eq!(
+            cargo_targets(&scan.artifacts),
             vec![
-                "test test_a [-p b --test common]".to_string(),
-                "test test_b [-p b --test common]".to_string(),
+                ("a".to_string(), "--lib".to_string()),
+                ("b".to_string(), "--test common".to_string()),
+                ("a".to_string(), "--doc".to_string()),
+                ("b".to_string(), "--doc".to_string()),
             ]
         );
-        // Base: only test_b fails (the env case); head adds test_a — a regression.
-        let base = adj_text(&[
-            "running 2 tests",
-            "test test_a ... ok",
-            "test test_b ... FAILED",
-            "",
-            "failures:",
-            "",
-            "---- test_b stdout ----",
-            "sandbox-exec: sandbox_apply: Operation not permitted",
-            "",
-            "failures:",
-            "    test_b",
-            "",
-            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-        ]);
-        let run = adj_head(&head, ADJ_COMMON_ERR, &base, ADJ_COMMON_ERR);
-        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(run.regressions, vec!["test test_a [-p b --test common]"]);
-        assert!(run.denies());
-    }
-
-    const ADJ_TWO_LIBS_ERR: &str =
-        "     Running unittests src/lib.rs (target/debug/deps/a-e9fdb13badb08122)\n\
-        error: test failed, to rerun pass `-p a --lib`\n     Running unittests src/lib.rs \
-        (target/debug/deps/b-a915afd4d70f2df2)\nerror: 1 target failed:\n    `-p a --lib`\n";
-
-    /// agy a1b1 #2 (first half): a child cargo's `Running …` line inside a test's captured
-    /// stdout. Only the STDERR scan's binary list is aligned, so the stdout entry it adds changes
-    /// no qualifier.
-    #[test]
-    fn child_cargo_line_in_captured_stdout_changes_no_qualifier_1060() {
-        let head = adj_text(&[
-            "running 1 test",
-            "test t ... FAILED",
-            "",
-            "failures:",
-            "",
-            "---- t stdout ----",
-            "child stderr:",
-            "     Running unittests src/lib.rs (target/debug/deps/child-1)",
-            "error: test failed, to rerun pass `-p child --lib`",
-            "",
-            "thread 't' panicked at a/src/lib.rs:1:1:",
-            "boom",
-            "",
-            "failures:",
-            "    t",
-            "",
-            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-            "",
-            "running 1 test",
-            "test u ... ok",
-            "",
-            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
-        ]);
-        let scan = scan_of(&head);
-        let (ids, _, _, _) = qualify(scan, scan_of(ADJ_TWO_LIBS_ERR));
-        assert_eq!(ids, vec!["test t [-p a --lib]".to_string()]);
-    }
-
-    /// agy a1b1 #2 (second half): a bare `failures:` line inside captured stdout ends the
-    /// section early. What follows in that test's output then reads as top-level text: a child's
-    /// selector there is an anomaly (every id becomes `[?]`, never matched), a child's
-    /// `test x ... FAILED` is set aside (libtest prints its own before `failures:`), and a lost
-    /// launcher signature only withholds `env_cannot_run`. Fail-closed either way.
-    #[test]
-    fn bare_failures_line_in_captured_stdout_fails_closed_1060() {
-        let body = |selector: bool| {
-            let mut v = vec![
-                "running 2 tests",
-                "test t ... FAILED",
-                "test u ... FAILED",
-                "",
-                "failures:",
-                "",
-                "---- t stdout ----",
-                "expected libtest output:",
-                "failures:",
-                "    inner",
-                "test inner ... FAILED",
-                "sandbox-exec: sandbox_apply: Operation not permitted",
-            ];
-            if selector {
-                v.push("error: test failed, to rerun pass `-p child --lib`");
-            }
-            v.extend([
-                "",
-                "---- u stdout ----",
-                "boom",
-                "",
-                "failures:",
-                "    t",
-                "    u",
-                "",
-                "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out",
-            ]);
-            adj_text(&v)
+        // Bounded: past MAX_SCAN_ENTRIES targets the list overflows (the check is not split).
+        let mut big = LineScan {
+            collect_targets: true,
+            ..LineScan::default()
         };
-        let err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n\
-            error: test failed, to rerun pass `-p a --lib`\n";
-        let base = adj_text(&[
-            "running 2 tests",
-            "test t ... ok",
-            "test u ... FAILED",
-            "",
-            "failures:",
-            "    u",
-            "",
-            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-        ]);
-        for selector in [false, true] {
-            let run = adj_head(&body(selector), err, &base, err);
-            assert_eq!(
-                run.classification.as_deref(),
-                Some(REGRESSION),
-                "{selector}"
-            );
-            assert!(
-                run.regressions.iter().any(|r| r.starts_with("test t ")),
-                "{selector}: {:?}",
-                run.regressions
-            );
-            assert!(run.denies());
+        for i in 0..MAX_SCAN_ENTRIES + 3 {
+            big.line(&line("b", "test", &format!("t{i}"), false, true));
         }
+        assert_eq!(big.artifacts.len(), MAX_SCAN_ENTRIES);
+        assert!(big.artifacts_overflow);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// agy a1b1 #3: a FAILING child whose captured output prints a stray `0 failed` result line
-    /// closes the child early (no `failed == names` check), and the child's own result then
-    /// closes the outer binary. Whatever the outer binary prints next is an anomaly: every id is
-    /// `[?]` and stays a regression.
+    /// codex round 12: the creator's test writes libtest framing to raw stdout (`failures:`,
+    /// `---- fake stdout ----`, `running 2 tests`) and an exit callback prints a forged closing
+    /// summary that lines up. In one target's output every FAILED line counts: `new` is a
+    /// regression.
     #[test]
-    fn child_closed_early_by_a_stray_ok_line_fails_closed_1060() {
-        let head = adj_text(&[
-            "running 1 test",
-            "test t ... FAILED",
-            "",
-            "failures:",
-            "",
-            "---- t stdout ----",
-            "child output:",
-            "running 1 test",
-            "test t ... FAILED",
-            "",
-            "failures:",
-            "",
-            "---- t stdout ----",
-            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
-            "",
-            "failures:",
-            "    t",
-            "",
-            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-            "",
-            "thread 't' panicked at a/src/lib.rs:1:1:",
-            "child failed",
-            "",
-            "failures:",
-            "    t",
-            "",
-            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-        ]);
-        let err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n\
-            error: test failed, to rerun pass `-p a --lib`\n";
-        let base = adj_text(&[
-            "running 1 test",
-            "test t ... ok",
-            "",
-            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
-        ]);
-        // The base fails a same-named test in ANOTHER binary only (b): head t must not match it.
-        let base = format!(
-            "{base}\n{}",
-            adj_text(&[
-                "running 1 test",
-                "test t ... FAILED",
-                "",
-                "failures:",
-                "    t",
-                "",
-                "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-            ])
-        );
-        let base_err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n     \
-            Running unittests src/lib.rs (target/debug/deps/b-2)\n\
-            error: test failed, to rerun pass `-p b --lib`\n";
-        let run = adj_head(&head, err, &base, base_err);
-        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-        assert!(run.denies());
-    }
-
-    /// agy a1b1 #4 and #5, and agy a1b2 #2: a child run that never closes (its captured
-    /// `test foo ... FAILED` spoils its own listing), or a passing binary whose own result line
-    /// a child run consumes, or a binary whose own result line does not add up, leaves the
-    /// structure unresolved and SWALLOWS the next binary as captured output. With cargo's
-    /// identity on stderr the swallowed failure is reported `[?]` (a regression); with no target
-    /// identity at all (stderr not captured) it is `[?]` too — it once stayed bare and matched a
-    /// same-named base failure in another binary.
-    #[test]
-    fn a_swallowed_binary_never_stays_bare_1060() {
-        // Binary a passes with --show-output; a1's output holds a child run cut off after its
-        // header, counting as many tests as a itself — the child "closes" on a's own result.
-        let head = adj_text(&[
-            "running 2 tests",
-            "test a1 ... ok",
-            "test a2 ... ok",
-            "",
-            "successes:",
-            "",
-            "---- a1 stdout ----",
-            "child: running 2 tests",
-            "test c1 ... ok",
-            "",
-            "",
-            "successes:",
-            "    a1",
-            "    a2",
-            "",
-            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
-            "",
-            "running 1 test",
-            "test shared ... FAILED",
-            "",
-            "failures:",
-            "",
-            "---- shared stdout ----",
-            "b boom",
-            "",
-            "failures:",
-            "    shared",
-            "",
-            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-        ]);
-        // Base: binary a fails `shared` and fail-fast stops there.
-        let base = adj_text(&[
-            "running 3 tests",
-            "test a1 ... ok",
-            "test a2 ... ok",
-            "test shared ... FAILED",
-            "",
-            "failures:",
-            "    shared",
-            "",
-            "test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-        ]);
-        // With cargo's stderr: the swallowed failure is `[?]`.
-        let err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n     \
-            Running unittests src/lib.rs (target/debug/deps/b-2)\n\
-            error: test failed, to rerun pass `-p b --lib`\n";
-        let base_err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n\
-            error: test failed, to rerun pass `-p a --lib`\n";
-        let run = adj_head(&head, err, &base, base_err);
-        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-        // Without it (`cargo test 2>/dev/null`, a wrapper): still never bare.
-        let run = adj_head(&head, "", &base, "");
-        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(run.regressions, vec!["test shared [?]"]);
-        assert!(run.denies());
-
-        // a1b1 #5: a binary whose own result line does not add up (2 tests announced, 3
-        // counted) while its captured output is open swallows the next binary the same way.
-        let head = adj_text(&[
-            "running 2 tests",
-            "test a1 ... ok",
-            "test a2 ... ok",
-            "",
-            "successes:",
-            "    a1",
-            "    a2",
-            "",
-            "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
-            "",
-            "running 1 test",
-            "test shared ... FAILED",
-            "",
-            "failures:",
-            "    shared",
-            "",
-            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-        ]);
-        for (e, b) in [(err, base_err), ("", "")] {
-            let run = adj_head(&head, e, &base, b);
-            assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-            assert!(run.denies());
-        }
-    }
-
-    /// agy a1b2 #2: libtest routed to stderr (`./a 1>&2; ./b 1>&2`, no cargo) prints several
-    /// blocks on the stream the alignment does not count: its ids are `[?]`, never matched.
-    #[test]
-    fn blocks_on_stderr_count_as_binaries_1060() {
-        let pass_a = adj_text(&[
-            "running 1 test",
-            "test a1 ... ok",
-            "",
-            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
-        ]);
-        let fail = |name: &str| {
-            adj_text(&[
-                "running 1 test",
-                &format!("test {name} ... FAILED"),
-                "",
-                "failures:",
-                &format!("    {name}"),
-                "",
-                "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-            ])
-        };
-        // Head: a passes, b newly fails `shared`; base: a fails `shared` (the run stops).
-        let head_err = format!("{pass_a}\n{}", fail("shared"));
-        let run = adj_head("", &head_err, "", &fail("shared"));
-        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-        assert!(run.denies());
-    }
-
-    /// codex on #1060 (round 8): a wrapper that prints only the FAILING suites shows one block
-    /// per tree and no cargo line — no proof that both trees ran the same binary. `shared`
-    /// failing in binary b on the head and in binary a on the base never meet.
-    #[test]
-    fn a_wrapper_showing_only_failing_suites_is_no_identity_1060() {
-        let fail = |name: &str, panicked_at: &str| {
-            adj_text(&[
-                "running 3 tests",
-                &format!("test {name} ... FAILED"),
-                "test other1 ... ok",
-                "test other2 ... ok",
-                "",
-                "failures:",
-                "",
-                &format!("---- {name} stdout ----"),
-                &format!("thread '{name}' panicked at {panicked_at}:"),
-                "boom",
-                "",
-                "failures:",
-                &format!("    {name}"),
-                "",
-                "test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-            ])
-        };
-        let run = adj_head(
-            &fail("shared", "b/src/lib.rs:1:1"),
-            "",
-            &fail("shared", "a/src/lib.rs:1:1"),
-            "",
-        );
-        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(run.regressions, vec!["test shared [?]"]);
-        assert_eq!(run.ambiguous, vec!["test shared [?]"], "the reason is said");
-        assert!(run.denies());
-    }
-
-    /// agy on #1060 (round 8): an outer binary left open before its captured output (cut off
-    /// after its `test x ... FAILED` line) with no cargo identity: `[?]`, never matched.
-    #[test]
-    fn an_unclosed_outer_binary_never_matches_1060() {
-        let head = adj_text(&["running 2 tests", "test shared ... FAILED"]);
-        let scan = scan_of(&head);
-        assert!(scan.open && !scan.capture);
-        let base = adj_text(&[
-            "running 1 test",
-            "test shared ... FAILED",
-            "",
-            "failures:",
-            "    shared",
-            "",
-            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-        ]);
-        let run = adj_head(&head, "", &base, "");
-        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(run.regressions, vec!["test shared [?]"]);
-        assert!(run.denies());
-    }
-
-    /// codex on #1060 (round 9): crafted output cannot grow the scan without bound. A run nested
-    /// deeper than [`MAX_NESTED_DEPTH`], more blocks / cargo binaries / failing names than
-    /// [`MAX_SCAN_ENTRIES`]: the lists stop at their caps and the structure is an anomaly, so the
-    /// failure is `[?]` and stays a regression against a base that fails it qualified.
-    #[test]
-    fn oversized_or_deeply_nested_output_is_bounded_and_fails_closed_1060() {
-        let base_out = adj_text(&[
-            "running 1 test",
-            "test shared ... FAILED",
-            "",
-            "failures:",
-            "    shared",
-            "",
-            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-        ]);
-        let one_err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n\
-            error: test failed, to rerun pass `-p a --lib`\n";
-        let regression = |out: &str, err: &str| {
-            let run = adj_head(out, err, &base_out, one_err);
-            assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-            assert!(
-                run.regressions
-                    .iter()
-                    .all(|r| r.ends_with(" [?]") || r == FAILURE_IDS_TRUNCATED),
-                "{:?}",
-                run.regressions
-            );
-            assert!(run.denies());
-        };
-
-        // (1) 100 runs nested inside the failing test's captured output.
-        let mut v = vec![
-            "running 1 test".to_string(),
-            "test shared ... FAILED".to_string(),
-            String::new(),
-            "failures:".to_string(),
-            String::new(),
-            "---- shared stdout ----".to_string(),
-        ];
-        v.extend((0..100).map(|_| "running 1 test".to_string()));
-        v.extend([
-            String::new(),
-            "failures:".to_string(),
-            "    shared".to_string(),
-            String::new(),
-            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out"
-                .to_string(),
-        ]);
-        let deep = v.join("\n");
-        let scan = scan_of(&deep);
-        assert!(scan.nested.len() <= MAX_NESTED_DEPTH && scan.anomaly);
-        regression(&deep, one_err);
-
-        // (2) More blocks than the cap, the failing one last.
-        let mut out = "running 0 tests\n\ntest result: ok. 0 passed; 0 failed\n\n"
-            .repeat(MAX_SCAN_ENTRIES + 5);
-        out.push_str(&base_out);
-        let scan = scan_of(&out);
-        assert_eq!(scan.blocks.len(), MAX_SCAN_ENTRIES);
-        assert_eq!(scan.footers.len(), MAX_SCAN_ENTRIES);
-        assert!(scan.anomaly);
-        regression(&out, one_err);
-
-        // (3) More cargo binaries than the cap.
-        let err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n"
-            .repeat(MAX_SCAN_ENTRIES + 5)
-            + "error: test failed, to rerun pass `-p a --lib`\n";
-        let scan = scan_of(&err);
-        assert_eq!(scan.binaries.len(), MAX_SCAN_ENTRIES);
-        assert_eq!(scan.doc.len(), MAX_SCAN_ENTRIES);
-        assert!(scan.anomaly);
-        regression(&base_out, &err);
-
-        // (4) More failing names in one binary (and in its listing) than the cap.
-        let n = MAX_SCAN_ENTRIES + 5;
-        let mut out = format!("running {n} tests\n");
-        for i in 0..n {
-            out.push_str(&format!("test t{i} ... FAILED\n"));
-        }
-        out.push_str("test shared ... FAILED\n\nfailures:\n");
-        for i in 0..n {
-            out.push_str(&format!("    t{i}\n"));
-        }
-        out.push_str(&format!(
-            "    shared\n\ntest result: FAILED. 0 passed; {} failed\n",
-            n + 1
-        ));
-        let scan = scan_of(&out);
-        assert_eq!(scan.block_names.len(), MAX_SCAN_ENTRIES);
-        assert!(scan.ids.len() <= MAX_FAILURE_IDS);
-        assert!(scan.anomaly);
-        regression(&out, one_err);
-    }
-
-    /// codex on #1060 (round 9): past [`MAX_FAILURE_IDS`] the dropped ids could hide the head's
-    /// one new failure behind a base that shares every kept one — the check carries
-    /// [`FAILURE_IDS_TRUNCATED`], which nothing matches (not even the base's own marker).
-    #[test]
-    fn failure_ids_past_the_cap_never_read_as_pre_existing_1060() {
-        let shared: String = (0..MAX_FAILURE_IDS)
-            .map(|i| format!("FAILED tests/t.py::test_{i} - red\n"))
-            .collect();
-        let head = format!("{shared}FAILED tests/t.py::test_new - red\n");
-        let base = format!("{shared}FAILED tests/t.py::test_other - red\n");
-        let (ids, _, _, _) = qualify(scan_of(&head), LineScan::default());
-        assert_eq!(ids.len(), MAX_FAILURE_IDS + 1);
-        assert_eq!(ids.last().map(String::as_str), Some(FAILURE_IDS_TRUNCATED));
-        let run = adj_head(&head, "", &base, "");
-        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(run.regressions, vec![FAILURE_IDS_TRUNCATED]);
-        assert!(run.denies());
-    }
-
-    /// (#1060 round 10) A raw `---- x stdout ----` line while a binary is still printing its
-    /// results (before `failures:`) is an anomaly, not a section: the `test y ... FAILED` after it
-    /// is still read — never dropped — and, with the structure failed closed, is `[?]`.
-    #[test]
-    fn a_section_header_before_failures_drops_no_failure_1060() {
-        let head = adj_text(&[
-            "running 2 tests",
-            "test a ... ok",
-            "---- x stdout ----",
-            "test y ... FAILED",
-            "",
-            "failures:",
-            "    y",
-            "",
-            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-        ]);
-        let scan = scan_of(&head);
-        assert!(scan.anomaly && scan.section.is_none());
-        let err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n\
-            error: test failed, to rerun pass `-p a --lib`\n";
-        assert_eq!(
-            qualify(scan_of(&head), scan_of(err)).0,
-            vec!["test y [?]".to_string()]
-        );
-        // The base fails y qualified in the same binary: still a regression (unattributed).
-        let base = adj_text(&[
-            "running 2 tests",
-            "test a ... ok",
-            "test y ... FAILED",
-            "",
-            "failures:",
-            "    y",
-            "",
-            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-        ]);
-        let run = adj_head(&head, err, &base, err);
-        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(run.regressions, vec!["test y [?]"]);
-        assert!(run.denies());
-    }
-
-    /// agy on #1060 (round 10): the creator controls the test code, so a test can print libtest
-    /// framing to raw stdout — `failures:` then `---- x stdout ----` while its binary is still
-    /// running. The real `test y ... FAILED` after them must never be dropped: it is set aside
-    /// and, with the binary's own result line not adding up (1 failed, 0 read), the structure
-    /// fails closed and reports it `[?]`. In a check that also prints a pre-existing non-libtest
-    /// failure, a dropped `y` left only that shared id: a regression read as pre-existing.
-    #[test]
-    fn raw_libtest_framing_from_a_test_drops_no_failure_1060() {
-        let head = adj_text(&[
-            "running 2 tests",
-            "test a ... ok",
-            "failures:",
-            "---- x stdout ----",
-            "test y ... FAILED",
-            "",
-            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-        ]);
-        let err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n\
-            error: test failed, to rerun pass `-p a --lib`\n";
-        assert_eq!(
-            qualify(scan_of(&head), scan_of(err)).0,
-            vec!["test y [?]".to_string()]
-        );
-        // (1) The base fails y in the same binary: a regression (unattributed), never matched.
-        let base = adj_text(&[
-            "running 2 tests",
-            "test a ... ok",
-            "test y ... FAILED",
-            "",
-            "failures:",
-            "    y",
-            "",
-            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-        ]);
-        let run = adj_head(&head, err, &base, err);
-        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(run.regressions, vec!["test y [?]"]);
-        // (2) A mixed check (pytest + cargo): the pytest failure is pre-existing, y is new.
-        let old = "FAILED tests/t.py::test_old - red\n";
-        let base_ok = adj_text(&[
-            "running 2 tests",
-            "test a ... ok",
-            "test y ... ok",
-            "",
-            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
-        ]);
-        let base_err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n";
-        let run = adj_head(
-            &format!("{old}{head}"),
-            err,
-            &format!("{old}{base_ok}"),
-            base_err,
-        );
-        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(run.regressions, vec!["test y [?]"]);
-        assert!(run.denies());
-    }
-
-    /// (#1060 round 12) Failures set aside in captured output are reported `[?]` even when the
-    /// structure lines up, and their overflow carries the truncation marker: no alignment, however
-    /// clean, deletes one (the accepted cost: a pre-existing test whose captured output carries a
-    /// child's failures denies — the operator's floor override covers it).
-    #[test]
-    fn set_aside_failures_are_reported_even_in_a_verified_run_1060() {
-        let mut out =
-            String::from("running 1 test\ntest t ... FAILED\n\nfailures:\n\n---- t stdout ----\n");
-        for i in 0..MAX_FAILURE_IDS + 5 {
-            out.push_str(&format!("test child{i} ... FAILED\n"));
-        }
-        out.push_str(
-            "\nfailures:\n    t\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; \
-             0 filtered out\n",
-        );
-        let err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n\
-            error: test failed, to rerun pass `-p a --lib`\n";
-        let scan = scan_of(&out);
-        assert!(scan.truncated && !scan.anomaly);
-        let ids = qualify(scan, scan_of(err)).0;
-        assert_eq!(ids.first().map(String::as_str), Some("test t [-p a --lib]"));
-        assert_eq!(ids.last().map(String::as_str), Some(FAILURE_IDS_TRUNCATED));
-        assert!(ids[1..ids.len() - 1].iter().all(|i| i.ends_with(" [?]")));
-    }
-
-    /// codex on #1060 (round 12, reproduced with real `cargo test`): the creator's test `new`
-    /// writes libtest framing straight to stdout (`test old ... FAILED`, `failures:`,
-    /// `---- fake stdout ----`, `running 2 tests`) and panics; an exit callback prints a forged
-    /// closing summary whose counts and listing match. Every frame lines up, so a "verified"
-    /// structure once dropped the set-aside real `test new ... FAILED` and the check read as
-    /// pre-existing. Set-aside ids are always reported, `[?]`: text alignment never deletes one.
-    #[test]
-    fn forged_framing_with_a_matching_summary_drops_no_failure_1060() {
-        let head = adj_text(&[
-            "",
+    fn forged_stdout_framing_cannot_drop_a_failure_1063() {
+        let head_out = adj_text(&[
             "running 2 tests",
             "test old ... FAILED",
             "failures:",
@@ -12185,100 +11098,230 @@ error: 2 targets failed:
             "test old ... FAILED",
             "",
             "failures:",
-            "",
-            "---- new stdout ----",
-            "",
-            "thread 'new' panicked at src/lib.rs:9:5:",
-            "n",
-            "",
-            "---- old stdout ----",
-            "",
-            "thread 'old' panicked at src/lib.rs:5:78:",
-            "pre-existing",
-            "",
-            "",
-            "failures:",
             "    new",
             "    old",
             "",
-            "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; \
-             finished in 0.05s",
-            "",
+            "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out",
             "",
             "failures:",
             "    old",
             "",
             "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured",
         ]);
-        let base = adj_text(&[
+        let base_out = adj_text(&[
             "running 2 tests",
             "test new ... ok",
             "test old ... FAILED",
             "",
-            "failures:",
-            "    old",
-            "",
             "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
         ]);
-        let err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n\
-            error: test failed, to rerun pass `--lib`\n";
-        let run = adj_head(&head, err, &base, err);
-        assert!(
-            run.failure_ids.iter().any(|i| i == "test new [?]"),
-            "{:?}",
-            run.failure_ids
+        let t = [("a", "--lib")];
+        let run = split_head(
+            split_run(&t, &[("-p a --lib", Some(101), &head_out, "")]),
+            split_run(&t, &[("-p a --lib", Some(101), &base_out, "")]),
         );
         assert_eq!(run.classification.as_deref(), Some(REGRESSION));
-        assert!(run.regressions.iter().any(|r| r == "test new [?]"));
+        assert_eq!(run.regressions, vec!["test new [-p a --lib]"]);
+        assert_eq!(run.pre_existing, vec!["test old [-p a --lib]"]);
         assert!(run.denies());
     }
 
-    /// agy a1b2 #1: a LAST binary that crashed after printing a failure (real cargo: the block
-    /// stays open on stdout, cargo prints the selector and `signal: 6`). The open block's
-    /// verdict is never `failed`, so a selector for it breaks the walk, and with no selector its
-    /// cargo entry carries no target — either way the id is `[?]`. Rust 2024's doctest pair cut
-    /// off in its standalone run leaves one block no cargo line owns.
+    /// codex round 13: the creator's test in `b` writes a forged cargo selector for `a` and a
+    /// section header to raw STDERR. The qualifier is the target the floor ran, so `shared`
+    /// failing in `b` never meets the base's `shared` failing in `a`.
     #[test]
-    fn a_crashed_last_binary_is_unknown_1060() {
-        let passing = adj_text(&[
-            "running 2 tests",
-            "test t::fine ... ok",
-            "test t::shared ... ok",
-            "",
-            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
-            "",
-        ]);
-        let head = format!(
-            "{passing}{}",
-            adj_text(&["running 2 tests", "test t::bad ... FAILED"])
+    fn a_forged_cargo_selector_cannot_move_a_failure_1063() {
+        let t = [("a", "--lib"), ("b", "--lib")];
+        let fail = "running 1 test\ntest shared ... FAILED\n\nfailures:\n    shared\n\n\
+            test result: FAILED. 0 passed; 1 failed\n";
+        let pass = "running 1 test\ntest shared ... ok\n\ntest result: ok. 1 passed; 0 failed\n";
+        let forged = "error: test failed, to rerun pass `-p a --lib`\n---- fake stdout ----\n\
+            test result: FAILED. 0 passed; 99 failed\n";
+        let run = split_head(
+            split_run(
+                &t,
+                &[
+                    ("-p a --lib", Some(0), pass, ""),
+                    ("-p b --lib", Some(101), fail, forged),
+                ],
+            ),
+            split_run(
+                &t,
+                &[
+                    ("-p a --lib", Some(101), fail, ""),
+                    ("-p b --lib", Some(0), pass, ""),
+                ],
+            ),
         );
-        let running =
-            "     Running unittests src/lib.rs (target/debug/deps/a-e9fdb13badb08122)\n     \
-            Running unittests src/lib.rs (target/debug/deps/c-a7e017f12a8667bb)\n";
-        let with_sel = format!(
-            "{running}error: test failed, to rerun pass `-p c --lib`\n\nCaused by:\n  process \
-             didn't exit successfully: `target/debug/deps/c-a7e017f12a8667bb` (signal: 6, \
-             SIGABRT: process abort signal)\n"
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(run.regressions, vec!["test shared [-p b --lib]"]);
+        assert!(run.pre_existing.is_empty() && run.denies());
+    }
+
+    /// agy round 13: consecutive `Doc-tests` targets, the first printing no merged-doctest footer
+    /// and the second one: each doc-test run is its own process, so a failure in `crate_b`'s doc
+    /// tests is never `crate_a`'s, whatever the footers say.
+    #[test]
+    fn doc_tests_of_two_crates_never_share_a_qualifier_1063() {
+        let t = [
+            ("crate_a", "--lib"),
+            ("crate_b", "--lib"),
+            ("crate_a", "--doc"),
+            ("crate_b", "--doc"),
+        ];
+        let ok = "running 0 tests\n\ntest result: ok. 0 passed; 0 failed\n";
+        let doc_fail = "running 1 test\ntest src/lib.rs - f (line 1) ... FAILED\n\nfailures:\n    \
+            src/lib.rs - f (line 1)\n\ntest result: FAILED. 0 passed; 1 failed\n\n\
+            all doctests ran in 0.4s; merged doctests compilation took 0.3s\n";
+        let doc_ok = "running 1 test\ntest src/lib.rs - f (line 1) ... ok\n\n\
+            test result: ok. 1 passed; 0 failed\n\nall doctests ran in 0.4s\n";
+        let run = split_head(
+            split_run(
+                &t,
+                &[
+                    ("-p crate_a --lib", Some(0), ok, ""),
+                    ("-p crate_b --lib", Some(0), ok, ""),
+                    ("-p crate_a --doc", Some(0), ok, ""),
+                    ("-p crate_b --doc", Some(101), doc_fail, ""),
+                ],
+            ),
+            split_run(
+                &t,
+                &[
+                    ("-p crate_a --lib", Some(0), ok, ""),
+                    ("-p crate_b --lib", Some(0), ok, ""),
+                    ("-p crate_a --doc", Some(101), doc_fail, ""),
+                    ("-p crate_b --doc", Some(0), doc_ok, ""),
+                ],
+            ),
         );
-        for err in [with_sel.as_str(), running] {
-            let (ids, _, _, _) = qualify(scan_of(&head), scan_of(err));
-            assert_eq!(ids, vec!["test t::bad [?]".to_string()], "{err}");
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(
+            run.regressions,
+            vec!["test src/lib.rs - f (line 1) [-p crate_b --doc]"]
+        );
+        assert!(run.denies());
+    }
+
+    /// A target that fails without naming a test (a harness of its own, a compile-time panic) or
+    /// dies other than libtest's 101 (a crash, a signal) carries `[<target>] exited <how>`: the
+    /// base's same exit matches it, a new one is a regression, and it is never re-run alone. A
+    /// launcher signature in a target's output makes its failures env candidates.
+    #[test]
+    fn a_target_that_dies_is_its_own_failure_1063() {
+        let t = [("b", "--test harness"), ("c", "--lib")];
+        let crash = "running 2 tests\ntest t::bad ... FAILED\n";
+        let run = split_run(
+            &t,
+            &[
+                (
+                    "-p b --test harness",
+                    Some(1),
+                    "custom harness: 1 failure\n",
+                    "",
+                ),
+                ("-p c --lib", None, crash, ""),
+            ],
+        );
+        assert_eq!(
+            run.failure_ids,
+            vec![
+                "[-p b --test harness] exited with code 1",
+                "test t::bad [-p c --lib]",
+                "[-p c --lib] exited by a signal",
+            ]
+        );
+        assert!(!run.passed());
+        let base = split_run(
+            &t,
+            &[
+                (
+                    "-p b --test harness",
+                    Some(1),
+                    "custom harness: 1 failure\n",
+                    "",
+                ),
+                ("-p c --lib", Some(101), "test t::bad ... FAILED\n", ""),
+            ],
+        );
+        let head = split_head(run, base);
+        assert_eq!(head.regressions, vec!["[-p c --lib] exited by a signal"]);
+        assert!(
+            isolated_rerun_argv(&s(&["cargo", "test"]), "[-p c --lib] exited by a signal")
+                .is_none()
+        );
+        // Env: the launcher signature marks THAT target's failures, on both trees.
+        let t = [("c", "--lib")];
+        let jailed = "test sb ... FAILED\nsandbox-exec: sandbox_apply: Operation not permitted\n";
+        let env_run = || split_run(&t, &[("-p c --lib", Some(101), jailed, "")]);
+        assert_eq!(env_run().env_cannot_run, vec!["test sb [-p c --lib]"]);
+        let head = split_head(env_run(), env_run());
+        assert_eq!(head.classification.as_deref(), Some(ENV_CANNOT_RUN));
+    }
+
+    /// A cargo check the floor cannot split (a wrapper, explicit targets) runs as one process:
+    /// its libtest ids are `[?]`, never matched and never re-run alone — a wrapper that prints
+    /// only its failing suites (codex round 8) cannot pass a moved failure off as pre-existing.
+    /// Colored output reads as plain.
+    #[test]
+    fn an_unsplit_run_never_matches_a_libtest_id_1063() {
+        let colored = "\u{1b}[1mtest shared ... \u{1b}[31mFAILED\u{1b}[0m\n";
+        let (ids, _, _, _) = qualify(scan_of(colored), LineScan::default(), None);
+        assert_eq!(ids, vec!["test shared [?]"]);
+        assert_eq!(
+            strip_ansi("\u{1b}]8;;http://x\u{7}link\u{1b}]8;;\u{7} ok"),
+            "link ok"
+        );
+        let mut head = failed_run(&["test shared [?]"], &[]);
+        classify(&mut head, base_of(failed_run(&["test shared [?]"], &[])));
+        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(head.ambiguous, vec!["test shared [?]"]);
+        assert!(head.denies());
+        let mut head = failed_run(&["test shared [-p b --lib]"], &[]);
+        classify(&mut head, base_of(failed_run(&["test shared [?]"], &[])));
+        assert_eq!(head.ambiguous, vec!["test shared [-p b --lib]"]);
+        assert!(
+            isolated_rerun_argv(&s(&["cargo", "test", "--workspace"]), "test shared [?]").is_none()
+        );
+    }
+
+    /// Past [`MAX_FAILURE_IDS`] the dropped ids could hide the head's one new failure behind a
+    /// base that shares every kept one: the check carries [`FAILURE_IDS_TRUNCATED`], which
+    /// nothing matches (not even the base's own marker) — one process or many.
+    #[test]
+    fn failure_ids_past_the_cap_never_read_as_pre_existing_1063() {
+        let shared: String = (0..MAX_FAILURE_IDS)
+            .map(|i| format!("FAILED tests/t.py::test_{i} - red\n"))
+            .collect();
+        let head = format!("{shared}FAILED tests/t.py::test_new - red\n");
+        let base = format!("{shared}FAILED tests/t.py::test_other - red\n");
+        let (ids, _, _, _) = qualify(scan_of(&head), LineScan::default(), None);
+        assert_eq!(ids.len(), MAX_FAILURE_IDS + 1);
+        assert_eq!(ids.last().map(String::as_str), Some(FAILURE_IDS_TRUNCATED));
+        let (b_ids, _, _, _) = qualify(scan_of(&base), LineScan::default(), None);
+        fn v(x: &[String]) -> Vec<&str> {
+            x.iter().map(String::as_str).collect()
         }
-        // Doc-tests: the merged block failed and closed, the standalone block crashed open.
-        let doc = adj_text(&[
-            "running 1 test",
-            "test b/src/lib.rs - ok (line 1) ... FAILED",
-            "",
-            "failures:",
-            "    b/src/lib.rs - ok (line 1)",
-            "",
-            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
-            "",
-            "running 2 tests",
-            "test b/src/lib.rs - ok2 (line 5) ... FAILED",
-        ]);
-        let doc_err = "   Doc-tests b\nerror: doctest failed, to rerun pass `-p b --doc`\n";
-        let (ids, _, _, _) = qualify(scan_of(&doc), scan_of(doc_err));
-        assert!(ids.iter().all(|i| i.ends_with(" [?]")), "{ids:?}");
+        let mut run = failed_run(&v(&ids), &[]);
+        classify(&mut run, base_of(failed_run(&v(&b_ids), &[])));
+        assert_eq!(run.regressions, vec![FAILURE_IDS_TRUNCATED]);
+        assert!(run.denies());
+        // Across targets: each one's cap, and the check's.
+        let t = [("a", "--lib"), ("b", "--lib")];
+        let many: String = (0..MAX_FAILURE_IDS)
+            .map(|i| format!("test t{i} ... FAILED\n"))
+            .collect();
+        let run = split_run(
+            &t,
+            &[
+                ("-p a --lib", Some(101), &many, ""),
+                ("-p b --lib", Some(101), "test late ... FAILED\n", ""),
+            ],
+        );
+        assert_eq!(run.failure_ids.len(), MAX_FAILURE_IDS + 1);
+        assert_eq!(
+            run.failure_ids.last().map(String::as_str),
+            Some(FAILURE_IDS_TRUNCATED)
+        );
     }
 }
