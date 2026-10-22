@@ -46,8 +46,10 @@ Two release tracks share this file, newest entry first regardless of track:
   ids alone cannot show which binary a bare id came from: it stays a regression, listed as `ambiguous`, and the
   denial says so rather than guessing. (2) The floor's macOS sandbox refused `/dev/ptmx`, so no PTY or
   tmux test could run on it. The repo-checks floor (only it, not workers or validators) may now open `/dev/ptmx`
-  and write to the `/dev/ttysN` slaves the kernel's `com.apple.sandbox.pty` extension marks as its own; no other
-  path, device or network rule changes, and the operator's terminals and `/dev/tty` stay unwritable. Linux bwrap
+  and write to the `/dev/ttysN` slaves the kernel's `com.apple.sandbox.pty` extension marks as its own. The jail
+  may not issue that extension class itself (file, generic, mach and iokit issuance are refused), so a check cannot
+  mint it for an outside terminal. No other path, device or network rule changes, and the operator's terminals and
+  `/dev/tty` stay unwritable. Linux bwrap
   already gave the jail a private devpts. A PTY refusal is still not `env_cannot_run` (only nested-sandbox launcher
   signatures are). (3) At most 2 head-only failures were re-run, and a loaded host produced 21-27. On an
   oversubscribed host each head-only failure is now re-run once, alone and serially, up to `MAX_FLAKE_RERUN` = 50
@@ -61,8 +63,10 @@ Two release tracks share this file, newest entry first regardless of track:
   `the_same_test_name_in_two_crates_stays_distinct`, `a_failure_that_passes_alone_is_flaky_and_does_not_block`,
   `a_failure_that_fails_again_alone_stays_a_regression`,
   `a_spent_rerun_budget_is_reported_and_the_rest_stay_regressions`,
-  `the_floor_profile_adds_only_its_own_pty_devices` and
-  `a_pty_opens_inside_the_floor_sandbox_and_no_existing_terminal_is_reachable`.
+  `the_floor_profile_adds_only_its_own_pty_devices`,
+  `a_pty_opens_inside_the_floor_sandbox_and_no_existing_terminal_is_reachable` and
+  `a_jailed_check_cannot_mint_a_pty_extension_for_an_outside_terminal` (fails without the issuance deny: the jail
+  issued itself all four extension kinds and wrote the outside terminal).
 - **A container seat's gate hook no longer refuses a call silently, and a killed gate hook is judged again.** In
   core#997's end-to-end run a claude seat's `cargo test` loop was refused with "the gate hook failed (exit 1): ;"
   and nothing else: no reason, no line in the daemon's log, no deny in the unit's decisions log. The host gate

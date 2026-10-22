@@ -461,7 +461,8 @@ enum NetworkPolicy {
 /// on macOS: `/dev/ptmx` (opening it ALLOCATES a new pair; it reaches no existing terminal) and a
 /// `/dev/ttysN` slave only with the `com.apple.sandbox.pty` extension, which the kernel issues to
 /// the process that allocated that pair — the operator's own terminals stay unwritable, and
-/// `/dev/tty` stays denied. No path, no other device and no network rule changes. Linux bwrap's
+/// `/dev/tty` stays denied. The jail may not issue that extension class itself (file, generic,
+/// mach or iokit issuance are all refused), so the kernel's grant is the only source of it. No path, no other device and no network rule changes. Linux bwrap's
 /// `--dev /dev` already mounts a PRIVATE devpts instance (the host's ptys are not in it), so
 /// the policy changes nothing there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -627,6 +628,14 @@ fn macos_sandbox_profile_for_roots(
         p.push_str(
             "(allow file-write-data (require-all (regex #\"^/dev/ttys[0-9]+$\") \
              (extension \"com.apple.sandbox.pty\")))\n",
+        );
+        // (codex on #1060, P1) `(allow default)` lets a process ISSUE itself extensions: a
+        // file or a generic one of this class for an outside terminal satisfies the rule above.
+        // Every issuance of the class is refused, so only the kernel's own grant at allocation
+        // carries it.
+        p.push_str(
+            "(deny file-issue-extension generic-issue-extension mach-issue-extension \
+             iokit-issue-extension (extension-class \"com.apple.sandbox.pty\"))\n",
         );
     }
     Some(p)
@@ -6102,8 +6111,9 @@ mod worker_sandbox_tests {
     use super::*;
 
     /// The repo-checks floor's profile is the worker's plus exactly two write rules — `/dev/ptmx`
-    /// and the slaves carrying the kernel's per-allocation pty extension — appended at the end:
-    /// no other path, device or network rule differs.
+    /// and the slaves carrying the kernel's per-allocation pty extension — and one DENY (no
+    /// process may issue itself that extension), appended at the end: no other path, device or
+    /// network rule differs.
     #[test]
     fn the_floor_profile_adds_only_its_own_pty_devices() {
         let root = std::env::temp_dir().join(format!("wicked-floor-pty-{}", std::process::id()));
@@ -6124,7 +6134,9 @@ mod worker_sandbox_tests {
         assert_eq!(
             &floor[worker.len()..],
             "(allow file-write-data (literal \"/dev/ptmx\"))\n(allow file-write-data \
-             (require-all (regex #\"^/dev/ttys[0-9]+$\") (extension \"com.apple.sandbox.pty\")))\n"
+             (require-all (regex #\"^/dev/ttys[0-9]+$\") (extension \"com.apple.sandbox.pty\")))\n\
+             (deny file-issue-extension generic-issue-extension mach-issue-extension \
+             iokit-issue-extension (extension-class \"com.apple.sandbox.pty\"))\n"
         );
         assert!(!worker.contains("ptmx") && !worker.contains("ttys"));
         let _ = std::fs::remove_dir_all(root);
@@ -6133,15 +6145,190 @@ mod worker_sandbox_tests {
     /// Run `argv` inside `sandbox`'s wrapper in `dir`, stdin closed.
     #[cfg(target_os = "macos")]
     fn jailed(sandbox: &WorkerSandbox, dir: &Path, argv: &[&str]) -> std::process::Output {
+        jailed_with(sandbox, dir, argv, &[])
+    }
+
+    /// [`jailed`] with extra environment for the jailed child.
+    #[cfg(target_os = "macos")]
+    fn jailed_with(
+        sandbox: &WorkerSandbox,
+        dir: &Path,
+        argv: &[&str],
+        env: &[(&str, &str)],
+    ) -> std::process::Output {
         // spawn-audit: hardened — the jail under test around a fixed probe command.
         std::process::Command::new(&sandbox.wrapper[0])
             .hardened()
             .args(&sandbox.wrapper[1..])
             .args(argv)
+            .envs(env.iter().copied())
             .current_dir(dir)
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap()
+    }
+
+    /// A pty allocated by THIS process, outside any jail, standing in for an operator's terminal:
+    /// (master, slave, slave path). CLOCAL is set so an open of the slave does not wait for
+    /// carrier (without it a blocking open can sit in the tty driver for minutes before any
+    /// permission answer comes back).
+    #[cfg(target_os = "macos")]
+    fn outside_pty() -> (i32, i32, String) {
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: openpty writes two fds into the out-params; the null name/termios/winsize are
+        // documented as "not wanted". `slave` is then an open tty fd, `tio` plain data
+        // tcgetattr fills, and ttyname returns a static NUL-terminated name.
+        unsafe {
+            assert_eq!(
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                0,
+                "openpty outside the jail"
+            );
+            let mut tio: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave, &mut tio), 0);
+            tio.c_cflag |= libc::CLOCAL;
+            assert_eq!(libc::tcsetattr(slave, libc::TCSANOW, &tio), 0);
+            let name = std::ffi::CStr::from_ptr(libc::ttyname(slave))
+                .to_string_lossy()
+                .into_owned();
+            (master, slave, name)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    extern "C" {
+        fn sandbox_extension_issue_file(
+            class: *const libc::c_char,
+            path: *const libc::c_char,
+            flags: u32,
+        ) -> *mut libc::c_char;
+        fn sandbox_extension_issue_generic(
+            class: *const libc::c_char,
+            flags: u32,
+        ) -> *mut libc::c_char;
+        fn sandbox_extension_issue_mach(
+            class: *const libc::c_char,
+            name: *const libc::c_char,
+            flags: u32,
+        ) -> *mut libc::c_char;
+        fn sandbox_extension_issue_iokit_registry_entry_class(
+            class: *const libc::c_char,
+            name: *const libc::c_char,
+            flags: u32,
+        ) -> *mut libc::c_char;
+        fn sandbox_extension_consume(token: *const libc::c_char) -> i64;
+    }
+
+    /// NOT a test on its own: the jailed half of
+    /// [`a_jailed_check_cannot_mint_a_pty_extension_for_an_outside_terminal`], run by it inside
+    /// the floor's jail. Does nothing unless `WICKED_PTY_ATTACK_TARGET` names a terminal. Tries
+    /// every way to issue itself the `com.apple.sandbox.pty` extension (codex on #1060: `(allow
+    /// default)` permits issuing it, and a generic one satisfies the path filter), consumes what it
+    /// gets, then tries to open the outside terminal for writing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pty_extension_attack_child() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let Some(target) = std::env::var_os("WICKED_PTY_ATTACK_TARGET") else {
+            return;
+        };
+        let class = c"com.apple.sandbox.pty";
+        let path = std::ffi::CString::new(target.as_bytes()).unwrap();
+        let mut issued: Vec<&str> = Vec::new();
+        // SAFETY: NUL-terminated inputs; a returned token is a malloc'd NUL-terminated string
+        // handed straight to consume (leaked: this process exits right after).
+        unsafe {
+            let tokens = [
+                (
+                    "file",
+                    sandbox_extension_issue_file(class.as_ptr(), path.as_ptr(), 0),
+                ),
+                (
+                    "generic",
+                    sandbox_extension_issue_generic(class.as_ptr(), 0),
+                ),
+                (
+                    "mach",
+                    sandbox_extension_issue_mach(
+                        class.as_ptr(),
+                        c"com.apple.system.logger".as_ptr(),
+                        0,
+                    ),
+                ),
+                (
+                    "iokit",
+                    sandbox_extension_issue_iokit_registry_entry_class(
+                        class.as_ptr(),
+                        c"IOService".as_ptr(),
+                        0,
+                    ),
+                ),
+            ];
+            for (how, token) in tokens {
+                if !token.is_null() {
+                    issued.push(how);
+                    sandbox_extension_consume(token);
+                }
+            }
+        }
+        let wrote = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+            .open(&target)
+            .is_ok();
+        println!(
+            "ATTACK issued={issued:?} result={}",
+            if wrote { "WROTE" } else { "REFUSED" }
+        );
+    }
+
+    /// (codex on #1060, P1) A check inside the floor's jail cannot issue ITSELF the pty extension
+    /// for a terminal that exists outside it: every issuance of that class is refused, so the
+    /// slave rule's extension predicate still means "a pair this jail allocated".
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_jailed_check_cannot_mint_a_pty_extension_for_an_outside_terminal() {
+        let dir = std::env::temp_dir().join(format!("wicked-floor-ptymint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let floor = detect_floor_sandbox(std::slice::from_ref(&dir));
+        if floor.level != SandboxLevel::Sandboxed || floor.wrapper.is_empty() {
+            eprintln!("no sandbox-exec here — the floor's PTY grant is not exercised");
+            return;
+        }
+        let (master, slave, name) = outside_pty();
+        let exe = std::env::current_exe().unwrap();
+        let out = jailed_with(
+            &floor,
+            &dir,
+            &[
+                exe.to_str().unwrap(),
+                "--exact",
+                "validator::worker_sandbox_tests::pty_extension_attack_child",
+                "--nocapture",
+                "--test-threads=1",
+            ],
+            &[("WICKED_PTY_ATTACK_TARGET", name.as_str())],
+        );
+        // SAFETY: both fds were opened by outside_pty and are closed once.
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("ATTACK issued=[] result=REFUSED"),
+            "a jailed check minted a pty extension or wrote {name}: {stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A PTY opens inside the repo-checks floor's sandbox (`script(1)` allocates one and runs
@@ -6173,32 +6360,7 @@ mod worker_sandbox_tests {
             "the worker's jail has no pty grant: {out:?}"
         );
 
-        let (mut master, mut slave) = (-1, -1);
-        // SAFETY: openpty writes two fds into the out-params; the null name/termios/winsize are
-        // documented as "not wanted".
-        let rc = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(rc, 0, "openpty outside the jail");
-        // CLOCAL: an open of the slave does not wait for carrier (without it a blocking open can
-        // sit in the tty driver for minutes before any permission answer comes back).
-        // SAFETY: `slave` is an open tty fd and `tio` a plain-data struct tcgetattr fills.
-        unsafe {
-            let mut tio: libc::termios = std::mem::zeroed();
-            assert_eq!(libc::tcgetattr(slave, &mut tio), 0);
-            tio.c_cflag |= libc::CLOCAL;
-            assert_eq!(libc::tcsetattr(slave, libc::TCSANOW, &tio), 0);
-        }
-        // SAFETY: `slave` is an open tty fd; ttyname returns a static NUL-terminated name.
-        let name = unsafe { std::ffi::CStr::from_ptr(libc::ttyname(slave)) }
-            .to_string_lossy()
-            .into_owned();
+        let (master, slave, name) = outside_pty();
         let write = ["/bin/sh", "-c", "printf x > \"$0\"", name.as_str()];
         let inside = jailed(&floor, &dir, &write);
         // spawn-audit: hardened — the unjailed control of the same write.
