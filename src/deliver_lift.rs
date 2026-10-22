@@ -2276,12 +2276,13 @@ mod tests {
     /// refuse the deliver (classified, not denying); a head-only failure is a `regression` and
     /// refuses with `passed: false` evidence; with a base known the repo's `test_targeted` is
     /// preferred, exactly as at verify. `.wicked/checks.json` only — `sh` is the runner, every
-    /// `tests/*.red` marker is a failing test (cargo-style id lines).
+    /// `tests/*.red` marker is a failing test (pytest-style id lines: a bare libtest id names no
+    /// binary and never matches the base, #1060).
     #[cfg(unix)]
     #[test]
     fn deliver_reverify_excuses_failures_the_tip_shares_and_refuses_regressions() {
         const CHECK: &str = "r=0; for f in tests/*.red; do [ -e \"$f\" ] || continue; \
-                             echo \"test $(basename \"$f\" .red) ... FAILED\"; r=1; done; exit $r";
+                             echo \"FAILED tests/t.py::$(basename \"$f\" .red) - red\"; r=1; done; exit $r";
         let config = serde_json::json!({
             "test": ["sh", "-c", CHECK],
             "test_targeted": ["sh", "-c", CHECK],
@@ -2327,7 +2328,7 @@ mod tests {
             c.name, "test_targeted",
             "with a base known the targeted set is preferred"
         );
-        assert_eq!(c.failure_ids, vec!["test shared".to_string()]);
+        assert_eq!(c.failure_ids, vec!["FAILED tests/t.py::shared".to_string()]);
         assert!(!c.denies(), "{c:?}");
         assert!(
             matches!(
@@ -2344,7 +2345,7 @@ mod tests {
         );
         assert_eq!(
             base.run.as_ref().map(|r| r.failure_ids.clone()),
-            Some(vec!["test shared".to_string()])
+            Some(vec!["FAILED tests/t.py::shared".to_string()])
         );
         assert_eq!(
             checks_evaluated(&events.borrow(), false),
@@ -2382,7 +2383,7 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_default();
-        assert_eq!(regressions, vec!["test new".to_string()]);
+        assert_eq!(regressions, vec!["FAILED tests/t.py::new".to_string()]);
     }
 
     /// DES-L2 2E, the SKIPPED-lift arm: with no remote there is no tip to measure against, so the
@@ -2393,7 +2394,7 @@ mod tests {
     #[test]
     fn a_skipped_lift_measures_the_reverify_against_the_run_base() {
         const CHECK: &str = "r=0; for f in tests/*.red; do [ -e \"$f\" ] || continue; \
-                             echo \"test $(basename \"$f\" .red) ... FAILED\"; r=1; done; exit $r";
+                             echo \"FAILED tests/t.py::$(basename \"$f\" .red) - red\"; r=1; done; exit $r";
         let layout = |tag: &str| {
             let base = scratch(tag);
             let repo = base.join("repo");

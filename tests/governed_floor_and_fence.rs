@@ -544,7 +544,7 @@ fn make_git_repo_with_a_red_test_on_the_base(name: &str) -> PathBuf {
     std::fs::create_dir_all(repo.join(".wicked")).unwrap();
     std::fs::write(
         repo.join(".wicked/checks.json"),
-        r#"{"test":["sh","-c","echo 'test shared ... FAILED'; exit 1"],"timeout_s":60}"#,
+        r#"{"test":["sh","-c","echo 'FAILED tests/t.py::shared - red'; exit 1"],"timeout_s":60}"#,
     )
     .unwrap();
     std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
@@ -714,7 +714,7 @@ fn deliver_reverify_runs_the_baseline_diff_floor_against_the_run_base_2e() {
     );
     let c = checks.first().expect("the repo's `test` ran at deliver");
     assert_eq!(c.name, "test");
-    assert_eq!(c.failure_ids, vec!["test shared".to_string()]);
+    assert_eq!(c.failure_ids, vec!["FAILED tests/t.py::shared".to_string()]);
     assert!(
         c.classification.is_some() && !c.denies(),
         "a failure the base shares is classified, never a bare failure: {c:?}"
@@ -729,7 +729,7 @@ fn deliver_reverify_runs_the_baseline_diff_floor_against_the_run_base_2e() {
     );
     assert_eq!(
         base.run.as_ref().map(|r| r.failure_ids.clone()),
-        Some(vec!["test shared".to_string()]),
+        Some(vec!["FAILED tests/t.py::shared".to_string()]),
         "the base run itself is on the record"
     );
     let env = env.expect("the env record rides a floor that ran");

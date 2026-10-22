@@ -258,8 +258,24 @@ pub const MAX_CONFIG_TIMEOUT_S: u64 = 4 * 60 * 60;
 pub const LOAD_FACTOR_CAP: f64 = 3.0;
 /// How much of each stream's TAIL is kept as evidence.
 pub const TAIL_BYTES: usize = 4096;
-/// The most failure identifiers the streaming scanner keeps per check.
+/// The most failure identifiers the streaming scanner keeps per check. Past it the check also
+/// carries [`FAILURE_IDS_TRUNCATED`], which nothing matches.
 pub const MAX_FAILURE_IDS: usize = 1000;
+/// The failure id that stands for every id past [`MAX_FAILURE_IDS`]: a dropped id could have been
+/// the head's only regression, so this one is never matched to a base id — the check denies.
+pub const FAILURE_IDS_TRUNCATED: &str = "(more failure ids than the floor keeps)";
+/// The most entries any one list of the libtest scan holds (test binaries, cargo binaries, failing
+/// test names, listing lines, launcher-signature tests): past it the output is not read as
+/// structure — an anomaly, so every libtest id is `[?]`.
+const MAX_SCAN_ENTRIES: usize = 4 * MAX_FAILURE_IDS;
+/// The deepest stack of runs printed inside runs the libtest scan follows; a deeper one is an
+/// anomaly.
+const MAX_NESTED_DEPTH: usize = 8;
+/// The version of the floor's check policy (its sandbox and its failure-id format) a cached base
+/// run was recorded under. A record of another — or no — version is a cache miss: core#1060
+/// opened `/dev/ptmx` to the checks and qualifies libtest ids, so a base result from before it
+/// could make a head PTY-test failure read as pre-existing. Bump it whenever either changes.
+const FLOOR_POLICY_VERSION: u32 = 2;
 /// Where the checks' isolated `HOME`, caches and build output live: `<worker home>/repo-checks/`,
 /// the engine's own cache area — never inside the tree a floor checks (see "Where the check
 /// scratch lives" in the module docs). The OS boundary arms the floor's leaf as a write root.
@@ -4105,6 +4121,13 @@ fn remove_base_export(worktree: &Path, scratch: &CheckScratch) -> Result<(), Str
     }
 }
 
+/// A cached base run with the floor policy it ran under ([`BaseTree::cached`]).
+#[derive(Debug, Serialize, Deserialize)]
+struct BaseCacheRecord {
+    floor_policy: u32,
+    run: CheckRun,
+}
+
 impl BaseTree {
     fn cache_path(scratch: &CheckScratch, head: &str, check: &RepoCheck) -> PathBuf {
         // (core#817) A subdirectory package's check is its own entry (`dir` with `/` flattened).
@@ -4122,10 +4145,15 @@ impl BaseTree {
         ))
     }
 
-    /// This run's cached result of `check` on `head`, when an earlier floor of the run paid for it.
+    /// This run's cached result of `check` on `head`, when an earlier floor of the run paid for it
+    /// under the SAME floor policy ([`FLOOR_POLICY_VERSION`]).
     fn cached(scratch: &CheckScratch, head: &str, check: &RepoCheck) -> Option<BaseRun> {
         let raw = std::fs::read_to_string(Self::cache_path(scratch, head, check)).ok()?;
-        let run = serde_json::from_str::<CheckRun>(&raw).ok()?;
+        let record = serde_json::from_str::<BaseCacheRecord>(&raw).ok()?;
+        if record.floor_policy != FLOOR_POLICY_VERSION {
+            return None;
+        }
+        let run = record.run;
         // The base runs the head's argv, and it can change within a run (a targeted command with
         // the files a rework touches — `{files}`, the derived `-p <crate>` — or a reworked
         // `.wicked/checks.json`): a cached run of ANOTHER argv is not this comparison.
@@ -4232,9 +4260,14 @@ impl BaseTree {
         }
         let run = run_one(&self.dir, &target, sandbox, scratch, Tree::Base);
         let _ = std::fs::create_dir_all(scratch.root.join("base-cache"));
-        if let Ok(json) = serde_json::to_string(&run) {
+        let record = BaseCacheRecord {
+            floor_policy: FLOOR_POLICY_VERSION,
+            run,
+        };
+        if let Ok(json) = serde_json::to_string(&record) {
             let _ = std::fs::write(&cache, json);
         }
+        let run = record.run;
         BaseRun {
             head: self.head.clone(),
             cached: false,
@@ -4328,6 +4361,9 @@ fn match_base<'a>(
     let unknown = |t: Option<&str>| t.is_none_or(|t| t == UNKNOWN_TARGET);
     let mut m = BaseMatch::default();
     for &h in head {
+        if h == FAILURE_IDS_TRUNCATED {
+            continue;
+        }
         let parts = libtest_parts(h);
         let h_unknown = parts.is_some_and(|(_, t)| unknown(t));
         if !h_unknown && base.contains(h) {
@@ -5404,8 +5440,12 @@ struct LineScan {
     /// Failure ids read INSIDE nested runs: a child's, not this suite's — unless the structure
     /// does not verify, when [`qualify`] reports them too (`[?]`) rather than lose a failure.
     nested_ids: Vec<String>,
-    /// The structure contradicted itself (see above): no libtest id is qualified.
+    /// The structure contradicted itself (see above), or outgrew [`MAX_SCAN_ENTRIES`] /
+    /// [`MAX_NESTED_DEPTH`]: no libtest id is qualified.
     anomaly: bool,
+    /// More failure ids than [`MAX_FAILURE_IDS`] were seen: [`qualify`] adds
+    /// [`FAILURE_IDS_TRUNCATED`].
+    truncated: bool,
     /// libtest: the test whose captured output (`---- name stdout ----`) is being read.
     section: Option<String>,
     /// Failure ids in order of first sight; libtest ids carry their binary's ordinal.
@@ -5426,6 +5466,16 @@ struct LineScan {
     watch: Vec<String>,
     /// (core#789/#790) Environment signals in order of sight ([`env_signal_of_line`]).
     signals: Vec<String>,
+}
+
+/// Push onto one of the libtest scan's lists; past [`MAX_SCAN_ENTRIES`] the item is not kept and
+/// the structure is an anomaly (fail-closed: no libtest id is qualified, none is lost).
+fn bounded<T>(list: &mut Vec<T>, item: T, anomaly: &mut bool) {
+    if list.len() < MAX_SCAN_ENTRIES {
+        list.push(item);
+    } else {
+        *anomaly = true;
+    }
 }
 
 impl LineScan {
@@ -5478,7 +5528,11 @@ impl LineScan {
                 if self.nested.is_empty() {
                     self.outer = self.section.clone();
                 }
-                self.nested.push((n, Vec::new()));
+                if self.nested.len() < MAX_NESTED_DEPTH {
+                    self.nested.push((n, Vec::new()));
+                } else {
+                    self.anomaly = true;
+                }
                 return;
             }
             if self.open {
@@ -5490,8 +5544,12 @@ impl LineScan {
                 }
                 self.anomaly = true;
             }
-            self.blocks.push(false);
-            self.footers.push(false);
+            if self.blocks.len() < MAX_SCAN_ENTRIES {
+                self.blocks.push(false);
+                self.footers.push(false);
+            } else {
+                self.anomaly = true;
+            }
             self.open = true;
             self.header_n = n;
             self.block_failures = 0;
@@ -5569,31 +5627,41 @@ impl LineScan {
                 self.listed = Some(Vec::new());
             } else if !s.is_empty() {
                 match self.listed.as_mut() {
-                    Some(names) if line.starts_with("    ") => names.push(s.to_string()),
+                    Some(names) if line.starts_with("    ") => {
+                        bounded(names, s.to_string(), &mut self.anomaly)
+                    }
                     _ => self.listed = None,
                 }
             }
             if let (Some(name), Some(_)) = (self.outer.clone(), launcher_signature(s)) {
                 let block = self.blocks.len().checked_sub(1);
                 if !self.env.iter().any(|(n, b)| n == &name && *b == block) {
-                    self.env.push((name, block));
+                    bounded(&mut self.env, (name, block), &mut self.anomaly);
                 }
             }
             if let Some(id) = failure_id_of_line(line, &mut self.eslint_file) {
                 if id.starts_with("test ") {
                     if let Some((_, names)) = self.nested.last_mut() {
-                        names.push(listing_name(&id));
+                        bounded(names, listing_name(&id), &mut self.anomaly);
                     }
                 }
-                if self.nested_ids.len() < MAX_FAILURE_IDS && !self.nested_ids.contains(&id) {
-                    self.nested_ids.push(id);
+                if !self.nested_ids.contains(&id) {
+                    if self.nested_ids.len() < MAX_FAILURE_IDS {
+                        self.nested_ids.push(id);
+                    } else {
+                        self.truncated = true;
+                    }
                 }
             }
             return;
         }
         if cargo_binary_line(s) {
-            self.binaries.push(None);
-            self.doc.push(s.starts_with("Doc-tests "));
+            if self.binaries.len() < MAX_SCAN_ENTRIES {
+                self.binaries.push(None);
+                self.doc.push(s.starts_with("Doc-tests "));
+            } else {
+                self.anomaly = true;
+            }
             return;
         }
         if let Some(name) = s
@@ -5617,7 +5685,9 @@ impl LineScan {
         if self.open && self.capture && !s.is_empty() {
             // The `failures:` listing: four-space-indented names, nothing else.
             match self.listed.as_mut() {
-                Some(names) if line.starts_with("    ") => names.push(s.to_string()),
+                Some(names) if line.starts_with("    ") => {
+                    bounded(names, s.to_string(), &mut self.anomaly)
+                }
                 _ => self.listed = None,
             }
         }
@@ -5628,7 +5698,7 @@ impl LineScan {
             if launcher_signature(s).is_some()
                 && !self.env.iter().any(|(n, b)| n == &name && *b == block)
             {
-                self.env.push((name, block));
+                bounded(&mut self.env, (name, block), &mut self.anomaly);
             }
             return;
         }
@@ -5675,19 +5745,25 @@ impl LineScan {
                 // libtest prints its `test x ... FAILED` lines before `failures:`: one after it
                 // is captured output (a child's, once its section's own state was lost) — set
                 // aside like a nested run's (agy on #1060).
-                if self.nested_ids.len() < MAX_FAILURE_IDS && !self.nested_ids.contains(&id) {
-                    self.nested_ids.push(id);
+                if !self.nested_ids.contains(&id) {
+                    if self.nested_ids.len() < MAX_FAILURE_IDS {
+                        self.nested_ids.push(id);
+                    } else {
+                        self.truncated = true;
+                    }
                 }
                 return;
             }
             if libtest && self.open {
                 self.block_failures += 1;
-                self.block_names.push(listing_name(&id));
+                bounded(&mut self.block_names, listing_name(&id), &mut self.anomaly);
             }
-            if self.ids.len() < MAX_FAILURE_IDS
-                && !self.ids.iter().any(|(i, b)| i == &id && *b == block)
-            {
-                self.ids.push((id, block));
+            if !self.ids.iter().any(|(i, b)| i == &id && *b == block) {
+                if self.ids.len() < MAX_FAILURE_IDS {
+                    self.ids.push((id, block));
+                } else {
+                    self.truncated = true;
+                }
             }
         }
     }
@@ -5896,21 +5972,31 @@ fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<Strin
     };
     let mut ids: Vec<String> = Vec::new();
     let mut env: Vec<String> = Vec::new();
+    let mut truncated = out.truncated || err.truncated;
+    let mut keep = |ids: &mut Vec<String>, q: String| {
+        if !ids.contains(&q) {
+            if ids.len() < MAX_FAILURE_IDS {
+                ids.push(q);
+            } else {
+                truncated = true;
+            }
+        }
+    };
     for scan in [&out, &err] {
         for (id, block) in &scan.ids {
-            let q = qualified(id, target_of(scan, id, *block).as_deref());
-            if !ids.contains(&q) && ids.len() < MAX_FAILURE_IDS {
-                ids.push(q);
-            }
+            keep(
+                &mut ids,
+                qualified(id, target_of(scan, id, *block).as_deref()),
+            );
         }
         // Set aside as a child's only when the structure verified: otherwise a misread could
         // have hidden one of this suite's own failures there.
         if !lined_up || !std::ptr::eq(scan, &out) {
             for id in &scan.nested_ids {
-                let q = qualified(id, target_of(scan, id, None).as_deref());
-                if !ids.contains(&q) && ids.len() < MAX_FAILURE_IDS {
-                    ids.push(q);
-                }
+                keep(
+                    &mut ids,
+                    qualified(id, target_of(scan, id, None).as_deref()),
+                );
             }
         }
         for (name, block) in &scan.env {
@@ -5920,6 +6006,10 @@ fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<Strin
                 env.push(q);
             }
         }
+    }
+    // A dropped id could have been the only regression: the check carries one nothing matches.
+    if truncated {
+        ids.push(FAILURE_IDS_TRUNCATED.to_string());
     }
     // Only a FAILING test is in the env class.
     env.retain(|e| ids.contains(e));
@@ -11051,7 +11141,11 @@ error: 2 targets failed:
             },
         );
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, serde_json::to_string(&ran).unwrap()).unwrap();
+        let record = |policy: Option<u32>| match policy {
+            Some(p) => serde_json::json!({ "floor_policy": p, "run": &ran }).to_string(),
+            None => serde_json::to_string(&ran).unwrap(),
+        };
+        std::fs::write(&path, record(Some(FLOOR_POLICY_VERSION))).unwrap();
         let check = |argv: &[&str]| RepoCheck {
             name: "test_targeted".into(),
             argv: s(argv),
@@ -11065,6 +11159,16 @@ error: 2 targets failed:
         assert!(
             BaseTree::cached(&scratch_dir, head, &check(&["cargo", "test", "-p", "a"])).is_none()
         );
+        // (codex on #1060) A record of an earlier floor policy (a sandbox that denied
+        // `/dev/ptmx`, bare libtest ids) — or of none, the pre-versioned format — is a miss.
+        for old in [Some(FLOOR_POLICY_VERSION - 1), None] {
+            std::fs::write(&path, record(old)).unwrap();
+            assert!(
+                BaseTree::cached(&scratch_dir, head, &check(&["cargo", "test", "-p", "b"]))
+                    .is_none(),
+                "{old:?}"
+            );
+        }
         drop(scratch_dir);
         let _ = std::fs::remove_dir_all(&wt);
     }
@@ -11798,6 +11902,119 @@ error: 2 targets failed:
         let run = adj_head(&head, "", &base, "");
         assert_eq!(run.classification.as_deref(), Some(REGRESSION));
         assert_eq!(run.regressions, vec!["test shared [?]"]);
+        assert!(run.denies());
+    }
+
+    /// codex on #1060 (round 9): crafted output cannot grow the scan without bound. A run nested
+    /// deeper than [`MAX_NESTED_DEPTH`], more blocks / cargo binaries / failing names than
+    /// [`MAX_SCAN_ENTRIES`]: the lists stop at their caps and the structure is an anomaly, so the
+    /// failure is `[?]` and stays a regression against a base that fails it qualified.
+    #[test]
+    fn oversized_or_deeply_nested_output_is_bounded_and_fails_closed_1060() {
+        let base_out = adj_text(&[
+            "running 1 test",
+            "test shared ... FAILED",
+            "",
+            "failures:",
+            "    shared",
+            "",
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]);
+        let one_err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n\
+            error: test failed, to rerun pass `-p a --lib`\n";
+        let regression = |out: &str, err: &str| {
+            let run = adj_head(out, err, &base_out, one_err);
+            assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+            assert!(
+                run.regressions
+                    .iter()
+                    .all(|r| r.ends_with(" [?]") || r == FAILURE_IDS_TRUNCATED),
+                "{:?}",
+                run.regressions
+            );
+            assert!(run.denies());
+        };
+
+        // (1) 100 runs nested inside the failing test's captured output.
+        let mut v = vec![
+            "running 1 test".to_string(),
+            "test shared ... FAILED".to_string(),
+            String::new(),
+            "failures:".to_string(),
+            String::new(),
+            "---- shared stdout ----".to_string(),
+        ];
+        v.extend((0..100).map(|_| "running 1 test".to_string()));
+        v.extend([
+            String::new(),
+            "failures:".to_string(),
+            "    shared".to_string(),
+            String::new(),
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out"
+                .to_string(),
+        ]);
+        let deep = v.join("\n");
+        let scan = scan_of(&deep);
+        assert!(scan.nested.len() <= MAX_NESTED_DEPTH && scan.anomaly);
+        regression(&deep, one_err);
+
+        // (2) More blocks than the cap, the failing one last.
+        let mut out = "running 0 tests\n\ntest result: ok. 0 passed; 0 failed\n\n"
+            .repeat(MAX_SCAN_ENTRIES + 5);
+        out.push_str(&base_out);
+        let scan = scan_of(&out);
+        assert_eq!(scan.blocks.len(), MAX_SCAN_ENTRIES);
+        assert_eq!(scan.footers.len(), MAX_SCAN_ENTRIES);
+        assert!(scan.anomaly);
+        regression(&out, one_err);
+
+        // (3) More cargo binaries than the cap.
+        let err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n"
+            .repeat(MAX_SCAN_ENTRIES + 5)
+            + "error: test failed, to rerun pass `-p a --lib`\n";
+        let scan = scan_of(&err);
+        assert_eq!(scan.binaries.len(), MAX_SCAN_ENTRIES);
+        assert_eq!(scan.doc.len(), MAX_SCAN_ENTRIES);
+        assert!(scan.anomaly);
+        regression(&base_out, &err);
+
+        // (4) More failing names in one binary (and in its listing) than the cap.
+        let n = MAX_SCAN_ENTRIES + 5;
+        let mut out = format!("running {n} tests\n");
+        for i in 0..n {
+            out.push_str(&format!("test t{i} ... FAILED\n"));
+        }
+        out.push_str("test shared ... FAILED\n\nfailures:\n");
+        for i in 0..n {
+            out.push_str(&format!("    t{i}\n"));
+        }
+        out.push_str(&format!(
+            "    shared\n\ntest result: FAILED. 0 passed; {} failed\n",
+            n + 1
+        ));
+        let scan = scan_of(&out);
+        assert_eq!(scan.block_names.len(), MAX_SCAN_ENTRIES);
+        assert!(scan.ids.len() <= MAX_FAILURE_IDS);
+        assert!(scan.anomaly);
+        regression(&out, one_err);
+    }
+
+    /// codex on #1060 (round 9): past [`MAX_FAILURE_IDS`] the dropped ids could hide the head's
+    /// one new failure behind a base that shares every kept one — the check carries
+    /// [`FAILURE_IDS_TRUNCATED`], which nothing matches (not even the base's own marker).
+    #[test]
+    fn failure_ids_past_the_cap_never_read_as_pre_existing_1060() {
+        let shared: String = (0..MAX_FAILURE_IDS)
+            .map(|i| format!("FAILED tests/t.py::test_{i} - red\n"))
+            .collect();
+        let head = format!("{shared}FAILED tests/t.py::test_new - red\n");
+        let base = format!("{shared}FAILED tests/t.py::test_other - red\n");
+        let (ids, _, _, _) = qualify(scan_of(&head), LineScan::default());
+        assert_eq!(ids.len(), MAX_FAILURE_IDS + 1);
+        assert_eq!(ids.last().map(String::as_str), Some(FAILURE_IDS_TRUNCATED));
+        let run = adj_head(&head, "", &base, "");
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(run.regressions, vec![FAILURE_IDS_TRUNCATED]);
         assert!(run.denies());
     }
 
