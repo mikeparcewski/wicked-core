@@ -82,8 +82,8 @@
 //! is "flaky (passed alone)" (`flaky`, never denies); one that fails again, or that the cap or the
 //! budget does not reach (`not_rechecked`), stays a `regression`. If every one passes the check is
 //! `flaky_under_load` (never denies; both attempts and the load at each are on the record). The
-//! head and base ids are compared on (test name, binary); a bare id never meets a qualified one
-//! (which binary it came from is unknown): it stays a regression, listed as `ambiguous`. A base that
+//! head and base ids are compared on (test name, binary); a libtest id the floor cannot qualify
+//! with its binary (`[?]`) never meets a base id: it stays a regression, listed as `ambiguous`. A base that
 //! cannot be run or compared leaves the
 //! check denying as before (fail-closed). `baseline_diff: false` in the repo config opts out. A
 //! creator transcript that CLAIMS a failure is pre-existing is annotated against that comparison
@@ -539,7 +539,7 @@ pub struct CheckRun {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub not_rechecked: usize,
     /// Head failures whose test name the base also fails, with a binary that cannot be told on one
-    /// side (a bare id against a qualified one, or an unattributed `[?]` id): kept as
+    /// side (an unattributed `[?]` id): kept as
     /// regressions, not guessed — and listed here so the denial says why.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ambiguous: Vec<String>,
@@ -4307,25 +4307,25 @@ fn classify(head: &mut CheckRun, base: BaseRun) {
 struct BaseMatch<'a> {
     /// (head id, the base id it is) — the head failures the base shares.
     pairs: Vec<(&'a str, &'a str)>,
-    /// Head ids whose test name the base also fails, but in the OTHER form (one side's binary is
-    /// unknown): never matched — they stay regressions, and say why.
+    /// Head ids whose test name the base also fails, where one side's binary is unknown: never
+    /// matched — they stay regressions, and say why.
     ambiguous: Vec<&'a str>,
 }
 
 /// Match head failure ids to base failure ids on the normalised key (test name, target).
 ///
-/// Ids of the same form match on equality: qualified ids only for the SAME target
-/// (`[-p a --lib]` never meets `[-p b --lib]`), bare ids (a run of one test binary) by name. A
-/// bare id never meets a qualified one, and an id whose binary is unknown (`[?]`, one of several
-/// the floor could not attribute) never meets anything: failing ids alone are no evidence of
-/// which binary such an id came from — the same name may fail in crate B on one side and in
-/// crate A on the other (codex on #1060). The head id stays a regression (fail-closed) and, when
-/// the base fails that name too, is listed as ambiguous: said, not guessed.
+/// Non-libtest ids match on equality; libtest ids only when qualified with the SAME target
+/// (`[-p a --lib]` never meets `[-p b --lib]`). A libtest id whose binary is unknown — `[?]`, or
+/// bare (a record from a floor that still kept unqualified ids) — never meets anything: failing
+/// ids alone are no evidence of which binary such an id came from — the same name may fail in
+/// crate B on one side and in crate A on the other (codex on #1060). The head id stays a
+/// regression (fail-closed) and, when the base fails that name too, is listed as ambiguous:
+/// said, not guessed.
 fn match_base<'a>(
     head: &std::collections::BTreeSet<&'a str>,
     base: &std::collections::BTreeSet<&'a str>,
 ) -> BaseMatch<'a> {
-    let unknown = |t: Option<&str>| t == Some(UNKNOWN_TARGET);
+    let unknown = |t: Option<&str>| t.is_none_or(|t| t == UNKNOWN_TARGET);
     let mut m = BaseMatch::default();
     for &h in head {
         let parts = libtest_parts(h);
@@ -4334,14 +4334,12 @@ fn match_base<'a>(
             m.pairs.push((h, h));
             continue;
         }
-        let Some((name, target)) = parts else {
+        let Some((name, _)) = parts else {
             continue;
         };
-        let undecidable = base.iter().any(|b| {
-            libtest_parts(b).is_some_and(|(n, t)| {
-                n == name && (h_unknown || unknown(t) || t.is_some() != target.is_some())
-            })
-        });
+        let undecidable = base
+            .iter()
+            .any(|b| libtest_parts(b).is_some_and(|(n, t)| n == name && (h_unknown || unknown(t))));
         if undecidable {
             m.ambiguous.push(h);
         }
@@ -5370,10 +5368,10 @@ pub(crate) fn launcher_signature(line: &str) -> Option<&'static str> {
 /// lines may precede the next header (agy on #1060). Anything the structure
 /// cannot explain — a result line with no binary open, the binary's own result rejected, the
 /// block and binary lists disagreeing on length or on which binaries failed (a silent custom
-/// harness, codex on #1060) — leaves EVERY libtest id bare (fail-closed): aggregate counts that
+/// harness, codex on #1060) — leaves EVERY libtest id unknown (`[?]`, fail-closed): aggregate counts that
 /// happen to agree are no evidence of which target an id belongs to. Lines inside a nested run
 /// are captured output (only a launcher signature is read, for the test it was printed in); the
-/// failure ids among them are set aside and reported, bare, whenever the structure does not
+/// failure ids among them are set aside and reported, `[?]`, whenever the structure does not
 /// verify — a misread structure can cost a qualifier, never a failure.
 #[derive(Debug, Default)]
 struct LineScan {
@@ -5404,7 +5402,7 @@ struct LineScan {
     /// libtest: the captured section a nested run was printed in, restored when it ends.
     outer: Option<String>,
     /// Failure ids read INSIDE nested runs: a child's, not this suite's — unless the structure
-    /// does not verify, when [`qualify`] reports them too (bare) rather than lose a failure.
+    /// does not verify, when [`qualify`] reports them too (`[?]`) rather than lose a failure.
     nested_ids: Vec<String>,
     /// The structure contradicted itself (see above): no libtest id is qualified.
     anomaly: bool,
@@ -5421,9 +5419,6 @@ struct LineScan {
     /// cargo: which of `binaries` are a crate's doc-tests (`Doc-tests a`) — Rust 2024's rustdoc
     /// prints a merged and a standalone run (two blocks) under one such line.
     doc: Vec<bool>,
-    /// cargo printed a `to rerun pass` selector: the run carried target identity, so an id it
-    /// cannot attribute is unknown (`[?]`), never bare.
-    saw_selector: bool,
     /// libtest: per block, whether rustdoc's `all doctests ran in …` footer followed it.
     footers: Vec<bool>,
     /// libtest names seen PASSING (`test name ... ok`) among `watch` — the isolated re-run's witness.
@@ -5639,7 +5634,6 @@ impl LineScan {
         }
         if let Some(target) = rerun_target_of_line(s) {
             // cargo prints a failing binary's selector after its `Running` line.
-            self.saw_selector = true;
             match self.binaries.last_mut() {
                 Some(slot @ None) => {
                     *slot = Some(target);
@@ -5825,8 +5819,8 @@ fn strip_ansi(line: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
-/// The target a libtest id carries when the floor could not tell which of SEVERAL test binaries
-/// it came from: `test shared [?]`. [`match_base`] never matches it — not even to itself.
+/// The target a libtest id carries when the floor could not tell which test binary it came from:
+/// `test shared [?]`. [`match_base`] never matches it — not even to itself.
 const UNKNOWN_TARGET: &str = "?";
 
 /// A libtest id qualified by its test binary: `test t::shared [-p b --lib]` (core#481).
@@ -5886,20 +5880,10 @@ fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<Strin
     // (every stdout block ended). A crashed LAST binary does not line up: its ids are `[?]`.
     let lined_up =
         walk_ok && (j == bins.len() || (j + 1 == bins.len() && bins[j].is_none() && !out.open));
-    // A libtest id the alignment cannot attribute is `[?]` (unknown binary, never matched) —
-    // plain bare only when the run carried no target identity at all (no cargo binary line, no
-    // selector) and printed at most one block (codex on #1060: one block on each tree does not
-    // make them the same binary) on EITHER stream, in a structure that resolved: a binary read
-    // as captured output is no block, so an unresolved or contradicted structure cannot vouch
-    // for "one binary" (agy on #1060).
-    let shaky = |s: &LineScan| s.anomaly || !s.nested.is_empty() || (s.open && s.capture);
-    let unknown = n + err.blocks.len() > 1
-        || !bins.is_empty()
-        || !out.binaries.is_empty()
-        || err.saw_selector
-        || out.saw_selector
-        || shaky(&out)
-        || shaky(&err);
+    // A libtest id the alignment cannot attribute is `[?]`, whatever the run looked like: no
+    // shape of the output proves which binary it came from (a wrapper that prints only the
+    // failing suites hides every passing binary, codex on #1060), so it never matches a base id
+    // and stays a regression.
     let target_of = |scan: &LineScan, id: &str, block: Option<usize>| -> Option<String> {
         if !id.starts_with("test ") {
             return None;
@@ -5908,7 +5892,7 @@ fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<Strin
             .filter(|_| lined_up && std::ptr::eq(scan, &out))
             .and_then(|b| owner.get(b))
             .and_then(|&j| bins.get(j).cloned().flatten())
-            .or_else(|| unknown.then(|| UNKNOWN_TARGET.to_string()))
+            .or_else(|| Some(UNKNOWN_TARGET.to_string()))
     };
     let mut ids: Vec<String> = Vec::new();
     let mut env: Vec<String> = Vec::new();
@@ -7808,7 +7792,7 @@ mod tests {
         std::fs::create_dir_all(repo.join(".wicked")).unwrap();
         std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
         let script = "git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo NOGIT; \
-                      exit 2; }; echo 'test t::shared ... FAILED'; exit 101";
+                      exit 2; }; echo 'FAILED tests/t.py::test_shared - boom'; exit 101";
         std::fs::write(
             repo.join(".wicked/checks.json"),
             serde_json::json!({ "test": ["sh", "-c", script] }).to_string(),
@@ -9575,7 +9559,7 @@ mod tests {
         );
 
         // A run cut off inside its last binary (the check's bound): cargo printed no selector
-        // for it, so its id stays bare and the finished binary before it keeps its target.
+        // for it, so its id is `[?]` and the finished binary before it keeps its target.
         let cut = "\nrunning 1 test\ntest y ... FAILED\n\nfailures:\n    y\n\ntest result: \
             FAILED. 0 passed; 1 failed\n\nrunning 3 tests\ntest late ... FAILED\n";
         let one =
@@ -9601,7 +9585,7 @@ mod tests {
     /// selector, no libtest output); target `b`'s failing `shared` carries two child runs, the
     /// second without its header, so its result line closes `b` early. Aligned by counts alone,
     /// `b`'s failure took `a`'s qualifier and met a base where `a`'s `shared` fails: a new
-    /// regression read as pre-existing. Now the lists disagree and the id stays bare — a
+    /// regression read as pre-existing. Now the lists disagree and the id is `[?]` — a
     /// regression against that base, said to be ambiguous.
     #[test]
     fn a_silent_harness_and_nested_runs_cannot_shift_a_qualifier() {
@@ -9754,11 +9738,11 @@ mod tests {
         );
     }
 
-    /// Head and base ids are compared on (test name, target). Ids of one form match on equality;
-    /// a bare id against a qualified one of the same name cannot say which binary it came from, so
-    /// it is never counted pre-existing: it stays a regression, listed as ambiguous, and the
-    /// denial says so (codex on #1060 — the same name may fail in crate B on the base and in crate
-    /// A on the head).
+    /// Head and base ids are compared on (test name, target): qualified ids of the same target
+    /// match. A bare libtest id (a record from a floor that still kept them) cannot say which
+    /// binary it came from — against a qualified id OR another bare one — so it is never counted
+    /// pre-existing: it stays a regression, listed as ambiguous, and the denial says so (codex on
+    /// #1060 — the same name may fail in crate B on the base and in crate A on the head).
     #[test]
     fn head_and_base_ids_match_across_qualified_and_bare_forms() {
         // Head bare (its qualification fell back), base qualified.
@@ -9799,13 +9783,12 @@ mod tests {
             )),
         );
         assert_eq!(head.classification.as_deref(), Some(ENV_CANNOT_RUN));
-        let mut head = failed_run(&["test sb"], &[]);
-        classify(&mut head, base_of(failed_run(&["test sb"], &[])));
-        assert_eq!(
-            head.classification.as_deref(),
-            Some(PRE_EXISTING_IN_SANDBOX)
-        );
-        assert!(head.ambiguous.is_empty());
+        // Bare on both sides is no identity either: never matched.
+        let mut head = failed_run(&["test sb"], &["test sb"]);
+        classify(&mut head, base_of(failed_run(&["test sb"], &["test sb"])));
+        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(head.ambiguous, vec!["test sb"]);
+        assert!(head.denies());
     }
 
     /// The same test name in two crates stays two failures: qualified ids of different binaries
@@ -10336,10 +10319,10 @@ error: 2 targets failed:
         classify(&mut h, base_of(b));
         assert_eq!(h.classification.as_deref(), Some(REGRESSION));
         assert!(h.pre_existing.is_empty());
-        // No cargo identity at all (a lone libtest binary run directly): bare, as before.
+        // No cargo identity at all (a lone libtest binary run directly): unknown too.
         assert_eq!(
             qualify(scan_of(quiet), LineScan::default()).0,
-            vec!["test shared"]
+            vec!["test shared [?]"]
         );
     }
 
@@ -11012,13 +10995,13 @@ error: 2 targets failed:
         let cfg = |script: &str| serde_json::json!({ "test": ["sh", "-c", script] }).to_string();
         std::fs::write(
             repo.join(".wicked/checks.json"),
-            cfg("echo 'test t::one ... FAILED'; exit 101"),
+            cfg("echo 'FAILED tests/t.py::test_one - x'; exit 101"),
         )
         .unwrap();
         let base = git_repo_with_commit(&repo);
         std::fs::write(
             repo.join(".wicked/checks.json"),
-            cfg("echo 'test t::one ... FAILED'; echo 'test t::two ... FAILED'; exit 101"),
+            cfg("echo 'FAILED tests/t.py::test_one - x'; echo 'FAILED tests/t.py::test_two - x'; exit 101"),
         )
         .unwrap();
         let ctx = FloorContext {
@@ -11640,9 +11623,8 @@ error: 2 targets failed:
     /// `test foo ... FAILED` spoils its own listing), or a passing binary whose own result line
     /// a child run consumes, or a binary whose own result line does not add up, leaves the
     /// structure unresolved and SWALLOWS the next binary as captured output. With cargo's
-    /// identity on stderr the swallowed failure is reported `[?]` (a regression). The case that
-    /// leaked: no target identity at all (stderr not captured) — the swallowed binary did not
-    /// count as a block, so the run looked like ONE binary and its id stayed bare, matching a
+    /// identity on stderr the swallowed failure is reported `[?]` (a regression); with no target
+    /// identity at all (stderr not captured) it is `[?]` too — it once stayed bare and matched a
     /// same-named base failure in another binary.
     #[test]
     fn a_swallowed_binary_never_stays_bare_1060() {
@@ -11734,8 +11716,7 @@ error: 2 targets failed:
     }
 
     /// agy a1b2 #2: libtest routed to stderr (`./a 1>&2; ./b 1>&2`, no cargo) prints several
-    /// blocks on the stream the alignment does not count: one binary per run must hold across
-    /// BOTH streams before an id stays bare.
+    /// blocks on the stream the alignment does not count: its ids are `[?]`, never matched.
     #[test]
     fn blocks_on_stderr_count_as_binaries_1060() {
         let pass_a = adj_text(&[
@@ -11759,6 +11740,64 @@ error: 2 targets failed:
         let head_err = format!("{pass_a}\n{}", fail("shared"));
         let run = adj_head("", &head_err, "", &fail("shared"));
         assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert!(run.denies());
+    }
+
+    /// codex on #1060 (round 8): a wrapper that prints only the FAILING suites shows one block
+    /// per tree and no cargo line — no proof that both trees ran the same binary. `shared`
+    /// failing in binary b on the head and in binary a on the base never meet.
+    #[test]
+    fn a_wrapper_showing_only_failing_suites_is_no_identity_1060() {
+        let fail = |name: &str, panicked_at: &str| {
+            adj_text(&[
+                "running 3 tests",
+                &format!("test {name} ... FAILED"),
+                "test other1 ... ok",
+                "test other2 ... ok",
+                "",
+                "failures:",
+                "",
+                &format!("---- {name} stdout ----"),
+                &format!("thread '{name}' panicked at {panicked_at}:"),
+                "boom",
+                "",
+                "failures:",
+                &format!("    {name}"),
+                "",
+                "test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+            ])
+        };
+        let run = adj_head(
+            &fail("shared", "b/src/lib.rs:1:1"),
+            "",
+            &fail("shared", "a/src/lib.rs:1:1"),
+            "",
+        );
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(run.regressions, vec!["test shared [?]"]);
+        assert_eq!(run.ambiguous, vec!["test shared [?]"], "the reason is said");
+        assert!(run.denies());
+    }
+
+    /// agy on #1060 (round 8): an outer binary left open before its captured output (cut off
+    /// after its `test x ... FAILED` line) with no cargo identity: `[?]`, never matched.
+    #[test]
+    fn an_unclosed_outer_binary_never_matches_1060() {
+        let head = adj_text(&["running 2 tests", "test shared ... FAILED"]);
+        let scan = scan_of(&head);
+        assert!(scan.open && !scan.capture);
+        let base = adj_text(&[
+            "running 1 test",
+            "test shared ... FAILED",
+            "",
+            "failures:",
+            "    shared",
+            "",
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]);
+        let run = adj_head(&head, "", &base, "");
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert_eq!(run.regressions, vec!["test shared [?]"]);
         assert!(run.denies());
     }
 
