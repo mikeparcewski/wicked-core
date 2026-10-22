@@ -74,13 +74,19 @@ type Ran = Arc<Mutex<Vec<(String, u32)>>>;
 struct ScriptedSeat {
     rework: Rework,
     ran: Ran,
+    /// The engine's judge answers REJECT instead of PASS.
+    judge_rejects: bool,
 }
 impl StepRunner for ScriptedSeat {
     fn run_unit(&self, input: &StepInput) -> StepOutput {
         let phase = input.unit.phase_id().unwrap_or("").to_string();
         let mut output = format!("did: {phase}");
         if input.unit.session_id == "validator" {
-            output = "PASS\nthe work meets the criterion\nPASS".to_string();
+            output = if self.judge_rejects {
+                "REJECT\nthe fix does not address the bug\nREJECT".to_string()
+            } else {
+                "PASS\nthe work meets the criterion\nPASS".to_string()
+            };
         } else {
             self.ran
                 .lock()
@@ -202,6 +208,10 @@ fn make_repo(name: &str, test_argv: &str, timeout_s: u64, markers: &[&str]) -> P
 }
 
 fn core_for(name: &str, rework: Rework) -> (Core, Ran) {
+    core_with(name, rework, false)
+}
+
+fn core_with(name: &str, rework: Rework, judge_rejects: bool) -> (Core, Ran) {
     let dir = std::env::temp_dir().join(format!(
         "wicked-core-floorgate-db-{name}-{}-{:?}",
         std::process::id(),
@@ -217,6 +227,7 @@ fn core_for(name: &str, rework: Rework) -> (Core, Ran) {
         Arc::new(ScriptedSeat {
             rework,
             ran: ran.clone(),
+            judge_rejects,
         }),
     );
     // (M1) `bug` launches the built-in PRESET now (PA scoping, floor fill). These tests exercise the
@@ -982,5 +993,58 @@ fn operator_judgment_overrides_a_failed_floor_only_with_a_rationale_and_keeps_qe
     let (_, _, combined, source, _) = gate(&second, 4).expect("verify's gate");
     assert!(!combined, "verify's floor still denies the failing tree");
     assert_eq!(source.as_deref(), Some("repo_checks"));
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (operator ruling 2026-10-21, xreview r1) Deny-dominates survives the carry-forward: the judge
+/// REJECTS the fix while its floor fails (the floor names the gate), and the engine's automatic
+/// rework changes nothing, so the failed floor is carried and the judge is not asked again. The
+/// judge's REJECT still stands behind the floor: the prompt offers no override, and
+/// `operator_judgment` is refused naming it — the operator's judgment answers the floor only.
+#[test]
+fn a_carried_floor_keeps_the_judges_reject_and_the_override_is_refused() {
+    let repo = make_repo(
+        "opjudge-reject",
+        TEST_FAILS_ON_BROKEN,
+        60,
+        &[".break-in-fix"],
+    );
+    let (core, ran) = core_with("opjudge-reject", Rework::ChangesNothing, true);
+    let sid = "fg-opjudge-reject";
+    let events = launch(&core, "opjudge-reject", &repo, sid);
+    let first = until_settled(&events, sid);
+    no_session_failed(&first);
+    if !fix_floor_denied(&first, "repo_checks") {
+        return;
+    }
+    let reworked = ran.lock().unwrap().contains(&("fix".to_string(), 1));
+    eprintln!("the automatic rework ran: {reworked}");
+    let prompt = first
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            CoreEvent::AwaitingHuman {
+                session, prompt, ..
+            } if session == sid => Some(prompt.clone()),
+            _ => None,
+        })
+        .expect("the escalation's prompt");
+    assert!(!prompt.contains("operator_judgment"), "{prompt}");
+    let err = core
+        .confirm_gate(
+            sid,
+            HumanDecision::OperatorJudgment {
+                rationale: "flakes".into(),
+            },
+        )
+        .expect_err("the judge's REJECT still denies");
+    assert!(
+        err.to_string().contains("ALSO denied by `agent_validator`"),
+        "{err}"
+    );
+    let views = core.sessions_detail().expect("sessions");
+    let s = views.iter().find(|v| v.session.id == sid).expect("run");
+    assert_eq!(s.units[2].status, wicked_core::UnitStatus::Rejected);
+    assert!(s.session.assurance.floor_overrides.is_empty());
     let _ = std::fs::remove_dir_all(&repo);
 }

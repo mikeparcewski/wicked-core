@@ -20073,6 +20073,20 @@ mod request_changes_tests {
                 .collect::<Vec<_>>(),
             ["floor overridden by operator"]
         );
+        // …and it survives a later rework of the unit, whose fresh gate receipt has no judgment:
+        // the run's own record keeps it on the delivery (once, never twice).
+        let mut reworked = units.clone();
+        reworked[2].assurance = Some(crate::assurance::AssuranceReceipt::for_run(
+            &session.assurance,
+            1,
+        ));
+        let after = crate::deliver_lift::delivery_receipt(&session, &reworked);
+        assert_eq!(after.operator_judges, vec![j.clone()]);
+        assert!(after
+            .ran
+            .iter()
+            .any(|i| i == crate::assurance::OPERATOR_JUDGE));
+        assert_eq!(delivery.operator_judges.len(), 1, "never twice");
         // …and on the wire, camelCase.
         let wire = serde_json::to_value(&delivery).unwrap();
         assert_eq!(
@@ -20218,6 +20232,14 @@ mod request_changes_tests {
         let p = denial_gate_prompt(&u, "floor_failed", "checks failed", None, "");
         assert!(!p.contains("operator_judgment"), "{p}");
         u.denials_behind = Some(Vec::new());
+        // A floor that did not finish is the same floor class, and takes the same offer.
+        u.denial = Some(UnitDenial::new(
+            crate::repo_checks::DENIAL_SOURCE_TIMEOUT,
+            "test timed out",
+        ));
+        assert_eq!(denial_class(u.denial.as_ref(), false), "floor_failed");
+        let p = denial_gate_prompt(&u, "floor_failed", "test timed out", None, "");
+        assert!(p.contains("action `operator_judgment`"), "{p}");
         u.denial = Some(UnitDenial::new("substance", "no change"));
         let p = denial_gate_prompt(&u, "floor_failed", "no change", None, "");
         assert!(!p.contains("operator_judgment"), "{p}");

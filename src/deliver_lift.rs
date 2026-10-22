@@ -803,7 +803,11 @@ pub(crate) fn delivery_receipt(
         // Every council the run's gates recorded: who decided its disputes.
         r.councils.extend(g.councils.iter().cloned());
         // …and every gate the operator judged ("judged by operator").
-        r.operator_judges.extend(g.operator_judges.iter().cloned());
+        for j in &g.operator_judges {
+            if !r.operator_judges.contains(j) {
+                r.operator_judges.push(j.clone());
+            }
+        }
         // …and every gate whose judge was a fallback seat (operator ruling 2026-10-14).
         r.judge_fallbacks.extend(g.judge_fallbacks.iter().cloned());
     }
@@ -814,6 +818,15 @@ pub(crate) fn delivery_receipt(
             r.councils
                 .extend(m.reviews.iter().filter_map(|x| x.dispute.clone()));
         }
+    }
+    // (operator ruling 2026-10-21, xreview r1) Every floor the operator overrode on this run, from
+    // the run's own record: a later rework of that unit cuts a fresh gate receipt, which must not
+    // drop the override (its label, rationale and floor result) from the delivery.
+    for j in &session.assurance.floor_overrides {
+        if !r.operator_judges.contains(j) {
+            r.operator_judges.push(j.clone());
+        }
+        r.ran(crate::assurance::OPERATOR_JUDGE);
     }
     r.tree = session.verified_tree.clone();
     r

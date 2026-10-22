@@ -1261,6 +1261,12 @@ pub(crate) fn apply_and_finish_unit(
                 .clone()
                 .map(|why| (why, r.outcome(), r.tree.clone()))
         });
+    // (operator ruling 2026-10-21, xreview r1) Whether this attempt's floor denial is the unit's
+    // LAST result carried onto an unchanged tree: then the judge does not re-run either
+    // (`cli_runner` arms the default judge only on a changed or unfloored tree), so the layers
+    // that denied behind the floor last time still stand — read before this fold replaces them.
+    let mut floor_carried = false;
+    let prior_denials_behind = unit.denials_behind.clone();
     let checks_denial: Option<(&'static str, String)> =
         match &evidence.repo_checks {
             Some(report) => {
@@ -1346,6 +1352,7 @@ pub(crate) fn apply_and_finish_unit(
                 ))
             }
             None if carried.as_ref().is_some_and(|r| !r.passed) => {
+                floor_carried = true;
                 let r = carried.as_ref().expect("checked");
                 Some((
                     r.denial_source(),
@@ -1762,7 +1769,23 @@ pub(crate) fn apply_and_finish_unit(
     unit.denial = outcome.denial.clone();
     // Recorded on every fold — empty when one layer (or none) denied — and only by this fold, so
     // a denial that never reached it (a worker failure, the substance floor) carries `None`.
-    unit.denials_behind = (!outcome.approved).then_some(denials_behind);
+    // A carried floor keeps what denied behind it last time (deny-dominates: the judge's REJECT
+    // or hold over the same tree is not cleared by an attempt that never asked the judge again);
+    // with no record of last time, there is no record now (fail-closed).
+    unit.denials_behind = if outcome.approved {
+        None
+    } else if floor_carried {
+        prior_denials_behind.map(|mut prior| {
+            for d in denials_behind {
+                if !prior.contains(&d) {
+                    prior.push(d);
+                }
+            }
+            prior
+        })
+    } else {
+        Some(denials_behind)
+    };
     unit.status = if outcome.approved {
         UnitStatus::Done
     } else {
