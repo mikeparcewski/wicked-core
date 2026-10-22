@@ -43,12 +43,17 @@ Two release tracks share this file, newest entry first regardless of track:
   the two streams describe the same binaries one for one: stdout's top-level `running N tests` blocks (a run inside a
   test's captured output is a nested run on a counted stack; a binary closes only on its own result line, whose
   counts and preceding `failures:` listing match it; a binary that died without one certifies nothing) and cargo's `Running` / `Doc-tests` lines with their
-  selectors (ANSI colours stripped). Any disagreement or structural anomaly makes every libtest id of a
-  multi-binary run `test x [?]` (unknown binary), which never matches and is not re-run alone; failures read in
-  captured output are then reported too, so a misread costs a qualifier, never a failure. Head and base ids are compared on (test name,
-  target). Ids qualified with different targets never meet. A bare id never meets a qualified one, and a `[?]` id
-  meets nothing, because failing ids alone cannot show which binary such an id came from: it stays a regression,
-  listed as `ambiguous`, and the denial says so rather than guessing. (2) The floor's macOS sandbox refused `/dev/ptmx`, so no PTY or
+  selectors (ANSI colours stripped). Any disagreement or structural anomaly, or a run with no cargo identity at
+  all, makes a libtest id `test x [?]` (unknown binary), which never matches and is not re-run alone. Failure
+  lines read inside captured output (a child's run, or framing a test printed to raw stdout) are always reported,
+  `[?]`. Every frame is text the creator's test can print, including a forged closing summary whose counts line
+  up, so alignment never deletes a `FAILED` line. The accepted cost: a pre-existing failing test whose captured
+  output carries a child's `FAILED` lines denies, and the operator's floor override covers it. The scan's lists
+  are bounded (an overflow is an anomaly; ids past `MAX_FAILURE_IDS` add an id nothing matches), and a cached base
+  run is reused only under the same floor policy version. Head and base ids are compared on (test name, target).
+  Ids qualified with different targets never meet, and an unqualified or `[?]` libtest id meets nothing, because
+  failing ids alone cannot show which binary such an id came from: it stays a regression, listed as `ambiguous`,
+  and the denial says so rather than guessing. (2) The floor's macOS sandbox refused `/dev/ptmx`, so no PTY or
   tmux test could run on it. The repo-checks floor (only it, not workers or validators) may now open `/dev/ptmx`
   and write to the `/dev/ttysN` slaves the kernel's `com.apple.sandbox.pty` extension marks as its own. The jail
   may not issue that extension class itself (file, generic, mach and iokit issuance are refused), so a check cannot

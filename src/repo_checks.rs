@@ -5407,8 +5407,9 @@ pub(crate) fn launcher_signature(line: &str) -> Option<&'static str> {
 /// harness, codex on #1060) — leaves EVERY libtest id unknown (`[?]`, fail-closed): aggregate counts that
 /// happen to agree are no evidence of which target an id belongs to. Lines inside a nested run
 /// are captured output (only a launcher signature is read, for the test it was printed in); the
-/// failure ids among them are set aside and reported, `[?]`, whenever the structure does not
-/// verify — a misread structure can cost a qualifier, never a failure.
+/// failure ids among them — and in any captured section — are set aside and ALWAYS reported,
+/// `[?]`: every frame is text the creator's test can print (a forged closing summary lines up,
+/// codex on #1060), so alignment never authorizes deleting a failure line.
 #[derive(Debug, Default)]
 struct LineScan {
     eslint_file: Option<String>,
@@ -5437,8 +5438,8 @@ struct LineScan {
     nested: Vec<(usize, Vec<String>)>,
     /// libtest: the captured section a nested run was printed in, restored when it ends.
     outer: Option<String>,
-    /// Failure ids read INSIDE nested runs: a child's, not this suite's — unless the structure
-    /// does not verify, when [`qualify`] reports them too (`[?]`) rather than lose a failure.
+    /// Failure ids read inside captured output (nested runs, sections): perhaps a child's, perhaps
+    /// this suite's behind forged framing — [`qualify`] always reports them, `[?]`.
     nested_ids: Vec<String>,
     /// The structure contradicted itself (see above), or outgrew [`MAX_SCAN_ENTRIES`] /
     /// [`MAX_NESTED_DEPTH`]: no libtest id is qualified.
@@ -5446,8 +5447,6 @@ struct LineScan {
     /// More failure ids than [`MAX_FAILURE_IDS`] were seen: [`qualify`] adds
     /// [`FAILURE_IDS_TRUNCATED`].
     truncated: bool,
-    /// More set-aside ids than [`MAX_FAILURE_IDS`]: counts only when [`qualify`] reports them.
-    nested_truncated: bool,
     /// libtest: the test whose captured output (`---- name stdout ----`) is being read.
     section: Option<String>,
     /// Failure ids in order of first sight; libtest ids carry their binary's ordinal.
@@ -5494,7 +5493,7 @@ impl LineScan {
             if self.nested_ids.len() < MAX_FAILURE_IDS {
                 self.nested_ids.push(id);
             } else {
-                self.nested_truncated = true;
+                self.truncated = true;
             }
         }
     }
@@ -5985,12 +5984,7 @@ fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<Strin
     };
     let mut ids: Vec<String> = Vec::new();
     let mut env: Vec<String> = Vec::new();
-    // Set-aside ids are reported (and their overflow counts) only when the structure did not
-    // verify (agy on #1060: a verified run's child failures are not this suite's).
-    let mut truncated = out.truncated
-        || err.truncated
-        || (!lined_up && out.nested_truncated)
-        || err.nested_truncated;
+    let mut truncated = out.truncated || err.truncated;
     let mut keep = |ids: &mut Vec<String>, q: String| {
         if !ids.contains(&q) {
             if ids.len() < MAX_FAILURE_IDS {
@@ -6007,15 +6001,13 @@ fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<Strin
                 qualified(id, target_of(scan, id, *block).as_deref()),
             );
         }
-        // Set aside as a child's only when the structure verified: otherwise a misread could
-        // have hidden one of this suite's own failures there.
-        if !lined_up || !std::ptr::eq(scan, &out) {
-            for id in &scan.nested_ids {
-                keep(
-                    &mut ids,
-                    qualified(id, target_of(scan, id, None).as_deref()),
-                );
-            }
+        // Failures read in captured output: always reported, never attributed (codex on #1060 —
+        // a forged summary makes any structure "verify").
+        for id in &scan.nested_ids {
+            keep(
+                &mut ids,
+                qualified(id, target_of(scan, id, None).as_deref()),
+            );
         }
         for (name, block) in &scan.env {
             let id = format!("test {name}");
@@ -9609,7 +9601,8 @@ mod tests {
     /// child's run inside a test's captured output is nested, not a test binary, so it cannot
     /// strip the `[-p … ]` qualifier from every id. Binary 1 fails two tests, one carrying a whole
     /// child run and the other a stray header-less result line; binary 2's only failure is the
-    /// harness itself; binary 3 is an ordinary failure.
+    /// harness itself; binary 3 is an ordinary failure. The child's own failure, read in captured
+    /// output, is reported too — `[?]`, never attributed (#1060 round 12).
     #[test]
     fn a_childs_result_line_in_captured_output_keeps_every_id_qualified() {
         let stdout = format!(
@@ -9638,6 +9631,7 @@ mod tests {
                 "test t::red [-p core --lib]".to_string(),
                 "test live::resize [-p core --test live]".to_string(),
                 "test a_check_the_base_fails [-p core --test guard]".to_string(),
+                "test terminal::live::attach [?]".to_string(),
             ]
         );
 
@@ -9733,24 +9727,36 @@ mod tests {
             vec!["test shared [?]", "test terminal::live::attach [?]"],
             "one block is no identity: cargo named a binary, so unverified ids are unknown"
         );
-        // Without it, the same binary is qualified: the nested child with its header is not one.
+        // Without it, the same binary is qualified: the nested child with its header is not one
+        // (its failure is reported, `[?]`).
         let clean = format!(
             "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
              child 1: {CHILD_RUN}\nfailures:\n    shared\n\ntest result: FAILED. 0 passed; 1 \
              failed; 0 ignored\n"
         );
         let (ids, _, _, _) = qualify(scan_of(&clean), scan_of(stderr_b));
-        assert_eq!(ids, vec!["test shared [--test b]"]);
+        assert_eq!(
+            ids,
+            vec!["test shared [--test b]", "test terminal::live::attach [?]"]
+        );
 
         // After a nested run the captured section it was printed in goes on: a `test x ...
-        // FAILED` line later in that section is still the output's, not a failure of the suite.
+        // FAILED` line later in that section is the output's — never the suite's binary's — and
+        // is reported `[?]`, never dropped.
         let after = format!(
             "\nrunning 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
              child 1: {CHILD_RUN}test echoed ... FAILED\n\nfailures:\n    shared\n\ntest result: \
              FAILED. 0 passed; 1 failed; 0 ignored\n"
         );
         let (ids, _, _, _) = qualify(scan_of(&after), scan_of(stderr_b));
-        assert_eq!(ids, vec!["test shared [--test b]"]);
+        assert_eq!(
+            ids,
+            vec![
+                "test shared [--test b]",
+                "test terminal::live::attach [?]",
+                "test echoed [?]"
+            ]
+        );
 
         // (agy on #1060) The header-less child closes `b` early, then a truncated child of the
         // SAME test opens a block the binary's own listing and result line close: with the
@@ -12135,10 +12141,12 @@ error: 2 targets failed:
         assert!(run.denies());
     }
 
-    /// agy on #1060 (round 10, P3): child failures set aside in a VERIFIED run are not this
-    /// suite's, so their overflow adds no truncation marker (a pre-existing failure stays one).
+    /// (#1060 round 12) Failures set aside in captured output are reported `[?]` even when the
+    /// structure lines up, and their overflow carries the truncation marker: no alignment, however
+    /// clean, deletes one (the accepted cost: a pre-existing test whose captured output carries a
+    /// child's failures denies — the operator's floor override covers it).
     #[test]
-    fn set_aside_overflow_in_a_verified_run_adds_no_marker_1060() {
+    fn set_aside_failures_are_reported_even_in_a_verified_run_1060() {
         let mut out =
             String::from("running 1 test\ntest t ... FAILED\n\nfailures:\n\n---- t stdout ----\n");
         for i in 0..MAX_FAILURE_IDS + 5 {
@@ -12151,11 +12159,78 @@ error: 2 targets failed:
         let err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n\
             error: test failed, to rerun pass `-p a --lib`\n";
         let scan = scan_of(&out);
-        assert!(scan.nested_truncated && !scan.anomaly);
-        assert_eq!(
-            qualify(scan, scan_of(err)).0,
-            vec!["test t [-p a --lib]".to_string()]
+        assert!(scan.truncated && !scan.anomaly);
+        let ids = qualify(scan, scan_of(err)).0;
+        assert_eq!(ids.first().map(String::as_str), Some("test t [-p a --lib]"));
+        assert_eq!(ids.last().map(String::as_str), Some(FAILURE_IDS_TRUNCATED));
+        assert!(ids[1..ids.len() - 1].iter().all(|i| i.ends_with(" [?]")));
+    }
+
+    /// codex on #1060 (round 12, reproduced with real `cargo test`): the creator's test `new`
+    /// writes libtest framing straight to stdout (`test old ... FAILED`, `failures:`,
+    /// `---- fake stdout ----`, `running 2 tests`) and panics; an exit callback prints a forged
+    /// closing summary whose counts and listing match. Every frame lines up, so a "verified"
+    /// structure once dropped the set-aside real `test new ... FAILED` and the check read as
+    /// pre-existing. Set-aside ids are always reported, `[?]`: text alignment never deletes one.
+    #[test]
+    fn forged_framing_with_a_matching_summary_drops_no_failure_1060() {
+        let head = adj_text(&[
+            "",
+            "running 2 tests",
+            "test old ... FAILED",
+            "failures:",
+            "---- fake stdout ----",
+            "running 2 tests",
+            "test new ... FAILED",
+            "test old ... FAILED",
+            "",
+            "failures:",
+            "",
+            "---- new stdout ----",
+            "",
+            "thread 'new' panicked at src/lib.rs:9:5:",
+            "n",
+            "",
+            "---- old stdout ----",
+            "",
+            "thread 'old' panicked at src/lib.rs:5:78:",
+            "pre-existing",
+            "",
+            "",
+            "failures:",
+            "    new",
+            "    old",
+            "",
+            "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; \
+             finished in 0.05s",
+            "",
+            "",
+            "failures:",
+            "    old",
+            "",
+            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured",
+        ]);
+        let base = adj_text(&[
+            "running 2 tests",
+            "test new ... ok",
+            "test old ... FAILED",
+            "",
+            "failures:",
+            "    old",
+            "",
+            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out",
+        ]);
+        let err = "     Running unittests src/lib.rs (target/debug/deps/a-1)\n\
+            error: test failed, to rerun pass `--lib`\n";
+        let run = adj_head(&head, err, &base, err);
+        assert!(
+            run.failure_ids.iter().any(|i| i == "test new [?]"),
+            "{:?}",
+            run.failure_ids
         );
+        assert_eq!(run.classification.as_deref(), Some(REGRESSION));
+        assert!(run.regressions.iter().any(|r| r == "test new [?]"));
+        assert!(run.denies());
     }
 
     /// agy a1b2 #1: a LAST binary that crashed after printing a failure (real cargo: the block
