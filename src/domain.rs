@@ -1025,7 +1025,10 @@ pub struct WorkUnit {
     /// plus any earlier denial over the same tree whose layer that fold did not ask again
     /// (`pipeline::denials_behind_after_fold`). What keeps deny-dominates whole when an answer
     /// overrides one layer: the operator's judgment over a failed repo-checks floor is refused
-    /// while any of these stands. `Some(empty)`: known — nothing but the floor (or nothing) denied.
+    /// while any of these stands — bar the judge's `judge_unavailable` no-verdict hold, which the
+    /// same judgment answers as the judge (operator ruling 2026-10-20,
+    /// `pipeline::judge_absent_behind_floor`). `Some(empty)`: known — nothing but the floor (or
+    /// nothing) denied.
     /// `None`: unknown (a unit persisted before this field, or a same-tree attempt that could not
     /// establish it) — read as unknown (fail-closed), never as none.
     #[serde(default, skip_serializing_if = "Option::is_none")]

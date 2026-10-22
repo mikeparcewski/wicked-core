@@ -66,11 +66,43 @@ pub struct OperatorJudgment {
         skip_serializing_if = "Option::is_none"
     )]
     pub floor_override: Option<FloorOverride>,
+    /// (operator ruling 2026-10-20, core#1061 follow-on) Set when this judgment stood in for the
+    /// JUDGE behind a floor override: the same operator judgment overrode a failed repo-checks
+    /// floor whose gate also held a `judge_unavailable` no-verdict (no judge seat produced a
+    /// verdict), and this record is the judge layer's — labelled [`JUDGE_STAND_IN_LABEL`]. `note`
+    /// is the same rationale; `reason` is the judge layer's own denial text. Absent otherwise.
+    #[serde(
+        default,
+        rename = "judgeStandIn",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub judge_stand_in: Option<JudgeStandIn>,
 }
 
 /// (operator ruling 2026-10-21) The label every surface shows for a floor the operator overrode:
 /// the run, the gate and the delivery.
 pub const FLOOR_OVERRIDE_LABEL: &str = "floor overridden by operator";
+
+/// (operator ruling 2026-10-20) The label of the judge layer an operator's floor override also
+/// answered because no judge seat could rule ([`JudgeStandIn`]).
+pub const JUDGE_STAND_IN_LABEL: &str = "judge: operator (no judge seat available)";
+
+/// (operator ruling 2026-10-20: no judge available and no fallback judge ⇒ a person approves) The
+/// judge layer an operator's judgment over a failed floor ALSO answered: the gate's only other
+/// denial was the judge's `judge_unavailable` no-verdict, so the operator stands in for the judge
+/// exactly as at a `judge_unavailable` gate of its own. Never a judge that RULED (a REJECT with a
+/// verdict is `agent_validator` and refuses the override), and it waives nothing else: QE
+/// acceptance and every later gate stand as they were.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JudgeStandIn {
+    /// The judge layer's denial source: [`crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE`].
+    pub source: String,
+    /// The floor result the same judgment overrode ([`FloorOverride::result_id`]).
+    pub floor_result_id: String,
+    /// [`JUDGE_STAND_IN_LABEL`], verbatim — the line to show as-is.
+    pub label: String,
+}
 
 /// (operator ruling 2026-10-21) The failed floor result an operator's judgment overrode. The
 /// override answers the deterministic repo-checks floor ONLY: every other layer of the gate still
@@ -308,7 +340,10 @@ pub struct RunAssurance {
     pub qe: Option<QeAcceptance>,
     /// (operator ruling 2026-10-21) Every failed floor the operator overrode on this run, with who,
     /// when and why ([`OperatorJudgment::floor_override`] set) — the run's own
-    /// "floor overridden by operator" label. Absent when none (the routine case).
+    /// "floor overridden by operator" label — each followed, when that gate's judge could not rule
+    /// either, by the judge layer's record of the same judgment
+    /// ([`OperatorJudgment::judge_stand_in`] set, operator ruling 2026-10-20). Absent when none
+    /// (the routine case).
     #[serde(
         default,
         rename = "floorOverrides",
