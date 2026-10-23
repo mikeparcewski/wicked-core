@@ -58,14 +58,6 @@ pub(crate) fn run_dir(root: &Path, run_id: Option<&str>, worktree: &Path) -> Pat
     root.join(key)
 }
 
-/// Reap the run's log store (the run ended).
-pub(crate) fn remove_run_logs(root: &Path, run_id: &str) {
-    let dir = run_dir(root, Some(run_id), Path::new(""));
-    if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
-        let _ = std::fs::remove_dir_all(dir);
-    }
-}
-
 /// The finished capture of one stream.
 #[derive(Debug, Default)]
 pub(crate) struct Captured {

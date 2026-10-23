@@ -44,7 +44,7 @@ Two release tracks share this file, newest entry first regardless of track:
   classification (`classify` and the binary qualifiers, `LineScan`, the libtest `env_cannot_run` class and its
   launcher signatures, the isolated `--exact` and vitest file re-runs, the load-class and env-crash re-runs,
   `MAX_FLAKE_RERUN`, the environment signals) and the 4 KB ring buffer as a source of truth. Every stream is now
-  stored once, content-addressed (sha256), in the run's log store (reaped with the run's check scratch, never while a floor of the run holds any of its scratch), with a lazy line TOC and ranges read by ref
+  stored once, content-addressed (sha256), in the run's log store (reaped when the run ends, by the last floor of the run to leave — never while one still holds any of its scratch), with a lazy line TOC and ranges read by ref
   and verified against the hash (`floor_log`); a stream past 64 MiB keeps its prefix, marked `truncated`, and a
   truncated inventory is never precise. Kept: the PTY grant (core#1060's Seatbelt rules, cherry-picked), the
   load-aware bound, the base cache (now `{floor_policy: 8, run, toc}`; an inventory or alone run that did not finish is not cached), `.wicked/checks.json`, the operator

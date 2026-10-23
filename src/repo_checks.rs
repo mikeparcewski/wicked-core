@@ -2765,7 +2765,16 @@ fn orphan_path(leaf: &Path) -> PathBuf {
 /// lease, the leaf is MARKED orphaned instead (and logged) and `false` returned. The 0-byte lock
 /// file is KEPT, as the cap keeps it: a floor may already have it open, waiting in
 /// `lock_shared`, and unlinking it would hand that floor a lease on an inode no later lock sees.
+/// A leaf that goes may take its finished run's log store with it ([`reap_run_logs`]).
 fn retire_leaf(leaf: &Path) -> bool {
+    let gone = retire_leaf_now(leaf);
+    if gone {
+        reap_run_logs(leaf);
+    }
+    gone
+}
+
+fn retire_leaf_now(leaf: &Path) -> bool {
     let mark = orphan_path(leaf);
     if std::fs::symlink_metadata(lease_path(leaf)).is_err()
         && std::fs::symlink_metadata(leaf).is_err()
@@ -2819,36 +2828,64 @@ pub(crate) fn remove_check_scratch(worktree: &Path, run_id: &str) {
 
 /// [`remove_check_scratch`] against an explicit cache root. Returns whether the leaf is gone.
 pub(crate) fn remove_check_scratch_in(cache: &Path, worktree: &Path, run_id: Option<&str>) -> bool {
-    // (codex r8) The run's logs go only with its leaf: a leaf a floor still holds keeps them (a
-    // capture in flight must not lose its store; they stay for the operator to inspect).
-    let gone = retire_leaf(&scratch_dir_for(cache, worktree, run_id));
-    if let (true, Some(id)) = (gone, run_id) {
-        // (codex r9) Every tree of the run (a guarded checkout too) shares its log store: it goes
-        // only while no floor holds a leaf of the run, each held exclusively for the removal.
-        if let Some(_held) = run_leases(cache, id) {
-            let root = cache
-                .parent()
-                .unwrap_or(cache)
-                .join(crate::floor_log::LOG_SUBDIR);
-            crate::floor_log::remove_run_logs(&root, id);
+    // (codex r8-r10) The run ended: its log store is marked for reaping, and goes with the last
+    // floor of the run to leave ([`reap_run_logs`]) — never while one still writes to it.
+    if let Some(id) = run_id {
+        let root = cache.parent().unwrap_or(cache);
+        let logs =
+            crate::floor_log::run_dir(&root.join(crate::floor_log::LOG_SUBDIR), Some(id), worktree);
+        if logs.exists() {
+            let _ = std::fs::write(logs.with_extension("reap"), b"");
         }
     }
-    gone
+    retire_leaf(&scratch_dir_for(cache, worktree, run_id))
 }
 
-/// Every check-scratch leaf of run `run_id` (any tree), each locked EXCLUSIVELY — `None` when a
-/// floor holds one.
-fn run_leases(cache: &Path, run_id: &str) -> Option<Vec<std::fs::File>> {
-    let suffix = format!("-r{}", hex12(run_id.as_bytes()));
-    let mut held = Vec::new();
+/// (codex r9, r10) A finished run's log store (marked `r-<hex>.reap` by
+/// [`remove_check_scratch_in`]) is shared by every tree of the run, a guarded checkout too: it is
+/// removed only when no floor holds ANY leaf of the run — a starting floor holds its lock file
+/// before its directory exists — each locked exclusively for the removal. Tried whenever a leaf of
+/// the run is retired, so the last floor out takes it.
+fn reap_run_logs(leaf: &Path) {
+    let name = leaf
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let (Some((_, hex)), Some(cache)) =
+        (name.rsplit_once("-r"), leaf.parent().and_then(Path::parent))
+    else {
+        return;
+    };
+    let logs = cache
+        .parent()
+        .unwrap_or(cache)
+        .join(crate::floor_log::LOG_SUBDIR)
+        .join(format!("r-{hex}"));
+    let mark = logs.with_extension("reap");
+    if !mark.exists() {
+        return;
+    }
+    let suffix = format!("-r{hex}");
+    let mut leaves = std::collections::BTreeSet::new();
     let groups = std::fs::read_dir(cache).into_iter().flatten().flatten();
-    for leaf in groups.flat_map(|g| std::fs::read_dir(g.path()).into_iter().flatten().flatten()) {
-        let p = leaf.path();
-        if p.is_dir() && p.to_string_lossy().ends_with(&suffix) {
-            held.push(lock_leaf(&p, true).ok()??);
+    for e in groups.flat_map(|g| std::fs::read_dir(g.path()).into_iter().flatten().flatten()) {
+        let p = e.path().to_string_lossy().into_owned();
+        if let Some(l) = p.strip_suffix(".lock").filter(|l| l.ends_with(&suffix)) {
+            leaves.insert(PathBuf::from(l));
+        } else if p.ends_with(&suffix) {
+            leaves.insert(PathBuf::from(p));
         }
     }
-    Some(held)
+    let mut held = Vec::new();
+    for l in &leaves {
+        match lock_leaf(l, true) {
+            Ok(Some(f)) => held.push(f),
+            _ => return,
+        }
+    }
+    if std::fs::remove_dir_all(&logs).is_ok() || !logs.exists() {
+        let _ = std::fs::remove_file(&mark);
+    }
 }
 
 /// Remove EVERY run's check-scratch leaf of the tree at `dir` — a guarded floor checkout, whose
@@ -6839,8 +6876,14 @@ pub(crate) mod tests {
         assert!(orphan_path(&leaf_a).exists(), "marked orphaned instead");
         // (codex r8) A held leaf keeps the run's log store: a capture in flight needs it.
         assert!(logs_a.exists(), "the held run's logs stay");
-        // (codex r9) So does a held leaf of ANOTHER tree of the run (a guarded checkout): the
-        // live tree's idle leaf goes, the shared logs stay until that floor ends.
+        // (codex r10) ... and goes with the last floor of the run to leave.
+        drop(floor_a);
+        assert!(
+            !logs_a.exists(),
+            "the last floor out reaps the finished run's logs"
+        );
+        // (codex r9) A held leaf of ANOTHER tree of the run (a guarded checkout) keeps them too:
+        // the live tree's idle leaf goes, the shared logs stay until that floor ends.
         let guarded = base.join("guarded-a");
         std::fs::create_dir_all(&guarded).unwrap();
         let wt2 = base.join("repo").join("wicked-worktrees").join("other");
@@ -6851,18 +6894,25 @@ pub(crate) mod tests {
         let logs_b =
             crate::floor_log::run_dir(&base.join(crate::floor_log::LOG_SUBDIR), Some(run_b), &wt2);
         std::fs::create_dir_all(&logs_b).unwrap();
+        // (codex r10) A floor that is only starting holds its lock file, not yet its directory.
+        let starting = scratch_dir_for(&cache, &base.join("starting"), Some(run_b));
+        std::fs::create_dir_all(starting.parent().unwrap()).unwrap();
+        let starting_lease = lock_leaf(&starting, false).unwrap();
+        drop(floor_g);
         assert!(remove_check_scratch_in(&cache, &wt2, Some(run_b)));
         assert!(
             logs_b.exists(),
-            "a guarded floor of the run still holds a leaf"
+            "a starting floor of the run holds its lease"
         );
-        drop(floor_g);
+        drop(starting_lease);
+        // The guarded checkout's retirement, after the run ended, takes the logs.
+        remove_tree_scratch_in(&cache, &guarded);
+        assert!(!logs_b.exists(), "the last leaf of the run out reaps them");
         // Run B, a distinct run on the same path, never sees A's output.
         let floor_b = CheckScratch::prepare_in(&cache, &wt, Some(run_b), u64::MAX).unwrap();
         assert_eq!(floor_b.root(), leaf_b);
         assert!(!leaf_b.join("cargo-target/head/a-binary").exists());
-        // A's floor ends: its orphaned leaf goes with it.
-        drop(floor_a);
+        // A's floor ended: its orphaned leaf went with it.
         assert!(!leaf_a.exists() && !orphan_path(&leaf_a).exists());
         // An orphan no floor could retire is removed by the next cap pass, whatever the cap.
         std::fs::create_dir_all(leaf_a.join("home")).unwrap();
