@@ -94,6 +94,20 @@
           "content": "#[ctor::ctor(unsafe)]\nfn arm_hermetic_emit_spool() {\n    wicked_apps_core::emit::hermetic_test_spool();\n}\n\n#[test]\nfn floor_probe_mutation_two() {\n    panic!(\"the build guide's second mutation probe\");\n}\n",
           "expectId": "floor_probe_mutation_two"
         }
+      },
+      "verified": {
+        "baseSha": "b5ec205f97086e2755f21085c9c7dfcd11902b67",
+        "runnerVersion": "",
+        "at": "2026-10-23T18:59:07Z",
+        "results": {
+          "alone": "pass",
+          "deselect": "pass",
+          "ids": "pass",
+          "list": "pass",
+          "multi": "pass",
+          "mutation": "pass",
+          "run": "pass"
+        }
       }
     }
   ]
