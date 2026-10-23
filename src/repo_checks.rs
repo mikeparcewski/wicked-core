@@ -66,17 +66,17 @@
 //! * The head check runs unchanged. Exit 0 is a `pass`.
 //! * Otherwise the base runs the same argv. A green base makes the failure a `new_failure`. A red
 //!   base is inventoried by its own runner on the base tree — its TOC: `cargo test <args> --
-//!   --list`, `pytest --collect-only -q`, `go test -list .` — and its failing tests are read from
+//!   --list` or `pytest --collect-only -q` — and its failing tests are read from
 //!   the BASE output and kept only when the base TOC lists them verbatim.
 //! * When exclusion is precise — every kept name unique in the base TOC and at most once in the
 //!   head's TOC, the argv on the core#1060 r16 allowlist, no head `.cargo/config*` setting
 //!   `rustdocflags` or test args, and (cargo) no whitespace in a name, which rustdoc would split
 //!   out of a test argument — the head runs once more with them deselected natively (libtest
-//!   `--skip=<name> --exact`, pytest `--deselect=<nodeid>`, go `-skip=^(…)$`). Exit 0 is
+//!   `--skip=<name> --exact`, pytest `--deselect=<nodeid>`). Exit 0 is
 //!   `pass_excluded` with the names listed; non-zero is a `new_failure`. Anything else is
 //!   `base_red_unseparated`: escalated with both logs, the operator's floor override the path
-//!   through. vitest, jest, tsc, eslint and shell runners have no precise deselect and escalate
-//!   the same way.
+//!   through. go test (its subtests are absent from its inventory), vitest, jest, tsc, eslint and
+//!   shell runners have no precise deselect and escalate the same way.
 //! * A deciding run that fails on an oversubscribed host (1-min load above the CPU count) is
 //!   re-run ONCE with the same argv after waiting, bounded, for headroom (Bazel's
 //!   `flaky_test_attempts=2`): exit 0 is `passed on retry (flaky)`, a second failure is
@@ -241,8 +241,7 @@ use wicked_apps_core::spawn::HardenedCommand;
 
 use crate::floor_runner::{
     cargo_config_bends_test_args, cargo_test_sub, deselect_argv, deselectable, failing_names,
-    go_subtest_failed, parse_toc, passing_names, pytest_prefix_collision, runner_of, toc_argv,
-    Runner,
+    parse_toc, passing_names, pytest_prefix_collision, runner_of, toc_argv, Runner,
 };
 use crate::validator::WorkerSandbox;
 
@@ -828,7 +827,7 @@ impl RepoChecksReport {
                 };
                 // (core#469) A TIMEOUT is a check that did not finish, not one that failed: say
                 // so, and say what the gate can do about it.
-                if c.timed_out {
+                if c.did_not_finish() {
                     return format!(
                         "{line}. This check did not FINISH — the change is unverified by it, not \
                          refuted: extend the bound (`timeout_s` in `{CONFIG_PATH}`), declare a \
@@ -838,6 +837,12 @@ impl RepoChecksReport {
                 }
                 // (DES-FLOOR-V2) What the decision established, from exit codes only.
                 let short = |h: &str| h[..h.len().min(10)].to_string();
+                let failed = |d: &CheckDecision| {
+                    matches!(
+                        d.outcome.as_str(),
+                        OUTCOME_NEW_FAILURE | OUTCOME_FLAKY_TWICE
+                    )
+                };
                 let base_note = match (&c.decision, c.base.as_deref()) {
                     (_, Some(BaseRun { error: Some(e), .. })) => {
                         format!(" — the base could not be compared ({e}); fail-closed")
@@ -849,7 +854,7 @@ impl RepoChecksReport {
                         short(&b.head),
                         d.reason.as_deref().unwrap_or("base red, cannot separate")
                     ),
-                    (Some(d), Some(b)) if !d.excluded.is_empty() => format!(
+                    (Some(d), Some(b)) if !d.excluded.is_empty() && failed(d) => format!(
                         " — NEW FAILURE: the head still fails with the base's {} failing test{} \
                          ({}) deselected{}",
                         d.excluded.len(),
@@ -861,15 +866,19 @@ impl RepoChecksReport {
                             format!(" (base {})", short(&b.head))
                         }
                     ),
-                    (Some(_), Some(b)) if b.run.as_ref().is_some_and(CheckRun::passed) => format!(
-                        " — NEW FAILURE: the run base {} passes this check{}",
-                        short(&b.head),
-                        if c.regressions.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" (the head printed: {})", c.regressions.join(", "))
-                        }
-                    ),
+                    (Some(d), Some(b))
+                        if failed(d) && b.run.as_ref().is_some_and(CheckRun::passed) =>
+                    {
+                        format!(
+                            " — NEW FAILURE: the run base {} passes this check{}",
+                            short(&b.head),
+                            if c.regressions.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" (the head printed: {})", c.regressions.join(", "))
+                            }
+                        )
+                    }
                     _ => String::new(),
                 };
                 let base_note = match &c.decision {
@@ -1894,7 +1903,10 @@ fn derive_targeted(
             let mut manifests = false;
             for f in &files {
                 let name = base_name(f);
-                if f.starts_with(".cargo/") || name.starts_with("rust-toolchain") {
+                if f.starts_with(".cargo/")
+                    || f.contains("/.cargo/")
+                    || name.starts_with("rust-toolchain")
+                {
                     return Ok(None);
                 }
                 // A manifest or the lockfile is the metadata diff's to read.
@@ -4176,9 +4188,12 @@ impl BaseTree {
             run,
             toc,
         };
-        let _ = std::fs::create_dir_all(scratch.root.join("base-cache"));
-        if let Ok(json) = serde_json::to_string(&rec) {
-            let _ = std::fs::write(&cache, json);
+        // A base run that did not finish or could not start is not cached: it says nothing lasting.
+        if !rec.run.timed_out && rec.run.spawn_error.is_none() {
+            let _ = std::fs::create_dir_all(scratch.root.join("base-cache"));
+            if let Ok(json) = serde_json::to_string(&rec) {
+                let _ = std::fs::write(&cache, json);
+            }
         }
         BaseSide {
             base: BaseRun {
@@ -4441,8 +4456,8 @@ fn decide(
     if let (Some(b), Some(side)) = (red_base, side.as_ref()) {
         plan = (|| {
             let runner = runner_of(&check.argv).ok_or_else(|| {
-                "the runner has no precise per-test deselect the floor knows (only cargo test, \
-                 pytest and go test)"
+                "the runner has no precise per-test deselect the floor knows (only cargo test and \
+                 pytest)"
                     .to_string()
             })?;
             let toc = side
@@ -4465,13 +4480,6 @@ fn decide(
                 .and_then(|l| crate::floor_log::read_blob(&scratch.logs, l))
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                 .map_err(|e| format!("the base's output could not be read back: {e}"))?;
-            if runner == Runner::Go && go_subtest_failed(&base_text) {
-                return Err(
-                    "a go SUBTEST failed on the base; its parent cannot be skipped without its \
-                     passing siblings"
-                        .to_string(),
-                );
-            }
             // Kept only when the base's own inventory lists the name VERBATIM — and (libtest, which
             // prints every test's own result line) when the base did not ALSO report it `ok`: a
             // failing base test's captured output can carry a child run's `test X ... FAILED` for
@@ -4479,7 +4487,7 @@ fn decide(
             let passed = passing_names(runner, &base_text);
             let failing: Vec<String> = failing_names(runner, &base_text)
                 .into_iter()
-                .filter(|n| toc.count(n) > 0 && !passed.contains(n))
+                .filter(|n| toc.count(n) > 0 && !(toc.count(n) == 1 && passed.contains(n)))
                 .collect();
             decision.base_failing = failing.clone();
             if failing.is_empty() {
@@ -4492,11 +4500,6 @@ fn decide(
                     "the check's argv is not on the deselection allowlist ({})",
                     check.argv.join(" ")
                 ));
-            }
-            if runner == Runner::Cargo {
-                if let Some(why) = cargo_config_bends_test_args(worktree, &check.dir) {
-                    return Err(why);
-                }
             }
             // cargo hands rustdoc each test argument through `--test-args`, which rustdoc SPLITS on
             // whitespace: a doctest name (`src/lib.rs - f (line 1)`) would become positional
@@ -4524,6 +4527,11 @@ fn decide(
                     "`{n}` names {} tests in the head's inventory",
                     head_toc.count(n)
                 ));
+            }
+            if runner == Runner::Cargo {
+                if let Some(why) = config_bends(worktree, check, scratch) {
+                    return Err(why);
+                }
             }
             if runner == Runner::Pytest {
                 if let Some(n) = pytest_prefix_collision(&failing, &head_toc.names) {
@@ -4569,9 +4577,17 @@ fn decide(
     }
     let unseparated = red_base.is_some() && plan.is_err();
     // Failing twice is `flaky_twice` only when BOTH attempts ran oversubscribed: a retry that had
-    // its headroom and failed again reproduced the failure without the load — a new failure.
+    // its headroom and failed again reproduced the failure without the load — a new failure. An
+    // excluded run is retried only while no cargo config bends its `--exact` (a test of the first
+    // attempt may have written one into the scratch CARGO_HOME).
     let mut twice = false;
-    if let Some(r) = retry_if_loaded(worktree, &deciding_check, &deciding, sandbox, scratch) {
+    let retry_safe = !excluded_run
+        || matches!(&plan, Ok((r, _)) if *r != Runner::Cargo)
+        || config_bends(worktree, check, scratch).is_none();
+    let retry = retry_safe
+        .then(|| retry_if_loaded(worktree, &deciding_check, &deciding, sandbox, scratch))
+        .flatten();
+    if let Some(r) = retry {
         logs.extend(r.logs.iter().cloned());
         head.reruns.push(r.clone());
         decision.flaky = r.passed();
@@ -4595,13 +4611,14 @@ fn decide(
         (OUTCOME_PASS_EXCLUDED, Some(PRE_EXISTING_IN_SANDBOX))
     } else if deciding.passed() {
         (OUTCOME_PASS, Some(FLAKY_UNDER_LOAD))
+    } else if let (true, Err(why)) = (unseparated, &plan) {
+        // Before a retry's own timeout or spawn failure: the first run decided this.
+        decision.reason = Some(format!("base red, cannot separate: {why}"));
+        (OUTCOME_BASE_RED_UNSEPARATED, Some(BASE_RED_UNSEPARATED))
     } else if deciding.timed_out {
         (OUTCOME_TIMED_OUT, None)
     } else if deciding.spawn_error.is_some() {
         (OUTCOME_COULD_NOT_RUN, None)
-    } else if let (true, Err(why)) = (unseparated, &plan) {
-        decision.reason = Some(format!("base red, cannot separate: {why}"));
-        (OUTCOME_BASE_RED_UNSEPARATED, Some(BASE_RED_UNSEPARATED))
     } else {
         // `regression` (the compatible token) only when a base was compared.
         let compared = (base_passed || plan.is_ok()).then_some(REGRESSION);
@@ -4621,7 +4638,7 @@ fn decide(
             decision.excluded.join(", ")
         ));
         head.pre_existing = decision.excluded.clone();
-    } else if outcome != OUTCOME_BASE_RED_UNSEPARATED {
+    } else if matches!(outcome, OUTCOME_NEW_FAILURE | OUTCOME_FLAKY_TWICE) {
         head.regressions = annotated;
     }
     if decision.flaky {
@@ -4636,6 +4653,12 @@ fn decide(
     head.classification = classification.map(str::to_string);
     head.base = side.map(|s| Box::new(s.base));
     head.decision = Some(decision);
+}
+
+/// Does any cargo config the check's runs load bend `--exact` (see
+/// [`cargo_config_bends_test_args`]): the tree's and its ancestors', and the scratch CARGO_HOME?
+fn config_bends(worktree: &Path, check: &RepoCheck, scratch: &CheckScratch) -> Option<String> {
+    cargo_config_bends_test_args(&worktree.join(&check.dir), &scratch.root.join("cargo-home"))
 }
 
 /// The decision of a check whose first run decides alone: it passed, timed out or could not
@@ -4868,6 +4891,17 @@ fn affected_packages(
     let mut manifests = false;
     for f in &files {
         let name = f.rsplit('/').next().unwrap_or(f);
+        if f.starts_with(".cargo/") || f.contains("/.cargo/") || name.starts_with("rust-toolchain")
+        {
+            return Err(format!("`{f}` configures cargo outside package metadata"));
+        }
+        // A manifest or lockfile path is read by the diffs below AND names its owning member (a
+        // fixture manifest under `crates/foo/tests/…` belongs to `foo`).
+        if name == "Cargo.toml" || name == "Cargo.lock" {
+            if let Some(owner) = owner_of(&head, f) {
+                changed.insert(owner.name.clone());
+            }
+        }
         if name == "Cargo.toml" {
             manifests = true;
         } else if name == "Cargo.lock" {
@@ -4934,6 +4968,16 @@ fn affected_packages(
                 if old.get(key) != new.get(key) {
                     return Err(format!(
                         "`{rel}` changes `[{key}]`, which package metadata does not carry"
+                    ));
+                }
+            }
+            // The resolver (and the edition that defaults it) decides feature unification for the
+            // whole workspace.
+            let pkg = |t: &toml::Table, k: &str| t.get("package").and_then(|p| p.get(k)).cloned();
+            for key in ["resolver", "edition"] {
+                if pkg(&old, key) != pkg(&new, key) {
+                    return Err(format!(
+                        "`{rel}` changes `package.{key}`, which reaches every member"
                     ));
                 }
             }
@@ -5512,7 +5556,8 @@ pub(crate) fn run_one(
     // ANNOTATION only (DES-FLOOR-V2): the ids a runner printed, both streams, first sight order.
     // They name failures for the reader; no outcome reads them.
     let mut eslint_file = None;
-    for line in stdout.lines().chain(stderr.lines()) {
+    let failed = result.exit_code != Some(0);
+    for line in stdout.lines().chain(stderr.lines()).filter(|_| failed) {
         if result.failure_ids.len() >= MAX_FAILURE_IDS {
             break;
         }
@@ -8604,6 +8649,15 @@ mod tests {
         assert_eq!(t.name, "test_targeted");
         assert_eq!(t.argv, s(&["cargo", "test", "--no-fail-fast", "-p", "b"]));
         git(&repo, &["checkout", "-q", "--", "Cargo.toml"]);
+        // (agy r2) A nested `.cargo/` config configures cargo for every crate below it ⇒ full.
+        std::fs::create_dir_all(repo.join("b/.cargo")).unwrap();
+        std::fs::write(repo.join("b/.cargo/config.toml"), "[build]\n").unwrap();
+        let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
+        assert_eq!(
+            t.name, "cargo-test",
+            "a nested .cargo config never narrows the set"
+        );
+        std::fs::remove_dir_all(repo.join("b/.cargo")).unwrap();
         // A deleted file elsewhere (crate `a`) could break what it left ⇒ full.
         std::fs::remove_file(repo.join("a/src/lib.rs")).unwrap();
         let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
@@ -9130,6 +9184,16 @@ mod tests {
         .unwrap();
         unseparated(&repo, &ctx, "escaped cargo config test-args");
         std::fs::remove_dir_all(repo.join(".cargo")).unwrap();
+        // (codex r2) The scratch CARGO_HOME is writable by a test body: its config counts too.
+        let home = leaf_of(&repo).join("cargo-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "[build]\nrustdocflags = [\"--test-args=documented\"]\n",
+        )
+        .unwrap();
+        unseparated(&repo, &ctx, "a CARGO_HOME config written by a test");
+        std::fs::remove_file(home.join("config.toml")).unwrap();
         // (e) A base inventory that lists the failing name twice (a fresh base commit).
         let (repo2, ctx2, argv2) = red_base("unsep-dup");
         write_tree(
@@ -9729,6 +9793,16 @@ mod tests {
             "{source}"
         );
         git(&repo, &["checkout", "--", "Cargo.toml"]);
+        // (codex r2) A member's edition (which defaults the resolver) reaches every member.
+        std::fs::write(
+            repo.join("a/Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\n",
+        )
+        .unwrap();
+        let (argv, source) = targeted(&run_floor(&repo, &ctx));
+        assert!(!argv.iter().any(|x| x == "-p"), "{argv:?}");
+        assert!(source.contains("package.edition"), "{source}");
+        git(&repo, &["checkout", "--", "a/Cargo.toml"]);
         // A change in `c` alone: `c` only.
         git(&repo, &["checkout", "--", "a/src/lib.rs"]);
         std::fs::write(repo.join("c/src/lib.rs"), "pub fn y() {}\n").unwrap();

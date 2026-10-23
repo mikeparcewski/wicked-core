@@ -1,9 +1,14 @@
 //! FLOOR RUNNERS — what the repo-checks floor knows about the test runners whose failures it may
-//! EXCLUDE (DES-FLOOR-V2): cargo test (libtest + rustdoc), pytest and go test. For each, the argv
-//! that prints the runner's own inventory of a selection (its TOC), the strict reading of that
+//! EXCLUDE (DES-FLOOR-V2): cargo test (libtest + rustdoc) and pytest. For each, the argv that
+//! prints the runner's own inventory of a selection (its TOC), the strict reading of that
 //! inventory, the failing names a run's own output reports, and the runner's native, precise
 //! per-test deselection — plus the allowlist an argv must be on before anything is appended to it.
 //! Pure over argv and text; the floor ([`crate::repo_checks`]) runs the processes and decides.
+//!
+//! go test is not here on purpose: its subtests are created at run time and absent from
+//! `go test -list`, so skipping a failing top-level test can skip a passing subtest the head then
+//! breaks, and no inventory can show otherwise (#1066 review round 2). A red go base escalates, like
+//! vitest's and jest's.
 
 use std::path::Path;
 
@@ -14,8 +19,6 @@ pub(crate) enum Runner {
     Cargo,
     /// pytest: `--collect-only -q`, `--deselect <nodeid>`.
     Pytest,
-    /// `go test`: `-list .`, `-skip '^(Name)$'`.
-    Go,
 }
 
 fn bin_name(argv: &[String]) -> Option<&str> {
@@ -32,7 +35,6 @@ pub(crate) fn runner_of(argv: &[String]) -> Option<Runner> {
         "python" | "python3" if argv.get(1..3) == Some(&["-m".into(), "pytest".into()]) => {
             Some(Runner::Pytest)
         }
-        "go" if argv.get(1).map(String::as_str) == Some("test") => Some(Runner::Go),
         _ => None,
     }
 }
@@ -114,9 +116,9 @@ fn understood_cargo_test(argv: &[String]) -> Option<(&[String], &[String])> {
     .then_some((cargo_args, test_args))
 }
 
-/// Is `argv` on the deselection allowlist for its runner? pytest and go refuse their own selection
-/// and state flags (a `--deselect`/`-skip` of their own, collect-only, last-failed / stepwise
-/// state, `-run`, `-list`, `-json`, `-exec`).
+/// Is `argv` on the deselection allowlist for its runner? cargo: the r16 allowlist plus
+/// `--no-fail-fast`; pytest refuses its own selection and state flags (a `--deselect` of its own,
+/// collect-only, last-failed / stepwise state, `--`).
 pub(crate) fn deselectable(runner: Runner, argv: &[String]) -> bool {
     match runner {
         Runner::Cargo => {
@@ -140,14 +142,6 @@ pub(crate) fn deselectable(runner: Runner, argv: &[String]) -> bool {
                     | "--sw-skip"
                     | "--stepwise-skip"
             )
-        }),
-        Runner::Go => !argv[2..].iter().any(|a| {
-            if a == "--" {
-                return true;
-            }
-            let k = a.trim_start_matches('-');
-            let k = k.split('=').next().unwrap_or(k);
-            a.starts_with('-') && matches!(k, "run" | "skip" | "list" | "json" | "exec" | "c")
         }),
     }
 }
@@ -175,12 +169,6 @@ pub(crate) fn toc_argv(runner: Runner, argv: &[String]) -> Vec<String> {
             };
             let mut out: Vec<String> = argv.iter().filter(|a| !verbosity(a)).cloned().collect();
             out.extend(["--collect-only".to_string(), "-q".to_string()]);
-            out
-        }
-        Runner::Go => {
-            let mut out = argv[..2].to_vec();
-            out.extend(["-list".to_string(), ".".to_string()]);
-            out.extend(argv[2..].iter().cloned());
             out
         }
     }
@@ -233,30 +221,21 @@ pub(crate) fn parse_toc(runner: Runner, stdout: &str) -> Option<Vec<String>> {
                 listed += if n == "no" { 0 } else { n.parse().ok()? };
                 summaries += 1;
             }
-            Runner::Go => {
-                if l.starts_with("ok ") || l.starts_with("?   ") {
-                    summaries += 1;
-                    continue;
-                }
-                let ident = |s: &str| {
-                    s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-                        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                };
-                if !ident(l) {
-                    return None;
-                }
-                names.push(l.to_string());
-            }
         }
     }
-    let counted = runner == Runner::Go || listed == names.len();
-    (counted && summaries > 0).then_some(names)
+    (listed == names.len() && summaries > 0).then_some(names)
+}
+
+/// libtest's result-line name, without the ` - should panic` it prints for a `#[should_panic]`
+/// test (its inventory lists the bare name).
+fn libtest_name(r: &str) -> &str {
+    r.strip_suffix(" - should panic").unwrap_or(r)
 }
 
 /// The failing test names a run's OWN stdout (the base's) carries, read only from the runner's
-/// own result lines: libtest `test X ... FAILED`; pytest's `short test summary info` section
-/// (`FAILED <id>` / `ERROR <id>`, never a test's captured output above it); go's top-level
-/// `--- FAIL: X (Ns)` at column 0 (a subtest is indented — see [`go_subtest_failed`]).
+/// own result lines: libtest `test X ... FAILED`; pytest's LAST `short test summary info` section
+/// (`FAILED <id>` / `ERROR <id>`) — the outer run prints it at the very end, so a child pytest's
+/// summary inside a test's captured output, which comes earlier, is discarded.
 pub(crate) fn failing_names(runner: Runner, text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut in_summary = false;
@@ -264,21 +243,21 @@ pub(crate) fn failing_names(runner: Runner, text: &str) -> Vec<String> {
         let l = line.trim_end_matches('\r');
         if runner == Runner::Pytest && l.starts_with('=') {
             in_summary = l.contains(" short test summary info ");
+            if in_summary {
+                out.clear();
+            }
             continue;
         }
         let name = match runner {
             Runner::Cargo => l
                 .strip_prefix("test ")
-                .and_then(|r| r.strip_suffix(" ... FAILED")),
+                .and_then(|r| r.strip_suffix(" ... FAILED"))
+                .map(libtest_name),
             Runner::Pytest if in_summary => l
                 .strip_prefix("FAILED ")
                 .or_else(|| l.strip_prefix("ERROR "))
                 .map(|r| r.split(" - ").next().unwrap_or(r).trim_end()),
             Runner::Pytest => None,
-            Runner::Go => l.strip_prefix("--- FAIL: ").and_then(|r| {
-                let (n, t) = r.split_once(' ')?;
-                (t.starts_with('(') && t.ends_with("s)")).then_some(n)
-            }),
         };
         if let Some(n) = name.filter(|n| !n.is_empty()) {
             if !out.iter().any(|o| o == n) && out.len() < crate::repo_checks::MAX_FAILURE_IDS {
@@ -299,22 +278,11 @@ pub(crate) fn passing_names(runner: Runner, text: &str) -> Vec<String> {
                 let r = l.trim_end_matches('\r').strip_prefix("test ")?;
                 r.strip_suffix(" ... ok")
                     .or_else(|| r.strip_suffix(" ... ignored"))
-                    .map(str::to_string)
+                    .map(|n| libtest_name(n).to_string())
             })
             .collect(),
-        Runner::Pytest | Runner::Go => Vec::new(),
+        Runner::Pytest => Vec::new(),
     }
-}
-
-/// Did a go run's output report a failing SUBTEST (`--- FAIL: TestA/sub (…)`, indented)? A
-/// subtest is not addressable by `-skip=^(TestA)$` without skipping its passing siblings, so the
-/// floor cannot separate it.
-pub(crate) fn go_subtest_failed(text: &str) -> bool {
-    text.lines().any(|l| {
-        l.trim_start()
-            .strip_prefix("--- FAIL: ")
-            .is_some_and(|r| r.split(' ').next().is_some_and(|n| n.contains('/')))
-    })
 }
 
 /// (pytest) `--deselect` matches node-id PREFIXES: the first deselected name that would also remove
@@ -331,7 +299,7 @@ pub(crate) fn pytest_prefix_collision<'a>(names: &'a [String], head: &[String]) 
 }
 
 /// `argv` with `names` deselected natively: libtest `--skip <name>` … `--exact` (exact names,
-/// every binary), pytest `--deselect <nodeid>`, go `-skip '^(A|B)$'`.
+/// every binary), pytest `--deselect <nodeid>`.
 pub(crate) fn deselect_argv(runner: Runner, argv: &[String], names: &[String]) -> Vec<String> {
     match runner {
         Runner::Cargo => {
@@ -352,39 +320,39 @@ pub(crate) fn deselect_argv(runner: Runner, argv: &[String], names: &[String]) -
             }
             out
         }
-        Runner::Go => {
-            let mut out = argv[..2].to_vec();
-            out.push(format!("-skip=^({})$", names.join("|")));
-            out.extend(argv[2..].iter().cloned());
-            out
-        }
     }
 }
 
-/// (core#1060 r21) A head `.cargo/config[.toml]` at or above the check's directory (inside the
-/// tree) that sets `rustdocflags` or test arguments: `--exact` would then turn its filter into an
-/// exact name, and a doctest failure would deselect to nothing. `Some(why)` refuses exclusion; an
-/// unreadable or linked config refuses too.
-pub(crate) fn cargo_config_bends_test_args(worktree: &Path, dir: &str) -> Option<String> {
-    let mut at = worktree.join(dir);
-    loop {
-        for name in [".cargo/config", ".cargo/config.toml"] {
-            let p = at.join(name);
+/// (core#1060 r21) A cargo config that sets `rustdocflags` or test arguments: `--exact` would
+/// then turn its filter into an exact name, and a doctest failure would deselect to nothing.
+/// Every config cargo loads is read — `.cargo/config[.toml]` in `check_dir` and EVERY ancestor up
+/// to the filesystem root, and `config[.toml]` in `cargo_home` (the floor's scratch, which a test
+/// can write: the floor re-reads it before each further run). `Some(why)` refuses exclusion; an
+/// unreadable, linked or unparseable config refuses too.
+pub(crate) fn cargo_config_bends_test_args(check_dir: &Path, cargo_home: &Path) -> Option<String> {
+    let mut files: Vec<std::path::PathBuf> = check_dir
+        .ancestors()
+        .flat_map(|d| [d.join(".cargo/config"), d.join(".cargo/config.toml")])
+        .collect();
+    files.extend([cargo_home.join("config"), cargo_home.join("config.toml")]);
+    {
+        for p in files {
+            let name = p.display().to_string();
             match std::fs::symlink_metadata(&p) {
                 Err(_) => continue,
                 Ok(m) if !m.is_file() => {
-                    return Some(format!("`{name}` is not a regular file"));
+                    return Some(format!("a cargo config is not a regular file ({name})"));
                 }
                 Ok(_) => {}
             }
             let raw = match std::fs::read_to_string(&p) {
                 Ok(r) => r,
-                Err(e) => return Some(format!("`{name}` could not be read: {e}")),
+                Err(e) => return Some(format!("a cargo config could not be read: {e}")),
             };
             // Decoded as cargo decodes it (`"rustdoc\u0066lags"` is `rustdocflags`); a config
             // that does not parse, or that includes another, cannot be vouched for.
             let Ok(v) = toml::from_str::<toml::Value>(&raw) else {
-                return Some(format!("the head's `{name}` does not parse as TOML"));
+                return Some("a cargo config does not parse as TOML".to_string());
             };
             fn bends(v: &toml::Value) -> bool {
                 let word = |s: &str| {
@@ -401,16 +369,15 @@ pub(crate) fn cargo_config_bends_test_args(worktree: &Path, dir: &str) -> Option
                 }
             }
             if bends(&v) {
-                return Some(format!(
-                    "the head's `{name}` sets rustdocflags, test args or an include, which \
-                     `--exact` would change"
-                ));
+                return Some(
+                    "a cargo config sets rustdocflags, test args or an include, which `--exact` \
+                     would change"
+                        .to_string(),
+                );
             }
         }
-        if at == worktree || !at.pop() || !at.starts_with(worktree) {
-            return None;
-        }
     }
+    None
 }
 
 #[cfg(test)]
@@ -455,11 +422,6 @@ mod tests {
             None
         );
         assert_eq!(
-            parse_toc(Runner::Go, "TestA\nTestB\nok  \texample.com/m\t0.004s\n?   \texample.com/m/x\t[no test files]\n"),
-            Some(s(&["TestA", "TestB"]))
-        );
-        assert_eq!(parse_toc(Runner::Go, "TestA\npanic: boom\n"), None);
-        assert_eq!(
             failing_names(
                 Runner::Cargo,
                 "test t::a ... FAILED\ntest t::b ... ok\n    test t::c ... FAILED trailing\n"
@@ -474,14 +436,15 @@ mod tests {
             ),
             s(&["tests/a.py::test_x", "tests/a.py::test_e"])
         );
-        // A subtest is indented; only the top-level name is read (and the subtest is flagged by
-        // `go_subtest_failed`).
+        // (agy r2) libtest prints `- should panic` after a `#[should_panic]` test's name; the
+        // inventory lists the bare name.
         assert_eq!(
-            failing_names(
-                Runner::Go,
-                "--- FAIL: TestA (0.00s)\n    --- FAIL: TestA/sub (0.00s)\n"
-            ),
-            s(&["TestA"])
+            failing_names(Runner::Cargo, "test t::sp - should panic ... FAILED\n"),
+            s(&["t::sp"])
+        );
+        assert_eq!(
+            passing_names(Runner::Cargo, "test t::sp - should panic ... ok\n"),
+            s(&["t::sp"])
         );
         let cargo = s(&["cargo", "test", "--locked", "--", "--test-threads=4"]);
         assert_eq!(
@@ -517,32 +480,22 @@ mod tests {
             s(&["pytest", "tests", "--deselect=tests/a.py::test_x"])
         );
         assert_eq!(
-            deselect_argv(
-                Runner::Go,
-                &s(&["go", "test", "./..."]),
-                &s(&["TestA", "TestB"])
-            ),
-            s(&["go", "test", "-skip=^(TestA|TestB)$", "./..."])
-        );
-        assert_eq!(
-            toc_argv(Runner::Go, &s(&["go", "test", "./..."])),
-            s(&["go", "test", "-list", ".", "./..."])
-        );
-        assert_eq!(
             runner_of(&s(&["python3", "-m", "pytest", "-q"])),
             Some(Runner::Pytest)
         );
         assert_eq!(runner_of(&s(&["npx", "vitest", "run"])), None);
         assert_eq!(runner_of(&s(&["npm", "run", "test"])), None);
+        // (#1066 review round 2) go's subtests are not in its inventory: no precise deselect.
+        assert_eq!(runner_of(&s(&["go", "test", "./..."])), None);
     }
 
-    /// Round 1 of #1066: an empty inventory is no inventory; pytest's verbosity is pinned for the
-    /// inventory; only the runners' OWN result lines name failures (pytest's short summary, go's
-    /// top-level lines); a go subtest is flagged; `ignored` is a libtest witness; a pytest
-    /// prefix that would take another test is caught.
+    /// Rounds 1-2 of #1066: an empty inventory is no inventory; pytest's verbosity is pinned for
+    /// the inventory; only the runners' OWN result lines name failures (pytest's last short
+    /// summary); `ignored` is a libtest witness; a pytest prefix that would take another test is
+    /// caught.
     #[test]
     fn inventories_and_failures_read_only_the_runners_own_lines() {
-        for r in [Runner::Cargo, Runner::Pytest, Runner::Go] {
+        for r in [Runner::Cargo, Runner::Pytest] {
             assert_eq!(
                 parse_toc(r, ""),
                 None,
@@ -564,10 +517,16 @@ mod tests {
             failing_names(Runner::Pytest, py),
             s(&["tests/a.py::test_x"])
         );
-        let go = "--- FAIL: TestA (0.00s)\n    --- FAIL: TestA/sub (0.00s)\n    logged: --- FAIL: TestB (0.00s)\n\
-                  --- FAIL: TestC is printed text\n";
-        assert_eq!(failing_names(Runner::Go, go), s(&["TestA"]));
-        assert!(go_subtest_failed(go) && !go_subtest_failed("--- FAIL: TestA (0.00s)\n"));
+        // (codex r2) A child pytest's summary inside a test's captured output comes BEFORE the
+        // outer run's own, which is last: only the last section counts.
+        let nested = "---- Captured stdout call ----\n=== short test summary info ===\n\
+                      FAILED tests/a.py::test_fine - a child run's line\n=== 1 failed ===\n\
+                      =========== short test summary info ===========\n\
+                      FAILED tests/a.py::test_old - boom\n=========== 1 failed ===========\n";
+        assert_eq!(
+            failing_names(Runner::Pytest, nested),
+            s(&["tests/a.py::test_old"])
+        );
         assert_eq!(
             passing_names(
                 Runner::Cargo,
@@ -625,9 +584,6 @@ mod tests {
             &["cargo", "test", "--", "--nocapture", "--", "x"],
             &["pytest", "--deselect", "a::b"],
             &["pytest", "--lf"],
-            &["go", "test", "-run", "TestA", "./..."],
-            &["go", "test", "-json", "./..."],
-            &["go", "test", "./...", "--", "-x"],
             &["pytest", "--", "tests"],
         ] {
             assert!(!ok(bad), "{bad:?} must not be deselected");

@@ -126,6 +126,7 @@ impl State {
                 if let Err(e) = f.write_all(kept) {
                     self.error = Some(format!("the floor log could not be written: {e}"));
                     self.file = None;
+                    let _ = std::fs::remove_file(&self.tmp);
                 }
             }
         }

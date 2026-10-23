@@ -19,22 +19,21 @@ Two release tracks share this file, newest entry first regardless of track:
   parser of the head's test output, and every round found a new forgery of text the creator's tests write. The
   floor now trusts two inputs: the base tree, and the exit codes of the processes it launches. A failed head
   check is compared with the base. A green base makes it a `new_failure`. A red base is inventoried by its own
-  runner on the base tree (`cargo test <args> -- --list`, `pytest --collect-only -q`, `go test -list .`), and
+  runner on the base tree (`cargo test <args> -- --list`, `pytest --collect-only -q`), and
   its failing tests are read from the base output and kept only when that inventory lists them verbatim (and,
   for libtest, when the base did not also report them `ok`). When the exclusion is precise, the head runs once
-  more with those tests deselected natively (libtest `--skip=<name> --exact`, pytest `--deselect`, go
-  `-skip=^(…)$`): exit 0 is `pass_excluded` ("1 pre-existing excluded: t::a"), non-zero is a `new_failure`.
+  more with those tests deselected natively (libtest `--skip=<name> --exact`, pytest `--deselect`): exit 0 is `pass_excluded` ("1 pre-existing excluded: t::a"), non-zero is a `new_failure`.
   Precise means every name is unique in the base inventory and at most once in the head's, the argv is on
   core#1060's r16 allowlist, no head `.cargo/config*` sets `rustdocflags` or test args, and no cargo name has
   whitespace (rustdoc splits each test argument, so a doctest name deselects nothing exactly). Review round 1
   tightened it: cargo needs `--no-fail-fast` (every listed test then prints its own result line), the guard reads
   `.cargo/config*` as decoded TOML, a pytest `--deselect` that would also remove another head test by node-id
-  prefix is refused, a failing go subtest is refused, the base's failing names come only from its stdout's own
-  result lines (pytest's short summary, go's top-level lines) and never from a truncated stream, an empty
+  prefix is refused, the base's failing names come only from its stdout's own
+  result lines (pytest's last short summary) and never from a truncated stream, an empty
   inventory is no inventory, and a manifest change to `[profile]`, `[patch]`, `[replace]`, `[workspace]` or
   `[lints]` runs the full suite. Anything else is
   `base_red_unseparated`: it escalates with both logs, and the operator's floor override (core#1061, core#1065)
-  is the path through. vitest, jest, tsc, eslint and shell runners escalate the same way. A deciding run that
+  is the path through. go test (its subtests are invisible to `go test -list`, so skipping a red parent can hide a newly broken subtest; review round 2), vitest, jest, tsc, eslint and shell runners escalate the same way. A deciding run that
   fails on an oversubscribed host is re-run once with the same argv after waiting up to 30 s for headroom (`WICKED_REPO_CHECKS_RETRY_WAIT_S`, at most 600): exit 0 is
   `passed on retry (flaky)`, and a second failure under load is `flaky_twice` (denies). Deleted: head-side
   classification (`classify` and the binary qualifiers, `LineScan`, the libtest `env_cannot_run` class and its
