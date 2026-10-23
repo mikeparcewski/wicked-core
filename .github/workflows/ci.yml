@@ -90,6 +90,8 @@ jobs:
           echo "$RUNNER_TEMP/probe-py/bin" >> "$GITHUB_PATH"
           npm install --prefix "$RUNNER_TEMP/probe-vt" --no-audit --no-fund vitest@3
           echo "WICKED_TEST_VITEST=$RUNNER_TEMP/probe-vt/node_modules/.bin/vitest" >> "$GITHUB_ENV"
+          # A probe fixture that would skip here (no tool, no sandbox) fails instead.
+          echo "WICKED_REQUIRE_PROBE_TOOLS=1" >> "$GITHUB_ENV"
 
       - name: cargo test
         run: cargo test --workspace

@@ -683,6 +683,13 @@ fn a_flake_under_load_passes_on_its_identical_retry_and_failing_twice_denies() {
     let _ = std::fs::remove_dir_all(&repo2);
 }
 
+/// CI's ubuntu job sets `WICKED_REQUIRE_PROBE_TOOLS`: there a probe fixture that would skip (no
+/// pytest, no vitest, no floor sandbox) fails instead.
+#[cfg(unix)]
+fn tools_required() -> bool {
+    std::env::var_os("WICKED_REQUIRE_PROBE_TOOLS").is_some()
+}
+
 /// Probe `guide` (written beside the committed tree) against `repo`'s HEAD; `None` when the
 /// floor sandbox does not arm here.
 #[cfg(unix)]
@@ -705,6 +712,7 @@ fn probe(repo: &Path, guide: serde_json::Value) -> Option<crate::floor_probe::Pr
             Some(all.remove(0).1)
         }
         Err(e) if e.contains("does not arm") => {
+            assert!(!tools_required(), "the floor sandbox is required here: {e}");
             eprintln!("repo_checks: {e} — skipping the probe");
             None
         }
@@ -766,6 +774,10 @@ fn the_probe_passes_every_piece_of_a_real_cargo_guide() {
 #[test]
 fn the_probe_passes_every_piece_of_a_junit_pytest_guide() {
     let Some(py) = crate::validator::find_on_path("pytest") else {
+        assert!(
+            !tools_required(),
+            "pytest is required here (WICKED_REQUIRE_PROBE_TOOLS)"
+        );
         eprintln!("repo_checks: pytest not on PATH — skipping the pytest guide probe");
         return;
     };
@@ -828,6 +840,10 @@ fn the_probe_passes_every_piece_of_a_junit_vitest_guide() {
         .ok()
         .filter(|v| Path::new(v).exists())
     else {
+        assert!(
+            !tools_required(),
+            "vitest is required here (WICKED_REQUIRE_PROBE_TOOLS)"
+        );
         eprintln!("repo_checks: WICKED_TEST_VITEST unset — skipping the vitest guide probe");
         return;
     };
