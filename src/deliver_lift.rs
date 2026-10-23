@@ -2286,7 +2286,8 @@ mod tests {
              b=$(basename \"$f\"); echo \"${b%.*}: test\"; n=$((n+1)); done; echo; echo \"$n tests, 0 benchmarks\"; \
              echo '     Running unittests src/lib.rs (target/debug/deps/fixture-0)' >&2; exit 0; fi\n\
              r=0; n=0; for f in tests/*.red; do [ -e \"$f\" ] || continue; t=$(basename \"$f\" .red); \
-             case \"$skips\" in *\" $t \"*) continue;; esac; echo \"test $t ... FAILED\"; r=101; n=$((n+1)); done; \
+             case \"$skips\" in *\" $t \"*) continue;; esac; echo \"test $t ... FAILED\"; fl=\"$fl $t\"; r=101; n=$((n+1)); done; \
+             if [ $n -gt 0 ]; then echo; echo failures:; for t in $fl; do echo \"    $t\"; done; echo; fi; \
              echo \"test result: FAILED. 0 passed; $n failed; 0 ignored; 0 measured; 0 filtered out\"; exit $r\n",
         )
         .unwrap();

@@ -125,7 +125,7 @@ pub(crate) fn gc(root: &Path, now: std::time::SystemTime, cap: u64) -> Vec<PathB
             continue;
         }
         if age(&m) > ttl {
-            if std::fs::remove_file(&path).is_ok() {
+            if evict(&path, now, ttl) {
                 removed.push(path);
             }
         } else {
@@ -138,12 +138,23 @@ pub(crate) fn gc(root: &Path, now: std::time::SystemTime, cap: u64) -> Vec<PathB
         if total <= cap || age <= CAP_SPARES {
             break;
         }
-        if std::fs::remove_file(&path).is_ok() {
+        if evict(&path, now, CAP_SPARES) {
             total -= bytes;
             removed.push(path);
         }
     }
     removed
+}
+
+/// (codex r14) Remove `path` only if it is STILL older than `window`, re-stated just before the
+/// removal: a dedup or a cached record's reuse may have restarted its age since the traversal.
+fn evict(path: &Path, now: std::time::SystemTime, window: Duration) -> bool {
+    let old = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| now.duration_since(t).ok())
+        .is_some_and(|age| age > window);
+    old && std::fs::remove_file(path).is_ok()
 }
 
 /// The finished capture of one stream.
@@ -490,6 +501,21 @@ mod tests {
         aged(&run.join(".part-x"), now, 25 * H, 1);
         assert_eq!(gc(&root, now, u64::MAX), vec![run.join(".part-x")]);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// (codex r14) A blob whose age restarted after the traversal saw it old is never evicted.
+    #[test]
+    fn eviction_re_stats_and_spares_a_blob_refreshed_since_the_traversal() {
+        let root = store("gc-restat");
+        let now = std::time::SystemTime::now();
+        let blob = root.join("r-0123456789ab").join("blob");
+        aged(&blob, now, 48 * H, 4);
+        touch(&blob);
+        assert!(!evict(&blob, now, CAP_SPARES), "refreshed: spared");
+        assert!(blob.exists());
+        aged(&blob, now, 48 * H, 4);
+        assert!(evict(&blob, now, CAP_SPARES) && !blob.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// (codex r12) A capture identical to an aged blob dedups onto it and restarts its age: GC over

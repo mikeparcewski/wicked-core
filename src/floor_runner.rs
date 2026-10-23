@@ -293,76 +293,69 @@ fn libtest_name(r: &str) -> &str {
     r.strip_suffix(" - compile fail").unwrap_or(r)
 }
 
-/// The test name of a libtest `test X ... <verdict>` line, or `None` for any other line.
-fn libtest_verdict<'a>(l: &'a str, verdict: &str) -> Option<&'a str> {
-    let (name, v) = l
-        .trim_end_matches('\r')
-        .strip_prefix("test ")?
-        .rsplit_once(" ... ")?;
-    (v == verdict).then(|| libtest_name(name))
-}
-
-/// (codex r13) The test names a libtest run's OWN stdout reports `ok`: a base candidate the same
-/// run passed is no base failure — an order-dependent test fails alone, so the alone run cannot
-/// tell. pytest: none.
-pub(crate) fn passing_names(runner: Runner, text: &str) -> Vec<String> {
-    match runner {
-        Runner::Cargo => text
-            .lines()
-            .filter_map(|l| libtest_verdict(l, "ok"))
-            .map(String::from)
-            .collect(),
-        Runner::Pytest => Vec::new(),
-    }
-}
-
 /// The failing test names a run's OWN stdout (the base's) carries, read only from the runner's
-/// own result lines: libtest `test X ... FAILED`; pytest's LAST `short test summary info` section
-/// (`FAILED <id>` / `ERROR <id>`), and only when the `=` line that closes it is the run's final
-/// line — the outer run prints its summary and footer at the very end, so a child pytest's summary
-/// inside a test's captured output (which comes earlier and is followed by more output), or a run
-/// whose summary is suppressed (`-rN`) or unbannered (`-q`), names nothing.
+/// own final summary. cargo (round 14): for every `test result: FAILED` line, the indented names of
+/// the LAST `failures:` block before it — libtest writes that list from its own records after every
+/// test ran, so a child's output, a result line a child split, or an order-dependent test's own
+/// line names nothing. pytest: the LAST `short test summary info` section (`FAILED <id>` /
+/// `ERROR <id>`), and only when the `=` line that closes it is the run's final line — a child
+/// pytest's summary inside captured output, or a run whose summary is suppressed (`-rN`) or
+/// unbannered (`-q`), names nothing.
 pub(crate) fn failing_names(runner: Runner, text: &str) -> Vec<String> {
     // Uncapped: a cap here, before the caller's filters, could let a base's printed lines crowd
     // out its real failures (the confirmation limit bounds the work).
     let mut out: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = Default::default();
-    let mut in_summary = false;
+    let mut block: Vec<String> = Vec::new();
+    let mut open = false;
     // pytest: the section is closed by an `=` footer, which must be the last non-empty line.
     let mut closed_at_end = false;
-    for line in text.lines() {
-        let l = line.trim_end_matches('\r');
-        if runner == Runner::Pytest && !l.trim().is_empty() {
-            closed_at_end = false;
-        }
-        if runner == Runner::Pytest && l.starts_with('=') {
-            if l.contains(" short test summary info ") {
-                in_summary = true;
-                out.clear();
-                seen.clear();
-            } else if in_summary {
-                in_summary = false;
-                closed_at_end = true;
+    for l in text.lines().map(|l| l.trim_end_matches('\r')) {
+        match runner {
+            Runner::Cargo if l == "failures:" => {
+                block.clear();
+                open = true;
             }
-            continue;
-        }
-        let name = match runner {
-            Runner::Cargo => libtest_verdict(l, "FAILED"),
-            Runner::Pytest if in_summary => l
-                .strip_prefix("FAILED ")
-                .or_else(|| l.strip_prefix("ERROR "))
-                .map(|r| r.split(" - ").next().unwrap_or(r).trim_end()),
-            Runner::Pytest => None,
-        };
-        if let Some(n) = name.filter(|n| !n.is_empty()) {
-            if seen.insert(n.to_string()) {
-                out.push(n.to_string());
+            Runner::Cargo if l.starts_with("test result: FAILED") => {
+                out.append(&mut block);
+                open = false;
+            }
+            Runner::Cargo if open && !l.trim().is_empty() => {
+                match l.strip_prefix("    ").filter(|n| !n.starts_with(' ')) {
+                    Some(n) => block.push(libtest_name(n).to_string()),
+                    None => {
+                        open = false;
+                        block.clear();
+                    }
+                }
+            }
+            Runner::Cargo => {}
+            Runner::Pytest => {
+                if !l.trim().is_empty() {
+                    closed_at_end = false;
+                }
+                if l.starts_with('=') {
+                    if l.contains(" short test summary info ") {
+                        open = true;
+                        out.clear();
+                    } else if open {
+                        open = false;
+                        closed_at_end = true;
+                    }
+                } else if let Some(r) = l
+                    .strip_prefix("FAILED ")
+                    .or_else(|| l.strip_prefix("ERROR "))
+                    .filter(|_| open)
+                {
+                    out.push(r.split(" - ").next().unwrap_or(r).trim_end().to_string());
+                }
             }
         }
     }
     if runner == Runner::Pytest && !closed_at_end {
         out.clear();
     }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|n| !n.is_empty() && seen.insert(n.clone()));
     out
 }
 
@@ -580,13 +573,18 @@ mod tests {
             ),
             None
         );
+        // (round 14) cargo: only libtest's own final `failures:` list before `test result: FAILED`
+        // names a failure — never a result line, never a captured section's text.
         assert_eq!(
             failing_names(
                 Runner::Cargo,
-                "test t::a ... FAILED\ntest t::b ... ok\n    test t::c ... FAILED trailing\n"
+                "test t::a ... FAILED\ntest t::b ... ok\n\nfailures:\n\n---- t::a stdout ----\n\
+                 test t::b ... FAILED\nfailures:\n    t::b\n\nfailures:\n    t::a\n\n\
+                 test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n"
             ),
             s(&["t::a"])
         );
+        assert!(failing_names(Runner::Cargo, "test t::a ... FAILED\n").is_empty());
         assert_eq!(
             failing_names(
                 Runner::Pytest,
@@ -598,7 +596,10 @@ mod tests {
         // (agy r2) libtest prints `- should panic` after a `#[should_panic]` test's name; the
         // inventory lists the bare name.
         assert_eq!(
-            failing_names(Runner::Cargo, "test t::sp - should panic ... FAILED\n"),
+            failing_names(
+                Runner::Cargo,
+                "failures:\n    t::sp\n\ntest result: FAILED. 0 passed; 1 failed\n"
+            ),
             s(&["t::sp"])
         );
         let out =
@@ -709,7 +710,7 @@ mod tests {
     }
 
     /// Rounds 1-2 of #1066: an empty inventory is no inventory; pytest's verbosity is pinned for
-    /// the inventory; only the runners' OWN result lines name failures (pytest's last short
+    /// the inventory; only the runners' OWN summaries name failures (pytest's last short
     /// summary); a pytest prefix that would take another test is
     /// caught.
     #[test]

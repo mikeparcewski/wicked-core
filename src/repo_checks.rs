@@ -241,8 +241,7 @@ use wicked_apps_core::spawn::HardenedCommand;
 
 use crate::floor_runner::{
     alone_argv, alone_failed, cargo_config_bends_test_args, cargo_toc_targets, deselect_argv,
-    deselectable, failing_names, parse_toc, passing_names, pytest_prefix_collision, runner_of,
-    toc_argv, Runner,
+    deselectable, failing_names, parse_toc, pytest_prefix_collision, runner_of, toc_argv, Runner,
 };
 use crate::validator::WorkerSandbox;
 
@@ -4159,7 +4158,7 @@ impl BaseTree {
         // pytest summary left open — none can then be excluded: a misread base only NARROWS.
         let runner = runner_of(&target.argv);
         if let (Some(t), Some(runner)) = (toc.as_mut().filter(|t| t.incomplete.is_none()), runner) {
-            // The base's own result lines are on its STDOUT, read verified: a stream cut at the
+            // The base's own summary is on its STDOUT, read verified: a stream cut at the
             // cap, or one the store cannot return, may have lost a failure line.
             let text = run
                 .logs
@@ -4169,11 +4168,9 @@ impl BaseTree {
                 .and_then(|l| crate::floor_log::read_blob(&scratch.logs, l));
             match text {
                 Ok(b) => {
-                    let text = String::from_utf8_lossy(&b);
-                    let passed = passing_names(runner, &text);
-                    t.failing = failing_names(runner, &text)
+                    t.failing = failing_names(runner, &String::from_utf8_lossy(&b))
                         .into_iter()
-                        .filter(|n| t.count(n) > 0 && !passed.contains(n))
+                        .filter(|n| t.count(n) > 0)
                         .collect()
                 }
                 Err(e) => t.incomplete = Some(format!("the base's output: {e}")),
@@ -8651,6 +8648,9 @@ pub(crate) mod tests {
                  cat excluded.out 2>/dev/null; cat excluded.err >&2 2>/dev/null\n\
                  if [ -f flake.excluded ] && [ $n = 1 ]; then exit 101; fi; exit $(code excluded.exit);;\n\
                *) cat run.out 2>/dev/null; cat run.err >&2 2>/dev/null\n\
+                 case \"$0\" in *cargo) if [ -f run.out ] && ! grep -q '^test result:' run.out; then \
+                 f=$(sed -n 's/^test \\(.*\\) \\.\\.\\. FAILED$/    \\1/p' run.out); \
+                 [ -n \"$f\" ] && printf '\\nfailures:\\n%s\\n\\ntest result: FAILED.\\n' \"$f\"; fi;; esac\n\
                  if [ -f flake ] && [ $n = 1 ]; then exit 101; fi; exit $(code run.exit);;\n\
              esac\n",
         )
@@ -8715,8 +8715,8 @@ pub(crate) mod tests {
                 // A real libtest run prints a result line for every test it lists, and its footer.
                 (
                     "run.out",
-                    "test new ... ok\ntest fine ... ok\ntest old ... FAILED\n\ntest result: FAILED. 2 \
-                     passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n",
+                    "test new ... ok\ntest fine ... ok\ntest old ... FAILED\n\nfailures:\n    old\n\n\
+                     test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n",
                 ),
                 ("run.exit", "101"),
                 ("excluded.exit", "0"),
@@ -9546,9 +9546,11 @@ pub(crate) mod tests {
             .unwrap_or_else(|| panic!("a cargo test check ran: {report:#?}"))
     }
 
-    /// (codex r13) Real cargo, `--test-threads=1`: `fine` depends on order (it passes in the suite,
-    /// fails alone) and `old` prints a child-style `test t::fine ... FAILED` line and fails. The
-    /// base reported `fine ... ok`, so `fine` is no base failure: the head breaking it denies.
+    /// (codex r13, r14) Real cargo, `--test-threads=1`: `fine` depends on order (it passes in the
+    /// suite, fails alone) and spawns a child that inherits stdout, SPLITTING its own result line
+    /// (`test t::fine ... x` then `ok`); `old` prints a child-style `test t::fine ... FAILED` line
+    /// and fails. Only libtest's own `failures:` list names a base failure (`t::old`), so the head
+    /// breaking `fine` denies.
     #[cfg(unix)]
     #[test]
     fn an_order_dependent_test_the_base_passed_is_never_excluded() {
@@ -9563,11 +9565,11 @@ pub(crate) mod tests {
                  panic!(\"old\");\n    }}\n}}\n"
             )
         };
-        std::fs::write(
-            repo.join("src/lib.rs"),
-            lib("assert!(READY.load(Ordering::SeqCst));"),
-        )
-        .unwrap();
+        // spawn-audit: test-only — fixture SOURCE text: the fixture crate's own test spawns a child
+        // that inherits stdout, to split its libtest result line.
+        let fine = "let _ = std::process::Command::new(\"echo\").arg(\"x\").status();\n        \
+                    assert!(READY.load(Ordering::SeqCst));";
+        std::fs::write(repo.join("src/lib.rs"), lib(fine)).unwrap();
         std::fs::create_dir_all(repo.join(".wicked")).unwrap();
         std::fs::write(
             repo.join(CONFIG_PATH),
@@ -9591,6 +9593,49 @@ pub(crate) mod tests {
         let d = c.decision.as_ref().expect("decided");
         assert_eq!(d.base_failing, s(&["t::old"]), "{c:#?}");
         assert_eq!(d.outcome, OUTCOME_NEW_FAILURE, "{c:#?}");
+        assert!(!report.passed);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// (agy r14) Real cargo: `smoke` passes in the lib and fails in an integration test — one
+    /// name in two binaries. libtest's own list names the failing one, the base inventory lists
+    /// the name twice, so the floor cannot separate it: `base_red_unseparated`, the failure on
+    /// the record.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_failing_in_one_binary_and_passing_in_another_cannot_be_separated() {
+        let _load = seam::pin(0.5, 4);
+        let (repo, _) = real_crate("realv2-smoke");
+        std::fs::write(repo.join("src/lib.rs"), "#[test]\nfn smoke() {}\n").unwrap();
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        std::fs::write(
+            repo.join("tests/it.rs"),
+            "#[test]\nfn smoke() {\n    panic!(\"it\");\n}\n",
+        )
+        .unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "smoke in two binaries"]);
+        let ctx = FloorContext {
+            stage: FloorStage::Verify,
+            base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        std::fs::write(repo.join("README.md"), "head\n").unwrap();
+        let report = run_floor(&repo, &ctx);
+        if report.sandbox_error.is_some() {
+            return;
+        }
+        let c = cargo_check(&report);
+        let d = c.decision.as_ref().expect("decided");
+        assert_eq!(d.base_failing, s(&["smoke"]), "{c:#?}");
+        assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{c:#?}");
+        assert!(
+            d.reason
+                .as_deref()
+                .is_some_and(|r| r.contains("names 2 tests")),
+            "{d:?}"
+        );
         assert!(!report.passed);
         let _ = std::fs::remove_dir_all(&repo);
     }

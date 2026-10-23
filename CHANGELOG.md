@@ -20,8 +20,9 @@ Two release tracks share this file, newest entry first regardless of track:
   floor now trusts two inputs: the base tree, and the exit codes of the processes it launches. A failed head
   check is compared with the base. A green base makes it a `new_failure`. A red base is inventoried by its own
   runner on the base tree (`cargo test <args> -- --list`, `pytest --collect-only -q`), and
-  its failing tests are read once from the base's verified stdout and kept only when that inventory lists them
-  verbatim and (libtest) the same base run did not also report them `ok` (stored with the base record). When the exclusion is precise, the head runs once
+  its failing tests are read once from the base's verified stdout — for libtest only from its own final `failures:`
+  list before each `test result: FAILED` (never a result line: a child's output or a split line cannot name one), for
+  pytest its last short summary — and kept only when that inventory lists them verbatim (stored with the base record). When the exclusion is precise, the head runs once
   more with those tests deselected natively (libtest `--skip=<name> --exact`, pytest `--deselect`): exit 0 is `pass_excluded` ("1 pre-existing excluded: t::a"), non-zero is a `new_failure`.
   Precise means every name is unique in the base inventory and at most once in the head's, the argv is on
   core#1060's r16 allowlist, no head `.cargo/config*` sets `rustdocflags` or test args, and no cargo name has
@@ -47,7 +48,7 @@ Two release tracks share this file, newest entry first regardless of track:
   launcher signatures, the isolated `--exact` and vitest file re-runs, the load-class and env-crash re-runs,
   `MAX_FLAKE_RERUN`, the environment signals) and the 4 KB ring buffer as a source of truth. Every stream is now
   stored once, content-addressed (sha256), in the run's log store (garbage-collected by age at every floor's start, as sccache and Bazel's disk cache do (a dedup onto an existing blob
-  restarts its age):
+  restarts its age, and every eviction re-stats the file first):
   finished blobs after `FLOOR_LOG_TTL` = 7 days, `.part-*` after a day, and oldest-first over a byte cap of
   `WICKED_FLOOR_LOG_CAP_GB` (default 5) that never evicts anything modified in the last 24 hours), with a lazy line TOC and ranges read by ref
   and verified against the hash (`floor_log`); a stream past 64 MiB keeps its prefix, marked `truncated`, and a
