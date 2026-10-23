@@ -20,22 +20,34 @@ Two release tracks share this file, newest entry first regardless of track:
   runner rules (libtest and pytest parsing, allowlists, rootdir and config rules) one finding at a time. The
   floor now trusts the base tree and the exit codes of the processes it launches, and every runner fact is
   DATA: `.wicked/build-guide.json` (contract v1, `schemas/build-guide.v1.json`), read from the BASE tree only
-  (a head edit to the guide never applies to its own run). A failed head check is compared with the base: a
-  green base makes it a `new_failure`; a red base, for a check whose argv is exactly a guide check's `run`,
-  is listed by the guide's `list` piece, its results (`text` line rules and blocks, or `junit`) nominate the
+  (a head edit to the guide never applies to its own run). When the base carries a guide, its checks for the
+  stage (`stage`; both when absent) ARE the floor's checks: their argv, cwd and stage replace detection for the
+  repo (a build, lint or install step is a check of the guide; `.wicked/checks.json`'s `timeout_s` still bounds
+  them), and detection is the fallback only with no guide or one that does not parse. A failed head check is
+  compared with the base: a green base makes it a `new_failure`; a red base, for a guide check, is listed by
+  the guide's `list` piece, its results (`text` line rules and blocks, or `junit`) nominate the
   failing ids the list holds, each is confirmed by its exit code run `alone` on the base (`failedExit`), and
   the head runs once more with them `deselect`ed — that exit code decides (`pass_excluded`, "1 pre-existing
   excluded: t::a"). Precise means each id is unique in the base list by (qualifier, id), at most once in the
   head's, under the same qualifier on both, and the head's own list with them deselected lists exactly the rest
-  (the runner's selection is the precision check). A guide check is relied on only when every probe passed
+  (the runner's selection is the precision check). Exit codes: one outside `failedExit` and 0 (a crash, a
+  build error) is `could_not_run`, on the head's run and on its deselected run; a red base whose results name
+  no test has no candidates (`base_red_unseparated`); a deselected run that fails naming nothing is a
+  `new_failure`, so exclusion never passes a failing run. A guide check is relied on only when every probe passed
   (`wicked-core floor probe --repo <dir> --guide <file> [--check <name>]`: list, run, ids, alone,
-  deselect, mutation, multi — two mutations, both parsed, both deselected — and affected, in a scratch copy
-  under the floor sandbox; it writes `verified`; a junit testcase a filter skipped counts as neither passed
+  deselect, mutation, multi — two mutations, both parsed, both deselected — affected, and version, in a scratch
+  copy under the floor sandbox; it writes `verified`; a probe that fails is retried once on a fresh copy and
+  recorded `pass (retried)` (relied on) or `fail: … (retried)` (unverified: a suite too flaky to pass a probe
+  twice cannot be separated); a check with no `list` piece is not probed; a junit testcase a filter skipped counts as neither passed
   nor failed; it never runs in the operator's worker home: unless `WICKED_WORKER_HOME` is set explicitly,
-  it creates a fresh worker home under the system temp dir and removes it at the end). Deselect tokens from the first `{id}` onward repeat per id, so a flag and its value are one
-  token (`--skip={id}`); `{id}` values fill whole argv elements and never pass through a shell, so no
-  escaping is needed. The probes must also have run on an ancestor of
-  the base, with no `derivedFrom` file changed since and no touched file matching `invalidatedBy`; otherwise
+  it creates a fresh worker home under the system temp dir and removes it at the end). Deselect tokens from
+  the first per-id token onward repeat per id, so a flag and its value are one token (`--skip={id}`); `{id}`
+  values fill whole argv elements verbatim and never pass through a shell, so no escaping is needed; for a
+  runner that takes a regex, `{id:re}` is the id regex-escaped (per id) and `{ids:re|}` every id escaped and
+  joined by `|` in one token (`--testNamePattern=^(?!(?:{ids:re|})$)`). The probes must also have run on an
+  ancestor of the base, with no `derivedFrom` file changed since, no touched file matching `invalidatedBy`
+  and, when the check declares a `version` command, the runner still printing `verified.runnerVersion` (the
+  probe records that command's first output line); otherwise
   the check runs exit-code only and a red base escalates as `base_red_unseparated` (the operator's floor
   override, core#1061/#1065, is the path through), with `decision.guide: {present, usable, reason}` saying
   why. With no guide, main's detection and derived targeting are the fallback; a guided base narrows only

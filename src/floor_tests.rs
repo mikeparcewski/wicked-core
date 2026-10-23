@@ -351,14 +351,19 @@ fn imprecise_exclusion_escalates_as_base_red_unseparated() {
         &head_red(&[("toc.txt", &toc_of(&["old", "fine"])), ("toc.exit", "1")]),
     );
     unseparated(&repo, &ctx, "a head list that exits non-zero");
-    // (c) A positional filter in the argv: `--exact` would change what it selects.
+    // (c) A head `.wicked/checks.json` that adds a positional filter changes nothing: the base's
+    // guide is the check list, so the check runs the guide's argv (and excludes precisely).
     let filtered: Vec<String> = argv.iter().cloned().chain(["old".to_string()]).collect();
     write_tree(
         &repo,
         &filtered,
         &head_red(&[("toc.txt", &toc_of(&["old", "new", "fine"]))]),
     );
-    unseparated(&repo, &ctx, "a filter in the argv");
+    if let Some((_, c)) = floor_test(&repo, &ctx) {
+        assert_eq!(c.argv, argv, "the guide's argv, not the head config's");
+        let d = c.decision.as_ref().expect("a decision");
+        assert_eq!(d.outcome, OUTCOME_PASS_EXCLUDED, "{d:?}");
+    }
     // (d) A touched file the guide's `invalidatedBy` names (a runner config that bends its
     // selection): exclusion is off for this change.
     write_tree(
@@ -1025,8 +1030,14 @@ fn each_outcome_rides_the_wire_as_a_typed_decision() {
     assert!(
         !report.passed && report.timed_out() && report.denial_source() == DENIAL_SOURCE_TIMEOUT
     );
-    // could_not_run: a runner that is not on PATH.
-    std::fs::write(repo.join(CONFIG_PATH), r#"{"test":["no-such-runner-v2"]}"#).unwrap();
+    // could_not_run: an exit outside the guide's `failedExit` (a crash).
+    std::fs::write(
+        repo.join(CONFIG_PATH),
+        serde_json::json!({ "test": argv }).to_string(),
+    )
+    .unwrap();
+    let _ = std::fs::remove_file(repo.join("excluded.sleep"));
+    std::fs::write(repo.join("run.exit"), "2").unwrap();
     let Some((report, c)) = floor_test(&repo, &ctx) else {
         return;
     };
@@ -1063,13 +1074,10 @@ fn real_crate(tag: &str) -> (PathBuf, FloorContext) {
     std::fs::write(repo.join(".gitignore"), "Cargo.lock\ntmp/\n").unwrap();
     std::fs::write(repo.join("src/lib.rs"), real_lib(true, false)).unwrap();
     git_repo_with_commit(&repo);
-    // The guide for the detected check, with and without the lockfile cargo writes.
+    // The guide: its one check is the floor's.
     let base = commit_guide(
         &repo,
-        &[
-            libtest_check(&s(&["cargo", "test", "--no-fail-fast"])),
-            libtest_check(&s(&["cargo", "test", "--locked", "--no-fail-fast"])),
-        ],
+        &[libtest_check(&s(&["cargo", "test", "--no-fail-fast"]))],
     );
     let ctx = FloorContext {
         stage: FloorStage::Verify,
@@ -1413,5 +1421,262 @@ fn doctests_run_under_the_real_floor_sandbox() {
     let seam = run_with_sandbox(&repo, sandbox_for(&repo));
     let c = cargo_check(&seam);
     assert!(c.passed(), "the test seam arms the private TMPDIR: {c:#?}");
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// A libtest-shaped stand-in for the probe: tests `a` and `b`, plus `m` / `m2` while the
+/// mutation files `zz_m` / `zz_m2` exist (they fail). `--list` lists, `--skip=<id>` deselects,
+/// `-- <id> --exact` runs one. A `flaky.list` file fails the first list of a probe scratch; a
+/// `broken.alone` file fails every passing test run alone.
+#[cfg(unix)]
+const STAND_IN: &str = r#"mode=run; name=; skip=' '
+for a in "$@"; do case "$a" in --list) mode=list;; --skip=*) skip="$skip${a#--skip=} ";; --|--exact) ;; *) name=$a; mode=alone;; esac; done
+all="a b"; [ -f zz_m ] && all="$all m"; [ -f zz_m2 ] && all="$all m2"
+case $mode in
+  list) if [ -f flaky.list ] && [ ! -f "$TMPDIR/listed" ]; then : > "$TMPDIR/listed"; exit 1; fi
+    for t in $all; do case "$skip" in *" $t "*) continue;; esac; echo "$t: test"; done; exit 0;;
+  alone) case $name in m|m2) exit 101;; esac; [ -f broken.alone ] && exit 1; exit 0;;
+  *) f=; for t in $all; do case "$skip" in *" $t "*) continue;; esac; case $t in m|m2) f="$f $t";; esac; done
+    if [ -z "$f" ]; then echo 'test result: ok.'; exit 0; fi
+    printf '\nfailures:\n'; for t in $f; do echo "    $t"; done; printf '\ntest result: FAILED.\n'; exit 101;;
+esac
+"#;
+
+/// A guide for [`STAND_IN`] (`runner.sh`), with a `version` command.
+#[cfg(unix)]
+fn stand_in_guide() -> serde_json::Value {
+    serde_json::json!({
+        "name": "test", "run": ["sh", "runner.sh"], "failedExit": [101],
+        "results": {"kind": "text"},
+        "parser": {"blocks": [{"start": "^failures:$", "item": r"^    (?P<id>\S+)$",
+                               "end": "^test result: FAILED"}]},
+        "list": {"run": ["sh", "runner.sh", "--list"], "item": r"^(?P<id>\S+): test$"},
+        "alone": {"run": ["sh", "runner.sh", "--", "{id}", "--exact"]},
+        "deselect": {"append": ["--skip={id}"]},
+        "version": {"run": ["sh", "-c", "echo; echo stand-in 1.0"]},
+        "probes": {
+            "mutation": {"file": "zz_m", "content": "m\n", "expectId": "m"},
+            "mutation2": {"file": "zz_m2", "content": "m2\n", "expectId": "m2"}},
+    })
+}
+
+/// Rulings 2 and 3: the probe records the `version` command's first line as
+/// `verified.runnerVersion`; a probe that fails once and passes its one retry is
+/// `pass (retried)` (relied on); one that fails its retry too is `fail: … (retried)`.
+#[cfg(unix)]
+#[test]
+fn a_failed_probe_is_retried_once_and_the_runner_version_is_recorded() {
+    let _load = seam::pin(0.5, 4);
+    let repo = scratch("probe-retry");
+    std::fs::write(repo.join("runner.sh"), STAND_IN).unwrap();
+    std::fs::write(repo.join("flaky.list"), "").unwrap();
+    std::fs::write(repo.join(".gitignore"), "tmp/\nprobe-guide.json\n").unwrap();
+    git_repo_with_commit(&repo);
+    let Some(results) = probe(&repo, stand_in_guide()) else {
+        return;
+    };
+    for p in crate::floor_guide::REQUIRED_PROBES
+        .iter()
+        .chain(&["version"])
+    {
+        let want = if *p == "list" {
+            "pass (retried)"
+        } else {
+            "pass"
+        };
+        assert_eq!(
+            results.get(*p).map(String::as_str),
+            Some(want),
+            "{p}: {results:?}"
+        );
+    }
+    let written: crate::floor_guide::BuildGuide =
+        serde_json::from_str(&std::fs::read_to_string(repo.join("probe-guide.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        written.checks[0].verified.as_ref().unwrap().runner_version,
+        "stand-in 1.0"
+    );
+    // Run alone, a passing test fails every time: its retry fails too.
+    std::fs::remove_file(repo.join("flaky.list")).unwrap();
+    std::fs::write(repo.join("broken.alone"), "").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "alone is broken"]);
+    let results = probe(&repo, stand_in_guide()).unwrap();
+    let alone = results.get("alone").cloned().unwrap_or_default();
+    assert!(
+        alone.starts_with("fail: ") && alone.ends_with(" (retried)"),
+        "{results:?}"
+    );
+    assert_eq!(results.get("list").map(String::as_str), Some("pass"));
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// Ruling 2: a check that declares a `version` command is relied on only while the runner still
+/// prints the version its probes ran under; otherwise the guide is stale (exit codes only).
+#[cfg(unix)]
+#[test]
+fn a_runner_whose_version_moved_since_the_probe_makes_the_guide_stale() {
+    let _load = seam::pin(0.5, 4);
+    for (tag, recorded, usable) in [
+        ("version-same", "runner 2", true),
+        ("version-moved", "runner 1", false),
+    ] {
+        let (repo, _, argv) = red_base(tag);
+        let mut g = libtest_check(&argv);
+        g["version"] = serde_json::json!({"run": ["sh", "-c", "echo; echo runner 2"]});
+        write_guide(&repo, &[g], &git(&repo, &["rev-parse", "HEAD~1"]));
+        let path = repo.join(crate::floor_guide::GUIDE_PATH);
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        doc["checks"][0]["verified"]["runnerVersion"] = recorded.into();
+        doc["checks"][0]["verified"]["results"]["version"] = "pass".into();
+        std::fs::write(&path, doc.to_string()).unwrap();
+        git(&repo, &["commit", "-qam", "a guide with a runner version"]);
+        let ctx = FloorContext {
+            base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+            stage: FloorStage::Verify,
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        write_tree(
+            &repo,
+            &argv,
+            &[
+                ("run.out", "test old ... FAILED\n"),
+                ("run.exit", "101"),
+                ("excluded.exit", "0"),
+                ("toc.txt", &toc_of(&["old", "new", "fine"])),
+            ],
+        );
+        let Some((_, c)) = floor_test(&repo, &ctx) else {
+            return;
+        };
+        let d = c.decision.as_ref().expect("a decision");
+        let g = d.guide.as_ref().expect("the guide's state");
+        if usable {
+            assert_eq!(d.outcome, OUTCOME_PASS_EXCLUDED, "{d:?}");
+            assert!(g.usable, "{g:?}");
+        } else {
+            assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
+            assert!(
+                g.reason.as_deref().is_some_and(|r| r.starts_with(
+                    "stale: the runner reports `runner 2`, the guide was verified under `runner 1`"
+                )),
+                "{g:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+}
+
+/// Ruling 4: an exit outside `failedExit` and 0 (a crash, a build error) is `could_not_run`, on
+/// the head's run and on its deselected run; a deselected run that fails naming nothing is a
+/// `new_failure`; a red base whose results name nothing has no candidates and escalates.
+#[cfg(unix)]
+#[test]
+fn an_exit_outside_failed_exit_could_not_run_and_a_failure_naming_nothing_never_passes() {
+    let _load = seam::pin(0.5, 4);
+    let (repo, ctx, argv) = red_base("exit-codes");
+    let toc = toc_of(&["old", "new", "fine"]);
+    let outcome = |files: &[(&str, &str)]| {
+        write_tree(&repo, &argv, files);
+        floor_test(&repo, &ctx).map(|(report, c)| {
+            assert!(!report.passed, "{c:?}");
+            c.decision.expect("a decision")
+        })
+    };
+    // (a) The head's run crashes.
+    let Some(d) = outcome(&[
+        ("run.out", "error: could not build\n"),
+        ("run.exit", "2"),
+        ("toc.txt", &toc),
+    ]) else {
+        return;
+    };
+    assert_eq!(d.outcome, OUTCOME_COULD_NOT_RUN, "{d:?}");
+    assert!(
+        d.reason.as_deref().is_some_and(
+            |r| r.contains("exit 2 is not one of the guide's `failedExit` codes [101]")
+        ),
+        "{d:?}"
+    );
+    let red = [
+        ("run.out", "test old ... FAILED\n"),
+        ("run.exit", "101"),
+        ("toc.txt", toc.as_str()),
+    ];
+    // (b) The deselected run crashes.
+    let d = outcome(&[red[0], red[1], red[2], ("excluded.exit", "2")]).unwrap();
+    assert_eq!(d.outcome, OUTCOME_COULD_NOT_RUN, "{d:?}");
+    // (c) The deselected run fails naming nothing.
+    let d = outcome(&[red[0], red[1], red[2], ("excluded.exit", "101")]).unwrap();
+    assert_eq!(d.outcome, OUTCOME_NEW_FAILURE, "{d:?}");
+    // (d) A base that fails naming nothing: no candidates.
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.out", "something went wrong\n"),
+            ("run.exit", "101"),
+            ("toc.txt", &toc),
+            ("alone.fail", "old\n"),
+        ],
+    );
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "a base red with nothing named"]);
+    let ctx = FloorContext {
+        base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+        ..ctx.clone()
+    };
+    write_tree(
+        &repo,
+        &argv,
+        &[red[0], red[1], red[2], ("excluded.exit", "0")],
+    );
+    let (_, c) = floor_test(&repo, &ctx).unwrap();
+    let d = c.decision.expect("a decision");
+    assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// Ruling 5: with a guide in the base, the guide's checks for the stage ARE the floor's checks
+/// (detection would add the config's `test` at the creator); without one, detection decides.
+#[cfg(unix)]
+#[test]
+fn the_base_guides_checks_for_the_stage_are_the_floors_checks() {
+    let (repo, _, argv) = red_base("guide-checks");
+    let mut test = libtest_check(&argv);
+    test["stage"] = serde_json::json!(["verify"]);
+    let lint = serde_json::json!({"name": "lint", "run": ["sh", "-c", "exit 0"],
+        "failedExit": [1], "results": {"kind": "text"}, "stage": ["creator"]});
+    let base = commit_guide(&repo, &[test, lint]);
+    let at = |stage, base: &str| {
+        detect_with(
+            &repo,
+            &FloorContext {
+                stage,
+                base_head: Some(base.to_string()),
+                git_dir: Some(repo.join(".git")),
+                ..FloorContext::default()
+            },
+        )
+        .unwrap()
+    };
+    for (stage, want) in [(FloorStage::Verify, "test"), (FloorStage::Creator, "lint")] {
+        let checks = at(stage, &base);
+        assert_eq!(names(&checks), [want], "{checks:?}");
+        assert!(
+            checks.iter().all(|c| c.source == GUIDE_SOURCE),
+            "{checks:?}"
+        );
+    }
+    // The first commit carries no guide: detection.
+    let checks = at(FloorStage::Verify, &git(&repo, &["rev-parse", "HEAD~2"]));
+    assert_eq!(names(&checks), ["test"], "{checks:?}");
+    assert!(
+        checks.iter().all(|c| c.source != GUIDE_SOURCE),
+        "{checks:?}"
+    );
     let _ = std::fs::remove_dir_all(&repo);
 }

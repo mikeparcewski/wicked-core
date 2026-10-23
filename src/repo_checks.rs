@@ -1413,6 +1413,9 @@ pub(crate) fn detect(worktree: &Path) -> Result<Vec<RepoCheck>, String> {
 /// the checks would fail for the wrong reason; always frozen and `--ignore-scripts`). Pure over
 /// the filesystem (one `git diff` when a targeted command asks for `{files}`) — runs nothing.
 pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>, String> {
+    if let Some(checks) = guide_checks(worktree, ctx)? {
+        return Ok(checks);
+    }
     let pkgs = subdir_packages(worktree, ctx)?;
     if pkgs.dirs.is_empty() {
         return detect_package(worktree, ctx);
@@ -1837,8 +1840,6 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
         && matches!(r_test, Resolved::Default)
         && ctx.base_head.is_some()
         && ctx.git_dir.is_some()
-        // (DES-BUILD-GUIDE) A base with a build guide narrows only through its `affected` piece.
-        && !base_has_guide(worktree, ctx)
     {
         if let Some(derived) = derive_targeted(worktree, ctx, &test, &cargo, &node_test_script)? {
             test = Some(derived);
@@ -1862,14 +1863,37 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
     Ok(out)
 }
 
-/// Does the run base carry a build guide ([`crate::floor_guide::GUIDE_PATH`])?
-fn base_has_guide(worktree: &Path, ctx: &FloorContext) -> bool {
-    let (Some(base), Some(git_dir)) = (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) else {
-        return false;
+/// The `source` of a check the base's build guide declares.
+pub const GUIDE_SOURCE: &str = "the run base's build guide (DES-BUILD-GUIDE)";
+
+/// (DES-BUILD-GUIDE) When the run base carries a build guide, ITS checks for this stage are the
+/// floor's checks: their argv, cwd and stage replace detection for the repo (only
+/// [`CONFIG_PATH`]'s `timeout_s` still bounds them). `None` — detection, the fallback — when the
+/// base has no guide, or one that does not parse (each check's `decision.guide` then says why).
+fn guide_checks(worktree: &Path, ctx: &FloorContext) -> Result<Option<Vec<RepoCheck>>, String> {
+    let (Some(base), Some(git_dir), None) = (
+        ctx.base_head.as_deref(),
+        ctx.git_dir.as_deref(),
+        ctx.package_dir.as_deref(),
+    ) else {
+        return Ok(None);
     };
-    let root = package_root(worktree, ctx).map_or(worktree.to_path_buf(), |(r, _)| r);
-    let spec = format!("{base}:{}", crate::floor_guide::GUIDE_PATH);
-    crate::worktree_guard::git(&root, &["cat-file", "-e", &spec], &[("GIT_DIR", git_dir)]).is_ok()
+    let Ok(Some(guide)) = crate::floor_guide::load_base(worktree, git_dir, base) else {
+        return Ok(None);
+    };
+    let timeout_s = read_config(worktree)?.and_then(|c| c.timeout_s);
+    Ok(Some(
+        guide
+            .checks_at(ctx.stage.as_wire())
+            .map(|c| RepoCheck {
+                name: c.name.clone(),
+                argv: c.run.clone(),
+                source: GUIDE_SOURCE.into(),
+                timeout_s,
+                dir: c.dir().to_string(),
+            })
+            .collect(),
+    ))
 }
 
 /// The derived source string on a [`derive_targeted`] check.
@@ -3295,9 +3319,14 @@ pub(crate) fn run_with_sandbox_ctx(
             skipped.push(check.name.clone());
             continue;
         }
-        let gcheck = guide_for(&guide, check, ctx, worktree, &touched);
+        let present = match &guide {
+            Ok(Some(g)) => g.check_for(&check.argv, &check.dir),
+            _ => None,
+        };
+        let gcheck = guide_for(&guide, check, ctx, worktree, &touched)
+            .and_then(|g| runner_current(worktree, check, g, &sandbox, &scratch).map(|()| g));
         let status = GuideStatus {
-            present: matches!(&guide, Ok(Some(g)) if g.check_for(&check.argv, &check.dir).is_some()),
+            present: present.is_some(),
             usable: gcheck.is_ok(),
             reason: gcheck.as_ref().err().cloned(),
         };
@@ -3331,6 +3360,13 @@ pub(crate) fn run_with_sandbox_ctx(
         // ones that may be excluded. No known base ⇒ the failure denies as it always did.
         if run.passed() || run.timed_out || run.spawn_error.is_some() {
             decide_alone(&mut run);
+        } else if let Some(why) = crashed(&run, present) {
+            // An exit the guide does not call a test failure (a crash, a build error): the
+            // check could not run, whatever the base does.
+            decide_alone(&mut run);
+            if let Some(d) = run.decision.as_mut() {
+                d.reason = Some(why);
+            }
         } else {
             let compare = check.name != "install" && !is_formatter_check(&check.name);
             let side = match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
@@ -4230,7 +4266,11 @@ impl BaseTree {
             Ok(d) => d,
             Err(e) => return fail(format!("the base's checks could not be determined: {e}")),
         };
-        if check.name != "test_targeted" && !detected.iter().any(|c| c.name == check.name) {
+        // A guide's check is the base's by construction: the guide is read from the base.
+        if check.name != "test_targeted"
+            && check.source != GUIDE_SOURCE
+            && !detected.iter().any(|c| c.name == check.name)
+        {
             return fail(format!(
                 "the run base declares no `{}` check (the change introduced it)",
                 check.name
@@ -4626,6 +4666,80 @@ fn guide_for<'g>(
     Ok(c)
 }
 
+/// (DES-BUILD-GUIDE) A failed run whose exit code is neither 0 nor one of the guide's
+/// `failedExit` codes did not fail tests — it crashed or did not build: why, or `None`.
+fn crashed(run: &CheckRun, g: Option<&GuideCheck>) -> Option<String> {
+    let g = g.filter(|g| !g.failed_exit.is_empty())?;
+    let code = run
+        .exit_code
+        .filter(|c| *c != 0 && !g.failed_exit.contains(c))?;
+    Some(format!(
+        "exit {code} is not one of the guide's `failedExit` codes {:?}: a crash or a build \
+         failure, not a test failure",
+        g.failed_exit
+    ))
+}
+
+/// (DES-BUILD-GUIDE) A check that declares a `version` command is relied on only while the runner
+/// still reports the version its probes ran under (`verified.runnerVersion`).
+fn runner_current(
+    worktree: &Path,
+    check: &RepoCheck,
+    g: &GuideCheck,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+) -> Result<(), String> {
+    if g.version.is_none() {
+        return Ok(());
+    }
+    let now = runner_version(worktree, check, g, sandbox, scratch, Tree::Head)?;
+    let then = g
+        .verified
+        .as_ref()
+        .map_or("", |v| v.runner_version.as_str());
+    if now != then {
+        return Err(format!(
+            "stale: the runner reports `{now}`, the guide was verified under `{then}`"
+        ));
+    }
+    Ok(())
+}
+
+/// The first line the guide's `version` command prints (stdout and stderr merged) on `tree`.
+pub(crate) fn runner_version(
+    dir: &Path,
+    check: &RepoCheck,
+    g: &GuideCheck,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+    tree: Tree,
+) -> Result<String, String> {
+    let v = g.version.as_ref().ok_or("no `version` piece")?;
+    let rc = RepoCheck {
+        argv: v.run.clone(),
+        source: format!("`{}`'s runner version (DES-BUILD-GUIDE)", check.name),
+        timeout_s: Some(120),
+        ..check.clone()
+    };
+    let r = run_one_with(dir, &rc, &exec_of(g, true), sandbox, scratch, tree);
+    if !r.passed() {
+        return Err(format!(
+            "the version command did not pass ({})",
+            r.summary()
+        ));
+    }
+    let text = match r.logs.first() {
+        Some(log) => crate::floor_log::read_blob(&scratch.logs, log)?,
+        None => Vec::new(),
+    };
+    String::from_utf8_lossy(&text)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "the version command printed nothing".to_string())
+}
+
 fn relabel(
     mut logs: Vec<crate::floor_log::LogRef>,
     attempt: &str,
@@ -4904,6 +5018,9 @@ fn decide(
     } else if deciding.timed_out {
         (OUTCOME_TIMED_OUT, None)
     } else if deciding.spawn_error.is_some() {
+        (OUTCOME_COULD_NOT_RUN, None)
+    } else if let Some(why) = crashed(&deciding, guide.as_ref().ok().copied()) {
+        decision.reason = Some(why);
         (OUTCOME_COULD_NOT_RUN, None)
     } else {
         // `regression` (the compatible token) only when a base was compared.
@@ -7519,7 +7636,7 @@ pub(crate) mod tests {
         git(repo, &["rev-parse", "HEAD"])
     }
 
-    fn names(checks: &[RepoCheck]) -> Vec<&str> {
+    pub(crate) fn names(checks: &[RepoCheck]) -> Vec<&str> {
         checks.iter().map(|c| c.name.as_str()).collect()
     }
 

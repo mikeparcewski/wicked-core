@@ -59,6 +59,10 @@ pub struct GuideCheck {
     pub deselect: Option<Deselect>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub affected: Option<RunPiece>,
+    /// The runner's version command: `floor probe` records its first output line as
+    /// `verified.runnerVersion`, and the floor relies on the check only while it still prints that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<RunPiece>,
     /// Globs: a head file the change touched that matches one disables exclusion for this check.
     #[serde(default)]
     pub invalidated_by: Vec<String>,
@@ -238,6 +242,13 @@ fn norm_dir(d: &str) -> &str {
 }
 
 impl BuildGuide {
+    /// The checks that run at `stage` (`creator` | `verify`): a check with no `stage` runs at both.
+    pub(crate) fn checks_at<'a>(&'a self, stage: &'a str) -> impl Iterator<Item = &'a GuideCheck> {
+        self.checks
+            .iter()
+            .filter(move |c| c.stage.is_empty() || c.stage.iter().any(|s| s == stage))
+    }
+
     /// The guide check whose `run` is exactly `argv` in `dir` — the guide is the allowlist.
     pub(crate) fn check_for(&self, argv: &[String], dir: &str) -> Option<&GuideCheck> {
         self.checks
@@ -338,9 +349,12 @@ impl GuideCheck {
         if self.affected.is_some() {
             probes.push("affected");
         }
+        if self.version.is_some() {
+            probes.push("version");
+        }
         for p in probes {
             match v.results.get(p).map(String::as_str) {
-                Some("pass") => {}
+                Some(r) if passed(r) => {}
                 Some(r) => return Err(format!("probe `{p}`: {r}")),
                 None => return Err(format!("probe `{p}` never ran")),
             }
@@ -388,12 +402,13 @@ impl GuideCheck {
     pub(crate) fn alone_argv(&self, t: &TestId) -> Vec<String> {
         self.alone
             .as_ref()
-            .map(|a| fill(&a.run, t))
+            .map(|a| fill_all(&fill(&a.run, t), std::slice::from_ref(t)))
             .unwrap_or_default()
     }
 
-    /// `argv` with `ids` deselected: `deselect.append`'s tokens before its first `{id}`/`{q}`
-    /// token are emitted once, the tokens through the last one once per id, the rest once. A
+    /// `argv` with `ids` deselected: `deselect.append`'s tokens before its first per-id token
+    /// (`{id}`, `{id:re}`, `{q}`) are emitted once, the tokens through the last one once per id,
+    /// the rest once; `{ids:re|}` (every id, regex-escaped, joined by `|`) fills a once-token. A
     /// leading `--` is dropped when `argv` already has one (an end of options cannot repeat).
     pub(crate) fn deselected(&self, argv: &[String], ids: &[TestId]) -> Vec<String> {
         let tokens = self
@@ -401,7 +416,7 @@ impl GuideCheck {
             .as_ref()
             .map(|d| d.append.as_slice())
             .unwrap_or_default();
-        let per = |t: &String| t.contains("{id}") || t.contains("{q}");
+        let per = |t: &String| t.contains("{id}") || t.contains("{id:re}") || t.contains("{q}");
         let first = tokens.iter().position(per).unwrap_or(tokens.len());
         let last = tokens.iter().rposition(per).map_or(first, |i| i + 1);
         let mut out = argv.to_vec();
@@ -409,11 +424,11 @@ impl GuideCheck {
         if prefix.first().map(String::as_str) == Some("--") && argv.iter().any(|a| a == "--") {
             prefix = &prefix[1..];
         }
-        out.extend(prefix.iter().cloned());
+        out.extend(fill_all(prefix, ids));
         for t in ids {
-            out.extend(fill(&tokens[first..last], t));
+            out.extend(fill_all(&fill(&tokens[first..last], t), ids));
         }
-        out.extend(tokens[last..].iter().cloned());
+        out.extend(fill_all(&tokens[last..], ids));
         out
     }
 
@@ -433,10 +448,40 @@ impl GuideCheck {
     }
 }
 
+/// `{id}` and `{q}` verbatim, `{id:re}` regex-escaped (values fill argv elements; no shell).
 fn fill(argv: &[String], t: &TestId) -> Vec<String> {
     argv.iter()
-        .map(|a| a.replace("{id}", &t.id).replace("{q}", &t.q))
+        .map(|a| {
+            a.replace("{id:re}", &regex::escape(&t.id))
+                .replace("{id}", &t.id)
+                .replace("{q}", &t.q)
+        })
         .collect()
+}
+
+/// `{ids:re|}`: every id, regex-escaped, joined by `|`, in one token.
+fn fill_all(argv: &[String], ids: &[TestId]) -> Vec<String> {
+    let all = || {
+        ids.iter()
+            .map(|t| regex::escape(&t.id))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    argv.iter()
+        .map(|a| {
+            if a.contains("{ids:re|}") {
+                a.replace("{ids:re|}", &all())
+            } else {
+                a.clone()
+            }
+        })
+        .collect()
+}
+
+/// A probe result the floor may rely on: `pass`, or `pass (retried)` (it failed once and passed
+/// its one retry).
+pub(crate) fn passed(r: &str) -> bool {
+    r == "pass" || r == "pass (retried)"
 }
 
 impl Compiled {
@@ -740,6 +785,35 @@ mod tests {
             s(&["runner", "list", "--", "x", "--not=a", "--exact"])
         );
         assert_eq!(g.alone_argv(&t("q", "a")), s(&["runner", "one", "a"]));
+        // `{id:re}` repeats per id, regex-escaped; `{ids:re|}` is one token over every id; plain
+        // `{id}` stays verbatim.
+        let mut r = g.clone();
+        r.deselect = Some(Deselect {
+            append: s(&[
+                "--pattern=^(?!(?:{ids:re|})$)",
+                "--not={id:re}",
+                "--raw={id}",
+            ]),
+        });
+        assert_eq!(
+            r.deselected(&s(&["runner", "go"]), &[t("", "a.b"), t("", "c(d)")]),
+            s(&[
+                "runner",
+                "go",
+                r"--pattern=^(?!(?:a\.b|c\(d\))$)",
+                r"--not=a\.b",
+                "--raw=a.b",
+                r"--not=c\(d\)",
+                "--raw=c(d)",
+            ])
+        );
+        r.alone = Some(RunPiece {
+            run: s(&["runner", "--only=^{id:re}$", "--any={ids:re|}"]),
+        });
+        assert_eq!(
+            r.alone_argv(&t("", "x+y")),
+            s(&["runner", r"--only=^x\+y$", r"--any=x\+y"])
+        );
         let mut a = g.clone();
         a.affected = Some(RunPiece {
             run: s(&["runner", "go", "{files}"]),
@@ -759,14 +833,26 @@ mod tests {
         assert!(glob_match("tool-?", "tool-1") && !glob_match("tool-?", "tool-12"));
     }
 
-    /// The guide is the allowlist: a floor check matches only on its exact argv and cwd.
+    /// The guide is the allowlist: a floor check matches only on its exact argv and cwd; a check
+    /// runs at the stages it names (both when it names none).
     #[test]
     fn a_check_matches_only_its_exact_argv_and_cwd() {
+        let mut verify_only = check("text");
+        verify_only.name = "slow".into();
+        verify_only.stage = s(&["verify"]);
         let g = BuildGuide {
             version: 1,
             derived_from: vec![],
-            checks: vec![check("text")],
+            checks: vec![check("text"), verify_only],
         };
+        let names = |stage| {
+            g.checks_at(stage)
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names("creator"), ["test"]);
+        assert_eq!(names("verify"), ["test", "slow"]);
+        assert!(passed("pass") && passed("pass (retried)") && !passed("fail: x (retried)"));
         assert!(g.check_for(&s(&["runner", "go"]), "").is_some());
         assert!(g.check_for(&s(&["runner", "go"]), ".").is_some());
         assert!(g.check_for(&s(&["runner", "go", "x"]), "").is_none());

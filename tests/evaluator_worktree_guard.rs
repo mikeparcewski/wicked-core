@@ -399,8 +399,8 @@ fn make_git_repo(name: &str, cargo_test: Option<bool>) -> PathBuf {
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "init"]);
     if cargo_test.is_some() {
-        // DES-BUILD-GUIDE: the base's build guide for the detected `cargo test` (with and without
-        // the lockfile cargo writes), verified on the commit before it.
+        // DES-BUILD-GUIDE: the base's build guide — its checks are the floor's: the formatter (no
+        // probes: never excluded) and `cargo test`, verified on the commit before it.
         let out = Command::new("git")
             .arg("-C")
             .arg(&repo)
@@ -408,16 +408,19 @@ fn make_git_repo(name: &str, cargo_test: Option<bool>) -> PathBuf {
             .output()
             .unwrap();
         let verified = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let guide = |argv: &[&str]| {
-            let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
-            guide_support::libtest_guide(&argv, &verified)
-        };
+        let argv: Vec<String> = ["cargo", "test", "--no-fail-fast"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let mut test = guide_support::libtest_guide(&argv, &verified);
+        test["name"] = "cargo-test".into();
         std::fs::create_dir_all(repo.join(".wicked")).unwrap();
         std::fs::write(
             repo.join(".wicked/build-guide.json"),
             serde_json::json!({"version": 1, "checks": [
-                guide(&["cargo", "test", "--no-fail-fast"]),
-                guide(&["cargo", "test", "--locked", "--no-fail-fast"]),
+                {"name": "cargo-fmt-check", "run": ["cargo", "fmt", "--all", "--check"],
+                 "failedExit": [1], "results": {"kind": "text"}},
+                test,
             ]})
             .to_string(),
         )

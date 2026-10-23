@@ -2300,8 +2300,8 @@ mod tests {
     /// tree"): the deliver re-verify is the SAME baseline-diff floor the verify phase runs,
     /// measured against the tip the work was lifted onto. A failure the tip shares does not
     /// refuse the deliver (classified, not denying); a head-only failure is a `regression` and
-    /// refuses with `passed: false` evidence; with a base known the repo's `test_targeted` is
-    /// preferred, exactly as at verify. `.wicked/checks.json` only — [`deselecting_runner`] is the
+    /// refuses with `passed: false` evidence; the tip's build guide names the checks, exactly as
+    /// at verify. [`deselecting_runner`] is the
     /// runner, every `tests/*.red` marker is a failing test (DES-FLOOR-V2: the tip's failure is
     /// deselected by name, and the head's exit code with it deselected decides).
     #[cfg(unix)]
@@ -2360,8 +2360,8 @@ mod tests {
         assert!(report.passed, "{report:?}");
         let c = &report.checks[0];
         assert_eq!(
-            c.name, "test_targeted",
-            "with a base known the targeted set is preferred"
+            c.name, "test",
+            "the tip's build guide names the floor's checks (DES-BUILD-GUIDE)"
         );
         assert_eq!(c.failure_ids, vec!["test shared".to_string()]);
         assert!(!c.denies(), "{c:?}");

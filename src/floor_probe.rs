@@ -17,17 +17,23 @@
 //! * `multi` — with `probes.mutation2` written too, the run's new failures are exactly the two
 //!   expected ids, and the run deselecting both leaves the clean run's failures;
 //! * `affected` (when the check has the piece) — with the mutation file as `{files}`, its run's
-//!   failures include the mutated id.
+//!   failures include the mutated id;
+//! * `version` (when the check has the piece) — the command passes and prints a line, recorded as
+//!   `verified.runnerVersion`.
+//!
+//! A probe that fails is retried once, on a fresh copy (`pass (retried)` / `fail: … (retried)`): a
+//! suite too flaky to pass a probe twice in a row is left unverified. A check with no `list` piece
+//! (a build, a lint) has nothing to probe and is skipped.
 //!
 //! Its worker home (check scratch, log store) is `WICKED_WORKER_HOME` when set explicitly, else a
 //! fresh temp dir removed at the end — never the operator's default home.
 
 use std::path::Path;
 
-use crate::floor_guide::{BuildGuide, GuideCheck, TestId};
+use crate::floor_guide::{passed, BuildGuide, GuideCheck, TestId};
 use crate::repo_checks::{
-    exec_of, inventory, remove_base_export, results_of, run_one_with, BaseTree, CheckScratch,
-    RepoCheck, Tree,
+    exec_of, inventory, remove_base_export, results_of, run_one_with, runner_version, BaseTree,
+    CheckScratch, RepoCheck, Tree,
 };
 
 /// A results run's parse: every testcase (junit) and the failures.
@@ -68,9 +74,17 @@ pub fn probe_guide(
         if only.is_some_and(|n| n != c.name) {
             continue;
         }
-        let results = probe_check(repo, &git_dir, &head, c)?;
+        if only.is_none() && c.list.is_none() {
+            eprintln!(
+                "wicked-core floor probe: `{}` has no `list` piece (not a test check): skipped",
+                c.name
+            );
+            continue;
+        }
+        let (results, version) = probe_check(repo, &git_dir, &head, c)?;
         let v = c.verified.get_or_insert_with(Default::default);
         v.base_sha = head.clone();
+        v.runner_version = version;
         v.at = now_rfc3339();
         v.results = results.clone();
         out.push((c.name.clone(), results));
@@ -114,7 +128,7 @@ pub fn probe_cli(args: &[String]) -> i32 {
             let mut ok = true;
             for (check, results) in all {
                 for (probe, r) in results {
-                    ok &= r == "pass";
+                    ok &= passed(&r);
                     println!("{check}\t{probe}\t{r}");
                 }
             }
@@ -151,7 +165,7 @@ fn probe_check(
     git_dir: &Path,
     head: &str,
     g: &GuideCheck,
-) -> Result<ProbeResults, String> {
+) -> Result<(ProbeResults, String), String> {
     g.compile()?;
     let scratch = CheckScratch::prepare_for(repo, Some("floor-probe"))
         .map_err(|e| format!("the probe's scratch: {e}"))?;
@@ -171,22 +185,58 @@ fn probe_check(
                 .unwrap_or("no boundary tool")
         ));
     }
-    let results = Probe {
-        dir: &tree.dir,
-        g,
-        rc: RepoCheck {
-            name: g.name.clone(),
-            argv: g.run.clone(),
-            source: "floor probe (DES-BUILD-GUIDE)".into(),
-            timeout_s: Some(3600),
-            dir: g.dir().to_string(),
-        },
-        sandbox: &sandbox,
-        scratch: &scratch,
+    let rc = RepoCheck {
+        name: g.name.clone(),
+        argv: g.run.clone(),
+        source: "floor probe (DES-BUILD-GUIDE)".into(),
+        timeout_s: Some(3600),
+        dir: g.dir().to_string(),
+    };
+    // One attempt of every probe on `dir` (a fresh copy): the results and the runner version.
+    let attempt = |dir: &Path| {
+        let mut out = Probe {
+            dir,
+            g,
+            rc: rc.clone(),
+            sandbox: &sandbox,
+            scratch: &scratch,
+        }
+        .all();
+        let mut version = String::new();
+        if g.version.is_some() {
+            let v = runner_version(dir, &rc, g, &sandbox, &scratch, Tree::Base);
+            out.insert(
+                "version".into(),
+                verdict(v.is_ok(), || v.clone().unwrap_err()),
+            );
+            version = v.unwrap_or_default();
+        }
+        (out, version)
+    };
+    let (mut results, mut version) = attempt(&tree.dir);
+    // A failed probe gets ONE retry (a missing piece is not retried: it cannot pass).
+    let failed: Vec<String> = results
+        .iter()
+        .filter(|(_, r)| !passed(r) && !r.starts_with("fail: no `"))
+        .map(|(p, _)| p.clone())
+        .collect();
+    if !failed.is_empty() {
+        remove_base_export(repo, &scratch)?;
+        let again = BaseTree::export(repo, &scratch, git_dir, head)?;
+        let (second, v2) = attempt(&again.dir);
+        for p in failed {
+            let r = second
+                .get(&p)
+                .cloned()
+                .unwrap_or_else(|| "fail: it did not run on the retry".into());
+            if p == "version" && passed(&r) {
+                version = v2.clone();
+            }
+            results.insert(p, format!("{r} (retried)"));
+        }
     }
-    .all();
     let _ = remove_base_export(repo, &scratch);
-    Ok(results)
+    Ok((results, version))
 }
 
 struct Probe<'a> {
