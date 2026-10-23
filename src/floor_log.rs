@@ -70,6 +70,22 @@ pub(crate) fn run_dir(root: &Path, run_id: Option<&str>, worktree: &Path) -> Pat
     root.join(key)
 }
 
+/// Restart a blob's age (best-effort).
+fn touch(path: &Path) {
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+}
+
+/// (codex r12) A receipt about to be reused (a cached base record): its blob must still be there,
+/// whole ([`read_blob`]), and its age restarts. `Err` — the record is no longer evidence.
+pub(crate) fn refresh(dir: &Path, r: &LogRef) -> Result<(), String> {
+    read_blob(dir, r)?;
+    touch(&dir.join(&r.sha256));
+    Ok(())
+}
+
 /// [`FLOOR_LOG_CAP_ENV`] in bytes.
 pub(crate) fn log_cap_bytes() -> u64 {
     std::env::var(FLOOR_LOG_CAP_ENV)
@@ -276,6 +292,9 @@ impl Capture {
             let stored = f.flush().and_then(|()| {
                 drop(f);
                 if dest.is_file() {
+                    // (codex r12) A dedup is a fresh use: the blob's age restarts, so the age GC
+                    // keeps what this receipt names.
+                    touch(&dest);
                     std::fs::remove_file(&s.tmp)
                 } else {
                     std::fs::rename(&s.tmp, &dest)
@@ -471,6 +490,35 @@ mod tests {
         aged(&run.join(".part-x"), now, 25 * H, 1);
         assert_eq!(gc(&root, now, u64::MAX), vec![run.join(".part-x")]);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// (codex r12) A capture identical to an aged blob dedups onto it and restarts its age: GC over
+    /// the cap then spares it, and the new receipt still reads.
+    #[test]
+    fn a_dedup_restarts_the_blob_age_so_its_new_receipt_survives_gc() {
+        let root = store("gc-dedup");
+        let dir = root.join("r-0123456789ab");
+        let take = || {
+            capture(
+                std::io::Cursor::new(b"same output\n".to_vec()),
+                &dir,
+                MAX_STREAM_BYTES,
+            )
+            .finish(Duration::from_secs(5))
+        };
+        let first = take();
+        let now = std::time::SystemTime::now();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(&first.sha256))
+            .unwrap()
+            .set_modified(now - 48 * H)
+            .unwrap();
+        let again = take();
+        assert_eq!(again.sha256, first.sha256, "content-addressed: one blob");
+        assert!(gc(&root, std::time::SystemTime::now(), 0).is_empty());
+        assert!(read_blob(&dir, &again.log_ref("head", "stdout")).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// DONE WHEN 6: a range fetched by ref verifies against the receipt hash, a 40 KB line comes

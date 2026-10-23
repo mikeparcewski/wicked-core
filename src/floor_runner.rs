@@ -118,38 +118,95 @@ fn understood_cargo_test(argv: &[String]) -> bool {
         && allowed(test_args, TEST_BARE, TEST_VALUED)
 }
 
-/// Is `argv` on the deselection allowlist for its runner? cargo: the r16 allowlist plus
-/// `--no-fail-fast`; pytest refuses its own selection and state flags (a `--deselect` of its own,
-/// collect-only, last-failed / stepwise state, `--`, and `-r` / `--report-chars`, which can
-/// suppress the run's own short summary).
-pub(crate) fn deselectable(runner: Runner, argv: &[String]) -> bool {
-    match runner {
-        Runner::Cargo => understood_cargo_test(argv) && argv.iter().any(|a| a == "--no-fail-fast"),
-        Runner::Pytest => !argv.iter().any(|a| {
-            let k = a.split('=').next().unwrap_or(a);
-            matches!(
-                k,
-                "--" | "--deselect"
-                    | "--report-chars"
-                    | "--co"
-                    | "--collect-only"
-                    | "--lf"
-                    | "--last-failed"
-                    | "--ff"
-                    | "--failed-first"
-                    | "--nf"
-                    | "--new-first"
-                    | "--sw"
-                    | "--stepwise"
-                    | "--sw-skip"
-                    | "--stepwise-skip"
-            ) || (a.starts_with("-r") && !a.starts_with("--"))
-        }),
+/// (pytest) The flags that take their value as the NEXT element; any other bare word in a pytest
+/// argv is a positional path.
+const PYTEST_VALUED: &[&str] = &[
+    "-p",
+    "-k",
+    "-m",
+    "-o",
+    "-W",
+    "-n",
+    "--basetemp",
+    "--tb",
+    "--maxfail",
+    "--durations",
+    "--junitxml",
+    "--junit-xml",
+    "--log-level",
+    "--ignore",
+    "--ignore-glob",
+    "--import-mode",
+    "--capture",
+    "--override-ini",
+    "--timeout",
+    "--dist",
+];
+
+/// (pytest) How many elements launch pytest: `pytest` / `py.test`, or `python -m pytest`.
+fn pytest_launcher(argv: &[String]) -> usize {
+    if bin_name(argv).is_some_and(|b| b.starts_with("python")) {
+        3
+    } else {
+        1
     }
 }
 
-/// The argv that prints the runner's own inventory of `argv`'s selection (its TOC).
-pub(crate) fn toc_argv(runner: Runner, argv: &[String]) -> Vec<String> {
+/// Is `argv` on the deselection allowlist for its runner? cargo: the r16 allowlist plus
+/// `--no-fail-fast`. pytest: only flags (agy r12) — a positional path, or a bare word after a flag
+/// the floor does not know takes a value, makes the node ids relative to a rootdir the floor does
+/// not set — and none that moves the rootdir or the config (`--rootdir`, `-c` / `--config-file`,
+/// `--confcutdir`), selects (`--deselect`, `--`), replays state (last-failed, stepwise),
+/// collects only, or suppresses the run's own summary (`-r` / `--report-chars`).
+pub(crate) fn deselectable(runner: Runner, argv: &[String]) -> bool {
+    match runner {
+        Runner::Cargo => understood_cargo_test(argv) && argv.iter().any(|a| a == "--no-fail-fast"),
+        Runner::Pytest => {
+            let mut it = argv.get(pytest_launcher(argv)..).unwrap_or(&[]).iter();
+            while let Some(a) = it.next() {
+                let k = a.split('=').next().unwrap_or(a);
+                let refused = matches!(
+                    k,
+                    "--" | "--deselect"
+                        | "--report-chars"
+                        | "--rootdir"
+                        | "--config-file"
+                        | "--confcutdir"
+                        | "--co"
+                        | "--collect-only"
+                        | "--lf"
+                        | "--last-failed"
+                        | "--ff"
+                        | "--failed-first"
+                        | "--nf"
+                        | "--new-first"
+                        | "--sw"
+                        | "--stepwise"
+                        | "--sw-skip"
+                        | "--stepwise-skip"
+                ) || (!a.starts_with("--")
+                    && (a.starts_with("-r") || a.starts_with("-c")));
+                if refused || !a.starts_with('-') {
+                    return false;
+                }
+                if PYTEST_VALUED.contains(&a.as_str()) && it.next().is_none() {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+}
+
+/// (pytest) Every run the floor builds for exclusion (the inventory, the alone run, the excluded
+/// run) names the check's directory as pytest's rootdir, so node ids mean the same tests in all
+/// three (agy r12). The plain head run never gets it.
+fn rootdir(argv: &mut Vec<String>, dir: &Path) {
+    argv.push(format!("--rootdir={}", dir.display()));
+}
+
+/// The argv that prints the runner's own inventory of `argv`'s selection (its TOC), run in `dir`.
+pub(crate) fn toc_argv(runner: Runner, argv: &[String], dir: &Path) -> Vec<String> {
     match runner {
         Runner::Cargo => {
             let split = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
@@ -170,6 +227,7 @@ pub(crate) fn toc_argv(runner: Runner, argv: &[String]) -> Vec<String> {
                         && a[1..].chars().all(|c| c == 'q' || c == 'v'))
             };
             let mut out: Vec<String> = argv.iter().filter(|a| !verbosity(a)).cloned().collect();
+            rootdir(&mut out, dir);
             out.extend(["--collect-only".to_string(), "-q".to_string()]);
             out
         }
@@ -333,12 +391,11 @@ pub(crate) fn cargo_toc_targets(stdout: &str, stderr: &str) -> Option<Vec<(Strin
     (block == targets.len()).then_some(out)
 }
 
-/// The argv that runs ONLY `name` of `argv`'s selection: the floor's confirmation, on the base,
-/// that a name its output reports failing fails when run alone. cargo: `-- <name> --exact`.
-/// pytest: the node id right after the launcher, the check's flags kept and its positional paths
-/// dropped (they would select more); a flag whose value was dropped then takes the node id, or
-/// nothing, and the run errors — never a confirmation (see [`alone_failed`]).
-pub(crate) fn alone_argv(runner: Runner, argv: &[String], name: &str) -> Vec<String> {
+/// The argv that runs ONLY `name` of `argv`'s selection (run in `dir`): the floor's confirmation,
+/// on the base, that a name its output reports failing fails when run alone. cargo:
+/// `-- <name> --exact`. pytest: the check's flags (a deselectable argv has no positional path),
+/// the check's directory as rootdir, and the node id.
+pub(crate) fn alone_argv(runner: Runner, argv: &[String], name: &str, dir: &Path) -> Vec<String> {
     match runner {
         Runner::Cargo => {
             let split = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
@@ -349,48 +406,9 @@ pub(crate) fn alone_argv(runner: Runner, argv: &[String], name: &str) -> Vec<Str
             out
         }
         Runner::Pytest => {
-            const VALUED: &[&str] = &[
-                "-p",
-                "-k",
-                "-m",
-                "-c",
-                "-o",
-                "-W",
-                "-n",
-                "--rootdir",
-                "--confcutdir",
-                "--basetemp",
-                "--tb",
-                "--maxfail",
-                "--durations",
-                "--junitxml",
-                "--junit-xml",
-                "--log-level",
-                "--ignore",
-                "--ignore-glob",
-                "--import-mode",
-                "--capture",
-                "--override-ini",
-                "--config-file",
-                "--timeout",
-                "--dist",
-            ];
-            let launcher = if bin_name(argv).is_some_and(|b| b.starts_with("python")) {
-                3
-            } else {
-                1
-            };
-            let mut out = argv[..launcher.min(argv.len())].to_vec();
+            let mut out = argv.to_vec();
+            rootdir(&mut out, dir);
             out.push(name.to_string());
-            let mut rest = argv.get(launcher..).unwrap_or(&[]).iter();
-            while let Some(a) = rest.next() {
-                if VALUED.contains(&a.as_str()) {
-                    out.push(a.clone());
-                    out.extend(rest.next().cloned());
-                } else if a.starts_with('-') {
-                    out.push(a.clone());
-                }
-            }
             out
         }
     }
@@ -421,7 +439,12 @@ pub(crate) fn pytest_prefix_collision<'a>(names: &'a [String], head: &[String]) 
 
 /// `argv` with `names` deselected natively: libtest `--skip <name>` … `--exact` (exact names,
 /// every binary), pytest `--deselect <nodeid>`.
-pub(crate) fn deselect_argv(runner: Runner, argv: &[String], names: &[String]) -> Vec<String> {
+pub(crate) fn deselect_argv(
+    runner: Runner,
+    argv: &[String],
+    names: &[String],
+    dir: &Path,
+) -> Vec<String> {
     match runner {
         Runner::Cargo => {
             let split = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
@@ -436,6 +459,7 @@ pub(crate) fn deselect_argv(runner: Runner, argv: &[String], names: &[String]) -
         }
         Runner::Pytest => {
             let mut out = argv.to_vec();
+            rootdir(&mut out, dir);
             for n in names {
                 out.push(format!("--deselect={n}"));
             }
@@ -592,7 +616,8 @@ mod tests {
             alone_argv(
                 Runner::Cargo,
                 &s(&["cargo", "test", "--no-fail-fast", "--", "--test-threads=1"]),
-                "t::a"
+                "t::a",
+                Path::new("/w")
             ),
             s(&[
                 "cargo",
@@ -613,7 +638,7 @@ mod tests {
         assert!(failing_names(Runner::Pytest, child_then_more).is_empty());
         let cargo = s(&["cargo", "test", "--locked", "--", "--test-threads=4"]);
         assert_eq!(
-            toc_argv(Runner::Cargo, &cargo),
+            toc_argv(Runner::Cargo, &cargo, Path::new("/w")),
             s(&[
                 "cargo",
                 "test",
@@ -624,7 +649,12 @@ mod tests {
             ])
         );
         assert_eq!(
-            deselect_argv(Runner::Cargo, &cargo, &s(&["t::a", "t::b"])),
+            deselect_argv(
+                Runner::Cargo,
+                &cargo,
+                &s(&["t::a", "t::b"]),
+                Path::new("/w")
+            ),
             s(&[
                 "cargo",
                 "test",
@@ -639,10 +669,16 @@ mod tests {
         assert_eq!(
             deselect_argv(
                 Runner::Pytest,
-                &s(&["pytest", "tests"]),
-                &s(&["tests/a.py::test_x"])
+                &s(&["pytest", "-q"]),
+                &s(&["tests/a.py::test_x"]),
+                Path::new("/w/sub")
             ),
-            s(&["pytest", "tests", "--deselect=tests/a.py::test_x"])
+            s(&[
+                "pytest",
+                "-q",
+                "--rootdir=/w/sub",
+                "--deselect=tests/a.py::test_x"
+            ])
         );
         assert_eq!(
             runner_of(&s(&["python3", "-m", "pytest", "-q"])),
@@ -674,9 +710,17 @@ mod tests {
         assert_eq!(
             toc_argv(
                 Runner::Pytest,
-                &s(&["pytest", "-q", "-vv", "--quiet", "tests"])
+                &s(&["pytest", "-q", "-vv", "--quiet", "-p", "no:x"]),
+                Path::new("/w/sub")
             ),
-            s(&["pytest", "tests", "--collect-only", "-q"])
+            s(&[
+                "pytest",
+                "-p",
+                "no:x",
+                "--rootdir=/w/sub",
+                "--collect-only",
+                "-q"
+            ])
         );
         let py = "tests/a.py::test_x PASSED\nFAILED tests/a.py::test_ok - printed by a test\n\
                   =========== short test summary info ===========\n\
@@ -708,32 +752,28 @@ mod tests {
         assert_eq!(pytest_prefix_collision(&s(&["b.py::t"]), &head), None);
     }
 
-    /// (agy r7) A pytest node id runs alone with the check's flags and without its paths; only a
-    /// TEST failure (exit 1) confirms it. `-r` / `--report-chars` is off the allowlist.
+    /// (agy r7, r12) A pytest node id runs alone with the check's flags under the check's directory
+    /// as rootdir; only a TEST failure (exit 1) confirms it. A positional path, a bare word after
+    /// an unknown flag, a rootdir / config / confcutdir of the check's own, and `-r` /
+    /// `--report-chars` are off the allowlist.
     #[test]
     fn a_pytest_node_id_runs_alone_and_only_a_test_failure_confirms_it() {
         assert_eq!(
             alone_argv(
                 Runner::Pytest,
-                &s(&[
-                    "python",
-                    "-m",
-                    "pytest",
-                    "-p",
-                    "no:cacheprovider",
-                    "tests",
-                    "-q"
-                ]),
-                "tests/a.py::t"
+                &s(&["python", "-m", "pytest", "-p", "no:cacheprovider", "-q"]),
+                "tests/a.py::t",
+                Path::new("/w/sub")
             ),
             s(&[
                 "python",
                 "-m",
                 "pytest",
-                "tests/a.py::t",
                 "-p",
                 "no:cacheprovider",
-                "-q"
+                "-q",
+                "--rootdir=/w/sub",
+                "tests/a.py::t"
             ])
         );
         assert!(alone_failed(Runner::Pytest, Some(1)));
@@ -745,12 +785,20 @@ mod tests {
             &["pytest", "-rN"][..],
             &["pytest", "--report-chars=N"],
             &["pytest", "-r", "fE"],
+            &["pytest", "sub/tests"],
+            &["pytest", "--ds", "proj.settings", "-q"],
+            &["pytest", "--rootdir", "x"],
+            &["pytest", "--rootdir=x"],
+            &["pytest", "-c", "x.ini"],
+            &["pytest", "--config-file=x.ini"],
+            &["pytest", "--confcutdir", "x"],
+            &["python", "-m", "pytest", "tests"],
         ] {
-            assert!(!deselectable(Runner::Pytest, &s(a)), "{a:?}");
+            assert!(!deselectable(runner_of(&s(a)).unwrap(), &s(a)), "{a:?}");
         }
         assert!(deselectable(
             Runner::Pytest,
-            &s(&["pytest", "--rootdir", "x", "-p", "no:x"])
+            &s(&["pytest", "-p", "no:x", "-k", "fast", "-q", "--tb=short"])
         ));
     }
 
@@ -795,5 +843,100 @@ mod tests {
         ] {
             assert!(!ok(bad), "{bad:?} must not be deselected");
         }
+    }
+
+    /// (agy r12) A REAL pytest, `sub/pyproject.toml` beside `sub/tests` and the check run from the
+    /// repo root: an honest base failure is confirmed alone and excluded (`pass_excluded`); the
+    /// head breaking `sub`'s `test_x` denies; a check naming `sub/tests` positionally escalates.
+    /// Skipped where pytest is not on `PATH`.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_pytest_subdir_with_its_own_config_separates_by_rootdir() {
+        use crate::repo_checks::tests::{git, git_repo_with_commit, scratch};
+        use crate::repo_checks::{
+            run_floor, test_seam as seam, FloorContext, FloorStage, OUTCOME_BASE_RED_UNSEPARATED,
+            OUTCOME_NEW_FAILURE, OUTCOME_PASS_EXCLUDED,
+        };
+        let Some(pytest) = crate::validator::find_on_path("pytest") else {
+            eprintln!("floor_runner: pytest not on PATH — skipping the real pytest fixture");
+            return;
+        };
+        let _load = seam::pin(0.5, 4);
+        let repo = scratch("real-pytest");
+        let config = |extra: &[&str]| {
+            let mut argv = vec![
+                pytest.to_string_lossy().into_owned(),
+                "-p".into(),
+                "no:cacheprovider".into(),
+            ];
+            argv.extend(extra.iter().map(|a| a.to_string()));
+            std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+            std::fs::write(
+                repo.join(".wicked/checks.json"),
+                serde_json::json!({ "test": argv, "timeout_s": 120 }).to_string(),
+            )
+            .unwrap();
+        };
+        let tests = |x: &str| {
+            std::fs::create_dir_all(repo.join("sub/tests")).unwrap();
+            std::fs::write(
+                repo.join("sub/tests/test_sub.py"),
+                format!("def test_x():\n    assert {x}\n\n\ndef test_old():\n    assert False\n"),
+            )
+            .unwrap();
+        };
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        std::fs::write(
+            repo.join("sub/pyproject.toml"),
+            "[tool.pytest.ini_options]\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join(".gitignore"), "tmp/\n__pycache__/\n").unwrap();
+        config(&[]);
+        tests("True");
+        let base = git_repo_with_commit(&repo);
+        let ctx = FloorContext {
+            stage: FloorStage::Verify,
+            base_head: Some(base),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        let decide = || {
+            let report = run_floor(&repo, &ctx);
+            if report.sandbox_error.is_some() {
+                return None;
+            }
+            let c = report
+                .checks
+                .iter()
+                .find(|c| c.name == "test")
+                .unwrap_or_else(|| panic!("the pytest check ran: {report:#?}"))
+                .clone();
+            Some((report, c))
+        };
+        // The base's own failure, still failing on the head: confirmed alone, excluded.
+        std::fs::write(repo.join("README.md"), "head\n").unwrap();
+        let Some((report, c)) = decide() else {
+            return;
+        };
+        let d = c.decision.as_ref().expect("a decision");
+        assert_eq!(d.outcome, OUTCOME_PASS_EXCLUDED, "{d:?}");
+        assert_eq!(d.excluded, s(&["sub/tests/test_sub.py::test_old"]));
+        assert!(report.passed, "{report:#?}");
+        // The head breaks `sub`'s `test_x`: deselecting the base's failure leaves it red.
+        tests("False");
+        let (report, c) = decide().unwrap();
+        let d = c.decision.as_ref().expect("a decision");
+        assert_eq!(d.outcome, OUTCOME_NEW_FAILURE, "{d:?}");
+        assert!(!report.passed);
+        // agy's case: the check names `sub/tests` positionally — node ids would follow
+        // `sub/pyproject.toml`'s rootdir, not the one the floor sets — so it escalates.
+        config(&["sub/tests"]);
+        let (report, c) = decide().unwrap();
+        let d = c.decision.as_ref().expect("a decision");
+        assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
+        assert!(!report.passed);
+        let _ = git(&repo, &["status", "--short"]);
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

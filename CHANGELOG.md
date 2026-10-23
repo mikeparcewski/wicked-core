@@ -32,8 +32,10 @@ Two release tracks share this file, newest entry first regardless of track:
   result lines (pytest's last short summary) and never from a truncated stream, an empty
   inventory is no inventory, an excluded name must sit in the same test target on both trees (each inventory list block matched to cargo's
   own `Running` line, executable hash included, so two packages' `tests/smoke.rs` are two targets), and every base failure the base's output names is only a candidate until the base's exit code
-  confirms it — run alone on the base (cargo `-- <name> --exact`; pytest the node id with the check's flags and
-  without its paths, where only exit 1 counts) it must fail, so a child run's line, a child pytest summary left
+  confirms it — run alone on the base (cargo `-- <name> --exact`; pytest the node id with the check's flags, where only exit 1
+  counts; every pytest run the floor builds for exclusion names the check's directory as `--rootdir`, and a pytest
+  argv with a positional path, an unknown valued flag, or its own `--rootdir`/`-c`/`--config-file`/`--confcutdir`
+  is not deselectable) it must fail, so a child run's line, a child pytest summary left
   open, or a test a crashed binary never reached cannot be excluded (at most 16, more escalates); pytest's `-r` /
   `--report-chars` is off the allowlist; a base that timed out or could not run escalates; and a manifest change to `[profile]`, `[patch]`, `[replace]`, `[workspace]` or
   `[lints]` runs the full suite. Anything else is
@@ -44,12 +46,14 @@ Two release tracks share this file, newest entry first regardless of track:
   classification (`classify` and the binary qualifiers, `LineScan`, the libtest `env_cannot_run` class and its
   launcher signatures, the isolated `--exact` and vitest file re-runs, the load-class and env-crash re-runs,
   `MAX_FLAKE_RERUN`, the environment signals) and the 4 KB ring buffer as a source of truth. Every stream is now
-  stored once, content-addressed (sha256), in the run's log store (garbage-collected by age at every floor's start, as sccache and Bazel's disk cache do:
+  stored once, content-addressed (sha256), in the run's log store (garbage-collected by age at every floor's start, as sccache and Bazel's disk cache do (a dedup onto an existing blob
+  restarts its age):
   finished blobs after `FLOOR_LOG_TTL` = 7 days, `.part-*` after a day, and oldest-first over a byte cap of
   `WICKED_FLOOR_LOG_CAP_GB` (default 5) that never evicts anything modified in the last 24 hours), with a lazy line TOC and ranges read by ref
   and verified against the hash (`floor_log`); a stream past 64 MiB keeps its prefix, marked `truncated`, and a
   truncated inventory is never precise. Kept: the PTY grant (core#1060's Seatbelt rules, cherry-picked), the
-  load-aware bound, the base cache (now `{floor_policy: 9, run, toc}`; an inventory or alone run that did not finish is not cached), `.wicked/checks.json`, the operator
+  load-aware bound, the base cache (now `{floor_policy: 10, head_argv, run, toc}`, keyed by the head argv it answered; a reused record's blobs must
+  still read whole and have their age restarted, or the base re-runs; an inventory or alone run that did not finish is not cached), `.wicked/checks.json`, the operator
   override and QE. An unconfigured cargo repo (or a cargo workspace in a subdirectory: the derived set's
   provenance is a typed field, not its display source) runs its affected set at the creator only (the verify floor keeps
   the full suite, as before: the affected set cannot prove a package owns a file), named from cargo metadata alone (detection no longer guesses packages from
@@ -59,7 +63,7 @@ Two release tracks share this file, newest entry first regardless of track:
   closed until every member that reaches what the selection reaches is in it, over the members' metadata and the
   lock graphs (the full suite builds every member together, so a shared dependency's features are on for all of
   them; a reached package neither graph describes runs the full suite), in one `-p a -p b` invocation; on the base the set runs only over the packages the base has (an all-new set is a `new_failure`); a `[profile]`, `[patch]`,
-  `[replace]`, `[workspace]`, `[lints]`, `package.resolver`/`edition`, nested `.cargo/` or `rust-toolchain` change, or a touched file that is not Rust source (any package may read a fixture),
+  `[replace]`, `[workspace]`, `[lints]`, `package.resolver`/`edition`, nested `.cargo/` or `rust-toolchain` change, or a touched file that is not Rust source (any package may read a fixture) or lies outside the check's directory,
   runs the full suite. The macOS floor's test seam now arms the private `TMPDIR` as
   production does, so doctests run under the real floor sandbox. Wire (additive): every
   `repoChecksEvaluated.checks[]` entry carries `decision: {outcome, baseSha, baseFailing, excluded, logRefs:

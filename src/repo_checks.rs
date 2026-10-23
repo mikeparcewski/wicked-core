@@ -3990,7 +3990,19 @@ impl BaseTree {
         // The base runs the head's argv, and it can change within a run (a targeted command with
         // the files a rework touches — `{files}`, the derived `-p <crate>` — or a reworked
         // `.wicked/checks.json`): a cached run of ANOTHER argv is not this comparison.
-        if rec.floor_policy != FLOOR_POLICY_VERSION || rec.run.argv != check.argv {
+        if rec.floor_policy != FLOOR_POLICY_VERSION || rec.head_argv != check.argv {
+            return None;
+        }
+        // (codex r12) Reused evidence must still be there, whole — and its age restarts, so the
+        // log GC keeps what the new receipt names. A blob gone or altered: the base re-runs.
+        let toc_logs = rec.toc.iter().flat_map(|t| t.logs.iter());
+        if rec
+            .run
+            .logs
+            .iter()
+            .chain(toc_logs)
+            .any(|l| crate::floor_log::refresh(&scratch.logs, l).is_err())
+        {
             return None;
         }
         Some(BaseSide {
@@ -4173,7 +4185,7 @@ impl BaseTree {
             if t.incomplete.is_none() && candidates.len() <= MAX_ALONE_CONFIRMATIONS {
                 for n in candidates {
                     let one = RepoCheck {
-                        argv: alone_argv(runner, &target.argv, &n),
+                        argv: alone_argv(runner, &target.argv, &n, &self.dir.join(&check.dir)),
                         source: format!("`{n}` alone on the base (DES-FLOOR-V2)"),
                         ..target.clone()
                     };
@@ -4195,6 +4207,7 @@ impl BaseTree {
         }
         let rec = BaseRecord {
             floor_policy: FLOOR_POLICY_VERSION,
+            head_argv: check.argv.clone(),
             run,
             toc,
         };
@@ -4225,6 +4238,9 @@ impl BaseTree {
 #[derive(Debug, Serialize, Deserialize)]
 struct BaseRecord {
     floor_policy: u32,
+    /// The head argv the base answered (its run may be narrowed to the base's packages).
+    #[serde(default)]
+    head_argv: Vec<String>,
     run: CheckRun,
     #[serde(default)]
     toc: Option<Toc>,
@@ -4285,7 +4301,7 @@ pub const OUTCOME_COULD_NOT_RUN: &str = "could_not_run";
 pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
 /// The versioned base-cache record (core#1060 r9 keyed the cache by sandbox policy; v4 adds the
 /// base inventory): a record of any other version, or a bare `CheckRun`, is a miss.
-const FLOOR_POLICY_VERSION: u32 = 9;
+const FLOOR_POLICY_VERSION: u32 = 10;
 /// The most base failures the floor confirms one by one (each run alone on the base); more than
 /// this escalates rather than paying for them.
 const MAX_ALONE_CONFIRMATIONS: usize = 16;
@@ -4351,7 +4367,7 @@ fn inventory(
     tree: Tree,
 ) -> Toc {
     let probe = RepoCheck {
-        argv: toc_argv(runner, &check.argv),
+        argv: toc_argv(runner, &check.argv, &dir.join(&check.dir)),
         source: format!("the inventory of `{}` (DES-FLOOR-V2)", check.name),
         ..check.clone()
     };
@@ -4620,7 +4636,7 @@ fn decide(
     let (deciding_check, mut deciding, excluded_run) = match &plan {
         Ok((runner, names)) if !names.is_empty() => {
             let one = RepoCheck {
-                argv: deselect_argv(*runner, &check.argv, names),
+                argv: deselect_argv(*runner, &check.argv, names, &worktree.join(&check.dir)),
                 source: format!(
                     "`{}` with the base's {} failing test{} deselected (DES-FLOOR-V2)",
                     check.name,
@@ -4665,20 +4681,17 @@ fn decide(
     }
     // Head ids are an ANNOTATION: listed beside the outcome, never deciding it (the deciding
     // run's, when it was the excluded one).
-    let annotated: Vec<String> = if excluded_run {
-        &deciding.failure_ids
-    } else {
-        &head.failure_ids
-    }
-    .iter()
-    .filter(|id| {
-        !decision
-            .excluded
-            .iter()
-            .any(|n| id_name(id) == Some(n.as_str()))
-    })
-    .cloned()
-    .collect();
+    let annotated: Vec<String> = deciding
+        .failure_ids
+        .iter()
+        .filter(|id| {
+            !decision
+                .excluded
+                .iter()
+                .any(|n| id_name(id) == Some(n.as_str()))
+        })
+        .cloned()
+        .collect();
     let base_passed = base_run.is_some_and(CheckRun::passed);
     // A base that could not be established — it timed out, could not start, or could not be
     // exported or provisioned — separates nothing: escalate. (A base that declares no such check,
@@ -8521,6 +8534,7 @@ pub(crate) mod tests {
         assert!(BaseTree::cached(&scratch_dir, head, &bare).is_none());
         let rec = BaseRecord {
             floor_policy: FLOOR_POLICY_VERSION,
+            head_argv: s(&["cargo", "test", "-p", "b"]),
             run: ran,
             toc: None,
         };
@@ -8538,6 +8552,20 @@ pub(crate) mod tests {
         );
         assert!(
             BaseTree::cached(&scratch_dir, head, &check(&["cargo", "test", "-p", "a"])).is_none()
+        );
+        // (codex r12) A record whose blob is gone is no evidence: a miss, so the base re-runs.
+        let mut rec: BaseRecord =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        rec.run.logs = vec![crate::floor_log::LogRef {
+            attempt: "base".into(),
+            stream: "stdout".into(),
+            sha256: "0".repeat(64),
+            bytes: 1,
+            truncated: false,
+        }];
+        std::fs::write(&path, serde_json::to_string(&rec).unwrap()).unwrap();
+        assert!(
+            BaseTree::cached(&scratch_dir, head, &check(&["cargo", "test", "-p", "b"])).is_none()
         );
         drop(scratch_dir);
         let _ = std::fs::remove_dir_all(&wt);

@@ -320,6 +320,16 @@ fn affected_packages(
         return Err(format!("`{f}` configures cargo outside package metadata"));
     }
     if !check.dir.is_empty() {
+        // (agy r12) A touched file outside the check's directory (an ancestor `Cargo.lock` or
+        // `Cargo.toml`, a repo-level fixture) is invisible once the paths are made relative: the
+        // full suite.
+        let prefix = format!("{}/", check.dir.trim_end_matches('/'));
+        if let Some(f) = files.iter().find(|f| !f.starts_with(&prefix)) {
+            return Err(format!(
+                "`{f}` is outside the check's directory `{}`",
+                check.dir
+            ));
+        }
         files = package_relative(files, &check.dir);
     }
     let head = workspace_members(worktree, check, sandbox, scratch, Tree::Head)?;
@@ -976,6 +986,21 @@ mod tests {
             c.argv
         );
         assert!(!report.passed, "b's regression denies: {report:#?}");
+        // (agy r12) A touched file outside `rust/` beside it: the full suite, said in `source`.
+        std::fs::create_dir_all(repo.join("fixtures")).unwrap();
+        std::fs::write(repo.join("fixtures/data.json"), "{}\n").unwrap();
+        let report = run_floor(&repo, &ctx);
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "test_targeted" && c.source.starts_with("rust/"))
+            .unwrap_or_else(|| panic!("the nested derived set ran: {report:#?}"));
+        assert!(!c.argv.iter().any(|x| x == "-p"), "{:?}", c.argv);
+        assert!(
+            c.source.contains("outside the check's directory"),
+            "{}",
+            c.source
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 
