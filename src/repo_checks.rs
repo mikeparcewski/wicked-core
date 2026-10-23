@@ -240,8 +240,9 @@ use serde::{Deserialize, Serialize};
 use wicked_apps_core::spawn::HardenedCommand;
 
 use crate::floor_runner::{
-    alone_argv, cargo_config_bends_test_args, cargo_toc_targets, deselect_argv, deselectable,
-    failing_names, parse_toc, passing_names, pytest_prefix_collision, runner_of, toc_argv, Runner,
+    alone_argv, alone_failed, cargo_config_bends_test_args, cargo_toc_targets, deselect_argv,
+    deselectable, failing_names, parse_toc, passing_names, pytest_prefix_collision, runner_of,
+    toc_argv, Runner,
 };
 use crate::validator::WorkerSandbox;
 
@@ -394,6 +395,10 @@ pub struct RepoCheck {
     /// checks do not cover runs THAT package's checks ([`subdir_packages`]).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub dir: String,
+    /// (DES-FLOOR-V2 §5) The floor DERIVED this set from the touched files ([`derive_targeted`]):
+    /// typed provenance, never read off `source` (which a subdirectory package prefixes).
+    #[serde(skip)]
+    pub derived: bool,
 }
 
 impl RepoCheck {
@@ -1287,6 +1292,7 @@ fn apply(slot: &mut Option<RepoCheck>, r: Resolved, key: &str) {
                 source: format!("{CONFIG_PATH} {key}"),
                 timeout_s: None,
                 dir: String::new(),
+                derived: false,
             })
         }
     }
@@ -1634,6 +1640,7 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
                     source: format!("{CONFIG_PATH} {key}"),
                     timeout_s: None,
                     dir: String::new(),
+                    derived: false,
                 });
             }
         }
@@ -1646,6 +1653,7 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
             source: format!("{CONFIG_PATH} e2e"),
             timeout_s: None,
             dir: String::new(),
+            derived: false,
         }),
         _ => None,
     };
@@ -1734,6 +1742,7 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
                     source,
                     timeout_s: None,
                     dir: String::new(),
+                    derived: false,
                 });
             }
             for k in wanted {
@@ -1743,6 +1752,7 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
                     source: format!("package.json scripts.{k}"),
                     timeout_s: None,
                     dir: String::new(),
+                    derived: false,
                 };
                 match k {
                     "typecheck" => typecheck = Some(check),
@@ -1771,6 +1781,7 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
             source: "Cargo.toml".into(),
             timeout_s: None,
             dir: String::new(),
+            derived: false,
         });
         // `--no-fail-fast` (core#481): cargo otherwise stops at the first failing test binary, so
         // a crate whose red test the base shares would hide every later crate from the baseline
@@ -1785,6 +1796,7 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
             source: "Cargo.toml".into(),
             timeout_s: None,
             dir: String::new(),
+            derived: false,
         });
     }
     // The repo config speaks over the manifests.
@@ -1806,6 +1818,7 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
                 source: format!("{CONFIG_PATH} test"),
                 timeout_s: None,
                 dir: String::new(),
+                derived: false,
             });
             cargo = None;
         }
@@ -1828,6 +1841,7 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
                 source: format!("{CONFIG_PATH} test_targeted"),
                 timeout_s: None,
                 dir: String::new(),
+                derived: false,
             });
             cargo = None;
         }
@@ -1898,43 +1912,9 @@ fn derive_targeted(
     }
     let base_name = |f: &str| f.rsplit('/').next().unwrap_or(f).to_string();
     let argv = match (test, cargo) {
-        (None, Some(c)) => {
-            let mut crates: Vec<String> = Vec::new();
-            let mut manifests = false;
-            for f in &files {
-                let name = base_name(f);
-                if f.starts_with(".cargo/")
-                    || f.contains("/.cargo/")
-                    || name.starts_with("rust-toolchain")
-                {
-                    return Ok(None);
-                }
-                // A manifest or the lockfile is the metadata diff's to read.
-                if name == "Cargo.toml" || name == "Cargo.lock" {
-                    manifests = true;
-                    continue;
-                }
-                // A path no package owns (a workspace manifest, a shared `include!`d file, docs
-                // beside a virtual workspace) can reach any crate: never narrow past it.
-                match cargo_package_of(worktree, f)? {
-                    Some(p) => {
-                        if !crates.contains(&p) {
-                            crates.push(p);
-                        }
-                    }
-                    None => return Ok(None),
-                }
-            }
-            if crates.is_empty() && !manifests {
-                return Ok(None);
-            }
-            let mut argv = c.argv.clone();
-            for p in crates {
-                argv.push("-p".into());
-                argv.push(p);
-            }
-            argv
-        }
+        // cargo: the packages are [`crate::floor_affected::resolve_affected`]'s, from cargo
+        // metadata — it runs the full suite whenever they cannot be named.
+        (None, Some(c)) => c.argv.clone(),
         (Some(_), None) => {
             let Some((pm, script)) = node_test_script else {
                 return Ok(None);
@@ -1974,68 +1954,8 @@ fn derive_targeted(
         source: DERIVED_TARGETED_SOURCE.into(),
         timeout_s: None,
         dir: String::new(),
+        derived: true,
     }))
-}
-
-/// The package owning `rel`: the nearest `Cargo.toml` at or above its directory, read without
-/// following links; `None` when that manifest declares no `[package]` (a virtual workspace root)
-/// or there is none.
-fn cargo_package_of(worktree: &Path, rel: &str) -> Result<Option<String>, String> {
-    let mut dir: Option<&str> = Some(rel.rsplit_once('/').map(|(d, _)| d).unwrap_or(""));
-    while let Some(d) = dir {
-        let manifest = if d.is_empty() {
-            "Cargo.toml".to_string()
-        } else {
-            format!("{d}/Cargo.toml")
-        };
-        if let Some(probed) = probe(worktree, &manifest)? {
-            let is_file = probed.is_file();
-            let Some(mut file) = probed.file.filter(|_| is_file) else {
-                return Err(format!("`{manifest}` is not a regular file"));
-            };
-            let mut raw = String::new();
-            file.read_to_string(&mut raw)
-                .map_err(|e| format!("`{manifest}` could not be read: {e}"))?;
-            return Ok(cargo_package_name(&raw));
-        }
-        dir = if d.is_empty() {
-            None
-        } else {
-            Some(d.rsplit_once('/').map(|(p, _)| p).unwrap_or(""))
-        };
-    }
-    Ok(None)
-}
-
-/// `[package] name = "…"` off a manifest — a line scan, enough for the one key; a name that is not
-/// a plain crate name is refused (it becomes an argv element).
-fn cargo_package_name(raw: &str) -> Option<String> {
-    let mut in_package = false;
-    for line in raw.lines() {
-        let l = line.trim();
-        if l.starts_with('[') {
-            in_package = l == "[package]";
-            continue;
-        }
-        if !in_package {
-            continue;
-        }
-        let Some(rest) = l.strip_prefix("name") else {
-            continue;
-        };
-        let Some(v) = rest.trim_start().strip_prefix('=') else {
-            continue;
-        };
-        let v = v.split('#').next().unwrap_or("").trim().trim_matches('"');
-        if !v.is_empty()
-            && v.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            return Some(v.to_string());
-        }
-        return None;
-    }
-    None
 }
 
 /// Why the worktree's `node_modules/` does NOT provision the checks, or `None` when it does.
@@ -4157,14 +4077,14 @@ impl BaseTree {
             Ok(d) => d,
             Err(e) => return fail(format!("the base's checks could not be determined: {e}")),
         };
-        // A derived set stands for the base's own test check: the export has no base of its own,
-        // so it detects `test` / `cargo-test`, never `test_targeted`.
+        // A derived set stands for the base's own test check (the export has no base of its own,
+        // so it detects `test` / `cargo-test`); a configured `test_targeted` anchored on the head's
+        // `{files}` is not re-derivable there, and runs verbatim.
         let declares = |c: &RepoCheck| {
             c.name == check.name
-                || (check.name == "test_targeted"
-                    && matches!(c.name.as_str(), "test" | "cargo-test"))
+                || (check.derived && matches!(c.name.as_str(), "test" | "cargo-test"))
         };
-        if !detected.iter().any(declares) {
+        if !(check.name == "test_targeted" && !check.derived) && !detected.iter().any(declares) {
             return fail(format!(
                 "the run base declares no `{}` check (the change introduced it)",
                 check.name
@@ -4186,12 +4106,18 @@ impl BaseTree {
         }
         // (agy r6) A derived cargo set names the HEAD's packages; the base runs only those it has.
         // An all-new set is a check the base does not declare: a new failure, never escalated.
-        if check.name == "test_targeted" && check.argv.iter().any(|a| a == "-p") {
-            let have =
-                match crate::floor_affected::base_packages(&self.dir, check, sandbox, scratch) {
-                    Ok(h) => h,
-                    Err(e) => return fail(format!("the base's packages could not be listed: {e}")),
-                };
+        // (codex r7) Only a DERIVED cargo set's `-p` is a package (pytest's is a plugin).
+        if check.derived && runner_of(&check.argv) == Some(Runner::Cargo) {
+            let have: Vec<String> = match crate::floor_affected::workspace_members(
+                &self.dir,
+                check,
+                sandbox,
+                scratch,
+                Tree::Base,
+            ) {
+                Ok(m) => m.into_iter().map(|m| m.name).collect(),
+                Err(e) => return fail(format!("the base's packages could not be listed: {e}")),
+            };
             let (mut argv, mut new) = (Vec::new(), Vec::new());
             let mut it = check.argv.iter();
             while let Some(a) = it.next() {
@@ -4222,26 +4148,27 @@ impl BaseTree {
             .then(|| runner_of(&target.argv))
             .flatten()
             .map(|runner| inventory(&self.dir, &target, runner, sandbox, scratch, Tree::Base));
-        // (cargo) Each failure the base's output names is confirmed by the base's EXIT CODE: run
-        // alone (`-- <name> --exact`) on this export, it must fail. A captured child run's line,
-        // or a test a crashed binary never reached, then cannot be excluded.
+        // Each failure the base's output names is only a CANDIDATE until the base's EXIT CODE
+        // confirms it: run alone on this export (cargo `-- <name> --exact`, pytest `<nodeid>`), it
+        // must fail. A captured child run's line, a test a crashed binary never reached, a child
+        // pytest summary left open — none can then be excluded: a misread base only NARROWS.
         if let Some(t) = toc.as_mut().filter(|t| t.incomplete.is_none()) {
-            if runner_of(&target.argv) == Some(Runner::Cargo) {
+            if let Some(runner) = runner_of(&target.argv) {
                 let text = run
                     .logs
                     .first()
                     .map(|l| crate::floor_log::text(&scratch.logs, l))
                     .unwrap_or_default();
-                let passed = passing_names(Runner::Cargo, &text);
-                let candidates: Vec<String> = failing_names(Runner::Cargo, &text)
+                let passed = passing_names(runner, &text);
+                let candidates: Vec<String> = failing_names(runner, &text)
                     .into_iter()
                     .filter(|n| t.count(n) == 1 && !passed.contains(n))
-                    .filter(|n| !n.contains(char::is_whitespace))
+                    .filter(|n| runner != Runner::Cargo || !n.contains(char::is_whitespace))
                     .collect();
                 if candidates.len() <= MAX_ALONE_CONFIRMATIONS {
                     for n in candidates {
                         let one = RepoCheck {
-                            argv: alone_argv(&target.argv, &n),
+                            argv: alone_argv(runner, &target.argv, &n),
                             source: format!("`{n}` alone on the base (DES-FLOOR-V2)"),
                             ..target.clone()
                         };
@@ -4257,7 +4184,7 @@ impl BaseTree {
                             t.transient = true;
                             break;
                         }
-                        t.alone.push((n, !r.passed()));
+                        t.alone.push((n, alone_failed(runner, r.exit_code)));
                     }
                 }
             }
@@ -4354,7 +4281,7 @@ pub const OUTCOME_COULD_NOT_RUN: &str = "could_not_run";
 pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
 /// The versioned base-cache record (core#1060 r9 keyed the cache by sandbox policy; v4 adds the
 /// base inventory): a record of any other version, or a bare `CheckRun`, is a miss.
-const FLOOR_POLICY_VERSION: u32 = 7;
+const FLOOR_POLICY_VERSION: u32 = 8;
 /// The most base failures the floor confirms one by one (each run alone on the base); more than
 /// this escalates rather than paying for them.
 const MAX_ALONE_CONFIRMATIONS: usize = 16;
@@ -4639,19 +4566,17 @@ fn decide(
                     toc.count(n)
                 ));
             }
-            if runner == Runner::Cargo {
-                for n in &failing {
-                    match toc.alone.iter().find(|(a, _)| a == n) {
-                        Some((_, true)) => {}
-                        Some((_, false)) => {
-                            return Err(format!("`{n}` passes when the base runs it alone"))
-                        }
-                        None => {
-                            return Err(format!(
-                                "`{n}` was not confirmed on the base (more than \
-                                 {MAX_ALONE_CONFIRMATIONS} failures, or its name has whitespace)"
-                            ))
-                        }
+            for n in &failing {
+                match toc.alone.iter().find(|(a, _)| a == n) {
+                    Some((_, true)) => {}
+                    Some(_) => {
+                        return Err(format!("`{n}` does not fail when the base runs it alone"))
+                    }
+                    None => {
+                        return Err(format!(
+                            "`{n}` was not confirmed on the base (more than \
+                             {MAX_ALONE_CONFIRMATIONS} failures, or a cargo name with whitespace)"
+                        ))
                     }
                 }
             }
@@ -5632,6 +5557,7 @@ pub(crate) mod tests {
                 source: "package-lock.json (node_modules absent)".into(),
                 timeout_s: None,
                 dir: String::new(),
+                derived: false,
             }],
             checks: vec![CheckRun {
                 name: "install".into(),
@@ -6206,6 +6132,7 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: String::new(),
+            derived: false,
         };
         if !run_one(&wt, &inside, &sandbox, &scratch, Tree::Head).passed() {
             eprintln!("repo_checks: the sandbox wrapper cannot run on this host — skipping the kernel claim");
@@ -6224,6 +6151,7 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: String::new(),
+            derived: false,
         };
         let r = run_one(&wt, &escaping, &sandbox, &scratch, Tree::Head);
         assert!(!r.passed(), "an outside write must fail the check: {r:?}");
@@ -6243,6 +6171,7 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: String::new(),
+            derived: false,
         };
         let r = run_one(&wt, &home_probe, &sandbox, &scratch, Tree::Head);
         assert!(r.passed());
@@ -6275,6 +6204,7 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: String::new(),
+            derived: false,
         };
         let r = run_one(&wt, &env_dump, &sandbox, &scratch, Tree::Head);
         std::env::remove_var(PLANTED);
@@ -6489,6 +6419,7 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: String::new(),
+            derived: false,
         };
         let dead = run_one(
             &wt,
@@ -6560,6 +6491,7 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: String::new(),
+            derived: false,
         };
         let started = Instant::now();
         let r = run_one(&wt, &holder, &sandbox, &scratch, Tree::Head);
@@ -7140,6 +7072,7 @@ pub(crate) mod tests {
                 source: "fixture".into(),
                 timeout_s: None,
                 dir: String::new(),
+                derived: false,
             },
             RepoCheck {
                 name: "test".into(),
@@ -7147,6 +7080,7 @@ pub(crate) mod tests {
                 source: "fixture".into(),
                 timeout_s: None,
                 dir: String::new(),
+                derived: false,
             },
         ];
         let mut runs = Vec::new();
@@ -7205,6 +7139,7 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: String::new(),
+            derived: false,
         };
         if crate::validator::find_on_path("sh").is_none() {
             eprintln!("repo_checks: sh not on PATH — skipping the bounded-tail check");
@@ -7398,6 +7333,7 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: Some(1),
             dir: String::new(),
+            derived: false,
         };
         let started = Instant::now();
         let r = run_one(&wt, &slow, &sandbox, &scratch, Tree::Head);
@@ -7586,6 +7522,7 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: Some(100),
             dir: String::new(),
+            derived: false,
         };
         let (bound, note) = effective_bound(&check);
         assert!(
@@ -7598,6 +7535,7 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: Some(100),
             dir: String::new(),
+            derived: false,
         };
         assert_eq!(
             install.base_timeout(),
@@ -7610,6 +7548,7 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: String::new(),
+            derived: false,
         };
         assert_eq!(default.base_timeout(), CHECK_TIMEOUT);
     }
@@ -8066,6 +8005,7 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: "giphy".into(),
+            derived: false,
         };
         let r = run_one(&repo, &pwd, &sandbox, &scratch_dir, Tree::Head);
         if r.passed() {
@@ -8399,10 +8339,10 @@ pub(crate) mod tests {
         assert_eq!(load_band(Some(f64::NAN), 14), None);
     }
 
-    /// core#482: a repo with no configured test commands gets a derived change-scoped set at the
-    /// CREATOR floor — the crates owning the touched files, or `vitest related` over them — and
-    /// the full set wherever the change can reach every test (manifests, lockfiles, configs) and
-    /// at verify.
+    /// core#482: a repo with no configured test commands gets a derived change-scoped set — a
+    /// cargo set whose packages the floor names from cargo metadata when it runs
+    /// ([`crate::floor_affected`]'s tests), or `vitest related` over the touched files — and the
+    /// full set wherever the change can reach every test (a deletion, a lockfile, configs).
     #[test]
     fn an_unconfigured_repo_derives_its_targeted_set_from_the_touched_files_482() {
         let repo = scratch("derive482");
@@ -8438,7 +8378,8 @@ pub(crate) mod tests {
         let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
         assert_eq!(t.name, "test_targeted");
         assert_eq!(t.source, DERIVED_TARGETED_SOURCE);
-        assert_eq!(t.argv, s(&["cargo", "test", "--no-fail-fast", "-p", "b"]));
+        assert!(t.derived);
+        assert_eq!(t.argv, s(&["cargo", "test", "--no-fail-fast"]));
         // DES-FLOOR-V2 §5: verify derives the affected set too, unless the repo says `full: true`.
         let t = test_of(&detect_with(&repo, &ctx(FloorStage::Verify)).unwrap());
         assert_eq!(t.name, "test_targeted", "verify runs the affected set");
@@ -8450,26 +8391,6 @@ pub(crate) mod tests {
             "`full: true` keeps the full suite at verify"
         );
         std::fs::remove_dir_all(repo.join(".wicked")).unwrap();
-        // The workspace manifest is the metadata diff's to read when the floor runs
-        // (`resolve_affected`): detection derives the set with no package named yet.
-        std::fs::write(
-            repo.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n",
-        )
-        .unwrap();
-        let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
-        assert_eq!(t.name, "test_targeted");
-        assert_eq!(t.argv, s(&["cargo", "test", "--no-fail-fast", "-p", "b"]));
-        git(&repo, &["checkout", "-q", "--", "Cargo.toml"]);
-        // (agy r2) A nested `.cargo/` config configures cargo for every crate below it ⇒ full.
-        std::fs::create_dir_all(repo.join("b/.cargo")).unwrap();
-        std::fs::write(repo.join("b/.cargo/config.toml"), "[build]\n").unwrap();
-        let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
-        assert_eq!(
-            t.name, "cargo-test",
-            "a nested .cargo config never narrows the set"
-        );
-        std::fs::remove_dir_all(repo.join("b/.cargo")).unwrap();
         // A deleted file elsewhere (crate `a`) could break what it left ⇒ full.
         std::fs::remove_file(repo.join("a/src/lib.rs")).unwrap();
         let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
@@ -8478,12 +8399,6 @@ pub(crate) mod tests {
             &repo,
             &["checkout", "-q", "--", "a/src/lib.rs", "b/src/lib.rs"],
         );
-        // A path no package owns beside a crate change (a shared file any crate may
-        // `include!`) ⇒ full.
-        std::fs::write(repo.join("README.md"), "y\n").unwrap();
-        std::fs::write(repo.join("b/src/lib.rs"), "pub fn x() {}\n").unwrap();
-        let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
-        assert_eq!(t.name, "cargo-test");
         // A configured test command is the repo's own choice — never overridden.
         std::fs::write(repo.join("a/src/lib.rs"), "pub fn y() {}\n").unwrap();
         std::fs::create_dir_all(repo.join(".wicked")).unwrap();
@@ -8616,6 +8531,7 @@ pub(crate) mod tests {
                 source: String::new(),
                 timeout_s: None,
                 dir: String::new(),
+                derived: false,
             },
         );
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -8627,6 +8543,7 @@ pub(crate) mod tests {
             source: DERIVED_TARGETED_SOURCE.into(),
             timeout_s: None,
             dir: String::new(),
+            derived: false,
         };
         assert!(BaseTree::cached(&scratch_dir, head, &bare).is_none());
         let rec = BaseRecord {
@@ -8641,6 +8558,7 @@ pub(crate) mod tests {
             source: DERIVED_TARGETED_SOURCE.into(),
             timeout_s: None,
             dir: String::new(),
+            derived: false,
         };
         assert!(
             BaseTree::cached(&scratch_dir, head, &check(&["cargo", "test", "-p", "b"])).is_some()
@@ -8713,8 +8631,9 @@ pub(crate) mod tests {
             &path,
             "#!/bin/sh\n\
              mode=run\n\
-             prev=; name=\n\
+             prev=; name=; fail=101; case \"$0\" in *pytest) fail=1;; esac\n\
              for a in \"$@\"; do case \"$a\" in --list|--collect-only) mode=toc;; --skip=*|--deselect=*) mode=excluded;; \
+             *::*) [ $mode = run ] && mode=alone && name=$a;; \
              --exact) [ $mode = run ] && mode=alone && name=$prev;; esac; prev=$a; done\n\
              key=\"$TMPDIR/n-$(pwd | cksum | cut -d' ' -f1)-$mode\"\n\
              n=$(cat \"$key\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$key\"\n\
@@ -8723,7 +8642,7 @@ pub(crate) mod tests {
                toc) cat toc.txt 2>/dev/null\n\
                  if [ -f toc.err ]; then cat toc.err >&2; else echo '     Running unittests src/lib.rs (target/debug/deps/fake-0)' >&2; fi\n\
                  exit $(code toc.exit);;\n\
-               alone) grep -qx \"$name\" alone.fail 2>/dev/null && exit 101; exit 0;;\n\
+               alone) grep -qx \"$name\" alone.fail 2>/dev/null && exit $fail; exit 0;;\n\
                excluded) [ -f excluded.sleep ] && sleep $(cat excluded.sleep)\n\
                  cat excluded.out 2>/dev/null; cat excluded.err >&2 2>/dev/null\n\
                  if [ -f flake.excluded ] && [ $n = 1 ]; then exit 101; fi; exit $(code excluded.exit);;\n\
@@ -9088,7 +9007,12 @@ pub(crate) mod tests {
         write_tree(
             &repo5,
             &py,
-            &[("run.out", summary), ("run.exit", "1"), ("toc.txt", toc)],
+            &[
+                ("run.out", summary),
+                ("run.exit", "1"),
+                ("toc.txt", toc),
+                ("alone.fail", "tests/a.py::test_case\n"),
+            ],
         );
         git(&repo5, &["add", "-A"]);
         git(&repo5, &["commit", "-qm", "a pytest base"]);
@@ -9249,6 +9173,113 @@ pub(crate) mod tests {
         for r in [repo, repo2, repo3, repo4, repo5, repo6, repo7, repo8, repo9] {
             let _ = std::fs::remove_dir_all(r);
         }
+    }
+
+    /// A configured pytest `test_targeted` (`argv` after the stand-in): the base's `base` files
+    /// committed, the head's `head` files over them; the floor's `test_targeted` run.
+    #[cfg(unix)]
+    fn pytest_floor(
+        tag: &str,
+        argv: &[&str],
+        base: &[(&str, &str)],
+        head: &[(&str, &str)],
+    ) -> Option<(RepoChecksReport, CheckRun)> {
+        let (repo, ctx, _) = red_base(tag);
+        let mut py = vec![fake_runner(tag, "pytest")];
+        py.extend(argv.iter().map(|a| a.to_string()));
+        let config = serde_json::json!({ "test_targeted": py, "timeout_s": 60 }).to_string();
+        write_tree(&repo, &py, base);
+        std::fs::write(repo.join(CONFIG_PATH), &config).unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "a red pytest base"]);
+        let ctx = FloorContext {
+            base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+            ..ctx
+        };
+        write_tree(&repo, &py, head);
+        std::fs::write(repo.join(CONFIG_PATH), &config).unwrap();
+        let report = run_floor(&repo, &ctx);
+        let _ = std::fs::remove_dir_all(&repo);
+        if report.sandbox_error.is_some() {
+            return None;
+        }
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "test_targeted")
+            .unwrap_or_else(|| panic!("the targeted check ran: {report:#?}"))
+            .clone();
+        Some((report, c))
+    }
+
+    /// (codex r7) A configured pytest `test_targeted` with pytest's own `-p no:cacheprovider` (a
+    /// plugin, not a cargo package) separates like any pytest check: `pass_excluded`.
+    #[cfg(unix)]
+    #[test]
+    fn a_configured_pytest_targeted_with_a_plugin_flag_still_separates() {
+        let _load = seam::pin(0.5, 4);
+        let summary = "=== short test summary info ===\nFAILED tests/a.py::test_case - boom\n=== 1 failed, 1 passed ===\n";
+        let toc = "tests/a.py::test_case\ntests/a.py::test_ok\n\n2 tests collected in 0.01s\n";
+        let base = [
+            ("run.out", summary),
+            ("run.exit", "1"),
+            ("toc.txt", toc),
+            ("alone.fail", "tests/a.py::test_case\n"),
+        ];
+        let head = [
+            ("run.out", summary),
+            ("run.exit", "1"),
+            ("excluded.exit", "0"),
+            ("toc.txt", toc),
+        ];
+        let Some((report, c)) =
+            pytest_floor("py-plugin", &["-p", "no:cacheprovider", "-q"], &base, &head)
+        else {
+            return;
+        };
+        let d = c.decision.as_ref().expect("a decision");
+        assert_eq!(d.outcome, OUTCOME_PASS_EXCLUDED, "{d:?}");
+        assert_eq!(d.excluded, ["tests/a.py::test_case"]);
+        assert!(report.passed, "{report:#?}");
+    }
+
+    /// (agy r7) A failing base test's captured output carries a CHILD `pytest -q` summary that is
+    /// never closed, naming `test_ok` — which passed on the base. Run alone on the base it passes,
+    /// so it is never deselected: the head breaking `test_ok` denies.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_pytest_summary_in_the_base_output_never_excludes_a_passing_test() {
+        let _load = seam::pin(0.5, 4);
+        let base_out = "=== short test summary info ===\nFAILED tests/a.py::test_ok - child failure\n1 failed in 0.01s\nmore captured output\n=== 1 failed, 5 passed in 0.50s ===\n";
+        let toc = "tests/a.py::test_case\ntests/a.py::test_ok\n\n2 tests collected in 0.01s\n";
+        let base = [
+            ("run.out", base_out),
+            ("run.exit", "1"),
+            ("toc.txt", toc),
+            ("alone.fail", "tests/a.py::test_case\n"),
+        ];
+        let head = [
+            (
+                "run.out",
+                "=== short test summary info ===\nFAILED tests/a.py::test_ok - broken\n=== 1 failed, 1 passed ===\n",
+            ),
+            ("run.exit", "1"),
+            ("excluded.exit", "0"),
+            ("toc.txt", toc),
+        ];
+        let Some((report, c)) = pytest_floor("py-child", &["-q"], &base, &head) else {
+            return;
+        };
+        let d = c.decision.as_ref().expect("a decision");
+        assert!(d.excluded.is_empty(), "{d:?}");
+        assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
+        assert!(
+            d.reason
+                .as_deref()
+                .is_some_and(|r| r.contains("does not fail when the base runs it alone")),
+            "{d:?}"
+        );
+        assert!(!report.passed && c.denies());
     }
 
     /// DONE WHEN 4: a deciding run that fails on an oversubscribed host is re-run ONCE, with the

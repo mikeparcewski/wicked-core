@@ -119,7 +119,8 @@ fn understood_cargo_test(argv: &[String]) -> Option<(&[String], &[String])> {
 
 /// Is `argv` on the deselection allowlist for its runner? cargo: the r16 allowlist plus
 /// `--no-fail-fast`; pytest refuses its own selection and state flags (a `--deselect` of its own,
-/// collect-only, last-failed / stepwise state, `--`).
+/// collect-only, last-failed / stepwise state, `--`, and `-r` / `--report-chars`, which can
+/// suppress the run's own short summary).
 pub(crate) fn deselectable(runner: Runner, argv: &[String]) -> bool {
     match runner {
         Runner::Cargo => {
@@ -130,6 +131,7 @@ pub(crate) fn deselectable(runner: Runner, argv: &[String]) -> bool {
             matches!(
                 k,
                 "--" | "--deselect"
+                    | "--report-chars"
                     | "--co"
                     | "--collect-only"
                     | "--lf"
@@ -142,7 +144,7 @@ pub(crate) fn deselectable(runner: Runner, argv: &[String]) -> bool {
                     | "--stepwise"
                     | "--sw-skip"
                     | "--stepwise-skip"
-            )
+            ) || (a.starts_with("-r") && !a.starts_with("--"))
         }),
     }
 }
@@ -352,15 +354,77 @@ pub(crate) fn cargo_toc_targets(stdout: &str, stderr: &str) -> Option<Vec<(Strin
     (block == targets.len()).then_some(out)
 }
 
-/// (cargo) The argv that runs ONLY `name` (exactly) of `argv`'s selection: the floor's
-/// confirmation, on the base, that a name its output reports failing fails when run alone.
-pub(crate) fn alone_argv(argv: &[String], name: &str) -> Vec<String> {
-    let split = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
-    let mut out = argv[..split].to_vec();
-    out.push("--".into());
-    out.extend(argv.get(split + 1..).unwrap_or(&[]).iter().cloned());
-    out.extend([name.to_string(), "--exact".to_string()]);
-    out
+/// The argv that runs ONLY `name` of `argv`'s selection: the floor's confirmation, on the base,
+/// that a name its output reports failing fails when run alone. cargo: `-- <name> --exact`.
+/// pytest: the node id right after the launcher, the check's flags kept and its positional paths
+/// dropped (they would select more); a flag whose value was dropped then takes the node id, or
+/// nothing, and the run errors — never a confirmation (see [`alone_failed`]).
+pub(crate) fn alone_argv(runner: Runner, argv: &[String], name: &str) -> Vec<String> {
+    match runner {
+        Runner::Cargo => {
+            let split = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+            let mut out = argv[..split].to_vec();
+            out.push("--".into());
+            out.extend(argv.get(split + 1..).unwrap_or(&[]).iter().cloned());
+            out.extend([name.to_string(), "--exact".to_string()]);
+            out
+        }
+        Runner::Pytest => {
+            const VALUED: &[&str] = &[
+                "-p",
+                "-k",
+                "-m",
+                "-c",
+                "-o",
+                "-W",
+                "-n",
+                "--rootdir",
+                "--confcutdir",
+                "--basetemp",
+                "--tb",
+                "--maxfail",
+                "--durations",
+                "--junitxml",
+                "--junit-xml",
+                "--log-level",
+                "--ignore",
+                "--ignore-glob",
+                "--import-mode",
+                "--capture",
+                "--override-ini",
+                "--config-file",
+                "--timeout",
+                "--dist",
+            ];
+            let launcher = if bin_name(argv).is_some_and(|b| b.starts_with("python")) {
+                3
+            } else {
+                1
+            };
+            let mut out = argv[..launcher.min(argv.len())].to_vec();
+            out.push(name.to_string());
+            let mut rest = argv.get(launcher..).unwrap_or(&[]).iter();
+            while let Some(a) = rest.next() {
+                if VALUED.contains(&a.as_str()) {
+                    out.push(a.clone());
+                    out.extend(rest.next().cloned());
+                } else if a.starts_with('-') {
+                    out.push(a.clone());
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Did a run of [`alone_argv`] fail as a TEST failure? cargo: a non-zero exit (the build already
+/// passed on this tree). pytest: exactly 1, "tests failed" — 2-5 (interrupted, internal error,
+/// usage error, nothing collected) confirm nothing.
+pub(crate) fn alone_failed(runner: Runner, exit: Option<i32>) -> bool {
+    match runner {
+        Runner::Cargo => exit.is_some_and(|c| c != 0),
+        Runner::Pytest => exit == Some(1),
+    }
 }
 
 /// (pytest) `--deselect` matches node-id PREFIXES: the first deselected name that would also remove
@@ -559,6 +623,7 @@ mod tests {
         );
         assert_eq!(
             alone_argv(
+                Runner::Cargo,
                 &s(&["cargo", "test", "--no-fail-fast", "--", "--test-threads=1"]),
                 "t::a"
             ),
@@ -681,6 +746,52 @@ mod tests {
             Some("a.py::test_case")
         );
         assert_eq!(pytest_prefix_collision(&s(&["b.py::t"]), &head), None);
+    }
+
+    /// (agy r7) A pytest node id runs alone with the check's flags and without its paths; only a
+    /// TEST failure (exit 1) confirms it. `-r` / `--report-chars` is off the allowlist.
+    #[test]
+    fn a_pytest_node_id_runs_alone_and_only_a_test_failure_confirms_it() {
+        assert_eq!(
+            alone_argv(
+                Runner::Pytest,
+                &s(&[
+                    "python",
+                    "-m",
+                    "pytest",
+                    "-p",
+                    "no:cacheprovider",
+                    "tests",
+                    "-q"
+                ]),
+                "tests/a.py::t"
+            ),
+            s(&[
+                "python",
+                "-m",
+                "pytest",
+                "tests/a.py::t",
+                "-p",
+                "no:cacheprovider",
+                "-q"
+            ])
+        );
+        assert!(alone_failed(Runner::Pytest, Some(1)));
+        for code in [Some(0), Some(2), Some(4), Some(5), None] {
+            assert!(!alone_failed(Runner::Pytest, code), "{code:?}");
+        }
+        assert!(alone_failed(Runner::Cargo, Some(101)) && !alone_failed(Runner::Cargo, Some(0)));
+        for a in [
+            &["pytest", "-rN"][..],
+            &["pytest", "--report-chars=N"],
+            &["pytest", "-r", "fE"],
+        ] {
+            assert!(!deselectable(Runner::Pytest, &s(a)), "{a:?}");
+        }
+        assert!(deselectable(
+            Runner::Pytest,
+            &s(&["pytest", "--rootdir", "x", "-p", "no:x"])
+        ));
     }
 
     /// (core#1060 r16) The allowlist: what the floor appends cannot be bent by the argv.

@@ -31,9 +31,11 @@ Two release tracks share this file, newest entry first regardless of track:
   prefix is refused, the base's failing names come only from its stdout's own
   result lines (pytest's last short summary) and never from a truncated stream, an empty
   inventory is no inventory, an excluded name must sit in the same test target on both trees (each inventory list block matched to cargo's
-  own `Running` line, executable hash included, so two packages' `tests/smoke.rs` are two targets), and every cargo base failure is confirmed by the base's exit code — run alone on the base
-  (`-- <name> --exact`) it must fail, so a child run's line or a test a crashed binary never reached cannot be
-  excluded (at most 16, more escalates); a base that timed out or could not run escalates; and a manifest change to `[profile]`, `[patch]`, `[replace]`, `[workspace]` or
+  own `Running` line, executable hash included, so two packages' `tests/smoke.rs` are two targets), and every base failure the base's output names is only a candidate until the base's exit code
+  confirms it — run alone on the base (cargo `-- <name> --exact`; pytest the node id with the check's flags and
+  without its paths, where only exit 1 counts) it must fail, so a child run's line, a child pytest summary left
+  open, or a test a crashed binary never reached cannot be excluded (at most 16, more escalates); pytest's `-r` /
+  `--report-chars` is off the allowlist; a base that timed out or could not run escalates; and a manifest change to `[profile]`, `[patch]`, `[replace]`, `[workspace]` or
   `[lints]` runs the full suite. Anything else is
   `base_red_unseparated`: it escalates with both logs, and the operator's floor override (core#1061, core#1065)
   is the path through. go test (its subtests are invisible to `go test -list`, so skipping a red parent can hide a newly broken subtest; review round 2), vitest, jest, tsc, eslint and shell runners escalate the same way. A deciding run that
@@ -45,9 +47,11 @@ Two release tracks share this file, newest entry first regardless of track:
   stored once, content-addressed (sha256), in the run's log store, with a lazy line TOC and ranges read by ref
   and verified against the hash (`floor_log`); a stream past 64 MiB keeps its prefix, marked `truncated`, and a
   truncated inventory is never precise. Kept: the PTY grant (core#1060's Seatbelt rules, cherry-picked), the
-  load-aware bound, the base cache (now `{floor_policy: 7, run, toc}`; an inventory or alone run that did not finish is not cached), `.wicked/checks.json`, the operator
-  override and QE. An unconfigured cargo repo runs its affected set at the creator AND at verify (`full: true`
-  keeps verify full): the members owning a touched file plus the members a manifest change (`cargo metadata
+  load-aware bound, the base cache (now `{floor_policy: 8, run, toc}`; an inventory or alone run that did not finish is not cached), `.wicked/checks.json`, the operator
+  override and QE. An unconfigured cargo repo (or a cargo workspace in a subdirectory: the derived set's
+  provenance is a typed field, not its display source) runs its affected set at the creator AND at verify
+  (`full: true` keeps verify full), named from cargo metadata alone (detection no longer guesses packages from
+  manifest paths): the members owning a touched file plus the members a manifest change (`cargo metadata
   --no-deps` diffed against the base) or a lockfile change reaches, closed over their reverse path
   dependencies and over every member that reaches what a moved package reaches (a dependency whose declaration
   changed, every dependency of a member whose `[features]` table changed, a changed lock entry), closed over the

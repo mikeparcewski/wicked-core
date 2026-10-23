@@ -13,7 +13,7 @@ use std::path::Path;
 use crate::floor_runner::cargo_test_sub;
 use crate::repo_checks::{
     package_relative, remove_base_export, run_one, touched_files, BaseTree, CheckScratch,
-    FloorContext, RepoCheck, Tree, DERIVED_TARGETED_SOURCE,
+    FloorContext, RepoCheck, Tree,
 };
 use crate::validator::WorkerSandbox;
 
@@ -23,8 +23,8 @@ fn s(v: &[&str]) -> Vec<String> {
 
 /// One workspace member as `cargo metadata --no-deps` reports it.
 #[derive(Debug, Clone)]
-struct Member {
-    name: String,
+pub(crate) struct Member {
+    pub(crate) name: String,
     /// The member's directory relative to the check's directory (`/` separated, `""` = the root).
     dir: String,
     /// The directories (same base) of the members it depends on by path.
@@ -37,7 +37,7 @@ struct Member {
 /// The workspace members of the tree at `dir` (`check.dir` under `tree_root`), from
 /// `cargo metadata --format-version 1 --no-deps --offline` run INSIDE the floor's boundary (the
 /// manifests and `.cargo/config` are repo-controlled).
-fn workspace_members(
+pub(crate) fn workspace_members(
     tree_root: &Path,
     check: &RepoCheck,
     sandbox: &WorkerSandbox,
@@ -249,20 +249,6 @@ fn workspace_locks(worktree: &Path, ctx: &FloorContext, check: &RepoCheck) -> Ve
     }
 }
 
-/// The package names of the base export's workspace: a derived `-p` set runs on the base only
-/// over the packages the base has.
-pub(crate) fn base_packages(
-    dir: &Path,
-    check: &RepoCheck,
-    sandbox: &WorkerSandbox,
-    scratch: &CheckScratch,
-) -> Result<Vec<String>, String> {
-    Ok(workspace_members(dir, check, sandbox, scratch, Tree::Base)?
-        .into_iter()
-        .map(|m| m.name)
-        .collect())
-}
-
 /// (DES-FLOOR-V2 §5) The packages a derived cargo test set runs: the members owning a touched
 /// file, plus the members whose metadata entry changed between the base and the head (a manifest-
 /// only change) and every member that reaches a package a manifest or lockfile change moved —
@@ -301,10 +287,6 @@ fn affected_packages(
     let mut base_members: Vec<Member> = Vec::new();
     for f in &files {
         let name = f.rsplit('/').next().unwrap_or(f);
-        if f.starts_with(".cargo/") || f.contains("/.cargo/") || name.starts_with("rust-toolchain")
-        {
-            return Err(format!("`{f}` configures cargo outside package metadata"));
-        }
         // A manifest or lockfile path is read by the diffs below AND names its owning member (a
         // fixture manifest under `crates/foo/tests/…` belongs to `foo`).
         if name == "Cargo.toml" || name == "Cargo.lock" {
@@ -483,7 +465,8 @@ pub(crate) fn resolve_affected(
     scratch: &CheckScratch,
 ) {
     for c in detected.iter_mut() {
-        if c.source != DERIVED_TARGETED_SOURCE || cargo_test_sub(&c.argv).is_none() {
+        // (codex r7) Typed provenance: a subdirectory package's derived set has a prefixed source.
+        if !c.derived || cargo_test_sub(&c.argv).is_none() {
             continue;
         }
         let mut full: Vec<String> = Vec::new();
@@ -506,7 +489,8 @@ pub(crate) fn resolve_affected(
             Ok(_) => {
                 c.argv = full;
                 c.source = format!(
-                    "{DERIVED_TARGETED_SOURCE}; no package is affected by name — the full suite"
+                    "{}; no package is affected by name — the full suite",
+                    c.source
                 );
             }
             Err(why) => {
@@ -515,7 +499,8 @@ pub(crate) fn resolve_affected(
                 );
                 c.argv = full;
                 c.source = format!(
-                    "{DERIVED_TARGETED_SOURCE}; the affected set could not be computed ({why}) — the full suite"
+                    "{}; the affected set could not be computed ({why}) — the full suite",
+                    c.source
                 );
             }
         }
@@ -529,7 +514,8 @@ mod tests {
     use crate::repo_checks::tests::{git, git_repo_with_commit, scratch};
     #[cfg(unix)]
     use crate::repo_checks::{
-        run_floor, test_seam as seam, FloorStage, RepoChecksReport, OUTCOME_NEW_FAILURE,
+        run_floor, test_seam as seam, FloorStage, RepoChecksReport, DERIVED_TARGETED_SOURCE,
+        OUTCOME_NEW_FAILURE,
     };
 
     fn s(v: &[&str]) -> Vec<String> {
@@ -664,6 +650,22 @@ mod tests {
         assert!(!argv.iter().any(|x| x == "-p"), "{argv:?}");
         assert!(source.contains("package.edition"), "{source}");
         git(&repo, &["checkout", "--", "a/Cargo.toml"]);
+        // (agy r2, r5) A nested `.cargo/` config, and a path no package owns (a file any crate may
+        // `include!`), each reach every crate: the full suite.
+        for (path, why) in [
+            (
+                "b/.cargo/config.toml",
+                "configures cargo outside package metadata",
+            ),
+            ("README.md", "is owned by no package"),
+        ] {
+            std::fs::create_dir_all(repo.join(path).parent().unwrap()).unwrap();
+            std::fs::write(repo.join(path), "\n").unwrap();
+            let (argv, source) = targeted(&run_floor(&repo, &ctx));
+            assert!(!argv.iter().any(|x| x == "-p"), "{path}: {argv:?}");
+            assert!(source.contains(why), "{path}: {source}");
+            std::fs::remove_file(repo.join(path)).unwrap();
+        }
         // A change in `c` alone: `c` only.
         git(&repo, &["checkout", "--", "a/src/lib.rs"]);
         std::fs::write(repo.join("c/src/lib.rs"), "pub fn y() {}\n").unwrap();
@@ -850,6 +852,60 @@ mod tests {
             "{base_err}"
         );
         assert!(!report.passed);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// (codex r7) A cargo workspace in a SUBDIRECTORY (`rust/`, no root manifest): its derived set
+    /// is closed over like the root's — `b` depends on `a`, so a change to `a` runs `b` too, and
+    /// `b`'s regression denies.
+    #[cfg(unix)]
+    #[test]
+    fn a_nested_workspace_runs_the_dependents_of_its_changed_package() {
+        let _load = seam::pin(0.5, 4);
+        let repo = scratch("nested-ws");
+        let rust = repo.join("rust");
+        std::fs::create_dir_all(rust.join("src")).unwrap();
+        std::fs::create_dir_all(rust.join("b/src")).unwrap();
+        std::fs::write(
+            rust.join("Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\nmembers = [\"b\"]\ndefault-members = [\".\", \"b\"]\n",
+        )
+        .unwrap();
+        std::fs::write(rust.join("src/lib.rs"), "pub fn f() -> u32 {\n    1\n}\n").unwrap();
+        std::fs::write(
+            rust.join("b/Cargo.toml"),
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\na = { path = \"..\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            rust.join("b/src/lib.rs"),
+            "#[cfg(test)]\nmod t {\n    #[test]\n    fn one() {\n        assert_eq!(a::f(), 1);\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join(".gitignore"), "Cargo.lock\ntmp/\ntarget/\n").unwrap();
+        let base = git_repo_with_commit(&repo);
+        let ctx = FloorContext {
+            stage: FloorStage::Verify,
+            base_head: Some(base),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        std::fs::write(rust.join("src/lib.rs"), "pub fn f() -> u32 {\n    2\n}\n").unwrap();
+        let report = run_floor(&repo, &ctx);
+        if report.sandbox_error.is_some() {
+            return;
+        }
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "test_targeted" && c.source.starts_with("rust/"))
+            .unwrap_or_else(|| panic!("the nested derived set ran: {report:#?}"));
+        assert!(
+            c.argv.ends_with(&s(&["-p", "a", "-p", "b"])),
+            "{:?}",
+            c.argv
+        );
+        assert!(!report.passed, "b's regression denies: {report:#?}");
         let _ = std::fs::remove_dir_all(&repo);
     }
 }
