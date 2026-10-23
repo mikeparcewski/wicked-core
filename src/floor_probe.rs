@@ -209,6 +209,17 @@ impl Probe<'_> {
         .exit_code
     }
 
+    /// `failed`'s ids beyond `before` that still fail run alone (a flake that passes alone is set
+    /// aside).
+    fn steady(&self, failed: &[TestId], before: &[TestId]) -> Vec<TestId> {
+        failed
+            .iter()
+            .filter(|t| !before.contains(t))
+            .filter(|t| self.failed_exit(self.exit_of(self.g.alone_argv(t))))
+            .cloned()
+            .collect()
+    }
+
     fn failed_exit(&self, code: Option<i32>) -> bool {
         code.is_some_and(|c| self.g.failed_exit.contains(&c))
     }
@@ -278,16 +289,13 @@ impl Probe<'_> {
             );
             return out;
         }
-        // The mutation: its run fails with exactly one new failure, the expected one.
+        // The mutation: its run fails with exactly one new failure, the expected one. A suite's
+        // other new failures that PASS when run alone are its flakes, not the parser's mistakes,
+        // and are set aside (a red or flaky suite still proves its parser this way).
         let (mexit, mutated) = self.results(&g.run);
         let new: Vec<TestId> = mutated
             .as_ref()
-            .map(|(_, f)| {
-                f.iter()
-                    .filter(|t| !clean_failed.contains(t))
-                    .cloned()
-                    .collect()
-            })
+            .map(|(_, f)| self.steady(f, &clean_failed))
             .unwrap_or_default();
         let expected = new
             .first()
@@ -306,7 +314,9 @@ impl Probe<'_> {
             _ if !self.failed_exit(mexit) => format!("fail: the mutated run exited {mexit:?}"),
             (_, Some(t)) => {
                 let (dexit, d) = self.results(&g.deselected(&g.run, std::slice::from_ref(t)));
-                let deselected_ok = d.as_ref().is_ok_and(|(_, f)| *f == clean_failed)
+                let deselected_ok = d
+                    .as_ref()
+                    .is_ok_and(|(_, f)| !f.contains(t) && self.steady(f, &clean_failed).is_empty())
                     && (!clean_failed.is_empty() || dexit == Some(0));
                 if !deselected_ok {
                     format!("fail: deselecting `{}` did not leave the clean run's failures (exit {dexit:?})", t.id)

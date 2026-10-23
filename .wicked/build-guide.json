@@ -27,11 +27,14 @@
       "results": {
         "kind": "text",
         "how": {
+          "argvAppend": [],
+          "env": {},
           "merge": true
         }
       },
       "parser": {
         "section": "^\\s+(?:Running .*\\((?:.*[/\\\\])?|Doc-tests )(?P<q>[^/\\\\()\\s]+)\\)?$",
+        "failed": [],
         "blocks": [
           {
             "start": "^failures:$",
@@ -83,7 +86,7 @@
       "probes": {
         "mutation": {
           "file": "tests/zz_floor_probe_mutation.rs",
-          "content": "#[test]\nfn floor_probe_mutation() {\n    panic!(\"the build guide's mutation probe\");\n}\n",
+          "content": "#[ctor::ctor(unsafe)]\nfn arm_hermetic_emit_spool() {\n    wicked_apps_core::emit::hermetic_test_spool();\n}\n\n#[test]\nfn floor_probe_mutation() {\n    panic!(\"the build guide's mutation probe\");\n}\n",
           "expectId": "floor_probe_mutation"
         }
       }
