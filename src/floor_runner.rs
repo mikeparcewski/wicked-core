@@ -22,7 +22,8 @@ pub(crate) enum Runner {
 }
 
 fn bin_name(argv: &[String]) -> Option<&str> {
-    Path::new(argv.first()?).file_stem()?.to_str()
+    let name = Path::new(argv.first()?).file_name()?.to_str()?;
+    Some(name.strip_suffix(".exe").unwrap_or(name))
 }
 
 /// The runner a check's argv invokes, when it is one the floor can inventory and deselect.
@@ -253,7 +254,10 @@ fn libtest_result(l: &str) -> Option<(&str, &str)> {
 /// inside a test's captured output (which comes earlier and is followed by more output), or a run
 /// whose summary is suppressed (`-rN`) or unbannered (`-q`), names nothing.
 pub(crate) fn failing_names(runner: Runner, text: &str) -> Vec<String> {
+    // Uncapped: a cap here, before the caller's filters, could let a base's printed lines crowd
+    // out its real failures (the confirmation limit bounds the work).
     let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = Default::default();
     let mut in_summary = false;
     // pytest: the section is closed by an `=` footer, which must be the last non-empty line.
     let mut closed_at_end = false;
@@ -266,6 +270,7 @@ pub(crate) fn failing_names(runner: Runner, text: &str) -> Vec<String> {
             if l.contains(" short test summary info ") {
                 in_summary = true;
                 out.clear();
+                seen.clear();
             } else if in_summary {
                 in_summary = false;
                 closed_at_end = true;
@@ -283,7 +288,7 @@ pub(crate) fn failing_names(runner: Runner, text: &str) -> Vec<String> {
             Runner::Pytest => None,
         };
         if let Some(n) = name.filter(|n| !n.is_empty()) {
-            if !out.iter().any(|o| o == n) && out.len() < crate::repo_checks::MAX_FAILURE_IDS {
+            if seen.insert(n.to_string()) {
                 out.push(n.to_string());
             }
         }
@@ -306,6 +311,43 @@ pub(crate) fn passing_names(runner: Runner, text: &str) -> Vec<String> {
             .collect(),
         Runner::Pytest => Vec::new(),
     }
+}
+
+/// (cargo) Each listed test's TARGET: in `--list` mode no test body runs and cargo runs its
+/// binaries one after another, so the k-th list block on stdout (ended by its `N tests, M
+/// benchmarks` line) is the k-th `Running …` / `Doc-tests …` line cargo printed on stderr. The
+/// target is that line without the executable's directory and hash (`unittests src/lib.rs a`,
+/// `tests/b.rs b`, `doc a`). `None` when the counts disagree — then no name has a target.
+pub(crate) fn cargo_toc_targets(stdout: &str, stderr: &str) -> Option<Vec<(String, String)>> {
+    let targets: Vec<String> = stderr
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| {
+            if let Some(r) = l.strip_prefix("Running ") {
+                let (what, exe) = r.rsplit_once(" (")?;
+                let stem = Path::new(exe.trim_end_matches(')')).file_name()?.to_str()?;
+                let stem = stem.strip_suffix(".exe").unwrap_or(stem);
+                let stem = stem.rsplit_once('-').map_or(stem, |(s, _)| s);
+                Some(format!("{what} {stem}"))
+            } else {
+                l.strip_prefix("Doc-tests ").map(|c| format!("doc {c}"))
+            }
+        })
+        .collect();
+    let mut out = Vec::new();
+    let mut block = 0usize;
+    for line in stdout.lines() {
+        let l = line.trim_end_matches('\r');
+        if let Some(n) = l
+            .strip_suffix(": test")
+            .or_else(|| l.strip_suffix(": benchmark"))
+        {
+            out.push((targets.get(block)?.clone(), libtest_name(n).to_string()));
+        } else if l.contains(" tests, ") || l.contains(" test, ") {
+            block += 1;
+        }
+    }
+    (block == targets.len()).then_some(out)
 }
 
 /// (cargo) The argv that runs ONLY `name` (exactly) of `argv`'s selection: the floor's
@@ -488,6 +530,21 @@ mod tests {
             ),
             s(&["a", "src/lib.rs - f (line 3)"])
         );
+        let out =
+            "a: test\nold: test\n\n2 tests, 0 benchmarks\nold2: test\n\n1 test, 0 benchmarks\n";
+        let err = "     Running tests/a.rs (target/debug/deps/a-1f2e3d)\n     Running tests/b.rs (target/debug/deps/b-9a8b7c)\n";
+        assert_eq!(
+            cargo_toc_targets(out, err),
+            Some(vec![
+                ("tests/a.rs a".to_string(), "a".to_string()),
+                ("tests/a.rs a".to_string(), "old".to_string()),
+                ("tests/b.rs b".to_string(), "old2".to_string()),
+            ])
+        );
+        assert_eq!(
+            cargo_toc_targets(out, "     Running tests/a.rs (target/debug/deps/a-1)\n"),
+            None
+        );
         assert_eq!(
             alone_argv(
                 &s(&["cargo", "test", "--no-fail-fast", "--", "--test-threads=1"]),
@@ -549,6 +606,10 @@ mod tests {
         );
         assert_eq!(runner_of(&s(&["npx", "vitest", "run"])), None);
         assert_eq!(runner_of(&s(&["npm", "run", "test"])), None);
+        assert_eq!(
+            runner_of(&s(&["/usr/bin/py.test", "-q"])),
+            Some(Runner::Pytest)
+        );
         // (#1066 review round 2) go's subtests are not in its inventory: no precise deselect.
         assert_eq!(runner_of(&s(&["go", "test", "./..."])), None);
     }

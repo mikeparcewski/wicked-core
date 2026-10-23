@@ -30,7 +30,8 @@ Two release tracks share this file, newest entry first regardless of track:
   `.cargo/config*` as decoded TOML, a pytest `--deselect` that would also remove another head test by node-id
   prefix is refused, the base's failing names come only from its stdout's own
   result lines (pytest's last short summary) and never from a truncated stream, an empty
-  inventory is no inventory, every cargo base failure is confirmed by the base's exit code — run alone on the base
+  inventory is no inventory, an excluded name must sit in the same test target on both trees (each inventory list block matched to cargo's
+  own `Running` line), and every cargo base failure is confirmed by the base's exit code — run alone on the base
   (`-- <name> --exact`) it must fail, so a child run's line or a test a crashed binary never reached cannot be
   excluded (at most 16, more escalates); a base that timed out or could not run escalates; and a manifest change to `[profile]`, `[patch]`, `[replace]`, `[workspace]` or
   `[lints]` runs the full suite. Anything else is
@@ -48,7 +49,8 @@ Two release tracks share this file, newest entry first regardless of track:
   override and QE. An unconfigured cargo repo runs its affected set at the creator AND at verify (`full: true`
   keeps verify full): the members owning a touched file plus the members a manifest change (`cargo metadata
   --no-deps` diffed against the base) or a lockfile change reaches, closed over their reverse path
-  dependencies and over every member sharing a dependency whose declaration or feature activation changed
+  dependencies and over every member sharing a dependency whose declaration changed, or any dependency of a member whose
+  `[features]` table changed,
   (cargo unifies features across what it builds), in one `-p a -p b` invocation; a `[profile]`, `[patch]`,
   `[replace]`, `[workspace]`, `[lints]`, `package.resolver`/`edition`, nested `.cargo/` or `rust-toolchain` change
   runs the full suite. The macOS floor's test seam now arms the private `TMPDIR` as

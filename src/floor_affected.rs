@@ -206,6 +206,19 @@ fn affected_packages(
     scratch: &CheckScratch,
 ) -> Result<Vec<String>, String> {
     let mut files = touched_files(worktree, ctx)?;
+    // cargo and rustup read `.cargo/` and `rust-toolchain*` in every ancestor of the check's
+    // directory: one anywhere in the change runs the full suite (checked before the paths are
+    // made package-relative, which would drop an ancestor's).
+    if let Some(f) = files.iter().find(|f| {
+        f.starts_with(".cargo/")
+            || f.contains("/.cargo/")
+            || f.rsplit('/')
+                .next()
+                .unwrap_or(f)
+                .starts_with("rust-toolchain")
+    }) {
+        return Err(format!("`{f}` configures cargo outside package metadata"));
+    }
     if !check.dir.is_empty() {
         files = package_relative(files, &check.dir);
     }
@@ -321,26 +334,6 @@ fn affected_packages(
                 .filter_map(|d| Some((d.get("name")?.as_str()?.to_string(), d.clone())))
                 .collect()
         };
-        // A feature definition that names `dep/feat`, `dep?/feat` or `dep:dep` moves that dependency.
-        let feature_deps =
-            |e: &serde_json::Value| -> std::collections::BTreeMap<String, serde_json::Value> {
-                e.get("features")
-                    .and_then(|f| f.as_object())
-                    .map(|f| f.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                    .unwrap_or_default()
-            };
-        let referenced = |v: &serde_json::Value| -> Vec<String> {
-            v.as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|x| x.as_str())
-                .filter_map(|x| {
-                    x.strip_prefix("dep:")
-                        .or_else(|| x.split_once('/').map(|(d, _)| d.trim_end_matches('?')))
-                })
-                .map(str::to_string)
-                .collect()
-        };
         let mut moved_deps: std::collections::BTreeSet<String> = Default::default();
         // A member removed from the workspace no longer unifies anything it depended on.
         for b in base_members
@@ -351,15 +344,12 @@ fn affected_packages(
         }
         for m in &head {
             let base = base_members.iter().find(|b| b.name == m.name);
-            if let Some(b) = base {
-                let (old, new) = (feature_deps(&b.entry), feature_deps(&m.entry));
-                for k in old.keys().chain(new.keys()) {
-                    if old.get(k) != new.get(k) {
-                        for v in [old.get(k), new.get(k)].into_iter().flatten() {
-                            moved_deps.extend(referenced(v));
-                        }
-                    }
-                }
+            // A changed `[features]` table can turn on any dependency's features — through
+            // `dep/feat`, an implicit optional-dependency feature, another feature, a rename — so
+            // EVERY dependency of the member moves (a superset, never a resolver emulation).
+            if let Some(b) = base.filter(|b| b.entry.get("features") != m.entry.get("features")) {
+                moved_deps.extend(deps(&b.entry).into_iter().map(|(n, _)| n));
+                moved_deps.extend(deps(&m.entry).into_iter().map(|(n, _)| n));
             }
             if base.map(|b| &b.entry) != Some(&m.entry) {
                 changed.insert(m.name.clone());

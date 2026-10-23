@@ -2283,7 +2283,8 @@ mod tests {
             "#!/bin/sh\nlist=0; skips=' '\n\
              for a in \"$@\"; do case \"$a\" in --list) list=1;; --skip=*) skips=\"$skips${a#--skip=} \";; esac; done\n\
              if [ $list = 1 ]; then n=0; for f in tests/*.red tests/*.ok; do [ -e \"$f\" ] || continue; \
-             b=$(basename \"$f\"); echo \"${b%.*}: test\"; n=$((n+1)); done; echo; echo \"$n tests, 0 benchmarks\"; exit 0; fi\n\
+             b=$(basename \"$f\"); echo \"${b%.*}: test\"; n=$((n+1)); done; echo; echo \"$n tests, 0 benchmarks\"; \
+             echo '     Running unittests src/lib.rs (target/debug/deps/fixture-0)' >&2; exit 0; fi\n\
              r=0; n=0; for f in tests/*.red; do [ -e \"$f\" ] || continue; t=$(basename \"$f\" .red); \
              case \"$skips\" in *\" $t \"*) continue;; esac; echo \"test $t ... FAILED\"; r=101; n=$((n+1)); done; \
              echo \"test result: FAILED. 0 passed; $n failed; 0 ignored; 0 measured; 0 filtered out\"; exit $r\n",

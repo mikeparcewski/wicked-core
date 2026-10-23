@@ -240,8 +240,8 @@ use serde::{Deserialize, Serialize};
 use wicked_apps_core::spawn::HardenedCommand;
 
 use crate::floor_runner::{
-    alone_argv, cargo_config_bends_test_args, deselect_argv, deselectable, failing_names,
-    parse_toc, passing_names, pytest_prefix_collision, runner_of, toc_argv, Runner,
+    alone_argv, cargo_config_bends_test_args, cargo_toc_targets, deselect_argv, deselectable,
+    failing_names, parse_toc, passing_names, pytest_prefix_collision, runner_of, toc_argv, Runner,
 };
 use crate::validator::WorkerSandbox;
 
@@ -4302,7 +4302,7 @@ pub const OUTCOME_COULD_NOT_RUN: &str = "could_not_run";
 pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
 /// The versioned base-cache record (core#1060 r9 keyed the cache by sandbox policy; v4 adds the
 /// base inventory): a record of any other version, or a bare `CheckRun`, is a miss.
-const FLOOR_POLICY_VERSION: u32 = 5;
+const FLOOR_POLICY_VERSION: u32 = 6;
 /// The most base failures the floor confirms one by one (each run alone on the base); more than
 /// this escalates rather than paying for them.
 const MAX_ALONE_CONFIRMATIONS: usize = 16;
@@ -4331,11 +4331,23 @@ struct Toc {
     /// code, not the output, says whether the name is a base failure.
     #[serde(default)]
     alone: Vec<(String, bool)>,
+    /// (cargo) `(target, name)` for every listed test ([`cargo_toc_targets`]).
+    #[serde(default)]
+    targets: Vec<(String, String)>,
 }
 
 impl Toc {
     fn count(&self, name: &str) -> usize {
         self.names.iter().filter(|n| *n == name).count()
+    }
+
+    /// The one target that lists `name`, when exactly one does.
+    fn target(&self, name: &str) -> Option<&str> {
+        let mut hits = self.targets.iter().filter(|(_, n)| n == name);
+        match (hits.next(), hits.next()) {
+            (Some((t, _)), None) => Some(t.as_str()),
+            _ => None,
+        }
     }
 }
 
@@ -4367,6 +4379,16 @@ fn inventory(
         .as_ref()
         .ok()
         .and_then(|b| parse_toc(runner, &String::from_utf8_lossy(b)));
+    let targets = match (runner, &stdout) {
+        (Runner::Cargo, Ok(out)) => {
+            let err = logs
+                .get(1)
+                .map(|l| crate::floor_log::text(&scratch.logs, l))
+                .unwrap_or_default();
+            cargo_toc_targets(&String::from_utf8_lossy(out), &err)
+        }
+        _ => Some(Vec::new()),
+    };
     let incomplete = if let Err(e) = &stdout {
         Some(format!("its inventory could not be read back ({e})"))
     } else if !r.passed() {
@@ -4375,6 +4397,10 @@ fn inventory(
         Some("its inventory was cut at the log cap".to_string())
     } else if parsed.is_none() {
         Some("its inventory printed lines that are not the runner's own".to_string())
+    } else if targets.is_none() {
+        Some(
+            "its inventory's lists could not be matched to cargo's own `Running` lines".to_string(),
+        )
     } else {
         None
     };
@@ -4383,6 +4409,7 @@ fn inventory(
         incomplete,
         logs,
         alone: Vec::new(),
+        targets: targets.unwrap_or_default(),
     }
 }
 
@@ -4586,6 +4613,19 @@ fn decide(
             if runner == Runner::Cargo {
                 if let Some(why) = config_bends(worktree, check, scratch) {
                     return Err(why);
+                }
+            }
+            // (codex r5) A name is the same TEST on both trees only in the same target: a base
+            // failure renamed away, and a new failing test of that name in another target, must
+            // not be skipped.
+            if runner == Runner::Cargo {
+                if let Some(n) = failing.iter().find(|n| {
+                    head_toc.count(n) == 1
+                        && toc.target(n).is_none_or(|t| head_toc.target(n) != Some(t))
+                }) {
+                    return Err(format!(
+                        "`{n}` is not in the same test target on the base and the head"
+                    ));
                 }
             }
             if runner == Runner::Pytest {
@@ -8617,7 +8657,9 @@ mod tests {
              n=$(cat \"$key\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$key\"\n\
              code() { if [ -f \"$1\" ]; then cat \"$1\"; else echo 0; fi; }\n\
              case $mode in\n\
-               toc) cat toc.txt 2>/dev/null; exit $(code toc.exit);;\n\
+               toc) cat toc.txt 2>/dev/null\n\
+                 if [ -f toc.err ]; then cat toc.err >&2; else echo '     Running unittests src/lib.rs (target/debug/deps/fake-0)' >&2; fi\n\
+                 exit $(code toc.exit);;\n\
                alone) grep -qx \"$name\" alone.fail 2>/dev/null && exit 101; exit 0;;\n\
                excluded) [ -f excluded.sleep ] && sleep $(cat excluded.sleep)\n\
                  cat excluded.out 2>/dev/null; cat excluded.err >&2 2>/dev/null\n\
@@ -8662,6 +8704,7 @@ mod tests {
             "excluded.sleep",
             "toc.txt",
             "toc.exit",
+            "toc.err",
             "flake",
             "flake.excluded",
         ] {
@@ -9065,7 +9108,46 @@ mod tests {
             ],
         );
         unseparated(&repo7, &ctx7, "a base binary that stopped early");
-        for r in [repo, repo2, repo3, repo4, repo5, repo6, repo7] {
+        // (k, codex r5) The base's failing `old` (tests/a.rs) is renamed away on the head, and a
+        // NEW failing `old` appears in tests/b.rs: one name, two tests — never skipped.
+        let (repo8, ctx8, argv8) = red_base("unsep-target");
+        let two = |a: &str, b: &str| {
+            format!("{a}: test\n\n1 test, 0 benchmarks\n{b}: test\n\n1 test, 0 benchmarks\n")
+        };
+        let runs = "     Running tests/a.rs (target/debug/deps/a-1)\n     Running tests/b.rs (target/debug/deps/b-2)\n";
+        write_tree(
+            &repo8,
+            &argv8,
+            &[
+                ("run.out", "test old ... FAILED\ntest fine ... ok\n"),
+                ("run.exit", "101"),
+                ("toc.txt", &two("old", "fine")),
+                ("toc.err", runs),
+            ],
+        );
+        git(&repo8, &["add", "-A"]);
+        git(
+            &repo8,
+            &["commit", "-qm", "old in tests/a.rs, fine in tests/b.rs"],
+        );
+        let ctx8 = FloorContext {
+            base_head: Some(git(&repo8, &["rev-parse", "HEAD"])),
+            ..ctx8
+        };
+        write_tree(
+            &repo8,
+            &argv8,
+            &[
+                ("run.out", "test old ... FAILED\n"),
+                ("run.exit", "101"),
+                ("excluded.exit", "0"),
+                ("toc.txt", &two("renamed", "old")),
+                ("toc.err", runs),
+            ],
+        );
+        std::fs::write(repo8.join("toc.txt"), "renamed: test\n\n1 test, 0 benchmarks\nfine: test\nold: test\n\n2 tests, 0 benchmarks\n").unwrap();
+        unseparated(&repo8, &ctx8, "one name in two targets");
+        for r in [repo, repo2, repo3, repo4, repo5, repo6, repo7, repo8] {
             let _ = std::fs::remove_dir_all(r);
         }
     }

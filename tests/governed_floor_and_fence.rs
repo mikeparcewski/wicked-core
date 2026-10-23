@@ -559,7 +559,8 @@ fn make_git_repo_with_a_red_test_on_the_base(name: &str) -> PathBuf {
     std::fs::write(
         &cargo,
         "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in\n\
-         --list) echo 'shared: test'; echo; echo '1 test, 0 benchmarks'; exit 0;;\n\
+         --list) echo 'shared: test'; echo; echo '1 test, 0 benchmarks'\n\
+         echo '     Running unittests src/lib.rs (target/debug/deps/fixture-0)' >&2; exit 0;;\n\
          --skip=shared) echo 'test result: ok. 0 passed; 0 failed; 1 filtered out'; exit 0;;\n\
          esac; done\necho 'test shared ... FAILED'\n\
          echo 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out'; exit 101\n",

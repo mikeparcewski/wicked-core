@@ -1435,7 +1435,7 @@ export interface FloorCheckDecisionJson {
 /** One stored stream ({@link FloorCheckDecisionJson.logRefs}): its blob is named by its sha256 in the
  * run's log store, so any range of it verifies against this hash. */
 export interface FloorLogRefJson {
-  attempt: 'head' | 'base' | 'toc-base' | 'toc-head' | 'excluded' | 'retry'
+  attempt: 'head' | 'base' | 'toc-base' | 'toc-head' | 'alone-base' | 'excluded' | 'retry'
   stream: 'stdout' | 'stderr'
   sha256: string
   bytes: number
