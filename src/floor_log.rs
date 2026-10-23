@@ -46,9 +46,10 @@ const TAIL: usize = crate::repo_checks::TAIL_BYTES;
 /// One stored stream of one floor process, as the gate receipt names it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogRef {
-    /// Which process of the check: `head`, `excluded`, `retry`, `base`, `toc-base`, `toc-head`.
+    /// Which process of the check: `head`, `excluded`, `retry`, `base`, `toc-base`, `toc-head`,
+    /// `toc-excluded`, `alone-base`, `results`.
     pub attempt: String,
-    /// `stdout` | `stderr`.
+    /// `stdout` | `stderr` | `file` (a results file).
     pub stream: String,
     /// The blob's sha256 (lowercase hex) — also its file name in the run's log store.
     pub sha256: String,
@@ -70,19 +71,35 @@ pub(crate) fn run_dir(root: &Path, run_id: Option<&str>, worktree: &Path) -> Pat
     root.join(key)
 }
 
-/// Restart a blob's age (best-effort).
-fn touch(path: &Path) {
-    let _ = std::fs::OpenOptions::new()
+/// Restart a blob's age.
+fn touch(path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
         .write(true)
         .open(path)
-        .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        .and_then(|f| f.set_modified(std::time::SystemTime::now()))
 }
 
-/// (codex r12) A receipt about to be reused (a cached base record): its blob must still be there,
-/// whole ([`read_blob`]), and its age restarts. `Err` — the record is no longer evidence.
+/// The store's one advisory lock (`<root>/.lock`, where `root` holds every run's directory): [`gc`]
+/// holds it while it evicts, a dedup and a [`refresh`] while they restart a blob's age — so an
+/// eviction never lands between a reuse and its age restart. `None` when it cannot be taken.
+fn store_lock(root: &Path) -> Option<std::fs::File> {
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join(".lock"))
+        .ok()?;
+    f.lock().ok()?;
+    Some(f)
+}
+
+/// (codex r12) A receipt about to be reused (a cached base record): its age restarts, under the
+/// store lock, and its blob must still be there, whole ([`read_blob`]). `Err` — the record is no
+/// longer evidence.
 pub(crate) fn refresh(dir: &Path, r: &LogRef) -> Result<(), String> {
+    let _lock = dir.parent().and_then(store_lock);
+    touch(&dir.join(&r.sha256)).map_err(|e| format!("log {}: {e}", r.sha256))?;
     read_blob(dir, r)?;
-    touch(&dir.join(&r.sha256));
     Ok(())
 }
 
@@ -101,6 +118,7 @@ pub(crate) fn log_cap_bytes() -> u64 {
 /// only (`Path::file_name`), so separators never matter. Directories stay (a capture may be about
 /// to create its blob in one). Returns the removed paths.
 pub(crate) fn gc(root: &Path, now: std::time::SystemTime, cap: u64) -> Vec<PathBuf> {
+    let _lock = store_lock(root);
     let age = |m: &std::fs::Metadata| {
         m.modified()
             .ok()
@@ -170,13 +188,14 @@ pub(crate) struct Captured {
 }
 
 impl Captured {
+    /// The receipt; a stream the store could not keep is `truncated` (its readers escalate).
     pub(crate) fn log_ref(&self, attempt: &str, stream: &str) -> LogRef {
         LogRef {
             attempt: attempt.to_string(),
             stream: stream.to_string(),
             sha256: self.sha256.clone(),
             bytes: self.bytes,
-            truncated: self.truncated,
+            truncated: self.truncated || self.error.is_some(),
         }
     }
 }
@@ -302,14 +321,18 @@ impl Capture {
             let dest = self.dir.join(&sha256);
             let stored = f.flush().and_then(|()| {
                 drop(f);
-                if dest.is_file() {
-                    // (codex r12) A dedup is a fresh use: the blob's age restarts, so the age GC
-                    // keeps what this receipt names.
-                    touch(&dest);
-                    std::fs::remove_file(&s.tmp)
-                } else {
-                    std::fs::rename(&s.tmp, &dest)
-                }
+                // (codex r12) A dedup is a fresh use: the fresh file replaces the blob (a new age),
+                // under the store lock so no eviction lands between. Where a replace is refused
+                // (a reader holds it open on Windows), the blob's age restarts instead.
+                let _lock = self.dir.parent().and_then(store_lock);
+                std::fs::rename(&s.tmp, &dest).or_else(|e| {
+                    if dest.is_file() {
+                        touch(&dest)?;
+                        std::fs::remove_file(&s.tmp)
+                    } else {
+                        Err(e)
+                    }
+                })
             });
             if let Err(e) = stored {
                 let _ = std::fs::remove_file(&s.tmp);
@@ -400,12 +423,9 @@ pub fn toc(dir: &Path, r: &LogRef, ids: &[String]) -> Result<LogToc, String> {
     Ok(LogToc { lines, marks })
 }
 
-/// The text of a stored stream, lossily decoded, for the floor's own readers (the base's failing
-/// ids, an inventory). Empty when the blob cannot be read.
-pub(crate) fn text(dir: &Path, r: &LogRef) -> String {
-    read_blob(dir, r)
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default()
+/// The text of a stored stream, lossily decoded; `Err` when the blob cannot be read whole.
+pub(crate) fn text(dir: &Path, r: &LogRef) -> Result<String, String> {
+    read_blob(dir, r).map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
 #[cfg(test)]
@@ -510,7 +530,7 @@ mod tests {
         let now = std::time::SystemTime::now();
         let blob = root.join("r-0123456789ab").join("blob");
         aged(&blob, now, 48 * H, 4);
-        touch(&blob);
+        touch(&blob).unwrap();
         assert!(!evict(&blob, now, CAP_SPARES), "refreshed: spared");
         assert!(blob.exists());
         aged(&blob, now, 48 * H, 4);
@@ -610,5 +630,25 @@ mod tests {
         let r = c.log_ref("base", "stderr");
         assert_eq!(read_blob(&dir, &r).unwrap().len(), 1000);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (review round 15, item 19) A stream the store could not keep is `truncated` (its readers
+    /// escalate), and a blob that cannot be read whole is an error, never empty text.
+    #[test]
+    fn an_unstored_or_unreadable_blob_is_never_read_as_empty() {
+        let c = Captured {
+            error: Some("disk full".into()),
+            ..Captured::default()
+        };
+        assert!(c.log_ref("head", "stdout").truncated);
+        let dir = store("unreadable");
+        let r = LogRef {
+            attempt: "head".into(),
+            stream: "stdout".into(),
+            sha256: "0".repeat(64),
+            bytes: 3,
+            truncated: false,
+        };
+        assert!(text(&dir, &r).is_err());
     }
 }

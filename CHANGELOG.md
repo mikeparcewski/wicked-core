@@ -36,13 +36,18 @@ Two release tracks share this file, newest entry first regardless of track:
   `new_failure`, so exclusion never passes a failing run. A guide check is relied on only when every probe passed
   (`wicked-core floor probe --repo <dir> --guide <file> [--check <name>]`: list, run, ids, alone,
   deselect, mutation, multi — two mutations, both parsed, both deselected — affected, and version, in a scratch
-  copy under the floor sandbox; it writes `verified`; a probe that fails is retried once on a fresh copy and
-  recorded `pass (retried)` (relied on) or `fail: … (retried)` (unverified: a suite too flaky to pass a probe
-  twice cannot be separated); a check with no `list` piece is not probed; a junit testcase a filter skipped counts as neither passed
+  copy under the floor sandbox; it writes `verified`; the probes need a green clean run (a red one fails them,
+  "needs a green base"), a mutation names exactly its test, `alone` on the mutated test runs exactly it, and
+  mutations are written inside the check's directory, never through `..` or a link; when any probe fails the
+  whole probe re-runs once on a fresh copy and that retry's results are recorded, each `(retried)`:
+  `pass (retried)` is relied on, any `fail: … (retried)` leaves the check unverified; a check with no `list`
+  piece is not probed; a junit testcase a filter skipped counts as neither passed
   nor failed; it never runs in the operator's worker home: unless `WICKED_WORKER_HOME` is set explicitly,
   it creates a fresh worker home under the system temp dir and removes it at the end). Deselect tokens from
   the first per-id token onward repeat per id, so a flag and its value are one token (`--skip={id}`); `{id}`
-  values fill whole argv elements verbatim and never pass through a shell, so no escaping is needed; for a
+  values fill whole argv elements verbatim and never pass through a shell, so no escaping is needed; appended
+  tokens compose around an argv's `--` (those before their own `--` go before it, the rest after one `--`;
+  a second `--` is never emitted), and `{ids:re|}` among the per-id tokens is refused; for a
   runner that takes a regex, `{id:re}` is the id regex-escaped (per id) and `{ids:re|}` every id escaped and
   joined by `|` in one token (`--testNamePattern=^(?!(?:{ids:re|})$)`). The probes must also have run on an
   ancestor of the base, with no `derivedFrom` file changed since, no touched file matching `invalidatedBy`
@@ -64,7 +69,17 @@ Two release tracks share this file, newest entry first regardless of track:
   cache record restarts a blob's age, and eviction re-stats first), with a lazy line TOC and ranges read by
   ref and verified against the hash (`floor_log`). The seed guide for wicked-core itself is committed and
   probed. Kept: the PTY grant (core#1060's Seatbelt rules), the load-aware bound, the base cache (now
-  `{floor_policy: 11, head_argv, run, toc}`), `.wicked/checks.json`, the operator override and QE. The macOS
+  `{floor_policy: 12, head_argv, guide, run, toc}`, keyed by the guide check it ran under), `.wicked/checks.json`,
+  the operator override and QE. Fail-closed reads: a results file (`results.how.path`) counts only as a regular
+  file inside the tree, written since the run started, within the log cap (read without following a link);
+  a stream the store could not keep, or a blob that cannot be read whole, escalates instead of reading as
+  empty; a process ended by a signal is `could_not_run`; the launcher-failure check reads the merged stream
+  when stderr is merged; the identical retry reuses the deciding run's env; `invalidatedBy` sees deleted and
+  renamed-away files, and a change whose files cannot be listed makes the guide unusable; with an unusable
+  guide a non-zero exit is a plain failure; an id is excluded only when unique across every qualifier unless
+  `alone` and `deselect` both name `{q}`; a guide with an unknown field or no `checks` does not parse
+  (detection decides); `affected` gets a root check's files, and none (or one named like a flag) runs the
+  full check. The log store's GC, dedup and refresh share one advisory lock (`<store>/.lock`). The macOS
   floor's test seam arms the private `TMPDIR` as production does. Wire (additive): every
   `repoChecksEvaluated.checks[]` entry carries `decision: {outcome, baseSha, baseFailing, excluded, logRefs:
   [{attempt, stream, sha256, bytes, truncated}], flaky, reason, guide: {present, usable, reason}}`, with

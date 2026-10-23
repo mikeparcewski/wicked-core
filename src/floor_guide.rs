@@ -25,18 +25,20 @@ pub const REQUIRED_PROBES: [&str; 7] = [
 /// A repository's build/test guide (contract v1).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct BuildGuide {
     pub version: u32,
     /// The repo-relative files the guide was derived from: a base change to one makes it stale.
     #[serde(default)]
     pub derived_from: Vec<String>,
-    #[serde(default)]
+    /// Required: a guide that misspells or drops it does not parse, and detection decides.
     pub checks: Vec<GuideCheck>,
 }
 
 /// One check of the guide.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct GuideCheck {
     pub name: String,
     #[serde(default = "dot")]
@@ -48,6 +50,8 @@ pub struct GuideCheck {
     /// Exit codes that mean "tests failed" (any other non-zero exit: a crash, could not run).
     #[serde(default)]
     pub failed_exit: Vec<i32>,
+    /// How a test check's results are read; a gate check (no `list`) has none.
+    #[serde(default, skip_serializing_if = "Results::is_unset")]
     pub results: Results,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parser: Option<Parser>,
@@ -76,8 +80,15 @@ fn dot() -> String {
     ".".into()
 }
 
+impl Results {
+    fn is_unset(&self) -> bool {
+        *self == Results::default()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct Results {
     /// `text` | `junit` (v1); `json-lines` | `tap` are reserved.
     pub kind: String,
@@ -94,6 +105,7 @@ pub struct Results {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct How {
     /// Appended to every argv whose results the floor reads (the base run, the probes' runs).
     #[serde(default)]
@@ -110,6 +122,7 @@ pub struct How {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Parser {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section: Option<String>,
@@ -120,6 +133,7 @@ pub struct Parser {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Block {
     pub start: String,
     pub item: String,
@@ -134,6 +148,7 @@ fn last_before_end() -> String {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListPiece {
     pub run: Vec<String>,
     pub item: String,
@@ -145,16 +160,19 @@ pub struct ListPiece {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunPiece {
     pub run: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Deselect {
     pub append: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Probes {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutation: Option<Mutation>,
@@ -166,6 +184,7 @@ pub struct Probes {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct Mutation {
     /// Relative to the check's `cwd`.
     pub file: String,
@@ -177,6 +196,7 @@ pub struct Mutation {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct Verified {
     #[serde(default)]
     pub base_sha: String,
@@ -309,6 +329,18 @@ impl GuideCheck {
             }
             k => return Err(format!("`results.kind` `{k}`")),
         };
+        let tokens = self
+            .deselect
+            .as_ref()
+            .map_or(&[][..], |d| d.append.as_slice());
+        let (first, last) = per_id_range(tokens);
+        if tokens[first..last].iter().any(|t| t.contains("{ids:re|}")) {
+            return Err(
+                "`deselect.append`: `{ids:re|}` is once-only and cannot sit among the \
+                        per-id tokens"
+                    .into(),
+            );
+        }
         Ok(Compiled {
             section,
             failed,
@@ -391,11 +423,17 @@ impl GuideCheck {
         Ok(())
     }
 
-    /// The argv whose results the floor reads: `argv` plus `results.how.argvAppend`.
+    /// The argv whose results the floor reads: `argv` with `results.how.argvAppend` ([`compose`]).
     pub(crate) fn for_results(&self, argv: &[String]) -> Vec<String> {
-        let mut out = argv.to_vec();
-        out.extend(self.results.how.argv_append.iter().cloned());
-        out
+        compose(argv, &self.results.how.argv_append)
+    }
+
+    /// Do `alone` AND `deselect` both name the qualifier (`{q}`)? Otherwise an id is one test only
+    /// when it is unique across every qualifier.
+    pub(crate) fn q_scoped(&self) -> bool {
+        let has_q = |v: &[String]| v.iter().any(|t| t.contains("{q}"));
+        self.alone.as_ref().is_some_and(|a| has_q(&a.run))
+            && self.deselect.as_ref().is_some_and(|d| has_q(&d.append))
     }
 
     /// The `alone` argv for `t`.
@@ -407,34 +445,31 @@ impl GuideCheck {
     }
 
     /// `argv` with `ids` deselected: `deselect.append`'s tokens before its first per-id token
-    /// (`{id}`, `{id:re}`, `{q}`) are emitted once, the tokens through the last one once per id,
-    /// the rest once; `{ids:re|}` (every id, regex-escaped, joined by `|`) fills a once-token. A
-    /// leading `--` is dropped when `argv` already has one (an end of options cannot repeat).
+    /// (`{id}`, `{id:re}`, `{q}`) once, the tokens through the last one once per id, the rest once
+    /// (`{ids:re|}`, every id regex-escaped and joined by `|`, fills a once-token), then
+    /// [`compose`]d onto `argv`.
     pub(crate) fn deselected(&self, argv: &[String], ids: &[TestId]) -> Vec<String> {
         let tokens = self
             .deselect
             .as_ref()
             .map(|d| d.append.as_slice())
             .unwrap_or_default();
-        let per = |t: &String| t.contains("{id}") || t.contains("{id:re}") || t.contains("{q}");
-        let first = tokens.iter().position(per).unwrap_or(tokens.len());
-        let last = tokens.iter().rposition(per).map_or(first, |i| i + 1);
-        let mut out = argv.to_vec();
-        let mut prefix = &tokens[..first];
-        if prefix.first().map(String::as_str) == Some("--") && argv.iter().any(|a| a == "--") {
-            prefix = &prefix[1..];
-        }
-        out.extend(fill_all(prefix, ids));
+        let (first, last) = per_id_range(tokens);
+        let mut extra = fill_all(&tokens[..first], ids);
         for t in ids {
-            out.extend(fill_all(&fill(&tokens[first..last], t), ids));
+            extra.extend(fill(&tokens[first..last], t));
         }
-        out.extend(fill_all(&tokens[last..], ids));
-        out
+        extra.extend(fill_all(&tokens[last..], ids));
+        compose(argv, &extra)
     }
 
     /// The `affected` argv for `files` (a token that is exactly `{files}` becomes one element per
     /// file; inside a token they are joined by spaces).
+    /// `None` — the full check runs — with no file, or a file that would read as a flag (`-x`).
     pub(crate) fn affected_argv(&self, files: &[String]) -> Option<Vec<String>> {
+        if files.is_empty() || files.iter().any(|f| f.starts_with('-')) {
+            return None;
+        }
         let a = self.affected.as_ref()?;
         let mut out = Vec::new();
         for t in &a.run {
@@ -446,6 +481,37 @@ impl GuideCheck {
         }
         Some(out)
     }
+}
+
+/// `argv` with `extra` appended around its end of options (`--`): `extra`'s tokens before its own
+/// `--` (all of them when it has none) are the runner's options and go just before `argv`'s `--`
+/// (at the end when `argv` has none); its tokens after that `--` go last, behind ONE `--` (`argv`'s,
+/// or the one `extra` brings). A second `--` is never emitted.
+pub(crate) fn compose(argv: &[String], extra: &[String]) -> Vec<String> {
+    let end_of_options = |v: &[String]| v.iter().position(|a| a == "--");
+    let (opts, tail) = match end_of_options(extra) {
+        Some(i) => (&extra[..i], Some(&extra[i + 1..])),
+        None => (extra, None),
+    };
+    let mut out = argv.to_vec();
+    let at = end_of_options(argv).unwrap_or(out.len());
+    out.splice(at..at, opts.iter().cloned());
+    if let Some(tail) = tail {
+        if end_of_options(&out).is_none() {
+            out.push("--".into());
+        }
+        out.extend(tail.iter().filter(|t| *t != "--").cloned());
+    }
+    out
+}
+
+/// The per-id tokens of `deselect.append`: from the first token with `{id}`, `{id:re}` or `{q}`
+/// through the last one.
+fn per_id_range(tokens: &[String]) -> (usize, usize) {
+    let per = |t: &String| t.contains("{id}") || t.contains("{id:re}") || t.contains("{q}");
+    let first = tokens.iter().position(per).unwrap_or(tokens.len());
+    let last = tokens.iter().rposition(per).map_or(first, |i| i + 1);
+    (first, last)
 }
 
 /// `{id}` and `{q}` verbatim, `{id:re}` regex-escaped (values fill argv elements; no shell).
@@ -500,6 +566,11 @@ impl Compiled {
                     .name("q")
                     .map(|m| m.as_str().to_string())
                     .unwrap_or_default();
+                // A new section drops every block the last one left uncommitted.
+                for (blocks, is_open) in &mut open {
+                    blocks.clear();
+                    *is_open = false;
+                }
             }
             for r in &self.failed {
                 if let Some(id) = r.captures(l).and_then(|c| c.name("id")) {
@@ -514,7 +585,7 @@ impl Compiled {
                     let take: Vec<Vec<TestId>> = std::mem::take(blocks);
                     if *all {
                         out.extend(take.into_iter().flatten());
-                    } else if let Some(b) = take.into_iter().last() {
+                    } else if let Some(b) = take.into_iter().rev().find(|b| !b.is_empty()) {
                         out.extend(b);
                     }
                     *is_open = false;
@@ -652,12 +723,21 @@ pub(crate) fn junit(
     seen_suite.then(|| (dedup(all, keyed), dedup(failed, keyed)))
 }
 
+/// The five XML entities, in ONE pass (`&amp;quot;` is the text `&quot;`).
 fn unescape(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
+    let entity = Regex::new("&(lt|gt|quot|apos|amp);").expect("static regex");
+    entity
+        .replace_all(s, |c: &regex::Captures| {
+            match &c[1] {
+                "lt" => "<",
+                "gt" => ">",
+                "quot" => "\"",
+                "apos" => "'",
+                _ => "&",
+            }
+            .to_string()
+        })
+        .into_owned()
 }
 
 /// Does repo-relative `path` match `glob` (`**` any depth, `*` and `?` within a segment)?
@@ -712,6 +792,46 @@ mod tests {
         .unwrap()
     }
 
+    /// A new section drops an uncommitted block; an empty block never hides the one before it.
+    #[test]
+    fn a_section_change_drops_open_blocks_and_an_empty_block_hides_nothing() {
+        let c = check("text").compile().unwrap();
+        let out = "== bin1\nsummary:\n  stale\n== bin2\nsummary:\n  real\nsummary:\ndone: red\n";
+        assert_eq!(c.failures(out, true), vec![t("bin2", "real")]);
+    }
+
+    /// `argvAppend` and `deselect.append` compose around an existing `--`: options before it,
+    /// test-binary arguments after it, and never a second `--`.
+    #[test]
+    fn argv_composition_keeps_one_end_of_options() {
+        let v = |x: &[&str]| s(x);
+        assert_eq!(
+            compose(&v(&["r", "t"]), &v(&["--o"])),
+            v(&["r", "t", "--o"])
+        );
+        assert_eq!(
+            compose(&v(&["r", "t", "--", "--list"]), &v(&["--o", "--", "--x"])),
+            v(&["r", "t", "--o", "--", "--list", "--x"])
+        );
+        assert_eq!(
+            compose(&v(&["r", "t"]), &v(&["--", "--x", "--", "--y"])),
+            v(&["r", "t", "--", "--x", "--y"])
+        );
+        let mut g = check("text");
+        g.results.how.argv_append = v(&["--report", "--", "--show"]);
+        let both = g.for_results(&g.deselected(&v(&["r", "go"]), &[t("", "a")]));
+        assert_eq!(
+            both,
+            v(&["r", "go", "--report", "--", "--not=a", "--exact", "--show"])
+        );
+        assert_eq!(both.iter().filter(|a| *a == "--").count(), 1);
+        // `{ids:re|}` among the per-id tokens is refused.
+        g.deselect = Some(Deselect {
+            append: v(&["--not={id}", "--all={ids:re|}", "--raw={id}"]),
+        });
+        assert!(g.compile().is_err());
+    }
+
     /// The text parser: `failed` rules and the LAST block before each end, each id in its
     /// section; an item-shaped line after a non-item line inside a block is not the block's.
     #[test]
@@ -761,6 +881,7 @@ mod tests {
             <testcase classname="m.b" name="left_out" file="m/b.x"><skipped/></testcase>
             </testsuite></testsuites>"#;
         let (all, failed) = junit(xml, &[], "::", true).unwrap();
+        assert_eq!(unescape("a&amp;quot;b&lt;"), "a&quot;b<");
         assert_eq!(all.len(), 3);
         assert_eq!(
             failed,

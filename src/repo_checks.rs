@@ -63,20 +63,20 @@
 //! head's output text is evidence only: twenty-one review rounds of core#1060 each found a new way
 //! for a head's own text to excuse a failure, so no head text decides anything here.
 //!
-//! * The head check runs unchanged. Exit 0 is a `pass`.
+//! * The head check runs unchanged. Exit 0 is a `pass`; a signal, or (for a check of a usable
+//!   build guide) an exit outside its `failedExit`, is `could_not_run`.
 //! * Otherwise the base runs the same argv. A green base makes the failure a `new_failure`. A red
-//!   base is inventoried by its own runner on the base tree — its TOC: `cargo test <args> --
-//!   --list` or `pytest --collect-only -q` — and its failing tests are read from
-//!   the BASE output and kept only when the base TOC lists them verbatim.
-//! * When exclusion is precise — every kept name unique in the base TOC and at most once in the
-//!   head's TOC, the argv on the core#1060 r16 allowlist, no head `.cargo/config*` setting
-//!   `rustdocflags` or test args, and (cargo) no whitespace in a name, which rustdoc would split
-//!   out of a test argument — the head runs once more with them deselected natively (libtest
-//!   `--skip=<name> --exact`, pytest `--deselect=<nodeid>`). Exit 0 is
-//!   `pass_excluded` with the names listed; non-zero is a `new_failure`. Anything else is
+//!   base, for a check of the base's build guide ([`crate::floor_guide`], DES-BUILD-GUIDE) whose
+//!   probes passed, is listed by the guide's `list` piece; its failing tests are read from the
+//!   BASE results, kept only when the base list names them, and each is confirmed by its exit
+//!   code run `alone` on the base.
+//! * When exclusion is precise — each kept test unique in the base list (across every qualifier
+//!   unless `alone` and `deselect` name it), at most once in the head's, under the same qualifier,
+//!   and the head's own list with them deselected listing exactly the rest — the head runs once
+//!   more with them `deselect`ed. Exit 0 is `pass_excluded` with the names listed; non-zero is a
+//!   `new_failure`. Anything else, a check with no usable guide included, is
 //!   `base_red_unseparated`: escalated with both logs, the operator's floor override the path
-//!   through. go test (its subtests are absent from its inventory), vitest, jest, tsc, eslint and
-//!   shell runners have no precise deselect and escalate the same way.
+//!   through.
 //! * A deciding run that fails on an oversubscribed host (1-min load above the CPU count) is
 //!   re-run ONCE with the same argv after waiting, bounded, for headroom (Bazel's
 //!   `flaky_test_attempts=2`): exit 0 is `passed on retry (flaky)`, a second failure is
@@ -105,10 +105,9 @@
 //! element each) and `{base}` (the base commit id) so a runner's own change-aware mode can be used
 //! (`vitest run --changed {base}`, `jest --changedSince {base}`, `cargo test -p <crate>`).
 //! A repo that configures NO test command gets the AFFECTED set (core#482, DES-FLOOR-V2 §5,
-//! [`derive_targeted`]): `cargo test -p a -p b …` — the members owning a touched file and those a
-//! manifest or lockfile change reaches, closed over feature unification
-//! ([`crate::floor_affected`]), in one invocation — or `vitest related
-//! --run <files>` for a plain `vitest` test script. At the creator floor only: the verify floor runs
+//! [`derive_targeted`]): `cargo test -p a -p b …` for the packages owning a touched file, or
+//! `vitest related --run <files>` for a plain `vitest` test script. A repo whose base carries a
+//! build guide runs the guide's checks instead, narrowed only by their `affected` piece. At the creator floor only: the verify floor runs
 //! the full suite, as does the PR's CI on every OS.
 //!
 //! ## Load-aware bound
@@ -1328,6 +1327,18 @@ pub(crate) fn touched_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<S
     Ok(files)
 }
 
+/// (DES-BUILD-GUIDE `invalidatedBy`) Every path the change touched: added, modified and untracked
+/// ([`touched_files`]), deleted, and a rename's old path.
+fn changed_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, String> {
+    let mut files = touched_files(worktree, ctx)?;
+    for d in deleted_files(worktree, ctx)? {
+        if !files.contains(&d) {
+            files.push(d);
+        }
+    }
+    Ok(files)
+}
+
 /// Did the change delete a tracked file relative to the base — renames counted as a deletion of
 /// the old path (`--no-renames`)? A derived targeted set cannot see what a missing file broke.
 fn deletes_a_file(worktree: &Path, ctx: &FloorContext) -> Result<bool, String> {
@@ -1455,6 +1466,10 @@ fn package_root(worktree: &Path, ctx: &FloorContext) -> Option<(PathBuf, String)
 
 /// Repo-relative paths under `dir/`, made relative to it; others dropped.
 pub(crate) fn package_relative(files: Vec<String>, dir: &str) -> Vec<String> {
+    let dir = dir.trim_matches('/');
+    if dir.is_empty() || dir == "." {
+        return files;
+    }
     let prefix = format!("{dir}/");
     files
         .into_iter()
@@ -3297,12 +3312,13 @@ pub(crate) fn run_with_sandbox_ctx(
         .map(|e| format!("the checks' scratch could not be made safe: {e}"));
     // (DES-BUILD-GUIDE) The BASE tree's build guide — a head edit to it never applies to its own
     // run — and the files the change touched (for `invalidatedBy` and `affected`).
-    let (guide, touched) = match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
+    let (guide, touched, changed) = match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
         (Some(base), Some(git_dir)) => (
             crate::floor_guide::load_base(worktree, git_dir, base),
             touched_files(worktree, ctx).unwrap_or_default(),
+            changed_files(worktree, ctx),
         ),
-        _ => (Ok(None), Vec::new()),
+        _ => (Ok(None), Vec::new(), Ok(Vec::new())),
     };
     let candidates = engine_generated_candidates(worktree, &detected);
     let env = scratch.env_record(&sandbox_level);
@@ -3323,7 +3339,7 @@ pub(crate) fn run_with_sandbox_ctx(
             Ok(Some(g)) => g.check_for(&check.argv, &check.dir),
             _ => None,
         };
-        let gcheck = guide_for(&guide, check, ctx, worktree, &touched)
+        let gcheck = guide_for(&guide, check, ctx, worktree, &changed)
             .and_then(|g| runner_current(worktree, check, g, &sandbox, &scratch).map(|()| g));
         let status = GuideStatus {
             present: present.is_some(),
@@ -3360,7 +3376,7 @@ pub(crate) fn run_with_sandbox_ctx(
         // ones that may be excluded. No known base ⇒ the failure denies as it always did.
         if run.passed() || run.timed_out || run.spawn_error.is_some() {
             decide_alone(&mut run);
-        } else if let Some(why) = crashed(&run, present) {
+        } else if let Some(why) = crashed(&run, gcheck.as_ref().ok().copied()) {
             // An exit the guide does not call a test failure (a crash, a build error): the
             // check could not run, whatever the base does.
             decide_alone(&mut run);
@@ -3387,36 +3403,40 @@ pub(crate) fn run_with_sandbox_ctx(
                 (Some(head), Some(git_dir)) => {
                     // This run's cache first; on a miss the base is exported, run (and, red,
                     // inventoried), cached, and the export removed before the next HEAD run.
-                    Some(match BaseTree::cached(&scratch, head, check) {
-                        Some(cached) => cached,
-                        None => {
-                            let side = match BaseTree::export(worktree, &scratch, git_dir, head) {
-                                Ok(t) => t.run_check(
-                                    check,
-                                    ctx,
-                                    &sandbox,
-                                    &scratch,
-                                    gcheck.as_ref().ok().copied(),
-                                ),
-                                Err(e) => BaseSide {
-                                    base: BaseRun {
-                                        head: head.to_string(),
-                                        cached: false,
-                                        run: None,
-                                        error: Some(e),
+                    Some(
+                        match BaseTree::cached(&scratch, head, check, gcheck.as_ref().ok().copied())
+                        {
+                            Some(cached) => cached,
+                            None => {
+                                let side = match BaseTree::export(worktree, &scratch, git_dir, head)
+                                {
+                                    Ok(t) => t.run_check(
+                                        check,
+                                        ctx,
+                                        &sandbox,
+                                        &scratch,
+                                        gcheck.as_ref().ok().copied(),
+                                    ),
+                                    Err(e) => BaseSide {
+                                        base: BaseRun {
+                                            head: head.to_string(),
+                                            cached: false,
+                                            run: None,
+                                            error: Some(e),
+                                        },
+                                        toc: None,
                                     },
-                                    toc: None,
-                                },
-                            };
-                            if let Err(e) = remove_base_export(worktree, &scratch) {
-                                scratch_error = Some(format!(
-                                    "the base export could not be removed before the next \
+                                };
+                                if let Err(e) = remove_base_export(worktree, &scratch) {
+                                    scratch_error = Some(format!(
+                                        "the base export could not be removed before the next \
                                      check: {e}"
-                                ));
+                                    ));
+                                }
+                                side
                             }
-                            side
-                        }
-                    })
+                        },
+                    )
                 }
                 _ => None,
             };
@@ -4160,9 +4180,18 @@ impl BaseTree {
     /// This run's cached result of `check` on `head`, when an earlier floor of the run paid for it:
     /// a record of THIS policy version ([`FLOOR_POLICY_VERSION`]; an older or bare record is a
     /// miss) for the same argv.
-    fn cached(scratch: &CheckScratch, head: &str, check: &RepoCheck) -> Option<BaseSide> {
+    fn cached(
+        scratch: &CheckScratch,
+        head: &str,
+        check: &RepoCheck,
+        guide: Option<&GuideCheck>,
+    ) -> Option<BaseSide> {
         let raw = std::fs::read_to_string(Self::cache_path(scratch, head, check)).ok()?;
         let rec = serde_json::from_str::<BaseRecord>(&raw).ok()?;
+        // A record taken under another guide (or none: no inventory) is not this comparison.
+        if rec.guide != guide_id(guide) {
+            return None;
+        }
         // The base runs the head's argv, and it can change within a run (a targeted command with
         // the files a rework touches — `{files}`, the derived `-p <crate>` — or a reworked
         // `.wicked/checks.json`): a cached run of ANOTHER argv is not this comparison.
@@ -4294,6 +4323,7 @@ impl BaseTree {
         // red base is listed by the guide's `list`, its results nominate the failing ids the list
         // holds, and each is confirmed by its EXIT CODE run alone (`failedExit`). A misread result
         // can then only narrow what is excluded.
+        let since = std::time::SystemTime::now();
         let mut run = run_one_with(
             &self.dir,
             &RepoCheck {
@@ -4313,7 +4343,7 @@ impl BaseTree {
         {
             let mut t = inventory(&self.dir, &target, g, &[], sandbox, scratch, Tree::Base);
             if t.incomplete.is_none() {
-                match results_of(&self.dir, &target, g, &mut run, scratch) {
+                match results_of(&self.dir, &target, g, &mut run, scratch, since) {
                     Ok((_, failed)) => {
                         t.failing = failed.into_iter().filter(|x| t.count(x) > 0).collect()
                     }
@@ -4362,6 +4392,7 @@ impl BaseTree {
         let rec = BaseRecord {
             floor_policy: FLOOR_POLICY_VERSION,
             head_argv: check.argv.clone(),
+            guide: guide_id(guide),
             run,
             toc,
         };
@@ -4388,6 +4419,11 @@ impl BaseTree {
     }
 }
 
+/// A guide check's identity for the base cache: 12 hex of its serialized form.
+fn guide_id(g: Option<&GuideCheck>) -> Option<String> {
+    g.map(|g| hex12(&serde_json::to_vec(g).unwrap_or_default()))
+}
+
 /// The base cache's record: the base run and (a red base) its inventory, under the policy version.
 #[derive(Debug, Serialize, Deserialize)]
 struct BaseRecord {
@@ -4395,6 +4431,9 @@ struct BaseRecord {
     /// The head argv the base answered (its run may be narrowed to the base's packages).
     #[serde(default)]
     head_argv: Vec<String>,
+    /// The usable guide check the base ran under ([`guide_id`]), or none.
+    #[serde(default)]
+    guide: Option<String>,
     run: CheckRun,
     #[serde(default)]
     toc: Option<Toc>,
@@ -4458,7 +4497,7 @@ pub const OUTCOME_COULD_NOT_RUN: &str = "could_not_run";
 pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
 /// The versioned base-cache record (core#1060 r9 keyed the cache by sandbox policy; v4 adds the
 /// base inventory): a record of any other version, or a bare `CheckRun`, is a miss.
-const FLOOR_POLICY_VERSION: u32 = 11;
+const FLOOR_POLICY_VERSION: u32 = 12;
 /// The most base failures the floor confirms one by one (each run alone on the base); more than
 /// this escalates rather than paying for them.
 const MAX_ALONE_CONFIRMATIONS: usize = 16;
@@ -4591,20 +4630,26 @@ pub(crate) fn inventory(
 }
 
 /// A results run's ids per the guide: every testcase (junit; text names failures only) and the
-/// failing ones. The results file (`how.path`, relative to the check's directory) is stored in
-/// the log store beside the run's streams.
+/// failing ones. The results file (`how.path`, relative to the check's directory) must be a
+/// regular file inside the tree, written since `since` (the run's start), within the log cap; it
+/// is stored in the log store beside the run's streams. Anything else is no results.
 pub(crate) fn results_of(
     dir: &Path,
     check: &RepoCheck,
     g: &GuideCheck,
     run: &mut CheckRun,
     scratch: &CheckScratch,
+    since: std::time::SystemTime,
 ) -> Result<(Vec<TestId>, Vec<TestId>), String> {
     let c = g.compile()?;
     let r = match &g.results.how.path {
         Some(path) => {
-            let f = std::fs::File::open(dir.join(&check.dir).join(path))
-                .map_err(|e| format!("`{path}` could not be opened: {e}"))?;
+            let f = open_results(
+                dir,
+                &Path::new(&check.dir).join(path).to_string_lossy(),
+                since,
+            )
+            .map_err(|e| format!("`{path}`: {e}"))?;
             let cap =
                 crate::floor_log::capture(f, &scratch.logs, scratch.log_cap).finish(DRAIN_CAP);
             if let Some(e) = cap.error {
@@ -4637,6 +4682,76 @@ pub(crate) fn results_of(
     }
 }
 
+/// (DES-BUILD-GUIDE) `rel` under `root`, refused unless it is relative with no `..`, and no
+/// component of it that exists is a symlink: a path a guide names never leaves the tree.
+pub(crate) fn confined(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let mut out = root.to_path_buf();
+    for c in Path::new(rel).components() {
+        match c {
+            std::path::Component::Normal(n) => out.push(n),
+            std::path::Component::CurDir => continue,
+            _ => return Err(format!("`{rel}` must stay inside the tree")),
+        }
+        if std::fs::symlink_metadata(&out).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!("`{rel}` passes through a symlink"));
+        }
+    }
+    Ok(out)
+}
+
+/// Open options that never follow a final symlink, nor block on a FIFO (unix).
+fn no_follow(o: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    o
+}
+
+/// The results file `rel` under `root`: [`confined`], a regular file within the log cap,
+/// modified since `since`.
+fn open_results(
+    root: &Path,
+    rel: &str,
+    since: std::time::SystemTime,
+) -> Result<std::fs::File, String> {
+    let path = confined(root, rel)?;
+    let m = std::fs::symlink_metadata(&path).map_err(|e| format!("no results file ({e})"))?;
+    if !m.is_file() {
+        return Err("not a regular file".into());
+    }
+    if m.len() > crate::floor_log::MAX_STREAM_BYTES {
+        return Err("larger than the log cap".into());
+    }
+    if m.modified().map_or(true, |t| t < since) {
+        return Err("not written by this run".into());
+    }
+    no_follow(std::fs::OpenOptions::new().read(true))
+        .open(&path)
+        .map_err(|e| e.to_string())
+}
+
+/// (DES-BUILD-GUIDE) Write `content` at `rel` under `root` ([`confined`]; missing directories
+/// created), never through a symlink.
+pub(crate) fn write_confined(root: &Path, rel: &str, content: &str) -> Result<(), String> {
+    let path = confined(root, rel)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // Re-checked once the directories exist: none of them may be a link.
+    let path = confined(root, rel)?;
+    let mut f = no_follow(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true),
+    )
+    .open(&path)
+    .map_err(|e| e.to_string())?;
+    std::io::Write::write_all(&mut f, content.as_bytes()).map_err(|e| e.to_string())
+}
+
 /// (DES-BUILD-GUIDE) The base guide's check for `check`, when its pieces may be relied on for
 /// this head; `Err` says why not (no guide, no such check, a probe not passed, stale, invalidated).
 fn guide_for<'g>(
@@ -4644,7 +4759,7 @@ fn guide_for<'g>(
     check: &RepoCheck,
     ctx: &FloorContext,
     worktree: &Path,
-    touched: &[String],
+    changed: &Result<Vec<String>, String>,
 ) -> Result<&'g GuideCheck, String> {
     let g = match guide {
         Err(e) => return Err(e.clone()),
@@ -4662,7 +4777,10 @@ fn guide_for<'g>(
     let (Some(base), Some(git_dir)) = (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) else {
         return Err("no base to verify the guide against".into());
     };
-    c.usable(g, worktree, git_dir, base, touched)?;
+    let changed = changed
+        .as_ref()
+        .map_err(|e| format!("the change's files could not be listed: {e}"))?;
+    c.usable(g, worktree, git_dir, base, changed)?;
     Ok(c)
 }
 
@@ -4763,6 +4881,7 @@ fn ran_loaded(run: &CheckRun) -> bool {
 fn retry_if_loaded(
     worktree: &Path,
     one: &RepoCheck,
+    exec: &ExecOpts,
     first: &CheckRun,
     sandbox: &WorkerSandbox,
     scratch: &CheckScratch,
@@ -4779,7 +4898,7 @@ fn retry_if_loaded(
         }
         std::thread::sleep(Duration::from_secs(1).min(bound));
     }
-    let mut r = run_one(worktree, one, sandbox, scratch, Tree::Head);
+    let mut r = run_one_with(worktree, one, exec, sandbox, scratch, Tree::Head);
     r.logs = relabel(r.logs, "retry");
     r.source = format!(
         "the identical retry of `{}` after waiting {:.0}s for headroom (DES-FLOOR-V2)",
@@ -4869,6 +4988,17 @@ fn decide(
                     toc.count(t)
                 ));
             }
+            // `alone`/`deselect` that do not name the qualifier reach the id under every one.
+            if let Some(t) = failing
+                .iter()
+                .find(|t| !g.q_scoped() && toc.qs(&t.id).len() != 1)
+            {
+                return Err(format!(
+                    "`{}` is listed under more than one qualifier, and the guide's `alone` and \
+                     `deselect` do not name `{{q}}`",
+                    t.id
+                ));
+            }
             for t in &failing {
                 match toc.alone.iter().find(|(a, _)| a == t) {
                     Some((_, true)) => {}
@@ -4938,7 +5068,7 @@ fn decide(
     }
     // The deciding run: the excluded head run when exclusion is precise and has something to
     // deselect, else the unchanged head run itself.
-    let (deciding_check, mut deciding, excluded_run) = match &plan {
+    let (deciding_check, deciding_exec, mut deciding, excluded_run) = match &plan {
         Ok(names) if !names.is_empty() => {
             let g = guide.as_ref().expect("a precise plan has a guide");
             let one = RepoCheck {
@@ -4951,19 +5081,13 @@ fn decide(
                 ),
                 ..check.clone()
             };
-            let mut e = run_one_with(
-                worktree,
-                &one,
-                &exec_of(g, false),
-                sandbox,
-                scratch,
-                Tree::Head,
-            );
+            let exec = exec_of(g, false);
+            let mut e = run_one_with(worktree, &one, &exec, sandbox, scratch, Tree::Head);
             e.logs = relabel(e.logs, "excluded");
             decision.excluded = names.iter().map(|t| t.id.clone()).collect();
-            (one, e.clone(), true)
+            (one, exec, e.clone(), true)
         }
-        _ => (check.clone(), head.clone(), false),
+        _ => (check.clone(), ExecOpts::default(), head.clone(), false),
     };
     if excluded_run {
         logs.extend(deciding.logs.iter().cloned());
@@ -4973,7 +5097,14 @@ fn decide(
     // Failing twice is `flaky_twice` only when BOTH attempts ran oversubscribed: a retry that had
     // its headroom and failed again reproduced the failure without the load — a new failure.
     let mut twice = false;
-    let retry = retry_if_loaded(worktree, &deciding_check, &deciding, sandbox, scratch);
+    let retry = retry_if_loaded(
+        worktree,
+        &deciding_check,
+        &deciding_exec,
+        &deciding,
+        sandbox,
+        scratch,
+    );
     if let Some(r) = retry {
         logs.extend(r.logs.iter().cloned());
         head.reruns.push(r.clone());
@@ -5593,6 +5724,10 @@ pub(crate) fn run_one_with(
         }
     };
     result.exit_code = status.and_then(|st| st.code());
+    // Ended by a signal (no exit code): it did not run to a verdict.
+    if let Some(st) = status.filter(|st| st.code().is_none()) {
+        result.spawn_error = Some(format!("the process was ended by a signal ({st})"));
+    }
     // BOUNDED: the group is dead, but a detached descendant may still hold the pipe — take what
     // was read (marked truncated) and move on rather than wait for an EOF that may never come.
     let out = out_h.map(|c| c.finish(DRAIN_CAP)).unwrap_or_default();
@@ -5614,10 +5749,19 @@ pub(crate) fn run_one_with(
     // Read back only for a failing run: nothing below reads a passing run's streams (agy r6).
     let failed = result.exit_code != Some(0);
     let (stdout, stderr) = if failed {
-        (
+        match (
             crate::floor_log::text(store, &result.logs[0]),
             crate::floor_log::text(store, &result.logs[1]),
-        )
+        ) {
+            (Ok(o), Ok(e)) => (o, e),
+            // An unreadable record is no record: the run is not evidence.
+            (Err(e), _) | (_, Err(e)) => {
+                result
+                    .spawn_error
+                    .get_or_insert(format!("its output could not be read back: {e}"));
+                Default::default()
+            }
+        }
     } else {
         Default::default()
     };
@@ -5625,12 +5769,14 @@ pub(crate) fn run_one_with(
     // destination dies BEFORE exec with `bwrap: Can't mkdir …` and exit 1 (so does a launcher
     // whose `execvp` of the check's binary fails) — the check never ran, so recording
     // `exit_code: 1` as its `failed` blames the repo for the jail. The ONE predicate
-    // (`validator::launcher_failure`) reads the first stderr line; a hit is `could_not_run`
-    // (denies, fail-closed, attribution honest). Never applied to a passing exit or a timeout.
+    // (`validator::launcher_failure`) reads the first stderr line (of the one merged stream when
+    // stderr was merged); a hit is `could_not_run` (denies, fail-closed, attribution honest).
+    // Never applied to a passing exit or a timeout.
     if !result.timed_out && result.exit_code != Some(0) {
+        let first_err = if exec.merge { &stdout } else { &stderr };
         if let Some(msg) = crate::validator::launcher_failure(
             &sandbox.wrapper,
-            stderr.lines().next().unwrap_or(""),
+            first_err.lines().next().unwrap_or(""),
         ) {
             result.spawn_error = Some(msg);
         }
@@ -8867,14 +9013,27 @@ pub(crate) mod tests {
             timeout_s: None,
             dir: String::new(),
         };
-        assert!(BaseTree::cached(&scratch_dir, head, &bare).is_none());
+        assert!(BaseTree::cached(&scratch_dir, head, &bare, None).is_none());
         let rec = BaseRecord {
             floor_policy: FLOOR_POLICY_VERSION,
             head_argv: s(&["cargo", "test", "-p", "b"]),
+            guide: None,
             run: ran,
             toc: None,
         };
         std::fs::write(&path, serde_json::to_string(&rec).unwrap()).unwrap();
+        // (review round 15, item 17) A record taken without a guide is no answer under one.
+        let g: crate::floor_guide::GuideCheck = serde_json::from_value(serde_json::json!({
+            "name": "test", "run": ["cargo", "test", "-p", "b"]}))
+        .unwrap();
+        let b = RepoCheck {
+            name: "test_targeted".into(),
+            argv: s(&["cargo", "test", "-p", "b"]),
+            source: DERIVED_TARGETED_SOURCE.into(),
+            timeout_s: None,
+            dir: String::new(),
+        };
+        assert!(BaseTree::cached(&scratch_dir, head, &b, Some(&g)).is_none());
         let check = |argv: &[&str]| RepoCheck {
             name: "test_targeted".into(),
             argv: s(argv),
@@ -8882,12 +9041,20 @@ pub(crate) mod tests {
             timeout_s: None,
             dir: String::new(),
         };
-        assert!(
-            BaseTree::cached(&scratch_dir, head, &check(&["cargo", "test", "-p", "b"])).is_some()
-        );
-        assert!(
-            BaseTree::cached(&scratch_dir, head, &check(&["cargo", "test", "-p", "a"])).is_none()
-        );
+        assert!(BaseTree::cached(
+            &scratch_dir,
+            head,
+            &check(&["cargo", "test", "-p", "b"]),
+            None
+        )
+        .is_some());
+        assert!(BaseTree::cached(
+            &scratch_dir,
+            head,
+            &check(&["cargo", "test", "-p", "a"]),
+            None
+        )
+        .is_none());
         // (codex r12) A record whose blob is gone is no evidence: a miss, so the base re-runs.
         let mut rec: BaseRecord =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -8899,9 +9066,13 @@ pub(crate) mod tests {
             truncated: false,
         }];
         std::fs::write(&path, serde_json::to_string(&rec).unwrap()).unwrap();
-        assert!(
-            BaseTree::cached(&scratch_dir, head, &check(&["cargo", "test", "-p", "b"])).is_none()
-        );
+        assert!(BaseTree::cached(
+            &scratch_dir,
+            head,
+            &check(&["cargo", "test", "-p", "b"]),
+            None
+        )
+        .is_none());
         drop(scratch_dir);
         let _ = std::fs::remove_dir_all(&wt);
     }
