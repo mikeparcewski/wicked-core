@@ -3369,7 +3369,10 @@ mod tests {
             "timed_out",
             "could_not_run",
         ] {
-            assert!(outcomes.contains(&format!("'{o}'")), "outcome {o} is declared");
+            assert!(
+                outcomes.contains(&format!("'{o}'")),
+                "outcome {o} is declared"
+            );
         }
         assert_eq!(decision["outcome"], "pass_excluded");
         assert_eq!(decision["baseSha"], "abc");

@@ -5481,7 +5481,9 @@ pub(crate) mod test_seam {
         WAIT.with(Cell::get)
     }
     /// Pin the load this thread's floor reads (and a zero headroom wait) until dropped.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) struct Pinned;
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn pin(load1: f64, cpus: usize) -> Pinned {
         LOAD.with(|c| c.set(Some((Some(load1), cpus))));
         WAIT.with(|c| c.set(Some(Duration::ZERO)));
@@ -5500,6 +5502,7 @@ mod tests {
     use super::*;
     use crate::validator::SandboxLevel;
 
+    #[cfg(unix)]
     use super::test_seam as seam;
 
     fn scratch(name: &str) -> PathBuf {
@@ -8741,6 +8744,7 @@ mod tests {
     /// `excluded.sleep` seconds first); any other run prints `run.out` / `run.err` and exits
     /// `run.exit` — or, with `flake` present, 101 the first time in this floor and `run.exit`
     /// after (`flake.excluded`: the same for the excluded run). Absolute path, outside every tree.
+    #[cfg(unix)]
     fn fake_cargo(tag: &str) -> String {
         let bin = scratch(&format!("{tag}-bin"));
         let path = bin.join("cargo");
@@ -8771,6 +8775,7 @@ mod tests {
     }
 
     /// The libtest inventory format: `name: test` lines and the per-binary count.
+    #[cfg(unix)]
     fn toc_of(names: &[&str]) -> String {
         let mut t: String = names.iter().map(|n| format!("{n}: test\n")).collect();
         t.push_str(&format!("\n{} tests, 0 benchmarks\n", names.len()));
@@ -8778,6 +8783,7 @@ mod tests {
     }
 
     /// A tree driven by [`fake_cargo`]: `files` written, `.wicked/checks.json` running `argv`.
+    #[cfg(unix)]
     fn write_tree(repo: &Path, argv: &[String], files: &[(&str, &str)]) {
         std::fs::create_dir_all(repo.join(".wicked")).unwrap();
         std::fs::write(
@@ -8807,6 +8813,7 @@ mod tests {
 
     /// A base commit red on `old` (its own inventory lists `old`, `new`, `fine`), a floor context
     /// against it, and the fake cargo's argv.
+    #[cfg(unix)]
     fn red_base(tag: &str) -> (PathBuf, FloorContext, Vec<String>) {
         let repo = scratch(tag);
         let argv = vec![fake_cargo(tag), "test".into(), "--no-fail-fast".into()];
@@ -8832,6 +8839,7 @@ mod tests {
     }
 
     /// The `checks[].decision` the wire carries for `c`, through the real event serializer.
+    #[cfg(unix)]
     fn wire_decision(c: &CheckRun) -> serde_json::Value {
         crate::event::CoreEvent::RepoChecksEvaluated {
             session: "s".into(),
@@ -8856,6 +8864,7 @@ mod tests {
     }
 
     /// The one check a fake-cargo floor ran (`test`), or `None` when the host has no boundary.
+    #[cfg(unix)]
     fn floor_test(repo: &Path, ctx: &FloorContext) -> Option<(RepoChecksReport, CheckRun)> {
         let report = run_floor(repo, ctx);
         if report.sandbox_error.is_some() {
@@ -9310,6 +9319,7 @@ mod tests {
     }
 
     /// `a` red when asked, `b` red when asked, and a doctest that always passes.
+    #[cfg(unix)]
     fn real_lib(a_red: bool, b_red: bool) -> String {
         let body = |red: bool| {
             if red {
@@ -9327,6 +9337,7 @@ mod tests {
     }
 
     /// The `cargo test` check a real-cargo floor ran (the full suite or the derived set).
+    #[cfg(unix)]
     fn cargo_check(report: &RepoChecksReport) -> &CheckRun {
         report
             .checks
@@ -9428,6 +9439,7 @@ mod tests {
     }
 
     /// The run's log store a test floor over `repo` wrote to.
+    #[cfg(unix)]
     fn report_logs(repo: &Path, ctx: &FloorContext) -> PathBuf {
         crate::floor_log::run_dir(
             &check_cache_root()
