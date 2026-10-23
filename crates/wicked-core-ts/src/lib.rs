@@ -3321,7 +3321,8 @@ mod tests {
             "decision": {
                 "outcome": "pass_excluded", "base_sha": "abc", "base_failing": ["t::a"],
                 "excluded": ["t::a"], "flaky": false, "reason": "1 pre-existing excluded: t::a",
-                "log_refs": [{"attempt": "excluded", "stream": "stdout", "sha256": "0", "bytes": 0}]
+                "log_refs": [{"attempt": "excluded", "stream": "stdout", "sha256": "0", "bytes": 0}],
+                "guide": {"present": true, "usable": false, "reason": "probe `run` never ran"}
             }
         }))
         .expect("a check run with a decision deserializes");
@@ -3350,6 +3351,7 @@ mod tests {
             ("RepoCheckRunJson", check),
             ("FloorCheckDecisionJson", decision),
             ("FloorLogRefJson", log_ref),
+            ("FloorGuideStatusJson", &decision["guide"]),
         ] {
             let declared = iface(name);
             for key in obj.as_object().expect("object").keys() {

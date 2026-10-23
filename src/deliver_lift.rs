@@ -2282,9 +2282,10 @@ mod tests {
             &path,
             "#!/bin/sh\nlist=0; skips=' '\n\
              for a in \"$@\"; do case \"$a\" in --list) list=1;; --skip=*) skips=\"$skips${a#--skip=} \";; esac; done\n\
+             echo '     Running unittests src/lib.rs (target/debug/deps/fixture-0)' >&2\n\
              if [ $list = 1 ]; then n=0; for f in tests/*.red tests/*.ok; do [ -e \"$f\" ] || continue; \
-             b=$(basename \"$f\"); echo \"${b%.*}: test\"; n=$((n+1)); done; echo; echo \"$n tests, 0 benchmarks\"; \
-             echo '     Running unittests src/lib.rs (target/debug/deps/fixture-0)' >&2; exit 0; fi\n\
+             b=$(basename \"$f\"); t=${b%.*}; case \"$skips\" in *\" $t \"*) continue;; esac; echo \"$t: test\"; n=$((n+1)); done; \
+             echo; echo \"$n tests, 0 benchmarks\"; exit 0; fi\n\
              r=0; n=0; for f in tests/*.red; do [ -e \"$f\" ] || continue; t=$(basename \"$f\" .red); \
              case \"$skips\" in *\" $t \"*) continue;; esac; echo \"test $t ... FAILED\"; fl=\"$fl $t\"; r=101; n=$((n+1)); done; \
              if [ $n -gt 0 ]; then echo; echo failures:; for t in $fl; do echo \"    $t\"; done; echo; fi; \
@@ -2319,6 +2320,16 @@ mod tests {
             std::fs::write(o.join(".wicked/checks.json"), &config).unwrap();
             std::fs::write(o.join("tests/shared.red"), "").unwrap();
             std::fs::write(o.join("src/landed.ts"), "export const landed = 1;\n").unwrap();
+            // The tip's build guide for the runner, verified on the commit before it.
+            crate::repo_checks::tests::write_guide(
+                o,
+                &[crate::repo_checks::tests::libtest_guide(&[
+                    runner.clone(),
+                    "test".into(),
+                    "--no-fail-fast".into(),
+                ])],
+                &run_git(o, &["rev-parse", "HEAD"]),
+            );
         };
         let checks_evaluated = |evs: &[CoreEvent], passed_wanted: bool| {
             evs.iter()
@@ -2435,6 +2446,18 @@ mod tests {
             std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
             run_git(&repo, &["add", "-A"]);
             run_git(&repo, &["commit", "-qm", "base"]);
+            // The base's build guide for the runner, verified on the commit before it.
+            crate::repo_checks::tests::write_guide(
+                &repo,
+                &[crate::repo_checks::tests::libtest_guide(&[
+                    runner.clone(),
+                    "test".into(),
+                    "--no-fail-fast".into(),
+                ])],
+                &run_git(&repo, &["rev-parse", "HEAD"]),
+            );
+            run_git(&repo, &["add", "-A"]);
+            run_git(&repo, &["commit", "-qm", "the build guide"]);
             let base_commit = run_git(&repo, &["rev-parse", "HEAD"]);
             let wt = base.join("wt");
             run_git(

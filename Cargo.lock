@@ -3556,6 +3556,7 @@ dependencies = [
  "libc",
  "memchr",
  "portable-pty",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

@@ -1430,13 +1430,32 @@ export interface FloorCheckDecisionJson {
   flaky: boolean
   /** In words: what was excluded, why a base red could not be separated. */
   reason: string | null
+  /** (DES-BUILD-GUIDE) The base's build guide for this check; `null` on a record from before it. */
+  guide: FloorGuideStatusJson | null
+}
+
+/** (DES-BUILD-GUIDE) The base tree's `.wicked/build-guide.json` for one check: whether it has a check
+ * with this argv and cwd, whether its pieces may be relied on for this head, and why not. */
+export interface FloorGuideStatusJson {
+  present: boolean
+  usable: boolean
+  reason: string | null
 }
 
 /** One stored stream ({@link FloorCheckDecisionJson.logRefs}): its blob is named by its sha256 in the
  * run's log store, so any range of it verifies against this hash. */
 export interface FloorLogRefJson {
-  attempt: 'head' | 'base' | 'toc-base' | 'toc-head' | 'alone-base' | 'excluded' | 'retry'
-  stream: 'stdout' | 'stderr'
+  attempt:
+    | 'head'
+    | 'base'
+    | 'toc-base'
+    | 'toc-head'
+    | 'toc-excluded'
+    | 'alone-base'
+    | 'excluded'
+    | 'retry'
+    | 'results'
+  stream: 'stdout' | 'stderr' | 'file'
   sha256: string
   bytes: number
   /** The process wrote past the per-stream cap, or held its pipe open: the blob is a prefix. */

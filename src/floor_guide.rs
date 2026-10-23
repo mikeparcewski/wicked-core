@@ -1,0 +1,806 @@
+//! FLOOR GUIDE (DES-BUILD-GUIDE, contract v1) — the per-repo build/test guide the repo-checks
+//! floor interprets. The guide is DATA (`.wicked/build-guide.json`), discovered at onboarding and
+//! checked piece by piece by `wicked-core floor probe` ([`crate::floor_probe`]); this module reads
+//! it, decides whether a check's pieces may be relied on, and turns its pieces into argv and parsed
+//! test ids. It knows no runner: every runner fact (how to list, run one test, deselect, read a
+//! result) is a guide piece, and a piece the probes did not pass is never relied on.
+//!
+//! The floor reads the guide from the BASE tree only, so a head edit to the guide never applies to
+//! its own run. Its parsed results only nominate candidates; exit codes decide (DES-FLOOR-V2).
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+
+/// Where a repository keeps its guide.
+pub const GUIDE_PATH: &str = ".wicked/build-guide.json";
+/// The probes every check needs, all `pass`, before its exclusion is relied on (plus `affected`
+/// when the check has that piece).
+pub const REQUIRED_PROBES: [&str; 5] = ["list", "run", "alone", "deselect", "mutation"];
+
+/// A repository's build/test guide (contract v1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildGuide {
+    pub version: u32,
+    /// The repo-relative files the guide was derived from: a base change to one makes it stale.
+    #[serde(default)]
+    pub derived_from: Vec<String>,
+    #[serde(default)]
+    pub checks: Vec<GuideCheck>,
+}
+
+/// One check of the guide.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuideCheck {
+    pub name: String,
+    #[serde(default = "dot")]
+    pub cwd: String,
+    #[serde(default)]
+    pub stage: Vec<String>,
+    /// The exact argv: exclusion happens only for a floor check whose argv equals it.
+    pub run: Vec<String>,
+    /// Exit codes that mean "tests failed" (any other non-zero exit: a crash, could not run).
+    #[serde(default)]
+    pub failed_exit: Vec<i32>,
+    pub results: Results,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parser: Option<Parser>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list: Option<ListPiece>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alone: Option<RunPiece>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deselect: Option<Deselect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affected: Option<RunPiece>,
+    /// Globs: a head file the change touched that matches one disables exclusion for this check.
+    #[serde(default)]
+    pub invalidated_by: Vec<String>,
+    #[serde(default)]
+    pub probes: Probes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<Verified>,
+}
+
+fn dot() -> String {
+    ".".into()
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Results {
+    /// `text` | `junit` (v1); `json-lines` | `tap` are reserved.
+    pub kind: String,
+    #[serde(default)]
+    pub how: How,
+    /// (junit) The testcase attributes whose values, joined by `::`, form an id (default
+    /// `["classname", "name"]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub id: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct How {
+    /// Appended to every argv whose results the floor reads (the base run, the probes' runs).
+    #[serde(default)]
+    pub argv_append: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// The results file (relative to `cwd`), when the results are not on stdout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Capture stderr into the same stream as stdout, in order (a runner that names its test
+    /// binaries on stderr and their results on stdout).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub merge: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Parser {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    #[serde(default)]
+    pub failed: Vec<String>,
+    #[serde(default)]
+    pub blocks: Vec<Block>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Block {
+    pub start: String,
+    pub item: String,
+    pub end: String,
+    /// `last-before-end` (default) | `all`.
+    #[serde(rename = "use", default = "last_before_end")]
+    pub use_: String,
+}
+
+fn last_before_end() -> String {
+    "last-before-end".into()
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListPiece {
+    pub run: Vec<String>,
+    pub item: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    /// As [`How::merge`], for the list run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub merge: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunPiece {
+    pub run: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deselect {
+    pub append: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Probes {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation: Option<Mutation>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Mutation {
+    /// Relative to the check's `cwd`.
+    pub file: String,
+    pub content: String,
+    pub expect_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_q: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Verified {
+    #[serde(default)]
+    pub base_sha: String,
+    #[serde(default)]
+    pub runner_version: String,
+    #[serde(default)]
+    pub at: String,
+    #[serde(default)]
+    pub results: BTreeMap<String, String>,
+}
+
+/// One test: its qualifier scope (`q`, e.g. a test binary; empty when the list has none) and id.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TestId {
+    pub q: String,
+    pub id: String,
+}
+
+/// The guide's state for one floor check, on the wire (`decision.guide`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuideStatus {
+    /// The base's guide has a check whose argv and cwd are this check's.
+    pub present: bool,
+    /// Its pieces may be relied on for this head (probes passed, verified on an ancestor, not
+    /// stale, not invalidated by the change).
+    pub usable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The base tree's guide, read with git from `base` — never from the head's worktree. `Ok(None)`
+/// when the base has none; `Err` when it has one that does not parse.
+pub(crate) fn load_base(
+    worktree: &Path,
+    git_dir: &Path,
+    base: &str,
+) -> Result<Option<BuildGuide>, String> {
+    let env: [(&str, &Path); 1] = [("GIT_DIR", git_dir)];
+    let spec = format!("{base}:{GUIDE_PATH}");
+    if crate::worktree_guard::git(worktree, &["cat-file", "-e", &spec], &env).is_err() {
+        return Ok(None);
+    }
+    let raw = crate::worktree_guard::git_string(worktree, &["show", &spec], &env)
+        .map_err(|e| format!("the base's `{GUIDE_PATH}` could not be read: {e}"))?;
+    let guide: BuildGuide = serde_json::from_str(&raw)
+        .map_err(|e| format!("the base's `{GUIDE_PATH}` does not parse: {e}"))?;
+    if guide.version != 1 {
+        return Err(format!(
+            "guide version {} (this floor reads 1)",
+            guide.version
+        ));
+    }
+    Ok(Some(guide))
+}
+
+fn norm_dir(d: &str) -> &str {
+    let d = d.trim_end_matches('/');
+    if d == "." {
+        ""
+    } else {
+        d.strip_prefix("./").unwrap_or(d)
+    }
+}
+
+impl BuildGuide {
+    /// The guide check whose `run` is exactly `argv` in `dir` — the guide is the allowlist.
+    pub(crate) fn check_for(&self, argv: &[String], dir: &str) -> Option<&GuideCheck> {
+        self.checks
+            .iter()
+            .find(|c| c.run == argv && norm_dir(&c.cwd) == norm_dir(dir))
+    }
+}
+
+/// A compiled parser: each regex applies to one line at a time (RE2 syntax: the `regex` crate).
+pub(crate) struct Compiled {
+    section: Option<Regex>,
+    failed: Vec<Regex>,
+    blocks: Vec<(Regex, Regex, Regex, bool)>,
+    list_item: Regex,
+    list_section: Option<Regex>,
+}
+
+fn re(p: &str) -> Result<Regex, String> {
+    Regex::new(p).map_err(|e| format!("regex `{p}`: {e}"))
+}
+
+impl GuideCheck {
+    /// The cwd relative to the repo root (`""` = the root).
+    pub(crate) fn dir(&self) -> &str {
+        norm_dir(&self.cwd)
+    }
+
+    /// Compile every regex the check's pieces name; `Err` names the first that is missing or bad.
+    pub(crate) fn compile(&self) -> Result<Compiled, String> {
+        let list = self.list.as_ref().ok_or("no `list` piece")?;
+        let (section, failed, blocks) = match self.results.kind.as_str() {
+            "text" => {
+                let p = self
+                    .parser
+                    .as_ref()
+                    .ok_or("`results.kind` text with no `parser`")?;
+                let blocks = p
+                    .blocks
+                    .iter()
+                    .map(|b| {
+                        let all = match b.use_.as_str() {
+                            "all" => true,
+                            "last-before-end" => false,
+                            u => return Err(format!("block `use` `{u}`")),
+                        };
+                        Ok((re(&b.start)?, re(&b.item)?, re(&b.end)?, all))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                (
+                    p.section.as_deref().map(re).transpose()?,
+                    p.failed.iter().map(|f| re(f)).collect::<Result<_, _>>()?,
+                    blocks,
+                )
+            }
+            "junit" => (None, Vec::new(), Vec::new()),
+            k @ ("json-lines" | "tap") => {
+                return Err(format!("`results.kind` `{k}` is reserved (not read in v1)"))
+            }
+            k => return Err(format!("`results.kind` `{k}`")),
+        };
+        Ok(Compiled {
+            section,
+            failed,
+            blocks,
+            list_item: re(&list.item)?,
+            list_section: list.section.as_deref().map(re).transpose()?,
+        })
+    }
+
+    /// May the floor rely on this check's pieces against `base` for a change touching `touched`?
+    /// Every required probe passed, on a commit that is an ancestor of the base, no file the guide
+    /// was derived from changed since, and no touched file matches `invalidatedBy`.
+    pub(crate) fn usable(
+        &self,
+        guide: &BuildGuide,
+        worktree: &Path,
+        git_dir: &Path,
+        base: &str,
+        touched: &[String],
+    ) -> Result<(), String> {
+        self.compile()?;
+        for piece in [
+            ("alone", self.alone.is_some()),
+            ("deselect", self.deselect.is_some()),
+        ] {
+            if !piece.1 {
+                return Err(format!("no `{}` piece", piece.0));
+            }
+        }
+        if self.failed_exit.is_empty() {
+            return Err("no `failedExit`".into());
+        }
+        let v = self
+            .verified
+            .as_ref()
+            .ok_or("never probed (no `verified`)")?;
+        let mut probes: Vec<&str> = REQUIRED_PROBES.to_vec();
+        if self.affected.is_some() {
+            probes.push("affected");
+        }
+        for p in probes {
+            match v.results.get(p).map(String::as_str) {
+                Some("pass") => {}
+                Some(r) => return Err(format!("probe `{p}`: {r}")),
+                None => return Err(format!("probe `{p}` never ran")),
+            }
+        }
+        let env: [(&str, &Path); 1] = [("GIT_DIR", git_dir)];
+        if v.base_sha.is_empty()
+            || crate::worktree_guard::git(
+                worktree,
+                &["merge-base", "--is-ancestor", &v.base_sha, base],
+                &env,
+            )
+            .is_err()
+        {
+            return Err(format!(
+                "verified on `{}`, which is not an ancestor of the base",
+                v.base_sha
+            ));
+        }
+        if !guide.derived_from.is_empty() {
+            let mut args = vec!["diff", "--name-only", v.base_sha.as_str(), base, "--"];
+            args.extend(guide.derived_from.iter().map(String::as_str));
+            let changed = crate::worktree_guard::git_string(worktree, &args, &env)
+                .map_err(|e| format!("staleness could not be read: {e}"))?;
+            if let Some(f) = changed.lines().find(|l| !l.trim().is_empty()) {
+                return Err(format!("stale: `{f}` changed since the guide was verified"));
+            }
+        }
+        if let Some(f) = touched
+            .iter()
+            .find(|f| self.invalidated_by.iter().any(|g| glob_match(g, f)))
+        {
+            return Err(format!("the change touches `{f}` (`invalidatedBy`)"));
+        }
+        Ok(())
+    }
+
+    /// The argv whose results the floor reads: `argv` plus `results.how.argvAppend`.
+    pub(crate) fn for_results(&self, argv: &[String]) -> Vec<String> {
+        let mut out = argv.to_vec();
+        out.extend(self.results.how.argv_append.iter().cloned());
+        out
+    }
+
+    /// The `alone` argv for `t`.
+    pub(crate) fn alone_argv(&self, t: &TestId) -> Vec<String> {
+        self.alone
+            .as_ref()
+            .map(|a| fill(&a.run, t))
+            .unwrap_or_default()
+    }
+
+    /// `argv` with `ids` deselected: `deselect.append`'s tokens before its first `{id}`/`{q}`
+    /// token are emitted once, the tokens through the last one once per id, the rest once. A
+    /// leading `--` is dropped when `argv` already has one (an end of options cannot repeat).
+    pub(crate) fn deselected(&self, argv: &[String], ids: &[TestId]) -> Vec<String> {
+        let tokens = self
+            .deselect
+            .as_ref()
+            .map(|d| d.append.as_slice())
+            .unwrap_or_default();
+        let per = |t: &String| t.contains("{id}") || t.contains("{q}");
+        let first = tokens.iter().position(per).unwrap_or(tokens.len());
+        let last = tokens.iter().rposition(per).map_or(first, |i| i + 1);
+        let mut out = argv.to_vec();
+        let mut prefix = &tokens[..first];
+        if prefix.first().map(String::as_str) == Some("--") && argv.iter().any(|a| a == "--") {
+            prefix = &prefix[1..];
+        }
+        out.extend(prefix.iter().cloned());
+        for t in ids {
+            out.extend(fill(&tokens[first..last], t));
+        }
+        out.extend(tokens[last..].iter().cloned());
+        out
+    }
+
+    /// The `affected` argv for `files` (a token that is exactly `{files}` becomes one element per
+    /// file; inside a token they are joined by spaces).
+    pub(crate) fn affected_argv(&self, files: &[String]) -> Option<Vec<String>> {
+        let a = self.affected.as_ref()?;
+        let mut out = Vec::new();
+        for t in &a.run {
+            if t == "{files}" {
+                out.extend(files.iter().cloned());
+            } else {
+                out.push(t.replace("{files}", &files.join(" ")));
+            }
+        }
+        Some(out)
+    }
+}
+
+fn fill(argv: &[String], t: &TestId) -> Vec<String> {
+    argv.iter()
+        .map(|a| a.replace("{id}", &t.id).replace("{q}", &t.q))
+        .collect()
+}
+
+impl Compiled {
+    /// The failing ids a run's text results name (kind text): `failed` line rules, and the items of
+    /// `blocks` (a block opens at `start`; its contiguous `item` lines, blanks allowed, are its
+    /// ids; any other line ends it; at `end` the last block since the previous end — or, with
+    /// `all`, every one — is taken). Each id carries the `section` scope it appeared in.
+    pub(crate) fn failures(&self, text: &str, keyed: bool) -> Vec<TestId> {
+        let mut out: Vec<TestId> = Vec::new();
+        let mut q = String::new();
+        // Per block rule: the blocks since the last end, and whether the newest is still open.
+        let mut open: Vec<(Vec<Vec<TestId>>, bool)> = vec![(Vec::new(), false); self.blocks.len()];
+        for l in text.lines().map(|l| l.trim_end_matches('\r')) {
+            if let Some(s) = self.section.as_ref().and_then(|r| r.captures(l)) {
+                q = s
+                    .name("q")
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default();
+            }
+            for r in &self.failed {
+                if let Some(id) = r.captures(l).and_then(|c| c.name("id")) {
+                    out.push(TestId {
+                        q: q.clone(),
+                        id: id.as_str().to_string(),
+                    });
+                }
+            }
+            for ((start, item, end, all), (blocks, is_open)) in self.blocks.iter().zip(&mut open) {
+                if end.is_match(l) {
+                    let take: Vec<Vec<TestId>> = std::mem::take(blocks);
+                    if *all {
+                        out.extend(take.into_iter().flatten());
+                    } else if let Some(b) = take.into_iter().last() {
+                        out.extend(b);
+                    }
+                    *is_open = false;
+                } else if start.is_match(l) {
+                    blocks.push(Vec::new());
+                    *is_open = true;
+                } else if *is_open {
+                    match item.captures(l).and_then(|c| c.name("id")) {
+                        Some(id) => blocks.last_mut().expect("open").push(TestId {
+                            q: q.clone(),
+                            id: id.as_str().to_string(),
+                        }),
+                        None if l.trim().is_empty() => {}
+                        None => *is_open = false,
+                    }
+                }
+            }
+        }
+        dedup(out, keyed)
+    }
+
+    /// The ids a list run prints: `item` lines, each in the `section` scope it appeared in. Other
+    /// lines are not the list's.
+    pub(crate) fn list(&self, text: &str) -> Vec<TestId> {
+        let mut out = Vec::new();
+        let mut q = String::new();
+        for l in text.lines().map(|l| l.trim_end_matches('\r')) {
+            if let Some(s) = self.list_section.as_ref().and_then(|r| r.captures(l)) {
+                q = s
+                    .name("q")
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default();
+                continue;
+            }
+            if let Some(id) = self.list_item.captures(l).and_then(|c| c.name("id")) {
+                out.push(TestId {
+                    q: q.clone(),
+                    id: id.as_str().to_string(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Does the list carry a qualifier? When it does not, ids are compared without one.
+    pub(crate) fn keyed(&self) -> bool {
+        self.list_section.is_some()
+    }
+}
+
+/// Unique, first-seen order; without a keyed list, the qualifier is dropped.
+fn dedup(ids: Vec<TestId>, keyed: bool) -> Vec<TestId> {
+    let mut seen = std::collections::HashSet::new();
+    ids.into_iter()
+        .map(|t| {
+            if keyed {
+                t
+            } else {
+                TestId {
+                    q: String::new(),
+                    ..t
+                }
+            }
+        })
+        .filter(|t| !t.id.is_empty() && seen.insert(t.clone()))
+        .collect()
+}
+
+/// (junit) Every testcase and the failing ones (a `failure` or `error` child): id = the `attrs`
+/// values joined by `::`, q = the enclosing testsuite's `name`. A minimal reader of the elements
+/// the format defines; `None` when the text holds no testsuite.
+pub(crate) fn junit(
+    xml: &str,
+    attrs: &[String],
+    keyed: bool,
+) -> Option<(Vec<TestId>, Vec<TestId>)> {
+    let tag = Regex::new(
+        r#"<(/?)(testsuite|testcase|failure|error)\b((?:[^>"']|"[^"]*"|'[^']*')*?)(/?)>"#,
+    )
+    .expect("static regex");
+    let attr = Regex::new(r#"([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)')"#)
+        .expect("static regex");
+    let default_attrs = ["classname".to_string(), "name".to_string()];
+    let attrs = if attrs.is_empty() {
+        &default_attrs[..]
+    } else {
+        attrs
+    };
+    let (mut all, mut failed) = (Vec::new(), Vec::new());
+    let (mut suite, mut seen_suite, mut current): (String, bool, Option<TestId>) =
+        (String::new(), false, None);
+    for c in tag.captures_iter(xml) {
+        let (close, name, body, selfclose) = (&c[1] == "/", &c[2], &c[3], &c[4] == "/");
+        let get = |k: &str| {
+            attr.captures_iter(body)
+                .find(|a| &a[1] == k)
+                .map(|a| unescape(a.get(2).or(a.get(3)).map_or("", |m| m.as_str())))
+        };
+        match (name, close) {
+            ("testsuite", false) => {
+                suite = get("name").unwrap_or_default();
+                seen_suite = true;
+            }
+            ("testcase", false) => {
+                let id = attrs
+                    .iter()
+                    .map(|a| get(a).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join("::");
+                let t = TestId {
+                    q: suite.clone(),
+                    id,
+                };
+                all.push(t.clone());
+                current = (!selfclose).then_some(t);
+            }
+            ("testcase", true) => current = None,
+            ("failure" | "error", false) => {
+                if let Some(t) = &current {
+                    failed.push(t.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    seen_suite.then(|| (dedup(all, keyed), dedup(failed, keyed)))
+}
+
+fn unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Does repo-relative `path` match `glob` (`**` any depth, `*` and `?` within a segment)?
+pub(crate) fn glob_match(glob: &str, path: &str) -> bool {
+    let mut p = String::from("^");
+    let mut chars = glob.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' if chars.peek() == Some(&'*') => {
+                chars.next();
+                if chars.peek() == Some(&'/') {
+                    chars.next();
+                    p.push_str("(?:.*/)?");
+                } else {
+                    p.push_str(".*");
+                }
+            }
+            '*' => p.push_str("[^/]*"),
+            '?' => p.push_str("[^/]"),
+            c => p.push_str(&regex::escape(&c.to_string())),
+        }
+    }
+    p.push('$');
+    Regex::new(&p).is_ok_and(|r| r.is_match(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    fn t(q: &str, id: &str) -> TestId {
+        TestId {
+            q: q.into(),
+            id: id.into(),
+        }
+    }
+
+    fn check(kind: &str) -> GuideCheck {
+        serde_json::from_value(serde_json::json!({
+            "name": "test", "run": ["runner", "go"], "failedExit": [3],
+            "results": {"kind": kind},
+            "parser": {"section": "^== (?P<q>\\S+)$", "failed": ["^BAD (?P<id>\\S+)$"],
+                       "blocks": [{"start": "^summary:$", "item": "^  (?P<id>\\S+)$", "end": "^done: red"}]},
+            "list": {"run": ["runner", "list"], "item": "^(?P<id>\\S+)$", "section": "^== (?P<q>\\S+)$"},
+            "alone": {"run": ["runner", "one", "{id}"]},
+            "deselect": {"append": ["--", "--not={id}", "--exact"]},
+        }))
+        .unwrap()
+    }
+
+    /// The text parser: `failed` rules and the LAST block before each end, each id in its
+    /// section; an item-shaped line after a non-item line inside a block is not the block's.
+    #[test]
+    fn the_text_parser_reads_line_rules_and_the_last_block_in_its_section() {
+        let c = check("text").compile().unwrap();
+        let out =
+            "== bin1\nBAD a\nsummary:\n\n--- captured\n  ghost\nsummary:\n  b\n  c\n\ndone: red\n\
+                   == bin2\nsummary:\n  d\ndone: red\n  e\n";
+        assert_eq!(
+            c.failures(out, true),
+            vec![
+                t("bin1", "a"),
+                t("bin1", "b"),
+                t("bin1", "c"),
+                t("bin2", "d")
+            ]
+        );
+        assert_eq!(
+            c.failures(out, false)[0],
+            t("", "a"),
+            "unkeyed: no qualifier"
+        );
+        let mut all = check("text");
+        all.parser.as_mut().unwrap().blocks[0].use_ = "all".into();
+        let out2 = "summary:\n  x\nnoise\nsummary:\n  y\ndone: red\n";
+        assert_eq!(
+            all.compile().unwrap().failures(out2, false),
+            vec![t("", "x"), t("", "y")]
+        );
+        assert_eq!(
+            c.list("== bin1\na\nb\n== bin2\na\n"),
+            vec![t("bin1", "a"), t("bin1", "b"), t("bin2", "a")]
+        );
+        assert!(
+            check("tap").compile().is_err(),
+            "reserved kinds are not read"
+        );
+    }
+
+    /// junit: every testcase and the failing ones; id = the configured attributes, q = suite.
+    #[test]
+    fn the_junit_reader_takes_testcases_and_failures() {
+        let xml = r#"<?xml version="1.0"?><testsuites><testsuite name="s1">
+            <testcase classname="m.a" name="ok_one" file="m/a.x"/>
+            <testcase classname="m.a" name="bad &amp; worse" file="m/a.x"><failure message="x"/></testcase>
+            <testcase classname="m.b" name="err" file="m/b.x"><error/></testcase>
+            </testsuite></testsuites>"#;
+        let (all, failed) = junit(xml, &[], true).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            failed,
+            vec![t("s1", "m.a::bad & worse"), t("s1", "m.b::err")]
+        );
+        let (_, by_file) = junit(xml, &s(&["file", "name"]), false).unwrap();
+        assert_eq!(by_file[1], t("", "m/b.x::err"));
+        assert!(junit("no xml here", &[], true).is_none());
+    }
+
+    /// Deselect: tokens before the first `{id}` once (a `--` already in the argv is not
+    /// repeated), the `{id}` tokens per id, the rest once; alone and affected fill their templates.
+    #[test]
+    fn templates_fill_per_id_and_once() {
+        let g = check("text");
+        assert_eq!(
+            g.deselected(&s(&["runner", "go"]), &[t("q", "a"), t("q", "b")]),
+            s(&["runner", "go", "--", "--not=a", "--not=b", "--exact"])
+        );
+        assert_eq!(
+            g.deselected(&s(&["runner", "list", "--", "x"]), &[t("q", "a")]),
+            s(&["runner", "list", "--", "x", "--not=a", "--exact"])
+        );
+        assert_eq!(g.alone_argv(&t("q", "a")), s(&["runner", "one", "a"]));
+        let mut a = g.clone();
+        a.affected = Some(RunPiece {
+            run: s(&["runner", "go", "{files}"]),
+        });
+        assert_eq!(
+            a.affected_argv(&s(&["x.y", "z.y"])).unwrap(),
+            s(&["runner", "go", "x.y", "z.y"])
+        );
+    }
+
+    #[test]
+    fn globs_match_by_segment_and_any_depth() {
+        assert!(glob_match(".cfg/**", ".cfg/a/b.toml"));
+        assert!(glob_match("**/.cfg/**", "x/y/.cfg/c"));
+        assert!(glob_match("**/*.lock", "a/b/c.lock") && glob_match("**/*.lock", "c.lock"));
+        assert!(!glob_match("*.lock", "a/c.lock"));
+        assert!(glob_match("tool-?", "tool-1") && !glob_match("tool-?", "tool-12"));
+    }
+
+    /// The guide is the allowlist: a floor check matches only on its exact argv and cwd.
+    #[test]
+    fn a_check_matches_only_its_exact_argv_and_cwd() {
+        let g = BuildGuide {
+            version: 1,
+            derived_from: vec![],
+            checks: vec![check("text")],
+        };
+        assert!(g.check_for(&s(&["runner", "go"]), "").is_some());
+        assert!(g.check_for(&s(&["runner", "go"]), ".").is_some());
+        assert!(g.check_for(&s(&["runner", "go", "x"]), "").is_none());
+        assert!(g.check_for(&s(&["runner", "go"]), "sub").is_none());
+    }
+
+    /// The schema (`schemas/build-guide.v1.json`) declares every field these types write.
+    #[test]
+    fn the_schema_declares_every_field_the_types_write() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../schemas/build-guide.v1.json")).unwrap();
+        let mut c = check("text");
+        c.affected = Some(RunPiece { run: s(&["x"]) });
+        c.invalidated_by = s(&["a/**"]);
+        c.results.how = How {
+            argv_append: s(&["--r"]),
+            env: [("K".to_string(), "v".to_string())].into(),
+            path: Some("r.xml".into()),
+            merge: true,
+        };
+        c.results.id = s(&["file", "name"]);
+        c.probes.mutation = Some(Mutation {
+            file: "m".into(),
+            content: "c".into(),
+            expect_id: "i".into(),
+            expect_q: Some("q".into()),
+        });
+        c.verified = Some(Verified::default());
+        let wrote = serde_json::to_value(&c).unwrap();
+        let props = |v: &serde_json::Value| -> Vec<String> {
+            v["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect()
+        };
+        let check_props = props(&schema["$defs"]["check"]);
+        for k in wrote.as_object().unwrap().keys() {
+            assert!(
+                check_props.contains(k),
+                "`{k}` is written but not in the schema"
+            );
+        }
+        let results = &schema["$defs"]["check"]["properties"]["results"];
+        for k in wrote["results"].as_object().unwrap().keys() {
+            assert!(props(results).contains(k), "results.{k}");
+        }
+        for k in wrote["results"]["how"].as_object().unwrap().keys() {
+            assert!(
+                props(&results["properties"]["how"]).contains(k),
+                "results.how.{k}"
+            );
+        }
+    }
+}

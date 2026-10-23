@@ -1465,6 +1465,12 @@ fn check_decision_json(d: &crate::repo_checks::CheckDecision) -> serde_json::Val
         })).collect::<Vec<_>>(),
         "flaky": d.flaky,
         "reason": d.reason,
+        // DES-BUILD-GUIDE (additive): the base's build guide for this check.
+        "guide": d.guide.as_ref().map(|g| serde_json::json!({
+            "present": g.present,
+            "usable": g.usable,
+            "reason": g.reason,
+        })),
     })
 }
 

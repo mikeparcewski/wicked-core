@@ -89,9 +89,9 @@ pub fn boot_seeded_rule_ids() -> anyhow::Result<std::collections::BTreeSet<Strin
         .map(|r| r.id)
         .collect())
 }
-mod floor_affected;
+pub mod floor_guide;
 mod floor_log;
-mod floor_runner;
+pub mod floor_probe;
 mod mcp_isolation;
 mod memory;
 mod operator_config_fence;

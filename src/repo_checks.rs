@@ -239,10 +239,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use wicked_apps_core::spawn::HardenedCommand;
 
-use crate::floor_runner::{
-    alone_argv, alone_failed, cargo_config_bends_test_args, cargo_toc_targets, deselect_argv,
-    deselectable, failing_names, parse_toc, pytest_prefix_collision, runner_of, toc_argv, Runner,
-};
+use crate::floor_guide::{GuideCheck, GuideStatus, TestId};
 use crate::validator::WorkerSandbox;
 
 /// The criterion this floor asserts — phrased as the property, because it is what an operator
@@ -394,10 +391,6 @@ pub struct RepoCheck {
     /// checks do not cover runs THAT package's checks ([`subdir_packages`]).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub dir: String,
-    /// (DES-FLOOR-V2 §5) The floor DERIVED this set from the touched files ([`derive_targeted`]):
-    /// typed provenance, never read off `source` (which a subdirectory package prefixes).
-    #[serde(skip)]
-    pub derived: bool,
 }
 
 impl RepoCheck {
@@ -1291,7 +1284,6 @@ fn apply(slot: &mut Option<RepoCheck>, r: Resolved, key: &str) {
                 source: format!("{CONFIG_PATH} {key}"),
                 timeout_s: None,
                 dir: String::new(),
-                derived: false,
             })
         }
     }
@@ -1639,7 +1631,6 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
                     source: format!("{CONFIG_PATH} {key}"),
                     timeout_s: None,
                     dir: String::new(),
-                    derived: false,
                 });
             }
         }
@@ -1652,7 +1643,6 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
             source: format!("{CONFIG_PATH} e2e"),
             timeout_s: None,
             dir: String::new(),
-            derived: false,
         }),
         _ => None,
     };
@@ -1741,7 +1731,6 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
                     source,
                     timeout_s: None,
                     dir: String::new(),
-                    derived: false,
                 });
             }
             for k in wanted {
@@ -1751,7 +1740,6 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
                     source: format!("package.json scripts.{k}"),
                     timeout_s: None,
                     dir: String::new(),
-                    derived: false,
                 };
                 match k {
                     "typecheck" => typecheck = Some(check),
@@ -1780,7 +1768,6 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
             source: "Cargo.toml".into(),
             timeout_s: None,
             dir: String::new(),
-            derived: false,
         });
         // `--no-fail-fast` (core#481): cargo otherwise stops at the first failing test binary, so
         // a crate whose red test the base shares would hide every later crate from the baseline
@@ -1795,7 +1782,6 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
             source: "Cargo.toml".into(),
             timeout_s: None,
             dir: String::new(),
-            derived: false,
         });
     }
     // The repo config speaks over the manifests.
@@ -1817,7 +1803,6 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
                 source: format!("{CONFIG_PATH} test"),
                 timeout_s: None,
                 dir: String::new(),
-                derived: false,
             });
             cargo = None;
         }
@@ -1840,20 +1825,20 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
                 source: format!("{CONFIG_PATH} test_targeted"),
                 timeout_s: None,
                 dir: String::new(),
-                derived: false,
             });
             cargo = None;
         }
     }
-    // DERIVED TARGETED (core#482, DES-FLOOR-V2 §5): a repo that declares no test commands of its
-    // own gets the AFFECTED set derived from the touched files at the CREATOR stage only — the
-    // verify floor, the last local gate, keeps the full suite (round 11: the affected set cannot
-    // prove a package owns a file, e.g. another package's `include_str!` of it).
+    // DERIVED TARGETED (core#482): a repo that declares no test commands of its own gets a
+    // change-scoped set derived from the touched files at the CREATOR stage — the verify floor
+    // keeps the full suite, so an unconfigured repo pays for one full run, not three.
     if ctx.stage == FloorStage::Creator
         && matches!(r_targeted, Resolved::Default)
         && matches!(r_test, Resolved::Default)
         && ctx.base_head.is_some()
         && ctx.git_dir.is_some()
+        // (DES-BUILD-GUIDE) A base with a build guide narrows only through its `affected` piece.
+        && !base_has_guide(worktree, ctx)
     {
         if let Some(derived) = derive_targeted(worktree, ctx, &test, &cargo, &node_test_script)? {
             test = Some(derived);
@@ -1877,6 +1862,16 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
     Ok(out)
 }
 
+/// Does the run base carry a build guide ([`crate::floor_guide::GUIDE_PATH`])?
+fn base_has_guide(worktree: &Path, ctx: &FloorContext) -> bool {
+    let (Some(base), Some(git_dir)) = (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) else {
+        return false;
+    };
+    let root = package_root(worktree, ctx).map_or(worktree.to_path_buf(), |(r, _)| r);
+    let spec = format!("{base}:{}", crate::floor_guide::GUIDE_PATH);
+    crate::worktree_guard::git(&root, &["cat-file", "-e", &spec], &[("GIT_DIR", git_dir)]).is_ok()
+}
+
 /// The derived source string on a [`derive_targeted`] check.
 pub const DERIVED_TARGETED_SOURCE: &str =
     "derived from the touched files (no `.wicked/checks.json` \
@@ -1884,9 +1879,11 @@ pub const DERIVED_TARGETED_SOURCE: &str =
 
 /// (core#482) The change-scoped test command for a repo that configures none, derived from the
 /// touched files, or `None` to keep the full set:
-/// * cargo — the check's own `cargo test`, its `-p` packages named from cargo metadata when the
-///   floor runs ([`crate::floor_affected`], DES-FLOOR-V2 §5), which runs the full suite whenever
-///   they cannot be named;
+/// * cargo — `cargo test … -p <crate>` for each package owning a touched file (the nearest
+///   `Cargo.toml` with a `[package]` name); a touched `Cargo.lock`, `.cargo/…`, `rust-toolchain*`
+///   or a path no package owns (a workspace manifest, a shared file, docs beside a virtual
+///   workspace) can affect every crate ⇒ full. The narrowing stops at the owning crates — their
+///   dependents are the verify floor's full suite to test;
 /// * any deleted (or renamed-away) tracked file ⇒ full: what it left behind cannot be mapped;
 /// * vitest — a `test` script that is exactly `vitest` / `vitest run` ⇒ `vitest related --run
 ///   --passWithNoTests <files>` (the touched test files and the tests importing touched modules);
@@ -1909,9 +1906,37 @@ fn derive_targeted(
     }
     let base_name = |f: &str| f.rsplit('/').next().unwrap_or(f).to_string();
     let argv = match (test, cargo) {
-        // cargo: the packages are [`crate::floor_affected::resolve_affected`]'s, from cargo
-        // metadata — it runs the full suite whenever they cannot be named.
-        (None, Some(c)) => c.argv.clone(),
+        (None, Some(c)) => {
+            let mut crates: Vec<String> = Vec::new();
+            for f in &files {
+                let name = base_name(f);
+                if name == "Cargo.lock"
+                    || f.starts_with(".cargo/")
+                    || name.starts_with("rust-toolchain")
+                {
+                    return Ok(None);
+                }
+                // A path no package owns (a workspace manifest, a shared `include!`d file, docs
+                // beside a virtual workspace) can reach any crate: never narrow past it.
+                match cargo_package_of(worktree, f)? {
+                    Some(p) => {
+                        if !crates.contains(&p) {
+                            crates.push(p);
+                        }
+                    }
+                    None => return Ok(None),
+                }
+            }
+            if crates.is_empty() {
+                return Ok(None);
+            }
+            let mut argv = c.argv.clone();
+            for p in crates {
+                argv.push("-p".into());
+                argv.push(p);
+            }
+            argv
+        }
         (Some(_), None) => {
             let Some((pm, script)) = node_test_script else {
                 return Ok(None);
@@ -1951,8 +1976,68 @@ fn derive_targeted(
         source: DERIVED_TARGETED_SOURCE.into(),
         timeout_s: None,
         dir: String::new(),
-        derived: true,
     }))
+}
+
+/// The package owning `rel`: the nearest `Cargo.toml` at or above its directory, read without
+/// following links; `None` when that manifest declares no `[package]` (a virtual workspace root)
+/// or there is none.
+fn cargo_package_of(worktree: &Path, rel: &str) -> Result<Option<String>, String> {
+    let mut dir: Option<&str> = Some(rel.rsplit_once('/').map(|(d, _)| d).unwrap_or(""));
+    while let Some(d) = dir {
+        let manifest = if d.is_empty() {
+            "Cargo.toml".to_string()
+        } else {
+            format!("{d}/Cargo.toml")
+        };
+        if let Some(probed) = probe(worktree, &manifest)? {
+            let is_file = probed.is_file();
+            let Some(mut file) = probed.file.filter(|_| is_file) else {
+                return Err(format!("`{manifest}` is not a regular file"));
+            };
+            let mut raw = String::new();
+            file.read_to_string(&mut raw)
+                .map_err(|e| format!("`{manifest}` could not be read: {e}"))?;
+            return Ok(cargo_package_name(&raw));
+        }
+        dir = if d.is_empty() {
+            None
+        } else {
+            Some(d.rsplit_once('/').map(|(p, _)| p).unwrap_or(""))
+        };
+    }
+    Ok(None)
+}
+
+/// `[package] name = "…"` off a manifest — a line scan, enough for the one key; a name that is not
+/// a plain crate name is refused (it becomes an argv element).
+fn cargo_package_name(raw: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in raw.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            in_package = l == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some(rest) = l.strip_prefix("name") else {
+            continue;
+        };
+        let Some(v) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let v = v.split('#').next().unwrap_or("").trim().trim_matches('"');
+        if !v.is_empty()
+            && v.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Some(v.to_string());
+        }
+        return None;
+    }
+    None
 }
 
 /// Why the worktree's `node_modules/` does NOT provision the checks, or `None` when it does.
@@ -2336,6 +2421,11 @@ impl CheckScratch {
     }
 
     /// The scratch's leaf directory — the boundary's third write root.
+    /// The checks' private `TMPDIR`.
+    pub(crate) fn tmp_path(&self) -> &Path {
+        self.tmp.path()
+    }
+
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
@@ -2902,6 +2992,14 @@ pub fn run_floor_rerun(
 /// launcher on `PATH` whose probe failed here (bwrap with user namespaces disabled) is no boundary,
 /// so the detection is downgraded and the operator's unsandboxed opt-in applies — exactly what
 /// `hostBoundary().verifyFloor` predicts — instead of bwrap failing every check at run time.
+/// The floor's own sandbox over `write_roots`, armed only when this host's floor probe passes.
+pub(crate) fn floor_sandbox(write_roots: &[PathBuf]) -> WorkerSandbox {
+    arm_probed(
+        crate::validator::detect_floor_sandbox(write_roots),
+        floor_probe(),
+    )
+}
+
 fn arm_probed(
     sandbox: WorkerSandbox,
     probe: Result<&'static str, crate::worker_sandbox::FloorUnarmed>,
@@ -3165,7 +3263,7 @@ pub(crate) fn run_with_sandbox_ctx(
         },
         None => (detected, Vec::new()),
     };
-    let mut detected = detected;
+    let detected = detected;
     // (F-RC2-009) Never run a HEAD process beside a copy of the base — a crash mid-floor could
     // have left one; the export lives only between its creation and the caching of its result.
     // (core#1050) A base export that cannot be cleared (a linked or non-directory `tmp`, a link
@@ -3174,9 +3272,15 @@ pub(crate) fn run_with_sandbox_ctx(
     let mut scratch_error = remove_base_export(worktree, &scratch)
         .err()
         .map(|e| format!("the checks' scratch could not be made safe: {e}"));
-    if scratch_error.is_none() {
-        crate::floor_affected::resolve_affected(worktree, ctx, &mut detected, &sandbox, &scratch);
-    }
+    // (DES-BUILD-GUIDE) The BASE tree's build guide — a head edit to it never applies to its own
+    // run — and the files the change touched (for `invalidatedBy` and `affected`).
+    let (guide, touched) = match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
+        (Some(base), Some(git_dir)) => (
+            crate::floor_guide::load_base(worktree, git_dir, base),
+            touched_files(worktree, ctx).unwrap_or_default(),
+        ),
+        _ => (Ok(None), Vec::new()),
+    };
     let candidates = engine_generated_candidates(worktree, &detected);
     let env = scratch.env_record(&sandbox_level);
     // (core#817) Per package: a subdirectory package's own `baseline_diff: false` holds for it.
@@ -3192,7 +3296,35 @@ pub(crate) fn run_with_sandbox_ctx(
             skipped.push(check.name.clone());
             continue;
         }
-        let mut run = run_one(worktree, check, &sandbox, &scratch, Tree::Head);
+        let gcheck = guide_for(&guide, check, ctx, worktree, &touched);
+        let status = GuideStatus {
+            present: matches!(&guide, Ok(Some(g)) if g.check_for(&check.argv, &check.dir).is_some()),
+            usable: gcheck.is_ok(),
+            reason: gcheck.as_ref().err().cloned(),
+        };
+        // (DES-BUILD-GUIDE) At the creator, a usable guide's `affected` piece is a fast pre-pass:
+        // its pass decides; its failure runs the check as declared.
+        let affected = gcheck
+            .as_ref()
+            .ok()
+            .filter(|_| ctx.stage == FloorStage::Creator && !touched.is_empty())
+            .and_then(|g| g.affected_argv(&package_relative(touched.clone(), &check.dir)));
+        let mut run = match affected {
+            Some(argv) => {
+                let a = RepoCheck {
+                    argv,
+                    source: format!("`{}`'s affected set (DES-BUILD-GUIDE)", check.name),
+                    ..check.clone()
+                };
+                let r = run_one(worktree, &a, &sandbox, &scratch, Tree::Head);
+                if r.passed() {
+                    r
+                } else {
+                    run_one(worktree, check, &sandbox, &scratch, Tree::Head)
+                }
+            }
+            None => run_one(worktree, check, &sandbox, &scratch, Tree::Head),
+        };
         // (DES-FLOOR-V2) A check that passed, timed out or could not start decides alone. A
         // FAILURE is compared with the run base (the install and the formatter never are: they
         // say nothing about the base, and a formatting diff is deterministic, core#551); the
@@ -3224,7 +3356,13 @@ pub(crate) fn run_with_sandbox_ctx(
                         Some(cached) => cached,
                         None => {
                             let side = match BaseTree::export(worktree, &scratch, git_dir, head) {
-                                Ok(t) => t.run_check(check, ctx, &sandbox, &scratch),
+                                Ok(t) => t.run_check(
+                                    check,
+                                    ctx,
+                                    &sandbox,
+                                    &scratch,
+                                    gcheck.as_ref().ok().copied(),
+                                ),
                                 Err(e) => BaseSide {
                                     base: BaseRun {
                                         head: head.to_string(),
@@ -3254,8 +3392,11 @@ pub(crate) fn run_with_sandbox_ctx(
                     ..run.decision.take().expect("set above")
                 });
             } else {
-                decide(worktree, check, &mut run, side, &sandbox, &scratch);
+                decide(worktree, check, &mut run, side, &gcheck, &sandbox, &scratch);
             }
+        }
+        if let Some(d) = run.decision.as_mut() {
+            d.guide = Some(status);
         }
         eprintln!(
             "wicked-core: repo checks floor — `{}` {} in {:.1}s (bound {}s){}",
@@ -4066,6 +4207,7 @@ impl BaseTree {
         ctx: &FloorContext,
         sandbox: &WorkerSandbox,
         scratch: &CheckScratch,
+        guide: Option<&GuideCheck>,
     ) -> BaseSide {
         let cache = Self::cache_path(scratch, &self.head, check);
         let fail = |e: String| BaseSide {
@@ -4089,20 +4231,13 @@ impl BaseTree {
             Ok(d) => d,
             Err(e) => return fail(format!("the base's checks could not be determined: {e}")),
         };
-        // A derived set stands for the base's own test check (the export has no base of its own,
-        // so it detects `test` / `cargo-test`); a configured `test_targeted` anchored on the head's
-        // `{files}` is not re-derivable there, and runs verbatim.
-        let declares = |c: &RepoCheck| {
-            c.name == check.name
-                || (check.derived && matches!(c.name.as_str(), "test" | "cargo-test"))
-        };
-        if !(check.name == "test_targeted" && !check.derived) && !detected.iter().any(declares) {
+        if check.name != "test_targeted" && !detected.iter().any(|c| c.name == check.name) {
             return fail(format!(
                 "the run base declares no `{}` check (the change introduced it)",
                 check.name
             ));
         }
-        let mut target = check.clone();
+        let target = check.clone();
         if let Some(install) = detected.iter().find(|c| c.name == "install") {
             let install = RepoCheck {
                 dir: check.dir.clone(),
@@ -4116,94 +4251,74 @@ impl BaseTree {
                 ));
             }
         }
-        // (agy r6) A derived cargo set names the HEAD's packages; the base runs only those it has.
-        // An all-new set is a check the base does not declare: a new failure, never escalated.
-        // (agy r6, codex r7, agy r8) A derived cargo set that NAMES packages (pytest's `-p` is a
-        // plugin; the full-suite fallback names none) runs on the base over those the base has.
-        if check.derived
-            && runner_of(&check.argv) == Some(Runner::Cargo)
-            && check.argv.iter().any(|a| a == "-p")
+        // (DES-BUILD-GUIDE) With a usable guide, the base runs with its results on (`how`); a
+        // red base is listed by the guide's `list`, its results nominate the failing ids the list
+        // holds, and each is confirmed by its EXIT CODE run alone (`failedExit`). A misread result
+        // can then only narrow what is excluded.
+        let mut run = run_one_with(
+            &self.dir,
+            &RepoCheck {
+                argv: guide.map_or_else(|| target.argv.clone(), |g| g.for_results(&target.argv)),
+                ..target.clone()
+            },
+            &guide
+                .map(|g| exec_of(g, g.results.how.merge))
+                .unwrap_or_default(),
+            sandbox,
+            scratch,
+            Tree::Base,
+        );
+        let mut toc = None;
+        if let Some(g) =
+            guide.filter(|_| !run.passed() && !run.timed_out && run.spawn_error.is_none())
         {
-            let has = crate::floor_affected::workspace_members(
-                &self.dir,
-                check,
-                sandbox,
-                scratch,
-                Tree::Base,
-            );
-            let has: Vec<String> = match has {
-                Ok(m) => m.into_iter().map(|m| m.name).collect(),
-                Err(e) => return fail(format!("the base's packages could not be listed: {e}")),
-            };
-            match crate::floor_affected::on_base(&check.argv, &has) {
-                Ok(argv) => target.argv = argv,
-                Err(new) => {
-                    return fail(format!(
-                        "the run base declares no `{}` check over `{}` (the change introduced it)",
-                        check.name,
-                        new.join("`, `")
-                    ))
+            let mut t = inventory(&self.dir, &target, g, &[], sandbox, scratch, Tree::Base);
+            if t.incomplete.is_none() {
+                match results_of(&self.dir, &target, g, &mut run, scratch) {
+                    Ok((_, failed)) => {
+                        t.failing = failed.into_iter().filter(|x| t.count(x) > 0).collect()
+                    }
+                    Err(e) => t.incomplete = Some(format!("the base's results: {e}")),
                 }
             }
-        }
-        let run = run_one(&self.dir, &target, sandbox, scratch, Tree::Base);
-        // A red base is inventoried on the same export, by its own runner (its TOC).
-        let mut toc = (!run.passed() && !run.timed_out && run.spawn_error.is_none())
-            .then(|| runner_of(&target.argv))
-            .flatten()
-            .map(|runner| inventory(&self.dir, &target, runner, sandbox, scratch, Tree::Base));
-        // Each failure the base's output names is only a CANDIDATE until the base's EXIT CODE
-        // confirms it: run alone on this export (cargo `-- <name> --exact`, pytest `<nodeid>`), it
-        // must fail. A captured child run's line, a test a crashed binary never reached, a child
-        // pytest summary left open — none can then be excluded: a misread base only NARROWS.
-        let runner = runner_of(&target.argv);
-        if let (Some(t), Some(runner)) = (toc.as_mut().filter(|t| t.incomplete.is_none()), runner) {
-            // The base's own summary is on its STDOUT, read verified: a stream cut at the
-            // cap, or one the store cannot return, may have lost a failure line.
-            let text = run
-                .logs
-                .first()
-                .filter(|l| !l.truncated)
-                .ok_or_else(|| "it was cut at the log cap".to_string())
-                .and_then(|l| crate::floor_log::read_blob(&scratch.logs, l));
-            match text {
-                Ok(b) => {
-                    t.failing = failing_names(runner, &String::from_utf8_lossy(&b))
-                        .into_iter()
-                        .filter(|n| t.count(n) > 0)
-                        .collect()
-                }
-                Err(e) => t.incomplete = Some(format!("the base's output: {e}")),
-            }
-            let candidates: Vec<String> = t
+            let candidates: Vec<TestId> = t
                 .failing
                 .iter()
-                .filter(|n| t.count(n) == 1)
-                .filter(|n| runner != Runner::Cargo || !n.contains(char::is_whitespace))
+                .filter(|x| t.count(x) == 1)
                 .cloned()
                 .collect();
             if t.incomplete.is_none() && candidates.len() <= MAX_ALONE_CONFIRMATIONS {
                 for n in candidates {
                     let one = RepoCheck {
-                        argv: alone_argv(runner, &target.argv, &n, &self.dir.join(&check.dir)),
-                        source: format!("`{n}` alone on the base (DES-FLOOR-V2)"),
+                        argv: g.alone_argv(&n),
+                        source: format!("`{}` alone on the base (DES-BUILD-GUIDE)", n.id),
                         ..target.clone()
                     };
-                    let r = run_one(&self.dir, &one, sandbox, scratch, Tree::Base);
+                    let r = run_one_with(
+                        &self.dir,
+                        &one,
+                        &exec_of(g, false),
+                        sandbox,
+                        scratch,
+                        Tree::Base,
+                    );
                     t.logs.extend(relabel(r.logs.clone(), "alone-base"));
                     // (agy r6) One that did not finish or start confirms nothing: the
                     // inventory is incomplete (escalates) and not cached.
                     if r.timed_out || r.spawn_error.is_some() {
                         t.incomplete = Some(format!(
-                            "`{n}` run alone on the base did not finish ({})",
+                            "`{}` run alone on the base did not finish ({})",
+                            n.id,
                             r.summary()
                         ));
                         t.transient = true;
                         break;
                     }
-                    t.alone.push((n, alone_failed(runner, r.exit_code)));
+                    let failed = r.exit_code.is_some_and(|c| g.failed_exit.contains(&c));
+                    t.alone.push((n, failed));
                 }
             }
+            toc = Some(t);
         }
         let rec = BaseRecord {
             floor_policy: FLOOR_POLICY_VERSION,
@@ -4278,6 +4393,9 @@ pub struct CheckDecision {
     /// Why, in words: what was excluded, why the base red could not be separated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// (DES-BUILD-GUIDE) The base's build guide for this check: present, usable, and why not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide: Option<GuideStatus>,
 }
 
 /// The check exited 0 (on its first run, or on its identical retry — `flaky`).
@@ -4301,7 +4419,7 @@ pub const OUTCOME_COULD_NOT_RUN: &str = "could_not_run";
 pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
 /// The versioned base-cache record (core#1060 r9 keyed the cache by sandbox policy; v4 adds the
 /// base inventory): a record of any other version, or a bare `CheckRun`, is a miss.
-const FLOOR_POLICY_VERSION: u32 = 10;
+const FLOOR_POLICY_VERSION: u32 = 11;
 /// The most base failures the floor confirms one by one (each run alone on the base); more than
 /// this escalates rather than paying for them.
 const MAX_ALONE_CONFIRMATIONS: usize = 16;
@@ -4316,109 +4434,192 @@ pub const RETRY_WAIT_ENV: &str = "WICKED_REPO_CHECKS_RETRY_WAIT_S";
 #[cfg_attr(test, allow(dead_code))]
 pub const MAX_RETRY_WAIT_S: u64 = 600;
 
-/// The inventory of `check` on one tree, from the runner itself (never from a test's output).
+/// The inventory of `check` on one tree, from the guide's `list` piece (never from a test's
+/// output): every id it lists, with its qualifier.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct Toc {
-    names: Vec<String>,
-    /// Why the inventory is not complete (non-zero exit, unreadable line, truncated stream);
-    /// `None` when every line was the runner's own.
+pub(crate) struct Toc {
+    pub(crate) ids: Vec<TestId>,
+    /// Why the inventory is not complete (non-zero exit, unreadable, truncated, empty); `None`
+    /// when the list ran clean.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    incomplete: Option<String>,
+    pub(crate) incomplete: Option<String>,
     #[serde(default)]
     logs: Vec<crate::floor_log::LogRef>,
-    /// The base's failing names (read once, from its own verified stdout) that its inventory lists:
-    /// CANDIDATES only, until [`Toc::alone`] confirms them.
+    /// The base's failing ids its results name that its list holds: CANDIDATES only, until
+    /// [`Toc::alone`] confirms them.
     #[serde(default)]
-    failing: Vec<String>,
-    /// Each candidate run ALONE on the base: `(name, it failed)` — the exit code, not the output,
-    /// says whether the name is a base failure.
+    failing: Vec<TestId>,
+    /// Each candidate run ALONE on the base: `(id, it failed)` — by exit code (`failedExit`).
     #[serde(default)]
-    alone: Vec<(String, bool)>,
-    /// (cargo) `(target, name)` for every listed test ([`cargo_toc_targets`]).
-    #[serde(default)]
-    targets: Vec<(String, String)>,
+    alone: Vec<(TestId, bool)>,
     /// The inventory or an alone run did not finish or could not start: never cached.
     #[serde(skip)]
     transient: bool,
 }
 
 impl Toc {
-    fn count(&self, name: &str) -> usize {
-        self.names.iter().filter(|n| *n == name).count()
+    fn count(&self, t: &TestId) -> usize {
+        self.ids.iter().filter(|i| *i == t).count()
     }
 
-    /// The one target that lists `name`, when exactly one does.
-    fn target(&self, name: &str) -> Option<&str> {
-        let mut hits = self.targets.iter().filter(|(_, n)| n == name);
-        match (hits.next(), hits.next()) {
-            (Some((t, _)), None) => Some(t.as_str()),
-            _ => None,
-        }
+    /// The qualifiers `id` is listed under.
+    fn qs(&self, id: &str) -> Vec<&str> {
+        self.ids
+            .iter()
+            .filter(|i| i.id == id)
+            .map(|i| i.q.as_str())
+            .collect()
     }
 }
 
-/// Run `check`'s inventory on `dir` (a tree), labelled `attempt`.
-fn inventory(
+/// The run options a guide asks for: its `how.env`, and stderr merged into stdout when `merge`.
+pub(crate) fn exec_of(g: &GuideCheck, merge: bool) -> ExecOpts {
+    ExecOpts {
+        env: g
+            .results
+            .how
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        merge,
+    }
+}
+
+/// Run the guide's `list` for `check` on one tree (with `ids` deselected, when given) and read
+/// its ids.
+pub(crate) fn inventory(
     dir: &Path,
     check: &RepoCheck,
-    runner: Runner,
+    g: &GuideCheck,
+    ids: &[TestId],
     sandbox: &WorkerSandbox,
     scratch: &CheckScratch,
     tree: Tree,
 ) -> Toc {
+    let (c, list) = match (g.compile(), g.list.as_ref()) {
+        (Ok(c), Some(l)) => (c, l),
+        (Err(e), _) => {
+            return Toc {
+                incomplete: Some(e),
+                ..Toc::default()
+            }
+        }
+        (Ok(_), None) => unreachable!("compile requires a list"),
+    };
     let probe = RepoCheck {
-        argv: toc_argv(runner, &check.argv, &dir.join(&check.dir)),
-        source: format!("the inventory of `{}` (DES-FLOOR-V2)", check.name),
+        argv: if ids.is_empty() {
+            list.run.clone()
+        } else {
+            g.deselected(&list.run, ids)
+        },
+        source: format!("the list of `{}` (DES-BUILD-GUIDE)", check.name),
         ..check.clone()
     };
-    let r = run_one(dir, &probe, sandbox, scratch, tree);
-    let attempt = match tree {
-        Tree::Head => "toc-head",
-        Tree::Base => "toc-base",
+    let r = run_one_with(dir, &probe, &exec_of(g, list.merge), sandbox, scratch, tree);
+    let attempt = match (tree, ids.is_empty()) {
+        (Tree::Base, _) => "toc-base",
+        (Tree::Head, true) => "toc-head",
+        (Tree::Head, false) => "toc-excluded",
     };
     let logs = relabel(r.logs.clone(), attempt);
-    let stdout = logs
+    let text = logs
         .first()
         .ok_or_else(|| "no stored output".to_string())
-        .and_then(|l| crate::floor_log::read_blob(&scratch.logs, l));
-    let parsed = stdout
-        .as_ref()
-        .ok()
-        .and_then(|b| parse_toc(runner, &String::from_utf8_lossy(b)));
-    let targets = match (runner, &stdout) {
-        (Runner::Cargo, Ok(out)) => {
-            let err = logs
-                .get(1)
-                .map(|l| crate::floor_log::text(&scratch.logs, l))
-                .unwrap_or_default();
-            cargo_toc_targets(&String::from_utf8_lossy(out), &err)
-        }
-        _ => Some(Vec::new()),
-    };
-    let incomplete = if let Err(e) = &stdout {
-        Some(format!("its inventory could not be read back ({e})"))
+        .and_then(|l| crate::floor_log::read_blob(&scratch.logs, l))
+        .map(|b| String::from_utf8_lossy(&b).into_owned());
+    let deselecting = !ids.is_empty();
+    let ids = text.as_deref().map(|t| c.list(t)).unwrap_or_default();
+    let incomplete = if let Err(e) = &text {
+        Some(format!("its list could not be read back ({e})"))
     } else if !r.passed() {
-        Some(format!("its inventory did not exit 0 ({})", r.summary()))
+        Some(format!("its list did not exit 0 ({})", r.summary()))
     } else if logs.iter().any(|l| l.truncated) {
-        Some("its inventory was cut at the log cap".to_string())
-    } else if parsed.is_none() {
-        Some("its inventory printed lines that are not the runner's own".to_string())
-    } else if targets.is_none() {
-        Some(
-            "its inventory's lists could not be matched to cargo's own `Running` lines".to_string(),
-        )
+        Some("its list was cut at the log cap".to_string())
+    } else if ids.is_empty() && !deselecting {
+        Some("its list names no test".to_string())
     } else {
         None
     };
     Toc {
-        names: parsed.unwrap_or_default(),
+        ids,
         incomplete,
         logs,
         failing: Vec::new(),
         alone: Vec::new(),
-        targets: targets.unwrap_or_default(),
         transient: r.timed_out || r.spawn_error.is_some(),
     }
+}
+
+/// A results run's ids per the guide: every testcase (junit; text names failures only) and the
+/// failing ones. The results file (`how.path`, relative to the check's directory) is stored in
+/// the log store beside the run's streams.
+pub(crate) fn results_of(
+    dir: &Path,
+    check: &RepoCheck,
+    g: &GuideCheck,
+    run: &mut CheckRun,
+    scratch: &CheckScratch,
+) -> Result<(Vec<TestId>, Vec<TestId>), String> {
+    let c = g.compile()?;
+    let r = match &g.results.how.path {
+        Some(path) => {
+            let f = std::fs::File::open(dir.join(&check.dir).join(path))
+                .map_err(|e| format!("`{path}` could not be opened: {e}"))?;
+            let cap =
+                crate::floor_log::capture(f, &scratch.logs, scratch.log_cap).finish(DRAIN_CAP);
+            if let Some(e) = cap.error {
+                return Err(e);
+            }
+            let r = cap.log_ref("results", "file");
+            run.logs.push(r.clone());
+            r
+        }
+        None => run
+            .logs
+            .first()
+            .cloned()
+            .ok_or_else(|| "the run has no stored output".to_string())?,
+    };
+    if r.truncated {
+        return Err("they were cut at the log cap".into());
+    }
+    let text =
+        String::from_utf8_lossy(&crate::floor_log::read_blob(&scratch.logs, &r)?).into_owned();
+    match g.results.kind.as_str() {
+        "junit" => crate::floor_guide::junit(&text, &g.results.id, c.keyed())
+            .ok_or_else(|| "the results hold no testsuite".to_string()),
+        _ => Ok((Vec::new(), c.failures(&text, c.keyed()))),
+    }
+}
+
+/// (DES-BUILD-GUIDE) The base guide's check for `check`, when its pieces may be relied on for
+/// this head; `Err` says why not (no guide, no such check, a probe not passed, stale, invalidated).
+fn guide_for<'g>(
+    guide: &'g Result<Option<crate::floor_guide::BuildGuide>, String>,
+    check: &RepoCheck,
+    ctx: &FloorContext,
+    worktree: &Path,
+    touched: &[String],
+) -> Result<&'g GuideCheck, String> {
+    let g = match guide {
+        Err(e) => return Err(e.clone()),
+        Ok(None) => {
+            return Err(format!(
+                "the base has no `{}`",
+                crate::floor_guide::GUIDE_PATH
+            ))
+        }
+        Ok(Some(g)) => g,
+    };
+    let c = g
+        .check_for(&check.argv, &check.dir)
+        .ok_or("the base's guide has no check with this argv and cwd")?;
+    let (Some(base), Some(git_dir)) = (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) else {
+        return Err("no base to verify the guide against".into());
+    };
+    c.usable(g, worktree, git_dir, base, touched)?;
+    Ok(c)
 }
 
 fn relabel(
@@ -4502,6 +4703,7 @@ fn decide(
     check: &RepoCheck,
     head: &mut CheckRun,
     side: Option<BaseSide>,
+    guide: &Result<&GuideCheck, String>,
     sandbox: &WorkerSandbox,
     scratch: &CheckScratch,
 ) {
@@ -4515,6 +4717,7 @@ fn decide(
         log_refs: Vec::new(),
         flaky: false,
         reason: None,
+        guide: None,
     };
     let base_run = side.as_ref().and_then(|s| s.base.run.as_ref());
     if let Some(b) = base_run {
@@ -4522,121 +4725,106 @@ fn decide(
     }
     // The base is red and finished: separate its failures from the head's, if it can be precise.
     let red_base = base_run.filter(|b| !b.passed() && !b.timed_out && b.spawn_error.is_none());
-    let mut plan: Result<(Runner, Vec<String>), String> =
-        Err("the base passes this check".to_string());
+    let mut plan: Result<Vec<TestId>, String> = Err("the base passes this check".to_string());
     if let (Some(_), Some(side)) = (red_base, side.as_ref()) {
         plan = (|| {
-            let runner = runner_of(&check.argv).ok_or_else(|| {
-                "the runner has no precise per-test deselect the floor knows (only cargo test and \
-                 pytest)"
-                    .to_string()
-            })?;
+            let g = guide
+                .as_ref()
+                .map_err(|e| format!("no usable build guide: {e}"))?;
             let toc = side
                 .toc
                 .as_ref()
-                .ok_or_else(|| "the base's inventory was not taken".to_string())?;
+                .ok_or_else(|| "the base's list was not taken".to_string())?;
             logs.extend(toc.logs.iter().cloned());
             if let Some(why) = &toc.incomplete {
                 return Err(format!("the base: {why}"));
             }
             let failing = toc.failing.clone();
-            decision.base_failing = failing.clone();
+            decision.base_failing = failing.iter().map(|t| t.id.clone()).collect();
             if failing.is_empty() {
-                return Err(
-                    "no failing test of the base appears in the base's own inventory".to_string(),
-                );
+                return Err("no failing test of the base appears in the base's own list".into());
             }
-            if !deselectable(runner, &check.argv) {
+            if let Some(t) = failing.iter().find(|t| toc.count(t) != 1) {
                 return Err(format!(
-                    "the check's argv is not on the deselection allowlist ({})",
-                    check.argv.join(" ")
+                    "`{}` names {} tests in the base's list",
+                    t.id,
+                    toc.count(t)
                 ));
             }
-            // cargo hands rustdoc each test argument through `--test-args`, which rustdoc SPLITS on
-            // whitespace: a doctest name (`src/lib.rs - f (line 1)`) would become positional
-            // filters that, under `--exact`, select no doctest at all.
-            if runner == Runner::Cargo {
-                if let Some(n) = failing.iter().find(|n| n.contains(char::is_whitespace)) {
-                    return Err(format!(
-                        "`{n}` has whitespace, which rustdoc splits out of a test argument"
-                    ));
-                }
-            }
-            if let Some(n) = failing.iter().find(|n| toc.count(n) != 1) {
-                return Err(format!(
-                    "`{n}` names {} tests in the base's inventory",
-                    toc.count(n)
-                ));
-            }
-            for n in &failing {
-                match toc.alone.iter().find(|(a, _)| a == n) {
+            for t in &failing {
+                match toc.alone.iter().find(|(a, _)| a == t) {
                     Some((_, true)) => {}
                     Some(_) => {
-                        return Err(format!("`{n}` does not fail when the base runs it alone"))
+                        return Err(format!(
+                            "`{}` does not fail when the base runs it alone",
+                            t.id
+                        ))
                     }
                     None => {
                         return Err(format!(
-                            "`{n}` was not confirmed on the base (more than \
-                             {MAX_ALONE_CONFIRMATIONS} failures, or a cargo name with whitespace)"
+                            "`{}` was not confirmed on the base (more than \
+                             {MAX_ALONE_CONFIRMATIONS} failures)",
+                            t.id
                         ))
                     }
                 }
             }
-            let head_toc = inventory(worktree, check, runner, sandbox, scratch, Tree::Head);
+            let head_toc = inventory(worktree, check, g, &[], sandbox, scratch, Tree::Head);
             logs.extend(head_toc.logs.iter().cloned());
             if let Some(why) = &head_toc.incomplete {
                 return Err(format!("the head: {why}"));
             }
-            if let Some(n) = failing.iter().find(|n| head_toc.count(n) > 1) {
-                return Err(format!(
-                    "`{n}` names {} tests in the head's inventory",
-                    head_toc.count(n)
-                ));
-            }
-            if runner == Runner::Cargo {
-                if let Some(why) = cargo_config_bends_test_args(
-                    &worktree.join(&check.dir),
-                    &scratch.root.join("cargo-home"),
-                ) {
-                    return Err(why);
-                }
-            }
-            // (codex r5) A name is the same TEST on both trees only in the same target: a base
-            // failure renamed away, and a new failing test of that name in another target, must
-            // not be skipped.
-            if runner == Runner::Cargo {
-                if let Some(n) = failing.iter().find(|n| {
-                    head_toc.count(n) == 1
-                        && toc.target(n).is_none_or(|t| head_toc.target(n) != Some(t))
-                }) {
+            for t in &failing {
+                if head_toc.count(t) > 1 {
                     return Err(format!(
-                        "`{n}` is not in the same test target on the base and the head"
+                        "`{}` names {} tests in the head's list",
+                        t.id,
+                        head_toc.count(t)
+                    ));
+                }
+                if head_toc.qs(&t.id).iter().any(|q| *q != t.q) {
+                    return Err(format!(
+                        "`{}` is not under the same qualifier on the base and the head",
+                        t.id
                     ));
                 }
             }
-            if runner == Runner::Pytest {
-                if let Some(n) = pytest_prefix_collision(&failing, &head_toc.names) {
-                    return Err(format!(
-                        "`--deselect={n}` would also remove another head test (pytest matches \
-                         node-id prefixes)"
-                    ));
+            let names: Vec<TestId> = failing
+                .into_iter()
+                .filter(|t| head_toc.count(t) == 1)
+                .collect();
+            // Precision, by the runner's own selection: the head's list with them deselected
+            // lists exactly the rest of the head's tests.
+            if !names.is_empty() {
+                let rest = inventory(worktree, check, g, &names, sandbox, scratch, Tree::Head);
+                logs.extend(rest.logs.iter().cloned());
+                let mut want: Vec<TestId> = head_toc
+                    .ids
+                    .iter()
+                    .filter(|i| !names.contains(i))
+                    .cloned()
+                    .collect();
+                let mut got = rest.ids.clone();
+                want.sort();
+                got.sort();
+                if rest.incomplete.is_some() || got != want {
+                    return Err(
+                        "deselecting the base's failures does not list exactly the rest of the \
+                         head's tests"
+                            .into(),
+                    );
                 }
             }
-            Ok((
-                runner,
-                failing
-                    .into_iter()
-                    .filter(|n| head_toc.count(n) == 1)
-                    .collect(),
-            ))
+            Ok(names)
         })();
     }
     // The deciding run: the excluded head run when exclusion is precise and has something to
     // deselect, else the unchanged head run itself.
     let (deciding_check, mut deciding, excluded_run) = match &plan {
-        Ok((runner, names)) if !names.is_empty() => {
+        Ok(names) if !names.is_empty() => {
+            let g = guide.as_ref().expect("a precise plan has a guide");
             let one = RepoCheck {
-                argv: deselect_argv(*runner, &check.argv, names, &worktree.join(&check.dir)),
+                argv: g.deselected(&check.argv, names),
                 source: format!(
                     "`{}` with the base's {} failing test{} deselected (DES-FLOOR-V2)",
                     check.name,
@@ -4645,9 +4833,16 @@ fn decide(
                 ),
                 ..check.clone()
             };
-            let mut e = run_one(worktree, &one, sandbox, scratch, Tree::Head);
+            let mut e = run_one_with(
+                worktree,
+                &one,
+                &exec_of(g, false),
+                sandbox,
+                scratch,
+                Tree::Head,
+            );
             e.logs = relabel(e.logs, "excluded");
-            decision.excluded = names.clone();
+            decision.excluded = names.iter().map(|t| t.id.clone()).collect();
             (one, e.clone(), true)
         }
         _ => (check.clone(), head.clone(), false),
@@ -4658,20 +4853,9 @@ fn decide(
     }
     let unseparated = red_base.is_some() && plan.is_err();
     // Failing twice is `flaky_twice` only when BOTH attempts ran oversubscribed: a retry that had
-    // its headroom and failed again reproduced the failure without the load — a new failure. An
-    // excluded run is retried only while no cargo config bends its `--exact` (a test of the first
-    // attempt may have written one into the scratch CARGO_HOME).
+    // its headroom and failed again reproduced the failure without the load — a new failure.
     let mut twice = false;
-    let retry_safe = !excluded_run
-        || runner_of(&check.argv) != Some(Runner::Cargo)
-        || cargo_config_bends_test_args(
-            &worktree.join(&check.dir),
-            &scratch.root.join("cargo-home"),
-        )
-        .is_none();
-    let retry = retry_safe
-        .then(|| retry_if_loaded(worktree, &deciding_check, &deciding, sandbox, scratch))
-        .flatten();
+    let retry = retry_if_loaded(worktree, &deciding_check, &deciding, sandbox, scratch);
     if let Some(r) = retry {
         logs.extend(r.logs.iter().cloned());
         head.reruns.push(r.clone());
@@ -4681,17 +4865,7 @@ fn decide(
     }
     // Head ids are an ANNOTATION: listed beside the outcome, never deciding it (the deciding
     // run's, when it was the excluded one).
-    let annotated: Vec<String> = deciding
-        .failure_ids
-        .iter()
-        .filter(|id| {
-            !decision
-                .excluded
-                .iter()
-                .any(|n| id_name(id) == Some(n.as_str()))
-        })
-        .cloned()
-        .collect();
+    let annotated: Vec<String> = deciding.failure_ids.clone();
     let base_passed = base_run.is_some_and(CheckRun::passed);
     // A base that could not be established — it timed out, could not start, or could not be
     // exported or provisioned — separates nothing: escalate. (A base that declares no such check,
@@ -4781,20 +4955,13 @@ fn decide_alone(run: &mut CheckRun) {
         log_refs: run.logs.clone(),
         flaky: false,
         reason: None,
+        guide: None,
     });
 }
 
 /// The decision's outcome of a check, when it has one.
 fn outcome_of(c: &CheckRun) -> Option<&str> {
     c.decision.as_ref().map(|d| d.outcome.as_str())
-}
-
-/// The runner-native test name an annotation id carries (`test t::a` → `t::a`, `FAILED x::y` →
-/// `x::y`, `FAIL TestA` → `TestA`).
-fn id_name(id: &str) -> Option<&str> {
-    id.strip_prefix("test ")
-        .or_else(|| id.strip_prefix("FAILED "))
-        .or_else(|| id.strip_prefix("FAIL "))
 }
 
 /// (core#553) Is the host oversubscribed — its 1-min load above its logical CPU count? The one
@@ -5130,6 +5297,33 @@ pub(crate) fn run_one(
     scratch: &CheckScratch,
     tree: Tree,
 ) -> CheckRun {
+    run_one_with(
+        worktree,
+        check,
+        &ExecOpts::default(),
+        sandbox,
+        scratch,
+        tree,
+    )
+}
+
+/// How a run the floor builds from a guide is spawned: extra environment, and stderr merged into
+/// stdout (one stream, in order).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExecOpts {
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) merge: bool,
+}
+
+/// [`run_one`] with [`ExecOpts`].
+pub(crate) fn run_one_with(
+    worktree: &Path,
+    check: &RepoCheck,
+    exec: &ExecOpts,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+    tree: Tree,
+) -> CheckRun {
     let started = Instant::now();
     let mut result = CheckRun {
         name: check.name.clone(),
@@ -5196,6 +5390,23 @@ pub(crate) fn run_one(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     scratch.apply_env(&mut cmd, tree);
+    for (k, v) in &exec.env {
+        cmd.env(k, v);
+    }
+    let merged = if exec.merge {
+        match std::io::pipe().and_then(|(r, w)| Ok((r, w.try_clone()?, w))) {
+            Ok((r, w1, w2)) => {
+                cmd.stdout(w1).stderr(w2);
+                Some(r)
+            }
+            Err(e) => {
+                result.spawn_error = Some(format!("the merged output pipe: {e}"));
+                return result;
+            }
+        }
+    } else {
+        None
+    };
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -5211,16 +5422,27 @@ pub(crate) fn run_one(
             return result;
         }
     };
+    // The parent's copies of a merged pipe's write ends close here, so EOF comes with the child's.
+    drop(cmd);
     let store = scratch.logs.as_path();
     let cap = scratch.log_cap;
-    let out_h = child
-        .stdout
-        .take()
-        .map(|r| crate::floor_log::capture(r, store, cap));
-    let err_h = child
-        .stderr
-        .take()
-        .map(|r| crate::floor_log::capture(r, store, cap));
+    let (out_h, err_h) = match merged {
+        // Merged: one stream, and an empty stderr blob beside it.
+        Some(r) => (
+            Some(crate::floor_log::capture(r, store, cap)),
+            Some(crate::floor_log::capture(std::io::empty(), store, cap)),
+        ),
+        None => (
+            child
+                .stdout
+                .take()
+                .map(|r| crate::floor_log::capture(r, store, cap)),
+            child
+                .stderr
+                .take()
+                .map(|r| crate::floor_log::capture(r, store, cap)),
+        ),
+    };
     let status = loop {
         match crate::validator::has_exited_unreaped(&mut child) {
             Ok(true) => {
@@ -5551,7 +5773,6 @@ pub(crate) mod tests {
                 source: "package-lock.json (node_modules absent)".into(),
                 timeout_s: None,
                 dir: String::new(),
-                derived: false,
             }],
             checks: vec![CheckRun {
                 name: "install".into(),
@@ -6126,7 +6347,6 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: String::new(),
-            derived: false,
         };
         if !run_one(&wt, &inside, &sandbox, &scratch, Tree::Head).passed() {
             eprintln!("repo_checks: the sandbox wrapper cannot run on this host — skipping the kernel claim");
@@ -6145,7 +6365,6 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: String::new(),
-            derived: false,
         };
         let r = run_one(&wt, &escaping, &sandbox, &scratch, Tree::Head);
         assert!(!r.passed(), "an outside write must fail the check: {r:?}");
@@ -6165,7 +6384,6 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: String::new(),
-            derived: false,
         };
         let r = run_one(&wt, &home_probe, &sandbox, &scratch, Tree::Head);
         assert!(r.passed());
@@ -6198,7 +6416,6 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: String::new(),
-            derived: false,
         };
         let r = run_one(&wt, &env_dump, &sandbox, &scratch, Tree::Head);
         std::env::remove_var(PLANTED);
@@ -6413,7 +6630,6 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: String::new(),
-            derived: false,
         };
         let dead = run_one(
             &wt,
@@ -6485,7 +6701,6 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: String::new(),
-            derived: false,
         };
         let started = Instant::now();
         let r = run_one(&wt, &holder, &sandbox, &scratch, Tree::Head);
@@ -7066,7 +7281,6 @@ pub(crate) mod tests {
                 source: "fixture".into(),
                 timeout_s: None,
                 dir: String::new(),
-                derived: false,
             },
             RepoCheck {
                 name: "test".into(),
@@ -7074,7 +7288,6 @@ pub(crate) mod tests {
                 source: "fixture".into(),
                 timeout_s: None,
                 dir: String::new(),
-                derived: false,
             },
         ];
         let mut runs = Vec::new();
@@ -7133,7 +7346,6 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: String::new(),
-            derived: false,
         };
         if crate::validator::find_on_path("sh").is_none() {
             eprintln!("repo_checks: sh not on PATH — skipping the bounded-tail check");
@@ -7327,7 +7539,6 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: Some(1),
             dir: String::new(),
-            derived: false,
         };
         let started = Instant::now();
         let r = run_one(&wt, &slow, &sandbox, &scratch, Tree::Head);
@@ -7516,7 +7727,6 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: Some(100),
             dir: String::new(),
-            derived: false,
         };
         let (bound, note) = effective_bound(&check);
         assert!(
@@ -7529,7 +7739,6 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: Some(100),
             dir: String::new(),
-            derived: false,
         };
         assert_eq!(
             install.base_timeout(),
@@ -7542,7 +7751,6 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: String::new(),
-            derived: false,
         };
         assert_eq!(default.base_timeout(), CHECK_TIMEOUT);
     }
@@ -7999,7 +8207,6 @@ pub(crate) mod tests {
             source: "fixture".into(),
             timeout_s: None,
             dir: "giphy".into(),
-            derived: false,
         };
         let r = run_one(&repo, &pwd, &sandbox, &scratch_dir, Tree::Head);
         if r.passed() {
@@ -8333,10 +8540,10 @@ pub(crate) mod tests {
         assert_eq!(load_band(Some(f64::NAN), 14), None);
     }
 
-    /// core#482: a repo with no configured test commands gets a derived change-scoped set — a
-    /// cargo set whose packages the floor names from cargo metadata when it runs
-    /// ([`crate::floor_affected`]'s tests), or `vitest related` over the touched files — and the
-    /// full set wherever the change can reach every test (a deletion, a lockfile, configs).
+    /// core#482: a repo with no configured test commands gets a derived change-scoped set at the
+    /// CREATOR floor — the crates owning the touched files, or `vitest related` over them — and
+    /// the full set wherever the change can reach every test (manifests, lockfiles, configs) and
+    /// at verify.
     #[test]
     fn an_unconfigured_repo_derives_its_targeted_set_from_the_touched_files_482() {
         let repo = scratch("derive482");
@@ -8372,11 +8579,18 @@ pub(crate) mod tests {
         let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
         assert_eq!(t.name, "test_targeted");
         assert_eq!(t.source, DERIVED_TARGETED_SOURCE);
-        assert!(t.derived);
-        assert_eq!(t.argv, s(&["cargo", "test", "--no-fail-fast"]));
-        // The verify floor, the last local gate, keeps the full suite (round 11).
+        assert_eq!(t.argv, s(&["cargo", "test", "--no-fail-fast", "-p", "b"]));
         let t = test_of(&detect_with(&repo, &ctx(FloorStage::Verify)).unwrap());
-        assert_eq!(t.name, "cargo-test", "verify runs the full suite");
+        assert_eq!(t.name, "cargo-test", "verify keeps the full suite");
+        // The workspace manifest can change every member ⇒ full.
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
+        assert_eq!(t.name, "cargo-test");
+        git(&repo, &["checkout", "-q", "--", "Cargo.toml"]);
         // A deleted file elsewhere (crate `a`) could break what it left ⇒ full.
         std::fs::remove_file(repo.join("a/src/lib.rs")).unwrap();
         let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
@@ -8385,6 +8599,12 @@ pub(crate) mod tests {
             &repo,
             &["checkout", "-q", "--", "a/src/lib.rs", "b/src/lib.rs"],
         );
+        // A path no package owns beside a crate change (a shared file any crate may
+        // `include!`) ⇒ full.
+        std::fs::write(repo.join("README.md"), "y\n").unwrap();
+        std::fs::write(repo.join("b/src/lib.rs"), "pub fn x() {}\n").unwrap();
+        let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
+        assert_eq!(t.name, "cargo-test");
         // A configured test command is the repo's own choice — never overridden.
         std::fs::write(repo.join("a/src/lib.rs"), "pub fn y() {}\n").unwrap();
         std::fs::create_dir_all(repo.join(".wicked")).unwrap();
@@ -8517,7 +8737,6 @@ pub(crate) mod tests {
                 source: String::new(),
                 timeout_s: None,
                 dir: String::new(),
-                derived: false,
             },
         );
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -8529,7 +8748,6 @@ pub(crate) mod tests {
             source: DERIVED_TARGETED_SOURCE.into(),
             timeout_s: None,
             dir: String::new(),
-            derived: false,
         };
         assert!(BaseTree::cached(&scratch_dir, head, &bare).is_none());
         let rec = BaseRecord {
@@ -8545,7 +8763,6 @@ pub(crate) mod tests {
             source: DERIVED_TARGETED_SOURCE.into(),
             timeout_s: None,
             dir: String::new(),
-            derived: false,
         };
         assert!(
             BaseTree::cached(&scratch_dir, head, &check(&["cargo", "test", "-p", "b"])).is_some()
@@ -8633,21 +8850,23 @@ pub(crate) mod tests {
             "#!/bin/sh\n\
              mode=run\n\
              prev=; name=; fail=101; case \"$0\" in *pytest) fail=1;; esac\n\
-             for a in \"$@\"; do case \"$a\" in --list|--collect-only) mode=toc;; --skip=*|--deselect=*) mode=excluded;; \
+             skip=' '\n\
+             for a in \"$@\"; do case \"$a\" in --list|--collect-only) mode=toc;; --skip=*|--deselect=*) skip=\"$skip${a#--*=} \"; [ $mode = toc ] || mode=excluded;; \
              *::*) [ $mode = run ] && mode=alone && name=$a;; \
              --exact) [ $mode = run ] && mode=alone && name=$prev;; esac; prev=$a; done\n\
              key=\"$TMPDIR/n-$(pwd | cksum | cut -d' ' -f1)-$mode\"\n\
              n=$(cat \"$key\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$key\"\n\
              code() { if [ -f \"$1\" ]; then cat \"$1\"; else echo 0; fi; }\n\
              case $mode in\n\
-               toc) cat toc.txt 2>/dev/null\n\
-                 if [ -f toc.err ]; then cat toc.err >&2; else echo '     Running unittests src/lib.rs (target/debug/deps/fake-0)' >&2; fi\n\
+               toc) if [ -f toc.err ]; then cat toc.err >&2; else echo '     Running unittests src/lib.rs (target/debug/deps/fake-0)' >&2; fi\n\
+                 while IFS= read -r l; do t=${l%: test}; case \"$skip\" in *\" $t \"*) [ \"$t\" != \"$l\" ] && continue;; esac; if [ -f skip.prefix ] && [ \"$t\" != \"$l\" ]; then p=0; for s in $skip; do case \"$t\" in \"$s\"*) p=1;; esac; done; [ $p = 1 ] && continue; fi; printf '%s\\n' \"$l\"; done < toc.txt 2>/dev/null\n\
                  exit $(code toc.exit);;\n\
                alone) grep -qx \"$name\" alone.fail 2>/dev/null && exit $fail; exit 0;;\n\
                excluded) [ -f excluded.sleep ] && sleep $(cat excluded.sleep)\n\
                  cat excluded.out 2>/dev/null; cat excluded.err >&2 2>/dev/null\n\
                  if [ -f flake.excluded ] && [ $n = 1 ]; then exit 101; fi; exit $(code excluded.exit);;\n\
-               *) cat run.out 2>/dev/null; cat run.err >&2 2>/dev/null\n\
+               *) if [ -f toc.err ]; then cat toc.err >&2; else echo '     Running unittests src/lib.rs (target/debug/deps/fake-0)' >&2; fi\n\
+                 cat run.out 2>/dev/null; cat run.err >&2 2>/dev/null\n\
                  case \"$0\" in *cargo) if [ -f run.out ] && ! grep -q '^test result:' run.out; then \
                  f=$(sed -n 's/^test \\(.*\\) \\.\\.\\. FAILED$/    \\1/p' run.out); \
                  [ -n \"$f\" ] && printf '\\nfailures:\\n%s\\n\\ntest result: FAILED.\\n' \"$f\"; fi;; esac\n\
@@ -8693,6 +8912,7 @@ pub(crate) mod tests {
             "toc.err",
             "flake",
             "flake.excluded",
+            "skip.prefix",
         ] {
             let _ = std::fs::remove_file(repo.join(f));
         }
@@ -8725,7 +8945,8 @@ pub(crate) mod tests {
                 ("alone.fail", "old\n"),
             ],
         );
-        let base = git_repo_with_commit(&repo);
+        git_repo_with_commit(&repo);
+        let base = commit_guide(&repo, &[libtest_guide(&argv)]);
         let ctx = FloorContext {
             stage: FloorStage::Verify,
             base_head: Some(base),
@@ -8733,6 +8954,73 @@ pub(crate) mod tests {
             ..FloorContext::default()
         };
         (repo, ctx, argv)
+    }
+
+    /// A build-guide check for a libtest-style runner (`cargo test` and the stand-in that mimics
+    /// it): the binaries' `Running` lines (merged from stderr) qualify ids; a failure is a name in
+    /// the final `failures:` list; one test runs alone with `<name> --exact`, and deselects with
+    /// `--skip=<name> --exact`. Test fixture data: the floor knows none of it.
+    pub(crate) fn libtest_guide(argv: &[String]) -> serde_json::Value {
+        let has_sep = argv.iter().any(|a| a == "--");
+        let tail = |extra: &[&str]| {
+            let mut v = argv.to_vec();
+            if !has_sep {
+                v.push("--".into());
+            }
+            v.extend(extra.iter().map(|s| s.to_string()));
+            v
+        };
+        let section = r"^\s+(?:Running .*\((?:.*[/\\])?|Doc-tests )(?P<q>[^/\\()\s]+)\)?$";
+        serde_json::json!({
+            "name": "test", "cwd": ".", "stage": ["creator", "verify"],
+            "run": argv, "failedExit": [101],
+            "results": {"kind": "text", "how": {"merge": true}},
+            "parser": {"section": section, "blocks": [{
+                "start": "^failures:$", "item": r"^    (?P<id>\S+)$",
+                "end": "^test result: FAILED", "use": "last-before-end"}]},
+            "list": {"run": tail(&["--list"]), "item": r"^(?P<id>\S+): test$",
+                     "section": section, "merge": true},
+            "alone": {"run": tail(&["{id}", "--exact"])},
+            "deselect": {"append": ["--", "--skip={id}", "--exact"]},
+            "invalidatedBy": [".cargo/**", "**/.cargo/**"],
+        })
+    }
+
+    /// Commit `checks` as the repo's `.wicked/build-guide.json`, each verified (every probe
+    /// `pass`) on the current HEAD — so verified on an ancestor of the new base. Returns the new
+    /// HEAD.
+    pub(crate) fn commit_guide(repo: &Path, checks: &[serde_json::Value]) -> String {
+        let head = git(repo, &["rev-parse", "HEAD"]);
+        write_guide(repo, checks, &head);
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-qm", "the build guide"]);
+        git(repo, &["rev-parse", "HEAD"])
+    }
+
+    /// Write `checks` as `repo`'s `.wicked/build-guide.json`, verified (every probe `pass`) on
+    /// `verified_on`.
+    pub(crate) fn write_guide(repo: &Path, checks: &[serde_json::Value], verified_on: &str) {
+        let head = verified_on;
+        let checks: Vec<serde_json::Value> = checks
+            .iter()
+            .cloned()
+            .map(|mut c| {
+                c["verified"] = serde_json::json!({
+                    "baseSha": head, "runnerVersion": "", "at": "",
+                    "results": {"list": "pass", "run": "pass", "alone": "pass",
+                                "deselect": "pass", "mutation": "pass"}});
+                c
+            })
+            .collect();
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        std::fs::write(
+            repo.join(crate::floor_guide::GUIDE_PATH),
+            serde_json::to_string_pretty(
+                &serde_json::json!({"version": 1, "derivedFrom": [], "checks": checks}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
     }
 
     /// The `checks[].decision` the wire carries for `c`, through the real event serializer.
@@ -8844,10 +9132,12 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
-    /// DONE WHEN 3 + the escalation class: base red, cannot separate — with the reason — for a
-    /// name not unique in the base or head inventory, a filter in the argv, a head cargo config
-    /// that sets test args, a doctest name (rustdoc splits each test-arg on whitespace), an
-    /// inventory with a line that is not the runner's, and a runner with no precise deselect.
+    /// DONE WHEN 3 + the escalation class, guide-driven: base red, cannot separate — with the
+    /// reason — for a name not unique in the base or head list, a head list that does not run
+    /// clean, an argv that is not the guide's `run`, a touched file the guide's `invalidatedBy`
+    /// names, a name the parser does not take (a doctest), a runner the guide does not describe, a
+    /// deselect that removes more than it was asked to, a truncated base log, a crashed base, and
+    /// one name under two qualifiers.
     #[cfg(unix)]
     #[test]
     fn imprecise_exclusion_escalates_as_base_red_unseparated() {
@@ -8893,16 +9183,13 @@ pub(crate) mod tests {
         let toc2 = toc_of(&["old", "old", "fine"]);
         write_tree(&repo, &argv, &head_red(&[("toc.txt", &toc2)]));
         unseparated(&repo, &ctx, "duplicate in the head inventory");
-        // (b) A head inventory with a line that is not the runner's own.
+        // (b) A head list that does not run clean.
         write_tree(
             &repo,
             &argv,
-            &head_red(&[(
-                "toc.txt",
-                "old: test\nhello world\n\n1 test, 0 benchmarks\n",
-            )]),
+            &head_red(&[("toc.txt", &toc_of(&["old", "fine"])), ("toc.exit", "1")]),
         );
-        unseparated(&repo, &ctx, "unreadable head inventory");
+        unseparated(&repo, &ctx, "a head list that exits non-zero");
         // (c) A positional filter in the argv: `--exact` would change what it selects.
         let filtered: Vec<String> = argv.iter().cloned().chain(["old".to_string()]).collect();
         write_tree(
@@ -8911,37 +9198,17 @@ pub(crate) mod tests {
             &head_red(&[("toc.txt", &toc_of(&["old", "new", "fine"]))]),
         );
         unseparated(&repo, &ctx, "a filter in the argv");
-        // (d) A head `.cargo/config.toml` that sets rustdocflags.
+        // (d) A touched file the guide's `invalidatedBy` names (a runner config that bends its
+        // selection): exclusion is off for this change.
         write_tree(
             &repo,
             &argv,
             &head_red(&[("toc.txt", &toc_of(&["old", "new", "fine"]))]),
         );
         std::fs::create_dir_all(repo.join(".cargo")).unwrap();
-        std::fs::write(
-            repo.join(".cargo/config.toml"),
-            "[build]\nrustdocflags = [\"--test-args\", \"foo\"]\n",
-        )
-        .unwrap();
-        unseparated(&repo, &ctx, "cargo config test-args");
-        // (codex r1) The same key, escaped: cargo decodes TOML, so the guard does too.
-        std::fs::write(
-            repo.join(".cargo/config.toml"),
-            "[build]\n\"rustdoc\\u0066lags\" = [\"--test\\u002dargs=foo\"]\n",
-        )
-        .unwrap();
-        unseparated(&repo, &ctx, "escaped cargo config test-args");
+        std::fs::write(repo.join(".cargo/config.toml"), "[build]\n").unwrap();
+        unseparated(&repo, &ctx, "an invalidatedBy file touched");
         std::fs::remove_dir_all(repo.join(".cargo")).unwrap();
-        // (codex r2) The scratch CARGO_HOME is writable by a test body: its config counts too.
-        let home = leaf_of(&repo).join("cargo-home");
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(
-            home.join("config.toml"),
-            "[build]\nrustdocflags = [\"--test-args=documented\"]\n",
-        )
-        .unwrap();
-        unseparated(&repo, &ctx, "a CARGO_HOME config written by a test");
-        std::fs::remove_file(home.join("config.toml")).unwrap();
         // (e) A base inventory that lists the failing name twice (a fresh base commit).
         let (repo2, ctx2, argv2) = red_base("unsep-dup");
         write_tree(
@@ -9003,38 +9270,18 @@ pub(crate) mod tests {
         };
         std::fs::write(repo4.join("README.md"), "changed\n").unwrap();
         unseparated(&repo4, &ctx4, "no precise deselect");
-        // (h, codex r1) pytest deselects by node-id PREFIX: `test_case` would take `test_case_extra`.
-        let (repo5, ctx5, _) = red_base("unsep-pytest");
-        let py = vec![fake_runner("unsep-pytest", "pytest"), "-q".to_string()];
-        let summary = "=== short test summary info ===\nFAILED tests/a.py::test_case - boom\n=== 1 failed ===\n";
-        let toc = "tests/a.py::test_case\ntests/a.py::test_case_extra\ntests/a.py::test_ok\n\n3 tests collected in 0.01s\n";
+        // (h, codex r1) A deselect that matches by PREFIX (`old` would also take `old_extra`): the
+        // head's list deselecting the base's failure lists fewer than the rest — never skipped.
+        let (repo5, ctx5, argv5) = red_base("unsep-prefix");
         write_tree(
             &repo5,
-            &py,
-            &[
-                ("run.out", summary),
-                ("run.exit", "1"),
-                ("toc.txt", toc),
-                ("alone.fail", "tests/a.py::test_case\n"),
-            ],
+            &argv5,
+            &head_red(&[
+                ("toc.txt", &toc_of(&["old", "old_extra", "fine"])),
+                ("skip.prefix", ""),
+            ]),
         );
-        git(&repo5, &["add", "-A"]);
-        git(&repo5, &["commit", "-qm", "a pytest base"]);
-        let ctx5 = FloorContext {
-            base_head: Some(git(&repo5, &["rev-parse", "HEAD"])),
-            ..ctx5
-        };
-        write_tree(
-            &repo5,
-            &py,
-            &[
-                ("run.out", summary),
-                ("run.exit", "1"),
-                ("excluded.exit", "0"),
-                ("toc.txt", toc),
-            ],
-        );
-        unseparated(&repo5, &ctx5, "a pytest prefix collision");
+        unseparated(&repo5, &ctx5, "a deselect by prefix");
         // (i, codex r1) A base whose output was cut at the log cap may have lost a witness.
         let (repo6, ctx6, argv6) = red_base("unsep-cap");
         let long = format!("test old ... FAILED\n{}", "x".repeat(4096));
@@ -9100,20 +9347,27 @@ pub(crate) mod tests {
         );
         unseparated(&repo7, &ctx7, "a base binary that stopped early");
         // (k, codex r5) The base's failing `old` (tests/a.rs) is renamed away on the head, and a
-        // NEW failing `old` appears in tests/b.rs: one name, two tests — never skipped.
+        // NEW failing `old` appears in tests/b.rs: one name, under another qualifier — never
+        // skipped.
         let (repo8, ctx8, argv8) = red_base("unsep-target");
+        let ra = "     Running tests/a.rs (target/debug/deps/a-1)\n";
+        let rb = "     Running tests/b.rs (target/debug/deps/b-2)\n";
         let two = |a: &str, b: &str| {
-            format!("{a}: test\n\n1 test, 0 benchmarks\n{b}: test\n\n1 test, 0 benchmarks\n")
+            format!(
+                "{ra}{a}: test\n\n1 test, 0 benchmarks\n{rb}{b}: test\n\n1 test, 0 benchmarks\n"
+            )
         };
-        let runs = "     Running tests/a.rs (target/debug/deps/a-1)\n     Running tests/b.rs (target/debug/deps/b-2)\n";
         write_tree(
             &repo8,
             &argv8,
             &[
-                ("run.out", "test old ... FAILED\ntest fine ... ok\n"),
+                (
+                    "run.out",
+                    &format!("{ra}test old ... FAILED\n{rb}test fine ... ok\n"),
+                ),
                 ("run.exit", "101"),
                 ("toc.txt", &two("old", "fine")),
-                ("toc.err", runs),
+                ("toc.err", ""),
             ],
         );
         git(&repo8, &["add", "-A"]);
@@ -9129,15 +9383,14 @@ pub(crate) mod tests {
             &repo8,
             &argv8,
             &[
-                ("run.out", "test old ... FAILED\n"),
+                ("run.out", &format!("{rb}test old ... FAILED\n")),
                 ("run.exit", "101"),
                 ("excluded.exit", "0"),
                 ("toc.txt", &two("renamed", "old")),
-                ("toc.err", runs),
+                ("toc.err", ""),
             ],
         );
-        std::fs::write(repo8.join("toc.txt"), "renamed: test\n\n1 test, 0 benchmarks\nfine: test\nold: test\n\n2 tests, 0 benchmarks\n").unwrap();
-        unseparated(&repo8, &ctx8, "one name in two targets");
+        unseparated(&repo8, &ctx8, "one name under two qualifiers");
         // (l, codex r6) The base's failing `old` is in one package's `tests/smoke.rs`; the head
         // moves it to ANOTHER package's `tests/smoke.rs`: same path, another executable hash.
         let (repo9, ctx9, argv9) = red_base("unsep-package");
@@ -9177,113 +9430,6 @@ pub(crate) mod tests {
         for r in [repo, repo2, repo3, repo4, repo5, repo6, repo7, repo8, repo9] {
             let _ = std::fs::remove_dir_all(r);
         }
-    }
-
-    /// A configured pytest `test_targeted` (`argv` after the stand-in): the base's `base` files
-    /// committed, the head's `head` files over them; the floor's `test_targeted` run.
-    #[cfg(unix)]
-    fn pytest_floor(
-        tag: &str,
-        argv: &[&str],
-        base: &[(&str, &str)],
-        head: &[(&str, &str)],
-    ) -> Option<(RepoChecksReport, CheckRun)> {
-        let (repo, ctx, _) = red_base(tag);
-        let mut py = vec![fake_runner(tag, "pytest")];
-        py.extend(argv.iter().map(|a| a.to_string()));
-        let config = serde_json::json!({ "test_targeted": py, "timeout_s": 60 }).to_string();
-        write_tree(&repo, &py, base);
-        std::fs::write(repo.join(CONFIG_PATH), &config).unwrap();
-        git(&repo, &["add", "-A"]);
-        git(&repo, &["commit", "-qm", "a red pytest base"]);
-        let ctx = FloorContext {
-            base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
-            ..ctx
-        };
-        write_tree(&repo, &py, head);
-        std::fs::write(repo.join(CONFIG_PATH), &config).unwrap();
-        let report = run_floor(&repo, &ctx);
-        let _ = std::fs::remove_dir_all(&repo);
-        if report.sandbox_error.is_some() {
-            return None;
-        }
-        let c = report
-            .checks
-            .iter()
-            .find(|c| c.name == "test_targeted")
-            .unwrap_or_else(|| panic!("the targeted check ran: {report:#?}"))
-            .clone();
-        Some((report, c))
-    }
-
-    /// (codex r7) A configured pytest `test_targeted` with pytest's own `-p no:cacheprovider` (a
-    /// plugin, not a cargo package) separates like any pytest check: `pass_excluded`.
-    #[cfg(unix)]
-    #[test]
-    fn a_configured_pytest_targeted_with_a_plugin_flag_still_separates() {
-        let _load = seam::pin(0.5, 4);
-        let summary = "=== short test summary info ===\nFAILED tests/a.py::test_case - boom\n=== 1 failed, 1 passed ===\n";
-        let toc = "tests/a.py::test_case\ntests/a.py::test_ok\n\n2 tests collected in 0.01s\n";
-        let base = [
-            ("run.out", summary),
-            ("run.exit", "1"),
-            ("toc.txt", toc),
-            ("alone.fail", "tests/a.py::test_case\n"),
-        ];
-        let head = [
-            ("run.out", summary),
-            ("run.exit", "1"),
-            ("excluded.exit", "0"),
-            ("toc.txt", toc),
-        ];
-        let Some((report, c)) =
-            pytest_floor("py-plugin", &["-p", "no:cacheprovider", "-q"], &base, &head)
-        else {
-            return;
-        };
-        let d = c.decision.as_ref().expect("a decision");
-        assert_eq!(d.outcome, OUTCOME_PASS_EXCLUDED, "{d:?}");
-        assert_eq!(d.excluded, ["tests/a.py::test_case"]);
-        assert!(report.passed, "{report:#?}");
-    }
-
-    /// (agy r7) A failing base test's captured output carries a CHILD `pytest -q` summary that is
-    /// never closed, naming `test_ok` — which passed on the base. Run alone on the base it passes,
-    /// so it is never deselected: the head breaking `test_ok` denies.
-    #[cfg(unix)]
-    #[test]
-    fn a_child_pytest_summary_in_the_base_output_never_excludes_a_passing_test() {
-        let _load = seam::pin(0.5, 4);
-        let base_out = "=== short test summary info ===\nFAILED tests/a.py::test_ok - child failure\n1 failed in 0.01s\nmore captured output\n=== 1 failed, 5 passed in 0.50s ===\n";
-        let toc = "tests/a.py::test_case\ntests/a.py::test_ok\n\n2 tests collected in 0.01s\n";
-        let base = [
-            ("run.out", base_out),
-            ("run.exit", "1"),
-            ("toc.txt", toc),
-            ("alone.fail", "tests/a.py::test_case\n"),
-        ];
-        let head = [
-            (
-                "run.out",
-                "=== short test summary info ===\nFAILED tests/a.py::test_ok - broken\n=== 1 failed, 1 passed ===\n",
-            ),
-            ("run.exit", "1"),
-            ("excluded.exit", "0"),
-            ("toc.txt", toc),
-        ];
-        let Some((report, c)) = pytest_floor("py-child", &["-q"], &base, &head) else {
-            return;
-        };
-        let d = c.decision.as_ref().expect("a decision");
-        assert!(d.excluded.is_empty(), "{d:?}");
-        assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
-        assert!(
-            d.reason
-                .as_deref()
-                .is_some_and(|r| r.contains("does not fail when the base runs it alone")),
-            "{d:?}"
-        );
-        assert!(!report.passed && c.denies());
     }
 
     /// DONE WHEN 4: a deciding run that fails on an oversubscribed host is re-run ONCE, with the
@@ -9412,6 +9558,138 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&repo2);
     }
 
+    /// DES-BUILD-GUIDE DONE WHEN 3-5: the floor reads the BASE's guide (a head edit to the guide
+    /// does not apply to its own run); a guide whose probe failed, or one a base change made stale
+    /// (a `derivedFrom` file changed since it was verified), never excludes — the check
+    /// escalates, and `decision.guide` says why.
+    #[cfg(unix)]
+    #[test]
+    fn the_floor_reads_the_base_guide_and_never_relies_on_a_failed_or_stale_one() {
+        let _load = seam::pin(0.5, 4);
+        let head_red = |repo: &Path, argv: &[String]| {
+            write_tree(
+                repo,
+                argv,
+                &[
+                    ("run.out", "test old ... FAILED\n"),
+                    ("run.exit", "101"),
+                    ("excluded.exit", "0"),
+                    ("toc.txt", &toc_of(&["old", "new", "fine"])),
+                ],
+            );
+        };
+        // (3) The head rewrites the guide into nonsense: the base's still decides.
+        let (repo, ctx, argv) = red_base("guide-head-edit");
+        head_red(&repo, &argv);
+        std::fs::write(
+            repo.join(crate::floor_guide::GUIDE_PATH),
+            "{\"version\": 9}",
+        )
+        .unwrap();
+        let Some((report, c)) = floor_test(&repo, &ctx) else {
+            return;
+        };
+        let d = c.decision.as_ref().expect("a decision");
+        assert_eq!(d.outcome, OUTCOME_PASS_EXCLUDED, "{d:?}");
+        assert!(report.passed);
+        let g = d
+            .guide
+            .as_ref()
+            .expect("the guide's state rides the decision");
+        assert!(g.present && g.usable && g.reason.is_none(), "{g:?}");
+        // (4) A probe that did not pass: the check escalates, the reason names the probe.
+        let (repo2, _, argv2) = red_base("guide-failed-probe");
+        let mut guide = libtest_guide(&argv2);
+        guide["verified"] = serde_json::json!({});
+        write_guide(&repo2, &[guide], &git(&repo2, &["rev-parse", "HEAD~1"]));
+        let path = repo2.join(crate::floor_guide::GUIDE_PATH);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            raw.replace(
+                "\"mutation\": \"pass\"",
+                "\"mutation\": \"fail: the run exited 0\"",
+            ),
+        )
+        .unwrap();
+        git(
+            &repo2,
+            &["commit", "-qam", "a guide whose mutation probe failed"],
+        );
+        let ctx2 = FloorContext {
+            base_head: Some(git(&repo2, &["rev-parse", "HEAD"])),
+            stage: FloorStage::Verify,
+            git_dir: Some(repo2.join(".git")),
+            ..FloorContext::default()
+        };
+        head_red(&repo2, &argv2);
+        let (report, c) = floor_test(&repo2, &ctx2).unwrap();
+        let d = c.decision.as_ref().expect("a decision");
+        assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
+        assert!(!report.passed && d.excluded.is_empty());
+        let g = d.guide.as_ref().unwrap();
+        assert!(g.present && !g.usable, "{g:?}");
+        assert!(
+            g.reason
+                .as_deref()
+                .is_some_and(|r| r.contains("probe `mutation`")),
+            "{g:?}"
+        );
+        // (5) Stale: the guide was derived from `.wicked/checks.json`, which the base changed
+        // since it was verified.
+        let (repo3, _, argv3) = red_base("guide-stale");
+        let raw = std::fs::read_to_string(repo3.join(crate::floor_guide::GUIDE_PATH)).unwrap();
+        std::fs::write(
+            repo3.join(crate::floor_guide::GUIDE_PATH),
+            raw.replace(
+                "\"derivedFrom\": []",
+                "\"derivedFrom\": [\".wicked/checks.json\"]",
+            ),
+        )
+        .unwrap();
+        git(
+            &repo3,
+            &["commit", "-qam", "the guide names what it was derived from"],
+        );
+        let mut cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(repo3.join(CONFIG_PATH)).unwrap())
+                .unwrap();
+        cfg["timeout_s"] = serde_json::json!(61);
+        std::fs::write(repo3.join(CONFIG_PATH), cfg.to_string()).unwrap();
+        git(&repo3, &["commit", "-qam", "the checks config changed"]);
+        let ctx3 = FloorContext {
+            base_head: Some(git(&repo3, &["rev-parse", "HEAD"])),
+            stage: FloorStage::Verify,
+            git_dir: Some(repo3.join(".git")),
+            ..FloorContext::default()
+        };
+        write_tree(
+            &repo3,
+            &argv3,
+            &[
+                ("run.out", "test old ... FAILED\n"),
+                ("run.exit", "101"),
+                ("excluded.exit", "0"),
+                ("toc.txt", &toc_of(&["old", "new", "fine"])),
+            ],
+        );
+        std::fs::write(repo3.join(CONFIG_PATH), cfg.to_string()).unwrap();
+        let (report, c) = floor_test(&repo3, &ctx3).unwrap();
+        let d = c.decision.as_ref().expect("a decision");
+        assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
+        assert!(!report.passed);
+        assert!(
+            d.guide
+                .as_ref()
+                .and_then(|g| g.reason.as_deref())
+                .is_some_and(|r| r.starts_with("stale")),
+            "{d:?}"
+        );
+        for r in [repo, repo2, repo3] {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
     /// Every outcome serializes on the wire as `checks[].decision` (the coordinator's addendum):
     /// `pass_excluded` (DONE WHEN 1), `timed_out` (an excluded run past its bound) and
     /// `could_not_run`; the others are asserted in their own DONE WHEN tests.
@@ -9508,7 +9786,15 @@ pub(crate) mod tests {
         .unwrap();
         std::fs::write(repo.join(".gitignore"), "Cargo.lock\ntmp/\n").unwrap();
         std::fs::write(repo.join("src/lib.rs"), real_lib(true, false)).unwrap();
-        let base = git_repo_with_commit(&repo);
+        git_repo_with_commit(&repo);
+        // The guide for the detected check, with and without the lockfile cargo writes.
+        let base = commit_guide(
+            &repo,
+            &[
+                libtest_guide(&s(&["cargo", "test", "--no-fail-fast"])),
+                libtest_guide(&s(&["cargo", "test", "--locked", "--no-fail-fast"])),
+            ],
+        );
         let ctx = FloorContext {
             stage: FloorStage::Verify,
             base_head: Some(base),
@@ -9578,6 +9864,16 @@ pub(crate) mod tests {
         .unwrap();
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-qm", "an order-dependent base"]);
+        commit_guide(
+            &repo,
+            &[libtest_guide(&s(&[
+                "cargo",
+                "test",
+                "--no-fail-fast",
+                "--",
+                "--test-threads=1",
+            ]))],
+        );
         let ctx = FloorContext {
             stage: FloorStage::Verify,
             base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
@@ -9633,10 +9929,75 @@ pub(crate) mod tests {
         assert!(
             d.reason
                 .as_deref()
-                .is_some_and(|r| r.contains("names 2 tests")),
+                .is_some_and(|r| r.contains("not under the same qualifier")),
             "{d:?}"
         );
         assert!(!report.passed);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// (codex r10-r11, ported) Package `b` compiles in `a`'s source by `include_str!`, with no
+    /// cargo edge. A base with a guide (and no `affected` piece) runs the full check at the
+    /// creator and at verify, so `b`'s regression denies at both.
+    #[cfg(unix)]
+    #[test]
+    fn an_include_str_across_packages_denies_at_the_creator_and_at_verify() {
+        let _load = seam::pin(0.5, 4);
+        let repo = scratch("include-str");
+        for (name, body) in [
+            ("a", "pub fn one() -> u32 {\n    1\n}\n"),
+            (
+                "b",
+                "#[cfg(test)]\nmod t {\n    #[test]\n    fn reads_a() {\n        assert!(include_str!(\"../../a/src/lib.rs\").contains(\"fn one\"));\n    }\n}\n",
+            ),
+        ] {
+            std::fs::create_dir_all(repo.join(name).join("src")).unwrap();
+            std::fs::write(
+                repo.join(name).join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+            )
+            .unwrap();
+            std::fs::write(repo.join(name).join("src/lib.rs"), body).unwrap();
+        }
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join(".gitignore"), "Cargo.lock\ntmp/\ntarget/\n").unwrap();
+        git_repo_with_commit(&repo);
+        let base = commit_guide(
+            &repo,
+            &[
+                libtest_guide(&s(&["cargo", "test", "--no-fail-fast"])),
+                libtest_guide(&s(&["cargo", "test", "--locked", "--no-fail-fast"])),
+            ],
+        );
+        let ctx = |stage| FloorContext {
+            stage,
+            base_head: Some(base.clone()),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        std::fs::write(
+            repo.join("a/src/lib.rs"),
+            "pub fn two() -> u32 {\n    2\n}\n",
+        )
+        .unwrap();
+        for stage in [FloorStage::Creator, FloorStage::Verify] {
+            let report = run_floor(&repo, &ctx(stage));
+            if report.sandbox_error.is_some() {
+                return;
+            }
+            assert!(
+                report.checks.iter().all(|c| c.name != "test_targeted"),
+                "{stage:?}: a guided base never narrows without `affected`: {report:#?}"
+            );
+            assert!(
+                !report.passed,
+                "{stage:?}: `b`'s regression denies: {report:#?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&repo);
     }
 
