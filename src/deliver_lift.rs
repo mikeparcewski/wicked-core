@@ -2270,21 +2270,43 @@ mod tests {
         assert!(agent.tool_cmd.is_none() && !is_deliver_unit(&agent));
     }
 
+    /// A stand-in `cargo test` that reads its tests off `tests/*.red` (failing) and `tests/*.ok`
+    /// markers, lists them under `-- --list` in libtest's format and honours `--skip=<name>` — a
+    /// runner the floor can inventory and deselect precisely (DES-FLOOR-V2). Absolute path.
+    #[cfg(unix)]
+    fn deselecting_runner() -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("deselecting-runner");
+        let path = dir.join("cargo");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nlist=0; skips=' '\n\
+             for a in \"$@\"; do case \"$a\" in --list) list=1;; --skip=*) skips=\"$skips${a#--skip=} \";; esac; done\n\
+             if [ $list = 1 ]; then n=0; for f in tests/*.red tests/*.ok; do [ -e \"$f\" ] || continue; \
+             b=$(basename \"$f\"); echo \"${b%.*}: test\"; n=$((n+1)); done; echo; echo \"$n tests, 0 benchmarks\"; exit 0; fi\n\
+             r=0; for f in tests/*.red; do [ -e \"$f\" ] || continue; t=$(basename \"$f\" .red); \
+             case \"$skips\" in *\" $t \"*) continue;; esac; echo \"test $t ... FAILED\"; r=101; done; exit $r\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
     /// DES-L2 2E (D-22 / core #489, F-RC1-132 — P7 "verify said PASS, deliver denied the same
     /// tree"): the deliver re-verify is the SAME baseline-diff floor the verify phase runs,
     /// measured against the tip the work was lifted onto. A failure the tip shares does not
     /// refuse the deliver (classified, not denying); a head-only failure is a `regression` and
     /// refuses with `passed: false` evidence; with a base known the repo's `test_targeted` is
-    /// preferred, exactly as at verify. `.wicked/checks.json` only — `sh` is the runner, every
-    /// `tests/*.red` marker is a failing test (cargo-style id lines).
+    /// preferred, exactly as at verify. `.wicked/checks.json` only — [`deselecting_runner`] is the
+    /// runner, every `tests/*.red` marker is a failing test (DES-FLOOR-V2: the tip's failure is
+    /// deselected by name, and the head's exit code with it deselected decides).
     #[cfg(unix)]
     #[test]
     fn deliver_reverify_excuses_failures_the_tip_shares_and_refuses_regressions() {
-        const CHECK: &str = "r=0; for f in tests/*.red; do [ -e \"$f\" ] || continue; \
-                             echo \"test $(basename \"$f\" .red) ... FAILED\"; r=1; done; exit $r";
+        let runner = deselecting_runner();
         let config = serde_json::json!({
-            "test": ["sh", "-c", CHECK],
-            "test_targeted": ["sh", "-c", CHECK],
+            "test": [runner.as_str(), "test"],
+            "test_targeted": [runner.as_str(), "test"],
             "timeout_s": 60
         })
         .to_string();
@@ -2392,8 +2414,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_skipped_lift_measures_the_reverify_against_the_run_base() {
-        const CHECK: &str = "r=0; for f in tests/*.red; do [ -e \"$f\" ] || continue; \
-                             echo \"test $(basename \"$f\" .red) ... FAILED\"; r=1; done; exit $r";
+        let runner = deselecting_runner();
         let layout = |tag: &str| {
             let base = scratch(tag);
             let repo = base.join("repo");
@@ -2403,7 +2424,8 @@ mod tests {
             identity(&repo);
             std::fs::write(
                 repo.join(".wicked/checks.json"),
-                serde_json::json!({ "test": ["sh", "-c", CHECK], "timeout_s": 60 }).to_string(),
+                serde_json::json!({ "test": [runner.as_str(), "test"], "timeout_s": 60 })
+                    .to_string(),
             )
             .unwrap();
             std::fs::write(repo.join("tests/shared.red"), "").unwrap();

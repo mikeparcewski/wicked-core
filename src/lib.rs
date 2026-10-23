@@ -89,6 +89,8 @@ pub fn boot_seeded_rule_ids() -> anyhow::Result<std::collections::BTreeSet<Strin
         .map(|r| r.id)
         .collect())
 }
+mod floor_log;
+mod floor_runner;
 mod mcp_isolation;
 mod memory;
 mod operator_config_fence;
@@ -248,6 +250,7 @@ pub use catalog::{
     catalog_entries, catalog_entry, CatalogEntry, PresetDescriptor, CATALOG_IDS,
     SECURITY_REVIEW_SKILL,
 };
+pub use floor_log::{read_blob, read_range, toc, LogRef, LogToc};
 pub use graph_browser::{
     browse_nodes, graph_kinds, list_node_notes, node_detail, NeighborEdge, NodeDetail, NodeNote,
     NodeSummary, SymbolAnnotation,
@@ -281,7 +284,8 @@ pub use repo::{
     FINDING_CODE_GRAPH_ROOT_UNRESOLVABLE, FINDING_IN_TREE_CODE_GRAPH_IGNORED,
 };
 pub use repo_checks::{
-    BaseRun, CheckRun, ClaimCheck, FloorContext, FloorEnv, FloorStage, RepoCheck, RepoChecksReport,
+    BaseRun, CheckDecision, CheckRun, ClaimCheck, FloorContext, FloorEnv, FloorStage, RepoCheck,
+    RepoChecksReport,
 };
 pub use repo_intel::{
     change_digest_since, commits_since, profile_repo, Commit, GraphStats, Hotspot, RepoProfile,

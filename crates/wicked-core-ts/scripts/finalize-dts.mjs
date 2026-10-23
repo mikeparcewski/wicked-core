@@ -202,6 +202,13 @@ const HAND_AUTHORED = `${BEGIN}
  * previousOutcome, outcome, passed} — an operator retry (a plain approve at an escalated unit's
  * gate) re-ran the unit's failed floor once on the SAME tree its last floor judged; it follows the
  * fresh repoChecksEvaluated, \`reason\` is \`'operator retry'\`.
+ * DES-FLOOR-V2 (additive; see {@link RepoChecksEvaluatedEventJson}): every repoChecksEvaluated
+ * \`checks[]\` entry carries \`decision\` — the floor's machine-readable outcome (\`pass\` |
+ * \`pass_excluded\` | \`new_failure\` | \`base_red_unseparated\` | \`flaky_twice\` | \`timed_out\` |
+ * \`could_not_run\`), decided by exit codes and the base's own inventory, never by head text;
+ * \`classification\` gains \`'base_red_unseparated'\` (denies) and no longer produces
+ * \`'env_cannot_run'\` / \`'unclassified_red_base'\`; \`envCannotRun\` is always \`[]\`; libtest ids
+ * lose their \`[<target>]\` qualifier and \`preExisting\` holds the runner-native names excluded.
  * Judge re-run (additive, new event): \`judgeRerunRequested\` {session, ord, attempt, fromAttempt,
  * seats, previousReason, by} — the operator answered a \`judge_unavailable\` gate with action
  * \`rejudge\`: attempt \`attempt\` re-reads attempt \`fromAttempt\`'s captured output with a judge drawn
@@ -313,6 +320,99 @@ export interface RecordedEventJson extends CoreEventJson {
   seq: number
   /** Present, and \`true\`, only on the first entry a restarted engine recorded for this run. */
   daemonRestarted?: true
+}
+
+/**
+ * The \`repoChecksEvaluated\` event — the engine ran the repository's own checks for a unit — as
+ * delivered to the {@link Core.subscribe} callback once \`type === 'repoChecksEvaluated'\`. Only the
+ * fields a consumer keys on are typed here; the rest of the frame is documented on
+ * {@link CoreEventJson}. Pinned against wicked-core's \`event_to_json\` by the binding's own tests.
+ */
+export interface RepoChecksEvaluatedEventJson extends CoreEventJson {
+  type: 'repoChecksEvaluated'
+  session: string
+  ord: number
+  attempt: number
+  /** \`false\` ⇒ the unit is denied. */
+  passed: boolean
+  outcome: 'passed' | 'failed' | 'timed_out' | 'not_run'
+  floor: 'creator' | 'verify'
+  checks: RepoCheckRunJson[]
+  skipped: string[]
+}
+
+/** One check the floor ran ({@link RepoChecksEvaluatedEventJson.checks}). */
+export interface RepoCheckRunJson {
+  name: string
+  argv: string[]
+  source: string
+  exitCode: number | null
+  timedOut: boolean
+  spawnError: string | null
+  durationMs: number
+  /** The effective bound in seconds (base × host-load factor) and how it was derived. */
+  boundS: number
+  boundNote: string | null
+  /** The same check on the run base, when the floor ran (or cached) it. */
+  base: { head: string; cached: boolean; run: RepoCheckRunJson | null; error: string | null } | null
+  /** How this run itself ended — NOT the floor's decision (see \`decision\`). */
+  outcome: 'passed' | 'failed' | 'timed_out' | 'could_not_run'
+  /** The compatible token of \`decision\` for older readers (\`'pre_existing_in_sandbox'\` and
+   * \`'flaky_under_load'\` do not deny). */
+  classification: string | null
+  /** The 4 KB display tails; the whole streams are behind \`decision.logRefs\`. */
+  stdoutTail: string
+  stderrTail: string
+  /** The runner-native names the head's excluded run deselected. */
+  preExisting: string[]
+  /** Head failure ids — an annotation; never what decided. */
+  failureIds: string[]
+  regressions: string[]
+  /** DEPRECATED: always \`[]\`. */
+  envCannotRun: string[]
+  /** The further runs: the excluded run, then the identical retry. */
+  reruns: RepoCheckRunJson[]
+  /** The floor's decision; \`null\` on a nested run (a re-run, a base run). */
+  decision: FloorCheckDecisionJson | null
+}
+
+/**
+ * (DES-FLOOR-V2) The floor's machine-readable decision on one check. Trusted inputs only: the base
+ * tree, the base's own inventory (its TOC) and the exit codes of the processes the floor launched.
+ * Only \`pass\` and \`pass_excluded\` pass.
+ */
+export interface FloorCheckDecisionJson {
+  outcome:
+    | 'pass'
+    | 'pass_excluded'
+    | 'new_failure'
+    | 'base_red_unseparated'
+    | 'flaky_twice'
+    | 'timed_out'
+    | 'could_not_run'
+  /** The base commit compared against, when the base ran or was read from the run's cache. */
+  baseSha: string | null
+  /** The base's failing tests its own inventory lists verbatim. */
+  baseFailing: string[]
+  /** The names actually deselected on the head's excluded run. */
+  excluded: string[]
+  /** Every stream of every process the decision ran, by hash. */
+  logRefs: FloorLogRefJson[]
+  /** The deciding run failed on an oversubscribed host and passed its identical retry. */
+  flaky: boolean
+  /** In words: what was excluded, why a base red could not be separated. */
+  reason: string | null
+}
+
+/** One stored stream ({@link FloorCheckDecisionJson.logRefs}): its blob is named by its sha256 in the
+ * run's log store, so any range of it verifies against this hash. */
+export interface FloorLogRefJson {
+  attempt: 'head' | 'base' | 'toc-base' | 'toc-head' | 'excluded' | 'retry'
+  stream: 'stdout' | 'stderr'
+  sha256: string
+  bytes: number
+  /** The process wrote past the per-stream cap, or held its pipe open: the blob is a prefix. */
+  truncated: boolean
 }
 ${END}
 `

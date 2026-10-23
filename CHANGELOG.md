@@ -14,6 +14,47 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The repo-checks floor decides by exit codes and the base's own test inventory; head output never decides
+  (DES-FLOOR-V2, pipeline-blocker plain PR, operator-approved).** core#1060 spent 21 review rounds patching a
+  parser of the head's test output, and every round found a new forgery of text the creator's tests write. The
+  floor now trusts two inputs: the base tree, and the exit codes of the processes it launches. A failed head
+  check is compared with the base. A green base makes it a `new_failure`. A red base is inventoried by its own
+  runner on the base tree (`cargo test <args> -- --list`, `pytest --collect-only -q`, `go test -list .`), and
+  its failing tests are read from the base output and kept only when that inventory lists them verbatim (and,
+  for libtest, when the base did not also report them `ok`). When the exclusion is precise, the head runs once
+  more with those tests deselected natively (libtest `--skip=<name> --exact`, pytest `--deselect`, go
+  `-skip=^(…)$`): exit 0 is `pass_excluded` ("1 pre-existing excluded: t::a"), non-zero is a `new_failure`.
+  Precise means every name is unique in the base inventory and at most once in the head's, the argv is on
+  core#1060's r16 allowlist, no head `.cargo/config*` sets `rustdocflags` or test args, and no cargo name has
+  whitespace (rustdoc splits each test argument, so a doctest name deselects nothing exactly). Anything else is
+  `base_red_unseparated`: it escalates with both logs, and the operator's floor override (core#1061, core#1065)
+  is the path through. vitest, jest, tsc, eslint and shell runners escalate the same way. A deciding run that
+  fails on an oversubscribed host is re-run once with the same argv after waiting up to 30 s for headroom (`WICKED_REPO_CHECKS_RETRY_WAIT_S`, at most 600): exit 0 is
+  `passed on retry (flaky)`, and a second failure under load is `flaky_twice` (denies). Deleted: head-side
+  classification (`classify` and the binary qualifiers, `LineScan`, the libtest `env_cannot_run` class and its
+  launcher signatures, the isolated `--exact` and vitest file re-runs, the load-class and env-crash re-runs,
+  `MAX_FLAKE_RERUN`, the environment signals) and the 4 KB ring buffer as a source of truth. Every stream is now
+  stored once, content-addressed (sha256), in the run's log store, with a lazy line TOC and ranges read by ref
+  and verified against the hash (`floor_log`); a stream past 64 MiB keeps its prefix, marked `truncated`, and a
+  truncated inventory is never precise. Kept: the PTY grant (core#1060's Seatbelt rules, cherry-picked), the
+  load-aware bound, the base cache (now `{floor_policy: 4, run, toc}`), `.wicked/checks.json`, the operator
+  override and QE. An unconfigured cargo repo runs its affected set at the creator AND at verify (`full: true`
+  keeps verify full): the members owning a touched file plus the members a manifest change (`cargo metadata
+  --no-deps` diffed against the base) or a lockfile change reaches, closed over their reverse path
+  dependencies, in one `-p a -p b` invocation. The macOS floor's test seam now arms the private `TMPDIR` as
+  production does, so doctests run under the real floor sandbox. Wire (additive): every
+  `repoChecksEvaluated.checks[]` entry carries `decision: {outcome, baseSha, baseFailing, excluded, logRefs:
+  [{attempt, stream, sha256, bytes, truncated}], flaky, reason}`, with `outcome` one of `pass`, `pass_excluded`,
+  `new_failure`, `base_red_unseparated`, `flaky_twice`, `timed_out`, `could_not_run`, typed in core-ts as
+  `RepoChecksEvaluatedEventJson`, `RepoCheckRunJson`, `FloorCheckDecisionJson` and `FloorLogRefJson`.
+  `classification` keeps its tokens for older readers (`pre_existing_in_sandbox` = `pass_excluded`, `regression`
+  = a compared `new_failure` or `flaky_twice`, `flaky_under_load` = passed on retry) and gains
+  `base_red_unseparated`; it no longer produces `env_cannot_run` or `unclassified_red_base`. `envCannotRun` is
+  always `[]` (deprecated). `preExisting` holds runner-native names (`t::a`), and libtest `failureIds` lose their
+  `[<target>]` qualifier. Accepted costs: a red base under a runner with no precise deselect, or a red doctest,
+  now escalates where the old classifier excused it; a base whose red is not fully explained by named tests (a
+  crashed binary) makes the head's failure read `new_failure`; and every failed check on a loaded host pays one
+  retry and up to 30 s of waiting.
 - **The floor override is also offered when the judge could not rule either.** core#1061's operator judgment
   over a failed repo-checks floor was refused whenever anything else stood behind the floor, and that included
   the judge's `judge_unavailable` no-verdict hold. So when the judge seats were benched (run 2ebd9da2, attempt

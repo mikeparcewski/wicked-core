@@ -29,6 +29,14 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// DES-FLOOR-V2: a failed floor on an oversubscribed host retries once; this harness does not wait
+/// for headroom first. SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one
+/// process env var.
+#[ctor::ctor(unsafe)]
+fn no_retry_headroom_wait() {
+    std::env::set_var("WICKED_REPO_CHECKS_RETRY_WAIT_S", "0");
+}
+
 use wicked_apps_core::{ConformanceClaim, Decision};
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
@@ -927,9 +935,21 @@ fn a_clean_evaluator_passes_and_the_repo_checks_are_the_gates_evidence() {
     );
     assert_eq!(checks[0].name, "cargo-fmt-check");
     assert_eq!(checks[0].exit_code, Some(0), "{:?}", checks[0]);
-    assert_eq!(checks[1].name, "cargo-test");
+    // DES-FLOOR-V2 §5: an unconfigured repo runs its affected set at verify too (the full suite
+    // when the verify unit's tree is its base).
+    assert!(
+        matches!(checks[1].name.as_str(), "cargo-test" | "test_targeted"),
+        "{:?}",
+        checks[1]
+    );
     // `--no-fail-fast` (core#481): a red crate never hides the crates after it.
-    assert_eq!(checks[1].argv, vec!["cargo", "test", "--no-fail-fast"]);
+    assert!(
+        checks[1]
+            .argv
+            .starts_with(&["cargo".to_string(), "test".into(), "--no-fail-fast".into()]),
+        "{:?}",
+        checks[1].argv
+    );
     assert_eq!(checks[1].exit_code, Some(0), "{:?}", checks[1]);
     assert!(
         checks[1].stdout_tail.contains("test result: ok"),
@@ -1124,8 +1144,8 @@ fn a_regression_the_creator_introduces_is_denied_at_the_creator_gate_before_veri
     let reason = fix.denial_reason.expect("reason");
     assert!(
         reason.contains("test_targeted: exit 101")
-            && reason.contains("[regression]")
-            && reason.contains("REGRESSION: the run base")
+            && reason.contains("[regression")
+            && reason.contains("NEW FAILURE: the run base")
             && reason.contains("test result: FAILED"),
         "the denial carries the exit code, the classification, the base comparison and cargo's \
          own verdict line from the captured tail: {reason}"
@@ -1173,10 +1193,7 @@ fn a_regression_the_creator_introduces_is_denied_at_the_creator_gate_before_veri
     assert_eq!(c.exit_code, Some(101));
     assert_eq!(c.outcome(), "failed");
     assert_eq!(c.classification.as_deref(), Some("regression"));
-    assert_eq!(
-        c.regressions,
-        vec!["test t::boom [-p wtguard_fixture --lib]".to_string()]
-    );
+    assert_eq!(c.regressions, vec!["test t::boom".to_string()]);
     // core#553: a single head-only failure is re-run once, alone, but only on an oversubscribed
     // host (the evidence of load); on a host with headroom it is not re-run. Either way the
     // always-red test stays a regression.
@@ -1835,7 +1852,8 @@ fn a_read_only_phase_writing_under_its_notes_root_never_trips_the_guard() {
 
 /// F-RC2-009 — BASELINE-DIFF: the fixture's base ALREADY fails `cargo test` and the fix changes
 /// nothing about that. The floor's sandbox reports the failure on the head, runs the same check
-/// on the base, finds the failure sets IDENTICAL ⇒ `pre_existing_in_sandbox` (core#481 — the fact,
+/// on the base, deselects the base's own failing test by name and the head then PASSES ⇒
+/// `pass_excluded`, read by older consumers as `pre_existing_in_sandbox` (DES-FLOOR-V2 — the fact,
 /// not an inferred environment cause): recorded on both the creator's floor (the derived targeted
 /// set, core#482) and the evaluator's (the full suite), denying neither — the run COMPLETES and
 /// the shared failure is listed.
@@ -1885,12 +1903,14 @@ fn a_check_the_base_fails_identically_is_recorded_not_denied() {
         // `cargo-fmt-check` is first and clean; the shared failure is in the test set (core#551):
         // the derived targeted set at the creator (core#482), the full suite at verify.
         let c = &checks[1];
-        let (want_name, want_id) = if ord == 3 {
-            ("test_targeted", "test t::boom [-p wtguard_fixture --lib]")
-        } else {
-            ("cargo-test", "test t::boom [--lib]")
-        };
-        assert_eq!(c.name, want_name);
+        // DES-FLOOR-V2: the excluded names are runner-native (`t::boom`), and verify runs the
+        // affected set as the creator does (the full suite when its tree is its base).
+        let want_id = "t::boom";
+        assert!(
+            matches!(c.name.as_str(), "test_targeted" | "cargo-test"),
+            "ord {ord}: {}",
+            c.name
+        );
         assert_eq!(
             c.exit_code,
             Some(101),

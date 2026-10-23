@@ -37,6 +37,9 @@ use wicked_core::{
 /// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
+    // DES-FLOOR-V2: a failed floor on an oversubscribed host retries once; this harness does not
+    // wait for headroom first (the bound's own behaviour is the unit tests').
+    std::env::set_var("WICKED_REPO_CHECKS_RETRY_WAIT_S", "0");
     wicked_apps_core::emit::hermetic_test_spool();
 }
 
@@ -540,11 +543,33 @@ impl StepRunner for CommittingSeat {
 /// change did not cause.
 #[cfg(unix)]
 fn make_git_repo_with_a_red_test_on_the_base(name: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
     let repo = make_git_repo(name);
+    // DES-FLOOR-V2: the shared red is excluded by NAME, so the runner must be one the floor can
+    // inventory and deselect: a stand-in `cargo test` (absolute path, outside the tree) whose
+    // only test `shared` fails, listed under `-- --list`, skipped under `--skip=shared`.
+    let bin = std::env::temp_dir().join(format!(
+        "wicked-core-w6floor-bin-{name}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&bin);
+    std::fs::create_dir_all(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    std::fs::write(
+        &cargo,
+        "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in\n\
+         --list) echo 'shared: test'; echo; echo '1 test, 0 benchmarks'; exit 0;;\n\
+         --skip=shared) echo 'test result: ok. 0 passed; 0 failed; 1 filtered out'; exit 0;;\n\
+         esac; done\necho 'test shared ... FAILED'; exit 101\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::create_dir_all(repo.join(".wicked")).unwrap();
     std::fs::write(
         repo.join(".wicked/checks.json"),
-        r#"{"test":["sh","-c","echo 'test shared ... FAILED'; exit 1"],"timeout_s":60}"#,
+        serde_json::json!({ "test": [cargo.to_str().unwrap(), "test"], "timeout_s": 60 })
+            .to_string(),
     )
     .unwrap();
     std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
