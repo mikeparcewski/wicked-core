@@ -30,7 +30,8 @@ Two release tracks share this file, newest entry first regardless of track:
   `.cargo/config*` as decoded TOML, a pytest `--deselect` that would also remove another head test by node-id
   prefix is refused, the base's failing names come only from its stdout's own
   result lines (pytest's last short summary) and never from a truncated stream, an empty
-  inventory is no inventory, and a manifest change to `[profile]`, `[patch]`, `[replace]`, `[workspace]` or
+  inventory is no inventory, a base whose test binary stopped early (a listed test with no result line) cannot be
+  separated, and a manifest change to `[profile]`, `[patch]`, `[replace]`, `[workspace]` or
   `[lints]` runs the full suite. Anything else is
   `base_red_unseparated`: it escalates with both logs, and the operator's floor override (core#1061, core#1065)
   is the path through. go test (its subtests are invisible to `go test -list`, so skipping a red parent can hide a newly broken subtest; review round 2), vitest, jest, tsc, eslint and shell runners escalate the same way. A deciding run that

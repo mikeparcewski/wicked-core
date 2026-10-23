@@ -309,13 +309,38 @@ fn affected_packages(
         let base_members = workspace_members(&tree.dir, check, sandbox, scratch, Tree::Base);
         remove_base_export(worktree, scratch)?;
         let base_members = base_members?;
+        // Dependencies whose declaration changed in some member (added, removed, features,
+        // default features, version, kind): cargo unifies a dependency's features across every
+        // member built together, so EVERY member that depends on one of them is affected, path
+        // dependency or not.
+        let deps = |e: &serde_json::Value| -> Vec<(String, serde_json::Value)> {
+            e.get("dependencies")
+                .and_then(|d| d.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|d| Some((d.get("name")?.as_str()?.to_string(), d.clone())))
+                .collect()
+        };
+        let mut moved_deps: std::collections::BTreeSet<String> = Default::default();
         for m in &head {
-            if base_members
-                .iter()
-                .find(|b| b.name == m.name)
-                .map(|b| &b.entry)
-                != Some(&m.entry)
-            {
+            let base = base_members.iter().find(|b| b.name == m.name);
+            if base.map(|b| &b.entry) != Some(&m.entry) {
+                changed.insert(m.name.clone());
+                let (old, new) = (
+                    base.map(|b| deps(&b.entry)).unwrap_or_default(),
+                    deps(&m.entry),
+                );
+                for (name, d) in old.iter().chain(new.iter()) {
+                    let in_old = old.iter().any(|(n, o)| n == name && o == d);
+                    let in_new = new.iter().any(|(n, o)| n == name && o == d);
+                    if in_old != in_new {
+                        moved_deps.insert(name.clone());
+                    }
+                }
+            }
+        }
+        for m in &head {
+            if deps(&m.entry).iter().any(|(n, _)| moved_deps.contains(n)) {
                 changed.insert(m.name.clone());
             }
         }

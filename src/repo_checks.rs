@@ -241,7 +241,7 @@ use wicked_apps_core::spawn::HardenedCommand;
 
 use crate::floor_runner::{
     cargo_config_bends_test_args, deselect_argv, deselectable, failing_names, parse_toc,
-    passing_names, pytest_prefix_collision, runner_of, toc_argv, Runner,
+    passing_names, pytest_prefix_collision, result_names, runner_of, toc_argv, Runner,
 };
 use crate::validator::WorkerSandbox;
 
@@ -4485,6 +4485,17 @@ fn decide(
             // failing base test's captured output can carry a child run's `test X ... FAILED` for
             // a test X that passed, and X must never be deselected on the head.
             let passed = passing_names(runner, &base_text);
+            // libtest prints a result line for every test that ran; a listed test with none means
+            // a binary stopped early (a crash, an abort), and then a `FAILED` line without its
+            // `ok` witness proves nothing — the base is not complete enough to separate.
+            if runner == Runner::Cargo {
+                let reported = result_names(&base_text);
+                if let Some(n) = toc.names.iter().find(|n| !reported.contains(*n)) {
+                    return Err(format!(
+                        "the base reported no result for `{n}` (a test binary stopped early)"
+                    ));
+                }
+            }
             let failing: Vec<String> = failing_names(runner, &base_text)
                 .into_iter()
                 .filter(|n| toc.count(n) > 0 && !(toc.count(n) == 1 && passed.contains(n)))
@@ -8600,7 +8611,11 @@ mod tests {
             &repo,
             &argv,
             &[
-                ("run.out", "test old ... FAILED\n"),
+                // A real libtest run prints a result line for every test it lists.
+                (
+                    "run.out",
+                    "test new ... ok\ntest fine ... ok\ntest old ... FAILED\n",
+                ),
                 ("run.exit", "101"),
                 ("excluded.exit", "0"),
                 ("toc.txt", &toc_of(&["old", "new", "fine"])),
@@ -8943,7 +8958,39 @@ mod tests {
             let _cap = seam::cap(1024);
             unseparated(&repo6, &ctx6, "a truncated base log");
         }
-        for r in [repo, repo2, repo3, repo4, repo5, repo6] {
+        // (j, codex r3) A base binary that stopped early (a crash) printed no result for some
+        // listed tests: a FAILED line without its `ok` witness then proves nothing.
+        let (repo7, ctx7, argv7) = red_base("unsep-crash");
+        write_tree(
+            &repo7,
+            &argv7,
+            &[
+                ("run.out", "test new ... FAILED\ntest old ... FAILED\n"),
+                ("run.exit", "101"),
+                ("toc.txt", &toc_of(&["old", "new", "fine"])),
+            ],
+        );
+        git(&repo7, &["add", "-A"]);
+        git(
+            &repo7,
+            &["commit", "-qm", "a base whose binary stopped early"],
+        );
+        let ctx7 = FloorContext {
+            base_head: Some(git(&repo7, &["rev-parse", "HEAD"])),
+            ..ctx7
+        };
+        write_tree(
+            &repo7,
+            &argv7,
+            &[
+                ("run.out", "test new ... FAILED\n"),
+                ("run.exit", "101"),
+                ("excluded.exit", "0"),
+                ("toc.txt", &toc_of(&["old", "new", "fine"])),
+            ],
+        );
+        unseparated(&repo7, &ctx7, "a base binary that stopped early");
+        for r in [repo, repo2, repo3, repo4, repo5, repo6, repo7] {
             let _ = std::fs::remove_dir_all(r);
         }
     }

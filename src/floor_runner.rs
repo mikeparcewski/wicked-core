@@ -285,6 +285,19 @@ pub(crate) fn passing_names(runner: Runner, text: &str) -> Vec<String> {
     }
 }
 
+/// Every test name a libtest run's output reports a result for (`ok`, `ignored` or `FAILED`).
+pub(crate) fn result_names(text: &str) -> std::collections::BTreeSet<String> {
+    text.lines()
+        .filter_map(|l| {
+            let r = l.trim_end_matches('\r').strip_prefix("test ")?;
+            r.strip_suffix(" ... ok")
+                .or_else(|| r.strip_suffix(" ... ignored"))
+                .or_else(|| r.strip_suffix(" ... FAILED"))
+                .map(|n| libtest_name(n).to_string())
+        })
+        .collect()
+}
+
 /// (pytest) `--deselect` matches node-id PREFIXES: the first deselected name that would also remove
 /// a head test outside `names` (`a.py::test_x` takes `a.py::test_x_extra` and `a.py::test_x[1]`),
 /// or `None` when every match is intended.
@@ -446,6 +459,9 @@ mod tests {
             passing_names(Runner::Cargo, "test t::sp - should panic ... ok\n"),
             s(&["t::sp"])
         );
+        let all =
+            result_names("test a ... ok\ntest b ... FAILED\ntest c - should panic ... ignored\n");
+        assert_eq!(all.into_iter().collect::<Vec<_>>(), s(&["a", "b", "c"]));
         let cargo = s(&["cargo", "test", "--locked", "--", "--test-threads=4"]);
         assert_eq!(
             toc_argv(Runner::Cargo, &cargo),
