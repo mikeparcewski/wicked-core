@@ -31,7 +31,7 @@ Two release tracks share this file, newest entry first regardless of track:
   prefix is refused, the base's failing names come only from its stdout's own
   result lines (pytest's last short summary) and never from a truncated stream, an empty
   inventory is no inventory, an excluded name must sit in the same test target on both trees (each inventory list block matched to cargo's
-  own `Running` line), and every cargo base failure is confirmed by the base's exit code — run alone on the base
+  own `Running` line, executable hash included, so two packages' `tests/smoke.rs` are two targets), and every cargo base failure is confirmed by the base's exit code — run alone on the base
   (`-- <name> --exact`) it must fail, so a child run's line or a test a crashed binary never reached cannot be
   excluded (at most 16, more escalates); a base that timed out or could not run escalates; and a manifest change to `[profile]`, `[patch]`, `[replace]`, `[workspace]` or
   `[lints]` runs the full suite. Anything else is
@@ -45,13 +45,14 @@ Two release tracks share this file, newest entry first regardless of track:
   stored once, content-addressed (sha256), in the run's log store, with a lazy line TOC and ranges read by ref
   and verified against the hash (`floor_log`); a stream past 64 MiB keeps its prefix, marked `truncated`, and a
   truncated inventory is never precise. Kept: the PTY grant (core#1060's Seatbelt rules, cherry-picked), the
-  load-aware bound, the base cache (now `{floor_policy: 4, run, toc}`), `.wicked/checks.json`, the operator
+  load-aware bound, the base cache (now `{floor_policy: 7, run, toc}`; an inventory or alone run that did not finish is not cached), `.wicked/checks.json`, the operator
   override and QE. An unconfigured cargo repo runs its affected set at the creator AND at verify (`full: true`
   keeps verify full): the members owning a touched file plus the members a manifest change (`cargo metadata
   --no-deps` diffed against the base) or a lockfile change reaches, closed over their reverse path
-  dependencies and over every member sharing a dependency whose declaration changed, or any dependency of a member whose
-  `[features]` table changed,
-  (cargo unifies features across what it builds), in one `-p a -p b` invocation; a `[profile]`, `[patch]`,
+  dependencies and over every member that reaches what a moved package reaches (a dependency whose declaration
+  changed, every dependency of a member whose `[features]` table changed, a changed lock entry), closed over the
+  members' metadata and the lock graphs (cargo unifies features across what it builds), in one `-p a -p b`
+  invocation; on the base the set runs only over the packages the base has (an all-new set is a `new_failure`); a `[profile]`, `[patch]`,
   `[replace]`, `[workspace]`, `[lints]`, `package.resolver`/`edition`, nested `.cargo/` or `rust-toolchain` change
   runs the full suite. The macOS floor's test seam now arms the private `TMPDIR` as
   production does, so doctests run under the real floor sandbox. Wire (additive): every

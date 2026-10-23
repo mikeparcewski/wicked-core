@@ -4157,13 +4157,20 @@ impl BaseTree {
             Ok(d) => d,
             Err(e) => return fail(format!("the base's checks could not be determined: {e}")),
         };
-        if check.name != "test_targeted" && !detected.iter().any(|c| c.name == check.name) {
+        // A derived set stands for the base's own test check: the export has no base of its own,
+        // so it detects `test` / `cargo-test`, never `test_targeted`.
+        let declares = |c: &RepoCheck| {
+            c.name == check.name
+                || (check.name == "test_targeted"
+                    && matches!(c.name.as_str(), "test" | "cargo-test"))
+        };
+        if !detected.iter().any(declares) {
             return fail(format!(
                 "the run base declares no `{}` check (the change introduced it)",
                 check.name
             ));
         }
-        let target = check.clone();
+        let mut target = check.clone();
         if let Some(install) = detected.iter().find(|c| c.name == "install") {
             let install = RepoCheck {
                 dir: check.dir.clone(),
@@ -4176,6 +4183,38 @@ impl BaseTree {
                     r.summary()
                 ));
             }
+        }
+        // (agy r6) A derived cargo set names the HEAD's packages; the base runs only those it has.
+        // An all-new set is a check the base does not declare: a new failure, never escalated.
+        if check.name == "test_targeted" && check.argv.iter().any(|a| a == "-p") {
+            let have =
+                match crate::floor_affected::base_packages(&self.dir, check, sandbox, scratch) {
+                    Ok(h) => h,
+                    Err(e) => return fail(format!("the base's packages could not be listed: {e}")),
+                };
+            let (mut argv, mut new) = (Vec::new(), Vec::new());
+            let mut it = check.argv.iter();
+            while let Some(a) = it.next() {
+                match (a.as_str(), it.clone().next()) {
+                    ("-p", Some(p)) => {
+                        it.next();
+                        if have.contains(p) {
+                            argv.extend([a.clone(), p.clone()]);
+                        } else {
+                            new.push(p.clone());
+                        }
+                    }
+                    _ => argv.push(a.clone()),
+                }
+            }
+            if !argv.iter().any(|a| a == "-p") {
+                return fail(format!(
+                    "the run base declares no `{}` check over `{}` (the change introduced it)",
+                    check.name,
+                    new.join("`, `")
+                ));
+            }
+            target.argv = argv;
         }
         let run = run_one(&self.dir, &target, sandbox, scratch, Tree::Base);
         // A red base is inventoried on the same export, by its own runner (its TOC).
@@ -4208,8 +4247,17 @@ impl BaseTree {
                         };
                         let r = run_one(&self.dir, &one, sandbox, scratch, Tree::Base);
                         t.logs.extend(relabel(r.logs.clone(), "alone-base"));
-                        let failed = !r.passed() && !r.timed_out && r.spawn_error.is_none();
-                        t.alone.push((n, failed));
+                        // (agy r6) One that did not finish or start confirms nothing: the
+                        // inventory is incomplete (escalates) and not cached.
+                        if r.timed_out || r.spawn_error.is_some() {
+                            t.incomplete = Some(format!(
+                                "`{n}` run alone on the base did not finish ({})",
+                                r.summary()
+                            ));
+                            t.transient = true;
+                            break;
+                        }
+                        t.alone.push((n, !r.passed()));
                     }
                 }
             }
@@ -4219,8 +4267,12 @@ impl BaseTree {
             run,
             toc,
         };
-        // A base run that did not finish or could not start is not cached: it says nothing lasting.
-        if !rec.run.timed_out && rec.run.spawn_error.is_none() {
+        // A base run (or its inventory, or an alone run) that did not finish or could not start is
+        // not cached: it says nothing lasting.
+        if !rec.run.timed_out
+            && rec.run.spawn_error.is_none()
+            && !rec.toc.as_ref().is_some_and(|t| t.transient)
+        {
             let _ = std::fs::create_dir_all(scratch.root.join("base-cache"));
             if let Ok(json) = serde_json::to_string(&rec) {
                 let _ = std::fs::write(&cache, json);
@@ -4302,7 +4354,7 @@ pub const OUTCOME_COULD_NOT_RUN: &str = "could_not_run";
 pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
 /// The versioned base-cache record (core#1060 r9 keyed the cache by sandbox policy; v4 adds the
 /// base inventory): a record of any other version, or a bare `CheckRun`, is a miss.
-const FLOOR_POLICY_VERSION: u32 = 6;
+const FLOOR_POLICY_VERSION: u32 = 7;
 /// The most base failures the floor confirms one by one (each run alone on the base); more than
 /// this escalates rather than paying for them.
 const MAX_ALONE_CONFIRMATIONS: usize = 16;
@@ -4334,6 +4386,9 @@ struct Toc {
     /// (cargo) `(target, name)` for every listed test ([`cargo_toc_targets`]).
     #[serde(default)]
     targets: Vec<(String, String)>,
+    /// The inventory or an alone run did not finish or could not start: never cached.
+    #[serde(skip)]
+    transient: bool,
 }
 
 impl Toc {
@@ -4410,6 +4465,7 @@ fn inventory(
         logs,
         alone: Vec::new(),
         targets: targets.unwrap_or_default(),
+        transient: r.timed_out || r.spawn_error.is_some(),
     }
 }
 
@@ -5286,8 +5342,16 @@ pub(crate) fn run_one(
     if let Some(e) = out.error.or(err.error) {
         result.spawn_error = Some(e);
     }
-    let stdout = crate::floor_log::text(store, &result.logs[0]);
-    let stderr = crate::floor_log::text(store, &result.logs[1]);
+    // Read back only for a failing run: nothing below reads a passing run's streams (agy r6).
+    let failed = result.exit_code != Some(0);
+    let (stdout, stderr) = if failed {
+        (
+            crate::floor_log::text(store, &result.logs[0]),
+            crate::floor_log::text(store, &result.logs[1]),
+        )
+    } else {
+        Default::default()
+    };
     // The launcher's exit is not the repository's (core#493): bwrap that cannot `mkdir` a `--tmpfs`
     // destination dies BEFORE exec with `bwrap: Can't mkdir …` and exit 1 (so does a launcher
     // whose `execvp` of the check's binary fails) — the check never ran, so recording
@@ -5305,7 +5369,6 @@ pub(crate) fn run_one(
     // ANNOTATION only (DES-FLOOR-V2): the ids a runner printed, both streams, first sight order.
     // They name failures for the reader; no outcome reads them.
     let mut eslint_file = None;
-    let failed = result.exit_code != Some(0);
     for line in stdout.lines().chain(stderr.lines()).filter(|_| failed) {
         if result.failure_ids.len() >= MAX_FAILURE_IDS {
             break;
@@ -5380,14 +5443,14 @@ pub(crate) mod test_seam {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::validator::SandboxLevel;
 
     #[cfg(unix)]
     use super::test_seam as seam;
 
-    fn scratch(name: &str) -> PathBuf {
+    pub(crate) fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "wicked-repochecks-{name}-{}-{:?}",
             std::process::id(),
@@ -7159,7 +7222,7 @@ mod tests {
         assert!(r.stdout_tail.contains("long-line-of-output"));
     }
 
-    fn git(repo: &Path, args: &[&str]) -> String {
+    pub(crate) fn git(repo: &Path, args: &[&str]) -> String {
         // spawn-audit: test-only — builds the baseline-diff fixture repository.
         let out = Command::new("git")
             .arg("-C")
@@ -7303,7 +7366,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&wt);
     }
 
-    fn git_repo_with_commit(repo: &Path) -> String {
+    pub(crate) fn git_repo_with_commit(repo: &Path) -> String {
         git(repo, &["init", "-q"]);
         git(repo, &["config", "user.email", "t@example.invalid"]);
         git(repo, &["config", "user.name", "t"]);
@@ -9147,7 +9210,43 @@ mod tests {
         );
         std::fs::write(repo8.join("toc.txt"), "renamed: test\n\n1 test, 0 benchmarks\nfine: test\nold: test\n\n2 tests, 0 benchmarks\n").unwrap();
         unseparated(&repo8, &ctx8, "one name in two targets");
-        for r in [repo, repo2, repo3, repo4, repo5, repo6, repo7, repo8] {
+        // (l, codex r6) The base's failing `old` is in one package's `tests/smoke.rs`; the head
+        // moves it to ANOTHER package's `tests/smoke.rs`: same path, another executable hash.
+        let (repo9, ctx9, argv9) = red_base("unsep-package");
+        let smoke =
+            |h: &str| format!("     Running tests/smoke.rs (target/debug/deps/smoke-{h})\n");
+        write_tree(
+            &repo9,
+            &argv9,
+            &[
+                ("run.out", "test old ... FAILED\n"),
+                ("run.exit", "101"),
+                ("toc.txt", &toc_of(&["old"])),
+                ("toc.err", &smoke("ab326bc8")),
+            ],
+        );
+        git(&repo9, &["add", "-A"]);
+        git(
+            &repo9,
+            &["commit", "-qm", "old in package a's tests/smoke.rs"],
+        );
+        let ctx9 = FloorContext {
+            base_head: Some(git(&repo9, &["rev-parse", "HEAD"])),
+            ..ctx9
+        };
+        write_tree(
+            &repo9,
+            &argv9,
+            &[
+                ("run.out", "test old ... FAILED\n"),
+                ("run.exit", "101"),
+                ("excluded.exit", "0"),
+                ("toc.txt", &toc_of(&["old"])),
+                ("toc.err", &smoke("62bd74a4")),
+            ],
+        );
+        unseparated(&repo9, &ctx9, "one file name in two packages");
+        for r in [repo, repo2, repo3, repo4, repo5, repo6, repo7, repo8, repo9] {
             let _ = std::fs::remove_dir_all(r);
         }
     }
@@ -9540,166 +9639,6 @@ mod tests {
         let seam = run_with_sandbox(&repo, sandbox_for(&repo));
         let c = cargo_check(&seam);
         assert!(c.passed(), "the test seam arms the private TMPDIR: {c:#?}");
-        let _ = std::fs::remove_dir_all(&repo);
-    }
-
-    /// DONE WHEN 5: a manifest-only change runs the metadata closure — the member whose manifest
-    /// changed and the members that depend on it by path — in one `-p` invocation, never the
-    /// whole workspace; a source change runs its owner plus its dependents.
-    #[cfg(unix)]
-    #[test]
-    fn a_manifest_only_change_runs_the_metadata_closure_not_the_workspace() {
-        let _load = seam::pin(0.5, 4);
-        let repo = scratch("affected");
-        for (name, deps) in [("a", ""), ("b", "a = { path = \"../a\" }\n"), ("c", "")] {
-            std::fs::create_dir_all(repo.join(name).join("src")).unwrap();
-            std::fs::write(
-                repo.join(name).join("Cargo.toml"),
-                format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\n{deps}"),
-            )
-            .unwrap();
-            std::fs::write(
-                repo.join(name).join("src/lib.rs"),
-                "#[cfg(test)]\nmod t {\n    #[test]\n    fn ok() {}\n}\n",
-            )
-            .unwrap();
-        }
-        std::fs::write(
-            repo.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n",
-        )
-        .unwrap();
-        std::fs::write(repo.join(".gitignore"), "Cargo.lock\ntmp/\ntarget/\n").unwrap();
-        let base = git_repo_with_commit(&repo);
-        let ctx = FloorContext {
-            stage: FloorStage::Creator,
-            base_head: Some(base),
-            git_dir: Some(repo.join(".git")),
-            ..FloorContext::default()
-        };
-        let targeted = |report: &RepoChecksReport| {
-            report
-                .checks
-                .iter()
-                .find(|c| c.name == "test_targeted")
-                .map(|c| (c.argv.clone(), c.source.clone()))
-                .unwrap_or_else(|| panic!("a derived set ran: {report:#?}"))
-        };
-        // A manifest-only change to `a` (a feature): `a` and its dependent `b`, never `c`.
-        std::fs::write(
-            repo.join("a/Cargo.toml"),
-            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nextra = []\n[dependencies]\n",
-        )
-        .unwrap();
-        let report = run_floor(&repo, &ctx);
-        if report.sandbox_error.is_some() {
-            return;
-        }
-        let (argv, source) = targeted(&report);
-        assert_eq!(source, DERIVED_TARGETED_SOURCE, "{argv:?}");
-        assert!(argv.ends_with(&s(&["-p", "a", "-p", "b"])), "{argv:?}");
-        assert!(
-            !argv.iter().any(|x| x == "c" || x == "--workspace"),
-            "{argv:?}"
-        );
-        assert!(report.passed, "{report:#?}");
-        // A source change in `a` alone: `a` plus its reverse dependency `b`.
-        git(&repo, &["checkout", "--", "a/Cargo.toml"]);
-        std::fs::write(
-            repo.join("a/src/lib.rs"),
-            "pub fn x() {}\n#[cfg(test)]\nmod t {\n    #[test]\n    fn ok() {}\n}\n",
-        )
-        .unwrap();
-        let (argv, _) = targeted(&run_floor(&repo, &ctx));
-        assert!(argv.ends_with(&s(&["-p", "a", "-p", "b"])), "{argv:?}");
-        // (codex r1) A root `[profile]` change beside a source edit in `a`: package metadata does not
-        // carry profiles, so every member is affected — the full suite.
-        std::fs::write(
-            repo.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n[profile.dev]\noverflow-checks = false\n",
-        )
-        .unwrap();
-        let (argv, source) = targeted(&run_floor(&repo, &ctx));
-        assert!(!argv.iter().any(|x| x == "-p"), "{argv:?}");
-        assert!(
-            source.contains("`[profile]`") && source.contains("the full suite"),
-            "{source}"
-        );
-        git(&repo, &["checkout", "--", "Cargo.toml"]);
-        // (codex r2) A member's edition (which defaults the resolver) reaches every member.
-        std::fs::write(
-            repo.join("a/Cargo.toml"),
-            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\n",
-        )
-        .unwrap();
-        let (argv, source) = targeted(&run_floor(&repo, &ctx));
-        assert!(!argv.iter().any(|x| x == "-p"), "{argv:?}");
-        assert!(source.contains("package.edition"), "{source}");
-        git(&repo, &["checkout", "--", "a/Cargo.toml"]);
-        // A change in `c` alone: `c` only.
-        git(&repo, &["checkout", "--", "a/src/lib.rs"]);
-        std::fs::write(repo.join("c/src/lib.rs"), "pub fn y() {}\n").unwrap();
-        let (argv, _) = targeted(&run_floor(&repo, &ctx));
-        assert!(
-            argv.ends_with(&s(&["-p", "c"])) && !argv.contains(&"a".to_string()),
-            "{argv:?}"
-        );
-        let _ = std::fs::remove_dir_all(&repo);
-    }
-
-    /// (codex r4) A member's `[features]` change that turns on a shared dependency's feature
-    /// reaches every member that depends on it (cargo unifies features across what it builds):
-    /// `a` enabling `s/bad` selects `b` (which does not depend on `a`) and `s` itself.
-    #[cfg(unix)]
-    #[test]
-    fn a_feature_change_on_a_shared_dependency_selects_its_other_consumers() {
-        let _load = seam::pin(0.5, 4);
-        let repo = scratch("features");
-        let member = |name: &str, deps: &str, features: &str| {
-            std::fs::create_dir_all(repo.join(name).join("src")).unwrap();
-            std::fs::write(
-                repo.join(name).join("Cargo.toml"),
-                format!(
-                    "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
-                     [features]\n{features}[dependencies]\n{deps}"
-                ),
-            )
-            .unwrap();
-            std::fs::write(repo.join(name).join("src/lib.rs"), "\n").unwrap();
-        };
-        member("s", "", "bad = []\n");
-        member("a", "s = { path = \"../s\" }\n", "");
-        member("b", "s = { path = \"../s\" }\n", "");
-        member("c", "", "");
-        std::fs::write(
-            repo.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"s\", \"a\", \"b\", \"c\"]\nresolver = \"2\"\n",
-        )
-        .unwrap();
-        std::fs::write(repo.join(".gitignore"), "Cargo.lock\ntmp/\n").unwrap();
-        let base = git_repo_with_commit(&repo);
-        let ctx = FloorContext {
-            stage: FloorStage::Creator,
-            base_head: Some(base),
-            git_dir: Some(repo.join(".git")),
-            ..FloorContext::default()
-        };
-        member("a", "s = { path = \"../s\" }\n", "default = [\"s/bad\"]\n");
-        let report = run_floor(&repo, &ctx);
-        if report.sandbox_error.is_some() {
-            return;
-        }
-        let c = report
-            .checks
-            .iter()
-            .find(|c| c.name == "test_targeted")
-            .unwrap_or_else(|| panic!("a derived set ran: {report:#?}"));
-        assert!(
-            c.argv.ends_with(&s(&["-p", "a", "-p", "b", "-p", "s"])),
-            "{:?}",
-            c.argv
-        );
-        assert!(!c.argv.contains(&"c".to_string()), "{:?}", c.argv);
         let _ = std::fs::remove_dir_all(&repo);
     }
 

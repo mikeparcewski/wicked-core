@@ -316,8 +316,11 @@ pub(crate) fn passing_names(runner: Runner, text: &str) -> Vec<String> {
 /// (cargo) Each listed test's TARGET: in `--list` mode no test body runs and cargo runs its
 /// binaries one after another, so the k-th list block on stdout (ended by its `N tests, M
 /// benchmarks` line) is the k-th `Running …` / `Doc-tests …` line cargo printed on stderr. The
-/// target is that line without the executable's directory and hash (`unittests src/lib.rs a`,
-/// `tests/b.rs b`, `doc a`). `None` when the counts disagree — then no name has a target.
+/// target is that line with the executable's file name, HASH INCLUDED (`unittests src/lib.rs
+/// a-1f2e`, `tests/b.rs b-9a8b`, `doc a`): cargo's hash is the unit's metadata (package, target,
+/// features, dependencies), stable across checkouts and source edits, so two packages'
+/// `tests/smoke.rs` are two targets (codex r6) and a dependency or feature change leaves the
+/// target's names unmatched (escalates). `None` when the counts disagree.
 pub(crate) fn cargo_toc_targets(stdout: &str, stderr: &str) -> Option<Vec<(String, String)>> {
     let targets: Vec<String> = stderr
         .lines()
@@ -327,7 +330,6 @@ pub(crate) fn cargo_toc_targets(stdout: &str, stderr: &str) -> Option<Vec<(Strin
                 let (what, exe) = r.rsplit_once(" (")?;
                 let stem = Path::new(exe.trim_end_matches(')')).file_name()?.to_str()?;
                 let stem = stem.strip_suffix(".exe").unwrap_or(stem);
-                let stem = stem.rsplit_once('-').map_or(stem, |(s, _)| s);
                 Some(format!("{what} {stem}"))
             } else {
                 l.strip_prefix("Doc-tests ").map(|c| format!("doc {c}"))
@@ -536,11 +538,21 @@ mod tests {
         assert_eq!(
             cargo_toc_targets(out, err),
             Some(vec![
-                ("tests/a.rs a".to_string(), "a".to_string()),
-                ("tests/a.rs a".to_string(), "old".to_string()),
-                ("tests/b.rs b".to_string(), "old2".to_string()),
+                ("tests/a.rs a-1f2e3d".to_string(), "a".to_string()),
+                ("tests/a.rs a-1f2e3d".to_string(), "old".to_string()),
+                ("tests/b.rs b-9a8b7c".to_string(), "old2".to_string()),
             ])
         );
+        // (codex r6) Two packages' `tests/smoke.rs` are two targets (cargo hashes the package in).
+        let smoke = |h: &str| {
+            cargo_toc_targets(
+                "old: test\n\n1 test, 0 benchmarks\n",
+                &format!("     Running tests/smoke.rs (target/debug/deps/smoke-{h})\n"),
+            )
+            .unwrap()
+        };
+        assert_ne!(smoke("ab326bc8"), smoke("62bd74a4"));
+        assert_eq!(smoke("ab326bc8"), smoke("ab326bc8"));
         assert_eq!(
             cargo_toc_targets(out, "     Running tests/a.rs (target/debug/deps/a-1)\n"),
             None
