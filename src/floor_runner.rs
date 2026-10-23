@@ -119,12 +119,14 @@ fn understood_cargo_test(argv: &[String]) -> Option<(&[String], &[String])> {
 /// state, `-run`, `-list`, `-json`, `-exec`).
 pub(crate) fn deselectable(runner: Runner, argv: &[String]) -> bool {
     match runner {
-        Runner::Cargo => understood_cargo_test(argv).is_some(),
+        Runner::Cargo => {
+            understood_cargo_test(argv).is_some() && argv.iter().any(|a| a == "--no-fail-fast")
+        }
         Runner::Pytest => !argv.iter().any(|a| {
             let k = a.split('=').next().unwrap_or(a);
             matches!(
                 k,
-                "--deselect"
+                "--" | "--deselect"
                     | "--co"
                     | "--collect-only"
                     | "--lf"
@@ -140,6 +142,9 @@ pub(crate) fn deselectable(runner: Runner, argv: &[String]) -> bool {
             )
         }),
         Runner::Go => !argv[2..].iter().any(|a| {
+            if a == "--" {
+                return true;
+            }
             let k = a.trim_start_matches('-');
             let k = k.split('=').next().unwrap_or(k);
             a.starts_with('-') && matches!(k, "run" | "skip" | "list" | "json" | "exec" | "c")
@@ -159,7 +164,16 @@ pub(crate) fn toc_argv(runner: Runner, argv: &[String]) -> Vec<String> {
             out
         }
         Runner::Pytest => {
-            let mut out = argv.to_vec();
+            // Verbosity stacks (`-q -q` lists per-file counts, `-v -q` the tree): the check's own
+            // flags are dropped so the inventory prints exactly one node id per line.
+            let verbosity = |a: &str| {
+                matches!(a, "--quiet" | "--verbose")
+                    || (a.len() > 1
+                        && a.starts_with('-')
+                        && !a.starts_with("--")
+                        && a[1..].chars().all(|c| c == 'q' || c == 'v'))
+            };
+            let mut out: Vec<String> = argv.iter().filter(|a| !verbosity(a)).cloned().collect();
             out.extend(["--collect-only".to_string(), "-q".to_string()]);
             out
         }
@@ -178,6 +192,7 @@ pub(crate) fn toc_argv(runner: Runner, argv: &[String]) -> Vec<String> {
 pub(crate) fn parse_toc(runner: Runner, stdout: &str) -> Option<Vec<String>> {
     let mut names = Vec::new();
     let mut listed = 0usize;
+    let mut summaries = 0usize;
     for line in stdout.lines() {
         let l = line.trim_end_matches('\r');
         if l.trim().is_empty() {
@@ -203,6 +218,7 @@ pub(crate) fn parse_toc(runner: Runner, stdout: &str) -> Option<Vec<String>> {
                     (u == unit || u == format!("{unit}s")).then(|| n.parse().ok())?
                 };
                 listed += count(t, "test")? + count(b, "benchmark")?;
+                summaries += 1;
             }
             Runner::Pytest => {
                 if l.contains("::") && !l.contains(' ') {
@@ -215,9 +231,11 @@ pub(crate) fn parse_toc(runner: Runner, stdout: &str) -> Option<Vec<String>> {
                     return None;
                 }
                 listed += if n == "no" { 0 } else { n.parse().ok()? };
+                summaries += 1;
             }
             Runner::Go => {
                 if l.starts_with("ok ") || l.starts_with("?   ") {
+                    summaries += 1;
                     continue;
                 }
                 let ident = |s: &str| {
@@ -232,26 +250,35 @@ pub(crate) fn parse_toc(runner: Runner, stdout: &str) -> Option<Vec<String>> {
         }
     }
     let counted = runner == Runner::Go || listed == names.len();
-    counted.then_some(names)
+    (counted && summaries > 0).then_some(names)
 }
 
-/// The failing test names a run's OWN output (the base's) carries, in its runner's format.
+/// The failing test names a run's OWN stdout (the base's) carries, read only from the runner's
+/// own result lines: libtest `test X ... FAILED`; pytest's `short test summary info` section
+/// (`FAILED <id>` / `ERROR <id>`, never a test's captured output above it); go's top-level
+/// `--- FAIL: X (Ns)` at column 0 (a subtest is indented — see [`go_subtest_failed`]).
 pub(crate) fn failing_names(runner: Runner, text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let mut in_summary = false;
     for line in text.lines() {
         let l = line.trim_end_matches('\r');
+        if runner == Runner::Pytest && l.starts_with('=') {
+            in_summary = l.contains(" short test summary info ");
+            continue;
+        }
         let name = match runner {
             Runner::Cargo => l
                 .strip_prefix("test ")
                 .and_then(|r| r.strip_suffix(" ... FAILED")),
-            Runner::Pytest => l
+            Runner::Pytest if in_summary => l
                 .strip_prefix("FAILED ")
                 .or_else(|| l.strip_prefix("ERROR "))
                 .map(|r| r.split(" - ").next().unwrap_or(r).trim_end()),
-            Runner::Go => l
-                .trim_start()
-                .strip_prefix("--- FAIL: ")
-                .map(|r| r.split(' ').next().unwrap_or(r)),
+            Runner::Pytest => None,
+            Runner::Go => l.strip_prefix("--- FAIL: ").and_then(|r| {
+                let (n, t) = r.split_once(' ')?;
+                (t.starts_with('(') && t.ends_with("s)")).then_some(n)
+            }),
         };
         if let Some(n) = name.filter(|n| !n.is_empty()) {
             if !out.iter().any(|o| o == n) && out.len() < crate::repo_checks::MAX_FAILURE_IDS {
@@ -269,14 +296,38 @@ pub(crate) fn passing_names(runner: Runner, text: &str) -> Vec<String> {
         Runner::Cargo => text
             .lines()
             .filter_map(|l| {
-                l.trim_end_matches('\r')
-                    .strip_prefix("test ")?
-                    .strip_suffix(" ... ok")
+                let r = l.trim_end_matches('\r').strip_prefix("test ")?;
+                r.strip_suffix(" ... ok")
+                    .or_else(|| r.strip_suffix(" ... ignored"))
                     .map(str::to_string)
             })
             .collect(),
         Runner::Pytest | Runner::Go => Vec::new(),
     }
+}
+
+/// Did a go run's output report a failing SUBTEST (`--- FAIL: TestA/sub (…)`, indented)? A
+/// subtest is not addressable by `-skip=^(TestA)$` without skipping its passing siblings, so the
+/// floor cannot separate it.
+pub(crate) fn go_subtest_failed(text: &str) -> bool {
+    text.lines().any(|l| {
+        l.trim_start()
+            .strip_prefix("--- FAIL: ")
+            .is_some_and(|r| r.split(' ').next().is_some_and(|n| n.contains('/')))
+    })
+}
+
+/// (pytest) `--deselect` matches node-id PREFIXES: the first deselected name that would also remove
+/// a head test outside `names` (`a.py::test_x` takes `a.py::test_x_extra` and `a.py::test_x[1]`),
+/// or `None` when every match is intended.
+pub(crate) fn pytest_prefix_collision<'a>(names: &'a [String], head: &[String]) -> Option<&'a str> {
+    names
+        .iter()
+        .find(|n| {
+            head.iter()
+                .any(|h| h.starts_with(n.as_str()) && !names.contains(h))
+        })
+        .map(String::as_str)
 }
 
 /// `argv` with `names` deselected natively: libtest `--skip <name>` … `--exact` (exact names,
@@ -330,10 +381,29 @@ pub(crate) fn cargo_config_bends_test_args(worktree: &Path, dir: &str) -> Option
                 Ok(r) => r,
                 Err(e) => return Some(format!("`{name}` could not be read: {e}")),
             };
-            if raw.contains("rustdocflags") || raw.contains("test-args") {
+            // Decoded as cargo decodes it (`"rustdoc\u0066lags"` is `rustdocflags`); a config
+            // that does not parse, or that includes another, cannot be vouched for.
+            let Ok(v) = toml::from_str::<toml::Value>(&raw) else {
+                return Some(format!("the head's `{name}` does not parse as TOML"));
+            };
+            fn bends(v: &toml::Value) -> bool {
+                let word = |s: &str| {
+                    let s = s.to_ascii_lowercase();
+                    s.contains("rustdocflags") || s.contains("test-args") || s.contains("test_args")
+                };
+                match v {
+                    toml::Value::String(s) => word(s),
+                    toml::Value::Array(a) => a.iter().any(bends),
+                    toml::Value::Table(t) => {
+                        t.iter().any(|(k, v)| word(k) || k == "include" || bends(v))
+                    }
+                    _ => false,
+                }
+            }
+            if bends(&v) {
                 return Some(format!(
-                    "the head's `{name}` sets rustdocflags or test-args, which `--exact` would \
-                     change"
+                    "the head's `{name}` sets rustdocflags, test args or an include, which \
+                     `--exact` would change"
                 ));
             }
         }
@@ -399,16 +469,19 @@ mod tests {
         assert_eq!(
             failing_names(
                 Runner::Pytest,
-                "FAILED tests/a.py::test_x - assert 1 == 2\nERROR tests/a.py::test_e\n"
+                "=== short test summary info ===\nFAILED tests/a.py::test_x - assert 1 == 2\n\
+                 ERROR tests/a.py::test_e\n=== 1 failed, 1 error ===\n"
             ),
             s(&["tests/a.py::test_x", "tests/a.py::test_e"])
         );
+        // A subtest is indented; only the top-level name is read (and the subtest is flagged by
+        // `go_subtest_failed`).
         assert_eq!(
             failing_names(
                 Runner::Go,
                 "--- FAIL: TestA (0.00s)\n    --- FAIL: TestA/sub (0.00s)\n"
             ),
-            s(&["TestA", "TestA/sub"])
+            s(&["TestA"])
         );
         let cargo = s(&["cargo", "test", "--locked", "--", "--test-threads=4"]);
         assert_eq!(
@@ -463,6 +536,58 @@ mod tests {
         assert_eq!(runner_of(&s(&["npm", "run", "test"])), None);
     }
 
+    /// Round 1 of #1066: an empty inventory is no inventory; pytest's verbosity is pinned for the
+    /// inventory; only the runners' OWN result lines name failures (pytest's short summary, go's
+    /// top-level lines); a go subtest is flagged; `ignored` is a libtest witness; a pytest
+    /// prefix that would take another test is caught.
+    #[test]
+    fn inventories_and_failures_read_only_the_runners_own_lines() {
+        for r in [Runner::Cargo, Runner::Pytest, Runner::Go] {
+            assert_eq!(
+                parse_toc(r, ""),
+                None,
+                "{r:?}: an empty stdout is no inventory"
+            );
+        }
+        assert_eq!(
+            toc_argv(
+                Runner::Pytest,
+                &s(&["pytest", "-q", "-vv", "--quiet", "tests"])
+            ),
+            s(&["pytest", "tests", "--collect-only", "-q"])
+        );
+        let py = "tests/a.py::test_x PASSED\nFAILED tests/a.py::test_ok - printed by a test\n\
+                  =========== short test summary info ===========\n\
+                  FAILED tests/a.py::test_x - assert 1 == 2\n=========== 1 failed ===========\n\
+                  FAILED tests/a.py::test_after - after the summary\n";
+        assert_eq!(
+            failing_names(Runner::Pytest, py),
+            s(&["tests/a.py::test_x"])
+        );
+        let go = "--- FAIL: TestA (0.00s)\n    --- FAIL: TestA/sub (0.00s)\n    logged: --- FAIL: TestB (0.00s)\n\
+                  --- FAIL: TestC is printed text\n";
+        assert_eq!(failing_names(Runner::Go, go), s(&["TestA"]));
+        assert!(go_subtest_failed(go) && !go_subtest_failed("--- FAIL: TestA (0.00s)\n"));
+        assert_eq!(
+            passing_names(
+                Runner::Cargo,
+                "test a ... ok\ntest b ... ignored\ntest c ... FAILED\n"
+            ),
+            s(&["a", "b"])
+        );
+        let head = s(&[
+            "a.py::test_case",
+            "a.py::test_case_extra",
+            "a.py::test_case[1]",
+            "b.py::t",
+        ]);
+        assert_eq!(
+            pytest_prefix_collision(&s(&["a.py::test_case"]), &head),
+            Some("a.py::test_case")
+        );
+        assert_eq!(pytest_prefix_collision(&s(&["b.py::t"]), &head), None);
+    }
+
     /// (core#1060 r16) The allowlist: what the floor appends cannot be bent by the argv.
     #[test]
     fn only_an_allowlisted_argv_is_deselected() {
@@ -478,7 +603,17 @@ mod tests {
             "--test-threads",
             "4"
         ]));
-        assert!(ok(&["cargo", "+nightly", "test", "--workspace", "-Ffeat"]));
+        assert!(ok(&[
+            "cargo",
+            "+nightly",
+            "test",
+            "--workspace",
+            "-Ffeat",
+            "--no-fail-fast"
+        ]));
+        // (agy r1) Without `--no-fail-fast` cargo stops at the first red binary, so later tests
+        // print no result line — no witness for the base's names.
+        assert!(!ok(&["cargo", "test", "--workspace"]));
         for bad in [
             &["cargo", "test", "foo"][..],
             &["cargo", "test", "--", "--skip", "x"],
@@ -492,6 +627,8 @@ mod tests {
             &["pytest", "--lf"],
             &["go", "test", "-run", "TestA", "./..."],
             &["go", "test", "-json", "./..."],
+            &["go", "test", "./...", "--", "-x"],
+            &["pytest", "--", "tests"],
         ] {
             assert!(!ok(bad), "{bad:?} must not be deselected");
         }

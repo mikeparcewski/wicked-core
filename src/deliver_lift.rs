@@ -2305,8 +2305,8 @@ mod tests {
     fn deliver_reverify_excuses_failures_the_tip_shares_and_refuses_regressions() {
         let runner = deselecting_runner();
         let config = serde_json::json!({
-            "test": [runner.as_str(), "test"],
-            "test_targeted": [runner.as_str(), "test"],
+            "test": [runner.as_str(), "test", "--no-fail-fast"],
+            "test_targeted": [runner.as_str(), "test", "--no-fail-fast"],
             "timeout_s": 60
         })
         .to_string();
@@ -2424,7 +2424,7 @@ mod tests {
             identity(&repo);
             std::fs::write(
                 repo.join(".wicked/checks.json"),
-                serde_json::json!({ "test": [runner.as_str(), "test"], "timeout_s": 60 })
+                serde_json::json!({ "test": [runner.as_str(), "test", "--no-fail-fast"], "timeout_s": 60 })
                     .to_string(),
             )
             .unwrap();

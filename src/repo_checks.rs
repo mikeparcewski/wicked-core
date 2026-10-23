@@ -241,7 +241,8 @@ use wicked_apps_core::spawn::HardenedCommand;
 
 use crate::floor_runner::{
     cargo_config_bends_test_args, cargo_test_sub, deselect_argv, deselectable, failing_names,
-    parse_toc, passing_names, runner_of, toc_argv, Runner,
+    go_subtest_failed, parse_toc, passing_names, pytest_prefix_collision, runner_of, toc_argv,
+    Runner,
 };
 use crate::validator::WorkerSandbox;
 
@@ -765,10 +766,16 @@ impl RepoChecksReport {
             let said = match d.outcome.as_str() {
                 OUTCOME_PASS_EXCLUDED => format!(
                     "passed with {} (the base fails them too; the head passed with them \
-                     deselected)",
+                     deselected){}",
                     d.reason
                         .as_deref()
-                        .unwrap_or("pre-existing failures excluded")
+                        .unwrap_or("pre-existing failures excluded"),
+                    if d.flaky {
+                        " — the excluded run failed on an oversubscribed host first; an \
+                         order-dependent failure reads the same way"
+                    } else {
+                        ""
+                    }
                 ),
                 OUTCOME_PASS if d.flaky => "failed on an oversubscribed host and passed on its \
                                             identical retry (flaky) — not denied; an \
@@ -2395,7 +2402,7 @@ impl CheckScratch {
             tmp,
             lease: Some(lease),
             logs,
-            log_cap: crate::floor_log::MAX_STREAM_BYTES,
+            log_cap: log_cap(),
         })
     }
 
@@ -4301,10 +4308,15 @@ fn inventory(
     let logs = relabel(r.logs.clone(), attempt);
     let stdout = logs
         .first()
-        .map(|l| crate::floor_log::text(&scratch.logs, l))
-        .unwrap_or_default();
-    let parsed = parse_toc(runner, &stdout);
-    let incomplete = if !r.passed() {
+        .ok_or_else(|| "no stored output".to_string())
+        .and_then(|l| crate::floor_log::read_blob(&scratch.logs, l));
+    let parsed = stdout
+        .as_ref()
+        .ok()
+        .and_then(|b| parse_toc(runner, &String::from_utf8_lossy(b)));
+    let incomplete = if let Err(e) = &stdout {
+        Some(format!("its inventory could not be read back ({e})"))
+    } else if !r.passed() {
         Some(format!("its inventory did not exit 0 ({})", r.summary()))
     } else if logs.iter().any(|l| l.truncated) {
         Some("its inventory was cut at the log cap".to_string())
@@ -4441,12 +4453,25 @@ fn decide(
             if let Some(why) = &toc.incomplete {
                 return Err(format!("the base: {why}"));
             }
+            // The base's own result lines are on its STDOUT; a stream cut at the cap, or one the
+            // store cannot return verified, can have lost a failure line or a passing witness.
+            if b.logs.iter().any(|l| l.truncated) {
+                return Err("the base's output was cut at the log cap".to_string());
+            }
             let base_text = b
                 .logs
-                .iter()
-                .map(|l| crate::floor_log::text(&scratch.logs, l))
-                .collect::<Vec<_>>()
-                .join("\n");
+                .first()
+                .ok_or_else(|| "the base run has no stored output".to_string())
+                .and_then(|l| crate::floor_log::read_blob(&scratch.logs, l))
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .map_err(|e| format!("the base's output could not be read back: {e}"))?;
+            if runner == Runner::Go && go_subtest_failed(&base_text) {
+                return Err(
+                    "a go SUBTEST failed on the base; its parent cannot be skipped without its \
+                     passing siblings"
+                        .to_string(),
+                );
+            }
             // Kept only when the base's own inventory lists the name VERBATIM — and (libtest, which
             // prints every test's own result line) when the base did not ALSO report it `ok`: a
             // failing base test's captured output can carry a child run's `test X ... FAILED` for
@@ -4483,13 +4508,6 @@ fn decide(
                     ));
                 }
             }
-            if runner == Runner::Go
-                && failing
-                    .iter()
-                    .any(|n| n.contains(|c: char| !c.is_ascii_alphanumeric() && c != '_'))
-            {
-                return Err("a go test name is not a plain identifier".to_string());
-            }
             if let Some(n) = failing.iter().find(|n| toc.count(n) != 1) {
                 return Err(format!(
                     "`{n}` names {} tests in the base's inventory",
@@ -4506,6 +4524,14 @@ fn decide(
                     "`{n}` names {} tests in the head's inventory",
                     head_toc.count(n)
                 ));
+            }
+            if runner == Runner::Pytest {
+                if let Some(n) = pytest_prefix_collision(&failing, &head_toc.names) {
+                    return Err(format!(
+                        "`--deselect={n}` would also remove another head test (pytest matches \
+                         node-id prefixes)"
+                    ));
+                }
             }
             Ok((
                 runner,
@@ -4876,6 +4902,42 @@ fn affected_packages(
         let (Some(base), Some(git_dir)) = (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) else {
             return Err("no base to diff the manifests against".into());
         };
+        // `cargo metadata` does not carry every manifest table: a changed `[profile]`,
+        // `[patch]`, `[replace]`, `[workspace]` or `[lints]` reaches every member.
+        let env: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
+        for f in files
+            .iter()
+            .filter(|f| f.rsplit('/').next() == Some("Cargo.toml"))
+        {
+            let rel = if check.dir.is_empty() {
+                f.clone()
+            } else {
+                format!("{}/{f}", check.dir)
+            };
+            let old = crate::worktree_guard::git_string(
+                worktree,
+                &["show", &format!("{base}:{rel}")],
+                &env,
+            )
+            .unwrap_or_default();
+            let new = std::fs::read_to_string(worktree.join(&rel)).unwrap_or_default();
+            let table = |raw: &str| toml::from_str::<toml::Table>(raw).unwrap_or_default();
+            let (old, new) = (table(&old), table(&new));
+            for key in [
+                "profile",
+                "patch",
+                "replace",
+                "workspace",
+                "lints",
+                "cargo-features",
+            ] {
+                if old.get(key) != new.get(key) {
+                    return Err(format!(
+                        "`{rel}` changes `[{key}]`, which package metadata does not carry"
+                    ));
+                }
+            }
+        }
         let tree = BaseTree::export(worktree, scratch, git_dir, base)?;
         let base_members = workspace_members(&tree.dir, check, sandbox, scratch, Tree::Base);
         remove_base_export(worktree, scratch)?;
@@ -5464,8 +5526,17 @@ pub(crate) fn run_one(
     result
 }
 
-/// Per-thread stand-ins for the host's load and the retry's headroom wait: a floor runs on its
-/// caller's thread, so a test pins what IT sees without touching any other test.
+/// The per-stream log cap ([`crate::floor_log::MAX_STREAM_BYTES`]; a test may lower it).
+fn log_cap() -> u64 {
+    #[cfg(test)]
+    if let Some(c) = test_seam::log_cap() {
+        return c;
+    }
+    crate::floor_log::MAX_STREAM_BYTES
+}
+
+/// Per-thread stand-ins for the host's load, the retry's headroom wait and the log cap: a floor
+/// runs on its caller's thread, so a test pins what IT sees without touching any other test.
 #[cfg(test)]
 pub(crate) mod test_seam {
     use std::cell::Cell;
@@ -5473,6 +5544,23 @@ pub(crate) mod test_seam {
     thread_local! {
         static LOAD: Cell<Option<(Option<f64>, usize)>> = const { Cell::new(None) };
         static WAIT: Cell<Option<Duration>> = const { Cell::new(None) };
+        static CAP: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+    pub(crate) fn log_cap() -> Option<u64> {
+        CAP.with(Cell::get)
+    }
+    /// Lower this thread's per-stream log cap until dropped.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) struct Capped;
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn cap(bytes: u64) -> Capped {
+        CAP.with(|c| c.set(Some(bytes)));
+        Capped
+    }
+    impl Drop for Capped {
+        fn drop(&mut self) {
+            CAP.with(|c| c.set(None));
+        }
     }
     pub(crate) fn load() -> Option<(Option<f64>, usize)> {
         LOAD.with(Cell::get)
@@ -8746,13 +8834,20 @@ mod tests {
     /// after (`flake.excluded`: the same for the excluded run). Absolute path, outside every tree.
     #[cfg(unix)]
     fn fake_cargo(tag: &str) -> String {
+        fake_runner(tag, "cargo")
+    }
+
+    /// [`fake_cargo`] under another runner's name (`pytest`): `--collect-only` is its inventory,
+    /// `--deselect=` its excluded run.
+    #[cfg(unix)]
+    fn fake_runner(tag: &str, name: &str) -> String {
         let bin = scratch(&format!("{tag}-bin"));
-        let path = bin.join("cargo");
+        let path = bin.join(name);
         std::fs::write(
             &path,
             "#!/bin/sh\n\
              mode=run\n\
-             for a in \"$@\"; do case \"$a\" in --list) mode=toc;; --skip=*) mode=excluded;; esac; done\n\
+             for a in \"$@\"; do case \"$a\" in --list|--collect-only) mode=toc;; --skip=*|--deselect=*) mode=excluded;; esac; done\n\
              key=\"$TMPDIR/n-$(pwd | cksum | cut -d' ' -f1)-$mode\"\n\
              n=$(cat \"$key\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$key\"\n\
              code() { if [ -f \"$1\" ]; then cat \"$1\"; else echo 0; fi; }\n\
@@ -9027,6 +9122,13 @@ mod tests {
         )
         .unwrap();
         unseparated(&repo, &ctx, "cargo config test-args");
+        // (codex r1) The same key, escaped: cargo decodes TOML, so the guard does too.
+        std::fs::write(
+            repo.join(".cargo/config.toml"),
+            "[build]\n\"rustdoc\\u0066lags\" = [\"--test\\u002dargs=foo\"]\n",
+        )
+        .unwrap();
+        unseparated(&repo, &ctx, "escaped cargo config test-args");
         std::fs::remove_dir_all(repo.join(".cargo")).unwrap();
         // (e) A base inventory that lists the failing name twice (a fresh base commit).
         let (repo2, ctx2, argv2) = red_base("unsep-dup");
@@ -9089,7 +9191,66 @@ mod tests {
         };
         std::fs::write(repo4.join("README.md"), "changed\n").unwrap();
         unseparated(&repo4, &ctx4, "no precise deselect");
-        for r in [repo, repo2, repo3, repo4] {
+        // (h, codex r1) pytest deselects by node-id PREFIX: `test_case` would take `test_case_extra`.
+        let (repo5, ctx5, _) = red_base("unsep-pytest");
+        let py = vec![fake_runner("unsep-pytest", "pytest"), "-q".to_string()];
+        let summary = "=== short test summary info ===\nFAILED tests/a.py::test_case - boom\n=== 1 failed ===\n";
+        let toc = "tests/a.py::test_case\ntests/a.py::test_case_extra\ntests/a.py::test_ok\n\n3 tests collected in 0.01s\n";
+        write_tree(
+            &repo5,
+            &py,
+            &[("run.out", summary), ("run.exit", "1"), ("toc.txt", toc)],
+        );
+        git(&repo5, &["add", "-A"]);
+        git(&repo5, &["commit", "-qm", "a pytest base"]);
+        let ctx5 = FloorContext {
+            base_head: Some(git(&repo5, &["rev-parse", "HEAD"])),
+            ..ctx5
+        };
+        write_tree(
+            &repo5,
+            &py,
+            &[
+                ("run.out", summary),
+                ("run.exit", "1"),
+                ("excluded.exit", "0"),
+                ("toc.txt", toc),
+            ],
+        );
+        unseparated(&repo5, &ctx5, "a pytest prefix collision");
+        // (i, codex r1) A base whose output was cut at the log cap may have lost a witness.
+        let (repo6, ctx6, argv6) = red_base("unsep-cap");
+        let long = format!("test old ... FAILED\n{}", "x".repeat(4096));
+        write_tree(
+            &repo6,
+            &argv6,
+            &[
+                ("run.out", &long),
+                ("run.exit", "101"),
+                ("toc.txt", &toc_of(&["old", "fine"])),
+            ],
+        );
+        git(&repo6, &["add", "-A"]);
+        git(&repo6, &["commit", "-qm", "a long base"]);
+        let ctx6 = FloorContext {
+            base_head: Some(git(&repo6, &["rev-parse", "HEAD"])),
+            ..ctx6
+        };
+        write_tree(
+            &repo6,
+            &argv6,
+            &[
+                ("run.out", "test old ... FAILED\n"),
+                ("run.exit", "101"),
+                ("excluded.exit", "0"),
+                ("toc.txt", &toc_of(&["old", "fine"])),
+            ],
+        );
+        {
+            let _cap = seam::cap(1024);
+            unseparated(&repo6, &ctx6, "a truncated base log");
+        }
+        for r in [repo, repo2, repo3, repo4, repo5, repo6] {
             let _ = std::fs::remove_dir_all(r);
         }
     }
@@ -9554,6 +9715,20 @@ mod tests {
         .unwrap();
         let (argv, _) = targeted(&run_floor(&repo, &ctx));
         assert!(argv.ends_with(&s(&["-p", "a", "-p", "b"])), "{argv:?}");
+        // (codex r1) A root `[profile]` change beside a source edit in `a`: package metadata does not
+        // carry profiles, so every member is affected — the full suite.
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n[profile.dev]\noverflow-checks = false\n",
+        )
+        .unwrap();
+        let (argv, source) = targeted(&run_floor(&repo, &ctx));
+        assert!(!argv.iter().any(|x| x == "-p"), "{argv:?}");
+        assert!(
+            source.contains("`[profile]`") && source.contains("the full suite"),
+            "{source}"
+        );
+        git(&repo, &["checkout", "--", "Cargo.toml"]);
         // A change in `c` alone: `c` only.
         git(&repo, &["checkout", "--", "a/src/lib.rs"]);
         std::fs::write(repo.join("c/src/lib.rs"), "pub fn y() {}\n").unwrap();

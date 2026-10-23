@@ -568,7 +568,7 @@ fn make_git_repo_with_a_red_test_on_the_base(name: &str) -> PathBuf {
     std::fs::create_dir_all(repo.join(".wicked")).unwrap();
     std::fs::write(
         repo.join(".wicked/checks.json"),
-        serde_json::json!({ "test": [cargo.to_str().unwrap(), "test"], "timeout_s": 60 })
+        serde_json::json!({ "test": [cargo.to_str().unwrap(), "test", "--no-fail-fast"], "timeout_s": 60 })
             .to_string(),
     )
     .unwrap();
