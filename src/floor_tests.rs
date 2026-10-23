@@ -1862,8 +1862,13 @@ fn a_results_file_is_a_fresh_regular_file_inside_the_tree() {
     let outside = scratch("results-file-outside").join("secret");
     std::fs::write(&outside, "<testsuite/>").unwrap();
     std::fs::write(root.join("old.xml"), "<testsuite/>").unwrap();
-    std::thread::sleep(Duration::from_millis(20));
     let since = std::time::SystemTime::now();
+    std::fs::File::options()
+        .write(true)
+        .open(root.join("old.xml"))
+        .unwrap()
+        .set_modified(since - Duration::from_secs(10))
+        .unwrap();
     std::fs::write(root.join("fresh.xml"), "<testsuite/>").unwrap();
     std::os::unix::fs::symlink(&outside, root.join("link.xml")).unwrap();
     std::fs::create_dir_all(root.join("dir.xml")).unwrap();

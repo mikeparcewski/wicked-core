@@ -71,7 +71,8 @@ Two release tracks share this file, newest entry first regardless of track:
   probed. Kept: the PTY grant (core#1060's Seatbelt rules), the load-aware bound, the base cache (now
   `{floor_policy: 12, head_argv, guide, run, toc}`, keyed by the guide check it ran under), `.wicked/checks.json`,
   the operator override and QE. Fail-closed reads: a results file (`results.how.path`) counts only as a regular
-  file inside the tree, written since the run started, within the log cap (read without following a link);
+  file inside the tree, written since the run started (a leftover is removed before the run; one second of
+  file-system clock slack), within the log cap (read without following a link);
   a stream the store could not keep, or a blob that cannot be read whole, escalates instead of reading as
   empty; a process ended by a signal is `could_not_run`; the launcher-failure check reads the merged stream
   when stderr is merged; the identical retry reuses the deciding run's env; `invalidatedBy` sees deleted and

@@ -4323,6 +4323,9 @@ impl BaseTree {
         // red base is listed by the guide's `list`, its results nominate the failing ids the list
         // holds, and each is confirmed by its EXIT CODE run alone (`failedExit`). A misread result
         // can then only narrow what is excluded.
+        if let Some(g) = guide {
+            clear_results(&self.dir, &target, g);
+        }
         let since = std::time::SystemTime::now();
         let mut run = run_one_with(
             &self.dir,
@@ -4709,8 +4712,21 @@ fn no_follow(o: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
     o
 }
 
+/// How far a file system's coarse clock may stamp a fresh file before the floor's `now`.
+const FS_CLOCK_SLACK: Duration = Duration::from_secs(1);
+
+/// Remove a results file (`results.how.path`) a run is about to write, so whatever is there after
+/// the run is that run's.
+pub(crate) fn clear_results(dir: &Path, check: &RepoCheck, g: &GuideCheck) {
+    if let Some(path) = &g.results.how.path {
+        if let Ok(p) = confined(dir, &Path::new(&check.dir).join(path).to_string_lossy()) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// The results file `rel` under `root`: [`confined`], a regular file within the log cap,
-/// modified since `since`.
+/// modified since `since` (less [`FS_CLOCK_SLACK`]; the run cleared it first, [`clear_results`]).
 fn open_results(
     root: &Path,
     rel: &str,
@@ -4724,7 +4740,7 @@ fn open_results(
     if m.len() > crate::floor_log::MAX_STREAM_BYTES {
         return Err("larger than the log cap".into());
     }
-    if m.modified().map_or(true, |t| t < since) {
+    if m.modified().map_or(true, |t| t + FS_CLOCK_SLACK < since) {
         return Err("not written by this run".into());
     }
     no_follow(std::fs::OpenOptions::new().read(true))

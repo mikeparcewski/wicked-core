@@ -260,6 +260,7 @@ impl Probe<'_> {
             argv: self.g.for_results(argv),
             ..self.rc.clone()
         };
+        crate::repo_checks::clear_results(self.dir, &self.rc, self.g);
         let since = std::time::SystemTime::now();
         let mut r = run_one_with(
             self.dir,
