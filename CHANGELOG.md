@@ -40,11 +40,11 @@ Two release tracks share this file, newest entry first regardless of track:
   `base_red_unseparated`: it escalates with both logs, and the operator's floor override (core#1061, core#1065)
   is the path through. go test (its subtests are invisible to `go test -list`, so skipping a red parent can hide a newly broken subtest; review round 2), vitest, jest, tsc, eslint and shell runners escalate the same way. A deciding run that
   fails on an oversubscribed host is re-run once with the same argv after waiting up to 30 s for headroom (`WICKED_REPO_CHECKS_RETRY_WAIT_S`, at most 600): exit 0 is
-  `passed on retry (flaky)`, and a second failure under load is `flaky_twice` (denies). Deleted: head-side
+  `passed on retry (flaky)`, and a second failure under load is `flaky_twice` (denies); only the excluded run's retry is refused when a cargo config bends `--exact`. Deleted: head-side
   classification (`classify` and the binary qualifiers, `LineScan`, the libtest `env_cannot_run` class and its
   launcher signatures, the isolated `--exact` and vitest file re-runs, the load-class and env-crash re-runs,
   `MAX_FLAKE_RERUN`, the environment signals) and the 4 KB ring buffer as a source of truth. Every stream is now
-  stored once, content-addressed (sha256), in the run's log store (reaped with the run's check scratch, never while a floor holds it), with a lazy line TOC and ranges read by ref
+  stored once, content-addressed (sha256), in the run's log store (reaped with the run's check scratch, never while a floor of the run holds any of its scratch), with a lazy line TOC and ranges read by ref
   and verified against the hash (`floor_log`); a stream past 64 MiB keeps its prefix, marked `truncated`, and a
   truncated inventory is never precise. Kept: the PTY grant (core#1060's Seatbelt rules, cherry-picked), the
   load-aware bound, the base cache (now `{floor_policy: 8, run, toc}`; an inventory or alone run that did not finish is not cached), `.wicked/checks.json`, the operator
@@ -57,7 +57,7 @@ Two release tracks share this file, newest entry first regardless of track:
   closed until every member that reaches what the selection reaches is in it, over the members' metadata and the
   lock graphs (the full suite builds every member together, so a shared dependency's features are on for all of
   them; a reached package neither graph describes runs the full suite), in one `-p a -p b` invocation; on the base the set runs only over the packages the base has (an all-new set is a `new_failure`); a `[profile]`, `[patch]`,
-  `[replace]`, `[workspace]`, `[lints]`, `package.resolver`/`edition`, nested `.cargo/` or `rust-toolchain` change
+  `[replace]`, `[workspace]`, `[lints]`, `package.resolver`/`edition`, nested `.cargo/` or `rust-toolchain` change, or a touched file that is not Rust source (any package may read a fixture),
   runs the full suite. The macOS floor's test seam now arms the private `TMPDIR` as
   production does, so doctests run under the real floor sandbox. Wire (additive): every
   `repoChecksEvaluated.checks[]` entry carries `decision: {outcome, baseSha, baseFailing, excluded, logRefs:

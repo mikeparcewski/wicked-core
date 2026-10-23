@@ -2474,7 +2474,7 @@ fn check_cache_cap_bytes() -> u64 {
 }
 
 /// 12 hex of `sha256(bytes)`.
-fn hex12(bytes: &[u8]) -> String {
+pub(crate) fn hex12(bytes: &[u8]) -> String {
     use sha2::Digest;
     let digest = sha2::Sha256::digest(bytes);
     digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
@@ -2823,13 +2823,32 @@ pub(crate) fn remove_check_scratch_in(cache: &Path, worktree: &Path, run_id: Opt
     // capture in flight must not lose its store; they stay for the operator to inspect).
     let gone = retire_leaf(&scratch_dir_for(cache, worktree, run_id));
     if let (true, Some(id)) = (gone, run_id) {
-        let root = cache
-            .parent()
-            .unwrap_or(cache)
-            .join(crate::floor_log::LOG_SUBDIR);
-        crate::floor_log::remove_run_logs(&root, id);
+        // (codex r9) Every tree of the run (a guarded checkout too) shares its log store: it goes
+        // only while no floor holds a leaf of the run, each held exclusively for the removal.
+        if let Some(_held) = run_leases(cache, id) {
+            let root = cache
+                .parent()
+                .unwrap_or(cache)
+                .join(crate::floor_log::LOG_SUBDIR);
+            crate::floor_log::remove_run_logs(&root, id);
+        }
     }
     gone
+}
+
+/// Every check-scratch leaf of run `run_id` (any tree), each locked EXCLUSIVELY — `None` when a
+/// floor holds one.
+fn run_leases(cache: &Path, run_id: &str) -> Option<Vec<std::fs::File>> {
+    let suffix = format!("-r{}", hex12(run_id.as_bytes()));
+    let mut held = Vec::new();
+    let groups = std::fs::read_dir(cache).into_iter().flatten().flatten();
+    for leaf in groups.flat_map(|g| std::fs::read_dir(g.path()).into_iter().flatten().flatten()) {
+        let p = leaf.path();
+        if p.is_dir() && p.to_string_lossy().ends_with(&suffix) {
+            held.push(lock_leaf(&p, true).ok()??);
+        }
+    }
+    Some(held)
 }
 
 /// Remove EVERY run's check-scratch leaf of the tree at `dir` — a guarded floor checkout, whose
@@ -4651,7 +4670,8 @@ fn decide(
     // excluded run is retried only while no cargo config bends its `--exact` (a test of the first
     // attempt may have written one into the scratch CARGO_HOME).
     let mut twice = false;
-    let retry_safe = runner_of(&check.argv) != Some(Runner::Cargo)
+    let retry_safe = !excluded_run
+        || runner_of(&check.argv) != Some(Runner::Cargo)
         || config_bends(worktree, check, scratch).is_none();
     let retry = retry_safe
         .then(|| retry_if_loaded(worktree, &deciding_check, &deciding, sandbox, scratch))
@@ -6819,6 +6839,24 @@ pub(crate) mod tests {
         assert!(orphan_path(&leaf_a).exists(), "marked orphaned instead");
         // (codex r8) A held leaf keeps the run's log store: a capture in flight needs it.
         assert!(logs_a.exists(), "the held run's logs stay");
+        // (codex r9) So does a held leaf of ANOTHER tree of the run (a guarded checkout): the
+        // live tree's idle leaf goes, the shared logs stay until that floor ends.
+        let guarded = base.join("guarded-a");
+        std::fs::create_dir_all(&guarded).unwrap();
+        let wt2 = base.join("repo").join("wicked-worktrees").join("other");
+        std::fs::create_dir_all(&wt2).unwrap();
+        let floor_g = CheckScratch::prepare_in(&cache, &guarded, Some(run_b), u64::MAX).unwrap();
+        let _idle = CheckScratch::prepare_in(&cache, &wt2, Some(run_b), u64::MAX).unwrap();
+        drop(_idle);
+        let logs_b =
+            crate::floor_log::run_dir(&base.join(crate::floor_log::LOG_SUBDIR), Some(run_b), &wt2);
+        std::fs::create_dir_all(&logs_b).unwrap();
+        assert!(remove_check_scratch_in(&cache, &wt2, Some(run_b)));
+        assert!(
+            logs_b.exists(),
+            "a guarded floor of the run still holds a leaf"
+        );
+        drop(floor_g);
         // Run B, a distinct run on the same path, never sees A's output.
         let floor_b = CheckScratch::prepare_in(&cache, &wt, Some(run_b), u64::MAX).unwrap();
         assert_eq!(floor_b.root(), leaf_b);
@@ -9310,6 +9348,14 @@ pub(crate) mod tests {
                 ("toc.txt", &toc_of(&["old"])),
             ],
         );
+        // (codex r9) A cargo config that bends `--exact` concerns only the EXCLUDED run: the
+        // unchanged command is still retried.
+        std::fs::create_dir_all(repo.join(".cargo")).unwrap();
+        std::fs::write(
+            repo.join(".cargo/config.toml"),
+            "[build]\nrustdocflags = [\"-D\", \"warnings\"]\n",
+        )
+        .unwrap();
         {
             let _load = seam::pin(cpus as f64 * 2.5, cpus);
             let Some((report, c)) = floor_test(&repo, &ctx) else {

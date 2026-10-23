@@ -14,6 +14,7 @@
 //! hash anyway ([`read_range`]). The line TOC is lazy: computed from the blob on request
 //! ([`toc`]), never stored. The store is reaped with the run's check scratch.
 
+use crate::repo_checks::hex12;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -63,14 +64,6 @@ pub(crate) fn remove_run_logs(root: &Path, run_id: &str) {
     if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
         let _ = std::fs::remove_dir_all(dir);
     }
-}
-
-fn hex12(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .take(6)
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 /// The finished capture of one stream.

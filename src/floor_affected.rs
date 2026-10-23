@@ -145,13 +145,14 @@ fn lock_entries(raw: &str) -> Option<std::collections::BTreeMap<String, toml::Va
     Some(out)
 }
 
-/// The package names a lockfile change moved: every head entry that is new or changed (version,
-/// source, checksum or dependencies) — `None` when either side does not parse.
+/// The package names a lockfile change moved: every entry new, changed (version, source, checksum
+/// or dependencies) or dropped — `None` when either side does not parse.
 fn lock_changed(base: &str, head: &str) -> Option<Vec<String>> {
     let (b, h) = (lock_entries(base)?, lock_entries(head)?);
     Some(
         h.iter()
             .filter(|(k, v)| b.get(*k) != Some(*v))
+            .chain(b.iter().filter(|(k, v)| h.get(*k) != Some(*v)))
             .filter_map(|(_, v)| v.get("name")?.as_str().map(String::from))
             .collect(),
     )
@@ -361,6 +362,10 @@ fn affected_packages(
                 .map_err(|e| format!("the head's `{rel}`: {e}"))?;
             roots.extend(lock_changed(&old, &new).ok_or("a `Cargo.lock` does not parse")?);
             locks.extend([old, new]);
+        } else if !name.ends_with(".rs") {
+            // (codex r9) A fixture, a doc, a data file: any package may read it (`include_str!`, a
+            // test's `fs::read`), and nothing in the metadata says which.
+            return Err(format!("`{f}` is not Rust source: any package may read it"));
         } else {
             let owner =
                 owner_of(&head, f).ok_or_else(|| format!("`{f}` is owned by no package"))?;
@@ -423,11 +428,13 @@ fn affected_packages(
         let members = workspace_members(&tree.dir, check, sandbox, scratch, Tree::Base);
         remove_base_export(worktree, scratch)?;
         base_members = members?;
-        // A member removed from the workspace no longer unifies anything it depended on.
+        // A member removed (or renamed) is moved — its dependents reach it — and no longer
+        // unifies anything it depended on.
         for b in base_members
             .iter()
             .filter(|b| !head.iter().any(|m| m.name == b.name))
         {
+            roots.insert(b.name.clone());
             roots.extend(deps(&b.entry).into_iter().map(|(n, _)| n));
         }
         for m in &head {
@@ -581,8 +588,12 @@ mod tests {
         };
         assert_eq!(
             lock_changed(&lock("1.0.0"), &lock("1.0.1")).unwrap(),
-            s(&["s"])
+            s(&["s", "s"])
         );
+        // (agy r9) An entry the head dropped moved too.
+        let dropped =
+            lock("1.0.0").replace("[[package]]\nname = \"c\"\nversion = \"0.1.0\"\n\n", "");
+        assert_eq!(lock_changed(&lock("1.0.0"), &dropped).unwrap(), s(&["c"]));
         assert!(lock_changed(&lock("1.0.0"), &lock("1.0.0"))
             .unwrap()
             .is_empty());
@@ -716,7 +727,7 @@ mod tests {
                 "b/.cargo/config.toml",
                 "configures cargo outside package metadata",
             ),
-            ("README.md", "is owned by no package"),
+            ("README.md", "is not Rust source"),
         ] {
             std::fs::create_dir_all(repo.join(path).parent().unwrap()).unwrap();
             std::fs::write(repo.join(path), "\n").unwrap();
