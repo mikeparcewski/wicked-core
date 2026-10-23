@@ -1,0 +1,1407 @@
+//! (DES-FLOOR-V2, DES-BUILD-GUIDE) The guide-driven floor's tests: stand-in runners whose exit
+//! codes are each tree's truth, real cargo, pytest and vitest fixtures, the probe, and the forgery
+//! rounds of core#1060 / #1066 — each must deny or escalate, never pass. A child of
+//! `repo_checks`, so it reads the floor's private items.
+
+#![cfg_attr(not(unix), allow(unused_imports, dead_code))]
+
+#[cfg(unix)]
+use super::test_seam as seam;
+use super::tests::*;
+use super::*;
+
+// ─── DES-FLOOR-V2: the suite's TOC plus exit codes ─────────────────────────────────────────
+
+/// A stand-in `cargo` whose EXIT CODES are the truth of each tree and whose TEXT is whatever
+/// a test (or a forger) prints. It reads its behaviour from files in the tree it runs in:
+/// `-- --list` prints `toc.txt` (exit `toc.exit`, default 0); a run with any `--skip=` is the
+/// excluded run (`excluded.out` / `excluded.err`, exit `excluded.exit`, sleeping
+/// `excluded.sleep` seconds first); any other run prints `run.out` / `run.err` and exits
+/// `run.exit` — or, with `flake` present, 101 the first time in this floor and `run.exit`
+/// after (`flake.excluded`: the same for the excluded run). Absolute path, outside every tree.
+#[cfg(unix)]
+fn fake_cargo(tag: &str) -> String {
+    fake_runner(tag, "cargo")
+}
+
+/// [`fake_cargo`] under another runner's name (`pytest`): `--collect-only` is its inventory,
+/// `--deselect=` its excluded run.
+#[cfg(unix)]
+fn fake_runner(tag: &str, name: &str) -> String {
+    let bin = scratch(&format!("{tag}-bin"));
+    let path = bin.join(name);
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n\
+         mode=run\n\
+         prev=; name=; fail=101; case \"$0\" in *pytest) fail=1;; esac\n\
+         skip=' '\n\
+         for a in \"$@\"; do case \"$a\" in --list|--collect-only) mode=toc;; --skip=*|--deselect=*) skip=\"$skip${a#--*=} \"; [ $mode = toc ] || mode=excluded;; \
+         *::*) [ $mode = run ] && mode=alone && name=$a;; \
+         --exact) [ $mode = run ] && mode=alone && name=$prev;; esac; prev=$a; done\n\
+         key=\"$TMPDIR/n-$(pwd | cksum | cut -d' ' -f1)-$mode\"\n\
+         n=$(cat \"$key\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$key\"\n\
+         code() { if [ -f \"$1\" ]; then cat \"$1\"; else echo 0; fi; }\n\
+         case $mode in\n\
+           toc) if [ -f toc.err ]; then cat toc.err >&2; else echo '     Running unittests src/lib.rs (target/debug/deps/fake-0)' >&2; fi\n\
+             while IFS= read -r l; do t=${l%: test}; case \"$skip\" in *\" $t \"*) [ \"$t\" != \"$l\" ] && continue;; esac; if [ -f skip.prefix ] && [ \"$t\" != \"$l\" ]; then p=0; for s in $skip; do case \"$t\" in \"$s\"*) p=1;; esac; done; [ $p = 1 ] && continue; fi; printf '%s\\n' \"$l\"; done < toc.txt 2>/dev/null\n\
+             exit $(code toc.exit);;\n\
+           alone) grep -qx \"$name\" alone.fail 2>/dev/null && exit $fail; exit 0;;\n\
+           excluded) [ -f excluded.sleep ] && sleep $(cat excluded.sleep)\n\
+             cat excluded.out 2>/dev/null; cat excluded.err >&2 2>/dev/null\n\
+             if [ -f flake.excluded ] && [ $n = 1 ]; then exit 101; fi; exit $(code excluded.exit);;\n\
+           *) if [ -f toc.err ]; then cat toc.err >&2; else echo '     Running unittests src/lib.rs (target/debug/deps/fake-0)' >&2; fi\n\
+             cat run.out 2>/dev/null; cat run.err >&2 2>/dev/null\n\
+             case \"$0\" in *cargo) if [ -f run.out ] && ! grep -q '^test result:' run.out; then \
+             f=$(sed -n 's/^test \\(.*\\) \\.\\.\\. FAILED$/    \\1/p' run.out); \
+             [ -n \"$f\" ] && printf '\\nfailures:\\n%s\\n\\ntest result: FAILED.\\n' \"$f\"; fi;; esac\n\
+             if [ -f flake ] && [ $n = 1 ]; then exit 101; fi; exit $(code run.exit);;\n\
+         esac\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path.to_string_lossy().into_owned()
+}
+
+/// The libtest inventory format: `name: test` lines and the per-binary count.
+#[cfg(unix)]
+fn toc_of(names: &[&str]) -> String {
+    let mut t: String = names.iter().map(|n| format!("{n}: test\n")).collect();
+    t.push_str(&format!("\n{} tests, 0 benchmarks\n", names.len()));
+    t
+}
+
+/// A tree driven by [`fake_cargo`]: `files` written, `.wicked/checks.json` running `argv`.
+#[cfg(unix)]
+fn write_tree(repo: &Path, argv: &[String], files: &[(&str, &str)]) {
+    std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+    std::fs::write(
+        repo.join(CONFIG_PATH),
+        serde_json::json!({ "test": argv, "timeout_s": 60 }).to_string(),
+    )
+    .unwrap();
+    for f in [
+        "run.out",
+        "run.err",
+        "run.exit",
+        "excluded.out",
+        "excluded.err",
+        "excluded.exit",
+        "excluded.sleep",
+        "toc.txt",
+        "toc.exit",
+        "toc.err",
+        "flake",
+        "flake.excluded",
+        "skip.prefix",
+    ] {
+        let _ = std::fs::remove_file(repo.join(f));
+    }
+    for (name, body) in files {
+        std::fs::write(repo.join(name), body).unwrap();
+    }
+}
+
+/// A base commit red on `old` (its own inventory lists `old`, `new`, `fine`), a floor context
+/// against it, and the fake cargo's argv.
+#[cfg(unix)]
+fn red_base(tag: &str) -> (PathBuf, FloorContext, Vec<String>) {
+    let repo = scratch(tag);
+    let argv = vec![fake_cargo(tag), "test".into(), "--no-fail-fast".into()];
+    std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            // A real libtest run prints a result line for every test it lists, and its footer.
+            (
+                "run.out",
+                "test new ... ok\ntest fine ... ok\ntest old ... FAILED\n\nfailures:\n    old\n\n\
+                 test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n",
+            ),
+            ("run.exit", "101"),
+            ("excluded.exit", "0"),
+            ("toc.txt", &toc_of(&["old", "new", "fine"])),
+            // Run alone on the base, only `old` fails.
+            ("alone.fail", "old\n"),
+        ],
+    );
+    git_repo_with_commit(&repo);
+    let base = commit_guide(&repo, &[libtest_check(&argv)]);
+    let ctx = FloorContext {
+        stage: FloorStage::Verify,
+        base_head: Some(base),
+        git_dir: Some(repo.join(".git")),
+        ..FloorContext::default()
+    };
+    (repo, ctx, argv)
+}
+
+#[cfg(unix)]
+include!("../tests/support/libtest_guide.rs");
+
+/// [`libtest_guide`], not yet verified.
+#[cfg(unix)]
+pub(crate) fn libtest_check(argv: &[String]) -> serde_json::Value {
+    libtest_guide(argv, "")
+}
+
+/// Commit `checks` as the repo's `.wicked/build-guide.json`, each verified (every probe
+/// `pass`) on the current HEAD — so verified on an ancestor of the new base. Returns the new
+/// HEAD.
+#[cfg(unix)]
+pub(crate) fn commit_guide(repo: &Path, checks: &[serde_json::Value]) -> String {
+    let head = git(repo, &["rev-parse", "HEAD"]);
+    write_guide(repo, checks, &head);
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-qm", "the build guide"]);
+    git(repo, &["rev-parse", "HEAD"])
+}
+
+/// Write `checks` as `repo`'s `.wicked/build-guide.json`, verified (every probe `pass`) on
+/// `verified_on`.
+#[cfg(unix)]
+pub(crate) fn write_guide(repo: &Path, checks: &[serde_json::Value], verified_on: &str) {
+    let checks: Vec<serde_json::Value> = checks
+        .iter()
+        .map(|c| {
+            let mut c = c.clone();
+            c["verified"] = libtest_guide(&[], verified_on)["verified"].clone();
+            c
+        })
+        .collect();
+    std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+    std::fs::write(
+        repo.join(crate::floor_guide::GUIDE_PATH),
+        serde_json::to_string_pretty(
+            &serde_json::json!({"version": 1, "derivedFrom": [], "checks": checks}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+/// The `checks[].decision` the wire carries for `c`, through the real event serializer.
+#[cfg(unix)]
+fn wire_decision(c: &CheckRun) -> serde_json::Value {
+    crate::event::CoreEvent::RepoChecksEvaluated {
+        session: "s".into(),
+        ord: 1,
+        attempt: 0,
+        passed: !c.denies(),
+        criterion: CRITERION.into(),
+        checks: vec![c.clone()],
+        skipped: Vec::new(),
+        sandbox_level: "sandboxed".into(),
+        sandbox_error: None,
+        detect_error: None,
+        outcome: "failed".into(),
+        floor: "verify".into(),
+        claim: None,
+        env: None,
+        changed: Vec::new(),
+        changed_truncated: false,
+    }
+    .to_json()["checks"][0]["decision"]
+        .clone()
+}
+
+/// The one check a fake-cargo floor ran (`test`), or `None` when the host has no boundary.
+#[cfg(unix)]
+fn floor_test(repo: &Path, ctx: &FloorContext) -> Option<(RepoChecksReport, CheckRun)> {
+    let report = run_floor(repo, ctx);
+    if report.sandbox_error.is_some() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return None;
+    }
+    let c = report
+        .checks
+        .iter()
+        .find(|c| c.name == "test")
+        .unwrap_or_else(|| panic!("the test check ran: {report:#?}"))
+        .clone();
+    Some((report, c))
+}
+
+/// DONE WHEN 2: every forgery of rounds 1-21 of core#1060, replayed as the HEAD's own text
+/// beside an honest new failure (`new`, the excluded run's exit 101), denies — none passes.
+/// The text is the creator's to write; the decision reads only exit codes and the base.
+#[cfg(unix)]
+#[test]
+fn every_forgery_of_rounds_1_to_21_denies_or_escalates_never_passes() {
+    let _load = seam::pin(0.5, 4);
+    let (repo, ctx, argv) = red_base("forge");
+    let forgeries: &[(&str, &str, &str)] = &[
+        ("r1 bare id across crates", "test old ... FAILED\ntest new ... FAILED\n", ""),
+        ("r2 child result line in captured output", "running 2 tests\ntest old ... FAILED\n---- old stdout ----\ntest result: FAILED. 0 passed; 9 failed\ntest new ... FAILED\n", ""),
+        ("r3 silent harness + nested runs", "running 1 test\nrunning 3 tests\ntest result: ok. 3 passed; 0 failed\ntest old ... FAILED\n", ""),
+        ("r4 coloured + quiet output", "\u{1b}[31mtest new ... FAILED\u{1b}[0m\nnew --- FAILED\n", ""),
+        ("r5 merged doctest footer", "all doctests ran in 0.1s; merged doctests compilation took 0.1s\ntest old ... FAILED\n", ""),
+        ("r7 unclosed nested run", "running 2 tests\n---- old stdout ----\nrunning 1 test\ntest new ... FAILED\n", ""),
+        ("r7 child Running line", "     Running unittests src/lib.rs (target/x)\ntest old ... FAILED\n", "error: test failed, to rerun pass `-p other --lib`\n"),
+        ("r8 wrapper showing only failing suites", "test old ... FAILED\n", ""),
+        ("r9 oversized nesting", &"running 1 test\n".repeat(50), ""),
+        ("r10 section header before failures", "---- new stdout ----\ntest new ... FAILED\nfailures:\n", ""),
+        ("r11 raw failures: + section", "test a ... ok\nfailures:\n---- x stdout ----\ntest new ... FAILED\ntest result: FAILED. 1 passed; 1 failed\n", ""),
+        ("r12 forged closing summary", "test new ... FAILED\ntest result: ok. 2 passed; 0 failed; 0 ignored\n", ""),
+        ("r13 forged stderr selector", "test old ... FAILED\n", "error: test failed, to rerun pass `-p a --lib`\n"),
+        ("r14 crash behind a named failure", "test old ... FAILED\n", "process didn't exit successfully: (signal: 11, SIGSEGV)\n"),
+        ("r15 unnamed failures / unterminated escape", "\u{1b}[31", "Couldn't compile the test.\n"),
+        ("r16 positional-filter confirmation", "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out\n", ""),
+        ("r17 partial CSI eats the t", "\u{1b}[test new ... FAILED\n", ""),
+        ("r18 truncated failure set", &"test x ... FAILED\n".repeat(1200), ""),
+        ("r19 parameterised CSI/OSC", "\u{1b}[31ERROR\n\u{1b}]8;;x\u{7}FAILED\n", ""),
+        ("r20 control characters", "test new\u{0} ... FAILED\r\n\u{9b}test old ... ok\n", ""),
+        ("r21 long unfinished line", &"y".repeat(9000), ""),
+    ];
+    for (round, out, err) in forgeries {
+        // The head: `new` really fails, so its excluded run exits 101 — whatever it prints.
+        write_tree(
+            &repo,
+            &argv,
+            &[
+                ("run.out", out),
+                ("run.err", err),
+                ("run.exit", "101"),
+                ("excluded.out", out),
+                ("excluded.err", err),
+                ("excluded.exit", "101"),
+                ("toc.txt", &toc_of(&["old", "new", "fine"])),
+            ],
+        );
+        let Some((report, c)) = floor_test(&repo, &ctx) else {
+            return;
+        };
+        let d = c.decision.as_ref().expect("a decision");
+        assert!(
+            matches!(
+                d.outcome.as_str(),
+                OUTCOME_NEW_FAILURE | OUTCOME_BASE_RED_UNSEPARATED | OUTCOME_FLAKY_TWICE
+            ),
+            "{round}: {d:?}"
+        );
+        assert!(!report.passed && c.denies(), "{round}: {d:?}");
+        assert_eq!(
+            d.excluded,
+            s(&["old"]),
+            "{round}: only the base's own failure is deselected"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// DONE WHEN 3 + the escalation class, guide-driven: base red, cannot separate — with the
+/// reason — for a name not unique in the base or head list, a head list that does not run
+/// clean, an argv that is not the guide's `run` (a filter; a runner it does not describe), a
+/// touched file the guide's `invalidatedBy` names, a deselect that removes more than it was
+/// asked to, a truncated base log, a crashed base, and one name under two qualifiers.
+#[cfg(unix)]
+#[test]
+fn imprecise_exclusion_escalates_as_base_red_unseparated() {
+    let _load = seam::pin(0.5, 4);
+    let (repo, ctx, argv) = red_base("unsep");
+    fn head_red<'a>(extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+        let mut f = vec![
+            ("run.out", "test old ... FAILED\n"),
+            ("run.exit", "101"),
+            ("excluded.exit", "0"),
+        ];
+        f.extend_from_slice(extra);
+        f
+    }
+    let unseparated = |repo: &Path, ctx: &FloorContext, why: &str| {
+        let Some((report, c)) = floor_test(repo, ctx) else {
+            return;
+        };
+        let d = c.decision.as_ref().expect("a decision");
+        assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{why}: {d:?}");
+        assert!(
+            d.reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("base red, cannot separate")),
+            "{why}: {d:?}"
+        );
+        assert!(d.excluded.is_empty(), "{why}: nothing ran deselected");
+        assert_eq!(c.classification.as_deref(), Some(BASE_RED_UNSEPARATED));
+        assert!(!report.passed && c.denies());
+        assert!(
+            report
+                .denial_reason()
+                .contains("the operator's floor override is the path through"),
+            "{}",
+            report.denial_reason()
+        );
+        assert!(report
+            .classification_note()
+            .is_some_and(|n| n.contains("cannot separate")));
+        assert_eq!(wire_decision(&c)["outcome"], OUTCOME_BASE_RED_UNSEPARATED);
+    };
+    // (a) The head's inventory lists `old` twice (another binary has it): not unique.
+    let toc2 = toc_of(&["old", "old", "fine"]);
+    write_tree(&repo, &argv, &head_red(&[("toc.txt", &toc2)]));
+    unseparated(&repo, &ctx, "duplicate in the head inventory");
+    // (b) A head list that does not run clean.
+    write_tree(
+        &repo,
+        &argv,
+        &head_red(&[("toc.txt", &toc_of(&["old", "fine"])), ("toc.exit", "1")]),
+    );
+    unseparated(&repo, &ctx, "a head list that exits non-zero");
+    // (c) A positional filter in the argv: `--exact` would change what it selects.
+    let filtered: Vec<String> = argv.iter().cloned().chain(["old".to_string()]).collect();
+    write_tree(
+        &repo,
+        &filtered,
+        &head_red(&[("toc.txt", &toc_of(&["old", "new", "fine"]))]),
+    );
+    unseparated(&repo, &ctx, "a filter in the argv");
+    // (d) A touched file the guide's `invalidatedBy` names (a runner config that bends its
+    // selection): exclusion is off for this change.
+    write_tree(
+        &repo,
+        &argv,
+        &head_red(&[("toc.txt", &toc_of(&["old", "new", "fine"]))]),
+    );
+    std::fs::create_dir_all(repo.join(".cargo")).unwrap();
+    std::fs::write(repo.join(".cargo/config.toml"), "[build]\n").unwrap();
+    unseparated(&repo, &ctx, "an invalidatedBy file touched");
+    std::fs::remove_dir_all(repo.join(".cargo")).unwrap();
+    // (e) A base inventory that lists the failing name twice (a fresh base commit).
+    let (repo2, ctx2, argv2) = red_base("unsep-dup");
+    write_tree(
+        &repo2,
+        &argv2,
+        &[
+            ("run.out", "test old ... FAILED\n"),
+            ("run.exit", "101"),
+            ("toc.txt", &toc_of(&["old", "old"])),
+        ],
+    );
+    git(&repo2, &["commit", "-qam", "base lists old twice"]);
+    let ctx2 = FloorContext {
+        base_head: Some(git(&repo2, &["rev-parse", "HEAD"])),
+        ..ctx2
+    };
+    write_tree(
+        &repo2,
+        &argv2,
+        &head_red(&[("toc.txt", &toc_of(&["old", "new"]))]),
+    );
+    unseparated(&repo2, &ctx2, "duplicate in the base inventory");
+    // (h, codex r1) A deselect that matches by PREFIX (`old` would also take `old_extra`): the
+    // head's list deselecting the base's failure lists fewer than the rest — never skipped.
+    let (repo5, ctx5, argv5) = red_base("unsep-prefix");
+    write_tree(
+        &repo5,
+        &argv5,
+        &head_red(&[
+            ("toc.txt", &toc_of(&["old", "old_extra", "fine"])),
+            ("skip.prefix", ""),
+        ]),
+    );
+    unseparated(&repo5, &ctx5, "a deselect by prefix");
+    // (i, codex r1) A base whose output was cut at the log cap may have lost a witness.
+    let (repo6, ctx6, argv6) = red_base("unsep-cap");
+    let long = format!("test old ... FAILED\n{}", "x".repeat(4096));
+    write_tree(
+        &repo6,
+        &argv6,
+        &[
+            ("run.out", &long),
+            ("run.exit", "101"),
+            ("toc.txt", &toc_of(&["old", "fine"])),
+        ],
+    );
+    git(&repo6, &["add", "-A"]);
+    git(&repo6, &["commit", "-qm", "a long base"]);
+    let ctx6 = FloorContext {
+        base_head: Some(git(&repo6, &["rev-parse", "HEAD"])),
+        ..ctx6
+    };
+    write_tree(
+        &repo6,
+        &argv6,
+        &[
+            ("run.out", "test old ... FAILED\n"),
+            ("run.exit", "101"),
+            ("excluded.exit", "0"),
+            ("toc.txt", &toc_of(&["old", "fine"])),
+        ],
+    );
+    {
+        let _cap = seam::cap(1024);
+        unseparated(&repo6, &ctx6, "a truncated base log");
+    }
+    // (j, codex r3) A base binary that stopped early (a crash) printed no result for some
+    // listed tests: a FAILED line without its `ok` witness then proves nothing.
+    let (repo7, ctx7, argv7) = red_base("unsep-crash");
+    write_tree(
+        &repo7,
+        &argv7,
+        &[
+            ("run.out", "test new ... FAILED\ntest old ... FAILED\n"),
+            ("run.exit", "101"),
+            ("toc.txt", &toc_of(&["old", "new", "fine"])),
+        ],
+    );
+    git(&repo7, &["add", "-A"]);
+    git(
+        &repo7,
+        &["commit", "-qm", "a base whose binary stopped early"],
+    );
+    let ctx7 = FloorContext {
+        base_head: Some(git(&repo7, &["rev-parse", "HEAD"])),
+        ..ctx7
+    };
+    write_tree(
+        &repo7,
+        &argv7,
+        &[
+            ("run.out", "test new ... FAILED\n"),
+            ("run.exit", "101"),
+            ("excluded.exit", "0"),
+            ("toc.txt", &toc_of(&["old", "new", "fine"])),
+        ],
+    );
+    unseparated(&repo7, &ctx7, "a base binary that stopped early");
+    // (k, codex r5) The base's failing `old` (tests/a.rs) is renamed away on the head, and a
+    // NEW failing `old` appears in tests/b.rs: one name, under another qualifier — never
+    // skipped.
+    let (repo8, ctx8, argv8) = red_base("unsep-target");
+    let ra = "     Running tests/a.rs (target/debug/deps/a-1)\n";
+    let rb = "     Running tests/b.rs (target/debug/deps/b-2)\n";
+    let two = |a: &str, b: &str| {
+        format!("{ra}{a}: test\n\n1 test, 0 benchmarks\n{rb}{b}: test\n\n1 test, 0 benchmarks\n")
+    };
+    write_tree(
+        &repo8,
+        &argv8,
+        &[
+            (
+                "run.out",
+                &format!("{ra}test old ... FAILED\n{rb}test fine ... ok\n"),
+            ),
+            ("run.exit", "101"),
+            ("toc.txt", &two("old", "fine")),
+            ("toc.err", ""),
+        ],
+    );
+    git(&repo8, &["add", "-A"]);
+    git(
+        &repo8,
+        &["commit", "-qm", "old in tests/a.rs, fine in tests/b.rs"],
+    );
+    let ctx8 = FloorContext {
+        base_head: Some(git(&repo8, &["rev-parse", "HEAD"])),
+        ..ctx8
+    };
+    write_tree(
+        &repo8,
+        &argv8,
+        &[
+            ("run.out", &format!("{rb}test old ... FAILED\n")),
+            ("run.exit", "101"),
+            ("excluded.exit", "0"),
+            ("toc.txt", &two("renamed", "old")),
+            ("toc.err", ""),
+        ],
+    );
+    unseparated(&repo8, &ctx8, "one name under two qualifiers");
+    for r in [repo, repo2, repo5, repo6, repo7, repo8] {
+        let _ = std::fs::remove_dir_all(r);
+    }
+}
+
+/// DONE WHEN 4: a deciding run that fails on an oversubscribed host is re-run ONCE, with the
+/// same argv, after waiting for headroom: a pass is `passed on retry (flaky)` with both
+/// attempts on the record; failing twice is `flaky_twice` and denies. With headroom, nothing
+/// is re-run.
+#[cfg(unix)]
+#[test]
+fn a_flake_under_load_passes_on_its_identical_retry_and_failing_twice_denies() {
+    let (repo, ctx, argv) = red_base("flake");
+    let cpus = 4;
+    // A green base, so the unchanged head run decides.
+    write_tree(
+        &repo,
+        &argv,
+        &[("run.exit", "0"), ("toc.txt", &toc_of(&["old"]))],
+    );
+    git(&repo, &["commit", "-qam", "green base"]);
+    let ctx = FloorContext {
+        base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+        ..ctx
+    };
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.exit", "0"),
+            ("flake", ""),
+            ("toc.txt", &toc_of(&["old"])),
+        ],
+    );
+    // (codex r9) A cargo config that bends `--exact` concerns only the EXCLUDED run: the
+    // unchanged command is still retried.
+    std::fs::create_dir_all(repo.join(".cargo")).unwrap();
+    std::fs::write(
+        repo.join(".cargo/config.toml"),
+        "[build]\nrustdocflags = [\"-D\", \"warnings\"]\n",
+    )
+    .unwrap();
+    {
+        let _load = seam::pin(cpus as f64 * 2.5, cpus);
+        let Some((report, c)) = floor_test(&repo, &ctx) else {
+            return;
+        };
+        let d = c.decision.as_ref().unwrap();
+        assert_eq!(d.outcome, OUTCOME_PASS, "{d:?}");
+        assert!(
+            d.flaky && d.reason.as_deref() == Some("passed on retry (flaky)"),
+            "{d:?}"
+        );
+        assert!(report.passed && !c.denies());
+        assert_eq!(c.classification.as_deref(), Some(FLAKY_UNDER_LOAD));
+        assert_eq!(c.reruns.len(), 1, "one identical retry");
+        assert_eq!(c.reruns[0].argv, c.argv, "the SAME argv");
+        assert!(c.reruns[0].passed() && !c.passed());
+        assert!(
+            d.log_refs.iter().any(|l| l.attempt == "head")
+                && d.log_refs.iter().any(|l| l.attempt == "retry")
+        );
+        assert!(report
+            .classification_note()
+            .unwrap()
+            .contains("passed on its identical retry"));
+        let w = wire_decision(&c);
+        assert_eq!(
+            (w["outcome"].as_str(), w["flaky"].as_bool()),
+            (Some("pass"), Some(true))
+        );
+    }
+    // Red every time ⇒ failing twice denies.
+    write_tree(
+        &repo,
+        &argv,
+        &[("run.exit", "101"), ("toc.txt", &toc_of(&["old"]))],
+    );
+    {
+        let _load = seam::pin(cpus as f64 * 2.5, cpus);
+        let Some((report, c)) = floor_test(&repo, &ctx) else {
+            return;
+        };
+        let d = c.decision.as_ref().unwrap();
+        assert_eq!(d.outcome, OUTCOME_FLAKY_TWICE, "{d:?}");
+        assert!(!d.flaky && !report.passed && c.denies());
+        assert_eq!(c.reruns.len(), 1);
+        assert_eq!(wire_decision(&c)["outcome"], OUTCOME_FLAKY_TWICE);
+    }
+    // Headroom ⇒ no retry: a failure is a new failure.
+    {
+        let _load = seam::pin(1.0, cpus);
+        let Some((_, c)) = floor_test(&repo, &ctx) else {
+            return;
+        };
+        assert_eq!(c.decision.as_ref().unwrap().outcome, OUTCOME_NEW_FAILURE);
+        assert!(c.reruns.is_empty());
+        assert_eq!(wire_decision(&c)["outcome"], OUTCOME_NEW_FAILURE);
+    }
+    // The EXCLUDED run is the deciding run when exclusion is precise: it is the one retried.
+    let (repo2, ctx2, argv2) = red_base("flake-x");
+    write_tree(
+        &repo2,
+        &argv2,
+        &[
+            ("run.out", "test old ... FAILED\n"),
+            ("run.exit", "101"),
+            ("excluded.exit", "0"),
+            ("flake.excluded", ""),
+            ("toc.txt", &toc_of(&["old", "fine"])),
+        ],
+    );
+    {
+        let _load = seam::pin(cpus as f64 * 2.5, cpus);
+        let Some((report, c)) = floor_test(&repo2, &ctx2) else {
+            return;
+        };
+        let d = c.decision.as_ref().unwrap();
+        assert_eq!(
+            (d.outcome.as_str(), d.flaky),
+            (OUTCOME_PASS_EXCLUDED, true),
+            "{d:?}"
+        );
+        assert!(report.passed);
+        assert_eq!(c.reruns.len(), 2, "the excluded run, then its retry");
+        assert_eq!(c.reruns[0].argv, c.reruns[1].argv);
+    }
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&repo2);
+}
+
+/// Probe `guide` (written beside the committed tree) against `repo`'s HEAD; `None` when the
+/// floor sandbox does not arm here.
+#[cfg(unix)]
+fn probe(repo: &Path, guide: serde_json::Value) -> Option<crate::floor_probe::ProbeResults> {
+    let path = repo.join("probe-guide.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({"version": 1, "checks": [guide]}).to_string(),
+    )
+    .unwrap();
+    match crate::floor_probe::probe_guide(repo, &path, None) {
+        Ok(mut all) => {
+            let written: crate::floor_guide::BuildGuide =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let v = written.checks[0]
+                .verified
+                .clone()
+                .expect("verified is written");
+            assert_eq!(v.base_sha, git(repo, &["rev-parse", "HEAD"]));
+            Some(all.remove(0).1)
+        }
+        Err(e) if e.contains("does not arm") => {
+            eprintln!("repo_checks: {e} — skipping the probe");
+            None
+        }
+        Err(e) => panic!("the probe ran: {e}"),
+    }
+}
+
+/// DES-BUILD-GUIDE DONE WHEN 1 (cargo): every probe of a libtest guide passes on a real crate
+/// under the real floor sandbox, the mutation probe included.
+#[cfg(unix)]
+#[test]
+fn the_probe_passes_every_piece_of_a_real_cargo_guide() {
+    let _load = seam::pin(0.5, 4);
+    let repo = scratch("probe-cargo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"probe_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("src/lib.rs"),
+        "#[cfg(test)]\nmod t {\n    #[test]\n    fn a() {}\n    #[test]\n    fn b() {}\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".gitignore"),
+        "Cargo.lock\ntmp/\nprobe-guide.json\n",
+    )
+    .unwrap();
+    git_repo_with_commit(&repo);
+    let mut g = libtest_check(&s(&["cargo", "test", "--no-fail-fast"]));
+    g["probes"] = serde_json::json!({"mutation": {
+        "file": "tests/zz_mutation.rs",
+        "content": "#[test]\nfn floor_mutation() {\n    panic!(\"mutated\");\n}\n",
+        "expectId": "floor_mutation"}});
+    let Some(results) = probe(&repo, g) else {
+        return;
+    };
+    for p in crate::floor_guide::REQUIRED_PROBES {
+        assert_eq!(
+            results.get(p).map(String::as_str),
+            Some("pass"),
+            "{p}: {results:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// DES-BUILD-GUIDE DONE WHEN 1 (pytest, JUnit via `--junitxml`): every probe passes. Skipped
+/// where pytest is not on `PATH`.
+#[cfg(unix)]
+#[test]
+fn the_probe_passes_every_piece_of_a_junit_pytest_guide() {
+    let Some(py) = crate::validator::find_on_path("pytest") else {
+        eprintln!("repo_checks: pytest not on PATH — skipping the pytest guide probe");
+        return;
+    };
+    let py = py.to_string_lossy().into_owned();
+    let _load = seam::pin(0.5, 4);
+    let repo = scratch("probe-pytest");
+    std::fs::create_dir_all(repo.join("tests")).unwrap();
+    std::fs::write(
+        repo.join("tests/test_a.py"),
+        "def test_x():\n    assert True\n\n\ndef test_y():\n    assert True\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".gitignore"),
+        "tmp/\n__pycache__/\nprobe-guide.json\nfloor-junit.xml\n",
+    )
+    .unwrap();
+    git_repo_with_commit(&repo);
+    let run = [py.as_str(), "-p", "no:cacheprovider"];
+    let g = serde_json::json!({
+        "name": "test", "run": run, "failedExit": [1],
+        "results": {"kind": "junit", "id": ["file", "name"],
+                    "how": {"argvAppend": ["--junitxml=floor-junit.xml", "-o", "junit_family=xunit1"],
+                            "path": "floor-junit.xml"}},
+        "list": {"run": [py.as_str(), "-p", "no:cacheprovider", "--collect-only", "-q"],
+                 "item": r"^(?P<id>\S+::\S+)$"},
+        "alone": {"run": [py.as_str(), "-p", "no:cacheprovider", "{id}"]},
+        "deselect": {"append": ["--deselect={id}"]},
+        "probes": {"mutation": {
+            "file": "tests/test_zz_mutation.py",
+            "content": "def test_mutated():\n    assert False\n",
+            "expectId": "tests/test_zz_mutation.py::test_mutated"}},
+    });
+    let Some(results) = probe(&repo, g) else {
+        return;
+    };
+    for p in crate::floor_guide::REQUIRED_PROBES {
+        assert_eq!(
+            results.get(p).map(String::as_str),
+            Some("pass"),
+            "{p}: {results:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// DES-BUILD-GUIDE (vitest, JUnit reporter): the list, the run and the parse agree, but the
+/// runner has no per-test alone or deselect the guide can express, so those probes fail and
+/// the check is never relied on for exclusion. Skipped unless `WICKED_TEST_VITEST` names a
+/// vitest binary.
+#[cfg(unix)]
+#[test]
+fn a_junit_vitest_guide_parses_but_without_alone_or_deselect_is_never_relied_on() {
+    let Some(vt) = std::env::var("WICKED_TEST_VITEST")
+        .ok()
+        .filter(|v| Path::new(v).exists())
+    else {
+        eprintln!("repo_checks: WICKED_TEST_VITEST unset — skipping the vitest guide probe");
+        return;
+    };
+    let _load = seam::pin(0.5, 4);
+    let repo = scratch("probe-vitest");
+    std::fs::write(
+        repo.join("a.test.mjs"),
+        "describe(\"math\", () => {\n  test(\"adds\", () => {\n    expect(1 + 1).toBe(2);\n  });\n});\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".gitignore"),
+        "tmp/\nprobe-guide.json\nfloor-junit.xml\nnode_modules/\n",
+    )
+    .unwrap();
+    git_repo_with_commit(&repo);
+    let g = serde_json::json!({
+        "name": "test", "run": [vt.as_str(), "run", "--globals"], "failedExit": [1],
+        "results": {"kind": "junit", "id": ["classname", "name"], "idJoin": " > ",
+                    "how": {"argvAppend": ["--reporter=junit", "--outputFile=floor-junit.xml"],
+                            "path": "floor-junit.xml"}},
+        "list": {"run": [vt.as_str(), "list", "--globals"], "item": r"^(?P<id>\S+ > .+)$"},
+        "probes": {"mutation": {
+            "file": "zz.test.mjs",
+            "content": "test(\"mutated\", () => {\n  expect(1).toBe(2);\n});\n",
+            "expectId": "zz.test.mjs > mutated"}},
+    });
+    let Some(results) = probe(&repo, g) else {
+        return;
+    };
+    assert_eq!(
+        results.get("list").map(String::as_str),
+        Some("pass"),
+        "{results:?}"
+    );
+    assert_eq!(
+        results.get("run").map(String::as_str),
+        Some("pass"),
+        "{results:?}"
+    );
+    for p in ["alone", "deselect", "mutation"] {
+        assert!(
+            results.get(p).is_some_and(|r| r.starts_with("fail: no `")),
+            "{p}: {results:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// DES-BUILD-GUIDE DONE WHEN 3-5: the floor reads the BASE's guide (a head edit to the guide
+/// does not apply to its own run); a guide whose probe failed, or one a base change made stale
+/// (a `derivedFrom` file changed since it was verified), never excludes — the check
+/// escalates, and `decision.guide` says why.
+#[cfg(unix)]
+#[test]
+fn the_floor_reads_the_base_guide_and_never_relies_on_a_failed_or_stale_one() {
+    let _load = seam::pin(0.5, 4);
+    let head_red = |repo: &Path, argv: &[String]| {
+        write_tree(
+            repo,
+            argv,
+            &[
+                ("run.out", "test old ... FAILED\n"),
+                ("run.exit", "101"),
+                ("excluded.exit", "0"),
+                ("toc.txt", &toc_of(&["old", "new", "fine"])),
+            ],
+        );
+    };
+    // (3) The head rewrites the guide into nonsense: the base's still decides.
+    let (repo, ctx, argv) = red_base("guide-head-edit");
+    head_red(&repo, &argv);
+    std::fs::write(
+        repo.join(crate::floor_guide::GUIDE_PATH),
+        "{\"version\": 9}",
+    )
+    .unwrap();
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    let d = c.decision.as_ref().expect("a decision");
+    assert_eq!(d.outcome, OUTCOME_PASS_EXCLUDED, "{d:?}");
+    assert!(report.passed);
+    let g = d
+        .guide
+        .as_ref()
+        .expect("the guide's state rides the decision");
+    assert!(g.present && g.usable && g.reason.is_none(), "{g:?}");
+    // (4) A probe that did not pass: the check escalates, the reason names the probe.
+    let (repo2, _, argv2) = red_base("guide-failed-probe");
+    let mut guide = libtest_check(&argv2);
+    guide["verified"] = serde_json::json!({});
+    write_guide(&repo2, &[guide], &git(&repo2, &["rev-parse", "HEAD~1"]));
+    let path = repo2.join(crate::floor_guide::GUIDE_PATH);
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        raw.replace(
+            "\"mutation\": \"pass\"",
+            "\"mutation\": \"fail: the run exited 0\"",
+        ),
+    )
+    .unwrap();
+    git(
+        &repo2,
+        &["commit", "-qam", "a guide whose mutation probe failed"],
+    );
+    let ctx2 = FloorContext {
+        base_head: Some(git(&repo2, &["rev-parse", "HEAD"])),
+        stage: FloorStage::Verify,
+        git_dir: Some(repo2.join(".git")),
+        ..FloorContext::default()
+    };
+    head_red(&repo2, &argv2);
+    let (report, c) = floor_test(&repo2, &ctx2).unwrap();
+    let d = c.decision.as_ref().expect("a decision");
+    assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
+    assert!(!report.passed && d.excluded.is_empty());
+    let g = d.guide.as_ref().unwrap();
+    assert!(g.present && !g.usable, "{g:?}");
+    assert!(
+        g.reason
+            .as_deref()
+            .is_some_and(|r| r.contains("probe `mutation`")),
+        "{g:?}"
+    );
+    // (5) Stale: the guide was derived from `.wicked/checks.json`, which the base changed
+    // since it was verified.
+    let (repo3, _, argv3) = red_base("guide-stale");
+    let raw = std::fs::read_to_string(repo3.join(crate::floor_guide::GUIDE_PATH)).unwrap();
+    std::fs::write(
+        repo3.join(crate::floor_guide::GUIDE_PATH),
+        raw.replace(
+            "\"derivedFrom\": []",
+            "\"derivedFrom\": [\".wicked/checks.json\"]",
+        ),
+    )
+    .unwrap();
+    git(
+        &repo3,
+        &["commit", "-qam", "the guide names what it was derived from"],
+    );
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(repo3.join(CONFIG_PATH)).unwrap()).unwrap();
+    cfg["timeout_s"] = serde_json::json!(61);
+    std::fs::write(repo3.join(CONFIG_PATH), cfg.to_string()).unwrap();
+    git(&repo3, &["commit", "-qam", "the checks config changed"]);
+    let ctx3 = FloorContext {
+        base_head: Some(git(&repo3, &["rev-parse", "HEAD"])),
+        stage: FloorStage::Verify,
+        git_dir: Some(repo3.join(".git")),
+        ..FloorContext::default()
+    };
+    write_tree(
+        &repo3,
+        &argv3,
+        &[
+            ("run.out", "test old ... FAILED\n"),
+            ("run.exit", "101"),
+            ("excluded.exit", "0"),
+            ("toc.txt", &toc_of(&["old", "new", "fine"])),
+        ],
+    );
+    std::fs::write(repo3.join(CONFIG_PATH), cfg.to_string()).unwrap();
+    let (report, c) = floor_test(&repo3, &ctx3).unwrap();
+    let d = c.decision.as_ref().expect("a decision");
+    assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
+    assert!(!report.passed);
+    assert!(
+        d.guide
+            .as_ref()
+            .and_then(|g| g.reason.as_deref())
+            .is_some_and(|r| r.starts_with("stale")),
+        "{d:?}"
+    );
+    for r in [repo, repo2, repo3] {
+        let _ = std::fs::remove_dir_all(r);
+    }
+}
+
+/// Every outcome serializes on the wire as `checks[].decision` (the coordinator's addendum):
+/// `pass_excluded` (DONE WHEN 1), `timed_out` (an excluded run past its bound) and
+/// `could_not_run`; the others are asserted in their own DONE WHEN tests.
+#[cfg(unix)]
+#[test]
+fn each_outcome_rides_the_wire_as_a_typed_decision() {
+    let _load = seam::pin(0.5, 4);
+    let (repo, ctx, argv) = red_base("wire");
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.out", "test old ... FAILED\n"),
+            ("run.exit", "101"),
+            ("excluded.exit", "0"),
+            ("toc.txt", &toc_of(&["old", "new", "fine"])),
+        ],
+    );
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    let w = wire_decision(&c);
+    assert_eq!(w["outcome"], OUTCOME_PASS_EXCLUDED, "{w}");
+    assert_eq!(w["baseSha"], serde_json::json!(ctx.base_head));
+    assert_eq!(w["baseFailing"], serde_json::json!(["old"]));
+    assert_eq!(w["excluded"], serde_json::json!(["old"]));
+    assert_eq!(w["reason"], "1 pre-existing excluded: old");
+    let attempts: Vec<&str> = w["logRefs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["attempt"].as_str().unwrap())
+        .collect();
+    for a in ["head", "base", "toc-base", "toc-head", "excluded"] {
+        assert!(attempts.contains(&a), "{a} in {attempts:?}");
+    }
+    for r in w["logRefs"].as_array().unwrap() {
+        assert!(
+            r["sha256"].as_str().is_some_and(|h| h.len() == 64)
+                && r["bytes"].is_u64()
+                && r["stream"].is_string(),
+            "{r}"
+        );
+    }
+    assert!(report.passed);
+    // timed_out: the excluded run outlives its bound.
+    std::fs::write(
+        repo.join(CONFIG_PATH),
+        serde_json::json!({ "test": argv, "timeout_s": 2 }).to_string(),
+    )
+    .unwrap();
+    std::fs::write(repo.join("excluded.sleep"), "30").unwrap();
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    assert_eq!(wire_decision(&c)["outcome"], OUTCOME_TIMED_OUT);
+    assert!(
+        !report.passed && report.timed_out() && report.denial_source() == DENIAL_SOURCE_TIMEOUT
+    );
+    // could_not_run: a runner that is not on PATH.
+    std::fs::write(repo.join(CONFIG_PATH), r#"{"test":["no-such-runner-v2"]}"#).unwrap();
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    assert_eq!(wire_decision(&c)["outcome"], OUTCOME_COULD_NOT_RUN);
+    assert!(!report.passed);
+    // A passing check: `pass`, its own two streams on the record.
+    std::fs::write(
+        repo.join(CONFIG_PATH),
+        serde_json::json!({ "test": argv }).to_string(),
+    )
+    .unwrap();
+    std::fs::write(repo.join("run.exit"), "0").unwrap();
+    let Some((_, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    let w = wire_decision(&c);
+    assert_eq!(
+        (w["outcome"].as_str(), w["logRefs"].as_array().map(Vec::len)),
+        (Some("pass"), Some(2))
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// A real cargo crate: `a` red on the base, `b` and the doctests green.
+#[cfg(unix)]
+fn real_crate(tag: &str) -> (PathBuf, FloorContext) {
+    let repo = scratch(tag);
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"floorv2_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join(".gitignore"), "Cargo.lock\ntmp/\n").unwrap();
+    std::fs::write(repo.join("src/lib.rs"), real_lib(true, false)).unwrap();
+    git_repo_with_commit(&repo);
+    // The guide for the detected check, with and without the lockfile cargo writes.
+    let base = commit_guide(
+        &repo,
+        &[
+            libtest_check(&s(&["cargo", "test", "--no-fail-fast"])),
+            libtest_check(&s(&["cargo", "test", "--locked", "--no-fail-fast"])),
+        ],
+    );
+    let ctx = FloorContext {
+        stage: FloorStage::Verify,
+        base_head: Some(base),
+        git_dir: Some(repo.join(".git")),
+        ..FloorContext::default()
+    };
+    (repo, ctx)
+}
+
+/// `a` red when asked, `b` red when asked, and a doctest that always passes.
+#[cfg(unix)]
+fn real_lib(a_red: bool, b_red: bool) -> String {
+    let body = |red: bool| {
+        if red {
+            "{\n        assert!(false, \"BOOM\");\n    }"
+        } else {
+            "{}"
+        }
+    };
+    format!(
+        "/// ```\n/// assert_eq!(floorv2_fixture::two(), 2);\n/// ```\npub fn two() -> u32 {{\n    2\n}}\n\n\
+         #[cfg(test)]\nmod t {{\n    #[test]\n    fn a() {}\n    #[test]\n    fn b() {}\n}}\n",
+        body(a_red),
+        body(b_red)
+    )
+}
+
+/// The `cargo test` check a real-cargo floor ran (the full suite or the derived set).
+#[cfg(unix)]
+fn cargo_check(report: &RepoChecksReport) -> &CheckRun {
+    report
+        .checks
+        .iter()
+        .find(|c| c.argv.get(1).map(String::as_str) == Some("test"))
+        .unwrap_or_else(|| panic!("a cargo test check ran: {report:#?}"))
+}
+
+/// (codex r13, r14) Real cargo, `--test-threads=1`: `fine` depends on order (it passes in the
+/// suite, fails alone) and spawns a child that inherits stdout, SPLITTING its own result line
+/// (`test t::fine ... x` then `ok`); `old` prints a child-style `test t::fine ... FAILED` line
+/// and fails. Only libtest's own `failures:` list names a base failure (`t::old`), so the head
+/// breaking `fine` denies.
+#[cfg(unix)]
+#[test]
+fn an_order_dependent_test_the_base_passed_is_never_excluded() {
+    let _load = seam::pin(0.5, 4);
+    let (repo, _) = real_crate("realv2-order");
+    let lib = |fine: &str| {
+        format!(
+            "#[cfg(test)]\nmod t {{\n    use std::sync::atomic::{{AtomicBool, Ordering}};\n\n    \
+             static READY: AtomicBool = AtomicBool::new(false);\n\n    #[test]\n    fn a_setup() {{\n        \
+             READY.store(true, Ordering::SeqCst);\n    }}\n\n    #[test]\n    fn fine() {{\n        \
+             {fine}\n    }}\n\n    #[test]\n    fn old() {{\n        println!(\"test t::fine ... FAILED\");\n        \
+             panic!(\"old\");\n    }}\n}}\n"
+        )
+    };
+    // spawn-audit: test-only — fixture SOURCE text: the fixture crate's own test spawns a child
+    // that inherits stdout, to split its libtest result line.
+    let fine = "let _ = std::process::Command::new(\"echo\").arg(\"x\").status();\n        \
+                assert!(READY.load(Ordering::SeqCst));";
+    std::fs::write(repo.join("src/lib.rs"), lib(fine)).unwrap();
+    std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+    std::fs::write(
+        repo.join(CONFIG_PATH),
+        r#"{"test":["cargo","test","--no-fail-fast","--","--test-threads=1"]}"#,
+    )
+    .unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "an order-dependent base"]);
+    commit_guide(
+        &repo,
+        &[libtest_check(&s(&[
+            "cargo",
+            "test",
+            "--no-fail-fast",
+            "--",
+            "--test-threads=1",
+        ]))],
+    );
+    let ctx = FloorContext {
+        stage: FloorStage::Verify,
+        base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+        git_dir: Some(repo.join(".git")),
+        ..FloorContext::default()
+    };
+    std::fs::write(repo.join("src/lib.rs"), lib("panic!(\"broken\");")).unwrap();
+    let report = run_floor(&repo, &ctx);
+    if report.sandbox_error.is_some() {
+        return;
+    }
+    let c = cargo_check(&report);
+    let d = c.decision.as_ref().expect("decided");
+    assert_eq!(d.base_failing, s(&["t::old"]), "{c:#?}");
+    assert_eq!(d.outcome, OUTCOME_NEW_FAILURE, "{c:#?}");
+    assert!(!report.passed);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (agy r14) Real cargo: `smoke` passes in the lib and fails in an integration test — one
+/// name in two binaries. libtest's own list names the failing one, the base inventory lists
+/// the name twice, so the floor cannot separate it: `base_red_unseparated`, the failure on
+/// the record.
+#[cfg(unix)]
+#[test]
+fn a_name_failing_in_one_binary_and_passing_in_another_cannot_be_separated() {
+    let _load = seam::pin(0.5, 4);
+    let (repo, _) = real_crate("realv2-smoke");
+    std::fs::write(repo.join("src/lib.rs"), "#[test]\nfn smoke() {}\n").unwrap();
+    std::fs::create_dir_all(repo.join("tests")).unwrap();
+    std::fs::write(
+        repo.join("tests/it.rs"),
+        "#[test]\nfn smoke() {\n    panic!(\"it\");\n}\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "smoke in two binaries"]);
+    let ctx = FloorContext {
+        stage: FloorStage::Verify,
+        base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+        git_dir: Some(repo.join(".git")),
+        ..FloorContext::default()
+    };
+    std::fs::write(repo.join("README.md"), "head\n").unwrap();
+    let report = run_floor(&repo, &ctx);
+    if report.sandbox_error.is_some() {
+        return;
+    }
+    let c = cargo_check(&report);
+    let d = c.decision.as_ref().expect("decided");
+    assert_eq!(d.base_failing, s(&["smoke"]), "{c:#?}");
+    assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{c:#?}");
+    assert!(
+        d.reason
+            .as_deref()
+            .is_some_and(|r| r.contains("not under the same qualifier")),
+        "{d:?}"
+    );
+    assert!(!report.passed);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (codex r10-r11, ported) Package `b` compiles in `a`'s source by `include_str!`, with no
+/// cargo edge. A base with a guide (and no `affected` piece) runs the full check at the
+/// creator and at verify, so `b`'s regression denies at both.
+#[cfg(unix)]
+#[test]
+fn an_include_str_across_packages_denies_at_the_creator_and_at_verify() {
+    let _load = seam::pin(0.5, 4);
+    let repo = scratch("include-str");
+    for (name, body) in [
+        ("a", "pub fn one() -> u32 {\n    1\n}\n"),
+        (
+            "b",
+            "#[cfg(test)]\nmod t {\n    #[test]\n    fn reads_a() {\n        assert!(include_str!(\"../../a/src/lib.rs\").contains(\"fn one\"));\n    }\n}\n",
+        ),
+    ] {
+        std::fs::create_dir_all(repo.join(name).join("src")).unwrap();
+        std::fs::write(
+            repo.join(name).join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .unwrap();
+        std::fs::write(repo.join(name).join("src/lib.rs"), body).unwrap();
+    }
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join(".gitignore"), "Cargo.lock\ntmp/\ntarget/\n").unwrap();
+    git_repo_with_commit(&repo);
+    let base = commit_guide(
+        &repo,
+        &[
+            libtest_check(&s(&["cargo", "test", "--no-fail-fast"])),
+            libtest_check(&s(&["cargo", "test", "--locked", "--no-fail-fast"])),
+        ],
+    );
+    let ctx = |stage| FloorContext {
+        stage,
+        base_head: Some(base.clone()),
+        git_dir: Some(repo.join(".git")),
+        ..FloorContext::default()
+    };
+    std::fs::write(
+        repo.join("a/src/lib.rs"),
+        "pub fn two() -> u32 {\n    2\n}\n",
+    )
+    .unwrap();
+    for stage in [FloorStage::Creator, FloorStage::Verify] {
+        let report = run_floor(&repo, &ctx(stage));
+        if report.sandbox_error.is_some() {
+            return;
+        }
+        assert!(
+            report.checks.iter().all(|c| c.name != "test_targeted"),
+            "{stage:?}: a guided base never narrows without `affected`: {report:#?}"
+        );
+        assert!(
+            !report.passed,
+            "{stage:?}: `b`'s regression denies: {report:#?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// DONE WHEN 1 + 6 + 7, on real cargo under the real floor sandbox: base red on `a`, head red
+/// on `a` only ⇒ passes with "1 pre-existing excluded: t::a"; head also red on `b` ⇒ a new
+/// failure, denied. The doctest runs inside the floor's boundary on every run. A log range
+/// fetched by its receipt ref verifies against the hash.
+#[cfg(unix)]
+#[test]
+fn real_cargo_excludes_the_base_failure_and_denies_a_new_one() {
+    let _load = seam::pin(0.5, 4);
+    let (repo, ctx) = real_crate("realv2");
+    // Head red on `a` only (an unrelated edit, so the tree changed).
+    std::fs::write(
+        repo.join("src/lib.rs"),
+        real_lib(true, false) + "\n// edited\n",
+    )
+    .unwrap();
+    // The tree is unconfigured, so verify runs its full suite.
+    let report = run_floor(&repo, &ctx);
+    if report.sandbox_error.is_some() {
+        eprintln!("repo_checks: no sandbox tool here — the real floor cannot run");
+        return;
+    }
+    let c = cargo_check(&report);
+    let d = c.decision.as_ref().expect("decided");
+    assert_eq!(d.outcome, OUTCOME_PASS_EXCLUDED, "{c:#?}");
+    assert_eq!(d.reason.as_deref(), Some("1 pre-existing excluded: t::a"));
+    assert_eq!(d.excluded, s(&["t::a"]));
+    assert_eq!(d.base_failing, s(&["t::a"]));
+    assert_eq!(d.base_sha, ctx.base_head);
+    assert!(report.passed, "{report:#?}");
+    assert_eq!(c.pre_existing, s(&["t::a"]));
+    let excluded = &c.reruns[0];
+    assert!(
+        excluded.argv.ends_with(&s(&["--skip=t::a", "--exact"])),
+        "{:?}",
+        excluded.argv
+    );
+    assert!(excluded.passed());
+    // DONE WHEN 7: the doctest RAN inside the floor's sandbox (rustdoc made its temp dir).
+    let store = report_logs(&repo, &ctx);
+    let out = crate::floor_log::text(&store, &excluded.logs[0]);
+    assert!(
+        out.contains("test src/lib.rs - two (line 1) ... ok"),
+        "{out}"
+    );
+    let err = crate::floor_log::text(&store, &excluded.logs[1]);
+    assert!(
+        !err.contains("failed to create temporary directory"),
+        "{err}"
+    );
+    // DONE WHEN 6: the receipt's ref fetches a verifiable range.
+    let r = &d
+        .log_refs
+        .iter()
+        .find(|l| l.attempt == "excluded" && l.stream == "stdout")
+        .unwrap();
+    let t = crate::floor_log::toc(&store, r, &[]).unwrap();
+    let (a, b) = t.lines[t.lines.len() - 1];
+    assert!(crate::floor_log::read_range(&store, r, a, b).is_ok());
+    assert_eq!(wire_decision(c)["outcome"], OUTCOME_PASS_EXCLUDED);
+
+    // Head red on `a` AND `b`: the excluded run still fails ⇒ a new failure, denied.
+    std::fs::write(repo.join("src/lib.rs"), real_lib(true, true)).unwrap();
+    let report = run_floor(&repo, &ctx);
+    let c = cargo_check(&report);
+    let d = c.decision.as_ref().unwrap();
+    assert!(
+        matches!(
+            d.outcome.as_str(),
+            OUTCOME_NEW_FAILURE | OUTCOME_FLAKY_TWICE
+        ),
+        "{c:#?}"
+    );
+    assert_eq!(d.excluded, s(&["t::a"]));
+    assert!(!report.passed && c.denies());
+    assert_eq!(c.classification.as_deref(), Some(REGRESSION));
+    assert!(
+        c.regressions.contains(&"test t::b".to_string()),
+        "annotated: {:?}",
+        c.regressions
+    );
+    let denial = report.denial_reason();
+    assert!(
+        denial.contains("NEW FAILURE") && denial.contains("t::a"),
+        "{denial}"
+    );
+    assert_eq!(
+        wire_decision(c)["outcome"].as_str(),
+        Some(d.outcome.as_str())
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// The run's log store a test floor over `repo` wrote to.
+#[cfg(unix)]
+fn report_logs(repo: &Path, ctx: &FloorContext) -> PathBuf {
+    crate::floor_log::run_dir(
+        &check_cache_root()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(crate::floor_log::LOG_SUBDIR),
+        ctx.run_id.as_deref(),
+        repo,
+    )
+}
+
+/// DONE WHEN 7: a real doctest runs under the real macOS floor sandbox — the production path
+/// (`run_floor`) and the test seam, which now arms the private `TMPDIR` as production does
+/// (rustdoc creates its temp dir there; the seam used to leave it out, so no doctest ran).
+#[cfg(unix)]
+#[test]
+fn doctests_run_under_the_real_floor_sandbox() {
+    let _load = seam::pin(0.5, 4);
+    let (repo, ctx) = real_crate("doctest");
+    std::fs::write(repo.join("src/lib.rs"), real_lib(false, false)).unwrap();
+    let report = run_floor(
+        &repo,
+        &FloorContext {
+            base_head: None,
+            git_dir: None,
+            ..ctx.clone()
+        },
+    );
+    if report.sandbox_error.is_some() {
+        return;
+    }
+    let c = cargo_check(&report);
+    let store = report_logs(&repo, &ctx);
+    let out = crate::floor_log::text(&store, &c.logs[0]);
+    assert!(
+        c.passed() && out.contains("test src/lib.rs - two (line 1) ... ok"),
+        "{c:#?}\n{out}"
+    );
+    let seam = run_with_sandbox(&repo, sandbox_for(&repo));
+    let c = cargo_check(&seam);
+    assert!(c.passed(), "the test seam arms the private TMPDIR: {c:#?}");
+    let _ = std::fs::remove_dir_all(&repo);
+}

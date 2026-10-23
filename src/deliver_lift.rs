@@ -2321,9 +2321,9 @@ mod tests {
             std::fs::write(o.join("tests/shared.red"), "").unwrap();
             std::fs::write(o.join("src/landed.ts"), "export const landed = 1;\n").unwrap();
             // The tip's build guide for the runner, verified on the commit before it.
-            crate::repo_checks::tests::write_guide(
+            crate::repo_checks::floor_tests::write_guide(
                 o,
-                &[crate::repo_checks::tests::libtest_check(&[
+                &[crate::repo_checks::floor_tests::libtest_check(&[
                     runner.clone(),
                     "test".into(),
                     "--no-fail-fast".into(),
@@ -2447,9 +2447,9 @@ mod tests {
             run_git(&repo, &["add", "-A"]);
             run_git(&repo, &["commit", "-qm", "base"]);
             // The base's build guide for the runner, verified on the commit before it.
-            crate::repo_checks::tests::write_guide(
+            crate::repo_checks::floor_tests::write_guide(
                 &repo,
-                &[crate::repo_checks::tests::libtest_check(&[
+                &[crate::repo_checks::floor_tests::libtest_check(&[
                     runner.clone(),
                     "test".into(),
                     "--no-fail-fast".into(),
