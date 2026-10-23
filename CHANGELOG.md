@@ -31,7 +31,8 @@ Two release tracks share this file, newest entry first regardless of track:
   (`wicked-core floor probe --repo <dir> --guide <file> [--check <name>]`: list, run, ids, alone,
   deselect, mutation, multi — two mutations, both parsed, both deselected — and affected, in a scratch copy
   under the floor sandbox; it writes `verified`; a junit testcase a filter skipped counts as neither passed
-  nor failed). Deselect tokens from the first `{id}` onward repeat per id, so a flag and its value are one
+  nor failed; it never runs in the operator's worker home: unless `WICKED_WORKER_HOME` is set explicitly,
+  it creates a fresh worker home under the system temp dir and removes it at the end). Deselect tokens from the first `{id}` onward repeat per id, so a flag and its value are one
   token (`--skip={id}`); `{id}` values fill whole argv elements and never pass through a shell, so no
   escaping is needed. The probes must also have run on an ancestor of
   the base, with no `derivedFrom` file changed since and no touched file matching `invalidatedBy`; otherwise

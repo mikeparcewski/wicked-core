@@ -18,6 +18,9 @@
 //!   expected ids, and the run deselecting both leaves the clean run's failures;
 //! * `affected` (when the check has the piece) — with the mutation file as `{files}`, its run's
 //!   failures include the mutated id.
+//!
+//! Its worker home (check scratch, log store) is `WICKED_WORKER_HOME` when set explicitly, else a
+//! fresh temp dir removed at the end — never the operator's default home.
 
 use std::path::Path;
 
@@ -94,6 +97,14 @@ pub fn probe_cli(args: &[String]) -> i32 {
         eprintln!("usage: wicked-core floor probe --repo <dir> --guide <file> [--check <name>]");
         return 2;
     };
+    // Held to the end of the probe: dropping it removes the temporary worker home.
+    let _home = match probe_worker_home() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("wicked-core floor probe: no temporary worker home: {e}");
+            return 2;
+        }
+    };
     match probe_guide(
         Path::new(&repo),
         Path::new(&guide),
@@ -114,6 +125,25 @@ pub fn probe_cli(args: &[String]) -> i32 {
             2
         }
     }
+}
+
+/// The probe never runs in the operator's worker home: unless `WICKED_WORKER_HOME` is set
+/// explicitly, the run gets a fresh private dir under the system temp dir (the variable points at
+/// it for this process, before anything resolves the home) and the returned guard removes it.
+fn probe_worker_home() -> std::io::Result<Option<crate::repo_checks::PrivateTmp>> {
+    use wicked_apps_core::spawn::WORKER_HOME_ENV;
+    if std::env::var_os(WORKER_HOME_ENV).is_some() {
+        return Ok(None);
+    }
+    let tmp = crate::repo_checks::PrivateTmp::create()?;
+    // Spelled without a symlink (`/var` → `/private/var` on macOS): the home must be normal.
+    let dir = tmp.path().canonicalize()?;
+    std::env::set_var(WORKER_HOME_ENV, &dir);
+    eprintln!(
+        "wicked-core floor probe: worker home {} (temporary; removed at the end)",
+        dir.display()
+    );
+    Ok(Some(tmp))
 }
 
 fn probe_check(
