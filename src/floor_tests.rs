@@ -1472,6 +1472,7 @@ for a in "$@"; do case "$a" in --list) mode=list;; --skip=*) skip="$skip${a#--sk
 all="a b"; [ -f zz_m ] && [ ! -L zz_m ] && all="$all m"; [ -f zz_m2 ] && all="$all m2"
 if [ -n "$name" ] && [ ! -f alone.all ]; then case " $all " in *" $name "*) all=$name;; *) all=;; esac; fi
 [ -n "$name" ] && [ -f broken.alone ] && [ "$name" = a ] && exit 1
+[ -n "$LEAK" ] && [ $mode = list ] && exit 3
 [ -f plant.link ] && [ ! -L zz_m ] && ln -s "$OUTSIDE" zz_m
 case $mode in
   list) if [ -f flaky.list ] && [ ! -f "$TMPDIR/listed" ]; then : > "$TMPDIR/listed"; exit 1; fi
@@ -1565,7 +1566,9 @@ fn the_probe_needs_a_green_base_an_isolated_alone_and_confined_mutations() {
     std::fs::write(repo.join(".gitignore"), "tmp/\nprobe-guide.json\n").unwrap();
     git_repo_with_commit(&repo);
     let mut g = stand_in_guide();
-    g["results"]["how"] = serde_json::json!({"env": {"OUTSIDE": outside.to_string_lossy()}});
+    // (round 16, item 7) The results env reaches the results runs only: a list that saw it fails.
+    g["results"]["how"] =
+        serde_json::json!({"env": {"OUTSIDE": outside.to_string_lossy(), "LEAK": "1"}});
     let with = |marker: &str, g: &serde_json::Value| {
         std::fs::write(repo.join(marker), "").unwrap();
         git(&repo, &["add", "-A"]);
@@ -1591,6 +1594,31 @@ fn the_probe_needs_a_green_base_an_isolated_alone_and_confined_mutations() {
     let r = with("escape.marker", &esc).unwrap();
     assert!(r["mutation"].contains("must stay inside the tree"), "{r:?}");
     assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
+    // (round 16, items 4, 6, 12) `affected` must fail with a `failedExit`, not only name the test;
+    // a `mutation2` naming the first mutation's test proves nothing; a second mutation that cannot
+    // be written fails the probes still open, and leaves `mutation`'s own verdict.
+    let mut odd = g.clone();
+    odd["affected"] = serde_json::json!({"run": ["sh", "-c",
+        "printf '\\nfailures:\\n    m\\n\\ntest result: FAILED.\\n'; exit 0", "sh", "{files}"]});
+    odd["probes"]["mutation2"]["expectId"] = "m".into();
+    let r = with("odd.marker", &odd).unwrap();
+    assert!(
+        r["affected"].starts_with("fail: the affected run did not fail"),
+        "{r:?}"
+    );
+    assert!(r["multi"].starts_with("fail:"), "{r:?}");
+    assert_eq!(
+        r["list"], "pass (retried)",
+        "the list never saw the results env: {r:?}"
+    );
+    let mut bad2 = g.clone();
+    bad2["probes"]["mutation2"]["file"] = "../m2".into();
+    let r = with("bad2.marker", &bad2).unwrap();
+    assert_eq!(r["mutation"], "pass (retried)", "{r:?}");
+    assert!(
+        r["multi"].contains("second mutation could not be written"),
+        "{r:?}"
+    );
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(outside.parent().unwrap());
 }
@@ -1749,6 +1777,24 @@ fn a_signal_could_not_run_and_an_unusable_guide_has_no_exit_code_semantics() {
     assert!(!passed && d.outcome == OUTCOME_COULD_NOT_RUN, "{d:?}");
     let (passed, d) = decided(&[red[0], red[1], red[2], red[3], ("excluded.signal", "")]).unwrap();
     assert!(!passed && d.outcome == OUTCOME_COULD_NOT_RUN, "{d:?}");
+    // (round 16, item 11) Under load, a deselected run that crashed is decided, not retried.
+    {
+        let _loaded = seam::pin(64.0, 4);
+        write_tree(
+            &repo,
+            &argv,
+            &[red[0], red[1], red[2], ("excluded.exit", "2")],
+        );
+        let (_, c) = floor_test(&repo, &ctx).unwrap();
+        let d = c.decision.as_ref().expect("decided");
+        assert_eq!(d.outcome, OUTCOME_COULD_NOT_RUN, "{d:?}");
+        assert_eq!(
+            c.reruns.len(),
+            1,
+            "the deselected run only, no retry: {c:?}"
+        );
+    }
+    let _load = seam::pin(0.5, 4);
     // A change touching `invalidatedBy`: the exit outside `failedExit` is a plain failure.
     std::fs::create_dir_all(repo.join(".cargo")).unwrap();
     std::fs::write(repo.join(".cargo/config.toml"), "[build]\n").unwrap();
@@ -1802,10 +1848,13 @@ fn affected_gets_the_root_checks_files_and_a_flag_shaped_file_runs_the_full_chec
         ..FloorContext::default()
     };
     // The full check is red with a new failure: only the affected run can pass it.
+    // Every tracked fixture file stays (a deletion would rule `affected` out, below).
+    let toc = toc_of(&["old", "new", "fine"]);
     let head = [
         ("run.out", "test new ... FAILED\n"),
         ("run.exit", "101"),
         ("excluded.exit", "101"),
+        ("toc.txt", toc.as_str()),
     ];
     write_tree(&repo, &argv, &head);
     std::fs::write(repo.join("marker.txt"), "x").unwrap();
@@ -1820,6 +1869,12 @@ fn affected_gets_the_root_checks_files_and_a_flag_shaped_file_runs_the_full_chec
         !report.passed,
         "a flag-shaped file runs the full, red check: {c:?}"
     );
+    // (round 16, item 2) A deleted file: what it left behind cannot be mapped — the full check.
+    std::fs::remove_file(repo.join("-x")).unwrap();
+    std::fs::remove_file(repo.join("alone.fail")).unwrap();
+    let (report, c) = floor_test(&repo, &ctx).unwrap();
+    assert!(!report.passed, "a deletion runs the full, red check: {c:?}");
+    assert!(!c.source.contains("affected set"), "{}", c.source);
     let _ = std::fs::remove_dir_all(&repo);
 }
 
@@ -1919,6 +1974,24 @@ fn the_base_guides_checks_for_the_stage_are_the_floors_checks() {
             "{checks:?}"
         );
     }
+    // (round 16, item 1) A package the guide does not cover keeps its detected checks.
+    std::fs::create_dir_all(repo.join("sub/node_modules")).unwrap();
+    std::fs::write(
+        repo.join("sub/package.json"),
+        r#"{"scripts":{"test":"exit 0"}}"#,
+    )
+    .unwrap();
+    let checks = at(FloorStage::Verify, &base);
+    assert!(
+        checks
+            .iter()
+            .any(|c| c.dir == "sub" && c.source != GUIDE_SOURCE),
+        "{checks:?}"
+    );
+    assert!(checks
+        .iter()
+        .any(|c| c.name == "test" && c.source == GUIDE_SOURCE));
+    std::fs::remove_dir_all(repo.join("sub")).unwrap();
     // The first commit carries no guide: detection.
     let checks = at(FloorStage::Verify, &git(&repo, &["rev-parse", "HEAD~2"]));
     assert_eq!(names(&checks), ["test"], "{checks:?}");
@@ -1935,4 +2008,62 @@ fn the_base_guides_checks_for_the_stage_are_the_floors_checks() {
         assert!(checks.iter().all(|c| c.source != GUIDE_SOURCE), "{bad}");
     }
     let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (round 16, item 8) A claim of "pre-existing" is judged on the check that DENIED, and a head
+/// that dropped the base's failing test (nothing to deselect) still rejects it.
+#[cfg(unix)]
+#[test]
+fn a_pre_existing_claim_is_judged_on_the_denying_check() {
+    let run = |name: &str, outcome: &str, base_failing: &[&str], excluded: &[&str]| {
+        let mut c: CheckRun = serde_json::from_value(serde_json::json!({
+            "name": name, "argv": ["x"], "source": "s", "exit_code": 1, "timed_out": false,
+            "duration_ms": 0, "stdout_tail": "", "stderr_tail": ""}))
+        .unwrap();
+        c.decision = Some(CheckDecision {
+            outcome: outcome.into(),
+            base_sha: Some("b".into()),
+            base_failing: s(base_failing),
+            excluded: s(excluded),
+            log_refs: Vec::new(),
+            flaky: false,
+            reason: None,
+            guide: None,
+        });
+        c
+    };
+    let ctx = FloorContext {
+        stage: FloorStage::Creator,
+        claim_text: Some("The failing test is pre-existing.".into()),
+        ..FloorContext::default()
+    };
+    let checks = [
+        run("first", OUTCOME_PASS_EXCLUDED, &["a"], &["a"]),
+        run("second", OUTCOME_NEW_FAILURE, &[], &[]),
+    ];
+    let mut second = checks[1].clone();
+    second.base = Some(Box::new(BaseRun {
+        head: "b".into(),
+        cached: false,
+        run: Some(run("second", OUTCOME_PASS, &[], &[])),
+        error: None,
+    }));
+    second
+        .base
+        .as_mut()
+        .unwrap()
+        .run
+        .as_mut()
+        .unwrap()
+        .exit_code = Some(0);
+    let c = judge_claim(&ctx, &[checks[0].clone(), second]).unwrap();
+    assert_eq!(
+        (c.check.as_str(), c.verdict.as_str()),
+        ("second", CLAIM_REJECTED)
+    );
+    let c = judge_claim(&ctx, &[run("t", OUTCOME_NEW_FAILURE, &["old"], &[])]).unwrap();
+    assert_eq!(
+        c.verdict, CLAIM_REJECTED,
+        "the head dropped `old`; what fails is its own"
+    );
 }

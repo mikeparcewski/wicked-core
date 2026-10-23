@@ -1424,9 +1424,20 @@ pub(crate) fn detect(worktree: &Path) -> Result<Vec<RepoCheck>, String> {
 /// the checks would fail for the wrong reason; always frozen and `--ignore-scripts`). Pure over
 /// the filesystem (one `git diff` when a targeted command asks for `{files}`) — runs nothing.
 pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>, String> {
-    if let Some(checks) = guide_checks(worktree, ctx)? {
-        return Ok(checks);
-    }
+    let detected = detect_manifests(worktree, ctx)?;
+    // (DES-BUILD-GUIDE) The base's guide replaces detection only for the directories its checks
+    // cover: a package it does not cover keeps its detected checks (exit codes only).
+    Ok(match guide_checks(worktree, ctx)? {
+        Some((mut guided, covered)) => {
+            guided.extend(detected.into_iter().filter(|c| !covered.contains(&c.dir)));
+            guided
+        }
+        None => detected,
+    })
+}
+
+/// The manifests' checks (see [`detect_with`]).
+fn detect_manifests(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>, String> {
     let pkgs = subdir_packages(worktree, ctx)?;
     if pkgs.dirs.is_empty() {
         return detect_package(worktree, ctx);
@@ -1878,14 +1889,17 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
     Ok(out)
 }
 
+/// A base guide's checks for the stage, and the directories its checks cover.
+type GuidedChecks = (Vec<RepoCheck>, Vec<String>);
+
 /// The `source` of a check the base's build guide declares.
 pub const GUIDE_SOURCE: &str = "the run base's build guide (DES-BUILD-GUIDE)";
 
-/// (DES-BUILD-GUIDE) When the run base carries a build guide, ITS checks for this stage are the
-/// floor's checks: their argv, cwd and stage replace detection for the repo (only
-/// [`CONFIG_PATH`]'s `timeout_s` still bounds them). `None` — detection, the fallback — when the
-/// base has no guide, or one that does not parse (each check's `decision.guide` then says why).
-fn guide_checks(worktree: &Path, ctx: &FloorContext) -> Result<Option<Vec<RepoCheck>>, String> {
+/// (DES-BUILD-GUIDE) When the run base carries a build guide, ITS checks for this stage, and the
+/// directories its checks cover (any stage): there they replace detection (only [`CONFIG_PATH`]'s
+/// `timeout_s` still bounds them). `None` — detection, the fallback — when the base has no guide,
+/// or one that does not parse (each check's `decision.guide` then says why).
+fn guide_checks(worktree: &Path, ctx: &FloorContext) -> Result<Option<GuidedChecks>, String> {
     let (Some(base), Some(git_dir), None) = (
         ctx.base_head.as_deref(),
         ctx.git_dir.as_deref(),
@@ -1897,18 +1911,18 @@ fn guide_checks(worktree: &Path, ctx: &FloorContext) -> Result<Option<Vec<RepoCh
         return Ok(None);
     };
     let timeout_s = read_config(worktree)?.and_then(|c| c.timeout_s);
-    Ok(Some(
-        guide
-            .checks_at(ctx.stage.as_wire())
-            .map(|c| RepoCheck {
-                name: c.name.clone(),
-                argv: c.run.clone(),
-                source: GUIDE_SOURCE.into(),
-                timeout_s,
-                dir: c.dir().to_string(),
-            })
-            .collect(),
-    ))
+    let checks = guide
+        .checks_at(ctx.stage.as_wire())
+        .map(|c| RepoCheck {
+            name: c.name.clone(),
+            argv: c.run.clone(),
+            source: GUIDE_SOURCE.into(),
+            timeout_s,
+            dir: c.dir().to_string(),
+        })
+        .collect();
+    let covered = guide.checks.iter().map(|c| c.dir().to_string()).collect();
+    Ok(Some((checks, covered)))
 }
 
 /// The derived source string on a [`derive_targeted`] check.
@@ -3348,10 +3362,14 @@ pub(crate) fn run_with_sandbox_ctx(
         };
         // (DES-BUILD-GUIDE) At the creator, a usable guide's `affected` piece is a fast pre-pass:
         // its pass decides; its failure runs the check as declared.
+        // A deleted (or renamed-away) file: what it left behind cannot be mapped — the full check.
+        let deletes = changed
+            .as_ref()
+            .map_or(true, |c| c.iter().any(|f| !touched.contains(f)));
         let affected = gcheck
             .as_ref()
             .ok()
-            .filter(|_| ctx.stage == FloorStage::Creator && !touched.is_empty())
+            .filter(|_| ctx.stage == FloorStage::Creator && !touched.is_empty() && !deletes)
             .and_then(|g| g.affected_argv(&package_relative(touched.clone(), &check.dir)));
         let mut run = match affected {
             Some(argv) => {
@@ -4333,9 +4351,7 @@ impl BaseTree {
                 argv: guide.map_or_else(|| target.argv.clone(), |g| g.for_results(&target.argv)),
                 ..target.clone()
             },
-            &guide
-                .map(|g| exec_of(g, g.results.how.merge))
-                .unwrap_or_default(),
+            &guide.map(results_exec).unwrap_or_default(),
             sandbox,
             scratch,
             Tree::Base,
@@ -4344,9 +4360,11 @@ impl BaseTree {
         if let Some(g) =
             guide.filter(|_| !run.passed() && !run.timed_out && run.spawn_error.is_none())
         {
+            // The results first: the list must not overwrite them.
+            let results = results_of(&self.dir, &target, g, &mut run, scratch, since);
             let mut t = inventory(&self.dir, &target, g, &[], sandbox, scratch, Tree::Base);
             if t.incomplete.is_none() {
-                match results_of(&self.dir, &target, g, &mut run, scratch, since) {
+                match results {
                     Ok((_, failed)) => {
                         t.failing = failed.into_iter().filter(|x| t.count(x) > 0).collect()
                     }
@@ -4369,7 +4387,7 @@ impl BaseTree {
                     let r = run_one_with(
                         &self.dir,
                         &one,
-                        &exec_of(g, false),
+                        &ExecOpts::default(),
                         sandbox,
                         scratch,
                         Tree::Base,
@@ -4553,8 +4571,9 @@ impl Toc {
     }
 }
 
-/// The run options a guide asks for: its `how.env`, and stderr merged into stdout when `merge`.
-pub(crate) fn exec_of(g: &GuideCheck, merge: bool) -> ExecOpts {
+/// The options of a run whose RESULTS the floor reads: the guide's `results.how` env and merge.
+/// No other run (a list, a one-test run, the deselected run, the version) gets that env.
+pub(crate) fn results_exec(g: &GuideCheck) -> ExecOpts {
     ExecOpts {
         env: g
             .results
@@ -4563,6 +4582,14 @@ pub(crate) fn exec_of(g: &GuideCheck, merge: bool) -> ExecOpts {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        merge: g.results.how.merge,
+    }
+}
+
+/// A run that only merges its streams (or not), with no guide env.
+fn merged(merge: bool) -> ExecOpts {
+    ExecOpts {
+        env: Vec::new(),
         merge,
     }
 }
@@ -4597,7 +4624,7 @@ pub(crate) fn inventory(
         source: format!("the list of `{}` (DES-BUILD-GUIDE)", check.name),
         ..check.clone()
     };
-    let r = run_one_with(dir, &probe, &exec_of(g, list.merge), sandbox, scratch, tree);
+    let r = run_one_with(dir, &probe, &merged(list.merge), sandbox, scratch, tree);
     let attempt = match (tree, ids.is_empty()) {
         (Tree::Base, _) => "toc-base",
         (Tree::Head, true) => "toc-head",
@@ -4855,7 +4882,7 @@ pub(crate) fn runner_version(
         timeout_s: Some(120),
         ..check.clone()
     };
-    let r = run_one_with(dir, &rc, &exec_of(g, true), sandbox, scratch, tree);
+    let r = run_one_with(dir, &rc, &merged(true), sandbox, scratch, tree);
     if !r.passed() {
         return Err(format!(
             "the version command did not pass ({})",
@@ -5097,7 +5124,7 @@ fn decide(
                 ),
                 ..check.clone()
             };
-            let exec = exec_of(g, false);
+            let exec = ExecOpts::default();
             let mut e = run_one_with(worktree, &one, &exec, sandbox, scratch, Tree::Head);
             e.logs = relabel(e.logs, "excluded");
             decision.excluded = names.iter().map(|t| t.id.clone()).collect();
@@ -5113,14 +5140,20 @@ fn decide(
     // Failing twice is `flaky_twice` only when BOTH attempts ran oversubscribed: a retry that had
     // its headroom and failed again reproduced the failure without the load — a new failure.
     let mut twice = false;
-    let retry = retry_if_loaded(
-        worktree,
-        &deciding_check,
-        &deciding_exec,
-        &deciding,
-        sandbox,
-        scratch,
-    );
+    // A deselected run that crashed is decided as it stands (`could_not_run`): no retry.
+    let crashed_out = excluded_run && crashed(&deciding, guide.as_ref().ok().copied()).is_some();
+    let retry = (!crashed_out)
+        .then(|| {
+            retry_if_loaded(
+                worktree,
+                &deciding_check,
+                &deciding_exec,
+                &deciding,
+                sandbox,
+                scratch,
+            )
+        })
+        .flatten();
     if let Some(r) = retry {
         logs.extend(r.logs.iter().cloned());
         head.reruns.push(r.clone());
@@ -5333,7 +5366,10 @@ fn judge_claim(ctx: &FloorContext, checks: &[CheckRun]) -> Option<ClaimCheck> {
         return None;
     }
     let phrase = detect_claim(ctx.claim_text.as_deref()?)?;
-    let failing = checks.iter().find(|c| !c.passed() && c.name != "install")?;
+    let failing = checks
+        .iter()
+        .find(|c| c.denies() && c.name != "install")
+        .or_else(|| checks.iter().find(|c| !c.passed() && c.name != "install"))?;
     let base_passed = failing
         .base
         .as_deref()
@@ -5345,11 +5381,13 @@ fn judge_claim(ctx: &FloorContext, checks: &[CheckRun]) -> Option<ClaimCheck> {
         // A failure that remains with every base failure excluded, or against a green base, is
         // this change's; a pass on retry is a flake, not a pre-existing failure.
         Some(OUTCOME_NEW_FAILURE) | Some(OUTCOME_FLAKY_TWICE) if base_passed => CLAIM_REJECTED,
+        // A red base the floor separated (its failures established, even ones the head no longer
+        // has): what is left failing is this change's.
         Some(OUTCOME_NEW_FAILURE) | Some(OUTCOME_FLAKY_TWICE)
             if failing
                 .decision
                 .as_ref()
-                .is_some_and(|d| !d.excluded.is_empty()) =>
+                .is_some_and(|d| !d.excluded.is_empty() || !d.base_failing.is_empty()) =>
         {
             CLAIM_REJECTED
         }

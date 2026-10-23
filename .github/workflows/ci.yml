@@ -79,6 +79,18 @@ jobs:
           bwrap --ro-bind / / --dev /dev --proc /proc --unshare-all --die-with-parent -- /bin/true
           echo "bwrap can arm a boundary on this runner"
 
+      # DES-BUILD-GUIDE: the build-guide probe fixtures run against a REAL pytest and vitest here
+      # (elsewhere they skip): a lane-local venv on PATH, and `WICKED_TEST_VITEST` naming vitest.
+      - name: pytest and vitest for the build-guide probe fixtures (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          python3 -m venv "$RUNNER_TEMP/probe-py"
+          "$RUNNER_TEMP/probe-py/bin/pip" install --quiet pytest
+          echo "$RUNNER_TEMP/probe-py/bin" >> "$GITHUB_PATH"
+          npm install --prefix "$RUNNER_TEMP/probe-vt" --no-audit --no-fund vitest@3
+          echo "WICKED_TEST_VITEST=$RUNNER_TEMP/probe-vt/node_modules/.bin/vitest" >> "$GITHUB_ENV"
+
       - name: cargo test
         run: cargo test --workspace
 

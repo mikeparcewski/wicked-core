@@ -21,9 +21,12 @@ Two release tracks share this file, newest entry first regardless of track:
   floor now trusts the base tree and the exit codes of the processes it launches, and every runner fact is
   DATA: `.wicked/build-guide.json` (contract v1, `schemas/build-guide.v1.json`), read from the BASE tree only
   (a head edit to the guide never applies to its own run). When the base carries a guide, its checks for the
-  stage (`stage`; both when absent) ARE the floor's checks: their argv, cwd and stage replace detection for the
-  repo (a build, lint or install step is a check of the guide; `.wicked/checks.json`'s `timeout_s` still bounds
-  them), and detection is the fallback only with no guide or one that does not parse. A failed head check is
+  stage (`stage`; both when absent) ARE the floor's checks for the directories they cover (their `cwd`s, at any
+  stage): there their argv, cwd and stage replace detection (a build, lint or install step is a check of the
+  guide; `.wicked/checks.json`'s `timeout_s` still bounds them), while a detected package no guide check covers
+  keeps its detected checks, exit codes only; detection is the whole floor with no guide or one that does not
+  parse — and a guide is checked on load (every `run` non-empty, `stage` values `creator` / `verify`, a test
+  check naming its `failedExit`). A failed head check is
   compared with the base: a green base makes it a `new_failure`; a red base, for a guide check, is listed by
   the guide's `list` piece, its results (`text` line rules and blocks, or `junit`) nominate the
   failing ids the list holds, each is confirmed by its exit code run `alone` on the base (`failedExit`), and
@@ -67,8 +70,12 @@ Two release tracks share this file, newest entry first regardless of track:
   start (finished blobs after `FLOOR_LOG_TTL` = 7 days, `.part-*` after a day, oldest-first over
   `WICKED_FLOOR_LOG_CAP_GB`, default 5, never anything modified in the last 24 hours; a dedup or a reused
   cache record restarts a blob's age, and eviction re-stats first), with a lazy line TOC and ranges read by
-  ref and verified against the hash (`floor_log`). The seed guide for wicked-core itself is committed and
-  probed. Kept: the PTY grant (core#1060's Seatbelt rules), the load-aware bound, the base cache (now
+  ref and verified against the hash (`floor_log`). The seed guide for wicked-core itself is committed: its
+  gate checks (fmt, typecheck, clippy, and core-ts's fmt, clippy, test, `finalize-dts` and `tsc`, as CI gates
+  them) run on exit codes; **its `test` check is UNVERIFIED until it is re-probed on main after this merges**
+  (its `version` piece and the tightened probes postdate its last probe), so until then a red base on it
+  escalates instead of excluding. The ubuntu CI job installs pytest and vitest so the pytest and vitest probe
+  fixtures run there. Kept: the PTY grant (core#1060's Seatbelt rules), the load-aware bound, the base cache (now
   `{floor_policy: 12, head_argv, guide, run, toc}`, keyed by the guide check it ran under), `.wicked/checks.json`,
   the operator override and QE. Fail-closed reads: a results file (`results.how.path`) counts only as a regular
   file inside the tree, written since the run started (a leftover is removed before the run; one second of
@@ -79,8 +86,14 @@ Two release tracks share this file, newest entry first regardless of track:
   renamed-away files, and a change whose files cannot be listed makes the guide unusable; with an unusable
   guide a non-zero exit is a plain failure; an id is excluded only when unique across every qualifier unless
   `alone` and `deselect` both name `{q}`; a guide with an unknown field or no `checks` does not parse
-  (detection decides); `affected` gets a root check's files, and none (or one named like a flag) runs the
-  full check. The log store's GC, dedup and refresh share one advisory lock (`<store>/.lock`). The macOS
+  (detection decides); `affected` gets a root check's files, and none, one named like a flag, or any deleted or
+  renamed-away file runs the full check; the `results.how` env reaches only the runs whose results are read
+  (never a list, a one-test run, the deselected run or the version), and the base's results are read before
+  its list runs; the JUnit reader judges each `<testcase>` on its own (a skipped twin erases nothing, two
+  that ran count twice); `{id}`/`{q}` fill in one pass; the `affected` probe needs a `failedExit`, and `multi`
+  a second failure other than the first mutation's; a deselected run that crashed is not retried; a
+  "pre-existing" claim is judged on the check that denied, and rejected when the base's failures were
+  established and the head still fails. The log store's GC, dedup and refresh share one advisory lock (`<store>/.lock`). The macOS
   floor's test seam arms the private `TMPDIR` as production does. Wire (additive): every
   `repoChecksEvaluated.checks[]` entry carries `decision: {outcome, baseSha, baseFailing, excluded, logRefs:
   [{attempt, stream, sha256, bytes, truncated}], flaky, reason, guide: {present, usable, reason}}`, with

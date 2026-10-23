@@ -33,8 +33,8 @@ use std::path::Path;
 
 use crate::floor_guide::{passed, BuildGuide, GuideCheck, Mutation, TestId};
 use crate::repo_checks::{
-    exec_of, inventory, remove_base_export, results_of, run_one_with, runner_version, BaseTree,
-    CheckScratch, RepoCheck, Tree,
+    inventory, remove_base_export, results_exec, results_of, run_one_with, runner_version,
+    BaseTree, CheckScratch, RepoCheck, Tree,
 };
 
 /// A results run's parse: every testcase (junit) and the failures.
@@ -57,13 +57,7 @@ pub fn probe_guide(
     let raw = std::fs::read_to_string(guide_path)
         .map_err(|e| format!("`{}` could not be read: {e}", guide_path.display()))?;
     let mut guide: BuildGuide =
-        serde_json::from_str(&raw).map_err(|e| format!("the guide does not parse: {e}"))?;
-    if guide.version != 1 {
-        return Err(format!(
-            "guide version {} (this probe reads 1)",
-            guide.version
-        ));
-    }
+        crate::floor_guide::parse(&raw).map_err(|e| format!("the guide {e}"))?;
     let git_dir =
         crate::worktree_guard::git_string(repo, &["rev-parse", "--absolute-git-dir"], &[])
             .map(std::path::PathBuf::from)
@@ -265,7 +259,7 @@ impl Probe<'_> {
         let mut r = run_one_with(
             self.dir,
             &rc,
-            &exec_of(self.g, self.g.results.how.merge),
+            &results_exec(self.g),
             self.sandbox,
             self.scratch,
             Tree::Base,
@@ -318,12 +312,15 @@ impl Probe<'_> {
 
     fn all(&self) -> ProbeResults {
         let mut out = ProbeResults::new();
+        let g = self.g;
+        // Every probe not yet decided fails with `why` (`affected` too, when the check has it).
         let fail_rest = |out: &mut ProbeResults, why: &str| {
-            for p in AFTER_RUN {
-                out.insert(p.into(), format!("fail: {why}"));
+            let affected = g.affected.is_some().then_some("affected");
+            for p in AFTER_RUN.into_iter().chain(affected) {
+                out.entry(p.into())
+                    .or_insert_with(|| format!("fail: {why}"));
             }
         };
-        let g = self.g;
         let clean_list = self.list(&[]);
         out.insert(
             "list".into(),
@@ -410,7 +407,7 @@ impl Probe<'_> {
                 if self.failed_exit(bexit)
                     && f.len() == 2
                     && f.contains(&t)
-                    && f.iter().any(|x| is(x, m2)) =>
+                    && f.iter().any(|x| *x != t && is(x, m2)) =>
             {
                 f.clone()
             }
@@ -518,12 +515,19 @@ impl Probe<'_> {
         if g.affected.is_some() {
             let a = g
                 .affected_argv(std::slice::from_ref(&m.file))
-                .map(|argv| self.results(&argv).1);
+                .map(|argv| self.results(&argv));
             out.insert(
                 "affected".into(),
                 verdict(
-                    a.is_some_and(|r| r.is_ok_and(|(_, f)| f.contains(&t))),
-                    || format!("the affected run's failures do not include `{}`", t.id),
+                    a.is_some_and(|(exit, r)| {
+                        self.failed_exit(exit) && r.is_ok_and(|(_, f)| f.contains(&t))
+                    }),
+                    || {
+                        format!(
+                            "the affected run did not fail with a `failedExit` naming `{}`",
+                            t.id
+                        )
+                    },
                 ),
             );
         }
