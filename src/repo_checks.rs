@@ -241,7 +241,8 @@ use wicked_apps_core::spawn::HardenedCommand;
 
 use crate::floor_runner::{
     alone_argv, alone_failed, cargo_config_bends_test_args, cargo_toc_targets, deselect_argv,
-    deselectable, failing_names, parse_toc, pytest_prefix_collision, runner_of, toc_argv, Runner,
+    deselectable, failing_names, parse_toc, passing_names, pytest_prefix_collision, runner_of,
+    toc_argv, Runner,
 };
 use crate::validator::WorkerSandbox;
 
@@ -4168,9 +4169,11 @@ impl BaseTree {
                 .and_then(|l| crate::floor_log::read_blob(&scratch.logs, l));
             match text {
                 Ok(b) => {
-                    t.failing = failing_names(runner, &String::from_utf8_lossy(&b))
+                    let text = String::from_utf8_lossy(&b);
+                    let passed = passing_names(runner, &text);
+                    t.failing = failing_names(runner, &text)
                         .into_iter()
-                        .filter(|n| t.count(n) > 0)
+                        .filter(|n| t.count(n) > 0 && !passed.contains(n))
                         .collect()
                 }
                 Err(e) => t.incomplete = Some(format!("the base's output: {e}")),
@@ -9543,6 +9546,55 @@ pub(crate) mod tests {
             .unwrap_or_else(|| panic!("a cargo test check ran: {report:#?}"))
     }
 
+    /// (codex r13) Real cargo, `--test-threads=1`: `fine` depends on order (it passes in the suite,
+    /// fails alone) and `old` prints a child-style `test t::fine ... FAILED` line and fails. The
+    /// base reported `fine ... ok`, so `fine` is no base failure: the head breaking it denies.
+    #[cfg(unix)]
+    #[test]
+    fn an_order_dependent_test_the_base_passed_is_never_excluded() {
+        let _load = seam::pin(0.5, 4);
+        let (repo, _) = real_crate("realv2-order");
+        let lib = |fine: &str| {
+            format!(
+                "#[cfg(test)]\nmod t {{\n    use std::sync::atomic::{{AtomicBool, Ordering}};\n\n    \
+                 static READY: AtomicBool = AtomicBool::new(false);\n\n    #[test]\n    fn a_setup() {{\n        \
+                 READY.store(true, Ordering::SeqCst);\n    }}\n\n    #[test]\n    fn fine() {{\n        \
+                 {fine}\n    }}\n\n    #[test]\n    fn old() {{\n        println!(\"test t::fine ... FAILED\");\n        \
+                 panic!(\"old\");\n    }}\n}}\n"
+            )
+        };
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            lib("assert!(READY.load(Ordering::SeqCst));"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        std::fs::write(
+            repo.join(CONFIG_PATH),
+            r#"{"test":["cargo","test","--no-fail-fast","--","--test-threads=1"]}"#,
+        )
+        .unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "an order-dependent base"]);
+        let ctx = FloorContext {
+            stage: FloorStage::Verify,
+            base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        std::fs::write(repo.join("src/lib.rs"), lib("panic!(\"broken\");")).unwrap();
+        let report = run_floor(&repo, &ctx);
+        if report.sandbox_error.is_some() {
+            return;
+        }
+        let c = cargo_check(&report);
+        let d = c.decision.as_ref().expect("decided");
+        assert_eq!(d.base_failing, s(&["t::old"]), "{c:#?}");
+        assert_eq!(d.outcome, OUTCOME_NEW_FAILURE, "{c:#?}");
+        assert!(!report.passed);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     /// DONE WHEN 1 + 6 + 7, on real cargo under the real floor sandbox: base red on `a`, head red
     /// on `a` only ⇒ passes with "1 pre-existing excluded: t::a"; head also red on `b` ⇒ a new
     /// failure, denied. The doctest runs inside the floor's boundary on every run. A log range
@@ -9684,7 +9736,7 @@ pub(crate) mod tests {
 
     /// A failing BASE test's captured output that carries a child run's `test fine ... FAILED` (for
     /// a test that itself passed on the base, its own `ok` line printed) never makes `fine`
-    /// excludable: run alone on the base it passes, so the head breaking `fine` denies.
+    /// excludable: the head breaking `fine` is a new failure.
     #[cfg(unix)]
     #[test]
     fn a_base_tests_captured_child_line_never_excludes_a_passing_test() {
@@ -9732,18 +9784,12 @@ pub(crate) mod tests {
         let Some((report, c)) = floor_test(&repo, &ctx) else {
             return;
         };
-        // `fine` is a candidate only: run alone on the base it passes, so nothing is deselected and
-        // the floor cannot separate the base's red — it escalates, denying.
+        // The base reported `fine ... ok`: it is no base failure, only `old` is deselected, and
+        // the head's broken `fine` is a new failure.
         let d = c.decision.as_ref().unwrap();
-        assert_eq!(d.base_failing, s(&["old", "fine"]), "{d:?}");
-        assert!(d.excluded.is_empty(), "{d:?}");
-        assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
-        assert!(
-            d.reason
-                .as_deref()
-                .is_some_and(|r| r.contains("`fine` does not fail when the base runs it alone")),
-            "{d:?}"
-        );
+        assert_eq!(d.base_failing, s(&["old"]), "{d:?}");
+        assert_eq!(d.excluded, s(&["old"]));
+        assert_eq!(d.outcome, OUTCOME_NEW_FAILURE, "{d:?}");
         assert!(!report.passed);
         let _ = std::fs::remove_dir_all(&repo);
     }

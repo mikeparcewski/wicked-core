@@ -21,7 +21,7 @@ Two release tracks share this file, newest entry first regardless of track:
   check is compared with the base. A green base makes it a `new_failure`. A red base is inventoried by its own
   runner on the base tree (`cargo test <args> -- --list`, `pytest --collect-only -q`), and
   its failing tests are read once from the base's verified stdout and kept only when that inventory lists them
-  verbatim (stored with the base record). When the exclusion is precise, the head runs once
+  verbatim and (libtest) the same base run did not also report them `ok` (stored with the base record). When the exclusion is precise, the head runs once
   more with those tests deselected natively (libtest `--skip=<name> --exact`, pytest `--deselect`): exit 0 is `pass_excluded` ("1 pre-existing excluded: t::a"), non-zero is a `new_failure`.
   Precise means every name is unique in the base inventory and at most once in the head's, the argv is on
   core#1060's r16 allowlist, no head `.cargo/config*` sets `rustdocflags` or test args, and no cargo name has

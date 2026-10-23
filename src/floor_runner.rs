@@ -293,13 +293,27 @@ fn libtest_name(r: &str) -> &str {
     r.strip_suffix(" - compile fail").unwrap_or(r)
 }
 
-/// The test name of a libtest `test X ... FAILED` line, or `None` for any other line.
-fn libtest_failed(l: &str) -> Option<&str> {
-    let (name, verdict) = l
+/// The test name of a libtest `test X ... <verdict>` line, or `None` for any other line.
+fn libtest_verdict<'a>(l: &'a str, verdict: &str) -> Option<&'a str> {
+    let (name, v) = l
         .trim_end_matches('\r')
         .strip_prefix("test ")?
         .rsplit_once(" ... ")?;
-    (verdict == "FAILED").then(|| libtest_name(name))
+    (v == verdict).then(|| libtest_name(name))
+}
+
+/// (codex r13) The test names a libtest run's OWN stdout reports `ok`: a base candidate the same
+/// run passed is no base failure — an order-dependent test fails alone, so the alone run cannot
+/// tell. pytest: none.
+pub(crate) fn passing_names(runner: Runner, text: &str) -> Vec<String> {
+    match runner {
+        Runner::Cargo => text
+            .lines()
+            .filter_map(|l| libtest_verdict(l, "ok"))
+            .map(String::from)
+            .collect(),
+        Runner::Pytest => Vec::new(),
+    }
 }
 
 /// The failing test names a run's OWN stdout (the base's) carries, read only from the runner's
@@ -333,7 +347,7 @@ pub(crate) fn failing_names(runner: Runner, text: &str) -> Vec<String> {
             continue;
         }
         let name = match runner {
-            Runner::Cargo => libtest_failed(l),
+            Runner::Cargo => libtest_verdict(l, "FAILED"),
             Runner::Pytest if in_summary => l
                 .strip_prefix("FAILED ")
                 .or_else(|| l.strip_prefix("ERROR "))
