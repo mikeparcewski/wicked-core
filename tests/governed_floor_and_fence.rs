@@ -16,6 +16,8 @@
 //!    `finished_at` are recorded, and the completed run's worktree is RETAINED until the run is
 //!    archived — then reaped (clean-only).
 
+#[path = "support/libtest_guide.rs"]
+mod guide_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -586,28 +588,13 @@ fn make_git_repo_with_a_red_test_on_the_base(name: &str) -> PathBuf {
         .output()
         .unwrap();
     let verified = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let argv = [cargo.to_str().unwrap(), "test", "--no-fail-fast"];
-    let tail = |extra: &[&'static str]| {
-        let mut v: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
-        v.push("--".into());
-        v.extend(extra.iter().map(|a| a.to_string()));
-        v
-    };
-    let section = r"^\s+(?:Running .*\((?:.*[/\\])?|Doc-tests )(?P<q>[^/\\()\s]+)\)?$";
+    let argv: Vec<String> = [cargo.to_str().unwrap(), "test", "--no-fail-fast"]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
     std::fs::write(
         repo.join(".wicked/build-guide.json"),
-        serde_json::json!({"version": 1, "checks": [{
-            "name": "test", "run": argv, "failedExit": [101],
-            "results": {"kind": "text", "how": {"merge": true}},
-            "parser": {"section": section, "blocks": [{"start": "^failures:$",
-                "item": r"^    (?P<id>\S+)$", "end": "^test result: FAILED"}]},
-            "list": {"run": tail(&["--list"]), "item": r"^(?P<id>\S+): test$",
-                     "section": section, "merge": true},
-            "alone": {"run": tail(&["{id}", "--exact"])},
-            "deselect": {"append": ["--", "--skip={id}", "--exact"]},
-            "verified": {"baseSha": verified, "results": {"list": "pass", "run": "pass",
-                "alone": "pass", "deselect": "pass", "mutation": "pass"}},
-        }]})
+        serde_json::json!({"version": 1, "checks": [guide_support::libtest_guide(&argv, &verified)]})
         .to_string(),
     )
     .unwrap();

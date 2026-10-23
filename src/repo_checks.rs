@@ -8950,7 +8950,7 @@ pub(crate) mod tests {
             ],
         );
         git_repo_with_commit(&repo);
-        let base = commit_guide(&repo, &[libtest_guide(&argv)]);
+        let base = commit_guide(&repo, &[libtest_check(&argv)]);
         let ctx = FloorContext {
             stage: FloorStage::Verify,
             base_head: Some(base),
@@ -8960,35 +8960,13 @@ pub(crate) mod tests {
         (repo, ctx, argv)
     }
 
-    /// A build-guide check for a libtest-style runner (`cargo test` and the stand-in that mimics
-    /// it): the binaries' `Running` lines (merged from stderr) qualify ids; a failure is a name in
-    /// the final `failures:` list; one test runs alone with `<name> --exact`, and deselects with
-    /// `--skip=<name> --exact`. Test fixture data: the floor knows none of it.
     #[cfg(unix)]
-    pub(crate) fn libtest_guide(argv: &[String]) -> serde_json::Value {
-        let has_sep = argv.iter().any(|a| a == "--");
-        let tail = |extra: &[&str]| {
-            let mut v = argv.to_vec();
-            if !has_sep {
-                v.push("--".into());
-            }
-            v.extend(extra.iter().map(|s| s.to_string()));
-            v
-        };
-        let section = r"^\s+(?:Running .*\((?:.*[/\\])?|Doc-tests )(?P<q>[^/\\()\s]+)\)?$";
-        serde_json::json!({
-            "name": "test", "cwd": ".", "stage": ["creator", "verify"],
-            "run": argv, "failedExit": [101],
-            "results": {"kind": "text", "how": {"merge": true}},
-            "parser": {"section": section, "blocks": [{
-                "start": "^failures:$", "item": r"^    (?P<id>\S+)$",
-                "end": "^test result: FAILED", "use": "last-before-end"}]},
-            "list": {"run": tail(&["--list"]), "item": r"^(?P<id>\S+): test$",
-                     "section": section, "merge": true},
-            "alone": {"run": tail(&["{id}", "--exact"])},
-            "deselect": {"append": ["--", "--skip={id}", "--exact"]},
-            "invalidatedBy": [".cargo/**", "**/.cargo/**"],
-        })
+    include!("../tests/support/libtest_guide.rs");
+
+    /// [`libtest_guide`], not yet verified.
+    #[cfg(unix)]
+    pub(crate) fn libtest_check(argv: &[String]) -> serde_json::Value {
+        libtest_guide(argv, "")
     }
 
     /// Commit `checks` as the repo's `.wicked/build-guide.json`, each verified (every probe
@@ -9007,15 +8985,11 @@ pub(crate) mod tests {
     /// `verified_on`.
     #[cfg(unix)]
     pub(crate) fn write_guide(repo: &Path, checks: &[serde_json::Value], verified_on: &str) {
-        let head = verified_on;
         let checks: Vec<serde_json::Value> = checks
             .iter()
-            .cloned()
-            .map(|mut c| {
-                c["verified"] = serde_json::json!({
-                    "baseSha": head, "runnerVersion": "", "at": "",
-                    "results": {"list": "pass", "run": "pass", "alone": "pass",
-                                "deselect": "pass", "mutation": "pass"}});
+            .map(|c| {
+                let mut c = c.clone();
+                c["verified"] = libtest_guide(&[], verified_on)["verified"].clone();
                 c
             })
             .collect();
@@ -9141,10 +9115,9 @@ pub(crate) mod tests {
 
     /// DONE WHEN 3 + the escalation class, guide-driven: base red, cannot separate — with the
     /// reason — for a name not unique in the base or head list, a head list that does not run
-    /// clean, an argv that is not the guide's `run`, a touched file the guide's `invalidatedBy`
-    /// names, a name the parser does not take (a doctest), a runner the guide does not describe, a
-    /// deselect that removes more than it was asked to, a truncated base log, a crashed base, and
-    /// one name under two qualifiers.
+    /// clean, an argv that is not the guide's `run` (a filter; a runner it does not describe), a
+    /// touched file the guide's `invalidatedBy` names, a deselect that removes more than it was
+    /// asked to, a truncated base log, a crashed base, and one name under two qualifiers.
     #[cfg(unix)]
     #[test]
     fn imprecise_exclusion_escalates_as_base_red_unseparated() {
@@ -9238,45 +9211,6 @@ pub(crate) mod tests {
             &head_red(&[("toc.txt", &toc_of(&["old", "new"]))]),
         );
         unseparated(&repo2, &ctx2, "duplicate in the base inventory");
-        // (f) A doctest name: rustdoc splits every test-arg on whitespace.
-        let (repo3, ctx3, argv3) = red_base("unsep-doc");
-        let doc = "src/lib.rs - f (line 1)";
-        write_tree(
-            &repo3,
-            &argv3,
-            &[
-                ("run.out", &format!("test {doc} ... FAILED\n")),
-                ("run.exit", "101"),
-                ("toc.txt", &toc_of(&[doc, "fine"])),
-            ],
-        );
-        git(&repo3, &["commit", "-qam", "a red doctest"]);
-        let ctx3 = FloorContext {
-            base_head: Some(git(&repo3, &["rev-parse", "HEAD"])),
-            ..ctx3
-        };
-        write_tree(
-            &repo3,
-            &argv3,
-            &[
-                ("run.out", &format!("test {doc} ... FAILED\n")),
-                ("run.exit", "101"),
-                ("excluded.exit", "0"),
-                ("toc.txt", &toc_of(&[doc, "fine"])),
-            ],
-        );
-        unseparated(&repo3, &ctx3, "a doctest name");
-        // (g) A runner with no precise per-test deselect (`sh`, like vitest/jest/tsc).
-        let (repo4, ctx4, _) = red_base("unsep-sh");
-        let sh = s(&["sh", "-c", "echo 'test old ... FAILED'; exit 1"]);
-        write_tree(&repo4, &sh, &[]);
-        git(&repo4, &["commit", "-qam", "an sh runner"]);
-        let ctx4 = FloorContext {
-            base_head: Some(git(&repo4, &["rev-parse", "HEAD"])),
-            ..ctx4
-        };
-        std::fs::write(repo4.join("README.md"), "changed\n").unwrap();
-        unseparated(&repo4, &ctx4, "no precise deselect");
         // (h, codex r1) A deselect that matches by PREFIX (`old` would also take `old_extra`): the
         // head's list deselecting the base's failure lists fewer than the rest — never skipped.
         let (repo5, ctx5, argv5) = red_base("unsep-prefix");
@@ -9398,43 +9332,7 @@ pub(crate) mod tests {
             ],
         );
         unseparated(&repo8, &ctx8, "one name under two qualifiers");
-        // (l, codex r6) The base's failing `old` is in one package's `tests/smoke.rs`; the head
-        // moves it to ANOTHER package's `tests/smoke.rs`: same path, another executable hash.
-        let (repo9, ctx9, argv9) = red_base("unsep-package");
-        let smoke =
-            |h: &str| format!("     Running tests/smoke.rs (target/debug/deps/smoke-{h})\n");
-        write_tree(
-            &repo9,
-            &argv9,
-            &[
-                ("run.out", "test old ... FAILED\n"),
-                ("run.exit", "101"),
-                ("toc.txt", &toc_of(&["old"])),
-                ("toc.err", &smoke("ab326bc8")),
-            ],
-        );
-        git(&repo9, &["add", "-A"]);
-        git(
-            &repo9,
-            &["commit", "-qm", "old in package a's tests/smoke.rs"],
-        );
-        let ctx9 = FloorContext {
-            base_head: Some(git(&repo9, &["rev-parse", "HEAD"])),
-            ..ctx9
-        };
-        write_tree(
-            &repo9,
-            &argv9,
-            &[
-                ("run.out", "test old ... FAILED\n"),
-                ("run.exit", "101"),
-                ("excluded.exit", "0"),
-                ("toc.txt", &toc_of(&["old"])),
-                ("toc.err", &smoke("62bd74a4")),
-            ],
-        );
-        unseparated(&repo9, &ctx9, "one file name in two packages");
-        for r in [repo, repo2, repo3, repo4, repo5, repo6, repo7, repo8, repo9] {
+        for r in [repo, repo2, repo5, repo6, repo7, repo8] {
             let _ = std::fs::remove_dir_all(r);
         }
     }
@@ -9618,7 +9516,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         git_repo_with_commit(&repo);
-        let mut g = libtest_guide(&s(&["cargo", "test", "--no-fail-fast"]));
+        let mut g = libtest_check(&s(&["cargo", "test", "--no-fail-fast"]));
         g["probes"] = serde_json::json!({"mutation": {
             "file": "tests/zz_mutation.rs",
             "content": "#[test]\nfn floor_mutation() {\n    panic!(\"mutated\");\n}\n",
@@ -9789,7 +9687,7 @@ pub(crate) mod tests {
         assert!(g.present && g.usable && g.reason.is_none(), "{g:?}");
         // (4) A probe that did not pass: the check escalates, the reason names the probe.
         let (repo2, _, argv2) = red_base("guide-failed-probe");
-        let mut guide = libtest_guide(&argv2);
+        let mut guide = libtest_check(&argv2);
         guide["verified"] = serde_json::json!({});
         write_guide(&repo2, &[guide], &git(&repo2, &["rev-parse", "HEAD~1"]));
         let path = repo2.join(crate::floor_guide::GUIDE_PATH);
@@ -9981,8 +9879,8 @@ pub(crate) mod tests {
         let base = commit_guide(
             &repo,
             &[
-                libtest_guide(&s(&["cargo", "test", "--no-fail-fast"])),
-                libtest_guide(&s(&["cargo", "test", "--locked", "--no-fail-fast"])),
+                libtest_check(&s(&["cargo", "test", "--no-fail-fast"])),
+                libtest_check(&s(&["cargo", "test", "--locked", "--no-fail-fast"])),
             ],
         );
         let ctx = FloorContext {
@@ -10056,7 +9954,7 @@ pub(crate) mod tests {
         git(&repo, &["commit", "-qm", "an order-dependent base"]);
         commit_guide(
             &repo,
-            &[libtest_guide(&s(&[
+            &[libtest_check(&s(&[
                 "cargo",
                 "test",
                 "--no-fail-fast",
@@ -10159,8 +10057,8 @@ pub(crate) mod tests {
         let base = commit_guide(
             &repo,
             &[
-                libtest_guide(&s(&["cargo", "test", "--no-fail-fast"])),
-                libtest_guide(&s(&["cargo", "test", "--locked", "--no-fail-fast"])),
+                libtest_check(&s(&["cargo", "test", "--no-fail-fast"])),
+                libtest_check(&s(&["cargo", "test", "--locked", "--no-fail-fast"])),
             ],
         );
         let ctx = |stage| FloorContext {

@@ -24,6 +24,8 @@
 //!    back (retry against the restored tree / cancel) instead of ending it `sessionFailed`, and a
 //!    read-only unit has a NOTES ROOT outside the tree where a note never trips the guard.
 
+#[path = "support/libtest_guide.rs"]
+mod guide_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -407,25 +409,8 @@ fn make_git_repo(name: &str, cargo_test: Option<bool>) -> PathBuf {
             .unwrap();
         let verified = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let guide = |argv: &[&str]| {
-            let tail = |extra: &[&'static str]| {
-                let mut v: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
-                v.push("--".into());
-                v.extend(extra.iter().map(|a| a.to_string()));
-                v
-            };
-            let section = r"^\s+(?:Running .*\((?:.*[/\\])?|Doc-tests )(?P<q>[^/\\()\s]+)\)?$";
-            serde_json::json!({
-                "name": "test", "run": argv, "failedExit": [101],
-                "results": {"kind": "text", "how": {"merge": true}},
-                "parser": {"section": section, "blocks": [{"start": "^failures:$",
-                    "item": r"^    (?P<id>\S+)$", "end": "^test result: FAILED"}]},
-                "list": {"run": tail(&["--list"]), "item": r"^(?P<id>\S+): test$",
-                         "section": section, "merge": true},
-                "alone": {"run": tail(&["{id}", "--exact"])},
-                "deselect": {"append": ["--", "--skip={id}", "--exact"]},
-                "verified": {"baseSha": verified, "results": {"list": "pass", "run": "pass",
-                    "alone": "pass", "deselect": "pass", "mutation": "pass"}},
-            })
+            let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+            guide_support::libtest_guide(&argv, &verified)
         };
         std::fs::create_dir_all(repo.join(".wicked")).unwrap();
         std::fs::write(

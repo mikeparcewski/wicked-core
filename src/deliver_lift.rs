@@ -2323,7 +2323,7 @@ mod tests {
             // The tip's build guide for the runner, verified on the commit before it.
             crate::repo_checks::tests::write_guide(
                 o,
-                &[crate::repo_checks::tests::libtest_guide(&[
+                &[crate::repo_checks::tests::libtest_check(&[
                     runner.clone(),
                     "test".into(),
                     "--no-fail-fast".into(),
@@ -2449,7 +2449,7 @@ mod tests {
             // The base's build guide for the runner, verified on the commit before it.
             crate::repo_checks::tests::write_guide(
                 &repo,
-                &[crate::repo_checks::tests::libtest_guide(&[
+                &[crate::repo_checks::tests::libtest_check(&[
                     runner.clone(),
                     "test".into(),
                     "--no-fail-fast".into(),
