@@ -558,11 +558,12 @@ fn make_git_repo_with_a_red_test_on_the_base(name: &str) -> PathBuf {
     let cargo = bin.join("cargo");
     std::fs::write(
         &cargo,
-        "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in\n\
-         --list) echo 'shared: test'; echo; echo '1 test, 0 benchmarks'\n\
-         echo '     Running unittests src/lib.rs (target/debug/deps/fixture-0)' >&2; exit 0;;\n\
-         --skip=shared) echo 'test result: ok. 0 passed; 0 failed; 1 filtered out'; exit 0;;\n\
-         esac; done\necho 'test shared ... FAILED'\necho; echo 'failures:'; echo '    shared'; echo\n\
+        "#!/bin/sh\nlist=0; skip=0\nfor a in \"$@\"; do case \"$a\" in\n\
+         --list) list=1;; --skip=shared) skip=1;;\n\
+         esac; done\necho '     Running unittests src/lib.rs (target/debug/deps/fixture-0)' >&2\n\
+         if [ $list = 1 ]; then [ $skip = 0 ] && echo 'shared: test'; echo; echo '1 test, 0 benchmarks'; exit 0; fi\n\
+         if [ $skip = 1 ]; then echo 'test result: ok. 0 passed; 0 failed; 1 filtered out'; exit 0; fi\n\
+         echo 'test shared ... FAILED'\necho; echo 'failures:'; echo '    shared'; echo\n\
          echo 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out'; exit 101\n",
     )
     .unwrap();
@@ -577,6 +578,41 @@ fn make_git_repo_with_a_red_test_on_the_base(name: &str) -> PathBuf {
     std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "a red test the base carries"]);
+    // DES-BUILD-GUIDE: the base's build guide for the stand-in, verified on the commit before it.
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let verified = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let argv = [cargo.to_str().unwrap(), "test", "--no-fail-fast"];
+    let tail = |extra: &[&'static str]| {
+        let mut v: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+        v.push("--".into());
+        v.extend(extra.iter().map(|a| a.to_string()));
+        v
+    };
+    let section = r"^\s+(?:Running .*\((?:.*[/\\])?|Doc-tests )(?P<q>[^/\\()\s]+)\)?$";
+    std::fs::write(
+        repo.join(".wicked/build-guide.json"),
+        serde_json::json!({"version": 1, "checks": [{
+            "name": "test", "run": argv, "failedExit": [101],
+            "results": {"kind": "text", "how": {"merge": true}},
+            "parser": {"section": section, "blocks": [{"start": "^failures:$",
+                "item": r"^    (?P<id>\S+)$", "end": "^test result: FAILED"}]},
+            "list": {"run": tail(&["--list"]), "item": r"^(?P<id>\S+): test$",
+                     "section": section, "merge": true},
+            "alone": {"run": tail(&["{id}", "--exact"])},
+            "deselect": {"append": ["--", "--skip={id}", "--exact"]},
+            "verified": {"baseSha": verified, "results": {"list": "pass", "run": "pass",
+                "alone": "pass", "deselect": "pass", "mutation": "pass"}},
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "the build guide"]);
     repo
 }
 

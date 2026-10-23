@@ -14,71 +14,50 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
-- **The repo-checks floor decides by exit codes and the base's own test inventory; head output never decides
-  (DES-FLOOR-V2, pipeline-blocker plain PR, operator-approved).** core#1060 spent 21 review rounds patching a
-  parser of the head's test output, and every round found a new forgery of text the creator's tests write. The
-  floor now trusts two inputs: the base tree, and the exit codes of the processes it launches. A failed head
-  check is compared with the base. A green base makes it a `new_failure`. A red base is inventoried by its own
-  runner on the base tree (`cargo test <args> -- --list`, `pytest --collect-only -q`), and
-  its failing tests are read once from the base's verified stdout — for libtest only from its own final `failures:`
-  list before each `test result: FAILED` (never a result line: a child's output or a split line cannot name one), for
-  pytest its last short summary — and kept only when that inventory lists them verbatim (stored with the base record). When the exclusion is precise, the head runs once
-  more with those tests deselected natively (libtest `--skip=<name> --exact`, pytest `--deselect`): exit 0 is `pass_excluded` ("1 pre-existing excluded: t::a"), non-zero is a `new_failure`.
-  Precise means every name is unique in the base inventory and at most once in the head's, the argv is on
-  core#1060's r16 allowlist, no head `.cargo/config*` sets `rustdocflags` or test args, and no cargo name has
-  whitespace (rustdoc splits each test argument, so a doctest name deselects nothing exactly). Review round 1
-  tightened it: cargo needs `--no-fail-fast` (every listed test then prints its own result line), the guard reads
-  `.cargo/config*` as decoded TOML, a pytest `--deselect` that would also remove another head test by node-id
-  prefix is refused, the base's failing names come only from its stdout's own
-  result lines (pytest's last short summary) and never from a truncated stream, an empty
-  inventory is no inventory, an excluded name must sit in the same test target on both trees (each inventory list block matched to cargo's
-  own `Running` line, executable hash included, so two packages' `tests/smoke.rs` are two targets), and every base failure the base's output names is only a candidate until the base's exit code
-  confirms it — run alone on the base (cargo `-- <name> --exact`; pytest the node id with the check's flags, where only exit 1
-  counts; every pytest run the floor builds for exclusion names the check's directory as `--rootdir`, and a pytest
-  argv with a positional path, an unknown valued flag, or its own `--rootdir`/`-c`/`--config-file`/`--confcutdir`
-  is not deselectable) it must fail, so a child run's line, a child pytest summary left
-  open, or a test a crashed binary never reached cannot be excluded (at most 16, more escalates); pytest's `-r` /
-  `--report-chars` is off the allowlist; a base that timed out or could not run escalates; and a manifest change to `[profile]`, `[patch]`, `[replace]`, `[workspace]` or
-  `[lints]` runs the full suite. Anything else is
-  `base_red_unseparated`: it escalates with both logs, and the operator's floor override (core#1061, core#1065)
-  is the path through. go test (its subtests are invisible to `go test -list`, so skipping a red parent can hide a newly broken subtest; review round 2), vitest, jest, tsc, eslint and shell runners escalate the same way. A deciding run that
-  fails on an oversubscribed host is re-run once with the same argv after waiting up to 30 s for headroom (`WICKED_REPO_CHECKS_RETRY_WAIT_S`, at most 600): exit 0 is
-  `passed on retry (flaky)`, and a second failure under load is `flaky_twice` (denies); only the excluded run's retry is refused when a cargo config bends `--exact`. Deleted: head-side
-  classification (`classify` and the binary qualifiers, `LineScan`, the libtest `env_cannot_run` class and its
-  launcher signatures, the isolated `--exact` and vitest file re-runs, the load-class and env-crash re-runs,
-  `MAX_FLAKE_RERUN`, the environment signals) and the 4 KB ring buffer as a source of truth. Every stream is now
-  stored once, content-addressed (sha256), in the run's log store (garbage-collected by age at every floor's start, as sccache and Bazel's disk cache do (a dedup onto an existing blob
-  restarts its age, and every eviction re-stats the file first):
-  finished blobs after `FLOOR_LOG_TTL` = 7 days, `.part-*` after a day, and oldest-first over a byte cap of
-  `WICKED_FLOOR_LOG_CAP_GB` (default 5) that never evicts anything modified in the last 24 hours), with a lazy line TOC and ranges read by ref
-  and verified against the hash (`floor_log`); a stream past 64 MiB keeps its prefix, marked `truncated`, and a
-  truncated inventory is never precise. Kept: the PTY grant (core#1060's Seatbelt rules, cherry-picked), the
-  load-aware bound, the base cache (now `{floor_policy: 10, head_argv, run, toc}`, keyed by the head argv it answered; a reused record's blobs must
-  still read whole and have their age restarted, or the base re-runs; an inventory or alone run that did not finish is not cached), `.wicked/checks.json`, the operator
-  override and QE. An unconfigured cargo repo (or a cargo workspace in a subdirectory: the derived set's
-  provenance is a typed field, not its display source) runs its affected set at the creator only (the verify floor keeps
-  the full suite, as before: the affected set cannot prove a package owns a file), named from cargo metadata alone (detection no longer guesses packages from
-  manifest paths): the members owning a touched file plus the members a manifest change (`cargo metadata
-  --no-deps` diffed against the base) changed and the packages it or a lockfile change moved (a dependency whose
-  declaration changed, every dependency of a member whose `[features]` table changed, a changed lock entry),
-  closed until every member that reaches what the selection reaches is in it, over the members' metadata and the
-  lock graphs (the full suite builds every member together, so a shared dependency's features are on for all of
-  them; a reached package neither graph describes runs the full suite), in one `-p a -p b` invocation; on the base the set runs only over the packages the base has (an all-new set is a `new_failure`); a `[profile]`, `[patch]`,
-  `[replace]`, `[workspace]`, `[lints]`, `package.resolver`/`edition`, nested `.cargo/` or `rust-toolchain` change, or a touched file that is not Rust source (any package may read a fixture) or lies outside the check's directory,
-  runs the full suite. The macOS floor's test seam now arms the private `TMPDIR` as
-  production does, so doctests run under the real floor sandbox. Wire (additive): every
+- **The repo-checks floor decides by exit codes and interprets a per-repo build guide; no runner knowledge
+  in the engine (DES-FLOOR-V2 + DES-BUILD-GUIDE, pipeline-blocker plain PR, operator-approved).** core#1060
+  spent 21 review rounds patching a parser of the head's test output, and #1066's first 14 rounds hardcoded
+  runner rules (libtest and pytest parsing, allowlists, rootdir and config rules) one finding at a time. The
+  floor now trusts the base tree and the exit codes of the processes it launches, and every runner fact is
+  DATA: `.wicked/build-guide.json` (contract v1, `schemas/build-guide.v1.json`), read from the BASE tree only
+  (a head edit to the guide never applies to its own run). A failed head check is compared with the base: a
+  green base makes it a `new_failure`; a red base, for a check whose argv is exactly a guide check's `run`,
+  is listed by the guide's `list` piece, its results (`text` line rules and blocks, or `junit`) nominate the
+  failing ids the list holds, each is confirmed by its exit code run `alone` on the base (`failedExit`), and
+  the head runs once more with them `deselect`ed — that exit code decides (`pass_excluded`, "1 pre-existing
+  excluded: t::a"). Precise means each id is unique in the base list by (qualifier, id), at most once in the
+  head's, under the same qualifier on both, and the head's own list with them deselected lists exactly the rest
+  (the runner's selection is the precision check). A guide check is relied on only when every probe passed
+  (`wicked-core floor probe --repo <dir> --guide <file> [--check <name>]`: list, run, alone, deselect,
+  mutation and affected, in a scratch copy under the floor sandbox; it writes `verified`), on an ancestor of
+  the base, with no `derivedFrom` file changed since and no touched file matching `invalidatedBy`; otherwise
+  the check runs exit-code only and a red base escalates as `base_red_unseparated` (the operator's floor
+  override, core#1061/#1065, is the path through), with `decision.guide: {present, usable, reason}` saying
+  why. With no guide, main's detection and derived targeting are the fallback; a guided base narrows only
+  through its `affected` piece (at the creator), and the verify floor runs the full check. A deciding run that
+  fails on an oversubscribed host is re-run once with the same argv after waiting up to 30 s for headroom
+  (`WICKED_REPO_CHECKS_RETRY_WAIT_S`, at most 600): exit 0 is `passed on retry (flaky)`, a second failure
+  under load is `flaky_twice` (denies). Deleted: head-side classification (`classify`, the binary qualifiers,
+  `LineScan`, the `env_cannot_run` class and launcher signatures, the isolated and vitest re-runs, the
+  load-class and env-crash re-runs, `MAX_FLAKE_RERUN`, the environment signals), the 4 KB ring buffer as a
+  source of truth, and #1066's own runner modules (`floor_runner.rs`, `floor_affected.rs`). Every stream is
+  stored once, content-addressed (sha256), in the run's log store, garbage-collected by age at every floor's
+  start (finished blobs after `FLOOR_LOG_TTL` = 7 days, `.part-*` after a day, oldest-first over
+  `WICKED_FLOOR_LOG_CAP_GB`, default 5, never anything modified in the last 24 hours; a dedup or a reused
+  cache record restarts a blob's age, and eviction re-stats first), with a lazy line TOC and ranges read by
+  ref and verified against the hash (`floor_log`). The seed guide for wicked-core itself is committed and
+  probed. Kept: the PTY grant (core#1060's Seatbelt rules), the load-aware bound, the base cache (now
+  `{floor_policy: 11, head_argv, run, toc}`), `.wicked/checks.json`, the operator override and QE. The macOS
+  floor's test seam arms the private `TMPDIR` as production does. Wire (additive): every
   `repoChecksEvaluated.checks[]` entry carries `decision: {outcome, baseSha, baseFailing, excluded, logRefs:
-  [{attempt, stream, sha256, bytes, truncated}], flaky, reason}`, with `outcome` one of `pass`, `pass_excluded`,
-  `new_failure`, `base_red_unseparated`, `flaky_twice`, `timed_out`, `could_not_run`, typed in core-ts as
-  `RepoChecksEvaluatedEventJson`, `RepoCheckRunJson`, `FloorCheckDecisionJson` and `FloorLogRefJson`.
-  `classification` keeps its tokens for older readers (`pre_existing_in_sandbox` = `pass_excluded`, `regression`
-  = a compared `new_failure` or `flaky_twice`, `flaky_under_load` = passed on retry) and gains
-  `base_red_unseparated`; it no longer produces `env_cannot_run` or `unclassified_red_base`. `envCannotRun` is
-  always `[]` (deprecated). `preExisting` holds runner-native names (`t::a`), and libtest `failureIds` lose their
-  `[<target>]` qualifier. Accepted costs: a red base under a runner with no precise deselect, or a red doctest,
-  now escalates where the old classifier excused it; a base whose red is not fully explained by named tests (a
-  crashed binary) makes the head's failure read `new_failure`; and every failed check on a loaded host pays one
-  retry and up to 30 s of waiting.
+  [{attempt, stream, sha256, bytes, truncated}], flaky, reason, guide: {present, usable, reason}}`, with
+  `outcome` one of `pass`, `pass_excluded`, `new_failure`, `base_red_unseparated`, `flaky_twice`, `timed_out`,
+  `could_not_run`, typed in core-ts (`RepoChecksEvaluatedEventJson`, `RepoCheckRunJson`,
+  `FloorCheckDecisionJson`, `FloorLogRefJson`, `FloorGuideStatusJson`). `classification` keeps its tokens for
+  older readers and gains `base_red_unseparated`; it no longer produces `env_cannot_run` or
+  `unclassified_red_base`; `envCannotRun` is always `[]` (deprecated). Accepted costs: a repo without a usable
+  guide gets no exclusion (a red base escalates) until onboarding writes and probes one; every failed check on
+  a loaded host pays one retry and up to 30 s of waiting.
 - **The floor override is also offered when the judge could not rule either.** core#1061's operator judgment
   over a failed repo-checks floor was refused whenever anything else stood behind the floor, and that included
   the judge's `judge_unavailable` no-verdict hold. So when the judge seats were benched (run 2ebd9da2, attempt

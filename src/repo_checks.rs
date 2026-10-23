@@ -3263,7 +3263,6 @@ pub(crate) fn run_with_sandbox_ctx(
         },
         None => (detected, Vec::new()),
     };
-    let detected = detected;
     // (F-RC2-009) Never run a HEAD process beside a copy of the base — a crash mid-floor could
     // have left one; the export lives only between its creation and the caching of its result.
     // (core#1050) A base export that cannot be cleared (a linked or non-directory `tmp`, a link
@@ -8965,6 +8964,7 @@ pub(crate) mod tests {
     /// it): the binaries' `Running` lines (merged from stderr) qualify ids; a failure is a name in
     /// the final `failures:` list; one test runs alone with `<name> --exact`, and deselects with
     /// `--skip=<name> --exact`. Test fixture data: the floor knows none of it.
+    #[cfg(unix)]
     pub(crate) fn libtest_guide(argv: &[String]) -> serde_json::Value {
         let has_sep = argv.iter().any(|a| a == "--");
         let tail = |extra: &[&str]| {
@@ -8994,6 +8994,7 @@ pub(crate) mod tests {
     /// Commit `checks` as the repo's `.wicked/build-guide.json`, each verified (every probe
     /// `pass`) on the current HEAD — so verified on an ancestor of the new base. Returns the new
     /// HEAD.
+    #[cfg(unix)]
     pub(crate) fn commit_guide(repo: &Path, checks: &[serde_json::Value]) -> String {
         let head = git(repo, &["rev-parse", "HEAD"]);
         write_guide(repo, checks, &head);
@@ -9004,6 +9005,7 @@ pub(crate) mod tests {
 
     /// Write `checks` as `repo`'s `.wicked/build-guide.json`, verified (every probe `pass`) on
     /// `verified_on`.
+    #[cfg(unix)]
     pub(crate) fn write_guide(repo: &Path, checks: &[serde_json::Value], verified_on: &str) {
         let head = verified_on;
         let checks: Vec<serde_json::Value> = checks
@@ -10325,66 +10327,6 @@ pub(crate) mod tests {
         let seam = run_with_sandbox(&repo, sandbox_for(&repo));
         let c = cargo_check(&seam);
         assert!(c.passed(), "the test seam arms the private TMPDIR: {c:#?}");
-        let _ = std::fs::remove_dir_all(&repo);
-    }
-
-    /// A failing BASE test's captured output that carries a child run's `test fine ... FAILED` (for
-    /// a test that itself passed on the base, its own `ok` line printed) never makes `fine`
-    /// excludable: the head breaking `fine` is a new failure.
-    #[cfg(unix)]
-    #[test]
-    fn a_base_tests_captured_child_line_never_excludes_a_passing_test() {
-        let _load = seam::pin(0.5, 4);
-        let (repo, _, argv) = red_base("childline");
-        let base_out =
-            "test fine ... ok\ntest old ... FAILED\n\nfailures:\n\n---- old stdout ----\n\
-                        test fine ... FAILED\n\nfailures:\n    old\n\ntest result: FAILED. 1 passed; 1 failed; \
-                        0 ignored; 0 measured; 0 filtered out\n";
-        write_tree(
-            &repo,
-            &argv,
-            &[
-                ("run.out", base_out),
-                ("run.exit", "101"),
-                ("toc.txt", &toc_of(&["old", "fine"])),
-            ],
-        );
-        git(&repo, &["add", "-A"]);
-        git(
-            &repo,
-            &[
-                "commit",
-                "-qm",
-                "a base whose failing test prints a child's line",
-            ],
-        );
-        let ctx = FloorContext {
-            stage: FloorStage::Verify,
-            base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
-            git_dir: Some(repo.join(".git")),
-            ..FloorContext::default()
-        };
-        // The head broke `fine` too: with only `old` deselected it still exits 101.
-        write_tree(
-            &repo,
-            &argv,
-            &[
-                ("run.out", "test old ... FAILED\ntest fine ... FAILED\n"),
-                ("run.exit", "101"),
-                ("excluded.exit", "101"),
-                ("toc.txt", &toc_of(&["old", "fine"])),
-            ],
-        );
-        let Some((report, c)) = floor_test(&repo, &ctx) else {
-            return;
-        };
-        // The base reported `fine ... ok`: it is no base failure, only `old` is deselected, and
-        // the head's broken `fine` is a new failure.
-        let d = c.decision.as_ref().unwrap();
-        assert_eq!(d.base_failing, s(&["old"]), "{d:?}");
-        assert_eq!(d.excluded, s(&["old"]));
-        assert_eq!(d.outcome, OUTCOME_NEW_FAILURE, "{d:?}");
-        assert!(!report.passed);
         let _ = std::fs::remove_dir_all(&repo);
     }
 }

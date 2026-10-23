@@ -23,6 +23,9 @@ use crate::repo_checks::{
     RepoCheck, Tree,
 };
 
+/// A results run's parse: every testcase (junit) and the failures.
+type Parsed = Result<(Vec<TestId>, Vec<TestId>), String>;
+
 /// The probe results of one check: probe name → `pass` | `fail: <why>`.
 pub type ProbeResults = std::collections::BTreeMap<String, String>;
 
@@ -33,6 +36,10 @@ pub fn probe_guide(
     guide_path: &Path,
     only: Option<&str>,
 ) -> Result<Vec<(String, ProbeResults)>, String> {
+    // Absolute: the sandbox's write roots and every run's cwd hang off it.
+    let repo = &repo
+        .canonicalize()
+        .map_err(|e| format!("`{}`: {e}", repo.display()))?;
     let raw = std::fs::read_to_string(guide_path)
         .map_err(|e| format!("`{}` could not be read: {e}", guide_path.display()))?;
     let mut guide: BuildGuide =
@@ -166,10 +173,7 @@ fn verdict(ok: bool, why: impl FnOnce() -> String) -> String {
 
 impl Probe<'_> {
     /// A results run of `argv` (with `how`): its exit code, every testcase (junit), its failures.
-    fn results(
-        &self,
-        argv: &[String],
-    ) -> (Option<i32>, Result<(Vec<TestId>, Vec<TestId>), String>) {
+    fn results(&self, argv: &[String]) -> (Option<i32>, Parsed) {
         let rc = RepoCheck {
             argv: self.g.for_results(argv),
             ..self.rc.clone()

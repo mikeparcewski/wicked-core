@@ -396,6 +396,50 @@ fn make_git_repo(name: &str, cargo_test: Option<bool>) -> PathBuf {
     }
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "init"]);
+    if cargo_test.is_some() {
+        // DES-BUILD-GUIDE: the base's build guide for the detected `cargo test` (with and without
+        // the lockfile cargo writes), verified on the commit before it.
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let verified = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let guide = |argv: &[&str]| {
+            let tail = |extra: &[&'static str]| {
+                let mut v: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+                v.push("--".into());
+                v.extend(extra.iter().map(|a| a.to_string()));
+                v
+            };
+            let section = r"^\s+(?:Running .*\((?:.*[/\\])?|Doc-tests )(?P<q>[^/\\()\s]+)\)?$";
+            serde_json::json!({
+                "name": "test", "run": argv, "failedExit": [101],
+                "results": {"kind": "text", "how": {"merge": true}},
+                "parser": {"section": section, "blocks": [{"start": "^failures:$",
+                    "item": r"^    (?P<id>\S+)$", "end": "^test result: FAILED"}]},
+                "list": {"run": tail(&["--list"]), "item": r"^(?P<id>\S+): test$",
+                         "section": section, "merge": true},
+                "alone": {"run": tail(&["{id}", "--exact"])},
+                "deselect": {"append": ["--", "--skip={id}", "--exact"]},
+                "verified": {"baseSha": verified, "results": {"list": "pass", "run": "pass",
+                    "alone": "pass", "deselect": "pass", "mutation": "pass"}},
+            })
+        };
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        std::fs::write(
+            repo.join(".wicked/build-guide.json"),
+            serde_json::json!({"version": 1, "checks": [
+                guide(&["cargo", "test", "--no-fail-fast"]),
+                guide(&["cargo", "test", "--locked", "--no-fail-fast"]),
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "the build guide"]);
+    }
     repo
 }
 
@@ -1143,7 +1187,8 @@ fn a_regression_the_creator_introduces_is_denied_at_the_creator_gate_before_veri
     );
     let reason = fix.denial_reason.expect("reason");
     assert!(
-        reason.contains("test_targeted: exit 101")
+        // A base with a build guide runs the full check at the creator (DES-BUILD-GUIDE).
+        reason.contains("cargo-test: exit 101")
             && reason.contains("[regression")
             && reason.contains("NEW FAILURE: the run base")
             && reason.contains("test result: FAILED"),
@@ -1189,7 +1234,10 @@ fn a_regression_the_creator_introduces_is_denied_at_the_creator_gate_before_veri
     // (core#482), its ids qualified by their binary (core#481).
     assert_eq!(checks[0].name, "cargo-fmt-check");
     let c = &checks[1];
-    assert_eq!(c.name, "test_targeted");
+    assert_eq!(
+        c.name, "cargo-test",
+        "a guided base narrows only through `affected`"
+    );
     assert_eq!(c.exit_code, Some(101));
     assert_eq!(c.outcome(), "failed");
     assert_eq!(c.classification.as_deref(), Some("regression"));
