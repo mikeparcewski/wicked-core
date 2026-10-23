@@ -4587,8 +4587,13 @@ pub(crate) fn results_of(
     let text =
         String::from_utf8_lossy(&crate::floor_log::read_blob(&scratch.logs, &r)?).into_owned();
     match g.results.kind.as_str() {
-        "junit" => crate::floor_guide::junit(&text, &g.results.id, c.keyed())
-            .ok_or_else(|| "the results hold no testsuite".to_string()),
+        "junit" => crate::floor_guide::junit(
+            &text,
+            &g.results.id,
+            g.results.id_join.as_deref().unwrap_or("::"),
+            c.keyed(),
+        )
+        .ok_or_else(|| "the results hold no testsuite".to_string()),
         _ => Ok((Vec::new(), c.failures(&text, c.keyed()))),
     }
 }
@@ -9556,6 +9561,189 @@ pub(crate) mod tests {
         }
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&repo2);
+    }
+
+    /// Probe `guide` (written beside the committed tree) against `repo`'s HEAD; `None` when the
+    /// floor sandbox does not arm here.
+    #[cfg(unix)]
+    fn probe(repo: &Path, guide: serde_json::Value) -> Option<crate::floor_probe::ProbeResults> {
+        let path = repo.join("probe-guide.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"version": 1, "checks": [guide]}).to_string(),
+        )
+        .unwrap();
+        match crate::floor_probe::probe_guide(repo, &path, None) {
+            Ok(mut all) => {
+                let written: crate::floor_guide::BuildGuide =
+                    serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                let v = written.checks[0]
+                    .verified
+                    .clone()
+                    .expect("verified is written");
+                assert_eq!(v.base_sha, git(repo, &["rev-parse", "HEAD"]));
+                Some(all.remove(0).1)
+            }
+            Err(e) if e.contains("does not arm") => {
+                eprintln!("repo_checks: {e} — skipping the probe");
+                None
+            }
+            Err(e) => panic!("the probe ran: {e}"),
+        }
+    }
+
+    /// DES-BUILD-GUIDE DONE WHEN 1 (cargo): every probe of a libtest guide passes on a real crate
+    /// under the real floor sandbox, the mutation probe included.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_passes_every_piece_of_a_real_cargo_guide() {
+        let _load = seam::pin(0.5, 4);
+        let repo = scratch("probe-cargo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"probe_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("src/lib.rs"),
+            "#[cfg(test)]\nmod t {\n    #[test]\n    fn a() {}\n    #[test]\n    fn b() {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join(".gitignore"),
+            "Cargo.lock\ntmp/\nprobe-guide.json\n",
+        )
+        .unwrap();
+        git_repo_with_commit(&repo);
+        let mut g = libtest_guide(&s(&["cargo", "test", "--no-fail-fast"]));
+        g["probes"] = serde_json::json!({"mutation": {
+            "file": "tests/zz_mutation.rs",
+            "content": "#[test]\nfn floor_mutation() {\n    panic!(\"mutated\");\n}\n",
+            "expectId": "floor_mutation"}});
+        let Some(results) = probe(&repo, g) else {
+            return;
+        };
+        for p in crate::floor_guide::REQUIRED_PROBES {
+            assert_eq!(
+                results.get(p).map(String::as_str),
+                Some("pass"),
+                "{p}: {results:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// DES-BUILD-GUIDE DONE WHEN 1 (pytest, JUnit via `--junitxml`): every probe passes. Skipped
+    /// where pytest is not on `PATH`.
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_passes_every_piece_of_a_junit_pytest_guide() {
+        let Some(py) = crate::validator::find_on_path("pytest") else {
+            eprintln!("repo_checks: pytest not on PATH — skipping the pytest guide probe");
+            return;
+        };
+        let py = py.to_string_lossy().into_owned();
+        let _load = seam::pin(0.5, 4);
+        let repo = scratch("probe-pytest");
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        std::fs::write(
+            repo.join("tests/test_a.py"),
+            "def test_x():\n    assert True\n\n\ndef test_y():\n    assert True\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join(".gitignore"),
+            "tmp/\n__pycache__/\nprobe-guide.json\nfloor-junit.xml\n",
+        )
+        .unwrap();
+        git_repo_with_commit(&repo);
+        let run = [py.as_str(), "-p", "no:cacheprovider"];
+        let g = serde_json::json!({
+            "name": "test", "run": run, "failedExit": [1],
+            "results": {"kind": "junit", "id": ["file", "name"],
+                        "how": {"argvAppend": ["--junitxml=floor-junit.xml", "-o", "junit_family=xunit1"],
+                                "path": "floor-junit.xml"}},
+            "list": {"run": [py.as_str(), "-p", "no:cacheprovider", "--collect-only", "-q"],
+                     "item": r"^(?P<id>\S+::\S+)$"},
+            "alone": {"run": [py.as_str(), "-p", "no:cacheprovider", "{id}"]},
+            "deselect": {"append": ["--deselect={id}"]},
+            "probes": {"mutation": {
+                "file": "tests/test_zz_mutation.py",
+                "content": "def test_mutated():\n    assert False\n",
+                "expectId": "tests/test_zz_mutation.py::test_mutated"}},
+        });
+        let Some(results) = probe(&repo, g) else {
+            return;
+        };
+        for p in crate::floor_guide::REQUIRED_PROBES {
+            assert_eq!(
+                results.get(p).map(String::as_str),
+                Some("pass"),
+                "{p}: {results:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// DES-BUILD-GUIDE (vitest, JUnit reporter): the list, the run and the parse agree, but the
+    /// runner has no per-test alone or deselect the guide can express, so those probes fail and
+    /// the check is never relied on for exclusion. Skipped unless `WICKED_TEST_VITEST` names a
+    /// vitest binary.
+    #[cfg(unix)]
+    #[test]
+    fn a_junit_vitest_guide_parses_but_without_alone_or_deselect_is_never_relied_on() {
+        let Some(vt) = std::env::var("WICKED_TEST_VITEST")
+            .ok()
+            .filter(|v| Path::new(v).exists())
+        else {
+            eprintln!("repo_checks: WICKED_TEST_VITEST unset — skipping the vitest guide probe");
+            return;
+        };
+        let _load = seam::pin(0.5, 4);
+        let repo = scratch("probe-vitest");
+        std::fs::write(
+            repo.join("a.test.mjs"),
+            "describe(\"math\", () => {\n  test(\"adds\", () => {\n    expect(1 + 1).toBe(2);\n  });\n});\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join(".gitignore"),
+            "tmp/\nprobe-guide.json\nfloor-junit.xml\nnode_modules/\n",
+        )
+        .unwrap();
+        git_repo_with_commit(&repo);
+        let g = serde_json::json!({
+            "name": "test", "run": [vt.as_str(), "run", "--globals"], "failedExit": [1],
+            "results": {"kind": "junit", "id": ["classname", "name"], "idJoin": " > ",
+                        "how": {"argvAppend": ["--reporter=junit", "--outputFile=floor-junit.xml"],
+                                "path": "floor-junit.xml"}},
+            "list": {"run": [vt.as_str(), "list", "--globals"], "item": r"^(?P<id>\S+ > .+)$"},
+            "probes": {"mutation": {
+                "file": "zz.test.mjs",
+                "content": "test(\"mutated\", () => {\n  expect(1).toBe(2);\n});\n",
+                "expectId": "zz.test.mjs > mutated"}},
+        });
+        let Some(results) = probe(&repo, g) else {
+            return;
+        };
+        assert_eq!(
+            results.get("list").map(String::as_str),
+            Some("pass"),
+            "{results:?}"
+        );
+        assert_eq!(
+            results.get("run").map(String::as_str),
+            Some("pass"),
+            "{results:?}"
+        );
+        for p in ["alone", "deselect", "mutation"] {
+            assert!(
+                results.get(p).is_some_and(|r| r.starts_with("fail: no `")),
+                "{p}: {results:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// DES-BUILD-GUIDE DONE WHEN 3-5: the floor reads the BASE's guide (a head edit to the guide

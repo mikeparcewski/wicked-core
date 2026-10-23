@@ -243,6 +243,19 @@ impl Probe<'_> {
                 ),
             },
         );
+        for (piece, present) in [
+            ("alone", g.alone.is_some()),
+            ("deselect", g.deselect.is_some()),
+        ] {
+            if !present {
+                for p in ["mutation", piece] {
+                    out.insert(p.into(), format!("fail: no `{piece}` piece"));
+                }
+            }
+        }
+        if out.len() > 2 {
+            return out;
+        }
         let Some(m) = g.probes.mutation.as_ref() else {
             for p in ["mutation", "alone", "deselect"] {
                 out.insert(p.into(), "fail: no `probes.mutation`".into());

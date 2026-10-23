@@ -81,6 +81,9 @@ pub struct Results {
     /// `["classname", "name"]`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub id: Vec<String>,
+    /// (junit) What joins the `id` attributes (default `::`), so the ids can be the list's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_join: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -530,11 +533,12 @@ fn dedup(ids: Vec<TestId>, keyed: bool) -> Vec<TestId> {
 }
 
 /// (junit) Every testcase and the failing ones (a `failure` or `error` child): id = the `attrs`
-/// values joined by `::`, q = the enclosing testsuite's `name`. A minimal reader of the elements
+/// values joined by `join`, q = the enclosing testsuite's `name`. A minimal reader of the elements
 /// the format defines; `None` when the text holds no testsuite.
 pub(crate) fn junit(
     xml: &str,
     attrs: &[String],
+    join: &str,
     keyed: bool,
 ) -> Option<(Vec<TestId>, Vec<TestId>)> {
     let tag = Regex::new(
@@ -569,7 +573,7 @@ pub(crate) fn junit(
                     .iter()
                     .map(|a| get(a).unwrap_or_default())
                     .collect::<Vec<_>>()
-                    .join("::");
+                    .join(join);
                 let t = TestId {
                     q: suite.clone(),
                     id,
@@ -696,15 +700,15 @@ mod tests {
             <testcase classname="m.a" name="bad &amp; worse" file="m/a.x"><failure message="x"/></testcase>
             <testcase classname="m.b" name="err" file="m/b.x"><error/></testcase>
             </testsuite></testsuites>"#;
-        let (all, failed) = junit(xml, &[], true).unwrap();
+        let (all, failed) = junit(xml, &[], "::", true).unwrap();
         assert_eq!(all.len(), 3);
         assert_eq!(
             failed,
             vec![t("s1", "m.a::bad & worse"), t("s1", "m.b::err")]
         );
-        let (_, by_file) = junit(xml, &s(&["file", "name"]), false).unwrap();
+        let (_, by_file) = junit(xml, &s(&["file", "name"]), "::", false).unwrap();
         assert_eq!(by_file[1], t("", "m/b.x::err"));
-        assert!(junit("no xml here", &[], true).is_none());
+        assert!(junit("no xml here", &[], "::", true).is_none());
     }
 
     /// Deselect: tokens before the first `{id}` once (a `--` already in the argv is not
@@ -769,6 +773,7 @@ mod tests {
             merge: true,
         };
         c.results.id = s(&["file", "name"]);
+        c.results.id_join = Some(" > ".into());
         c.probes.mutation = Some(Mutation {
             file: "m".into(),
             content: "c".into(),

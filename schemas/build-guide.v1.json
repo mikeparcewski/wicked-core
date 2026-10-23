@@ -62,9 +62,13 @@
               }
             },
             "id": {
-              "description": "(junit) The testcase attributes whose values, joined by `::`, form an id. Default [\"classname\", \"name\"].",
+              "description": "(junit) The testcase attributes whose values, joined by `idJoin`, form an id. Default [\"classname\", \"name\"].",
               "type": "array",
               "items": { "type": "string" }
+            },
+            "idJoin": {
+              "description": "(junit) What joins the `id` attributes (default `::`), so the ids can be the list's.",
+              "type": "string"
             }
           }
         },

@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "derivedFrom": [
+    "Cargo.toml",
+    "Cargo.lock",
+    ".wicked/checks.json",
+    ".github/workflows/ci.yml"
+  ],
+  "checks": [
+    {
+      "name": "test",
+      "cwd": ".",
+      "stage": [
+        "creator",
+        "verify"
+      ],
+      "run": [
+        "cargo",
+        "test",
+        "--locked",
+        "--workspace",
+        "--no-fail-fast"
+      ],
+      "failedExit": [
+        101
+      ],
+      "results": {
+        "kind": "text",
+        "how": {
+          "merge": true
+        }
+      },
+      "parser": {
+        "section": "^\\s+(?:Running .*\\((?:.*[/\\\\])?|Doc-tests )(?P<q>[^/\\\\()\\s]+)\\)?$",
+        "blocks": [
+          {
+            "start": "^failures:$",
+            "item": "^    (?P<id>\\S+)$",
+            "end": "^test result: FAILED",
+            "use": "last-before-end"
+          }
+        ]
+      },
+      "list": {
+        "run": [
+          "cargo",
+          "test",
+          "--locked",
+          "--workspace",
+          "--no-fail-fast",
+          "--",
+          "--list"
+        ],
+        "item": "^(?P<id>\\S+): test$",
+        "section": "^\\s+(?:Running .*\\((?:.*[/\\\\])?|Doc-tests )(?P<q>[^/\\\\()\\s]+)\\)?$",
+        "merge": true
+      },
+      "alone": {
+        "run": [
+          "cargo",
+          "test",
+          "--locked",
+          "--workspace",
+          "--no-fail-fast",
+          "--",
+          "{id}",
+          "--exact"
+        ]
+      },
+      "deselect": {
+        "append": [
+          "--",
+          "--skip={id}",
+          "--exact"
+        ]
+      },
+      "invalidatedBy": [
+        ".cargo/**",
+        "**/.cargo/**",
+        "rust-toolchain*",
+        "**/rust-toolchain*"
+      ],
+      "probes": {
+        "mutation": {
+          "file": "tests/zz_floor_probe_mutation.rs",
+          "content": "#[test]\nfn floor_probe_mutation() {\n    panic!(\"the build guide's mutation probe\");\n}\n",
+          "expectId": "floor_probe_mutation"
+        }
+      }
+    }
+  ]
+}
