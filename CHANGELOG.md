@@ -20,8 +20,8 @@ Two release tracks share this file, newest entry first regardless of track:
   floor now trusts two inputs: the base tree, and the exit codes of the processes it launches. A failed head
   check is compared with the base. A green base makes it a `new_failure`. A red base is inventoried by its own
   runner on the base tree (`cargo test <args> -- --list`, `pytest --collect-only -q`), and
-  its failing tests are read from the base output and kept only when that inventory lists them verbatim (and,
-  for libtest, when the base did not also report them `ok`). When the exclusion is precise, the head runs once
+  its failing tests are read once from the base's verified stdout and kept only when that inventory lists them
+  verbatim (stored with the base record). When the exclusion is precise, the head runs once
   more with those tests deselected natively (libtest `--skip=<name> --exact`, pytest `--deselect`): exit 0 is `pass_excluded` ("1 pre-existing excluded: t::a"), non-zero is a `new_failure`.
   Precise means every name is unique in the base inventory and at most once in the head's, the argv is on
   core#1060's r16 allowlist, no head `.cargo/config*` sets `rustdocflags` or test args, and no cargo name has
@@ -44,13 +44,15 @@ Two release tracks share this file, newest entry first regardless of track:
   classification (`classify` and the binary qualifiers, `LineScan`, the libtest `env_cannot_run` class and its
   launcher signatures, the isolated `--exact` and vitest file re-runs, the load-class and env-crash re-runs,
   `MAX_FLAKE_RERUN`, the environment signals) and the 4 KB ring buffer as a source of truth. Every stream is now
-  stored once, content-addressed (sha256), in the run's log store (reaped when the run ends, by the last floor of the run to leave — never while one still holds any of its scratch), with a lazy line TOC and ranges read by ref
+  stored once, content-addressed (sha256), in the run's log store (garbage-collected by age at every floor's start, as sccache and Bazel's disk cache do:
+  finished blobs after `FLOOR_LOG_TTL` = 7 days, `.part-*` after a day, and oldest-first over a byte cap of
+  `WICKED_FLOOR_LOG_CAP_GB` (default 5) that never evicts anything modified in the last 24 hours), with a lazy line TOC and ranges read by ref
   and verified against the hash (`floor_log`); a stream past 64 MiB keeps its prefix, marked `truncated`, and a
   truncated inventory is never precise. Kept: the PTY grant (core#1060's Seatbelt rules, cherry-picked), the
-  load-aware bound, the base cache (now `{floor_policy: 8, run, toc}`; an inventory or alone run that did not finish is not cached), `.wicked/checks.json`, the operator
+  load-aware bound, the base cache (now `{floor_policy: 9, run, toc}`; an inventory or alone run that did not finish is not cached), `.wicked/checks.json`, the operator
   override and QE. An unconfigured cargo repo (or a cargo workspace in a subdirectory: the derived set's
-  provenance is a typed field, not its display source) runs its affected set at the creator AND at verify
-  (`full: true` keeps verify full), named from cargo metadata alone (detection no longer guesses packages from
+  provenance is a typed field, not its display source) runs its affected set at the creator only (the verify floor keeps
+  the full suite, as before: the affected set cannot prove a package owns a file), named from cargo metadata alone (detection no longer guesses packages from
   manifest paths): the members owning a touched file plus the members a manifest change (`cargo metadata
   --no-deps` diffed against the base) changed and the packages it or a lockfile change moved (a dependency whose
   declaration changed, every dependency of a member whose `[features]` table changed, a changed lock entry),

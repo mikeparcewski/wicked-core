@@ -12,7 +12,9 @@
 //! The store lives OUTSIDE every write root the floor's sandbox arms (the worktree, the check
 //! scratch leaf, the private `TMPDIR`), so a check cannot rewrite a blob, and a reader verifies the
 //! hash anyway ([`read_range`]). The line TOC is lazy: computed from the blob on request
-//! ([`toc`]), never stored. The store is reaped with the run's check scratch.
+//! ([`toc`]), never stored. The store is garbage-collected by AGE, as sccache's and Bazel's disk
+//! caches are ([`gc`], at the start of every floor): no lease, no marker — a blob a live floor
+//! or a receipt still uses is younger than any expiry.
 
 use crate::repo_checks::hex12;
 use std::io::{Read, Write};
@@ -28,6 +30,16 @@ use sha2::{Digest, Sha256};
 pub const MAX_STREAM_BYTES: u64 = 64 * 1024 * 1024;
 /// The log store's directory under the worker home.
 pub const LOG_SUBDIR: &str = "floor-logs";
+/// A finished blob older than this is collected ([`gc`]).
+pub const FLOOR_LOG_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+/// An unfinished `.part-*` older than this is collected: no capture runs a day.
+const PART_TTL: Duration = Duration::from_secs(24 * 3600);
+/// Nothing modified within this is ever evicted by the byte cap.
+const CAP_SPARES: Duration = Duration::from_secs(24 * 3600);
+/// The log store's total byte cap, in GB (default [`DEFAULT_FLOOR_LOG_CAP_GB`]); oldest first.
+pub const FLOOR_LOG_CAP_ENV: &str = "WICKED_FLOOR_LOG_CAP_GB";
+/// The default of [`FLOOR_LOG_CAP_ENV`].
+pub const DEFAULT_FLOOR_LOG_CAP_GB: u64 = 5;
 /// How much of a stream's end a check run still carries inline (`stdoutTail` / `stderrTail`).
 const TAIL: usize = crate::repo_checks::TAIL_BYTES;
 
@@ -56,6 +68,66 @@ pub(crate) fn run_dir(root: &Path, run_id: Option<&str>, worktree: &Path) -> Pat
         None => format!("t-{}", hex12(worktree.as_os_str().as_encoded_bytes())),
     };
     root.join(key)
+}
+
+/// [`FLOOR_LOG_CAP_ENV`] in bytes.
+pub(crate) fn log_cap_bytes() -> u64 {
+    std::env::var(FLOOR_LOG_CAP_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_FLOOR_LOG_CAP_GB)
+        .saturating_mul(1_000_000_000)
+}
+
+/// Best-effort age GC of the log store at `root` (every run's directory): a finished blob older
+/// than [`FLOOR_LOG_TTL`] and a `.part-*` older than [`PART_TTL`] go; then, over `cap` bytes, the
+/// oldest blobs go first, never one modified within [`CAP_SPARES`]. Files are told apart by NAME
+/// only (`Path::file_name`), so separators never matter. Directories stay (a capture may be about
+/// to create its blob in one). Returns the removed paths.
+pub(crate) fn gc(root: &Path, now: std::time::SystemTime, cap: u64) -> Vec<PathBuf> {
+    let age = |m: &std::fs::Metadata| {
+        m.modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .unwrap_or_default()
+    };
+    let mut removed = Vec::new();
+    let mut kept: Vec<(Duration, PathBuf, u64)> = Vec::new();
+    let runs = std::fs::read_dir(root).into_iter().flatten().flatten();
+    for e in runs.flat_map(|r| std::fs::read_dir(r.path()).into_iter().flatten().flatten()) {
+        let (path, Ok(m)) = (e.path(), e.metadata()) else {
+            continue;
+        };
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        let ttl = if name.starts_with(".part-") {
+            PART_TTL
+        } else {
+            FLOOR_LOG_TTL
+        };
+        if !m.is_file() {
+            continue;
+        }
+        if age(&m) > ttl {
+            if std::fs::remove_file(&path).is_ok() {
+                removed.push(path);
+            }
+        } else {
+            kept.push((age(&m), path, m.len()));
+        }
+    }
+    let mut total: u64 = kept.iter().map(|k| k.2).sum();
+    kept.sort_by_key(|k| std::cmp::Reverse(k.0));
+    for (age, path, bytes) in kept {
+        if total <= cap || age <= CAP_SPARES {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total -= bytes;
+            removed.push(path);
+        }
+    }
+    removed
 }
 
 /// The finished capture of one stream.
@@ -318,6 +390,87 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    /// A file `age` old (by mtime, relative to `now`) of `bytes` bytes.
+    fn aged(path: &Path, now: std::time::SystemTime, age: Duration, bytes: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![b'x'; bytes]).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(now - age).unwrap();
+    }
+
+    const H: Duration = Duration::from_secs(3600);
+
+    /// (round 11) Age GC: a blob past [`FLOOR_LOG_TTL`] goes, a recent one stays; a `.part-*`
+    /// younger than a day survives (a capture may be writing it), an older one goes.
+    #[test]
+    fn gc_removes_old_blobs_and_stale_parts_and_keeps_recent_ones() {
+        let root = store("gc-age");
+        let now = std::time::SystemTime::now();
+        let run = root.join("r-0123456789ab");
+        aged(&run.join("old-blob"), now, FLOOR_LOG_TTL + H, 4);
+        aged(&run.join("new-blob"), now, H, 4);
+        aged(&run.join(".part-young"), now, 20 * H, 4);
+        aged(&run.join(".part-stale"), now, 25 * H, 4);
+        let removed = gc(&root, now, u64::MAX);
+        assert_eq!(removed.len(), 2, "{removed:?}");
+        assert!(!run.join("old-blob").exists() && !run.join(".part-stale").exists());
+        assert!(run.join("new-blob").exists() && run.join(".part-young").exists());
+        assert!(
+            run.is_dir(),
+            "a run's directory stays for a capture about to write into it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (round 11) Over the byte cap the oldest blobs go first, and nothing touched in the last 24
+    /// hours is ever evicted, even when the store stays over the cap.
+    #[test]
+    fn the_byte_cap_evicts_oldest_first_and_spares_the_last_day() {
+        let root = store("gc-cap");
+        let now = std::time::SystemTime::now();
+        for (run, name, age) in [
+            ("r-a", "five-days", 120 * H),
+            ("r-b", "three-days", 72 * H),
+            ("r-a", "one-hour", H),
+        ] {
+            aged(&root.join(run).join(name), now, age, 10);
+        }
+        // 30 bytes over a 15-byte cap: the five-day blob goes, then the three-day one.
+        let removed = gc(&root, now, 15);
+        let names: Vec<String> = removed
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["five-days", "three-days"]);
+        // Still over a zero cap: the hour-old blob is spared.
+        assert!(gc(&root, now, 0).is_empty());
+        assert!(root.join("r-a").join("one-hour").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (round 11) Windows: the store's paths are built by `Path::join` and files told apart by
+    /// file NAME, so a root with spaces works with either separator, and a run key holds only
+    /// characters every filesystem accepts.
+    #[test]
+    fn the_log_store_paths_hold_on_windows() {
+        let root = store("gc paths").join("floor logs");
+        let now = std::time::SystemTime::now();
+        let run = run_dir(
+            &root,
+            Some("run:1/with\\separators"),
+            Path::new("C:\\w\\tree"),
+        );
+        let key = run.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "{key}"
+        );
+        assert_eq!(run.parent(), Some(root.as_path()));
+        aged(&run.join(".part-x"), now, 25 * H, 1);
+        assert_eq!(gc(&root, now, u64::MAX), vec![run.join(".part-x")]);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
     /// DONE WHEN 6: a range fetched by ref verifies against the receipt hash, a 40 KB line comes

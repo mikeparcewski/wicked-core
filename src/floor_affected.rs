@@ -955,7 +955,7 @@ mod tests {
         std::fs::write(repo.join(".gitignore"), "Cargo.lock\ntmp/\ntarget/\n").unwrap();
         let base = git_repo_with_commit(&repo);
         let ctx = FloorContext {
-            stage: FloorStage::Verify,
+            stage: FloorStage::Creator,
             base_head: Some(base),
             git_dir: Some(repo.join(".git")),
             ..FloorContext::default()
@@ -976,6 +976,73 @@ mod tests {
             c.argv
         );
         assert!(!report.passed, "b's regression denies: {report:#?}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// (codex r11) Package `b` compiles in `a`'s source by `include_str!`, with no cargo edge: the
+    /// creator's affected set (`-p a`) misses `b` — the documented trade of narrowing — and the
+    /// verify floor, which runs the full suite, denies `b`'s regression.
+    #[cfg(unix)]
+    #[test]
+    fn an_include_str_across_packages_is_missed_at_the_creator_and_denied_at_verify() {
+        let _load = seam::pin(0.5, 4);
+        let repo = scratch("include-str");
+        for (name, body) in [
+            ("a", "pub fn one() -> u32 {\n    1\n}\n"),
+            (
+                "b",
+                "#[cfg(test)]\nmod t {\n    #[test]\n    fn reads_a() {\n        assert!(include_str!(\"../../a/src/lib.rs\").contains(\"fn one\"));\n    }\n}\n",
+            ),
+        ] {
+            std::fs::create_dir_all(repo.join(name).join("src")).unwrap();
+            std::fs::write(
+                repo.join(name).join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+            )
+            .unwrap();
+            std::fs::write(repo.join(name).join("src/lib.rs"), body).unwrap();
+        }
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join(".gitignore"), "Cargo.lock\ntmp/\ntarget/\n").unwrap();
+        let base = git_repo_with_commit(&repo);
+        let ctx = |stage| FloorContext {
+            stage,
+            base_head: Some(base.clone()),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        std::fs::write(
+            repo.join("a/src/lib.rs"),
+            "pub fn two() -> u32 {\n    2\n}\n",
+        )
+        .unwrap();
+        let creator = run_floor(&repo, &ctx(FloorStage::Creator));
+        if creator.sandbox_error.is_some() {
+            return;
+        }
+        let c = creator
+            .checks
+            .iter()
+            .find(|c| c.name == "test_targeted")
+            .unwrap_or_else(|| panic!("a derived set ran: {creator:#?}"));
+        assert!(c.argv.ends_with(&s(&["-p", "a"])), "{:?}", c.argv);
+        assert!(
+            creator.passed,
+            "the creator's narrowed set misses `b`: {creator:#?}"
+        );
+        let verify = run_floor(&repo, &ctx(FloorStage::Verify));
+        assert!(
+            verify.checks.iter().all(|c| c.name != "test_targeted"),
+            "verify never narrows: {verify:#?}"
+        );
+        assert!(
+            !verify.passed,
+            "verify's full suite denies `b`: {verify:#?}"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 }

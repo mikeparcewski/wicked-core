@@ -56,8 +56,10 @@ pub(crate) fn cargo_test_sub(argv: &[String]) -> Option<usize> {
 /// positional TESTNAME (`--exact` turns it into a name no test has), a `--skip` or `--exact` of
 /// its own, `--ignored` / `--include-ignored`, `-q`, an unknown flag, a second `--` — could make
 /// that select something else.
-fn understood_cargo_test(argv: &[String]) -> Option<(&[String], &[String])> {
-    let sub = cargo_test_sub(argv)?;
+fn understood_cargo_test(argv: &[String]) -> bool {
+    let Some(sub) = cargo_test_sub(argv) else {
+        return false;
+    };
     const CARGO_BARE: &[&str] = &[
         "--workspace",
         "--all",
@@ -112,9 +114,8 @@ fn understood_cargo_test(argv: &[String]) -> Option<(&[String], &[String])> {
     }
     let split = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
     let (cargo_args, test_args) = (&argv[..split], argv.get(split + 1..).unwrap_or(&[]));
-    (allowed(&cargo_args[sub + 1..], CARGO_BARE, CARGO_VALUED)
-        && allowed(test_args, TEST_BARE, TEST_VALUED))
-    .then_some((cargo_args, test_args))
+    allowed(&cargo_args[sub + 1..], CARGO_BARE, CARGO_VALUED)
+        && allowed(test_args, TEST_BARE, TEST_VALUED)
 }
 
 /// Is `argv` on the deselection allowlist for its runner? cargo: the r16 allowlist plus
@@ -123,9 +124,7 @@ fn understood_cargo_test(argv: &[String]) -> Option<(&[String], &[String])> {
 /// suppress the run's own short summary).
 pub(crate) fn deselectable(runner: Runner, argv: &[String]) -> bool {
     match runner {
-        Runner::Cargo => {
-            understood_cargo_test(argv).is_some() && argv.iter().any(|a| a == "--no-fail-fast")
-        }
+        Runner::Cargo => understood_cargo_test(argv) && argv.iter().any(|a| a == "--no-fail-fast"),
         Runner::Pytest => !argv.iter().any(|a| {
             let k = a.split('=').next().unwrap_or(a);
             matches!(
@@ -236,17 +235,13 @@ fn libtest_name(r: &str) -> &str {
     r.strip_suffix(" - compile fail").unwrap_or(r)
 }
 
-/// A libtest result line's test name and verdict (`ok`, `ignored` — with or without its `, reason`
-/// — or `FAILED`), or `None` for any other line.
-fn libtest_result(l: &str) -> Option<(&str, &str)> {
-    let r = l.trim_end_matches('\r').strip_prefix("test ")?;
-    let (name, verdict) = r.rsplit_once(" ... ")?;
-    let verdict = match verdict {
-        "ok" | "FAILED" => verdict,
-        v if v == "ignored" || v.starts_with("ignored, ") => "ignored",
-        _ => return None,
-    };
-    Some((libtest_name(name), verdict))
+/// The test name of a libtest `test X ... FAILED` line, or `None` for any other line.
+fn libtest_failed(l: &str) -> Option<&str> {
+    let (name, verdict) = l
+        .trim_end_matches('\r')
+        .strip_prefix("test ")?
+        .rsplit_once(" ... ")?;
+    (verdict == "FAILED").then(|| libtest_name(name))
 }
 
 /// The failing test names a run's OWN stdout (the base's) carries, read only from the runner's
@@ -280,9 +275,7 @@ pub(crate) fn failing_names(runner: Runner, text: &str) -> Vec<String> {
             continue;
         }
         let name = match runner {
-            Runner::Cargo => libtest_result(l)
-                .filter(|(_, v)| *v == "FAILED")
-                .map(|(n, _)| n),
+            Runner::Cargo => libtest_failed(l),
             Runner::Pytest if in_summary => l
                 .strip_prefix("FAILED ")
                 .or_else(|| l.strip_prefix("ERROR "))
@@ -299,20 +292,6 @@ pub(crate) fn failing_names(runner: Runner, text: &str) -> Vec<String> {
         out.clear();
     }
     out
-}
-
-/// The test names a run's output reports PASSING, where the runner prints a line per test by
-/// default (libtest `test X ... ok`); empty for runners that list only failures.
-pub(crate) fn passing_names(runner: Runner, text: &str) -> Vec<String> {
-    match runner {
-        Runner::Cargo => text
-            .lines()
-            .filter_map(libtest_result)
-            .filter(|(_, v)| *v != "FAILED")
-            .map(|(n, _)| n.to_string())
-            .collect(),
-        Runner::Pytest => Vec::new(),
-    }
 }
 
 /// (cargo) Each listed test's TARGET: in `--list` mode no test body runs and cargo runs its
@@ -584,18 +563,6 @@ mod tests {
             failing_names(Runner::Cargo, "test t::sp - should panic ... FAILED\n"),
             s(&["t::sp"])
         );
-        assert_eq!(
-            passing_names(Runner::Cargo, "test t::sp - should panic ... ok\n"),
-            s(&["t::sp"])
-        );
-        // (agy r4) `ignored, reason` and `- compile fail` are libtest's own spellings.
-        assert_eq!(
-            passing_names(
-                Runner::Cargo,
-                "test a ... ignored, flaky on CI\ntest src/lib.rs - f (line 3) - compile fail ... ok\n"
-            ),
-            s(&["a", "src/lib.rs - f (line 3)"])
-        );
         let out =
             "a: test\nold: test\n\n2 tests, 0 benchmarks\nold2: test\n\n1 test, 0 benchmarks\n";
         let err = "     Running tests/a.rs (target/debug/deps/a-1f2e3d)\n     Running tests/b.rs (target/debug/deps/b-9a8b7c)\n";
@@ -693,7 +660,7 @@ mod tests {
 
     /// Rounds 1-2 of #1066: an empty inventory is no inventory; pytest's verbosity is pinned for
     /// the inventory; only the runners' OWN result lines name failures (pytest's last short
-    /// summary); `ignored` is a libtest witness; a pytest prefix that would take another test is
+    /// summary); a pytest prefix that would take another test is
     /// caught.
     #[test]
     fn inventories_and_failures_read_only_the_runners_own_lines() {
@@ -727,13 +694,6 @@ mod tests {
         assert_eq!(
             failing_names(Runner::Pytest, nested),
             s(&["tests/a.py::test_old"])
-        );
-        assert_eq!(
-            passing_names(
-                Runner::Cargo,
-                "test a ... ok\ntest b ... ignored\ntest c ... FAILED\n"
-            ),
-            s(&["a", "b"])
         );
         let head = s(&[
             "a.py::test_case",

@@ -108,8 +108,8 @@
 //! [`derive_targeted`]): `cargo test -p a -p b …` — the members owning a touched file and those a
 //! manifest or lockfile change reaches, closed over feature unification
 //! ([`crate::floor_affected`]), in one invocation — or `vitest related
-//! --run <files>` for a plain `vitest` test script. At the creator floor always, at verify unless
-//! `full: true`; the full suite on every OS is the PR's CI.
+//! --run <files>` for a plain `vitest` test script. At the creator floor only: the verify floor runs
+//! the full suite, as does the PR's CI on every OS.
 //!
 //! ## Load-aware bound
 //!
@@ -241,8 +241,7 @@ use wicked_apps_core::spawn::HardenedCommand;
 
 use crate::floor_runner::{
     alone_argv, alone_failed, cargo_config_bends_test_args, cargo_toc_targets, deselect_argv,
-    deselectable, failing_names, parse_toc, passing_names, pytest_prefix_collision, runner_of,
-    toc_argv, Runner,
+    deselectable, failing_names, parse_toc, pytest_prefix_collision, runner_of, toc_argv, Runner,
 };
 use crate::validator::WorkerSandbox;
 
@@ -1847,9 +1846,10 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
         }
     }
     // DERIVED TARGETED (core#482, DES-FLOOR-V2 §5): a repo that declares no test commands of its
-    // own gets the AFFECTED set derived from the touched files — at the creator, and at verify
-    // unless the repo says `full: true`; the full suite on every OS is the PR's CI.
-    if (ctx.stage == FloorStage::Creator || !cfg.full)
+    // own gets the AFFECTED set derived from the touched files at the CREATOR stage only — the
+    // verify floor, the last local gate, keeps the full suite (round 11: the affected set cannot
+    // prove a package owns a file, e.g. another package's `include_str!` of it).
+    if ctx.stage == FloorStage::Creator
         && matches!(r_targeted, Resolved::Default)
         && matches!(r_test, Resolved::Default)
         && ctx.base_head.is_some()
@@ -2765,16 +2765,7 @@ fn orphan_path(leaf: &Path) -> PathBuf {
 /// lease, the leaf is MARKED orphaned instead (and logged) and `false` returned. The 0-byte lock
 /// file is KEPT, as the cap keeps it: a floor may already have it open, waiting in
 /// `lock_shared`, and unlinking it would hand that floor a lease on an inode no later lock sees.
-/// A leaf that goes may take its finished run's log store with it ([`reap_run_logs`]).
 fn retire_leaf(leaf: &Path) -> bool {
-    let gone = retire_leaf_now(leaf);
-    if gone {
-        reap_run_logs(leaf);
-    }
-    gone
-}
-
-fn retire_leaf_now(leaf: &Path) -> bool {
     let mark = orphan_path(leaf);
     if std::fs::symlink_metadata(lease_path(leaf)).is_err()
         && std::fs::symlink_metadata(leaf).is_err()
@@ -2828,64 +2819,7 @@ pub(crate) fn remove_check_scratch(worktree: &Path, run_id: &str) {
 
 /// [`remove_check_scratch`] against an explicit cache root. Returns whether the leaf is gone.
 pub(crate) fn remove_check_scratch_in(cache: &Path, worktree: &Path, run_id: Option<&str>) -> bool {
-    // (codex r8-r10) The run ended: its log store is marked for reaping, and goes with the last
-    // floor of the run to leave ([`reap_run_logs`]) — never while one still writes to it.
-    if let Some(id) = run_id {
-        let root = cache.parent().unwrap_or(cache);
-        let logs =
-            crate::floor_log::run_dir(&root.join(crate::floor_log::LOG_SUBDIR), Some(id), worktree);
-        if logs.exists() {
-            let _ = std::fs::write(logs.with_extension("reap"), b"");
-        }
-    }
     retire_leaf(&scratch_dir_for(cache, worktree, run_id))
-}
-
-/// (codex r9, r10) A finished run's log store (marked `r-<hex>.reap` by
-/// [`remove_check_scratch_in`]) is shared by every tree of the run, a guarded checkout too: it is
-/// removed only when no floor holds ANY leaf of the run — a starting floor holds its lock file
-/// before its directory exists — each locked exclusively for the removal. Tried whenever a leaf of
-/// the run is retired, so the last floor out takes it.
-fn reap_run_logs(leaf: &Path) {
-    let name = leaf
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
-    let (Some((_, hex)), Some(cache)) =
-        (name.rsplit_once("-r"), leaf.parent().and_then(Path::parent))
-    else {
-        return;
-    };
-    let logs = cache
-        .parent()
-        .unwrap_or(cache)
-        .join(crate::floor_log::LOG_SUBDIR)
-        .join(format!("r-{hex}"));
-    let mark = logs.with_extension("reap");
-    if !mark.exists() {
-        return;
-    }
-    let suffix = format!("-r{hex}");
-    let mut leaves = std::collections::BTreeSet::new();
-    let groups = std::fs::read_dir(cache).into_iter().flatten().flatten();
-    for e in groups.flat_map(|g| std::fs::read_dir(g.path()).into_iter().flatten().flatten()) {
-        let p = e.path().to_string_lossy().into_owned();
-        if let Some(l) = p.strip_suffix(".lock").filter(|l| l.ends_with(&suffix)) {
-            leaves.insert(PathBuf::from(l));
-        } else if p.ends_with(&suffix) {
-            leaves.insert(PathBuf::from(p));
-        }
-    }
-    let mut held = Vec::new();
-    for l in &leaves {
-        match lock_leaf(l, true) {
-            Ok(Some(f)) => held.push(f),
-            _ => return,
-        }
-    }
-    if std::fs::remove_dir_all(&logs).is_ok() || !logs.exists() {
-        let _ = std::fs::remove_file(&mark);
-    }
 }
 
 /// Remove EVERY run's check-scratch leaf of the tree at `dir` — a guarded floor checkout, whose
@@ -2945,6 +2879,14 @@ pub fn run_floor_rerun(
             return scratch_refused(worktree, ctx, &sandbox, &e);
         }
     };
+    // (round 11) The log store's lifetime is its age, collected best-effort at every floor's start.
+    if let Some(root) = scratch.logs.parent() {
+        crate::floor_log::gc(
+            root,
+            std::time::SystemTime::now(),
+            crate::floor_log::log_cap_bytes(),
+        );
+    }
     let sandbox = crate::validator::detect_floor_sandbox(&[
         worktree.to_path_buf(),
         scratch.tmp.path().to_path_buf(),
@@ -4202,40 +4144,52 @@ impl BaseTree {
         // confirms it: run alone on this export (cargo `-- <name> --exact`, pytest `<nodeid>`), it
         // must fail. A captured child run's line, a test a crashed binary never reached, a child
         // pytest summary left open — none can then be excluded: a misread base only NARROWS.
-        if let Some(t) = toc.as_mut().filter(|t| t.incomplete.is_none()) {
-            if let Some(runner) = runner_of(&target.argv) {
-                let text = run
-                    .logs
-                    .first()
-                    .map(|l| crate::floor_log::text(&scratch.logs, l))
-                    .unwrap_or_default();
-                let passed = passing_names(runner, &text);
-                let candidates: Vec<String> = failing_names(runner, &text)
-                    .into_iter()
-                    .filter(|n| t.count(n) == 1 && !passed.contains(n))
-                    .filter(|n| runner != Runner::Cargo || !n.contains(char::is_whitespace))
-                    .collect();
-                if candidates.len() <= MAX_ALONE_CONFIRMATIONS {
-                    for n in candidates {
-                        let one = RepoCheck {
-                            argv: alone_argv(runner, &target.argv, &n),
-                            source: format!("`{n}` alone on the base (DES-FLOOR-V2)"),
-                            ..target.clone()
-                        };
-                        let r = run_one(&self.dir, &one, sandbox, scratch, Tree::Base);
-                        t.logs.extend(relabel(r.logs.clone(), "alone-base"));
-                        // (agy r6) One that did not finish or start confirms nothing: the
-                        // inventory is incomplete (escalates) and not cached.
-                        if r.timed_out || r.spawn_error.is_some() {
-                            t.incomplete = Some(format!(
-                                "`{n}` run alone on the base did not finish ({})",
-                                r.summary()
-                            ));
-                            t.transient = true;
-                            break;
-                        }
-                        t.alone.push((n, alone_failed(runner, r.exit_code)));
+        let runner = runner_of(&target.argv);
+        if let (Some(t), Some(runner)) = (toc.as_mut().filter(|t| t.incomplete.is_none()), runner) {
+            // The base's own result lines are on its STDOUT, read verified: a stream cut at the
+            // cap, or one the store cannot return, may have lost a failure line.
+            let text = run
+                .logs
+                .first()
+                .filter(|l| !l.truncated)
+                .ok_or_else(|| "it was cut at the log cap".to_string())
+                .and_then(|l| crate::floor_log::read_blob(&scratch.logs, l));
+            match text {
+                Ok(b) => {
+                    t.failing = failing_names(runner, &String::from_utf8_lossy(&b))
+                        .into_iter()
+                        .filter(|n| t.count(n) > 0)
+                        .collect()
+                }
+                Err(e) => t.incomplete = Some(format!("the base's output: {e}")),
+            }
+            let candidates: Vec<String> = t
+                .failing
+                .iter()
+                .filter(|n| t.count(n) == 1)
+                .filter(|n| runner != Runner::Cargo || !n.contains(char::is_whitespace))
+                .cloned()
+                .collect();
+            if t.incomplete.is_none() && candidates.len() <= MAX_ALONE_CONFIRMATIONS {
+                for n in candidates {
+                    let one = RepoCheck {
+                        argv: alone_argv(runner, &target.argv, &n),
+                        source: format!("`{n}` alone on the base (DES-FLOOR-V2)"),
+                        ..target.clone()
+                    };
+                    let r = run_one(&self.dir, &one, sandbox, scratch, Tree::Base);
+                    t.logs.extend(relabel(r.logs.clone(), "alone-base"));
+                    // (agy r6) One that did not finish or start confirms nothing: the
+                    // inventory is incomplete (escalates) and not cached.
+                    if r.timed_out || r.spawn_error.is_some() {
+                        t.incomplete = Some(format!(
+                            "`{n}` run alone on the base did not finish ({})",
+                            r.summary()
+                        ));
+                        t.transient = true;
+                        break;
                     }
+                    t.alone.push((n, alone_failed(runner, r.exit_code)));
                 }
             }
         }
@@ -4331,7 +4285,7 @@ pub const OUTCOME_COULD_NOT_RUN: &str = "could_not_run";
 pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
 /// The versioned base-cache record (core#1060 r9 keyed the cache by sandbox policy; v4 adds the
 /// base inventory): a record of any other version, or a bare `CheckRun`, is a miss.
-const FLOOR_POLICY_VERSION: u32 = 8;
+const FLOOR_POLICY_VERSION: u32 = 9;
 /// The most base failures the floor confirms one by one (each run alone on the base); more than
 /// this escalates rather than paying for them.
 const MAX_ALONE_CONFIRMATIONS: usize = 16;
@@ -4356,8 +4310,12 @@ struct Toc {
     incomplete: Option<String>,
     #[serde(default)]
     logs: Vec<crate::floor_log::LogRef>,
-    /// (cargo) Each candidate base failure run ALONE on the base: `(name, it failed)` — the exit
-    /// code, not the output, says whether the name is a base failure.
+    /// The base's failing names (read once, from its own verified stdout) that its inventory lists:
+    /// CANDIDATES only, until [`Toc::alone`] confirms them.
+    #[serde(default)]
+    failing: Vec<String>,
+    /// Each candidate run ALONE on the base: `(name, it failed)` — the exit code, not the output,
+    /// says whether the name is a base failure.
     #[serde(default)]
     alone: Vec<(String, bool)>,
     /// (cargo) `(target, name)` for every listed test ([`cargo_toc_targets`]).
@@ -4440,6 +4398,7 @@ fn inventory(
         names: parsed.unwrap_or_default(),
         incomplete,
         logs,
+        failing: Vec::new(),
         alone: Vec::new(),
         targets: targets.unwrap_or_default(),
         transient: r.timed_out || r.spawn_error.is_some(),
@@ -4500,19 +4459,16 @@ fn retry_if_loaded(
     Some(r)
 }
 
-#[cfg(not(test))]
 fn retry_headroom_wait() -> Duration {
+    // Unit tests never wait for headroom.
+    if cfg!(test) {
+        return Duration::ZERO;
+    }
     std::env::var(RETRY_WAIT_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(|s| Duration::from_secs(s.min(MAX_RETRY_WAIT_S)))
         .unwrap_or(RETRY_HEADROOM_WAIT)
-}
-
-/// Tests wait for headroom only when they pin a load ([`test_seam::pin`]).
-#[cfg(test)]
-fn retry_headroom_wait() -> Duration {
-    test_seam::retry_wait().unwrap_or(Duration::ZERO)
 }
 
 /// The base side of a failed head check: the base run (fresh or cached) and, when it failed, its
@@ -4552,7 +4508,7 @@ fn decide(
     let red_base = base_run.filter(|b| !b.passed() && !b.timed_out && b.spawn_error.is_none());
     let mut plan: Result<(Runner, Vec<String>), String> =
         Err("the base passes this check".to_string());
-    if let (Some(b), Some(side)) = (red_base, side.as_ref()) {
+    if let (Some(_), Some(side)) = (red_base, side.as_ref()) {
         plan = (|| {
             let runner = runner_of(&check.argv).ok_or_else(|| {
                 "the runner has no precise per-test deselect the floor knows (only cargo test and \
@@ -4567,27 +4523,7 @@ fn decide(
             if let Some(why) = &toc.incomplete {
                 return Err(format!("the base: {why}"));
             }
-            // The base's own result lines are on its STDOUT; a stream cut at the cap, or one the
-            // store cannot return verified, can have lost a failure line or a passing witness.
-            if b.logs.iter().any(|l| l.truncated) {
-                return Err("the base's output was cut at the log cap".to_string());
-            }
-            let base_text = b
-                .logs
-                .first()
-                .ok_or_else(|| "the base run has no stored output".to_string())
-                .and_then(|l| crate::floor_log::read_blob(&scratch.logs, l))
-                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                .map_err(|e| format!("the base's output could not be read back: {e}"))?;
-            // Kept only when the base's own inventory lists the name VERBATIM — and (libtest, which
-            // prints every test's own result line) when the base did not ALSO report it `ok`: a
-            // failing base test's captured output can carry a child run's `test X ... FAILED` for
-            // a test X that passed, and X must never be deselected on the head.
-            let passed = passing_names(runner, &base_text);
-            let failing: Vec<String> = failing_names(runner, &base_text)
-                .into_iter()
-                .filter(|n| toc.count(n) > 0 && !(toc.count(n) == 1 && passed.contains(n)))
-                .collect();
+            let failing = toc.failing.clone();
             decision.base_failing = failing.clone();
             if failing.is_empty() {
                 return Err(
@@ -4642,7 +4578,10 @@ fn decide(
                 ));
             }
             if runner == Runner::Cargo {
-                if let Some(why) = config_bends(worktree, check, scratch) {
+                if let Some(why) = cargo_config_bends_test_args(
+                    &worktree.join(&check.dir),
+                    &scratch.root.join("cargo-home"),
+                ) {
                     return Err(why);
                 }
             }
@@ -4709,7 +4648,11 @@ fn decide(
     let mut twice = false;
     let retry_safe = !excluded_run
         || runner_of(&check.argv) != Some(Runner::Cargo)
-        || config_bends(worktree, check, scratch).is_none();
+        || cargo_config_bends_test_args(
+            &worktree.join(&check.dir),
+            &scratch.root.join("cargo-home"),
+        )
+        .is_none();
     let retry = retry_safe
         .then(|| retry_if_loaded(worktree, &deciding_check, &deciding, sandbox, scratch))
         .flatten();
@@ -4805,12 +4748,6 @@ fn decide(
     head.classification = classification.map(str::to_string);
     head.base = side.map(|s| Box::new(s.base));
     head.decision = Some(decision);
-}
-
-/// Does any cargo config the check's runs load bend `--exact` (see
-/// [`cargo_config_bends_test_args`]): the tree's and its ancestors', and the scratch CARGO_HOME?
-fn config_bends(worktree: &Path, check: &RepoCheck, scratch: &CheckScratch) -> Option<String> {
-    cargo_config_bends_test_args(&worktree.join(&check.dir), &scratch.root.join("cargo-home"))
 }
 
 /// The decision of a check whose first run decides alone: it passed, timed out or could not
@@ -5373,10 +5310,8 @@ fn log_cap() -> u64 {
 #[cfg(test)]
 pub(crate) mod test_seam {
     use std::cell::Cell;
-    use std::time::Duration;
     thread_local! {
         static LOAD: Cell<Option<(Option<f64>, usize)>> = const { Cell::new(None) };
-        static WAIT: Cell<Option<Duration>> = const { Cell::new(None) };
         static CAP: Cell<Option<u64>> = const { Cell::new(None) };
     }
     pub(crate) fn log_cap() -> Option<u64> {
@@ -5398,22 +5333,17 @@ pub(crate) mod test_seam {
     pub(crate) fn load() -> Option<(Option<f64>, usize)> {
         LOAD.with(Cell::get)
     }
-    pub(crate) fn retry_wait() -> Option<Duration> {
-        WAIT.with(Cell::get)
-    }
     /// Pin the load this thread's floor reads (and a zero headroom wait) until dropped.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) struct Pinned;
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn pin(load1: f64, cpus: usize) -> Pinned {
         LOAD.with(|c| c.set(Some((Some(load1), cpus))));
-        WAIT.with(|c| c.set(Some(Duration::ZERO)));
         Pinned
     }
     impl Drop for Pinned {
         fn drop(&mut self) {
             LOAD.with(|c| c.set(None));
-            WAIT.with(|c| c.set(None));
         }
     }
 }
@@ -6866,53 +6796,17 @@ pub(crate) mod tests {
         // Run A's floor is building when A is cancelled and its worktree removed.
         let floor_a = CheckScratch::prepare_in(&cache, &wt, Some(run_a), u64::MAX).unwrap();
         std::fs::write(leaf_a.join("cargo-target/head/a-binary"), "A").unwrap();
-        let logs_a =
-            crate::floor_log::run_dir(&base.join(crate::floor_log::LOG_SUBDIR), Some(run_a), &wt);
-        std::fs::create_dir_all(&logs_a).unwrap();
         assert!(
             !remove_check_scratch_in(&cache, &wt, Some(run_a)),
             "held: not removed"
         );
         assert!(orphan_path(&leaf_a).exists(), "marked orphaned instead");
-        // (codex r8) A held leaf keeps the run's log store: a capture in flight needs it.
-        assert!(logs_a.exists(), "the held run's logs stay");
-        // (codex r10) ... and goes with the last floor of the run to leave.
-        drop(floor_a);
-        assert!(
-            !logs_a.exists(),
-            "the last floor out reaps the finished run's logs"
-        );
-        // (codex r9) A held leaf of ANOTHER tree of the run (a guarded checkout) keeps them too:
-        // the live tree's idle leaf goes, the shared logs stay until that floor ends.
-        let guarded = base.join("guarded-a");
-        std::fs::create_dir_all(&guarded).unwrap();
-        let wt2 = base.join("repo").join("wicked-worktrees").join("other");
-        std::fs::create_dir_all(&wt2).unwrap();
-        let floor_g = CheckScratch::prepare_in(&cache, &guarded, Some(run_b), u64::MAX).unwrap();
-        let _idle = CheckScratch::prepare_in(&cache, &wt2, Some(run_b), u64::MAX).unwrap();
-        drop(_idle);
-        let logs_b =
-            crate::floor_log::run_dir(&base.join(crate::floor_log::LOG_SUBDIR), Some(run_b), &wt2);
-        std::fs::create_dir_all(&logs_b).unwrap();
-        // (codex r10) A floor that is only starting holds its lock file, not yet its directory.
-        let starting = scratch_dir_for(&cache, &base.join("starting"), Some(run_b));
-        std::fs::create_dir_all(starting.parent().unwrap()).unwrap();
-        let starting_lease = lock_leaf(&starting, false).unwrap();
-        drop(floor_g);
-        assert!(remove_check_scratch_in(&cache, &wt2, Some(run_b)));
-        assert!(
-            logs_b.exists(),
-            "a starting floor of the run holds its lease"
-        );
-        drop(starting_lease);
-        // The guarded checkout's retirement, after the run ended, takes the logs.
-        remove_tree_scratch_in(&cache, &guarded);
-        assert!(!logs_b.exists(), "the last leaf of the run out reaps them");
         // Run B, a distinct run on the same path, never sees A's output.
         let floor_b = CheckScratch::prepare_in(&cache, &wt, Some(run_b), u64::MAX).unwrap();
         assert_eq!(floor_b.root(), leaf_b);
         assert!(!leaf_b.join("cargo-target/head/a-binary").exists());
-        // A's floor ended: its orphaned leaf went with it.
+        // A's floor ends: its orphaned leaf goes with it.
+        drop(floor_a);
         assert!(!leaf_a.exists() && !orphan_path(&leaf_a).exists());
         // An orphan no floor could retire is removed by the next cap pass, whatever the cap.
         std::fs::create_dir_all(leaf_a.join("home")).unwrap();
@@ -8467,17 +8361,9 @@ pub(crate) mod tests {
         assert_eq!(t.source, DERIVED_TARGETED_SOURCE);
         assert!(t.derived);
         assert_eq!(t.argv, s(&["cargo", "test", "--no-fail-fast"]));
-        // DES-FLOOR-V2 §5: verify derives the affected set too, unless the repo says `full: true`.
+        // The verify floor, the last local gate, keeps the full suite (round 11).
         let t = test_of(&detect_with(&repo, &ctx(FloorStage::Verify)).unwrap());
-        assert_eq!(t.name, "test_targeted", "verify runs the affected set");
-        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
-        std::fs::write(repo.join(CONFIG_PATH), r#"{"full":true}"#).unwrap();
-        let t = test_of(&detect_with(&repo, &ctx(FloorStage::Verify)).unwrap());
-        assert_eq!(
-            t.name, "cargo-test",
-            "`full: true` keeps the full suite at verify"
-        );
-        std::fs::remove_dir_all(repo.join(".wicked")).unwrap();
+        assert_eq!(t.name, "cargo-test", "verify runs the full suite");
         // A deleted file elsewhere (crate `a`) could break what it left ⇒ full.
         std::fs::remove_file(repo.join("a/src/lib.rs")).unwrap();
         let t = test_of(&detect_with(&repo, &ctx(FloorStage::Creator)).unwrap());
@@ -9644,7 +9530,7 @@ pub(crate) mod tests {
             real_lib(true, false) + "\n// edited\n",
         )
         .unwrap();
-        // The tree is unconfigured, so verify runs the affected set: this crate (`-p`).
+        // The tree is unconfigured, so verify runs its full suite.
         let report = run_floor(&repo, &ctx);
         if report.sandbox_error.is_some() {
             eprintln!("repo_checks: no sandbox tool here — the real floor cannot run");
@@ -9770,7 +9656,7 @@ pub(crate) mod tests {
 
     /// A failing BASE test's captured output that carries a child run's `test fine ... FAILED` (for
     /// a test that itself passed on the base, its own `ok` line printed) never makes `fine`
-    /// excludable: the head breaking `fine` is a new failure.
+    /// excludable: run alone on the base it passes, so the head breaking `fine` denies.
     #[cfg(unix)]
     #[test]
     fn a_base_tests_captured_child_line_never_excludes_a_passing_test() {
@@ -9818,12 +9704,19 @@ pub(crate) mod tests {
         let Some((report, c)) = floor_test(&repo, &ctx) else {
             return;
         };
+        // `fine` is a candidate only: run alone on the base it passes, so nothing is deselected and
+        // the floor cannot separate the base's red — it escalates, denying.
         let d = c.decision.as_ref().unwrap();
-        assert_eq!(d.base_failing, s(&["old"]), "{d:?}");
-        assert_eq!(d.excluded, s(&["old"]));
-        assert_eq!(d.outcome, OUTCOME_NEW_FAILURE, "{d:?}");
+        assert_eq!(d.base_failing, s(&["old", "fine"]), "{d:?}");
+        assert!(d.excluded.is_empty(), "{d:?}");
+        assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
+        assert!(
+            d.reason
+                .as_deref()
+                .is_some_and(|r| r.contains("`fine` does not fail when the base runs it alone")),
+            "{d:?}"
+        );
         assert!(!report.passed);
-        assert_eq!(passing_names(Runner::Cargo, base_out), s(&["fine"]));
         let _ = std::fs::remove_dir_all(&repo);
     }
 }
