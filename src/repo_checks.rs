@@ -105,9 +105,9 @@
 //! element each) and `{base}` (the base commit id) so a runner's own change-aware mode can be used
 //! (`vitest run --changed {base}`, `jest --changedSince {base}`, `cargo test -p <crate>`).
 //! A repo that configures NO test command gets the AFFECTED set (core#482, DES-FLOOR-V2 §5,
-//! [`derive_targeted`]): `cargo test -p a -p b …` — the members owning a touched file, the members
-//! a manifest or lockfile change reaches (the `cargo metadata` diff against the base, the lock
-//! graph), closed over their reverse path dependencies, in one invocation — or `vitest related
+//! [`derive_targeted`]): `cargo test -p a -p b …` — the members owning a touched file and those a
+//! manifest or lockfile change reaches, closed over feature unification
+//! ([`crate::floor_affected`]), in one invocation — or `vitest related
 //! --run <files>` for a plain `vitest` test script. At the creator floor always, at verify unless
 //! `full: true`; the full suite on every OS is the PR's CI.
 //!
@@ -1884,12 +1884,9 @@ pub const DERIVED_TARGETED_SOURCE: &str =
 
 /// (core#482) The change-scoped test command for a repo that configures none, derived from the
 /// touched files, or `None` to keep the full set:
-/// * cargo — `cargo test … -p <crate>` for each package owning a touched file (the nearest
-///   `Cargo.toml` with a `[package]` name). A touched manifest or `Cargo.lock` is read by the
-///   metadata diff, and the whole set is closed over the reverse path dependencies, when the floor
-///   runs ([`resolve_affected`], DES-FLOOR-V2 §5). A touched `.cargo/…`, `rust-toolchain*` or a
-///   path no package owns (a shared file, docs beside a virtual workspace) can affect every crate
-///   ⇒ full;
+/// * cargo — the check's own `cargo test`, its `-p` packages named from cargo metadata when the
+///   floor runs ([`crate::floor_affected`], DES-FLOOR-V2 §5), which runs the full suite whenever
+///   they cannot be named;
 /// * any deleted (or renamed-away) tracked file ⇒ full: what it left behind cannot be mapped;
 /// * vitest — a `test` script that is exactly `vitest` / `vitest run` ⇒ `vitest related --run
 ///   --passWithNoTests <files>` (the touched test files and the tests importing touched modules);
@@ -2822,14 +2819,17 @@ pub(crate) fn remove_check_scratch(worktree: &Path, run_id: &str) {
 
 /// [`remove_check_scratch`] against an explicit cache root. Returns whether the leaf is gone.
 pub(crate) fn remove_check_scratch_in(cache: &Path, worktree: &Path, run_id: Option<&str>) -> bool {
-    if let Some(id) = run_id {
+    // (codex r8) The run's logs go only with its leaf: a leaf a floor still holds keeps them (a
+    // capture in flight must not lose its store; they stay for the operator to inspect).
+    let gone = retire_leaf(&scratch_dir_for(cache, worktree, run_id));
+    if let (true, Some(id)) = (gone, run_id) {
         let root = cache
             .parent()
             .unwrap_or(cache)
             .join(crate::floor_log::LOG_SUBDIR);
         crate::floor_log::remove_run_logs(&root, id);
     }
-    retire_leaf(&scratch_dir_for(cache, worktree, run_id))
+    gone
 }
 
 /// Remove EVERY run's check-scratch leaf of the tree at `dir` — a guarded floor checkout, whose
@@ -3168,7 +3168,17 @@ pub(crate) fn run_with_sandbox_ctx(
         None => (detected, Vec::new()),
     };
     let mut detected = detected;
-    crate::floor_affected::resolve_affected(worktree, ctx, &mut detected, &sandbox, &scratch);
+    // (F-RC2-009) Never run a HEAD process beside a copy of the base — a crash mid-floor could
+    // have left one; the export lives only between its creation and the caching of its result.
+    // (core#1050) A base export that cannot be cleared (a linked or non-directory `tmp`, a link
+    // at the export path) REFUSES the floor, fail-closed: no check runs, and none may pass beside
+    // a scratch the floor could not make safe.
+    let mut scratch_error = remove_base_export(worktree, &scratch)
+        .err()
+        .map(|e| format!("the checks' scratch could not be made safe: {e}"));
+    if scratch_error.is_none() {
+        crate::floor_affected::resolve_affected(worktree, ctx, &mut detected, &sandbox, &scratch);
+    }
     let candidates = engine_generated_candidates(worktree, &detected);
     let env = scratch.env_record(&sandbox_level);
     // (core#817) Per package: a subdirectory package's own `baseline_diff: false` holds for it.
@@ -3179,14 +3189,6 @@ pub(crate) fn run_with_sandbox_ctx(
     let mut checks = Vec::new();
     let mut skipped = Vec::new();
     let mut failed = false;
-    // (F-RC2-009) Never run a HEAD check beside a copy of the base — a crash mid-floor could have
-    // left one; the export lives only between its creation and the caching of its result.
-    // (core#1050) A base export that cannot be cleared (a linked or non-directory `tmp`, a link
-    // at the export path) REFUSES the floor, fail-closed: no check runs, and none may pass beside
-    // a scratch the floor could not make safe.
-    let mut scratch_error = remove_base_export(worktree, &scratch)
-        .err()
-        .map(|e| format!("the checks' scratch could not be made safe: {e}"));
     for check in &detected {
         if failed || scratch_error.is_some() {
             skipped.push(check.name.clone());
@@ -4106,41 +4108,33 @@ impl BaseTree {
         }
         // (agy r6) A derived cargo set names the HEAD's packages; the base runs only those it has.
         // An all-new set is a check the base does not declare: a new failure, never escalated.
-        // (codex r7) Only a DERIVED cargo set's `-p` is a package (pytest's is a plugin).
-        if check.derived && runner_of(&check.argv) == Some(Runner::Cargo) {
-            let have: Vec<String> = match crate::floor_affected::workspace_members(
+        // (agy r6, codex r7, agy r8) A derived cargo set that NAMES packages (pytest's `-p` is a
+        // plugin; the full-suite fallback names none) runs on the base over those the base has.
+        if check.derived
+            && runner_of(&check.argv) == Some(Runner::Cargo)
+            && check.argv.iter().any(|a| a == "-p")
+        {
+            let has = crate::floor_affected::workspace_members(
                 &self.dir,
                 check,
                 sandbox,
                 scratch,
                 Tree::Base,
-            ) {
+            );
+            let has: Vec<String> = match has {
                 Ok(m) => m.into_iter().map(|m| m.name).collect(),
                 Err(e) => return fail(format!("the base's packages could not be listed: {e}")),
             };
-            let (mut argv, mut new) = (Vec::new(), Vec::new());
-            let mut it = check.argv.iter();
-            while let Some(a) = it.next() {
-                match (a.as_str(), it.clone().next()) {
-                    ("-p", Some(p)) => {
-                        it.next();
-                        if have.contains(p) {
-                            argv.extend([a.clone(), p.clone()]);
-                        } else {
-                            new.push(p.clone());
-                        }
-                    }
-                    _ => argv.push(a.clone()),
+            match crate::floor_affected::on_base(&check.argv, &has) {
+                Ok(argv) => target.argv = argv,
+                Err(new) => {
+                    return fail(format!(
+                        "the run base declares no `{}` check over `{}` (the change introduced it)",
+                        check.name,
+                        new.join("`, `")
+                    ))
                 }
             }
-            if !argv.iter().any(|a| a == "-p") {
-                return fail(format!(
-                    "the run base declares no `{}` check over `{}` (the change introduced it)",
-                    check.name,
-                    new.join("`, `")
-                ));
-            }
-            target.argv = argv;
         }
         let run = run_one(&self.dir, &target, sandbox, scratch, Tree::Base);
         // A red base is inventoried on the same export, by its own runner (its TOC).
@@ -6815,11 +6809,16 @@ pub(crate) mod tests {
         // Run A's floor is building when A is cancelled and its worktree removed.
         let floor_a = CheckScratch::prepare_in(&cache, &wt, Some(run_a), u64::MAX).unwrap();
         std::fs::write(leaf_a.join("cargo-target/head/a-binary"), "A").unwrap();
+        let logs_a =
+            crate::floor_log::run_dir(&base.join(crate::floor_log::LOG_SUBDIR), Some(run_a), &wt);
+        std::fs::create_dir_all(&logs_a).unwrap();
         assert!(
             !remove_check_scratch_in(&cache, &wt, Some(run_a)),
             "held: not removed"
         );
         assert!(orphan_path(&leaf_a).exists(), "marked orphaned instead");
+        // (codex r8) A held leaf keeps the run's log store: a capture in flight needs it.
+        assert!(logs_a.exists(), "the held run's logs stay");
         // Run B, a distinct run on the same path, never sees A's output.
         let floor_b = CheckScratch::prepare_in(&cache, &wt, Some(run_b), u64::MAX).unwrap();
         assert_eq!(floor_b.root(), leaf_b);

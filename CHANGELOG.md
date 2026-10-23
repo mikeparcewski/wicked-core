@@ -44,7 +44,7 @@ Two release tracks share this file, newest entry first regardless of track:
   classification (`classify` and the binary qualifiers, `LineScan`, the libtest `env_cannot_run` class and its
   launcher signatures, the isolated `--exact` and vitest file re-runs, the load-class and env-crash re-runs,
   `MAX_FLAKE_RERUN`, the environment signals) and the 4 KB ring buffer as a source of truth. Every stream is now
-  stored once, content-addressed (sha256), in the run's log store, with a lazy line TOC and ranges read by ref
+  stored once, content-addressed (sha256), in the run's log store (reaped with the run's check scratch, never while a floor holds it), with a lazy line TOC and ranges read by ref
   and verified against the hash (`floor_log`); a stream past 64 MiB keeps its prefix, marked `truncated`, and a
   truncated inventory is never precise. Kept: the PTY grant (core#1060's Seatbelt rules, cherry-picked), the
   load-aware bound, the base cache (now `{floor_policy: 8, run, toc}`; an inventory or alone run that did not finish is not cached), `.wicked/checks.json`, the operator
@@ -52,11 +52,11 @@ Two release tracks share this file, newest entry first regardless of track:
   provenance is a typed field, not its display source) runs its affected set at the creator AND at verify
   (`full: true` keeps verify full), named from cargo metadata alone (detection no longer guesses packages from
   manifest paths): the members owning a touched file plus the members a manifest change (`cargo metadata
-  --no-deps` diffed against the base) or a lockfile change reaches, closed over their reverse path
-  dependencies and over every member that reaches what a moved package reaches (a dependency whose declaration
-  changed, every dependency of a member whose `[features]` table changed, a changed lock entry), closed over the
-  members' metadata and the lock graphs (cargo unifies features across what it builds), in one `-p a -p b`
-  invocation; on the base the set runs only over the packages the base has (an all-new set is a `new_failure`); a `[profile]`, `[patch]`,
+  --no-deps` diffed against the base) changed and the packages it or a lockfile change moved (a dependency whose
+  declaration changed, every dependency of a member whose `[features]` table changed, a changed lock entry),
+  closed until every member that reaches what the selection reaches is in it, over the members' metadata and the
+  lock graphs (the full suite builds every member together, so a shared dependency's features are on for all of
+  them; a reached package neither graph describes runs the full suite), in one `-p a -p b` invocation; on the base the set runs only over the packages the base has (an all-new set is a `new_failure`); a `[profile]`, `[patch]`,
   `[replace]`, `[workspace]`, `[lints]`, `package.resolver`/`edition`, nested `.cargo/` or `rust-toolchain` change
   runs the full suite. The macOS floor's test seam now arms the private `TMPDIR` as
   production does, so doctests run under the real floor sandbox. Wire (additive): every

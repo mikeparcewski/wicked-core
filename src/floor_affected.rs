@@ -1,10 +1,10 @@
 //! FLOOR AFFECTED SET (DES-FLOOR-V2 §5) — which cargo packages a change reaches, for the floor's
 //! derived test set ([`crate::repo_checks`]'s `derive_targeted`): the members owning a touched file,
 //! the members a manifest change reaches (`cargo metadata --no-deps` on head and base, diffed —
-//! run INSIDE the floor's boundary, the manifests and `.cargo/config` being repo-controlled), every
-//! member that reaches a package a manifest or `Cargo.lock` change moved (feature unification,
-//! closed over the members' metadata and the lock graphs), all closed over the reverse path
-//! dependencies, and run in one `-p a -p b` invocation. Anything that cannot be
+//! run INSIDE the floor's boundary, the manifests and `.cargo/config` being repo-controlled) and
+//! the packages a manifest or `Cargo.lock` change moved, closed until every member that reaches
+//! what the selection reaches is in it (feature unification; see [`select`]), and run in one
+//! `-p a -p b` invocation. Anything that cannot be
 //! computed runs the full suite, said in the check's `source`. The full suite on every OS is the
 //! PR's CI.
 
@@ -27,8 +27,6 @@ pub(crate) struct Member {
     pub(crate) name: String,
     /// The member's directory relative to the check's directory (`/` separated, `""` = the root).
     dir: String,
-    /// The directories (same base) of the members it depends on by path.
-    path_deps: Vec<String>,
     /// The member's metadata entry with every absolute path made relative — what a manifest-only
     /// change is diffed on.
     entry: serde_json::Value,
@@ -113,20 +111,11 @@ pub(crate) fn workspace_members(
             .parent()
             .and_then(|d| rel(&d.to_string_lossy()))
             .ok_or_else(|| format!("the member `{name}` is outside the checked tree"))?;
-        let path_deps = p
-            .get("dependencies")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|d| d.get("path").and_then(|v| v.as_str()))
-            .filter_map(rel)
-            .collect();
         let mut entry = p.clone();
         relativize(&mut entry, &root);
         out.push(Member {
             name: name.to_string(),
             dir,
-            path_deps,
             entry,
         });
     }
@@ -207,6 +196,35 @@ fn reach(
     Ok(seen)
 }
 
+/// (codex r6, r8) The members a change selects. The full suite builds every member together, so a
+/// package's features are on for every member that reaches it: starting from `seeds` (the changed
+/// members and the moved packages), every member that reaches anything the selection reaches joins
+/// it, until nothing more does. A dependent reaches what it depends on, so this also closes over
+/// reverse dependencies. `Err` when a reached package is in no graph (the full suite runs).
+fn select(
+    g: &Graph,
+    members: &[String],
+    seeds: impl IntoIterator<Item = String>,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let reaches = members
+        .iter()
+        .map(|m| Ok((m, reach(g, [m.clone()])?)))
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut picked: std::collections::BTreeSet<String> = seeds.into_iter().collect();
+    loop {
+        let touched = reach(g, picked.iter().cloned())?;
+        let before = picked.len();
+        for (m, r) in &reaches {
+            if !r.is_disjoint(&touched) {
+                picked.insert(m.to_string());
+            }
+        }
+        if picked.len() == before {
+            return Ok(picked);
+        }
+    }
+}
+
 /// A member's declared dependencies (name, declaration) from its metadata entry.
 fn deps(e: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
     e.get("dependencies")
@@ -249,10 +267,36 @@ fn workspace_locks(worktree: &Path, ctx: &FloorContext, check: &RepoCheck) -> Ve
     }
 }
 
+/// (agy r6) A derived set's argv on the base: only the `-p` packages the base `has`. `Err` names
+/// them when EVERY named package is new on the head (a check the base does not declare); an argv
+/// naming none (the full suite) is unchanged.
+pub(crate) fn on_base(argv: &[String], has: &[String]) -> Result<Vec<String>, Vec<String>> {
+    let (mut out, mut new) = (Vec::new(), Vec::new());
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        match (a.as_str(), it.clone().next()) {
+            ("-p", Some(p)) => {
+                it.next();
+                if has.contains(p) {
+                    out.extend([a.clone(), p.clone()]);
+                } else {
+                    new.push(p.clone());
+                }
+            }
+            _ => out.push(a.clone()),
+        }
+    }
+    if new.is_empty() || out.iter().any(|a| a == "-p") {
+        Ok(out)
+    } else {
+        Err(new)
+    }
+}
+
 /// (DES-FLOOR-V2 §5) The packages a derived cargo test set runs: the members owning a touched
 /// file, plus the members whose metadata entry changed between the base and the head (a manifest-
-/// only change) and every member that reaches a package a manifest or lockfile change moved —
-/// closed over the reverse path dependencies. `Err` names why the set could not be computed (the caller runs the full suite).
+/// only change) and the packages a manifest or lockfile change moved, closed by [`select`]. `Err`
+/// names why the set could not be computed (the caller runs the full suite).
 fn affected_packages(
     worktree: &Path,
     ctx: &FloorContext,
@@ -413,40 +457,20 @@ fn affected_packages(
             }
         }
     }
-    // (codex r6) Feature unification crosses the dependency graph: a moved package can turn on
-    // features of anything it reaches, and those are on for every member built beside it. Every
-    // member that reaches what the moved packages reach is affected — over the members' metadata
-    // and the lock graphs (head and base); a reached package neither describes runs the full suite.
-    if !roots.is_empty() {
-        let mut g = Graph::new();
-        for m in head.iter().chain(base_members.iter()) {
-            g.entry(m.name.clone())
-                .or_default()
-                .extend(deps(&m.entry).into_iter().map(|(n, _)| n));
-        }
-        locks.extend(workspace_locks(worktree, ctx, check));
-        for l in &locks {
-            add_lock(&mut g, l).ok_or("a `Cargo.lock` does not parse")?;
-        }
-        let moved = reach(&g, roots.iter().cloned())?;
-        for m in &head {
-            if !reach(&g, [m.name.clone()])?.is_disjoint(&moved) {
-                changed.insert(m.name.clone());
-            }
-        }
+    // (codex r6, r8) Feature unification: the graph of the members' metadata and the lock files
+    // (head and base) closes the selection ([`select`]).
+    let mut g = Graph::new();
+    for m in head.iter().chain(base_members.iter()) {
+        g.entry(m.name.clone())
+            .or_default()
+            .extend(deps(&m.entry).into_iter().map(|(n, _)| n));
     }
-    // Reverse path-dependency closure: whatever depends on a changed member is affected.
-    let mut frontier: Vec<String> = changed.iter().cloned().collect();
-    while let Some(name) = frontier.pop() {
-        let Some(dir) = head.iter().find(|m| m.name == name).map(|m| m.dir.clone()) else {
-            continue;
-        };
-        for m in &head {
-            if m.path_deps.contains(&dir) && changed.insert(m.name.clone()) {
-                frontier.push(m.name.clone());
-            }
-        }
+    locks.extend(workspace_locks(worktree, ctx, check));
+    for l in &locks {
+        add_lock(&mut g, l).ok_or("a `Cargo.lock` does not parse")?;
     }
+    let members: Vec<String> = head.iter().map(|m| m.name.clone()).collect();
+    let changed = select(&g, &members, changed.into_iter().chain(roots))?;
     // A lockfile entry that is no longer a member (a package removed) selects nothing.
     Ok(changed
         .into_iter()
@@ -522,6 +546,25 @@ mod tests {
         v.iter().map(|x| x.to_string()).collect()
     }
 
+    /// (agy r6, r8) On the base a derived set keeps the packages the base has; all-new is `Err`;
+    /// a set naming none (the full-suite fallback) runs as is.
+    #[test]
+    fn a_derived_set_runs_on_the_base_over_the_packages_it_has() {
+        let has = s(&["a", "b"]);
+        assert_eq!(
+            on_base(&s(&["cargo", "test", "-p", "a", "-p", "n"]), &has),
+            Ok(s(&["cargo", "test", "-p", "a"]))
+        );
+        assert_eq!(
+            on_base(&s(&["cargo", "test", "-p", "n"]), &has),
+            Err(s(&["n"]))
+        );
+        assert_eq!(
+            on_base(&s(&["cargo", "test", "--no-fail-fast"]), &has),
+            Ok(s(&["cargo", "test", "--no-fail-fast"]))
+        );
+    }
+
     /// (codex r6) A lockfile change moves the entries it changed; a moved package's features
     /// reach everything it depends on, and every member that reaches one of those is affected —
     /// pure, over the lock graph.
@@ -553,6 +596,22 @@ mod tests {
             .filter(|m| !reach(&g, [m.to_string()]).unwrap().is_disjoint(&moved))
             .collect();
         assert_eq!(hit, ["a", "b"]);
+        // (codex r8) A SOURCE-only change to `a` still selects `b`: both reach `common`, and `b`
+        // may turn on `common`'s features in the full suite; `c` shares nothing.
+        let mut g = Graph::new();
+        for (m, d) in [
+            ("a", &["common"][..]),
+            ("b", &["common"]),
+            ("c", &[]),
+            ("common", &[]),
+        ] {
+            g.entry(m.to_string())
+                .or_default()
+                .extend(d.iter().map(|x| x.to_string()));
+        }
+        let members = s(&["a", "b", "c"]);
+        let picked = select(&g, &members, s(&["a"])).unwrap();
+        assert!(picked.contains("b") && !picked.contains("c"), "{picked:?}");
         // A package no graph describes cannot be closed over: the full suite.
         assert!(reach(&g, s(&["ghost"])).is_err());
     }
