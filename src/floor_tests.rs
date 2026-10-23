@@ -696,10 +696,15 @@ fn the_probe_passes_every_piece_of_a_real_cargo_guide() {
     .unwrap();
     git_repo_with_commit(&repo);
     let mut g = libtest_check(&s(&["cargo", "test", "--no-fail-fast"]));
-    g["probes"] = serde_json::json!({"mutation": {
-        "file": "tests/zz_mutation.rs",
-        "content": "#[test]\nfn floor_mutation() {\n    panic!(\"mutated\");\n}\n",
-        "expectId": "floor_mutation"}});
+    g["probes"] = serde_json::json!({
+        "mutation": {
+            "file": "tests/zz_mutation.rs",
+            "content": "#[test]\nfn floor_mutation() {\n    panic!(\"mutated\");\n}\n",
+            "expectId": "floor_mutation"},
+        "mutation2": {
+            "file": "tests/zz_mutation_two.rs",
+            "content": "#[test]\nfn floor_mutation_two() {\n    panic!(\"mutated\");\n}\n",
+            "expectId": "floor_mutation_two"}});
     let Some(results) = probe(&repo, g) else {
         return;
     };
@@ -747,10 +752,15 @@ fn the_probe_passes_every_piece_of_a_junit_pytest_guide() {
                  "item": r"^(?P<id>\S+::\S+)$"},
         "alone": {"run": [py.as_str(), "-p", "no:cacheprovider", "{id}"]},
         "deselect": {"append": ["--deselect={id}"]},
-        "probes": {"mutation": {
-            "file": "tests/test_zz_mutation.py",
-            "content": "def test_mutated():\n    assert False\n",
-            "expectId": "tests/test_zz_mutation.py::test_mutated"}},
+        "probes": {
+            "mutation": {
+                "file": "tests/test_zz_mutation.py",
+                "content": "def test_mutated():\n    assert False\n",
+                "expectId": "tests/test_zz_mutation.py::test_mutated"},
+            "mutation2": {
+                "file": "tests/test_zz_mutation_two.py",
+                "content": "def test_mutated_two():\n    assert False\n",
+                "expectId": "tests/test_zz_mutation_two.py::test_mutated_two"}},
     });
     let Some(results) = probe(&repo, g) else {
         return;
@@ -816,7 +826,7 @@ fn a_junit_vitest_guide_parses_but_without_alone_or_deselect_is_never_relied_on(
         Some("pass"),
         "{results:?}"
     );
-    for p in ["alone", "deselect", "mutation"] {
+    for p in ["alone", "deselect", "mutation", "multi", "ids"] {
         assert!(
             results.get(p).is_some_and(|r| r.starts_with("fail: no `")),
             "{p}: {results:?}"

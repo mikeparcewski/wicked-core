@@ -31,8 +31,8 @@ pub fn libtest_guide(argv: &[String], verified: &str) -> serde_json::Value {
     if !verified.is_empty() {
         g["verified"] = serde_json::json!({
             "baseSha": verified, "runnerVersion": "", "at": "",
-            "results": {"list": "pass", "run": "pass", "alone": "pass",
-                        "deselect": "pass", "mutation": "pass"}});
+            "results": {"list": "pass", "run": "pass", "ids": "pass", "alone": "pass",
+                        "deselect": "pass", "mutation": "pass", "multi": "pass"}});
     }
     g
 }

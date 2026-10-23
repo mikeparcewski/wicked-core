@@ -88,6 +88,11 @@
           "file": "tests/zz_floor_probe_mutation.rs",
           "content": "#[ctor::ctor(unsafe)]\nfn arm_hermetic_emit_spool() {\n    wicked_apps_core::emit::hermetic_test_spool();\n}\n\n#[test]\nfn floor_probe_mutation() {\n    panic!(\"the build guide's mutation probe\");\n}\n",
           "expectId": "floor_probe_mutation"
+        },
+        "mutation2": {
+          "file": "tests/zz_floor_probe_mutation_two.rs",
+          "content": "#[ctor::ctor(unsafe)]\nfn arm_hermetic_emit_spool() {\n    wicked_apps_core::emit::hermetic_test_spool();\n}\n\n#[test]\nfn floor_probe_mutation_two() {\n    panic!(\"the build guide's second mutation probe\");\n}\n",
+          "expectId": "floor_probe_mutation_two"
         }
       }
     }

@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 pub const GUIDE_PATH: &str = ".wicked/build-guide.json";
 /// The probes every check needs, all `pass`, before its exclusion is relied on (plus `affected`
 /// when the check has that piece).
-pub const REQUIRED_PROBES: [&str; 5] = ["list", "run", "alone", "deselect", "mutation"];
+pub const REQUIRED_PROBES: [&str; 7] = [
+    "list", "run", "ids", "alone", "deselect", "mutation", "multi",
+];
 
 /// A repository's build/test guide (contract v1).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +154,10 @@ pub struct Deselect {
 pub struct Probes {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutation: Option<Mutation>,
+    /// A SECOND deliberately failing test: with both written, both are parsed and deselecting
+    /// both runs clean (a deselect that breaks with two ids, a summary cut at a wrapped line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation2: Option<Mutation>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -532,7 +538,8 @@ fn dedup(ids: Vec<TestId>, keyed: bool) -> Vec<TestId> {
         .collect()
 }
 
-/// (junit) Every testcase and the failing ones (a `failure` or `error` child): id = the `attrs`
+/// (junit) Every testcase that ran (one with a `skipped` child neither passed nor failed) and the
+/// failing ones (a `failure` or `error` child): id = the `attrs`
 /// values joined by `join`, q = the enclosing testsuite's `name`. A minimal reader of the elements
 /// the format defines; `None` when the text holds no testsuite.
 pub(crate) fn junit(
@@ -542,7 +549,7 @@ pub(crate) fn junit(
     keyed: bool,
 ) -> Option<(Vec<TestId>, Vec<TestId>)> {
     let tag = Regex::new(
-        r#"<(/?)(testsuite|testcase|failure|error)\b((?:[^>"']|"[^"]*"|'[^']*')*?)(/?)>"#,
+        r#"<(/?)(testsuite|testcase|failure|error|skipped)\b((?:[^>"']|"[^"]*"|'[^']*')*?)(/?)>"#,
     )
     .expect("static regex");
     let attr = Regex::new(r#"([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)')"#)
@@ -553,7 +560,7 @@ pub(crate) fn junit(
     } else {
         attrs
     };
-    let (mut all, mut failed) = (Vec::new(), Vec::new());
+    let (mut all, mut failed, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
     let (mut suite, mut seen_suite, mut current): (String, bool, Option<TestId>) =
         (String::new(), false, None);
     for c in tag.captures_iter(xml) {
@@ -587,9 +594,16 @@ pub(crate) fn junit(
                     failed.push(t.clone());
                 }
             }
+            // A testcase a filter left out (or the runner skipped) neither passed nor failed.
+            ("skipped", false) => {
+                if let Some(t) = &current {
+                    skipped.push(t.clone());
+                }
+            }
             _ => {}
         }
     }
+    all.retain(|t| !skipped.contains(t));
     seen_suite.then(|| (dedup(all, keyed), dedup(failed, keyed)))
 }
 
@@ -699,6 +713,7 @@ mod tests {
             <testcase classname="m.a" name="ok_one" file="m/a.x"/>
             <testcase classname="m.a" name="bad &amp; worse" file="m/a.x"><failure message="x"/></testcase>
             <testcase classname="m.b" name="err" file="m/b.x"><error/></testcase>
+            <testcase classname="m.b" name="left_out" file="m/b.x"><skipped/></testcase>
             </testsuite></testsuites>"#;
         let (all, failed) = junit(xml, &[], "::", true).unwrap();
         assert_eq!(all.len(), 3);

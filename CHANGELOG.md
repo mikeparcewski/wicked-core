@@ -28,8 +28,12 @@ Two release tracks share this file, newest entry first regardless of track:
   excluded: t::a"). Precise means each id is unique in the base list by (qualifier, id), at most once in the
   head's, under the same qualifier on both, and the head's own list with them deselected lists exactly the rest
   (the runner's selection is the precision check). A guide check is relied on only when every probe passed
-  (`wicked-core floor probe --repo <dir> --guide <file> [--check <name>]`: list, run, alone, deselect,
-  mutation and affected, in a scratch copy under the floor sandbox; it writes `verified`), on an ancestor of
+  (`wicked-core floor probe --repo <dir> --guide <file> [--check <name>]`: list, run, ids, alone,
+  deselect, mutation, multi — two mutations, both parsed, both deselected — and affected, in a scratch copy
+  under the floor sandbox; it writes `verified`; a junit testcase a filter skipped counts as neither passed
+  nor failed). Deselect tokens from the first `{id}` onward repeat per id, so a flag and its value are one
+  token (`--skip={id}`); `{id}` values fill whole argv elements and never pass through a shell, so no
+  escaping is needed. The probes must also have run on an ancestor of
   the base, with no `derivedFrom` file changed since and no touched file matching `invalidatedBy`; otherwise
   the check runs exit-code only and a red base escalates as `base_red_unseparated` (the operator's floor
   override, core#1061/#1065, is the path through), with `decision.guide: {present, usable, reason}` saying

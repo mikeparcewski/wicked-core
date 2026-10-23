@@ -12,6 +12,10 @@
 //! * `alone` — with the mutation present, a passing id run alone exits 0 and names no failure (and,
 //!   with junit results, names exactly that test): alone runs no more than its id;
 //! * `deselect` — the list deselecting that passing id lists exactly the rest;
+//! * `ids` — every id the clean run's results report (all of them with junit, the failures with
+//!   text) is in the list, and so is the mutated id;
+//! * `multi` — with `probes.mutation2` written too, the run's new failures are exactly the two
+//!   expected ids, and the run deselecting both leaves the clean run's failures;
 //! * `affected` (when the check has the piece) — with the mutation file as `{files}`, its run's
 //!   failures include the mutated id.
 
@@ -209,6 +213,47 @@ impl Probe<'_> {
         .exit_code
     }
 
+    /// Both mutations written (the first already is): exactly the two expected ids are new, and
+    /// deselecting both leaves the clean run's failures.
+    fn multi(&self, m: &crate::floor_guide::Mutation, clean: &[TestId]) -> String {
+        let g = self.g;
+        let Some(m2) = g.probes.mutation2.as_ref() else {
+            return "fail: no `probes.mutation2`".into();
+        };
+        let file = self.dir.join(g.dir()).join(&m2.file);
+        if let Err(e) = file
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&file, &m2.content))
+        {
+            return format!("fail: the second mutation could not be written: {e}");
+        }
+        let (exit, run) = self.results(&g.run);
+        let new = match &run {
+            Ok((_, f)) => self.steady(f, clean),
+            Err(e) => return format!("fail: the run's results: {e}"),
+        };
+        let matches = |t: &TestId, m: &crate::floor_guide::Mutation| {
+            t.id == m.expect_id && m.expect_q.as_ref().is_none_or(|q| *q == t.q)
+        };
+        let both = new.len() == 2
+            && new.iter().any(|t| matches(t, m))
+            && new.iter().any(|t| matches(t, m2));
+        if !both || !self.failed_exit(exit) {
+            return format!(
+                "fail: with both mutations the new failures are {new:?} (exit {exit:?}), not `{}` and `{}`",
+                m.expect_id, m2.expect_id
+            );
+        }
+        let (dexit, d) = self.results(&g.deselected(&g.run, &new));
+        let ok = d.as_ref().is_ok_and(|(_, f)| {
+            !new.iter().any(|t| f.contains(t)) && self.steady(f, clean).is_empty()
+        }) && (!clean.is_empty() || dexit == Some(0));
+        verdict(ok, || {
+            format!("deselecting both did not leave the clean run's failures (exit {dexit:?})")
+        })
+    }
+
     /// `failed`'s ids beyond `before` that still fail run alone (a flake that passes alone is set
     /// aside).
     fn steady(&self, failed: &[TestId], before: &[TestId]) -> Vec<TestId> {
@@ -263,16 +308,16 @@ impl Probe<'_> {
             ("deselect", g.deselect.is_some()),
         ] {
             if !present {
-                for p in ["mutation", piece] {
+                for p in ["mutation", "multi", "ids", piece] {
                     out.insert(p.into(), format!("fail: no `{piece}` piece"));
                 }
             }
         }
-        if out.len() > 2 {
+        if out.contains_key("mutation") {
             return out;
         }
         let Some(m) = g.probes.mutation.as_ref() else {
-            for p in ["mutation", "alone", "deselect"] {
+            for p in ["mutation", "multi", "ids", "alone", "deselect"] {
                 out.insert(p.into(), "fail: no `probes.mutation`".into());
             }
             return out;
@@ -328,8 +373,8 @@ impl Probe<'_> {
             }
         };
         out.insert("mutation".into(), mutation);
-        // alone + deselect precision, with the mutation present.
-        let listed = inventory(
+        // ids: what the results name is what the list names (a partly wrong id joins nothing).
+        let listed_now = inventory(
             self.dir,
             &self.rc,
             g,
@@ -338,6 +383,30 @@ impl Probe<'_> {
             self.scratch,
             Tree::Base,
         );
+        let reported: Vec<TestId> = match &clean {
+            Ok((all, f)) => all.iter().chain(f).cloned().collect(),
+            Err(_) => Vec::new(),
+        };
+        let stray = reported
+            .iter()
+            .chain(expected.iter())
+            .find(|t| !listed_now.ids.contains(t))
+            .cloned();
+        out.insert(
+            "ids".into(),
+            verdict(
+                clean.is_ok() && expected.is_some() && stray.is_none(),
+                || match &stray {
+                    Some(t) => format!(
+                        "the results name `{}` (q `{}`), which the list does not",
+                        t.id, t.q
+                    ),
+                    None => "the clean or mutated run's ids could not be established".into(),
+                },
+            ),
+        );
+        // alone + deselect precision, with the mutation present.
+        let listed = listed_now;
         let failing: Vec<TestId> = mutated.as_ref().map(|(_, f)| f.clone()).unwrap_or_default();
         let passing = listed
             .ids
@@ -401,6 +470,7 @@ impl Probe<'_> {
                 );
             }
         }
+        out.insert("multi".into(), self.multi(m, &clean_failed));
         if let (Some(argv), Some(t)) = (g.affected_argv(std::slice::from_ref(&m.file)), &expected) {
             let (_, a) = self.results(&argv);
             out.insert(
