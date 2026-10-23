@@ -2284,8 +2284,9 @@ mod tests {
              for a in \"$@\"; do case \"$a\" in --list) list=1;; --skip=*) skips=\"$skips${a#--skip=} \";; esac; done\n\
              if [ $list = 1 ]; then n=0; for f in tests/*.red tests/*.ok; do [ -e \"$f\" ] || continue; \
              b=$(basename \"$f\"); echo \"${b%.*}: test\"; n=$((n+1)); done; echo; echo \"$n tests, 0 benchmarks\"; exit 0; fi\n\
-             r=0; for f in tests/*.red; do [ -e \"$f\" ] || continue; t=$(basename \"$f\" .red); \
-             case \"$skips\" in *\" $t \"*) continue;; esac; echo \"test $t ... FAILED\"; r=101; done; exit $r\n",
+             r=0; n=0; for f in tests/*.red; do [ -e \"$f\" ] || continue; t=$(basename \"$f\" .red); \
+             case \"$skips\" in *\" $t \"*) continue;; esac; echo \"test $t ... FAILED\"; r=101; n=$((n+1)); done; \
+             echo \"test result: FAILED. 0 passed; $n failed; 0 ignored; 0 measured; 0 filtered out\"; exit $r\n",
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();

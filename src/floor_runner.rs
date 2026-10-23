@@ -196,7 +196,7 @@ pub(crate) fn parse_toc(runner: Runner, stdout: &str) -> Option<Vec<String>> {
                     .strip_suffix(": test")
                     .or_else(|| l.strip_suffix(": benchmark"))
                 {
-                    names.push(n.to_string());
+                    names.push(libtest_name(n).to_string());
                     continue;
                 }
                 // `N tests, M benchmarks` — one per binary; the counts must add up.
@@ -229,30 +229,53 @@ pub(crate) fn parse_toc(runner: Runner, stdout: &str) -> Option<Vec<String>> {
 /// libtest's result-line name, without the ` - should panic` it prints for a `#[should_panic]`
 /// test (its inventory lists the bare name).
 fn libtest_name(r: &str) -> &str {
-    r.strip_suffix(" - should panic").unwrap_or(r)
+    let r = r.strip_suffix(" - should panic").unwrap_or(r);
+    r.strip_suffix(" - compile fail").unwrap_or(r)
+}
+
+/// A libtest result line's test name and verdict (`ok`, `ignored` — with or without its `, reason`
+/// — or `FAILED`), or `None` for any other line.
+fn libtest_result(l: &str) -> Option<(&str, &str)> {
+    let r = l.trim_end_matches('\r').strip_prefix("test ")?;
+    let (name, verdict) = r.rsplit_once(" ... ")?;
+    let verdict = match verdict {
+        "ok" | "FAILED" => verdict,
+        v if v == "ignored" || v.starts_with("ignored, ") => "ignored",
+        _ => return None,
+    };
+    Some((libtest_name(name), verdict))
 }
 
 /// The failing test names a run's OWN stdout (the base's) carries, read only from the runner's
 /// own result lines: libtest `test X ... FAILED`; pytest's LAST `short test summary info` section
-/// (`FAILED <id>` / `ERROR <id>`) — the outer run prints it at the very end, so a child pytest's
-/// summary inside a test's captured output, which comes earlier, is discarded.
+/// (`FAILED <id>` / `ERROR <id>`), and only when the `=` line that closes it is the run's final
+/// line — the outer run prints its summary and footer at the very end, so a child pytest's summary
+/// inside a test's captured output (which comes earlier and is followed by more output), or a run
+/// whose summary is suppressed (`-rN`) or unbannered (`-q`), names nothing.
 pub(crate) fn failing_names(runner: Runner, text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut in_summary = false;
+    // pytest: the section is closed by an `=` footer, which must be the last non-empty line.
+    let mut closed_at_end = false;
     for line in text.lines() {
         let l = line.trim_end_matches('\r');
+        if runner == Runner::Pytest && !l.trim().is_empty() {
+            closed_at_end = false;
+        }
         if runner == Runner::Pytest && l.starts_with('=') {
-            in_summary = l.contains(" short test summary info ");
-            if in_summary {
+            if l.contains(" short test summary info ") {
+                in_summary = true;
                 out.clear();
+            } else if in_summary {
+                in_summary = false;
+                closed_at_end = true;
             }
             continue;
         }
         let name = match runner {
-            Runner::Cargo => l
-                .strip_prefix("test ")
-                .and_then(|r| r.strip_suffix(" ... FAILED"))
-                .map(libtest_name),
+            Runner::Cargo => libtest_result(l)
+                .filter(|(_, v)| *v == "FAILED")
+                .map(|(n, _)| n),
             Runner::Pytest if in_summary => l
                 .strip_prefix("FAILED ")
                 .or_else(|| l.strip_prefix("ERROR "))
@@ -265,6 +288,9 @@ pub(crate) fn failing_names(runner: Runner, text: &str) -> Vec<String> {
             }
         }
     }
+    if runner == Runner::Pytest && !closed_at_end {
+        out.clear();
+    }
     out
 }
 
@@ -274,28 +300,23 @@ pub(crate) fn passing_names(runner: Runner, text: &str) -> Vec<String> {
     match runner {
         Runner::Cargo => text
             .lines()
-            .filter_map(|l| {
-                let r = l.trim_end_matches('\r').strip_prefix("test ")?;
-                r.strip_suffix(" ... ok")
-                    .or_else(|| r.strip_suffix(" ... ignored"))
-                    .map(|n| libtest_name(n).to_string())
-            })
+            .filter_map(libtest_result)
+            .filter(|(_, v)| *v != "FAILED")
+            .map(|(n, _)| n.to_string())
             .collect(),
         Runner::Pytest => Vec::new(),
     }
 }
 
-/// Every test name a libtest run's output reports a result for (`ok`, `ignored` or `FAILED`).
-pub(crate) fn result_names(text: &str) -> std::collections::BTreeSet<String> {
-    text.lines()
-        .filter_map(|l| {
-            let r = l.trim_end_matches('\r').strip_prefix("test ")?;
-            r.strip_suffix(" ... ok")
-                .or_else(|| r.strip_suffix(" ... ignored"))
-                .or_else(|| r.strip_suffix(" ... FAILED"))
-                .map(|n| libtest_name(n).to_string())
-        })
-        .collect()
+/// (cargo) The argv that runs ONLY `name` (exactly) of `argv`'s selection: the floor's
+/// confirmation, on the base, that a name its output reports failing fails when run alone.
+pub(crate) fn alone_argv(argv: &[String], name: &str) -> Vec<String> {
+    let split = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    let mut out = argv[..split].to_vec();
+    out.push("--".into());
+    out.extend(argv.get(split + 1..).unwrap_or(&[]).iter().cloned());
+    out.extend([name.to_string(), "--exact".to_string()]);
+    out
 }
 
 /// (pytest) `--deselect` matches node-id PREFIXES: the first deselected name that would also remove
@@ -459,9 +480,36 @@ mod tests {
             passing_names(Runner::Cargo, "test t::sp - should panic ... ok\n"),
             s(&["t::sp"])
         );
-        let all =
-            result_names("test a ... ok\ntest b ... FAILED\ntest c - should panic ... ignored\n");
-        assert_eq!(all.into_iter().collect::<Vec<_>>(), s(&["a", "b", "c"]));
+        // (agy r4) `ignored, reason` and `- compile fail` are libtest's own spellings.
+        assert_eq!(
+            passing_names(
+                Runner::Cargo,
+                "test a ... ignored, flaky on CI\ntest src/lib.rs - f (line 3) - compile fail ... ok\n"
+            ),
+            s(&["a", "src/lib.rs - f (line 3)"])
+        );
+        assert_eq!(
+            alone_argv(
+                &s(&["cargo", "test", "--no-fail-fast", "--", "--test-threads=1"]),
+                "t::a"
+            ),
+            s(&[
+                "cargo",
+                "test",
+                "--no-fail-fast",
+                "--",
+                "--test-threads=1",
+                "t::a",
+                "--exact"
+            ])
+        );
+        // (agy r4) a pytest summary counts only when its closing footer is the run's last line.
+        let unclosed = "=== short test summary info ===\nFAILED a.py::t - x\n1 failed in 0.01s\n";
+        assert!(failing_names(Runner::Pytest, unclosed).is_empty());
+        let child_then_more =
+            "=== short test summary info ===\nFAILED a.py::fine - x\n=== 1 failed in 0.1s ===\n\
+                               more captured output\n=== 2 passed, 1 failed in 0.5s ===\n";
+        assert!(failing_names(Runner::Pytest, child_then_more).is_empty());
         let cargo = s(&["cargo", "test", "--locked", "--", "--test-threads=4"]);
         assert_eq!(
             toc_argv(Runner::Cargo, &cargo),
@@ -527,8 +575,7 @@ mod tests {
         );
         let py = "tests/a.py::test_x PASSED\nFAILED tests/a.py::test_ok - printed by a test\n\
                   =========== short test summary info ===========\n\
-                  FAILED tests/a.py::test_x - assert 1 == 2\n=========== 1 failed ===========\n\
-                  FAILED tests/a.py::test_after - after the summary\n";
+                  FAILED tests/a.py::test_x - assert 1 == 2\n=========== 1 failed ===========\n";
         assert_eq!(
             failing_names(Runner::Pytest, py),
             s(&["tests/a.py::test_x"])

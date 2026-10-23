@@ -180,7 +180,13 @@ pub(crate) fn capture<R: Read + Send + 'static>(mut r: R, dir: &Path, cap: u64) 
         let mut chunk = [0u8; 8192];
         loop {
             match r.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // Any other read error leaves the stream unread past this point: a prefix.
+                Err(_) => {
+                    shared.lock().unwrap_or_else(|p| p.into_inner()).truncated = true;
+                    break;
+                }
                 Ok(n) => shared
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())

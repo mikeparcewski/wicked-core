@@ -240,8 +240,8 @@ use serde::{Deserialize, Serialize};
 use wicked_apps_core::spawn::HardenedCommand;
 
 use crate::floor_runner::{
-    cargo_config_bends_test_args, deselect_argv, deselectable, failing_names, parse_toc,
-    passing_names, pytest_prefix_collision, result_names, runner_of, toc_argv, Runner,
+    alone_argv, cargo_config_bends_test_args, deselect_argv, deselectable, failing_names,
+    parse_toc, passing_names, pytest_prefix_collision, runner_of, toc_argv, Runner,
 };
 use crate::validator::WorkerSandbox;
 
@@ -4179,10 +4179,41 @@ impl BaseTree {
         }
         let run = run_one(&self.dir, &target, sandbox, scratch, Tree::Base);
         // A red base is inventoried on the same export, by its own runner (its TOC).
-        let toc = (!run.passed() && !run.timed_out && run.spawn_error.is_none())
+        let mut toc = (!run.passed() && !run.timed_out && run.spawn_error.is_none())
             .then(|| runner_of(&target.argv))
             .flatten()
             .map(|runner| inventory(&self.dir, &target, runner, sandbox, scratch, Tree::Base));
+        // (cargo) Each failure the base's output names is confirmed by the base's EXIT CODE: run
+        // alone (`-- <name> --exact`) on this export, it must fail. A captured child run's line,
+        // or a test a crashed binary never reached, then cannot be excluded.
+        if let Some(t) = toc.as_mut().filter(|t| t.incomplete.is_none()) {
+            if runner_of(&target.argv) == Some(Runner::Cargo) {
+                let text = run
+                    .logs
+                    .first()
+                    .map(|l| crate::floor_log::text(&scratch.logs, l))
+                    .unwrap_or_default();
+                let passed = passing_names(Runner::Cargo, &text);
+                let candidates: Vec<String> = failing_names(Runner::Cargo, &text)
+                    .into_iter()
+                    .filter(|n| t.count(n) == 1 && !passed.contains(n))
+                    .filter(|n| !n.contains(char::is_whitespace))
+                    .collect();
+                if candidates.len() <= MAX_ALONE_CONFIRMATIONS {
+                    for n in candidates {
+                        let one = RepoCheck {
+                            argv: alone_argv(&target.argv, &n),
+                            source: format!("`{n}` alone on the base (DES-FLOOR-V2)"),
+                            ..target.clone()
+                        };
+                        let r = run_one(&self.dir, &one, sandbox, scratch, Tree::Base);
+                        t.logs.extend(relabel(r.logs.clone(), "alone-base"));
+                        let failed = !r.passed() && !r.timed_out && r.spawn_error.is_none();
+                        t.alone.push((n, failed));
+                    }
+                }
+            }
+        }
         let rec = BaseRecord {
             floor_policy: FLOOR_POLICY_VERSION,
             run,
@@ -4271,7 +4302,10 @@ pub const OUTCOME_COULD_NOT_RUN: &str = "could_not_run";
 pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
 /// The versioned base-cache record (core#1060 r9 keyed the cache by sandbox policy; v4 adds the
 /// base inventory): a record of any other version, or a bare `CheckRun`, is a miss.
-const FLOOR_POLICY_VERSION: u32 = 4;
+const FLOOR_POLICY_VERSION: u32 = 5;
+/// The most base failures the floor confirms one by one (each run alone on the base); more than
+/// this escalates rather than paying for them.
+const MAX_ALONE_CONFIRMATIONS: usize = 16;
 /// The longest the identical retry waits for the 1-min load to fall below the CPU count, by
 /// default; [`RETRY_WAIT_ENV`] sets it in whole seconds (at most [`MAX_RETRY_WAIT_S`]).
 #[cfg_attr(test, allow(dead_code))]
@@ -4293,6 +4327,10 @@ struct Toc {
     incomplete: Option<String>,
     #[serde(default)]
     logs: Vec<crate::floor_log::LogRef>,
+    /// (cargo) Each candidate base failure run ALONE on the base: `(name, it failed)` — the exit
+    /// code, not the output, says whether the name is a base failure.
+    #[serde(default)]
+    alone: Vec<(String, bool)>,
 }
 
 impl Toc {
@@ -4344,6 +4382,7 @@ fn inventory(
         names: parsed.unwrap_or_default(),
         incomplete,
         logs,
+        alone: Vec::new(),
     }
 }
 
@@ -4357,11 +4396,11 @@ fn relabel(
     logs
 }
 
-/// (DES-FLOOR-V2 §4) Was the host oversubscribed while `run` ran — at its start (its load band)
-/// or now?
+/// (DES-FLOOR-V2 §4) Was the host oversubscribed when `run` started (its load band)?
 fn ran_loaded(run: &CheckRun) -> bool {
-    let (load1, cpus) = host_load();
-    run.load_band.is_some_and(|b| b >= 1) || oversubscribed(load1, cpus)
+    // The run's OWN load band, sampled as it started — never the load after other runs (the
+    // base's) raised it.
+    run.load_band.is_some_and(|b| b >= 1)
 }
 
 /// (DES-FLOOR-V2 §4) Bazel's `flaky_test_attempts=2`: when the deciding run FAILED (not a
@@ -4485,17 +4524,6 @@ fn decide(
             // failing base test's captured output can carry a child run's `test X ... FAILED` for
             // a test X that passed, and X must never be deselected on the head.
             let passed = passing_names(runner, &base_text);
-            // libtest prints a result line for every test that ran; a listed test with none means
-            // a binary stopped early (a crash, an abort), and then a `FAILED` line without its
-            // `ok` witness proves nothing — the base is not complete enough to separate.
-            if runner == Runner::Cargo {
-                let reported = result_names(&base_text);
-                if let Some(n) = toc.names.iter().find(|n| !reported.contains(*n)) {
-                    return Err(format!(
-                        "the base reported no result for `{n}` (a test binary stopped early)"
-                    ));
-                }
-            }
             let failing: Vec<String> = failing_names(runner, &base_text)
                 .into_iter()
                 .filter(|n| toc.count(n) > 0 && !(toc.count(n) == 1 && passed.contains(n)))
@@ -4527,6 +4555,22 @@ fn decide(
                     "`{n}` names {} tests in the base's inventory",
                     toc.count(n)
                 ));
+            }
+            if runner == Runner::Cargo {
+                for n in &failing {
+                    match toc.alone.iter().find(|(a, _)| a == n) {
+                        Some((_, true)) => {}
+                        Some((_, false)) => {
+                            return Err(format!("`{n}` passes when the base runs it alone"))
+                        }
+                        None => {
+                            return Err(format!(
+                                "`{n}` was not confirmed on the base (more than \
+                                 {MAX_ALONE_CONFIRMATIONS} failures, or its name has whitespace)"
+                            ))
+                        }
+                    }
+                }
             }
             let head_toc = inventory(worktree, check, runner, sandbox, scratch, Tree::Head);
             logs.extend(head_toc.logs.iter().cloned());
@@ -4592,8 +4636,7 @@ fn decide(
     // excluded run is retried only while no cargo config bends its `--exact` (a test of the first
     // attempt may have written one into the scratch CARGO_HOME).
     let mut twice = false;
-    let retry_safe = !excluded_run
-        || matches!(&plan, Ok((r, _)) if *r != Runner::Cargo)
+    let retry_safe = runner_of(&check.argv) != Some(Runner::Cargo)
         || config_bends(worktree, check, scratch).is_none();
     let retry = retry_safe
         .then(|| retry_if_loaded(worktree, &deciding_check, &deciding, sandbox, scratch))
@@ -4605,24 +4648,50 @@ fn decide(
         twice = !r.passed() && !r.timed_out && r.spawn_error.is_none() && ran_loaded(&r);
         deciding = r;
     }
-    // Head ids are an ANNOTATION: listed beside the outcome, never deciding it.
-    let annotated: Vec<String> = head
-        .failure_ids
-        .iter()
-        .filter(|id| {
-            !decision
-                .excluded
-                .iter()
-                .any(|n| id_name(id) == Some(n.as_str()))
-        })
-        .cloned()
-        .collect();
+    // Head ids are an ANNOTATION: listed beside the outcome, never deciding it (the deciding
+    // run's, when it was the excluded one).
+    let annotated: Vec<String> = if excluded_run {
+        &deciding.failure_ids
+    } else {
+        &head.failure_ids
+    }
+    .iter()
+    .filter(|id| {
+        !decision
+            .excluded
+            .iter()
+            .any(|n| id_name(id) == Some(n.as_str()))
+    })
+    .cloned()
+    .collect();
     let base_passed = base_run.is_some_and(CheckRun::passed);
+    // A base that could not be established — it timed out, could not start, or could not be
+    // exported or provisioned — separates nothing: escalate. (A base that declares no such check,
+    // and a repo that opted out of the comparison, leave the head's failure a new one.)
+    let base_unknown: Option<String> = side.as_ref().and_then(|s| match &s.base.run {
+        Some(b) if b.timed_out => Some("the base run did not finish".to_string()),
+        Some(b) if b.spawn_error.is_some() => Some(format!(
+            "the base run could not start ({})",
+            b.spawn_error.as_deref().unwrap_or_default()
+        )),
+        None => s
+            .base
+            .error
+            .as_deref()
+            .filter(|e| !e.contains("declares no `") && !e.contains("baseline_diff: false"))
+            .map(|e| format!("the base could not be run ({e})")),
+        _ => None,
+    });
+    let cannot_separate: Option<String> = if unseparated {
+        plan.as_ref().err().cloned()
+    } else {
+        base_unknown
+    };
     let (outcome, classification) = if deciding.passed() && excluded_run {
         (OUTCOME_PASS_EXCLUDED, Some(PRE_EXISTING_IN_SANDBOX))
     } else if deciding.passed() {
         (OUTCOME_PASS, Some(FLAKY_UNDER_LOAD))
-    } else if let (true, Err(why)) = (unseparated, &plan) {
+    } else if let Some(why) = &cannot_separate {
         // Before a retry's own timeout or spawn failure: the first run decided this.
         decision.reason = Some(format!("base red, cannot separate: {why}"));
         (OUTCOME_BASE_RED_UNSEPARATED, Some(BASE_RED_UNSEPARATED))
@@ -8541,12 +8610,15 @@ mod tests {
             &path,
             "#!/bin/sh\n\
              mode=run\n\
-             for a in \"$@\"; do case \"$a\" in --list|--collect-only) mode=toc;; --skip=*|--deselect=*) mode=excluded;; esac; done\n\
+             prev=; name=\n\
+             for a in \"$@\"; do case \"$a\" in --list|--collect-only) mode=toc;; --skip=*|--deselect=*) mode=excluded;; \
+             --exact) [ $mode = run ] && mode=alone && name=$prev;; esac; prev=$a; done\n\
              key=\"$TMPDIR/n-$(pwd | cksum | cut -d' ' -f1)-$mode\"\n\
              n=$(cat \"$key\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$key\"\n\
              code() { if [ -f \"$1\" ]; then cat \"$1\"; else echo 0; fi; }\n\
              case $mode in\n\
                toc) cat toc.txt 2>/dev/null; exit $(code toc.exit);;\n\
+               alone) grep -qx \"$name\" alone.fail 2>/dev/null && exit 101; exit 0;;\n\
                excluded) [ -f excluded.sleep ] && sleep $(cat excluded.sleep)\n\
                  cat excluded.out 2>/dev/null; cat excluded.err >&2 2>/dev/null\n\
                  if [ -f flake.excluded ] && [ $n = 1 ]; then exit 101; fi; exit $(code excluded.exit);;\n\
@@ -8611,14 +8683,17 @@ mod tests {
             &repo,
             &argv,
             &[
-                // A real libtest run prints a result line for every test it lists.
+                // A real libtest run prints a result line for every test it lists, and its footer.
                 (
                     "run.out",
-                    "test new ... ok\ntest fine ... ok\ntest old ... FAILED\n",
+                    "test new ... ok\ntest fine ... ok\ntest old ... FAILED\n\ntest result: FAILED. 2 \
+                     passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n",
                 ),
                 ("run.exit", "101"),
                 ("excluded.exit", "0"),
                 ("toc.txt", &toc_of(&["old", "new", "fine"])),
+                // Run alone on the base, only `old` fails.
+                ("alone.fail", "old\n"),
             ],
         );
         let base = git_repo_with_commit(&repo);
@@ -9490,6 +9565,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// (codex r4) A member's `[features]` change that turns on a shared dependency's feature
+    /// reaches every member that depends on it (cargo unifies features across what it builds):
+    /// `a` enabling `s/bad` selects `b` (which does not depend on `a`) and `s` itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_feature_change_on_a_shared_dependency_selects_its_other_consumers() {
+        let _load = seam::pin(0.5, 4);
+        let repo = scratch("features");
+        let member = |name: &str, deps: &str, features: &str| {
+            std::fs::create_dir_all(repo.join(name).join("src")).unwrap();
+            std::fs::write(
+                repo.join(name).join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+                     [features]\n{features}[dependencies]\n{deps}"
+                ),
+            )
+            .unwrap();
+            std::fs::write(repo.join(name).join("src/lib.rs"), "\n").unwrap();
+        };
+        member("s", "", "bad = []\n");
+        member("a", "s = { path = \"../s\" }\n", "");
+        member("b", "s = { path = \"../s\" }\n", "");
+        member("c", "", "");
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"s\", \"a\", \"b\", \"c\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join(".gitignore"), "Cargo.lock\ntmp/\n").unwrap();
+        let base = git_repo_with_commit(&repo);
+        let ctx = FloorContext {
+            stage: FloorStage::Creator,
+            base_head: Some(base),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        };
+        member("a", "s = { path = \"../s\" }\n", "default = [\"s/bad\"]\n");
+        let report = run_floor(&repo, &ctx);
+        if report.sandbox_error.is_some() {
+            return;
+        }
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name == "test_targeted")
+            .unwrap_or_else(|| panic!("a derived set ran: {report:#?}"));
+        assert!(
+            c.argv.ends_with(&s(&["-p", "a", "-p", "b", "-p", "s"])),
+            "{:?}",
+            c.argv
+        );
+        assert!(!c.argv.contains(&"c".to_string()), "{:?}", c.argv);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     /// A failing BASE test's captured output that carries a child run's `test fine ... FAILED` (for
     /// a test that itself passed on the base, its own `ok` line printed) never makes `fine`
     /// excludable: the head breaking `fine` is a new failure.
@@ -9500,7 +9631,8 @@ mod tests {
         let (repo, _, argv) = red_base("childline");
         let base_out =
             "test fine ... ok\ntest old ... FAILED\n\nfailures:\n\n---- old stdout ----\n\
-                        test fine ... FAILED\n";
+                        test fine ... FAILED\n\nfailures:\n    old\n\ntest result: FAILED. 1 passed; 1 failed; \
+                        0 ignored; 0 measured; 0 filtered out\n";
         write_tree(
             &repo,
             &argv,

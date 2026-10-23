@@ -30,8 +30,9 @@ Two release tracks share this file, newest entry first regardless of track:
   `.cargo/config*` as decoded TOML, a pytest `--deselect` that would also remove another head test by node-id
   prefix is refused, the base's failing names come only from its stdout's own
   result lines (pytest's last short summary) and never from a truncated stream, an empty
-  inventory is no inventory, a base whose test binary stopped early (a listed test with no result line) cannot be
-  separated, and a manifest change to `[profile]`, `[patch]`, `[replace]`, `[workspace]` or
+  inventory is no inventory, every cargo base failure is confirmed by the base's exit code — run alone on the base
+  (`-- <name> --exact`) it must fail, so a child run's line or a test a crashed binary never reached cannot be
+  excluded (at most 16, more escalates); a base that timed out or could not run escalates; and a manifest change to `[profile]`, `[patch]`, `[replace]`, `[workspace]` or
   `[lints]` runs the full suite. Anything else is
   `base_red_unseparated`: it escalates with both logs, and the operator's floor override (core#1061, core#1065)
   is the path through. go test (its subtests are invisible to `go test -list`, so skipping a red parent can hide a newly broken subtest; review round 2), vitest, jest, tsc, eslint and shell runners escalate the same way. A deciding run that
@@ -47,7 +48,10 @@ Two release tracks share this file, newest entry first regardless of track:
   override and QE. An unconfigured cargo repo runs its affected set at the creator AND at verify (`full: true`
   keeps verify full): the members owning a touched file plus the members a manifest change (`cargo metadata
   --no-deps` diffed against the base) or a lockfile change reaches, closed over their reverse path
-  dependencies, in one `-p a -p b` invocation. The macOS floor's test seam now arms the private `TMPDIR` as
+  dependencies and over every member sharing a dependency whose declaration or feature activation changed
+  (cargo unifies features across what it builds), in one `-p a -p b` invocation; a `[profile]`, `[patch]`,
+  `[replace]`, `[workspace]`, `[lints]`, `package.resolver`/`edition`, nested `.cargo/` or `rust-toolchain` change
+  runs the full suite. The macOS floor's test seam now arms the private `TMPDIR` as
   production does, so doctests run under the real floor sandbox. Wire (additive): every
   `repoChecksEvaluated.checks[]` entry carries `decision: {outcome, baseSha, baseFailing, excluded, logRefs:
   [{attempt, stream, sha256, bytes, truncated}], flaky, reason}`, with `outcome` one of `pass`, `pass_excluded`,

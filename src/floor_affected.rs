@@ -321,9 +321,46 @@ fn affected_packages(
                 .filter_map(|d| Some((d.get("name")?.as_str()?.to_string(), d.clone())))
                 .collect()
         };
+        // A feature definition that names `dep/feat`, `dep?/feat` or `dep:dep` moves that dependency.
+        let feature_deps =
+            |e: &serde_json::Value| -> std::collections::BTreeMap<String, serde_json::Value> {
+                e.get("features")
+                    .and_then(|f| f.as_object())
+                    .map(|f| f.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    .unwrap_or_default()
+            };
+        let referenced = |v: &serde_json::Value| -> Vec<String> {
+            v.as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|x| x.as_str())
+                .filter_map(|x| {
+                    x.strip_prefix("dep:")
+                        .or_else(|| x.split_once('/').map(|(d, _)| d.trim_end_matches('?')))
+                })
+                .map(str::to_string)
+                .collect()
+        };
         let mut moved_deps: std::collections::BTreeSet<String> = Default::default();
+        // A member removed from the workspace no longer unifies anything it depended on.
+        for b in base_members
+            .iter()
+            .filter(|b| !head.iter().any(|m| m.name == b.name))
+        {
+            moved_deps.extend(deps(&b.entry).into_iter().map(|(n, _)| n));
+        }
         for m in &head {
             let base = base_members.iter().find(|b| b.name == m.name);
+            if let Some(b) = base {
+                let (old, new) = (feature_deps(&b.entry), feature_deps(&m.entry));
+                for k in old.keys().chain(new.keys()) {
+                    if old.get(k) != new.get(k) {
+                        for v in [old.get(k), new.get(k)].into_iter().flatten() {
+                            moved_deps.extend(referenced(v));
+                        }
+                    }
+                }
+            }
             if base.map(|b| &b.entry) != Some(&m.entry) {
                 changed.insert(m.name.clone());
                 let (old, new) = (
@@ -340,7 +377,11 @@ fn affected_packages(
             }
         }
         for m in &head {
-            if deps(&m.entry).iter().any(|(n, _)| moved_deps.contains(n)) {
+            // A member whose features moved is built and tested with them; so is every member
+            // that depends on it.
+            if moved_deps.contains(&m.name)
+                || deps(&m.entry).iter().any(|(n, _)| moved_deps.contains(n))
+            {
                 changed.insert(m.name.clone());
             }
         }
