@@ -35,9 +35,11 @@ Two release tracks share this file, newest entry first regardless of track:
   output is replaced, never added). The change's paths are read NUL-separated (`-z`, never quoted or
   trimmed; a path that is not UTF-8 fails closed). `derivedFrom` matches as `invalidatedBy` does, on the
   base's changes since the probe and on the change itself (a head that edits one cannot use the guide), and
-  `cwd` refuses `.` segments and `:`.
-  **Exclusion ships DISABLED.** `WICKED_FLOOR_EXCLUDE=on` (or `1`) enables it; unset or anything else, it is
-  off: a failing head over a red base escalates as `base_red_unseparated` ("exclusion disabled
+  `cwd` refuses `.` segments, `:` and `""`. A check's `cwd` must be a plain directory of the tree it runs on,
+  every component (a head that turns it into a link gets `could_not_run`). Base staleness reads a rename as
+  the old path gone (`--no-renames`). The last block is kept per (block rule, qualifier).
+  **Exclusion ships DISABLED.** `WICKED_FLOOR_EXCLUDE` exactly `on` or `1` (read once per floor run, never
+  trimmed or case-folded) enables it; unset or anything else, it is off: a failing head over a red base escalates as `base_red_unseparated` ("exclusion disabled
   (WICKED_FLOOR_EXCLUDE)") with both logs, and the base's list, the one-test runs and the deselected head
   run are never executed. A usable guide still names the checks, is still checked at load and for staleness,
   and `floor probe` still works. The cost, plainly: until exclusion is enabled, every repo whose base is red
@@ -89,7 +91,8 @@ Two release tracks share this file, newest entry first regardless of track:
   gate checks (fmt, typecheck, clippy, the workspace and `--features postgres` builds, and core-ts's fmt,
   clippy, test, `finalize-dts` — checked against a copy, so no tracked file is rewritten — and `tsc`, as CI
   gates them) run on exit codes — the builds and the core-ts ones at the verify stage only (`stage: ["verify"]`), so the creator
-  floor stays fast and the verify floor runs everything before delivery; **its `test` check is UNVERIFIED until it is re-probed on main after this merges**
+  floor stays fast and the verify floor runs everything before delivery; **its `test` check is UNVERIFIED until it is re-probed on main after this merges** (its `verified` block
+  is stale by design: the floor reads it as "missing probe `version`", unusable, never as a parse error)
   (its `version` piece and the tightened probes postdate its last probe), so until then a red base on it
   escalates instead of excluding. The ubuntu CI job installs pytest and vitest so the pytest and vitest probe
   fixtures run there. Kept: the PTY grant (core#1060's Seatbelt rules), the load-aware bound, the base cache (now

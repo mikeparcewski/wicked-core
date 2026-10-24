@@ -41,7 +41,7 @@
           "type": "string",
           "default": ".",
           "description": "Relative to the repo root: `.` or `/`-separated segments, none empty, `.` or `..`, and no `\\` or `:` (no Windows drive).",
-          "pattern": "^(\\.|(?!.*(^|/)\\.\\.?(/|$))[^/\\\\:]+(/[^/\\\\:]+)*)?$"
+          "pattern": "^(\\.|(?!.*(^|/)\\.\\.?(/|$))[^/\\\\:]+(/[^/\\\\:]+)*)$"
         },
         "stage": {
           "description": "The floor stages the check runs at; absent or empty = both.",

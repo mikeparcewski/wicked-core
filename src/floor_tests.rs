@@ -40,6 +40,7 @@ fn fake_runner(tag: &str, name: &str) -> String {
          *::*) [ $mode = run ] && mode=alone && name=$a;; \
          --exact) [ $mode = run ] && mode=alone && name=$prev;; esac; prev=$a; done\n\
          key=\"$TMPDIR/n-$(pwd | cksum | cut -d' ' -f1)-$mode\"\n\
+         [ -f counters.dir ] && { d=$(cat counters.dir); mkdir -p \"$d\" && echo x >> \"$d/$mode\"; } 2>/dev/null\n\
          n=$(cat \"$key\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$key\"\n\
          code() { if [ -f \"$1\" ]; then cat \"$1\"; else echo 0; fi; }\n\
          case $mode in\n\
@@ -2314,6 +2315,20 @@ fn with_exclusion_off_a_red_base_escalates_and_nothing_is_deselected() {
     let _load = seam::pin(0.5, 4);
     let _off = seam::exclude(false);
     let (repo, ctx, argv) = red_base("exclude-off");
+    // The fake runner counts every run by mode under `tmp/counters` (ignored, inside the tree):
+    // committed, so the base export counts too.
+    let counters = repo.join("tmp/counters");
+    std::fs::write(
+        repo.join("counters.dir"),
+        counters.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "count the runs"]);
+    let ctx = FloorContext {
+        base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+        ..ctx
+    };
     write_tree(
         &repo,
         &argv,
@@ -2347,6 +2362,166 @@ fn with_exclusion_off_a_red_base_escalates_and_nothing_is_deselected() {
     assert!(
         d.guide.as_ref().is_some_and(|g| g.present && g.usable),
         "{d:?}"
+    );
+    // The head and the base ran; no list, no one-test run, no deselected run did.
+    assert!(counters.join("run").is_file(), "the runs were counted");
+    for mode in ["toc", "alone", "excluded"] {
+        assert!(!counters.join(mode).exists(), "a `{mode}` run happened");
+    }
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// The switch reads exactly `on` or `1`: nothing trimmed, nothing case-folded.
+#[test]
+fn the_exclusion_switch_reads_exactly_on_or_1() {
+    for (v, on) in [
+        (None, false),
+        (Some("on"), true),
+        (Some("1"), true),
+        (Some("ON"), false),
+        (Some("true"), false),
+        (Some(" on"), false),
+        (Some("1\n"), false),
+    ] {
+        assert_eq!(exclusion_from(v), on, "{v:?}");
+    }
+}
+
+/// (final review, codex P2) A head that swaps a guided `cwd` for a link out of the tree: the
+/// check does not run there (`could_not_run`), and nothing lands outside.
+#[cfg(unix)]
+#[test]
+fn a_guided_cwd_turned_into_a_link_does_not_run() {
+    let _load = seam::pin(0.5, 4);
+    let repo = scratch("cwd-link");
+    let outside = scratch("cwd-link-outside");
+    std::fs::create_dir_all(repo.join("pkg")).unwrap();
+    std::fs::write(repo.join("pkg/keep.txt"), "x").unwrap();
+    std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
+    git_repo_with_commit(&repo);
+    let gate = serde_json::json!({"name": "gate", "cwd": "pkg",
+        "run": ["sh", "-c", "touch escaped; exit 0"]});
+    let base = commit_guide(&repo, &[gate]);
+    std::fs::remove_dir_all(repo.join("pkg")).unwrap();
+    std::os::unix::fs::symlink(&outside, repo.join("pkg")).unwrap();
+    let ctx = FloorContext {
+        stage: FloorStage::Verify,
+        base_head: Some(base),
+        git_dir: Some(repo.join(".git")),
+        ..FloorContext::default()
+    };
+    let report = run_floor(&repo, &ctx);
+    if report.sandbox_error.is_some() {
+        return;
+    }
+    let c = report
+        .checks
+        .iter()
+        .find(|c| c.name == "gate")
+        .unwrap_or_else(|| panic!("the gate ran: {report:#?}"));
+    assert!(!report.passed, "{report:#?}");
+    assert!(
+        c.spawn_error
+            .as_deref()
+            .is_some_and(|e| e.contains("not a plain directory")),
+        "{c:?}"
+    );
+    assert!(!outside.join("escaped").exists());
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// (final review, codex P2) A `derivedFrom` file the base RENAMED since the probe makes the guide
+/// stale (renames read as the old path gone).
+#[cfg(unix)]
+#[test]
+fn a_derived_from_file_renamed_on_the_base_makes_the_guide_stale() {
+    let _load = seam::pin(0.5, 4);
+    let (repo, _, argv) = red_base("derived-rename");
+    std::fs::create_dir_all(repo.join("cfg")).unwrap();
+    std::fs::write(repo.join("cfg/a.toml"), "setting = 1\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "a runner config"]);
+    write_guide(
+        &repo,
+        &[libtest_check(&argv)],
+        &git(&repo, &["rev-parse", "HEAD"]),
+    );
+    let path = repo.join(crate::floor_guide::GUIDE_PATH);
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        raw.replace("\"derivedFrom\": []", "\"derivedFrom\": [\"cfg/a.toml\"]"),
+    )
+    .unwrap();
+    git(
+        &repo,
+        &["commit", "-qam", "the guide, derived from cfg/a.toml"],
+    );
+    git(&repo, &["mv", "cfg/a.toml", "cfg/b.toml"]);
+    git(&repo, &["commit", "-qm", "the config renamed"]);
+    let ctx = FloorContext {
+        base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+        stage: FloorStage::Verify,
+        git_dir: Some(repo.join(".git")),
+        ..FloorContext::default()
+    };
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.out", "test old ... FAILED\n"),
+            ("run.exit", "101"),
+            ("excluded.exit", "0"),
+            ("toc.txt", &toc_of(&["old", "new", "fine"])),
+        ],
+    );
+    let Some((_, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    let g = c.decision.as_ref().and_then(|d| d.guide.clone()).unwrap();
+    assert!(
+        !g.usable
+            && g.reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("stale: `cfg/a.toml`")),
+        "{g:?}"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (final review, G4) A changed path that is not UTF-8 cannot be matched against `invalidatedBy`:
+/// the change's files cannot be listed and the guide is unusable. (Where the file system refuses
+/// such a name — APFS — there is nothing to test.)
+#[cfg(unix)]
+#[test]
+fn a_changed_path_that_is_not_utf8_makes_the_guide_unusable() {
+    use std::os::unix::ffi::OsStrExt;
+    let _load = seam::pin(0.5, 4);
+    let (repo, ctx, argv) = red_base("non-utf8");
+    let name = std::ffi::OsStr::from_bytes(b"bad-\xff.txt");
+    if std::fs::write(repo.join(name), "x").is_err() {
+        eprintln!("repo_checks: this file system refuses non-UTF-8 names — nothing to test");
+        return;
+    }
+    assert!(changed_files(&repo, &ctx).is_err());
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.out", "test old ... FAILED\n"),
+            ("run.exit", "101"),
+            ("excluded.exit", "0"),
+            ("toc.txt", &toc_of(&["old", "new", "fine"])),
+        ],
+    );
+    let Some((_, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    let g = c.decision.as_ref().and_then(|d| d.guide.clone()).unwrap();
+    assert!(
+        !g.usable && g.reason.as_deref().is_some_and(|r| r.contains("not UTF-8")),
+        "{g:?}"
     );
     let _ = std::fs::remove_dir_all(&repo);
 }

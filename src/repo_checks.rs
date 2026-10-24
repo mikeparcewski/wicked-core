@@ -3321,6 +3321,8 @@ pub(crate) fn run_with_sandbox_ctx(
         .map(|e| format!("the checks' scratch could not be made safe: {e}"));
     // (DES-BUILD-GUIDE) The BASE tree's build guide — a head edit to it never applies to its own
     // run — and the files the change touched (for `invalidatedBy` and `affected`).
+    // Read once per floor run: every check of it decides under the same switch.
+    let exclude = exclusion_enabled();
     let (guide, touched, changed) = match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
         (Some(base), Some(git_dir)) => (
             crate::floor_guide::load_base(worktree, git_dir, base),
@@ -3399,11 +3401,7 @@ pub(crate) fn run_with_sandbox_ctx(
         } else {
             let compare = check.name != "install" && !is_formatter_check(&check.name);
             // With exclusion off the base runs plainly: no results, no list, no alone runs.
-            let excluding = gcheck
-                .as_ref()
-                .ok()
-                .copied()
-                .filter(|_| exclusion_enabled());
+            let excluding = gcheck.as_ref().ok().copied().filter(|_| exclude);
             let side = match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
                 _ if !compare => None,
                 (Some(head), _) if !(baseline_diff && baseline_diff_for(&check.dir)) => {
@@ -3456,7 +3454,9 @@ pub(crate) fn run_with_sandbox_ctx(
                     ..run.decision.take().expect("set above")
                 });
             } else {
-                decide(worktree, check, &mut run, side, &gcheck, &sandbox, &scratch);
+                decide(
+                    worktree, check, &mut run, side, &gcheck, exclude, &sandbox, &scratch,
+                );
             }
         }
         if let Some(d) = run.decision.as_mut() {
@@ -4703,16 +4703,18 @@ pub(crate) fn results_of(
 /// one-test run, nor a deselected head run, is executed. A usable guide still names the checks.
 pub const FLOOR_EXCLUDE_ENV: &str = "WICKED_FLOOR_EXCLUDE";
 
-/// Is exclusion on ([`FLOOR_EXCLUDE_ENV`])?
+/// Is exclusion on ([`FLOOR_EXCLUDE_ENV`])? Read once per floor run.
 pub(crate) fn exclusion_enabled() -> bool {
     #[cfg(test)]
     if let Some(on) = test_seam::exclusion() {
         return on;
     }
-    matches!(
-        std::env::var(FLOOR_EXCLUDE_ENV).as_deref().map(str::trim),
-        Ok("on") | Ok("1")
-    )
+    exclusion_from(std::env::var(FLOOR_EXCLUDE_ENV).ok().as_deref())
+}
+
+/// The switch's value: exactly `on` or `1` (never trimmed, never case-folded) enables it.
+fn exclusion_from(value: Option<&str>) -> bool {
+    matches!(value, Some("on") | Some("1"))
 }
 
 /// (DES-BUILD-GUIDE) `rel` under `root`, refused unless it is relative with no `..`, and no
@@ -4981,12 +4983,14 @@ struct BaseSide {
 /// (DES-FLOOR-V2 §3) Decide a FAILED head check `head` (its first, unchanged run) against its base
 /// side: the head's exit codes decide, the base's TOC-validated failures are the only ones that
 /// may be excluded, and head text is never read to decide.
+#[allow(clippy::too_many_arguments)]
 fn decide(
     worktree: &Path,
     check: &RepoCheck,
     head: &mut CheckRun,
     side: Option<BaseSide>,
     guide: &Result<&GuideCheck, String>,
+    exclude: bool,
     sandbox: &WorkerSandbox,
     scratch: &CheckScratch,
 ) {
@@ -5011,7 +5015,7 @@ fn decide(
     let mut plan: Result<Vec<TestId>, String> = Err("the base passes this check".to_string());
     if let (Some(_), Some(side)) = (red_base, side.as_ref()) {
         plan = (|| {
-            if !exclusion_enabled() {
+            if !exclude {
                 return Err(format!("exclusion disabled ({FLOOR_EXCLUDE_ENV})"));
             }
             let g = guide
@@ -5682,6 +5686,15 @@ pub(crate) fn run_one_with(
         result.spawn_error = Some("empty argv".into());
         return result;
     };
+    // The check's directory must be a real directory of THIS tree, every component (a head that
+    // turned it into a link could send the check out of the tree): otherwise it does not run.
+    if !check.dir.is_empty() && !plain_dir(worktree, &check.dir) {
+        result.spawn_error = Some(format!(
+            "`{}` is not a plain directory of the tree (a link, or missing)",
+            check.dir
+        ));
+        return result;
+    }
     // Resolve on PATH the way `Command::new` will, so "not installed" is a legible spawn error
     // rather than a bare OS code.
     let Some(exe) = crate::validator::find_on_path(bin) else {

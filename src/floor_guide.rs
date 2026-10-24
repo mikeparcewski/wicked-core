@@ -246,11 +246,10 @@ pub(crate) fn load_base(
         .map_err(|e| format!("the base's `{GUIDE_PATH}` {e}"))
 }
 
-/// A relative directory inside the repo: `.`/empty, or segments none of which is empty, `.` or
+/// A relative directory inside the repo: `.`, or segments none of which is empty, `.` or
 /// `..`, with no `\\` and no `:` (no Windows drive, `C:x` included).
 fn cwd_ok(cwd: &str) -> bool {
-    cwd.is_empty()
-        || cwd == "."
+    cwd == "."
         || !(Path::new(cwd).is_absolute()
             || cwd.starts_with('/')
             || cwd.contains('\\')
@@ -426,7 +425,7 @@ impl GuideCheck {
             match v.results.get(p).map(String::as_str) {
                 Some(r) if passed(r) => {}
                 Some(r) => return Err(format!("probe `{p}`: {r}")),
-                None => return Err(format!("probe `{p}` never ran")),
+                None => return Err(format!("the verified block is missing probe `{p}`")),
             }
         }
         let env: [(&str, &Path); 1] = [("GIT_DIR", git_dir)];
@@ -451,7 +450,14 @@ impl GuideCheck {
         if !guide.derived_from.is_empty() {
             let since = git_paths(
                 worktree,
-                &["diff", "--name-only", "-z", v.base_sha.as_str(), base],
+                &[
+                    "diff",
+                    "--name-only",
+                    "-z",
+                    "--no-renames",
+                    v.base_sha.as_str(),
+                    base,
+                ],
                 &env,
             )
             .map_err(|e| format!("staleness could not be read: {e}"))?;
@@ -614,7 +620,7 @@ impl Compiled {
         let mut open: Vec<(Vec<Vec<TestId>>, bool)> = vec![(Vec::new(), false); self.blocks.len()];
         // (`last-before-end`) The ONE block each qualifier ends with: an earlier footer-shaped
         // block (a test's captured output can print one) is replaced, never accumulated.
-        let mut last: Vec<(String, Vec<TestId>)> = Vec::new();
+        let mut last: Vec<((usize, String), Vec<TestId>)> = Vec::new();
         for l in text.lines().map(|l| l.trim_end_matches('\r')) {
             if let Some(s) = self.section.as_ref().and_then(|r| r.captures(l)) {
                 q = s
@@ -635,15 +641,18 @@ impl Compiled {
                     });
                 }
             }
-            for ((start, item, end, all), (blocks, is_open)) in self.blocks.iter().zip(&mut open) {
+            for (rule, ((start, item, end, all), (blocks, is_open))) in
+                self.blocks.iter().zip(&mut open).enumerate()
+            {
                 if end.is_match(l) {
                     let take: Vec<Vec<TestId>> = std::mem::take(blocks);
                     if *all {
                         out.extend(take.into_iter().flatten());
                     } else if let Some(b) = take.into_iter().rev().find(|b| !b.is_empty()) {
-                        match last.iter_mut().find(|(k, _)| *k == q) {
+                        let key = (rule, q.clone());
+                        match last.iter_mut().find(|(k, _)| *k == key) {
                             Some((_, kept)) => *kept = b,
-                            None => last.push((q.clone(), b)),
+                            None => last.push((key, b)),
                         }
                     }
                     *is_open = false;
@@ -870,6 +879,7 @@ mod tests {
             ("cwd", serde_json::json!("a//b")),
             ("cwd", serde_json::json!("a/./b")),
             ("cwd", serde_json::json!("C:x")),
+            ("cwd", serde_json::json!("")),
             (
                 "deselect",
                 serde_json::json!({"append": ["--not={id}", "--all={ids:re|}", "--raw={id}"]}),
@@ -896,10 +906,19 @@ mod tests {
     #[test]
     fn the_committed_seed_guide_parses() {
         let g = parse(include_str!("../.wicked/build-guide.json")).expect("the seed guide parses");
-        assert!(g
+        let t = g
             .checks
             .iter()
-            .any(|c| c.name == "test" && c.list.is_some()));
+            .find(|c| c.name == "test" && c.list.is_some())
+            .expect("a test check");
+        // Accepted: the seed's verified block predates its `version` piece until it is re-probed
+        // on main, so the floor reads the check as unusable ("missing probe `version`"), never as
+        // a guide that does not parse.
+        assert!(t.version.is_some());
+        assert!(!t
+            .verified
+            .as_ref()
+            .is_some_and(|v| v.results.contains_key("version")));
     }
 
     /// A new section drops an uncommitted block; an empty block never hides the one before it;
