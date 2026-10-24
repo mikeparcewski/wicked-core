@@ -72,7 +72,8 @@ Two release tracks share this file, newest entry first regardless of track:
   cache record restarts a blob's age, and eviction re-stats first), with a lazy line TOC and ranges read by
   ref and verified against the hash (`floor_log`). The seed guide for wicked-core itself is committed: its
   gate checks (fmt, typecheck, clippy, and core-ts's fmt, clippy, test, `finalize-dts` and `tsc`, as CI gates
-  them) run on exit codes; **its `test` check is UNVERIFIED until it is re-probed on main after this merges**
+  them) run on exit codes — the core-ts ones at the verify stage only (`stage: ["verify"]`), so the creator
+  floor stays fast and the verify floor runs everything before delivery; **its `test` check is UNVERIFIED until it is re-probed on main after this merges**
   (its `version` piece and the tightened probes postdate its last probe), so until then a red base on it
   escalates instead of excluding. The ubuntu CI job installs pytest and vitest so the pytest and vitest probe
   fixtures run there. Kept: the PTY grant (core#1060's Seatbelt rules), the load-aware bound, the base cache (now

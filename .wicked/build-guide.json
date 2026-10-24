@@ -168,6 +168,9 @@
         "cargo",
         "fmt",
         "--check"
+      ],
+      "stage": [
+        "verify"
       ]
     },
     {
@@ -180,6 +183,9 @@
         "--",
         "-D",
         "warnings"
+      ],
+      "stage": [
+        "verify"
       ]
     },
     {
@@ -188,6 +194,9 @@
       "run": [
         "cargo",
         "test"
+      ],
+      "stage": [
+        "verify"
       ]
     },
     {
@@ -197,6 +206,9 @@
         "sh",
         "-c",
         "node --check scripts/finalize-dts.mjs && node scripts/finalize-dts.mjs && git diff --exit-code -- index.d.ts"
+      ],
+      "stage": [
+        "verify"
       ]
     },
     {
@@ -206,6 +218,9 @@
         "sh",
         "-c",
         "npm ci --ignore-scripts --no-audit --no-fund && npm run typecheck"
+      ],
+      "stage": [
+        "verify"
       ]
     }
   ]
