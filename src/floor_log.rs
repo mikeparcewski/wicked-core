@@ -93,13 +93,14 @@ fn store_lock(root: &Path) -> Option<std::fs::File> {
     Some(f)
 }
 
-/// (codex r12) A receipt about to be reused (a cached base record): its age restarts, under the
-/// store lock, and its blob must still be there, whole ([`read_blob`]). `Err` — the record is no
-/// longer evidence.
+/// (codex r12) A receipt about to be reused (a cached base record): its blob must still be there,
+/// whole ([`read_blob`] — which also validates the ref's sha, so a malformed one never names a
+/// path), and only THEN its age restarts, under the store lock. `Err` — the record is no longer
+/// evidence.
 pub(crate) fn refresh(dir: &Path, r: &LogRef) -> Result<(), String> {
     let _lock = dir.parent().and_then(store_lock);
-    touch(&dir.join(&r.sha256)).map_err(|e| format!("log {}: {e}", r.sha256))?;
     read_blob(dir, r)?;
+    touch(&dir.join(&r.sha256)).map_err(|e| format!("log {}: {e}", r.sha256))?;
     Ok(())
 }
 
@@ -451,6 +452,32 @@ mod tests {
     }
 
     const H: Duration = Duration::from_secs(3600);
+
+    /// (sweep review on #1066) [`refresh`] validates the receipt BEFORE it restarts any age: a
+    /// ref whose sha is not one (here a path out of the store) touches nothing.
+    #[test]
+    fn refresh_validates_the_receipt_before_touching_anything() {
+        let root = store("refresh-order");
+        let now = std::time::SystemTime::now();
+        let victim = root.join("victim");
+        aged(&victim, now, 10 * H, 4);
+        let dir = root.join("r-0123456789ab");
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = LogRef {
+            attempt: "base".into(),
+            stream: "stdout".into(),
+            sha256: "../victim".into(),
+            bytes: 4,
+            truncated: false,
+        };
+        assert!(refresh(&dir, &r).is_err());
+        let mtime = std::fs::metadata(&victim).unwrap().modified().unwrap();
+        assert!(
+            mtime <= now - 9 * H,
+            "a malformed ref restarted the age of a file outside the store"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// (round 11) Age GC: a blob past [`FLOOR_LOG_TTL`] goes, a recent one stays; a `.part-*`
     /// younger than a day survives (a capture may be writing it), an older one goes.

@@ -5,7 +5,9 @@
     "Cargo.lock",
     ".wicked/checks.json",
     ".github/workflows/ci.yml",
-    "crates/*/Cargo.toml"
+    "crates/*/Cargo.toml",
+    "crates/wicked-core-ts/package.json",
+    "crates/wicked-core-ts/package-lock.json"
   ],
   "checks": [
     {

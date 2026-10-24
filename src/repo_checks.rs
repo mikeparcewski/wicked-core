@@ -2444,38 +2444,38 @@ impl CheckScratch {
             }
             lease = take_orphan_free_lease(&root)?;
         }
-        match std::fs::symlink_metadata(&root) {
-            Ok(m) if m.file_type().is_symlink() || !m.is_dir() => {
-                return Err(std::io::Error::new(
+        // The leaf and every scratch directory under it are made through the leaf HELD
+        // (`O_DIRECTORY|O_NOFOLLOW`, then component by component, [`HeldDir`]), never by path:
+        // an earlier floor's repo-controlled check could write the leaf, and a link it left (or a
+        // process it left running swaps in) at the leaf or any directory below must never have
+        // the engine create directories through it (adversarial review on #414, LOW; sweep review
+        // on #1066).
+        // The leaf itself (missing on a run's first floor): its parent is the engine's cache
+        // group, outside every write root; a link already at the leaf's path is refused by the
+        // hold below, never followed.
+        if std::fs::symlink_metadata(&root).is_err() {
+            std::fs::create_dir_all(&root)?;
+        }
+        let held = HeldDir::open(&root).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "`{}` is not a real directory — the checks' scratch is never written \
+                     through a link (refused, never followed): {e}",
+                    root.display()
+                ),
+            )
+        })?;
+        for sub in SCRATCH_LEAVES {
+            held.subdir(sub, true).map_err(|e| {
+                std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "`{}` is not a real directory — the checks' scratch is never written \
-                         through a link (refused, never followed)",
-                        root.display()
+                        "the checks' scratch leaves must be real directories (refused, never \
+                         followed): {e}"
                     ),
-                ))
-            }
-            _ => {}
-        }
-        // The leaves too (adversarial review on #414, LOW): `create_dir_all` would follow a
-        // symlink-to-directory at a leaf — one an earlier floor's repo-controlled check, which can
-        // write the leaf, left behind. Refuse a link at any leaf before creating.
-        for sub in SCRATCH_LEAVES {
-            if let Ok(m) = std::fs::symlink_metadata(root.join(sub)) {
-                if m.file_type().is_symlink() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "`{}` is a symlink — the checks' scratch leaves must be real \
-                             directories (refused, never followed)",
-                            root.join(sub).display()
-                        ),
-                    ));
-                }
-            }
-        }
-        for sub in SCRATCH_LEAVES {
-            std::fs::create_dir_all(root.join(sub))?;
+                )
+            })?;
         }
         // The checks' `TMPDIR` lives OUTSIDE the worktree, short (core#489) — drawn last, so a
         // refusal above leaves nothing behind under the system temp dir.
@@ -3345,7 +3345,13 @@ pub(crate) fn run_with_sandbox_ctx(
     // (core#1050) A base export that cannot be cleared (a linked or non-directory `tmp`, a link
     // at the export path) REFUSES the floor, fail-closed: no check runs, and none may pass beside
     // a scratch the floor could not make safe.
-    let mut scratch_error = remove_base_export(worktree, &scratch)
+    // Held before the first check runs: every later engine read, write or removal in the worktree
+    // goes through it, never by a path a check could have re-pointed ([`HeldDir`]).
+    let held_worktree = HeldDir::open(worktree);
+    let mut scratch_error = held_worktree
+        .as_ref()
+        .map_err(String::clone)
+        .and_then(remove_base_export)
         .err()
         .map(|e| format!("the checks' scratch could not be made safe: {e}"));
     // (DES-BUILD-GUIDE) The BASE tree's build guide — a head edit to it never applies to its own
@@ -3366,15 +3372,31 @@ pub(crate) fn run_with_sandbox_ctx(
             _ => (Ok(None), Vec::new(), Ok(Vec::new()), Ok(Vec::new())),
         };
     let candidates = engine_generated_candidates(worktree, &detected);
-    // Held before the first check runs: the engine-written files are removed through it, never
-    // by a path a check could have re-pointed ([`HeldDir`]).
-    let held_worktree = HeldDir::open(worktree);
+    let held_head = held_worktree.as_ref().ok();
     let env = scratch.env_record(&sandbox_level);
     // (core#817) Per package: a subdirectory package's own `baseline_diff: false` holds for it.
     // The root's opt-out covers the whole repo; a package's own opt-out covers the package.
+    // Every package's config is read HERE, before the first check runs: no `.wicked/checks.json`
+    // is read from the tree after a command could have rewritten (or re-pointed) it.
     let baseline_diff = baseline_diff_enabled(worktree);
+    let package_baseline: std::collections::HashMap<&str, bool> = detected
+        .iter()
+        .filter(|c| !c.dir.is_empty())
+        .map(|c| {
+            (
+                c.dir.as_str(),
+                baseline_diff_enabled(&worktree.join(&c.dir)),
+            )
+        })
+        .collect();
     let baseline_diff_for =
-        |dir: &str| dir.is_empty() || baseline_diff_enabled(&worktree.join(dir));
+        |dir: &str| dir.is_empty() || package_baseline.get(dir).copied().unwrap_or(false);
+    // The coverage notes' reads of the tree (the change's files, the packages' manifests) happen
+    // here too, before any check runs.
+    let package_note = package_coverage_note(worktree, ctx, &detected);
+    let e2e_paths = (ctx.stage == FloorStage::Verify)
+        .then(|| e2e_paths(worktree, ctx))
+        .flatten();
     let mut checks = Vec::new();
     let mut skipped = Vec::new();
     let mut failed = false;
@@ -3387,8 +3409,9 @@ pub(crate) fn run_with_sandbox_ctx(
             Ok(Some(g)) => g.check_for(&check.argv, &check.dir),
             _ => None,
         };
-        let gcheck = guide_for(&guide, check, ctx, worktree, &changed)
-            .and_then(|g| runner_current(worktree, check, g, &sandbox, &scratch).map(|()| g));
+        let gcheck = guide_for(&guide, check, ctx, worktree, &changed).and_then(|g| {
+            runner_current(worktree, held_head, check, g, &sandbox, &scratch).map(|()| g)
+        });
         let status = GuideStatus {
             present: present.is_some(),
             usable: gcheck.is_ok(),
@@ -3411,14 +3434,14 @@ pub(crate) fn run_with_sandbox_ctx(
                     source: format!("`{}`'s affected set (DES-BUILD-GUIDE)", check.name),
                     ..check.clone()
                 };
-                let r = run_one(worktree, &a, &sandbox, &scratch, Tree::Head);
+                let r = run_held(worktree, held_head, &a, &sandbox, &scratch, Tree::Head);
                 if r.passed() {
                     r
                 } else {
-                    run_one(worktree, check, &sandbox, &scratch, Tree::Head)
+                    run_held(worktree, held_head, check, &sandbox, &scratch, Tree::Head)
                 }
             }
-            None => run_one(worktree, check, &sandbox, &scratch, Tree::Head),
+            None => run_held(worktree, held_head, check, &sandbox, &scratch, Tree::Head),
         };
         // (DES-FLOOR-V2) A check that passed, timed out or could not start decides alone. A
         // FAILURE is compared with the run base (the install and the formatter never are: they
@@ -3459,13 +3482,10 @@ pub(crate) fn run_with_sandbox_ctx(
                     Some(match BaseTree::cached(&scratch, head, check, excluding) {
                         Some(cached) => cached,
                         None => {
-                            let export =
-                                held_worktree
-                                    .as_ref()
-                                    .map_err(String::clone)
-                                    .and_then(|root| {
-                                        BaseTree::export(worktree, root, &scratch, git_dir, head)
-                                    });
+                            let export = held_worktree
+                                .as_ref()
+                                .map_err(String::clone)
+                                .and_then(|root| BaseTree::export(worktree, root, git_dir, head));
                             let side = match export {
                                 Ok(t) => t.run_check(check, ctx, &sandbox, &scratch, excluding),
                                 Err(e) => BaseSide {
@@ -3478,7 +3498,11 @@ pub(crate) fn run_with_sandbox_ctx(
                                     toc: None,
                                 },
                             };
-                            if let Err(e) = remove_base_export(worktree, &scratch) {
+                            let removed = held_worktree
+                                .as_ref()
+                                .map_err(String::clone)
+                                .and_then(remove_base_export);
+                            if let Err(e) = removed {
                                 scratch_error = Some(format!(
                                     "the base export could not be removed before the next \
                                      check: {e}"
@@ -3498,7 +3522,8 @@ pub(crate) fn run_with_sandbox_ctx(
                 });
             } else {
                 decide(
-                    worktree, check, &mut run, side, &gcheck, exclude, &sandbox, &scratch,
+                    worktree, held_head, check, &mut run, side, &gcheck, exclude, &sandbox,
+                    &scratch,
                 );
             }
         }
@@ -3530,10 +3555,8 @@ pub(crate) fn run_with_sandbox_ctx(
         }
     }
     let notes: Vec<String> = [
-        (ctx.stage == FloorStage::Verify)
-            .then(|| e2e_coverage_note(worktree, ctx, &detected, &checks, &waived))
-            .flatten(),
-        package_coverage_note(worktree, ctx, &detected),
+        e2e_paths.and_then(|paths| e2e_coverage_note(paths, &detected, &checks, &waived)),
+        package_note,
     ]
     .into_iter()
     .flatten()
@@ -3611,8 +3634,7 @@ fn is_e2e_path(path: &str) -> bool {
 /// waived, or skipped after an earlier failure. `None` when an end-to-end check ran, nothing e2e
 /// was touched, or the run knows no base.
 fn e2e_coverage_note(
-    worktree: &Path,
-    ctx: &FloorContext,
+    e2e: Vec<String>,
     detected: &[RepoCheck],
     checks: &[CheckRun],
     waived: &[String],
@@ -3625,11 +3647,6 @@ fn e2e_coverage_note(
     {
         return None;
     }
-    let mut paths = touched_files(worktree, ctx).ok()?;
-    paths.extend(removed_files(worktree, ctx).ok()?);
-    let mut e2e: Vec<String> = paths.into_iter().filter(|p| is_e2e_path(p)).collect();
-    e2e.sort();
-    e2e.dedup();
     if e2e.is_empty() {
         return None;
     }
@@ -3655,6 +3672,17 @@ fn e2e_coverage_note(
             String::new()
         }
     ))
+}
+
+/// The end-to-end files the change touched or removed ([`is_e2e_path`]), sorted; `None` when the
+/// change's files cannot be listed. Read before any check runs.
+fn e2e_paths(worktree: &Path, ctx: &FloorContext) -> Option<Vec<String>> {
+    let mut paths = touched_files(worktree, ctx).ok()?;
+    paths.extend(removed_files(worktree, ctx).ok()?);
+    let mut e2e: Vec<String> = paths.into_iter().filter(|p| is_e2e_path(p)).collect();
+    e2e.sort();
+    e2e.dedup();
+    Some(e2e)
 }
 
 /// Is `name` one of the floor's TEST-set checks (the ones a `targeted` re-run replaces)?
@@ -3756,8 +3784,8 @@ pub(crate) struct FloorCheckout {
     worktree: PathBuf,
     /// Every blob entry written: `(mode, blob id, path)` — what [`Self::hold_to`] re-checks.
     entries: Vec<(String, String, PathBuf)>,
-    /// Every symlink entry's target as written (unix).
-    links: Vec<(PathBuf, Vec<u8>)>,
+    /// `dir`, held before anything ran in it: [`Self::hold_to`] re-reads every entry through it.
+    held: Option<HeldDir>,
 }
 
 impl Drop for FloorCheckout {
@@ -3830,7 +3858,7 @@ pub(crate) fn checkout_guarded_tree(
         git_dir: git_dir.to_path_buf(),
         worktree: worktree.to_path_buf(),
         entries: Vec::new(),
-        links: Vec::new(),
+        held: None,
     };
     // `--no-checkout` (codex r1 on the slice): a checkout runs the repository's `post-checkout`
     // hook and its configured smudge filters OUTSIDE the floor's sandbox. The worktree is made
@@ -3860,8 +3888,9 @@ pub(crate) fn checkout_guarded_tree(
     // Held before anything runs in it; every blob is written through the held fd.
     let held = HeldDir::open(&dir)
         .map_err(|e| format!("the guarded tree {tree} could not be written for the floor: {e}"))?;
-    (checkout.entries, checkout.links) = write_tree_blobs(worktree, git_dir, tree, &dir, &held)
+    checkout.entries = write_tree_blobs(worktree, git_dir, tree, &dir, &held)
         .map_err(|e| format!("the guarded tree {tree} could not be written for the floor: {e}"))?;
+    checkout.held = Some(held);
     crate::worktree_guard::git(&dir, &["-c", &no_hooks, "read-tree", &commit], &[])
         .map_err(|e| format!("the floor checkout's index could not be set: {e}"))?;
     Ok(checkout)
@@ -3872,14 +3901,13 @@ pub(crate) fn checkout_guarded_tree(
 /// `export-ignore`). Regular files keep their executable bit; a symlink entry becomes a symlink
 /// (unix) or a plain file holding its target; a submodule becomes an empty directory. A path that
 /// is absolute or climbs out of `dir` is refused.
-#[allow(clippy::type_complexity)]
 fn write_tree_blobs(
     worktree: &Path,
     git_dir: &Path,
     tree: &str,
     dir: &Path,
     dest: &HeldDir,
-) -> Result<(Vec<(String, String, PathBuf)>, Vec<(PathBuf, Vec<u8>)>), String> {
+) -> Result<Vec<(String, String, PathBuf)>, String> {
     use std::io::{BufRead, Read, Write};
     let env: [(&str, &Path); 1] = [("GIT_DIR", git_dir)];
     let listing = crate::worktree_guard::git(worktree, &["ls-tree", "-r", "-z", tree], &env)
@@ -3938,9 +3966,6 @@ fn write_tree_blobs(
         }
     });
     let mut out = std::io::BufReader::new(child.stdout.take().ok_or("git cat-file has no stdout")?);
-    // (codex r3) A symlink entry's TARGET, as written — what `hold_to` compares it against.
-    #[cfg_attr(not(unix), allow(unused_mut))] // only a unix checkout writes symlinks
-    let mut links: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     for (mode, sha, path) in &blobs {
         let mut header = String::new();
         out.read_line(&mut header).map_err(|e| e.to_string())?;
@@ -3959,10 +3984,7 @@ fn write_tree_blobs(
         let rel = rel_of(path)?;
         match mode.as_str() {
             #[cfg(unix)]
-            "120000" => {
-                dest.symlink(&rel, &body)?;
-                links.push((path.clone(), body.clone()));
-            }
+            "120000" => dest.symlink(&rel, &body)?,
             _ => dest.write_bytes(&rel, &body, mode == "100755")?,
         }
     }
@@ -3971,13 +3993,10 @@ fn write_tree_blobs(
     for (_, _, path) in entries.iter().filter(|(m, _, _)| m == "160000") {
         dest.subdir(&rel_of(path)?, true)?;
     }
-    Ok((
-        entries
-            .into_iter()
-            .filter(|(m, _, _)| m != "160000")
-            .collect(),
-        links,
-    ))
+    Ok(entries
+        .into_iter()
+        .filter(|(m, _, _)| m != "160000")
+        .collect())
 }
 
 impl FloorCheckout {
@@ -4009,83 +4028,107 @@ impl FloorCheckout {
         });
     }
 
-    /// The tree entries whose content no longer matches the blob written: re-hashed with
-    /// `hash-object --no-filters` (no repository filter runs); a symlink entry must still be a
-    /// symlink. Untracked files a check created are not entries and are not judged — only what
-    /// ships is.
+    /// The tree entries whose content no longer matches the blob written, every entry read
+    /// THROUGH the held checkout ([`HeldDir`]: parents walked through no link, the entry itself
+    /// never followed) — a check that swapped a directory of the tree for a link to an outside
+    /// copy has every entry under it read as changed, never the copy compared. A regular file
+    /// must still be one, with its executable bit, and hold exactly the blob's bytes (read from
+    /// `git cat-file --batch`, no filter runs); a symlink entry must still be a symlink to the
+    /// SAME target. Untracked files a check created are not entries and are not judged — only
+    /// what ships is.
     fn changed_entries(&self) -> Result<Vec<String>, String> {
+        use std::io::{BufRead, Read, Write};
+        let held = self
+            .held
+            .as_ref()
+            .ok_or("the floor checkout was never held")?;
         let rel = |p: &Path| p.strip_prefix(&self.dir).unwrap_or(p).display().to_string();
         let mut changed = Vec::new();
-        let mut files: Vec<&(String, String, PathBuf)> = Vec::new();
-        for e in &self.entries {
-            let (mode, _, path) = e;
-            match std::fs::symlink_metadata(path) {
-                Err(_) => changed.push(rel(path)),
-                Ok(m) if mode == "120000" => {
+        // spawn-audit: hardened — git plumbing reading the run's own object store.
+        let mut cat = Command::new("git");
+        cat.hardened()
+            .args(["cat-file", "--batch"])
+            .current_dir(&self.worktree)
+            .env("GIT_DIR", &self.git_dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut child = cat.spawn().map_err(|e| format!("git cat-file: {e}"))?;
+        let mut stdin = child.stdin.take().ok_or("git cat-file has no stdin")?;
+        let shas: Vec<String> = self.entries.iter().map(|(_, sha, _)| sha.clone()).collect();
+        let feeder = std::thread::spawn(move || {
+            for sha in shas {
+                if writeln!(stdin, "{sha}").is_err() {
+                    break;
+                }
+            }
+        });
+        let mut out =
+            std::io::BufReader::new(child.stdout.take().ok_or("git cat-file has no stdout")?);
+        let mut answer = || -> Result<(), String> {
+            for (mode, sha, path) in &self.entries {
+                let mut header = String::new();
+                out.read_line(&mut header).map_err(|e| e.to_string())?;
+                let size: usize = header
+                    .split_whitespace()
+                    .nth(2)
+                    .and_then(|n| n.parse().ok())
+                    .ok_or_else(|| format!("git cat-file answered {header:?} for {sha}"))?;
+                let mut body = vec![0u8; size];
+                out.read_exact(&mut body).map_err(|e| e.to_string())?;
+                let mut nl = [0u8; 1];
+                out.read_exact(&mut nl).map_err(|e| e.to_string())?;
+                let r = rel(path);
+                let same = if mode == "120000" {
                     // A symlink stays a symlink, to the SAME target (codex r3).
                     #[cfg(unix)]
-                    let same = m.file_type().is_symlink()
-                        && self.links.iter().any(|(p, want)| {
-                            use std::os::unix::ffi::OsStrExt;
-                            p == path
-                                && std::fs::read_link(path)
-                                    .is_ok_and(|t| t.as_os_str().as_bytes() == want.as_slice())
-                        });
+                    let same = held.kind(&r) == Ok(Some(EntryKind::Link))
+                        && held.read_link(&r).is_ok_and(|t| t == body);
                     #[cfg(not(unix))]
-                    let same = m.is_file();
-                    if !same {
-                        changed.push(rel(path));
-                    }
-                }
-                Ok(m) if !m.is_file() => changed.push(rel(path)),
-                Ok(m) => {
-                    // The executable bit is part of what ships (codex r3).
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let exec = m.permissions().mode() & 0o100 != 0; // git keys on the OWNER execute bit
-                        if exec != (mode == "100755") {
-                            changed.push(rel(path));
-                            continue;
-                        }
-                    }
-                    let _ = m;
-                    files.push(e);
+                    let same = held.kind(&r) == Ok(Some(EntryKind::File));
+                    same
+                } else {
+                    same_file(held, &r, mode == "100755", &body)
+                };
+                if !same {
+                    changed.push(r);
                 }
             }
-        }
-        // Paths as ARGUMENTS, in chunks (codex r3: a newline in a name splits `--stdin-paths`).
-        for chunk in files.chunks(256) {
-            let mut args: Vec<String> = vec![
-                "hash-object".to_string(),
-                "--no-filters".to_string(),
-                "--".to_string(),
-            ];
-            args.extend(
-                chunk
-                    .iter()
-                    .map(|(_, _, p)| p.to_string_lossy().into_owned()),
-            );
-            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let env: [(&str, &Path); 1] = [("GIT_DIR", self.git_dir.as_path())];
-            let text = crate::worktree_guard::git_string(&self.worktree, &refs, &env)
-                .map_err(|e| e.to_string())?;
-            let shas: Vec<&str> = text.lines().collect();
-            if shas.len() != chunk.len() {
-                return Err(format!(
-                    "git hash-object answered {} of {} paths",
-                    shas.len(),
-                    chunk.len()
-                ));
-            }
-            for ((_, sha, path), now) in chunk.iter().zip(shas) {
-                if sha != now {
-                    changed.push(rel(path));
-                }
-            }
-        }
+            Ok(())
+        };
+        let answered = answer();
+        drop(out);
+        let _ = feeder.join();
+        let _ = child.wait();
+        answered?;
         Ok(changed)
     }
+}
+
+/// Is the entry at `rel` of `held` a regular file (opened through no link) with the executable
+/// bit `exec` (unix; git keys on the OWNER execute bit, codex r3) holding exactly `body`?
+fn same_file(held: &HeldDir, rel: &str, exec: bool, body: &[u8]) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = held.open_read(rel) else {
+        return false;
+    };
+    let Ok(m) = f.metadata() else {
+        return false;
+    };
+    if !m.is_file() || m.len() != body.len() as u64 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if (m.permissions().mode() & 0o100 != 0) != exec {
+            return false;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = exec;
+    let mut now = Vec::with_capacity(body.len());
+    f.read_to_end(&mut now).is_ok() && now == body
 }
 
 /// The fail-closed report for a verify floor whose guarded checkout could not be made: nothing
@@ -4153,56 +4196,58 @@ pub const BASE_EXPORT_SUBDIR: &str = "wicked-floor-base";
 /// export an older engine left in it.
 const LEGACY_SCRATCH_SUBDIR: &str = "wicked-checks";
 
-/// `<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`]. The engine scratch root is repo-adjacent territory:
-/// a checkout or a seat could make `tmp` a SYMLINK out of the worktree, and the export (written by
-/// the engine, outside any sandbox) would follow it — so a `tmp` that is a link, or not a
-/// directory, is refused (adversarial review on #414), never followed.
-fn base_export_dir(worktree: &Path) -> Result<PathBuf, String> {
-    let tmp = worktree.join(crate::worktree_guard::ENGINE_SCRATCH_DIR);
-    match std::fs::symlink_metadata(&tmp) {
-        Ok(m) if m.file_type().is_symlink() || !m.is_dir() => Err(format!(
-            "`{}` is not a real directory — the base export is never written through a link",
-            tmp.display()
-        )),
-        Ok(_) => Ok(tmp.join(BASE_EXPORT_SUBDIR)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(tmp.join(BASE_EXPORT_SUBDIR)),
-        Err(e) => Err(format!("`{}` cannot be inspected: {e}", tmp.display())),
-    }
+/// `<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`] — the path the base's commands are spawned in. Only a
+/// path: the engine scratch root is repo-adjacent territory (a checkout or a seat could make `tmp`
+/// a SYMLINK out of the worktree, adversarial review on #414), so the export is created, written
+/// and removed only through the held worktree ([`HeldDir`]), which refuses the link, and every
+/// spawn there first checks the path still IS the held export ([`HeldDir::still_at`]).
+fn base_export_dir(worktree: &Path) -> PathBuf {
+    worktree
+        .join(crate::worktree_guard::ENGINE_SCRATCH_DIR)
+        .join(BASE_EXPORT_SUBDIR)
 }
 
 /// Remove the base export (`<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`]) if present (nothing writes
 /// the scratch index an older engine kept; the scratch is the checks' to write, never removed
-/// from by name after they ran). A symlink at the export path is refused, never followed. Called at the start of every
-/// floor, before an export and as soon as a base check's result is cached, so no HEAD check ever
-/// runs beside a copy of the base.
-pub(crate) fn remove_base_export(worktree: &Path, _scratch: &CheckScratch) -> Result<(), String> {
-    let dir = base_export_dir(worktree)?;
+/// from by name after they ran). Everything goes through `root` — the worktree, held before any
+/// check ran there ([`HeldDir`]): the export is removed entry by entry relative to its own
+/// directory fds ([`HeldDir::remove_tree`]), so a check (or a process it left running) that swaps
+/// `tmp` or the export for a link to an outside directory never has the engine delete through it.
+/// A linked or non-directory `tmp`, and a link at the export path, are refused (fail closed).
+/// Called at the start of every floor, before an export and as soon as a base check's result is
+/// cached, so no HEAD check ever runs beside a copy of the base.
+pub(crate) fn remove_base_export(root: &HeldDir) -> Result<(), String> {
+    let tmp = crate::worktree_guard::ENGINE_SCRATCH_DIR;
+    // Only "not found" is absence (codex on #1050): any other error inspecting a path (a `tmp`
+    // without search permission) is an export the floor could not clear, and refuses it.
+    match root.kind(tmp)? {
+        None => return Ok(()),
+        Some(EntryKind::Dir) => {}
+        Some(_) => {
+            return Err(format!(
+                "`{tmp}` is not a real directory — the base export is never written through a link"
+            ))
+        }
+    }
     // (codex on #1050) An engine from before the scratch moved left its export at
     // `tmp/wicked-checks/base` when it died mid-baseline; it removed that at every floor's start,
     // and so does this one — or a HEAD check globbing from the root runs over the old base. Only
     // that export: the rest of a legacy `tmp/wicked-checks` is not this floor's to judge. Never
-    // through a link (`tmp` was checked above; `wicked-checks` here; `base` is unlinked, not
-    // followed).
-    // Only "not found" is absence (codex on #1050): any other error inspecting a path (a `tmp`
-    // without search permission) is an export the floor could not clear, and refuses it.
-    let legacy = dir.with_file_name(LEGACY_SCRATCH_SUBDIR);
-    match std::fs::symlink_metadata(&legacy) {
-        Ok(m) if m.is_dir() => remove_leaf_dir(&legacy.join("base"))
-            .map_err(|e| format!("the legacy base export could not be removed: {e}"))?,
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("`{}` cannot be inspected: {e}", legacy.display())),
+    // through a link (a linked `wicked-checks` is left alone; `base` is unlinked, not followed).
+    let legacy = format!("{tmp}/{LEGACY_SCRATCH_SUBDIR}");
+    if root.kind(&legacy)? == Some(EntryKind::Dir) {
+        root.remove_tree(&format!("{legacy}/base"))
+            .map_err(|e| format!("the legacy base export could not be removed: {e}"))?;
     }
-    match std::fs::symlink_metadata(&dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("`{}` cannot be inspected: {e}", dir.display())),
-        Ok(m) if m.file_type().is_symlink() => Err(format!(
-            "`{}` is a symlink (the base export is never written through a link)",
-            dir.display()
+    let export = format!("{tmp}/{BASE_EXPORT_SUBDIR}");
+    match root.kind(&export)? {
+        None => Ok(()),
+        Some(EntryKind::Link) => Err(format!(
+            "`{export}` is a symlink (the base export is never written through a link)"
         )),
-        Ok(m) if m.is_dir() => std::fs::remove_dir_all(&dir)
-            .map_err(|e| format!("the base export could not be removed: {e}")),
-        Ok(_) => std::fs::remove_file(&dir)
+        Some(_) => root
+            .remove_tree(&export)
+            .map(drop)
             .map_err(|e| format!("the base export could not be removed: {e}")),
     }
 }
@@ -4276,13 +4321,12 @@ impl BaseTree {
     pub(crate) fn export(
         worktree: &Path,
         root: &HeldDir,
-        scratch: &CheckScratch,
         git_dir: &Path,
         head: &str,
     ) -> Result<Self, String> {
-        let dir = base_export_dir(worktree)?;
+        let dir = base_export_dir(worktree);
         // Always a fresh export: a stale one is removed, a link refused — never followed.
-        remove_base_export(worktree, scratch)?;
+        remove_base_export(root)?;
         let held = root
             .create_fresh_dir(&format!(
                 "{}/{BASE_EXPORT_SUBDIR}",
@@ -4343,6 +4387,12 @@ impl BaseTree {
             Ok(d) => d,
             Err(e) => return fail(format!("the base's checks could not be determined: {e}")),
         };
+        // Detection reads the export by path (each file `O_NOFOLLOW`, its identity checked,
+        // [`probe`]): what it read was the export only while the package's directory still IS the
+        // held one — a process the head left running that swapped it for a link fails the base.
+        if let Err(e) = self.held.still_at_rel(&self.dir, &check.dir) {
+            return fail(format!("the base's checks could not be determined: {e}"));
+        }
         // A guide's check is the base's by construction: the guide is read from the base.
         if check.name != "test_targeted"
             && check.source != GUIDE_SOURCE
@@ -4359,7 +4409,14 @@ impl BaseTree {
                 dir: check.dir.clone(),
                 ..install.clone()
             };
-            let r = run_one(&self.dir, &install, sandbox, scratch, Tree::Base);
+            let r = run_held(
+                &self.dir,
+                Some(&self.held),
+                &install,
+                sandbox,
+                scratch,
+                Tree::Base,
+            );
             if !r.passed() {
                 return fail(format!(
                     "the base's dependency install did not pass ({})",
@@ -4377,6 +4434,7 @@ impl BaseTree {
         let since = std::time::SystemTime::now();
         let mut run = run_one_with(
             &self.dir,
+            Some(&self.held),
             &RepoCheck {
                 argv: guide.map_or_else(|| target.argv.clone(), |g| g.for_results(&target.argv)),
                 ..target.clone()
@@ -4390,16 +4448,43 @@ impl BaseTree {
         if let Some(g) =
             guide.filter(|_| !run.passed() && !run.timed_out && run.spawn_error.is_none())
         {
+            // (DES-BUILD-GUIDE) A base that exited outside the guide's `failedExit` did not run to
+            // a test verdict (a crash, a build failure): nothing of it is inventoried, and nothing
+            // of it may be excluded.
+            let verdict = run
+                .exit_code
+                .is_some_and(|c| c != 0 && g.failed_exit.contains(&c));
             // The results first: the list must not overwrite them.
-            let results = results_of(&self.dir, &target, g, &mut run, scratch, since);
-            let mut t = inventory(&self.dir, &target, g, &[], sandbox, scratch, Tree::Base);
-            if t.incomplete.is_none() {
-                match results {
-                    Ok((_, failed)) => {
-                        t.failing = failed.into_iter().filter(|x| t.count(x) > 0).collect()
-                    }
-                    Err(e) => t.incomplete = Some(format!("the base's results: {e}")),
+            let results =
+                verdict.then(|| results_of(&self.held, &target, g, &mut run, scratch, since));
+            let mut t = match results {
+                Some(_) => inventory(
+                    &self.dir,
+                    Some(&self.held),
+                    &target,
+                    g,
+                    &[],
+                    sandbox,
+                    scratch,
+                    Tree::Base,
+                ),
+                None => Toc {
+                    incomplete: Some(format!(
+                        "the base exited {} — not one of the guide's `failedExit` codes {:?}: it \
+                         did not run to a test verdict",
+                        run.exit_code
+                            .map_or_else(|| "without a code".to_string(), |c| c.to_string()),
+                        g.failed_exit
+                    )),
+                    ..Toc::default()
+                },
+            };
+            match results.filter(|_| t.incomplete.is_none()) {
+                Some(Ok((_, failed))) => {
+                    t.failing = failed.into_iter().filter(|x| t.count(x) > 0).collect()
                 }
+                Some(Err(e)) => t.incomplete = Some(format!("the base's results: {e}")),
+                None => {}
             }
             let candidates: Vec<TestId> = t
                 .failing
@@ -4416,6 +4501,7 @@ impl BaseTree {
                     };
                     let r = run_one_with(
                         &self.dir,
+                        Some(&self.held),
                         &one,
                         &ExecOpts::default(),
                         sandbox,
@@ -4629,8 +4715,10 @@ fn merged(merge: bool) -> ExecOpts {
 
 /// Run the guide's `list` for `check` on one tree (with `ids` deselected, when given) and read
 /// its ids.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn inventory(
     dir: &Path,
+    held: Option<&HeldDir>,
     check: &RepoCheck,
     g: &GuideCheck,
     ids: &[TestId],
@@ -4657,7 +4745,15 @@ pub(crate) fn inventory(
         source: format!("the list of `{}` (DES-BUILD-GUIDE)", check.name),
         ..check.clone()
     };
-    let r = run_one_with(dir, &probe, &merged(list.merge), sandbox, scratch, tree);
+    let r = run_one_with(
+        dir,
+        held,
+        &probe,
+        &merged(list.merge),
+        sandbox,
+        scratch,
+        tree,
+    );
     let attempt = match (tree, ids.is_empty()) {
         (Tree::Base, _) => "toc-base",
         (Tree::Head, true) => "toc-head",
@@ -4697,7 +4793,7 @@ pub(crate) fn inventory(
 /// regular file inside the tree, written since `since` (the run's start), within the log cap; it
 /// is stored in the log store beside the run's streams. Anything else is no results.
 pub(crate) fn results_of(
-    dir: &Path,
+    held: &HeldDir,
     check: &RepoCheck,
     g: &GuideCheck,
     run: &mut CheckRun,
@@ -4708,7 +4804,7 @@ pub(crate) fn results_of(
     let r = match &g.results.how.path {
         Some(path) => {
             let f = open_results(
-                dir,
+                held,
                 &Path::new(&check.dir).join(path).to_string_lossy(),
                 since,
             )
@@ -4767,6 +4863,8 @@ fn exclusion_from(value: Option<&str>) -> bool {
 
 /// (DES-BUILD-GUIDE) `rel` under `root`, refused unless it is relative with no `..`, and no
 /// component of it that exists is a symlink: a path a guide names never leaves the tree.
+// Without directory fds (Windows) the held directory stands on it.
+#[cfg_attr(unix, allow(dead_code))]
 pub(crate) fn confined(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let mut out = root.to_path_buf();
     for c in Path::new(rel).components() {
@@ -4783,6 +4881,8 @@ pub(crate) fn confined(root: &Path, rel: &str) -> Result<PathBuf, String> {
 }
 
 /// Open options that never follow a final symlink, nor block on a FIFO (unix).
+// Without directory fds (Windows) the held directory stands on it.
+#[cfg_attr(unix, allow(dead_code))]
 fn no_follow(o: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
     #[cfg(unix)]
     {
@@ -4803,15 +4903,21 @@ pub(crate) fn clear_results(held: &HeldDir, check: &RepoCheck, g: &GuideCheck) {
     }
 }
 
-/// The results file `rel` under `root`: [`confined`], a regular file within the log cap,
-/// modified since `since` (less [`FS_CLOCK_SLACK`]; the run cleared it first, [`clear_results`]).
+/// The results file `rel` in the held tree `held` ([`HeldDir::open_read`]: its parents walked
+/// through no link, the file opened `O_NOFOLLOW | O_NONBLOCK`), and — on the OPENED file, never
+/// the path — a regular file within the log cap, modified since `since` (less
+/// [`FS_CLOCK_SLACK`]; the run cleared it first, [`clear_results`]). A command that renames the
+/// tree away and leaves a link, plants a FIFO, or swaps the file after a check, gets nothing read
+/// from outside the tree.
 fn open_results(
-    root: &Path,
+    held: &HeldDir,
     rel: &str,
     since: std::time::SystemTime,
 ) -> Result<std::fs::File, String> {
-    let path = confined(root, rel)?;
-    let m = std::fs::symlink_metadata(&path).map_err(|e| format!("no results file ({e})"))?;
+    let f = held
+        .open_read(rel)
+        .map_err(|e| format!("no results file ({e})"))?;
+    let m = f.metadata().map_err(|e| format!("no results file ({e})"))?;
     if !m.is_file() {
         return Err("not a regular file".into());
     }
@@ -4821,9 +4927,7 @@ fn open_results(
     if m.modified().map_or(true, |t| t + FS_CLOCK_SLACK < since) {
         return Err("not written by this run".into());
     }
-    no_follow(std::fs::OpenOptions::new().read(true))
-        .open(&path)
-        .map_err(|e| e.to_string())
+    Ok(f)
 }
 
 /// A tree the parent process writes into AFTER repository code may have run there, or while a
@@ -5056,6 +5160,261 @@ impl HeldDir {
         }
         Ok(true)
     }
+
+    /// What is at `rel` (its parents walked through no link), never following a link there;
+    /// `None` when nothing is.
+    pub(crate) fn kind(&self, rel: &str) -> Result<Option<EntryKind>, String> {
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let dir = self
+            .walk(parents, rel, false)
+            .map_err(|e| format!("cannot be inspected: {e}"))?;
+        let c = cstr(leaf.as_bytes())?;
+        match stat_at(&dir, &c) {
+            Ok(st) => Ok(Some(entry_kind(st.st_mode))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("`{rel}` cannot be inspected: {e}")),
+        }
+    }
+
+    /// Remove whatever is at `rel`, a directory recursively, every entry relative to its own
+    /// directory's fd: a directory below is opened `O_NOFOLLOW` and emptied, a link (or anything
+    /// else) is unlinked — never followed, so a command that swaps a directory of the tree for a
+    /// link to an outside one has the LINK removed, never the outside directory. `true` when
+    /// something was there.
+    pub(crate) fn remove_tree(&self, rel: &str) -> Result<bool, String> {
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let dir = self.walk(parents, rel, false)?;
+        let c = cstr(leaf.as_bytes())?;
+        match stat_at(&dir, &c) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(format!("`{rel}` cannot be inspected: {e}")),
+            Ok(_) => {}
+        }
+        remove_entry(&dir, &c, 0).map_err(|e| format!("`{rel}`: {e}"))?;
+        Ok(true)
+    }
+
+    /// The regular file at `rel` opened for reading (its parents walked through no link; the file
+    /// itself `O_NOFOLLOW | O_NONBLOCK`): what the caller then checks is the OPENED file, never a
+    /// path a command could re-point after the check.
+    pub(crate) fn open_read(&self, rel: &str) -> Result<std::fs::File, String> {
+        use std::os::fd::AsRawFd;
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let dir = self.walk(parents, rel, false)?;
+        let c = cstr(leaf.as_bytes())?;
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        // SAFETY: `dir` is an open directory fd; `c` is NUL-terminated.
+        owned_fd(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) })
+            .map(std::fs::File::from)
+            .map_err(|e| held_refusal(&dir, &c, rel, e))
+    }
+
+    /// The target of the symbolic link at `rel` (its parents walked through no link), as stored.
+    pub(crate) fn read_link(&self, rel: &str) -> Result<Vec<u8>, String> {
+        use std::os::fd::AsRawFd;
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let dir = self.walk(parents, rel, false)?;
+        let c = cstr(leaf.as_bytes())?;
+        let mut buf = vec![0u8; 4096];
+        // SAFETY: `dir` is an open directory fd; `c` is NUL-terminated; `buf` is writable for
+        // its length.
+        let n = unsafe {
+            libc::readlinkat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        if n < 0 {
+            return Err(format!("`{rel}`: {}", std::io::Error::last_os_error()));
+        }
+        buf.truncate(n as usize);
+        Ok(buf)
+    }
+
+    /// Is `path` still the held directory — a real directory (not a link) with the held fd's
+    /// device and inode? Checked before a command is spawned in the tree by path: a command that
+    /// replaced the tree's root with a link to an outside directory gets no later command started
+    /// there.
+    pub(crate) fn still_at(&self, path: &Path) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(path)
+            .map_err(|e| format!("`{}` cannot be inspected: {e}", path.display()))?;
+        let held = std::fs::File::from(self.fd.try_clone().map_err(|e| e.to_string())?)
+            .metadata()
+            .map_err(|e| e.to_string())?;
+        if m.file_type().is_symlink()
+            || !m.is_dir()
+            || (m.dev(), m.ino()) != (held.dev(), held.ino())
+        {
+            return Err(format!(
+                "`{}` is no longer the directory the floor held (replaced after a command ran)",
+                path.display()
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl HeldDir {
+    /// `root` — the path this directory was held at — and `root/rel` (`rel` empty: the root
+    /// alone) still name the held directory and its `rel`, walked from the held fd through no
+    /// link ([`HeldDir::still_at`]).
+    pub(crate) fn still_at_rel(&self, root: &Path, rel: &str) -> Result<(), String> {
+        self.still_at(root)?;
+        if rel.is_empty() || rel == "." {
+            return Ok(());
+        }
+        self.subdir(rel, false)?.still_at(&root.join(rel))
+    }
+}
+
+/// What a directory entry is, never following a link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntryKind {
+    Dir,
+    File,
+    Link,
+    Other,
+}
+
+#[cfg(unix)]
+fn entry_kind(mode: libc::mode_t) -> EntryKind {
+    match mode & libc::S_IFMT {
+        libc::S_IFDIR => EntryKind::Dir,
+        libc::S_IFREG => EntryKind::File,
+        libc::S_IFLNK => EntryKind::Link,
+        _ => EntryKind::Other,
+    }
+}
+
+/// `fstatat(dir, name, AT_SYMLINK_NOFOLLOW)`.
+#[cfg(unix)]
+fn stat_at(dir: &impl std::os::fd::AsRawFd, name: &std::ffi::CStr) -> std::io::Result<libc::stat> {
+    // SAFETY: zeroed `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `dir` is an open directory fd; `name` is NUL-terminated; `st` is writable.
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
+/// How deep [`HeldDir::remove_tree`] descends before it gives up (a bound on open fds).
+#[cfg(unix)]
+const MAX_REMOVE_DEPTH: usize = 256;
+
+/// `unlinkat(dir, name, flags)`, a missing entry being gone already.
+#[cfg(unix)]
+fn unlink_at(
+    dir: &impl std::os::fd::AsRawFd,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> std::io::Result<()> {
+    // SAFETY: `dir` is an open directory fd; `name` is NUL-terminated.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flags) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Remove `name` in `dir`: a directory is opened through no link, emptied and removed; anything
+/// else (a link included) is unlinked, never followed.
+#[cfg(unix)]
+fn remove_entry(
+    dir: &impl std::os::fd::AsRawFd,
+    name: &std::ffi::CStr,
+    depth: usize,
+) -> std::io::Result<()> {
+    let st = match stat_at(dir, name) {
+        Ok(st) => st,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if entry_kind(st.st_mode) != EntryKind::Dir {
+        return unlink_at(dir, name, 0);
+    }
+    // SAFETY: `dir` is an open directory fd; `name` is NUL-terminated.
+    match owned_fd(unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), HELD_DIR_FLAGS) }) {
+        Ok(sub) => {
+            empty_dir(&sub, depth + 1)?;
+            unlink_at(dir, name, libc::AT_REMOVEDIR)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // Swapped for a link (or a file) since the stat: unlinked, never followed.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) => {
+            unlink_at(dir, name, 0)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove every entry of the directory `dir` (a few passes: a process still writing there may
+/// add one; whatever remains makes the caller's `rmdir` fail, and that is reported).
+#[cfg(unix)]
+fn empty_dir(dir: &std::os::fd::OwnedFd, depth: usize) -> std::io::Result<()> {
+    if depth > MAX_REMOVE_DEPTH {
+        return Err(std::io::Error::other("the tree is too deep to remove"));
+    }
+    for _ in 0..3 {
+        let names = dir_names(dir)?;
+        if names.is_empty() {
+            break;
+        }
+        for n in &names {
+            remove_entry(dir, n, depth)?;
+        }
+    }
+    Ok(())
+}
+
+/// The entry names of the directory `dir` (not `.` or `..`), read through a fresh fd of it.
+#[cfg(unix)]
+fn dir_names(dir: &std::os::fd::OwnedFd) -> std::io::Result<Vec<std::ffi::CString>> {
+    use std::os::fd::{AsRawFd, IntoRawFd};
+    // SAFETY: `dir` is an open directory fd; the name is NUL-terminated.
+    let fresh = owned_fd(unsafe { libc::openat(dir.as_raw_fd(), c".".as_ptr(), HELD_DIR_FLAGS) })?;
+    let raw = fresh.into_raw_fd();
+    // SAFETY: `raw` is an open directory fd we own; on success the stream owns it.
+    let stream = unsafe { libc::fdopendir(raw) };
+    if stream.is_null() {
+        let e = std::io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, so `raw` is still ours to close.
+        unsafe { libc::close(raw) };
+        return Err(e);
+    }
+    let mut out = Vec::new();
+    loop {
+        // SAFETY: `stream` is an open directory stream.
+        let ent = unsafe { libc::readdir(stream) };
+        if ent.is_null() {
+            break;
+        }
+        // SAFETY: `ent` points at a valid entry whose `d_name` is NUL-terminated.
+        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            out.push(name.to_owned());
+        }
+    }
+    // SAFETY: `stream` is open, and closed exactly once (with the fd it owns).
+    unsafe { libc::closedir(stream) };
+    Ok(out)
 }
 
 /// Without directory fds: the path checks of [`confined`] before every operation.
@@ -5124,6 +5483,65 @@ impl HeldDir {
             _ => Ok(false),
         }
     }
+
+    /// `rel` under the held path, its PARENTS [`confined`] (the leaf itself may be a link: it is
+    /// inspected or removed, never followed).
+    fn leaf_path(&self, rel: &str) -> Result<PathBuf, String> {
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let mut p = if parents.is_empty() {
+            self.path.clone()
+        } else {
+            confined(&self.path, &parents.join("/"))?
+        };
+        p.push(leaf);
+        Ok(p)
+    }
+
+    pub(crate) fn kind(&self, rel: &str) -> Result<Option<EntryKind>, String> {
+        let p = self.leaf_path(rel)?;
+        match std::fs::symlink_metadata(&p) {
+            Ok(m) if m.file_type().is_symlink() => Ok(Some(EntryKind::Link)),
+            Ok(m) if m.is_dir() => Ok(Some(EntryKind::Dir)),
+            Ok(m) if m.is_file() => Ok(Some(EntryKind::File)),
+            Ok(_) => Ok(Some(EntryKind::Other)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("`{rel}` cannot be inspected: {e}")),
+        }
+    }
+
+    /// `remove_dir_all` removes a link (a junction, a symlink) without following it.
+    pub(crate) fn remove_tree(&self, rel: &str) -> Result<bool, String> {
+        let p = self.leaf_path(rel)?;
+        match std::fs::symlink_metadata(&p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("`{rel}` cannot be inspected: {e}")),
+            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => std::fs::remove_dir_all(&p)
+                .map(|()| true)
+                .map_err(|e| format!("`{rel}`: {e}")),
+            Ok(_) => std::fs::remove_file(&p)
+                .map(|()| true)
+                .map_err(|e| format!("`{rel}`: {e}")),
+        }
+    }
+
+    pub(crate) fn open_read(&self, rel: &str) -> Result<std::fs::File, String> {
+        rel_names(rel)?;
+        let p = confined(&self.path, rel)?;
+        no_follow(std::fs::OpenOptions::new().read(true))
+            .open(&p)
+            .map_err(|e| format!("`{rel}`: {e}"))
+    }
+
+    pub(crate) fn still_at(&self, path: &Path) -> Result<(), String> {
+        match std::fs::symlink_metadata(path) {
+            Ok(m) if m.is_dir() && !m.file_type().is_symlink() && path == self.path => Ok(()),
+            _ => Err(format!(
+                "`{}` is no longer the directory the floor held (replaced after a command ran)",
+                path.display()
+            )),
+        }
+    }
 }
 
 /// (DES-BUILD-GUIDE) The base guide's check for `check`, when its pieces may be relied on for
@@ -5176,6 +5594,7 @@ fn crashed(run: &CheckRun, g: Option<&GuideCheck>) -> Option<String> {
 /// still reports the version its probes ran under (`verified.runnerVersion`).
 fn runner_current(
     worktree: &Path,
+    held: Option<&HeldDir>,
     check: &RepoCheck,
     g: &GuideCheck,
     sandbox: &WorkerSandbox,
@@ -5184,7 +5603,7 @@ fn runner_current(
     if g.version.is_none() {
         return Ok(());
     }
-    let now = runner_version(worktree, check, g, sandbox, scratch, Tree::Head)?;
+    let now = runner_version(worktree, held, check, g, sandbox, scratch, Tree::Head)?;
     let then = g
         .verified
         .as_ref()
@@ -5200,6 +5619,7 @@ fn runner_current(
 /// The first line the guide's `version` command prints (stdout and stderr merged) on `tree`.
 pub(crate) fn runner_version(
     dir: &Path,
+    held: Option<&HeldDir>,
     check: &RepoCheck,
     g: &GuideCheck,
     sandbox: &WorkerSandbox,
@@ -5213,7 +5633,7 @@ pub(crate) fn runner_version(
         timeout_s: Some(120),
         ..check.clone()
     };
-    let r = run_one_with(dir, &rc, &merged(true), sandbox, scratch, tree);
+    let r = run_one_with(dir, held, &rc, &merged(true), sandbox, scratch, tree);
     if !r.passed() {
         return Err(format!(
             "the version command did not pass ({})",
@@ -5254,6 +5674,7 @@ fn ran_loaded(run: &CheckRun) -> bool {
 /// fall below the CPU count, then run the SAME argv once more. `None` when no retry was due.
 fn retry_if_loaded(
     worktree: &Path,
+    held: Option<&HeldDir>,
     one: &RepoCheck,
     exec: &ExecOpts,
     first: &CheckRun,
@@ -5272,7 +5693,7 @@ fn retry_if_loaded(
         }
         std::thread::sleep(Duration::from_secs(1).min(bound));
     }
-    let mut r = run_one_with(worktree, one, exec, sandbox, scratch, Tree::Head);
+    let mut r = run_one_with(worktree, held, one, exec, sandbox, scratch, Tree::Head);
     r.logs = relabel(r.logs, "retry");
     r.source = format!(
         "the identical retry of `{}` after waiting {:.0}s for headroom (DES-FLOOR-V2)",
@@ -5312,6 +5733,7 @@ struct BaseSide {
 #[allow(clippy::too_many_arguments)]
 fn decide(
     worktree: &Path,
+    held: Option<&HeldDir>,
     check: &RepoCheck,
     head: &mut CheckRun,
     side: Option<BaseSide>,
@@ -5396,7 +5818,7 @@ fn decide(
                     }
                 }
             }
-            let head_toc = inventory(worktree, check, g, &[], sandbox, scratch, Tree::Head);
+            let head_toc = inventory(worktree, held, check, g, &[], sandbox, scratch, Tree::Head);
             logs.extend(head_toc.logs.iter().cloned());
             if let Some(why) = &head_toc.incomplete {
                 return Err(format!("the head: {why}"));
@@ -5423,7 +5845,16 @@ fn decide(
             // Precision, by the runner's own selection: the head's list with them deselected
             // lists exactly the rest of the head's tests.
             if !names.is_empty() {
-                let rest = inventory(worktree, check, g, &names, sandbox, scratch, Tree::Head);
+                let rest = inventory(
+                    worktree,
+                    held,
+                    check,
+                    g,
+                    &names,
+                    sandbox,
+                    scratch,
+                    Tree::Head,
+                );
                 logs.extend(rest.logs.iter().cloned());
                 let mut want: Vec<TestId> = head_toc
                     .ids
@@ -5461,7 +5892,7 @@ fn decide(
                 ..check.clone()
             };
             let exec = ExecOpts::default();
-            let mut e = run_one_with(worktree, &one, &exec, sandbox, scratch, Tree::Head);
+            let mut e = run_one_with(worktree, held, &one, &exec, sandbox, scratch, Tree::Head);
             e.logs = relabel(e.logs, "excluded");
             decision.excluded = names.iter().map(|t| t.id.clone()).collect();
             (one, exec, e.clone(), true)
@@ -5482,6 +5913,7 @@ fn decide(
         .then(|| {
             retry_if_loaded(
                 worktree,
+                held,
                 &deciding_check,
                 &deciding_exec,
                 &deciding,
@@ -5932,6 +6364,9 @@ pub(crate) fn failure_id_of_line(line: &str, eslint_file: &mut Option<String>) -
 /// (`logs`, attempt `head`/`base` by `tree` — a caller relabels a re-run), the exit code, and the
 /// 4 KB display tails. A LAUNCHER that fails to arm (`bwrap: …` / `sandbox-exec: …` as the first
 /// stderr line, non-zero exit) is `could_not_run`, never the check's own `failed` (core#493).
+/// Unheld: tests only — the floor spawns through [`run_held`] / [`run_one_with`] with the tree's
+/// [`HeldDir`].
+#[cfg(test)]
 pub(crate) fn run_one(
     worktree: &Path,
     check: &RepoCheck,
@@ -5939,8 +6374,21 @@ pub(crate) fn run_one(
     scratch: &CheckScratch,
     tree: Tree,
 ) -> CheckRun {
+    run_held(worktree, None, check, sandbox, scratch, tree)
+}
+
+/// [`run_one_with`] with the default [`ExecOpts`].
+pub(crate) fn run_held(
+    worktree: &Path,
+    held: Option<&HeldDir>,
+    check: &RepoCheck,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+    tree: Tree,
+) -> CheckRun {
     run_one_with(
         worktree,
+        held,
         check,
         &ExecOpts::default(),
         sandbox,
@@ -5957,9 +6405,13 @@ pub(crate) struct ExecOpts {
     pub(crate) merge: bool,
 }
 
-/// [`run_one`] with [`ExecOpts`].
+/// [`run_one`] with [`ExecOpts`], in `worktree` — held as `held` from before any command ran
+/// there: the path must still be that directory when the command is spawned
+/// ([`HeldDir::still_at`]), or the run could not start (a command that swapped the tree's root for
+/// a link to an outside directory never gets a later command started there).
 pub(crate) fn run_one_with(
     worktree: &Path,
+    held: Option<&HeldDir>,
     check: &RepoCheck,
     exec: &ExecOpts,
     sandbox: &WorkerSandbox,
@@ -6019,6 +6471,13 @@ pub(crate) fn run_one_with(
             "`{}` is not a plain directory of the tree (a link, or missing)",
             check.dir
         ));
+        return result;
+    }
+    // Held, too: the tree's root and the check's directory, walked from the held fd through no link,
+    // must still be the directories the path names — a command that swapped either for a link to
+    // an outside directory gets no later command started there.
+    if let Some(e) = held.and_then(|h| h.still_at_rel(worktree, &check.dir).err()) {
+        result.spawn_error = Some(e);
         return result;
     }
     // Resolve on PATH the way `Command::new` will, so "not installed" is a legible spawn error
@@ -7863,7 +8322,8 @@ pub(crate) mod tests {
         std::fs::create_dir_all(legacy.join("home")).unwrap();
         std::fs::write(legacy.join("home/keep"), "x").unwrap();
         let scratch_dir = CheckScratch::prepare(&wt).unwrap();
-        remove_base_export(&wt, &scratch_dir).unwrap();
+        let held = HeldDir::open(&wt).unwrap();
+        remove_base_export(&held).unwrap();
         assert!(!legacy.join("base").exists(), "the legacy export is gone");
         assert!(
             legacy.join("home/keep").is_file(),
@@ -7876,7 +8336,7 @@ pub(crate) mod tests {
             std::fs::create_dir_all(outside.join("base")).unwrap();
             std::fs::remove_dir_all(&legacy).unwrap();
             std::os::unix::fs::symlink(&outside, &legacy).unwrap();
-            remove_base_export(&wt, &scratch_dir).unwrap();
+            remove_base_export(&held).unwrap();
             assert!(
                 outside.join("base").is_dir(),
                 "nothing removed through the link"
@@ -8182,6 +8642,29 @@ pub(crate) mod tests {
             );
             std::fs::remove_file(&link).unwrap();
             std::os::unix::fs::symlink("app.txt", &link).unwrap();
+            // (sweep review on #1066) A directory of the tree swapped for a link to an outside
+            // copy with the SAME content is a change too: every entry is re-read through the
+            // checkout held before the checks ran, never through the link.
+            let mut swapped = ok.clone();
+            let copy = scratch("guarded-checkout-outside-copy");
+            std::fs::copy(dir.join(CONFIG_PATH), copy.join("checks.json")).unwrap();
+            std::fs::rename(dir.join(".wicked"), dir.join(".wicked-moved")).unwrap();
+            std::os::unix::fs::symlink(&copy, dir.join(".wicked")).unwrap();
+            checkout.hold_to(&snap.tree, &mut swapped);
+            assert!(
+                !swapped.passed,
+                "a linked-away directory is a change: {swapped:?}"
+            );
+            assert!(
+                swapped
+                    .detect_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains(CONFIG_PATH)),
+                "{swapped:?}"
+            );
+            std::fs::remove_file(dir.join(".wicked")).unwrap();
+            std::fs::rename(dir.join(".wicked-moved"), dir.join(".wicked")).unwrap();
+            let _ = std::fs::remove_dir_all(&copy);
         }
         std::fs::write(dir.join("app.txt"), "rewritten by a check\n").unwrap();
         checkout.hold_to(&snap.tree, &mut ok);

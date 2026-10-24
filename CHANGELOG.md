@@ -157,7 +157,18 @@ Two release tracks share this file, newest entry first regardless of track:
   per component with `O_NOFOLLOW`; a file is opened non-blocking and must be a regular file): a linked
   component is refused, and a swapped root leaves the writes in the original, detached directory. The base
   export is a FRESH directory made through the held worktree (one already at the path is refused); a linked
-  export path still refuses the floor, fail-closed. The macOS profile (shared by the floor, workers and
+  export path still refuses the floor, fail-closed. The engine's READS and REMOVALS in such a tree go through
+  the same held directory (sweep review on #1066): the base export is removed entry by entry relative to its
+  own directory fds (a link is unlinked, never followed — a `tmp` or export directory swapped for a link to an
+  outside directory no longer gets that directory deleted); a results file is opened through the held tree and
+  its type, size and freshness are checked on the opened descriptor (a renamed-away tree, a FIFO or an
+  oversized file reads nothing); every command spawned in a held tree first checks that the tree's root and the
+  check's directory still are the held directories (else `could_not_run`); the guarded verify checkout is
+  re-checked by reading every entry through its held fd against the blob bytes (a directory swapped for a link
+  to an identical outside copy is a change); the per-package `baseline_diff` config and the coverage notes are
+  read before the first check runs. A red base that exited outside the guide's `failedExit` is not inventoried
+  (it did not run to a test verdict: `base_red_unseparated`), and a reused receipt is validated before its age
+  restarts. The macOS profile (shared by the floor, workers and
   validators) denies writes to each write root's OWN path, after every allow, so a sandboxed command cannot
   remove, rename or relink its root (Linux bwrap's bind-mounted roots already refuse it); entries below a root
   are unaffected. The base-cache record moved out of the check scratch (a sandbox write root) into the run's

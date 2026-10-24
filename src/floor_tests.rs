@@ -2047,7 +2047,8 @@ fn the_identical_retry_keeps_the_deciding_runs_env() {
     };
     let first = run_one(&wt, &one, &sandbox, &scratch, Tree::Head);
     assert!(!first.passed() && ran_loaded(&first), "{first:?}");
-    let retry = retry_if_loaded(&wt, &one, &exec, &first, &sandbox, &scratch).expect("retried");
+    let retry =
+        retry_if_loaded(&wt, None, &one, &exec, &first, &sandbox, &scratch).expect("retried");
     assert!(retry.passed(), "the retry ran with FLOOR_ENV=1: {retry:?}");
     let _ = std::fs::remove_dir_all(&wt);
 }
@@ -2071,7 +2072,8 @@ fn a_results_file_is_a_fresh_regular_file_inside_the_tree() {
     std::fs::write(root.join("fresh.xml"), "<testsuite/>").unwrap();
     std::os::unix::fs::symlink(&outside, root.join("link.xml")).unwrap();
     std::fs::create_dir_all(root.join("dir.xml")).unwrap();
-    assert!(open_results(&root, "fresh.xml", since).is_ok());
+    let held = HeldDir::open(&root).unwrap();
+    assert!(open_results(&held, "fresh.xml", since).is_ok());
     for (rel, why) in [
         ("old.xml", "not written by this run"),
         ("link.xml", "symlink"),
@@ -2079,7 +2081,7 @@ fn a_results_file_is_a_fresh_regular_file_inside_the_tree() {
         ("../x.xml", "inside the tree"),
         ("missing.xml", "no results file"),
     ] {
-        let e = open_results(&root, rel, since).expect_err(rel);
+        let e = open_results(&held, rel, since).expect_err(rel);
         assert!(e.contains(why), "{rel}: {e}");
     }
     let _ = std::fs::remove_dir_all(&root);
@@ -2245,12 +2247,13 @@ fn the_base_export_runs_no_repository_hook_or_filter() {
     let scratch_dir = CheckScratch::prepare(&repo).unwrap();
     let head = git(&repo, &["rev-parse", "HEAD"]);
     let root = crate::repo_checks::HeldDir::open(&repo).unwrap();
-    let tree = BaseTree::export(&repo, &root, &scratch_dir, &repo.join(".git"), &head).unwrap();
+    let tree = BaseTree::export(&repo, &root, &repo.join(".git"), &head).unwrap();
     assert_eq!(
         std::fs::read_to_string(tree.dir.join("a.txt")).unwrap(),
         "plain\n"
     );
-    let _ = remove_base_export(&repo, &scratch_dir);
+    let _ = remove_base_export(&root);
+    drop(scratch_dir);
     // The probe exports through the same path.
     let _ = probe(&repo, stand_in_guide());
     assert!(
@@ -3202,7 +3205,7 @@ fn run_with_env(
             .collect(),
         merge: false,
     };
-    run_one_with(wt, &check, &exec, sandbox, &scratch, Tree::Head)
+    run_one_with(wt, None, &check, &exec, sandbox, &scratch, Tree::Head)
 }
 
 /// (confirmation round on 5f93846, codex P1) A guide's env reaches the command INSIDE the
@@ -3389,4 +3392,215 @@ fn a_shallow_boundary_anchor_keeps_a_gate_only_guide_stale() {
     );
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&shallow);
+}
+
+/// (sweep review on #1066, P1) The base export is removed through the worktree held before any
+/// check ran: a `tmp` swapped (after the handle was opened) for a link to an outside directory
+/// holding a `wicked-floor-base` is refused and the outside directory survives; a directory INSIDE
+/// the export swapped for a link has the link removed, never what it points at.
+#[cfg(unix)]
+#[test]
+fn the_base_export_is_removed_through_the_held_worktree_never_through_a_swapped_link() {
+    let wt = scratch("held-remove");
+    let outside = scratch("held-remove-outside");
+    let export = wt.join("tmp").join(BASE_EXPORT_SUBDIR);
+    std::fs::create_dir_all(export.join("src")).unwrap();
+    std::fs::write(export.join("src/a.rs"), "x").unwrap();
+    let precious = outside.join(BASE_EXPORT_SUBDIR).join("keep/file");
+    std::fs::create_dir_all(precious.parent().unwrap()).unwrap();
+    std::fs::write(&precious, "precious").unwrap();
+    let held = HeldDir::open(&wt).unwrap();
+    // A command (or a process it left running) swaps `tmp` for a link out of the tree.
+    std::fs::rename(wt.join("tmp"), wt.join("tmp-moved")).unwrap();
+    std::os::unix::fs::symlink(&outside, wt.join("tmp")).unwrap();
+    let e = remove_base_export(&held).expect_err("a linked `tmp` is refused");
+    assert!(e.contains("not a real directory"), "{e}");
+    assert!(precious.is_file(), "nothing removed through the link");
+    // The real `tmp` back; a directory inside the export swapped for a link out of the tree.
+    std::fs::remove_file(wt.join("tmp")).unwrap();
+    std::fs::rename(wt.join("tmp-moved"), wt.join("tmp")).unwrap();
+    std::fs::remove_dir_all(export.join("src")).unwrap();
+    std::os::unix::fs::symlink(outside.join(BASE_EXPORT_SUBDIR), export.join("src")).unwrap();
+    remove_base_export(&held).unwrap();
+    assert!(
+        std::fs::symlink_metadata(&export).is_err(),
+        "the export is gone"
+    );
+    assert!(precious.is_file(), "the link was removed, never followed");
+    // `remove_tree` itself, on the leaf: a link there is unlinked, its target kept.
+    std::fs::create_dir_all(wt.join("tmp")).unwrap();
+    std::os::unix::fs::symlink(&outside, wt.join("tmp/leaf")).unwrap();
+    assert_eq!(held.remove_tree("tmp/leaf"), Ok(true));
+    assert!(precious.is_file());
+    let _ = std::fs::remove_dir_all(&wt);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// (sweep review on #1066, P1/P2) A results file is opened through the held tree and checked on
+/// the OPENED file: a tree renamed away with a link left in its place reads nothing from the
+/// link's target; a FIFO is no regular file (and never blocks); an oversized file is refused.
+#[cfg(unix)]
+#[test]
+fn a_results_file_is_read_through_the_held_tree_only() {
+    let root = scratch("held-results");
+    let outside = scratch("held-results-outside");
+    let since = std::time::SystemTime::now();
+    std::fs::write(outside.join("report.xml"), "<testsuite name=\"outside\"/>").unwrap();
+    let held = HeldDir::open(&root).unwrap();
+    let moved = root.with_file_name(format!(
+        "{}-moved",
+        root.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::rename(&root, &moved).unwrap();
+    std::os::unix::fs::symlink(&outside, &root).unwrap();
+    let e = open_results(&held, "report.xml", since).expect_err("nothing in the held tree");
+    assert!(e.contains("no results file"), "{e}");
+    // What the held (renamed) tree holds is what is read.
+    std::fs::write(moved.join("report.xml"), "<testsuite name=\"held\"/>").unwrap();
+    let mut text = String::new();
+    std::io::Read::read_to_string(
+        &mut open_results(&held, "report.xml", since).unwrap(),
+        &mut text,
+    )
+    .unwrap();
+    assert!(text.contains("held"), "{text}");
+    // A FIFO at the results path.
+    let fifo = std::ffi::CString::new(moved.join("fifo.xml").to_string_lossy().as_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+    let e = open_results(&held, "fifo.xml", since).expect_err("a FIFO");
+    assert!(e.contains("not a regular file"), "{e}");
+    // An oversized file (sparse).
+    std::fs::File::create(moved.join("big.xml"))
+        .unwrap()
+        .set_len(crate::floor_log::MAX_STREAM_BYTES + 1)
+        .unwrap();
+    let e = open_results(&held, "big.xml", since).expect_err("oversized");
+    assert!(e.contains("larger than the log cap"), "{e}");
+    let _ = std::fs::remove_file(&root);
+    let _ = std::fs::remove_dir_all(&moved);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// (sweep review on #1066, P2) No command starts in a held tree whose root, or whose check
+/// directory, was swapped for a link after the handle was opened: the run could not start.
+#[cfg(unix)]
+#[test]
+fn no_command_starts_in_a_held_tree_swapped_for_a_link() {
+    let wt = scratch("held-spawn");
+    let outside = scratch("held-spawn-outside");
+    std::fs::create_dir_all(wt.join("pkg")).unwrap();
+    std::fs::create_dir_all(outside.join("pkg")).unwrap();
+    let marker = outside.join("ran");
+    let held = HeldDir::open(&wt).unwrap();
+    let scratch_dir = CheckScratch::prepare(&wt).unwrap();
+    let sandbox = crate::validator::WorkerSandbox {
+        wrapper: Vec::new(),
+        level: crate::validator::SandboxLevel::BestEffort,
+        downgrade_reason: None,
+    };
+    let check = |dir: &str| RepoCheck {
+        name: "test".into(),
+        argv: s(&["sh", "-c", &format!("touch '{}'", marker.display())]),
+        source: "test".into(),
+        timeout_s: Some(30),
+        dir: dir.into(),
+    };
+    let run = |c: &RepoCheck| {
+        run_one_with(
+            &wt,
+            Some(&held),
+            c,
+            &ExecOpts::default(),
+            &sandbox,
+            &scratch_dir,
+            Tree::Base,
+        )
+    };
+    // The check's directory swapped for a link out of the tree.
+    std::fs::rename(wt.join("pkg"), wt.join("pkg-moved")).unwrap();
+    std::os::unix::fs::symlink(outside.join("pkg"), wt.join("pkg")).unwrap();
+    let r = run(&check("pkg"));
+    assert!(r.spawn_error.is_some(), "{r:?}");
+    // The root swapped for a link out of the tree.
+    let moved = wt.with_file_name(format!(
+        "{}-moved",
+        wt.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::rename(&wt, &moved).unwrap();
+    std::os::unix::fs::symlink(&outside, &wt).unwrap();
+    let r = run(&check(""));
+    assert!(
+        r.spawn_error
+            .as_deref()
+            .is_some_and(|e| e.contains("no longer the directory the floor held")),
+        "{r:?}"
+    );
+    assert!(!marker.exists(), "a command ran outside the held tree");
+    std::fs::remove_file(&wt).unwrap();
+    std::fs::rename(&moved, &wt).unwrap();
+    drop(scratch_dir);
+    let _ = remove_check_scratch_in(&check_cache_root().unwrap(), &wt, None);
+    let _ = std::fs::remove_dir_all(&wt);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// (sweep review on #1066, P3) A red base that exited OUTSIDE the guide's `failedExit` did not run
+/// to a test verdict: nothing of it is inventoried or excluded — the head's failure escalates as
+/// `base_red_unseparated`, even though its results name the failure and the alone run confirms it.
+#[cfg(unix)]
+#[test]
+fn a_base_that_exited_outside_failed_exit_is_never_inventoried() {
+    let _load = seam::pin(0.5, 4);
+    let (repo, ctx, argv) = red_base("base-crash");
+    let toc = toc_of(&["old", "new", "fine"]);
+    let named = "test new ... ok\ntest fine ... ok\ntest old ... FAILED\n\nfailures:\n    old\n\n\
+                 test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n";
+    // The base names `old` failing — and exits 2, not one of `failedExit` [101].
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.out", named),
+            ("run.exit", "2"),
+            ("toc.txt", &toc),
+            ("alone.fail", "old\n"),
+        ],
+    );
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &[
+            "commit",
+            "-qm",
+            "a base that crashed after naming a failure",
+        ],
+    );
+    let ctx = FloorContext {
+        base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+        ..ctx.clone()
+    };
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.out", named),
+            ("run.exit", "101"),
+            ("toc.txt", &toc),
+            ("excluded.exit", "0"),
+        ],
+    );
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    assert!(!report.passed, "{c:?}");
+    let d = c.decision.expect("a decision");
+    assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
+    assert!(
+        d.reason
+            .as_deref()
+            .is_some_and(|r| r.contains("not one of the guide's `failedExit` codes")),
+        "{d:?}"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
 }

@@ -42,8 +42,8 @@ use std::path::Path;
 
 use crate::floor_guide::{passed, BuildGuide, GuideCheck, Mutation, TestId};
 use crate::repo_checks::{
-    inventory, remove_base_export, results_exec, results_of, run_one, run_one_with, runner_version,
-    BaseTree, CheckScratch, RepoCheck, Tree,
+    inventory, remove_base_export, results_exec, results_of, run_held, run_one_with,
+    runner_version, BaseTree, CheckScratch, RepoCheck, Tree,
 };
 
 /// A results run's parse: every testcase (junit) and the failures.
@@ -220,7 +220,7 @@ fn probe_check(
     let root = crate::repo_checks::HeldDir::open(repo)?;
     // The first export arms the sandbox (its write roots must exist); every phase below exports
     // its own fresh copy at the same path.
-    let tree = BaseTree::export(repo, &root, &scratch, git_dir, head)?;
+    let tree = BaseTree::export(repo, &root, git_dir, head)?;
     let sandbox = crate::repo_checks::floor_sandbox(&[
         tree.dir.clone(),
         scratch.tmp_path().to_path_buf(),
@@ -228,7 +228,7 @@ fn probe_check(
     ]);
     drop(tree);
     if sandbox.level != crate::validator::SandboxLevel::Sandboxed {
-        let _ = remove_base_export(repo, &scratch);
+        let _ = remove_base_export(&root);
         return Err(format!(
             "the floor sandbox does not arm here ({})",
             sandbox
@@ -268,7 +268,7 @@ fn probe_check(
             .collect();
         version = v2;
     }
-    let _ = remove_base_export(repo, &scratch);
+    let _ = remove_base_export(&root);
     Ok((results, version))
 }
 
@@ -303,8 +303,8 @@ impl Probe<'_> {
     /// into a copy after repository code ran there, except to clear a results file — and that
     /// only through the copy's held directory fd ([`crate::repo_checks::HeldDir`]).
     fn copy(&self, mutations: &[&Mutation]) -> Result<BaseTree, String> {
-        remove_base_export(self.repo, self.scratch)?;
-        let tree = BaseTree::export(self.repo, self.root, self.scratch, self.git_dir, self.head)?;
+        remove_base_export(self.root)?;
+        let tree = BaseTree::export(self.repo, self.root, self.git_dir, self.head)?;
         for (i, m) in mutations.iter().enumerate() {
             let rel = Path::new(self.g.dir()).join(&m.file);
             let which = if i == 0 { "the" } else { "the second" };
@@ -313,7 +313,14 @@ impl Probe<'_> {
                 .map_err(|e| format!("{which} mutation could not be written: {e}"))?;
         }
         if let Some(i) = self.install {
-            let r = run_one(&tree.dir, i, self.sandbox, self.scratch, Tree::Base);
+            let r = run_held(
+                &tree.dir,
+                Some(&tree.held),
+                i,
+                self.sandbox,
+                self.scratch,
+                Tree::Base,
+            );
             if !r.passed() {
                 return Err(format!("install failed ({})", r.summary()));
             }
@@ -332,6 +339,7 @@ impl Probe<'_> {
         let since = std::time::SystemTime::now();
         let mut r = run_one_with(
             &c.dir,
+            Some(&c.held),
             &rc,
             &results_exec(self.g),
             self.sandbox,
@@ -341,7 +349,7 @@ impl Probe<'_> {
         if r.timed_out || r.spawn_error.is_some() {
             return (None, Err(format!("did not finish ({})", r.summary())));
         }
-        let parsed = results_of(&c.dir, &self.rc, self.g, &mut r, self.scratch, since);
+        let parsed = results_of(&c.held, &self.rc, self.g, &mut r, self.scratch, since);
         (r.exit_code, parsed)
     }
 
@@ -355,6 +363,7 @@ impl Probe<'_> {
     fn list(&self, c: &BaseTree, ids: &[TestId]) -> crate::repo_checks::Toc {
         inventory(
             &c.dir,
+            Some(&c.held),
             &self.rc,
             self.g,
             ids,
@@ -420,6 +429,7 @@ impl Probe<'_> {
         if g.version.is_some() {
             let v = runner_version(
                 &clean_copy.dir,
+                Some(&clean_copy.held),
                 &self.rc,
                 g,
                 self.sandbox,
