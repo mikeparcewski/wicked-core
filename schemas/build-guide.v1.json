@@ -76,7 +76,7 @@
                   "type": "array",
                   "items": { "type": "string" }
                 },
-                "env": { "type": "object", "additionalProperties": { "type": "string" } },
+                "env": { "type": "object", "propertyNames": { "pattern": "^(?!(LD_|DYLD_))(?!(BASH_ENV|ENV|SHELLOPTS|BASHOPTS|IFS|GCONV_PATH|LOCPATH)$)[A-Z_][A-Z0-9_]*$" }, "additionalProperties": { "type": "string" }, "description": "Set on the command INSIDE the floor sandbox only (never on the sandbox launcher). Names are `[A-Z_][A-Z0-9_]*` and never a loader or shell hook: `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `IFS`, `GCONV_PATH`, `LOCPATH`." },
                 "path": { "type": "string", "description": "The results file, relative to `cwd`, when not stdout." },
                 "merge": {
                   "type": "boolean",

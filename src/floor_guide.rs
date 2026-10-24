@@ -246,6 +246,51 @@ pub(crate) fn load_base(
         .map_err(|e| format!("the base's `{GUIDE_PATH}` {e}"))
 }
 
+/// The commits a shallow repository's history was cut at (its `shallow` file), or none when the
+/// repository is complete. `Err` (stale) when shallowness or the boundary cannot be read.
+fn shallow_boundary(worktree: &Path, env: &[(&str, &Path)]) -> Result<Vec<String>, String> {
+    let shallow =
+        crate::worktree_guard::git_string(worktree, &["rev-parse", "--is-shallow-repository"], env)
+            .map_err(|e| format!("whether the history is shallow could not be read: {e}"))?;
+    if shallow.trim() != "true" {
+        return Ok(Vec::new());
+    }
+    let file =
+        crate::worktree_guard::git_string(worktree, &["rev-parse", "--git-path", "shallow"], env)
+            .map_err(|e| format!("the shallow boundary could not be located: {e}"))?;
+    let file = Path::new(file.trim());
+    let file = if file.is_absolute() {
+        file.to_path_buf()
+    } else {
+        worktree.join(file)
+    };
+    let raw = std::fs::read_to_string(&file)
+        .map_err(|e| format!("the shallow boundary could not be read: {e}"))?;
+    Ok(raw
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// A guide `env` name the floor passes to a check: `^[A-Z_][A-Z0-9_]*$`, and never one that
+/// hijacks a loader or a shell before the command runs (`LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`,
+/// `SHELLOPTS`, `BASHOPTS`, `IFS`, `GCONV_PATH`, `LOCPATH`).
+pub(crate) fn env_name_ok(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let shape = bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_uppercase() || b == b'_')
+        && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+    shape
+        && !name.starts_with("LD_")
+        && !name.starts_with("DYLD_")
+        && !matches!(
+            name,
+            "BASH_ENV" | "ENV" | "SHELLOPTS" | "BASHOPTS" | "IFS" | "GCONV_PATH" | "LOCPATH"
+        )
+}
+
 /// A check name: 1-64 of `[A-Za-z0-9._-]`, never `.` or `..` — it keys engine-written files.
 fn name_ok(name: &str) -> bool {
     (1..=64).contains(&name.len())
@@ -271,7 +316,8 @@ fn cwd_ok(cwd: &str) -> bool {
 
 /// A guide's text, parsed and checked against the parts of the schema the floor relies on: version
 /// 1, every `run` non-empty, `stage` values `creator` | `verify`, a test check (one with a `list`)
-/// naming its `failedExit` (never 0), a `name` of 1-64 `[A-Za-z0-9._-]` (never `.` or `..`), a
+/// naming its `failedExit` (never 0), a `name` of 1-64 `[A-Za-z0-9._-]` (never `.` or `..`),
+/// `results.how.env` names that pass [`env_name_ok`], a
 /// `cwd` inside the repo, and a `deselect` whose
 /// `{ids:re|}` is once-only and never beside `{q}`. Anything else does not parse (detection
 /// decides).
@@ -288,6 +334,13 @@ pub(crate) fn parse(raw: &str) -> Result<BuildGuide, String> {
         if !name_ok(&c.name) {
             return Err(format!(
                 "is invalid: check name {:?} is not 1-64 of `A-Z a-z 0-9 . _ -` (and not `.` or `..`)",
+                c.name
+            ));
+        }
+        if let Some(k) = c.results.how.env.keys().find(|k| !env_name_ok(k)) {
+            return Err(format!(
+                "is invalid: check `{}` sets env {k:?}: names are `[A-Z_][A-Z0-9_]*`, and never \
+                 a loader or shell hook (`LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, …)",
                 c.name
             ));
         }
@@ -405,6 +458,19 @@ impl BuildGuide {
             Ok(a) => a,
             Err(why) => return Some(why),
         };
+        // In a shallow history the commit `git log` names may only be where the history was cut
+        // (the guide looks "added" there): an anchor at a shallow boundary — or a shallow history
+        // whose boundary cannot be read — cannot establish what changed since. Stale.
+        match shallow_boundary(worktree, &env) {
+            Err(why) => return Some(why),
+            Ok(cut) => {
+                if let Some(a) = anchors.iter().find(|a| cut.contains(a)) {
+                    return Some(format!(
+                        "`{a}` is a shallow boundary: the history cannot say what changed since"
+                    ));
+                }
+            }
+        }
         for from in &anchors {
             // A pre-squash (or otherwise foreign) commit says nothing about what changed since.
             if crate::worktree_guard::git(
@@ -1048,6 +1114,48 @@ mod tests {
             "...",
             ".hidden",
             &"a".repeat(64),
+        ] {
+            parse(&doc(good)).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+        }
+    }
+
+    /// (confirmation round on 5f93846, codex P1) A guide env name that hijacks a loader or a
+    /// shell (`LD_PRELOAD` first), or is not `[A-Z_][A-Z0-9_]*`, does not parse.
+    #[test]
+    fn a_guide_env_with_a_loader_or_shell_hook_does_not_parse() {
+        let doc = |name: &str| {
+            let mut c = serde_json::to_value(check("text")).unwrap();
+            c["results"]["how"]["env"] = serde_json::json!({ name: "x" });
+            serde_json::json!({"version": 1, "checks": [c]}).to_string()
+        };
+        for bad in [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "BASH_ENV",
+            "ENV",
+            "SHELLOPTS",
+            "BASHOPTS",
+            "IFS",
+            "GCONV_PATH",
+            "LOCPATH",
+            "path",
+            "A-B",
+            "1A",
+            "A=B",
+            "",
+        ] {
+            let e = parse(&doc(bad)).expect_err(bad);
+            assert!(e.contains("sets env"), "{bad:?}: {e}");
+        }
+        for good in [
+            "RUST_BACKTRACE",
+            "_X1",
+            "NODE_OPTIONS",
+            "ENVIRONMENT",
+            "XLD_PRELOAD",
         ] {
             parse(&doc(good)).unwrap_or_else(|e| panic!("{good:?}: {e}"));
         }

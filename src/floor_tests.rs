@@ -2879,7 +2879,11 @@ fn a_pre_squash_or_missing_verified_commit_makes_the_guide_stale() {
     let why = notes_guide(&root)
         .stale(&shallow, &shallow.join(".git"), &base, &none)
         .expect("an anchor the shallow history lost is stale");
-    assert!(why.contains("not an ancestor"), "{why}");
+    // Either the boundary the clone was cut at, or the verified commit it lacks.
+    assert!(
+        why.contains("shallow boundary") || why.contains("not an ancestor"),
+        "{why}"
+    );
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&shallow);
 }
@@ -3054,4 +3058,214 @@ fn a_stale_union_installs_first_and_runs_a_targeted_set_once() {
 #[cfg(unix)]
 fn path_of(repo: &Path) -> PathBuf {
     repo.join(crate::floor_guide::GUIDE_PATH)
+}
+
+/// One plain check run of `argv` in `wt` with the guide env `env`, under `sandbox`.
+#[cfg(unix)]
+fn run_with_env(
+    wt: &Path,
+    argv: &[&str],
+    env: &[(&str, &str)],
+    sandbox: &crate::validator::WorkerSandbox,
+) -> CheckRun {
+    let scratch = CheckScratch::prepare(wt).expect("scratch");
+    let check = RepoCheck {
+        name: "gate".into(),
+        argv: argv.iter().map(|a| a.to_string()).collect(),
+        source: String::new(),
+        timeout_s: Some(30),
+        dir: String::new(),
+    };
+    let exec = ExecOpts {
+        env: env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        merge: false,
+    };
+    run_one_with(wt, &check, &exec, sandbox, &scratch, Tree::Head)
+}
+
+/// (confirmation round on 5f93846, codex P1) A guide's env reaches the command INSIDE the
+/// boundary only: the launcher (here a stand-in that records its own environment, then execs the
+/// rest) gets the floor's sanitized environment and never the guide's; the command gets it. With
+/// no launcher, the command still gets it.
+#[cfg(unix)]
+#[test]
+fn the_guide_env_reaches_the_command_inside_the_boundary_never_the_launcher() {
+    let wt = scratch("guide-env-launcher");
+    let launcher_env = wt.join("launcher.env");
+    let launcher = crate::validator::WorkerSandbox {
+        wrapper: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "env > \"$0\"; exec \"$@\"".into(),
+            launcher_env.to_string_lossy().into_owned(),
+        ],
+        level: crate::validator::SandboxLevel::Sandboxed,
+        downgrade_reason: None,
+    };
+    let inner = ["sh", "-c", "printf %s \"$GUIDE_K\" > inner.out"];
+    let r = run_with_env(&wt, &inner, &[("GUIDE_K", "guided")], &launcher);
+    assert!(r.passed(), "{r:?}");
+    let seen = std::fs::read_to_string(&launcher_env).unwrap();
+    assert!(
+        !seen.contains("GUIDE_K"),
+        "the launcher saw the guide env: {seen}"
+    );
+    assert!(
+        seen.contains("TMPDIR="),
+        "the launcher has the floor's own env: {seen}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("inner.out")).unwrap(),
+        "guided"
+    );
+    // No launcher: the spawned process is the command, and it carries the env.
+    std::fs::remove_file(wt.join("inner.out")).unwrap();
+    let none = crate::validator::WorkerSandbox {
+        wrapper: Vec::new(),
+        level: crate::validator::SandboxLevel::BestEffort,
+        downgrade_reason: Some("test".into()),
+    };
+    let r = run_with_env(&wt, &inner, &[("GUIDE_K", "plain")], &none);
+    assert!(r.passed(), "{r:?}");
+    assert_eq!(
+        std::fs::read_to_string(wt.join("inner.out")).unwrap(),
+        "plain"
+    );
+    let _ = std::fs::remove_dir_all(&wt);
+}
+
+/// (confirmation round on 5f93846, codex P1) Linux, the real floor sandbox: a preload library
+/// whose constructor writes a sentinel OUTSIDE every write root. Handed to the run as guide env
+/// (the load check refuses the name; this proves the boundary by itself), it loads only inside
+/// bwrap, where that write fails — never in the launcher before it arms. Skipped without a C
+/// compiler or an armed floor sandbox.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_preload_in_the_guide_env_never_runs_outside_the_boundary() {
+    let wt = scratch("preload-wt");
+    let outside = scratch("preload-outside");
+    let sentinel = outside.join("sentinel");
+    let lib_dir = scratch("preload-lib");
+    let src = lib_dir.join("hijack.c");
+    std::fs::write(
+        &src,
+        format!(
+            "#include <fcntl.h>\n#include <unistd.h>\n\
+             __attribute__((constructor)) static void hijack(void) {{\n\
+             int fd = open(\"{}\", O_CREAT | O_WRONLY, 0644);\n\
+             if (fd >= 0) close(fd);\n}}\n",
+            sentinel.display()
+        ),
+    )
+    .unwrap();
+    let lib = lib_dir.join("hijack.so");
+    let built = std::process::Command::new("cc")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&lib)
+        .arg(&src)
+        .status();
+    if !built.is_ok_and(|s| s.success()) {
+        eprintln!("repo_checks: no C compiler here — skipping the preload test");
+        return;
+    }
+    // Control: the library does write the sentinel when nothing confines it.
+    let probe_run = std::process::Command::new("true")
+        .env("LD_PRELOAD", &lib)
+        .status()
+        .unwrap();
+    assert!(
+        probe_run.success() && sentinel.exists(),
+        "the stand-in hook works"
+    );
+    std::fs::remove_file(&sentinel).unwrap();
+    let scratch_dir = CheckScratch::prepare(&wt).expect("scratch");
+    let sandbox = crate::repo_checks::floor_sandbox(&[
+        wt.clone(),
+        scratch_dir.tmp_path().to_path_buf(),
+        scratch_dir.root().to_path_buf(),
+    ]);
+    if sandbox.level != crate::validator::SandboxLevel::Sandboxed {
+        eprintln!("repo_checks: the floor sandbox does not arm here — skipping");
+        return;
+    }
+    let lib_s = lib.to_string_lossy().into_owned();
+    let _ = run_with_env(&wt, &["true"], &[("LD_PRELOAD", lib_s.as_str())], &sandbox);
+    assert!(
+        !sentinel.exists(),
+        "a preload in the guide env ran outside the boundary"
+    );
+    for d in [&wt, &outside, &lib_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// (confirmation round on 5f93846, codex P2) A depth-1 clone: the only commit is the shallow
+/// boundary, where `git log` sees the guide "added". A gate-only guide (no verified block to
+/// anchor on) whose `derivedFrom` file changed before the cut cannot show it is fresh: it stays in
+/// the stale union.
+#[cfg(unix)]
+#[test]
+fn a_shallow_boundary_anchor_keeps_a_gate_only_guide_stale() {
+    let repo = scratch("shallow-gate");
+    let argv = vec!["detected-runner".to_string(), "test".into()];
+    write_tree(&repo, &argv, &[]);
+    std::fs::write(repo.join("notes.md"), "v1\n").unwrap();
+    std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+    std::fs::write(
+        path_of(&repo),
+        serde_json::json!({"version": 1, "derivedFrom": ["notes.md"],
+            "checks": [{"name": "gate", "run": ["sh", "-c", "exit 0"]}]})
+        .to_string(),
+    )
+    .unwrap();
+    git_repo_with_commit(&repo);
+    std::fs::write(repo.join("notes.md"), "v2\n").unwrap();
+    git(&repo, &["commit", "-qam", "notes changed after the guide"]);
+    let full_ctx = FloorContext {
+        base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+        stage: FloorStage::Verify,
+        git_dir: Some(repo.join(".git")),
+        ..FloorContext::default()
+    };
+    let names = |wt: &Path, ctx: &FloorContext| -> Vec<String> {
+        detect_with(wt, ctx)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect()
+    };
+    // The complete history: the guide's commit predates the change — stale.
+    assert!(names(&repo, &full_ctx).contains(&"test".to_string()));
+    let shallow = scratch("shallow-gate-clone");
+    let _ = std::fs::remove_dir_all(&shallow);
+    let url = format!("file://{}", repo.display());
+    git(
+        &repo,
+        &[
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            &url,
+            &shallow.to_string_lossy(),
+        ],
+    );
+    assert_eq!(
+        git(&shallow, &["rev-parse", "--is-shallow-repository"]),
+        "true"
+    );
+    let ctx = FloorContext {
+        git_dir: Some(shallow.join(".git")),
+        ..full_ctx
+    };
+    let got = names(&shallow, &ctx);
+    assert!(
+        got.contains(&"gate".to_string()) && got.contains(&"test".to_string()),
+        "the stale union: {got:?}"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&shallow);
 }

@@ -61,6 +61,14 @@ Two release tracks share this file, newest entry first regardless of track:
   disk is both removed and untracked). In a stale union a covered directory's detected `install` runs
   first, before every guided check, and a detected check a guided one already runs (argv and dir; a
   derived targeted set included) runs once.
+  A guide's `results.how.env` is set on the command INSIDE the floor sandbox only, through `env` after the
+  launcher (`[wrapper…] env K=V… <exe> …`); the launcher (bwrap, sandbox-exec) keeps the floor's
+  sanitized environment, so a non-setuid bwrap never sees a guide's `LD_PRELOAD` before it arms (with no
+  launcher, the spawned process is the command and gets the env directly). At load, env names must be
+  `[A-Z_][A-Z0-9_]*` and never a loader or shell hook (`LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `SHELLOPTS`,
+  `BASHOPTS`, `IFS`, `GCONV_PATH`, `LOCPATH`; schema `propertyNames` too). In a shallow history an anchor
+  at the shallow boundary (where `git log` sees the guide "added"), or a boundary that cannot be read,
+  makes the guide stale.
   **Exclusion ships DISABLED.** `WICKED_FLOOR_EXCLUDE` exactly `on` or `1` (read once per floor run, never
   trimmed or case-folded) enables it; unset or anything else, it is off: a failing head over a red base escalates as `base_red_unseparated` ("exclusion disabled
   (WICKED_FLOOR_EXCLUDE)") with both logs, and the base's list, the one-test runs and the deselected head

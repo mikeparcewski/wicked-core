@@ -5735,8 +5735,33 @@ pub(crate) fn run_one_with(
         result.duration_ms = started.elapsed().as_millis() as u64;
         return result;
     };
-    // `[<sandbox wrapper…>] <exe> <args…>` — an empty wrapper is the disclosed best-effort floor.
+    // `[<sandbox wrapper…>] [env K=V…] <exe> <args…>` — an empty wrapper is the disclosed
+    // best-effort floor. (DES-BUILD-GUIDE) A guide's env is applied INSIDE the boundary only,
+    // through `env` after the launcher: never on the launcher's own environment, which stays the
+    // floor's sanitized allow-list (a launcher that is not setuid — bwrap — honours `LD_PRELOAD`
+    // before it arms anything). With no launcher (no wrapper) the spawned process IS the command,
+    // and the env is set on it directly.
+    // (The names were checked when the guide loaded: `floor_guide::env_name_ok`.)
     let mut full: Vec<String> = sandbox.wrapper.clone();
+    let env_inside = !exec.env.is_empty() && !sandbox.wrapper.is_empty();
+    if env_inside {
+        let exe_s = exe.to_string_lossy();
+        let Some(env_bin) = crate::validator::find_on_path("env") else {
+            result.spawn_error = Some(
+                "`env` is not on PATH (it applies the guide's env inside the boundary)".into(),
+            );
+            return result;
+        };
+        // `env` reads a leading `NAME=VALUE` as an assignment: an exe path holding `=` would be.
+        if exe_s.contains('=') {
+            result.spawn_error = Some(format!(
+                "`{exe_s}` holds `=` (it would read as an env assignment)"
+            ));
+            return result;
+        }
+        full.push(env_bin.to_string_lossy().into_owned());
+        full.extend(exec.env.iter().map(|(k, v)| format!("{k}={v}")));
+    }
     full.push(exe.to_string_lossy().into_owned());
     full.extend(check.argv[1..].iter().cloned());
     // spawn-audit: hardened — the repository's own check command, run in the run's worktree.
@@ -5747,9 +5772,13 @@ pub(crate) fn run_one_with(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // The launcher's environment: the floor's sanitized allow-list only (the guide's is in `full`).
     scratch.apply_env(&mut cmd, tree);
-    for (k, v) in &exec.env {
-        cmd.env(k, v);
+    if !env_inside {
+        // No launcher: this process is the command itself.
+        for (k, v) in &exec.env {
+            cmd.env(k, v);
+        }
     }
     let merged = if exec.merge {
         match std::io::pipe().and_then(|(r, w)| Ok((r, w.try_clone()?, w))) {
