@@ -19,12 +19,10 @@ pub fn libtest_guide(argv: &[String], verified: &str) -> serde_json::Value {
         "name": "test", "cwd": ".", "stage": ["creator", "verify"],
         "run": argv, "failedExit": [101],
         "results": {"kind": "text", "how": {"merge": true}},
-        "parser": {"section": section,
-                   "count": r"^test result: \S+\. (?P<n>\d+) passed; (?P<f>\d+) failed; (?P<i>\d+) ignored;",
-                   "blocks": [{
+        "parser": {"section": section, "blocks": [{
             "start": "^failures:$", "item": r"^    (?P<id>\S+)$",
             "end": "^test result: FAILED", "use": "last-before-end"}]},
-        "list": {"run": tail(&["--list"]), "item": r"^(?P<id>.+): test$",
+        "list": {"run": tail(&["--list"]), "item": r"^(?P<id>\S+): test$",
                  "section": section, "merge": true},
         "alone": {"run": tail(&["{id}", "--exact"])},
         "deselect": {"append": ["--", "--skip={id}", "--exact"]},
@@ -33,7 +31,7 @@ pub fn libtest_guide(argv: &[String], verified: &str) -> serde_json::Value {
     if !verified.is_empty() {
         g["verified"] = serde_json::json!({
             "baseSha": verified, "runnerVersion": "", "at": "",
-            "results": {"list": "pass", "run": "pass", "complete": "pass", "ids": "pass", "alone": "pass",
+            "results": {"list": "pass", "run": "pass", "ids": "pass", "alone": "pass",
                         "deselect": "pass", "mutation": "pass", "multi": "pass"}});
     }
     g

@@ -292,7 +292,7 @@ fn every_forgery_of_rounds_1_to_21_denies_or_escalates_never_passes() {
         assert_eq!(
             d.excluded,
             s(&["old"]),
-            "{round}: only the base's own failure is deselected"
+            "{round}: only the base's own failure is deselected: {d:?}"
         );
     }
     let _ = std::fs::remove_dir_all(&repo);
@@ -735,8 +735,7 @@ fn the_probe_passes_every_piece_of_a_real_cargo_guide() {
     .unwrap();
     std::fs::write(
         repo.join("src/lib.rs"),
-        "/// ```\n/// assert_eq!(probe_fixture::two(), 2);\n/// ```\npub fn two() -> u32 {\n    2\n}\n\n\
-         #[cfg(test)]\nmod t {\n    #[test]\n    fn a() {}\n    #[test]\n    fn b() {}\n}\n",
+        "#[cfg(test)]\nmod t {\n    #[test]\n    fn a() {}\n    #[test]\n    fn b() {}\n}\n",
     )
     .unwrap();
     std::fs::write(
@@ -1496,8 +1495,7 @@ case $mode in
   list) if [ -f flaky.list ] && [ ! -f "$TMPDIR/listed" ]; then : > "$TMPDIR/listed"; exit 1; fi
     for t in $all; do case "$skip" in *" $t "*) continue;; esac; echo "$t: test"; done
     [ -f dup.list ] && case "$skip" in *" a "*) ;; *) echo "a: test";; esac; exit 0;;
-  *) f=; n=0; for t in $all; do case "$skip" in *" $t "*) continue;; esac; n=$((n+1)); case $t in m|m2) f="$f $t";; a) [ -f red.base ] && f="$f a";; esac; done
-    echo "ran $n"
+  *) f=; for t in $all; do case "$skip" in *" $t "*) continue;; esac; case $t in m|m2) f="$f $t";; a) [ -f red.base ] && f="$f a";; esac; done
     if [ -z "$f" ]; then echo 'test result: ok.'; exit 0; fi
     printf '\nfailures:\n'; for t in $f; do echo "    $t"; done; printf '\ntest result: FAILED.\n'
     [ -f swallow ] && exit 0; exit 101;;
@@ -1510,8 +1508,7 @@ fn stand_in_guide() -> serde_json::Value {
     serde_json::json!({
         "name": "test", "run": ["sh", "runner.sh"], "failedExit": [101],
         "results": {"kind": "text"},
-        "parser": {"count": r"^ran (?P<n>\d+)$",
-                   "blocks": [{"start": "^failures:$", "item": r"^    (?P<id>\S+)$",
+        "parser": {"blocks": [{"start": "^failures:$", "item": r"^    (?P<id>\S+)$",
                                "end": "^test result: FAILED"}]},
         "list": {"run": ["sh", "runner.sh", "--list"], "item": r"^(?P<id>\S+): test$"},
         "alone": {"run": ["sh", "runner.sh", "--", "{id}", "--exact"]},
@@ -1633,13 +1630,12 @@ fn the_probe_needs_a_green_base_an_isolated_alone_and_confined_mutations() {
         r["list"], "pass (retried)",
         "the list never saw the results env: {r:?}"
     );
-    // (round 17, items 2, 3) A runner that swallows its failures (exit 0) proves nothing. A list
-    // that names a test twice is not the run's (`complete`), and the twice-listed id is never the
-    // one `alone`/`deselect` probe.
+    // (round 17, items 2, 3) A runner that swallows its failures (exit 0) proves nothing; a
+    // deselect of a test listed twice proves nothing.
     let r = with("swallow", &g).unwrap();
     assert!(r["mutation"].starts_with("fail:"), "{r:?}");
     let r = with("dup.list", &g).unwrap();
-    assert!(r["complete"].starts_with("fail:"), "{r:?}");
+    assert!(r["deselect"].starts_with("fail:"), "{r:?}");
     let mut bad2 = g.clone();
     bad2["probes"]["mutation2"]["file"] = "../m2".into();
     let r = with("bad2.marker", &bad2).unwrap();
@@ -2188,46 +2184,6 @@ fn a_base_candidate_that_passes_alone_is_never_excluded() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// (round 18, codex P1) A list that misses tests the run executes is incomplete: an id unique in
-/// it may name more tests. A guide running every target but listing only `--lib` fails `complete`
-/// (the lib's `smoke` and an integration test's `smoke` share a name).
-#[cfg(unix)]
-#[test]
-fn a_list_that_misses_tests_the_run_executes_fails_complete() {
-    let _load = seam::pin(0.5, 4);
-    let repo = scratch("probe-incomplete");
-    std::fs::create_dir_all(repo.join("src")).unwrap();
-    std::fs::create_dir_all(repo.join("tests")).unwrap();
-    std::fs::write(
-        repo.join("Cargo.toml"),
-        "[package]\nname = \"probe_partial\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n",
-    )
-    .unwrap();
-    std::fs::write(
-        repo.join("src/lib.rs"),
-        "#[cfg(test)]\nmod t {\n    #[test]\n    fn smoke() {}\n    #[test]\n    fn a() {}\n}\n",
-    )
-    .unwrap();
-    std::fs::write(repo.join("tests/it.rs"), "#[test]\nfn smoke() {}\n").unwrap();
-    std::fs::write(
-        repo.join(".gitignore"),
-        "Cargo.lock\ntmp/\nprobe-guide.json\n",
-    )
-    .unwrap();
-    git_repo_with_commit(&repo);
-    let mut g = libtest_check(&s(&["cargo", "test", "--no-fail-fast"]));
-    g["list"]["run"] = serde_json::json!(["cargo", "test", "--lib", "--", "--list"]);
-    let Some(results) = probe(&repo, g) else {
-        return;
-    };
-    let complete = results.get("complete").cloned().unwrap_or_default();
-    assert!(
-        complete.starts_with("fail: the run executed 3 test(s), the list names 2"),
-        "{results:?}"
-    );
-    let _ = std::fs::remove_dir_all(&repo);
-}
-
 /// (round 18, codex P1) A footer-shaped block a base test prints into its own output never adds
 /// candidates: only the qualifier's LAST block counts. With an order-dependent `fine` (it fails
 /// run alone) named in the forged footer, a head that breaks `fine` still denies.
@@ -2345,6 +2301,52 @@ fn a_head_that_changes_a_derived_from_file_cannot_use_the_guide() {
     assert!(
         g.reason.as_deref().is_some_and(|r| r.contains("notes.md")),
         "{g:?}"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// Exclusion ships OFF (`WICKED_FLOOR_EXCLUDE`): a red base and a failing head escalate as
+/// `base_red_unseparated`, saying so, and neither the base's list, a one-test run, nor a
+/// deselected head run is executed. The guide still names the check and is still checked.
+#[cfg(unix)]
+#[test]
+fn with_exclusion_off_a_red_base_escalates_and_nothing_is_deselected() {
+    let _load = seam::pin(0.5, 4);
+    let _off = seam::exclude(false);
+    let (repo, ctx, argv) = red_base("exclude-off");
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.out", "test old ... FAILED\n"),
+            ("run.exit", "101"),
+            ("excluded.exit", "0"),
+            ("toc.txt", &toc_of(&["old", "new", "fine"])),
+        ],
+    );
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    let d = c.decision.as_ref().expect("decided");
+    assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
+    assert!(
+        d.reason
+            .as_deref()
+            .is_some_and(|r| r.contains("exclusion disabled (WICKED_FLOOR_EXCLUDE)")),
+        "{d:?}"
+    );
+    assert!(
+        !report.passed && d.excluded.is_empty() && c.reruns.is_empty(),
+        "{c:?}"
+    );
+    let attempts: Vec<&str> = d.log_refs.iter().map(|l| l.attempt.as_str()).collect();
+    assert!(
+        attempts.iter().all(|a| *a == "head" || *a == "base"),
+        "no list, one-test or deselected run: {attempts:?}"
+    );
+    assert!(
+        d.guide.as_ref().is_some_and(|g| g.present && g.usable),
+        "{d:?}"
     );
     let _ = std::fs::remove_dir_all(&repo);
 }

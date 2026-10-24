@@ -2634,10 +2634,12 @@ mod tests {
 /// `tests/harness_hygiene.rs`); this one covers the inline `#[cfg(test)]` modules.
 #[cfg(test)]
 mod test_harness_hygiene {
-    /// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one process env
-    /// var via the std API — no allocator setup, no threads, no panics across the FFI boundary.
+    /// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets process env vars
+    /// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
     #[ctor::ctor(unsafe)]
     fn arm_hermetic_emit_spool() {
         wicked_apps_core::emit::hermetic_test_spool();
+        // The floor's exclusion ships OFF; its tests exercise it ON (one test pins it off).
+        std::env::set_var(crate::repo_checks::FLOOR_EXCLUDE_ENV, "on");
     }
 }

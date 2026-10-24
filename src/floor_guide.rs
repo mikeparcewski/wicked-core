@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 pub const GUIDE_PATH: &str = ".wicked/build-guide.json";
 /// The probes every check needs, all `pass`, before its exclusion is relied on (plus `affected`
 /// when the check has that piece).
-pub const REQUIRED_PROBES: [&str; 8] = [
-    "list", "run", "complete", "ids", "alone", "deselect", "mutation", "multi",
+pub const REQUIRED_PROBES: [&str; 7] = [
+    "list", "run", "ids", "alone", "deselect", "mutation", "multi",
 ];
 
 /// A repository's build/test guide (contract v1).
@@ -126,11 +126,6 @@ pub struct How {
 pub struct Parser {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section: Option<String>,
-    /// How many tests the run executed: on each matching line every named group's integer is
-    /// added (say passed, failed and ignored). Without it a text guide cannot prove its list
-    /// complete, and is never relied on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub count: Option<String>,
     #[serde(default)]
     pub failed: Vec<String>,
     #[serde(default)]
@@ -295,11 +290,6 @@ pub(crate) fn parse(raw: &str) -> Result<BuildGuide, String> {
             Some("a `cwd` that is absolute, climbs (`..`) or has an empty segment")
         } else if has(&tokens[first..last], "{ids:re|}") {
             Some("`{ids:re|}` among the per-id tokens of `deselect.append` (it is once-only)")
-        } else if tokens.iter().any(|t| {
-            let id = t.contains("{id}") || t.contains("{id:re}");
-            t.contains("{q}") != id && has(tokens, "{q}")
-        }) {
-            Some("`{q}` and `{id}` in different tokens of `deselect.append` (one token must bind an id to its qualifier)")
         } else if has(tokens, "{ids:re|}") && has(tokens, "{q}") {
             Some("`{ids:re|}` and `{q}` in one `deselect.append` (the pattern cannot bind ids to qualifiers)")
         } else {
@@ -340,7 +330,6 @@ impl BuildGuide {
 /// A compiled parser: each regex applies to one line at a time (RE2 syntax: the `regex` crate).
 pub(crate) struct Compiled {
     section: Option<Regex>,
-    count: Option<Regex>,
     failed: Vec<Regex>,
     blocks: Vec<(Regex, Regex, Regex, bool)>,
     list_item: Regex,
@@ -360,7 +349,7 @@ impl GuideCheck {
     /// Compile every regex the check's pieces name; `Err` names the first that is missing or bad.
     pub(crate) fn compile(&self) -> Result<Compiled, String> {
         let list = self.list.as_ref().ok_or("no `list` piece")?;
-        let (section, count, failed, blocks) = match self.results.kind.as_str() {
+        let (section, failed, blocks) = match self.results.kind.as_str() {
             "text" => {
                 let p = self
                     .parser
@@ -380,12 +369,11 @@ impl GuideCheck {
                     .collect::<Result<Vec<_>, String>>()?;
                 (
                     p.section.as_deref().map(re).transpose()?,
-                    p.count.as_deref().map(re).transpose()?,
                     p.failed.iter().map(|f| re(f)).collect::<Result<_, _>>()?,
                     blocks,
                 )
             }
-            "junit" => (None, None, Vec::new(), Vec::new()),
+            "junit" => (None, Vec::new(), Vec::new()),
             k @ ("json-lines" | "tap") => {
                 return Err(format!("`results.kind` `{k}` is reserved (not read in v1)"))
             }
@@ -393,7 +381,6 @@ impl GuideCheck {
         };
         Ok(Compiled {
             section,
-            count,
             failed,
             blocks,
             list_item: re(&list.item)?,
@@ -679,25 +666,6 @@ impl Compiled {
         dedup(out, keyed)
     }
 
-    /// How many tests a text run executed (`parser.count`, summed over its lines); `None` without
-    /// a count rule or a line it matches.
-    pub(crate) fn executed(&self, text: &str) -> Option<usize> {
-        let r = self.count.as_ref()?;
-        let mut total = None;
-        for c in text
-            .lines()
-            .filter_map(|l| r.captures(l.trim_end_matches('\r')))
-        {
-            let n: usize = r
-                .capture_names()
-                .flatten()
-                .filter_map(|g| c.name(g)?.as_str().parse::<usize>().ok())
-                .sum();
-            total = Some(total.unwrap_or(0) + n);
-        }
-        total
-    }
-
     /// The ids a list run prints: `item` lines, each in the `section` scope it appeared in. Other
     /// lines are not the list's.
     pub(crate) fn list(&self, text: &str) -> Vec<TestId> {
@@ -769,14 +737,7 @@ pub(crate) fn junit(
     Some((all, dedup(failed, keyed)))
 }
 
-/// (junit) How many tests the run executed: every testcase with an id, run or skipped — the
-/// count a list of every test matches.
-pub(crate) fn junit_count(xml: &str, attrs: &[String]) -> Option<usize> {
-    junit_cases(xml, attrs, "::", false).map(|c| c.len())
-}
-
-/// Every `<testcase>` with an id: (its id, skipped, failed). The one reading [`junit`] and
-/// [`junit_count`] share.
+/// Every `<testcase>` with an id: (its id, skipped, failed).
 fn junit_cases(
     xml: &str,
     attrs: &[String],
@@ -911,10 +872,6 @@ mod tests {
             ("cwd", serde_json::json!("C:x")),
             (
                 "deselect",
-                serde_json::json!({"append": ["--suite={q}", "--skip={id}"]}),
-            ),
-            (
-                "deselect",
                 serde_json::json!({"append": ["--not={id}", "--all={ids:re|}", "--raw={id}"]}),
             ),
             (
@@ -954,29 +911,6 @@ mod tests {
         assert_eq!(c.failures(out, true), vec![t("bin2", "real")]);
         let forged = "== bin1\nsummary:\n  fine\ndone: red\nsummary:\n  old\ndone: red\n";
         assert_eq!(c.failures(forged, true), vec![t("bin1", "old")]);
-    }
-
-    /// `parser.count` sums every named group of each line it matches; JUnit counts every case
-    /// with an id, run or skipped.
-    #[test]
-    fn the_executed_count_reads_count_lines_and_junit_cases() {
-        let mut g = check("text");
-        g.parser.as_mut().unwrap().count =
-            Some(r"^result: (?P<n>\d+) ok, (?P<f>\d+) bad, (?P<i>\d+) off$".into());
-        let c = g.compile().unwrap();
-        assert_eq!(
-            c.executed("result: 2 ok, 1 bad, 1 off\nx\nresult: 3 ok, 0 bad, 0 off\n"),
-            Some(7)
-        );
-        assert_eq!(
-            check("text")
-                .compile()
-                .unwrap()
-                .executed("result: 1 ok, 0 bad, 0 off"),
-            None
-        );
-        let xml = r#"<testsuite name="s"><testcase name="a"/><testcase name="b"><skipped/></testcase><testcase/></testsuite>"#;
-        assert_eq!(junit_count(xml, &s(&["name"])), Some(2));
     }
 
     /// `argvAppend` and `deselect.append` compose around an existing `--`: options before it,

@@ -3398,6 +3398,12 @@ pub(crate) fn run_with_sandbox_ctx(
             }
         } else {
             let compare = check.name != "install" && !is_formatter_check(&check.name);
+            // With exclusion off the base runs plainly: no results, no list, no alone runs.
+            let excluding = gcheck
+                .as_ref()
+                .ok()
+                .copied()
+                .filter(|_| exclusion_enabled());
             let side = match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
                 _ if !compare => None,
                 (Some(head), _) if !(baseline_diff && baseline_diff_for(&check.dir)) => {
@@ -3416,40 +3422,30 @@ pub(crate) fn run_with_sandbox_ctx(
                 (Some(head), Some(git_dir)) => {
                     // This run's cache first; on a miss the base is exported, run (and, red,
                     // inventoried), cached, and the export removed before the next HEAD run.
-                    Some(
-                        match BaseTree::cached(&scratch, head, check, gcheck.as_ref().ok().copied())
-                        {
-                            Some(cached) => cached,
-                            None => {
-                                let side = match BaseTree::export(worktree, &scratch, git_dir, head)
-                                {
-                                    Ok(t) => t.run_check(
-                                        check,
-                                        ctx,
-                                        &sandbox,
-                                        &scratch,
-                                        gcheck.as_ref().ok().copied(),
-                                    ),
-                                    Err(e) => BaseSide {
-                                        base: BaseRun {
-                                            head: head.to_string(),
-                                            cached: false,
-                                            run: None,
-                                            error: Some(e),
-                                        },
-                                        toc: None,
+                    Some(match BaseTree::cached(&scratch, head, check, excluding) {
+                        Some(cached) => cached,
+                        None => {
+                            let side = match BaseTree::export(worktree, &scratch, git_dir, head) {
+                                Ok(t) => t.run_check(check, ctx, &sandbox, &scratch, excluding),
+                                Err(e) => BaseSide {
+                                    base: BaseRun {
+                                        head: head.to_string(),
+                                        cached: false,
+                                        run: None,
+                                        error: Some(e),
                                     },
-                                };
-                                if let Err(e) = remove_base_export(worktree, &scratch) {
-                                    scratch_error = Some(format!(
-                                        "the base export could not be removed before the next \
+                                    toc: None,
+                                },
+                            };
+                            if let Err(e) = remove_base_export(worktree, &scratch) {
+                                scratch_error = Some(format!(
+                                    "the base export could not be removed before the next \
                                      check: {e}"
-                                    ));
-                                }
-                                side
+                                ));
                             }
-                        },
-                    )
+                            side
+                        }
+                    })
                 }
                 _ => None,
             };
@@ -4701,23 +4697,22 @@ pub(crate) fn results_of(
     }
 }
 
-/// How many tests a results run executed: the guide's `parser.count` over its output (text), or
-/// every JUnit testcase with an id, run or skipped (junit). `None` when that cannot be read.
-pub(crate) fn executed_count(
-    g: &GuideCheck,
-    run: &CheckRun,
-    scratch: &CheckScratch,
-) -> Option<usize> {
-    let log = if g.results.how.path.is_some() {
-        run.logs.iter().find(|l| l.stream == "file")?
-    } else {
-        run.logs.first()?
-    };
-    let text = crate::floor_log::text(&scratch.logs, log).ok()?;
-    match g.results.kind.as_str() {
-        "junit" => crate::floor_guide::junit_count(&text, &g.results.id),
-        _ => g.compile().ok()?.executed(&text),
+/// The operator's switch for excluding a red base's own failures: `on` / `1` enables it; anything
+/// else, or unset, leaves it OFF — a red base then escalates as `base_red_unseparated` with both
+/// logs (the operator's floor override is the path through), and neither the base's list nor any
+/// one-test run, nor a deselected head run, is executed. A usable guide still names the checks.
+pub const FLOOR_EXCLUDE_ENV: &str = "WICKED_FLOOR_EXCLUDE";
+
+/// Is exclusion on ([`FLOOR_EXCLUDE_ENV`])?
+pub(crate) fn exclusion_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = test_seam::exclusion() {
+        return on;
     }
+    matches!(
+        std::env::var(FLOOR_EXCLUDE_ENV).as_deref().map(str::trim),
+        Ok("on") | Ok("1")
+    )
 }
 
 /// (DES-BUILD-GUIDE) `rel` under `root`, refused unless it is relative with no `..`, and no
@@ -5016,6 +5011,9 @@ fn decide(
     let mut plan: Result<Vec<TestId>, String> = Err("the base passes this check".to_string());
     if let (Some(_), Some(side)) = (red_base, side.as_ref()) {
         plan = (|| {
+            if !exclusion_enabled() {
+                return Err(format!("exclusion disabled ({FLOOR_EXCLUDE_ENV})"));
+            }
             let g = guide
                 .as_ref()
                 .map_err(|e| format!("no usable build guide: {e}"))?;
@@ -5877,6 +5875,23 @@ pub(crate) mod test_seam {
     thread_local! {
         static LOAD: Cell<Option<(Option<f64>, usize)>> = const { Cell::new(None) };
         static CAP: Cell<Option<u64>> = const { Cell::new(None) };
+        static EXCLUDE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+    pub(crate) fn exclusion() -> Option<bool> {
+        EXCLUDE.with(Cell::get)
+    }
+    /// Pin this thread's exclusion switch until dropped (the test binary arms it ON).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) struct Excluding;
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn exclude(on: bool) -> Excluding {
+        EXCLUDE.with(|c| c.set(Some(on)));
+        Excluding
+    }
+    impl Drop for Excluding {
+        fn drop(&mut self) {
+            EXCLUDE.with(|c| c.set(None));
+        }
     }
     pub(crate) fn log_cap() -> Option<u64> {
         CAP.with(Cell::get)

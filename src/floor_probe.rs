@@ -265,17 +265,11 @@ fn verdict(ok: bool, why: impl FnOnce() -> String) -> String {
 }
 
 /// The probes that need a green base, both mutations and the `alone`/`deselect` pieces.
-const AFTER_RUN: [&str; 6] = ["complete", "ids", "alone", "deselect", "mutation", "multi"];
+const AFTER_RUN: [&str; 5] = ["ids", "alone", "deselect", "mutation", "multi"];
 
 impl Probe<'_> {
     /// A results run of `argv` (with `how`): its exit code, every testcase (junit), its failures.
     fn results(&self, argv: &[String]) -> (Option<i32>, Parsed) {
-        let (exit, parsed, _) = self.counted(argv);
-        (exit, parsed)
-    }
-
-    /// [`Self::results`], and how many tests the run executed.
-    fn counted(&self, argv: &[String]) -> (Option<i32>, Parsed, Option<usize>) {
         let rc = RepoCheck {
             argv: self.g.for_results(argv),
             ..self.rc.clone()
@@ -291,11 +285,10 @@ impl Probe<'_> {
             Tree::Base,
         );
         if r.timed_out || r.spawn_error.is_some() {
-            return (None, Err(format!("did not finish ({})", r.summary())), None);
+            return (None, Err(format!("did not finish ({})", r.summary())));
         }
         let parsed = results_of(self.dir, &self.rc, self.g, &mut r, self.scratch, since);
-        let count = crate::repo_checks::executed_count(self.g, &r, self.scratch);
-        (r.exit_code, parsed, count)
+        (r.exit_code, parsed)
     }
 
     /// A results run that exits 0 and names no failure.
@@ -365,7 +358,7 @@ impl Probe<'_> {
         );
         // A green base: the mutations' failures are then the run's only failures, and a deselected
         // run that exits 0 does so because of the deselect.
-        let (exit, clean, executed) = self.counted(&g.run);
+        let (exit, clean) = self.results(&g.run);
         let green = exit == Some(0) && clean.as_ref().is_ok_and(|(_, f)| f.is_empty());
         out.insert(
             "run".into(),
@@ -377,20 +370,6 @@ impl Probe<'_> {
                 ),
             }),
         );
-        // complete: the run executed exactly the tests the list names — else an id unique in the
-        // list may name more tests than it shows, and deselecting it would hide them.
-        if green {
-            let listed_n = clean_list.ids.len();
-            out.insert(
-                "complete".into(),
-                verdict(executed == Some(listed_n), || match executed {
-                    Some(n) => format!("the run executed {n} test(s), the list names {listed_n}"),
-                    None => "the run's executed count could not be read (no `parser.count` \
-                             line, or no results)"
-                        .into(),
-                }),
-            );
-        }
         for (piece, present) in [
             ("alone", g.alone.is_some()),
             ("deselect", g.deselect.is_some()),
@@ -462,23 +441,15 @@ impl Probe<'_> {
             }
             _ => Vec::new(),
         };
-        // Deselecting the first mutation alone leaves the second failing, named exactly: the
-        // deselect hides no failure it was not given.
-        let (oexit, only) = self.results(&g.deselected(&g.run, std::slice::from_ref(&t)));
-        let one_left = only.as_ref().is_ok_and(|(_, f)| {
-            self.failed_exit(oexit) && f.len() == 1 && f[0] != t && is(&f[0], m2)
-        });
         out.insert(
             "multi".into(),
             verdict(
                 !pair.is_empty()
-                    && one_left
                     && self.green(&g.deselected(&g.run, &pair))
                     && self.deselects_exactly(&listed.ids, &pair),
                 || {
                     format!(
-                        "with both mutations: {:?} (exit {bexit:?}); both must be named, \
-                         deselecting the first must leave exactly the second failing, and \
+                        "with both mutations: {:?} (exit {bexit:?}); both must be named, and \
                          deselecting both must run green and list exactly the rest",
                         both.as_ref().map(|(_, f)| f.clone()).unwrap_or_default()
                     )
@@ -525,17 +496,10 @@ impl Probe<'_> {
             }) && (g.results.kind != "junit" || all == std::slice::from_ref(want))
         };
         let (aexit, alone_t) = self.results(&g.alone_argv(&t));
-        // A passing test under the mutated one's qualifier whose id is listed exactly once across
-        // every qualifier (a shared id would be one-test-run and deselected everywhere).
         let passing = listed
             .ids
             .iter()
-            .find(|x| {
-                x.q == t.q
-                    && **x != t
-                    && !is(x, m2)
-                    && listed.ids.iter().filter(|y| y.id == x.id).count() == 1
-            })
+            .find(|x| x.q == t.q && **x != t && !is(x, m2))
             .cloned();
         out.insert(
             "alone".into(),

@@ -112,8 +112,7 @@
             "end": "^test result: FAILED",
             "use": "last-before-end"
           }
-        ],
-        "count": "^test result: \\S+\\. (?P<n>\\d+) passed; (?P<f>\\d+) failed; (?P<i>\\d+) ignored;"
+        ]
       },
       "list": {
         "run": [
@@ -125,7 +124,7 @@
           "--",
           "--list"
         ],
-        "item": "^(?P<id>.+): test$",
+        "item": "^(?P<id>\\S+): test$",
         "section": "^\\s+(?:Running .*\\((?:.*[/\\\\])?|Doc-tests )(?P<q>[^/\\\\()\\s]+)\\)?$",
         "merge": true
       },

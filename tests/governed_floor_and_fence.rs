@@ -39,6 +39,8 @@ use wicked_core::{
 /// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
+    // The floor's exclusion ships OFF (`WICKED_FLOOR_EXCLUDE`); these tests exercise it ON.
+    std::env::set_var("WICKED_FLOOR_EXCLUDE", "on");
     // DES-FLOOR-V2: a failed floor on an oversubscribed host retries once; this harness does not
     // wait for headroom first (the bound's own behaviour is the unit tests').
     std::env::set_var("WICKED_REPO_CHECKS_RETRY_WAIT_S", "0");

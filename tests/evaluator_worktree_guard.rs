@@ -56,6 +56,8 @@ use wicked_core::{
 /// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
+    // The floor's exclusion ships OFF (`WICKED_FLOOR_EXCLUDE`); these tests exercise it ON.
+    std::env::set_var("WICKED_FLOOR_EXCLUDE", "on");
     wicked_apps_core::emit::hermetic_test_spool();
 }
 
