@@ -3,8 +3,12 @@
 //! in a scratch copy of the repo's HEAD under the real floor sandbox. The results land in each
 //! check's `verified`, and the floor relies on a check's exclusion only when every probe passed.
 //!
-//! The probes, per check (each on a scratch copy; the mutations are written inside the check's
-//! directory, never through a link):
+//! The probes, per check, in three FRESH copies of HEAD — clean (`list`, `run`, `version`), with
+//! the first mutation (`mutation`, `affected`), with both (`multi`, `ids`, `alone`, `deselect`).
+//! The mutations are written into a copy BEFORE any repository command runs there, inside the
+//! check's directory and through the copy's held directory fd, never through a link; after a
+//! command ran, the engine only clears a results file, through that fd
+//! ([`crate::repo_checks::HeldDir`]):
 //! * `list` — the list run exits 0 and names tests;
 //! * `run` — the clean run is GREEN (exit 0, no parsed failure): every later probe needs a green
 //!   base, so a mutation's failure is the run's only one and a deselected run that exits 0 does so
@@ -22,7 +26,7 @@
 //! * `version` (when the check has the piece) — the command passes and prints a line, recorded as
 //!   `verified.runnerVersion`.
 //!
-//! A probe that fails re-runs the whole probe once, on a fresh copy, and the retry's results are the
+//! A probe that fails re-runs the whole probe once, on fresh copies, and the retry's results are the
 //! result, each marked `(retried)`: a suite too flaky to pass twice is left unverified. A check with
 //! no `list` piece (a build, a lint) has nothing to probe and is skipped.
 //!
@@ -212,12 +216,17 @@ fn probe_check(
     g.compile()?;
     let scratch = CheckScratch::prepare_for(repo, Some("floor-probe"))
         .map_err(|e| format!("the probe's scratch: {e}"))?;
-    let tree = BaseTree::export(repo, &scratch, git_dir, head)?;
+    // Every copy is created through the repo, held ([`crate::repo_checks::HeldDir`]).
+    let root = crate::repo_checks::HeldDir::open(repo)?;
+    // The first export arms the sandbox (its write roots must exist); every phase below exports
+    // its own fresh copy at the same path.
+    let tree = BaseTree::export(repo, &root, &scratch, git_dir, head)?;
     let sandbox = crate::repo_checks::floor_sandbox(&[
         tree.dir.clone(),
         scratch.tmp_path().to_path_buf(),
         scratch.root().to_path_buf(),
     ]);
+    drop(tree);
     if sandbox.level != crate::validator::SandboxLevel::Sandboxed {
         let _ = remove_base_export(repo, &scratch);
         return Err(format!(
@@ -228,62 +237,31 @@ fn probe_check(
                 .unwrap_or("no boundary tool")
         ));
     }
-    let rc = RepoCheck {
-        name: g.name.clone(),
-        argv: g.run.clone(),
-        source: "floor probe (DES-BUILD-GUIDE)".into(),
-        timeout_s: Some(3600),
-        dir: g.dir().to_string(),
+    let probe = Probe {
+        repo,
+        root: &root,
+        git_dir,
+        head,
+        g,
+        rc: RepoCheck {
+            name: g.name.clone(),
+            argv: g.run.clone(),
+            source: "floor probe (DES-BUILD-GUIDE)".into(),
+            timeout_s: Some(3600),
+            dir: g.dir().to_string(),
+        },
+        install,
+        sandbox: &sandbox,
+        scratch: &scratch,
     };
-    // One attempt of every probe on `dir` (a fresh copy): the results and the runner version.
-    let attempt = |dir: &Path| {
-        if let Some(i) = install {
-            let r = run_one(dir, i, &sandbox, &scratch, Tree::Base);
-            if !r.passed() {
-                let why = format!("fail: install failed ({})", r.summary());
-                let mut names: Vec<&str> = crate::floor_guide::REQUIRED_PROBES.to_vec();
-                if g.affected.is_some() {
-                    names.push("affected");
-                }
-                if g.version.is_some() {
-                    names.push("version");
-                }
-                let out: ProbeResults = names
-                    .into_iter()
-                    .map(|p| (p.to_string(), why.clone()))
-                    .collect();
-                return (out, String::new());
-            }
-        }
-        let mut out = Probe {
-            dir,
-            g,
-            rc: rc.clone(),
-            sandbox: &sandbox,
-            scratch: &scratch,
-        }
-        .all();
-        let mut version = String::new();
-        if g.version.is_some() {
-            let v = runner_version(dir, &rc, g, &sandbox, &scratch, Tree::Base);
-            out.insert(
-                "version".into(),
-                verdict(v.is_ok(), || v.clone().unwrap_err()),
-            );
-            version = v.unwrap_or_default();
-        }
-        (out, version)
-    };
-    let (mut results, mut version) = attempt(&tree.dir);
-    // A failed probe re-runs the WHOLE probe once, on a fresh copy, and the retry's results are
+    let (mut results, mut version) = probe.all();
+    // A failed probe re-runs the WHOLE probe once, on fresh copies, and the retry's results are
     // the result (a missing piece is not retried: it cannot pass).
     if results
         .values()
         .any(|r| !passed(r) && !r.starts_with("fail: no `"))
     {
-        remove_base_export(repo, &scratch)?;
-        let again = BaseTree::export(repo, &scratch, git_dir, head)?;
-        let (second, v2) = attempt(&again.dir);
+        let (second, v2) = probe.all();
         results = second
             .into_iter()
             .map(|(p, r)| (p, format!("{r} (retried)")))
@@ -295,9 +273,15 @@ fn probe_check(
 }
 
 struct Probe<'a> {
-    dir: &'a Path,
+    repo: &'a Path,
+    /// `repo`, held: each copy is created through it.
+    root: &'a crate::repo_checks::HeldDir,
+    git_dir: &'a Path,
+    head: &'a str,
     g: &'a GuideCheck,
     rc: RepoCheck,
+    /// The guide's install step for the check's `cwd`.
+    install: Option<&'a RepoCheck>,
     sandbox: &'a crate::validator::WorkerSandbox,
     scratch: &'a CheckScratch,
 }
@@ -314,16 +298,40 @@ fn verdict(ok: bool, why: impl FnOnce() -> String) -> String {
 const AFTER_RUN: [&str; 5] = ["ids", "alone", "deselect", "mutation", "multi"];
 
 impl Probe<'_> {
-    /// A results run of `argv` (with `how`): its exit code, every testcase (junit), its failures.
-    fn results(&self, argv: &[String]) -> (Option<i32>, Parsed) {
+    /// A FRESH copy of the repo's HEAD for one phase: the engine writes `mutations` into it
+    /// FIRST, then the guide's install runs, then the phase's commands. The engine never writes
+    /// into a copy after repository code ran there, except to clear a results file — and that
+    /// only through the copy's held directory fd ([`crate::repo_checks::HeldDir`]).
+    fn copy(&self, mutations: &[&Mutation]) -> Result<BaseTree, String> {
+        remove_base_export(self.repo, self.scratch)?;
+        let tree = BaseTree::export(self.repo, self.root, self.scratch, self.git_dir, self.head)?;
+        for (i, m) in mutations.iter().enumerate() {
+            let rel = Path::new(self.g.dir()).join(&m.file);
+            let which = if i == 0 { "the" } else { "the second" };
+            tree.held
+                .write(&rel.to_string_lossy(), &m.content)
+                .map_err(|e| format!("{which} mutation could not be written: {e}"))?;
+        }
+        if let Some(i) = self.install {
+            let r = run_one(&tree.dir, i, self.sandbox, self.scratch, Tree::Base);
+            if !r.passed() {
+                return Err(format!("install failed ({})", r.summary()));
+            }
+        }
+        Ok(tree)
+    }
+
+    /// A results run of `argv` (with `how`) in `c`: its exit code, every testcase (junit), its
+    /// failures.
+    fn results(&self, c: &BaseTree, argv: &[String]) -> (Option<i32>, Parsed) {
         let rc = RepoCheck {
             argv: self.g.for_results(argv),
             ..self.rc.clone()
         };
-        crate::repo_checks::clear_results(self.dir, &self.rc, self.g);
+        crate::repo_checks::clear_results(&c.held, &self.rc, self.g);
         let since = std::time::SystemTime::now();
         let mut r = run_one_with(
-            self.dir,
+            &c.dir,
             &rc,
             &results_exec(self.g),
             self.sandbox,
@@ -333,20 +341,20 @@ impl Probe<'_> {
         if r.timed_out || r.spawn_error.is_some() {
             return (None, Err(format!("did not finish ({})", r.summary())));
         }
-        let parsed = results_of(self.dir, &self.rc, self.g, &mut r, self.scratch, since);
+        let parsed = results_of(&c.dir, &self.rc, self.g, &mut r, self.scratch, since);
         (r.exit_code, parsed)
     }
 
     /// A results run that exits 0 and names no failure.
-    fn green(&self, argv: &[String]) -> bool {
-        let (exit, r) = self.results(argv);
+    fn green(&self, c: &BaseTree, argv: &[String]) -> bool {
+        let (exit, r) = self.results(c, argv);
         exit == Some(0) && r.is_ok_and(|(_, f)| f.is_empty())
     }
 
-    /// The list (with `ids` deselected).
-    fn list(&self, ids: &[TestId]) -> crate::repo_checks::Toc {
+    /// The list (with `ids` deselected) in `c`.
+    fn list(&self, c: &BaseTree, ids: &[TestId]) -> crate::repo_checks::Toc {
         inventory(
-            self.dir,
+            &c.dir,
             &self.rc,
             self.g,
             ids,
@@ -358,14 +366,14 @@ impl Probe<'_> {
 
     /// The list deselecting `ids` names exactly `listed` minus them.
     /// Each of `ids` is listed exactly once (else deselecting it proves nothing).
-    fn deselects_exactly(&self, listed: &[TestId], ids: &[TestId]) -> bool {
+    fn deselects_exactly(&self, c: &BaseTree, listed: &[TestId], ids: &[TestId]) -> bool {
         if !ids
             .iter()
             .all(|id| listed.iter().filter(|t| *t == id).count() == 1)
         {
             return false;
         }
-        let rest = self.list(ids);
+        let rest = self.list(c, ids);
         let mut want: Vec<&TestId> = listed.iter().filter(|t| !ids.contains(t)).collect();
         let mut got: Vec<&TestId> = rest.ids.iter().collect();
         want.sort();
@@ -373,18 +381,14 @@ impl Probe<'_> {
         rest.incomplete.is_none() && got == want
     }
 
-    /// Write a mutation into the copy, inside the check's directory and through no link.
-    fn write(&self, m: &Mutation) -> Result<(), String> {
-        let rel = Path::new(self.g.dir()).join(&m.file);
-        crate::repo_checks::write_confined(self.dir, &rel.to_string_lossy(), &m.content)
-    }
-
     /// A NONZERO exit the guide calls a test failure.
     fn failed_exit(&self, code: Option<i32>) -> bool {
         code.is_some_and(|c| c != 0 && self.g.failed_exit.contains(&c))
     }
 
-    fn all(&self) -> ProbeResults {
+    /// Every probe, in three fresh copies (clean; the first mutation; both), and the runner
+    /// version.
+    fn all(&self) -> (ProbeResults, String) {
         let mut out = ProbeResults::new();
         let g = self.g;
         // Every probe not yet decided fails with `why` (`affected` too, when the check has it).
@@ -395,7 +399,40 @@ impl Probe<'_> {
                     .or_insert_with(|| format!("fail: {why}"));
             }
         };
-        let clean_list = self.list(&[]);
+        // Phase 1, a clean copy: the list, the run, the runner version.
+        let clean_copy = match self.copy(&[]) {
+            Ok(c) => c,
+            Err(e) => {
+                let why = format!("fail: {e}");
+                let mut names: Vec<&str> = crate::floor_guide::REQUIRED_PROBES.to_vec();
+                names.extend(g.affected.is_some().then_some("affected"));
+                names.extend(g.version.is_some().then_some("version"));
+                return (
+                    names
+                        .into_iter()
+                        .map(|p| (p.to_string(), why.clone()))
+                        .collect(),
+                    String::new(),
+                );
+            }
+        };
+        let mut version = String::new();
+        if g.version.is_some() {
+            let v = runner_version(
+                &clean_copy.dir,
+                &self.rc,
+                g,
+                self.sandbox,
+                self.scratch,
+                Tree::Base,
+            );
+            out.insert(
+                "version".into(),
+                verdict(v.is_ok(), || v.clone().unwrap_err()),
+            );
+            version = v.unwrap_or_default();
+        }
+        let clean_list = self.list(&clean_copy, &[]);
         out.insert(
             "list".into(),
             verdict(clean_list.incomplete.is_none(), || {
@@ -404,7 +441,8 @@ impl Probe<'_> {
         );
         // A green base: the mutations' failures are then the run's only failures, and a deselected
         // run that exits 0 does so because of the deselect.
-        let (exit, clean) = self.results(&g.run);
+        let (exit, clean) = self.results(&clean_copy, &g.run);
+        drop(clean_copy);
         let green = exit == Some(0) && clean.as_ref().is_ok_and(|(_, f)| f.is_empty());
         out.insert(
             "run".into(),
@@ -424,12 +462,12 @@ impl Probe<'_> {
         ] {
             if !present {
                 fail_rest(&mut out, &format!("no `{piece}`"));
-                return out;
+                return (out, version);
             }
         }
         if !green {
             fail_rest(&mut out, "needs a green base");
-            return out;
+            return (out, version);
         }
         let (m, m2) = (
             g.probes.mutation.as_ref().expect("checked"),
@@ -438,12 +476,16 @@ impl Probe<'_> {
         let is = |t: &TestId, m: &Mutation| {
             t.id == m.expect_id && m.expect_q.as_ref().is_none_or(|q| *q == t.q)
         };
-        // mutation: the run fails naming EXACTLY the expected test; deselecting it runs green.
-        if let Err(e) = self.write(m) {
-            fail_rest(&mut out, &format!("the mutation could not be written: {e}"));
-            return out;
-        }
-        let (mexit, mutated) = self.results(&g.run);
+        // Phase 2, a fresh copy with the first mutation: the run fails naming EXACTLY the
+        // expected test; deselecting it runs green; `affected` names it.
+        let one = match self.copy(&[m]) {
+            Ok(c) => c,
+            Err(e) => {
+                fail_rest(&mut out, &e);
+                return (out, version);
+            }
+        };
+        let (mexit, mutated) = self.results(&one, &g.run);
         let t = match &mutated {
             Ok((_, f)) if self.failed_exit(mexit) && f.len() == 1 && is(&f[0], m) => f[0].clone(),
             _ => {
@@ -455,27 +497,47 @@ impl Probe<'_> {
                         m.expect_id
                     ),
                 );
-                return out;
+                return (out, version);
             }
         };
         out.insert(
             "mutation".into(),
             verdict(
-                self.green(&g.deselected(&g.run, std::slice::from_ref(&t))),
+                self.green(&one, &g.deselected(&g.run, std::slice::from_ref(&t))),
                 || format!("deselecting `{}` did not run green", t.id),
             ),
         );
-        // multi: both mutations fail, named exactly; deselecting both runs green and lists exactly
-        // the rest.
-        if let Err(e) = self.write(m2) {
-            fail_rest(
-                &mut out,
-                &format!("the second mutation could not be written: {e}"),
+        if g.affected.is_some() {
+            let a = g
+                .affected_argv(std::slice::from_ref(&m.file))
+                .map(|argv| self.results(&one, &argv));
+            out.insert(
+                "affected".into(),
+                verdict(
+                    a.is_some_and(|(exit, r)| {
+                        self.failed_exit(exit) && r.is_ok_and(|(_, f)| f.contains(&t))
+                    }),
+                    || {
+                        format!(
+                            "the affected run did not fail with a `failedExit` naming `{}`",
+                            t.id
+                        )
+                    },
+                ),
             );
-            return out;
         }
-        let listed = self.list(&[]);
-        let (bexit, both) = self.results(&g.run);
+        drop(one);
+        // Phase 3, a fresh copy with both mutations: both fail, named exactly; deselecting both
+        // runs green and lists exactly the rest.
+        let both_copy = match self.copy(&[m, m2]) {
+            Ok(c) => c,
+            Err(e) => {
+                fail_rest(&mut out, &e);
+                return (out, version);
+            }
+        };
+        let listed = self.list(&both_copy, &[]);
+        let (bexit, both) = self.results(&both_copy, &g.run);
         let pair: Vec<TestId> = match &both {
             Ok((_, f))
                 if self.failed_exit(bexit)
@@ -491,8 +553,8 @@ impl Probe<'_> {
             "multi".into(),
             verdict(
                 !pair.is_empty()
-                    && self.green(&g.deselected(&g.run, &pair))
-                    && self.deselects_exactly(&listed.ids, &pair),
+                    && self.green(&both_copy, &g.deselected(&g.run, &pair))
+                    && self.deselects_exactly(&both_copy, &listed.ids, &pair),
                 || {
                     format!(
                         "with both mutations: {:?} (exit {bexit:?}); both must be named, and \
@@ -541,7 +603,7 @@ impl Probe<'_> {
                 f.is_empty()
             }) && (g.results.kind != "junit" || all == std::slice::from_ref(want))
         };
-        let (aexit, alone_t) = self.results(&g.alone_argv(&t));
+        let (aexit, alone_t) = self.results(&both_copy, &g.alone_argv(&t));
         let passing = listed
             .ids
             .iter()
@@ -562,7 +624,7 @@ impl Probe<'_> {
                     t.id
                 ),
                 (Some(p), _) => {
-                    let (pexit, alone_p) = self.results(&g.alone_argv(p));
+                    let (pexit, alone_p) = self.results(&both_copy, &g.alone_argv(p));
                     verdict(
                         pexit == Some(0)
                             && alone_p
@@ -587,7 +649,7 @@ impl Probe<'_> {
                     t.id
                 ),
                 Some(p) => verdict(
-                    self.deselects_exactly(&listed.ids, std::slice::from_ref(p)),
+                    self.deselects_exactly(&both_copy, &listed.ids, std::slice::from_ref(p)),
                     || {
                         format!(
                             "the list deselecting `{}` does not list exactly the rest",
@@ -597,26 +659,7 @@ impl Probe<'_> {
                 ),
             },
         );
-        if g.affected.is_some() {
-            let a = g
-                .affected_argv(std::slice::from_ref(&m.file))
-                .map(|argv| self.results(&argv));
-            out.insert(
-                "affected".into(),
-                verdict(
-                    a.is_some_and(|(exit, r)| {
-                        self.failed_exit(exit) && r.is_ok_and(|(_, f)| f.contains(&t))
-                    }),
-                    || {
-                        format!(
-                            "the affected run did not fail with a `failedExit` naming `{}`",
-                            t.id
-                        )
-                    },
-                ),
-            );
-        }
-        out
+        (out, version)
     }
 }
 

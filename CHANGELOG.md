@@ -89,8 +89,11 @@ Two release tracks share this file, newest entry first regardless of track:
   deselect, mutation, multi — two mutations, both parsed, both deselected — affected, and version, in a scratch
   copy under the floor sandbox; it writes `verified`; the probes need a green clean run (a red one fails them,
   "needs a green base"), a mutation names exactly its test, `alone` on the mutated test runs exactly it, and
-  mutations are written inside the check's directory, never through `..` or a link; when any probe fails the
-  whole probe re-runs once on a fresh copy and that retry's results are recorded, each `(retried)`:
+  mutations are written inside the check's directory, never through `..` or a link; the probes run in three
+  FRESH copies of HEAD (clean: `list`, `run`, `version`; the first mutation: `mutation`, `affected`; both:
+  `multi`, `ids`, `alone`, `deselect`), each mutation written before any repository command (the install
+  included) runs in that copy; when any probe fails the
+  whole probe re-runs once on fresh copies and that retry's results are recorded, each `(retried)`:
   `pass (retried)` is relied on, any `fail: … (retried)` leaves the check unverified; a check with no `list`
   piece is not probed; a junit testcase a filter skipped counts as neither passed
   nor failed; it never runs in the operator's worker home: unless `WICKED_WORKER_HOME` is set explicitly,
@@ -145,7 +148,21 @@ Two release tracks share this file, newest entry first regardless of track:
   that ran count twice); `{id}`/`{q}` fill in one pass; the `affected` probe needs a `failedExit`, and `multi`
   a second failure other than the first mutation's; a deselected run that crashed is not retried; a
   "pre-existing" claim is judged on the check that denied, and rejected when the base's failures were
-  established and the head still fails. The log store's GC, dedup and refresh share one advisory lock (`<store>/.lock`). The macOS
+  established and the head still fails. A repository command may not redirect a write of the engine's (codex
+  on #1066: a command that replaced its tree's root with a link to an outside directory got the probe's next
+  mutation written there): every write the engine makes into a tree a command ran in, or may still be running
+  in — the probe's copies, the base export (its directories and blobs), the guarded verify checkout,
+  clearing a results file, removing the files the checks generated — goes through a HELD directory (the root
+  opened `O_DIRECTORY|O_NOFOLLOW` before any command runs there, then `openat`/`mkdirat`/`symlinkat`/`unlinkat`
+  per component with `O_NOFOLLOW`; a file is opened non-blocking and must be a regular file): a linked
+  component is refused, and a swapped root leaves the writes in the original, detached directory. The base
+  export is a FRESH directory made through the held worktree (one already at the path is refused); a linked
+  export path still refuses the floor, fail-closed. The macOS profile (shared by the floor, workers and
+  validators) denies writes to each write root's OWN path, after every allow, so a sandboxed command cannot
+  remove, rename or relink its root (Linux bwrap's bind-mounted roots already refuse it); entries below a root
+  are unaffected. The base-cache record moved out of the check scratch (a sandbox write root) into the run's
+  log store (`base-<sha256>.json`, aged out with the logs), so no check can plant or redirect it; the dead
+  removal of an older engine's `base.idx` is gone. The log store's GC, dedup and refresh share one advisory lock (`<store>/.lock`). The macOS
   floor's test seam arms the private `TMPDIR` as production does. Wire (additive): every
   `repoChecksEvaluated.checks[]` entry carries `decision: {outcome, baseSha, baseFailing, excluded, logRefs:
   [{attempt, stream, sha256, bytes, truncated}], flaky, reason, guide: {present, usable, reason}}`, with

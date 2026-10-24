@@ -618,6 +618,21 @@ fn macos_sandbox_profile_for_roots(
             ));
         }
     }
+    // The write roots THEMSELVES stay put: `subpath` admits the root's own path, so without this a
+    // command could remove its root and put a link to an outside directory in its place, and the
+    // engine's next write "into" the tree would land outside (codex on #1066). Entries below a
+    // root are unaffected. LAST among the file-write rules, so no carve-out above re-admits it.
+    for root in std::iter::once(primary.clone()).chain(
+        write_roots
+            .iter()
+            .skip(1)
+            .filter_map(|root| root.canonicalize().ok()),
+    ) {
+        p.push_str(&format!(
+            "(deny file-write* (literal {}))\n",
+            sbpl_quote(&root)
+        ));
+    }
     p.push_str("(allow file-write-data (literal \"/dev/null\"))\n");
     p.push_str("(allow file-write-data (literal \"/dev/stdout\"))\n");
     p.push_str("(allow file-write-data (literal \"/dev/stderr\"))\n");
@@ -6384,6 +6399,66 @@ mod worker_sandbox_tests {
             "an existing terminal ({name}) must stay unwritable inside the floor's jail: {inside:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// (codex on #1066) Inside the jail a write root stays put — it cannot be removed, renamed,
+    /// or replaced by a link to an outside directory (the engine's later writes "into" the tree
+    /// would land there) — while everything below it stays writable. Every write root, the
+    /// primary and an extra one, under the floor's and the worker's profile.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_write_root_cannot_be_removed_renamed_or_relinked_from_inside_the_jail() {
+        let base = std::env::temp_dir().join(format!("wicked-root-stays-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let base = base.canonicalize().unwrap();
+        let (primary, extra, outside) = (base.join("wt"), base.join("extra"), base.join("outside"));
+        for d in [&primary, &extra, &outside] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let roots = [primary.clone(), extra.clone()];
+        for (label, sandbox) in [
+            ("floor", detect_floor_sandbox(&roots)),
+            ("worker", detect_worker_sandbox(&roots)),
+        ] {
+            if sandbox.level != SandboxLevel::Sandboxed || sandbox.wrapper.is_empty() {
+                eprintln!("no sandbox-exec here — the write-root rule is not exercised");
+                return;
+            }
+            for root in [&primary, &extra] {
+                let script = "d=\"$0\"; echo in > \"$d/inside\" && mkdir -p \"$d/sub\" && \
+                              mv \"$d/inside\" \"$d/sub/moved\" && rm -rf \"$d/sub\" || exit 9; \
+                              cd /; mv \"$d\" \"$d.moved\" 2>/dev/null; rmdir \"$d\" 2>/dev/null; \
+                              ln -s \"$1\" \"$d\" 2>/dev/null; exit 0";
+                let out = jailed(
+                    &sandbox,
+                    &primary,
+                    &[
+                        "/bin/sh",
+                        "-c",
+                        script,
+                        &root.to_string_lossy(),
+                        &outside.to_string_lossy(),
+                    ],
+                );
+                assert!(
+                    out.status.success(),
+                    "{label}: below the root stays writable: {out:?}"
+                );
+                let m = std::fs::symlink_metadata(root).unwrap();
+                assert!(
+                    m.is_dir() && !m.file_type().is_symlink(),
+                    "{label}: {} stays a real directory",
+                    root.display()
+                );
+                assert!(!base
+                    .join(format!(
+                        "{}.moved",
+                        root.file_name().unwrap().to_string_lossy()
+                    ))
+                    .exists());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

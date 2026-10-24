@@ -695,23 +695,33 @@ fn tools_required() -> bool {
 /// floor sandbox does not arm here.
 #[cfg(unix)]
 fn probe(repo: &Path, guide: serde_json::Value) -> Option<crate::floor_probe::ProbeResults> {
+    let mut all = probe_checks(repo, vec![guide])?;
+    let path = repo.join("probe-guide.json");
+    let written: crate::floor_guide::BuildGuide =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let v = written.checks[0]
+        .verified
+        .clone()
+        .expect("verified is written");
+    assert_eq!(v.base_sha, git(repo, &["rev-parse", "HEAD"]));
+    Some(all.remove(0).1)
+}
+
+/// Probe a guide of `checks` (written beside the committed tree) against `repo`'s HEAD: each
+/// probed check's results; `None` when the floor sandbox does not arm here.
+#[cfg(unix)]
+fn probe_checks(
+    repo: &Path,
+    checks: Vec<serde_json::Value>,
+) -> Option<Vec<(String, crate::floor_probe::ProbeResults)>> {
     let path = repo.join("probe-guide.json");
     std::fs::write(
         &path,
-        serde_json::json!({"version": 1, "checks": [guide]}).to_string(),
+        serde_json::json!({"version": 1, "checks": checks}).to_string(),
     )
     .unwrap();
     match crate::floor_probe::probe_guide(repo, &path, None) {
-        Ok(mut all) => {
-            let written: crate::floor_guide::BuildGuide =
-                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            let v = written.checks[0]
-                .verified
-                .clone()
-                .expect("verified is written");
-            assert_eq!(v.base_sha, git(repo, &["rev-parse", "HEAD"]));
-            Some(all.remove(0).1)
-        }
+        Ok(all) => Some(all),
         Err(e) if e.contains("does not arm") => {
             assert!(!tools_required(), "the floor sandbox is required here: {e}");
             eprintln!("repo_checks: {e} — skipping the probe");
@@ -1607,8 +1617,16 @@ fn the_probe_needs_a_green_base_an_isolated_alone_and_confined_mutations() {
     }
     let r = with("alone.all", &g).unwrap();
     assert!(r["alone"].starts_with("fail: `m` alone"), "{r:?}");
+    // (codex on #1066) A link a run planted in one copy never reaches a mutation: every phase
+    // writes its mutations into a FRESH copy before any command runs there.
     let r = with("plant.link", &g).unwrap();
+    assert_eq!(r["mutation"], "pass", "{r:?}");
+    // A link the tree itself carries at the mutation path is refused, never followed.
+    std::os::unix::fs::symlink(&outside, repo.join("zz_m")).unwrap();
+    let r = with("link.committed", &g).unwrap();
     assert!(r["mutation"].contains("passes through a symlink"), "{r:?}");
+    std::fs::remove_file(repo.join("zz_m")).unwrap();
+    git(&repo, &["commit", "-qam", "the link removed"]);
     let mut esc = g.clone();
     esc["probes"]["mutation"]["file"] = "../escape".into();
     let r = with("escape.marker", &esc).unwrap();
@@ -1647,6 +1665,106 @@ fn the_probe_needs_a_green_base_an_isolated_alone_and_confined_mutations() {
     );
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(outside.parent().unwrap());
+}
+
+/// (codex on #1066) A repository command that replaces its tree's ROOT with a link to an outside
+/// directory — in the guide's install step, or in the clean run right after it ran green (the
+/// engine used to write the next mutation into that same copy, by path: through the link) —
+/// never redirects a write of the engine's into that directory, and the probe fails rather than
+/// passes: the mutations are written into a FRESH copy before any command runs there, every later
+/// write goes through the copy's held directory fd ([`crate::repo_checks::HeldDir`]), and a next
+/// copy whose path is a link is refused. Under the floor sandbox the swap itself is refused too
+/// (macOS: a write root's own path is not writable; Linux: the root is a bind mount) — so the
+/// command can only empty its copy. Skipped where no floor sandbox arms (required on CI's ubuntu
+/// job).
+#[cfg(unix)]
+#[test]
+fn a_command_that_swaps_its_tree_root_for_a_link_never_redirects_the_probe() {
+    let _load = seam::pin(0.5, 4);
+    let outside = scratch("probe-swap-outside");
+    std::fs::write(outside.join("marker"), "untouched").unwrap();
+    // Every route a shell has: rename the root away (else empty and remove it), then put a link
+    // to `outside` at its path. Always exits 0, so the install "succeeds".
+    let swap = format!(
+        "d=$(pwd -P); cd /; mv \"$d\" \"$d.moved\" 2>/dev/null || rm -rf \"$d\" 2>/dev/null; \
+         ln -s '{}' \"$d\" 2>/dev/null; exit 0\n",
+        outside.display()
+    );
+    for (tag, in_install) in [("probe-swap-run", false), ("probe-swap-install", true)] {
+        let repo = scratch(tag);
+        std::fs::write(repo.join("runner.sh"), STAND_IN).unwrap();
+        std::fs::write(repo.join("swap.sh"), &swap).unwrap();
+        std::fs::write(repo.join(".gitignore"), "tmp/\nprobe-guide.json\n").unwrap();
+        git_repo_with_commit(&repo);
+        let mut test = stand_in_guide();
+        let mut checks = Vec::new();
+        if in_install {
+            checks.push(serde_json::json!({"name": "install", "run": ["sh", "swap.sh"]}));
+        } else {
+            // The run reports first (green on the clean copy), then swaps.
+            test["run"] = serde_json::json!([
+                "sh",
+                "-c",
+                "sh runner.sh \"$@\"; s=$?; sh swap.sh; exit $s",
+                "sh"
+            ]);
+        }
+        checks.push(test);
+        let path = repo.join("probe-guide.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"version": 1, "checks": checks}).to_string(),
+        )
+        .unwrap();
+        let probed = crate::floor_probe::probe_guide(&repo, &path, None);
+        // First, whatever the probe answered: nothing landed outside (an engine before the fix
+        // wrote the run variant's mutation, `zz_m`, there).
+        let mut seen: Vec<String> = std::fs::read_dir(&outside)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            ["marker"],
+            "{tag}: nothing lands outside ({probed:?})"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("marker")).unwrap(),
+            "untouched",
+            "{tag}"
+        );
+        let all = match probed {
+            Ok(all) => all,
+            Err(e) if e.contains("does not arm") => {
+                assert!(!tools_required(), "the floor sandbox is required here: {e}");
+                eprintln!("repo_checks: {e} — skipping the root-swap probe");
+                let _ = std::fs::remove_dir_all(&repo);
+                break;
+            }
+            Err(e) => panic!("{tag}: the probe ran to its verdicts: {e}"),
+        };
+        let r = &all
+            .iter()
+            .find(|(name, _)| name == "test")
+            .unwrap_or_else(|| panic!("{tag}: the test check was probed: {all:?}"))
+            .1;
+        eprintln!("{tag}: {r:?}");
+        let must_fail: &[&str] = if in_install {
+            &["list", "run", "mutation", "multi"]
+        } else {
+            &["mutation", "multi"]
+        };
+        for p in must_fail {
+            assert!(
+                r.get(*p).is_some_and(|v| v.starts_with("fail")),
+                "{tag}: `{p}` must fail: {r:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 /// Ruling 2: a check that declares a `version` command is relied on only while the runner still
@@ -2126,7 +2244,8 @@ fn the_base_export_runs_no_repository_hook_or_filter() {
     git(&repo, &["config", "filter.evil.clean", "cat"]);
     let scratch_dir = CheckScratch::prepare(&repo).unwrap();
     let head = git(&repo, &["rev-parse", "HEAD"]);
-    let tree = BaseTree::export(&repo, &scratch_dir, &repo.join(".git"), &head).unwrap();
+    let root = crate::repo_checks::HeldDir::open(&repo).unwrap();
+    let tree = BaseTree::export(&repo, &root, &scratch_dir, &repo.join(".git"), &head).unwrap();
     assert_eq!(
         std::fs::read_to_string(tree.dir.join("a.txt")).unwrap(),
         "plain\n"

@@ -2309,7 +2309,6 @@ const SCRATCH_LEAVES: &[&str] = &[
     "cargo-target/base",
     "xdg-config",
     "xdg-cache",
-    "base-cache",
 ];
 
 /// Bounded attempts at an unused random name under the system temp dir before giving up.
@@ -3367,6 +3366,9 @@ pub(crate) fn run_with_sandbox_ctx(
             _ => (Ok(None), Vec::new(), Ok(Vec::new()), Ok(Vec::new())),
         };
     let candidates = engine_generated_candidates(worktree, &detected);
+    // Held before the first check runs: the engine-written files are removed through it, never
+    // by a path a check could have re-pointed ([`HeldDir`]).
+    let held_worktree = HeldDir::open(worktree);
     let env = scratch.env_record(&sandbox_level);
     // (core#817) Per package: a subdirectory package's own `baseline_diff: false` holds for it.
     // The root's opt-out covers the whole repo; a package's own opt-out covers the package.
@@ -3457,7 +3459,14 @@ pub(crate) fn run_with_sandbox_ctx(
                     Some(match BaseTree::cached(&scratch, head, check, excluding) {
                         Some(cached) => cached,
                         None => {
-                            let side = match BaseTree::export(worktree, &scratch, git_dir, head) {
+                            let export =
+                                held_worktree
+                                    .as_ref()
+                                    .map_err(String::clone)
+                                    .and_then(|root| {
+                                        BaseTree::export(worktree, root, &scratch, git_dir, head)
+                                    });
+                            let side = match export {
                                 Ok(t) => t.run_check(check, ctx, &sandbox, &scratch, excluding),
                                 Err(e) => BaseSide {
                                     base: BaseRun {
@@ -3513,10 +3522,9 @@ pub(crate) fn run_with_sandbox_ctx(
     // An engine-written file (absent at detection, present now) is the checks' own side effect —
     // remove it so the guard's final comparison sees the tree the seat left. Never a symlink.
     let mut engine_writes_removed = Vec::new();
-    for rel in candidates {
-        let p = worktree.join(&rel);
-        if let Ok(m) = std::fs::symlink_metadata(&p) {
-            if m.is_file() && std::fs::remove_file(&p).is_ok() {
+    if let Ok(held) = &held_worktree {
+        for rel in candidates {
+            if held.remove_file(&rel) == Ok(true) {
                 engine_writes_removed.push(rel);
             }
         }
@@ -3849,7 +3857,10 @@ pub(crate) fn checkout_guarded_tree(
         &env[..1],
     )
     .map_err(|e| format!("the guarded tree {tree} could not be checked out for the floor: {e}"))?;
-    (checkout.entries, checkout.links) = write_tree_blobs(worktree, git_dir, tree, &dir)
+    // Held before anything runs in it; every blob is written through the held fd.
+    let held = HeldDir::open(&dir)
+        .map_err(|e| format!("the guarded tree {tree} could not be written for the floor: {e}"))?;
+    (checkout.entries, checkout.links) = write_tree_blobs(worktree, git_dir, tree, &dir, &held)
         .map_err(|e| format!("the guarded tree {tree} could not be written for the floor: {e}"))?;
     crate::worktree_guard::git(&dir, &["-c", &no_hooks, "read-tree", &commit], &[])
         .map_err(|e| format!("the floor checkout's index could not be set: {e}"))?;
@@ -3867,6 +3878,7 @@ fn write_tree_blobs(
     git_dir: &Path,
     tree: &str,
     dir: &Path,
+    dest: &HeldDir,
 ) -> Result<(Vec<(String, String, PathBuf)>, Vec<(PathBuf, Vec<u8>)>), String> {
     use std::io::{BufRead, Read, Write};
     let env: [(&str, &Path); 1] = [("GIT_DIR", git_dir)];
@@ -3898,6 +3910,14 @@ fn write_tree_blobs(
     }
     let blobs: Vec<&(String, String, PathBuf)> =
         entries.iter().filter(|(m, _, _)| m != "160000").collect();
+    // An entry's path relative to `dir` (UTF-8: checked above).
+    let rel_of = |path: &Path| -> Result<String, String> {
+        Ok(path
+            .strip_prefix(dir)
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .into_owned())
+    };
     // spawn-audit: hardened — git plumbing reading the run's own object store.
     let mut cat = Command::new("git");
     cat.hardened()
@@ -3933,44 +3953,23 @@ fn write_tree_blobs(
         out.read_exact(&mut body).map_err(|e| e.to_string())?;
         let mut nl = [0u8; 1];
         out.read_exact(&mut nl).map_err(|e| e.to_string())?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        // Never write through a link: no component under `dir`, nor the entry itself, may be one.
-        let mut at = dir.to_path_buf();
-        for c in path
-            .strip_prefix(dir)
-            .map_err(|e| e.to_string())?
-            .components()
-        {
-            at.push(c);
-            if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
-                return Err(format!("{} is a symlink in the checkout", at.display()));
-            }
-        }
+        // Through the held directory ([`HeldDir`]): missing directories are created, and no
+        // component under `dir`, nor the entry itself, is ever followed as a link — even one a
+        // process still running in the tree swaps in mid-export.
+        let rel = rel_of(path)?;
         match mode.as_str() {
             #[cfg(unix)]
             "120000" => {
-                use std::os::unix::ffi::OsStrExt;
-                let target = std::ffi::OsStr::from_bytes(&body);
-                std::os::unix::fs::symlink(target, path).map_err(|e| e.to_string())?;
+                dest.symlink(&rel, &body)?;
                 links.push((path.clone(), body.clone()));
             }
-            _ => {
-                std::fs::write(path, &body).map_err(|e| e.to_string())?;
-                #[cfg(unix)]
-                if mode == "100755" {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-                        .map_err(|e| e.to_string())?;
-                }
-            }
+            _ => dest.write_bytes(&rel, &body, mode == "100755")?,
         }
     }
     let _ = feeder.join();
     let _ = child.wait();
     for (_, _, path) in entries.iter().filter(|(m, _, _)| m == "160000") {
-        std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+        dest.subdir(&rel_of(path)?, true)?;
     }
     Ok((
         entries
@@ -4137,9 +4136,13 @@ pub(crate) fn guarded_checkout_refused(
 /// every floor: it is a full copy of the repo tree inside the worktree, and a HEAD check that
 /// globs from the worktree root (vitest's default include, a broad `tsconfig`, eslint without
 /// ignores) would otherwise run over the base's files too. The run pays for a base check once
-/// through the `base-cache` (in the check scratch), never through a persisted export.
+/// through the base cache (in the run's log store, outside every sandbox write root), never
+/// through a persisted export.
 pub(crate) struct BaseTree {
     pub(crate) dir: PathBuf,
+    /// The export, held from before any command ran in it ([`HeldDir`]): every later parent-side
+    /// write or removal in it goes through this.
+    pub(crate) held: HeldDir,
     head: String,
 }
 
@@ -4167,12 +4170,12 @@ fn base_export_dir(worktree: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Remove the base export (`<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`] and its scratch index) if
-/// present. A symlink at the export path is refused, never followed. Called at the start of every
+/// Remove the base export (`<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`]) if present (nothing writes
+/// the scratch index an older engine kept; the scratch is the checks' to write, never removed
+/// from by name after they ran). A symlink at the export path is refused, never followed. Called at the start of every
 /// floor, before an export and as soon as a base check's result is cached, so no HEAD check ever
 /// runs beside a copy of the base.
-pub(crate) fn remove_base_export(worktree: &Path, scratch: &CheckScratch) -> Result<(), String> {
-    let _ = std::fs::remove_file(scratch.root.join("base.idx"));
+pub(crate) fn remove_base_export(worktree: &Path, _scratch: &CheckScratch) -> Result<(), String> {
     let dir = base_export_dir(worktree)?;
     // (codex on #1050) An engine from before the scratch moved left its export at
     // `tmp/wicked-checks/base` when it died mid-baseline; it removed that at every floor's start,
@@ -4208,8 +4211,10 @@ impl BaseTree {
     fn cache_path(scratch: &CheckScratch, head: &str, check: &RepoCheck) -> PathBuf {
         // ONE file name, whatever the head, the `dir` (core#817: a subdirectory package's check
         // is its own entry) or the check's `name` (a guide's, repo-controlled) say: a sha256 over
-        // the three, NUL-separated (injective, a fixed length, never a path separator). The record
-        // is written by the engine, outside the sandbox — no name may steer where.
+        // the three, NUL-separated (injective, a fixed length, never a path separator). It lives
+        // in the run's log store, OUTSIDE every sandbox write root: no check can redirect the
+        // engine's write there, or plant a record the next comparison would read. Aged out with
+        // the logs ([`crate::floor_log::gc`]).
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         for part in [head, check.dir.as_str(), check.name.as_str()] {
@@ -4217,7 +4222,7 @@ impl BaseTree {
             h.update([0u8]);
         }
         let key: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-        scratch.root.join("base-cache").join(format!("{key}.json"))
+        scratch.logs.join(format!("base-{key}.json"))
     }
 
     /// This run's cached result of `check` on `head`, when an earlier floor of the run paid for it:
@@ -4264,8 +4269,13 @@ impl BaseTree {
         })
     }
 
+    /// Export `head` into a FRESH `<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`], every directory and
+    /// file of it created through `root` — `worktree`, held before any check ran there
+    /// ([`HeldDir`]): a check (or a process it left running) that re-pointed `tmp` or the export
+    /// path at an outside directory refuses the export; it never redirects it.
     pub(crate) fn export(
         worktree: &Path,
+        root: &HeldDir,
         scratch: &CheckScratch,
         git_dir: &Path,
         head: &str,
@@ -4273,12 +4283,16 @@ impl BaseTree {
         let dir = base_export_dir(worktree)?;
         // Always a fresh export: a stale one is removed, a link refused — never followed.
         remove_base_export(worktree, scratch)?;
-        std::fs::create_dir_all(&dir)
+        let held = root
+            .create_fresh_dir(&format!(
+                "{}/{BASE_EXPORT_SUBDIR}",
+                crate::worktree_guard::ENGINE_SCRATCH_DIR
+            ))
             .map_err(|e| format!("the base export directory could not be created: {e}"))?;
         // The base's own blobs, written raw (`ls-tree` + `cat-file --batch`, [`write_tree_blobs`]):
         // no index, so no `post-index-change` hook; no checkout, so no filter driver — nothing
         // the repository configures runs outside the floor's sandbox (codex round 17).
-        write_tree_blobs(worktree, git_dir, head, &dir).map_err(|e| {
+        write_tree_blobs(worktree, git_dir, head, &dir, &held).map_err(|e| {
             format!(
                 "the run base {} could not be exported for the baseline diff: {e}",
                 &head[..head.len().min(10)]
@@ -4286,6 +4300,7 @@ impl BaseTree {
         })?;
         Ok(Self {
             dir,
+            held,
             head: head.to_string(),
         })
     }
@@ -4294,7 +4309,7 @@ impl BaseTree {
     /// (a baseline diff compares one command on two trees: a change that edits the command — say
     /// adds `--no-fail-fast` — would otherwise read the base's shorter failure list as the head's
     /// regressions; a targeted command is the same change-scoped set on both trees) — and cache
-    /// the result under `base-cache/<sha256 of head, dir, name>.json` for the rest of the
+    /// the result under the log store's `base-<sha256 of head, dir, name>.json` for the rest of the
     /// run ([`Self::cached`]). The base's install step runs first when its tree needs
     /// provisioning (the same frozen, scripts-off install the head got, out of the same scratch
     /// cache).
@@ -4357,7 +4372,7 @@ impl BaseTree {
         // holds, and each is confirmed by its EXIT CODE run alone (`failedExit`). A misread result
         // can then only narrow what is excluded.
         if let Some(g) = guide {
-            clear_results(&self.dir, &target, g);
+            clear_results(&self.held, &target, g);
         }
         let since = std::time::SystemTime::now();
         let mut run = run_one_with(
@@ -4441,7 +4456,7 @@ impl BaseTree {
             && rec.run.spawn_error.is_none()
             && !rec.toc.as_ref().is_some_and(|t| t.transient)
         {
-            let _ = std::fs::create_dir_all(scratch.root.join("base-cache"));
+            let _ = std::fs::create_dir_all(&scratch.logs);
             if let Ok(json) = serde_json::to_string(&rec) {
                 let _ = std::fs::write(&cache, json);
             }
@@ -4782,11 +4797,9 @@ const FS_CLOCK_SLACK: Duration = Duration::from_secs(1);
 
 /// Remove a results file (`results.how.path`) a run is about to write, so whatever is there after
 /// the run is that run's.
-pub(crate) fn clear_results(dir: &Path, check: &RepoCheck, g: &GuideCheck) {
+pub(crate) fn clear_results(held: &HeldDir, check: &RepoCheck, g: &GuideCheck) {
     if let Some(path) = &g.results.how.path {
-        if let Ok(p) = confined(dir, &Path::new(&check.dir).join(path).to_string_lossy()) {
-            let _ = std::fs::remove_file(p);
-        }
+        let _ = held.remove_file(&Path::new(&check.dir).join(path).to_string_lossy());
     }
 }
 
@@ -4813,24 +4826,304 @@ fn open_results(
         .map_err(|e| e.to_string())
 }
 
-/// (DES-BUILD-GUIDE) Write `content` at `rel` under `root` ([`confined`]; missing directories
-/// created), never through a symlink.
-pub(crate) fn write_confined(root: &Path, rel: &str, content: &str) -> Result<(), String> {
-    let path = confined(root, rel)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+/// A tree the parent process writes into AFTER repository code may have run there, or while a
+/// process it started may still be running (a probe copy, the base export, the head worktree, the
+/// guarded checkout). The root is opened ONCE, before any command runs in it (`O_DIRECTORY |
+/// O_NOFOLLOW`), and every write, directory creation or removal walks from that held fd,
+/// component by component with `O_NOFOLLOW`: a command that swaps the root, or any directory
+/// below it, for a link to an outside directory cannot redirect the parent — the walk refuses the
+/// link, or lands in the original (now detached) directory. A file is opened non-blocking and
+/// must be a regular file (a planted FIFO neither stalls nor receives the write). Without
+/// directory fds (Windows) the path checks of [`confined`] stand in.
+pub(crate) struct HeldDir {
+    #[cfg(unix)]
+    fd: std::os::fd::OwnedFd,
+    #[cfg(not(unix))]
+    path: PathBuf,
+}
+
+/// `rel`'s components: plain names only (no root, `..`, or empty name; `.` skipped).
+fn rel_names(rel: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for c in Path::new(rel).components() {
+        match c {
+            std::path::Component::Normal(n) => out.push(
+                n.to_str()
+                    .ok_or_else(|| format!("`{rel}` is not UTF-8"))?
+                    .to_string(),
+            ),
+            std::path::Component::CurDir => {}
+            _ => return Err(format!("`{rel}` must stay inside the tree")),
+        }
     }
-    // Re-checked once the directories exist: none of them may be a link.
-    let path = confined(root, rel)?;
-    let mut f = no_follow(
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true),
-    )
-    .open(&path)
-    .map_err(|e| e.to_string())?;
-    std::io::Write::write_all(&mut f, content.as_bytes()).map_err(|e| e.to_string())
+    if out.is_empty() {
+        return Err(format!("`{rel}` names no file"));
+    }
+    Ok(out)
+}
+
+/// A directory opened through no link, close-on-exec.
+#[cfg(unix)]
+const HELD_DIR_FLAGS: libc::c_int =
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+#[cfg(unix)]
+fn cstr(b: &[u8]) -> Result<std::ffi::CString, String> {
+    std::ffi::CString::new(b).map_err(|_| "a path holds a NUL byte".to_string())
+}
+
+/// Own a just-returned fd, or the OS error that `-1` reported.
+#[cfg(unix)]
+fn owned_fd(fd: libc::c_int) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just opened by the caller and is owned by nothing else.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// Why `name` in `dir` was refused: "a symlink" when that is what is there (never followed),
+/// else the OS error.
+#[cfg(unix)]
+fn held_refusal(
+    dir: &std::os::fd::OwnedFd,
+    name: &std::ffi::CStr,
+    rel: &str,
+    err: std::io::Error,
+) -> String {
+    use std::os::fd::AsRawFd;
+    // SAFETY: zeroed `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `dir` is an open directory fd; `name` is NUL-terminated; `st` is writable.
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+        format!("`{rel}` passes through a symlink (never followed)")
+    } else {
+        format!("`{rel}`: {err}")
+    }
+}
+
+#[cfg(unix)]
+impl HeldDir {
+    /// Hold `root` — call it before any command runs there.
+    pub(crate) fn open(root: &Path) -> Result<Self, String> {
+        use std::os::unix::ffi::OsStrExt;
+        let c = cstr(root.as_os_str().as_bytes())?;
+        // SAFETY: a valid NUL-terminated path.
+        owned_fd(unsafe { libc::open(c.as_ptr(), HELD_DIR_FLAGS) })
+            .map(|fd| Self { fd })
+            .map_err(|e| format!("`{}` could not be held: {e}", root.display()))
+    }
+
+    /// The directory `names` name, walked from the held root through no link; a missing one is
+    /// created when `create`.
+    fn walk(
+        &self,
+        names: &[String],
+        rel: &str,
+        create: bool,
+    ) -> Result<std::os::fd::OwnedFd, String> {
+        use std::os::fd::AsRawFd;
+        let mut cur = self.fd.try_clone().map_err(|e| e.to_string())?;
+        for n in names {
+            let c = cstr(n.as_bytes())?;
+            // SAFETY: `cur` is an open directory fd; `c` is NUL-terminated.
+            let mut next =
+                owned_fd(unsafe { libc::openat(cur.as_raw_fd(), c.as_ptr(), HELD_DIR_FLAGS) });
+            if create && matches!(&next, Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+                // SAFETY: as above. A racing creator is fine: the open below decides.
+                unsafe { libc::mkdirat(cur.as_raw_fd(), c.as_ptr(), 0o777) };
+                // SAFETY: as above.
+                next =
+                    owned_fd(unsafe { libc::openat(cur.as_raw_fd(), c.as_ptr(), HELD_DIR_FLAGS) });
+            }
+            cur = next.map_err(|e| held_refusal(&cur, &c, rel, e))?;
+        }
+        Ok(cur)
+    }
+
+    /// The directory at `rel`, held (missing directories created when `create`), never through a
+    /// link.
+    pub(crate) fn subdir(&self, rel: &str, create: bool) -> Result<HeldDir, String> {
+        let names = rel_names(rel)?;
+        self.walk(&names, rel, create).map(|fd| HeldDir { fd })
+    }
+
+    /// A NEW directory at `rel` (its parents created as needed), held: one already there — a
+    /// leftover, or one a running command made — is refused, never reused.
+    pub(crate) fn create_fresh_dir(&self, rel: &str) -> Result<HeldDir, String> {
+        use std::os::fd::AsRawFd;
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let dir = self.walk(parents, rel, true)?;
+        let c = cstr(leaf.as_bytes())?;
+        // SAFETY: `dir` is an open directory fd; `c` is NUL-terminated.
+        if unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o777) } != 0 {
+            return Err(format!("`{rel}`: {}", std::io::Error::last_os_error()));
+        }
+        // SAFETY: as above.
+        owned_fd(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), HELD_DIR_FLAGS) })
+            .map(|fd| HeldDir { fd })
+            .map_err(|e| held_refusal(&dir, &c, rel, e))
+    }
+
+    /// Write `content` at `rel` (missing directories created), never through a link.
+    pub(crate) fn write(&self, rel: &str, content: &str) -> Result<(), String> {
+        self.write_bytes(rel, content.as_bytes(), false)
+    }
+
+    /// Write `body` at `rel` (missing directories created; mode 0755 when `exec`, else the
+    /// umask's default), never through a link, and only into a regular file.
+    pub(crate) fn write_bytes(&self, rel: &str, body: &[u8], exec: bool) -> Result<(), String> {
+        use std::os::fd::AsRawFd;
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let dir = self.walk(parents, rel, true)?;
+        let c = cstr(leaf.as_bytes())?;
+        let flags = libc::O_WRONLY
+            | libc::O_CREAT
+            | libc::O_TRUNC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | libc::O_CLOEXEC;
+        // SAFETY: `dir` is an open directory fd; `c` is NUL-terminated.
+        let fd = owned_fd(unsafe {
+            libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, 0o666 as libc::c_uint)
+        })
+        .map_err(|e| held_refusal(&dir, &c, rel, e))?;
+        let mut f = std::fs::File::from(fd);
+        if !f.metadata().map_err(|e| e.to_string())?.is_file() {
+            return Err(format!("`{rel}` is not a regular file"));
+        }
+        if exec {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("`{rel}`: {e}"))?;
+        }
+        std::io::Write::write_all(&mut f, body).map_err(|e| format!("`{rel}`: {e}"))
+    }
+
+    /// A symbolic link at `rel` pointing at `target` (written as is, never resolved; missing
+    /// directories created).
+    pub(crate) fn symlink(&self, rel: &str, target: &[u8]) -> Result<(), String> {
+        use std::os::fd::AsRawFd;
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let dir = self.walk(parents, rel, true)?;
+        let (c, t) = (cstr(leaf.as_bytes())?, cstr(target)?);
+        // SAFETY: `dir` is an open directory fd; both strings are NUL-terminated.
+        if unsafe { libc::symlinkat(t.as_ptr(), dir.as_raw_fd(), c.as_ptr()) } != 0 {
+            return Err(format!("`{rel}`: {}", std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// Remove the regular file at `rel` (a link or a directory there is left alone); `true` when
+    /// one was removed.
+    pub(crate) fn remove_file(&self, rel: &str) -> Result<bool, String> {
+        use std::os::fd::AsRawFd;
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let Ok(dir) = self.walk(parents, rel, false) else {
+            return Ok(false);
+        };
+        let c = cstr(leaf.as_bytes())?;
+        // SAFETY: zeroed `stat` is a valid out-parameter.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `dir` is an open directory fd; `c` is NUL-terminated; `st` is writable.
+        let rc = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Ok(false);
+        }
+        // SAFETY: as above.
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) } != 0 {
+            return Err(format!("`{rel}`: {}", std::io::Error::last_os_error()));
+        }
+        Ok(true)
+    }
+}
+
+/// Without directory fds: the path checks of [`confined`] before every operation.
+#[cfg(not(unix))]
+impl HeldDir {
+    pub(crate) fn open(root: &Path) -> Result<Self, String> {
+        match std::fs::symlink_metadata(root) {
+            Ok(m) if m.is_dir() => Ok(Self {
+                path: root.to_path_buf(),
+            }),
+            _ => Err(format!("`{}` is not a plain directory", root.display())),
+        }
+    }
+
+    pub(crate) fn subdir(&self, rel: &str, create: bool) -> Result<HeldDir, String> {
+        rel_names(rel)?;
+        let p = confined(&self.path, rel)?;
+        if create {
+            std::fs::create_dir_all(&p).map_err(|e| format!("`{rel}`: {e}"))?;
+        }
+        HeldDir::open(&confined(&self.path, rel)?)
+    }
+
+    pub(crate) fn create_fresh_dir(&self, rel: &str) -> Result<HeldDir, String> {
+        rel_names(rel)?;
+        let p = confined(&self.path, rel)?;
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("`{rel}`: {e}"))?;
+        }
+        std::fs::create_dir(confined(&self.path, rel)?).map_err(|e| format!("`{rel}`: {e}"))?;
+        HeldDir::open(&p)
+    }
+
+    pub(crate) fn write(&self, rel: &str, content: &str) -> Result<(), String> {
+        self.write_bytes(rel, content.as_bytes(), false)
+    }
+
+    pub(crate) fn write_bytes(&self, rel: &str, body: &[u8], _exec: bool) -> Result<(), String> {
+        rel_names(rel)?;
+        let path = confined(&self.path, rel)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        // Re-checked once the directories exist: none of them may be a link.
+        let path = confined(&self.path, rel)?;
+        let mut f = no_follow(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true),
+        )
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+        std::io::Write::write_all(&mut f, body).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn remove_file(&self, rel: &str) -> Result<bool, String> {
+        rel_names(rel)?;
+        let Ok(p) = confined(&self.path, rel) else {
+            return Ok(false);
+        };
+        match std::fs::symlink_metadata(&p) {
+            Ok(m) if m.is_file() => std::fs::remove_file(&p)
+                .map(|()| true)
+                .map_err(|e| e.to_string()),
+            _ => Ok(false),
+        }
+    }
 }
 
 /// (DES-BUILD-GUIDE) The base guide's check for `check`, when its pieces may be relied on for
@@ -9136,14 +9429,107 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// (codex on #1066) [`HeldDir`] never follows a link: not a linked directory component, not a
+    /// linked leaf, not `..`; it never opens a FIFO for a blocking write; and once the ROOT it
+    /// holds is swapped for a link to an outside directory, its writes land in the original
+    /// (detached) directory — never outside — and a fresh hold of the linked path is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_dir_never_follows_a_linked_component_nor_a_swapped_root() {
+        let base = scratch("held-dir");
+        let outside = scratch("held-dir-outside");
+        std::fs::write(outside.join("victim"), "v").unwrap();
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let held = HeldDir::open(&root).unwrap();
+        // A linked directory component: no write, no directory, no fresh directory through it,
+        // and a removal through it removes nothing.
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let e = held.write("link/x", "x").unwrap_err();
+        assert!(e.contains("passes through a symlink"), "{e}");
+        let e = held.subdir("link", false).err().expect("refused");
+        assert!(e.contains("passes through a symlink"), "{e}");
+        assert!(held.create_fresh_dir("link/fresh").is_err());
+        assert!(held.write_bytes("sub/../link/y", b"y", false).is_err());
+        assert_eq!(held.remove_file("link/victim"), Ok(false));
+        // A linked leaf: never written through, never removed as a file.
+        std::os::unix::fs::symlink(outside.join("victim"), root.join("leaf")).unwrap();
+        let e = held.write("leaf", "x").unwrap_err();
+        assert!(e.contains("passes through a symlink"), "{e}");
+        assert_eq!(held.remove_file("leaf"), Ok(false));
+        assert!(std::fs::symlink_metadata(root.join("leaf")).is_ok());
+        assert!(
+            held.symlink("leaf", b"elsewhere").is_err(),
+            "never replaced"
+        );
+        for rel in ["../x", "/abs", "sub/../../x", "", "."] {
+            assert!(held.write(rel, "x").is_err(), "{rel:?}");
+        }
+        // A FIFO at the path: refused at once, never waited on.
+        let fifo =
+            std::ffi::CString::new(root.join("fifo").as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        assert!(held.write("fifo", "x").is_err());
+        // A plain write creates its directories; an executable is 0755; a fresh directory is
+        // refused where one already exists.
+        held.write_bytes("sub/new/f", b"ok", true).unwrap();
+        assert_eq!(std::fs::read(root.join("sub/new/f")).unwrap(), b"ok");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(root.join("sub/new/f"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
+        assert!(held.create_fresh_dir("sub/new").is_err());
+        held.create_fresh_dir("sub/fresh")
+            .unwrap()
+            .write("in", "1")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("sub/fresh/in")).unwrap(),
+            "1"
+        );
+        assert_eq!(held.remove_file("sub/fresh/in"), Ok(true));
+        // The ROOT swapped for a link to the outside after it was held.
+        let moved = base.join("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+        held.write("after-swap", "x").unwrap();
+        held.create_fresh_dir("tmp/export").unwrap();
+        assert!(moved.join("after-swap").is_file());
+        assert!(moved.join("tmp/export").is_dir());
+        assert!(HeldDir::open(&root).is_err(), "a linked root is never held");
+        let mut seen: Vec<String> = std::fs::read_dir(&outside)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        seen.sort();
+        assert_eq!(seen, ["victim"], "nothing landed outside");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("victim")).unwrap(),
+            "v"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
     /// (confirmation round on d32b2b2, codex P1) The base cache record is written by the engine,
     /// outside the sandbox: whatever a check's `name` or `dir` say — a traversal included — its
-    /// path is ONE file directly in `base-cache`, and distinct (dir, name) pairs never share one.
+    /// path is ONE file directly in the run's log store (outside every sandbox write root), and
+    /// distinct (dir, name) pairs never share one.
     #[test]
     fn a_traversal_check_name_never_writes_outside_the_base_cache() {
         let wt = scratch("cache-name");
         let scratch_dir = CheckScratch::prepare(&wt).expect("scratch");
-        let cache = scratch_dir.root.join("base-cache");
+        let cache = scratch_dir.logs.clone();
+        assert!(
+            !cache.starts_with(&scratch_dir.root),
+            "outside the checks' scratch"
+        );
         let head = "0123456789abcdef0123";
         let at = |dir: &str, name: &str| {
             BaseTree::cache_path(
@@ -9172,9 +9558,10 @@ pub(crate) mod tests {
             assert_eq!(path.parent(), Some(cache.as_path()), "{dir:?} {name:?}");
             let file = path.file_name().unwrap().to_string_lossy().into_owned();
             assert!(
-                file.len() == 64 + 5
+                file.len() == 5 + 64 + 5
+                    && file.starts_with("base-")
                     && file.ends_with(".json")
-                    && file[..64].bytes().all(|b| b.is_ascii_hexdigit()),
+                    && file[5..69].bytes().all(|b| b.is_ascii_hexdigit()),
                 "{file}"
             );
             assert!(!seen.contains(&path), "{dir:?} {name:?} shares an entry");
@@ -9183,7 +9570,12 @@ pub(crate) mod tests {
             std::fs::create_dir_all(&cache).unwrap();
             std::fs::write(&path, "{}").unwrap();
         }
-        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), seen.len());
+        let records = std::fs::read_dir(&cache)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("base-"))
+            .count();
+        assert_eq!(records, seen.len());
         assert!(!scratch_dir.root.join("escaped").exists());
         assert!(!wt.join("escaped").exists());
         let _ = std::fs::remove_dir_all(&wt);
