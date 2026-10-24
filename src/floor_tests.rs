@@ -2491,7 +2491,7 @@ fn a_derived_from_file_renamed_on_the_base_makes_the_guide_stale() {
 }
 
 /// (final review, G4) A changed path that is not UTF-8 cannot be matched against `invalidatedBy`:
-/// the change's files cannot be listed and the guide is unusable. (Where the file system refuses
+/// the change's files cannot be listed, and the floor refuses (detection, or an unusable guide). (Where the file system refuses
 /// such a name — APFS — there is nothing to test.)
 #[cfg(unix)]
 #[test]
@@ -2515,13 +2515,24 @@ fn a_changed_path_that_is_not_utf8_makes_the_guide_unusable() {
             ("toc.txt", &toc_of(&["old", "new", "fine"])),
         ],
     );
-    let Some((_, c)) = floor_test(&repo, &ctx) else {
+    // Fail closed: the floor refuses — detection that needs the change's files reports it, or
+    // the guide is unusable for the check.
+    let report = run_floor(&repo, &ctx);
+    if report.sandbox_error.is_some() {
         return;
-    };
-    let g = c.decision.as_ref().and_then(|d| d.guide.clone()).unwrap();
-    assert!(
-        !g.usable && g.reason.as_deref().is_some_and(|r| r.contains("not UTF-8")),
-        "{g:?}"
-    );
+    }
+    let named = report
+        .detect_error
+        .as_deref()
+        .is_some_and(|e| e.contains("not UTF-8"))
+        || report.checks.iter().any(|c| {
+            c.decision
+                .as_ref()
+                .and_then(|d| d.guide.as_ref())
+                .is_some_and(|g| {
+                    !g.usable && g.reason.as_deref().is_some_and(|r| r.contains("not UTF-8"))
+                })
+        });
+    assert!(!report.passed && named, "{report:#?}");
     let _ = std::fs::remove_dir_all(&repo);
 }
