@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 pub const GUIDE_PATH: &str = ".wicked/build-guide.json";
 /// The probes every check needs, all `pass`, before its exclusion is relied on (plus `affected`
 /// when the check has that piece).
-pub const REQUIRED_PROBES: [&str; 7] = [
-    "list", "run", "ids", "alone", "deselect", "mutation", "multi",
+pub const REQUIRED_PROBES: [&str; 8] = [
+    "list", "run", "complete", "ids", "alone", "deselect", "mutation", "multi",
 ];
 
 /// A repository's build/test guide (contract v1).
@@ -126,6 +126,11 @@ pub struct How {
 pub struct Parser {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section: Option<String>,
+    /// How many tests the run executed: on each matching line every named group's integer is
+    /// added (say passed, failed and ignored). Without it a text guide cannot prove its list
+    /// complete, and is never relied on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<String>,
     #[serde(default)]
     pub failed: Vec<String>,
     #[serde(default)]
@@ -246,14 +251,18 @@ pub(crate) fn load_base(
         .map_err(|e| format!("the base's `{GUIDE_PATH}` {e}"))
 }
 
-/// A relative directory inside the repo: `.`/empty, or segments with no `..` and none empty.
+/// A relative directory inside the repo: `.`/empty, or segments none of which is empty, `.` or
+/// `..`, with no `\\` and no `:` (no Windows drive, `C:x` included).
 fn cwd_ok(cwd: &str) -> bool {
     cwd.is_empty()
         || cwd == "."
         || !(Path::new(cwd).is_absolute()
             || cwd.starts_with('/')
             || cwd.contains('\\')
-            || cwd.split('/').any(|s| s.is_empty() || s == ".."))
+            || cwd.contains(':')
+            || cwd
+                .split('/')
+                .any(|s| s.is_empty() || s == "." || s == ".."))
 }
 
 /// A guide's text, parsed and checked against the parts of the schema the floor relies on: version
@@ -286,6 +295,11 @@ pub(crate) fn parse(raw: &str) -> Result<BuildGuide, String> {
             Some("a `cwd` that is absolute, climbs (`..`) or has an empty segment")
         } else if has(&tokens[first..last], "{ids:re|}") {
             Some("`{ids:re|}` among the per-id tokens of `deselect.append` (it is once-only)")
+        } else if tokens.iter().any(|t| {
+            let id = t.contains("{id}") || t.contains("{id:re}");
+            t.contains("{q}") != id && has(tokens, "{q}")
+        }) {
+            Some("`{q}` and `{id}` in different tokens of `deselect.append` (one token must bind an id to its qualifier)")
         } else if has(tokens, "{ids:re|}") && has(tokens, "{q}") {
             Some("`{ids:re|}` and `{q}` in one `deselect.append` (the pattern cannot bind ids to qualifiers)")
         } else {
@@ -326,6 +340,7 @@ impl BuildGuide {
 /// A compiled parser: each regex applies to one line at a time (RE2 syntax: the `regex` crate).
 pub(crate) struct Compiled {
     section: Option<Regex>,
+    count: Option<Regex>,
     failed: Vec<Regex>,
     blocks: Vec<(Regex, Regex, Regex, bool)>,
     list_item: Regex,
@@ -345,7 +360,7 @@ impl GuideCheck {
     /// Compile every regex the check's pieces name; `Err` names the first that is missing or bad.
     pub(crate) fn compile(&self) -> Result<Compiled, String> {
         let list = self.list.as_ref().ok_or("no `list` piece")?;
-        let (section, failed, blocks) = match self.results.kind.as_str() {
+        let (section, count, failed, blocks) = match self.results.kind.as_str() {
             "text" => {
                 let p = self
                     .parser
@@ -365,11 +380,12 @@ impl GuideCheck {
                     .collect::<Result<Vec<_>, String>>()?;
                 (
                     p.section.as_deref().map(re).transpose()?,
+                    p.count.as_deref().map(re).transpose()?,
                     p.failed.iter().map(|f| re(f)).collect::<Result<_, _>>()?,
                     blocks,
                 )
             }
-            "junit" => (None, Vec::new(), Vec::new()),
+            "junit" => (None, None, Vec::new(), Vec::new()),
             k @ ("json-lines" | "tap") => {
                 return Err(format!("`results.kind` `{k}` is reserved (not read in v1)"))
             }
@@ -377,6 +393,7 @@ impl GuideCheck {
         };
         Ok(Compiled {
             section,
+            count,
             failed,
             blocks,
             list_item: re(&list.item)?,
@@ -426,7 +443,8 @@ impl GuideCheck {
             }
         }
         let env: [(&str, &Path); 1] = [("GIT_DIR", git_dir)];
-        if v.base_sha.is_empty()
+        let hex = !v.base_sha.is_empty() && v.base_sha.bytes().all(|b| b.is_ascii_hexdigit());
+        if !hex
             || crate::worktree_guard::git(
                 worktree,
                 &["merge-base", "--is-ancestor", &v.base_sha, base],
@@ -439,20 +457,28 @@ impl GuideCheck {
                 v.base_sha
             ));
         }
+        // `derivedFrom` matches as `invalidatedBy` does (`glob_match`), on the base's changes
+        // since the probe (stale) and on the change itself (a head that edits what the guide was
+        // derived from may not match it).
+        let derived = |f: &String| guide.derived_from.iter().any(|g| glob_match(g, f));
         if !guide.derived_from.is_empty() {
-            let mut args = vec!["diff", "--name-only", v.base_sha.as_str(), base, "--"];
-            args.extend(guide.derived_from.iter().map(String::as_str));
-            let changed = crate::worktree_guard::git_string(worktree, &args, &env)
-                .map_err(|e| format!("staleness could not be read: {e}"))?;
-            if let Some(f) = changed.lines().find(|l| !l.trim().is_empty()) {
+            let since = git_paths(
+                worktree,
+                &["diff", "--name-only", "-z", v.base_sha.as_str(), base],
+                &env,
+            )
+            .map_err(|e| format!("staleness could not be read: {e}"))?;
+            if let Some(f) = since.iter().find(|f| derived(f)) {
                 return Err(format!("stale: `{f}` changed since the guide was verified"));
             }
         }
         if let Some(f) = touched
             .iter()
-            .find(|f| self.invalidated_by.iter().any(|g| glob_match(g, f)))
+            .find(|f| derived(f) || self.invalidated_by.iter().any(|g| glob_match(g, f)))
         {
-            return Err(format!("the change touches `{f}` (`invalidatedBy`)"));
+            return Err(format!(
+                "the change touches `{f}` (`invalidatedBy` / `derivedFrom`)"
+            ));
         }
         Ok(())
     }
@@ -599,6 +625,9 @@ impl Compiled {
         let mut q = String::new();
         // Per block rule: the blocks since the last end, and whether the newest is still open.
         let mut open: Vec<(Vec<Vec<TestId>>, bool)> = vec![(Vec::new(), false); self.blocks.len()];
+        // (`last-before-end`) The ONE block each qualifier ends with: an earlier footer-shaped
+        // block (a test's captured output can print one) is replaced, never accumulated.
+        let mut last: Vec<(String, Vec<TestId>)> = Vec::new();
         for l in text.lines().map(|l| l.trim_end_matches('\r')) {
             if let Some(s) = self.section.as_ref().and_then(|r| r.captures(l)) {
                 q = s
@@ -625,7 +654,10 @@ impl Compiled {
                     if *all {
                         out.extend(take.into_iter().flatten());
                     } else if let Some(b) = take.into_iter().rev().find(|b| !b.is_empty()) {
-                        out.extend(b);
+                        match last.iter_mut().find(|(k, _)| *k == q) {
+                            Some((_, kept)) => *kept = b,
+                            None => last.push((q.clone(), b)),
+                        }
                     }
                     *is_open = false;
                 } else if start.is_match(l) {
@@ -643,7 +675,27 @@ impl Compiled {
                 }
             }
         }
+        out.extend(last.into_iter().flat_map(|(_, b)| b));
         dedup(out, keyed)
+    }
+
+    /// How many tests a text run executed (`parser.count`, summed over its lines); `None` without
+    /// a count rule or a line it matches.
+    pub(crate) fn executed(&self, text: &str) -> Option<usize> {
+        let r = self.count.as_ref()?;
+        let mut total = None;
+        for c in text
+            .lines()
+            .filter_map(|l| r.captures(l.trim_end_matches('\r')))
+        {
+            let n: usize = r
+                .capture_names()
+                .flatten()
+                .filter_map(|g| c.name(g)?.as_str().parse::<usize>().ok())
+                .sum();
+            total = Some(total.unwrap_or(0) + n);
+        }
+        total
     }
 
     /// The ids a list run prints: `item` lines, each in the `section` scope it appeared in. Other
@@ -704,6 +756,33 @@ pub(crate) fn junit(
     join: &str,
     keyed: bool,
 ) -> Option<(Vec<TestId>, Vec<TestId>)> {
+    let (mut all, mut failed) = (Vec::new(), Vec::new());
+    for (t, skipped, failing) in junit_cases(xml, attrs, join, keyed)? {
+        if skipped {
+            continue;
+        }
+        if failing {
+            failed.push(t.clone());
+        }
+        all.push(t);
+    }
+    Some((all, dedup(failed, keyed)))
+}
+
+/// (junit) How many tests the run executed: every testcase with an id, run or skipped — the
+/// count a list of every test matches.
+pub(crate) fn junit_count(xml: &str, attrs: &[String]) -> Option<usize> {
+    junit_cases(xml, attrs, "::", false).map(|c| c.len())
+}
+
+/// Every `<testcase>` with an id: (its id, skipped, failed). The one reading [`junit`] and
+/// [`junit_count`] share.
+fn junit_cases(
+    xml: &str,
+    attrs: &[String],
+    join: &str,
+    keyed: bool,
+) -> Option<Vec<(TestId, bool, bool)>> {
     let doc = roxmltree::Document::parse(xml).ok()?;
     if !doc.descendants().any(|n| n.has_tag_name("testsuite")) {
         return None;
@@ -714,16 +793,16 @@ pub(crate) fn junit(
     } else {
         attrs
     };
-    let (mut all, mut failed) = (Vec::new(), Vec::new());
+    let mut out = Vec::new();
     for tc in doc.descendants().filter(|n| n.has_tag_name("testcase")) {
         let values: Vec<&str> = attrs
             .iter()
             .map(|a| tc.attribute(a.as_str()).unwrap_or_default())
             .collect();
-        let child = |name: &str| tc.children().any(|c| c.has_tag_name(name));
-        if values.iter().all(|v| v.is_empty()) || child("skipped") {
+        if values.iter().all(|v| v.is_empty()) {
             continue;
         }
+        let child = |name: &str| tc.children().any(|c| c.has_tag_name(name));
         let q = tc
             .ancestors()
             .find(|s| s.has_tag_name("testsuite"))
@@ -734,17 +813,31 @@ pub(crate) fn junit(
             q: q.to_string(),
             id: values.join(join),
         };
-        if child("failure") || child("error") {
-            failed.push(t.clone());
-        }
-        all.push(t);
+        out.push((t, child("skipped"), child("failure") || child("error")));
     }
-    Some((all, dedup(failed, keyed)))
+    Some(out)
+}
+
+/// Repo-relative paths git prints NUL-separated (`-z`): each kept whole, never trimmed or
+/// unquoted; a path that is not UTF-8 is an error (fail closed).
+pub(crate) fn git_paths(
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &Path)],
+) -> Result<Vec<String>, String> {
+    let out = crate::worktree_guard::git(cwd, args, env).map_err(|e| e.to_string())?;
+    out.split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            String::from_utf8(p.to_vec()).map_err(|_| "a changed path is not UTF-8".to_string())
+        })
+        .collect()
 }
 
 /// Does repo-relative `path` match `glob` (`**` any depth, `*` and `?` within a segment)?
 pub(crate) fn glob_match(glob: &str, path: &str) -> bool {
-    let mut p = String::from("^");
+    // `(?s)`: `**` crosses a newline in a name too.
+    let mut p = String::from("(?s)^");
     let mut chars = glob.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
@@ -814,6 +907,12 @@ mod tests {
             ("cwd", serde_json::json!("../x")),
             ("cwd", serde_json::json!("/abs")),
             ("cwd", serde_json::json!("a//b")),
+            ("cwd", serde_json::json!("a/./b")),
+            ("cwd", serde_json::json!("C:x")),
+            (
+                "deselect",
+                serde_json::json!({"append": ["--suite={q}", "--skip={id}"]}),
+            ),
             (
                 "deselect",
                 serde_json::json!({"append": ["--not={id}", "--all={ids:re|}", "--raw={id}"]}),
@@ -846,12 +945,38 @@ mod tests {
             .any(|c| c.name == "test" && c.list.is_some()));
     }
 
-    /// A new section drops an uncommitted block; an empty block never hides the one before it.
+    /// A new section drops an uncommitted block; an empty block never hides the one before it;
+    /// a footer-shaped block an earlier line printed is REPLACED by the qualifier's last one.
     #[test]
     fn a_section_change_drops_open_blocks_and_an_empty_block_hides_nothing() {
         let c = check("text").compile().unwrap();
         let out = "== bin1\nsummary:\n  stale\n== bin2\nsummary:\n  real\nsummary:\ndone: red\n";
         assert_eq!(c.failures(out, true), vec![t("bin2", "real")]);
+        let forged = "== bin1\nsummary:\n  fine\ndone: red\nsummary:\n  old\ndone: red\n";
+        assert_eq!(c.failures(forged, true), vec![t("bin1", "old")]);
+    }
+
+    /// `parser.count` sums every named group of each line it matches; JUnit counts every case
+    /// with an id, run or skipped.
+    #[test]
+    fn the_executed_count_reads_count_lines_and_junit_cases() {
+        let mut g = check("text");
+        g.parser.as_mut().unwrap().count =
+            Some(r"^result: (?P<n>\d+) ok, (?P<f>\d+) bad, (?P<i>\d+) off$".into());
+        let c = g.compile().unwrap();
+        assert_eq!(
+            c.executed("result: 2 ok, 1 bad, 1 off\nx\nresult: 3 ok, 0 bad, 0 off\n"),
+            Some(7)
+        );
+        assert_eq!(
+            check("text")
+                .compile()
+                .unwrap()
+                .executed("result: 1 ok, 0 bad, 0 off"),
+            None
+        );
+        let xml = r#"<testsuite name="s"><testcase name="a"/><testcase name="b"><skipped/></testcase><testcase/></testsuite>"#;
+        assert_eq!(junit_count(xml, &s(&["name"])), Some(2));
     }
 
     /// `argvAppend` and `deselect.append` compose around an existing `--`: options before it,

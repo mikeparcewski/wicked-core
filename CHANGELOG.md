@@ -30,7 +30,16 @@ Two release tracks share this file, newest entry first regardless of track:
   tokens nor beside `{q}`). The base is exported from its raw blobs (no index, so no repository hook; no
   checkout, so no filter driver) for the floor and the probe alike; a base test confirmed "alone" must exit
   NONZERO; the JUnit reader is a real XML parser (`roxmltree`: CDATA, `<system-out>`, nested suites); and
-  `floor probe`'s temporary worker home is armed by the probe itself and the variable restored after. A failed head check is
+  `floor probe`'s temporary worker home is armed by the probe itself and the variable restored after.
+  A `complete` probe requires the clean run to execute exactly as many tests as `list` names
+  (`parser.count` for text — libtest: passed + failed + ignored; every JUnit case with an id, run or skipped):
+  an incomplete list would make an id look unique that names more tests. Under `last-before-end` only each
+  qualifier's LAST block counts (a footer-shaped block in a test's own output is replaced, never added). The
+  change's paths are read NUL-separated (`-z`, never quoted or trimmed; a path that is not UTF-8 fails
+  closed). `derivedFrom` matches as `invalidatedBy` does, on the base's changes since the probe and on the
+  change itself. `multi` also deselects the first mutation alone, which must leave exactly the second
+  failing. `alone`/`deselect` probe a passing test whose id no other qualifier lists. `{q}` and `{id}`
+  share a token, and `cwd` refuses `.` segments and `:`. A failed head check is
   compared with the base: a green base makes it a `new_failure`; a red base, for a guide check, is listed by
   the guide's `list` piece, its results (`text` line rules and blocks, or `junit`) nominate the
   failing ids the list holds, each is confirmed by its exit code run `alone` on the base (`failedExit`), and

@@ -1303,26 +1303,26 @@ pub(crate) fn touched_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<S
         return Ok(Vec::new());
     };
     let env: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
-    let tracked = crate::worktree_guard::git_string(
+    // NUL-separated (`-z`): the real names, never quoted, trimmed or split on a newline.
+    let tracked = crate::floor_guide::git_paths(
         worktree,
-        &["diff", "--name-only", "--diff-filter=ACMR", base],
+        &["diff", "--name-only", "-z", "--diff-filter=ACMR", base],
         &env,
     )
     .map_err(|e| format!("the change's touched files could not be listed: {e}"))?;
-    let untracked = crate::worktree_guard::git_string(
+    let untracked = crate::floor_guide::git_paths(
         worktree,
-        &["ls-files", "--others", "--exclude-standard"],
+        &["ls-files", "-z", "--others", "--exclude-standard"],
         &env,
     )
     .map_err(|e| format!("the change's untracked files could not be listed: {e}"))?;
     let scratch_prefix = format!("{}/", crate::worktree_guard::ENGINE_SCRATCH_DIR);
     let mut files: Vec<String> = Vec::new();
-    for line in tracked.lines().chain(untracked.lines()) {
-        let l = line.trim();
-        if l.is_empty() || l.starts_with(&scratch_prefix) || files.iter().any(|f| f == l) {
+    for f in tracked.into_iter().chain(untracked) {
+        if f.starts_with(&scratch_prefix) || files.contains(&f) {
             continue;
         }
-        files.push(l.to_string());
+        files.push(f);
     }
     Ok(files)
 }
@@ -1359,24 +1359,19 @@ fn deleted_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, Str
         return Ok(Vec::new());
     };
     let env: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
-    let deleted = crate::worktree_guard::git_string(
+    crate::floor_guide::git_paths(
         worktree,
         &[
             "diff",
             "--name-only",
+            "-z",
             "--no-renames",
             "--diff-filter=D",
             base,
         ],
         &env,
     )
-    .map_err(|e| format!("the change's deleted files could not be listed: {e}"))?;
-    Ok(deleted
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect())
+    .map_err(|e| format!("the change's deleted files could not be listed: {e}"))
 }
 
 /// Substitute `{files}` / `{base}` into a targeted command: a standalone `{files}` element expands
@@ -4097,9 +4092,10 @@ pub(crate) fn guarded_checkout_refused(
 }
 
 /// The run base, exported into the checks' scratch for the baseline diff — plain files, no git
-/// metadata, no nested worktree: `git read-tree` into a scratch index + `git checkout-index
-/// --prefix`, both through the PINNED git dir (never the worktree's own `.git` file, which the
-/// seat could have redirected). Lives at `<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`] — inside the OS
+/// metadata, no nested worktree: the base's own blobs, written raw (`ls-tree` + `cat-file
+/// --batch`, [`write_tree_blobs`]: no index, so no hook; no checkout, so no filter driver),
+/// through the PINNED git dir (never the worktree's own `.git` file, which the seat could have
+/// redirected). Lives at `<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`] — inside the OS
 /// write boundary, outside the guard's snapshot — so the sandbox wrapper armed for the worktree
 /// covers the base run too. It stays INSIDE the worktree when the rest of the check scratch moved
 /// to the engine's check cache: a base check that calls git (a `build.rs` running `git rev-parse`)
@@ -4702,6 +4698,25 @@ pub(crate) fn results_of(
         )
         .ok_or_else(|| "the results hold no testsuite".to_string()),
         _ => Ok((Vec::new(), c.failures(&text, c.keyed()))),
+    }
+}
+
+/// How many tests a results run executed: the guide's `parser.count` over its output (text), or
+/// every JUnit testcase with an id, run or skipped (junit). `None` when that cannot be read.
+pub(crate) fn executed_count(
+    g: &GuideCheck,
+    run: &CheckRun,
+    scratch: &CheckScratch,
+) -> Option<usize> {
+    let log = if g.results.how.path.is_some() {
+        run.logs.iter().find(|l| l.stream == "file")?
+    } else {
+        run.logs.first()?
+    };
+    let text = crate::floor_log::text(&scratch.logs, log).ok()?;
+    match g.results.kind.as_str() {
+        "junit" => crate::floor_guide::junit_count(&text, &g.results.id),
+        _ => g.compile().ok()?.executed(&text),
     }
 }
 

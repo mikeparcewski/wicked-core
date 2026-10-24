@@ -735,7 +735,8 @@ fn the_probe_passes_every_piece_of_a_real_cargo_guide() {
     .unwrap();
     std::fs::write(
         repo.join("src/lib.rs"),
-        "#[cfg(test)]\nmod t {\n    #[test]\n    fn a() {}\n    #[test]\n    fn b() {}\n}\n",
+        "/// ```\n/// assert_eq!(probe_fixture::two(), 2);\n/// ```\npub fn two() -> u32 {\n    2\n}\n\n\
+         #[cfg(test)]\nmod t {\n    #[test]\n    fn a() {}\n    #[test]\n    fn b() {}\n}\n",
     )
     .unwrap();
     std::fs::write(
@@ -1495,7 +1496,8 @@ case $mode in
   list) if [ -f flaky.list ] && [ ! -f "$TMPDIR/listed" ]; then : > "$TMPDIR/listed"; exit 1; fi
     for t in $all; do case "$skip" in *" $t "*) continue;; esac; echo "$t: test"; done
     [ -f dup.list ] && case "$skip" in *" a "*) ;; *) echo "a: test";; esac; exit 0;;
-  *) f=; for t in $all; do case "$skip" in *" $t "*) continue;; esac; case $t in m|m2) f="$f $t";; a) [ -f red.base ] && f="$f a";; esac; done
+  *) f=; n=0; for t in $all; do case "$skip" in *" $t "*) continue;; esac; n=$((n+1)); case $t in m|m2) f="$f $t";; a) [ -f red.base ] && f="$f a";; esac; done
+    echo "ran $n"
     if [ -z "$f" ]; then echo 'test result: ok.'; exit 0; fi
     printf '\nfailures:\n'; for t in $f; do echo "    $t"; done; printf '\ntest result: FAILED.\n'
     [ -f swallow ] && exit 0; exit 101;;
@@ -1508,7 +1510,8 @@ fn stand_in_guide() -> serde_json::Value {
     serde_json::json!({
         "name": "test", "run": ["sh", "runner.sh"], "failedExit": [101],
         "results": {"kind": "text"},
-        "parser": {"blocks": [{"start": "^failures:$", "item": r"^    (?P<id>\S+)$",
+        "parser": {"count": r"^ran (?P<n>\d+)$",
+                   "blocks": [{"start": "^failures:$", "item": r"^    (?P<id>\S+)$",
                                "end": "^test result: FAILED"}]},
         "list": {"run": ["sh", "runner.sh", "--list"], "item": r"^(?P<id>\S+): test$"},
         "alone": {"run": ["sh", "runner.sh", "--", "{id}", "--exact"]},
@@ -1630,12 +1633,13 @@ fn the_probe_needs_a_green_base_an_isolated_alone_and_confined_mutations() {
         r["list"], "pass (retried)",
         "the list never saw the results env: {r:?}"
     );
-    // (round 17, items 2, 3) A runner that swallows its failures (exit 0) proves nothing; a
-    // deselect of a test listed twice proves nothing.
+    // (round 17, items 2, 3) A runner that swallows its failures (exit 0) proves nothing. A list
+    // that names a test twice is not the run's (`complete`), and the twice-listed id is never the
+    // one `alone`/`deselect` probe.
     let r = with("swallow", &g).unwrap();
     assert!(r["mutation"].starts_with("fail:"), "{r:?}");
     let r = with("dup.list", &g).unwrap();
-    assert!(r["deselect"].starts_with("fail:"), "{r:?}");
+    assert!(r["complete"].starts_with("fail:"), "{r:?}");
     let mut bad2 = g.clone();
     bad2["probes"]["mutation2"]["file"] = "../m2".into();
     let r = with("bad2.marker", &bad2).unwrap();
@@ -2181,5 +2185,166 @@ fn a_base_candidate_that_passes_alone_is_never_excluded() {
         "{d:?}"
     );
     assert!(!report.passed && d.excluded.is_empty());
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (round 18, codex P1) A list that misses tests the run executes is incomplete: an id unique in
+/// it may name more tests. A guide running every target but listing only `--lib` fails `complete`
+/// (the lib's `smoke` and an integration test's `smoke` share a name).
+#[cfg(unix)]
+#[test]
+fn a_list_that_misses_tests_the_run_executes_fails_complete() {
+    let _load = seam::pin(0.5, 4);
+    let repo = scratch("probe-incomplete");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::create_dir_all(repo.join("tests")).unwrap();
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"probe_partial\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("src/lib.rs"),
+        "#[cfg(test)]\nmod t {\n    #[test]\n    fn smoke() {}\n    #[test]\n    fn a() {}\n}\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("tests/it.rs"), "#[test]\nfn smoke() {}\n").unwrap();
+    std::fs::write(
+        repo.join(".gitignore"),
+        "Cargo.lock\ntmp/\nprobe-guide.json\n",
+    )
+    .unwrap();
+    git_repo_with_commit(&repo);
+    let mut g = libtest_check(&s(&["cargo", "test", "--no-fail-fast"]));
+    g["list"]["run"] = serde_json::json!(["cargo", "test", "--lib", "--", "--list"]);
+    let Some(results) = probe(&repo, g) else {
+        return;
+    };
+    let complete = results.get("complete").cloned().unwrap_or_default();
+    assert!(
+        complete.starts_with("fail: the run executed 3 test(s), the list names 2"),
+        "{results:?}"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (round 18, codex P1) A footer-shaped block a base test prints into its own output never adds
+/// candidates: only the qualifier's LAST block counts. With an order-dependent `fine` (it fails
+/// run alone) named in the forged footer, a head that breaks `fine` still denies.
+#[cfg(unix)]
+#[test]
+fn a_forged_footer_in_the_base_output_adds_no_candidate() {
+    let _load = seam::pin(0.5, 4);
+    let (repo, _, argv) = red_base("forged-footer");
+    let forged = "test fine ... ok\n\nfailures:\n    fine\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored;\n\
+                  test old ... FAILED\n\nfailures:\n    old\n\n\
+                  test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n";
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.out", forged),
+            ("run.exit", "101"),
+            ("toc.txt", &toc_of(&["old", "new", "fine"])),
+            ("alone.fail", "old\nfine\n"),
+        ],
+    );
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &["commit", "-qm", "a base whose output forges a footer"],
+    );
+    let ctx = FloorContext {
+        base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+        stage: FloorStage::Verify,
+        git_dir: Some(repo.join(".git")),
+        ..FloorContext::default()
+    };
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.out", "test old ... FAILED\ntest fine ... FAILED\n"),
+            ("run.exit", "101"),
+            // With only `old` deselected, `fine` still fails.
+            ("excluded.exit", "101"),
+            ("toc.txt", &toc_of(&["old", "new", "fine"])),
+            ("alone.fail", "old\nfine\n"),
+        ],
+    );
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    let d = c.decision.as_ref().expect("decided");
+    assert_eq!(d.base_failing, s(&["old"]), "{d:?}");
+    assert_eq!(d.excluded, s(&["old"]), "{d:?}");
+    assert_eq!(d.outcome, OUTCOME_NEW_FAILURE, "{d:?}");
+    assert!(!report.passed);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (round 18, codex P2) The change's paths are read NUL-separated: a non-ASCII, tab or newline
+/// name reaches `invalidatedBy` as itself, never quoted or split.
+#[cfg(unix)]
+#[test]
+fn changed_paths_are_read_whole() {
+    let (repo, ctx, _) = red_base("z-paths");
+    std::fs::create_dir_all(repo.join(".cargo")).unwrap();
+    for name in ["é.toml", "a\tb.toml", "a\nb.toml"] {
+        std::fs::write(repo.join(".cargo").join(name), "x").unwrap();
+    }
+    let changed = changed_files(&repo, &ctx).unwrap();
+    for name in [".cargo/é.toml", ".cargo/a\tb.toml", ".cargo/a\nb.toml"] {
+        assert!(changed.iter().any(|f| f == name), "{name:?} in {changed:?}");
+        assert!(crate::floor_guide::glob_match(".cargo/**", name));
+    }
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (round 18, agy A P2) A head that changes a file the guide was derived from makes it unusable
+/// for that head, as `invalidatedBy` does.
+#[cfg(unix)]
+#[test]
+fn a_head_that_changes_a_derived_from_file_cannot_use_the_guide() {
+    let _load = seam::pin(0.5, 4);
+    let (repo, _, argv) = red_base("derived-head");
+    let path = repo.join(crate::floor_guide::GUIDE_PATH);
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        raw.replace("\"derivedFrom\": []", "\"derivedFrom\": [\"**/notes.md\"]"),
+    )
+    .unwrap();
+    git(
+        &repo,
+        &["commit", "-qam", "the guide names what it was derived from"],
+    );
+    let ctx = FloorContext {
+        base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+        stage: FloorStage::Verify,
+        git_dir: Some(repo.join(".git")),
+        ..FloorContext::default()
+    };
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.out", "test old ... FAILED\n"),
+            ("run.exit", "101"),
+            ("excluded.exit", "0"),
+            ("toc.txt", &toc_of(&["old", "new", "fine"])),
+        ],
+    );
+    std::fs::write(repo.join("notes.md"), "a root file the glob matches\n").unwrap();
+    let Some((_, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    let d = c.decision.as_ref().expect("decided");
+    assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
+    let g = d.guide.as_ref().unwrap();
+    assert!(
+        g.reason.as_deref().is_some_and(|r| r.contains("notes.md")),
+        "{g:?}"
+    );
     let _ = std::fs::remove_dir_all(&repo);
 }
