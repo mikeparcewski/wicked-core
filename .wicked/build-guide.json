@@ -237,12 +237,26 @@
       ]
     },
     {
+      "name": "install",
+      "cwd": "crates/wicked-core-ts",
+      "run": [
+        "npm",
+        "ci",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund"
+      ],
+      "stage": [
+        "verify"
+      ]
+    },
+    {
       "name": "core-ts-tsc",
       "cwd": "crates/wicked-core-ts",
       "run": [
-        "sh",
-        "-c",
-        "npm ci --ignore-scripts --no-audit --no-fund && npm run typecheck"
+        "npm",
+        "run",
+        "typecheck"
       ],
       "stage": [
         "verify"

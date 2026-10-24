@@ -37,7 +37,19 @@ Two release tracks share this file, newest entry first regardless of track:
   base's changes since the probe and on the change itself (a head that edits one cannot use the guide), and
   `cwd` refuses `.` segments, `:` and `""`. A check's `cwd` must be a plain directory of the tree it runs on,
   every component (a head that turns it into a link gets `could_not_run`). Base staleness reads a rename as
-  the old path gone (`--no-renames`). The last block is kept per (block rule, qualifier).
+  the old path gone (`--no-renames`). The last block is kept per (block rule, qualifier). A type change
+  (`T`: a tracked file replaced by a link, or a link by a file) counts with the deletions and renames: it
+  is matched against `invalidatedBy` and `derivedFrom`, and it rules the creator's `affected` pre-pass
+  (and derived targeting) out: the full check runs. `invalidatedBy` is also matched against the base's
+  changes since the check was verified, as `derivedFrom` is. A STALE guide (a `derivedFrom` file changed on
+  the base since the guide was last committed or since a check was verified, or in the change itself) may
+  name outdated commands: in the directories it covers the floor runs the UNION of its checks and the
+  detected ones (an identical argv in the same directory once; the detected ones say so in their
+  `source`), more checks and never fewer. Accepted by design: a directory whose guide checks are all
+  `verify`-only has no checks at the creator floor; the creator floor is fast feedback, and the verify
+  floor runs every check before delivery. A guide check named `install` is the floor's install step (the
+  install timeout, never compared with the base, a failure read as an environment finding); the floor's
+  sandbox confines writes, not the network, so an install inside it reaches the registry as detection's does.
   **Exclusion ships DISABLED.** `WICKED_FLOOR_EXCLUDE` exactly `on` or `1` (read once per floor run, never
   trimmed or case-folded) enables it; unset or anything else, it is off: a failing head over a red base escalates as `base_red_unseparated` ("exclusion disabled
   (WICKED_FLOOR_EXCLUDE)") with both logs, and the base's list, the one-test runs and the deselected head
@@ -89,7 +101,8 @@ Two release tracks share this file, newest entry first regardless of track:
   cache record restarts a blob's age, and eviction re-stats first), with a lazy line TOC and ranges read by
   ref and verified against the hash (`floor_log`). The seed guide for wicked-core itself is committed: its
   gate checks (fmt, typecheck, clippy, the workspace and `--features postgres` builds, and core-ts's fmt,
-  clippy, test, `finalize-dts` — checked against a copy, so no tracked file is rewritten — and `tsc`, as CI
+  clippy, test, `finalize-dts` — checked against a copy, so no tracked file is rewritten — and `tsc` after a
+  guided `install` in that cwd, detection's own `npm ci --ignore-scripts --no-audit --no-fund`, as CI
   gates them) run on exit codes — the builds and the core-ts ones at the verify stage only (`stage: ["verify"]`), so the creator
   floor stays fast and the verify floor runs everything before delivery; **its `test` check is UNVERIFIED until it is re-probed on main after this merges** (its `verified` block
   is stale by design: the floor reads it as "missing probe `version`", unusable, never as a parse error)

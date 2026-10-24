@@ -324,6 +324,61 @@ impl BuildGuide {
             .iter()
             .find(|c| c.run == argv && norm_dir(&c.cwd) == norm_dir(dir))
     }
+
+    /// Why the guide's COMMANDS may be outdated, or `None`: a `derivedFrom` file changed on the
+    /// base since the guide was last committed or since a check was verified, or the change
+    /// itself (`changed`) touches one. A list that cannot be read is stale (fail-closed). With no
+    /// `derivedFrom` there is nothing to be stale against.
+    pub(crate) fn stale(
+        &self,
+        worktree: &Path,
+        git_dir: &Path,
+        base: &str,
+        changed: &Result<Vec<String>, String>,
+    ) -> Option<String> {
+        if self.derived_from.is_empty() {
+            return None;
+        }
+        let derived = |f: &String| self.derived_from.iter().any(|g| glob_match(g, f));
+        match changed {
+            Err(e) => return Some(format!("the change's files could not be listed: {e}")),
+            Ok(c) => {
+                if let Some(f) = c.iter().find(|f| derived(f)) {
+                    return Some(format!("the change touches `{f}` (`derivedFrom`)"));
+                }
+            }
+        }
+        let env: [(&str, &Path); 1] = [("GIT_DIR", git_dir)];
+        let written = match git_paths(
+            worktree,
+            &["log", "-1", "-z", "--format=%H", base, "--", GUIDE_PATH],
+            &env,
+        ) {
+            Ok(w) => w,
+            Err(e) => return Some(format!("the guide's commit could not be read: {e}")),
+        };
+        let mut anchors: Vec<String> = written.into_iter().map(|w| w.trim().to_string()).collect();
+        for c in &self.checks {
+            if let Some(v) = c.verified.as_ref() {
+                if !anchors.contains(&v.base_sha) {
+                    anchors.push(v.base_sha.clone());
+                }
+            }
+        }
+        for from in anchors.iter().filter(|a| !a.is_empty()) {
+            match changed_since(worktree, git_dir, from, base) {
+                Err(e) => return Some(format!("staleness could not be read: {e}")),
+                Ok(since) => {
+                    if let Some(f) = since.iter().find(|f| derived(f)) {
+                        return Some(format!(
+                            "`{f}` (`derivedFrom`) changed on the base since `{from}`"
+                        ));
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 /// A compiled parser: each regex applies to one line at a time (RE2 syntax: the `regex` crate).
@@ -388,8 +443,8 @@ impl GuideCheck {
     }
 
     /// May the floor rely on this check's pieces against `base` for a change touching `touched`?
-    /// Every required probe passed, on a commit that is an ancestor of the base, no file the guide
-    /// was derived from changed since, and no touched file matches `invalidatedBy`.
+    /// Every required probe passed, on a commit that is an ancestor of the base; no `derivedFrom`
+    /// or `invalidatedBy` file changed on the base since; and no touched file matches either.
     pub(crate) fn usable(
         &self,
         guide: &BuildGuide,
@@ -443,32 +498,23 @@ impl GuideCheck {
                 v.base_sha
             ));
         }
-        // `derivedFrom` matches as `invalidatedBy` does (`glob_match`), on the base's changes
-        // since the probe (stale) and on the change itself (a head that edits what the guide was
-        // derived from may not match it).
+        // `derivedFrom` and `invalidatedBy` match the same way (`glob_match`), on the base's
+        // changes since the probe (stale) and on the change itself.
         let derived = |f: &String| guide.derived_from.iter().any(|g| glob_match(g, f));
-        if !guide.derived_from.is_empty() {
-            let since = git_paths(
-                worktree,
-                &[
-                    "diff",
-                    "--name-only",
-                    "-z",
-                    "--no-renames",
-                    v.base_sha.as_str(),
-                    base,
-                ],
-                &env,
-            )
-            .map_err(|e| format!("staleness could not be read: {e}"))?;
+        let invalidates = |f: &String| self.invalidated_by.iter().any(|g| glob_match(g, f));
+        if !guide.derived_from.is_empty() || !self.invalidated_by.is_empty() {
+            let since = changed_since(worktree, git_dir, &v.base_sha, base)
+                .map_err(|e| format!("staleness could not be read: {e}"))?;
             if let Some(f) = since.iter().find(|f| derived(f)) {
                 return Err(format!("stale: `{f}` changed since the guide was verified"));
             }
+            if let Some(f) = since.iter().find(|f| invalidates(f)) {
+                return Err(format!(
+                    "stale: `{f}` (`invalidatedBy`) changed since the check was verified"
+                ));
+            }
         }
-        if let Some(f) = touched
-            .iter()
-            .find(|f| derived(f) || self.invalidated_by.iter().any(|g| glob_match(g, f)))
-        {
+        if let Some(f) = touched.iter().find(|f| derived(f) || invalidates(f)) {
             return Err(format!(
                 "the change touches `{f}` (`invalidatedBy` / `derivedFrom`)"
             ));
@@ -788,6 +834,25 @@ fn junit_cases(
     Some(out)
 }
 
+/// The paths that differ between `from` and `base` (renames as the old path gone and the new one
+/// added: `--no-renames`). `from` must be hex (a commit id, never an option).
+pub(crate) fn changed_since(
+    worktree: &Path,
+    git_dir: &Path,
+    from: &str,
+    base: &str,
+) -> Result<Vec<String>, String> {
+    if from.is_empty() || !from.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("`{from}` is not a commit id"));
+    }
+    let env: [(&str, &Path); 1] = [("GIT_DIR", git_dir)];
+    git_paths(
+        worktree,
+        &["diff", "--name-only", "-z", "--no-renames", from, base],
+        &env,
+    )
+}
+
 /// Repo-relative paths git prints NUL-separated (`-z`): each kept whole, never trimmed or
 /// unquoted; a path that is not UTF-8 is an error (fail closed).
 pub(crate) fn git_paths(
@@ -919,6 +984,21 @@ mod tests {
             .verified
             .as_ref()
             .is_some_and(|v| v.results.contains_key("version")));
+        // (confirmation round) An npm gate provisions as detection does: an `install` check
+        // (detection's own argv, so the install's timeout and "environment finding" reading)
+        // runs before it in the same cwd; no gate installs inside its own command.
+        let pos = |n: &str| g.checks.iter().position(|c| c.name == n).unwrap();
+        let (install, tsc) = (&g.checks[pos("install")], &g.checks[pos("core-ts-tsc")]);
+        assert!(pos("install") < pos("core-ts-tsc") && install.cwd == tsc.cwd);
+        assert_eq!(
+            install.run,
+            ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]
+        );
+        assert!(g
+            .checks
+            .iter()
+            .filter(|c| c.name != "install")
+            .all(|c| !c.run.join(" ").contains("npm ci")));
     }
 
     /// A new section drops an uncommitted block; an empty block never hides the one before it;

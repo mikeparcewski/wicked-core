@@ -1328,10 +1328,10 @@ pub(crate) fn touched_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<S
 }
 
 /// (DES-BUILD-GUIDE `invalidatedBy`) Every path the change touched: added, modified and untracked
-/// ([`touched_files`]), deleted, and a rename's old path.
+/// ([`touched_files`]), plus [`removed_files`]: deleted, a rename's old path, and a type change.
 fn changed_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, String> {
     let mut files = touched_files(worktree, ctx)?;
-    for d in deleted_files(worktree, ctx)? {
+    for d in removed_files(worktree, ctx)? {
         if !files.contains(&d) {
             files.push(d);
         }
@@ -1339,21 +1339,24 @@ fn changed_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, Str
     Ok(files)
 }
 
-/// Did the change delete a tracked file relative to the base — renames counted as a deletion of
-/// the old path (`--no-renames`)? A derived targeted set cannot see what a missing file broke.
+/// Did the change remove a tracked file relative to the base ([`removed_files`]: a deletion, a
+/// rename's old path, or a type change)? A derived targeted set cannot see what a missing file
+/// broke.
 fn deletes_a_file(worktree: &Path, ctx: &FloorContext) -> Result<bool, String> {
-    Ok(!deleted_files(worktree, ctx)?.is_empty())
+    Ok(!removed_files(worktree, ctx)?.is_empty())
 }
 
-/// The tracked paths the change deleted relative to the base (a rename's old path included —
-/// `--no-renames`). Empty when the run knows no base.
-fn deleted_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, String> {
+/// The tracked paths the change removed relative to the base: deleted (a rename's old path
+/// included — `--no-renames`) or whose TYPE changed (`T`: a file replaced by a link, or a link by
+/// a file — what the path was is gone, and it is in no added/modified list). Empty when the run
+/// knows no base.
+fn removed_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, String> {
     if let Some((root, dir)) = package_root(worktree, ctx) {
         let root_ctx = FloorContext {
             package_dir: None,
             ..ctx.clone()
         };
-        return Ok(package_relative(deleted_files(&root, &root_ctx)?, &dir));
+        return Ok(package_relative(removed_files(&root, &root_ctx)?, &dir));
     }
     let (Some(base), Some(git_dir)) = (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) else {
         return Ok(Vec::new());
@@ -1366,12 +1369,12 @@ fn deleted_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, Str
             "--name-only",
             "-z",
             "--no-renames",
-            "--diff-filter=D",
+            "--diff-filter=DT",
             base,
         ],
         &env,
     )
-    .map_err(|e| format!("the change's deleted files could not be listed: {e}"))
+    .map_err(|e| format!("the change's removed files could not be listed: {e}"))
 }
 
 /// Substitute `{files}` / `{base}` into a targeted command: a standalone `{files}` element expands
@@ -1421,10 +1424,25 @@ pub(crate) fn detect(worktree: &Path) -> Result<Vec<RepoCheck>, String> {
 pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>, String> {
     let detected = detect_manifests(worktree, ctx)?;
     // (DES-BUILD-GUIDE) The base's guide replaces detection only for the directories its checks
-    // cover: a package it does not cover keeps its detected checks (exit codes only).
+    // cover: a package it does not cover keeps its detected checks (exit codes only). A STALE
+    // guide (a `derivedFrom` file changed) may name outdated commands: there the floor runs the
+    // UNION — the guide's checks and the detected ones (an identical argv in the same directory
+    // once) — more checks, never fewer.
     Ok(match guide_checks(worktree, ctx)? {
-        Some((mut guided, covered)) => {
-            guided.extend(detected.into_iter().filter(|c| !covered.contains(&c.dir)));
+        Some((mut guided, covered, stale)) => {
+            for mut c in detected {
+                if !covered.contains(&c.dir) {
+                    guided.push(c);
+                } else if let Some(why) = stale.as_deref() {
+                    if !guided.iter().any(|g| g.argv == c.argv && g.dir == c.dir) {
+                        c.source = format!(
+                            "{} — run beside the base's stale build guide ({why})",
+                            c.source
+                        );
+                        guided.push(c);
+                    }
+                }
+            }
             guided
         }
         None => detected,
@@ -1589,7 +1607,7 @@ pub(crate) fn subdir_packages(
     ctx: &FloorContext,
 ) -> Result<ChangePackages, String> {
     let mut files = touched_files(worktree, ctx)?;
-    files.extend(deleted_files(worktree, ctx)?);
+    files.extend(removed_files(worktree, ctx)?);
     let mut out = ChangePackages::default();
     for f in &files {
         let mut owner: Option<String> = None;
@@ -1884,15 +1902,16 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
     Ok(out)
 }
 
-/// A base guide's checks for the stage, and the directories its checks cover.
-type GuidedChecks = (Vec<RepoCheck>, Vec<String>);
+/// A base guide's checks for the stage, the directories its checks cover, and why the guide is
+/// stale (`None`: it is not — [`crate::floor_guide::BuildGuide::stale`]).
+type GuidedChecks = (Vec<RepoCheck>, Vec<String>, Option<String>);
 
 /// The `source` of a check the base's build guide declares.
 pub const GUIDE_SOURCE: &str = "the run base's build guide (DES-BUILD-GUIDE)";
 
 /// (DES-BUILD-GUIDE) When the run base carries a build guide, ITS checks for this stage, and the
 /// directories its checks cover (any stage): there they replace detection (only [`CONFIG_PATH`]'s
-/// `timeout_s` still bounds them). `None` — detection, the fallback — when the base has no guide,
+/// `timeout_s` still bounds them) — unless the guide is stale, when detection runs beside them. `None` — detection, the fallback — when the base has no guide,
 /// or one that does not parse (each check's `decision.guide` then says why).
 fn guide_checks(worktree: &Path, ctx: &FloorContext) -> Result<Option<GuidedChecks>, String> {
     let (Some(base), Some(git_dir), None) = (
@@ -1917,7 +1936,8 @@ fn guide_checks(worktree: &Path, ctx: &FloorContext) -> Result<Option<GuidedChec
         })
         .collect();
     let covered = guide.checks.iter().map(|c| c.dir().to_string()).collect();
-    Ok(Some((checks, covered)))
+    let stale = guide.stale(worktree, git_dir, base, &changed_files(worktree, ctx));
+    Ok(Some((checks, covered, stale)))
 }
 
 /// The derived source string on a [`derive_targeted`] check.
@@ -1948,8 +1968,8 @@ fn derive_targeted(
 ) -> Result<Option<RepoCheck>, String> {
     let files = touched_files(worktree, ctx)?;
     if files.is_empty() || deletes_a_file(worktree, ctx)? {
-        // A deleted (or renamed-away) path is not in `files`, and the crate or test it left can
-        // break without being named — never narrow past it.
+        // A deleted, renamed-away or type-changed path is not in `files`, and the crate or test
+        // it left can break without being named — never narrow past it.
         return Ok(None);
     }
     let base_name = |f: &str| f.rsplit('/').next().unwrap_or(f).to_string();
@@ -3359,7 +3379,8 @@ pub(crate) fn run_with_sandbox_ctx(
         };
         // (DES-BUILD-GUIDE) At the creator, a usable guide's `affected` piece is a fast pre-pass:
         // its pass decides; its failure runs the check as declared.
-        // A deleted (or renamed-away) file: what it left behind cannot be mapped — the full check.
+        // A deleted, renamed-away or type-changed file (in `changed`, not `touched`): what it left
+        // behind cannot be mapped — the full check.
         let deletes = changed
             .as_ref()
             .map_or(true, |c| c.iter().any(|f| !touched.contains(f)));
@@ -3584,7 +3605,7 @@ fn e2e_coverage_note(
         return None;
     }
     let mut paths = touched_files(worktree, ctx).ok()?;
-    paths.extend(deleted_files(worktree, ctx).ok()?);
+    paths.extend(removed_files(worktree, ctx).ok()?);
     let mut e2e: Vec<String> = paths.into_iter().filter(|p| is_e2e_path(p)).collect();
     e2e.sort();
     e2e.dedup();

@@ -2536,3 +2536,212 @@ fn a_changed_path_that_is_not_utf8_makes_the_guide_unusable() {
     assert!(!report.passed && named, "{report:#?}");
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+/// A guide check with an `affected` piece that ALWAYS passes, verified (every probe `pass`,
+/// `affected` included) on the repo's HEAD, committed. Returns the new HEAD.
+#[cfg(unix)]
+fn commit_guide_with_passing_affected(repo: &Path, argv: &[String]) -> String {
+    let mut g = libtest_check(argv);
+    g["affected"] = serde_json::json!({"run": ["sh", "-c", "exit 0", "sh", "{files}"]});
+    write_guide(repo, &[g], &git(repo, &["rev-parse", "HEAD"]));
+    let path = repo.join(crate::floor_guide::GUIDE_PATH);
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    doc["checks"][0]["verified"]["results"]["affected"] = "pass".into();
+    std::fs::write(&path, doc.to_string()).unwrap();
+    git(repo, &["add", "-A"]);
+    git(
+        repo,
+        &["commit", "-qm", "a guide with a passing affected piece"],
+    );
+    git(repo, &["rev-parse", "HEAD"])
+}
+
+/// (confirmation round, codex P2) A tracked config replaced by a link is a TYPE change (`T`): it
+/// is in the change's files (what `invalidatedBy` and `derivedFrom` match), and like a deletion it
+/// rules the creator's `affected` pre-pass out. With exclusion explicitly off, an affected run
+/// that would pass where the full run fails: the full check runs, and denies.
+#[cfg(unix)]
+#[test]
+fn a_config_replaced_by_a_link_runs_the_full_check_and_denies() {
+    let _load = seam::pin(0.5, 4);
+    let _off = seam::exclude(false);
+    let repo = scratch("type-change");
+    let argv = vec![
+        fake_cargo("type-change"),
+        "test".into(),
+        "--no-fail-fast".into(),
+    ];
+    std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
+    let toc = toc_of(&["new", "fine"]);
+    // A green base: the full run passes there.
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.out", "test new ... ok\ntest fine ... ok\n"),
+            ("run.exit", "0"),
+            ("toc.txt", toc.as_str()),
+        ],
+    );
+    std::fs::write(repo.join("runner.toml"), "setting = 1\n").unwrap();
+    std::fs::write(repo.join("other.toml"), "setting = 2\n").unwrap();
+    git_repo_with_commit(&repo);
+    let ctx = FloorContext {
+        base_head: Some(commit_guide_with_passing_affected(&repo, &argv)),
+        stage: FloorStage::Creator,
+        git_dir: Some(repo.join(".git")),
+        ..FloorContext::default()
+    };
+    // The head's full run is red with a new failure; only the affected pre-pass can pass it.
+    // Every tracked fixture file stays (a deletion would rule `affected` out on its own).
+    let head = [
+        ("run.out", "test new ... FAILED\n"),
+        ("run.exit", "101"),
+        ("toc.txt", toc.as_str()),
+    ];
+    write_tree(&repo, &argv, &head);
+    std::fs::write(repo.join("other.toml"), "setting = 3\n").unwrap();
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    assert!(
+        report.passed && c.source.contains("affected set"),
+        "control: a plain edit lets the affected run decide: {c:?}"
+    );
+    // The config becomes a link: `git diff` reports it as `T`, in no added/modified list.
+    std::fs::remove_file(repo.join("runner.toml")).unwrap();
+    std::os::unix::fs::symlink("other.toml", repo.join("runner.toml")).unwrap();
+    assert!(!touched_files(&repo, &ctx)
+        .unwrap()
+        .contains(&"runner.toml".to_string()));
+    assert!(changed_files(&repo, &ctx)
+        .unwrap()
+        .contains(&"runner.toml".to_string()));
+    let (report, c) = floor_test(&repo, &ctx).unwrap();
+    assert!(!report.passed, "the full, red check denies: {c:?}");
+    assert!(!c.source.contains("affected set"), "{}", c.source);
+    let d = c.decision.as_ref().expect("decided");
+    assert_eq!(d.outcome, OUTCOME_NEW_FAILURE, "{d:?}");
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (confirmation round, agy P1 #2) An `invalidatedBy` file the BASE changed since the check was
+/// verified makes it unusable, as a `derivedFrom` file does.
+#[cfg(unix)]
+#[test]
+fn an_invalidated_by_file_changed_on_the_base_since_verification_makes_the_check_unusable() {
+    let _load = seam::pin(0.5, 4);
+    let (repo, _, argv) = red_base("invalidated-since");
+    std::fs::create_dir_all(repo.join("cfg")).unwrap();
+    std::fs::write(repo.join("cfg/a.toml"), "setting = 1\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "a runner config"]);
+    let mut check = libtest_check(&argv);
+    check["invalidatedBy"] = serde_json::json!(["cfg/*.toml"]);
+    write_guide(&repo, &[check], &git(&repo, &["rev-parse", "HEAD"]));
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &["commit", "-qm", "the guide, invalidated by cfg/*.toml"],
+    );
+    std::fs::write(repo.join("cfg/a.toml"), "setting = 2\n").unwrap();
+    git(&repo, &["commit", "-qam", "the config changed on the base"]);
+    let ctx = FloorContext {
+        base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+        stage: FloorStage::Verify,
+        git_dir: Some(repo.join(".git")),
+        ..FloorContext::default()
+    };
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.out", "test old ... FAILED\n"),
+            ("run.exit", "101"),
+            ("excluded.exit", "0"),
+            ("toc.txt", &toc_of(&["old", "new", "fine"])),
+        ],
+    );
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    let g = c.decision.as_ref().and_then(|d| d.guide.clone()).unwrap();
+    assert!(
+        !report.passed
+            && g.present
+            && !g.usable
+            && g.reason.as_deref().is_some_and(|r| {
+                r.starts_with("stale: `cfg/a.toml`") && r.contains("invalidatedBy")
+            }),
+        "{g:?}"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (confirmation round, agy P1 #1) A STALE guide may name outdated commands: in the directories
+/// it covers, the floor runs the UNION of its checks and the detected ones — when the base changed
+/// a `derivedFrom` file since the guide was written, or when the change touches one. A fresh guide
+/// replaces detection there.
+#[cfg(unix)]
+#[test]
+fn a_stale_guide_runs_beside_the_detected_checks() {
+    let repo = scratch("stale-union");
+    // Detection (`.wicked/checks.json`) names `test`; the guide names only `gate`.
+    let argv = vec!["detected-runner".to_string(), "test".into()];
+    write_tree(&repo, &argv, &[]);
+    std::fs::write(repo.join("notes.md"), "v1\n").unwrap();
+    git_repo_with_commit(&repo);
+    let gate = serde_json::json!({"name": "gate", "run": ["sh", "-c", "exit 0"]});
+    write_guide(&repo, &[gate], &git(&repo, &["rev-parse", "HEAD"]));
+    let path = repo.join(crate::floor_guide::GUIDE_PATH);
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        raw.replace("\"derivedFrom\": []", "\"derivedFrom\": [\"notes.md\"]"),
+    )
+    .unwrap();
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &["commit", "-qm", "the guide, derived from notes.md"],
+    );
+    let ctx_at = |base: String| FloorContext {
+        base_head: Some(base),
+        stage: FloorStage::Verify,
+        git_dir: Some(repo.join(".git")),
+        ..FloorContext::default()
+    };
+    let checks = |ctx: &FloorContext| -> Vec<(String, String)> {
+        detect_with(&repo, ctx)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.name, c.source))
+            .collect()
+    };
+    let fresh = ctx_at(git(&repo, &["rev-parse", "HEAD"]));
+    let names: Vec<String> = checks(&fresh).into_iter().map(|c| c.0).collect();
+    assert_eq!(names, ["gate"], "a fresh guide replaces detection");
+    // The change touches a `derivedFrom` file: the union.
+    std::fs::write(repo.join("notes.md"), "v2\n").unwrap();
+    let got = checks(&fresh);
+    assert!(
+        got.iter().any(|c| c.0 == "gate")
+            && got.iter().any(|c| c.0 == "test"
+                && c.1.contains("stale build guide")
+                && c.1.contains("notes.md")),
+        "{got:?}"
+    );
+    // The base changed it since the guide was written: the union.
+    git(&repo, &["commit", "-qam", "notes changed on the base"]);
+    let moved = ctx_at(git(&repo, &["rev-parse", "HEAD"]));
+    let got = checks(&moved);
+    assert!(
+        got.iter().any(|c| c.0 == "gate")
+            && got
+                .iter()
+                .any(|c| c.0 == "test" && c.1.contains("changed on the base")),
+        "{got:?}"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
