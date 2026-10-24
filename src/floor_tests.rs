@@ -3162,6 +3162,7 @@ fn a_preload_in_the_guide_env_never_runs_outside_the_boundary() {
     )
     .unwrap();
     let lib = lib_dir.join("hijack.so");
+    // spawn-audit: test-only — builds the stand-in preload library with the host's C compiler.
     let built = std::process::Command::new("cc")
         .args(["-shared", "-fPIC", "-o"])
         .arg(&lib)
@@ -3172,6 +3173,7 @@ fn a_preload_in_the_guide_env_never_runs_outside_the_boundary() {
         return;
     }
     // Control: the library does write the sentinel when nothing confines it.
+    // spawn-audit: test-only — the unconfined control: proves the stand-in hook writes the sentinel.
     let probe_run = std::process::Command::new("true")
         .env("LD_PRELOAD", &lib)
         .status()
