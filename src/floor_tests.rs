@@ -2745,3 +2745,313 @@ fn a_stale_guide_runs_beside_the_detected_checks() {
     );
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+/// (confirmation round on d32b2b2, codex P2) The probe runs the guide's `install` step (a check
+/// named `install` in the same `cwd`) in EVERY fresh copy before probing — the retry's included,
+/// and under `--check`. The runner here exists only after the install: `node_modules/.bin`,
+/// generated from a committed source. An install that fails fails every probe.
+#[cfg(unix)]
+#[test]
+fn the_probe_runs_the_guides_install_step_in_every_fresh_copy() {
+    let _load = seam::pin(0.5, 4);
+    let repo = scratch("probe-install");
+    std::fs::create_dir_all(repo.join("tools")).unwrap();
+    std::fs::write(repo.join("tools/runner.src"), STAND_IN).unwrap();
+    // The first list fails: the whole probe re-runs on a fresh copy, which has no
+    // `node_modules` until its own install runs.
+    std::fs::write(repo.join("flaky.list"), "").unwrap();
+    std::fs::write(
+        repo.join(".gitignore"),
+        "tmp/\nprobe-guide.json\nnode_modules/\n",
+    )
+    .unwrap();
+    git_repo_with_commit(&repo);
+    let test: serde_json::Value = serde_json::from_str(
+        &stand_in_guide()
+            .to_string()
+            .replace("\"runner.sh\"", "\"node_modules/.bin/runner.sh\""),
+    )
+    .unwrap();
+    let path = repo.join("probe-guide.json");
+    let probe_with = |install: &str| {
+        let install = serde_json::json!({"name": "install", "run": ["sh", "-c", install]});
+        std::fs::write(
+            &path,
+            serde_json::json!({"version": 1, "checks": [install, test.clone()]}).to_string(),
+        )
+        .unwrap();
+        crate::floor_probe::probe_guide(&repo, &path, Some("test"))
+    };
+    let generate = "mkdir -p node_modules/.bin && cp tools/runner.src node_modules/.bin/runner.sh";
+    let results = match probe_with(generate) {
+        Ok(mut all) => all.remove(0).1,
+        Err(e) if e.contains("does not arm") => {
+            assert!(!tools_required(), "the floor sandbox is required here: {e}");
+            return;
+        }
+        Err(e) => panic!("the probe ran: {e}"),
+    };
+    for p in crate::floor_guide::REQUIRED_PROBES
+        .iter()
+        .chain(&["version"])
+    {
+        assert_eq!(
+            results.get(*p).map(String::as_str),
+            Some("pass (retried)"),
+            "{p}: {results:?}"
+        );
+    }
+    assert!(
+        !repo.join("node_modules").exists(),
+        "the install ran in the copies only"
+    );
+    // A failing install fails every probe, on the first copy and on the retry's.
+    let results = probe_with("exit 7").unwrap().remove(0).1;
+    assert_eq!(results.len(), crate::floor_guide::REQUIRED_PROBES.len() + 1);
+    for (p, r) in &results {
+        assert!(
+            r.starts_with("fail: install failed") && r.ends_with(" (retried)"),
+            "{p}: {r}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// A guide derived from `notes.md` whose one check was verified on `verified_on`.
+#[cfg(unix)]
+fn notes_guide(verified_on: &str) -> crate::floor_guide::BuildGuide {
+    let mut c = libtest_check(&["runner".to_string()]);
+    c["verified"] = libtest_guide(&[], verified_on)["verified"].clone();
+    serde_json::from_value(
+        serde_json::json!({"version": 1, "derivedFrom": ["notes.md"], "checks": [c]}),
+    )
+    .unwrap()
+}
+
+/// (confirmation round on d32b2b2, agy P2) A staleness anchor that is not an ancestor of the
+/// base — a pre-squash `verified.baseSha` still in the object store, or one a shallow clone does
+/// not have — says nothing about what changed since: the guide is stale (fail-closed).
+#[cfg(unix)]
+#[test]
+fn a_pre_squash_or_missing_verified_commit_makes_the_guide_stale() {
+    let repo = scratch("stale-anchor");
+    std::fs::write(repo.join("notes.md"), "v1\n").unwrap();
+    git_repo_with_commit(&repo);
+    let root = git(&repo, &["rev-parse", "HEAD"]);
+    // A side line (the pre-squash branch), then the guide on the main line.
+    git(&repo, &["checkout", "-qb", "side"]);
+    std::fs::write(repo.join("side.txt"), "x\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "pre-squash"]);
+    let side = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", "-q", "-"]);
+    std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+    std::fs::write(repo.join(crate::floor_guide::GUIDE_PATH), "{}").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "the guide"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    let git_dir = repo.join(".git");
+    let none: Result<Vec<String>, String> = Ok(Vec::new());
+    assert_eq!(
+        notes_guide(&root).stale(&repo, &git_dir, &base, &none),
+        None,
+        "control: verified on an ancestor, nothing derived changed"
+    );
+    let why = notes_guide(&side)
+        .stale(&repo, &git_dir, &base, &none)
+        .expect("a pre-squash anchor is stale");
+    assert!(why.contains("not an ancestor"), "{why}");
+    // A shallow clone holds the base but not the commit the check was verified on.
+    let shallow = scratch("stale-anchor-shallow");
+    let _ = std::fs::remove_dir_all(&shallow);
+    let url = format!("file://{}", repo.display());
+    git(
+        &repo,
+        &[
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            &url,
+            &shallow.to_string_lossy(),
+        ],
+    );
+    let why = notes_guide(&root)
+        .stale(&shallow, &shallow.join(".git"), &base, &none)
+        .expect("an anchor the shallow history lost is stale");
+    assert!(why.contains("not an ancestor"), "{why}");
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&shallow);
+}
+
+/// A creator-stage fixture: a GREEN base whose guide check has an `affected` piece that always
+/// passes, and a head whose full run is red with a new failure (only `affected` can pass it).
+/// Tracked: `runner.toml`, `other.toml`. Exclusion is the caller's to switch.
+#[cfg(unix)]
+fn affected_fixture(tag: &str) -> (PathBuf, FloorContext) {
+    let repo = scratch(tag);
+    let argv = vec![fake_cargo(tag), "test".into(), "--no-fail-fast".into()];
+    std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
+    let toc = toc_of(&["new", "fine"]);
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.out", "test new ... ok\ntest fine ... ok\n"),
+            ("run.exit", "0"),
+            ("toc.txt", toc.as_str()),
+        ],
+    );
+    std::fs::write(repo.join("runner.toml"), "setting = 1\n").unwrap();
+    std::fs::write(repo.join("other.toml"), "setting = 2\n").unwrap();
+    git_repo_with_commit(&repo);
+    let ctx = FloorContext {
+        base_head: Some(commit_guide_with_passing_affected(&repo, &argv)),
+        stage: FloorStage::Creator,
+        git_dir: Some(repo.join(".git")),
+        ..FloorContext::default()
+    };
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.out", "test new ... FAILED\n"),
+            ("run.exit", "101"),
+            ("toc.txt", toc.as_str()),
+        ],
+    );
+    (repo, ctx)
+}
+
+/// (confirmation round on d32b2b2, agy P2) A path deleted from the index but still on disk is
+/// both removed (git's D list) and untracked (touched): read from the D/T list directly, it still
+/// rules `affected` out — the full check runs and denies.
+#[cfg(unix)]
+#[test]
+fn a_deleted_path_still_on_disk_untracked_runs_the_full_check() {
+    let _load = seam::pin(0.5, 4);
+    let _off = seam::exclude(false);
+    let (repo, ctx) = affected_fixture("deleted-untracked");
+    git(&repo, &["rm", "-q", "--cached", "other.toml"]);
+    let other = "other.toml".to_string();
+    assert!(touched_files(&repo, &ctx).unwrap().contains(&other));
+    assert!(removed_files(&repo, &ctx).unwrap().contains(&other));
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    assert!(!report.passed, "the full, red check denies: {c:?}");
+    assert!(!c.source.contains("affected set"), "{}", c.source);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (confirmation round on d32b2b2, agy P2) In a stale union a covered directory's detected
+/// `install` runs FIRST, before every guided check (a guided install with the same argv is that
+/// install, once); a derived targeted creator check that a guided check already runs (argv and
+/// dir) is not run twice.
+#[cfg(unix)]
+#[test]
+fn a_stale_union_installs_first_and_runs_a_targeted_set_once() {
+    let ci = vec![
+        "npm".to_string(),
+        "ci".into(),
+        "--ignore-scripts".into(),
+        "--no-audit".into(),
+        "--no-fund".into(),
+    ];
+    // A Node package: detection adds `install` (no `node_modules/`) and `test`.
+    let repo = scratch("stale-order-node");
+    std::fs::write(
+        repo.join("package.json"),
+        r#"{"name":"p","scripts":{"test":"x"}}"#,
+    )
+    .unwrap();
+    std::fs::write(repo.join("package-lock.json"), "{}").unwrap();
+    git_repo_with_commit(&repo);
+    let gate = serde_json::json!({"name": "gate", "run": ["sh", "-c", "exit 0"]});
+    let install = serde_json::json!({"name": "install", "run": ci});
+    write_guide(&repo, &[gate, install], &git(&repo, &["rev-parse", "HEAD"]));
+    let path = repo.join(crate::floor_guide::GUIDE_PATH);
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        raw.replace("\"derivedFrom\": []", "\"derivedFrom\": [\"package.json\"]"),
+    )
+    .unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "the guide"]);
+    let ctx = FloorContext {
+        base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+        stage: FloorStage::Verify,
+        git_dir: Some(repo.join(".git")),
+        ..FloorContext::default()
+    };
+    // Fresh: the guide's own order.
+    let names = |ctx: &FloorContext| -> Vec<String> {
+        detect_with(&repo, ctx)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect()
+    };
+    assert_eq!(names(&ctx), ["gate", "install"]);
+    // Stale (the change touches `package.json`): install first, once; then the guide; then the
+    // detected rest.
+    std::fs::write(
+        repo.join("package.json"),
+        r#"{"name":"p","scripts":{"test":"x"},"private":true}"#,
+    )
+    .unwrap();
+    let got = detect_with(&repo, &ctx).unwrap();
+    let order: Vec<&str> = got.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(order, ["install", "gate", "test"], "{got:#?}");
+    assert!(got[0].source.contains("stale build guide"), "{got:#?}");
+    let _ = std::fs::remove_dir_all(&repo);
+
+    // A cargo package at the creator: detection derives `cargo test -p a` from the touched file;
+    // the guide already runs exactly that.
+    let repo = scratch("stale-order-cargo");
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    std::fs::write(repo.join("notes.md"), "v1\n").unwrap();
+    git_repo_with_commit(&repo);
+    let targeted = serde_json::json!({"name": "t-a", "run": ["cargo", "test", "-p", "a"]});
+    write_guide(&repo, &[targeted], &git(&repo, &["rev-parse", "HEAD"]));
+    let raw = std::fs::read_to_string(path_of(&repo)).unwrap();
+    std::fs::write(
+        path_of(&repo),
+        raw.replace("\"derivedFrom\": []", "\"derivedFrom\": [\"notes.md\"]"),
+    )
+    .unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "the guide"]);
+    let ctx = FloorContext {
+        base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+        stage: FloorStage::Creator,
+        git_dir: Some(repo.join(".git")),
+        ..FloorContext::default()
+    };
+    std::fs::write(repo.join("notes.md"), "v2\n").unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "pub fn f() -> u8 {\n    1\n}\n").unwrap();
+    let got = detect_with(&repo, &ctx).unwrap();
+    let ta = ["cargo", "test", "-p", "a"];
+    assert_eq!(
+        got.iter().filter(|c| c.argv == ta).count(),
+        1,
+        "the targeted set once: {got:#?}"
+    );
+    assert!(
+        got.iter().any(|c| c.source.contains("stale build guide")),
+        "the guide is stale here: {got:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[cfg(unix)]
+fn path_of(repo: &Path) -> PathBuf {
+    repo.join(crate::floor_guide::GUIDE_PATH)
+}

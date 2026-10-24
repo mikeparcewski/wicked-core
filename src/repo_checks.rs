@@ -1430,20 +1430,30 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
     // once) — more checks, never fewer.
     Ok(match guide_checks(worktree, ctx)? {
         Some((mut guided, covered, stale)) => {
+            let same = |a: &RepoCheck, b: &RepoCheck| a.argv == b.argv && a.dir == b.dir;
+            // In a stale union a covered directory's detected `install` runs FIRST — before every
+            // guided check (one that needs the dependencies included); a guided check with the
+            // same argv and dir is that install, run once, there.
+            let mut first: Vec<RepoCheck> = Vec::new();
+            let mut rest: Vec<RepoCheck> = Vec::new();
             for mut c in detected {
                 if !covered.contains(&c.dir) {
-                    guided.push(c);
+                    rest.push(c);
                 } else if let Some(why) = stale.as_deref() {
-                    if !guided.iter().any(|g| g.argv == c.argv && g.dir == c.dir) {
-                        c.source = format!(
-                            "{} — run beside the base's stale build guide ({why})",
-                            c.source
-                        );
-                        guided.push(c);
+                    c.source = format!(
+                        "{} — run beside the base's stale build guide ({why})",
+                        c.source
+                    );
+                    if c.name == "install" {
+                        guided.retain(|g| !same(g, &c));
+                        first.push(c);
+                    } else if !guided.iter().any(|g| same(g, &c)) {
+                        // A derived targeted set too: once, by argv and dir.
+                        rest.push(c);
                     }
                 }
             }
-            guided
+            first.into_iter().chain(guided).chain(rest).collect()
         }
         None => detected,
     })
@@ -3343,14 +3353,19 @@ pub(crate) fn run_with_sandbox_ctx(
     // run — and the files the change touched (for `invalidatedBy` and `affected`).
     // Read once per floor run: every check of it decides under the same switch.
     let exclude = exclusion_enabled();
-    let (guide, touched, changed) = match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
-        (Some(base), Some(git_dir)) => (
-            crate::floor_guide::load_base(worktree, git_dir, base),
-            touched_files(worktree, ctx).unwrap_or_default(),
-            changed_files(worktree, ctx),
-        ),
-        _ => (Ok(None), Vec::new(), Ok(Vec::new())),
-    };
+    // `removed` (deleted, renamed away, type-changed: git's own D/T list) is read directly, never
+    // inferred from `changed` minus `touched` — a path removed from the index but still on disk
+    // is in both.
+    let (guide, touched, changed, removed) =
+        match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
+            (Some(base), Some(git_dir)) => (
+                crate::floor_guide::load_base(worktree, git_dir, base),
+                touched_files(worktree, ctx).unwrap_or_default(),
+                changed_files(worktree, ctx),
+                removed_files(worktree, ctx),
+            ),
+            _ => (Ok(None), Vec::new(), Ok(Vec::new()), Ok(Vec::new())),
+        };
     let candidates = engine_generated_candidates(worktree, &detected);
     let env = scratch.env_record(&sandbox_level);
     // (core#817) Per package: a subdirectory package's own `baseline_diff: false` holds for it.
@@ -3379,11 +3394,9 @@ pub(crate) fn run_with_sandbox_ctx(
         };
         // (DES-BUILD-GUIDE) At the creator, a usable guide's `affected` piece is a fast pre-pass:
         // its pass decides; its failure runs the check as declared.
-        // A deleted, renamed-away or type-changed file (in `changed`, not `touched`): what it left
-        // behind cannot be mapped — the full check.
-        let deletes = changed
-            .as_ref()
-            .map_or(true, |c| c.iter().any(|f| !touched.contains(f)));
+        // A deleted, renamed-away or type-changed file (git's D/T list): what it left behind
+        // cannot be mapped — the full check. A list that cannot be read: the full check too.
+        let deletes = removed.as_ref().map_or(true, |r| !r.is_empty());
         let affected = gcheck
             .as_ref()
             .ok()
@@ -4193,19 +4206,18 @@ pub(crate) fn remove_base_export(worktree: &Path, scratch: &CheckScratch) -> Res
 
 impl BaseTree {
     fn cache_path(scratch: &CheckScratch, head: &str, check: &RepoCheck) -> PathBuf {
-        // (core#817) A subdirectory package's check is its own entry (`dir` with `/` flattened).
-        // Hex-encoded, so the key is injective (`a/b` and `a_b` never share an entry).
-        let dir = if check.dir.is_empty() {
-            String::new()
-        } else {
-            let hex: String = check.dir.bytes().map(|b| format!("{b:02x}")).collect();
-            format!("d{hex}--")
-        };
-        scratch.root.join("base-cache").join(format!(
-            "{}-{dir}{}.json",
-            &head[..head.len().min(12)],
-            check.name
-        ))
+        // ONE file name, whatever the head, the `dir` (core#817: a subdirectory package's check
+        // is its own entry) or the check's `name` (a guide's, repo-controlled) say: a sha256 over
+        // the three, NUL-separated (injective, a fixed length, never a path separator). The record
+        // is written by the engine, outside the sandbox — no name may steer where.
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for part in [head, check.dir.as_str(), check.name.as_str()] {
+            h.update(part.as_bytes());
+            h.update([0u8]);
+        }
+        let key: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        scratch.root.join("base-cache").join(format!("{key}.json"))
     }
 
     /// This run's cached result of `check` on `head`, when an earlier floor of the run paid for it:
@@ -4282,7 +4294,7 @@ impl BaseTree {
     /// (a baseline diff compares one command on two trees: a change that edits the command — say
     /// adds `--no-fail-fast` — would otherwise read the base's shorter failure list as the head's
     /// regressions; a targeted command is the same change-scoped set on both trees) — and cache
-    /// the result under `base-cache/<head>-<name>.json` for the rest of the
+    /// the result under `base-cache/<sha256 of head, dir, name>.json` for the rest of the
     /// run ([`Self::cached`]). The base's install step runs first when its tree needs
     /// provisioning (the same frozen, scripts-off install the head got, out of the same scratch
     /// cache).
@@ -9093,6 +9105,59 @@ pub(crate) mod tests {
         );
         assert!(!report.passed);
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// (confirmation round on d32b2b2, codex P1) The base cache record is written by the engine,
+    /// outside the sandbox: whatever a check's `name` or `dir` say — a traversal included — its
+    /// path is ONE file directly in `base-cache`, and distinct (dir, name) pairs never share one.
+    #[test]
+    fn a_traversal_check_name_never_writes_outside_the_base_cache() {
+        let wt = scratch("cache-name");
+        let scratch_dir = CheckScratch::prepare(&wt).expect("scratch");
+        let cache = scratch_dir.root.join("base-cache");
+        let head = "0123456789abcdef0123";
+        let at = |dir: &str, name: &str| {
+            BaseTree::cache_path(
+                &scratch_dir,
+                head,
+                &RepoCheck {
+                    name: name.into(),
+                    argv: Vec::new(),
+                    source: String::new(),
+                    timeout_s: None,
+                    dir: dir.into(),
+                },
+            )
+        };
+        let mut seen = Vec::new();
+        for (dir, name) in [
+            ("", "../../../escaped"),
+            ("", "/tmp/escaped"),
+            ("", "a/b"),
+            ("a", "b"),
+            ("a/b", ""),
+            ("../..", ".."),
+            ("", &"x".repeat(400)),
+        ] {
+            let path = at(dir, name);
+            assert_eq!(path.parent(), Some(cache.as_path()), "{dir:?} {name:?}");
+            let file = path.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                file.len() == 64 + 5
+                    && file.ends_with(".json")
+                    && file[..64].bytes().all(|b| b.is_ascii_hexdigit()),
+                "{file}"
+            );
+            assert!(!seen.contains(&path), "{dir:?} {name:?} shares an entry");
+            seen.push(path.clone());
+            // The record lands where the floor writes it: inside the cache, nowhere else.
+            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::write(&path, "{}").unwrap();
+        }
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), seen.len());
+        assert!(!scratch_dir.root.join("escaped").exists());
+        assert!(!wt.join("escaped").exists());
+        let _ = std::fs::remove_dir_all(&wt);
     }
 
     #[test]

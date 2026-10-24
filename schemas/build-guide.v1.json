@@ -36,7 +36,7 @@
       "dependentRequired": { "list": ["results", "failedExit"], "version": ["list"] },
       "additionalProperties": false,
       "properties": {
-        "name": { "type": "string" },
+        "name": { "type": "string", "pattern": "^(?!\\.\\.?$)[A-Za-z0-9._-]{1,64}$", "description": "1-64 of `A-Z a-z 0-9 . _ -`, never `.` or `..` (it keys files the engine writes). A check named `install` is the floor's install step." },
         "cwd": {
           "type": "string",
           "default": ".",
@@ -191,7 +191,7 @@
           }
         },
         "verified": {
-          "description": "Written by `wicked-core floor probe`. `results` keys: list, run, ids, alone, deselect, mutation, multi, plus affected and version when the check has that piece. The probes need a green clean run. When any probe fails, the whole probe re-runs once on a fresh copy and that retry's results are recorded, each marked ` (retried)`: `pass (retried)` counts as a pass, `fail: … (retried)` does not.",
+          "description": "Written by `wicked-core floor probe`, which first runs the guide's `install` check for the same `cwd` in every fresh copy it probes (an install that fails fails every probe). `results` keys: list, run, ids, alone, deselect, mutation, multi, plus affected and version when the check has that piece. The probes need a green clean run. When any probe fails, the whole probe re-runs once on a fresh copy and that retry's results are recorded, each marked ` (retried)`: `pass (retried)` counts as a pass, `fail: … (retried)` does not.",
           "type": "object",
           "additionalProperties": false,
           "properties": {

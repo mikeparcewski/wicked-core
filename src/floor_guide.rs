@@ -246,6 +246,16 @@ pub(crate) fn load_base(
         .map_err(|e| format!("the base's `{GUIDE_PATH}` {e}"))
 }
 
+/// A check name: 1-64 of `[A-Za-z0-9._-]`, never `.` or `..` — it keys engine-written files.
+fn name_ok(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
 /// A relative directory inside the repo: `.`, or segments none of which is empty, `.` or
 /// `..`, with no `\\` and no `:` (no Windows drive, `C:x` included).
 fn cwd_ok(cwd: &str) -> bool {
@@ -261,7 +271,8 @@ fn cwd_ok(cwd: &str) -> bool {
 
 /// A guide's text, parsed and checked against the parts of the schema the floor relies on: version
 /// 1, every `run` non-empty, `stage` values `creator` | `verify`, a test check (one with a `list`)
-/// naming its `failedExit` (never 0), a `cwd` inside the repo, and a `deselect` whose
+/// naming its `failedExit` (never 0), a `name` of 1-64 `[A-Za-z0-9._-]` (never `.` or `..`), a
+/// `cwd` inside the repo, and a `deselect` whose
 /// `{ids:re|}` is once-only and never beside `{q}`. Anything else does not parse (detection
 /// decides).
 pub(crate) fn parse(raw: &str) -> Result<BuildGuide, String> {
@@ -274,6 +285,12 @@ pub(crate) fn parse(raw: &str) -> Result<BuildGuide, String> {
         ));
     }
     for c in &guide.checks {
+        if !name_ok(&c.name) {
+            return Err(format!(
+                "is invalid: check name {:?} is not 1-64 of `A-Z a-z 0-9 . _ -` (and not `.` or `..`)",
+                c.name
+            ));
+        }
         let tokens = c.deselect.as_ref().map_or(&[][..], |d| d.append.as_slice());
         let (first, last) = per_id_range(tokens);
         let has = |t: &[String], s: &str| t.iter().any(|x| x.contains(s));
@@ -325,9 +342,36 @@ impl BuildGuide {
             .find(|c| c.run == argv && norm_dir(&c.cwd) == norm_dir(dir))
     }
 
+    /// The commits staleness is read from: the one that last wrote the guide (`written`, from
+    /// `git log -1`) and every check's `verified.baseSha`. `Err` (stale, fail-closed) when the log
+    /// names no commit (a shallow history that lost it) or a verified block names none.
+    fn anchors(&self, written: Vec<String>) -> Result<Vec<String>, String> {
+        let mut anchors: Vec<String> = written
+            .into_iter()
+            .map(|w| w.trim().to_string())
+            .filter(|w| !w.is_empty())
+            .collect();
+        if anchors.is_empty() {
+            return Err("the commit that wrote the guide is not in the base's history".into());
+        }
+        for c in &self.checks {
+            if let Some(v) = c.verified.as_ref() {
+                // Hex only: it reaches git as an argument, never as an option.
+                if v.base_sha.is_empty() || !v.base_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(format!("`{}`'s verified block names no commit", c.name));
+                }
+                if !anchors.contains(&v.base_sha) {
+                    anchors.push(v.base_sha.clone());
+                }
+            }
+        }
+        Ok(anchors)
+    }
+
     /// Why the guide's COMMANDS may be outdated, or `None`: a `derivedFrom` file changed on the
     /// base since the guide was last committed or since a check was verified, or the change
-    /// itself (`changed`) touches one. A list that cannot be read is stale (fail-closed). With no
+    /// itself (`changed`) touches one. A list that cannot be read, or an anchor that is missing or
+    /// not an ancestor of the base, is stale (fail-closed). With no
     /// `derivedFrom` there is nothing to be stale against.
     pub(crate) fn stale(
         &self,
@@ -357,15 +401,21 @@ impl BuildGuide {
             Ok(w) => w,
             Err(e) => return Some(format!("the guide's commit could not be read: {e}")),
         };
-        let mut anchors: Vec<String> = written.into_iter().map(|w| w.trim().to_string()).collect();
-        for c in &self.checks {
-            if let Some(v) = c.verified.as_ref() {
-                if !anchors.contains(&v.base_sha) {
-                    anchors.push(v.base_sha.clone());
-                }
+        let anchors = match self.anchors(written) {
+            Ok(a) => a,
+            Err(why) => return Some(why),
+        };
+        for from in &anchors {
+            // A pre-squash (or otherwise foreign) commit says nothing about what changed since.
+            if crate::worktree_guard::git(
+                worktree,
+                &["merge-base", "--is-ancestor", from, base],
+                &env,
+            )
+            .is_err()
+            {
+                return Some(format!("`{from}` is not an ancestor of the base"));
             }
-        }
-        for from in anchors.iter().filter(|a| !a.is_empty()) {
             match changed_since(worktree, git_dir, from, base) {
                 Err(e) => return Some(format!("staleness could not be read: {e}")),
                 Ok(since) => {
@@ -965,6 +1015,63 @@ mod tests {
             fill(&s(&["--{id}@{q}"]), &t("Q", "a{q}b")),
             s(&["--a{q}b@Q"])
         );
+    }
+
+    /// (confirmation round on d32b2b2, codex P1) A check name keys files the engine writes: only
+    /// 1-64 of `[A-Za-z0-9._-]`, never `.` or `..`, parses.
+    #[test]
+    fn a_check_name_outside_the_safe_set_does_not_parse() {
+        let doc = |name: &str| {
+            serde_json::json!({"version": 1, "checks": [{"name": name, "run": ["true"]}]})
+                .to_string()
+        };
+        let long = "a".repeat(65);
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "a b",
+            "a\nb",
+            "x:y",
+            long.as_str(),
+        ] {
+            let e = parse(&doc(bad)).expect_err(bad);
+            assert!(e.contains("check name"), "{bad:?}: {e}");
+        }
+        for good in [
+            "install",
+            "core-ts.tsc_1",
+            "...",
+            ".hidden",
+            &"a".repeat(64),
+        ] {
+            parse(&doc(good)).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+        }
+    }
+
+    /// (confirmation round on d32b2b2, agy P2) Staleness has nothing to read from when the log
+    /// names no commit (a shallow history that lost it) or a verified block names none: stale.
+    #[test]
+    fn a_missing_staleness_anchor_is_stale() {
+        let mut g = BuildGuide {
+            version: 1,
+            derived_from: vec!["x".into()],
+            checks: vec![check("text")],
+        };
+        assert!(g.anchors(Vec::new()).is_err());
+        assert!(g.anchors(vec!["\n".into()]).is_err());
+        assert_eq!(g.anchors(vec!["ab12".into()]).unwrap(), ["ab12"]);
+        for sha in ["", "--output=x", "HEAD"] {
+            g.checks[0].verified = Some(Verified {
+                base_sha: sha.into(),
+                ..Default::default()
+            });
+            assert!(g.anchors(vec!["ab12".into()]).is_err(), "{sha:?}");
+        }
     }
 
     /// (round 17) The committed seed guide parses and passes the load checks.

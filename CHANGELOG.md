@@ -50,6 +50,17 @@ Two release tracks share this file, newest entry first regardless of track:
   floor runs every check before delivery. A guide check named `install` is the floor's install step (the
   install timeout, never compared with the base, a failure read as an environment finding); the floor's
   sandbox confines writes, not the network, so an install inside it reaches the registry as detection's does.
+  A check `name` keys files the engine writes outside the sandbox, so a guide whose names are not 1-64 of
+  `[A-Za-z0-9._-]` (or are `.` / `..`) does not parse (schema `pattern` too), and the base-cache record's
+  file name is a sha256 of (head, dir, name) whatever they say. `floor probe` runs the guide's `install`
+  check for the probed check's `cwd` first in every fresh copy (the retry's and `--check` included); an
+  install that fails fails every probe ("install failed"). Staleness is fail-closed on its anchors: a
+  guide commit the log cannot name, a verified block with no hex commit, or an anchor that is not an
+  ancestor of the base (a pre-squash commit, one a shallow clone lacks) makes the guide stale. The
+  creator's `affected` pre-pass reads git's D/T list directly (a path removed from the index but still on
+  disk is both removed and untracked). In a stale union a covered directory's detected `install` runs
+  first, before every guided check, and a detected check a guided one already runs (argv and dir; a
+  derived targeted set included) runs once.
   **Exclusion ships DISABLED.** `WICKED_FLOOR_EXCLUDE` exactly `on` or `1` (read once per floor run, never
   trimmed or case-folded) enables it; unset or anything else, it is off: a failing head over a red base escalates as `base_red_unseparated` ("exclusion disabled
   (WICKED_FLOOR_EXCLUDE)") with both logs, and the base's list, the one-test runs and the deselected head

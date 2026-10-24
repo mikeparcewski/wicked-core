@@ -26,6 +26,11 @@
 //! result, each marked `(retried)`: a suite too flaky to pass twice is left unverified. A check with
 //! no `list` piece (a build, a lint) has nothing to probe and is skipped.
 //!
+//! The guide's install step for the check's `cwd` (a check named `install`, the name detection
+//! gives its own) runs first in EVERY fresh copy — the retry's included, and under `--check`: a
+//! runner the install provides (a `node_modules/.bin` one) exists only after it. An install that
+//! fails fails every probe of the check ("install failed").
+//!
 //! Its worker home (check scratch, log store) is `WICKED_WORKER_HOME` when set explicitly, else a
 //! fresh temp dir removed at the end — never the operator's default home.
 
@@ -33,7 +38,7 @@ use std::path::Path;
 
 use crate::floor_guide::{passed, BuildGuide, GuideCheck, Mutation, TestId};
 use crate::repo_checks::{
-    inventory, remove_base_export, results_exec, results_of, run_one_with, runner_version,
+    inventory, remove_base_export, results_exec, results_of, run_one, run_one_with, runner_version,
     BaseTree, CheckScratch, RepoCheck, Tree,
 };
 
@@ -66,6 +71,24 @@ pub fn probe_guide(
             .map_err(|e| format!("`{}` is not a git repository: {e}", repo.display()))?;
     let head = crate::worktree_guard::git_string(repo, &["rev-parse", "HEAD"], &[])
         .map_err(|e| format!("the repo's HEAD: {e}"))?;
+    // Each check's install step: the guide's check named `install` in the same `cwd`.
+    let installs: Vec<(String, RepoCheck)> = guide
+        .checks
+        .iter()
+        .filter(|c| c.name == "install")
+        .map(|c| {
+            (
+                c.dir().to_string(),
+                RepoCheck {
+                    name: "install".into(),
+                    argv: c.run.clone(),
+                    source: "the guide's install step (floor probe)".into(),
+                    timeout_s: None,
+                    dir: c.dir().to_string(),
+                },
+            )
+        })
+        .collect();
     let mut out = Vec::new();
     for c in guide.checks.iter_mut() {
         if only.is_some_and(|n| n != c.name) {
@@ -78,7 +101,11 @@ pub fn probe_guide(
             );
             continue;
         }
-        let (results, version) = probe_check(repo, &git_dir, &head, c)?;
+        let install = installs
+            .iter()
+            .find(|(d, _)| c.name != "install" && d == c.dir())
+            .map(|(_, i)| i);
+        let (results, version) = probe_check(repo, &git_dir, &head, c, install)?;
         let v = c.verified.get_or_insert_with(Default::default);
         v.base_sha = head.clone();
         v.runner_version = version;
@@ -180,6 +207,7 @@ fn probe_check(
     git_dir: &Path,
     head: &str,
     g: &GuideCheck,
+    install: Option<&RepoCheck>,
 ) -> Result<(ProbeResults, String), String> {
     g.compile()?;
     let scratch = CheckScratch::prepare_for(repo, Some("floor-probe"))
@@ -209,6 +237,24 @@ fn probe_check(
     };
     // One attempt of every probe on `dir` (a fresh copy): the results and the runner version.
     let attempt = |dir: &Path| {
+        if let Some(i) = install {
+            let r = run_one(dir, i, &sandbox, &scratch, Tree::Base);
+            if !r.passed() {
+                let why = format!("fail: install failed ({})", r.summary());
+                let mut names: Vec<&str> = crate::floor_guide::REQUIRED_PROBES.to_vec();
+                if g.affected.is_some() {
+                    names.push("affected");
+                }
+                if g.version.is_some() {
+                    names.push("version");
+                }
+                let out: ProbeResults = names
+                    .into_iter()
+                    .map(|p| (p.to_string(), why.clone()))
+                    .collect();
+                return (out, String::new());
+            }
+        }
         let mut out = Probe {
             dir,
             g,
