@@ -239,16 +239,28 @@ pub(crate) fn load_base(
     if crate::worktree_guard::git(worktree, &["cat-file", "-e", &spec], &env).is_err() {
         return Ok(None);
     }
-    let raw = crate::worktree_guard::git_string(worktree, &["show", &spec], &env)
+    let raw = crate::worktree_guard::git_string(worktree, &["cat-file", "blob", &spec], &env)
         .map_err(|e| format!("the base's `{GUIDE_PATH}` could not be read: {e}"))?;
     parse(&raw)
         .map(Some)
         .map_err(|e| format!("the base's `{GUIDE_PATH}` {e}"))
 }
 
+/// A relative directory inside the repo: `.`/empty, or segments with no `..` and none empty.
+fn cwd_ok(cwd: &str) -> bool {
+    cwd.is_empty()
+        || cwd == "."
+        || !(Path::new(cwd).is_absolute()
+            || cwd.starts_with('/')
+            || cwd.contains('\\')
+            || cwd.split('/').any(|s| s.is_empty() || s == ".."))
+}
+
 /// A guide's text, parsed and checked against the parts of the schema the floor relies on: version
-/// 1, every `run` non-empty, `stage` values `creator` | `verify`, and a test check (one with a
-/// `list`) naming its `failedExit`. Anything else does not parse (detection decides).
+/// 1, every `run` non-empty, `stage` values `creator` | `verify`, a test check (one with a `list`)
+/// naming its `failedExit` (never 0), a `cwd` inside the repo, and a `deselect` whose
+/// `{ids:re|}` is once-only and never beside `{q}`. Anything else does not parse (detection
+/// decides).
 pub(crate) fn parse(raw: &str) -> Result<BuildGuide, String> {
     let guide: BuildGuide =
         serde_json::from_str(raw).map_err(|e| format!("does not parse: {e}"))?;
@@ -259,12 +271,23 @@ pub(crate) fn parse(raw: &str) -> Result<BuildGuide, String> {
         ));
     }
     for c in &guide.checks {
+        let tokens = c.deselect.as_ref().map_or(&[][..], |d| d.append.as_slice());
+        let (first, last) = per_id_range(tokens);
+        let has = |t: &[String], s: &str| t.iter().any(|x| x.contains(s));
         let bad = if c.run.is_empty() {
             Some("an empty `run`")
         } else if c.stage.iter().any(|s| s != "creator" && s != "verify") {
             Some("a `stage` other than `creator` / `verify`")
         } else if c.list.is_some() && c.failed_exit.is_empty() {
             Some("a `list` and no `failedExit`")
+        } else if c.failed_exit.contains(&0) {
+            Some("`0` in `failedExit` (a failure exits nonzero)")
+        } else if !cwd_ok(&c.cwd) {
+            Some("a `cwd` that is absolute, climbs (`..`) or has an empty segment")
+        } else if has(&tokens[first..last], "{ids:re|}") {
+            Some("`{ids:re|}` among the per-id tokens of `deselect.append` (it is once-only)")
+        } else if has(tokens, "{ids:re|}") && has(tokens, "{q}") {
+            Some("`{ids:re|}` and `{q}` in one `deselect.append` (the pattern cannot bind ids to qualifiers)")
         } else {
             None
         };
@@ -352,18 +375,6 @@ impl GuideCheck {
             }
             k => return Err(format!("`results.kind` `{k}`")),
         };
-        let tokens = self
-            .deselect
-            .as_ref()
-            .map_or(&[][..], |d| d.append.as_slice());
-        let (first, last) = per_id_range(tokens);
-        if tokens[first..last].iter().any(|t| t.contains("{ids:re|}")) {
-            return Err(
-                "`deselect.append`: `{ids:re|}` is once-only and cannot sit among the \
-                        per-id tokens"
-                    .into(),
-            );
-        }
         Ok(Compiled {
             section,
             failed,
@@ -463,7 +474,7 @@ impl GuideCheck {
     pub(crate) fn alone_argv(&self, t: &TestId) -> Vec<String> {
         self.alone
             .as_ref()
-            .map(|a| fill_all(&fill(&a.run, t), std::slice::from_ref(t)))
+            .map(|a| fill(&a.run, t))
             .unwrap_or_default()
     }
 
@@ -538,13 +549,13 @@ fn per_id_range(tokens: &[String]) -> (usize, usize) {
 }
 
 /// `{id}` and `{q}` verbatim, `{id:re}` regex-escaped (values fill argv elements; no shell).
-/// One pass, so an id that holds `{q}` is never rewritten.
+/// One pass, so an id that holds a placeholder is never rewritten; `{ids:re|}` is this one id.
 fn fill(argv: &[String], t: &TestId) -> Vec<String> {
-    let slot = Regex::new(r"\{(?:id|id:re|q)\}").expect("static regex");
+    let slot = Regex::new(r"\{(?:id|id:re|ids:re\||q)\}").expect("static regex");
     argv.iter()
         .map(|a| {
             slot.replace_all(a, |c: &regex::Captures| match &c[0] {
-                "{id:re}" => regex::escape(&t.id),
+                "{id:re}" | "{ids:re|}" => regex::escape(&t.id),
                 "{id}" => t.id.clone(),
                 _ => t.q.clone(),
             })
@@ -684,20 +695,19 @@ fn dedup(ids: Vec<TestId>, keyed: bool) -> Vec<TestId> {
 
 /// (junit) Every testcase that ran, one entry per `<testcase>` (one with a `skipped` child neither
 /// passed nor failed), and the failing ones (a `failure` or `error` child): id = the `attrs`
-/// values joined by `join`, q = the enclosing testsuite's `name`. A minimal reader of the elements
-/// the format defines; `None` when the text holds no testsuite.
+/// values joined by `join` (a testcase whose attributes are all empty is dropped), q = the
+/// nearest enclosing testsuite's `name`. Read with an XML parser (CDATA, `<system-out>`, nested
+/// suites); `None` when the text is not XML or holds no testsuite.
 pub(crate) fn junit(
     xml: &str,
     attrs: &[String],
     join: &str,
     keyed: bool,
 ) -> Option<(Vec<TestId>, Vec<TestId>)> {
-    let tag = Regex::new(
-        r#"<(/?)(testsuite|testcase|failure|error|skipped)\b((?:[^>"']|"[^"]*"|'[^']*')*?)(/?)>"#,
-    )
-    .expect("static regex");
-    let attr = Regex::new(r#"([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)')"#)
-        .expect("static regex");
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    if !doc.descendants().any(|n| n.has_tag_name("testsuite")) {
+        return None;
+    }
     let default_attrs = ["classname".to_string(), "name".to_string()];
     let attrs = if attrs.is_empty() {
         &default_attrs[..]
@@ -705,92 +715,31 @@ pub(crate) fn junit(
         attrs
     };
     let (mut all, mut failed) = (Vec::new(), Vec::new());
-    // The open testcase and whether it was skipped: each `<testcase>` is judged on its own.
-    let (mut suite, mut seen_suite, mut current): (String, bool, Option<(TestId, bool)>) =
-        (String::new(), false, None);
-    let unkey = |t: TestId| {
-        if keyed {
-            t
-        } else {
-            TestId {
-                q: String::new(),
-                ..t
-            }
+    for tc in doc.descendants().filter(|n| n.has_tag_name("testcase")) {
+        let values: Vec<&str> = attrs
+            .iter()
+            .map(|a| tc.attribute(a.as_str()).unwrap_or_default())
+            .collect();
+        let child = |name: &str| tc.children().any(|c| c.has_tag_name(name));
+        if values.iter().all(|v| v.is_empty()) || child("skipped") {
+            continue;
         }
-    };
-    for c in tag.captures_iter(xml) {
-        let (close, name, body, selfclose) = (&c[1] == "/", &c[2], &c[3], &c[4] == "/");
-        let get = |k: &str| {
-            attr.captures_iter(body)
-                .find(|a| &a[1] == k)
-                .map(|a| unescape(a.get(2).or(a.get(3)).map_or("", |m| m.as_str())))
+        let q = tc
+            .ancestors()
+            .find(|s| s.has_tag_name("testsuite"))
+            .and_then(|s| s.attribute("name"))
+            .filter(|_| keyed)
+            .unwrap_or_default();
+        let t = TestId {
+            q: q.to_string(),
+            id: values.join(join),
         };
-        match (name, close) {
-            ("testsuite", false) => {
-                suite = get("name").unwrap_or_default();
-                seen_suite = true;
-            }
-            ("testcase", false) => {
-                let id = attrs
-                    .iter()
-                    .map(|a| get(a).unwrap_or_default())
-                    .collect::<Vec<_>>()
-                    .join(join);
-                let t = unkey(TestId {
-                    q: suite.clone(),
-                    id,
-                });
-                if let Some((prev, false)) = current.take() {
-                    all.push(prev);
-                }
-                if selfclose {
-                    all.push(t);
-                } else {
-                    current = Some((t, false));
-                }
-            }
-            ("testcase", true) => {
-                if let Some((t, false)) = current.take() {
-                    all.push(t);
-                }
-                current = None;
-            }
-            ("failure" | "error", false) => {
-                if let Some((t, _)) = &current {
-                    failed.push(t.clone());
-                }
-            }
-            // A testcase a filter left out (or the runner skipped) neither passed nor failed.
-            ("skipped", false) => {
-                if let Some((_, skipped)) = &mut current {
-                    *skipped = true;
-                }
-            }
-            _ => {}
+        if child("failure") || child("error") {
+            failed.push(t.clone());
         }
-    }
-    if let Some((t, false)) = current {
         all.push(t);
     }
-    all.retain(|t| !t.id.is_empty());
-    seen_suite.then(|| (all, dedup(failed, keyed)))
-}
-
-/// The five XML entities, in ONE pass (`&amp;quot;` is the text `&quot;`).
-fn unescape(s: &str) -> String {
-    let entity = Regex::new("&(lt|gt|quot|apos|amp);").expect("static regex");
-    entity
-        .replace_all(s, |c: &regex::Captures| {
-            match &c[1] {
-                "lt" => "<",
-                "gt" => ">",
-                "quot" => "\"",
-                "apos" => "'",
-                _ => "&",
-            }
-            .to_string()
-        })
-        .into_owned()
+    Some((all, dedup(failed, keyed)))
 }
 
 /// Does repo-relative `path` match `glob` (`**` any depth, `*` and `?` within a segment)?
@@ -857,11 +806,44 @@ mod tests {
         assert!(guide(serde_json::json!({"name": "g", "run": ["x"], "stage": ["ci"]})).is_err());
         let mut c = serde_json::to_value(check("text")).unwrap();
         c["failedExit"] = serde_json::json!([]);
-        assert!(guide(c).is_err());
+        assert!(guide(c.clone()).is_err());
+        // (round 17) A failure exits nonzero: `0` is refused, as is a `cwd` outside the repo,
+        // `{ids:re|}` among the per-id tokens, and `{ids:re|}` beside `{q}`.
+        for (k, v) in [
+            ("failedExit", serde_json::json!([0, 3])),
+            ("cwd", serde_json::json!("../x")),
+            ("cwd", serde_json::json!("/abs")),
+            ("cwd", serde_json::json!("a//b")),
+            (
+                "deselect",
+                serde_json::json!({"append": ["--not={id}", "--all={ids:re|}", "--raw={id}"]}),
+            ),
+            (
+                "deselect",
+                serde_json::json!({"append": ["--suite={q}", "--p=^(?!(?:{ids:re|})$)"]}),
+            ),
+        ] {
+            let mut bad = serde_json::to_value(check("text")).unwrap();
+            bad[k] = v.clone();
+            assert!(guide(bad).is_err(), "{k}: {v}");
+        }
+        let mut ok = serde_json::to_value(check("text")).unwrap();
+        ok["cwd"] = "crates/x".into();
+        assert!(guide(ok).is_ok());
         assert_eq!(
             fill(&s(&["--{id}@{q}"]), &t("Q", "a{q}b")),
             s(&["--a{q}b@Q"])
         );
+    }
+
+    /// (round 17) The committed seed guide parses and passes the load checks.
+    #[test]
+    fn the_committed_seed_guide_parses() {
+        let g = parse(include_str!("../.wicked/build-guide.json")).expect("the seed guide parses");
+        assert!(g
+            .checks
+            .iter()
+            .any(|c| c.name == "test" && c.list.is_some()));
     }
 
     /// A new section drops an uncommitted block; an empty block never hides the one before it.
@@ -897,11 +879,6 @@ mod tests {
             v(&["r", "go", "--report", "--", "--not=a", "--exact", "--show"])
         );
         assert_eq!(both.iter().filter(|a| *a == "--").count(), 1);
-        // `{ids:re|}` among the per-id tokens is refused.
-        g.deselect = Some(Deselect {
-            append: v(&["--not={id}", "--all={ids:re|}", "--raw={id}"]),
-        });
-        assert!(g.compile().is_err());
     }
 
     /// The text parser: `failed` rules and the LAST block before each end, each id in its
@@ -953,7 +930,6 @@ mod tests {
             <testcase classname="m.b" name="left_out" file="m/b.x"><skipped/></testcase>
             </testsuite></testsuites>"#;
         let (all, failed) = junit(xml, &[], "::", true).unwrap();
-        assert_eq!(unescape("a&amp;quot;b&lt;"), "a&quot;b<");
         assert_eq!(all.len(), 3);
         assert_eq!(
             failed,
@@ -970,6 +946,18 @@ mod tests {
         assert_eq!(junit(&skipped, &[], "::", false).unwrap().0.len(), 1);
         let ran = twins(r#"<testcase classname="c" name="x"></testcase>"#);
         assert_eq!(junit(&ran, &[], "::", false).unwrap().0.len(), 2);
+        // A real XML reader: tags inside CDATA or `<system-out>` are text, nested suites qualify
+        // their own cases, entities decode once, and a case with no id attributes is dropped.
+        let tricky = r#"<testsuites><testsuite name="outer"><testsuite name="inner">
+            <testcase classname="c" name="a &amp;quot;q&amp;quot;"><system-out><![CDATA[<failure/><skipped/>]]></system-out></testcase>
+            </testsuite><testcase classname="c" name="b"><failure>&lt;skipped/&gt;</failure></testcase>
+            <testcase/></testsuite></testsuites>"#;
+        let (all, failed) = junit(tricky, &[], "::", true).unwrap();
+        assert_eq!(
+            all,
+            vec![t("inner", "c::a &quot;q&quot;"), t("outer", "c::b")]
+        );
+        assert_eq!(failed, vec![t("outer", "c::b")]);
     }
 
     /// Deselect: tokens before the first `{id}` once (a `--` already in the argv is not

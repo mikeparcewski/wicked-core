@@ -50,6 +50,8 @@ pub fn probe_guide(
     guide_path: &Path,
     only: Option<&str>,
 ) -> Result<Vec<(String, ProbeResults)>, String> {
+    // Held to the end of the probe: dropping it restores the variable and removes the home.
+    let _home = ProbeHome::arm().map_err(|e| format!("no temporary worker home: {e}"))?;
     // Absolute: the sandbox's write roots and every run's cwd hang off it.
     let repo = &repo
         .canonicalize()
@@ -106,14 +108,6 @@ pub fn probe_cli(args: &[String]) -> i32 {
         eprintln!("usage: wicked-core floor probe --repo <dir> --guide <file> [--check <name>]");
         return 2;
     };
-    // Held to the end of the probe: dropping it removes the temporary worker home.
-    let _home = match probe_worker_home() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("wicked-core floor probe: no temporary worker home: {e}");
-            return 2;
-        }
-    };
     match probe_guide(
         Path::new(&repo),
         Path::new(&guide),
@@ -136,23 +130,49 @@ pub fn probe_cli(args: &[String]) -> i32 {
     }
 }
 
-/// The probe never runs in the operator's worker home: unless `WICKED_WORKER_HOME` is set
-/// explicitly, the run gets a fresh private dir under the system temp dir (the variable points at
-/// it for this process, before anything resolves the home) and the returned guard removes it.
-fn probe_worker_home() -> std::io::Result<Option<crate::repo_checks::PrivateTmp>> {
-    use wicked_apps_core::spawn::WORKER_HOME_ENV;
-    if std::env::var_os(WORKER_HOME_ENV).is_some() {
-        return Ok(None);
+/// The probe never runs in the operator's worker home: unless `WICKED_WORKER_HOME` is set (and
+/// not empty), the probe gets a fresh private dir under the system temp dir (the variable points at
+/// it while the probe runs) and dropping the guard restores the variable and removes the dir.
+struct ProbeHome {
+    previous: Option<std::ffi::OsString>,
+    tmp: Option<crate::repo_checks::PrivateTmp>,
+}
+
+impl ProbeHome {
+    fn arm() -> std::io::Result<Self> {
+        use wicked_apps_core::spawn::WORKER_HOME_ENV;
+        let previous = std::env::var_os(WORKER_HOME_ENV);
+        if previous.as_ref().is_some_and(|v| !v.is_empty()) {
+            return Ok(Self {
+                previous,
+                tmp: None,
+            });
+        }
+        let tmp = crate::repo_checks::PrivateTmp::create()?;
+        // Spelled without a symlink (`/var` → `/private/var` on macOS): the home must be normal.
+        let dir = tmp.path().canonicalize()?;
+        std::env::set_var(WORKER_HOME_ENV, &dir);
+        eprintln!(
+            "wicked-core floor probe: worker home {} (temporary; removed at the end)",
+            dir.display()
+        );
+        Ok(Self {
+            previous,
+            tmp: Some(tmp),
+        })
     }
-    let tmp = crate::repo_checks::PrivateTmp::create()?;
-    // Spelled without a symlink (`/var` → `/private/var` on macOS): the home must be normal.
-    let dir = tmp.path().canonicalize()?;
-    std::env::set_var(WORKER_HOME_ENV, &dir);
-    eprintln!(
-        "wicked-core floor probe: worker home {} (temporary; removed at the end)",
-        dir.display()
-    );
-    Ok(Some(tmp))
+}
+
+impl Drop for ProbeHome {
+    fn drop(&mut self) {
+        use wicked_apps_core::spawn::WORKER_HOME_ENV;
+        if self.tmp.is_some() {
+            match &self.previous {
+                Some(v) => std::env::set_var(WORKER_HOME_ENV, v),
+                None => std::env::remove_var(WORKER_HOME_ENV),
+            }
+        }
+    }
 }
 
 fn probe_check(
@@ -291,7 +311,14 @@ impl Probe<'_> {
     }
 
     /// The list deselecting `ids` names exactly `listed` minus them.
+    /// Each of `ids` is listed exactly once (else deselecting it proves nothing).
     fn deselects_exactly(&self, listed: &[TestId], ids: &[TestId]) -> bool {
+        if !ids
+            .iter()
+            .all(|id| listed.iter().filter(|t| *t == id).count() == 1)
+        {
+            return false;
+        }
         let rest = self.list(ids);
         let mut want: Vec<&TestId> = listed.iter().filter(|t| !ids.contains(t)).collect();
         let mut got: Vec<&TestId> = rest.ids.iter().collect();
@@ -306,8 +333,9 @@ impl Probe<'_> {
         crate::repo_checks::write_confined(self.dir, &rel.to_string_lossy(), &m.content)
     }
 
+    /// A NONZERO exit the guide calls a test failure.
     fn failed_exit(&self, code: Option<i32>) -> bool {
-        code.is_some_and(|c| self.g.failed_exit.contains(&c))
+        code.is_some_and(|c| c != 0 && self.g.failed_exit.contains(&c))
     }
 
     fn all(&self) -> ProbeResults {
@@ -437,13 +465,16 @@ impl Probe<'_> {
         out.insert(
             "ids".into(),
             verdict(
-                listed.incomplete.is_none() && stray.is_none(),
+                listed.incomplete.is_none() && !reported.is_empty() && stray.is_none(),
                 || match stray {
                     Some(x) => format!(
                         "the results name `{}` (q `{}`), which the list does not",
                         x.id, x.q
                     ),
-                    None => listed.incomplete.clone().unwrap_or_default(),
+                    None => listed
+                        .incomplete
+                        .clone()
+                        .unwrap_or_else(|| "the results named no test".into()),
                 },
             ),
         );

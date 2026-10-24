@@ -1481,7 +1481,8 @@ fn doctests_run_under_the_real_floor_sandbox() {
 /// mutation files `zz_m` / `zz_m2` exist (they fail). `--list` lists, `--skip=<id>` deselects,
 /// `-- <id> --exact` runs one. Markers: `flaky.list` fails the first list of a probe scratch,
 /// `broken.alone` fails `a` run alone, `red.base` fails `a` always, `alone.all` makes a one-test
-/// run run them all, `plant.link` plants `zz_m` as a link to `$OUTSIDE`.
+/// run run them all, `plant.link` plants `zz_m` as a link to `$OUTSIDE`, `swallow` exits 0 on a
+/// failure, `dup.list` lists `a` twice.
 #[cfg(unix)]
 const STAND_IN: &str = r#"mode=run; name=; skip=' '
 for a in "$@"; do case "$a" in --list) mode=list;; --skip=*) skip="$skip${a#--skip=} ";; --|--exact) ;; *) name=$a;; esac; done
@@ -1492,10 +1493,12 @@ if [ -n "$name" ] && [ ! -f alone.all ]; then case " $all " in *" $name "*) all=
 [ -f plant.link ] && [ ! -L zz_m ] && ln -s "$OUTSIDE" zz_m
 case $mode in
   list) if [ -f flaky.list ] && [ ! -f "$TMPDIR/listed" ]; then : > "$TMPDIR/listed"; exit 1; fi
-    for t in $all; do case "$skip" in *" $t "*) continue;; esac; echo "$t: test"; done; exit 0;;
+    for t in $all; do case "$skip" in *" $t "*) continue;; esac; echo "$t: test"; done
+    [ -f dup.list ] && case "$skip" in *" a "*) ;; *) echo "a: test";; esac; exit 0;;
   *) f=; for t in $all; do case "$skip" in *" $t "*) continue;; esac; case $t in m|m2) f="$f $t";; a) [ -f red.base ] && f="$f a";; esac; done
     if [ -z "$f" ]; then echo 'test result: ok.'; exit 0; fi
-    printf '\nfailures:\n'; for t in $f; do echo "    $t"; done; printf '\ntest result: FAILED.\n'; exit 101;;
+    printf '\nfailures:\n'; for t in $f; do echo "    $t"; done; printf '\ntest result: FAILED.\n'
+    [ -f swallow ] && exit 0; exit 101;;
 esac
 "#;
 
@@ -1627,6 +1630,12 @@ fn the_probe_needs_a_green_base_an_isolated_alone_and_confined_mutations() {
         r["list"], "pass (retried)",
         "the list never saw the results env: {r:?}"
     );
+    // (round 17, items 2, 3) A runner that swallows its failures (exit 0) proves nothing; a
+    // deselect of a test listed twice proves nothing.
+    let r = with("swallow", &g).unwrap();
+    assert!(r["mutation"].starts_with("fail:"), "{r:?}");
+    let r = with("dup.list", &g).unwrap();
+    assert!(r["deselect"].starts_with("fail:"), "{r:?}");
     let mut bad2 = g.clone();
     bad2["probes"]["mutation2"]["file"] = "../m2".into();
     let r = with("bad2.marker", &bad2).unwrap();
@@ -2082,4 +2091,95 @@ fn a_pre_existing_claim_is_judged_on_the_denying_check() {
         c.verdict, CLAIM_REJECTED,
         "the head dropped `old`; what fails is its own"
     );
+}
+
+/// (round 17, codex P1) Exporting the base for a probe or a floor runs no repository hook and no
+/// filter driver: a `post-index-change` hook and a smudge filter that would write outside never do.
+#[cfg(unix)]
+#[test]
+fn the_base_export_runs_no_repository_hook_or_filter() {
+    let _load = seam::pin(0.5, 4);
+    let repo = scratch("export-hooks");
+    let outside = scratch("export-hooks-outside");
+    let marker = outside.join("ran");
+    std::fs::write(repo.join("runner.sh"), STAND_IN).unwrap();
+    std::fs::write(repo.join("a.txt"), "plain\n").unwrap();
+    std::fs::write(repo.join(".gitattributes"), "*.txt filter=evil\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "tmp/\nprobe-guide.json\n").unwrap();
+    git_repo_with_commit(&repo);
+    // Configured AFTER the commit, as a repository could carry them.
+    let hooks = outside.join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("post-index-change");
+    std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    git(
+        &repo,
+        &["config", "core.hooksPath", &hooks.to_string_lossy()],
+    );
+    let smudge = format!("sh -c 'touch {}; cat'", marker.display());
+    git(&repo, &["config", "filter.evil.smudge", &smudge]);
+    git(&repo, &["config", "filter.evil.clean", "cat"]);
+    let scratch_dir = CheckScratch::prepare(&repo).unwrap();
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let tree = BaseTree::export(&repo, &scratch_dir, &repo.join(".git"), &head).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(tree.dir.join("a.txt")).unwrap(),
+        "plain\n"
+    );
+    let _ = remove_base_export(&repo, &scratch_dir);
+    // The probe exports through the same path.
+    let _ = probe(&repo, stand_in_guide());
+    assert!(
+        !marker.exists(),
+        "a repository hook or filter ran outside the sandbox"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// (round 17, codex P2) A base candidate that PASSES run alone is not a confirmed base failure:
+/// the check escalates instead of excluding it.
+#[cfg(unix)]
+#[test]
+fn a_base_candidate_that_passes_alone_is_never_excluded() {
+    let _load = seam::pin(0.5, 4);
+    let (repo, _, argv) = red_base("alone-passes");
+    std::fs::remove_file(repo.join("alone.fail")).unwrap();
+    git(
+        &repo,
+        &["commit", "-qam", "old passes when run alone on the base"],
+    );
+    let ctx = FloorContext {
+        base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+        stage: FloorStage::Verify,
+        git_dir: Some(repo.join(".git")),
+        ..FloorContext::default()
+    };
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.out", "test old ... FAILED\n"),
+            ("run.exit", "101"),
+            ("excluded.exit", "0"),
+            ("toc.txt", &toc_of(&["old", "new", "fine"])),
+        ],
+    );
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    let d = c.decision.as_ref().expect("decided");
+    assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
+    assert!(
+        d.reason
+            .as_deref()
+            .is_some_and(|r| r.contains("does not fail when the base runs it alone")),
+        "{d:?}"
+    );
+    assert!(!report.passed && d.excluded.is_empty());
+    let _ = std::fs::remove_dir_all(&repo);
 }

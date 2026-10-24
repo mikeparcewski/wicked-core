@@ -4250,20 +4250,10 @@ impl BaseTree {
         remove_base_export(worktree, scratch)?;
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("the base export directory could not be created: {e}"))?;
-        let idx = scratch.root.join("base.idx");
-        let _ = std::fs::remove_file(&idx);
-        let env: [(&str, &Path); 3] = [
-            ("GIT_DIR", git_dir),
-            ("GIT_WORK_TREE", worktree),
-            ("GIT_INDEX_FILE", idx.as_path()),
-        ];
-        let prefix = format!("--prefix={}/", dir.to_string_lossy());
-        let result =
-            crate::worktree_guard::git(worktree, &["read-tree", head], &env).and_then(|_| {
-                crate::worktree_guard::git(worktree, &["checkout-index", "-a", "-f", &prefix], &env)
-            });
-        let _ = std::fs::remove_file(&idx);
-        result.map_err(|e| {
+        // The base's own blobs, written raw (`ls-tree` + `cat-file --batch`, [`write_tree_blobs`]):
+        // no index, so no `post-index-change` hook; no checkout, so no filter driver — nothing
+        // the repository configures runs outside the floor's sandbox (codex round 17).
+        write_tree_blobs(worktree, git_dir, head, &dir).map_err(|e| {
             format!(
                 "the run base {} could not be exported for the baseline diff: {e}",
                 &head[..head.len().min(10)]
@@ -4404,7 +4394,10 @@ impl BaseTree {
                         t.transient = true;
                         break;
                     }
-                    let failed = r.exit_code.is_some_and(|c| g.failed_exit.contains(&c));
+                    // A NONZERO exit the guide calls a test failure: a pass confirms nothing.
+                    let failed = r
+                        .exit_code
+                        .is_some_and(|c| c != 0 && g.failed_exit.contains(&c));
                     t.alone.push((n, failed));
                 }
             }

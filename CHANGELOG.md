@@ -26,7 +26,11 @@ Two release tracks share this file, newest entry first regardless of track:
   guide; `.wicked/checks.json`'s `timeout_s` still bounds them), while a detected package no guide check covers
   keeps its detected checks, exit codes only; detection is the whole floor with no guide or one that does not
   parse — and a guide is checked on load (every `run` non-empty, `stage` values `creator` / `verify`, a test
-  check naming its `failedExit`). A failed head check is
+  check naming its `failedExit`, never `0`; a `cwd` inside the repo; `{ids:re|}` neither among the per-id
+  tokens nor beside `{q}`). The base is exported from its raw blobs (no index, so no repository hook; no
+  checkout, so no filter driver) for the floor and the probe alike; a base test confirmed "alone" must exit
+  NONZERO; the JUnit reader is a real XML parser (`roxmltree`: CDATA, `<system-out>`, nested suites); and
+  `floor probe`'s temporary worker home is armed by the probe itself and the variable restored after. A failed head check is
   compared with the base: a green base makes it a `new_failure`; a red base, for a guide check, is listed by
   the guide's `list` piece, its results (`text` line rules and blocks, or `junit`) nominate the
   failing ids the list holds, each is confirmed by its exit code run `alone` on the base (`failedExit`), and
@@ -71,8 +75,9 @@ Two release tracks share this file, newest entry first regardless of track:
   `WICKED_FLOOR_LOG_CAP_GB`, default 5, never anything modified in the last 24 hours; a dedup or a reused
   cache record restarts a blob's age, and eviction re-stats first), with a lazy line TOC and ranges read by
   ref and verified against the hash (`floor_log`). The seed guide for wicked-core itself is committed: its
-  gate checks (fmt, typecheck, clippy, and core-ts's fmt, clippy, test, `finalize-dts` and `tsc`, as CI gates
-  them) run on exit codes — the core-ts ones at the verify stage only (`stage: ["verify"]`), so the creator
+  gate checks (fmt, typecheck, clippy, the workspace and `--features postgres` builds, and core-ts's fmt,
+  clippy, test, `finalize-dts` — checked against a copy, so no tracked file is rewritten — and `tsc`, as CI
+  gates them) run on exit codes — the builds and the core-ts ones at the verify stage only (`stage: ["verify"]`), so the creator
   floor stays fast and the verify floor runs everything before delivery; **its `test` check is UNVERIFIED until it is re-probed on main after this merges**
   (its `version` piece and the tightened probes postdate its last probe), so until then a red base on it
   escalates instead of excluding. The ubuntu CI job installs pytest and vitest so the pytest and vitest probe
