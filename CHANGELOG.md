@@ -14,6 +14,148 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The repo-checks floor decides by exit codes and interprets a per-repo build guide; no runner knowledge
+  in the engine (DES-FLOOR-V2 + DES-BUILD-GUIDE, pipeline-blocker plain PR, operator-approved).** core#1060
+  spent 21 review rounds patching a parser of the head's test output, and #1066's first 14 rounds hardcoded
+  runner rules (libtest and pytest parsing, allowlists, rootdir and config rules) one finding at a time. The
+  floor now trusts the base tree and the exit codes of the processes it launches, and every runner fact is
+  DATA: `.wicked/build-guide.json` (contract v1, `schemas/build-guide.v1.json`), read from the BASE tree only
+  (a head edit to the guide never applies to its own run). When the base carries a guide, its checks for the
+  stage (`stage`; both when absent) ARE the floor's checks for the directories they cover (their `cwd`s, at any
+  stage): there their argv, cwd and stage replace detection (a build, lint or install step is a check of the
+  guide; `.wicked/checks.json`'s `timeout_s` still bounds them), while a detected package no guide check covers
+  keeps its detected checks, exit codes only; detection is the whole floor with no guide or one that does not
+  parse — and a guide is checked on load (every `run` non-empty, `stage` values `creator` / `verify`, a test
+  check naming its `failedExit`, never `0`; a `cwd` inside the repo; `{ids:re|}` neither among the per-id
+  tokens nor beside `{q}`). The base is exported from its raw blobs (no index, so no repository hook; no
+  checkout, so no filter driver) for the floor and the probe alike; a base test confirmed "alone" must exit
+  NONZERO; the JUnit reader is a real XML parser (`roxmltree`: CDATA, `<system-out>`, nested suites); and
+  `floor probe`'s temporary worker home is armed by the probe itself and the variable restored after.
+  Under `last-before-end` only each qualifier's LAST block counts (a footer-shaped block in a test's own
+  output is replaced, never added). The change's paths are read NUL-separated (`-z`, never quoted or
+  trimmed; a path that is not UTF-8 fails closed). `derivedFrom` matches as `invalidatedBy` does, on the
+  base's changes since the probe and on the change itself (a head that edits one cannot use the guide), and
+  `cwd` refuses `.` segments, `:` and `""`. A check's `cwd` must be a plain directory of the tree it runs on,
+  every component (a head that turns it into a link gets `could_not_run`). Base staleness reads a rename as
+  the old path gone (`--no-renames`). The last block is kept per (block rule, qualifier). A type change
+  (`T`: a tracked file replaced by a link, or a link by a file) counts with the deletions and renames: it
+  is matched against `invalidatedBy` and `derivedFrom`, and it rules the creator's `affected` pre-pass
+  (and derived targeting) out: the full check runs. `invalidatedBy` is also matched against the base's
+  changes since the check was verified, as `derivedFrom` is. A STALE guide (a `derivedFrom` file changed on
+  the base since the guide was last committed or since a check was verified, or in the change itself) may
+  name outdated commands: in the directories it covers the floor runs the UNION of its checks and the
+  detected ones (an identical argv in the same directory once; the detected ones say so in their
+  `source`), more checks and never fewer. Accepted by design: a directory whose guide checks are all
+  `verify`-only has no checks at the creator floor; the creator floor is fast feedback, and the verify
+  floor runs every check before delivery. A guide check named `install` is the floor's install step (the
+  install timeout, never compared with the base, a failure read as an environment finding); the floor's
+  sandbox confines writes, not the network, so an install inside it reaches the registry as detection's does.
+  A check `name` keys files the engine writes outside the sandbox, so a guide whose names are not 1-64 of
+  `[A-Za-z0-9._-]` (or are `.` / `..`) does not parse (schema `pattern` too), and the base-cache record's
+  file name is a sha256 of (head, dir, name) whatever they say. `floor probe` runs the guide's `install`
+  check for the probed check's `cwd` first in every fresh copy (the retry's and `--check` included); an
+  install that fails fails every probe ("install failed"). Staleness is fail-closed on its anchors: a
+  guide commit the log cannot name, a verified block with no hex commit, or an anchor that is not an
+  ancestor of the base (a pre-squash commit, one a shallow clone lacks) makes the guide stale. The
+  creator's `affected` pre-pass reads git's D/T list directly (a path removed from the index but still on
+  disk is both removed and untracked). In a stale union a covered directory's detected `install` runs
+  first, before every guided check, and a detected check a guided one already runs (argv and dir; a
+  derived targeted set included) runs once.
+  A guide's `results.how.env` is set on the command INSIDE the floor sandbox only, through `env` after the
+  launcher (`[wrapper…] env K=V… <exe> …`); the launcher (bwrap, sandbox-exec) keeps the floor's
+  sanitized environment, so a non-setuid bwrap never sees a guide's `LD_PRELOAD` before it arms (with no
+  launcher, the spawned process is the command and gets the env directly). At load, env names must be
+  `[A-Z_][A-Z0-9_]*` and never a loader or shell hook (`LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `SHELLOPTS`,
+  `BASHOPTS`, `IFS`, `GCONV_PATH`, `LOCPATH`; schema `propertyNames` too). In a shallow history an anchor
+  at the shallow boundary (where `git log` sees the guide "added"), or a boundary that cannot be read,
+  makes the guide stale.
+  **Exclusion ships DISABLED.** `WICKED_FLOOR_EXCLUDE` exactly `on` or `1` (read once per floor run, never
+  trimmed or case-folded) enables it; unset or anything else, it is off: a failing head over a red base escalates as `base_red_unseparated` ("exclusion disabled
+  (WICKED_FLOOR_EXCLUDE)") with both logs, and the base's list, the one-test runs and the deselected head
+  run are never executed. A usable guide still names the checks, is still checked at load and for staleness,
+  and `floor probe` still works. The cost, plainly: until exclusion is enabled, every repo whose base is red
+  escalates to the operator (the floor override, core#1061/#1065) instead of passing on its own failures. A failed head check is
+  compared with the base: a green base makes it a `new_failure`; a red base, for a guide check, is listed by
+  the guide's `list` piece, its results (`text` line rules and blocks, or `junit`) nominate the
+  failing ids the list holds, each is confirmed by its exit code run `alone` on the base (`failedExit`), and
+  the head runs once more with them `deselect`ed — that exit code decides (`pass_excluded`, "1 pre-existing
+  excluded: t::a"). Precise means each id is unique in the base list by (qualifier, id), at most once in the
+  head's, under the same qualifier on both, and the head's own list with them deselected lists exactly the rest
+  (the runner's selection is the precision check). Exit codes: one outside `failedExit` and 0 (a crash, a
+  build error) is `could_not_run`, on the head's run and on its deselected run; a red base whose results name
+  no test has no candidates (`base_red_unseparated`); a deselected run that fails naming nothing is a
+  `new_failure`, so exclusion never passes a failing run. A guide check is relied on only when every probe passed
+  (`wicked-core floor probe --repo <dir> --guide <file> [--check <name>]`: list, run, ids, alone,
+  deselect, mutation, multi — two mutations, both parsed, both deselected — affected, and version, in a scratch
+  copy under the floor sandbox; it writes `verified`; the probes need a green clean run (a red one fails them,
+  "needs a green base"), a mutation names exactly its test, `alone` on the mutated test runs exactly it, and
+  mutations are written inside the check's directory, never through `..` or a link; when any probe fails the
+  whole probe re-runs once on a fresh copy and that retry's results are recorded, each `(retried)`:
+  `pass (retried)` is relied on, any `fail: … (retried)` leaves the check unverified; a check with no `list`
+  piece is not probed; a junit testcase a filter skipped counts as neither passed
+  nor failed; it never runs in the operator's worker home: unless `WICKED_WORKER_HOME` is set explicitly,
+  it creates a fresh worker home under the system temp dir and removes it at the end). Deselect tokens from
+  the first per-id token onward repeat per id, so a flag and its value are one token (`--skip={id}`); `{id}`
+  values fill whole argv elements verbatim and never pass through a shell, so no escaping is needed; appended
+  tokens compose around an argv's `--` (those before their own `--` go before it, the rest after one `--`;
+  a second `--` is never emitted), and `{ids:re|}` among the per-id tokens is refused; for a
+  runner that takes a regex, `{id:re}` is the id regex-escaped (per id) and `{ids:re|}` every id escaped and
+  joined by `|` in one token (`--testNamePattern=^(?!(?:{ids:re|})$)`). The probes must also have run on an
+  ancestor of the base, with no `derivedFrom` file changed since, no touched file matching `invalidatedBy`
+  and, when the check declares a `version` command, the runner still printing `verified.runnerVersion` (the
+  probe records that command's first output line); otherwise
+  the check runs exit-code only and a red base escalates as `base_red_unseparated` (the operator's floor
+  override, core#1061/#1065, is the path through), with `decision.guide: {present, usable, reason}` saying
+  why. With no guide, main's detection and derived targeting are the fallback; a guided base narrows only
+  through its `affected` piece (at the creator), and the verify floor runs the full check. A deciding run that
+  fails on an oversubscribed host is re-run once with the same argv after waiting up to 30 s for headroom
+  (`WICKED_REPO_CHECKS_RETRY_WAIT_S`, at most 600): exit 0 is `passed on retry (flaky)`, a second failure
+  under load is `flaky_twice` (denies). Deleted: head-side classification (`classify`, the binary qualifiers,
+  `LineScan`, the `env_cannot_run` class and launcher signatures, the isolated and vitest re-runs, the
+  load-class and env-crash re-runs, `MAX_FLAKE_RERUN`, the environment signals), the 4 KB ring buffer as a
+  source of truth, and #1066's own runner modules (`floor_runner.rs`, `floor_affected.rs`). Every stream is
+  stored once, content-addressed (sha256), in the run's log store, garbage-collected by age at every floor's
+  start (finished blobs after `FLOOR_LOG_TTL` = 7 days, `.part-*` after a day, oldest-first over
+  `WICKED_FLOOR_LOG_CAP_GB`, default 5, never anything modified in the last 24 hours; a dedup or a reused
+  cache record restarts a blob's age, and eviction re-stats first), with a lazy line TOC and ranges read by
+  ref and verified against the hash (`floor_log`). The seed guide for wicked-core itself is committed: its
+  gate checks (fmt, typecheck, clippy, the workspace and `--features postgres` builds, and core-ts's fmt,
+  clippy, test, `finalize-dts` — checked against a copy, so no tracked file is rewritten — and `tsc` after a
+  guided `install` in that cwd, detection's own `npm ci --ignore-scripts --no-audit --no-fund`, as CI
+  gates them) run on exit codes — the builds and the core-ts ones at the verify stage only (`stage: ["verify"]`), so the creator
+  floor stays fast and the verify floor runs everything before delivery; **its `test` check is UNVERIFIED until it is re-probed on main after this merges** (its `verified` block
+  is stale by design: the floor reads it as "missing probe `version`", unusable, never as a parse error)
+  (its `version` piece and the tightened probes postdate its last probe), so until then a red base on it
+  escalates instead of excluding. The ubuntu CI job installs pytest and vitest so the pytest and vitest probe
+  fixtures run there. Kept: the PTY grant (core#1060's Seatbelt rules), the load-aware bound, the base cache (now
+  `{floor_policy: 12, head_argv, guide, run, toc}`, keyed by the guide check it ran under), `.wicked/checks.json`,
+  the operator override and QE. Fail-closed reads: a results file (`results.how.path`) counts only as a regular
+  file inside the tree, written since the run started (a leftover is removed before the run; one second of
+  file-system clock slack), within the log cap (read without following a link);
+  a stream the store could not keep, or a blob that cannot be read whole, escalates instead of reading as
+  empty; a process ended by a signal is `could_not_run`; the launcher-failure check reads the merged stream
+  when stderr is merged; the identical retry reuses the deciding run's env; `invalidatedBy` sees deleted and
+  renamed-away files, and a change whose files cannot be listed makes the guide unusable; with an unusable
+  guide a non-zero exit is a plain failure; an id is excluded only when unique across every qualifier unless
+  `alone` and `deselect` both name `{q}`; a guide with an unknown field or no `checks` does not parse
+  (detection decides); `affected` gets a root check's files, and none, one named like a flag, or any deleted or
+  renamed-away file runs the full check; the `results.how` env reaches only the runs whose results are read
+  (never a list, a one-test run, the deselected run or the version), and the base's results are read before
+  its list runs; the JUnit reader judges each `<testcase>` on its own (a skipped twin erases nothing, two
+  that ran count twice); `{id}`/`{q}` fill in one pass; the `affected` probe needs a `failedExit`, and `multi`
+  a second failure other than the first mutation's; a deselected run that crashed is not retried; a
+  "pre-existing" claim is judged on the check that denied, and rejected when the base's failures were
+  established and the head still fails. The log store's GC, dedup and refresh share one advisory lock (`<store>/.lock`). The macOS
+  floor's test seam arms the private `TMPDIR` as production does. Wire (additive): every
+  `repoChecksEvaluated.checks[]` entry carries `decision: {outcome, baseSha, baseFailing, excluded, logRefs:
+  [{attempt, stream, sha256, bytes, truncated}], flaky, reason, guide: {present, usable, reason}}`, with
+  `outcome` one of `pass`, `pass_excluded`, `new_failure`, `base_red_unseparated`, `flaky_twice`, `timed_out`,
+  `could_not_run`, typed in core-ts (`RepoChecksEvaluatedEventJson`, `RepoCheckRunJson`,
+  `FloorCheckDecisionJson`, `FloorLogRefJson`, `FloorGuideStatusJson`). `classification` keeps its tokens for
+  older readers and gains `base_red_unseparated`; it no longer produces `env_cannot_run` or
+  `unclassified_red_base`; `envCannotRun` is always `[]` (deprecated). Accepted costs: a repo without a usable
+  guide gets no exclusion (a red base escalates) until onboarding writes and probes one; every failed check on
+  a loaded host pays one retry and up to 30 s of waiting.
 - **The floor override is also offered when the judge could not rule either.** core#1061's operator judgment
   over a failed repo-checks floor was refused whenever anything else stood behind the floor, and that included
   the judge's `judge_unavailable` no-verdict hold. So when the judge seats were benched (run 2ebd9da2, attempt

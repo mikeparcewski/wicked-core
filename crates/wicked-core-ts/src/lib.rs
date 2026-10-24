@@ -3298,6 +3298,89 @@ mod tests {
         assert_unit_distributed_declared(&from_dts);
     }
 
+    /// DES-FLOOR-V2: every key `event_to_json` emits on a `repoChecksEvaluated` check, on its
+    /// `decision` and on each `decision.logRefs[]` entry is declared on `RepoCheckRunJson`,
+    /// `FloorCheckDecisionJson` and `FloorLogRefJson` — and the outcome union names every outcome
+    /// the engine produces.
+    #[test]
+    fn the_floor_decision_is_declared_for_every_key_on_the_wire() {
+        let (_, dts) = hand_authored_blocks(
+            include_str!("../scripts/finalize-dts.mjs"),
+            include_str!("../index.d.ts"),
+        );
+        let iface = |name: &str| -> String {
+            let start = dts
+                .find(&format!("export interface {name} "))
+                .unwrap_or_else(|| panic!("{name} is declared"));
+            let end = dts[start..].find("\n}").expect("interface closes") + start;
+            dts[start..=end].to_string()
+        };
+        let run: wicked_core::CheckRun = serde_json::from_value(serde_json::json!({
+            "name": "test", "argv": ["cargo", "test"], "source": "Cargo.toml", "exit_code": 101,
+            "timed_out": false, "duration_ms": 1, "stdout_tail": "", "stderr_tail": "",
+            "decision": {
+                "outcome": "pass_excluded", "base_sha": "abc", "base_failing": ["t::a"],
+                "excluded": ["t::a"], "flaky": false, "reason": "1 pre-existing excluded: t::a",
+                "log_refs": [{"attempt": "excluded", "stream": "stdout", "sha256": "0", "bytes": 0}],
+                "guide": {"present": true, "usable": false, "reason": "probe `run` never ran"}
+            }
+        }))
+        .expect("a check run with a decision deserializes");
+        let ev = event_to_json(&CoreEvent::RepoChecksEvaluated {
+            session: "s".into(),
+            ord: 1,
+            attempt: 0,
+            passed: true,
+            criterion: "c".into(),
+            checks: vec![run],
+            skipped: vec![],
+            sandbox_level: "sandboxed".into(),
+            sandbox_error: None,
+            detect_error: None,
+            outcome: "passed".into(),
+            floor: "verify".into(),
+            claim: None,
+            env: None,
+            changed: vec![],
+            changed_truncated: false,
+        });
+        let check = &ev["checks"][0];
+        let decision = &check["decision"];
+        let log_ref = &decision["logRefs"][0];
+        for (name, obj) in [
+            ("RepoCheckRunJson", check),
+            ("FloorCheckDecisionJson", decision),
+            ("FloorLogRefJson", log_ref),
+            ("FloorGuideStatusJson", &decision["guide"]),
+        ] {
+            let declared = iface(name);
+            for key in obj.as_object().expect("object").keys() {
+                assert!(
+                    declared.contains(&format!("\n  {key}:")),
+                    "`{key}` is on the wire but not declared on {name}"
+                );
+            }
+        }
+        let outcomes = iface("FloorCheckDecisionJson");
+        for o in [
+            "pass",
+            "pass_excluded",
+            "new_failure",
+            "base_red_unseparated",
+            "flaky_twice",
+            "timed_out",
+            "could_not_run",
+        ] {
+            assert!(
+                outcomes.contains(&format!("'{o}'")),
+                "outcome {o} is declared"
+            );
+        }
+        assert_eq!(decision["outcome"], "pass_excluded");
+        assert_eq!(decision["baseSha"], "abc");
+        assert!(decision["logRefs"][0]["truncated"] == false);
+    }
+
     /// A checkout with `core.autocrlf` (the Windows CI runner, #402 review pass 3) hands
     /// `include_str!` CRLF content: the line-anchored extraction must read it exactly as LF —
     /// same blocks, no `\r` left to defeat a `\n`-anchored match — and the declaration checks

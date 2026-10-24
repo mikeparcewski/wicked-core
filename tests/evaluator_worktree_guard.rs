@@ -24,10 +24,20 @@
 //!    back (retry against the restored tree / cancel) instead of ending it `sessionFailed`, and a
 //!    read-only unit has a NOTES ROOT outside the tree where a note never trips the guard.
 
+#[path = "support/libtest_guide.rs"]
+mod guide_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// DES-FLOOR-V2: a failed floor on an oversubscribed host retries once; this harness does not wait
+/// for headroom first. SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one
+/// process env var.
+#[ctor::ctor(unsafe)]
+fn no_retry_headroom_wait() {
+    std::env::set_var("WICKED_REPO_CHECKS_RETRY_WAIT_S", "0");
+}
 
 use wicked_apps_core::{ConformanceClaim, Decision};
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
@@ -46,6 +56,8 @@ use wicked_core::{
 /// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
+    // The floor's exclusion ships OFF (`WICKED_FLOOR_EXCLUDE`); these tests exercise it ON.
+    std::env::set_var("WICKED_FLOOR_EXCLUDE", "on");
     wicked_apps_core::emit::hermetic_test_spool();
 }
 
@@ -388,6 +400,36 @@ fn make_git_repo(name: &str, cargo_test: Option<bool>) -> PathBuf {
     }
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "init"]);
+    if cargo_test.is_some() {
+        // DES-BUILD-GUIDE: the base's build guide — its checks are the floor's: the formatter (no
+        // probes: never excluded) and `cargo test`, verified on the commit before it.
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let verified = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let argv: Vec<String> = ["cargo", "test", "--no-fail-fast"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let mut test = guide_support::libtest_guide(&argv, &verified);
+        test["name"] = "cargo-test".into();
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        std::fs::write(
+            repo.join(".wicked/build-guide.json"),
+            serde_json::json!({"version": 1, "checks": [
+                {"name": "cargo-fmt-check", "run": ["cargo", "fmt", "--all", "--check"],
+                 "failedExit": [1], "results": {"kind": "text"}},
+                test,
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-qm", "the build guide"]);
+    }
     repo
 }
 
@@ -927,9 +969,21 @@ fn a_clean_evaluator_passes_and_the_repo_checks_are_the_gates_evidence() {
     );
     assert_eq!(checks[0].name, "cargo-fmt-check");
     assert_eq!(checks[0].exit_code, Some(0), "{:?}", checks[0]);
-    assert_eq!(checks[1].name, "cargo-test");
+    // DES-FLOOR-V2 §5: an unconfigured repo runs its affected set at verify too (the full suite
+    // when the verify unit's tree is its base).
+    assert!(
+        matches!(checks[1].name.as_str(), "cargo-test" | "test_targeted"),
+        "{:?}",
+        checks[1]
+    );
     // `--no-fail-fast` (core#481): a red crate never hides the crates after it.
-    assert_eq!(checks[1].argv, vec!["cargo", "test", "--no-fail-fast"]);
+    assert!(
+        checks[1]
+            .argv
+            .starts_with(&["cargo".to_string(), "test".into(), "--no-fail-fast".into()]),
+        "{:?}",
+        checks[1].argv
+    );
     assert_eq!(checks[1].exit_code, Some(0), "{:?}", checks[1]);
     assert!(
         checks[1].stdout_tail.contains("test result: ok"),
@@ -1123,9 +1177,10 @@ fn a_regression_the_creator_introduces_is_denied_at_the_creator_gate_before_veri
     );
     let reason = fix.denial_reason.expect("reason");
     assert!(
-        reason.contains("test_targeted: exit 101")
-            && reason.contains("[regression]")
-            && reason.contains("REGRESSION: the run base")
+        // A base with a build guide runs the full check at the creator (DES-BUILD-GUIDE).
+        reason.contains("cargo-test: exit 101")
+            && reason.contains("[regression")
+            && reason.contains("NEW FAILURE: the run base")
             && reason.contains("test result: FAILED"),
         "the denial carries the exit code, the classification, the base comparison and cargo's \
          own verdict line from the captured tail: {reason}"
@@ -1169,14 +1224,14 @@ fn a_regression_the_creator_introduces_is_denied_at_the_creator_gate_before_veri
     // (core#482), its ids qualified by their binary (core#481).
     assert_eq!(checks[0].name, "cargo-fmt-check");
     let c = &checks[1];
-    assert_eq!(c.name, "test_targeted");
+    assert_eq!(
+        c.name, "cargo-test",
+        "a guided base narrows only through `affected`"
+    );
     assert_eq!(c.exit_code, Some(101));
     assert_eq!(c.outcome(), "failed");
     assert_eq!(c.classification.as_deref(), Some("regression"));
-    assert_eq!(
-        c.regressions,
-        vec!["test t::boom [-p wtguard_fixture --lib]".to_string()]
-    );
+    assert_eq!(c.regressions, vec!["test t::boom".to_string()]);
     // core#553: a single head-only failure is re-run once, alone, but only on an oversubscribed
     // host (the evidence of load); on a host with headroom it is not re-run. Either way the
     // always-red test stays a regression.
@@ -1835,7 +1890,8 @@ fn a_read_only_phase_writing_under_its_notes_root_never_trips_the_guard() {
 
 /// F-RC2-009 — BASELINE-DIFF: the fixture's base ALREADY fails `cargo test` and the fix changes
 /// nothing about that. The floor's sandbox reports the failure on the head, runs the same check
-/// on the base, finds the failure sets IDENTICAL ⇒ `pre_existing_in_sandbox` (core#481 — the fact,
+/// on the base, deselects the base's own failing test by name and the head then PASSES ⇒
+/// `pass_excluded`, read by older consumers as `pre_existing_in_sandbox` (DES-FLOOR-V2 — the fact,
 /// not an inferred environment cause): recorded on both the creator's floor (the derived targeted
 /// set, core#482) and the evaluator's (the full suite), denying neither — the run COMPLETES and
 /// the shared failure is listed.
@@ -1885,12 +1941,14 @@ fn a_check_the_base_fails_identically_is_recorded_not_denied() {
         // `cargo-fmt-check` is first and clean; the shared failure is in the test set (core#551):
         // the derived targeted set at the creator (core#482), the full suite at verify.
         let c = &checks[1];
-        let (want_name, want_id) = if ord == 3 {
-            ("test_targeted", "test t::boom [-p wtguard_fixture --lib]")
-        } else {
-            ("cargo-test", "test t::boom [--lib]")
-        };
-        assert_eq!(c.name, want_name);
+        // DES-FLOOR-V2: the excluded names are runner-native (`t::boom`), and verify runs the
+        // affected set as the creator does (the full suite when its tree is its base).
+        let want_id = "t::boom";
+        assert!(
+            matches!(c.name.as_str(), "test_targeted" | "cargo-test"),
+            "ord {ord}: {}",
+            c.name
+        );
         assert_eq!(
             c.exit_code,
             Some(101),

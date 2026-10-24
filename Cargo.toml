@@ -68,6 +68,9 @@ serde_yaml = "0.9"
 # uses, so cargo unifies one compilation.
 toml = "0.8"
 sha2 = "0.10"
+# The build guide's line rules (DES-BUILD-GUIDE): RE2-syntax regexes, linear time. Same major the
+# governance crate uses, so cargo unifies one compilation.
+regex = "1"
 # Rust↔wicked-bus bridge (DES-EXEC-001 §2.5): a direct SQLite handle to the wicked-bus event log
 # (a SEPARATE db from the estate store) so core can emit/poll `wicked.*` events the JS bus reads.
 # Pinned to estate's `0.32` + `bundled` so cargo unifies one libsqlite3-sys and it builds with no
@@ -89,6 +92,7 @@ tracing = "0.1"
 # The seat-secret guard's in-process substring search (`seat_secret_guard`): a seat's credential is
 # looked for in the work's objects without ever leaving this process.
 memchr = "2"
+roxmltree = "0.21.1"
 
 [target.'cfg(unix)'.dependencies]
 # `O_NOFOLLOW` for the skills-snapshot containment reads (`skills_snapshot::read_no_follow`): the

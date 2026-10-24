@@ -422,6 +422,11 @@ fn main() {
         Some("seed-domain-validators") => return seed_domain_validators_cmd(&args),
         Some("domain-graph") => return domain_graph_cmd(&args),
         Some("coverage") => return coverage_cmd(&args),
+        // `floor probe --repo <dir> --guide <file> [--check <name>]` (DES-BUILD-GUIDE): every piece
+        // of a build guide checked in a scratch copy under the floor sandbox; writes `verified`.
+        Some("floor") if args.get(2).map(String::as_str) == Some("probe") => {
+            std::process::exit(wicked_core::floor_probe::probe_cli(&args[3..]))
+        }
         // `rules ingest <dir>` populates a run's store with governance policies + conformance rules so
         // the output guardrail has something to deny/recall against (core#26). Opens the store directly.
         Some("rules") if args.get(2).map(String::as_str) == Some("ingest") => {
