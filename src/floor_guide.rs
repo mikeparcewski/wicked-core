@@ -1191,14 +1191,13 @@ mod tests {
             .iter()
             .find(|c| c.name == "test" && c.list.is_some())
             .expect("a test check");
-        // Accepted: the seed's verified block predates its `version` piece until it is re-probed
-        // on main, so the floor reads the check as unusable ("missing probe `version`"), never as
-        // a guide that does not parse.
+        // (J4) Re-probed on main: the verified block records the `version` piece and the runner
+        // version it printed. Its `run` does not pass in the probe's sandboxed copy (the suite's
+        // floor-nesting failures), so the floor still reads the check as unusable, never as a guide
+        // that does not parse.
         assert!(t.version.is_some());
-        assert!(!t
-            .verified
-            .as_ref()
-            .is_some_and(|v| v.results.contains_key("version")));
+        let v = t.verified.as_ref().expect("a verified block");
+        assert!(v.results.contains_key("version") && !v.runner_version.is_empty());
         // (confirmation round) An npm gate provisions as detection does: an `install` check
         // (detection's own argv, so the install's timeout and "environment finding" reading)
         // runs before it in the same cwd; no gate installs inside its own command.
