@@ -124,6 +124,13 @@ pub struct FloorOverride {
     pub tree: Option<String>,
     /// [`FLOOR_OVERRIDE_LABEL`], verbatim — the line to show as-is.
     pub label: String,
+    /// (deliver honors an override) The overridden result's exact identity — tree, base and check
+    /// set ([`crate::repo_checks::FloorKey`]). The deliver phase stands on this override instead
+    /// of running the checks again only when the tree it ships, its base and its check set are
+    /// all identical. `None` (an override recorded before the key existed, or over a floor that
+    /// did not run on a known tree) is never stood on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<crate::repo_checks::FloorKey>,
 }
 
 /// (operator ruling 2026-10-14) A judge seated IN PLACE of the run's preferred judge, because

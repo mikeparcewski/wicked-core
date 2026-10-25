@@ -709,9 +709,68 @@ pub struct RepoChecksReport {
     /// not run them, instead of a green floor implying it did ([`e2e_coverage_note`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_note: Option<String>,
+    /// (deliver honors an override) What this result is a result FOR ([`FloorKey`]): the tree the
+    /// checks ran on, the base they were measured against and the exact check set. Recorded only
+    /// when the checks ran on a known tree; `None` otherwise (never stood on by a later floor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<FloorKey>,
+}
+
+/// (deliver honors an override) The exact identity of one floor result inside a run: the tree the
+/// checks ran on, the base commit the baseline diff measured against, and a digest of the check
+/// set (the stage, then every detected check's name, directory, argv and bound, in run order). A
+/// later floor stands on a recorded result instead of running the checks again ONLY when all three
+/// are identical; anything different runs the checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FloorKey {
+    pub tree: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// Hex SHA-256 of the check set ([`check_set_digest`]).
+    pub checks: String,
+}
+
+impl FloorKey {
+    /// The key of a floor that ran (or would run) `detected` on `tree` for `ctx`.
+    pub(crate) fn of(tree: &str, ctx: &FloorContext, detected: &[RepoCheck]) -> Self {
+        FloorKey {
+            tree: tree.to_string(),
+            base: ctx.base_head.clone(),
+            checks: check_set_digest(ctx.stage, detected),
+        }
+    }
+}
+
+/// The digest of a floor's check set: the stage, then every check's name, directory, argv and
+/// configured bound, in run order — a reordered, added, removed, re-scoped or re-bounded check is a
+/// different set.
+pub(crate) fn check_set_digest(stage: FloorStage, detected: &[RepoCheck]) -> String {
+    use sha2::Digest;
+    let set: Vec<(&str, &str, &[String], Option<u64>)> = detected
+        .iter()
+        .map(|c| {
+            (
+                c.name.as_str(),
+                c.dir.as_str(),
+                c.argv.as_slice(),
+                c.timeout_s,
+            )
+        })
+        .collect();
+    let material = serde_json::json!({ "stage": stage.as_wire(), "checks": set });
+    let digest = sha2::Sha256::digest(material.to_string().as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl RepoChecksReport {
+    /// The [`FloorKey`] of this report when its checks RAN on `tree` (passed, failed or timed out)
+    /// — `None` for a floor that did not run (no boundary, a detection or checkout refusal).
+    pub(crate) fn key_for(&self, tree: Option<&str>, ctx: &FloorContext) -> Option<FloorKey> {
+        let tree = tree.filter(|t| !t.is_empty())?;
+        (self.outcome() != "not_run").then(|| FloorKey::of(tree, ctx, &self.detected))
+    }
+
     /// Did the floor stop on a check that hit its bound? A timed-out floor did not FINISH — it is
     /// not "checks failed" (core#469), and the fold denies it under [`DENIAL_SOURCE_TIMEOUT`].
     pub fn timed_out(&self) -> bool {
@@ -3186,6 +3245,7 @@ fn scratch_refused(
         requested_rerun: None,
         recheck: None,
         coverage_note: None,
+        key: None,
     }
 }
 
@@ -3285,6 +3345,7 @@ pub(crate) fn run_with_sandbox_ctx(
                     requested_rerun: None,
                     recheck: None,
                     coverage_note: None,
+                    key: None,
                 };
             }
         }
@@ -3310,6 +3371,7 @@ pub(crate) fn run_with_sandbox_ctx(
                 requested_rerun: None,
                 recheck: None,
                 coverage_note: None,
+                key: None,
             }
         }
     };
@@ -3335,6 +3397,7 @@ pub(crate) fn run_with_sandbox_ctx(
                     requested_rerun: None,
                     recheck: None,
                     coverage_note: None,
+                    key: None,
                 }
             }
         },
@@ -3583,6 +3646,7 @@ pub(crate) fn run_with_sandbox_ctx(
         requested_rerun: None,
         recheck: None,
         coverage_note,
+        key: None,
     }
 }
 
@@ -4170,6 +4234,7 @@ pub(crate) fn guarded_checkout_refused(
         requested_rerun: None,
         recheck: None,
         coverage_note: None,
+        key: None,
     }
 }
 
@@ -7056,6 +7121,7 @@ pub(crate) mod tests {
             requested_rerun: None,
             recheck: None,
             coverage_note: None,
+            key: None,
         };
         let reason = report.denial_reason();
         assert!(
@@ -8571,6 +8637,7 @@ pub(crate) mod tests {
             requested_rerun: None,
             recheck: None,
             coverage_note: None,
+            key: None,
         };
         let denial = report.denial_reason();
         assert!(
@@ -8842,6 +8909,7 @@ pub(crate) mod tests {
             requested_rerun: None,
             recheck: None,
             coverage_note: None,
+            key: None,
         };
         assert!(report.timed_out());
         assert_eq!(report.outcome(), "timed_out");
@@ -9623,6 +9691,7 @@ pub(crate) mod tests {
             requested_rerun: None,
             recheck: None,
             coverage_note: None,
+            key: None,
         }
     }
 

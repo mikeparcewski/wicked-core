@@ -3137,6 +3137,20 @@ fn run_unit_and_judge_on(
             // watchdog's ladder resets on the existing frame (crew clocks any frame carrying the
             // session). No new frame, hook, exemption or `FloorContext` change; the per-check
             // durations stay on `repoChecksEvaluated.checks[].durationMs`.
+            // (core#417, operator ruling (a)) A GUARDED verify floor runs on a clean checkout of
+            // exactly the tree the guard checked, never the live worktree — an untracked or
+            // ignored file there cannot steer the checks.
+            let guarded =
+                stage == crate::repo_checks::FloorStage::Verify && input.unit.worktree_guarded;
+            let git_dir = baseline.and_then(|b| b.git_dir.as_deref());
+            // The tree the GUARD checked: its first look, which judged the tree clean (the floor
+            // does not run over a mutated or unverifiable one).
+            let guard_tree = match &guard_first_look {
+                Some(crate::worktree_guard::WorktreeGuardOutcome::Clean { after, .. }) => {
+                    Some(after.tree.as_str())
+                }
+                _ => None,
+            };
             let report = with_floor_heartbeat(
                 emit_delta,
                 &format!(
@@ -3145,20 +3159,6 @@ fn run_unit_and_judge_on(
                 ),
                 FLOOR_HEARTBEAT_EVERY,
                 || {
-                    // (core#417, operator ruling (a)) A GUARDED verify floor runs on a clean
-                    // checkout of exactly the tree the guard checked, never the live worktree —
-                    // an untracked or ignored file there cannot steer the checks.
-                    let guarded = stage == crate::repo_checks::FloorStage::Verify
-                        && input.unit.worktree_guarded;
-                    let git_dir = baseline.and_then(|b| b.git_dir.as_deref());
-                    // The tree the GUARD checked: its first look, which judged the tree clean
-                    // (the floor does not run over a mutated or unverifiable one).
-                    let guard_tree = match &guard_first_look {
-                        Some(crate::worktree_guard::WorktreeGuardOutcome::Clean {
-                            after, ..
-                        }) => Some(after.tree.as_str()),
-                        _ => None,
-                    };
                     match (guarded, guard_tree, git_dir) {
                         (true, Some(tree), Some(git_dir)) => {
                             match crate::repo_checks::checkout_guarded_tree(
@@ -3191,6 +3191,16 @@ fn run_unit_and_judge_on(
             // against before it re-runs or carries this verdict.
             let mut report = report;
             report.tree = current_tree.clone();
+            // (deliver honors an override) The result's exact identity — the tree the checks RAN
+            // on (the guarded checkout's tree, else the live worktree's), the base and the check
+            // set — so an operator's override of it can be stood on at deliver, and only there,
+            // when all three are unchanged.
+            let ran_on = match (guarded, guard_tree, git_dir) {
+                (true, Some(tree), Some(_)) => Some(tree),
+                (true, _, _) => None,
+                (false, _, _) => current_tree.as_deref(),
+            };
+            report.key = report.key_for(ran_on, &ctx);
             eprintln!(
                 "wicked-core: repo checks floor ({}) for unit {}: {} — {}",
                 stage.as_wire(),
@@ -6589,6 +6599,12 @@ mod tests {
             "{:?}",
             evidence.worktree_guard
         );
+        let guarded_tree = match &evidence.worktree_guard {
+            Some(crate::worktree_guard::WorktreeGuardOutcome::Clean { after, .. }) => {
+                after.tree.clone()
+            }
+            other => panic!("{other:?}"),
+        };
         let report = evidence.repo_checks.expect("the floor ran");
         assert_eq!(
             report.rerun,
@@ -6596,8 +6612,20 @@ mod tests {
         );
         if report.sandbox_error.is_some() {
             eprintln!("cli_runner: no sandbox tool here — the floor fix's floor cannot run");
+            assert!(
+                report.key.is_none(),
+                "a floor that did not run is never keyed"
+            );
         } else {
             assert!(report.passed, "the floor judged the FIXED tree: {report:?}");
+            // (deliver honors an override) A GUARDED verify floor is keyed by the tree its
+            // checkout held — the guard's tree (its report's `tree` stays `None`).
+            let key = report
+                .key
+                .as_ref()
+                .expect("a guarded verify floor is keyed");
+            assert_eq!(key.tree, guarded_tree);
+            assert!(key.base.is_some(), "measured against the run base");
         }
         let _ = std::fs::remove_dir_all(&base);
     }
