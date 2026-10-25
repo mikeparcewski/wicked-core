@@ -3545,6 +3545,90 @@ fn no_command_starts_in_a_held_tree_swapped_for_a_link() {
     let _ = std::fs::remove_dir_all(&outside);
 }
 
+/// (codex on #1066, P2) A check STARTS in the held directory itself, never in what its pathname
+/// names at spawn time: a swap of the check directory for a link to an outside directory AFTER
+/// the directory checks and BEFORE the child's chdir (a detached descendant of an earlier check)
+/// leaves the command running in the original — now detached — directory.
+#[cfg(unix)]
+#[test]
+fn a_check_starts_in_the_held_directory_when_its_path_is_swapped_before_spawn() {
+    let wt = scratch("held-fchdir");
+    let outside = scratch("held-fchdir-outside");
+    std::fs::create_dir_all(wt.join("pkg")).unwrap();
+    std::fs::create_dir_all(outside.join("pkg")).unwrap();
+    let held = HeldDir::open(&wt).unwrap();
+    let scratch_dir = CheckScratch::prepare(&wt).unwrap();
+    let sandbox = crate::validator::WorkerSandbox {
+        wrapper: Vec::new(),
+        level: crate::validator::SandboxLevel::BestEffort,
+        downgrade_reason: None,
+    };
+    let check = RepoCheck {
+        name: "test".into(),
+        argv: s(&["sh", "-c", "touch here"]),
+        source: "test".into(),
+        timeout_s: Some(30),
+        dir: "pkg".into(),
+    };
+    let (w, o) = (wt.clone(), outside.clone());
+    seam::before_spawn(move || {
+        std::fs::rename(w.join("pkg"), w.join("pkg-moved")).unwrap();
+        std::os::unix::fs::symlink(o.join("pkg"), w.join("pkg")).unwrap();
+    });
+    let r = run_one_with(
+        &wt,
+        Some(&held),
+        &check,
+        &ExecOpts::default(),
+        &sandbox,
+        &scratch_dir,
+        Tree::Head,
+    );
+    assert!(
+        std::fs::symlink_metadata(wt.join("pkg"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the swap ran before the spawn"
+    );
+    assert!(
+        !outside.join("pkg").join("here").exists(),
+        "the check ran in the outside directory: {r:?}"
+    );
+    assert!(r.spawn_error.is_none() && r.exit_code == Some(0), "{r:?}");
+    assert!(
+        wt.join("pkg-moved").join("here").is_file(),
+        "the check ran in the held directory: {r:?}"
+    );
+    drop(scratch_dir);
+    let _ = remove_check_scratch_in(&check_cache_root().unwrap(), &wt, None);
+    let _ = std::fs::remove_dir_all(&wt);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// (codex on #1066, P2) A symlink entry materialized without symlinks (non-unix: a regular file
+/// holding the link's target) is unchanged only while it holds exactly that target — a check that
+/// rewrote the placeholder is a change to what ships. The comparison runs on every platform.
+#[test]
+fn a_link_placeholder_is_compared_by_content() {
+    let dir = scratch("link-placeholder");
+    let held = HeldDir::open(&dir).unwrap();
+    held.write_bytes("sub/link", b"app.txt", false).unwrap();
+    assert!(same_placeholder(&held, "sub/link", b"app.txt"));
+    // Same length, other target.
+    std::fs::write(dir.join("sub").join("link"), b"new.txt").unwrap();
+    assert!(!same_placeholder(&held, "sub/link", b"app.txt"));
+    // Longer.
+    std::fs::write(dir.join("sub").join("link"), b"app.txt.bak").unwrap();
+    assert!(!same_placeholder(&held, "sub/link", b"app.txt"));
+    // Not a file at all.
+    std::fs::remove_file(dir.join("sub").join("link")).unwrap();
+    std::fs::create_dir(dir.join("sub").join("link")).unwrap();
+    assert!(!same_placeholder(&held, "sub/link", b"app.txt"));
+    assert!(!same_placeholder(&held, "sub/missing", b"app.txt"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// (sweep review on #1066, P3) A red base that exited OUTSIDE the guide's `failedExit` did not run
 /// to a test verdict: nothing of it is inventoried or excluded — the head's failure escalates as
 /// `base_red_unseparated`, even though its results name the failure and the alone run confirms it.

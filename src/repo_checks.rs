@@ -4084,8 +4084,10 @@ impl FloorCheckout {
                     #[cfg(unix)]
                     let same = held.kind(&r) == Ok(Some(EntryKind::Link))
                         && held.read_link(&r).is_ok_and(|t| t == body);
+                    // Without symlinks it was written as a regular file holding the target: the
+                    // same file, with the same bytes (codex on #1066).
                     #[cfg(not(unix))]
-                    let same = held.kind(&r) == Ok(Some(EntryKind::File));
+                    let same = same_placeholder(held, &r, &body);
                     same
                 } else {
                     same_file(held, &r, mode == "100755", &body)
@@ -4103,6 +4105,14 @@ impl FloorCheckout {
         answered?;
         Ok(changed)
     }
+}
+
+/// A symlink entry materialized where there are no symlinks (non-unix: [`write_tree_blobs`]
+/// writes a regular file holding the link's target): unchanged only while it is still that regular
+/// file with exactly `target` as its content.
+#[cfg(any(not(unix), test))]
+fn same_placeholder(held: &HeldDir, rel: &str, target: &[u8]) -> bool {
+    same_file(held, rel, false, target)
 }
 
 /// Is the entry at `rel` of `held` a regular file (opened through no link) with the executable
@@ -5059,6 +5069,15 @@ impl HeldDir {
     pub(crate) fn subdir(&self, rel: &str, create: bool) -> Result<HeldDir, String> {
         let names = rel_names(rel)?;
         self.walk(&names, rel, create).map(|fd| HeldDir { fd })
+    }
+
+    /// The directory at `rel` (`rel` empty or `.`: the held root itself) as an open fd, walked
+    /// through no link — what a check's child enters with `fchdir`.
+    pub(crate) fn dir_fd(&self, rel: &str) -> Result<std::os::fd::OwnedFd, String> {
+        if rel.is_empty() || rel == "." {
+            return self.fd.try_clone().map_err(|e| e.to_string());
+        }
+        self.subdir(rel, false).map(|d| d.fd)
     }
 
     /// A NEW directory at `rel` (its parents created as needed), held: one already there — a
@@ -6480,6 +6499,18 @@ pub(crate) fn run_one_with(
         result.spawn_error = Some(e);
         return result;
     }
+    // (codex on #1066) …and the child STARTS there by fd, not by pathname: the check directory is
+    // opened from the held root through no link and kept open across the spawn, and the child
+    // enters it with `fchdir` — a detached descendant of an earlier check that swaps the path for a
+    // link between the check above and the child's chdir cannot send this command elsewhere.
+    #[cfg(unix)]
+    let start_dir = match held.map(|h| h.dir_fd(&check.dir)).transpose() {
+        Ok(fd) => fd,
+        Err(e) => {
+            result.spawn_error = Some(e);
+            return result;
+        }
+    };
     // Resolve on PATH the way `Command::new` will, so "not installed" is a legible spawn error
     // rather than a bare OS code.
     let Some(exe) = crate::validator::find_on_path(bin) else {
@@ -6520,10 +6551,35 @@ pub(crate) fn run_one_with(
     let mut cmd = Command::new(&full[0]);
     cmd.hardened()
         .args(&full[1..])
-        .current_dir(worktree.join(&check.dir))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    match &start_dir {
+        Some(fd) => {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            // Close-on-exec is fine: the hook runs in the child after fork, before exec.
+            let raw = fd.as_raw_fd();
+            // SAFETY: the hook calls only `fchdir` (async-signal-safe) and reads `errno`; `raw`
+            // stays open in the parent until `spawn` returns (`start_dir` outlives it), so the
+            // forked child's copy is the held directory.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::fchdir(raw) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+        }
+        None => {
+            cmd.current_dir(worktree.join(&check.dir));
+        }
+    }
+    #[cfg(not(unix))]
+    cmd.current_dir(worktree.join(&check.dir));
     // The launcher's environment: the floor's sanitized allow-list only (the guide's is in `full`).
     scratch.apply_env(&mut cmd, tree);
     if !env_inside {
@@ -6553,7 +6609,16 @@ pub(crate) fn run_one_with(
         // and never the daemon.
         cmd.process_group(0);
     }
-    let mut child = match cmd.spawn() {
+    // A test swaps the check directory here: after the checks above, before the child's chdir.
+    #[cfg(test)]
+    if let Some(f) = test_seam::take_before_spawn() {
+        f();
+    }
+    let spawned = cmd.spawn();
+    // The child holds its own working directory now: the parent's handle goes.
+    #[cfg(unix)]
+    drop(start_dir);
+    let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
             result.spawn_error = Some(e.to_string());
@@ -6698,14 +6763,25 @@ fn log_cap() -> u64 {
 /// runs on its caller's thread, so a test pins what IT sees without touching any other test.
 #[cfg(test)]
 pub(crate) mod test_seam {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    type Hook = Box<dyn FnOnce()>;
     thread_local! {
+        static BEFORE_SPAWN: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static LOAD: Cell<Option<(Option<f64>, usize)>> = const { Cell::new(None) };
         static CAP: Cell<Option<u64>> = const { Cell::new(None) };
         static EXCLUDE: Cell<Option<bool>> = const { Cell::new(None) };
     }
     pub(crate) fn exclusion() -> Option<bool> {
         EXCLUDE.with(Cell::get)
+    }
+    /// The hook this thread's next check spawn runs once, after its directory checks.
+    pub(crate) fn take_before_spawn() -> Option<Hook> {
+        BEFORE_SPAWN.with(|h| h.borrow_mut().take())
+    }
+    /// Run `f` once, just before this thread's next check spawn.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn before_spawn(f: impl FnOnce() + 'static) {
+        BEFORE_SPAWN.with(|h| *h.borrow_mut() = Some(Box::new(f)));
     }
     /// Pin this thread's exclusion switch until dropped (the test binary arms it ON).
     #[cfg_attr(not(unix), allow(dead_code))]

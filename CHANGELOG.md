@@ -163,9 +163,12 @@ Two release tracks share this file, newest entry first regardless of track:
   outside directory no longer gets that directory deleted); a results file is opened through the held tree and
   its type, size and freshness are checked on the opened descriptor (a renamed-away tree, a FIFO or an
   oversized file reads nothing); every command spawned in a held tree first checks that the tree's root and the
-  check's directory still are the held directories (else `could_not_run`); the guarded verify checkout is
+  check's directory still are the held directories (else `could_not_run`), and on unix the command STARTS in
+  that held directory by fd (opened through no link from the held root, entered with `fchdir` before exec), so
+  a swap of the path after the check cannot move it (codex on #1066); the guarded verify checkout is
   re-checked by reading every entry through its held fd against the blob bytes (a directory swapped for a link
-  to an identical outside copy is a change); the per-package `baseline_diff` config and the coverage notes are
+  to an identical outside copy is a change; a symlink materialized as a plain file where there are no
+  symlinks is compared by its content, codex on #1066); the per-package `baseline_diff` config and the coverage notes are
   read before the first check runs. A red base that exited outside the guide's `failedExit` is not inventoried
   (it did not run to a test verdict: `base_red_unseparated`), and a reused receipt is validated before its age
   restarts. The macOS profile (shared by the floor, workers and
