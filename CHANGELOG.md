@@ -14,6 +14,25 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Deliver honors the operator's floor override on the same tree (pipeline-blocker plain PR,
+  operator-approved).** A run whose base was already red could not deliver: the operator overrode the
+  failed floor at every gate ("floor overridden by operator"), but the deliver phase skipped its re-verify
+  only for a tree whose checks had PASSED, so it re-ran the full suites on the unchanged tree, got the same
+  unseparable base red, and refused ("Nothing was pushed"), with only "Deliver again" on the card. Now the
+  ordinary guarded floor (a clean checkout of the tree, as deliver's own) records its exact identity
+  (`RepoChecksReport.key`: the tree the checks ran on, the base they were measured against, and a digest of
+  the stage, package dir and check set; never an operator's re-run, waived checks or a live-worktree floor),
+  the operator's override carries that key (`floorOverride.key`), and the deliver lift stands on an
+  override, without running the checks, only when the tree that ships, its base and the check set it
+  detects are all identical, and the live worktree has not moved meanwhile. It says so on the unit's output
+  ("checks reused from verify: same tree …"), never records the tree as verified, and the delivery receipt
+  carries the override's label and rationale as before. Anything different (a lift onto a moved tip, an
+  edit, another check set) re-verifies as before. When that re-verify fails, the deliver
+  refusal gate now offers "Approve as your own judgment" for exactly that failed result; it is recorded
+  keyed and the deliver phase re-runs, standing on it only while the tree, base and checks are unchanged.
+  The verify floor stays a fresh run on every attempt (its design); the reuse is at deliver. The guarded
+  verify floor's override now also names its tree (it was `null`).
+
 - **The repo-checks floor decides by exit codes and interprets a per-repo build guide; no runner knowledge
   in the engine (DES-FLOOR-V2 + DES-BUILD-GUIDE, pipeline-blocker plain PR, operator-approved).** core#1060
   spent 21 review rounds patching a parser of the head's test output, and #1066's first 14 rounds hardcoded

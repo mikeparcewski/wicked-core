@@ -6282,6 +6282,11 @@ fn apply_step_result(
                 crate::deliver_lift::DENIAL_SOURCE_DELIVER_REFUSAL,
                 reason,
             ));
+            // (deliver honors an override) THIS attempt's floor, when its refusal was the
+            // repository's checks failing on the tree that would ship — and nothing otherwise, so
+            // the gate never offers a judgment over an earlier attempt's result.
+            unit.repo_checks = evidence.repo_checks.clone();
+            let offer = deliver_floor_override_offer(unit);
             put_node(store, unit.to_node())?;
             // The FULL refusal transcript survives the rejection (usability review #1).
             persist_rejected_transcript(store, &session, unit, &output.output);
@@ -6299,15 +6304,13 @@ fn apply_step_result(
             );
             // (No `fold_input_denial` here — a Tool unit is never `governed`: `dispatch_unit`
             // hands `run_tool_cmd` no gate hook and reports `governed: false`; review N6.)
-            let prompt = format!(
-                "The deliver phase refused: {}. Approve to re-run the deliver phase now (the \
-                 engine re-lifts and re-verifies first; no second deliver gate), reject to cancel \
-                 the run and keep the worktree.",
+            let prompt = deliver_refusal_prompt(
                 if raw.is_empty() {
                     "the deliver script exited non-zero with no output"
                 } else {
                     snippet.as_str()
-                }
+                },
+                offer,
             );
             pause_for_human(
                 store,
@@ -7540,13 +7543,60 @@ fn floor_override_offer(unit: &crate::domain::WorkUnit, source: &str) -> &'stati
         && !crate::deliver_lift::is_deliver_unit(unit)
         && floor_override_record_allows(unit.denials_behind.as_deref())
     {
-        " judge it yourself with a written rationale when the evidence shows the failures are \
-         not the work's (action `operator_judgment`: it overrides the failed floor, labelled \
-         \"floor overridden by operator\" on the run and the delivery; every other layer still \
-         denies and QE acceptance is still required),"
+        FLOOR_OVERRIDE_OFFER
     } else {
         ""
     }
+}
+
+/// The operator-judgment offer clause, byte-identical wherever the engine offers it (studio's
+/// `offersFloorOverride` matches it verbatim, right before the prompt's "or reject to cancel the
+/// run").
+const FLOOR_OVERRIDE_OFFER: &str = " judge it yourself with a written rationale when the \
+     evidence shows the failures are not the work's (action `operator_judgment`: it overrides the \
+     failed floor, labelled \"floor overridden by operator\" on the run and the delivery; every \
+     other layer still denies and QE acceptance is still required),";
+
+/// (deliver honors an override) The deliver refusal gate's offer of the operator's judgment: only
+/// when THIS attempt's refusal was the repository's checks failing on a known tree, base and check
+/// set (the unit's floor report, keyed) — exactly where [`floor_override_for`] takes it at a
+/// deliver unit. Empty for every other deliver refusal (a script refusal, a conflict, a credential
+/// in the tree, checks that changed the tree, a floor that did not run).
+fn deliver_floor_override_offer(unit: &crate::domain::WorkUnit) -> &'static str {
+    if deliver_floor_overridable(unit) {
+        FLOOR_OVERRIDE_OFFER
+    } else {
+        ""
+    }
+}
+
+/// The deliver refusal gate's prompt: the refusal, then the options — approve (re-run the deliver
+/// phase), the operator's judgment when `offer` is the engine's clause, or reject — the clause
+/// right before "or reject to cancel the run", where studio reads it.
+fn deliver_refusal_prompt(detail: &str, offer: &str) -> String {
+    format!(
+        "The deliver phase refused: {detail}. Approve to re-run the deliver phase now (the engine \
+         re-lifts and re-verifies first; no second deliver gate),{} reject to cancel the run and \
+         keep the worktree.",
+        if offer.is_empty() {
+            String::new()
+        } else {
+            format!("{offer} or")
+        }
+    )
+}
+
+/// Whether `unit` is a deliver unit whose last attempt was refused by its own checks failing on a
+/// keyed tree (see [`deliver_floor_override_offer`]).
+fn deliver_floor_overridable(unit: &crate::domain::WorkUnit) -> bool {
+    crate::deliver_lift::is_deliver_unit(unit)
+        && unit.member_step.is_none()
+        && unit.denial.as_ref().map(|d| d.source.as_str())
+            == Some(crate::deliver_lift::DENIAL_SOURCE_DELIVER_REFUSAL)
+        && unit
+            .repo_checks
+            .as_ref()
+            .is_some_and(|r| !r.passed && r.key.is_some())
 }
 
 /// (operator ruling 2026-10-20) The sentence a floor gate's prompt adds after its options when the
@@ -10345,13 +10395,31 @@ fn dispatch_unit(
                         match lifted {
                             // (crew#739) The engine's own refusal is sealed with the script's
                             // trusted sentinel, so the strand classifier reads one rule.
-                            Some(Err(text)) => (
-                                crate::deliver_lift::seal_engine_refusal(text, &cmd),
-                                crate::workflow::StepStatus::Failed,
-                            ),
+                            Some(Err(refusal)) => {
+                                // (deliver honors an override) A failed re-verify's report rides
+                                // as the unit's evidence: the refusal arm records it, and the
+                                // gate offers the operator's judgment over exactly that result.
+                                lift_checks = refusal.checks.map(|b| *b);
+                                (
+                                    crate::deliver_lift::seal_engine_refusal(refusal.text, &cmd),
+                                    crate::workflow::StepStatus::Failed,
+                                )
+                            }
                             Some(Ok(clearance)) => {
                                 lift_checks = clearance.checks;
-                                lift_verified_tree = Some(clearance.verified_tree);
+                                lift_verified_tree = clearance.verified_tree;
+                                // What the clearance stood on instead of re-running the checks,
+                                // said on the unit's output before the command runs.
+                                if let Some(note) = clearance.reused.as_deref() {
+                                    let _ = tx.send(crate::command::Command::CliOutputDelta {
+                                        run_id: input.run_id.clone(),
+                                        ord,
+                                        attempt,
+                                        chunk: format!("wicked-core: {note}\n"),
+                                        process_gen: None,
+                                        launch_seq: my_seq,
+                                    });
+                                }
                                 // The verified tip rides to the script (Copilot on #433): its own
                                 // fetch + rebase + push can still race a remote that advances in
                                 // the window; with this it can refuse or re-verify a moved base.
@@ -12618,6 +12686,39 @@ pub(crate) fn confirm_gate_as(
     // same record, at a gate whose plain approve is a retry — so only its own action reaches it.
     // Re-derived from the unit as persisted (the pre-check above refused every gate it does not
     // answer before the row resolved).
+    let mut session = session;
+    let decision = match decision {
+        // (deliver honors an override) At the DELIVER refusal gate the judgment is recorded and the
+        // deliver phase re-runs (a plain approve's re-dispatch): it ships only while the tree, base
+        // and check set are the ones judged, and never without the deliver command running.
+        crate::workflow::HumanDecision::OperatorJudgment { rationale }
+            if crate::domain::session_units(store, run_id)?
+                .get(session.unit_ix)
+                .is_some_and(crate::deliver_lift::is_deliver_unit) =>
+        {
+            let units = crate::domain::session_units(store, run_id)?;
+            let grant = floor_override_for(
+                &session,
+                units.get(session.unit_ix),
+                &rationale,
+                adjudication_open,
+                run_id,
+            )?;
+            record_deliver_floor_override(
+                store,
+                &mut session,
+                run_id,
+                actor.as_deref(),
+                &rationale,
+                grant,
+            )?;
+            crate::workflow::HumanDecision::Approve {
+                amend: None,
+                amend_scope: crate::workflow::AmendScope::Cursor,
+            }
+        }
+        d => d,
+    };
     if let crate::workflow::HumanDecision::OperatorJudgment { rationale } = &decision {
         let units = crate::domain::session_units(store, run_id)?;
         let grant = floor_override_for(
@@ -13619,14 +13720,22 @@ fn floor_override_for(
     }
     let u = cursor.ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor"))?;
     let source = u.denial.as_ref().map(|d| d.source.as_str());
+    let paused_on_unit = session.status == SessionStatus::AwaitingHuman
+        && u.status == crate::domain::UnitStatus::Rejected;
+    // (deliver honors an override) The deliver unit's refusal gate, when THIS attempt's refusal
+    // was its own checks failing on a keyed tree: the override is keyed by that result, and the
+    // deliver phase then re-runs, standing on it only while the tree, base and checks are the same.
+    let deliver_floor = paused_on_unit && deliver_floor_overridable(u);
     let layer = match source {
         Some(
             s @ (crate::repo_checks::DENIAL_SOURCE | crate::repo_checks::DENIAL_SOURCE_TIMEOUT),
-        ) if session.status == SessionStatus::AwaitingHuman
-            && u.status == crate::domain::UnitStatus::Rejected =>
-        {
-            s.to_string()
-        }
+        ) if paused_on_unit => s.to_string(),
+        Some(crate::deliver_lift::DENIAL_SOURCE_DELIVER_REFUSAL) if deliver_floor => u
+            .repo_checks
+            .as_ref()
+            .map(|r| r.denial_source())
+            .unwrap_or(crate::repo_checks::DENIAL_SOURCE)
+            .to_string(),
         _ => anyhow::bail!(
             "`{action}` answers the escalation gate of a failed repo-checks floor (denial source \
              `{}` or `{}`); unit {} is {:?}, denied by `{}`",
@@ -13644,14 +13753,18 @@ fn floor_override_for(
             u.ord
         );
     }
-    if u.tool_cmd.is_some() || crate::deliver_lift::is_deliver_unit(u) {
+    if u.tool_cmd.is_some() && !deliver_floor {
         anyhow::bail!(
             "unit {} is a tool step: its floor checks what it runs or ships, and `{action}` \
-             overrides an agent step's floor only — approve (retry) or reject",
+             overrides an agent step's floor (or the deliver phase's failed re-verify) only — \
+             approve (retry) or reject",
             u.ord
         );
     }
+    // The deliver unit's refusal has no other layer: its re-verify refused before the deliver
+    // command ran (no judge, no QE review, no seat).
     match u.denials_behind.as_deref() {
+        _ if deliver_floor => {}
         None => anyhow::bail!(
             "unit {}'s gate did not record whether any other layer denied it (a denial from \
              before that record existed, or a retry on the same tree that did not ask every \
@@ -13682,12 +13795,79 @@ fn floor_override_for(
             layer,
             ord: u.ord,
             attempt,
-            tree: u.repo_checks.as_ref().and_then(|r| r.tree.clone()),
+            tree: u.repo_checks.as_ref().and_then(|r| {
+                r.tree
+                    .clone()
+                    .or_else(|| r.key.as_ref().map(|k| k.tree.clone()))
+            }),
             label: crate::assurance::FLOOR_OVERRIDE_LABEL.to_string(),
+            key: u.repo_checks.as_ref().and_then(|r| r.key.clone()),
         },
-        // Every record behind the floor is the judge's no-verdict hold here (checked above).
-        judge_absent: u.denials_behind.clone().unwrap_or_default(),
+        // Every record behind the floor is the judge's no-verdict hold here (checked above); a
+        // deliver refusal has none.
+        judge_absent: if deliver_floor {
+            Vec::new()
+        } else {
+            u.denials_behind.clone().unwrap_or_default()
+        },
     })
+}
+
+/// (deliver honors an override) The operator's judgment over the deliver phase's failed re-verify:
+/// recorded exactly as at any floor gate — on the run's assurance contract
+/// (`RunAssurance::floor_overrides`, which the delivery receipt carries: "floor overridden by
+/// operator" with the rationale) and as a ruling on the deliver unit — keyed by the failed result's
+/// tree, base and check set. The unit is NOT counted: the caller re-dispatches the deliver phase,
+/// whose lift stands on this override only while all three are unchanged.
+fn record_deliver_floor_override(
+    store: &mut dyn GraphStore,
+    session: &mut crate::domain::AgentSession,
+    run_id: &str,
+    actor: Option<&str>,
+    rationale: &str,
+    grant: FloorOverrideGrant,
+) -> anyhow::Result<()> {
+    let note = rationale.trim();
+    if note.is_empty() {
+        anyhow::bail!(
+            "action `{}` needs a written rationale — why the failed floor is not the work's",
+            crate::workflow::OPERATOR_JUDGMENT_ACTION
+        );
+    }
+    let mut units = crate::domain::session_units(store, run_id)?;
+    let u = units
+        .get_mut(session.unit_ix)
+        .ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor to judge"))?;
+    let by = actor
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .unwrap_or("operator")
+        .to_string();
+    let at = crate::interaction::now_millis();
+    let attempt = u.last_attempt.unwrap_or(0);
+    let judgment = crate::assurance::OperatorJudgment {
+        by: by.clone(),
+        at,
+        note: Some(note.to_string()),
+        reason: u.denial_reason.clone(),
+        floor_override: Some(grant.floor),
+        judge_stand_in: None,
+    };
+    u.operator_rulings.push(crate::domain::OperatorRuling {
+        action: crate::workflow::OPERATOR_JUDGMENT_ACTION.to_string(),
+        text: format!("{} ({by}): {note}", crate::assurance::FLOOR_OVERRIDE_LABEL),
+        attempt,
+        at,
+    });
+    let ord = u.ord;
+    session.assurance.floor_overrides.push(judgment);
+    crate::domain::put_nodes(store, &[u.to_node(), session.to_node()])?;
+    eprintln!(
+        "wicked-core: unit {ord} of run {run_id}: {} (`{by}`) at its deliver refusal gate — the \
+         deliver phase re-runs and stands on it while the tree, base and checks are unchanged",
+        crate::assurance::FLOOR_OVERRIDE_LABEL
+    );
+    Ok(())
 }
 
 /// (operator ruling 2026-10-11) An approve at a `judge_unavailable` escalation: the operator's
@@ -20075,6 +20255,174 @@ mod request_changes_tests {
             false,
         );
         (r, drain(&erx))
+    }
+
+    /// (deliver honors an override) The deliver unit of `seed_bug_with_deliver`, refused by its
+    /// re-verify: `report` is that attempt's floor (or none — a script refusal).
+    fn seed_deliver_refused(
+        store: &mut dyn GraphStore,
+        run_id: &str,
+        report: Option<crate::repo_checks::RepoChecksReport>,
+    ) {
+        seed_bug_with_deliver(store, run_id);
+        let mut units = crate::domain::session_units(store, run_id).unwrap();
+        let deliver = units.iter_mut().find(|u| u.ord == 5).unwrap();
+        let why = "deliver refused on unit 5: deliver: the lift changed the tree, and the \
+                   repository's own checks FAILED on it";
+        deliver.status = UnitStatus::Rejected;
+        deliver.last_attempt = Some(0);
+        deliver.denial_reason = Some(why.into());
+        deliver.denial = Some(UnitDenial::new(
+            crate::deliver_lift::DENIAL_SOURCE_DELIVER_REFUSAL,
+            why,
+        ));
+        deliver.repo_checks = report;
+        put_node(store, deliver.to_node()).unwrap();
+    }
+
+    fn failed_deliver_floor(
+        key: Option<crate::repo_checks::FloorKey>,
+    ) -> crate::repo_checks::RepoChecksReport {
+        let mut r: crate::repo_checks::RepoChecksReport = serde_json::from_value(serde_json::json!({
+            "detected": [], "checks": [], "skipped": [], "passed": false, "sandbox_level": "none"
+        }))
+        .unwrap();
+        r.key = key;
+        r
+    }
+
+    fn lifted_key() -> crate::repo_checks::FloorKey {
+        crate::repo_checks::FloorKey {
+            tree: "tree-lifted".into(),
+            base: Some("tip-sha".into()),
+            checks: "digest-of-the-check-set".into(),
+        }
+    }
+
+    /// (deliver honors an override) A changed tree at deliver (a lift) re-verified red: the refusal
+    /// gate offers the operator's judgment in the engine's verbatim clause, right before "or reject
+    /// to cancel the run" — and only when THIS attempt's refusal was a keyed failed floor.
+    #[test]
+    fn the_deliver_refusal_gate_offers_the_judgment_only_over_its_own_failed_floor() {
+        let mut u = WorkUnit::pending("r:deliver", "r", 5, "deliver");
+        u.tool_cmd = Some(vec!["deliver.sh".into()]);
+        u.status = UnitStatus::Rejected;
+        u.denial = Some(UnitDenial::new(
+            crate::deliver_lift::DENIAL_SOURCE_DELIVER_REFUSAL,
+            "refused",
+        ));
+        u.repo_checks = Some(failed_deliver_floor(Some(lifted_key())));
+        assert!(crate::deliver_lift::is_deliver_unit(&u));
+        let offer = deliver_floor_override_offer(&u);
+        assert_eq!(offer, FLOOR_OVERRIDE_OFFER);
+        let p = deliver_refusal_prompt("deliver: the checks FAILED", offer);
+        assert!(
+            p.contains("required), or reject to cancel the run and keep the worktree."),
+            "{p}"
+        );
+        assert!(p.contains("action `operator_judgment`"), "{p}");
+        // No offer: the prompt is the one it always was.
+        assert_eq!(
+            deliver_refusal_prompt("deliver: gh: 403", ""),
+            "The deliver phase refused: deliver: gh: 403. Approve to re-run the deliver phase now \
+             (the engine re-lifts and re-verifies first; no second deliver gate), reject to cancel \
+             the run and keep the worktree."
+        );
+        // A script refusal (no floor), a passing floor, an unkeyed floor: no offer.
+        let mut none = u.clone();
+        none.repo_checks = None;
+        let mut passed = u.clone();
+        passed.repo_checks.as_mut().unwrap().passed = true;
+        let mut unkeyed = u.clone();
+        unkeyed.repo_checks = Some(failed_deliver_floor(None));
+        let mut not_deliver = u.clone();
+        not_deliver.tool_cmd = None;
+        for (tag, x) in [
+            ("script refusal", none),
+            ("passed", passed),
+            ("unkeyed", unkeyed),
+            ("agent step", not_deliver),
+        ] {
+            assert_eq!(deliver_floor_override_offer(&x), "", "{tag}");
+        }
+    }
+
+    /// (deliver honors an override) The judgment at the deliver refusal gate is recorded on the
+    /// run's assurance contract keyed by the failed result's tree, base and check set, and the
+    /// deliver phase RE-RUNS (never counted Done without its command running); the next lift reads
+    /// the key back as an override it may stand on.
+    #[test]
+    fn a_deliver_floor_override_is_recorded_keyed_and_the_deliver_phase_re_runs() {
+        let run_id = format!("deliver-over-ok-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_deliver_refused(
+            &mut store,
+            &run_id,
+            Some(failed_deliver_floor(Some(lifted_key()))),
+        );
+        let why = "39 failures, the same IDs on the tip; none in the files this run touched";
+        let (r, _) = operator_judgment(&mut store, &run_id, why);
+        r.expect("the override applies at the deliver refusal gate");
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.unit_ix, 4, "the cursor stays on the deliver unit");
+        assert_eq!(session.attempt, 1, "the deliver phase is re-dispatched");
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let deliver = units.iter().find(|u| u.ord == 5).unwrap();
+        assert_ne!(
+            deliver.status,
+            UnitStatus::Done,
+            "never counted without pushing"
+        );
+        assert_eq!(
+            deliver.operator_rulings.last().map(|r| r.action.as_str()),
+            Some(crate::workflow::OPERATOR_JUDGMENT_ACTION)
+        );
+        assert_eq!(session.assurance.floor_overrides.len(), 1);
+        let j = &session.assurance.floor_overrides[0];
+        assert_eq!(j.note.as_deref(), Some(why));
+        let over = j.floor_override.as_ref().expect("a floor override");
+        assert_eq!(over.label, crate::assurance::FLOOR_OVERRIDE_LABEL);
+        assert_eq!(over.ord, 5);
+        assert_eq!(over.key, Some(lifted_key()));
+        assert_eq!(over.tree.as_deref(), Some("tree-lifted"));
+        // The next lift stands on exactly that key…
+        let floors = crate::deliver_lift::overridden_floors(&session, &units);
+        assert_eq!(floors.len(), 1);
+        assert_eq!(floors[0].key, lifted_key());
+        assert_eq!(floors[0].phase, "deliver");
+        // …and the delivery carries the label and the rationale.
+        let delivery = crate::deliver_lift::delivery_receipt(&session, &units);
+        assert_eq!(delivery.operator_judges, vec![j.clone()]);
+    }
+
+    /// (deliver honors an override) Fail-closed: a deliver refusal that was NOT its own failed,
+    /// keyed floor (a script refusal, an unkeyed floor) takes no judgment — refused, nothing
+    /// recorded, the gate still open.
+    #[test]
+    fn a_deliver_refusal_without_its_own_keyed_failed_floor_takes_no_judgment() {
+        for (tag, report) in [
+            ("script refusal", None),
+            ("unkeyed floor", Some(failed_deliver_floor(None))),
+        ] {
+            let run_id = format!(
+                "deliver-over-no-{}-{}",
+                tag.replace(' ', "-"),
+                std::process::id()
+            );
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_deliver_refused(&mut store, &run_id, report);
+            let (r, _) = operator_judgment(&mut store, &run_id, "the base is red");
+            let e = r.expect_err("refused").to_string();
+            assert!(e.contains("operator_judgment"), "{tag}: {e}");
+            let session = crate::domain::get_session(&store, &run_id)
+                .unwrap()
+                .unwrap();
+            assert!(session.assurance.floor_overrides.is_empty(), "{tag}");
+            assert_eq!(session.status, SessionStatus::AwaitingHuman, "{tag}");
+            assert_eq!(session.attempt, 0, "{tag}: nothing re-dispatched");
+        }
     }
 
     /// (operator ruling 2026-10-21) The override needs a written rationale: a blank one is refused

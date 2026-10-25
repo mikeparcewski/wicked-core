@@ -709,9 +709,79 @@ pub struct RepoChecksReport {
     /// not run them, instead of a green floor implying it did ([`e2e_coverage_note`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_note: Option<String>,
+    /// (deliver honors an override) What this result is a result FOR ([`FloorKey`]): the tree the
+    /// checks ran on, the base they were measured against and the exact check set. Recorded only
+    /// when the checks ran on a known tree; `None` otherwise (never stood on by a later floor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<FloorKey>,
+}
+
+/// (deliver honors an override) The exact identity of one floor result inside a run: the tree the
+/// checks ran on, the base commit the baseline diff measured against, and a digest of the check
+/// set (the stage, then every detected check's name, directory, argv and bound, in run order). A
+/// later floor stands on a recorded result instead of running the checks again ONLY when all three
+/// are identical; anything different runs the checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FloorKey {
+    pub tree: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// Hex SHA-256 of the check set ([`check_set_digest`]).
+    pub checks: String,
+}
+
+impl FloorKey {
+    /// The key of a floor that ran (or would run) `detected` on `tree` for `ctx`.
+    pub(crate) fn of(tree: &str, ctx: &FloorContext, detected: &[RepoCheck]) -> Self {
+        FloorKey {
+            tree: tree.to_string(),
+            base: ctx.base_head.clone(),
+            checks: check_set_digest(ctx, detected),
+        }
+    }
+}
+
+/// The digest of a floor's check set: the stage and the package directory, then every check's
+/// name, directory, argv and configured bound, in run order — a reordered, added, removed,
+/// re-scoped or re-bounded check is a different set. A forced install (`force_install`, after a
+/// lockfile drift) acts only through detection — it adds the `install` check — so the set itself
+/// carries it: an attempt that forced the install and its retry that finds the same `install`
+/// check (no `node_modules/` in a fresh checkout) ran the same checks.
+pub(crate) fn check_set_digest(ctx: &FloorContext, detected: &[RepoCheck]) -> String {
+    use sha2::Digest;
+    let set: Vec<(&str, &str, &[String], Option<u64>)> = detected
+        .iter()
+        .map(|c| {
+            (
+                c.name.as_str(),
+                c.dir.as_str(),
+                c.argv.as_slice(),
+                c.timeout_s,
+            )
+        })
+        .collect();
+    let material = serde_json::json!({
+        "stage": ctx.stage.as_wire(),
+        "packageDir": ctx.package_dir,
+        "checks": set,
+    });
+    let digest = sha2::Sha256::digest(material.to_string().as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl RepoChecksReport {
+    /// The [`FloorKey`] of this report when its checks RAN on `tree` as the ordinary floor (passed,
+    /// failed or timed out) — `None` for a floor that did not run (no boundary, a detection or
+    /// checkout refusal) and for an operator's re-run (`extend` / `targeted` / `accept_partial` /
+    /// a floor fix) or a floor with waived checks: those ran a different set than the ordinary
+    /// floor would, so nothing may stand on them in its place (xreview r1).
+    pub(crate) fn key_for(&self, tree: Option<&str>, ctx: &FloorContext) -> Option<FloorKey> {
+        let tree = tree.filter(|t| !t.is_empty())?;
+        (self.outcome() != "not_run" && self.rerun.is_none() && self.waived.is_empty())
+            .then(|| FloorKey::of(tree, ctx, &self.detected))
+    }
+
     /// Did the floor stop on a check that hit its bound? A timed-out floor did not FINISH — it is
     /// not "checks failed" (core#469), and the fold denies it under [`DENIAL_SOURCE_TIMEOUT`].
     pub fn timed_out(&self) -> bool {
@@ -3186,6 +3256,7 @@ fn scratch_refused(
         requested_rerun: None,
         recheck: None,
         coverage_note: None,
+        key: None,
     }
 }
 
@@ -3285,6 +3356,7 @@ pub(crate) fn run_with_sandbox_ctx(
                     requested_rerun: None,
                     recheck: None,
                     coverage_note: None,
+                    key: None,
                 };
             }
         }
@@ -3310,6 +3382,7 @@ pub(crate) fn run_with_sandbox_ctx(
                 requested_rerun: None,
                 recheck: None,
                 coverage_note: None,
+                key: None,
             }
         }
     };
@@ -3335,6 +3408,7 @@ pub(crate) fn run_with_sandbox_ctx(
                     requested_rerun: None,
                     recheck: None,
                     coverage_note: None,
+                    key: None,
                 }
             }
         },
@@ -3583,6 +3657,7 @@ pub(crate) fn run_with_sandbox_ctx(
         requested_rerun: None,
         recheck: None,
         coverage_note,
+        key: None,
     }
 }
 
@@ -4170,6 +4245,7 @@ pub(crate) fn guarded_checkout_refused(
         requested_rerun: None,
         recheck: None,
         coverage_note: None,
+        key: None,
     }
 }
 
@@ -7056,6 +7132,7 @@ pub(crate) mod tests {
             requested_rerun: None,
             recheck: None,
             coverage_note: None,
+            key: None,
         };
         let reason = report.denial_reason();
         assert!(
@@ -8571,6 +8648,7 @@ pub(crate) mod tests {
             requested_rerun: None,
             recheck: None,
             coverage_note: None,
+            key: None,
         };
         let denial = report.denial_reason();
         assert!(
@@ -8842,6 +8920,7 @@ pub(crate) mod tests {
             requested_rerun: None,
             recheck: None,
             coverage_note: None,
+            key: None,
         };
         assert!(report.timed_out());
         assert_eq!(report.outcome(), "timed_out");
@@ -9603,6 +9682,88 @@ pub(crate) mod tests {
         }
     }
 
+    /// (deliver honors an override) A floor result's key: only the ordinary floor that RAN is keyed —
+    /// never one that did not run, an operator's re-run or a floor with waived checks — and the
+    /// digest moves with the stage, the package dir and every check's identity (a forced install
+    /// moves it through the `install` check it adds).
+    #[test]
+    fn a_floor_key_is_the_ordinary_floor_that_ran_and_its_exact_check_set() {
+        let check = |name: &str, argv: &[&str]| RepoCheck {
+            name: name.into(),
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+            source: "test".into(),
+            timeout_s: None,
+            dir: String::new(),
+        };
+        let mut r = report_of(Vec::new(), &[]);
+        r.passed = false;
+        r.detected = vec![
+            check("lint", &["npm", "run", "lint"]),
+            check("test", &["npm", "test"]),
+        ];
+        let ctx = FloorContext {
+            stage: FloorStage::Verify,
+            base_head: Some("base".into()),
+            ..Default::default()
+        };
+        let key = r
+            .key_for(Some("tree"), &ctx)
+            .expect("the ordinary floor is keyed");
+        assert_eq!(key.tree, "tree");
+        assert_eq!(key.base.as_deref(), Some("base"));
+        assert!(r.key_for(None, &ctx).is_none(), "no tree, no key");
+        assert!(r.key_for(Some(""), &ctx).is_none());
+        let mut not_run = r.clone();
+        not_run.sandbox_error = Some("no boundary".into());
+        assert!(not_run.key_for(Some("tree"), &ctx).is_none(), "did not run");
+        let mut rerun = r.clone();
+        rerun.rerun = Some(FloorRerunMode::Targeted);
+        assert!(
+            rerun.key_for(Some("tree"), &ctx).is_none(),
+            "an operator's re-run"
+        );
+        let mut waived = r.clone();
+        waived.waived = vec!["lint".into()];
+        assert!(
+            waived.key_for(Some("tree"), &ctx).is_none(),
+            "waived checks"
+        );
+        // The digest: any change to the context or the set is another key.
+        let digest = |c: &FloorContext, d: &[RepoCheck]| check_set_digest(c, d);
+        let base = digest(&ctx, &r.detected);
+        let pkg = FloorContext {
+            package_dir: Some("pkg".into()),
+            ..ctx.clone()
+        };
+        let creator = FloorContext {
+            stage: FloorStage::Creator,
+            ..ctx.clone()
+        };
+        let reordered = vec![r.detected[1].clone(), r.detected[0].clone()];
+        let mut bounded = r.detected.clone();
+        bounded[1].timeout_s = Some(60);
+        let mut moved = r.detected.clone();
+        moved[1].dir = "pkg".into();
+        for (tag, other) in [
+            (
+                "an added install",
+                digest(
+                    &ctx,
+                    &[vec![check("install", &["npm", "ci"])], r.detected.clone()].concat(),
+                ),
+            ),
+            ("package dir", digest(&pkg, &r.detected)),
+            ("stage", digest(&creator, &r.detected)),
+            ("order", digest(&ctx, &reordered)),
+            ("bound", digest(&ctx, &bounded)),
+            ("dir", digest(&ctx, &moved)),
+            ("subset", digest(&ctx, &r.detected[..1])),
+        ] {
+            assert_ne!(other, base, "{tag}");
+        }
+        assert_eq!(digest(&ctx, &r.detected), base, "deterministic");
+    }
+
     fn report_of(checks: Vec<CheckRun>, skipped: &[&str]) -> RepoChecksReport {
         let passed = !checks.iter().any(|c| c.denies());
         RepoChecksReport {
@@ -9623,6 +9784,7 @@ pub(crate) mod tests {
             requested_rerun: None,
             recheck: None,
             coverage_note: None,
+            key: None,
         }
     }
 

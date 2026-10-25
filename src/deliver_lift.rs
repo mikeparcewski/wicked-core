@@ -778,6 +778,49 @@ pub(crate) struct LiftContext {
     /// seats are handed; the seat-secret guard asks it which token the delivery must not carry.
     /// `None` for an engine with no file-backed state home (no seat was ever brokered).
     pub gateway_dir: Option<PathBuf>,
+    /// (deliver honors an override) Every failed floor the operator overrode on this run whose
+    /// exact identity is known ([`crate::repo_checks::FloorKey`]): the deliver phase stands on one
+    /// instead of running the checks again when the tree it ships, its base and its check set
+    /// all match. Empty when the operator overrode nothing (or only before keys were recorded).
+    pub floor_overrides: Vec<OverriddenFloor>,
+}
+
+/// (deliver honors an override) One floor result the operator overrode on this run, as the deliver
+/// phase may stand on it: its key, and where it was recorded (for the record the delivery shows).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OverriddenFloor {
+    pub key: crate::repo_checks::FloorKey,
+    /// The overridden result: `<run>:unit-<ord>:attempt-<n>:<layer>`.
+    pub result_id: String,
+    /// The unit's phase (`verify`, `build`, `deliver`, …), else `unit <ord>`.
+    pub phase: String,
+}
+
+/// The overridden floors of `session` the deliver phase may stand on (see [`OverriddenFloor`]):
+/// only overrides that recorded their result's key.
+pub(crate) fn overridden_floors(
+    session: &crate::domain::AgentSession,
+    units: &[crate::domain::WorkUnit],
+) -> Vec<OverriddenFloor> {
+    session
+        .assurance
+        .floor_overrides
+        .iter()
+        .filter_map(|j| j.floor_override.as_ref())
+        .filter_map(|f| {
+            let key = f.key.clone()?;
+            let phase = units
+                .iter()
+                .find(|u| u.ord == f.ord)
+                .and_then(|u| u.phase_id().map(str::to_string))
+                .unwrap_or_else(|| format!("unit {}", f.ord));
+            Some(OverriddenFloor {
+                key,
+                result_id: f.result_id.clone(),
+                phase,
+            })
+        })
+        .collect()
 }
 
 /// (core#850) What assured the run being delivered: its contract, every instrument any of its
@@ -852,6 +895,7 @@ pub(crate) fn lift_context(
         base_commit: session.base_commit.clone(),
         assurance: delivery_receipt(session, &units),
         gateway_dir: crate::actor::armed_gateway_dir(),
+        floor_overrides: overridden_floors(session, &units),
     })
 }
 
@@ -902,7 +946,42 @@ pub(crate) struct LiftClearance {
     pub verified_base: Option<String>,
     /// The tree id that is now VERIFIED — the one the command may ship. Persisted on the
     /// session by the fold so the next deliver attempt can tell whether it changed (F-433-001).
-    pub verified_tree: String,
+    /// `None` when the tree ships on an operator's override ([`LiftClearance::reused`]): an
+    /// overridden tree is never recorded as verified.
+    pub verified_tree: Option<String>,
+    /// What the clearance stood on instead of running the checks again — said on the unit's
+    /// output before the command runs (`checks reused from <phase>: same tree …`). `None` when
+    /// the checks ran here.
+    pub reused: Option<String>,
+}
+
+/// Why the deliver lift refused, and — when the refusal is the repository's checks FAILING on the
+/// tree that would ship — that floor's report, so the unit records it and the operator can judge
+/// it at the deliver gate (an override keyed by its tree, base and check set).
+#[derive(Debug)]
+pub(crate) struct LiftRefusal {
+    pub text: String,
+    pub checks: Option<Box<crate::repo_checks::RepoChecksReport>>,
+}
+
+impl From<String> for LiftRefusal {
+    fn from(text: String) -> Self {
+        LiftRefusal { text, checks: None }
+    }
+}
+
+/// The refusal reads as its text (the unit's failure output).
+impl std::ops::Deref for LiftRefusal {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for LiftRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
 }
 
 /// Lockfiles and manifests whose movement between the old base and the tip means the installed
@@ -951,7 +1030,7 @@ pub(crate) fn lift_and_reverify(
     ord: u32,
     attempt: u32,
     emit: &dyn Fn(CoreEvent),
-) -> Result<LiftClearance, String> {
+) -> Result<LiftClearance, LiftRefusal> {
     // The worktree must be ON THE RUN BRANCH before anything is lifted, reset or cleared
     // (Copilot on #433, fifth pass): a detached HEAD, or another branch switched in by hand at a
     // commit behind the tip, would pass the ancestry test and `reset --soft <tip>` would move
@@ -962,7 +1041,8 @@ pub(crate) fn lift_and_reverify(
             "deliver: {why} — nothing was lifted, reset or pushed; the deliver script only pushes \
              the run branch. Switch the worktree back to `{}` and approve to retry.",
             crate::repo::worktree_branch(run_id)
-        ));
+        )
+        .into());
     }
     let report = lift_onto_remote_default(&ctx.worktree, &ctx.repo_root);
     emit(report.to_event(run_id, ord, attempt, &ctx.assurance));
@@ -979,7 +1059,8 @@ pub(crate) fn lift_and_reverify(
                  Inspect the worktree (it may hold a partial checkout), restore or fix it, and \
                  approve to retry the deliver phase.",
                 report.note.as_deref().unwrap_or("no reason recorded")
-            ))
+            )
+            .into())
         }
         LiftOutcome::Conflict => {
             return Err(format!(
@@ -990,7 +1071,8 @@ pub(crate) fn lift_and_reverify(
                  retry the deliver phase.",
                 report.conflicts.join(", "),
                 report.base_before.as_deref().map(short).unwrap_or("?"),
-            ))
+            )
+            .into())
         }
         LiftOutcome::Unchanged => eprintln!(
             "wicked-core: deliver lift for unit {ord}: unchanged — {base_ref} is still at {tip}, \
@@ -1026,10 +1108,16 @@ pub(crate) fn lift_and_reverify(
              verified — the checks need not run again",
             short(&now.tree)
         );
+        let reused = format!(
+            "checks reused: tree {} is the tree the run verified (its checks passed there) — not \
+             run again at deliver",
+            short(&now.tree)
+        );
         return Ok(LiftClearance {
             checks: None,
             verified_base,
-            verified_tree: now.tree,
+            verified_tree: Some(now.tree),
+            reused: Some(reused),
         });
     }
     // Not the verified tree ⇒ RE-VERIFY, whatever moved it (a lift, a failed earlier re-verify's
@@ -1094,6 +1182,16 @@ pub(crate) fn lift_and_reverify(
     // checkout of `now.tree` — the tree that ships — never the live worktree, where an ignored
     // config or shim could steer it while the snapshot comparison stays clean. No pinned git dir
     // or no checkout ⇒ the floor is refused (fail-closed), never run on the live tree.
+    // (deliver honors an override) An operator's override of a failed floor stands for the exact
+    // result it judged: when the tree that ships, the base it is measured against and the check
+    // set the floor would run are ALL that result's ([`crate::repo_checks::FloorKey`]), the checks
+    // are not run again — the delivery carries the override (its label and rationale ride the
+    // receipt from the run's record). Anything different runs the checks below.
+    let overridden: Vec<&OverriddenFloor> = ctx
+        .floor_overrides
+        .iter()
+        .filter(|o| o.key.tree == now.tree && o.key.base == floor_ctx.base_head)
+        .collect();
     let checks = match floor_ctx.git_dir.as_deref() {
         Some(git_dir) => match crate::repo_checks::checkout_guarded_tree(
             &ctx.worktree,
@@ -1102,8 +1200,42 @@ pub(crate) fn lift_and_reverify(
             &format!("{run_id}-{ord}-deliver"),
         ) {
             Ok(checkout) => {
+                // (xreview r1) …and the live worktree is still exactly what was snapshotted: an
+                // edit, a moved HEAD or a switched branch while the checkout was inspected stands
+                // on nothing — the checks below run and their own after-check refuses it.
+                if let Some(o) = stands_on_override(
+                    &overridden,
+                    &checkout.dir,
+                    &floor_ctx,
+                    &now.tree,
+                )
+                .filter(|_| {
+                    crate::worktree_guard::snapshot(&ctx.worktree, &ctx.repo_root).is_ok_and(|a| {
+                        a.tree == now.tree && a.head == now.head && a.head_ref == now.head_ref
+                    })
+                }) {
+                    let reused = format!(
+                        "checks reused from {}: same tree {}, same base {}, same checks — the \
+                         operator overrode that failed floor ({}, \"{}\"); not run again at deliver",
+                        o.phase,
+                        short(&now.tree),
+                        o.key.base.as_deref().map(short).unwrap_or("none"),
+                        o.result_id,
+                        crate::assurance::FLOOR_OVERRIDE_LABEL,
+                    );
+                    eprintln!("wicked-core: deliver for unit {ord}: {reused}");
+                    return Ok(LiftClearance {
+                        checks: None,
+                        verified_base,
+                        verified_tree: None,
+                        reused: Some(reused),
+                    });
+                }
                 let mut r = crate::repo_checks::run_floor(&checkout.dir, &floor_ctx);
                 checkout.hold_to(&now.tree, &mut r);
+                // The result's identity, so an operator's override of it at this gate is keyed
+                // by exactly the tree, base and check set it judged.
+                r.key = r.key_for(Some(&now.tree), &floor_ctx);
                 r
             }
             Err(why) => {
@@ -1143,9 +1275,12 @@ pub(crate) fn lift_and_reverify(
             changed: Vec::new(),
             changed_truncated: false,
         });
-        Err(text)
+        Err(LiftRefusal { text, checks: None })
     };
     if !checks.passed {
+        // The failed floor rides the refusal: the unit records it, and the deliver gate offers the
+        // operator's judgment over exactly this result (its tree, base and check set).
+        let failed = checks.clone();
         return refuse(
             &checks,
             format!(
@@ -1155,7 +1290,11 @@ pub(crate) fn lift_and_reverify(
                  until the tree passes.",
                 checks.summary()
             ),
-        );
+        )
+        .map_err(|r| LiftRefusal {
+            checks: Some(Box::new(failed)),
+            ..r
+        });
     }
     // F-433-002: the checks are REPOSITORY-controlled code — a "passing" script can edit a
     // tracked file or move HEAD, and the Tool path has no final worktree guard. Prove the tree
@@ -1199,8 +1338,27 @@ pub(crate) fn lift_and_reverify(
     Ok(LiftClearance {
         checks: Some(checks),
         verified_base,
-        verified_tree: after.tree,
+        verified_tree: Some(after.tree),
+        reused: None,
     })
+}
+
+/// (deliver honors an override) The overridden floor the deliver phase stands on, if any: one of
+/// `overridden` (already matched on the tree and base) whose check set is EXACTLY the set the
+/// deliver floor detects in `checkout` for `floor_ctx`. Detection runs nothing; a detection error
+/// stands on nothing (the checks run, and say so).
+fn stands_on_override<'a>(
+    overridden: &[&'a OverriddenFloor],
+    checkout: &Path,
+    floor_ctx: &crate::repo_checks::FloorContext,
+    tree: &str,
+) -> Option<&'a OverriddenFloor> {
+    if overridden.is_empty() {
+        return None;
+    }
+    let detected = crate::repo_checks::detect_with(checkout, floor_ctx).ok()?;
+    let key = crate::repo_checks::FloorKey::of(tree, floor_ctx, &detected);
+    overridden.iter().copied().find(|o| o.key == key)
 }
 
 /// The credentials a delivery must not carry: every one this process put into a seat, plus the one
@@ -2043,6 +2201,7 @@ mod tests {
             base_commit: None,
             assurance: Default::default(),
             gateway_dir: None,
+            floor_overrides: Vec::new(),
         }
     }
 
@@ -2161,6 +2320,203 @@ mod tests {
         );
     }
 
+    /// (deliver honors an override) THE BRICK (core-ts 0.15.8): the verify floor failed on tree T
+    /// over a red base and the operator overrode it; deliver finds the tip unmoved and the tree
+    /// still T. The key the VERIFY floor recorded (a guarded checkout of T, the run base, the
+    /// verify stage) is the key deliver derives — so deliver stands on the override and ships,
+    /// running no checks, instead of re-running them into the same refusal.
+    #[test]
+    fn a_verify_override_on_the_unchanged_tree_delivers_without_rerunning_the_checks() {
+        // spawn-audit: test-only — probes for `npm` on PATH to decide whether the fixture can run; reads no engine state.
+        if Command::new("npm").arg("--version").output().is_err() {
+            eprintln!("npm not on PATH — the brick test cannot run here");
+            return;
+        }
+        let (clone, wt) = stale_base_layout("override-brick");
+        std::fs::write(
+            wt.join("package.json"),
+            r#"{"name":"brick","version":"0.0.0","scripts":{"test":"[ ! -e red.txt ]"}}"#,
+        )
+        .unwrap();
+        std::fs::write(wt.join("red.txt"), "red\n").unwrap();
+        run_git(&wt, &["add", "-A"]);
+        run_git(&wt, &["commit", "-qm", "the run's work"]);
+        let tree = crate::worktree_guard::snapshot(&wt, &clone).unwrap().tree;
+        let base = run_git(&wt, &["rev-parse", "origin/main"]);
+        // The verify unit's floor, exactly as `cli_runner` runs and keys it.
+        let git_dir = pinned_git_dir(&wt, &clone).unwrap();
+        let verify_ctx = crate::repo_checks::FloorContext {
+            stage: crate::repo_checks::FloorStage::Verify,
+            force_install: false,
+            base_head: Some(base.clone()),
+            git_dir: Some(git_dir.clone()),
+            claim_text: None,
+            package_dir: None,
+            run_id: Some("override-brick".into()),
+        };
+        let checkout =
+            crate::repo_checks::checkout_guarded_tree(&wt, &git_dir, &tree, "override-brick-4-a0")
+                .expect("a guarded checkout");
+        let mut verify = crate::repo_checks::run_floor_rerun(&checkout.dir, &verify_ctx, None);
+        checkout.hold_to(&tree, &mut verify);
+        drop(checkout);
+        assert!(
+            !verify.passed,
+            "the verify floor failed: {}",
+            verify.summary()
+        );
+        let key = verify.key_for(Some(&tree), &verify_ctx).expect("keyed");
+
+        // Without the override, deliver re-runs the checks and refuses (today's brick).
+        let events = std::cell::RefCell::new(Vec::new());
+        let emit = |ev: CoreEvent| events.borrow_mut().push(ev);
+        let mut ctx = ctx_for(&clone, &wt, None);
+        ctx.base_commit = Some(base.clone());
+        assert!(lift_and_reverify(&ctx, "override-brick", 5, 0, &emit).is_err());
+        let ran = |evs: &[CoreEvent]| {
+            evs.iter()
+                .filter(|e| matches!(e, CoreEvent::RepoChecksEvaluated { .. }))
+                .count()
+        };
+        assert_eq!(ran(&events.borrow()), 1);
+
+        // With the operator's override of the verify floor: delivered, nothing re-run.
+        ctx.floor_overrides = vec![OverriddenFloor {
+            key,
+            result_id: "override-brick:unit-4:attempt-0:repo_checks".into(),
+            phase: "verify".into(),
+        }];
+        let c = lift_and_reverify(&ctx, "override-brick", 5, 1, &emit)
+            .expect("the override on this exact tree clears the delivery");
+        assert!(c.checks.is_none());
+        assert!(c.verified_tree.is_none());
+        assert_eq!(ran(&events.borrow()), 1, "the checks did not run again");
+        let unchanged = events.borrow().iter().any(|e| {
+            matches!(e, CoreEvent::DeliverLiftEvaluated { attempt: 1, outcome, .. } if outcome == "unchanged")
+        });
+        assert!(unchanged, "the tip did not move");
+        let note = c.reused.expect("said");
+        assert!(
+            note.starts_with("checks reused from verify: same tree"),
+            "{note}"
+        );
+    }
+
+    /// (deliver honors an override) The operator overrode the failed re-verify on tree T: the next
+    /// deliver on the SAME tree, base and check set stands on it — no checks run, nothing recorded
+    /// as verified, the reuse said — while a different base, a different check set or a changed
+    /// tree runs the checks again (and refuses again).
+    #[test]
+    fn an_override_is_stood_on_only_for_the_same_tree_base_and_checks() {
+        // spawn-audit: test-only — probes for `npm` on PATH to decide whether the fixture can run; reads no engine state.
+        if Command::new("npm").arg("--version").output().is_err() {
+            eprintln!("npm not on PATH — the override reuse test cannot run here");
+            return;
+        }
+        let (clone, wt) = stale_base_layout("override-reuse");
+        land_on_origin("override-reuse", &clone, |o| {
+            std::fs::write(o.join("src/landed.ts"), "export const landed = 1;\n").unwrap();
+        });
+        let other = clone.parent().unwrap().join("other-override-reuse");
+        add_failing_npm_check(&other);
+        std::fs::write(wt.join("red.txt"), "red on this tree\n").unwrap();
+        let mut ctx = ctx_for(&clone, &wt, None);
+        let events = std::cell::RefCell::new(Vec::new());
+        let emit = |ev: CoreEvent| events.borrow_mut().push(ev);
+        let ran = |evs: &[CoreEvent]| {
+            evs.iter()
+                .filter(|e| matches!(e, CoreEvent::RepoChecksEvaluated { .. }))
+                .count()
+        };
+
+        // Attempt 0: lifted, the checks FAIL — the refusal carries the keyed floor.
+        let refusal = lift_and_reverify(&ctx, "override-reuse", 5, 0, &emit)
+            .err()
+            .expect("a failing check refuses");
+        let failed = refusal
+            .checks
+            .as_ref()
+            .expect("the failed floor rides the refusal");
+        assert!(!failed.passed);
+        let key = failed.key.clone().expect("the failed floor is keyed");
+        let tree = crate::worktree_guard::snapshot(&wt, &clone).unwrap().tree;
+        let tip = run_git(&wt, &["rev-parse", "origin/main"]);
+        assert_eq!(key.tree, tree, "keyed by the tree that would ship");
+        assert_eq!(
+            key.base.as_deref(),
+            Some(tip.as_str()),
+            "…and the tip it was measured on"
+        );
+        assert_eq!(ran(&events.borrow()), 1);
+
+        let with = |k: crate::repo_checks::FloorKey| OverriddenFloor {
+            key: k,
+            result_id: "override-reuse:unit-5:attempt-0:repo_checks".into(),
+            phase: "deliver".into(),
+        };
+        // A different BASE: not the result the operator judged — the checks run.
+        let mut other_base = key.clone();
+        other_base.base = Some("0000000000000000000000000000000000000000".into());
+        ctx.floor_overrides = vec![with(other_base)];
+        assert!(lift_and_reverify(&ctx, "override-reuse", 5, 1, &emit).is_err());
+        assert_eq!(
+            ran(&events.borrow()),
+            2,
+            "a different base re-runs the checks"
+        );
+        // A different CHECK SET: the checks run.
+        let mut other_checks = key.clone();
+        other_checks.checks = crate::repo_checks::check_set_digest(
+            &crate::repo_checks::FloorContext {
+                stage: crate::repo_checks::FloorStage::Creator,
+                ..Default::default()
+            },
+            &[],
+        );
+        ctx.floor_overrides = vec![with(other_checks)];
+        assert!(lift_and_reverify(&ctx, "override-reuse", 5, 2, &emit).is_err());
+        assert_eq!(
+            ran(&events.borrow()),
+            3,
+            "a different check set re-runs the checks"
+        );
+
+        // The exact key: stood on — no checks, nothing verified, the reuse said.
+        ctx.floor_overrides = vec![with(key.clone())];
+        let c = lift_and_reverify(&ctx, "override-reuse", 5, 3, &emit)
+            .expect("the overridden floor clears the same tree");
+        assert!(c.checks.is_none(), "no checks ran");
+        assert_eq!(ran(&events.borrow()), 3, "nothing re-ran");
+        assert!(
+            c.verified_tree.is_none(),
+            "an overridden tree is never recorded as verified"
+        );
+        assert_eq!(c.verified_base.as_deref(), Some(tip.as_str()));
+        let note = c.reused.expect("the reuse is said");
+        assert!(
+            note.starts_with("checks reused from deliver: same tree"),
+            "{note}"
+        );
+        assert!(note.contains("floor overridden by operator"), "{note}");
+
+        // The tree changes after the override (an edit): re-verified, and refused again.
+        std::fs::write(wt.join("src/after.ts"), "export const after = 1;\n").unwrap();
+        let again = lift_and_reverify(&ctx, "override-reuse", 5, 4, &emit)
+            .err()
+            .expect("a changed tree is re-verified");
+        assert!(again.contains("FAILED"), "{again}");
+        assert_eq!(
+            ran(&events.borrow()),
+            4,
+            "the changed tree re-ran the checks"
+        );
+        let rekeyed = again.checks.and_then(|r| r.key).expect("keyed anew");
+        assert_ne!(
+            rekeyed.tree, key.tree,
+            "a new override would be needed on the new tree"
+        );
+    }
+
     /// Copilot on #433 (fifth pass): the lift identifies the run by its BRANCH, not the commit.
     /// A worktree switched to another branch (or detached) at a commit behind the tip must be
     /// refused before anything is lifted or reset — else `reset --soft <tip>` would move that
@@ -2216,7 +2572,7 @@ mod tests {
         let emit = |_: CoreEvent| {};
         let c = lift_and_reverify(&ctx, "verified-match", 5, 0, &emit).expect("cleared");
         assert!(c.checks.is_none(), "no checks ran on the verified tree");
-        assert_eq!(c.verified_tree, verified);
+        assert_eq!(c.verified_tree.as_deref(), Some(verified.as_str()));
         assert_eq!(
             c.verified_base.as_deref(),
             Some(run_git(&wt, &["rev-parse", "origin/main"]).as_str())
