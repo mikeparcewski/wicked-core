@@ -113,6 +113,7 @@ mod review_context;
 #[allow(dead_code)]
 mod review_scale;
 mod scope;
+mod seat_bench;
 mod seat_credentials;
 mod seat_gateway;
 mod seat_login;

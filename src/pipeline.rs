@@ -1125,18 +1125,19 @@ pub(crate) fn apply_and_finish_unit(
     // judge, the failover ladder and the triage judge all skip it. `judge_refusals` carries every
     // refusal with its cause; `judge_auth_refusals` (authentication only) is read too, for a
     // payload from a serializer without the newer field.
-    let mut judge_benches: Vec<(String, String)> = evidence
+    let mut judge_benches: Vec<(String, String, Option<i64>)> = evidence
         .judge_refusals
         .iter()
-        .map(|r| (r.seat.clone(), r.reason.clone()))
+        .map(|r| (r.seat.clone(), r.reason.clone(), r.reset_at))
         .collect();
     for seat in &evidence.judge_auth_refusals {
-        if !judge_benches.iter().any(|(s, _)| s == seat) {
+        if !judge_benches.iter().any(|(s, _, _)| s == seat) {
             judge_benches.push((
                 seat.clone(),
                 wicked_council::types::SeatFailureReason::NotLoggedIn
                     .as_str()
                     .to_string(),
+                None,
             ));
         }
     }
@@ -1149,7 +1150,7 @@ pub(crate) fn apply_and_finish_unit(
             let units = crate::domain::session_units(&*store, session_id).unwrap_or_default();
             let mut changed = false;
             let mut newly_benched: Vec<CoreEvent> = Vec::new();
-            for (seat, token) in judge_benches {
+            for (seat, token, reset_at) in judge_benches {
                 let why = match wicked_council::types::SeatFailureReason::from_token(&token) {
                     Some(reason) => crate::domain::transcript_bench_reason(
                         reason,
@@ -1165,6 +1166,9 @@ pub(crate) fn apply_and_finish_unit(
                     );
                     continue;
                 };
+                // (PRODUCT-WORKS J4) A quota bench lifts at the provider's reset time when the
+                // refusal stated one; `bench_seat` stamps the backoff otherwise.
+                let quota = crate::seat_bench::quota_class(&why);
                 if crate::domain::bench_seat(
                     &mut session.benched_seats,
                     crate::domain::BenchedSeat {
@@ -1172,9 +1176,14 @@ pub(crate) fn apply_and_finish_unit(
                         reason: why.clone(),
                         source: "judge".to_string(),
                         governed_only: false,
+                        benched_until: reset_at.filter(|_| quota),
+                        strikes: u32::from(quota),
+                        replaced: None,
                     },
                 ) {
                     changed = true;
+                    let benched_until_ms =
+                        crate::seat_bench::until_of(&session.benched_seats, &seat);
                     // The bench on the wire, once (see `CoreEvent::SeatBenched`) — emitted only
                     // after the session write below, so no frame claims a bench the store lacks.
                     newly_benched.push(CoreEvent::SeatBenched {
@@ -1183,6 +1192,7 @@ pub(crate) fn apply_and_finish_unit(
                         cli: seat,
                         reason: why,
                         source: "judge".to_string(),
+                        benched_until_ms,
                     });
                 }
             }
@@ -4890,11 +4900,13 @@ mod judge_bench_tests {
                 crate::workflow::JudgeRefusal {
                     seat: "j".into(),
                     reason: "quota_exhausted".into(),
+                    reset_at: None,
                 },
                 // The same seat again (a second judge rotation): already benched, so no frame.
                 crate::workflow::JudgeRefusal {
                     seat: "j".into(),
                     reason: "not_logged_in".into(),
+                    reset_at: None,
                 },
             ],
             ..Default::default()

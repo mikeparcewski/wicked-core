@@ -803,10 +803,6 @@ pub(crate) fn run_unit_and_judge(
     Option<crate::validator::AgentVerdict>,
     crate::workflow::UnitEvidence,
 ) {
-    // (C5) The judge is an ungoverned engine call: a seat benched for governed work only (the
-    // host-floor bench) still judges.
-    let bench = &crate::domain::ungoverned_bench(bench);
-    let benched: Vec<String> = bench.iter().map(|b| b.cli.clone()).collect();
     // (operator ruling 2026-10-14) The fallback judge seats, read from the registry per call —
     // only for a run the caller knows (its roster): the bus worker knows neither roster nor
     // bench, and its judge is the evaluator daemon's.
@@ -815,6 +811,10 @@ pub(crate) fn run_unit_and_judge(
     } else {
         full_registry()
     };
+    // (C5) The judge is an ungoverned engine call: a seat benched for governed work only (the
+    // host-floor bench) still judges.
+    let bench = &crate::domain::ungoverned_bench(bench);
+    let benched: Vec<String> = bench.iter().map(|b| b.cli.clone()).collect();
     let pool = judge_fallback_pool(&registry);
     run_unit_and_judge_on(
         runner,
@@ -830,10 +830,69 @@ pub(crate) fn run_unit_and_judge(
             bench,
             work_authors,
             author_binaries,
+            // (PRODUCT-WORKS J4) Re-probe the run's due quota benches before the judge reads them.
+            reprobe: !run_roster.is_empty(),
         },
         exec_bus,
         team,
     )
+}
+
+/// (PRODUCT-WORKS J4) Re-probe every seat of `bench` whose QUOTA bench has fallen due at `now`
+/// ([`crate::seat_bench::due_for_reprobe`]) with one cheap call ([`crate::validator::reprobe_seat`])
+/// on its `registry` record, and return the bench as it stands after them (a seat that answered
+/// is dropped; one that did not is re-benched for longer) with the outcomes, for the actor to fold
+/// ([`crate::workflow::UnitEvidence::bench_reprobes`]). A due seat with no registry record cannot be
+/// asked and stays benched. Nothing is due: the bench comes back unchanged and nothing runs.
+pub(crate) fn reprobe_due_benches(
+    runner: &dyn StepRunner,
+    registry: &[crate::AgenticCli],
+    bench: &[crate::domain::BenchedSeat],
+    now: i64,
+    emit_delta: &DeltaSink,
+) -> (
+    Vec<crate::domain::BenchedSeat>,
+    Vec<crate::seat_bench::BenchReprobe>,
+) {
+    let mut after = bench.to_vec();
+    let reprobes: Vec<crate::seat_bench::BenchReprobe> = bench
+        .iter()
+        .filter(|b| crate::seat_bench::due_for_reprobe(b, now))
+        .filter_map(|b| {
+            let key = crate::team::runner::seat_key(&b.cli);
+            let seat = registry
+                .iter()
+                .find(|c| c.key == b.cli)
+                .or_else(|| registry.iter().find(|c| c.key == key))?;
+            let answer = crate::validator::reprobe_seat(&b.cli, seat, runner);
+            let r = crate::seat_bench::reprobe_outcome(
+                b,
+                answer.as_deref().map_err(String::as_str),
+                now,
+            );
+            engine_note(
+                emit_delta,
+                &match r.benched_until {
+                    None => format!(
+                        "seat {} answered its re-probe after its quota bench ({}): back on the \
+                         run's roster",
+                        b.cli, b.reason
+                    ),
+                    Some(until) => format!(
+                        "seat {} did not answer its re-probe after its quota bench ({}): benched \
+                         again until {} (strike {})",
+                        b.cli,
+                        b.reason,
+                        crate::seat_bench::iso(until),
+                        r.strikes
+                    ),
+                },
+            );
+            Some(r)
+        })
+        .collect();
+    crate::seat_bench::apply_reprobes(&mut after, &reprobes);
+    (after, reprobes)
 }
 
 /// (core#782) The unit a floor fix's seat runs: the operator's note as the whole task, on
@@ -1083,6 +1142,44 @@ fn run_unit_and_judge_with_launches(
             bench,
             work_authors,
             author_binaries,
+            reprobe: false,
+        },
+        None,
+        None,
+    )
+}
+
+/// (PRODUCT-WORKS J4) The production judge path with the re-probe armed: what [`run_unit_and_judge`]
+/// does, over a fabricated `roster` (the registry the due seats are looked up in).
+#[cfg(test)]
+fn run_unit_and_judge_reprobing(
+    runner: &Arc<dyn StepRunner>,
+    input: &StepInput,
+    roster: &[crate::AgenticCli],
+    run_roster: &[String],
+    bench: &[crate::domain::BenchedSeat],
+) -> (
+    StepOutput,
+    Option<crate::validator::AgentVerdict>,
+    crate::workflow::UnitEvidence,
+) {
+    let bench = &crate::domain::ungoverned_bench(bench);
+    let benched: Vec<String> = bench.iter().map(|b| b.cli.clone()).collect();
+    run_unit_and_judge_on(
+        runner,
+        input,
+        None,
+        &|_| {},
+        roster,
+        run_roster,
+        &benched,
+        JudgeFallbackCtx {
+            pool: &[],
+            registry: roster,
+            bench,
+            work_authors: &[],
+            author_binaries: Some(&[]),
+            reprobe: true,
         },
         None,
         None,
@@ -1258,7 +1355,12 @@ pub(crate) fn rejudge_seats(
     registry: &[crate::AgenticCli],
 ) -> (Vec<String>, Vec<crate::MissingJudgeSeat>) {
     use crate::team::runner::seat_key;
-    let bench = crate::domain::ungoverned_bench(bench);
+    // (PRODUCT-WORKS J4) A seat whose QUOTA bench has fallen due is a candidate: the re-judge's
+    // attempt re-probes it before its judge reads the bench, and seats it when it answers.
+    let bench = crate::domain::ungoverned_bench(&crate::seat_bench::without_due(
+        bench,
+        crate::seat_bench::now_ms(),
+    ));
     let benched: Vec<String> = bench.iter().map(|b| b.cli.clone()).collect();
     let pinned = unit.validator.as_ref().is_some_and(|v| v.approved);
     let work_author = unit
@@ -1499,6 +1601,11 @@ pub(crate) struct JudgeFallbackCtx<'a> {
     /// The binaries those authors actually ran ([`crate::pipeline::work_author_binaries`]); `None`
     /// when one cannot be established — then no fallback judge is seated.
     pub author_binaries: Option<&'a [String]>,
+    /// (PRODUCT-WORKS J4) Re-probe the seats of `bench` whose QUOTA bench has fallen due, against
+    /// `registry`, right before the judge reads the bench: after the unit's own work, so a bench
+    /// that fell due while the worker ran is asked too ([`reprobe_due_benches`]). The outcomes ride
+    /// [`crate::workflow::UnitEvidence::bench_reprobes`]. `false` (the default): no probe.
+    pub reprobe: bool,
 }
 
 /// (codex r1 on the fallback) The parties a FALLBACK judge must be distinct from: the judge's own
@@ -2405,6 +2512,31 @@ fn run_unit_and_judge_on(
         }
         Some(v)
     };
+    // (PRODUCT-WORKS J4) A seat whose QUOTA bench has fallen due answers one cheap call first, now
+    // (after the unit's own work, before the judge reads the bench): back on the roster when it
+    // answers, benched again for longer when it does not. A gate whose only distinct judge was
+    // benched for quota then picks the returned seat.
+    let (bench_now, bench_reprobes) = if fallback.reprobe {
+        reprobe_due_benches(
+            &**runner,
+            fallback.registry,
+            fallback.bench,
+            crate::seat_bench::now_ms(),
+            emit_delta,
+        )
+    } else {
+        (fallback.bench.to_vec(), Vec::new())
+    };
+    let benched_now: Vec<String> = benched
+        .iter()
+        .filter(|k| bench_now.iter().any(|b| &b.cli == *k) || !fallback.reprobe)
+        .cloned()
+        .collect();
+    let benched: &[String] = &benched_now;
+    let fallback = JudgeFallbackCtx {
+        bench: &bench_now,
+        ..fallback
+    };
     let pool = judge_pool(roster, run_roster);
     // (core#772) The same pool BEFORE the run's bench: a judge seat benched earlier in this run
     // (a quota / sign-in refusal while judging) must not turn "no distinct judge" into an
@@ -2481,9 +2613,17 @@ fn run_unit_and_judge_on(
                          run's bench (F-7R2-006 / review RT-1 / F-7R3-001)",
                         verb, input.unit.ord, token
                     );
+                    // (PRODUCT-WORKS J4) A quota refusal that states when the provider resets
+                    // lifts the bench then, instead of after the backoff.
+                    let reset_at = (token == SeatFailureReason::QuotaExhausted.as_str())
+                        .then(|| {
+                            crate::seat_bench::provider_reset_at(out, crate::seat_bench::now_ms())
+                        })
+                        .flatten();
                     v.push(crate::workflow::JudgeRefusal {
                         seat: seat.clone(),
                         reason: token.to_string(),
+                        reset_at,
                     });
                 }
             }
@@ -3337,6 +3477,7 @@ fn run_unit_and_judge_on(
         judge_refusals,
         team: team_snapshot,
         qe_review,
+        bench_reprobes,
     };
     (output, agent_verdict, evidence)
 }
@@ -5442,15 +5583,23 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let bench = vec![crate::domain::BenchedSeat {
+        // (PRODUCT-WORKS J4) A quota bench that is not due yet keeps the seat out.
+        let mut bench = vec![crate::domain::BenchedSeat {
             cli: "opencode".into(),
             reason: "quota_exhausted (no success in the run)".into(),
             source: "judge".into(),
             governed_only: false,
+            benched_until: Some(crate::seat_bench::now_ms() + 60 * 60 * 1000),
+            strikes: 1,
+            replaced: None,
         }];
         let (eligible, missing) =
             rejudge_seats(&unit, &roster, &run, &bench, &[], Some(&[]), &[], &roster);
         assert_eq!(eligible, ["pi"]);
+        // …and once it is due, the seat is a candidate: the re-judge's attempt re-probes it.
+        bench[0].benched_until = Some(crate::seat_bench::now_ms() - 1);
+        let (due, _) = rejudge_seats(&unit, &roster, &run, &bench, &[], Some(&[]), &[], &roster);
+        assert_eq!(due, ["pi", "opencode"]);
         let why = |k: &str| {
             missing
                 .iter()
@@ -5508,6 +5657,9 @@ mod tests {
                 reason: "signed out".into(),
                 source: "judge".into(),
                 governed_only: false,
+                benched_until: None,
+                strikes: 0,
+                replaced: None,
             })
             .collect();
         let (unknown, _) = rejudge_seats(
@@ -6687,6 +6839,283 @@ mod tests {
     /// configured (never a registry seat the launcher never seated), skips the bench, and a judge
     /// seat that refuses with an authentication failure is reported for the bench — so the next
     /// unit never re-tries it.
+    /// (PRODUCT-WORKS J4) The rig's copilot was benched for quota (429) and never re-checked, so
+    /// every later review had no distinct judge and the operator judged instead. A due quota bench
+    /// is re-probed right before the judge reads the bench: a seat that answers judges this very
+    /// gate; one that refuses again is re-benched with the next backoff and the gate still has no
+    /// judge; one that says anything but READY did not come back.
+    #[test]
+    fn a_due_quota_bench_is_reprobed_and_the_gate_that_had_no_judge_picks_the_returned_seat() {
+        use std::process::Command;
+        use std::sync::Mutex;
+        const MIN: i64 = 60 * 1000;
+        struct Seats {
+            /// What a seat says to its re-probe.
+            answer: Mutex<String>,
+            /// How long the unit's own work takes (a bench can fall due meanwhile).
+            work_ms: Mutex<u64>,
+            calls: Mutex<Vec<String>>,
+        }
+        impl StepRunner for Seats {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let mut out = StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "did".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                };
+                let seat = input.unit.assigned_cli.clone().unwrap_or_default();
+                let call = if input.unit.id == crate::validator::REPROBE_UNIT {
+                    "reprobe"
+                } else {
+                    input.unit.session_id.as_str()
+                };
+                match call {
+                    "reprobe" => {
+                        assert!(
+                            input.workdir.is_none()
+                                && input.governance.is_none()
+                                && crate::execute_wrapped::is_engine_internal(&input.unit),
+                            "the re-probe is the judge's ungoverned one-shot: no workdir, and one \
+                             of the engine's own sessions (it follows the seat floor)"
+                        );
+                        self.calls.lock().unwrap().push(format!("probe:{seat}"));
+                        out.output = self.answer.lock().unwrap().clone();
+                    }
+                    "validator" => {
+                        self.calls.lock().unwrap().push(format!("judge:{seat}"));
+                        out.output = "PASS\nfine\nPASS".into();
+                    }
+                    _ => {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            *self.work_ms.lock().unwrap(),
+                        ));
+                        if let Some(wd) = &input.workdir {
+                            std::fs::write(wd.join("note.txt"), "changed\n").unwrap();
+                        }
+                    }
+                }
+                out
+            }
+        }
+        fn sh(cwd: &std::path::Path, args: &[&str]) {
+            // spawn-audit: test-only — a git fixture building the layout under test.
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+        let base = std::env::temp_dir().join(format!("wicked-core-reprobe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        sh(&repo, &["init", "-q", "."]);
+        sh(&repo, &["config", "user.email", "t@example.invalid"]);
+        sh(&repo, &["config", "user.name", "t"]);
+        sh(&repo, &["config", "commit.gpgsign", "false"]);
+        sh(&repo, &["config", "core.autocrlf", "false"]);
+        std::fs::write(repo.join("README.md"), "base\n").unwrap();
+        sh(&repo, &["add", "-A"]);
+        sh(&repo, &["commit", "-qm", "base"]);
+        let wt = base.join("wt");
+        sh(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "wicked/reprobe",
+            ],
+        );
+        let input_for = |wt: &std::path::Path| {
+            let _ = std::fs::remove_file(wt.join("note.txt"));
+            let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "Add a note");
+            unit.assigned_cli = Some("claude".into());
+            unit.default_floor = true;
+            unit.worktree_baseline = Some(crate::worktree_guard::snapshot(wt, &repo).unwrap());
+            StepInput {
+                run_id: "r".into(),
+                unit_ix: 0,
+                attempt: 0,
+                unit,
+                workflow_id: "wf-r".into(),
+                entity_mode: EntityMode::Isolated,
+                workdir: Some(wt.to_path_buf()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            }
+        };
+        // claude built the work; copilot is the run's only other seat, benched for quota.
+        let registry = [
+            seat("claude", "claude -p {PROMPT}"),
+            seat("copilot", "copilot -p {PROMPT}"),
+        ];
+        let run_roster: Vec<String> = vec!["claude".into(), "copilot".into()];
+        let quota = |cli: &str, until: i64| crate::domain::BenchedSeat {
+            cli: cli.into(),
+            reason: "quota_exhausted (no success in the run)".into(),
+            source: "worker".into(),
+            governed_only: false,
+            benched_until: Some(until),
+            strikes: 1,
+            replaced: None,
+        };
+        let seats = Arc::new(Seats {
+            answer: Mutex::new(
+                "Error: You have exceeded your monthly quota (Request ID: D7DE:0)".into(),
+            ),
+            work_ms: Mutex::new(0),
+            calls: Mutex::new(Vec::new()),
+        });
+        let runner: Arc<dyn StepRunner> = seats.clone();
+        let judge = |bench: &[crate::domain::BenchedSeat], roster: &[String]| {
+            seats.calls.lock().unwrap().clear();
+            let input = input_for(&wt);
+            let (out, verdict, evidence) =
+                run_unit_and_judge_reprobing(&runner, &input, &registry, roster, bench);
+            let mut after = bench.to_vec();
+            crate::seat_bench::apply_reprobes(&mut after, &evidence.bench_reprobes);
+            (out, verdict, evidence, after)
+        };
+
+        // 1. Not due yet: no probe runs, and the gate has no judge (the seat failure the operator
+        //    used to answer by judging the work himself).
+        let not_due = quota("copilot", crate::seat_bench::now_ms() + 30 * MIN);
+        let (_, v, ev, after) = judge(std::slice::from_ref(&not_due), &run_roster);
+        assert!(ev.bench_reprobes.is_empty() && after == vec![not_due.clone()]);
+        let v = v.expect("a seat-failure verdict");
+        assert!(
+            !v.pass && v.judge_cli.is_none() && v.seat_failure.is_some(),
+            "{v:?}"
+        );
+        assert!(
+            !seats
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.contains("copilot")),
+            "a bench that is not due is never probed or drawn"
+        );
+
+        // 2. Due, and the re-probe is refused again: re-benched with the next backoff (30 min),
+        //    still no judge.
+        let due = quota("copilot", crate::seat_bench::now_ms() - 1);
+        let t0 = crate::seat_bench::now_ms();
+        let (_, v, ev, after) = judge(std::slice::from_ref(&due), &run_roster);
+        assert_eq!(
+            *seats.calls.lock().unwrap(),
+            vec!["probe:copilot".to_string()]
+        );
+        let r = &ev.bench_reprobes[0];
+        assert!(
+            !r.returned && r.prior_strikes == 1 && r.strikes == 2,
+            "{r:?}"
+        );
+        let until = r.benched_until.expect("re-benched");
+        assert!(until >= t0 + 30 * MIN && until <= crate::seat_bench::now_ms() + 30 * MIN);
+        assert_eq!((after[0].strikes, after[0].benched_until), (2, Some(until)));
+        assert!(v.expect("seat failure").judge_cli.is_none());
+
+        // 3. Anything but the word is not an answer: "not ready" (exit 0) stays benched.
+        *seats.answer.lock().unwrap() = "not ready".into();
+        let (_, _, ev, _) = judge(std::slice::from_ref(&due), &run_roster);
+        assert!(!ev.bench_reprobes[0].returned, "{:?}", ev.bench_reprobes);
+
+        // 4. Due, and the seat answers: back on the roster, and THIS gate's judge is copilot.
+        *seats.answer.lock().unwrap() = "**READY.**".into();
+        let (out, v, ev, after) = judge(std::slice::from_ref(&due), &run_roster);
+        assert_eq!(out.status, StepStatus::Ok);
+        assert!(
+            after.is_empty(),
+            "the returned seat is no longer benched: {after:?}"
+        );
+        assert!(ev.bench_reprobes[0].returned);
+        let v = v.expect("a judge ran");
+        assert!(v.pass, "{v:?}");
+        assert_eq!(
+            v.judge_cli.as_deref(),
+            Some("copilot"),
+            "the returned seat judges"
+        );
+        assert_eq!(
+            *seats.calls.lock().unwrap(),
+            vec!["probe:copilot".to_string(), "judge:copilot".to_string()],
+            "probed once, then seated as the judge"
+        );
+
+        // 5. A bench that falls due WHILE the unit's own work runs is probed before the judge
+        //    reads the bench, not left out until the next unit.
+        *seats.work_ms.lock().unwrap() = 1_500;
+        let soon = quota("copilot", crate::seat_bench::now_ms() + 700);
+        let (_, v, ev, _) = judge(std::slice::from_ref(&soon), &run_roster);
+        assert!(
+            ev.bench_reprobes.first().is_some_and(|r| r.returned),
+            "{ev:?}"
+        );
+        assert_eq!(
+            v.expect("a judge ran").judge_cli.as_deref(),
+            Some("copilot")
+        );
+        *seats.work_ms.lock().unwrap() = 0;
+
+        // 6. An instance bench probes THAT instance (its own configuration home), not the
+        //    registry record's primary key.
+        let roster2: Vec<String> = vec!["claude".into(), "copilot#2".into()];
+        let instance = quota("copilot#2", crate::seat_bench::now_ms() - 1);
+        let (_, _, ev, _) = judge(std::slice::from_ref(&instance), &roster2);
+        assert_eq!(ev.bench_reprobes[0].seat, "copilot#2");
+        assert!(
+            seats.calls.lock().unwrap().first().map(String::as_str) == Some("probe:copilot#2"),
+            "{:?}",
+            seats.calls.lock().unwrap()
+        );
+
+        // 7. The re-judge readiness counts a due seat as a candidate (its attempt re-probes it),
+        //    and not one that is still out.
+        let mut cursor = crate::domain::WorkUnit::pending("r:u1", "r", 1, "Add a note");
+        cursor.assigned_cli = Some("claude".into());
+        let (eligible, _) = rejudge_seats(
+            &cursor,
+            &registry,
+            &run_roster,
+            std::slice::from_ref(&due),
+            &[],
+            Some(&[]),
+            &[],
+            &registry,
+        );
+        assert_eq!(eligible, vec!["copilot".to_string()]);
+        let (eligible, _) = rejudge_seats(
+            &cursor,
+            &registry,
+            &run_roster,
+            std::slice::from_ref(&not_due),
+            &[],
+            Some(&[]),
+            &[],
+            &registry,
+        );
+        assert!(
+            eligible.is_empty(),
+            "a bench that is not due keeps the seat out"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn the_default_judge_uses_the_run_roster_minus_the_bench_and_reports_auth_refusals() {
         use crate::workflow::{StepOutput, StepRunner};
@@ -6856,10 +7285,12 @@ mod tests {
                 crate::workflow::JudgeRefusal {
                     seat: "dead".to_string(),
                     reason: "not_logged_in".to_string(),
+                    reset_at: None,
                 },
                 crate::workflow::JudgeRefusal {
                     seat: "quota".to_string(),
                     reason: "quota_exhausted".to_string(),
+                    reset_at: None,
                 },
             ]
         );
@@ -7912,6 +8343,9 @@ mod judge_fallback_tests {
             reason: crate::distribute::CODEX_WORKTREE_BENCH.into(),
             source: "launcher".into(),
             governed_only: false,
+            benched_until: None,
+            strikes: 0,
+            replaced: None,
         }]
     }
 
@@ -8115,6 +8549,9 @@ mod judge_fallback_tests {
             reason: crate::distribute::HOST_FLOOR_BENCH.into(),
             source: "launcher".into(),
             governed_only: true,
+            benched_until: None,
+            strikes: 0,
+            replaced: None,
         }];
         // Routing reads the bench: opencode is never handed governed work.
         let reg = registry();
@@ -8151,6 +8588,9 @@ mod judge_fallback_tests {
                 reason: "not_logged_in".into(),
                 source: "judge".into(),
                 governed_only: false,
+                benched_until: None,
+                strikes: 0,
+                replaced: None,
             }
         ));
         assert_eq!(every_call.len(), 1);
@@ -8194,6 +8634,9 @@ mod judge_fallback_tests {
             reason: "not_logged_in".into(),
             source: "judge".into(),
             governed_only: false,
+            benched_until: None,
+            strikes: 0,
+            replaced: None,
         });
         let (_, v, _) = run_unit_and_judge_with_fallback(
             &runner,
@@ -8262,6 +8705,7 @@ mod judge_fallback_tests {
             vec![crate::workflow::JudgeRefusal {
                 seat: "agy".into(),
                 reason: "not_logged_in".into(),
+                reset_at: None,
             }]
         );
         let _ = std::fs::remove_dir_all(&dir);

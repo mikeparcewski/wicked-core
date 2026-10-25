@@ -2479,6 +2479,57 @@ fn agent_validate_in(
 /// The `StepInput` every validator-judge call uses. Extracted so the rotation and the single-runner
 /// fallback cannot drift apart — notably `governance: None`, without which the engine's own judge
 /// would self-govern against an empty scope.
+/// (PRODUCT-WORKS J4) The unit id of a re-probe ([`reprobe_seat`]).
+pub(crate) const REPROBE_UNIT: &str = "seat-reprobe";
+
+/// (PRODUCT-WORKS J4) What a seat whose quota bench fell due is asked before it is seated again: one
+/// word, no tools, no files.
+pub(crate) const REPROBE_PROMPT: &str = "Readiness check from the wicked engine. Do not run any \
+     tool or command, and do not read or write any file. Reply with the single word READY and \
+     nothing else.";
+
+/// (PRODUCT-WORKS J4) Re-probe `seat`: one cheap call on the judge's own carrier
+/// ([`build_validator_input`]: ungoverned, no workdir; the judge's `validator` session, so the
+/// runner treats it as one of the engine's own one-shot calls and it follows the seat floor exactly
+/// as a judge does — `execute_wrapped::is_engine_internal`), asking for one word
+/// ([`REPROBE_PROMPT`]). Its unit id is [`REPROBE_UNIT`]. `Ok(answer)` when the seat ran and answered `READY`; `Err(output)` —
+/// what it said, for the provider's reset time — when it refused (quota, sign-in), failed, timed
+/// out, or answered anything else.
+pub(crate) fn reprobe_seat(
+    key: &str,
+    seat: &AgenticCli,
+    runner: &dyn StepRunner,
+) -> Result<String, String> {
+    // The judge's run id too: its one-shot scratch (the container seat home) is removed by the
+    // runner only for the engine's own prefixes (`execute_wrapped::ONE_SHOT_RUN_PREFIXES`).
+    let run_id = validator_run_id();
+    let mut unit = WorkUnit::pending(REPROBE_UNIT, "validator", 1, REPROBE_PROMPT);
+    // The BENCHED key, not the registry record's: an instance (`claude#2`) runs under its own
+    // configuration home, so its own sign-in and quota are what is asked.
+    unit.assigned_cli = Some(key.to_string());
+    unit.assigned_invocation = Some(seat.headless_invocation.clone());
+    let out = runner.run_unit(&build_validator_input(&run_id, unit));
+    runner.on_run_complete(&run_id);
+    let text = out.output.trim();
+    let exited_nonzero = crate::execute_wrapped::wrapped_exit_code(text).is_some_and(|c| c != 0);
+    let refused =
+        wicked_council::types::SeatFailureReason::classify_refusal(text, exited_nonzero).is_some();
+    // The whole answer is the word (any case, any punctuation or markup around it: `READY.`,
+    // `**Ready**`). "not ready", an error that mentions readiness or the prompt echoed back is not.
+    let ready = text
+        .chars()
+        .filter(char::is_ascii_alphabetic)
+        .collect::<String>()
+        .eq_ignore_ascii_case("ready");
+    if out.status == StepStatus::Ok && !exited_nonzero && !refused && ready {
+        Ok(text.to_string())
+    } else if text.is_empty() {
+        Err(format!("{:?} with no output", out.status))
+    } else {
+        Err(text.to_string())
+    }
+}
+
 fn build_validator_input(run_id: &str, unit: WorkUnit) -> StepInput {
     StepInput {
         run_id: run_id.to_string(),

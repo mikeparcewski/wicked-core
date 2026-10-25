@@ -389,6 +389,9 @@ pub(crate) fn host_floor_benched_with(
             reason: HOST_FLOOR_BENCH.to_string(),
             source: "launcher".to_string(),
             governed_only: true,
+            benched_until: None,
+            strikes: 0,
+            replaced: None,
         })
         .collect()
 }
@@ -424,24 +427,39 @@ pub(crate) fn worktree_benched_with(
             reason: CODEX_WORKTREE_BENCH.to_string(),
             source: "launcher".to_string(),
             governed_only: false,
+            benched_until: None,
+            strikes: 0,
+            replaced: None,
         })
         .collect()
 }
 
 /// (F-7R2-006) The launcher-declared bench: every seat whose roster record says
-/// `health.usable == false`, with the launcher's reason.
+/// `health.usable == false`, with the launcher's reason. (PRODUCT-WORKS J4) A quota-class one (crew's
+/// `recent quota_exhausted`) takes the first backoff from the launch ([`crate::seat_bench::stamp`]):
+/// the launcher just kept the seat out on its own clock, so the run re-probes it 15 minutes in rather
+/// than at once.
 pub(crate) fn launcher_benched(clis: &[AgenticCli]) -> Vec<BenchedSeat> {
+    let now = crate::seat_bench::now_ms();
     clis.iter()
         .filter_map(|c| {
             let h = c.health.as_ref()?;
-            (!h.usable).then(|| BenchedSeat {
-                cli: c.key.clone(),
-                reason: h
-                    .reason
-                    .clone()
-                    .unwrap_or_else(|| "unusable (launcher health probe)".to_string()),
-                source: "launcher".to_string(),
-                governed_only: false,
+            (!h.usable).then(|| {
+                crate::seat_bench::stamp(
+                    BenchedSeat {
+                        cli: c.key.clone(),
+                        reason: h
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "unusable (launcher health probe)".to_string()),
+                        source: "launcher".to_string(),
+                        governed_only: false,
+                        benched_until: None,
+                        strikes: 0,
+                        replaced: None,
+                    },
+                    now,
+                )
             })
         })
         .collect()
@@ -2020,6 +2038,9 @@ mod tests {
             reason: "not_logged_in".into(),
             source: "ballot".into(),
             governed_only: false,
+            benched_until: None,
+            strikes: 0,
+            replaced: None,
         };
         let dists = distribute_units_against_benched(
             &[tool_unit(1, "index")],
@@ -2389,6 +2410,9 @@ mod tests {
             reason: "auth_refusal (worker transcript)".to_string(),
             source: "worker".to_string(),
             governed_only: false,
+            benched_until: None,
+            strikes: 0,
+            replaced: None,
         };
         let err = distribute_units_against_benched(
             &build_and_review(),
@@ -3365,6 +3389,9 @@ mod tests {
             reason: "not_logged_in".into(),
             source: "worker".into(),
             governed_only: false,
+            benched_until: None,
+            strikes: 0,
+            replaced: None,
         }];
         let p = refill_pool(&u, &clis, &bench, Some("claude")).unwrap();
         assert_eq!(p.monitors, ["codex"], "{p:?}");
