@@ -43,12 +43,14 @@ pub struct GuideCheck {
     pub name: String,
     #[serde(default = "dot")]
     pub cwd: String,
-    #[serde(default)]
+    // (J4) Every defaulted field is skipped when empty: `floor probe` writes the guide back, and a
+    // field the author left out must stay out (`failedExit: []` is not schema-valid — minItems 1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stage: Vec<String>,
     /// The exact argv: exclusion happens only for a floor check whose argv equals it.
     pub run: Vec<String>,
     /// Exit codes that mean "tests failed" (any other non-zero exit: a crash, could not run).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed_exit: Vec<i32>,
     /// How a test check's results are read; a gate check (no `list`) has none.
     #[serde(default, skip_serializing_if = "Results::is_unset")]
@@ -68,9 +70,9 @@ pub struct GuideCheck {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<RunPiece>,
     /// Globs: a head file the change touched that matches one disables exclusion for this check.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invalidated_by: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Probes::is_unset")]
     pub probes: Probes,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified: Option<Verified>,
@@ -126,9 +128,9 @@ pub struct How {
 pub struct Parser {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub section: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<Block>,
 }
 
@@ -180,6 +182,12 @@ pub struct Probes {
     /// both runs clean (a deselect that breaks with two ids, a summary cut at a wrapped line).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutation2: Option<Mutation>,
+}
+
+impl Probes {
+    fn is_unset(&self) -> bool {
+        self.mutation.is_none() && self.mutation2.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1036,6 +1044,44 @@ mod tests {
             "deselect": {"append": ["--", "--not={id}", "--exact"]},
         }))
         .unwrap()
+    }
+
+    /// (J4) `floor probe` writes the guide back through this type: a field the author left out
+    /// stays out. A gate with no `failedExit`, `stage`, `invalidatedBy` or `probes` came back as
+    /// `failedExit: []` (refused by the schema's minItems 1), `stage: []`, `invalidatedBy: []` and
+    /// `probes: {}`, and a parser with `blocks` only gained `failed: []`.
+    #[test]
+    fn a_guide_written_back_keeps_the_fields_it_left_out_out() {
+        let raw = serde_json::json!({"version": 1, "derivedFrom": ["ci.yml"], "checks": [
+            {"name": "lint", "cwd": ".", "run": ["make", "lint"]},
+            {"name": "t", "cwd": ".", "run": ["r"], "failedExit": [1],
+             "results": {"kind": "text"},
+             "parser": {"blocks": [{"start": "^s$", "item": "^(?P<id>x)$", "end": "^e$"}]},
+             "list": {"run": ["r", "l"], "item": "^(?P<id>\\S+)$"}}
+        ]})
+        .to_string();
+        let back: serde_json::Value =
+            serde_json::to_value(parse(&raw).expect("parses")).expect("serializes");
+        let gate = back["checks"][0].as_object().expect("an object");
+        for absent in [
+            "failedExit",
+            "stage",
+            "invalidatedBy",
+            "probes",
+            "results",
+            "parser",
+        ] {
+            assert!(!gate.contains_key(absent), "{absent} was added: {gate:?}");
+        }
+        let test = &back["checks"][1];
+        assert_eq!(test["failedExit"], serde_json::json!([1]));
+        assert!(test["parser"].get("failed").is_none(), "{}", test["parser"]);
+        assert!(test.get("probes").is_none() && test.get("invalidatedBy").is_none());
+        // …and what was written parses again to the same guide.
+        assert_eq!(
+            parse(&back.to_string()).expect("re-parses"),
+            parse(&raw).unwrap()
+        );
     }
 
     /// A guide is checked on load: an empty `run`, an unknown `stage`, or a test check with no
