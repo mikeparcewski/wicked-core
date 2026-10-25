@@ -26,11 +26,12 @@
 //! * `Cargo.toml` → `cargo fmt --all --check` (formatting checked first, before tests), then
 //!   `cargo test`.
 //!
-//! Each command's exit code, duration and the TAIL of its stdout/stderr are captured as a
-//! [`CheckRun`] and attached to the gate: the fold persists the [`RepoChecksReport`] on the unit,
-//! emits `repoChecksEvaluated`, and DENIES the unit when any check REGRESSES (exits non-zero on
-//! the run's tree while the run base passes it), times out, or cannot be spawned (fail-closed — a
-//! check that cannot run has re-derived nothing). Checks stop at the first denying failure: the
+//! Each command's exit code and duration are captured as a [`CheckRun`], and both of its streams
+//! are stored whole, content-addressed, in the run's log store ([`crate::floor_log`]); the run is
+//! attached to the gate: the fold persists the [`RepoChecksReport`] on the unit, emits
+//! `repoChecksEvaluated` (each check with its [`CheckDecision`]), and DENIES the unit when any
+//! check's decision is not a pass, times out, or cannot be spawned (fail-closed — a check that
+//! cannot run has re-derived nothing). Checks stop at the first denying failure: the
 //! evidence of the failure is what the gate needs, and a failing typecheck makes the suite behind
 //! it moot.
 //!
@@ -54,35 +55,40 @@
 //! every check (`outcome`) and denies a timeout under its own source (`repo_checks_timeout`) so the
 //! gate can offer extend / targeted / accept instead of retry-the-same-tree.
 //!
-//! BASELINE-DIFF (F-RC2-009): a check the SANDBOX fails may fail the same way on the run base —
-//! on 2026-09-13 the floor reported 27 `cargo test` failures on a change whose 27 tests pass on the
-//! base in a normal shell. So when a check fails on the run's tree and the run knows its base
-//! commit, the engine exports that base commit into the checks' scratch (`git checkout-index`
-//! through the PINNED git dir — no nested worktree), runs the same check there once per run
-//! (cached by base sha + check name; the export itself is removed as soon as its result is
-//! cached, so a HEAD check that globs from the worktree root never sweeps it up), and compares
-//! the two runs' failure identifiers (streamed
-//! off the runner's output — `test x ... FAILED`, ` FAIL  file > name`, `path(l,c): error TS…`,
-//! `FAILED tests/x.py::y`, `--- FAIL: TestX`, eslint stylish): failures that also fail on the base
-//! — a subset or the identical set — are `pre_existing_in_sandbox` and never deny; only head-only
-//! failures are `regression`s and deny. libtest ids are QUALIFIED by their test binary
-//! (`test t::x [-p b --lib]`, from cargo's per-binary `to rerun pass` line — core#481), so the
-//! same test name red in crate A on the base cannot mask a regression in crate B; the
-//! auto-detected `cargo test` runs `--no-fail-fast` for the same reason. Positive evidence of the
-//! environment is its own class (core#546): failures whose captured output carries a
-//! nested-sandbox launcher signature on both trees are `env_cannot_run` (never deny; the count is
-//! on the gate's `floorNote` — external CI is the test gate for them), and a head-only failure
-//! with the signature still denies with an advisory naming the likely cause. A head-only set of
-//! at most [`MAX_FLAKE_RERUN`] libtest or vitest ids, read on an oversubscribed host (1-min load
-//! above the CPU count — the evidence it was load), is re-run ONCE, each alone (core#553): a
-//! libtest id by its `--exact` name, a vitest id as its test FILE alone (core#766 — a 5 s
-//! filesystem-walk `it` that hit vitest's default timeout under load 45-80 was denied twice as a
-//! regression; vitest was not re-run because only `cargo test` was). If every one passes it is
-//! `flaky_under_load` (never denies; both attempts and the load at each are on the record), else
-//! a `regression`. A base that cannot be run or compared leaves the
-//! check denying as before (fail-closed). `baseline_diff: false` in the repo config opts out. A
-//! creator transcript that CLAIMS a failure is pre-existing is annotated against that comparison
-//! ([`ClaimCheck`]: `claim_rejected` when the base is green).
+//! ## The decision: the suite's TOC plus exit codes (DES-FLOOR-V2)
+//!
+//! Two inputs are trusted: the BASE tree (the run base, exported through the PINNED git dir — no
+//! nested worktree — run once per run and cached by base sha + check name + argv, the export
+//! removed before the next head run) and the EXIT CODES of the processes the floor launches. The
+//! head's output text is evidence only: twenty-one review rounds of core#1060 each found a new way
+//! for a head's own text to excuse a failure, so no head text decides anything here.
+//!
+//! * The head check runs unchanged. Exit 0 is a `pass`; a signal, or (for a check of a usable
+//!   build guide) an exit outside its `failedExit`, is `could_not_run`.
+//! * Otherwise the base runs the same argv. A green base makes the failure a `new_failure`. A red
+//!   base, for a check of the base's build guide ([`crate::floor_guide`], DES-BUILD-GUIDE) whose
+//!   probes passed, is listed by the guide's `list` piece; its failing tests are read from the
+//!   BASE results, kept only when the base list names them, and each is confirmed by its exit
+//!   code run `alone` on the base.
+//! * When exclusion is precise — each kept test unique in the base list (across every qualifier
+//!   unless `alone` and `deselect` name it), at most once in the head's, under the same qualifier,
+//!   and the head's own list with them deselected listing exactly the rest — the head runs once
+//!   more with them `deselect`ed. Exit 0 is `pass_excluded` with the names listed; non-zero is a
+//!   `new_failure`. Anything else, a check with no usable guide included, is
+//!   `base_red_unseparated`: escalated with both logs, the operator's floor override the path
+//!   through.
+//! * A deciding run that fails on an oversubscribed host (1-min load above the CPU count) is
+//!   re-run ONCE with the same argv after waiting, bounded, for headroom (Bazel's
+//!   `flaky_test_attempts=2`): exit 0 is `passed on retry (flaky)`, a second failure is
+//!   `flaky_twice` and denies. Both attempts are on the record.
+//!
+//! Head failure ids are still read off the output to ANNOTATE the report (`failureIds`,
+//! `regressions`); an annotation never changes an outcome. The install and the formatter are never
+//! compared with the base (a formatting diff is deterministic, core#551). `baseline_diff: false`
+//! in the repo config opts out, and a base that cannot be run leaves the check denying
+//! (fail-closed). A creator transcript that CLAIMS a failure is pre-existing is annotated against
+//! the decision ([`ClaimCheck`]: `claim_rejected` when the base is green or the failure outlives
+//! the exclusion).
 //!
 //! ## Per-repo configuration: `.wicked/checks.json`
 //!
@@ -98,10 +104,11 @@
 //! substituting `{files}` (the paths the change touched relative to the base commit, one argv
 //! element each) and `{base}` (the base commit id) so a runner's own change-aware mode can be used
 //! (`vitest run --changed {base}`, `jest --changedSince {base}`, `cargo test -p <crate>`).
-//! A repo that configures NO test command gets one derived from the touched files at the
-//! creator floor (core#482, [`derive_targeted`]): `cargo test -p <owning crates>`, or
-//! `vitest related --run <files>` for a plain `vitest` test script; the verify floor keeps the
-//! full suite, so an unconfigured repo pays for one full run per governed run, not three.
+//! A repo that configures NO test command gets the AFFECTED set (core#482, DES-FLOOR-V2 §5,
+//! [`derive_targeted`]): `cargo test -p a -p b …` for the packages owning a touched file, or
+//! `vitest related --run <files>` for a plain `vitest` test script. A repo whose base carries a
+//! build guide runs the guide's checks instead, narrowed only by their `affected` piece. At the creator floor only: the verify floor runs
+//! the full suite, as does the PR's CI on every OS.
 //!
 //! ## Load-aware bound
 //!
@@ -114,7 +121,7 @@
 //!
 //! A `test` script is arbitrary code the repository chose. It runs the way the engine runs an
 //! ungoverned worker: inside the OS write boundary the worker sandbox provides
-//! ([`crate::validator::detect_worker_sandbox`] — macOS `sandbox-exec`, Linux `bwrap`; writes
+//! ([`crate::validator::detect_floor_sandbox`] — macOS `sandbox-exec`, Linux `bwrap`; writes
 //! confined to the worktree, the curated secret directories unreadable, network open because
 //! installs need it), with an ISOLATED `HOME` and package caches in the floor's CHECK SCRATCH
 //! (`HOME`, `npm_config_cache`, `CARGO_HOME`, `CARGO_TARGET_DIR`, `XDG_*` — see "Where the check
@@ -231,6 +238,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use wicked_apps_core::spawn::HardenedCommand;
 
+use crate::floor_guide::{GuideCheck, GuideStatus, TestId};
 use crate::validator::WorkerSandbox;
 
 /// The criterion this floor asserts — phrased as the property, because it is what an operator
@@ -277,35 +285,15 @@ pub const REGRESSION: &str = "regression";
 pub const PRE_EXISTING_IN_SANDBOX: &str = "pre_existing_in_sandbox";
 /// Retired (core#481): equal base and head failure sets used to be called a floor-environment
 /// mismatch, an inference the comparison cannot establish (any genuinely red base yields the same
-/// signal). The floor no longer produces it — equal sets are [`PRE_EXISTING_IN_SANDBOX`] and the
-/// positive-evidence environment case is [`ENV_CANNOT_RUN`]. Kept so a stored record still reads
-/// as non-denying.
+/// signal). The floor no longer produces it. Kept so a stored record still reads as non-denying.
 pub const FLOOR_ENV_MISMATCH: &str = "floor_env_mismatch";
-/// (core#546) Every head failure is a test the floor's host CANNOT run — its captured output
-/// carries a nested-sandbox launcher signature ([`LAUNCHER_SIGNATURES`]) on BOTH trees. Positive
-/// evidence of the environment, never denies, and the count is on the card: external CI is the
-/// test gate for those ids.
+/// Retired (DES-FLOOR-V2): core#546's nested-sandbox env class read the head's captured output.
+/// The floor no longer produces it; kept so a stored record still reads as non-denying.
 pub const ENV_CANNOT_RUN: &str = "env_cannot_run";
-/// (core#553) Every head-only failure (at most [`MAX_FLAKE_RERUN`]) of a floor that ran on an
-/// OVERSUBSCRIBED host (1-min load above the CPU count) PASSED when re-run once, alone, in the
-/// same worktree: a host-load flake, not a regression — never denies, named on the gate's
-/// `floorNote`; both attempts (and the load at each) are on the record (`reruns`).
+/// (DES-FLOOR-V2) The deciding run failed on an OVERSUBSCRIBED host (1-min load above the CPU
+/// count) and passed its identical retry: `passed on retry (flaky)` — never denies, named on the
+/// gate's `floorNote`; both attempts are on the record (`reruns`, `decision.logRefs`).
 pub const FLAKY_UNDER_LOAD: &str = "flaky_under_load";
-/// The largest head-only failure set the floor re-runs in isolation before calling it a
-/// regression (core#553). Larger sets are regressions as before.
-pub const MAX_FLAKE_RERUN: usize = 2;
-/// Both base and head fail with NO parseable failure identifiers (unknown runner output format,
-/// e.g. node:test without a TAP-aware parser). Cannot determine if pre-existing or a regression —
-/// fail-closed: always denies (#538).
-pub const UNCLASSIFIED_RED_BASE: &str = "unclassified_red_base";
-/// (core#789/#790) The most environment signals ([`CheckRun::env_signals`]) one check records;
-/// a scan that hit the cap is marked [`SIGNALS_TRUNCATED`] and the re-run rules that COUNT
-/// signals do not apply (fail-closed).
-pub const MAX_ENV_SIGNALS: usize = 200;
-/// The marker a capped signal list ends with.
-pub const SIGNALS_TRUNCATED: &str = "truncated";
-/// (core#790) The most test files a load-class re-run runs (in one serial invocation).
-pub const MAX_LOAD_RERUN_FILES: usize = 100;
 
 /// Claim verdicts on the wire (`ClaimCheck::verdict`).
 pub const CLAIM_REJECTED: &str = "claim_rejected";
@@ -483,45 +471,46 @@ pub struct CheckRun {
     /// How the bound was derived, for the operator: `1200s × 2.40 (1-min load 33.6 / 14 cpus)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_note: Option<String>,
-    /// Failure identifiers streamed off the runner's output (`test a::b ... FAILED`, ` FAIL
-    /// file > name`, `path: error TS1234: …`, …) — what the baseline diff compares. Empty when the
-    /// runner's format is not one the scanner knows (the diff then compares exit codes).
+    /// Failure identifiers the runner printed (`test a::b ... FAILED`, ` FAIL file > name`,
+    /// `path: error TS1234: …`, …) — an ANNOTATION for the reader (DES-FLOOR-V2): no outcome
+    /// reads them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failure_ids: Vec<String>,
-    /// `regression` | `pre_existing_in_sandbox` | `floor_env_mismatch` — set when the check failed
-    /// AND the same check was run on the base ([`Self::base`]); `None` when it passed, timed out,
-    /// could not run, or no base comparison was possible (the check then denies as before).
+    /// The compatible token of [`Self::decision`] for readers of the older field: `regression`
+    /// (`new_failure` against a base, `flaky_twice`), `pre_existing_in_sandbox` (`pass_excluded`),
+    /// `flaky_under_load` (passed on its identical retry), [`BASE_RED_UNSEPARATED`]; `None` when it
+    /// passed first time, did not finish, could not run, or no base was compared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub classification: Option<String>,
-    /// Head failures that ALSO fail on the base (never this change's doing).
+    /// The base's failing tests the head's excluded run deselected (`decision.excluded`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pre_existing: Vec<String>,
-    /// Head failures ABSENT on the base — the regressions that deny.
+    /// The head's annotated failure ids that were not excluded (annotation only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub regressions: Vec<String>,
     /// The same check run on the run base, when the floor ran it (see [`BaseRun`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<Box<BaseRun>>,
-    /// (core#546) Failing ids whose captured output carries a nested-sandbox launcher signature —
-    /// tests this host cannot run under the floor, whatever the change.
+    /// DEPRECATED (DES-FLOOR-V2): the nested-sandbox env class read head text and is gone. Kept so
+    /// a stored record and the wire's `envCannotRun` read as before; always empty now.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_cannot_run: Vec<String>,
-    /// (core#553) The isolated re-runs of a small head-only failure set, one per id, in order.
+    /// The further runs the decision made, in order: the excluded run (the base's failing tests
+    /// deselected), then the identical retry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reruns: Vec<CheckRun>,
-    /// (core#789/#790) Environment signals the scan read off the check's own output, at most
-    /// [`MAX_ENV_SIGNALS`], each prefixed by its class: `load: <line>` (a vitest pool worker that
-    /// never started — `Failed to start forks worker` / `Timeout waiting for worker to respond` —
-    /// or a per-test `Test timed out in Nms`), `errors: <N>` (vitest's own error count —
-    /// `Errors  N errors` / `Vitest caught N unhandled errors`) and `crash: <line>` (the tool itself died opening a dependency file —
-    /// `EPERM`/`EACCES` under `node_modules`). Evidence for the re-run rules, never a verdict.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub env_signals: Vec<String>,
     /// (core#781) The host's load band as the check started: `floor(1-min load / cpus)` — 0 has
     /// headroom, N is N× oversubscribed. `None` where the load is unknown. A head failure compared
     /// against a CACHED base from another band says so ([`cached_base_load_note`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_band: Option<u32>,
+    /// (DES-FLOOR-V2) The floor's decision on this check; `None` on a nested run (a re-run, a base
+    /// run) and on a stored record from before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<CheckDecision>,
+    /// This process's two streams in the run's log store ([`crate::floor_log`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logs: Vec<crate::floor_log::LogRef>,
 }
 
 impl CheckRun {
@@ -543,11 +532,13 @@ impl CheckRun {
         }
     }
 
-    /// Does this check deny the unit? A failure the base shares (`pre_existing_in_sandbox`), a
-    /// test the host cannot run on either tree (`env_cannot_run`) and a head-only failure that
-    /// passed its isolated re-run (`flaky_under_load`) do NOT (nor a stored `floor_env_mismatch`);
-    /// a regression, a timeout, a spawn failure and an un-compared failure do.
+    /// Does this check deny the unit? Its decision says: only `pass` and `pass_excluded` do not.
+    /// A stored record without one reads as before (a shared, env-class or flaky failure did not
+    /// deny).
     pub fn denies(&self) -> bool {
+        if let Some(o) = outcome_of(self) {
+            return !matches!(o, OUTCOME_PASS | OUTCOME_PASS_EXCLUDED);
+        }
         !self.passed()
             && !matches!(
                 self.classification.as_deref(),
@@ -558,16 +549,9 @@ impl CheckRun {
             )
     }
 
-    /// (core#789) Is this check's environment class a tool CRASH (`crash: …` entries) rather than
-    /// a nested-sandbox launcher signature?
-    pub fn env_crash(&self) -> bool {
-        self.env_cannot_run
-            .first()
-            .is_some_and(|e| e.starts_with("crash: "))
-            || self
-                .regressions
-                .first()
-                .is_some_and(|e| e.starts_with("crash: "))
+    /// Did a run the decision needed hit its bound (this one, or the excluded run / retry)?
+    pub fn did_not_finish(&self) -> bool {
+        self.timed_out || outcome_of(self) == Some(OUTCOME_TIMED_OUT)
     }
 
     /// One line an operator can read: `test: exit 1 (154.9s)`.
@@ -587,21 +571,18 @@ impl CheckRun {
                     .unwrap_or_default()
             );
         }
-        let cls = match self.classification.as_deref() {
-            Some(ENV_CANNOT_RUN) if !self.passed() && self.env_crash() => format!(
-                " [env_cannot_run: the tool crashed on head, base and a re-run — {}]",
-                self.env_cannot_run.join(", ")
-            ),
-            Some(ENV_CANNOT_RUN) if !self.passed() => format!(
-                " [env_cannot_run: {} tests cannot run under the floor's nested sandbox on this \
-                 host]",
-                self.env_cannot_run.len()
-            ),
-            Some(FLAKY_UNDER_LOAD) if !self.passed() => format!(
-                " [flaky_under_load: {} passed re-run alone]",
-                self.regressions.join(", ")
-            ),
-            Some(c) if !self.passed() => format!(" [{c}]"),
+        // `[<classification>: <outcome or reason>]` — the compatible token first, so a reader of
+        // the older words (`[regression]`) still finds them.
+        let cls = match (&self.decision, self.classification.as_deref()) {
+            (Some(d), c) if !self.passed() => {
+                let token = c.unwrap_or(d.outcome.as_str());
+                match (&d.reason, token == d.outcome) {
+                    (Some(r), _) => format!(" [{token}: {r}]"),
+                    (None, true) => format!(" [{token}]"),
+                    (None, false) => format!(" [{token}: {}]", d.outcome),
+                }
+            }
+            (None, Some(c)) if !self.passed() => format!(" [{c}]"),
             _ => String::new(),
         };
         match self.exit_code {
@@ -734,7 +715,7 @@ impl RepoChecksReport {
     /// Did the floor stop on a check that hit its bound? A timed-out floor did not FINISH — it is
     /// not "checks failed" (core#469), and the fold denies it under [`DENIAL_SOURCE_TIMEOUT`].
     pub fn timed_out(&self) -> bool {
-        self.checks.iter().any(|c| c.timed_out && c.denies())
+        self.checks.iter().any(|c| c.did_not_finish() && c.denies())
     }
 
     /// The floor's outcome on the wire: `passed` | `failed` | `timed_out` | `not_run` (no OS
@@ -760,23 +741,10 @@ impl RepoChecksReport {
         }
     }
 
-    /// Any check whose base and head failures were identical — the floor's environment is the
-    /// likely cause (F-RC2-009). Surfaced so the studio can show the recorded env beside it.
-    pub fn env_mismatch(&self) -> bool {
-        self.checks.iter().any(|c| {
-            matches!(
-                c.classification.as_deref(),
-                Some(FLOOR_ENV_MISMATCH) | Some(ENV_CANNOT_RUN)
-            )
-        })
-    }
-
-    /// (core#546) What the floor could not test on this host, for the gate's `floorNote`: the
-    /// failing ids that carry a nested-sandbox launcher signature. A NON-denying set ("the floor
-    /// could not run N tests; external CI is the test gate for them"), and — the advisory — a
-    /// head-only failure with the same signature, which still denies (fail-closed) but names the
-    /// likely cause so a `request_changes` can too; plus (core#553) each `flaky_under_load` check,
-    /// named. `None` when there is nothing of either kind to say.
+    /// What the floor's decisions say beyond pass/deny, for the gate's `floorNote`: the opted-in
+    /// boundary posture first; then, per check, the base failures it excluded, a pass on the
+    /// identical retry, and a base red it could not separate; then the e2e coverage note. `None`
+    /// when there is nothing of either kind to say.
     pub fn classification_note(&self) -> Option<String> {
         let mut notes: Vec<String> = Vec::new();
         // (core#416 item 3b) The boundary posture rides the gate's own note, first: an operator
@@ -789,72 +757,31 @@ impl RepoChecksReport {
             }));
         }
         for c in &self.checks {
-            if c.env_cannot_run.is_empty() {
-                continue;
-            }
-            // (core#789) A tool that crashed opening a dependency file on both trees and again on
-            // its re-run: the check did not run here; external CI is its gate.
-            if c.env_crash() {
-                notes.push(format!(
-                    "`{}`: the tool crashed with an environment error on the head, the base and a \
-                     re-run ({}) — env_cannot_run, not denied and not skipping the remaining \
-                     checks; external CI is the gate for it",
-                    c.name,
-                    c.env_cannot_run.join(", ")
-                ));
-                continue;
-            }
-            let head_only: Vec<&String> = c
-                .env_cannot_run
-                .iter()
-                .filter(|id| c.regressions.contains(id))
-                .collect();
-            let shared = c.env_cannot_run.len() - head_only.len();
-            if head_only.is_empty() || !c.denies() {
-                notes.push(format!(
-                    "`{}`: the floor could not run {} test{} on this host (the nested OS sandbox \
-                     refused to arm inside the floor's own); external CI is the test gate for \
-                     them",
-                    c.name,
-                    c.env_cannot_run.len(),
-                    if c.env_cannot_run.len() == 1 { "" } else { "s" }
-                ));
-            } else {
-                notes.push(format!(
-                    "`{}`: head-only failure{} {} carr{} the nested-sandbox launcher signature — \
-                     the same env class as {shared} pre-existing id{}; likely the floor's nested \
-                     sandbox, not the change (still denied, fail-closed)",
-                    c.name,
-                    if head_only.len() == 1 { "" } else { "s" },
-                    head_only
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    if head_only.len() == 1 { "ies" } else { "y" },
-                    if shared == 1 { "" } else { "s" }
-                ));
-            }
-        }
-        // (core#553) A failure that passed alone is not a denial, but it is not silent either: an
-        // order-dependent failure the change introduced reads the same way.
-        for c in &self.checks {
-            if c.classification.as_deref() == Some(FLAKY_UNDER_LOAD) && c.env_crash() {
-                notes.push(format!(
-                    "`{}`: crashed with an environment error on head and base ({}) and passed \
-                     its re-run — classed flaky_under_load, not denied",
-                    c.name,
-                    c.regressions.join(", ")
-                ));
-            } else if c.classification.as_deref() == Some(FLAKY_UNDER_LOAD) {
-                notes.push(format!(
-                    "`{}`: {} failed in the full run on an oversubscribed host and passed \
-                     re-run alone — classed flaky_under_load (host load), not denied; an \
-                     order-dependent failure reads the same way",
-                    c.name,
-                    c.regressions.join(", ")
-                ));
-            }
+            let Some(d) = &c.decision else { continue };
+            let said = match d.outcome.as_str() {
+                OUTCOME_PASS_EXCLUDED => format!(
+                    "passed with {} (the base fails them too; the head passed with them \
+                     deselected){}",
+                    d.reason
+                        .as_deref()
+                        .unwrap_or("pre-existing failures excluded"),
+                    if d.flaky {
+                        " — the excluded run failed on an oversubscribed host first; an \
+                         order-dependent failure reads the same way"
+                    } else {
+                        ""
+                    }
+                ),
+                OUTCOME_PASS if d.flaky => "failed on an oversubscribed host and passed on its \
+                                            identical retry (flaky) — not denied; an \
+                                            order-dependent failure reads the same way"
+                    .to_string(),
+                OUTCOME_BASE_RED_UNSEPARATED | OUTCOME_FLAKY_TWICE => {
+                    d.reason.clone().unwrap_or_else(|| d.outcome.clone())
+                }
+                _ => continue,
+            };
+            notes.push(format!("`{}`: {said}", c.name));
         }
         // (core#432 F-3R2-023) An end-to-end change the floor did not run, on a pass too.
         if let Some(n) = &self.coverage_note {
@@ -896,7 +823,7 @@ impl RepoChecksReport {
                 };
                 // (core#469) A TIMEOUT is a check that did not finish, not one that failed: say
                 // so, and say what the gate can do about it.
-                if c.timed_out {
+                if c.did_not_finish() {
                     return format!(
                         "{line}. This check did not FINISH — the change is unverified by it, not \
                          refuted: extend the bound (`timeout_s` in `{CONFIG_PATH}`), declare a \
@@ -904,54 +831,58 @@ impl RepoChecksReport {
                          targeted as this unit's floor at the gate"
                     );
                 }
-                // (F-RC2-009) What the baseline diff established about this failure.
-                let base_note = match c.base.as_deref() {
-                    Some(BaseRun {
-                        run: Some(b), head, ..
-                    }) if b.passed() => format!(
-                        " — REGRESSION: the run base {} passes this check{}",
-                        &head[..head.len().min(10)],
-                        if c.regressions.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" (head-only failures: {})", c.regressions.join(", "))
-                        }
-                    ),
-                    // (#538) Both sides red with no parseable failure identifiers — unknown runner
-                    // output format; cannot determine pre-existing vs regression. Fail closed.
-                    Some(BaseRun {
-                        run: Some(_), head, ..
-                    }) if c.classification.as_deref() == Some(UNCLASSIFIED_RED_BASE) => format!(
-                        " — the run base {} also fails this check; no failure identifiers could \
-                         be extracted from either run's output (unknown runner output format — \
-                         add a parser or use a runner the floor knows, e.g. node:test in TAP \
-                         mode). Cannot determine if pre-existing or a regression \
-                         (unclassified_red_base — fail-closed)",
-                        &head[..head.len().min(10)]
-                    ),
-                    Some(BaseRun {
-                        run: Some(_), head, ..
-                    }) => format!(
-                        " — the run base {} fails this check too, but not identically: \
-                         head-only failures {}{}",
-                        &head[..head.len().min(10)],
-                        if c.regressions.is_empty() {
-                            "could not be told apart (failure identifiers were extracted on one \
-                             side only)"
-                                .to_string()
-                        } else {
-                            c.regressions.join(", ")
-                        },
-                        if c.pre_existing.is_empty() {
-                            String::new()
-                        } else {
-                            format!("; also failing on the base: {}", c.pre_existing.join(", "))
-                        }
-                    ),
-                    Some(BaseRun { error: Some(e), .. }) => {
+                // (DES-FLOOR-V2) What the decision established, from exit codes only.
+                let short = |h: &str| h[..h.len().min(10)].to_string();
+                let failed = |d: &CheckDecision| {
+                    matches!(
+                        d.outcome.as_str(),
+                        OUTCOME_NEW_FAILURE | OUTCOME_FLAKY_TWICE
+                    )
+                };
+                let base_note = match (&c.decision, c.base.as_deref()) {
+                    (_, Some(BaseRun { error: Some(e), .. })) => {
                         format!(" — the base could not be compared ({e}); fail-closed")
                     }
+                    (Some(d), Some(b)) if d.outcome == OUTCOME_BASE_RED_UNSEPARATED => format!(
+                        " — the run base {} fails this check too, and its failures cannot be told \
+                         apart from the head's ({}): escalated with both logs — the operator's \
+                         floor override is the path through",
+                        short(&b.head),
+                        d.reason.as_deref().unwrap_or("base red, cannot separate")
+                    ),
+                    (Some(d), Some(b)) if !d.excluded.is_empty() && failed(d) => format!(
+                        " — NEW FAILURE: the head still fails with the base's {} failing test{} \
+                         ({}) deselected{}",
+                        d.excluded.len(),
+                        if d.excluded.len() == 1 { "" } else { "s" },
+                        d.excluded.join(", "),
+                        if b.head.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (base {})", short(&b.head))
+                        }
+                    ),
+                    (Some(d), Some(b))
+                        if failed(d) && b.run.as_ref().is_some_and(CheckRun::passed) =>
+                    {
+                        format!(
+                            " — NEW FAILURE: the run base {} passes this check{}",
+                            short(&b.head),
+                            if c.regressions.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" (the head printed: {})", c.regressions.join(", "))
+                            }
+                        )
+                    }
                     _ => String::new(),
+                };
+                let base_note = match &c.decision {
+                    Some(d) if d.outcome == OUTCOME_FLAKY_TWICE => format!(
+                        "{base_note} — it failed on an oversubscribed host and again on its \
+                         identical retry (flaky_twice)"
+                    ),
+                    _ => base_note,
                 };
                 let line = format!("{line}{base_note}{}", cached_base_load_note(c));
                 // A failed INSTALL is an environmental finding about provisioning the worktree,
@@ -988,7 +919,7 @@ impl RepoChecksReport {
                 self.skipped.join(", ")
             ));
         }
-        // (F-RC2-009) Failures the run base shares are on the record, not in the verdict.
+        // Failures the decision cleared (excluded, or passed on retry) are on the record.
         let tolerated: Vec<String> = self
             .checks
             .iter()
@@ -997,7 +928,7 @@ impl RepoChecksReport {
             .collect();
         if !tolerated.is_empty() {
             s.push_str(&format!(
-                " (failures the run base shares — recorded, not denying: {})",
+                " (failures the floor cleared — recorded, not denying: {})",
                 tolerated.join("; ")
             ));
         }
@@ -1360,7 +1291,7 @@ fn apply(slot: &mut Option<RepoCheck>, r: Resolved, key: &str) {
 /// The paths the unit's change touched relative to the base commit — tracked changes (added,
 /// copied, modified, renamed) plus untracked-not-ignored files, through the PINNED git dir; the
 /// engine scratch is never a touched path. Empty when the run knows no base.
-fn touched_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, String> {
+pub(crate) fn touched_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, String> {
     if let Some((root, dir)) = package_root(worktree, ctx) {
         let root_ctx = FloorContext {
             package_dir: None,
@@ -1372,68 +1303,78 @@ fn touched_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, Str
         return Ok(Vec::new());
     };
     let env: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
-    let tracked = crate::worktree_guard::git_string(
+    // NUL-separated (`-z`): the real names, never quoted, trimmed or split on a newline.
+    let tracked = crate::floor_guide::git_paths(
         worktree,
-        &["diff", "--name-only", "--diff-filter=ACMR", base],
+        &["diff", "--name-only", "-z", "--diff-filter=ACMR", base],
         &env,
     )
     .map_err(|e| format!("the change's touched files could not be listed: {e}"))?;
-    let untracked = crate::worktree_guard::git_string(
+    let untracked = crate::floor_guide::git_paths(
         worktree,
-        &["ls-files", "--others", "--exclude-standard"],
+        &["ls-files", "-z", "--others", "--exclude-standard"],
         &env,
     )
     .map_err(|e| format!("the change's untracked files could not be listed: {e}"))?;
     let scratch_prefix = format!("{}/", crate::worktree_guard::ENGINE_SCRATCH_DIR);
     let mut files: Vec<String> = Vec::new();
-    for line in tracked.lines().chain(untracked.lines()) {
-        let l = line.trim();
-        if l.is_empty() || l.starts_with(&scratch_prefix) || files.iter().any(|f| f == l) {
+    for f in tracked.into_iter().chain(untracked) {
+        if f.starts_with(&scratch_prefix) || files.contains(&f) {
             continue;
         }
-        files.push(l.to_string());
+        files.push(f);
     }
     Ok(files)
 }
 
-/// Did the change delete a tracked file relative to the base — renames counted as a deletion of
-/// the old path (`--no-renames`)? A derived targeted set cannot see what a missing file broke.
-fn deletes_a_file(worktree: &Path, ctx: &FloorContext) -> Result<bool, String> {
-    Ok(!deleted_files(worktree, ctx)?.is_empty())
+/// (DES-BUILD-GUIDE `invalidatedBy`) Every path the change touched: added, modified and untracked
+/// ([`touched_files`]), plus [`removed_files`]: deleted, a rename's old path, and a type change.
+fn changed_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, String> {
+    let mut files = touched_files(worktree, ctx)?;
+    for d in removed_files(worktree, ctx)? {
+        if !files.contains(&d) {
+            files.push(d);
+        }
+    }
+    Ok(files)
 }
 
-/// The tracked paths the change deleted relative to the base (a rename's old path included —
-/// `--no-renames`). Empty when the run knows no base.
-fn deleted_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, String> {
+/// Did the change remove a tracked file relative to the base ([`removed_files`]: a deletion, a
+/// rename's old path, or a type change)? A derived targeted set cannot see what a missing file
+/// broke.
+fn deletes_a_file(worktree: &Path, ctx: &FloorContext) -> Result<bool, String> {
+    Ok(!removed_files(worktree, ctx)?.is_empty())
+}
+
+/// The tracked paths the change removed relative to the base: deleted (a rename's old path
+/// included — `--no-renames`) or whose TYPE changed (`T`: a file replaced by a link, or a link by
+/// a file — what the path was is gone, and it is in no added/modified list). Empty when the run
+/// knows no base.
+fn removed_files(worktree: &Path, ctx: &FloorContext) -> Result<Vec<String>, String> {
     if let Some((root, dir)) = package_root(worktree, ctx) {
         let root_ctx = FloorContext {
             package_dir: None,
             ..ctx.clone()
         };
-        return Ok(package_relative(deleted_files(&root, &root_ctx)?, &dir));
+        return Ok(package_relative(removed_files(&root, &root_ctx)?, &dir));
     }
     let (Some(base), Some(git_dir)) = (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) else {
         return Ok(Vec::new());
     };
     let env: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
-    let deleted = crate::worktree_guard::git_string(
+    crate::floor_guide::git_paths(
         worktree,
         &[
             "diff",
             "--name-only",
+            "-z",
             "--no-renames",
-            "--diff-filter=D",
+            "--diff-filter=DT",
             base,
         ],
         &env,
     )
-    .map_err(|e| format!("the change's deleted files could not be listed: {e}"))?;
-    Ok(deleted
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .collect())
+    .map_err(|e| format!("the change's removed files could not be listed: {e}"))
 }
 
 /// Substitute `{files}` / `{base}` into a targeted command: a standalone `{files}` element expands
@@ -1481,6 +1422,45 @@ pub(crate) fn detect(worktree: &Path) -> Result<Vec<RepoCheck>, String> {
 /// the checks would fail for the wrong reason; always frozen and `--ignore-scripts`). Pure over
 /// the filesystem (one `git diff` when a targeted command asks for `{files}`) — runs nothing.
 pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>, String> {
+    let detected = detect_manifests(worktree, ctx)?;
+    // (DES-BUILD-GUIDE) The base's guide replaces detection only for the directories its checks
+    // cover: a package it does not cover keeps its detected checks (exit codes only). A STALE
+    // guide (a `derivedFrom` file changed) may name outdated commands: there the floor runs the
+    // UNION — the guide's checks and the detected ones (an identical argv in the same directory
+    // once) — more checks, never fewer.
+    Ok(match guide_checks(worktree, ctx)? {
+        Some((mut guided, covered, stale)) => {
+            let same = |a: &RepoCheck, b: &RepoCheck| a.argv == b.argv && a.dir == b.dir;
+            // In a stale union a covered directory's detected `install` runs FIRST — before every
+            // guided check (one that needs the dependencies included); a guided check with the
+            // same argv and dir is that install, run once, there.
+            let mut first: Vec<RepoCheck> = Vec::new();
+            let mut rest: Vec<RepoCheck> = Vec::new();
+            for mut c in detected {
+                if !covered.contains(&c.dir) {
+                    rest.push(c);
+                } else if let Some(why) = stale.as_deref() {
+                    c.source = format!(
+                        "{} — run beside the base's stale build guide ({why})",
+                        c.source
+                    );
+                    if c.name == "install" {
+                        guided.retain(|g| !same(g, &c));
+                        first.push(c);
+                    } else if !guided.iter().any(|g| same(g, &c)) {
+                        // A derived targeted set too: once, by argv and dir.
+                        rest.push(c);
+                    }
+                }
+            }
+            first.into_iter().chain(guided).chain(rest).collect()
+        }
+        None => detected,
+    })
+}
+
+/// The manifests' checks (see [`detect_with`]).
+fn detect_manifests(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>, String> {
     let pkgs = subdir_packages(worktree, ctx)?;
     if pkgs.dirs.is_empty() {
         return detect_package(worktree, ctx);
@@ -1519,7 +1499,11 @@ fn package_root(worktree: &Path, ctx: &FloorContext) -> Option<(PathBuf, String)
 }
 
 /// Repo-relative paths under `dir/`, made relative to it; others dropped.
-fn package_relative(files: Vec<String>, dir: &str) -> Vec<String> {
+pub(crate) fn package_relative(files: Vec<String>, dir: &str) -> Vec<String> {
+    let dir = dir.trim_matches('/');
+    if dir.is_empty() || dir == "." {
+        return files;
+    }
     let prefix = format!("{dir}/");
     files
         .into_iter()
@@ -1633,7 +1617,7 @@ pub(crate) fn subdir_packages(
     ctx: &FloorContext,
 ) -> Result<ChangePackages, String> {
     let mut files = touched_files(worktree, ctx)?;
-    files.extend(deleted_files(worktree, ctx)?);
+    files.extend(removed_files(worktree, ctx)?);
     let mut out = ChangePackages::default();
     for f in &files {
         let mut owner: Option<String> = None;
@@ -1928,6 +1912,44 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
     Ok(out)
 }
 
+/// A base guide's checks for the stage, the directories its checks cover, and why the guide is
+/// stale (`None`: it is not — [`crate::floor_guide::BuildGuide::stale`]).
+type GuidedChecks = (Vec<RepoCheck>, Vec<String>, Option<String>);
+
+/// The `source` of a check the base's build guide declares.
+pub const GUIDE_SOURCE: &str = "the run base's build guide (DES-BUILD-GUIDE)";
+
+/// (DES-BUILD-GUIDE) When the run base carries a build guide, ITS checks for this stage, and the
+/// directories its checks cover (any stage): there they replace detection (only [`CONFIG_PATH`]'s
+/// `timeout_s` still bounds them) — unless the guide is stale, when detection runs beside them. `None` — detection, the fallback — when the base has no guide,
+/// or one that does not parse (each check's `decision.guide` then says why).
+fn guide_checks(worktree: &Path, ctx: &FloorContext) -> Result<Option<GuidedChecks>, String> {
+    let (Some(base), Some(git_dir), None) = (
+        ctx.base_head.as_deref(),
+        ctx.git_dir.as_deref(),
+        ctx.package_dir.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    let Ok(Some(guide)) = crate::floor_guide::load_base(worktree, git_dir, base) else {
+        return Ok(None);
+    };
+    let timeout_s = read_config(worktree)?.and_then(|c| c.timeout_s);
+    let checks = guide
+        .checks_at(ctx.stage.as_wire())
+        .map(|c| RepoCheck {
+            name: c.name.clone(),
+            argv: c.run.clone(),
+            source: GUIDE_SOURCE.into(),
+            timeout_s,
+            dir: c.dir().to_string(),
+        })
+        .collect();
+    let covered = guide.checks.iter().map(|c| c.dir().to_string()).collect();
+    let stale = guide.stale(worktree, git_dir, base, &changed_files(worktree, ctx));
+    Ok(Some((checks, covered, stale)))
+}
+
 /// The derived source string on a [`derive_targeted`] check.
 pub const DERIVED_TARGETED_SOURCE: &str =
     "derived from the touched files (no `.wicked/checks.json` \
@@ -1956,8 +1978,8 @@ fn derive_targeted(
 ) -> Result<Option<RepoCheck>, String> {
     let files = touched_files(worktree, ctx)?;
     if files.is_empty() || deletes_a_file(worktree, ctx)? {
-        // A deleted (or renamed-away) path is not in `files`, and the crate or test it left can
-        // break without being named — never narrow past it.
+        // A deleted, renamed-away or type-changed path is not in `files`, and the crate or test
+        // it left can break without being named — never narrow past it.
         return Ok(None);
     }
     let base_name = |f: &str| f.rsplit('/').next().unwrap_or(f).to_string();
@@ -2211,6 +2233,11 @@ pub(crate) struct CheckScratch {
     /// only under an exclusive lock, so it never deletes the scratch a floor is building into.
     /// `Option` only so [`Drop`] can release it before retiring an orphaned leaf.
     lease: Option<std::fs::File>,
+    /// (DES-FLOOR-V2) The run's log store ([`crate::floor_log::run_dir`]) — outside every write
+    /// root the boundary arms.
+    pub(crate) logs: PathBuf,
+    /// The per-stream byte cap ([`crate::floor_log::MAX_STREAM_BYTES`]).
+    pub(crate) log_cap: u64,
 }
 
 impl Drop for CheckScratch {
@@ -2282,7 +2309,6 @@ const SCRATCH_LEAVES: &[&str] = &[
     "cargo-target/base",
     "xdg-config",
     "xdg-cache",
-    "base-cache",
 ];
 
 /// Bounded attempts at an unused random name under the system temp dir before giving up.
@@ -2418,50 +2444,65 @@ impl CheckScratch {
             }
             lease = take_orphan_free_lease(&root)?;
         }
-        match std::fs::symlink_metadata(&root) {
-            Ok(m) if m.file_type().is_symlink() || !m.is_dir() => {
-                return Err(std::io::Error::new(
+        // The leaf and every scratch directory under it are made through the leaf HELD
+        // (`O_DIRECTORY|O_NOFOLLOW`, then component by component, [`HeldDir`]), never by path:
+        // an earlier floor's repo-controlled check could write the leaf, and a link it left (or a
+        // process it left running swaps in) at the leaf or any directory below must never have
+        // the engine create directories through it (adversarial review on #414, LOW; sweep review
+        // on #1066).
+        // The leaf itself (missing on a run's first floor): its parent is the engine's cache
+        // group, outside every write root; a link already at the leaf's path is refused by the
+        // hold below, never followed.
+        if std::fs::symlink_metadata(&root).is_err() {
+            std::fs::create_dir_all(&root)?;
+        }
+        let held = HeldDir::open(&root).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "`{}` is not a real directory — the checks' scratch is never written \
+                     through a link (refused, never followed): {e}",
+                    root.display()
+                ),
+            )
+        })?;
+        for sub in SCRATCH_LEAVES {
+            held.subdir(sub, true).map_err(|e| {
+                std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "`{}` is not a real directory — the checks' scratch is never written \
-                         through a link (refused, never followed)",
-                        root.display()
+                        "the checks' scratch leaves must be real directories (refused, never \
+                         followed): {e}"
                     ),
-                ))
-            }
-            _ => {}
-        }
-        // The leaves too (adversarial review on #414, LOW): `create_dir_all` would follow a
-        // symlink-to-directory at a leaf — one an earlier floor's repo-controlled check, which can
-        // write the leaf, left behind. Refuse a link at any leaf before creating.
-        for sub in SCRATCH_LEAVES {
-            if let Ok(m) = std::fs::symlink_metadata(root.join(sub)) {
-                if m.file_type().is_symlink() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "`{}` is a symlink — the checks' scratch leaves must be real \
-                             directories (refused, never followed)",
-                            root.join(sub).display()
-                        ),
-                    ));
-                }
-            }
-        }
-        for sub in SCRATCH_LEAVES {
-            std::fs::create_dir_all(root.join(sub))?;
+                )
+            })?;
         }
         // The checks' `TMPDIR` lives OUTSIDE the worktree, short (core#489) — drawn last, so a
         // refusal above leaves nothing behind under the system temp dir.
         let tmp = PrivateTmp::create()?;
+        let logs = crate::floor_log::run_dir(
+            &cache
+                .parent()
+                .unwrap_or(cache)
+                .join(crate::floor_log::LOG_SUBDIR),
+            run_id,
+            worktree,
+        );
         Ok(Self {
             root,
             tmp,
             lease: Some(lease),
+            logs,
+            log_cap: log_cap(),
         })
     }
 
     /// The scratch's leaf directory — the boundary's third write root.
+    /// The checks' private `TMPDIR`.
+    pub(crate) fn tmp_path(&self) -> &Path {
+        self.tmp.path()
+    }
+
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
@@ -2600,7 +2641,7 @@ fn check_cache_cap_bytes() -> u64 {
 }
 
 /// 12 hex of `sha256(bytes)`.
-fn hex12(bytes: &[u8]) -> String {
+pub(crate) fn hex12(bytes: &[u8]) -> String {
     use sha2::Digest;
     let digest = sha2::Sha256::digest(bytes);
     digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
@@ -3001,11 +3042,19 @@ pub fn run_floor_rerun(
     let scratch = match CheckScratch::prepare_for(worktree, ctx.run_id.as_deref()) {
         Ok(s) => s,
         Err(e) => {
-            let sandbox = crate::validator::detect_worker_sandbox(&[worktree.to_path_buf()]);
+            let sandbox = crate::validator::detect_floor_sandbox(&[worktree.to_path_buf()]);
             return scratch_refused(worktree, ctx, &sandbox, &e);
         }
     };
-    let sandbox = crate::validator::detect_worker_sandbox(&[
+    // (round 11) The log store's lifetime is its age, collected best-effort at every floor's start.
+    if let Some(root) = scratch.logs.parent() {
+        crate::floor_log::gc(
+            root,
+            std::time::SystemTime::now(),
+            crate::floor_log::log_cap_bytes(),
+        );
+    }
+    let sandbox = crate::validator::detect_floor_sandbox(&[
         worktree.to_path_buf(),
         scratch.tmp.path().to_path_buf(),
         scratch.root().to_path_buf(),
@@ -3020,6 +3069,14 @@ pub fn run_floor_rerun(
 /// launcher on `PATH` whose probe failed here (bwrap with user namespaces disabled) is no boundary,
 /// so the detection is downgraded and the operator's unsandboxed opt-in applies — exactly what
 /// `hostBoundary().verifyFloor` predicts — instead of bwrap failing every check at run time.
+/// The floor's own sandbox over `write_roots`, armed only when this host's floor probe passes.
+pub(crate) fn floor_sandbox(write_roots: &[PathBuf]) -> WorkerSandbox {
+    arm_probed(
+        crate::validator::detect_floor_sandbox(write_roots),
+        floor_probe(),
+    )
+}
+
 fn arm_probed(
     sandbox: WorkerSandbox,
     probe: Result<&'static str, crate::worker_sandbox::FloorUnarmed>,
@@ -3047,7 +3104,7 @@ pub(crate) fn floor_probe() -> Result<&'static str, crate::worker_sandbox::Floor
         let dir = std::env::temp_dir().join(format!("wicked-floor-probe-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let armed = dir.canonicalize().ok().is_some_and(|d| {
-            let sandbox = crate::validator::detect_worker_sandbox(std::slice::from_ref(&d));
+            let sandbox = crate::validator::detect_floor_sandbox(std::slice::from_ref(&d));
             if sandbox.level != crate::validator::SandboxLevel::Sandboxed
                 || sandbox.wrapper.is_empty()
             {
@@ -3080,7 +3137,23 @@ pub(crate) fn floor_probe() -> Result<&'static str, crate::worker_sandbox::Floor
 pub(crate) fn run_with_sandbox(worktree: &Path, sandbox: WorkerSandbox) -> RepoChecksReport {
     let ctx = FloorContext::default();
     match CheckScratch::prepare(worktree) {
-        Ok(scratch) => run_with_sandbox_ctx(worktree, sandbox, &ctx, scratch, None),
+        Ok(scratch) => {
+            // An armed probe is re-armed over the roots production arms — the worktree, the
+            // private TMPDIR (rustdoc's temp dir lives there) and the scratch leaf; a probe that
+            // did not arm is handed through, so the fail-closed branches stay testable.
+            let sandbox = if sandbox.level == crate::validator::SandboxLevel::Sandboxed
+                && !sandbox.wrapper.is_empty()
+            {
+                crate::validator::detect_floor_sandbox(&[
+                    worktree.to_path_buf(),
+                    scratch.tmp.path().to_path_buf(),
+                    scratch.root().to_path_buf(),
+                ])
+            } else {
+                sandbox
+            };
+            run_with_sandbox_ctx(worktree, sandbox, &ctx, scratch, None)
+        }
         Err(e) => scratch_refused(worktree, &ctx, &sandbox, &e),
     }
 }
@@ -3267,88 +3340,195 @@ pub(crate) fn run_with_sandbox_ctx(
         },
         None => (detected, Vec::new()),
     };
-    let candidates = engine_generated_candidates(worktree, &detected);
-    let env = scratch.env_record(&sandbox_level);
-    // (core#817) Per package: a subdirectory package's own `baseline_diff: false` holds for it.
-    // The root's opt-out covers the whole repo; a package's own opt-out covers the package.
-    let baseline_diff = baseline_diff_enabled(worktree);
-    let baseline_diff_for =
-        |dir: &str| dir.is_empty() || baseline_diff_enabled(&worktree.join(dir));
-    let mut checks = Vec::new();
-    let mut skipped = Vec::new();
-    let mut failed = false;
-    // (F-RC2-009) Never run a HEAD check beside a copy of the base — a crash mid-floor could have
-    // left one; the export lives only between its creation and the caching of its result.
+    // (F-RC2-009) Never run a HEAD process beside a copy of the base — a crash mid-floor could
+    // have left one; the export lives only between its creation and the caching of its result.
     // (core#1050) A base export that cannot be cleared (a linked or non-directory `tmp`, a link
     // at the export path) REFUSES the floor, fail-closed: no check runs, and none may pass beside
     // a scratch the floor could not make safe.
-    let mut scratch_error = remove_base_export(worktree, &scratch)
+    // Held before the first check runs: every later engine read, write or removal in the worktree
+    // goes through it, never by a path a check could have re-pointed ([`HeldDir`]).
+    let held_worktree = HeldDir::open(worktree);
+    let mut scratch_error = held_worktree
+        .as_ref()
+        .map_err(String::clone)
+        .and_then(remove_base_export)
         .err()
         .map(|e| format!("the checks' scratch could not be made safe: {e}"));
+    // (DES-BUILD-GUIDE) The BASE tree's build guide — a head edit to it never applies to its own
+    // run — and the files the change touched (for `invalidatedBy` and `affected`).
+    // Read once per floor run: every check of it decides under the same switch.
+    let exclude = exclusion_enabled();
+    // `removed` (deleted, renamed away, type-changed: git's own D/T list) is read directly, never
+    // inferred from `changed` minus `touched` — a path removed from the index but still on disk
+    // is in both.
+    let (guide, touched, changed, removed) =
+        match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
+            (Some(base), Some(git_dir)) => (
+                crate::floor_guide::load_base(worktree, git_dir, base),
+                touched_files(worktree, ctx).unwrap_or_default(),
+                changed_files(worktree, ctx),
+                removed_files(worktree, ctx),
+            ),
+            _ => (Ok(None), Vec::new(), Ok(Vec::new()), Ok(Vec::new())),
+        };
+    let candidates = engine_generated_candidates(worktree, &detected);
+    let held_head = held_worktree.as_ref().ok();
+    let env = scratch.env_record(&sandbox_level);
+    // (core#817) Per package: a subdirectory package's own `baseline_diff: false` holds for it.
+    // The root's opt-out covers the whole repo; a package's own opt-out covers the package.
+    // Every package's config is read HERE, before the first check runs: no `.wicked/checks.json`
+    // is read from the tree after a command could have rewritten (or re-pointed) it.
+    let baseline_diff = baseline_diff_enabled(worktree);
+    let package_baseline: std::collections::HashMap<&str, bool> = detected
+        .iter()
+        .filter(|c| !c.dir.is_empty())
+        .map(|c| {
+            (
+                c.dir.as_str(),
+                baseline_diff_enabled(&worktree.join(&c.dir)),
+            )
+        })
+        .collect();
+    let baseline_diff_for =
+        |dir: &str| dir.is_empty() || package_baseline.get(dir).copied().unwrap_or(false);
+    // The coverage notes' reads of the tree (the change's files, the packages' manifests) happen
+    // here too, before any check runs.
+    let package_note = package_coverage_note(worktree, ctx, &detected);
+    let e2e_paths = (ctx.stage == FloorStage::Verify)
+        .then(|| e2e_paths(worktree, ctx))
+        .flatten();
+    let mut checks = Vec::new();
+    let mut skipped = Vec::new();
+    let mut failed = false;
     for check in &detected {
         if failed || scratch_error.is_some() {
             skipped.push(check.name.clone());
             continue;
         }
-        let mut run = run_one(worktree, check, &sandbox, &scratch, Tree::Head);
-        // BASELINE-DIFF (F-RC2-009): a FAILURE (not a timeout, not a spawn failure, not the
-        // install — those say nothing about the base) is compared against the run base before it
-        // may deny. No known base ⇒ the failure denies as it always did.
-        // A formatter check is excluded too (core#551): a formatting diff is deterministic and
-        // never environmental, so "the base fails identically" must not excuse it.
-        if !run.passed()
-            && run.spawn_error.is_none()
-            && !run.timed_out
-            && check.name != "install"
-            && !is_formatter_check(&check.name)
-        {
-            match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
+        let present = match &guide {
+            Ok(Some(g)) => g.check_for(&check.argv, &check.dir),
+            _ => None,
+        };
+        let gcheck = guide_for(&guide, check, ctx, worktree, &changed).and_then(|g| {
+            runner_current(worktree, held_head, check, g, &sandbox, &scratch).map(|()| g)
+        });
+        let status = GuideStatus {
+            present: present.is_some(),
+            usable: gcheck.is_ok(),
+            reason: gcheck.as_ref().err().cloned(),
+        };
+        // (DES-BUILD-GUIDE) At the creator, a usable guide's `affected` piece is a fast pre-pass:
+        // its pass decides; its failure runs the check as declared.
+        // A deleted, renamed-away or type-changed file (git's D/T list): what it left behind
+        // cannot be mapped — the full check. A list that cannot be read: the full check too.
+        let deletes = removed.as_ref().map_or(true, |r| !r.is_empty());
+        let affected = gcheck
+            .as_ref()
+            .ok()
+            .filter(|_| ctx.stage == FloorStage::Creator && !touched.is_empty() && !deletes)
+            .and_then(|g| g.affected_argv(&package_relative(touched.clone(), &check.dir)));
+        let mut run = match affected {
+            Some(argv) => {
+                let a = RepoCheck {
+                    argv,
+                    source: format!("`{}`'s affected set (DES-BUILD-GUIDE)", check.name),
+                    ..check.clone()
+                };
+                let r = run_held(worktree, held_head, &a, &sandbox, &scratch, Tree::Head);
+                if r.passed() {
+                    r
+                } else {
+                    run_held(worktree, held_head, check, &sandbox, &scratch, Tree::Head)
+                }
+            }
+            None => run_held(worktree, held_head, check, &sandbox, &scratch, Tree::Head),
+        };
+        // (DES-FLOOR-V2) A check that passed, timed out or could not start decides alone. A
+        // FAILURE is compared with the run base (the install and the formatter never are: they
+        // say nothing about the base, and a formatting diff is deterministic, core#551); the
+        // exit codes of the head's runs decide, the base's TOC-validated failures are the only
+        // ones that may be excluded. No known base ⇒ the failure denies as it always did.
+        if run.passed() || run.timed_out || run.spawn_error.is_some() {
+            decide_alone(&mut run);
+        } else if let Some(why) = crashed(&run, gcheck.as_ref().ok().copied()) {
+            // An exit the guide does not call a test failure (a crash, a build error): the
+            // check could not run, whatever the base does.
+            decide_alone(&mut run);
+            if let Some(d) = run.decision.as_mut() {
+                d.reason = Some(why);
+            }
+        } else {
+            let compare = check.name != "install" && !is_formatter_check(&check.name);
+            // With exclusion off the base runs plainly: no results, no list, no alone runs.
+            let excluding = gcheck.as_ref().ok().copied().filter(|_| exclude);
+            let side = match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
+                _ if !compare => None,
                 (Some(head), _) if !(baseline_diff && baseline_diff_for(&check.dir)) => {
-                    run.base = Some(Box::new(BaseRun {
-                        head: head.to_string(),
-                        cached: false,
-                        run: None,
-                        error: Some(format!(
-                            "baseline diff disabled by `{CONFIG_PATH}` (baseline_diff: false)"
-                        )),
-                    }));
+                    Some(BaseSide {
+                        base: BaseRun {
+                            head: head.to_string(),
+                            cached: false,
+                            run: None,
+                            error: Some(format!(
+                                "baseline diff disabled by `{CONFIG_PATH}` (baseline_diff: false)"
+                            )),
+                        },
+                        toc: None,
+                    })
                 }
                 (Some(head), Some(git_dir)) => {
-                    // This run's cache first; on a miss the base is exported, run, cached, and
-                    // the export removed before the next HEAD check can see it.
-                    let base_run = match BaseTree::cached(&scratch, head, check) {
+                    // This run's cache first; on a miss the base is exported, run (and, red,
+                    // inventoried), cached, and the export removed before the next HEAD run.
+                    Some(match BaseTree::cached(&scratch, head, check, excluding) {
                         Some(cached) => cached,
                         None => {
-                            let base_run = match BaseTree::export(worktree, &scratch, git_dir, head)
-                            {
-                                Ok(t) => t.run_check(check, ctx, &sandbox, &scratch),
-                                Err(e) => BaseRun {
-                                    head: head.to_string(),
-                                    cached: false,
-                                    run: None,
-                                    error: Some(e),
+                            let export = held_worktree
+                                .as_ref()
+                                .map_err(String::clone)
+                                .and_then(|root| BaseTree::export(worktree, root, git_dir, head));
+                            let side = match export {
+                                Ok(t) => t.run_check(check, ctx, &sandbox, &scratch, excluding),
+                                Err(e) => BaseSide {
+                                    base: BaseRun {
+                                        head: head.to_string(),
+                                        cached: false,
+                                        run: None,
+                                        error: Some(e),
+                                    },
+                                    toc: None,
                                 },
                             };
-                            if let Err(e) = remove_base_export(worktree, &scratch) {
+                            let removed = held_worktree
+                                .as_ref()
+                                .map_err(String::clone)
+                                .and_then(remove_base_export);
+                            if let Err(e) = removed {
                                 scratch_error = Some(format!(
                                     "the base export could not be removed before the next \
                                      check: {e}"
                                 ));
                             }
-                            base_run
+                            side
                         }
-                    };
-                    classify(&mut run, base_run);
-                    // (core#789) an identical environment crash, then (core#790) a load-class
-                    // failure whatever the base did, then (core#553) a small head-only set.
-                    if !rerun_env_crash(worktree, check, &mut run, &sandbox, &scratch)
-                        && !rerun_load_class(worktree, check, &mut run, &sandbox, &scratch)
-                    {
-                        rerun_flakes(worktree, check, &mut run, &sandbox, &scratch);
-                    }
+                    })
                 }
-                _ => {}
+                _ => None,
+            };
+            if scratch_error.is_some() {
+                decide_alone(&mut run);
+                run.decision = Some(CheckDecision {
+                    outcome: OUTCOME_COULD_NOT_RUN.to_string(),
+                    ..run.decision.take().expect("set above")
+                });
+            } else {
+                decide(
+                    worktree, held_head, check, &mut run, side, &gcheck, exclude, &sandbox,
+                    &scratch,
+                );
             }
+        }
+        if let Some(d) = run.decision.as_mut() {
+            d.guide = Some(status);
         }
         eprintln!(
             "wicked-core: repo checks floor — `{}` {} in {:.1}s (bound {}s){}",
@@ -3356,8 +3536,7 @@ pub(crate) fn run_with_sandbox_ctx(
             run.outcome(),
             run.duration_ms as f64 / 1000.0,
             run.bound_s,
-            run.classification
-                .as_deref()
+            outcome_of(&run)
                 .map(|c| format!(" — {c}"))
                 .unwrap_or_default()
         );
@@ -3368,19 +3547,16 @@ pub(crate) fn run_with_sandbox_ctx(
     // An engine-written file (absent at detection, present now) is the checks' own side effect —
     // remove it so the guard's final comparison sees the tree the seat left. Never a symlink.
     let mut engine_writes_removed = Vec::new();
-    for rel in candidates {
-        let p = worktree.join(&rel);
-        if let Ok(m) = std::fs::symlink_metadata(&p) {
-            if m.is_file() && std::fs::remove_file(&p).is_ok() {
+    if let Ok(held) = &held_worktree {
+        for rel in candidates {
+            if held.remove_file(&rel) == Ok(true) {
                 engine_writes_removed.push(rel);
             }
         }
     }
     let notes: Vec<String> = [
-        (ctx.stage == FloorStage::Verify)
-            .then(|| e2e_coverage_note(worktree, ctx, &detected, &checks, &waived))
-            .flatten(),
-        package_coverage_note(worktree, ctx, &detected),
+        e2e_paths.and_then(|paths| e2e_coverage_note(paths, &detected, &checks, &waived)),
+        package_note,
     ]
     .into_iter()
     .flatten()
@@ -3458,8 +3634,7 @@ fn is_e2e_path(path: &str) -> bool {
 /// waived, or skipped after an earlier failure. `None` when an end-to-end check ran, nothing e2e
 /// was touched, or the run knows no base.
 fn e2e_coverage_note(
-    worktree: &Path,
-    ctx: &FloorContext,
+    e2e: Vec<String>,
     detected: &[RepoCheck],
     checks: &[CheckRun],
     waived: &[String],
@@ -3472,11 +3647,6 @@ fn e2e_coverage_note(
     {
         return None;
     }
-    let mut paths = touched_files(worktree, ctx).ok()?;
-    paths.extend(deleted_files(worktree, ctx).ok()?);
-    let mut e2e: Vec<String> = paths.into_iter().filter(|p| is_e2e_path(p)).collect();
-    e2e.sort();
-    e2e.dedup();
     if e2e.is_empty() {
         return None;
     }
@@ -3502,6 +3672,17 @@ fn e2e_coverage_note(
             String::new()
         }
     ))
+}
+
+/// The end-to-end files the change touched or removed ([`is_e2e_path`]), sorted; `None` when the
+/// change's files cannot be listed. Read before any check runs.
+fn e2e_paths(worktree: &Path, ctx: &FloorContext) -> Option<Vec<String>> {
+    let mut paths = touched_files(worktree, ctx).ok()?;
+    paths.extend(removed_files(worktree, ctx).ok()?);
+    let mut e2e: Vec<String> = paths.into_iter().filter(|p| is_e2e_path(p)).collect();
+    e2e.sort();
+    e2e.dedup();
+    Some(e2e)
 }
 
 /// Is `name` one of the floor's TEST-set checks (the ones a `targeted` re-run replaces)?
@@ -3603,8 +3784,8 @@ pub(crate) struct FloorCheckout {
     worktree: PathBuf,
     /// Every blob entry written: `(mode, blob id, path)` — what [`Self::hold_to`] re-checks.
     entries: Vec<(String, String, PathBuf)>,
-    /// Every symlink entry's target as written (unix).
-    links: Vec<(PathBuf, Vec<u8>)>,
+    /// `dir`, held before anything ran in it: [`Self::hold_to`] re-reads every entry through it.
+    held: Option<HeldDir>,
 }
 
 impl Drop for FloorCheckout {
@@ -3677,7 +3858,7 @@ pub(crate) fn checkout_guarded_tree(
         git_dir: git_dir.to_path_buf(),
         worktree: worktree.to_path_buf(),
         entries: Vec::new(),
-        links: Vec::new(),
+        held: None,
     };
     // `--no-checkout` (codex r1 on the slice): a checkout runs the repository's `post-checkout`
     // hook and its configured smudge filters OUTSIDE the floor's sandbox. The worktree is made
@@ -3704,8 +3885,12 @@ pub(crate) fn checkout_guarded_tree(
         &env[..1],
     )
     .map_err(|e| format!("the guarded tree {tree} could not be checked out for the floor: {e}"))?;
-    (checkout.entries, checkout.links) = write_tree_blobs(worktree, git_dir, tree, &dir)
+    // Held before anything runs in it; every blob is written through the held fd.
+    let held = HeldDir::open(&dir)
         .map_err(|e| format!("the guarded tree {tree} could not be written for the floor: {e}"))?;
+    checkout.entries = write_tree_blobs(worktree, git_dir, tree, &dir, &held)
+        .map_err(|e| format!("the guarded tree {tree} could not be written for the floor: {e}"))?;
+    checkout.held = Some(held);
     crate::worktree_guard::git(&dir, &["-c", &no_hooks, "read-tree", &commit], &[])
         .map_err(|e| format!("the floor checkout's index could not be set: {e}"))?;
     Ok(checkout)
@@ -3716,13 +3901,13 @@ pub(crate) fn checkout_guarded_tree(
 /// `export-ignore`). Regular files keep their executable bit; a symlink entry becomes a symlink
 /// (unix) or a plain file holding its target; a submodule becomes an empty directory. A path that
 /// is absolute or climbs out of `dir` is refused.
-#[allow(clippy::type_complexity)]
 fn write_tree_blobs(
     worktree: &Path,
     git_dir: &Path,
     tree: &str,
     dir: &Path,
-) -> Result<(Vec<(String, String, PathBuf)>, Vec<(PathBuf, Vec<u8>)>), String> {
+    dest: &HeldDir,
+) -> Result<Vec<(String, String, PathBuf)>, String> {
     use std::io::{BufRead, Read, Write};
     let env: [(&str, &Path); 1] = [("GIT_DIR", git_dir)];
     let listing = crate::worktree_guard::git(worktree, &["ls-tree", "-r", "-z", tree], &env)
@@ -3753,6 +3938,14 @@ fn write_tree_blobs(
     }
     let blobs: Vec<&(String, String, PathBuf)> =
         entries.iter().filter(|(m, _, _)| m != "160000").collect();
+    // An entry's path relative to `dir` (UTF-8: checked above).
+    let rel_of = |path: &Path| -> Result<String, String> {
+        Ok(path
+            .strip_prefix(dir)
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .into_owned())
+    };
     // spawn-audit: hardened — git plumbing reading the run's own object store.
     let mut cat = Command::new("git");
     cat.hardened()
@@ -3773,9 +3966,6 @@ fn write_tree_blobs(
         }
     });
     let mut out = std::io::BufReader::new(child.stdout.take().ok_or("git cat-file has no stdout")?);
-    // (codex r3) A symlink entry's TARGET, as written — what `hold_to` compares it against.
-    #[cfg_attr(not(unix), allow(unused_mut))] // only a unix checkout writes symlinks
-    let mut links: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     for (mode, sha, path) in &blobs {
         let mut header = String::new();
         out.read_line(&mut header).map_err(|e| e.to_string())?;
@@ -3788,52 +3978,25 @@ fn write_tree_blobs(
         out.read_exact(&mut body).map_err(|e| e.to_string())?;
         let mut nl = [0u8; 1];
         out.read_exact(&mut nl).map_err(|e| e.to_string())?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        // Never write through a link: no component under `dir`, nor the entry itself, may be one.
-        let mut at = dir.to_path_buf();
-        for c in path
-            .strip_prefix(dir)
-            .map_err(|e| e.to_string())?
-            .components()
-        {
-            at.push(c);
-            if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
-                return Err(format!("{} is a symlink in the checkout", at.display()));
-            }
-        }
+        // Through the held directory ([`HeldDir`]): missing directories are created, and no
+        // component under `dir`, nor the entry itself, is ever followed as a link — even one a
+        // process still running in the tree swaps in mid-export.
+        let rel = rel_of(path)?;
         match mode.as_str() {
             #[cfg(unix)]
-            "120000" => {
-                use std::os::unix::ffi::OsStrExt;
-                let target = std::ffi::OsStr::from_bytes(&body);
-                std::os::unix::fs::symlink(target, path).map_err(|e| e.to_string())?;
-                links.push((path.clone(), body.clone()));
-            }
-            _ => {
-                std::fs::write(path, &body).map_err(|e| e.to_string())?;
-                #[cfg(unix)]
-                if mode == "100755" {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-                        .map_err(|e| e.to_string())?;
-                }
-            }
+            "120000" => dest.symlink(&rel, &body)?,
+            _ => dest.write_bytes(&rel, &body, mode == "100755")?,
         }
     }
     let _ = feeder.join();
     let _ = child.wait();
     for (_, _, path) in entries.iter().filter(|(m, _, _)| m == "160000") {
-        std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+        dest.subdir(&rel_of(path)?, true)?;
     }
-    Ok((
-        entries
-            .into_iter()
-            .filter(|(m, _, _)| m != "160000")
-            .collect(),
-        links,
-    ))
+    Ok(entries
+        .into_iter()
+        .filter(|(m, _, _)| m != "160000")
+        .collect())
 }
 
 impl FloorCheckout {
@@ -3865,83 +4028,117 @@ impl FloorCheckout {
         });
     }
 
-    /// The tree entries whose content no longer matches the blob written: re-hashed with
-    /// `hash-object --no-filters` (no repository filter runs); a symlink entry must still be a
-    /// symlink. Untracked files a check created are not entries and are not judged — only what
-    /// ships is.
+    /// The tree entries whose content no longer matches the blob written, every entry read
+    /// THROUGH the held checkout ([`HeldDir`]: parents walked through no link, the entry itself
+    /// never followed) — a check that swapped a directory of the tree for a link to an outside
+    /// copy has every entry under it read as changed, never the copy compared. A regular file
+    /// must still be one, with its executable bit, and hold exactly the blob's bytes (read from
+    /// `git cat-file --batch`, no filter runs); a symlink entry must still be a symlink to the
+    /// SAME target. Untracked files a check created are not entries and are not judged — only
+    /// what ships is.
     fn changed_entries(&self) -> Result<Vec<String>, String> {
+        use std::io::{BufRead, Read, Write};
+        let held = self
+            .held
+            .as_ref()
+            .ok_or("the floor checkout was never held")?;
         let rel = |p: &Path| p.strip_prefix(&self.dir).unwrap_or(p).display().to_string();
         let mut changed = Vec::new();
-        let mut files: Vec<&(String, String, PathBuf)> = Vec::new();
-        for e in &self.entries {
-            let (mode, _, path) = e;
-            match std::fs::symlink_metadata(path) {
-                Err(_) => changed.push(rel(path)),
-                Ok(m) if mode == "120000" => {
+        // spawn-audit: hardened — git plumbing reading the run's own object store.
+        let mut cat = Command::new("git");
+        cat.hardened()
+            .args(["cat-file", "--batch"])
+            .current_dir(&self.worktree)
+            .env("GIT_DIR", &self.git_dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut child = cat.spawn().map_err(|e| format!("git cat-file: {e}"))?;
+        let mut stdin = child.stdin.take().ok_or("git cat-file has no stdin")?;
+        let shas: Vec<String> = self.entries.iter().map(|(_, sha, _)| sha.clone()).collect();
+        let feeder = std::thread::spawn(move || {
+            for sha in shas {
+                if writeln!(stdin, "{sha}").is_err() {
+                    break;
+                }
+            }
+        });
+        let mut out =
+            std::io::BufReader::new(child.stdout.take().ok_or("git cat-file has no stdout")?);
+        let mut answer = || -> Result<(), String> {
+            for (mode, sha, path) in &self.entries {
+                let mut header = String::new();
+                out.read_line(&mut header).map_err(|e| e.to_string())?;
+                let size: usize = header
+                    .split_whitespace()
+                    .nth(2)
+                    .and_then(|n| n.parse().ok())
+                    .ok_or_else(|| format!("git cat-file answered {header:?} for {sha}"))?;
+                let mut body = vec![0u8; size];
+                out.read_exact(&mut body).map_err(|e| e.to_string())?;
+                let mut nl = [0u8; 1];
+                out.read_exact(&mut nl).map_err(|e| e.to_string())?;
+                let r = rel(path);
+                let same = if mode == "120000" {
                     // A symlink stays a symlink, to the SAME target (codex r3).
                     #[cfg(unix)]
-                    let same = m.file_type().is_symlink()
-                        && self.links.iter().any(|(p, want)| {
-                            use std::os::unix::ffi::OsStrExt;
-                            p == path
-                                && std::fs::read_link(path)
-                                    .is_ok_and(|t| t.as_os_str().as_bytes() == want.as_slice())
-                        });
+                    let same = held.kind(&r) == Ok(Some(EntryKind::Link))
+                        && held.read_link(&r).is_ok_and(|t| t == body);
+                    // Without symlinks it was written as a regular file holding the target: the
+                    // same file, with the same bytes (codex on #1066).
                     #[cfg(not(unix))]
-                    let same = m.is_file();
-                    if !same {
-                        changed.push(rel(path));
-                    }
-                }
-                Ok(m) if !m.is_file() => changed.push(rel(path)),
-                Ok(m) => {
-                    // The executable bit is part of what ships (codex r3).
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let exec = m.permissions().mode() & 0o100 != 0; // git keys on the OWNER execute bit
-                        if exec != (mode == "100755") {
-                            changed.push(rel(path));
-                            continue;
-                        }
-                    }
-                    let _ = m;
-                    files.push(e);
+                    let same = same_placeholder(held, &r, &body);
+                    same
+                } else {
+                    same_file(held, &r, mode == "100755", &body)
+                };
+                if !same {
+                    changed.push(r);
                 }
             }
-        }
-        // Paths as ARGUMENTS, in chunks (codex r3: a newline in a name splits `--stdin-paths`).
-        for chunk in files.chunks(256) {
-            let mut args: Vec<String> = vec![
-                "hash-object".to_string(),
-                "--no-filters".to_string(),
-                "--".to_string(),
-            ];
-            args.extend(
-                chunk
-                    .iter()
-                    .map(|(_, _, p)| p.to_string_lossy().into_owned()),
-            );
-            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let env: [(&str, &Path); 1] = [("GIT_DIR", self.git_dir.as_path())];
-            let text = crate::worktree_guard::git_string(&self.worktree, &refs, &env)
-                .map_err(|e| e.to_string())?;
-            let shas: Vec<&str> = text.lines().collect();
-            if shas.len() != chunk.len() {
-                return Err(format!(
-                    "git hash-object answered {} of {} paths",
-                    shas.len(),
-                    chunk.len()
-                ));
-            }
-            for ((_, sha, path), now) in chunk.iter().zip(shas) {
-                if sha != now {
-                    changed.push(rel(path));
-                }
-            }
-        }
+            Ok(())
+        };
+        let answered = answer();
+        drop(out);
+        let _ = feeder.join();
+        let _ = child.wait();
+        answered?;
         Ok(changed)
     }
+}
+
+/// A symlink entry materialized where there are no symlinks (non-unix: [`write_tree_blobs`]
+/// writes a regular file holding the link's target): unchanged only while it is still that regular
+/// file with exactly `target` as its content.
+#[cfg(any(not(unix), test))]
+fn same_placeholder(held: &HeldDir, rel: &str, target: &[u8]) -> bool {
+    same_file(held, rel, false, target)
+}
+
+/// Is the entry at `rel` of `held` a regular file (opened through no link) with the executable
+/// bit `exec` (unix; git keys on the OWNER execute bit, codex r3) holding exactly `body`?
+fn same_file(held: &HeldDir, rel: &str, exec: bool, body: &[u8]) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = held.open_read(rel) else {
+        return false;
+    };
+    let Ok(m) = f.metadata() else {
+        return false;
+    };
+    if !m.is_file() || m.len() != body.len() as u64 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if (m.permissions().mode() & 0o100 != 0) != exec {
+            return false;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = exec;
+    let mut now = Vec::with_capacity(body.len());
+    f.read_to_end(&mut now).is_ok() && now == body
 }
 
 /// The fail-closed report for a verify floor whose guarded checkout could not be made: nothing
@@ -3951,7 +4148,7 @@ pub(crate) fn guarded_checkout_refused(
     ctx: &FloorContext,
     why: &str,
 ) -> RepoChecksReport {
-    let sandbox = crate::validator::detect_worker_sandbox(&[worktree.to_path_buf()]);
+    let sandbox = crate::validator::detect_floor_sandbox(&[worktree.to_path_buf()]);
     RepoChecksReport {
         detected: detect_with(worktree, ctx).unwrap_or_default(),
         checks: Vec::new(),
@@ -3977,9 +4174,10 @@ pub(crate) fn guarded_checkout_refused(
 }
 
 /// The run base, exported into the checks' scratch for the baseline diff — plain files, no git
-/// metadata, no nested worktree: `git read-tree` into a scratch index + `git checkout-index
-/// --prefix`, both through the PINNED git dir (never the worktree's own `.git` file, which the
-/// seat could have redirected). Lives at `<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`] — inside the OS
+/// metadata, no nested worktree: the base's own blobs, written raw (`ls-tree` + `cat-file
+/// --batch`, [`write_tree_blobs`]: no index, so no hook; no checkout, so no filter driver),
+/// through the PINNED git dir (never the worktree's own `.git` file, which the seat could have
+/// redirected). Lives at `<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`] — inside the OS
 /// write boundary, outside the guard's snapshot — so the sandbox wrapper armed for the worktree
 /// covers the base run too. It stays INSIDE the worktree when the rest of the check scratch moved
 /// to the engine's check cache: a base check that calls git (a `build.rs` running `git rev-parse`)
@@ -3991,9 +4189,13 @@ pub(crate) fn guarded_checkout_refused(
 /// every floor: it is a full copy of the repo tree inside the worktree, and a HEAD check that
 /// globs from the worktree root (vitest's default include, a broad `tsconfig`, eslint without
 /// ignores) would otherwise run over the base's files too. The run pays for a base check once
-/// through the `base-cache` (in the check scratch), never through a persisted export.
-struct BaseTree {
-    dir: PathBuf,
+/// through the base cache (in the run's log store, outside every sandbox write root), never
+/// through a persisted export.
+pub(crate) struct BaseTree {
+    pub(crate) dir: PathBuf,
+    /// The export, held from before any command ran in it ([`HeldDir`]): every later parent-side
+    /// write or removal in it goes through this.
+    pub(crate) held: HeldDir,
     head: String,
 }
 
@@ -4004,120 +4206,147 @@ pub const BASE_EXPORT_SUBDIR: &str = "wicked-floor-base";
 /// export an older engine left in it.
 const LEGACY_SCRATCH_SUBDIR: &str = "wicked-checks";
 
-/// `<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`]. The engine scratch root is repo-adjacent territory:
-/// a checkout or a seat could make `tmp` a SYMLINK out of the worktree, and the export (written by
-/// the engine, outside any sandbox) would follow it — so a `tmp` that is a link, or not a
-/// directory, is refused (adversarial review on #414), never followed.
-fn base_export_dir(worktree: &Path) -> Result<PathBuf, String> {
-    let tmp = worktree.join(crate::worktree_guard::ENGINE_SCRATCH_DIR);
-    match std::fs::symlink_metadata(&tmp) {
-        Ok(m) if m.file_type().is_symlink() || !m.is_dir() => Err(format!(
-            "`{}` is not a real directory — the base export is never written through a link",
-            tmp.display()
-        )),
-        Ok(_) => Ok(tmp.join(BASE_EXPORT_SUBDIR)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(tmp.join(BASE_EXPORT_SUBDIR)),
-        Err(e) => Err(format!("`{}` cannot be inspected: {e}", tmp.display())),
-    }
+/// `<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`] — the path the base's commands are spawned in. Only a
+/// path: the engine scratch root is repo-adjacent territory (a checkout or a seat could make `tmp`
+/// a SYMLINK out of the worktree, adversarial review on #414), so the export is created, written
+/// and removed only through the held worktree ([`HeldDir`]), which refuses the link, and every
+/// spawn there first checks the path still IS the held export ([`HeldDir::still_at`]).
+fn base_export_dir(worktree: &Path) -> PathBuf {
+    worktree
+        .join(crate::worktree_guard::ENGINE_SCRATCH_DIR)
+        .join(BASE_EXPORT_SUBDIR)
 }
 
-/// Remove the base export (`<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`] and its scratch index) if
-/// present. A symlink at the export path is refused, never followed. Called at the start of every
-/// floor, before an export and as soon as a base check's result is cached, so no HEAD check ever
-/// runs beside a copy of the base.
-fn remove_base_export(worktree: &Path, scratch: &CheckScratch) -> Result<(), String> {
-    let _ = std::fs::remove_file(scratch.root.join("base.idx"));
-    let dir = base_export_dir(worktree)?;
+/// Remove the base export (`<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`]) if present (nothing writes
+/// the scratch index an older engine kept; the scratch is the checks' to write, never removed
+/// from by name after they ran). Everything goes through `root` — the worktree, held before any
+/// check ran there ([`HeldDir`]): the export is removed entry by entry relative to its own
+/// directory fds ([`HeldDir::remove_tree`]), so a check (or a process it left running) that swaps
+/// `tmp` or the export for a link to an outside directory never has the engine delete through it.
+/// A linked or non-directory `tmp`, and a link at the export path, are refused (fail closed).
+/// Called at the start of every floor, before an export and as soon as a base check's result is
+/// cached, so no HEAD check ever runs beside a copy of the base.
+pub(crate) fn remove_base_export(root: &HeldDir) -> Result<(), String> {
+    let tmp = crate::worktree_guard::ENGINE_SCRATCH_DIR;
+    // Only "not found" is absence (codex on #1050): any other error inspecting a path (a `tmp`
+    // without search permission) is an export the floor could not clear, and refuses it.
+    match root.kind(tmp)? {
+        None => return Ok(()),
+        Some(EntryKind::Dir) => {}
+        Some(_) => {
+            return Err(format!(
+                "`{tmp}` is not a real directory — the base export is never written through a link"
+            ))
+        }
+    }
     // (codex on #1050) An engine from before the scratch moved left its export at
     // `tmp/wicked-checks/base` when it died mid-baseline; it removed that at every floor's start,
     // and so does this one — or a HEAD check globbing from the root runs over the old base. Only
     // that export: the rest of a legacy `tmp/wicked-checks` is not this floor's to judge. Never
-    // through a link (`tmp` was checked above; `wicked-checks` here; `base` is unlinked, not
-    // followed).
-    // Only "not found" is absence (codex on #1050): any other error inspecting a path (a `tmp`
-    // without search permission) is an export the floor could not clear, and refuses it.
-    let legacy = dir.with_file_name(LEGACY_SCRATCH_SUBDIR);
-    match std::fs::symlink_metadata(&legacy) {
-        Ok(m) if m.is_dir() => remove_leaf_dir(&legacy.join("base"))
-            .map_err(|e| format!("the legacy base export could not be removed: {e}"))?,
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("`{}` cannot be inspected: {e}", legacy.display())),
+    // through a link (a linked `wicked-checks` is left alone; `base` is unlinked, not followed).
+    let legacy = format!("{tmp}/{LEGACY_SCRATCH_SUBDIR}");
+    if root.kind(&legacy)? == Some(EntryKind::Dir) {
+        root.remove_tree(&format!("{legacy}/base"))
+            .map_err(|e| format!("the legacy base export could not be removed: {e}"))?;
     }
-    match std::fs::symlink_metadata(&dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("`{}` cannot be inspected: {e}", dir.display())),
-        Ok(m) if m.file_type().is_symlink() => Err(format!(
-            "`{}` is a symlink (the base export is never written through a link)",
-            dir.display()
+    let export = format!("{tmp}/{BASE_EXPORT_SUBDIR}");
+    match root.kind(&export)? {
+        None => Ok(()),
+        Some(EntryKind::Link) => Err(format!(
+            "`{export}` is a symlink (the base export is never written through a link)"
         )),
-        Ok(m) if m.is_dir() => std::fs::remove_dir_all(&dir)
-            .map_err(|e| format!("the base export could not be removed: {e}")),
-        Ok(_) => std::fs::remove_file(&dir)
+        Some(_) => root
+            .remove_tree(&export)
+            .map(drop)
             .map_err(|e| format!("the base export could not be removed: {e}")),
     }
 }
 
 impl BaseTree {
     fn cache_path(scratch: &CheckScratch, head: &str, check: &RepoCheck) -> PathBuf {
-        // (core#817) A subdirectory package's check is its own entry (`dir` with `/` flattened).
-        // Hex-encoded, so the key is injective (`a/b` and `a_b` never share an entry).
-        let dir = if check.dir.is_empty() {
-            String::new()
-        } else {
-            let hex: String = check.dir.bytes().map(|b| format!("{b:02x}")).collect();
-            format!("d{hex}--")
-        };
-        scratch.root.join("base-cache").join(format!(
-            "{}-{dir}{}.json",
-            &head[..head.len().min(12)],
-            check.name
-        ))
+        // ONE file name, whatever the head, the `dir` (core#817: a subdirectory package's check
+        // is its own entry) or the check's `name` (a guide's, repo-controlled) say: a sha256 over
+        // the three, NUL-separated (injective, a fixed length, never a path separator). It lives
+        // in the run's log store, OUTSIDE every sandbox write root: no check can redirect the
+        // engine's write there, or plant a record the next comparison would read. Aged out with
+        // the logs ([`crate::floor_log::gc`]).
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for part in [head, check.dir.as_str(), check.name.as_str()] {
+            h.update(part.as_bytes());
+            h.update([0u8]);
+        }
+        let key: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        scratch.logs.join(format!("base-{key}.json"))
     }
 
-    /// This run's cached result of `check` on `head`, when an earlier floor of the run paid for it.
-    fn cached(scratch: &CheckScratch, head: &str, check: &RepoCheck) -> Option<BaseRun> {
+    /// This run's cached result of `check` on `head`, when an earlier floor of the run paid for it:
+    /// a record of THIS policy version ([`FLOOR_POLICY_VERSION`]; an older or bare record is a
+    /// miss) for the same argv.
+    fn cached(
+        scratch: &CheckScratch,
+        head: &str,
+        check: &RepoCheck,
+        guide: Option<&GuideCheck>,
+    ) -> Option<BaseSide> {
         let raw = std::fs::read_to_string(Self::cache_path(scratch, head, check)).ok()?;
-        let run = serde_json::from_str::<CheckRun>(&raw).ok()?;
+        let rec = serde_json::from_str::<BaseRecord>(&raw).ok()?;
+        // A record taken under another guide (or none: no inventory) is not this comparison.
+        if rec.guide != guide_id(guide) {
+            return None;
+        }
         // The base runs the head's argv, and it can change within a run (a targeted command with
         // the files a rework touches — `{files}`, the derived `-p <crate>` — or a reworked
         // `.wicked/checks.json`): a cached run of ANOTHER argv is not this comparison.
-        if run.argv != check.argv {
+        if rec.floor_policy != FLOOR_POLICY_VERSION || rec.head_argv != check.argv {
             return None;
         }
-        Some(BaseRun {
-            head: head.to_string(),
-            cached: true,
-            run: Some(run),
-            error: None,
+        // (codex r12) Reused evidence must still be there, whole — and its age restarts, so the
+        // log GC keeps what the new receipt names. A blob gone or altered: the base re-runs.
+        let toc_logs = rec.toc.iter().flat_map(|t| t.logs.iter());
+        if rec
+            .run
+            .logs
+            .iter()
+            .chain(toc_logs)
+            .any(|l| crate::floor_log::refresh(&scratch.logs, l).is_err())
+        {
+            return None;
+        }
+        Some(BaseSide {
+            base: BaseRun {
+                head: head.to_string(),
+                cached: true,
+                run: Some(rec.run),
+                error: None,
+            },
+            toc: rec.toc,
         })
     }
 
-    fn export(
+    /// Export `head` into a FRESH `<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`], every directory and
+    /// file of it created through `root` — `worktree`, held before any check ran there
+    /// ([`HeldDir`]): a check (or a process it left running) that re-pointed `tmp` or the export
+    /// path at an outside directory refuses the export; it never redirects it.
+    pub(crate) fn export(
         worktree: &Path,
-        scratch: &CheckScratch,
+        root: &HeldDir,
         git_dir: &Path,
         head: &str,
     ) -> Result<Self, String> {
-        let dir = base_export_dir(worktree)?;
+        let dir = base_export_dir(worktree);
         // Always a fresh export: a stale one is removed, a link refused — never followed.
-        remove_base_export(worktree, scratch)?;
-        std::fs::create_dir_all(&dir)
+        remove_base_export(root)?;
+        let held = root
+            .create_fresh_dir(&format!(
+                "{}/{BASE_EXPORT_SUBDIR}",
+                crate::worktree_guard::ENGINE_SCRATCH_DIR
+            ))
             .map_err(|e| format!("the base export directory could not be created: {e}"))?;
-        let idx = scratch.root.join("base.idx");
-        let _ = std::fs::remove_file(&idx);
-        let env: [(&str, &Path); 3] = [
-            ("GIT_DIR", git_dir),
-            ("GIT_WORK_TREE", worktree),
-            ("GIT_INDEX_FILE", idx.as_path()),
-        ];
-        let prefix = format!("--prefix={}/", dir.to_string_lossy());
-        let result =
-            crate::worktree_guard::git(worktree, &["read-tree", head], &env).and_then(|_| {
-                crate::worktree_guard::git(worktree, &["checkout-index", "-a", "-f", &prefix], &env)
-            });
-        let _ = std::fs::remove_file(&idx);
-        result.map_err(|e| {
+        // The base's own blobs, written raw (`ls-tree` + `cat-file --batch`, [`write_tree_blobs`]):
+        // no index, so no `post-index-change` hook; no checkout, so no filter driver — nothing
+        // the repository configures runs outside the floor's sandbox (codex round 17).
+        write_tree_blobs(worktree, git_dir, head, &dir, &held).map_err(|e| {
             format!(
                 "the run base {} could not be exported for the baseline diff: {e}",
                 &head[..head.len().min(10)]
@@ -4125,6 +4354,7 @@ impl BaseTree {
         })?;
         Ok(Self {
             dir,
+            held,
             head: head.to_string(),
         })
     }
@@ -4133,7 +4363,7 @@ impl BaseTree {
     /// (a baseline diff compares one command on two trees: a change that edits the command — say
     /// adds `--no-fail-fast` — would otherwise read the base's shorter failure list as the head's
     /// regressions; a targeted command is the same change-scoped set on both trees) — and cache
-    /// the result under `base-cache/<head>-<name>.json` for the rest of the
+    /// the result under the log store's `base-<sha256 of head, dir, name>.json` for the rest of the
     /// run ([`Self::cached`]). The base's install step runs first when its tree needs
     /// provisioning (the same frozen, scripts-off install the head got, out of the same scratch
     /// cache).
@@ -4143,13 +4373,17 @@ impl BaseTree {
         ctx: &FloorContext,
         sandbox: &WorkerSandbox,
         scratch: &CheckScratch,
-    ) -> BaseRun {
+        guide: Option<&GuideCheck>,
+    ) -> BaseSide {
         let cache = Self::cache_path(scratch, &self.head, check);
-        let fail = |e: String| BaseRun {
-            head: self.head.clone(),
-            cached: false,
-            run: None,
-            error: Some(e),
+        let fail = |e: String| BaseSide {
+            base: BaseRun {
+                head: self.head.clone(),
+                cached: false,
+                run: None,
+                error: Some(e),
+            },
+            toc: None,
         };
         // No base of its own: the export is not a worktree, so `{files}`/`{base}` cannot be
         // re-derived there — the head's targeted argv is reused verbatim below.
@@ -4163,7 +4397,17 @@ impl BaseTree {
             Ok(d) => d,
             Err(e) => return fail(format!("the base's checks could not be determined: {e}")),
         };
-        if check.name != "test_targeted" && !detected.iter().any(|c| c.name == check.name) {
+        // Detection reads the export by path (each file `O_NOFOLLOW`, its identity checked,
+        // [`probe`]): what it read was the export only while the package's directory still IS the
+        // held one — a process the head left running that swapped it for a link fails the base.
+        if let Err(e) = self.held.still_at_rel(&self.dir, &check.dir) {
+            return fail(format!("the base's checks could not be determined: {e}"));
+        }
+        // A guide's check is the base's by construction: the guide is read from the base.
+        if check.name != "test_targeted"
+            && check.source != GUIDE_SOURCE
+            && !detected.iter().any(|c| c.name == check.name)
+        {
             return fail(format!(
                 "the run base declares no `{}` check (the change introduced it)",
                 check.name
@@ -4175,7 +4419,14 @@ impl BaseTree {
                 dir: check.dir.clone(),
                 ..install.clone()
             };
-            let r = run_one(&self.dir, &install, sandbox, scratch, Tree::Base);
+            let r = run_held(
+                &self.dir,
+                Some(&self.held),
+                &install,
+                sandbox,
+                scratch,
+                Tree::Base,
+            );
             if !r.passed() {
                 return fail(format!(
                     "the base's dependency install did not pass ({})",
@@ -4183,719 +4434,1628 @@ impl BaseTree {
                 ));
             }
         }
-        let run = run_one(&self.dir, &target, sandbox, scratch, Tree::Base);
-        let _ = std::fs::create_dir_all(scratch.root.join("base-cache"));
-        if let Ok(json) = serde_json::to_string(&run) {
-            let _ = std::fs::write(&cache, json);
+        // (DES-BUILD-GUIDE) With a usable guide, the base runs with its results on (`how`); a
+        // red base is listed by the guide's `list`, its results nominate the failing ids the list
+        // holds, and each is confirmed by its EXIT CODE run alone (`failedExit`). A misread result
+        // can then only narrow what is excluded.
+        if let Some(g) = guide {
+            clear_results(&self.held, &target, g);
         }
-        BaseRun {
-            head: self.head.clone(),
-            cached: false,
-            run: Some(run),
-            error: None,
+        let since = std::time::SystemTime::now();
+        let mut run = run_one_with(
+            &self.dir,
+            Some(&self.held),
+            &RepoCheck {
+                argv: guide.map_or_else(|| target.argv.clone(), |g| g.for_results(&target.argv)),
+                ..target.clone()
+            },
+            &guide.map(results_exec).unwrap_or_default(),
+            sandbox,
+            scratch,
+            Tree::Base,
+        );
+        let mut toc = None;
+        if let Some(g) =
+            guide.filter(|_| !run.passed() && !run.timed_out && run.spawn_error.is_none())
+        {
+            // (DES-BUILD-GUIDE) A base that exited outside the guide's `failedExit` did not run to
+            // a test verdict (a crash, a build failure): nothing of it is inventoried, and nothing
+            // of it may be excluded.
+            let verdict = run
+                .exit_code
+                .is_some_and(|c| c != 0 && g.failed_exit.contains(&c));
+            // The results first: the list must not overwrite them.
+            let results =
+                verdict.then(|| results_of(&self.held, &target, g, &mut run, scratch, since));
+            let mut t = match results {
+                Some(_) => inventory(
+                    &self.dir,
+                    Some(&self.held),
+                    &target,
+                    g,
+                    &[],
+                    sandbox,
+                    scratch,
+                    Tree::Base,
+                ),
+                None => Toc {
+                    incomplete: Some(format!(
+                        "the base exited {} — not one of the guide's `failedExit` codes {:?}: it \
+                         did not run to a test verdict",
+                        run.exit_code
+                            .map_or_else(|| "without a code".to_string(), |c| c.to_string()),
+                        g.failed_exit
+                    )),
+                    ..Toc::default()
+                },
+            };
+            match results.filter(|_| t.incomplete.is_none()) {
+                Some(Ok((_, failed))) => {
+                    t.failing = failed.into_iter().filter(|x| t.count(x) > 0).collect()
+                }
+                Some(Err(e)) => t.incomplete = Some(format!("the base's results: {e}")),
+                None => {}
+            }
+            let candidates: Vec<TestId> = t
+                .failing
+                .iter()
+                .filter(|x| t.count(x) == 1)
+                .cloned()
+                .collect();
+            if t.incomplete.is_none() && candidates.len() <= MAX_ALONE_CONFIRMATIONS {
+                for n in candidates {
+                    let one = RepoCheck {
+                        argv: g.alone_argv(&n),
+                        source: format!("`{}` alone on the base (DES-BUILD-GUIDE)", n.id),
+                        ..target.clone()
+                    };
+                    let r = run_one_with(
+                        &self.dir,
+                        Some(&self.held),
+                        &one,
+                        &ExecOpts::default(),
+                        sandbox,
+                        scratch,
+                        Tree::Base,
+                    );
+                    t.logs.extend(relabel(r.logs.clone(), "alone-base"));
+                    // (agy r6) One that did not finish or start confirms nothing: the
+                    // inventory is incomplete (escalates) and not cached.
+                    if r.timed_out || r.spawn_error.is_some() {
+                        t.incomplete = Some(format!(
+                            "`{}` run alone on the base did not finish ({})",
+                            n.id,
+                            r.summary()
+                        ));
+                        t.transient = true;
+                        break;
+                    }
+                    // A NONZERO exit the guide calls a test failure: a pass confirms nothing.
+                    let failed = r
+                        .exit_code
+                        .is_some_and(|c| c != 0 && g.failed_exit.contains(&c));
+                    t.alone.push((n, failed));
+                }
+            }
+            toc = Some(t);
+        }
+        let rec = BaseRecord {
+            floor_policy: FLOOR_POLICY_VERSION,
+            head_argv: check.argv.clone(),
+            guide: guide_id(guide),
+            run,
+            toc,
+        };
+        // A base run (or its inventory, or an alone run) that did not finish or could not start is
+        // not cached: it says nothing lasting.
+        if !rec.run.timed_out
+            && rec.run.spawn_error.is_none()
+            && !rec.toc.as_ref().is_some_and(|t| t.transient)
+        {
+            let _ = std::fs::create_dir_all(&scratch.logs);
+            if let Ok(json) = serde_json::to_string(&rec) {
+                let _ = std::fs::write(&cache, json);
+            }
+        }
+        BaseSide {
+            base: BaseRun {
+                head: self.head.clone(),
+                cached: false,
+                run: Some(rec.run),
+                error: None,
+            },
+            toc: rec.toc,
         }
     }
 }
 
-/// Classify a failed head check against its base run and attach both (F-RC2-009).
-///
-/// * base passed ⇒ `regression` (every head failure is head-only);
-/// * base did not finish or could not run ⇒ no classification (denies, fail-closed);
-/// * both failed with identifiers on both sides ⇒ set arithmetic over binary-QUALIFIED ids
-///   (core#481): any head-only identifier ⇒ `regression` (the shared ones listed as
-///   `pre_existing`); otherwise (head ⊆ base, equal sets included) ⇒ `env_cannot_run` when every
-///   head failure carries the nested-sandbox launcher signature on both trees (core#546, positive
-///   evidence), else `pre_existing_in_sandbox` (the fact the comparison establishes);
-/// * both failed with NO identifiers on either side ⇒ `unclassified_red_base` (denies, #538);
-/// * identifiers on ONE side only ⇒ `regression` (cannot be compared — fail-closed).
-fn classify(head: &mut CheckRun, base: BaseRun) {
-    use std::collections::BTreeSet;
-    let verdict = match &base.run {
-        None => None,
-        Some(b) if b.passed() => {
-            head.regressions = head.failure_ids.clone();
-            Some(REGRESSION)
+/// A guide check's identity for the base cache: 12 hex of its serialized form.
+fn guide_id(g: Option<&GuideCheck>) -> Option<String> {
+    g.map(|g| hex12(&serde_json::to_vec(g).unwrap_or_default()))
+}
+
+/// The base cache's record: the base run and (a red base) its inventory, under the policy version.
+#[derive(Debug, Serialize, Deserialize)]
+struct BaseRecord {
+    floor_policy: u32,
+    /// The head argv the base answered (its run may be narrowed to the base's packages).
+    #[serde(default)]
+    head_argv: Vec<String>,
+    /// The usable guide check the base ran under ([`guide_id`]), or none.
+    #[serde(default)]
+    guide: Option<String>,
+    run: CheckRun,
+    #[serde(default)]
+    toc: Option<Toc>,
+}
+
+// ─── DES-FLOOR-V2: the suite's TOC plus exit codes ─────────────────────────────────────────────
+
+/// (DES-FLOOR-V2) The floor's machine-readable decision for one check (`checks[].decision` on
+/// `repoChecksEvaluated`). Only exit codes of processes the floor launched, the base tree and the
+/// base's inventory decide it; head output is never read to decide.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckDecision {
+    /// [`OUTCOME_PASS`] | [`OUTCOME_PASS_EXCLUDED`] | [`OUTCOME_NEW_FAILURE`] |
+    /// [`OUTCOME_BASE_RED_UNSEPARATED`] | [`OUTCOME_FLAKY_TWICE`] | [`OUTCOME_TIMED_OUT`] |
+    /// [`OUTCOME_COULD_NOT_RUN`]. Only the first two pass.
+    pub outcome: String,
+    /// The base commit the check was compared with, when the base ran (or was read from cache).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sha: Option<String>,
+    /// The base's failing tests that appear VERBATIM in the base's own inventory (its TOC) — the
+    /// only ids the floor may exclude.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_failing: Vec<String>,
+    /// The names actually deselected on the head's excluded run (a base failure the head no longer
+    /// has is not passed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded: Vec<String>,
+    /// Every stream of every process this decision ran, by hash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log_refs: Vec<crate::floor_log::LogRef>,
+    /// The deciding run failed on an oversubscribed host and passed its identical retry:
+    /// `passed on retry (flaky)`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flaky: bool,
+    /// Why, in words: what was excluded, why the base red could not be separated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// (DES-BUILD-GUIDE) The base's build guide for this check: present, usable, and why not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide: Option<GuideStatus>,
+}
+
+/// The check exited 0 (on its first run, or on its identical retry — `flaky`).
+pub const OUTCOME_PASS: &str = "pass";
+/// The head exited 0 once the base's own failing tests were deselected natively.
+pub const OUTCOME_PASS_EXCLUDED: &str = "pass_excluded";
+/// The deciding run exited non-zero and no base failure explains it — denies.
+pub const OUTCOME_NEW_FAILURE: &str = "new_failure";
+/// The base is red and its failures cannot be excluded precisely — escalates (denies).
+pub const OUTCOME_BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
+/// The deciding run failed on an oversubscribed host and failed again on its identical retry, which
+/// also ran oversubscribed (the bounded wait found no headroom) — denies; not shown to be a flake,
+/// only that load was present both times. A retry WITH headroom that fails is a new failure.
+pub const OUTCOME_FLAKY_TWICE: &str = "flaky_twice";
+/// A run the decision needed did not finish within its bound — denies under the timeout source.
+pub const OUTCOME_TIMED_OUT: &str = "timed_out";
+/// The check could not be started (not on PATH, the launcher could not arm) — denies.
+pub const OUTCOME_COULD_NOT_RUN: &str = "could_not_run";
+/// (DES-FLOOR-V2) The `classification` token of a base-red check whose failures cannot be
+/// excluded precisely. Denies.
+pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
+/// The versioned base-cache record (core#1060 r9 keyed the cache by sandbox policy; v4 adds the
+/// base inventory): a record of any other version, or a bare `CheckRun`, is a miss.
+const FLOOR_POLICY_VERSION: u32 = 12;
+/// The most base failures the floor confirms one by one (each run alone on the base); more than
+/// this escalates rather than paying for them.
+const MAX_ALONE_CONFIRMATIONS: usize = 16;
+/// The longest the identical retry waits for the 1-min load to fall below the CPU count, by
+/// default; [`RETRY_WAIT_ENV`] sets it in whole seconds (at most [`MAX_RETRY_WAIT_S`]).
+#[cfg_attr(test, allow(dead_code))]
+const RETRY_HEADROOM_WAIT: Duration = Duration::from_secs(30);
+/// The operator's (or a test harness's) bound on the retry's headroom wait, in seconds.
+#[cfg_attr(test, allow(dead_code))]
+pub const RETRY_WAIT_ENV: &str = "WICKED_REPO_CHECKS_RETRY_WAIT_S";
+/// The most [`RETRY_WAIT_ENV`] may ask for.
+#[cfg_attr(test, allow(dead_code))]
+pub const MAX_RETRY_WAIT_S: u64 = 600;
+
+/// The inventory of `check` on one tree, from the guide's `list` piece (never from a test's
+/// output): every id it lists, with its qualifier.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Toc {
+    pub(crate) ids: Vec<TestId>,
+    /// Why the inventory is not complete (non-zero exit, unreadable, truncated, empty); `None`
+    /// when the list ran clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) incomplete: Option<String>,
+    #[serde(default)]
+    logs: Vec<crate::floor_log::LogRef>,
+    /// The base's failing ids its results name that its list holds: CANDIDATES only, until
+    /// [`Toc::alone`] confirms them.
+    #[serde(default)]
+    failing: Vec<TestId>,
+    /// Each candidate run ALONE on the base: `(id, it failed)` — by exit code (`failedExit`).
+    #[serde(default)]
+    alone: Vec<(TestId, bool)>,
+    /// The inventory or an alone run did not finish or could not start: never cached.
+    #[serde(skip)]
+    transient: bool,
+}
+
+impl Toc {
+    fn count(&self, t: &TestId) -> usize {
+        self.ids.iter().filter(|i| *i == t).count()
+    }
+
+    /// The qualifiers `id` is listed under.
+    fn qs(&self, id: &str) -> Vec<&str> {
+        self.ids
+            .iter()
+            .filter(|i| i.id == id)
+            .map(|i| i.q.as_str())
+            .collect()
+    }
+}
+
+/// The options of a run whose RESULTS the floor reads: the guide's `results.how` env and merge.
+/// No other run (a list, a one-test run, the deselected run, the version) gets that env.
+pub(crate) fn results_exec(g: &GuideCheck) -> ExecOpts {
+    ExecOpts {
+        env: g
+            .results
+            .how
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        merge: g.results.how.merge,
+    }
+}
+
+/// A run that only merges its streams (or not), with no guide env.
+fn merged(merge: bool) -> ExecOpts {
+    ExecOpts {
+        env: Vec::new(),
+        merge,
+    }
+}
+
+/// Run the guide's `list` for `check` on one tree (with `ids` deselected, when given) and read
+/// its ids.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn inventory(
+    dir: &Path,
+    held: Option<&HeldDir>,
+    check: &RepoCheck,
+    g: &GuideCheck,
+    ids: &[TestId],
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+    tree: Tree,
+) -> Toc {
+    let (c, list) = match (g.compile(), g.list.as_ref()) {
+        (Ok(c), Some(l)) => (c, l),
+        (Err(e), _) => {
+            return Toc {
+                incomplete: Some(e),
+                ..Toc::default()
+            }
         }
-        Some(b) if b.timed_out || b.spawn_error.is_some() => None,
-        Some(b) => {
-            let head_ids: BTreeSet<&str> = head.failure_ids.iter().map(String::as_str).collect();
-            let base_ids: BTreeSet<&str> = b.failure_ids.iter().map(String::as_str).collect();
-            match (head_ids.is_empty(), base_ids.is_empty()) {
-                // (#538) Both sides red with zero IDs — the runner's output format is unknown;
-                // cannot determine if pre-existing or a regression. Fail closed.
-                (true, true) => Some(UNCLASSIFIED_RED_BASE),
-                (false, false) => {
-                    head.pre_existing = head_ids
-                        .intersection(&base_ids)
-                        .map(|s| s.to_string())
-                        .collect();
-                    head.regressions = head_ids
-                        .difference(&base_ids)
-                        .map(|s| s.to_string())
-                        .collect();
-                    let env_on_both = |id: &str| {
-                        head.env_cannot_run.iter().any(|e| e == id)
-                            && b.env_cannot_run.iter().any(|e| e == id)
-                    };
-                    if !head.regressions.is_empty() {
-                        Some(REGRESSION)
-                    } else if head_ids.iter().all(|id| env_on_both(id)) {
-                        Some(ENV_CANNOT_RUN)
-                    } else {
-                        Some(PRE_EXISTING_IN_SANDBOX)
+        (Ok(_), None) => unreachable!("compile requires a list"),
+    };
+    let probe = RepoCheck {
+        argv: if ids.is_empty() {
+            list.run.clone()
+        } else {
+            g.deselected(&list.run, ids)
+        },
+        source: format!("the list of `{}` (DES-BUILD-GUIDE)", check.name),
+        ..check.clone()
+    };
+    let r = run_one_with(
+        dir,
+        held,
+        &probe,
+        &merged(list.merge),
+        sandbox,
+        scratch,
+        tree,
+    );
+    let attempt = match (tree, ids.is_empty()) {
+        (Tree::Base, _) => "toc-base",
+        (Tree::Head, true) => "toc-head",
+        (Tree::Head, false) => "toc-excluded",
+    };
+    let logs = relabel(r.logs.clone(), attempt);
+    let text = logs
+        .first()
+        .ok_or_else(|| "no stored output".to_string())
+        .and_then(|l| crate::floor_log::read_blob(&scratch.logs, l))
+        .map(|b| String::from_utf8_lossy(&b).into_owned());
+    let deselecting = !ids.is_empty();
+    let ids = text.as_deref().map(|t| c.list(t)).unwrap_or_default();
+    let incomplete = if let Err(e) = &text {
+        Some(format!("its list could not be read back ({e})"))
+    } else if !r.passed() {
+        Some(format!("its list did not exit 0 ({})", r.summary()))
+    } else if logs.iter().any(|l| l.truncated) {
+        Some("its list was cut at the log cap".to_string())
+    } else if ids.is_empty() && !deselecting {
+        Some("its list names no test".to_string())
+    } else {
+        None
+    };
+    Toc {
+        ids,
+        incomplete,
+        logs,
+        failing: Vec::new(),
+        alone: Vec::new(),
+        transient: r.timed_out || r.spawn_error.is_some(),
+    }
+}
+
+/// A results run's ids per the guide: every testcase (junit; text names failures only) and the
+/// failing ones. The results file (`how.path`, relative to the check's directory) must be a
+/// regular file inside the tree, written since `since` (the run's start), within the log cap; it
+/// is stored in the log store beside the run's streams. Anything else is no results.
+pub(crate) fn results_of(
+    held: &HeldDir,
+    check: &RepoCheck,
+    g: &GuideCheck,
+    run: &mut CheckRun,
+    scratch: &CheckScratch,
+    since: std::time::SystemTime,
+) -> Result<(Vec<TestId>, Vec<TestId>), String> {
+    let c = g.compile()?;
+    let r = match &g.results.how.path {
+        Some(path) => {
+            let f = open_results(
+                held,
+                &Path::new(&check.dir).join(path).to_string_lossy(),
+                since,
+            )
+            .map_err(|e| format!("`{path}`: {e}"))?;
+            let cap =
+                crate::floor_log::capture(f, &scratch.logs, scratch.log_cap).finish(DRAIN_CAP);
+            if let Some(e) = cap.error {
+                return Err(e);
+            }
+            let r = cap.log_ref("results", "file");
+            run.logs.push(r.clone());
+            r
+        }
+        None => run
+            .logs
+            .first()
+            .cloned()
+            .ok_or_else(|| "the run has no stored output".to_string())?,
+    };
+    if r.truncated {
+        return Err("they were cut at the log cap".into());
+    }
+    let text =
+        String::from_utf8_lossy(&crate::floor_log::read_blob(&scratch.logs, &r)?).into_owned();
+    match g.results.kind.as_str() {
+        "junit" => crate::floor_guide::junit(
+            &text,
+            &g.results.id,
+            g.results.id_join.as_deref().unwrap_or("::"),
+            c.keyed(),
+        )
+        .ok_or_else(|| "the results hold no testsuite".to_string()),
+        _ => Ok((Vec::new(), c.failures(&text, c.keyed()))),
+    }
+}
+
+/// The operator's switch for excluding a red base's own failures: `on` / `1` enables it; anything
+/// else, or unset, leaves it OFF — a red base then escalates as `base_red_unseparated` with both
+/// logs (the operator's floor override is the path through), and neither the base's list nor any
+/// one-test run, nor a deselected head run, is executed. A usable guide still names the checks.
+pub const FLOOR_EXCLUDE_ENV: &str = "WICKED_FLOOR_EXCLUDE";
+
+/// Is exclusion on ([`FLOOR_EXCLUDE_ENV`])? Read once per floor run.
+pub(crate) fn exclusion_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = test_seam::exclusion() {
+        return on;
+    }
+    exclusion_from(std::env::var(FLOOR_EXCLUDE_ENV).ok().as_deref())
+}
+
+/// The switch's value: exactly `on` or `1` (never trimmed, never case-folded) enables it.
+fn exclusion_from(value: Option<&str>) -> bool {
+    matches!(value, Some("on") | Some("1"))
+}
+
+/// (DES-BUILD-GUIDE) `rel` under `root`, refused unless it is relative with no `..`, and no
+/// component of it that exists is a symlink: a path a guide names never leaves the tree.
+// Without directory fds (Windows) the held directory stands on it.
+#[cfg_attr(unix, allow(dead_code))]
+pub(crate) fn confined(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let mut out = root.to_path_buf();
+    for c in Path::new(rel).components() {
+        match c {
+            std::path::Component::Normal(n) => out.push(n),
+            std::path::Component::CurDir => continue,
+            _ => return Err(format!("`{rel}` must stay inside the tree")),
+        }
+        if std::fs::symlink_metadata(&out).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!("`{rel}` passes through a symlink"));
+        }
+    }
+    Ok(out)
+}
+
+/// Open options that never follow a final symlink, nor block on a FIFO (unix).
+// Without directory fds (Windows) the held directory stands on it.
+#[cfg_attr(unix, allow(dead_code))]
+fn no_follow(o: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    o
+}
+
+/// How far a file system's coarse clock may stamp a fresh file before the floor's `now`.
+const FS_CLOCK_SLACK: Duration = Duration::from_secs(1);
+
+/// Remove a results file (`results.how.path`) a run is about to write, so whatever is there after
+/// the run is that run's.
+pub(crate) fn clear_results(held: &HeldDir, check: &RepoCheck, g: &GuideCheck) {
+    if let Some(path) = &g.results.how.path {
+        let _ = held.remove_file(&Path::new(&check.dir).join(path).to_string_lossy());
+    }
+}
+
+/// The results file `rel` in the held tree `held` ([`HeldDir::open_read`]: its parents walked
+/// through no link, the file opened `O_NOFOLLOW | O_NONBLOCK`), and — on the OPENED file, never
+/// the path — a regular file within the log cap, modified since `since` (less
+/// [`FS_CLOCK_SLACK`]; the run cleared it first, [`clear_results`]). A command that renames the
+/// tree away and leaves a link, plants a FIFO, or swaps the file after a check, gets nothing read
+/// from outside the tree.
+fn open_results(
+    held: &HeldDir,
+    rel: &str,
+    since: std::time::SystemTime,
+) -> Result<std::fs::File, String> {
+    let f = held
+        .open_read(rel)
+        .map_err(|e| format!("no results file ({e})"))?;
+    let m = f.metadata().map_err(|e| format!("no results file ({e})"))?;
+    if !m.is_file() {
+        return Err("not a regular file".into());
+    }
+    if m.len() > crate::floor_log::MAX_STREAM_BYTES {
+        return Err("larger than the log cap".into());
+    }
+    if m.modified().map_or(true, |t| t + FS_CLOCK_SLACK < since) {
+        return Err("not written by this run".into());
+    }
+    Ok(f)
+}
+
+/// A tree the parent process writes into AFTER repository code may have run there, or while a
+/// process it started may still be running (a probe copy, the base export, the head worktree, the
+/// guarded checkout). The root is opened ONCE, before any command runs in it (`O_DIRECTORY |
+/// O_NOFOLLOW`), and every write, directory creation or removal walks from that held fd,
+/// component by component with `O_NOFOLLOW`: a command that swaps the root, or any directory
+/// below it, for a link to an outside directory cannot redirect the parent — the walk refuses the
+/// link, or lands in the original (now detached) directory. A file is opened non-blocking and
+/// must be a regular file (a planted FIFO neither stalls nor receives the write). Without
+/// directory fds (Windows) the path checks of [`confined`] stand in.
+pub(crate) struct HeldDir {
+    #[cfg(unix)]
+    fd: std::os::fd::OwnedFd,
+    #[cfg(not(unix))]
+    path: PathBuf,
+}
+
+/// `rel`'s components: plain names only (no root, `..`, or empty name; `.` skipped).
+fn rel_names(rel: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for c in Path::new(rel).components() {
+        match c {
+            std::path::Component::Normal(n) => out.push(
+                n.to_str()
+                    .ok_or_else(|| format!("`{rel}` is not UTF-8"))?
+                    .to_string(),
+            ),
+            std::path::Component::CurDir => {}
+            _ => return Err(format!("`{rel}` must stay inside the tree")),
+        }
+    }
+    if out.is_empty() {
+        return Err(format!("`{rel}` names no file"));
+    }
+    Ok(out)
+}
+
+/// A directory opened through no link, close-on-exec.
+#[cfg(unix)]
+const HELD_DIR_FLAGS: libc::c_int =
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+#[cfg(unix)]
+fn cstr(b: &[u8]) -> Result<std::ffi::CString, String> {
+    std::ffi::CString::new(b).map_err(|_| "a path holds a NUL byte".to_string())
+}
+
+/// Own a just-returned fd, or the OS error that `-1` reported.
+#[cfg(unix)]
+fn owned_fd(fd: libc::c_int) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just opened by the caller and is owned by nothing else.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// Why `name` in `dir` was refused: "a symlink" when that is what is there (never followed),
+/// else the OS error.
+#[cfg(unix)]
+fn held_refusal(
+    dir: &std::os::fd::OwnedFd,
+    name: &std::ffi::CStr,
+    rel: &str,
+    err: std::io::Error,
+) -> String {
+    use std::os::fd::AsRawFd;
+    // SAFETY: zeroed `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `dir` is an open directory fd; `name` is NUL-terminated; `st` is writable.
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+        format!("`{rel}` passes through a symlink (never followed)")
+    } else {
+        format!("`{rel}`: {err}")
+    }
+}
+
+#[cfg(unix)]
+impl HeldDir {
+    /// Hold `root` — call it before any command runs there.
+    pub(crate) fn open(root: &Path) -> Result<Self, String> {
+        use std::os::unix::ffi::OsStrExt;
+        let c = cstr(root.as_os_str().as_bytes())?;
+        // SAFETY: a valid NUL-terminated path.
+        owned_fd(unsafe { libc::open(c.as_ptr(), HELD_DIR_FLAGS) })
+            .map(|fd| Self { fd })
+            .map_err(|e| format!("`{}` could not be held: {e}", root.display()))
+    }
+
+    /// The directory `names` name, walked from the held root through no link; a missing one is
+    /// created when `create`.
+    fn walk(
+        &self,
+        names: &[String],
+        rel: &str,
+        create: bool,
+    ) -> Result<std::os::fd::OwnedFd, String> {
+        use std::os::fd::AsRawFd;
+        let mut cur = self.fd.try_clone().map_err(|e| e.to_string())?;
+        for n in names {
+            let c = cstr(n.as_bytes())?;
+            // SAFETY: `cur` is an open directory fd; `c` is NUL-terminated.
+            let mut next =
+                owned_fd(unsafe { libc::openat(cur.as_raw_fd(), c.as_ptr(), HELD_DIR_FLAGS) });
+            if create && matches!(&next, Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+                // SAFETY: as above. A racing creator is fine: the open below decides.
+                unsafe { libc::mkdirat(cur.as_raw_fd(), c.as_ptr(), 0o777) };
+                // SAFETY: as above.
+                next =
+                    owned_fd(unsafe { libc::openat(cur.as_raw_fd(), c.as_ptr(), HELD_DIR_FLAGS) });
+            }
+            cur = next.map_err(|e| held_refusal(&cur, &c, rel, e))?;
+        }
+        Ok(cur)
+    }
+
+    /// The directory at `rel`, held (missing directories created when `create`), never through a
+    /// link.
+    pub(crate) fn subdir(&self, rel: &str, create: bool) -> Result<HeldDir, String> {
+        let names = rel_names(rel)?;
+        self.walk(&names, rel, create).map(|fd| HeldDir { fd })
+    }
+
+    /// The directory at `rel` (`rel` empty or `.`: the held root itself) as an open fd, walked
+    /// through no link — what a check's child enters with `fchdir`.
+    pub(crate) fn dir_fd(&self, rel: &str) -> Result<std::os::fd::OwnedFd, String> {
+        if rel.is_empty() || rel == "." {
+            return self.fd.try_clone().map_err(|e| e.to_string());
+        }
+        self.subdir(rel, false).map(|d| d.fd)
+    }
+
+    /// A NEW directory at `rel` (its parents created as needed), held: one already there — a
+    /// leftover, or one a running command made — is refused, never reused.
+    pub(crate) fn create_fresh_dir(&self, rel: &str) -> Result<HeldDir, String> {
+        use std::os::fd::AsRawFd;
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let dir = self.walk(parents, rel, true)?;
+        let c = cstr(leaf.as_bytes())?;
+        // SAFETY: `dir` is an open directory fd; `c` is NUL-terminated.
+        if unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o777) } != 0 {
+            return Err(format!("`{rel}`: {}", std::io::Error::last_os_error()));
+        }
+        // SAFETY: as above.
+        owned_fd(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), HELD_DIR_FLAGS) })
+            .map(|fd| HeldDir { fd })
+            .map_err(|e| held_refusal(&dir, &c, rel, e))
+    }
+
+    /// Write `content` at `rel` (missing directories created), never through a link.
+    pub(crate) fn write(&self, rel: &str, content: &str) -> Result<(), String> {
+        self.write_bytes(rel, content.as_bytes(), false)
+    }
+
+    /// Write `body` at `rel` (missing directories created; mode 0755 when `exec`, else the
+    /// umask's default), never through a link, and only into a regular file.
+    pub(crate) fn write_bytes(&self, rel: &str, body: &[u8], exec: bool) -> Result<(), String> {
+        use std::os::fd::AsRawFd;
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let dir = self.walk(parents, rel, true)?;
+        let c = cstr(leaf.as_bytes())?;
+        let flags = libc::O_WRONLY
+            | libc::O_CREAT
+            | libc::O_TRUNC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | libc::O_CLOEXEC;
+        // SAFETY: `dir` is an open directory fd; `c` is NUL-terminated.
+        let fd = owned_fd(unsafe {
+            libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, 0o666 as libc::c_uint)
+        })
+        .map_err(|e| held_refusal(&dir, &c, rel, e))?;
+        let mut f = std::fs::File::from(fd);
+        if !f.metadata().map_err(|e| e.to_string())?.is_file() {
+            return Err(format!("`{rel}` is not a regular file"));
+        }
+        if exec {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("`{rel}`: {e}"))?;
+        }
+        std::io::Write::write_all(&mut f, body).map_err(|e| format!("`{rel}`: {e}"))
+    }
+
+    /// A symbolic link at `rel` pointing at `target` (written as is, never resolved; missing
+    /// directories created).
+    pub(crate) fn symlink(&self, rel: &str, target: &[u8]) -> Result<(), String> {
+        use std::os::fd::AsRawFd;
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let dir = self.walk(parents, rel, true)?;
+        let (c, t) = (cstr(leaf.as_bytes())?, cstr(target)?);
+        // SAFETY: `dir` is an open directory fd; both strings are NUL-terminated.
+        if unsafe { libc::symlinkat(t.as_ptr(), dir.as_raw_fd(), c.as_ptr()) } != 0 {
+            return Err(format!("`{rel}`: {}", std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// Remove the regular file at `rel` (a link or a directory there is left alone); `true` when
+    /// one was removed.
+    pub(crate) fn remove_file(&self, rel: &str) -> Result<bool, String> {
+        use std::os::fd::AsRawFd;
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let Ok(dir) = self.walk(parents, rel, false) else {
+            return Ok(false);
+        };
+        let c = cstr(leaf.as_bytes())?;
+        // SAFETY: zeroed `stat` is a valid out-parameter.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `dir` is an open directory fd; `c` is NUL-terminated; `st` is writable.
+        let rc = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Ok(false);
+        }
+        // SAFETY: as above.
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) } != 0 {
+            return Err(format!("`{rel}`: {}", std::io::Error::last_os_error()));
+        }
+        Ok(true)
+    }
+
+    /// What is at `rel` (its parents walked through no link), never following a link there;
+    /// `None` when nothing is.
+    pub(crate) fn kind(&self, rel: &str) -> Result<Option<EntryKind>, String> {
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let dir = self
+            .walk(parents, rel, false)
+            .map_err(|e| format!("cannot be inspected: {e}"))?;
+        let c = cstr(leaf.as_bytes())?;
+        match stat_at(&dir, &c) {
+            Ok(st) => Ok(Some(entry_kind(st.st_mode))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("`{rel}` cannot be inspected: {e}")),
+        }
+    }
+
+    /// Remove whatever is at `rel`, a directory recursively, every entry relative to its own
+    /// directory's fd: a directory below is opened `O_NOFOLLOW` and emptied, a link (or anything
+    /// else) is unlinked — never followed, so a command that swaps a directory of the tree for a
+    /// link to an outside one has the LINK removed, never the outside directory. `true` when
+    /// something was there.
+    pub(crate) fn remove_tree(&self, rel: &str) -> Result<bool, String> {
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let dir = self.walk(parents, rel, false)?;
+        let c = cstr(leaf.as_bytes())?;
+        match stat_at(&dir, &c) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(format!("`{rel}` cannot be inspected: {e}")),
+            Ok(_) => {}
+        }
+        remove_entry(&dir, &c, 0).map_err(|e| format!("`{rel}`: {e}"))?;
+        Ok(true)
+    }
+
+    /// The regular file at `rel` opened for reading (its parents walked through no link; the file
+    /// itself `O_NOFOLLOW | O_NONBLOCK`): what the caller then checks is the OPENED file, never a
+    /// path a command could re-point after the check.
+    pub(crate) fn open_read(&self, rel: &str) -> Result<std::fs::File, String> {
+        use std::os::fd::AsRawFd;
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let dir = self.walk(parents, rel, false)?;
+        let c = cstr(leaf.as_bytes())?;
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        // SAFETY: `dir` is an open directory fd; `c` is NUL-terminated.
+        owned_fd(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) })
+            .map(std::fs::File::from)
+            .map_err(|e| held_refusal(&dir, &c, rel, e))
+    }
+
+    /// The target of the symbolic link at `rel` (its parents walked through no link), as stored.
+    pub(crate) fn read_link(&self, rel: &str) -> Result<Vec<u8>, String> {
+        use std::os::fd::AsRawFd;
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let dir = self.walk(parents, rel, false)?;
+        let c = cstr(leaf.as_bytes())?;
+        let mut buf = vec![0u8; 4096];
+        // SAFETY: `dir` is an open directory fd; `c` is NUL-terminated; `buf` is writable for
+        // its length.
+        let n = unsafe {
+            libc::readlinkat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        if n < 0 {
+            return Err(format!("`{rel}`: {}", std::io::Error::last_os_error()));
+        }
+        buf.truncate(n as usize);
+        Ok(buf)
+    }
+
+    /// Is `path` still the held directory — a real directory (not a link) with the held fd's
+    /// device and inode? Checked before a command is spawned in the tree by path: a command that
+    /// replaced the tree's root with a link to an outside directory gets no later command started
+    /// there.
+    pub(crate) fn still_at(&self, path: &Path) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(path)
+            .map_err(|e| format!("`{}` cannot be inspected: {e}", path.display()))?;
+        let held = std::fs::File::from(self.fd.try_clone().map_err(|e| e.to_string())?)
+            .metadata()
+            .map_err(|e| e.to_string())?;
+        if m.file_type().is_symlink()
+            || !m.is_dir()
+            || (m.dev(), m.ino()) != (held.dev(), held.ino())
+        {
+            return Err(format!(
+                "`{}` is no longer the directory the floor held (replaced after a command ran)",
+                path.display()
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl HeldDir {
+    /// `root` — the path this directory was held at — and `root/rel` (`rel` empty: the root
+    /// alone) still name the held directory and its `rel`, walked from the held fd through no
+    /// link ([`HeldDir::still_at`]).
+    pub(crate) fn still_at_rel(&self, root: &Path, rel: &str) -> Result<(), String> {
+        self.still_at(root)?;
+        if rel.is_empty() || rel == "." {
+            return Ok(());
+        }
+        self.subdir(rel, false)?.still_at(&root.join(rel))
+    }
+}
+
+/// What a directory entry is, never following a link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntryKind {
+    Dir,
+    File,
+    Link,
+    Other,
+}
+
+#[cfg(unix)]
+fn entry_kind(mode: libc::mode_t) -> EntryKind {
+    match mode & libc::S_IFMT {
+        libc::S_IFDIR => EntryKind::Dir,
+        libc::S_IFREG => EntryKind::File,
+        libc::S_IFLNK => EntryKind::Link,
+        _ => EntryKind::Other,
+    }
+}
+
+/// `fstatat(dir, name, AT_SYMLINK_NOFOLLOW)`.
+#[cfg(unix)]
+fn stat_at(dir: &impl std::os::fd::AsRawFd, name: &std::ffi::CStr) -> std::io::Result<libc::stat> {
+    // SAFETY: zeroed `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `dir` is an open directory fd; `name` is NUL-terminated; `st` is writable.
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
+/// How deep [`HeldDir::remove_tree`] descends before it gives up (a bound on open fds).
+#[cfg(unix)]
+const MAX_REMOVE_DEPTH: usize = 256;
+
+/// `unlinkat(dir, name, flags)`, a missing entry being gone already.
+#[cfg(unix)]
+fn unlink_at(
+    dir: &impl std::os::fd::AsRawFd,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> std::io::Result<()> {
+    // SAFETY: `dir` is an open directory fd; `name` is NUL-terminated.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flags) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Remove `name` in `dir`: a directory is opened through no link, emptied and removed; anything
+/// else (a link included) is unlinked, never followed.
+#[cfg(unix)]
+fn remove_entry(
+    dir: &impl std::os::fd::AsRawFd,
+    name: &std::ffi::CStr,
+    depth: usize,
+) -> std::io::Result<()> {
+    let st = match stat_at(dir, name) {
+        Ok(st) => st,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if entry_kind(st.st_mode) != EntryKind::Dir {
+        return unlink_at(dir, name, 0);
+    }
+    // SAFETY: `dir` is an open directory fd; `name` is NUL-terminated.
+    match owned_fd(unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), HELD_DIR_FLAGS) }) {
+        Ok(sub) => {
+            empty_dir(&sub, depth + 1)?;
+            unlink_at(dir, name, libc::AT_REMOVEDIR)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // Swapped for a link (or a file) since the stat: unlinked, never followed.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) => {
+            unlink_at(dir, name, 0)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove every entry of the directory `dir` (a few passes: a process still writing there may
+/// add one; whatever remains makes the caller's `rmdir` fail, and that is reported).
+#[cfg(unix)]
+fn empty_dir(dir: &std::os::fd::OwnedFd, depth: usize) -> std::io::Result<()> {
+    if depth > MAX_REMOVE_DEPTH {
+        return Err(std::io::Error::other("the tree is too deep to remove"));
+    }
+    for _ in 0..3 {
+        let names = dir_names(dir)?;
+        if names.is_empty() {
+            break;
+        }
+        for n in &names {
+            remove_entry(dir, n, depth)?;
+        }
+    }
+    Ok(())
+}
+
+/// The entry names of the directory `dir` (not `.` or `..`), read through a fresh fd of it.
+#[cfg(unix)]
+fn dir_names(dir: &std::os::fd::OwnedFd) -> std::io::Result<Vec<std::ffi::CString>> {
+    use std::os::fd::{AsRawFd, IntoRawFd};
+    // SAFETY: `dir` is an open directory fd; the name is NUL-terminated.
+    let fresh = owned_fd(unsafe { libc::openat(dir.as_raw_fd(), c".".as_ptr(), HELD_DIR_FLAGS) })?;
+    let raw = fresh.into_raw_fd();
+    // SAFETY: `raw` is an open directory fd we own; on success the stream owns it.
+    let stream = unsafe { libc::fdopendir(raw) };
+    if stream.is_null() {
+        let e = std::io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, so `raw` is still ours to close.
+        unsafe { libc::close(raw) };
+        return Err(e);
+    }
+    let mut out = Vec::new();
+    loop {
+        // SAFETY: `stream` is an open directory stream.
+        let ent = unsafe { libc::readdir(stream) };
+        if ent.is_null() {
+            break;
+        }
+        // SAFETY: `ent` points at a valid entry whose `d_name` is NUL-terminated.
+        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            out.push(name.to_owned());
+        }
+    }
+    // SAFETY: `stream` is open, and closed exactly once (with the fd it owns).
+    unsafe { libc::closedir(stream) };
+    Ok(out)
+}
+
+/// Without directory fds: the path checks of [`confined`] before every operation.
+#[cfg(not(unix))]
+impl HeldDir {
+    pub(crate) fn open(root: &Path) -> Result<Self, String> {
+        match std::fs::symlink_metadata(root) {
+            Ok(m) if m.is_dir() => Ok(Self {
+                path: root.to_path_buf(),
+            }),
+            _ => Err(format!("`{}` is not a plain directory", root.display())),
+        }
+    }
+
+    pub(crate) fn subdir(&self, rel: &str, create: bool) -> Result<HeldDir, String> {
+        rel_names(rel)?;
+        let p = confined(&self.path, rel)?;
+        if create {
+            std::fs::create_dir_all(&p).map_err(|e| format!("`{rel}`: {e}"))?;
+        }
+        HeldDir::open(&confined(&self.path, rel)?)
+    }
+
+    pub(crate) fn create_fresh_dir(&self, rel: &str) -> Result<HeldDir, String> {
+        rel_names(rel)?;
+        let p = confined(&self.path, rel)?;
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("`{rel}`: {e}"))?;
+        }
+        std::fs::create_dir(confined(&self.path, rel)?).map_err(|e| format!("`{rel}`: {e}"))?;
+        HeldDir::open(&p)
+    }
+
+    pub(crate) fn write(&self, rel: &str, content: &str) -> Result<(), String> {
+        self.write_bytes(rel, content.as_bytes(), false)
+    }
+
+    pub(crate) fn write_bytes(&self, rel: &str, body: &[u8], _exec: bool) -> Result<(), String> {
+        rel_names(rel)?;
+        let path = confined(&self.path, rel)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        // Re-checked once the directories exist: none of them may be a link.
+        let path = confined(&self.path, rel)?;
+        let mut f = no_follow(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true),
+        )
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+        std::io::Write::write_all(&mut f, body).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn remove_file(&self, rel: &str) -> Result<bool, String> {
+        rel_names(rel)?;
+        let Ok(p) = confined(&self.path, rel) else {
+            return Ok(false);
+        };
+        match std::fs::symlink_metadata(&p) {
+            Ok(m) if m.is_file() => std::fs::remove_file(&p)
+                .map(|()| true)
+                .map_err(|e| e.to_string()),
+            _ => Ok(false),
+        }
+    }
+
+    /// `rel` under the held path, its PARENTS [`confined`] (the leaf itself may be a link: it is
+    /// inspected or removed, never followed).
+    fn leaf_path(&self, rel: &str) -> Result<PathBuf, String> {
+        let names = rel_names(rel)?;
+        let (leaf, parents) = names.split_last().expect("rel_names is never empty");
+        let mut p = if parents.is_empty() {
+            self.path.clone()
+        } else {
+            confined(&self.path, &parents.join("/"))?
+        };
+        p.push(leaf);
+        Ok(p)
+    }
+
+    pub(crate) fn kind(&self, rel: &str) -> Result<Option<EntryKind>, String> {
+        let p = self.leaf_path(rel)?;
+        match std::fs::symlink_metadata(&p) {
+            Ok(m) if m.file_type().is_symlink() => Ok(Some(EntryKind::Link)),
+            Ok(m) if m.is_dir() => Ok(Some(EntryKind::Dir)),
+            Ok(m) if m.is_file() => Ok(Some(EntryKind::File)),
+            Ok(_) => Ok(Some(EntryKind::Other)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("`{rel}` cannot be inspected: {e}")),
+        }
+    }
+
+    /// `remove_dir_all` removes a link (a junction, a symlink) without following it.
+    pub(crate) fn remove_tree(&self, rel: &str) -> Result<bool, String> {
+        let p = self.leaf_path(rel)?;
+        match std::fs::symlink_metadata(&p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("`{rel}` cannot be inspected: {e}")),
+            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => std::fs::remove_dir_all(&p)
+                .map(|()| true)
+                .map_err(|e| format!("`{rel}`: {e}")),
+            Ok(_) => std::fs::remove_file(&p)
+                .map(|()| true)
+                .map_err(|e| format!("`{rel}`: {e}")),
+        }
+    }
+
+    pub(crate) fn open_read(&self, rel: &str) -> Result<std::fs::File, String> {
+        rel_names(rel)?;
+        let p = confined(&self.path, rel)?;
+        no_follow(std::fs::OpenOptions::new().read(true))
+            .open(&p)
+            .map_err(|e| format!("`{rel}`: {e}"))
+    }
+
+    pub(crate) fn still_at(&self, path: &Path) -> Result<(), String> {
+        match std::fs::symlink_metadata(path) {
+            Ok(m) if m.is_dir() && !m.file_type().is_symlink() && path == self.path => Ok(()),
+            _ => Err(format!(
+                "`{}` is no longer the directory the floor held (replaced after a command ran)",
+                path.display()
+            )),
+        }
+    }
+}
+
+/// (DES-BUILD-GUIDE) The base guide's check for `check`, when its pieces may be relied on for
+/// this head; `Err` says why not (no guide, no such check, a probe not passed, stale, invalidated).
+fn guide_for<'g>(
+    guide: &'g Result<Option<crate::floor_guide::BuildGuide>, String>,
+    check: &RepoCheck,
+    ctx: &FloorContext,
+    worktree: &Path,
+    changed: &Result<Vec<String>, String>,
+) -> Result<&'g GuideCheck, String> {
+    let g = match guide {
+        Err(e) => return Err(e.clone()),
+        Ok(None) => {
+            return Err(format!(
+                "the base has no `{}`",
+                crate::floor_guide::GUIDE_PATH
+            ))
+        }
+        Ok(Some(g)) => g,
+    };
+    let c = g
+        .check_for(&check.argv, &check.dir)
+        .ok_or("the base's guide has no check with this argv and cwd")?;
+    let (Some(base), Some(git_dir)) = (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) else {
+        return Err("no base to verify the guide against".into());
+    };
+    let changed = changed
+        .as_ref()
+        .map_err(|e| format!("the change's files could not be listed: {e}"))?;
+    c.usable(g, worktree, git_dir, base, changed)?;
+    Ok(c)
+}
+
+/// (DES-BUILD-GUIDE) A failed run whose exit code is neither 0 nor one of the guide's
+/// `failedExit` codes did not fail tests — it crashed or did not build: why, or `None`.
+fn crashed(run: &CheckRun, g: Option<&GuideCheck>) -> Option<String> {
+    let g = g.filter(|g| !g.failed_exit.is_empty())?;
+    let code = run
+        .exit_code
+        .filter(|c| *c != 0 && !g.failed_exit.contains(c))?;
+    Some(format!(
+        "exit {code} is not one of the guide's `failedExit` codes {:?}: a crash or a build \
+         failure, not a test failure",
+        g.failed_exit
+    ))
+}
+
+/// (DES-BUILD-GUIDE) A check that declares a `version` command is relied on only while the runner
+/// still reports the version its probes ran under (`verified.runnerVersion`).
+fn runner_current(
+    worktree: &Path,
+    held: Option<&HeldDir>,
+    check: &RepoCheck,
+    g: &GuideCheck,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+) -> Result<(), String> {
+    if g.version.is_none() {
+        return Ok(());
+    }
+    let now = runner_version(worktree, held, check, g, sandbox, scratch, Tree::Head)?;
+    let then = g
+        .verified
+        .as_ref()
+        .map_or("", |v| v.runner_version.as_str());
+    if now != then {
+        return Err(format!(
+            "stale: the runner reports `{now}`, the guide was verified under `{then}`"
+        ));
+    }
+    Ok(())
+}
+
+/// The first line the guide's `version` command prints (stdout and stderr merged) on `tree`.
+pub(crate) fn runner_version(
+    dir: &Path,
+    held: Option<&HeldDir>,
+    check: &RepoCheck,
+    g: &GuideCheck,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+    tree: Tree,
+) -> Result<String, String> {
+    let v = g.version.as_ref().ok_or("no `version` piece")?;
+    let rc = RepoCheck {
+        argv: v.run.clone(),
+        source: format!("`{}`'s runner version (DES-BUILD-GUIDE)", check.name),
+        timeout_s: Some(120),
+        ..check.clone()
+    };
+    let r = run_one_with(dir, held, &rc, &merged(true), sandbox, scratch, tree);
+    if !r.passed() {
+        return Err(format!(
+            "the version command did not pass ({})",
+            r.summary()
+        ));
+    }
+    let text = match r.logs.first() {
+        Some(log) => crate::floor_log::read_blob(&scratch.logs, log)?,
+        None => Vec::new(),
+    };
+    String::from_utf8_lossy(&text)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "the version command printed nothing".to_string())
+}
+
+fn relabel(
+    mut logs: Vec<crate::floor_log::LogRef>,
+    attempt: &str,
+) -> Vec<crate::floor_log::LogRef> {
+    for l in &mut logs {
+        l.attempt = attempt.to_string();
+    }
+    logs
+}
+
+/// (DES-FLOOR-V2 §4) Was the host oversubscribed when `run` started (its load band)?
+fn ran_loaded(run: &CheckRun) -> bool {
+    // The run's OWN load band, sampled as it started — never the load after other runs (the
+    // base's) raised it.
+    run.load_band.is_some_and(|b| b >= 1)
+}
+
+/// (DES-FLOOR-V2 §4) Bazel's `flaky_test_attempts=2`: when the deciding run FAILED (not a
+/// timeout, not a spawn failure) on an oversubscribed host, wait (bounded) for the 1-min load to
+/// fall below the CPU count, then run the SAME argv once more. `None` when no retry was due.
+fn retry_if_loaded(
+    worktree: &Path,
+    held: Option<&HeldDir>,
+    one: &RepoCheck,
+    exec: &ExecOpts,
+    first: &CheckRun,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+) -> Option<CheckRun> {
+    if first.passed() || first.timed_out || first.spawn_error.is_some() || !ran_loaded(first) {
+        return None;
+    }
+    let waited = Instant::now();
+    let bound = retry_headroom_wait();
+    while waited.elapsed() < bound {
+        let (load1, cpus) = host_load();
+        if !oversubscribed(load1, cpus) {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1).min(bound));
+    }
+    let mut r = run_one_with(worktree, held, one, exec, sandbox, scratch, Tree::Head);
+    r.logs = relabel(r.logs, "retry");
+    r.source = format!(
+        "the identical retry of `{}` after waiting {:.0}s for headroom (DES-FLOOR-V2)",
+        one.name,
+        waited.elapsed().as_secs_f64()
+    );
+    eprintln!(
+        "wicked-core: repo checks floor — `{}` failed under load; its identical retry {}",
+        one.name,
+        if r.passed() { "passed" } else { "failed" }
+    );
+    Some(r)
+}
+
+fn retry_headroom_wait() -> Duration {
+    // Unit tests never wait for headroom.
+    if cfg!(test) {
+        return Duration::ZERO;
+    }
+    std::env::var(RETRY_WAIT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|s| Duration::from_secs(s.min(MAX_RETRY_WAIT_S)))
+        .unwrap_or(RETRY_HEADROOM_WAIT)
+}
+
+/// The base side of a failed head check: the base run (fresh or cached) and, when it failed, its
+/// inventory.
+struct BaseSide {
+    base: BaseRun,
+    toc: Option<Toc>,
+}
+
+/// (DES-FLOOR-V2 §3) Decide a FAILED head check `head` (its first, unchanged run) against its base
+/// side: the head's exit codes decide, the base's TOC-validated failures are the only ones that
+/// may be excluded, and head text is never read to decide.
+#[allow(clippy::too_many_arguments)]
+fn decide(
+    worktree: &Path,
+    held: Option<&HeldDir>,
+    check: &RepoCheck,
+    head: &mut CheckRun,
+    side: Option<BaseSide>,
+    guide: &Result<&GuideCheck, String>,
+    exclude: bool,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+) {
+    let mut logs = head.logs.clone();
+    let base_sha = side.as_ref().map(|s| s.base.head.clone());
+    let mut decision = CheckDecision {
+        outcome: OUTCOME_NEW_FAILURE.to_string(),
+        base_sha: base_sha.clone(),
+        base_failing: Vec::new(),
+        excluded: Vec::new(),
+        log_refs: Vec::new(),
+        flaky: false,
+        reason: None,
+        guide: None,
+    };
+    let base_run = side.as_ref().and_then(|s| s.base.run.as_ref());
+    if let Some(b) = base_run {
+        logs.extend(b.logs.iter().cloned());
+    }
+    // The base is red and finished: separate its failures from the head's, if it can be precise.
+    let red_base = base_run.filter(|b| !b.passed() && !b.timed_out && b.spawn_error.is_none());
+    let mut plan: Result<Vec<TestId>, String> = Err("the base passes this check".to_string());
+    if let (Some(_), Some(side)) = (red_base, side.as_ref()) {
+        plan = (|| {
+            if !exclude {
+                return Err(format!("exclusion disabled ({FLOOR_EXCLUDE_ENV})"));
+            }
+            let g = guide
+                .as_ref()
+                .map_err(|e| format!("no usable build guide: {e}"))?;
+            let toc = side
+                .toc
+                .as_ref()
+                .ok_or_else(|| "the base's list was not taken".to_string())?;
+            logs.extend(toc.logs.iter().cloned());
+            if let Some(why) = &toc.incomplete {
+                return Err(format!("the base: {why}"));
+            }
+            let failing = toc.failing.clone();
+            decision.base_failing = failing.iter().map(|t| t.id.clone()).collect();
+            if failing.is_empty() {
+                return Err("no failing test of the base appears in the base's own list".into());
+            }
+            if let Some(t) = failing.iter().find(|t| toc.count(t) != 1) {
+                return Err(format!(
+                    "`{}` names {} tests in the base's list",
+                    t.id,
+                    toc.count(t)
+                ));
+            }
+            // `alone`/`deselect` that do not name the qualifier reach the id under every one.
+            if let Some(t) = failing
+                .iter()
+                .find(|t| !g.q_scoped() && toc.qs(&t.id).len() != 1)
+            {
+                return Err(format!(
+                    "`{}` is listed under more than one qualifier, and the guide's `alone` and \
+                     `deselect` do not name `{{q}}`",
+                    t.id
+                ));
+            }
+            for t in &failing {
+                match toc.alone.iter().find(|(a, _)| a == t) {
+                    Some((_, true)) => {}
+                    Some(_) => {
+                        return Err(format!(
+                            "`{}` does not fail when the base runs it alone",
+                            t.id
+                        ))
+                    }
+                    None => {
+                        return Err(format!(
+                            "`{}` was not confirmed on the base (more than \
+                             {MAX_ALONE_CONFIRMATIONS} failures)",
+                            t.id
+                        ))
                     }
                 }
-                _ => Some(REGRESSION),
             }
-        }
-    };
-    head.classification = verdict.map(str::to_string);
-    head.base = Some(Box::new(base));
-}
-
-/// (core#553) The argv that re-runs ONE libtest id alone: the check's own `cargo test` with the
-/// workspace/target selection replaced by the id's binary (`-p b --test common`, when the id is
-/// qualified) and `-- --exact <name>`. (core#766) A vitest id (`FAIL <file> > suite > name`)
-/// re-runs as its FILE alone — the check's own `vitest` invocation (through `npx`, `pnpm exec`,
-/// `yarn`, or the binary) cut back to `vitest run <file>` plus any `--config`/`--root` it carried;
-/// a vitest test name is not addressable by exact match, the file is, and the issue asks for
-/// "that file only". `None` for any other runner or id shape — the floor then does not re-run and
-/// the classification stands.
-fn isolated_rerun_argv(argv: &[String], id: &str) -> Option<(Vec<String>, String)> {
-    if let Some(file) = vitest_file_of(id) {
-        if !rerun_file_ok(file) {
-            return None;
-        }
-        return vitest_file_rerun_argv(argv, file).map(|a| (a, id.to_string()));
-    }
-    let (name, target) = libtest_parts(id)?;
-    let bin = argv.first()?;
-    let is_cargo = Path::new(bin)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n == "cargo" || n == "cargo.exe");
-    let sub = match argv.get(1) {
-        Some(t) if t.starts_with('+') => 2,
-        _ => 1,
-    };
-    if !is_cargo || argv.get(sub).map(String::as_str) != Some("test") {
-        return None;
-    }
-    let split = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
-    let (cargo_args, test_args) = (&argv[..split], argv.get(split + 1..).unwrap_or(&[]));
-    let mut out: Vec<String> = Vec::new();
-    let mut skip_value = false;
-    for a in cargo_args {
-        if skip_value {
-            skip_value = false;
-            continue;
-        }
-        if target.is_some() {
-            // The id names its binary: every selection of the original command gives way to it.
-            if matches!(
-                a.as_str(),
-                "-p" | "--package" | "--test" | "--bin" | "--example" | "--bench" | "--exclude"
-            ) {
-                skip_value = true;
-                continue;
+            let head_toc = inventory(worktree, held, check, g, &[], sandbox, scratch, Tree::Head);
+            logs.extend(head_toc.logs.iter().cloned());
+            if let Some(why) = &head_toc.incomplete {
+                return Err(format!("the head: {why}"));
             }
-            if matches!(
-                a.as_str(),
-                "--workspace"
-                    | "--all"
-                    | "--lib"
-                    | "--bins"
-                    | "--tests"
-                    | "--doc"
-                    | "--examples"
-                    | "--benches"
-                    | "--all-targets"
-                    | "--no-fail-fast"
-            ) || a.starts_with("--package=")
-                || a.starts_with("--test=")
-                || a.starts_with("--bin=")
-                || a.starts_with("--exclude=")
-                || (a.starts_with("-p") && a.len() > 2)
-            {
-                continue;
+            for t in &failing {
+                if head_toc.count(t) > 1 {
+                    return Err(format!(
+                        "`{}` names {} tests in the head's list",
+                        t.id,
+                        head_toc.count(t)
+                    ));
+                }
+                if head_toc.qs(&t.id).iter().any(|q| *q != t.q) {
+                    return Err(format!(
+                        "`{}` is not under the same qualifier on the base and the head",
+                        t.id
+                    ));
+                }
             }
-        }
-        out.push(a.clone());
-    }
-    if let Some(t) = target {
-        out.extend(t.split_whitespace().map(String::from));
-    }
-    out.push("--".into());
-    out.extend(test_args.iter().cloned());
-    out.push("--exact".into());
-    out.push(name.to_string());
-    Some((out, name.to_string()))
-}
-
-/// (core#781) The runner behind a package-manager script check — `npm test`, `npm run <s>`,
-/// `pnpm [run] <s>`, `yarn [run] <s>` — read from the worktree's `package.json`: the script as
-/// `npx --no-install <tokens…>` when it is ONE plain `vitest` command (its first token `vitest`,
-/// no shell operator, quote, comment, glob, substitution or variable), else `None` (a script the floor cannot
-/// see through is not re-run, as before).
-fn script_runner_argv(worktree: &Path, argv: &[String]) -> Option<Vec<String>> {
-    let pm = Path::new(argv.first()?).file_stem()?.to_str()?;
-    if !matches!(pm, "npm" | "pnpm" | "yarn") {
-        return None;
-    }
-    let script = match argv.get(1..)? {
-        [t] if t == "test" => "test",
-        [r, name] if r == "run" || r == "run-script" => name.as_str(),
-        [name] if pm != "npm" => name.as_str(),
-        _ => return None,
-    };
-    let pkg: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(worktree.join("package.json")).ok()?).ok()?;
-    let body = pkg.get("scripts")?.get(script)?.as_str()?.trim();
-    if body.chars().any(|c| "&|;<>`$\"'(){}*?#~!\\\n".contains(c)) {
-        return None;
-    }
-    let tokens: Vec<String> = body.split_whitespace().map(String::from).collect();
-    if tokens.first().map(String::as_str) != Some("vitest") {
-        return None;
-    }
-    let mut out = vec!["npx".to_string(), "--no-install".to_string()];
-    out.extend(tokens);
-    Some(out)
-}
-
-/// (core#766) The test file a vitest failure id names: `FAIL tests/x.test.ts > suite > name` →
-/// `tests/x.test.ts`. The ` > ` separator is what makes it vitest's (go's `FAIL TestX` and a
-/// file-level `FAIL tests/x.test.ts [ tests/x.test.ts ]` import failure have none and are not
-/// re-run). The caller checks the runner.
-fn vitest_file_of(id: &str) -> Option<&str> {
-    let rest = id.strip_prefix("FAIL ")?;
-    let (file, _) = rest.split_once(" > ")?;
-    let file = file.trim();
-    (!file.is_empty() && !file.contains(char::is_whitespace) && file.contains('.')).then_some(file)
-}
-
-/// (core#766) The check's own `vitest` invocation cut back to one file: everything up to and
-/// including the `vitest` token (`npx --no-install vitest`, `pnpm exec vitest`, `yarn vitest`,
-/// `node_modules/.bin/vitest`), then `run <file>`, then the original's environment selection —
-/// `--config` / `--root` / `--dir` / `--project` / `--workspace` (both spellings; `--project`
-/// may repeat) — so the file re-runs under the SAME config and project, not a different one.
-/// `--changed <base>`, `related`, its file list and every other flag are dropped: the re-run is
-/// the one file, not the one selection. `None` when the argv has no `vitest` token (`npm run
-/// test` hides the runner behind a script).
-fn vitest_file_rerun_argv(argv: &[String], file: &str) -> Option<Vec<String>> {
-    vitest_files_rerun_argv(argv, &[file])
-}
-
-/// [`vitest_file_rerun_argv`] for a SET of files (core#790): `vitest run <f1> <f2> …` plus the
-/// original's environment selection.
-fn vitest_files_rerun_argv(argv: &[String], files: &[&str]) -> Option<Vec<String>> {
-    let at = argv.iter().position(|a| {
-        Path::new(a)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n == "vitest" || n == "vitest.mjs" || n == "vitest.js")
-    })?;
-    let mut out: Vec<String> = argv[..=at].to_vec();
-    out.push("run".into());
-    out.extend(files.iter().map(|f| f.to_string()));
-    let mut rest = argv[at + 1..].iter();
-    while let Some(a) = rest.next() {
-        if matches!(
-            a.as_str(),
-            "--config" | "-c" | "--root" | "-r" | "--dir" | "--project" | "--workspace" | "-w"
-        ) {
-            if let Some(v) = rest.next() {
-                out.push(a.clone());
-                out.push(v.clone());
+            let names: Vec<TestId> = failing
+                .into_iter()
+                .filter(|t| head_toc.count(t) == 1)
+                .collect();
+            // Precision, by the runner's own selection: the head's list with them deselected
+            // lists exactly the rest of the head's tests.
+            if !names.is_empty() {
+                let rest = inventory(
+                    worktree,
+                    held,
+                    check,
+                    g,
+                    &names,
+                    sandbox,
+                    scratch,
+                    Tree::Head,
+                );
+                logs.extend(rest.logs.iter().cloned());
+                let mut want: Vec<TestId> = head_toc
+                    .ids
+                    .iter()
+                    .filter(|i| !names.contains(i))
+                    .cloned()
+                    .collect();
+                let mut got = rest.ids.clone();
+                want.sort();
+                got.sort();
+                if rest.incomplete.is_some() || got != want {
+                    return Err(
+                        "deselecting the base's failures does not list exactly the rest of the \
+                         head's tests"
+                            .into(),
+                    );
+                }
             }
-        } else if [
-            "--config=",
-            "--root=",
-            "--dir=",
-            "--project=",
-            "--workspace=",
-        ]
-        .iter()
-        .any(|k| a.starts_with(k))
-        {
-            out.push(a.clone());
-        }
+            Ok(names)
+        })();
     }
-    Some(out)
+    // The deciding run: the excluded head run when exclusion is precise and has something to
+    // deselect, else the unchanged head run itself.
+    let (deciding_check, deciding_exec, mut deciding, excluded_run) = match &plan {
+        Ok(names) if !names.is_empty() => {
+            let g = guide.as_ref().expect("a precise plan has a guide");
+            let one = RepoCheck {
+                argv: g.deselected(&check.argv, names),
+                source: format!(
+                    "`{}` with the base's {} failing test{} deselected (DES-FLOOR-V2)",
+                    check.name,
+                    names.len(),
+                    if names.len() == 1 { "" } else { "s" }
+                ),
+                ..check.clone()
+            };
+            let exec = ExecOpts::default();
+            let mut e = run_one_with(worktree, held, &one, &exec, sandbox, scratch, Tree::Head);
+            e.logs = relabel(e.logs, "excluded");
+            decision.excluded = names.iter().map(|t| t.id.clone()).collect();
+            (one, exec, e.clone(), true)
+        }
+        _ => (check.clone(), ExecOpts::default(), head.clone(), false),
+    };
+    if excluded_run {
+        logs.extend(deciding.logs.iter().cloned());
+        head.reruns.push(deciding.clone());
+    }
+    let unseparated = red_base.is_some() && plan.is_err();
+    // Failing twice is `flaky_twice` only when BOTH attempts ran oversubscribed: a retry that had
+    // its headroom and failed again reproduced the failure without the load — a new failure.
+    let mut twice = false;
+    // A deselected run that crashed is decided as it stands (`could_not_run`): no retry.
+    let crashed_out = excluded_run && crashed(&deciding, guide.as_ref().ok().copied()).is_some();
+    let retry = (!crashed_out)
+        .then(|| {
+            retry_if_loaded(
+                worktree,
+                held,
+                &deciding_check,
+                &deciding_exec,
+                &deciding,
+                sandbox,
+                scratch,
+            )
+        })
+        .flatten();
+    if let Some(r) = retry {
+        logs.extend(r.logs.iter().cloned());
+        head.reruns.push(r.clone());
+        decision.flaky = r.passed();
+        twice = !r.passed() && !r.timed_out && r.spawn_error.is_none() && ran_loaded(&r);
+        deciding = r;
+    }
+    // Head ids are an ANNOTATION: listed beside the outcome, never deciding it (the deciding
+    // run's, when it was the excluded one).
+    let annotated: Vec<String> = deciding.failure_ids.clone();
+    let base_passed = base_run.is_some_and(CheckRun::passed);
+    // A base that could not be established — it timed out, could not start, or could not be
+    // exported or provisioned — separates nothing: escalate. (A base that declares no such check,
+    // and a repo that opted out of the comparison, leave the head's failure a new one.)
+    let base_unknown: Option<String> = side.as_ref().and_then(|s| match &s.base.run {
+        Some(b) if b.timed_out => Some("the base run did not finish".to_string()),
+        Some(b) if b.spawn_error.is_some() => Some(format!(
+            "the base run could not start ({})",
+            b.spawn_error.as_deref().unwrap_or_default()
+        )),
+        None => s
+            .base
+            .error
+            .as_deref()
+            .filter(|e| !e.contains("declares no `") && !e.contains("baseline_diff: false"))
+            .map(|e| format!("the base could not be run ({e})")),
+        _ => None,
+    });
+    let cannot_separate: Option<String> = if unseparated {
+        plan.as_ref().err().cloned()
+    } else {
+        base_unknown
+    };
+    let (outcome, classification) = if deciding.passed() && excluded_run {
+        (OUTCOME_PASS_EXCLUDED, Some(PRE_EXISTING_IN_SANDBOX))
+    } else if deciding.passed() {
+        (OUTCOME_PASS, Some(FLAKY_UNDER_LOAD))
+    } else if let Some(why) = &cannot_separate {
+        // Before a retry's own timeout or spawn failure: the first run decided this.
+        decision.reason = Some(format!("base red, cannot separate: {why}"));
+        (OUTCOME_BASE_RED_UNSEPARATED, Some(BASE_RED_UNSEPARATED))
+    } else if deciding.timed_out {
+        (OUTCOME_TIMED_OUT, None)
+    } else if deciding.spawn_error.is_some() {
+        (OUTCOME_COULD_NOT_RUN, None)
+    } else if let Some(why) = crashed(&deciding, guide.as_ref().ok().copied()) {
+        decision.reason = Some(why);
+        (OUTCOME_COULD_NOT_RUN, None)
+    } else {
+        // `regression` (the compatible token) only when a base was compared.
+        let compared = (base_passed || plan.is_ok()).then_some(REGRESSION);
+        (
+            if twice {
+                OUTCOME_FLAKY_TWICE
+            } else {
+                OUTCOME_NEW_FAILURE
+            },
+            compared,
+        )
+    };
+    if outcome == OUTCOME_PASS_EXCLUDED {
+        let n = decision.excluded.len();
+        decision.reason = Some(format!(
+            "{n} pre-existing excluded: {}",
+            decision.excluded.join(", ")
+        ));
+        head.pre_existing = decision.excluded.clone();
+    } else if matches!(outcome, OUTCOME_NEW_FAILURE | OUTCOME_FLAKY_TWICE) {
+        head.regressions = annotated;
+    }
+    if decision.flaky {
+        let said = "passed on retry (flaky)";
+        decision.reason = Some(match decision.reason.take() {
+            Some(r) => format!("{r}; {said}"),
+            None => said.to_string(),
+        });
+    }
+    decision.outcome = outcome.to_string();
+    decision.log_refs = logs;
+    head.classification = classification.map(str::to_string);
+    head.base = side.map(|s| Box::new(s.base));
+    head.decision = Some(decision);
 }
 
-/// (core#766) Does a vitest output line witness the id `FAIL <file> > suite > name` passing?
-/// Either the default reporter's per-file line with EVERY test passed — ` ✓ <file> (N tests)
-/// Nms`, a parenthetical with no `|` sub-count (`(3 tests | 1 skipped)` may have skipped the
-/// very test and is not a witness) — or the verbose reporter's per-test line for THIS id —
-/// ` ✓ <file> > suite > name[ Nms]`, the whole id, not a prefix of it (`> a > b` is not `> a`)
-/// and not another test of the same file. Another file's line is never it.
-fn vitest_pass_line_witnesses(s: &str, id: &str) -> bool {
-    let (Some(rest), Some(body), Some(file)) = (
-        s.strip_prefix('✓'),
-        id.strip_prefix("FAIL "),
-        vitest_file_of(id),
-    ) else {
-        return false;
-    };
-    let rest = rest.trim();
-    if let Some(after) = rest.strip_prefix(body) {
-        // The id ends here: nothing after it, or a SPACE then the duration — `> a1 5ms` is
-        // another test, not `> a` with a timing suffix.
-        if after.is_empty()
-            || (after.starts_with(' ')
-                && after.trim_start().starts_with(|c: char| c.is_ascii_digit()))
-        {
-            return true;
+/// The decision of a check whose first run decides alone: it passed, timed out or could not
+/// start.
+fn decide_alone(run: &mut CheckRun) {
+    run.decision = Some(CheckDecision {
+        outcome: if run.passed() {
+            OUTCOME_PASS
+        } else if run.timed_out {
+            OUTCOME_TIMED_OUT
+        } else {
+            OUTCOME_COULD_NOT_RUN
         }
-    }
-    match rest.strip_prefix(file).map(str::trim_start) {
-        Some(after) if after.starts_with('(') => {
-            let inner = &after[1..after.find(')').unwrap_or(after.len())];
-            !inner.contains('|') && inner.contains("test")
-        }
-        _ => false,
-    }
+        .to_string(),
+        base_sha: None,
+        base_failing: Vec::new(),
+        excluded: Vec::new(),
+        log_refs: run.logs.clone(),
+        flaky: false,
+        reason: None,
+        guide: None,
+    });
+}
+
+/// The decision's outcome of a check, when it has one.
+fn outcome_of(c: &CheckRun) -> Option<&str> {
+    c.decision.as_ref().map(|d| d.outcome.as_str())
 }
 
 /// (core#553) Is the host oversubscribed — its 1-min load above its logical CPU count? The one
 /// condition under which a head-only failure that passes alone is read as a load flake.
 pub(crate) fn oversubscribed(load1: Option<f64>, cpus: usize) -> bool {
     matches!(load1, Some(l) if l.is_finite() && cpus > 0 && l > cpus as f64)
-}
-
-/// (core#553) Re-run each head-only failure of a small `regression` set ONCE, alone, in the same
-/// worktree; when every one PASSES (exit 0 and libtest printed `test <name> ... ok` — a filter
-/// that matched nothing is not a pass) the check is `flaky_under_load`. Each re-run's own
-/// `bound_note` carries the host load at that attempt, beside the first attempt's. Anything else —
-/// a larger set, a runner the floor cannot filter, a re-run that fails — leaves `regression`.
-fn rerun_flakes(
-    worktree: &Path,
-    check: &RepoCheck,
-    run: &mut CheckRun,
-    sandbox: &WorkerSandbox,
-    scratch: &CheckScratch,
-) {
-    if run.classification.as_deref() != Some(REGRESSION)
-        || run.regressions.is_empty()
-        || run.regressions.len() > MAX_FLAKE_RERUN
-    {
-        return;
-    }
-    // The evidence that it was LOAD: the host is oversubscribed as the failure is read. On a host
-    // with headroom a failure that passes alone is as likely an order-dependent regression the
-    // change introduced — it stays a regression, and nothing is re-run.
-    let (load1, cpus) = host_load();
-    if !oversubscribed(load1, cpus) {
-        return;
-    }
-    // (core#781) `npm run test` hides its runner behind a script: when the script is a plain
-    // `vitest …` command the re-run goes through that runner (`npx --no-install vitest …`).
-    let runner_argv = script_runner_argv(&worktree.join(&check.dir), &check.argv);
-    let plans: Option<Vec<(Vec<String>, String)>> = run
-        .regressions
-        .iter()
-        .map(|id| {
-            isolated_rerun_argv(&check.argv, id).or_else(|| {
-                runner_argv
-                    .as_deref()
-                    .and_then(|a| isolated_rerun_argv(a, id))
-            })
-        })
-        .collect();
-    let Some(plans) = plans else {
-        return;
-    };
-    // (core#766) Two vitest ids in one file share one re-run argv — run the file once, witness
-    // both; libtest ids each carry their own `--exact` name and never group.
-    let mut groups: Vec<(Vec<String>, Vec<String>)> = Vec::new();
-    for (argv, name) in plans {
-        match groups.iter_mut().find(|(a, _)| *a == argv) {
-            Some((_, names)) => names.push(name),
-            None => groups.push((argv, vec![name])),
-        }
-    }
-    let mut all_passed = true;
-    for (argv, names) in groups {
-        let label = names.join("`, `");
-        let one = RepoCheck {
-            name: check.name.clone(),
-            argv,
-            source: format!("isolated re-run of `{label}` (core#553)"),
-            timeout_s: check.timeout_s,
-            dir: check.dir.clone(),
-        };
-        let (r, passed) = run_one_watching(worktree, &one, sandbox, scratch, Tree::Head, &names);
-        let ok = r.passed() && names.iter().all(|n| passed.iter().any(|p| p == n));
-        eprintln!(
-            "wicked-core: repo checks floor — isolated re-run of `{label}` {} ({:.1}s{})",
-            if ok { "passed" } else { "did not pass" },
-            r.duration_ms as f64 / 1000.0,
-            r.bound_note
-                .as_deref()
-                .map(|n| format!(", bound {n}"))
-                .unwrap_or_default()
-        );
-        all_passed &= ok;
-        run.reruns.push(r);
-        if !all_passed {
-            break;
-        }
-    }
-    if all_passed {
-        run.classification = Some(FLAKY_UNDER_LOAD.to_string());
-    }
-}
-
-/// (core#790) The watch prefix that asks [`LineScan`] for a whole FILE's check-mark line.
-const FILE_WATCH: &str = "file:";
-
-/// (core#790) Does a vitest output line witness `file` passing as a whole — ` ✓ <file> (N
-/// tests[ | M skipped]) Nms`, optionally behind a `|project|` label? A parenthetical that names a
-/// failure is never a witness, nor is another file's line.
-fn vitest_file_pass_line(s: &str, file: &str) -> bool {
-    let Some(rest) = s.strip_prefix('✓') else {
-        return false;
-    };
-    let mut rest = rest.trim_start();
-    if let Some(after) = rest.strip_prefix('|') {
-        match after.split_once('|') {
-            Some((_, r)) => rest = r.trim_start(),
-            None => return false,
-        }
-    }
-    match rest.strip_prefix(file).map(str::trim_start) {
-        Some(after) if after.starts_with('(') => {
-            let inner = &after[1..after.find(')').unwrap_or(after.len())];
-            inner.contains("test") && !inner.contains("fail")
-        }
-        _ => false,
-    }
-}
-
-/// (core#789/#790) The environment-signal class one output line carries, as recorded on
-/// [`CheckRun::env_signals`]: `load: …` for a vitest pool worker that could not start
-/// ([`LOAD_SIGNATURES`]) or a per-test/hook timeout (`Test timed out in Nms`), `errors: N` for
-/// vitest's own error count (`Errors  N errors`, `Vitest caught N unhandled errors`), `crash: …`
-/// for a tool that died opening a dependency file (`EPERM`/`EACCES` naming `node_modules`).
-fn env_signal_of_line(s: &str) -> Option<String> {
-    let clip = |line: &str| -> String { line.chars().take(300).collect() };
-    if LOAD_SIGNATURES.iter().any(|sig| s.contains(sig)) || per_test_timeout(s) {
-        return Some(format!("load: {}", clip(s)));
-    }
-    if let Some(n) = vitest_error_count(s) {
-        return Some(format!("errors: {n}"));
-    }
-    if (s.contains("EPERM: operation not permitted") || s.contains("EACCES: permission denied"))
-        && s.contains("node_modules")
-    {
-        return Some(format!("crash: {}", clip(s)));
-    }
-    None
-}
-
-/// The vitest pool's worker-start failure (core#790): `[vitest-pool]: Failed to start <pool>
-/// worker for test files <abs>, <abs>.` with its cause `Timeout waiting for worker to respond`.
-const LOAD_SIGNATURES: &[&str] = &[
-    "[vitest-pool]: Failed to start ",
-    "Timeout waiting for worker to respond",
-];
-
-/// The prefix of the worker-start line that names its files.
-const WORKER_START_FILES: &str = " worker for test files ";
-
-/// `Test timed out in 30000ms` / `Hook timed out in 10000ms` — vitest's per-test bound.
-fn per_test_timeout(s: &str) -> bool {
-    ["Test timed out in ", "Hook timed out in "]
-        .iter()
-        .any(|k| {
-            s.split_once(k).is_some_and(|(_, rest)| {
-                let n = rest.bytes().take_while(u8::is_ascii_digit).count();
-                n > 0 && rest[n..].starts_with("ms")
-            })
-        })
-}
-
-/// vitest's error count: the summary row `Errors  N error(s)` or the banner `Vitest caught N
-/// unhandled error(s)`.
-fn vitest_error_count(s: &str) -> Option<usize> {
-    let rest = if let Some(r) = s.strip_prefix("Errors ") {
-        r.trim_start()
-    } else {
-        s.split_once("Vitest caught ")?.1
-    };
-    let n = rest.bytes().take_while(u8::is_ascii_digit).count();
-    let count = rest[..n].parse().ok()?;
-    let tail = rest[n..].trim_start();
-    (tail.starts_with("error") || tail.starts_with("unhandled error")).then_some(count)
-}
-
-/// (core#790) The files a worker-start signal names, relative to `worktree` (absolute on vitest's
-/// line; a path outside the worktree is `Err` — the floor never re-runs a file it does not own).
-fn worker_start_files(signal: &str, worktree: &Path) -> Result<Vec<String>, ()> {
-    let Some((_, list)) = signal.split_once(WORKER_START_FILES) else {
-        return Ok(Vec::new());
-    };
-    let roots: Vec<String> = [Some(worktree.to_path_buf()), worktree.canonicalize().ok()]
-        .into_iter()
-        .flatten()
-        .map(|p| format!("{}/", p.to_string_lossy().trim_end_matches('/')))
-        .collect();
-    let list = list.trim_end().trim_end_matches('.');
-    let mut out = Vec::new();
-    for f in list.split(", ").map(str::trim).filter(|f| !f.is_empty()) {
-        let rel = if f.starts_with('/') || Path::new(f).is_absolute() {
-            match roots.iter().find_map(|r| f.strip_prefix(r.as_str())) {
-                Some(rel) => rel,
-                None => return Err(()),
-            }
-        } else {
-            f
-        };
-        if !rerun_file_ok(rel) {
-            return Err(());
-        }
-        out.push(rel.to_string());
-    }
-    Ok(out)
-}
-
-/// (core#790) May a file name ride a load-class re-run's argv? Relative, inside the tree (no
-/// `..`), no whitespace, not option-shaped (a leading `-`), non-empty.
-fn rerun_file_ok(rel: &str) -> bool {
-    !rel.is_empty()
-        && !rel.starts_with('-')
-        && !rel.starts_with('/')
-        && !rel.contains('\\')
-        && !Path::new(rel).is_absolute()
-        && !rel.split('/').any(|c| c == "..")
-        && !rel.contains(char::is_whitespace)
-}
-
-/// The test file a vitest id names: `FAIL <file> > suite > name` or a file-level failure
-/// `FAIL <file> [ <file> ]` (an import error, a worker that never started).
-fn vitest_any_file_of(id: &str) -> Option<&str> {
-    if let Some(f) = vitest_file_of(id) {
-        return Some(f);
-    }
-    let rest = id.strip_prefix("FAIL ")?;
-    let (file, bracket) = rest.split_once(" [ ")?;
-    let file = file.trim();
-    (bracket.trim_end().strip_suffix(']').map(str::trim) == Some(file)
-        && !file.contains(char::is_whitespace)
-        && file.contains('.'))
-    .then_some(file)
-}
-
-/// (core#790) LOAD-CLASS RE-RUN. A vitest check whose output carries a load-class signal — a pool
-/// worker that could not start, or a per-test timeout on an oversubscribed host — re-runs the
-/// files its head-only failures name, plus every file a worker never started for, ONCE, in one
-/// serial invocation (`--no-file-parallelism`), WHATEVER the base did: a red base is not evidence
-/// of a regression when the head's red is load. Every file must print its own passing line and
-/// the re-run must exit 0, then the check is `flaky_under_load`; anything else leaves the
-/// classification as it was. Not applied when a head-only id is not a vitest id (a tsc or lint id
-/// is never load), when the error count vitest printed exceeds the worker-start errors (an
-/// unhandled error that is not a worker-start one is unexplained), or when the signal list was
-/// truncated. Returns whether the re-run ran.
-fn rerun_load_class(
-    worktree: &Path,
-    check: &RepoCheck,
-    run: &mut CheckRun,
-    sandbox: &WorkerSandbox,
-    scratch: &CheckScratch,
-) -> bool {
-    use std::collections::BTreeSet;
-    if !matches!(
-        run.classification.as_deref(),
-        Some(REGRESSION) | Some(UNCLASSIFIED_RED_BASE)
-    ) || run.env_signals.iter().any(|s| s == SIGNALS_TRUNCATED)
-    {
-        return false;
-    }
-    let loads: Vec<&str> = run
-        .env_signals
-        .iter()
-        .filter_map(|s| s.strip_prefix("load: "))
-        .collect();
-    if loads.is_empty() {
-        return false;
-    }
-    let worker_start = loads
-        .iter()
-        .filter(|l| l.contains(LOAD_SIGNATURES[0]))
-        .count();
-    // A per-test timeout alone is load only on an oversubscribed host (core#553's rule); a worker
-    // that could not START in vitest's fixed window is load whatever the snapshot reads.
-    let (load1, cpus) = host_load();
-    if worker_start == 0 && !oversubscribed(load1, cpus) {
-        return false;
-    }
-    let errors = run
-        .env_signals
-        .iter()
-        .filter_map(|s| s.strip_prefix("errors: ")?.parse::<usize>().ok())
-        .max()
-        .unwrap_or(0);
-    if errors > worker_start {
-        return false;
-    }
-    // The head-only failures: the regressions, or — one side without ids, or no ids at all —
-    // every head id the base does not share.
-    let base_ids: BTreeSet<&str> = run
-        .base
-        .as_deref()
-        .and_then(|b| b.run.as_ref())
-        .map(|b| b.failure_ids.iter().map(String::as_str).collect())
-        .unwrap_or_default();
-    let head_only: Vec<String> = if run.regressions.is_empty() {
-        run.failure_ids
-            .iter()
-            .filter(|id| !base_ids.contains(id.as_str()))
-            .cloned()
-            .collect()
-    } else {
-        run.regressions.clone()
-    };
-    let mut files: Vec<String> = Vec::new();
-    for id in &head_only {
-        let Some(f) = vitest_any_file_of(id).filter(|f| rerun_file_ok(f)) else {
-            return false;
-        };
-        if !files.iter().any(|x| x == f) {
-            files.push(f.to_string());
-        }
-    }
-    for l in &loads {
-        match worker_start_files(l, &worktree.join(&check.dir)) {
-            Ok(fs) => {
-                for f in fs {
-                    if !files.contains(&f) {
-                        files.push(f);
-                    }
-                }
-            }
-            Err(()) => return false,
-        }
-    }
-    if files.is_empty() || files.len() > MAX_LOAD_RERUN_FILES {
-        return false;
-    }
-    let refs: Vec<&str> = files.iter().map(String::as_str).collect();
-    let argv = vitest_files_rerun_argv(&check.argv, &refs).or_else(|| {
-        script_runner_argv(&worktree.join(&check.dir), &check.argv)
-            .and_then(|a| vitest_files_rerun_argv(&a, &refs))
-    });
-    let Some(mut argv) = argv else {
-        return false;
-    };
-    if files.len() > 1 {
-        argv.push("--no-file-parallelism".into());
-    }
-    let watch: Vec<String> = files.iter().map(|f| format!("{FILE_WATCH}{f}")).collect();
-    let one = RepoCheck {
-        name: check.name.clone(),
-        argv,
-        source: format!(
-            "load-class re-run of {} file{} (core#790)",
-            files.len(),
-            if files.len() == 1 { "" } else { "s" }
-        ),
-        timeout_s: check.timeout_s,
-        dir: check.dir.clone(),
-    };
-    let (r, passed) = run_one_watching(worktree, &one, sandbox, scratch, Tree::Head, &watch);
-    let ok = r.passed() && watch.iter().all(|w| passed.contains(w));
-    eprintln!(
-        "wicked-core: repo checks floor — load-class re-run of {} file(s) {} ({:.1}s)",
-        files.len(),
-        if ok { "passed" } else { "did not pass" },
-        r.duration_ms as f64 / 1000.0
-    );
-    run.reruns.push(r);
-    if ok {
-        if run.regressions.is_empty() {
-            run.regressions = if head_only.is_empty() {
-                files.iter().map(|f| format!("FAIL {f} [ {f} ]")).collect()
-            } else {
-                head_only
-            };
-        }
-        run.classification = Some(FLAKY_UNDER_LOAD.to_string());
-    }
-    true
-}
-
-/// (core#789) ENVIRONMENT CRASH. Head and base both failed with no failure ids
-/// (`unclassified_red_base`) and BOTH outputs carry a `crash:` signal — the tool died opening a
-/// dependency file (`EPERM`/`EACCES` under `node_modules`; an endpoint scanner denying opens under
-/// load). Head and base must share the crash CLASS (the same errno — the file a scanner denies
-/// differs run to run). The head check is re-run ONCE: a pass makes it `flaky_under_load` (the
-/// crash is named); the same class again makes it `env_cannot_run` with the crash line on
-/// `env_cannot_run` — never denying, so the floor goes on to the remaining checks; any other
-/// outcome leaves it denying.
-/// Returns whether the re-run ran.
-fn rerun_env_crash(
-    worktree: &Path,
-    check: &RepoCheck,
-    run: &mut CheckRun,
-    sandbox: &WorkerSandbox,
-    scratch: &CheckScratch,
-) -> bool {
-    let crash_of = |r: &CheckRun| -> Option<String> {
-        r.env_signals
-            .iter()
-            .find(|s| s.starts_with("crash: "))
-            .cloned()
-    };
-    if run.classification.as_deref() != Some(UNCLASSIFIED_RED_BASE) {
-        return false;
-    }
-    let base_crash = run
-        .base
-        .as_deref()
-        .and_then(|b| b.run.as_ref())
-        .and_then(crash_of);
-    let (Some(head_crash), Some(base_crash)) = (crash_of(run), base_crash) else {
-        return false;
-    };
-    let class = crash_class(&head_crash);
-    if class != crash_class(&base_crash) {
-        return false;
-    }
-    let r = run_one(worktree, check, sandbox, scratch, Tree::Head);
-    let again = (!r.passed() && r.failure_ids.is_empty() && !r.timed_out)
-        .then(|| crash_of(&r))
-        .flatten()
-        .filter(|c| crash_class(c) == class);
-    eprintln!(
-        "wicked-core: repo checks floor — `{}` crashed on head and base ({head_crash}); re-run {}",
-        check.name,
-        if r.passed() {
-            "passed"
-        } else if again.is_some() {
-            "crashed again"
-        } else {
-            "failed otherwise"
-        }
-    );
-    if r.passed() {
-        run.regressions = vec![head_crash];
-        run.classification = Some(FLAKY_UNDER_LOAD.to_string());
-    } else if let Some(c) = again {
-        run.env_cannot_run = vec![c];
-        run.classification = Some(ENV_CANNOT_RUN.to_string());
-    }
-    run.reruns.push(r);
-    true
-}
-
-/// (core#789) The errno class of a `crash:` signal (`EPERM` / `EACCES`).
-fn crash_class(signal: &str) -> &'static str {
-    if signal.contains("EPERM: operation not permitted") {
-        "EPERM"
-    } else {
-        "EACCES"
-    }
 }
 
 /// Phrases a creator uses to wave a failure away, and the check-shaped words one of them must
@@ -4993,14 +6153,32 @@ fn judge_claim(ctx: &FloorContext, checks: &[CheckRun]) -> Option<ClaimCheck> {
         return None;
     }
     let phrase = detect_claim(ctx.claim_text.as_deref()?)?;
-    let failing = checks.iter().find(|c| !c.passed() && c.name != "install")?;
-    let verdict = match failing.classification.as_deref() {
-        Some(REGRESSION) => CLAIM_REJECTED,
-        Some(PRE_EXISTING_IN_SANDBOX) | Some(FLOOR_ENV_MISMATCH) | Some(ENV_CANNOT_RUN) => {
-            CLAIM_CONFIRMED
+    let failing = checks
+        .iter()
+        .find(|c| c.denies() && c.name != "install")
+        .or_else(|| checks.iter().find(|c| !c.passed() && c.name != "install"))?;
+    let base_passed = failing
+        .base
+        .as_deref()
+        .and_then(|b| b.run.as_ref())
+        .is_some_and(CheckRun::passed);
+    let verdict = match outcome_of(failing) {
+        // The head passed once the base's own failures were deselected.
+        Some(OUTCOME_PASS_EXCLUDED) => CLAIM_CONFIRMED,
+        // A failure that remains with every base failure excluded, or against a green base, is
+        // this change's; a pass on retry is a flake, not a pre-existing failure.
+        Some(OUTCOME_NEW_FAILURE) | Some(OUTCOME_FLAKY_TWICE) if base_passed => CLAIM_REJECTED,
+        // A red base the floor separated (its failures established, even ones the head no longer
+        // has): what is left failing is this change's.
+        Some(OUTCOME_NEW_FAILURE) | Some(OUTCOME_FLAKY_TWICE)
+            if failing
+                .decision
+                .as_ref()
+                .is_some_and(|d| !d.excluded.is_empty() || !d.base_failing.is_empty()) =>
+        {
+            CLAIM_REJECTED
         }
-        // The base passes it: a flake is not a pre-existing failure.
-        Some(FLAKY_UNDER_LOAD) => CLAIM_REJECTED,
+        Some(OUTCOME_PASS) => CLAIM_REJECTED,
         _ => CLAIM_UNVERIFIED,
     };
     Some(ClaimCheck {
@@ -5013,6 +6191,10 @@ fn judge_claim(ctx: &FloorContext, checks: &[CheckRun]) -> Option<ClaimCheck> {
 /// The host's 1-min load average and logical CPU count (`None` load where the platform has no
 /// `getloadavg` — Windows).
 pub(crate) fn host_load() -> (Option<f64>, usize) {
+    #[cfg(test)]
+    if let Some(l) = test_seam::load() {
+        return l;
+    }
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
@@ -5087,262 +6269,11 @@ fn effective_bound(check: &RepoCheck) -> (Duration, Option<String>) {
     (bound, note)
 }
 
-/// A bounded tail buffer: keeps the last [`TAIL_BYTES`] bytes of a stream.
 /// How long to wait for a check's stdout/stderr to reach EOF after the process group is dead. A
 /// detached descendant (`setsid`, a Node `detached` spawn with inherited stdio) can hold the pipe
-/// open forever; the drain is DETACHED after this and the tail read so far is what gets reported
+/// open forever; the capture is DETACHED after this and what was read so far is the (truncated) blob
 /// (adversarial review on #414 — an unbounded join wedged the verify unit).
 const DRAIN_CAP: Duration = Duration::from_secs(5);
-
-/// A stdout/stderr drain: the bounded tail accumulates in `buf` (shared, so a drain that never
-/// reaches EOF still yields what it saw), the [`LineScan`] of complete lines accumulates in `scan`,
-/// `done` fires at EOF.
-struct Drain {
-    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-    scan: std::sync::Arc<std::sync::Mutex<LineScan>>,
-    done: std::sync::mpsc::Receiver<()>,
-}
-
-impl Drain {
-    /// The tail read so far and the line scan, waiting at most `cap` for EOF; on timeout the
-    /// reader thread is left to die with the pipe (it holds only its own handles).
-    fn finish(self, cap: Duration) -> (Vec<u8>, LineScan) {
-        let _ = self.done.recv_timeout(cap);
-        let mut tail = std::mem::take(&mut *self.buf.lock().unwrap_or_else(|p| p.into_inner()));
-        if tail.len() > TAIL_BYTES {
-            let cut = tail.len() - TAIL_BYTES;
-            tail.drain(..cut);
-        }
-        let scan = std::mem::take(&mut *self.scan.lock().unwrap_or_else(|p| p.into_inner()));
-        (tail, scan)
-    }
-}
-
-/// The launcher signatures a test's own captured output carries when the test tried to arm an OS
-/// sandbox INSIDE the floor's sandbox (core#546): macOS cannot nest `sandbox-exec`, and an
-/// unprivileged `bwrap` inside `bwrap` cannot create its namespaces. A fact about the host, not
-/// about the change.
-const LAUNCHER_SIGNATURES: &[&str] = &[
-    "sandbox-exec: sandbox_apply: Operation not permitted",
-    "bwrap: No permissions to create",
-    "bwrap: Creating new namespace failed",
-    "bwrap: setting up uid map",
-    "bwrap: loopback: Failed RTM_NEWADDR",
-];
-
-/// Does `line` carry a nested-sandbox launcher signature ([`LAUNCHER_SIGNATURES`])?
-pub(crate) fn launcher_signature(line: &str) -> Option<&'static str> {
-    LAUNCHER_SIGNATURES
-        .iter()
-        .copied()
-        .find(|sig| line.contains(sig))
-}
-
-/// The line-level state of one output stream's failure scan.
-///
-/// libtest ids are not qualified by binary (core#481): `test shared ... FAILED` from crate A and
-/// from crate B are the same string. The scan therefore tags each libtest id with the index of the
-/// FAILING test binary it came from (the count of `test result: FAILED` lines seen before it), and
-/// collects cargo's per-binary `to rerun pass `-p b --test common`` lines (stderr) in order: the
-/// k-th failing binary is the k-th such line, so [`qualify`] can name the target exactly — and
-/// falls back to the bare id when the two counts disagree (a binary that crashed without a result
-/// line, a custom harness).
-#[derive(Debug, Default)]
-struct LineScan {
-    eslint_file: Option<String>,
-    /// libtest: `test result: FAILED` lines seen so far.
-    failed_blocks: usize,
-    /// libtest: the test whose captured output (`---- name stdout ----`) is being read.
-    section: Option<String>,
-    /// Failure ids in order of first sight; libtest ids carry their failing-binary index.
-    ids: Vec<(String, Option<usize>)>,
-    /// libtest tests whose captured output carries a launcher signature (core#546), with their
-    /// failing-binary index.
-    env: Vec<(String, usize)>,
-    /// cargo's `to rerun pass `…`` target selectors, one per failing test binary, in order.
-    targets: Vec<String>,
-    /// libtest names seen PASSING (`test name ... ok`) among `watch` — the isolated re-run's witness.
-    passed: Vec<String>,
-    watch: Vec<String>,
-    /// (core#789/#790) Environment signals in order of sight ([`env_signal_of_line`]).
-    signals: Vec<String>,
-}
-
-impl LineScan {
-    fn watching(watch: &[String]) -> Self {
-        Self {
-            watch: watch.to_vec(),
-            ..Self::default()
-        }
-    }
-
-    fn line(&mut self, line: &str) {
-        let s = line.trim();
-        if let Some(sig) = env_signal_of_line(s) {
-            let repeat = sig.starts_with("crash: ") && self.signals.contains(&sig);
-            if !repeat {
-                if self.signals.len() < MAX_ENV_SIGNALS {
-                    self.signals.push(sig);
-                } else if self.signals.last().map(String::as_str) != Some(SIGNALS_TRUNCATED) {
-                    *self.signals.last_mut().expect("cap > 0") = SIGNALS_TRUNCATED.to_string();
-                }
-            }
-        }
-        if s.starts_with("test result: FAILED") {
-            self.failed_blocks += 1;
-            self.section = None;
-            return;
-        }
-        if let Some(name) = s
-            .strip_prefix("---- ")
-            .and_then(|r| r.strip_suffix(" stdout ----"))
-        {
-            self.section = Some(name.to_string());
-            return;
-        }
-        if s == "failures:" {
-            self.section = None;
-            return;
-        }
-        if let Some(name) = self.section.clone() {
-            // A test's captured output: only the launcher signature is read here — a nested
-            // runner's own `test x ... FAILED` inside it is not a failure of THIS suite.
-            if launcher_signature(s).is_some()
-                && !self
-                    .env
-                    .iter()
-                    .any(|(n, b)| n == &name && *b == self.failed_blocks)
-            {
-                self.env.push((name, self.failed_blocks));
-            }
-            return;
-        }
-        if let Some(target) = rerun_target_of_line(s) {
-            self.targets.push(target);
-            return;
-        }
-        if !self.watch.is_empty() {
-            if let Some(name) = s
-                .strip_prefix("test ")
-                .and_then(|r| r.strip_suffix(" ... ok"))
-            {
-                let name = name.trim();
-                if self.watch.iter().any(|w| w == name) && !self.passed.iter().any(|p| p == name) {
-                    self.passed.push(name.to_string());
-                }
-                return;
-            }
-            // (core#766) A watched vitest id passes when its FILE's check-mark line is printed.
-            // (core#790) A watched `file:<path>` passes on that file's own check-mark line.
-            if s.starts_with('✓') {
-                for w in &self.watch {
-                    let hit = match w.strip_prefix(FILE_WATCH) {
-                        Some(file) => vitest_file_pass_line(s, file),
-                        None => vitest_pass_line_witnesses(s, w),
-                    };
-                    if hit && !self.passed.iter().any(|p| p == w) {
-                        self.passed.push(w.clone());
-                    }
-                }
-                return;
-            }
-        }
-        if let Some(id) = failure_id_of_line(line, &mut self.eslint_file) {
-            let block = id.starts_with("test ").then_some(self.failed_blocks);
-            if self.ids.len() < MAX_FAILURE_IDS
-                && !self.ids.iter().any(|(i, b)| i == &id && *b == block)
-            {
-                self.ids.push((id, block));
-            }
-        }
-    }
-}
-
-/// cargo's per-failing-binary selector: `error: test failed, to rerun pass `-p b --test common``
-/// (older cargo quotes with `'`) → `-p b --test common`.
-fn rerun_target_of_line(s: &str) -> Option<String> {
-    let (_, rest) = s.split_once("to rerun pass ")?;
-    let q = rest.chars().next().filter(|c| *c == '`' || *c == '\'')?;
-    let inner = &rest[1..];
-    let end = inner.find(q)?;
-    let target = inner[..end].trim();
-    (!target.is_empty()).then(|| target.to_string())
-}
-
-/// A libtest id qualified by its test binary: `test t::shared [-p b --lib]` (core#481).
-fn qualified(id: &str, target: Option<&str>) -> String {
-    match target {
-        Some(t) => format!("{id} [{t}]"),
-        None => id.to_string(),
-    }
-}
-
-/// Split a (possibly qualified) libtest id into its test name and cargo target selector.
-fn libtest_parts(id: &str) -> Option<(&str, Option<&str>)> {
-    let rest = id.strip_prefix("test ")?;
-    match rest.strip_suffix(']').and_then(|r| r.rsplit_once(" [")) {
-        Some((name, target)) => Some((name, Some(target))),
-        None => Some((rest, None)),
-    }
-}
-
-/// The scanned ids of one check run, qualified: the failure ids (stdout first, then stderr), the
-/// ids whose captured output carries a launcher signature, and the watched names seen passing.
-fn qualify(out: LineScan, err: LineScan) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-    // cargo prints the per-binary selector on stderr, libtest its results on stdout.
-    let targets: Vec<String> = out
-        .targets
-        .iter()
-        .chain(err.targets.iter())
-        .cloned()
-        .collect();
-    let label = |scan: &LineScan, block: Option<usize>| -> Option<String> {
-        let b = block?;
-        (scan.failed_blocks == targets.len())
-            .then(|| targets.get(b).cloned())
-            .flatten()
-    };
-    let mut ids: Vec<String> = Vec::new();
-    let mut env: Vec<String> = Vec::new();
-    for scan in [&out, &err] {
-        for (id, block) in &scan.ids {
-            let q = qualified(id, label(scan, *block).as_deref());
-            if !ids.contains(&q) && ids.len() < MAX_FAILURE_IDS {
-                ids.push(q);
-            }
-        }
-        for (name, block) in &scan.env {
-            let q = qualified(
-                &format!("test {name}"),
-                label(scan, Some(*block)).as_deref(),
-            );
-            if !env.contains(&q) {
-                env.push(q);
-            }
-        }
-    }
-    // Only a FAILING test is in the env class.
-    env.retain(|e| ids.contains(e));
-    let mut passed = out.passed;
-    for p in err.passed {
-        if !passed.contains(&p) {
-            passed.push(p);
-        }
-    }
-    let mut signals = out.signals;
-    for sig in err.signals {
-        if signals.len() >= MAX_ENV_SIGNALS {
-            if signals.last().map(String::as_str) != Some(SIGNALS_TRUNCATED) {
-                *signals.last_mut().expect("cap > 0") = SIGNALS_TRUNCATED.to_string();
-            }
-            break;
-        }
-        if !(sig.starts_with("crash: ") && signals.contains(&sig)) {
-            signals.push(sig);
-        }
-    }
-    (ids, env, passed, signals)
-}
 
 /// The failure identifier one complete output line carries, for the runners the floor knows —
 /// `None` for any other line. `eslint_file` carries eslint's stylish file header across its
@@ -5446,64 +6377,15 @@ pub(crate) fn failure_id_of_line(line: &str, eslint_file: &mut Option<String>) -
     None
 }
 
-fn drain_tail<R: Read + Send + 'static>(mut r: R, watch: &[String]) -> Drain {
-    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(TAIL_BYTES * 2)));
-    let scan = std::sync::Arc::new(std::sync::Mutex::new(LineScan::watching(watch)));
-    let (done_tx, done) = std::sync::mpsc::channel();
-    let shared = std::sync::Arc::clone(&buf);
-    let shared_scan = std::sync::Arc::clone(&scan);
-    std::thread::spawn(move || {
-        let mut chunk = [0u8; 8192];
-        let mut pending: Vec<u8> = Vec::new();
-        let scan = |line: &[u8]| {
-            let line = String::from_utf8_lossy(line);
-            shared_scan
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .line(&line);
-        };
-        loop {
-            match r.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    {
-                        let mut tail = shared.lock().unwrap_or_else(|p| p.into_inner());
-                        tail.extend_from_slice(&chunk[..n]);
-                        if tail.len() > TAIL_BYTES * 2 {
-                            let cut = tail.len() - TAIL_BYTES;
-                            tail.drain(..cut);
-                        }
-                    }
-                    // Line scanner: complete lines are judged, the partial one waits. A line
-                    // longer than the tail buffer is judged truncated (identifiers are short).
-                    pending.extend_from_slice(&chunk[..n]);
-                    while let Some(nl) = pending.iter().position(|b| *b == b'\n') {
-                        let line: Vec<u8> = pending.drain(..=nl).collect();
-                        scan(&line[..line.len() - 1]);
-                    }
-                    if pending.len() > TAIL_BYTES {
-                        let cut = pending.len() - TAIL_BYTES;
-                        pending.drain(..cut);
-                    }
-                }
-            }
-        }
-        if !pending.is_empty() {
-            scan(&pending);
-        }
-        let _ = done_tx.send(());
-    });
-    Drain { buf, scan, done }
-}
-
-fn lossy(bytes: Vec<u8>) -> String {
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
 /// Run one check in `worktree` under its timeout, inside `sandbox`'s write boundary with the
-/// isolated `scratch` homes (`tree` picks the cargo target leaf), capturing exit code + stream
-/// tails. A LAUNCHER that fails to arm (`bwrap: …` / `sandbox-exec: …` as the first stderr line,
-/// non-zero exit) is `could_not_run`, never the check's own `failed` (core#493).
+/// isolated `scratch` homes (`tree` picks the cargo target leaf). Both streams go to the run's log
+/// store ([`crate::floor_log`]) whole, up to the per-stream cap; the run carries their refs
+/// (`logs`, attempt `head`/`base` by `tree` — a caller relabels a re-run), the exit code, and the
+/// 4 KB display tails. A LAUNCHER that fails to arm (`bwrap: …` / `sandbox-exec: …` as the first
+/// stderr line, non-zero exit) is `could_not_run`, never the check's own `failed` (core#493).
+/// Unheld: tests only — the floor spawns through [`run_held`] / [`run_one_with`] with the tree's
+/// [`HeldDir`].
+#[cfg(test)]
 pub(crate) fn run_one(
     worktree: &Path,
     check: &RepoCheck,
@@ -5511,20 +6393,50 @@ pub(crate) fn run_one(
     scratch: &CheckScratch,
     tree: Tree,
 ) -> CheckRun {
-    run_one_watching(worktree, check, sandbox, scratch, tree, &[]).0
+    run_held(worktree, None, check, sandbox, scratch, tree)
 }
 
-/// [`run_one`], also reporting which of the libtest names in `watch` the run printed as PASSING
-/// (`test name ... ok`) — the witness an isolated re-run needs (core#553): exit 0 alone could be a
-/// filter that matched nothing.
-fn run_one_watching(
+/// [`run_one_with`] with the default [`ExecOpts`].
+pub(crate) fn run_held(
     worktree: &Path,
+    held: Option<&HeldDir>,
     check: &RepoCheck,
     sandbox: &WorkerSandbox,
     scratch: &CheckScratch,
     tree: Tree,
-    watch: &[String],
-) -> (CheckRun, Vec<String>) {
+) -> CheckRun {
+    run_one_with(
+        worktree,
+        held,
+        check,
+        &ExecOpts::default(),
+        sandbox,
+        scratch,
+        tree,
+    )
+}
+
+/// How a run the floor builds from a guide is spawned: extra environment, and stderr merged into
+/// stdout (one stream, in order).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExecOpts {
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) merge: bool,
+}
+
+/// [`run_one`] with [`ExecOpts`], in `worktree` — held as `held` from before any command ran
+/// there: the path must still be that directory when the command is spawned
+/// ([`HeldDir::still_at`]), or the run could not start (a command that swapped the tree's root for
+/// a link to an outside directory never gets a later command started there).
+pub(crate) fn run_one_with(
+    worktree: &Path,
+    held: Option<&HeldDir>,
+    check: &RepoCheck,
+    exec: &ExecOpts,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+    tree: Tree,
+) -> CheckRun {
     let started = Instant::now();
     let mut result = CheckRun {
         name: check.name.clone(),
@@ -5545,8 +6457,9 @@ fn run_one_watching(
         base: None,
         env_cannot_run: Vec::new(),
         reruns: Vec::new(),
-        env_signals: Vec::new(),
         load_band: None,
+        decision: None,
+        logs: Vec::new(),
     };
     let (load1, cpus) = host_load();
     result.load_band = load_band(load1, cpus);
@@ -5568,28 +6481,127 @@ fn run_one_watching(
     );
     let Some(bin) = check.argv.first() else {
         result.spawn_error = Some("empty argv".into());
-        return (result, Vec::new());
+        return result;
+    };
+    // The check's directory must be a real directory of THIS tree, every component (a head that
+    // turned it into a link could send the check out of the tree): otherwise it does not run.
+    if !check.dir.is_empty() && !plain_dir(worktree, &check.dir) {
+        result.spawn_error = Some(format!(
+            "`{}` is not a plain directory of the tree (a link, or missing)",
+            check.dir
+        ));
+        return result;
+    }
+    // Held, too: the tree's root and the check's directory, walked from the held fd through no link,
+    // must still be the directories the path names — a command that swapped either for a link to
+    // an outside directory gets no later command started there.
+    if let Some(e) = held.and_then(|h| h.still_at_rel(worktree, &check.dir).err()) {
+        result.spawn_error = Some(e);
+        return result;
+    }
+    // (codex on #1066) …and the child STARTS there by fd, not by pathname: the check directory is
+    // opened from the held root through no link and kept open across the spawn, and the child
+    // enters it with `fchdir` — a detached descendant of an earlier check that swaps the path for a
+    // link between the check above and the child's chdir cannot send this command elsewhere.
+    #[cfg(unix)]
+    let start_dir = match held.map(|h| h.dir_fd(&check.dir)).transpose() {
+        Ok(fd) => fd,
+        Err(e) => {
+            result.spawn_error = Some(e);
+            return result;
+        }
     };
     // Resolve on PATH the way `Command::new` will, so "not installed" is a legible spawn error
     // rather than a bare OS code.
     let Some(exe) = crate::validator::find_on_path(bin) else {
         result.spawn_error = Some(format!("`{bin}` is not on PATH"));
         result.duration_ms = started.elapsed().as_millis() as u64;
-        return (result, Vec::new());
+        return result;
     };
-    // `[<sandbox wrapper…>] <exe> <args…>` — an empty wrapper is the disclosed best-effort floor.
+    // `[<sandbox wrapper…>] [env K=V…] <exe> <args…>` — an empty wrapper is the disclosed
+    // best-effort floor. (DES-BUILD-GUIDE) A guide's env is applied INSIDE the boundary only,
+    // through `env` after the launcher: never on the launcher's own environment, which stays the
+    // floor's sanitized allow-list (a launcher that is not setuid — bwrap — honours `LD_PRELOAD`
+    // before it arms anything). With no launcher (no wrapper) the spawned process IS the command,
+    // and the env is set on it directly.
+    // (The names were checked when the guide loaded: `floor_guide::env_name_ok`.)
     let mut full: Vec<String> = sandbox.wrapper.clone();
+    let env_inside = !exec.env.is_empty() && !sandbox.wrapper.is_empty();
+    if env_inside {
+        let exe_s = exe.to_string_lossy();
+        let Some(env_bin) = crate::validator::find_on_path("env") else {
+            result.spawn_error = Some(
+                "`env` is not on PATH (it applies the guide's env inside the boundary)".into(),
+            );
+            return result;
+        };
+        // `env` reads a leading `NAME=VALUE` as an assignment: an exe path holding `=` would be.
+        if exe_s.contains('=') {
+            result.spawn_error = Some(format!(
+                "`{exe_s}` holds `=` (it would read as an env assignment)"
+            ));
+            return result;
+        }
+        full.push(env_bin.to_string_lossy().into_owned());
+        full.extend(exec.env.iter().map(|(k, v)| format!("{k}={v}")));
+    }
     full.push(exe.to_string_lossy().into_owned());
     full.extend(check.argv[1..].iter().cloned());
     // spawn-audit: hardened — the repository's own check command, run in the run's worktree.
     let mut cmd = Command::new(&full[0]);
     cmd.hardened()
         .args(&full[1..])
-        .current_dir(worktree.join(&check.dir))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    match &start_dir {
+        Some(fd) => {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            // Close-on-exec is fine: the hook runs in the child after fork, before exec.
+            let raw = fd.as_raw_fd();
+            // SAFETY: the hook calls only `fchdir` (async-signal-safe) and reads `errno`; `raw`
+            // stays open in the parent until `spawn` returns (`start_dir` outlives it), so the
+            // forked child's copy is the held directory.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::fchdir(raw) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+        }
+        None => {
+            cmd.current_dir(worktree.join(&check.dir));
+        }
+    }
+    #[cfg(not(unix))]
+    cmd.current_dir(worktree.join(&check.dir));
+    // The launcher's environment: the floor's sanitized allow-list only (the guide's is in `full`).
     scratch.apply_env(&mut cmd, tree);
+    if !env_inside {
+        // No launcher: this process is the command itself.
+        for (k, v) in &exec.env {
+            cmd.env(k, v);
+        }
+    }
+    let merged = if exec.merge {
+        match std::io::pipe().and_then(|(r, w)| Ok((r, w.try_clone()?, w))) {
+            Ok((r, w1, w2)) => {
+                cmd.stdout(w1).stderr(w2);
+                Some(r)
+            }
+            Err(e) => {
+                result.spawn_error = Some(format!("the merged output pipe: {e}"));
+                return result;
+            }
+        }
+    } else {
+        None
+    };
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -5597,16 +6609,44 @@ fn run_one_watching(
         // and never the daemon.
         cmd.process_group(0);
     }
-    let mut child = match cmd.spawn() {
+    // A test swaps the check directory here: after the checks above, before the child's chdir.
+    #[cfg(test)]
+    if let Some(f) = test_seam::take_before_spawn() {
+        f();
+    }
+    let spawned = cmd.spawn();
+    // The child holds its own working directory now: the parent's handle goes.
+    #[cfg(unix)]
+    drop(start_dir);
+    let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
             result.spawn_error = Some(e.to_string());
             result.duration_ms = started.elapsed().as_millis() as u64;
-            return (result, Vec::new());
+            return result;
         }
     };
-    let out_h = child.stdout.take().map(|r| drain_tail(r, watch));
-    let err_h = child.stderr.take().map(|r| drain_tail(r, watch));
+    // The parent's copies of a merged pipe's write ends close here, so EOF comes with the child's.
+    drop(cmd);
+    let store = scratch.logs.as_path();
+    let cap = scratch.log_cap;
+    let (out_h, err_h) = match merged {
+        // Merged: one stream, and an empty stderr blob beside it.
+        Some(r) => (
+            Some(crate::floor_log::capture(r, store, cap)),
+            Some(crate::floor_log::capture(std::io::empty(), store, cap)),
+        ),
+        None => (
+            child
+                .stdout
+                .take()
+                .map(|r| crate::floor_log::capture(r, store, cap)),
+            child
+                .stderr
+                .take()
+                .map(|r| crate::floor_log::capture(r, store, cap)),
+        ),
+    };
     let status = loop {
         match crate::validator::has_exited_unreaped(&mut child) {
             Ok(true) => {
@@ -5636,42 +6676,166 @@ fn run_one_watching(
         }
     };
     result.exit_code = status.and_then(|st| st.code());
+    // Ended by a signal (no exit code): it did not run to a verdict.
+    if let Some(st) = status.filter(|st| st.code().is_none()) {
+        result.spawn_error = Some(format!("the process was ended by a signal ({st})"));
+    }
     // BOUNDED: the group is dead, but a detached descendant may still hold the pipe — take what
-    // was read and move on rather than wait for an EOF that may never come.
-    let (out_tail, out_scan) = out_h.map(|d| d.finish(DRAIN_CAP)).unwrap_or_default();
-    let (err_tail, err_scan) = err_h.map(|d| d.finish(DRAIN_CAP)).unwrap_or_default();
-    result.stdout_tail = lossy(out_tail);
-    result.stderr_tail = lossy(err_tail);
+    // was read (marked truncated) and move on rather than wait for an EOF that may never come.
+    let out = out_h.map(|c| c.finish(DRAIN_CAP)).unwrap_or_default();
+    let err = err_h.map(|c| c.finish(DRAIN_CAP)).unwrap_or_default();
+    let attempt = match tree {
+        Tree::Head => "head",
+        Tree::Base => "base",
+    };
+    result.logs = vec![
+        out.log_ref(attempt, "stdout"),
+        err.log_ref(attempt, "stderr"),
+    ];
+    result.stdout_tail = String::from_utf8_lossy(&out.tail).into_owned();
+    result.stderr_tail = String::from_utf8_lossy(&err.tail).into_owned();
+    // A stream the store could not keep is no record: the check could not be run as evidence.
+    if let Some(e) = out.error.or(err.error) {
+        result.spawn_error = Some(e);
+    }
+    // Read back only for a failing run: nothing below reads a passing run's streams (agy r6).
+    let failed = result.exit_code != Some(0);
+    let (stdout, stderr) = if failed {
+        match (
+            crate::floor_log::text(store, &result.logs[0]),
+            crate::floor_log::text(store, &result.logs[1]),
+        ) {
+            (Ok(o), Ok(e)) => (o, e),
+            // An unreadable record is no record: the run is not evidence.
+            (Err(e), _) | (_, Err(e)) => {
+                result
+                    .spawn_error
+                    .get_or_insert(format!("its output could not be read back: {e}"));
+                Default::default()
+            }
+        }
+    } else {
+        Default::default()
+    };
     // The launcher's exit is not the repository's (core#493): bwrap that cannot `mkdir` a `--tmpfs`
     // destination dies BEFORE exec with `bwrap: Can't mkdir …` and exit 1 (so does a launcher
     // whose `execvp` of the check's binary fails) — the check never ran, so recording
     // `exit_code: 1` as its `failed` blames the repo for the jail. The ONE predicate
-    // (`validator::launcher_failure`) reads the first stderr line; a hit is `could_not_run`
-    // (denies, fail-closed, attribution honest). Never applied to a passing exit or a timeout.
+    // (`validator::launcher_failure`) reads the first stderr line (of the one merged stream when
+    // stderr was merged); a hit is `could_not_run` (denies, fail-closed, attribution honest).
+    // Never applied to a passing exit or a timeout.
     if !result.timed_out && result.exit_code != Some(0) {
+        let first_err = if exec.merge { &stdout } else { &stderr };
         if let Some(msg) = crate::validator::launcher_failure(
             &sandbox.wrapper,
-            result.stderr_tail.lines().next().unwrap_or(""),
+            first_err.lines().next().unwrap_or(""),
         ) {
             result.spawn_error = Some(msg);
         }
     }
-    // Identifiers from both streams (cargo prints its per-test lines on stdout, vitest on
-    // stderr), de-duplicated, in order of first sight; libtest ids qualified by their binary.
-    let (ids, env, passed, signals) = qualify(out_scan, err_scan);
-    result.failure_ids = ids;
-    result.env_cannot_run = env;
-    result.env_signals = signals;
+    // ANNOTATION only (DES-FLOOR-V2): the ids a runner printed, both streams, first sight order.
+    // They name failures for the reader; no outcome reads them.
+    let mut eslint_file = None;
+    for line in stdout.lines().chain(stderr.lines()).filter(|_| failed) {
+        if result.failure_ids.len() >= MAX_FAILURE_IDS {
+            break;
+        }
+        if let Some(id) = failure_id_of_line(line, &mut eslint_file) {
+            if !result.failure_ids.contains(&id) {
+                result.failure_ids.push(id);
+            }
+        }
+    }
     result.duration_ms = started.elapsed().as_millis() as u64;
-    (result, passed)
+    result
+}
+
+/// The per-stream log cap ([`crate::floor_log::MAX_STREAM_BYTES`]; a test may lower it).
+fn log_cap() -> u64 {
+    #[cfg(test)]
+    if let Some(c) = test_seam::log_cap() {
+        return c;
+    }
+    crate::floor_log::MAX_STREAM_BYTES
+}
+
+/// Per-thread stand-ins for the host's load, the retry's headroom wait and the log cap: a floor
+/// runs on its caller's thread, so a test pins what IT sees without touching any other test.
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use std::cell::{Cell, RefCell};
+    type Hook = Box<dyn FnOnce()>;
+    thread_local! {
+        static BEFORE_SPAWN: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static LOAD: Cell<Option<(Option<f64>, usize)>> = const { Cell::new(None) };
+        static CAP: Cell<Option<u64>> = const { Cell::new(None) };
+        static EXCLUDE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+    pub(crate) fn exclusion() -> Option<bool> {
+        EXCLUDE.with(Cell::get)
+    }
+    /// The hook this thread's next check spawn runs once, after its directory checks.
+    pub(crate) fn take_before_spawn() -> Option<Hook> {
+        BEFORE_SPAWN.with(|h| h.borrow_mut().take())
+    }
+    /// Run `f` once, just before this thread's next check spawn.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn before_spawn(f: impl FnOnce() + 'static) {
+        BEFORE_SPAWN.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+    /// Pin this thread's exclusion switch until dropped (the test binary arms it ON).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) struct Excluding;
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn exclude(on: bool) -> Excluding {
+        EXCLUDE.with(|c| c.set(Some(on)));
+        Excluding
+    }
+    impl Drop for Excluding {
+        fn drop(&mut self) {
+            EXCLUDE.with(|c| c.set(None));
+        }
+    }
+    pub(crate) fn log_cap() -> Option<u64> {
+        CAP.with(Cell::get)
+    }
+    /// Lower this thread's per-stream log cap until dropped.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) struct Capped;
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn cap(bytes: u64) -> Capped {
+        CAP.with(|c| c.set(Some(bytes)));
+        Capped
+    }
+    impl Drop for Capped {
+        fn drop(&mut self) {
+            CAP.with(|c| c.set(None));
+        }
+    }
+    pub(crate) fn load() -> Option<(Option<f64>, usize)> {
+        LOAD.with(Cell::get)
+    }
+    /// Pin the load this thread's floor reads (and a zero headroom wait) until dropped.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) struct Pinned;
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn pin(load1: f64, cpus: usize) -> Pinned {
+        LOAD.with(|c| c.set(Some((Some(load1), cpus))));
+        Pinned
+    }
+    impl Drop for Pinned {
+        fn drop(&mut self) {
+            LOAD.with(|c| c.set(None));
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::validator::SandboxLevel;
 
-    fn scratch(name: &str) -> PathBuf {
+    pub(crate) fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "wicked-repochecks-{name}-{}-{:?}",
             std::process::id(),
@@ -5701,10 +6865,10 @@ mod tests {
 
     /// The boundary a test floor arms: the worktree and the tree's check-scratch leaf (which
     /// lives in the engine's check cache, outside the worktree).
-    fn sandbox_for(wt: &Path) -> WorkerSandbox {
+    pub(crate) fn sandbox_for(wt: &Path) -> WorkerSandbox {
         let leaf = scratch_dir_for(&check_cache_root().unwrap(), wt, None);
         std::fs::create_dir_all(&leaf).unwrap();
-        crate::validator::detect_worker_sandbox(&[wt.to_path_buf(), leaf])
+        crate::validator::detect_floor_sandbox(&[wt.to_path_buf(), leaf])
     }
 
     #[test]
@@ -5873,7 +7037,8 @@ mod tests {
                 base: None,
                 env_cannot_run: Vec::new(),
                 reruns: Vec::new(),
-                env_signals: Vec::new(),
+                decision: None,
+                logs: Vec::new(),
                 load_band: None,
             }],
             skipped: vec!["typecheck".into(), "test".into()],
@@ -7202,12 +8367,14 @@ mod tests {
             .and_then(|b| b.run.as_ref())
             .expect("the base ran");
         assert!(!b.stdout_tail.contains("NOGIT"), "{b:?}");
+        assert_eq!(b.failure_ids, s(&["test t::shared"]), "{b:?}");
+        // DES-FLOOR-V2: an `sh` runner has no precise deselect, so the shared red escalates.
         assert_eq!(
             c.classification.as_deref(),
-            Some(PRE_EXISTING_IN_SANDBOX),
+            Some(BASE_RED_UNSEPARATED),
             "{c:#?}"
         );
-        assert!(report.passed, "{report:?}");
+        assert!(!report.passed, "{report:?}");
         assert_no_worktree_scratch(&repo);
         assert!(!repo.join("tmp").join(BASE_EXPORT_SUBDIR).exists());
         assert!(remove_check_scratch_in(
@@ -7231,7 +8398,8 @@ mod tests {
         std::fs::create_dir_all(legacy.join("home")).unwrap();
         std::fs::write(legacy.join("home/keep"), "x").unwrap();
         let scratch_dir = CheckScratch::prepare(&wt).unwrap();
-        remove_base_export(&wt, &scratch_dir).unwrap();
+        let held = HeldDir::open(&wt).unwrap();
+        remove_base_export(&held).unwrap();
         assert!(!legacy.join("base").exists(), "the legacy export is gone");
         assert!(
             legacy.join("home/keep").is_file(),
@@ -7244,7 +8412,7 @@ mod tests {
             std::fs::create_dir_all(outside.join("base")).unwrap();
             std::fs::remove_dir_all(&legacy).unwrap();
             std::os::unix::fs::symlink(&outside, &legacy).unwrap();
-            remove_base_export(&wt, &scratch_dir).unwrap();
+            remove_base_export(&held).unwrap();
             assert!(
                 outside.join("base").is_dir(),
                 "nothing removed through the link"
@@ -7440,7 +8608,7 @@ mod tests {
         assert!(r.stdout_tail.contains("long-line-of-output"));
     }
 
-    fn git(repo: &Path, args: &[&str]) -> String {
+    pub(crate) fn git(repo: &Path, args: &[&str]) -> String {
         // spawn-audit: test-only — builds the baseline-diff fixture repository.
         let out = Command::new("git")
             .arg("-C")
@@ -7550,6 +8718,29 @@ mod tests {
             );
             std::fs::remove_file(&link).unwrap();
             std::os::unix::fs::symlink("app.txt", &link).unwrap();
+            // (sweep review on #1066) A directory of the tree swapped for a link to an outside
+            // copy with the SAME content is a change too: every entry is re-read through the
+            // checkout held before the checks ran, never through the link.
+            let mut swapped = ok.clone();
+            let copy = scratch("guarded-checkout-outside-copy");
+            std::fs::copy(dir.join(CONFIG_PATH), copy.join("checks.json")).unwrap();
+            std::fs::rename(dir.join(".wicked"), dir.join(".wicked-moved")).unwrap();
+            std::os::unix::fs::symlink(&copy, dir.join(".wicked")).unwrap();
+            checkout.hold_to(&snap.tree, &mut swapped);
+            assert!(
+                !swapped.passed,
+                "a linked-away directory is a change: {swapped:?}"
+            );
+            assert!(
+                swapped
+                    .detect_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains(CONFIG_PATH)),
+                "{swapped:?}"
+            );
+            std::fs::remove_file(dir.join(".wicked")).unwrap();
+            std::fs::rename(dir.join(".wicked-moved"), dir.join(".wicked")).unwrap();
+            let _ = std::fs::remove_dir_all(&copy);
         }
         std::fs::write(dir.join("app.txt"), "rewritten by a check\n").unwrap();
         checkout.hold_to(&snap.tree, &mut ok);
@@ -7584,7 +8775,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&wt);
     }
 
-    fn git_repo_with_commit(repo: &Path) -> String {
+    pub(crate) fn git_repo_with_commit(repo: &Path) -> String {
         git(repo, &["init", "-q"]);
         git(repo, &["config", "user.email", "t@example.invalid"]);
         git(repo, &["config", "user.name", "t"]);
@@ -7595,7 +8786,7 @@ mod tests {
         git(repo, &["rev-parse", "HEAD"])
     }
 
-    fn names(checks: &[RepoCheck]) -> Vec<&str> {
+    pub(crate) fn names(checks: &[RepoCheck]) -> Vec<&str> {
         checks.iter().map(|c| c.name.as_str()).collect()
     }
 
@@ -7927,64 +9118,6 @@ mod tests {
         assert_eq!(id("TAP version 14", &mut f), None);
     }
 
-    /// (#538) Both base and head fail with no parseable failure identifiers → `unclassified_red_base`,
-    /// which must deny (fail-closed) and never be treated as pre-existing.
-    #[test]
-    fn unclassified_red_base_denies_when_both_sides_produce_zero_ids() {
-        let make_check = |exit: i32| CheckRun {
-            name: "test".to_string(),
-            argv: vec![],
-            source: "test".to_string(),
-            exit_code: Some(exit),
-            timed_out: false,
-            spawn_error: None,
-            duration_ms: 0,
-            stdout_tail: String::new(),
-            stderr_tail: String::new(),
-            bound_s: 0,
-            bound_note: None,
-            failure_ids: vec![],
-            classification: None,
-            pre_existing: vec![],
-            regressions: vec![],
-            base: None,
-            env_cannot_run: Vec::new(),
-            reruns: Vec::new(),
-            env_signals: Vec::new(),
-            load_band: None,
-        };
-        let make_base = |exit: i32| BaseRun {
-            head: "abc1234567".to_string(),
-            run: Some(make_check(exit)),
-            cached: false,
-            error: None,
-        };
-
-        // Same exit code on both sides — previously classified FLOOR_ENV_MISMATCH (which passed);
-        // must now be UNCLASSIFIED_RED_BASE and must deny.
-        let mut head = make_check(1);
-        classify(&mut head, make_base(1));
-        assert_eq!(
-            head.classification.as_deref(),
-            Some(UNCLASSIFIED_RED_BASE),
-            "zero ids both sides (same exit code) must be unclassified_red_base, not floor_env_mismatch"
-        );
-        assert!(
-            head.denies(),
-            "unclassified_red_base must deny (fail-closed)"
-        );
-
-        // Different exit codes on both sides — previously classified REGRESSION; still deny.
-        let mut head2 = make_check(2);
-        classify(&mut head2, make_base(1));
-        assert_eq!(
-            head2.classification.as_deref(),
-            Some(UNCLASSIFIED_RED_BASE),
-            "zero ids both sides (different exit codes) must also be unclassified_red_base"
-        );
-        assert!(head2.denies());
-    }
-
     /// core#467: the claim scanner is conservative — a claim phrase AND a check-shaped word in
     /// one sentence; a bug described as "pre-existing" in a fix summary is not a claim.
     #[test]
@@ -8123,211 +9256,6 @@ mod tests {
         assert!(fmt.denies(), "{fmt:?}");
         let denial = report.denial_reason();
         assert!(denial.contains("cargo-fmt-check"), "{denial}");
-    }
-
-    #[test]
-    fn baseline_diff_denies_only_regressions() {
-        let repo = scratch("basediff");
-        std::fs::create_dir_all(repo.join("src")).unwrap();
-        std::fs::write(
-            repo.join("Cargo.toml"),
-            "[package]\nname = \"basediff_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-             [lib]\npath = \"src/lib.rs\"\n[workspace]\n",
-        )
-        .unwrap();
-        std::fs::write(repo.join(".gitignore"), "Cargo.lock\ntmp/\n").unwrap();
-        let body = |shared: bool, other: bool, stable: bool| {
-            let fn_body = |ok: bool| -> &'static str {
-                if ok {
-                    "{}"
-                } else {
-                    "{\n        assert!(false, \"BOOM\");\n    }"
-                }
-            };
-            format!(
-                "#[cfg(test)]\nmod t {{\n    #[test]\n    fn shared() {}\n    #[test]\n    \
-                 fn other() {}\n    #[test]\n    fn stable() {}\n}}\n",
-                fn_body(shared),
-                fn_body(other),
-                fn_body(stable)
-            )
-        };
-        std::fs::write(repo.join("src/lib.rs"), body(false, false, true)).unwrap();
-        let base = git_repo_with_commit(&repo);
-        let ctx = FloorContext {
-            stage: FloorStage::Creator,
-            base_head: Some(base.clone()),
-            git_dir: Some(repo.join(".git")),
-            claim_text: Some(
-                "Done. The failing test is pre-existing on main and unrelated to my change."
-                    .to_string(),
-            ),
-            ..FloorContext::default()
-        };
-
-        // (1) REGRESSION: `stable` newly fails beside the two shared failures.
-        std::fs::write(repo.join("src/lib.rs"), body(false, false, false)).unwrap();
-        let report = run_floor(&repo, &ctx);
-        if report.sandbox_error.is_some() {
-            eprintln!("repo_checks: no sandbox tool here — the baseline diff cannot run");
-            return;
-        }
-        assert!(!report.passed, "{report:?}");
-        assert_eq!(report.outcome(), "failed");
-        assert_eq!(report.denial_source(), DENIAL_SOURCE);
-        assert_eq!(
-            report.checks[0].name, "cargo-fmt-check",
-            "formatter passes on formatted code"
-        );
-        let c = &report.checks[1];
-        // core#482: the creator floor of an unconfigured repo runs the touched crate only.
-        assert_eq!(c.name, "test_targeted");
-        assert_eq!(c.source, DERIVED_TARGETED_SOURCE);
-        assert_eq!(c.classification.as_deref(), Some(REGRESSION), "{c:?}");
-        assert_eq!(
-            c.regressions,
-            vec!["test t::stable [-p basediff_fixture --lib]".to_string()]
-        );
-        assert_eq!(
-            c.pre_existing,
-            vec![
-                "test t::other [-p basediff_fixture --lib]".to_string(),
-                "test t::shared [-p basediff_fixture --lib]".to_string()
-            ]
-        );
-        let b = c.base.as_deref().expect("the base run is attached");
-        assert_eq!(b.head, base);
-        assert!(!b.cached, "first comparison of this base: run, not cached");
-        let br = b.run.as_ref().expect("the base ran");
-        assert!(
-            !br.passed() && br.exit_code.is_some_and(|e| e != 0),
-            "{br:?}"
-        );
-        // First-seen order: cargo runs tests on several threads, so the two failures may be
-        // reported in either order (the macOS CI runner reports `shared` first) — compare sorted.
-        let mut base_ids = br.failure_ids.clone();
-        base_ids.sort();
-        assert_eq!(
-            base_ids,
-            vec![
-                "test t::other [-p basediff_fixture --lib]".to_string(),
-                "test t::shared [-p basediff_fixture --lib]".to_string()
-            ]
-        );
-        assert_eq!(
-            report.claim.as_ref().map(|c| c.verdict.as_str()),
-            Some(CLAIM_REJECTED),
-            "{:?}",
-            report.claim
-        );
-        assert_eq!(
-            report.claim.as_ref().map(|c| c.phrase.as_str()),
-            Some("pre-existing")
-        );
-        let denial = report.denial_reason();
-        assert!(
-            denial.contains("[regression]")
-                && denial.contains("head-only failures test t::stable [-p basediff_fixture --lib]")
-                && denial.contains("also failing on the base: test t::other [-p basediff_fixture --lib], test t::shared [-p basediff_fixture --lib]")
-                && denial.contains("REJECTED"),
-            "{denial}"
-        );
-        let env = report
-            .env
-            .as_ref()
-            .expect("the floor's env is on the record");
-        assert!(env.home.ends_with("home") && env.network == "open" && !env.path.is_empty());
-        let scratch_root = leaf_of(&repo);
-        assert_no_worktree_scratch(&repo);
-        assert!(
-            !repo
-                .join(crate::worktree_guard::ENGINE_SCRATCH_DIR)
-                .join(BASE_EXPORT_SUBDIR)
-                .exists(),
-            "the base export is removed as soon as its result is cached — a HEAD check never \
-             runs beside a copy of the base"
-        );
-        assert!(
-            scratch_root
-                .join("base-cache")
-                .join(format!("{}-test_targeted.json", &base[..12]))
-                .is_file(),
-            "the base run is cached by base sha + check name"
-        );
-
-        // (2) Identical failure sets: the FACT is that the base fails them too (core#481 —
-        // `pre_existing_in_sandbox`, never the inferred `floor_env_mismatch`) ⇒ the floor passes,
-        // the shared failures are listed. The tree equals the base, so no file is touched and the
-        // full `cargo-test` runs (no derived set to narrow to).
-        std::fs::write(repo.join("src/lib.rs"), body(false, false, true)).unwrap();
-        let report = run_floor(&repo, &ctx);
-        assert!(report.passed, "{:?}", report.checks[1]);
-        assert_eq!(report.outcome(), "passed");
-        let c = &report.checks[1];
-        assert!(!c.passed() && !c.denies());
-        assert_eq!(c.outcome(), "failed");
-        assert_eq!(c.classification.as_deref(), Some(PRE_EXISTING_IN_SANDBOX));
-        assert_eq!(
-            c.pre_existing,
-            vec![
-                "test t::other [--lib]".to_string(),
-                "test t::shared [--lib]".to_string()
-            ]
-        );
-        assert_eq!(c.name, "cargo-test");
-        assert!(c.regressions.is_empty());
-        assert!(!report.env_mismatch());
-        assert_eq!(
-            report.claim.as_ref().map(|c| c.verdict.as_str()),
-            Some(CLAIM_CONFIRMED)
-        );
-        assert!(
-            c.summary().contains("[pre_existing_in_sandbox]"),
-            "{}",
-            c.summary()
-        );
-
-        // (3) PRE_EXISTING_IN_SANDBOX: the head fixes `other`, breaks nothing ⇒ passes.
-        std::fs::write(repo.join("src/lib.rs"), body(false, true, true)).unwrap();
-        let report = run_floor(&repo, &ctx);
-        assert!(report.passed, "{:?}", report.checks[1]);
-        let c = &report.checks[1];
-        assert_eq!(c.classification.as_deref(), Some(PRE_EXISTING_IN_SANDBOX));
-        assert_eq!(
-            c.pre_existing,
-            vec!["test t::shared [-p basediff_fixture --lib]".to_string()]
-        );
-        assert!(c.regressions.is_empty() && !c.denies());
-        assert!(
-            c.base.as_deref().is_some_and(|b| b.cached),
-            "the base run is paid for once per run"
-        );
-        assert!(!report.env_mismatch());
-
-        // (4) Opt-out: the plain denial, with the reason the base was not compared.
-        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
-        std::fs::write(repo.join(CONFIG_PATH), r#"{"baseline_diff":false}"#).unwrap();
-        let report = run_floor(&repo, &ctx);
-        assert!(!report.passed);
-        let c = &report.checks[1];
-        assert!(c.classification.is_none() && c.denies());
-        assert!(
-            c.base
-                .as_deref()
-                .and_then(|b| b.error.as_deref())
-                .is_some_and(|e| e.contains("baseline_diff: false")),
-            "{:?}",
-            c.base
-        );
-        assert_eq!(
-            report.claim.as_ref().map(|c| c.verdict.as_str()),
-            Some(CLAIM_UNVERIFIED)
-        );
-        assert!(
-            report.denial_reason().contains("could not be compared"),
-            "{}",
-            report.denial_reason()
-        );
     }
 
     /// core#482 / F-3R2-023 (DES-L2 2D): `e2e` in `.wicked/checks.json` runs at the VERIFY stage
@@ -8669,7 +9597,8 @@ mod tests {
             base: None,
             env_cannot_run: Vec::new(),
             reruns: Vec::new(),
-            env_signals: Vec::new(),
+            decision: None,
+            logs: Vec::new(),
             load_band: None,
         }
     }
@@ -8800,63 +9729,6 @@ mod tests {
 
     // ─── core#481 / core#546 / core#553 / core#482 ──────────────────────────────────────────────
 
-    /// A two-crate workspace's `cargo test --no-fail-fast` output, as cargo splits it: libtest's
-    /// results on stdout, cargo's `Running` / `to rerun pass` lines on stderr.
-    const WS_STDOUT: &str = "\nrunning 2 tests\ntest t::ok ... ok\ntest t::shared ... FAILED\n\n\
-        failures:\n\n---- t::shared stdout ----\n\nthread 't::shared' panicked at a/src/lib.rs:1:44:\n\
-        boom\n\n\nfailures:\n    t::shared\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n\n\
-        running 2 tests\ntest t::ok ... ok\ntest t::shared ... FAILED\n\nfailures:\n\n\
-        ---- t::shared stdout ----\n\nthread 't::shared' panicked at b/src/lib.rs:1:44:\nboom\n\n\n\
-        failures:\n    t::shared\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n\n\
-        running 1 test\ntest shared ... FAILED\n\nfailures:\n\n---- shared stdout ----\n\
-        sandbox-exec: sandbox_apply: Operation not permitted\n\nthread 'shared' panicked at \
-        b/tests/common.rs:1:90:\nx\n\n\nfailures:\n    shared\n\ntest result: FAILED. 0 passed; 1 \
-        failed\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed\n";
-    const WS_STDERR: &str = "     Running unittests src/lib.rs (target/debug/deps/a-e4ae93d41f55510e)\n\
-        error: test failed, to rerun pass `-p a --lib`\n     Running unittests src/lib.rs \
-        (target/debug/deps/b-351d690dff5449db)\nerror: test failed, to rerun pass `-p b --lib`\n     \
-        Running tests/common.rs (target/debug/deps/common-8e62653fc2487ac4)\nerror: test failed, to \
-        rerun pass `-p b --test common`\n   Doc-tests a\nerror: 3 targets failed:\n    `-p a --lib`\n";
-
-    fn scan_of(text: &str) -> LineScan {
-        let mut scan = LineScan::default();
-        for line in text.lines() {
-            scan.line(line);
-        }
-        scan
-    }
-
-    /// core#481: a libtest id names its test binary, so the same test name failing in two crates
-    /// is two ids; and a nested sandbox's launcher line in a test's captured output marks that id
-    /// (core#546). With cargo's selectors missing, the ids stay bare (the historical form).
-    #[test]
-    fn libtest_ids_are_qualified_by_their_binary_481() {
-        let (ids, env, _, _) = qualify(scan_of(WS_STDOUT), scan_of(WS_STDERR));
-        assert_eq!(
-            ids,
-            vec![
-                "test t::shared [-p a --lib]".to_string(),
-                "test t::shared [-p b --lib]".to_string(),
-                "test shared [-p b --test common]".to_string(),
-            ]
-        );
-        assert_eq!(env, vec!["test shared [-p b --test common]".to_string()]);
-        // The summary block's trailing "`-p a --lib`" list line is not a second selector.
-        assert_eq!(scan_of(WS_STDERR).targets.len(), 3);
-        // No selectors (another runner wrapped cargo, or the stderr was lost): bare, de-duplicated.
-        let (ids, env, _, _) = qualify(scan_of(WS_STDOUT), LineScan::default());
-        assert_eq!(
-            ids,
-            vec!["test t::shared".to_string(), "test shared".to_string()]
-        );
-        assert_eq!(env, vec!["test shared".to_string()]);
-        assert_eq!(
-            rerun_target_of_line("error: test failed, to rerun pass '--lib'").as_deref(),
-            Some("--lib"),
-            "older cargo quotes with '"
-        );
-    }
-
     fn failed_run(ids: &[&str], env: &[&str]) -> CheckRun {
         CheckRun {
             name: "cargo-test".to_string(),
@@ -8877,7 +9749,8 @@ mod tests {
             base: None,
             env_cannot_run: env.iter().map(|x| x.to_string()).collect(),
             reruns: Vec::new(),
-            env_signals: Vec::new(),
+            decision: None,
+            logs: Vec::new(),
             load_band: None,
         }
     }
@@ -8912,8 +9785,8 @@ mod tests {
                 failure_ids: vec!["FAIL tests/chord.test.ts > scans".to_string()],
                 ..at(head_band, "1200s × 3.00 (1-min load 100.9 / 14 cpus)")
             };
-            classify(&mut head, base);
-            assert_eq!(head.classification.as_deref(), Some(REGRESSION));
+            head.base = Some(Box::new(base));
+            head.classification = Some(REGRESSION.to_string());
             report_of(vec![head], &[]).denial_reason()
         };
         let r = denial(7, passing_base(4, true));
@@ -8933,456 +9806,6 @@ mod tests {
         assert_eq!(load_band(Some(13.9), 14), Some(0));
         assert_eq!(load_band(None, 14), None);
         assert_eq!(load_band(Some(f64::NAN), 14), None);
-    }
-
-    /// core#481: a regression in crate B is not masked by the same-named red test in crate A,
-    /// and an identical failure set is the FACT `pre_existing_in_sandbox` — never the inference
-    /// `floor_env_mismatch`.
-    #[test]
-    fn a_same_named_failure_in_another_crate_is_a_regression_481() {
-        let mut head = failed_run(&["test t::shared [-p b --lib]"], &[]);
-        classify(
-            &mut head,
-            base_of(failed_run(&["test t::shared [-p a --lib]"], &[])),
-        );
-        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
-        assert_eq!(head.regressions, vec!["test t::shared [-p b --lib]"]);
-        assert!(head.denies());
-
-        let mut head = failed_run(&["test t::shared [-p a --lib]"], &[]);
-        classify(
-            &mut head,
-            base_of(failed_run(&["test t::shared [-p a --lib]"], &[])),
-        );
-        assert_eq!(
-            head.classification.as_deref(),
-            Some(PRE_EXISTING_IN_SANDBOX)
-        );
-        assert!(!head.denies());
-        let report = report_of(vec![head], &[]);
-        assert!(
-            !report.env_mismatch(),
-            "equal sets assert no environment cause"
-        );
-    }
-
-    /// core#546: failures carrying the nested-sandbox launcher signature on BOTH trees are
-    /// `env_cannot_run` (non-denying, counted on the card); a head-only failure with the same
-    /// signature still denies but the floor note names the likely cause.
-    #[test]
-    fn a_launcher_signature_failure_is_env_cannot_run_546() {
-        let ids = [
-            "test validator::jail [-p wicked-core --lib]",
-            "test r::s [-p wicked-core --lib]",
-        ];
-        let mut head = failed_run(&ids, &ids);
-        classify(&mut head, base_of(failed_run(&ids, &ids)));
-        assert_eq!(head.classification.as_deref(), Some(ENV_CANNOT_RUN));
-        assert!(!head.denies());
-        assert!(
-            head.summary()
-                .contains("[env_cannot_run: 2 tests cannot run under the floor's nested sandbox"),
-            "{}",
-            head.summary()
-        );
-        let report = report_of(vec![head], &[]);
-        assert!(report.passed && report.env_mismatch());
-        let note = report
-            .classification_note()
-            .expect("the env count is on the note");
-        assert!(
-            note.contains("could not run 2 tests on this host")
-                && note.contains("external CI is the test gate"),
-            "{note}"
-        );
-
-        // Mixed: one genuinely pre-existing failure beside the env class ⇒ pre-existing, env
-        // still counted.
-        let mixed = ["test a::real [--lib]", "test a::jail [--lib]"];
-        let mut head = failed_run(&mixed, &["test a::jail [--lib]"]);
-        classify(
-            &mut head,
-            base_of(failed_run(&mixed, &["test a::jail [--lib]"])),
-        );
-        assert_eq!(
-            head.classification.as_deref(),
-            Some(PRE_EXISTING_IN_SANDBOX)
-        );
-
-        // A NEW sandbox-spawning test: head-only, signature on the head ⇒ still a regression.
-        let mut head = failed_run(
-            &["test a::jail [--lib]", "test a::new_jail [--lib]"],
-            &["test a::jail [--lib]", "test a::new_jail [--lib]"],
-        );
-        classify(
-            &mut head,
-            base_of(failed_run(
-                &["test a::jail [--lib]"],
-                &["test a::jail [--lib]"],
-            )),
-        );
-        assert_eq!(head.classification.as_deref(), Some(REGRESSION));
-        assert!(head.denies());
-        let report = report_of(vec![head], &[]);
-        let note = report
-            .classification_note()
-            .expect("the advisory rides the note");
-        assert!(
-            note.contains("test a::new_jail [--lib]")
-                && note.contains("same env class as 1 pre-existing id;")
-                && note.contains("still denied"),
-            "{note}"
-        );
-        assert!(report_of(vec![failed_run(&["test x"], &[])], &[])
-            .classification_note()
-            .is_none());
-    }
-
-    /// core#553: the isolated re-run is the check's own `cargo test`, narrowed to the id's binary
-    /// and `--exact` name; any other runner is not re-run.
-    #[test]
-    fn an_isolated_rerun_narrows_cargo_test_to_the_one_id_553() {
-        let argv = s(&["cargo", "test", "--locked", "--workspace", "--no-fail-fast"]);
-        assert_eq!(
-            isolated_rerun_argv(&argv, "test actor::t::a_stop [-p wicked-core --lib]"),
-            Some((
-                s(&[
-                    "cargo",
-                    "test",
-                    "--locked",
-                    "-p",
-                    "wicked-core",
-                    "--lib",
-                    "--",
-                    "--exact",
-                    "actor::t::a_stop"
-                ]),
-                "actor::t::a_stop".to_string()
-            ))
-        );
-        assert_eq!(
-            isolated_rerun_argv(
-                &s(&["cargo", "test", "-p", "x", "--", "--test-threads", "1"]),
-                "test t::y"
-            )
-            .map(|p| p.0),
-            Some(s(&[
-                "cargo",
-                "test",
-                "-p",
-                "x",
-                "--",
-                "--test-threads",
-                "1",
-                "--exact",
-                "t::y"
-            ])),
-            "an unqualified id keeps the command's own selection"
-        );
-        assert!(isolated_rerun_argv(&s(&["npm", "run", "test"]), "test t::y").is_none());
-        assert!(
-            isolated_rerun_argv(&argv, "FAIL tests/x.test.ts > a").is_none(),
-            "a vitest id under a cargo check has no runner to re-run with"
-        );
-        assert!(isolated_rerun_argv(&s(&["cargo", "nextest", "run"]), "test t::y").is_none());
-        // Only an oversubscribed host earns the re-run: load above the CPU count.
-        assert!(oversubscribed(Some(15.0), 14));
-        assert!(!oversubscribed(Some(14.0), 14));
-        assert!(!oversubscribed(Some(3.0), 14));
-        assert!(!oversubscribed(None, 14), "an unknown load is no evidence");
-        assert!(!oversubscribed(Some(f64::NAN), 14));
-    }
-
-    /// core#781: `npm run test` / `npm test` hides vitest behind a script — the re-run reads the
-    /// script from the worktree's package.json and goes through `npx --no-install vitest`, cut to
-    /// the one file as for a direct vitest check; a compound script, a non-vitest script or a
-    /// missing package.json is not seen through.
-    #[test]
-    fn a_script_hidden_vitest_is_rerun_through_its_runner_781() {
-        let dir = std::env::temp_dir().join(format!("wicked-rc-781-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(script_runner_argv(&dir, &s(&["npm", "run", "test"])), None);
-        std::fs::write(
-            dir.join("package.json"),
-            r#"{"scripts":{"test":"vitest run","ci":"vitest run --config vitest.ci.ts","both":"tsc && vitest run","commented":"vitest run # --config alt.ts","lint":"eslint ."}}"#,
-        )
-        .unwrap();
-        let id = "FAIL tests/chordModifiers.test.ts > chords > a modifier";
-        let runner = script_runner_argv(&dir, &s(&["npm", "run", "test"])).unwrap();
-        assert_eq!(runner, s(&["npx", "--no-install", "vitest", "run"]));
-        assert_eq!(
-            isolated_rerun_argv(&runner, id).map(|p| p.0),
-            Some(s(&[
-                "npx",
-                "--no-install",
-                "vitest",
-                "run",
-                "tests/chordModifiers.test.ts"
-            ]))
-        );
-        assert_eq!(
-            script_runner_argv(&dir, &s(&["npm", "test"])),
-            Some(runner.clone())
-        );
-        assert_eq!(
-            script_runner_argv(&dir, &s(&["pnpm", "ci"]))
-                .and_then(|a| isolated_rerun_argv(&a, id))
-                .map(|p| p.0),
-            Some(s(&[
-                "npx",
-                "--no-install",
-                "vitest",
-                "run",
-                "tests/chordModifiers.test.ts",
-                "--config",
-                "vitest.ci.ts"
-            ]))
-        );
-        assert_eq!(script_runner_argv(&dir, &s(&["npm", "run", "both"])), None);
-        assert_eq!(
-            script_runner_argv(&dir, &s(&["npm", "run", "commented"])),
-            None,
-            "a comment must not turn into live flags on the re-run"
-        );
-        assert_eq!(script_runner_argv(&dir, &s(&["npm", "run", "lint"])), None);
-        assert_eq!(script_runner_argv(&dir, &s(&["cargo", "test"])), None);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// core#766: a vitest head-only failure (`Test timed out in 5000ms` on a 5 s filesystem walk
-    /// under load 45-80) is re-run as its FILE alone through the check's own `vitest` — the
-    /// `--changed`/`related` selection, its file list and the other flags give way to `run <file>`
-    /// (`--config`/`--root` ride along); `npm run test` hides the runner and is not re-run; go's
-    /// `FAIL TestX` and a file-level import failure are not vitest ids. The witness is the file's
-    /// check-mark line (default or verbose reporter), never another file's.
-    #[test]
-    fn a_vitest_head_only_failure_is_rerun_as_its_file_alone_766() {
-        let id = "FAIL tests/fonts.selfhosted.test.ts > fonts are self-hosted > index.html and \
-                  every source file name no font CDN";
-        assert_eq!(
-            isolated_rerun_argv(&s(&["npx", "vitest", "run"]), id),
-            Some((
-                s(&["npx", "vitest", "run", "tests/fonts.selfhosted.test.ts"]),
-                id.to_string()
-            ))
-        );
-        assert_eq!(
-            isolated_rerun_argv(
-                &s(&[
-                    "npx",
-                    "--no-install",
-                    "vitest",
-                    "related",
-                    "--run",
-                    "src/a.ts",
-                    "src/b.ts",
-                    "--config",
-                    "vitest.ci.ts",
-                    "--coverage",
-                    "--changed",
-                    "abc123"
-                ]),
-                "FAIL tests/x.test.ts > a"
-            )
-            .map(|p| p.0),
-            Some(s(&[
-                "npx",
-                "--no-install",
-                "vitest",
-                "run",
-                "tests/x.test.ts",
-                "--config",
-                "vitest.ci.ts"
-            ]))
-        );
-        assert_eq!(
-            isolated_rerun_argv(
-                &s(&["node_modules/.bin/vitest", "run", "--root=packages/a"]),
-                "FAIL tests/x.test.ts > a"
-            )
-            .map(|p| p.0),
-            Some(s(&[
-                "node_modules/.bin/vitest",
-                "run",
-                "tests/x.test.ts",
-                "--root=packages/a"
-            ]))
-        );
-        // The project/workspace selection rides along: the file re-runs under the SAME project.
-        assert_eq!(
-            isolated_rerun_argv(
-                &s(&[
-                    "pnpm",
-                    "exec",
-                    "vitest",
-                    "--project",
-                    "unit",
-                    "run",
-                    "--workspace=ws.ts"
-                ]),
-                "FAIL tests/x.test.ts > a"
-            )
-            .map(|p| p.0),
-            Some(s(&[
-                "pnpm",
-                "exec",
-                "vitest",
-                "run",
-                "tests/x.test.ts",
-                "--project",
-                "unit",
-                "--workspace=ws.ts"
-            ]))
-        );
-        assert!(
-            isolated_rerun_argv(&s(&["npm", "run", "test"]), "FAIL tests/x.test.ts > a").is_none()
-        );
-        assert!(isolated_rerun_argv(&s(&["npx", "vitest", "run"]), "FAIL TestX").is_none());
-        assert!(
-            isolated_rerun_argv(&s(&["npx", "vitest", "run"]), "FAIL --config=x.test.ts > a")
-                .is_none(),
-            "an option-shaped file never rides the re-run"
-        );
-        assert!(isolated_rerun_argv(
-            &s(&["npx", "vitest", "run"]),
-            "FAIL tests/x.test.ts [ tests/x.test.ts ]"
-        )
-        .is_none());
-        assert!(isolated_rerun_argv(&s(&["npx", "vitest", "run"]), "● suite › name").is_none());
-
-        // The witness: the re-run file's check-mark line, in either reporter's shape.
-        let watch = vec![id.to_string(), "FAIL tests/x.test.ts > a".to_string()];
-        let mut scan = LineScan::watching(&watch);
-        scan.line(" ✓ tests/other.test.ts (3 tests) 12ms");
-        scan.line(" ✓ tests/fonts.selfhosted.test.tsx (1 test) 1ms");
-        assert!(
-            scan.passed.is_empty(),
-            "another file is not the witness: {:?}",
-            scan.passed
-        );
-        scan.line(" ✓ tests/fonts.selfhosted.test.ts (3 tests | 1 skipped) 9ms");
-        scan.line(" ✓ tests/x.test.ts > other test 5ms");
-        scan.line(" ✓ tests/x.test.ts > a > nested 5ms");
-        scan.line(" ✓ tests/x.test.ts > a1 5ms");
-        assert!(
-            scan.passed.is_empty(),
-            "a file with a skipped test, another test of the file, or a longer id is no witness: {:?}",
-            scan.passed
-        );
-        scan.line(" ✓ tests/fonts.selfhosted.test.ts (2 tests) 1234ms");
-        assert_eq!(scan.passed, vec![id.to_string()]);
-        scan.line(" ✓ tests/x.test.ts > a 5ms");
-        assert_eq!(
-            scan.passed, watch,
-            "the verbose per-test line for THIS id witnesses too"
-        );
-        scan.line(" ✓ tests/x.test.ts (1 test) 5ms");
-        assert_eq!(scan.passed, watch, "a file is witnessed once");
-        let mut none = LineScan::watching(&watch);
-        none.line(" ❯ tests/fonts.selfhosted.test.ts (2 tests | 1 failed) 5001ms");
-        none.line("   × fonts are self-hosted > index.html and every source file name no font CDN");
-        none.line("     → Test timed out in 5000ms.");
-        none.line(" ↓ tests/x.test.ts (1 test | 1 skipped)");
-        assert!(none.passed.is_empty(), "{:?}", none.passed);
-    }
-
-    /// core#553, end to end on a real cargo crate: a test that fails once and passes alone is
-    /// `flaky_under_load` (the floor passes, both attempts on the record); a test that fails
-    /// every time stays a `regression` after its one re-run.
-    #[cfg(unix)]
-    #[test]
-    fn a_single_head_only_flake_is_rerun_alone_and_classed_flaky_553() {
-        let repo = scratch("flake553");
-        std::fs::create_dir_all(repo.join("src")).unwrap();
-        std::fs::write(
-            repo.join("Cargo.toml"),
-            "[package]\nname = \"flake_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
-             [workspace]\n",
-        )
-        .unwrap();
-        std::fs::write(repo.join(".gitignore"), "Cargo.lock\ntmp/\n").unwrap();
-        std::fs::write(
-            repo.join("src/lib.rs"),
-            "#[cfg(test)]\nmod t {\n    #[test]\n    fn ok() {}\n}\n",
-        )
-        .unwrap();
-        let base = git_repo_with_commit(&repo);
-        let ctx = FloorContext {
-            stage: FloorStage::Verify,
-            base_head: Some(base),
-            git_dir: Some(repo.join(".git")),
-            ..FloorContext::default()
-        };
-        // Fails the FIRST time in this floor (its private TMPDIR has no marker yet), then passes.
-        std::fs::write(
-            repo.join("src/lib.rs"),
-            "#[cfg(test)]\nmod t {\n    #[test]\n    fn ok() {}\n    #[test]\n    fn flaky() {\n        \
-             let m = std::env::temp_dir().join(\"flake-marker\");\n        if !m.exists() {\n            \
-             std::fs::write(&m, \"\").unwrap();\n            panic!(\"first attempt\");\n        \
-             }\n    }\n}\n",
-        )
-        .unwrap();
-        let report = run_floor(&repo, &ctx);
-        if report.sandbox_error.is_some() {
-            eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
-            return;
-        }
-        let (load1, cpus) = host_load();
-        if !oversubscribed(load1, cpus) {
-            // A host with headroom: no evidence of load, so no re-run — the failure stands.
-            let c = report
-                .checks
-                .iter()
-                .find(|c| c.name == "cargo-test")
-                .expect("cargo-test ran");
-            assert_eq!(c.classification.as_deref(), Some(REGRESSION), "{c:#?}");
-            assert!(c.reruns.is_empty() && !report.passed);
-            eprintln!("repo_checks: host not oversubscribed — the flake re-run is not exercised");
-            let _ = std::fs::remove_dir_all(&repo);
-            return;
-        }
-        let c = report
-            .checks
-            .iter()
-            .find(|c| c.name == "cargo-test")
-            .expect("cargo-test ran");
-        assert_eq!(
-            c.classification.as_deref(),
-            Some(FLAKY_UNDER_LOAD),
-            "{c:#?}"
-        );
-        assert!(report.passed, "{report:#?}");
-        assert_eq!(c.regressions, vec!["test t::flaky [--lib]".to_string()]);
-        assert_eq!(c.reruns.len(), 1);
-        assert!(c.reruns[0].passed(), "{:?}", c.reruns[0]);
-        assert!(c.reruns[0]
-            .argv
-            .ends_with(&s(&["--lib", "--", "--exact", "t::flaky"])));
-        let note = report.classification_note().expect("a flake is disclosed");
-        assert!(
-            note.contains("test t::flaky [--lib]") && note.contains("flaky_under_load"),
-            "{note}"
-        );
-
-        // Always red ⇒ one re-run, still a regression, still denies.
-        std::fs::write(
-            repo.join("src/lib.rs"),
-            "#[cfg(test)]\nmod t {\n    #[test]\n    fn ok() {}\n    #[test]\n    fn broken() {\n        \
-             panic!(\"always\");\n    }\n}\n",
-        )
-        .unwrap();
-        let report = run_floor(&repo, &ctx);
-        let c = report
-            .checks
-            .iter()
-            .find(|c| c.name == "cargo-test")
-            .expect("cargo-test ran");
-        assert_eq!(c.classification.as_deref(), Some(REGRESSION), "{c:#?}");
-        assert!(c.reruns.len() <= 1, "at most one re-run: {c:#?}");
-        assert!(c.reruns.iter().all(|r| !r.passed()));
-        assert!(!report.passed);
-        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// core#482: a repo with no configured test commands gets a derived change-scoped set at the
@@ -9555,8 +9978,166 @@ mod tests {
             .and_then(|b| b.run.as_ref())
             .expect("base ran");
         assert_eq!(b.argv, c.argv, "the base ran the head's command");
-        assert!(report.passed, "{report:#?}");
+        // DES-FLOOR-V2: `sh` has no precise deselect — the base red escalates, never excused.
+        assert_eq!(
+            c.decision.as_ref().map(|d| d.outcome.as_str()),
+            Some(OUTCOME_BASE_RED_UNSEPARATED),
+            "{c:#?}"
+        );
+        assert!(!report.passed);
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// (codex on #1066) [`HeldDir`] never follows a link: not a linked directory component, not a
+    /// linked leaf, not `..`; it never opens a FIFO for a blocking write; and once the ROOT it
+    /// holds is swapped for a link to an outside directory, its writes land in the original
+    /// (detached) directory — never outside — and a fresh hold of the linked path is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_dir_never_follows_a_linked_component_nor_a_swapped_root() {
+        let base = scratch("held-dir");
+        let outside = scratch("held-dir-outside");
+        std::fs::write(outside.join("victim"), "v").unwrap();
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let held = HeldDir::open(&root).unwrap();
+        // A linked directory component: no write, no directory, no fresh directory through it,
+        // and a removal through it removes nothing.
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let e = held.write("link/x", "x").unwrap_err();
+        assert!(e.contains("passes through a symlink"), "{e}");
+        let e = held.subdir("link", false).err().expect("refused");
+        assert!(e.contains("passes through a symlink"), "{e}");
+        assert!(held.create_fresh_dir("link/fresh").is_err());
+        assert!(held.write_bytes("sub/../link/y", b"y", false).is_err());
+        assert_eq!(held.remove_file("link/victim"), Ok(false));
+        // A linked leaf: never written through, never removed as a file.
+        std::os::unix::fs::symlink(outside.join("victim"), root.join("leaf")).unwrap();
+        let e = held.write("leaf", "x").unwrap_err();
+        assert!(e.contains("passes through a symlink"), "{e}");
+        assert_eq!(held.remove_file("leaf"), Ok(false));
+        assert!(std::fs::symlink_metadata(root.join("leaf")).is_ok());
+        assert!(
+            held.symlink("leaf", b"elsewhere").is_err(),
+            "never replaced"
+        );
+        for rel in ["../x", "/abs", "sub/../../x", "", "."] {
+            assert!(held.write(rel, "x").is_err(), "{rel:?}");
+        }
+        // A FIFO at the path: refused at once, never waited on.
+        let fifo =
+            std::ffi::CString::new(root.join("fifo").as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        assert!(held.write("fifo", "x").is_err());
+        // A plain write creates its directories; an executable is 0755; a fresh directory is
+        // refused where one already exists.
+        held.write_bytes("sub/new/f", b"ok", true).unwrap();
+        assert_eq!(std::fs::read(root.join("sub/new/f")).unwrap(), b"ok");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(root.join("sub/new/f"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
+        assert!(held.create_fresh_dir("sub/new").is_err());
+        held.create_fresh_dir("sub/fresh")
+            .unwrap()
+            .write("in", "1")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("sub/fresh/in")).unwrap(),
+            "1"
+        );
+        assert_eq!(held.remove_file("sub/fresh/in"), Ok(true));
+        // The ROOT swapped for a link to the outside after it was held.
+        let moved = base.join("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+        held.write("after-swap", "x").unwrap();
+        held.create_fresh_dir("tmp/export").unwrap();
+        assert!(moved.join("after-swap").is_file());
+        assert!(moved.join("tmp/export").is_dir());
+        assert!(HeldDir::open(&root).is_err(), "a linked root is never held");
+        let mut seen: Vec<String> = std::fs::read_dir(&outside)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        seen.sort();
+        assert_eq!(seen, ["victim"], "nothing landed outside");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("victim")).unwrap(),
+            "v"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// (confirmation round on d32b2b2, codex P1) The base cache record is written by the engine,
+    /// outside the sandbox: whatever a check's `name` or `dir` say — a traversal included — its
+    /// path is ONE file directly in the run's log store (outside every sandbox write root), and
+    /// distinct (dir, name) pairs never share one.
+    #[test]
+    fn a_traversal_check_name_never_writes_outside_the_base_cache() {
+        let wt = scratch("cache-name");
+        let scratch_dir = CheckScratch::prepare(&wt).expect("scratch");
+        let cache = scratch_dir.logs.clone();
+        assert!(
+            !cache.starts_with(&scratch_dir.root),
+            "outside the checks' scratch"
+        );
+        let head = "0123456789abcdef0123";
+        let at = |dir: &str, name: &str| {
+            BaseTree::cache_path(
+                &scratch_dir,
+                head,
+                &RepoCheck {
+                    name: name.into(),
+                    argv: Vec::new(),
+                    source: String::new(),
+                    timeout_s: None,
+                    dir: dir.into(),
+                },
+            )
+        };
+        let mut seen = Vec::new();
+        for (dir, name) in [
+            ("", "../../../escaped"),
+            ("", "/tmp/escaped"),
+            ("", "a/b"),
+            ("a", "b"),
+            ("a/b", ""),
+            ("../..", ".."),
+            ("", &"x".repeat(400)),
+        ] {
+            let path = at(dir, name);
+            assert_eq!(path.parent(), Some(cache.as_path()), "{dir:?} {name:?}");
+            let file = path.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                file.len() == 5 + 64 + 5
+                    && file.starts_with("base-")
+                    && file.ends_with(".json")
+                    && file[5..69].bytes().all(|b| b.is_ascii_hexdigit()),
+                "{file}"
+            );
+            assert!(!seen.contains(&path), "{dir:?} {name:?} shares an entry");
+            seen.push(path.clone());
+            // The record lands where the floor writes it: inside the cache, nowhere else.
+            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::write(&path, "{}").unwrap();
+        }
+        let records = std::fs::read_dir(&cache)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("base-"))
+            .count();
+        assert_eq!(records, seen.len());
+        assert!(!scratch_dir.root.join("escaped").exists());
+        assert!(!wt.join("escaped").exists());
+        let _ = std::fs::remove_dir_all(&wt);
     }
 
     #[test]
@@ -9579,7 +10160,36 @@ mod tests {
             },
         );
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A record from before the policy version (a bare check run) is a miss.
         std::fs::write(&path, serde_json::to_string(&ran).unwrap()).unwrap();
+        let bare = RepoCheck {
+            name: "test_targeted".into(),
+            argv: s(&["cargo", "test", "-p", "b"]),
+            source: DERIVED_TARGETED_SOURCE.into(),
+            timeout_s: None,
+            dir: String::new(),
+        };
+        assert!(BaseTree::cached(&scratch_dir, head, &bare, None).is_none());
+        let rec = BaseRecord {
+            floor_policy: FLOOR_POLICY_VERSION,
+            head_argv: s(&["cargo", "test", "-p", "b"]),
+            guide: None,
+            run: ran,
+            toc: None,
+        };
+        std::fs::write(&path, serde_json::to_string(&rec).unwrap()).unwrap();
+        // (review round 15, item 17) A record taken without a guide is no answer under one.
+        let g: crate::floor_guide::GuideCheck = serde_json::from_value(serde_json::json!({
+            "name": "test", "run": ["cargo", "test", "-p", "b"]}))
+        .unwrap();
+        let b = RepoCheck {
+            name: "test_targeted".into(),
+            argv: s(&["cargo", "test", "-p", "b"]),
+            source: DERIVED_TARGETED_SOURCE.into(),
+            timeout_s: None,
+            dir: String::new(),
+        };
+        assert!(BaseTree::cached(&scratch_dir, head, &b, Some(&g)).is_none());
         let check = |argv: &[&str]| RepoCheck {
             name: "test_targeted".into(),
             argv: s(argv),
@@ -9587,261 +10197,41 @@ mod tests {
             timeout_s: None,
             dir: String::new(),
         };
-        assert!(
-            BaseTree::cached(&scratch_dir, head, &check(&["cargo", "test", "-p", "b"])).is_some()
-        );
-        assert!(
-            BaseTree::cached(&scratch_dir, head, &check(&["cargo", "test", "-p", "a"])).is_none()
-        );
+        assert!(BaseTree::cached(
+            &scratch_dir,
+            head,
+            &check(&["cargo", "test", "-p", "b"]),
+            None
+        )
+        .is_some());
+        assert!(BaseTree::cached(
+            &scratch_dir,
+            head,
+            &check(&["cargo", "test", "-p", "a"]),
+            None
+        )
+        .is_none());
+        // (codex r12) A record whose blob is gone is no evidence: a miss, so the base re-runs.
+        let mut rec: BaseRecord =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        rec.run.logs = vec![crate::floor_log::LogRef {
+            attempt: "base".into(),
+            stream: "stdout".into(),
+            sha256: "0".repeat(64),
+            bytes: 1,
+            truncated: false,
+        }];
+        std::fs::write(&path, serde_json::to_string(&rec).unwrap()).unwrap();
+        assert!(BaseTree::cached(
+            &scratch_dir,
+            head,
+            &check(&["cargo", "test", "-p", "b"]),
+            None
+        )
+        .is_none());
         drop(scratch_dir);
         let _ = std::fs::remove_dir_all(&wt);
     }
-    /// core#789/#790: the environment signals one output line carries, and the helpers the
-    /// load-class re-run reads them with.
-    #[test]
-    fn env_signals_are_read_off_the_output_789_790() {
-        assert_eq!(
-            env_signal_of_line(
-                "[vitest-pool]: Failed to start forks worker for test files /w/a.test.ts, /w/b.test.ts."
-            )
-            .as_deref()
-            .map(|s| s.starts_with("load: ")),
-            Some(true)
-        );
-        assert!(env_signal_of_line("→ Test timed out in 30000ms.").is_some());
-        assert!(env_signal_of_line("Hook timed out in 10000ms").is_some());
-        assert!(env_signal_of_line("Test timed out in soon").is_none());
-        assert_eq!(
-            env_signal_of_line("Errors  44 errors").as_deref(),
-            Some("errors: 44")
-        );
-        assert_eq!(
-            env_signal_of_line("⎯⎯ Vitest caught 3 unhandled errors during the test run ⎯⎯")
-                .as_deref(),
-            Some("errors: 3")
-        );
-        assert_eq!(
-            env_signal_of_line(
-                "Error: EPERM: operation not permitted, open '/w/node_modules/eslint/lib/x.js'"
-            )
-            .as_deref()
-            .map(|s| s.starts_with("crash: ")),
-            Some(true)
-        );
-        assert!(
-            env_signal_of_line("Error: EPERM: operation not permitted, open '/w/src/a.ts'")
-                .is_none(),
-            "a denied open outside node_modules is not a dependency crash"
-        );
-        assert!(env_signal_of_line("ok 1 - a test").is_none());
-
-        let wt = Path::new("/w");
-        assert_eq!(
-            worker_start_files(
-                "[vitest-pool]: Failed to start forks worker for test files /w/a.test.ts, /w/src/b.test.ts.",
-                wt
-            ),
-            Ok(s(&["a.test.ts", "src/b.test.ts"]))
-        );
-        assert_eq!(
-            worker_start_files(
-                "[vitest-pool]: Failed to start forks worker for test files /elsewhere/a.test.ts.",
-                wt
-            ),
-            Err(()),
-            "a file outside the worktree is never re-run"
-        );
-        assert_eq!(
-            worker_start_files("Timeout waiting for worker to respond", wt),
-            Ok(vec![])
-        );
-
-        assert_eq!(
-            vitest_any_file_of("FAIL a.test.ts > s > n"),
-            Some("a.test.ts")
-        );
-        assert_eq!(
-            vitest_any_file_of("FAIL a.test.ts [ a.test.ts ]"),
-            Some("a.test.ts")
-        );
-        assert_eq!(vitest_any_file_of("FAIL a.test.ts [ b.test.ts ]"), None);
-        assert_eq!(vitest_any_file_of("FAIL TestX"), None);
-        assert!(rerun_file_ok("src/a.test.ts"));
-        for bad in [
-            "/abs/a.test.ts",
-            "../a.test.ts",
-            "--config=a.test.ts",
-            "a b.ts",
-            "",
-        ] {
-            assert!(!rerun_file_ok(bad), "{bad}");
-        }
-        assert_eq!(
-            crash_class("crash: Error: EPERM: operation not permitted, open 'x'"),
-            "EPERM"
-        );
-        assert_eq!(
-            crash_class("crash: Error: EACCES: permission denied, open 'x'"),
-            "EACCES"
-        );
-
-        assert!(vitest_file_pass_line(
-            "✓ a.test.ts (3 tests) 12ms",
-            "a.test.ts"
-        ));
-        assert!(vitest_file_pass_line(
-            "✓ |unit| a.test.ts (3 tests | 1 skipped) 12ms",
-            "a.test.ts"
-        ));
-        assert!(!vitest_file_pass_line(
-            "✓ a.test.tsx (3 tests) 12ms",
-            "a.test.ts"
-        ));
-        assert!(!vitest_file_pass_line(
-            "✓ a.test.ts (3 tests | 1 failed) 12ms",
-            "a.test.ts"
-        ));
-        assert!(!vitest_file_pass_line(
-            "✓ a.test.ts > one 12ms",
-            "a.test.ts"
-        ));
-
-        // The signal list is capped and marks the cut.
-        let mut scan = LineScan::watching(&[]);
-        for _ in 0..(MAX_ENV_SIGNALS + 5) {
-            scan.line("Test timed out in 5000ms");
-        }
-        assert_eq!(scan.signals.len(), MAX_ENV_SIGNALS);
-        assert_eq!(
-            scan.signals.last().map(String::as_str),
-            Some(SIGNALS_TRUNCATED)
-        );
-        // An identical crash line is recorded once.
-        let mut scan = LineScan::watching(&[]);
-        for _ in 0..3 {
-            scan.line("Error: EACCES: permission denied, open '/w/node_modules/x.js'");
-        }
-        assert_eq!(scan.signals.len(), 1);
-    }
-
-    /// core#789, end to end: a check that crashes with the SAME dependency-file EPERM on head and
-    /// base and again on its re-run is `env_cannot_run` — it does not deny and the floor goes on
-    /// to the next check (which used to be skipped).
-    #[cfg(unix)]
-    #[test]
-    fn an_identical_env_crash_on_head_and_base_is_env_cannot_run_and_skips_nothing_789() {
-        let repo = scratch("crash789");
-        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
-        std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
-        std::fs::write(
-            repo.join(CONFIG_PATH),
-            r#"{"lint":["sh","-c","echo \"Error: EPERM: operation not permitted, open '$PWD/node_modules/eslint/lib/x.js'\" >&2; exit 2"],"test":["true"],"timeout_s":45}"#,
-        )
-        .unwrap();
-        let base = git_repo_with_commit(&repo);
-        let ctx = FloorContext {
-            stage: FloorStage::Verify,
-            base_head: Some(base),
-            git_dir: Some(repo.join(".git")),
-            ..FloorContext::default()
-        };
-        let report = run_floor(&repo, &ctx);
-        if report.sandbox_error.is_some() {
-            eprintln!("repo_checks: no sandbox tool here — the crash floor cannot run");
-            return;
-        }
-        assert_eq!(names_run(&report), vec!["lint", "test"], "{report:?}");
-        assert!(report.skipped.is_empty(), "{report:?}");
-        let lint = &report.checks[0];
-        assert_eq!(
-            lint.classification.as_deref(),
-            Some(ENV_CANNOT_RUN),
-            "{lint:?}"
-        );
-        assert!(lint.env_crash());
-        assert!(!lint.denies());
-        assert_eq!(lint.reruns.len(), 1);
-        assert!(report.passed, "{report:?}");
-        assert!(report
-            .classification_note()
-            .is_some_and(|n| n.contains("crashed with an environment error")));
-        let _ = std::fs::remove_dir_all(&repo);
-    }
-
-    /// core#790, end to end: head and base BOTH red from load (different files never started),
-    /// so the id diff calls the head's failures regressions; the load-class re-run runs the
-    /// failing file plus the never-started file once, serially, and a pass is `flaky_under_load`.
-    /// An error count above the worker-start errors (an unexplained unhandled error) is not load.
-    #[cfg(unix)]
-    #[test]
-    fn a_load_class_failure_reruns_whatever_the_base_did_790() {
-        let repo = scratch("load790");
-        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
-        std::fs::create_dir_all(repo.join("vt")).unwrap();
-        std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
-        std::fs::write(
-            repo.join(CONFIG_PATH),
-            r#"{"test":["sh","vt/vitest","run"],"timeout_s":45}"#,
-        )
-        .unwrap();
-        let script = |fail_id: &str, never: &str, errors: usize| {
-            format!(
-                "if [ \"$1\" = run ] && [ -n \"$2\" ]; then shift; for f in \"$@\"; do case \"$f\" in \
-                 *.ts) echo \" ✓ $f (1 test) 1ms\";; esac; done; exit 0; fi\n\
-                 echo ' FAIL  {fail_id} > s > n'\n\
-                 echo \"[vitest-pool]: Failed to start forks worker for test files $PWD/{never}.\"\n\
-                 echo ' Errors  {errors} error'\n\
-                 exit 1\n"
-            )
-        };
-        std::fs::write(repo.join("vt/vitest"), script("c.test.ts", "d.test.ts", 1)).unwrap();
-        let base = git_repo_with_commit(&repo);
-        let ctx = FloorContext {
-            stage: FloorStage::Verify,
-            base_head: Some(base),
-            git_dir: Some(repo.join(".git")),
-            ..FloorContext::default()
-        };
-        std::fs::write(repo.join("vt/vitest"), script("a.test.ts", "b.test.ts", 1)).unwrap();
-        let report = run_floor(&repo, &ctx);
-        if report.sandbox_error.is_some() {
-            eprintln!("repo_checks: no sandbox tool here — the load floor cannot run");
-            return;
-        }
-        let test = &report.checks[0];
-        assert_eq!(
-            test.classification.as_deref(),
-            Some(FLAKY_UNDER_LOAD),
-            "{test:?}"
-        );
-        assert_eq!(test.reruns.len(), 1, "{test:?}");
-        assert_eq!(
-            test.reruns[0].argv,
-            s(&[
-                "sh",
-                "vt/vitest",
-                "run",
-                "a.test.ts",
-                "b.test.ts",
-                "--no-file-parallelism"
-            ])
-        );
-        assert!(report.passed, "{report:?}");
-
-        // More errors than worker-start failures: not explained by load — no load-class re-run
-        // (the never-started file is not re-run; core#553/#766's own one-file rule may still).
-        std::fs::write(repo.join("vt/vitest"), script("a.test.ts", "b.test.ts", 5)).unwrap();
-        let report = run_floor(&repo, &ctx);
-        let test = &report.checks[0];
-        assert!(
-            test.reruns
-                .iter()
-                .all(|r| !r.argv.iter().any(|a| a == "b.test.ts")),
-            "{test:?}"
-        );
-        let _ = std::fs::remove_dir_all(&repo);
-    }
-
     /// core#767: `journeys` are VERIFY-stage checks named `journey-<name>`, in name order after
     /// `e2e`; a bad name fails detection; `false` drops one; a journey is a test-set check.
     #[test]
@@ -9880,3 +10270,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 }
+
+#[cfg(test)]
+#[path = "floor_tests.rs"]
+pub(crate) mod floor_tests;

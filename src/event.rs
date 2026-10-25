@@ -1439,10 +1439,38 @@ fn check_run_json(c: &crate::repo_checks::CheckRun) -> serde_json::Value {
         "preExisting": c.pre_existing,
         "regressions": c.regressions,
         "base": c.base.as_deref().map(base_run_json),
-        // core#546 / core#553 (additive): the ids the host cannot run under the floor, and the
-        // isolated re-runs of a small head-only failure set.
+        // core#546 (deprecated by DES-FLOOR-V2: always `[]` now) and the decision's further runs
+        // (the excluded run, the identical retry).
         "envCannotRun": c.env_cannot_run,
         "reruns": c.reruns.iter().map(check_run_json).collect::<Vec<_>>(),
+        // DES-FLOOR-V2 (additive): the floor's machine-readable decision — `null` on a nested
+        // run and on a record from before it.
+        "decision": c.decision.as_ref().map(check_decision_json),
+    })
+}
+
+/// The wire form of the floor's decision on one check (`checks[].decision`).
+fn check_decision_json(d: &crate::repo_checks::CheckDecision) -> serde_json::Value {
+    serde_json::json!({
+        "outcome": d.outcome,
+        "baseSha": d.base_sha,
+        "baseFailing": d.base_failing,
+        "excluded": d.excluded,
+        "logRefs": d.log_refs.iter().map(|r| serde_json::json!({
+            "attempt": r.attempt,
+            "stream": r.stream,
+            "sha256": r.sha256,
+            "bytes": r.bytes,
+            "truncated": r.truncated,
+        })).collect::<Vec<_>>(),
+        "flaky": d.flaky,
+        "reason": d.reason,
+        // DES-BUILD-GUIDE (additive): the base's build guide for this check.
+        "guide": d.guide.as_ref().map(|g| serde_json::json!({
+            "present": g.present,
+            "usable": g.usable,
+            "reason": g.reason,
+        })),
     })
 }
 

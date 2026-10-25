@@ -36,6 +36,9 @@ use wicked_core::{
 
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
+    // DES-FLOOR-V2: a failed floor on an oversubscribed host retries once; this harness does not
+    // wait for headroom first (the bound's own behaviour is the unit tests').
+    std::env::set_var("WICKED_REPO_CHECKS_RETRY_WAIT_S", "0");
     wicked_apps_core::emit::hermetic_test_spool();
 }
 
@@ -1046,5 +1049,75 @@ fn a_carried_floor_keeps_the_judges_reject_and_the_override_is_refused() {
     let s = views.iter().find(|v| v.session.id == sid).expect("run");
     assert_eq!(s.units[2].status, wicked_core::UnitStatus::Rejected);
     assert!(s.session.assurance.floor_overrides.is_empty());
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// DONE WHEN 3 (DES-FLOOR-V2): a base that is red where the floor cannot separate its failures from
+/// the head's (`sh` has no precise per-test deselect, like vitest or jest) escalates as
+/// `base_red_unseparated` with both logs — never excused, never a plain new failure — and the
+/// operator's floor override clears it, labelled `floor overridden by operator`.
+#[test]
+fn a_base_red_the_floor_cannot_separate_escalates_and_the_override_clears_it_labelled() {
+    let repo = make_repo(
+        "unsep",
+        r#"["sh", "-c", "echo 'test old ... FAILED'; exit 1"]"#,
+        60,
+        &[],
+    );
+    let (core, _ran) = core_for("unsep", Rework::ChangesNothing);
+    let sid = "fg-unsep";
+    let events = launch(&core, "unsep", &repo, sid);
+    let first = until_settled(&events, sid);
+    no_session_failed(&first);
+    if !fix_floor_denied(&first, "repo_checks") {
+        return;
+    }
+    let check = first
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            CoreEvent::RepoChecksEvaluated { ord: 3, checks, .. } => {
+                checks.iter().find(|c| c.name == "test").cloned()
+            }
+            _ => None,
+        })
+        .expect("the fix floor's test check");
+    let d = check.decision.as_ref().expect("the floor decided");
+    assert_eq!(d.outcome, "base_red_unseparated", "{d:?}");
+    assert!(d.excluded.is_empty() && d.base_sha.is_some(), "{d:?}");
+    assert!(
+        d.log_refs.iter().any(|l| l.attempt == "head")
+            && d.log_refs.iter().any(|l| l.attempt == "base"),
+        "both logs ride the escalation: {d:?}"
+    );
+    assert_eq!(
+        check.classification.as_deref(),
+        Some("base_red_unseparated")
+    );
+    core.confirm_gate_as(
+        sid,
+        HumanDecision::OperatorJudgment {
+            rationale: "the red test is main's; the fix does not touch it".into(),
+        },
+        Some("operator-under-test".into()),
+    )
+    .expect("the operator's judgment over the unseparated floor");
+    let second = until_settled(&events, sid);
+    no_session_failed(&second);
+    let views = core.sessions_detail().expect("sessions");
+    let s = views.iter().find(|v| v.session.id == sid).expect("run");
+    let fix = &s.units[2];
+    assert_eq!(
+        fix.status,
+        wicked_core::UnitStatus::Done,
+        "the override cleared it"
+    );
+    let r = fix.assurance.as_ref().expect("the fix's gate receipt");
+    let over = r.operator_judges[0]
+        .floor_override
+        .as_ref()
+        .expect("recorded as a floor override");
+    assert_eq!(over.label, "floor overridden by operator");
+    assert_eq!(over.layer, "repo_checks");
     let _ = std::fs::remove_dir_all(&repo);
 }

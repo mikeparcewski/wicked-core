@@ -16,6 +16,8 @@
 //!    `finished_at` are recorded, and the completed run's worktree is RETAINED until the run is
 //!    archived — then reaped (clean-only).
 
+#[path = "support/libtest_guide.rs"]
+mod guide_support;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -37,6 +39,11 @@ use wicked_core::{
 /// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
+    // The floor's exclusion ships OFF (`WICKED_FLOOR_EXCLUDE`); these tests exercise it ON.
+    std::env::set_var("WICKED_FLOOR_EXCLUDE", "on");
+    // DES-FLOOR-V2: a failed floor on an oversubscribed host retries once; this harness does not
+    // wait for headroom first (the bound's own behaviour is the unit tests').
+    std::env::set_var("WICKED_REPO_CHECKS_RETRY_WAIT_S", "0");
     wicked_apps_core::emit::hermetic_test_spool();
 }
 
@@ -540,16 +547,61 @@ impl StepRunner for CommittingSeat {
 /// change did not cause.
 #[cfg(unix)]
 fn make_git_repo_with_a_red_test_on_the_base(name: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
     let repo = make_git_repo(name);
+    // DES-FLOOR-V2: the shared red is excluded by NAME, so the runner must be one the floor can
+    // inventory and deselect: a stand-in `cargo test` (absolute path, outside the tree) whose
+    // only test `shared` fails, listed under `-- --list`, skipped under `--skip=shared`.
+    let bin = std::env::temp_dir().join(format!(
+        "wicked-core-w6floor-bin-{name}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&bin);
+    std::fs::create_dir_all(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    std::fs::write(
+        &cargo,
+        "#!/bin/sh\nlist=0; skip=0\nfor a in \"$@\"; do case \"$a\" in\n\
+         --list) list=1;; --skip=shared) skip=1;;\n\
+         esac; done\necho '     Running unittests src/lib.rs (target/debug/deps/fixture-0)' >&2\n\
+         if [ $list = 1 ]; then [ $skip = 0 ] && echo 'shared: test'; echo; echo '1 test, 0 benchmarks'; exit 0; fi\n\
+         if [ $skip = 1 ]; then echo 'test result: ok. 0 passed; 0 failed; 1 filtered out'; exit 0; fi\n\
+         echo 'test shared ... FAILED'\necho; echo 'failures:'; echo '    shared'; echo\n\
+         echo 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out'; exit 101\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::create_dir_all(repo.join(".wicked")).unwrap();
     std::fs::write(
         repo.join(".wicked/checks.json"),
-        r#"{"test":["sh","-c","echo 'test shared ... FAILED'; exit 1"],"timeout_s":60}"#,
+        serde_json::json!({ "test": [cargo.to_str().unwrap(), "test", "--no-fail-fast"], "timeout_s": 60 })
+            .to_string(),
     )
     .unwrap();
     std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "a red test the base carries"]);
+    // DES-BUILD-GUIDE: the base's build guide for the stand-in, verified on the commit before it.
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let verified = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let argv: Vec<String> = [cargo.to_str().unwrap(), "test", "--no-fail-fast"]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+    std::fs::write(
+        repo.join(".wicked/build-guide.json"),
+        serde_json::json!({"version": 1, "checks": [guide_support::libtest_guide(&argv, &verified)]})
+        .to_string(),
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "the build guide"]);
     repo
 }
 
