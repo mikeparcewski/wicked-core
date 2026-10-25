@@ -577,6 +577,9 @@ pub(crate) fn read_rules_around_snapshot(
     // the DECLARED kind, so a directory named like a registered file (or a symlink of any name)
     // would pass admission and receive a rule that does not cover it.
     for name in list_names(state_home)? {
+        if is_os_metadata(&name) {
+            continue;
+        }
         let Some(entry) = registry.classify(&name) else {
             return Err(unclassified(state_home, &name));
         };
@@ -594,6 +597,9 @@ pub(crate) fn read_rules_around_snapshot(
     if std::fs::symlink_metadata(&skills_dir).is_ok() {
         let root_children = root_patterns(skills);
         for name in list_names(&skills_dir)? {
+            if is_os_metadata(&name) {
+                continue;
+            }
             let child = skills_dir.join(&name);
             let meta = std::fs::symlink_metadata(&child).map_err(|e| {
                 format!(
@@ -626,7 +632,7 @@ pub(crate) fn read_rules_around_snapshot(
     let patterns = slot_patterns(skills, slot);
     let mut siblings: Vec<PathBuf> = Vec::new();
     for name in list_names(&slot_dir)? {
-        if name == handed_gen {
+        if name == handed_gen || is_os_metadata(&name) {
             continue;
         }
         let path = slot_dir.join(&name);
@@ -720,7 +726,66 @@ pub(crate) fn read_rules_around_snapshot(
     for sibling in siblings {
         push(sibling, true)?;
     }
+    // OS metadata is ignored by the listings above, never opened: deny it at every checked level
+    // (so one created after launch is fenced too) and at any depth below the read slot, handed
+    // generation included, WITHOUT naming it — the ordinary snapshot files stay readable.
+    let slot_dir = skills_dir.join(slot);
+    for level in [state_home, skills_dir.as_path(), slot_dir.as_path()] {
+        for pat in OS_METADATA_PATTERNS {
+            push_metadata(&mut rules, spell, level, pat, false)?;
+        }
+    }
+    for pat in OS_METADATA_PATTERNS {
+        push_metadata(&mut rules, spell, &slot_dir, pat, true)?;
+    }
     Ok(rules)
+}
+
+/// OS-generated metadata names (macOS Finder, Spotlight, Trash, FSEvents, AppleDouble; Windows
+/// Explorer). Never stores and never data a worker may read: the registry listings skip them,
+/// the Read fence denies them. A trailing `*` matches any suffix, else the exact name.
+pub(crate) const OS_METADATA_PATTERNS: &[&str] = &[
+    ".DS_Store",
+    "._*",
+    ".Spotlight-V100",
+    ".Trashes",
+    ".fseventsd",
+    "Thumbs.db",
+    "desktop.ini",
+    "Icon\r",
+];
+
+/// Whether `name` is OS metadata ([`OS_METADATA_PATTERNS`]).
+pub(crate) fn is_os_metadata(name: &str) -> bool {
+    OS_METADATA_PATTERNS
+        .iter()
+        .any(|p| match p.strip_suffix('*') {
+            Some(stem) => name.starts_with(stem),
+            None => name == *p,
+        })
+}
+
+/// Deny `pattern` (and its tree) under `dir`; `deep` also matches below it at any depth. The rule
+/// syntax has no spelling for a control character, so `\r` is `?` there (a wider deny — safe).
+fn push_metadata(
+    rules: &mut Vec<String>,
+    spell: &dyn Fn(&Path) -> Option<String>,
+    dir: &Path,
+    pattern: &str,
+    deep: bool,
+) -> Result<(), String> {
+    let p = spell(dir).ok_or_else(|| {
+        format!(
+            "the fence cannot express a deny rule for {} (non-UTF8, or it contains a backslash \
+             or a comma)",
+            dir.display()
+        )
+    })?;
+    let pattern = pattern.replace('\r', "?");
+    let at = if deep { "**/" } else { "" };
+    rules.push(format!("Read({p}/{at}{pattern})"));
+    rules.push(format!("Read({p}/{at}{pattern}/**)"));
+    Ok(())
 }
 
 /// The ACTUAL kind of a classified top-level entry must be the registry's DECLARED kind (codex
@@ -982,7 +1047,7 @@ pub(crate) fn survey(state_home: &Path) -> Result<Vec<UnregisteredEntry>, String
     let registry = registry().map_err(|e| format!("the state-home registry is unusable ({e})"))?;
     let mut out = Vec::new();
     for name in list_names(state_home)? {
-        if registry.classify(&name).is_none() {
+        if !is_os_metadata(&name) && registry.classify(&name).is_none() {
             out.push(UnregisteredEntry {
                 path: state_home.join(&name).display().to_string(),
                 name,
@@ -999,7 +1064,10 @@ pub(crate) fn survey(state_home: &Path) -> Result<Vec<UnregisteredEntry>, String
                 let slot = skills.read_slot.as_deref();
                 let patterns = root_patterns(skills);
                 for name in list_names(&skills_dir)? {
-                    if Some(name.as_str()) == slot || patterns.iter().any(|p| p.matches(&name)) {
+                    if Some(name.as_str()) == slot
+                        || is_os_metadata(&name)
+                        || patterns.iter().any(|p| p.matches(&name))
+                    {
                         continue;
                     }
                     out.push(UnregisteredEntry {
@@ -1823,6 +1891,91 @@ mod tests {
     /// directory, a `.staging-*` that is a file, a `manifest.json.tmp-*` that is a directory, a
     /// `.tmp-current-*` that is a directory — and so does a non-transient unknown name, at the
     /// root and in the slot.
+    /// OS metadata (Finder's `.DS_Store`, AppleDouble `._*`, …) is never a store: the survey, the
+    /// intake fence and the launch-time admission all skip it at the state home, the skills root
+    /// and the read slot — while every other unknown entry (a near miss included) still refuses.
+    #[test]
+    fn os_metadata_is_ignored_at_every_checked_level_and_other_unknowns_still_refuse() {
+        let base = std::env::temp_dir().join(format!(
+            "wstate-osmeta-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home = base.join("crew-state");
+        let skills = home.join("skills");
+        let slot = skills.join("snapshots");
+        let gen7 = slot.join("000007");
+        std::fs::create_dir_all(&gen7).unwrap();
+        std::fs::write(home.join("core.db"), "db").unwrap();
+        let mut names: Vec<String> = OS_METADATA_PATTERNS
+            .iter()
+            .map(|p| p.replace('*', "foo"))
+            .collect();
+        // `Icon\r` cannot be created on every filesystem (Windows refuses control characters).
+        if cfg!(windows) {
+            names.retain(|n| !n.contains('\r'));
+        }
+        for level in [&home, &skills, &slot] {
+            for n in &names {
+                // Files for most; directories for the macOS directory-shaped names.
+                if n.starts_with('.') && !n.starts_with("._") && n != ".DS_Store" {
+                    std::fs::create_dir_all(level.join(n)).unwrap();
+                } else {
+                    std::fs::write(level.join(n), "").unwrap();
+                }
+            }
+        }
+        assert_eq!(survey(&home).unwrap(), Vec::<UnregisteredEntry>::new());
+        assert_eq!(intake_fence_for(Some(&gen7)), Ok(()));
+        let rules = read_rules_around_snapshot(&home, "000007", &spell)
+            .expect("OS metadata never refuses the launch");
+        let s = |p: &Path| p.to_str().unwrap().to_string();
+        // Denied at every level, and below the read slot; the handed generation is not named.
+        for level in [&home, &skills, &slot] {
+            assert!(
+                rules.contains(&format!("Read({}/.DS_Store)", s(level))),
+                "{rules:?}"
+            );
+            assert!(
+                rules.contains(&format!("Read({}/._*/**)", s(level))),
+                "{rules:?}"
+            );
+        }
+        assert!(
+            rules.contains(&format!("Read({}/**/.DS_Store)", s(&slot))),
+            "{rules:?}"
+        );
+        assert!(!rules.iter().any(|r| r.contains("000007")), "{rules:?}");
+
+        // Near misses and real unknowns are NOT metadata: they refuse, as before.
+        assert!(!is_os_metadata(".DS_Store-extra"));
+        assert!(!is_os_metadata("x.DS_Store"));
+        assert!(!is_os_metadata("_foo"));
+        for unknown in [".DS_Store-extra", "scratch"] {
+            std::fs::create_dir_all(home.join(unknown)).unwrap();
+            let found = survey(&home).unwrap();
+            assert_eq!(
+                found.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(),
+                vec![unknown]
+            );
+            assert!(intake_fence_for(Some(&gen7)).is_err());
+            let err = read_rules_around_snapshot(&home, "000007", &spell)
+                .expect_err("an unknown entry still refuses");
+            assert!(err.contains(unknown), "{err}");
+            std::fs::remove_dir_all(home.join(unknown)).unwrap();
+        }
+        std::fs::create_dir_all(skills.join("scratch")).unwrap();
+        assert_eq!(survey(&home).unwrap().len(), 1);
+        assert!(read_rules_around_snapshot(&home, "000007", &spell).is_err());
+        std::fs::remove_dir_all(skills.join("scratch")).unwrap();
+        std::fs::create_dir_all(slot.join("scratch")).unwrap();
+        assert!(read_rules_around_snapshot(&home, "000007", &spell).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn a_launch_admitted_while_a_crew_mutation_is_parked_classifies_every_transient_name() {
         let base = std::env::temp_dir().join(format!(

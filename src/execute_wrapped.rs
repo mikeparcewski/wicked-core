@@ -15196,6 +15196,7 @@ mod tests {
                 [b'*', rest @ ..] => (0..=s.len())
                     .take_while(|&i| i == 0 || s[i - 1] != b'/')
                     .any(|i| glob(rest, &s[i..])),
+                [b'?', rest @ ..] => s.first().is_some_and(|&c| c != b'/') && glob(rest, &s[1..]),
                 [c, rest @ ..] => s.first() == Some(c) && glob(rest, &s[1..]),
             }
         }
@@ -16111,6 +16112,26 @@ tail -c 1500 /work/claude.out
                 !denying(&fenced, "Read", &p).is_empty(),
                 "{} must stay denied for Read: {fenced:?}",
                 p.display()
+            );
+        }
+        // OS metadata is never a store and never readable: denied at every checked level and
+        // anywhere below the read slot — the handed generation's metadata included — while the
+        // snapshot's ordinary files (asserted readable above) stay open.
+        for p in [
+            crew.join(".DS_Store"),
+            crew.join("._foo"),
+            crew.join("Thumbs.db").join("x"),
+            crew.join("Icon\r"),
+            skills.join(".DS_Store"),
+            skills.join("snapshots").join(".DS_Store"),
+            gen7.join(".DS_Store"),
+            gen7.join("skills").join("domain").join("._SKILL.md"),
+            gen7.join(".fseventsd").join("0000"),
+        ] {
+            assert!(
+                !denying(&fenced, "Read", &p).is_empty(),
+                "OS metadata {:?} must stay denied for Read: {fenced:?}",
+                p
             );
         }
         // v3.3 §1 (codex round 4): a SIBLING generation is DENIED by name — the read slot is the
