@@ -168,17 +168,18 @@
         }
       },
       "verified": {
-        "baseSha": "b5ec205f97086e2755f21085c9c7dfcd11902b67",
-        "runnerVersion": "",
-        "at": "2026-10-23T18:59:07Z",
+        "baseSha": "7300e138de61e8fd88d44a4fca66e292adeff8a2",
+        "runnerVersion": "cargo 1.99.0 (5f94df478 2026-08-27) (Homebrew)",
+        "at": "2026-10-25T18:10:40Z",
         "results": {
-          "alone": "pass",
-          "deselect": "pass",
-          "ids": "pass",
-          "list": "pass",
-          "multi": "pass",
-          "mutation": "pass",
-          "run": "pass"
+          "alone": "fail: needs a green base (retried)",
+          "deselect": "fail: needs a green base (retried)",
+          "ids": "fail: needs a green base (retried)",
+          "list": "pass (retried)",
+          "multi": "fail: needs a green base (retried)",
+          "mutation": "fail: needs a green base (retried)",
+          "run": "fail: needs a green base: the clean run exited Some(101) with 42 parsed failure(s) (retried)",
+          "version": "pass (retried)"
         }
       },
       "version": {
