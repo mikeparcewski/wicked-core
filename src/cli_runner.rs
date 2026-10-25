@@ -811,22 +811,12 @@ pub(crate) fn run_unit_and_judge(
     } else {
         full_registry()
     };
-    // (PRODUCT-WORKS J4) A seat whose QUOTA bench fell due answers one cheap call first: back on
-    // the roster when it answers, benched again for longer when it does not. Before the judge
-    // reads the bench, so a gate whose only distinct judge was benched picks the returned seat.
-    let (bench, reprobes) = reprobe_due_benches(
-        &**runner,
-        &registry,
-        bench,
-        crate::seat_bench::now_ms(),
-        emit_delta,
-    );
     // (C5) The judge is an ungoverned engine call: a seat benched for governed work only (the
     // host-floor bench) still judges.
-    let bench = &crate::domain::ungoverned_bench(&bench);
+    let bench = &crate::domain::ungoverned_bench(bench);
     let benched: Vec<String> = bench.iter().map(|b| b.cli.clone()).collect();
     let pool = judge_fallback_pool(&registry);
-    let (output, verdict, mut evidence) = run_unit_and_judge_on(
+    run_unit_and_judge_on(
         runner,
         input,
         agent_review_target,
@@ -840,12 +830,12 @@ pub(crate) fn run_unit_and_judge(
             bench,
             work_authors,
             author_binaries,
+            // (PRODUCT-WORKS J4) Re-probe the run's due quota benches before the judge reads them.
+            reprobe: !run_roster.is_empty(),
         },
         exec_bus,
         team,
-    );
-    evidence.bench_reprobes = reprobes;
-    (output, verdict, evidence)
+    )
 }
 
 /// (PRODUCT-WORKS J4) Re-probe every seat of `bench` whose QUOTA bench has fallen due at `now`
@@ -874,7 +864,7 @@ pub(crate) fn reprobe_due_benches(
                 .iter()
                 .find(|c| c.key == b.cli)
                 .or_else(|| registry.iter().find(|c| c.key == key))?;
-            let answer = crate::validator::reprobe_seat(seat, runner);
+            let answer = crate::validator::reprobe_seat(&b.cli, seat, runner);
             let r = crate::seat_bench::reprobe_outcome(
                 b,
                 answer.as_deref().map_err(String::as_str),
@@ -1152,6 +1142,44 @@ fn run_unit_and_judge_with_launches(
             bench,
             work_authors,
             author_binaries,
+            reprobe: false,
+        },
+        None,
+        None,
+    )
+}
+
+/// (PRODUCT-WORKS J4) The production judge path with the re-probe armed: what [`run_unit_and_judge`]
+/// does, over a fabricated `roster` (the registry the due seats are looked up in).
+#[cfg(test)]
+fn run_unit_and_judge_reprobing(
+    runner: &Arc<dyn StepRunner>,
+    input: &StepInput,
+    roster: &[crate::AgenticCli],
+    run_roster: &[String],
+    bench: &[crate::domain::BenchedSeat],
+) -> (
+    StepOutput,
+    Option<crate::validator::AgentVerdict>,
+    crate::workflow::UnitEvidence,
+) {
+    let bench = &crate::domain::ungoverned_bench(bench);
+    let benched: Vec<String> = bench.iter().map(|b| b.cli.clone()).collect();
+    run_unit_and_judge_on(
+        runner,
+        input,
+        None,
+        &|_| {},
+        roster,
+        run_roster,
+        &benched,
+        JudgeFallbackCtx {
+            pool: &[],
+            registry: roster,
+            bench,
+            work_authors: &[],
+            author_binaries: Some(&[]),
+            reprobe: true,
         },
         None,
         None,
@@ -1573,6 +1601,11 @@ pub(crate) struct JudgeFallbackCtx<'a> {
     /// The binaries those authors actually ran ([`crate::pipeline::work_author_binaries`]); `None`
     /// when one cannot be established — then no fallback judge is seated.
     pub author_binaries: Option<&'a [String]>,
+    /// (PRODUCT-WORKS J4) Re-probe the seats of `bench` whose QUOTA bench has fallen due, against
+    /// `registry`, right before the judge reads the bench: after the unit's own work, so a bench
+    /// that fell due while the worker ran is asked too ([`reprobe_due_benches`]). The outcomes ride
+    /// [`crate::workflow::UnitEvidence::bench_reprobes`]. `false` (the default): no probe.
+    pub reprobe: bool,
 }
 
 /// (codex r1 on the fallback) The parties a FALLBACK judge must be distinct from: the judge's own
@@ -2478,6 +2511,31 @@ fn run_unit_and_judge_on(
             v.push(launched_identity(k, input.unit.assigned_invocation.clone()));
         }
         Some(v)
+    };
+    // (PRODUCT-WORKS J4) A seat whose QUOTA bench has fallen due answers one cheap call first, now
+    // (after the unit's own work, before the judge reads the bench): back on the roster when it
+    // answers, benched again for longer when it does not. A gate whose only distinct judge was
+    // benched for quota then picks the returned seat.
+    let (bench_now, bench_reprobes) = if fallback.reprobe {
+        reprobe_due_benches(
+            &**runner,
+            fallback.registry,
+            fallback.bench,
+            crate::seat_bench::now_ms(),
+            emit_delta,
+        )
+    } else {
+        (fallback.bench.to_vec(), Vec::new())
+    };
+    let benched_now: Vec<String> = benched
+        .iter()
+        .filter(|k| bench_now.iter().any(|b| &b.cli == *k) || !fallback.reprobe)
+        .cloned()
+        .collect();
+    let benched: &[String] = &benched_now;
+    let fallback = JudgeFallbackCtx {
+        bench: &bench_now,
+        ..fallback
     };
     let pool = judge_pool(roster, run_roster);
     // (core#772) The same pool BEFORE the run's bench: a judge seat benched earlier in this run
@@ -3419,8 +3477,7 @@ fn run_unit_and_judge_on(
         judge_refusals,
         team: team_snapshot,
         qe_review,
-        // Set by the caller that re-probed the bench (`run_unit_and_judge`).
-        bench_reprobes: Vec::new(),
+        bench_reprobes,
     };
     (output, agent_verdict, evidence)
 }
@@ -5534,6 +5591,7 @@ mod tests {
             governed_only: false,
             benched_until: Some(crate::seat_bench::now_ms() + 60 * 60 * 1000),
             strikes: 1,
+            replaced: None,
         }];
         let (eligible, missing) =
             rejudge_seats(&unit, &roster, &run, &bench, &[], Some(&[]), &[], &roster);
@@ -5601,6 +5659,7 @@ mod tests {
                 governed_only: false,
                 benched_until: None,
                 strikes: 0,
+                replaced: None,
             })
             .collect();
         let (unknown, _) = rejudge_seats(
@@ -6782,16 +6841,19 @@ mod tests {
     /// unit never re-tries it.
     /// (PRODUCT-WORKS J4) The rig's copilot was benched for quota (429) and never re-checked, so
     /// every later review had no distinct judge and the operator judged instead. A due quota bench
-    /// is re-probed before the judge reads the bench: a seat that answers judges this very gate; one
-    /// that refuses again is re-benched with the next backoff and the gate still has no judge.
+    /// is re-probed right before the judge reads the bench: a seat that answers judges this very
+    /// gate; one that refuses again is re-benched with the next backoff and the gate still has no
+    /// judge; one that says anything but READY did not come back.
     #[test]
     fn a_due_quota_bench_is_reprobed_and_the_gate_that_had_no_judge_picks_the_returned_seat() {
         use std::process::Command;
         use std::sync::Mutex;
         const MIN: i64 = 60 * 1000;
         struct Seats {
-            /// What copilot says to its re-probe: `true` = READY, `false` = the quota refusal.
-            copilot_ready: Mutex<bool>,
+            /// What a seat says to its re-probe.
+            answer: Mutex<String>,
+            /// How long the unit's own work takes (a bench can fall due meanwhile).
+            work_ms: Mutex<u64>,
             calls: Mutex<Vec<String>>,
         }
         impl StepRunner for Seats {
@@ -6808,25 +6870,31 @@ mod tests {
                     governed: false,
                 };
                 let seat = input.unit.assigned_cli.clone().unwrap_or_default();
-                match input.unit.session_id.as_str() {
-                    "seat-reprobe" => {
+                let call = if input.unit.id == crate::validator::REPROBE_UNIT {
+                    "reprobe"
+                } else {
+                    input.unit.session_id.as_str()
+                };
+                match call {
+                    "reprobe" => {
                         assert!(
-                            input.workdir.is_none() && input.governance.is_none(),
-                            "the re-probe is the judge's ungoverned one-shot, no workdir"
+                            input.workdir.is_none()
+                                && input.governance.is_none()
+                                && crate::execute_wrapped::is_engine_internal(&input.unit),
+                            "the re-probe is the judge's ungoverned one-shot: no workdir, and one \
+                             of the engine's own sessions (it follows the seat floor)"
                         );
                         self.calls.lock().unwrap().push(format!("probe:{seat}"));
-                        out.output = if *self.copilot_ready.lock().unwrap() {
-                            "READY".into()
-                        } else {
-                            "Error: You have exceeded your monthly quota (Request ID: D7DE:0)"
-                                .into()
-                        };
+                        out.output = self.answer.lock().unwrap().clone();
                     }
                     "validator" => {
                         self.calls.lock().unwrap().push(format!("judge:{seat}"));
                         out.output = "PASS\nfine\nPASS".into();
                     }
                     _ => {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            *self.work_ms.lock().unwrap(),
+                        ));
                         if let Some(wd) = &input.workdir {
                             std::fs::write(wd.join("note.txt"), "changed\n").unwrap();
                         }
@@ -6896,44 +6964,38 @@ mod tests {
             seat("copilot", "copilot -p {PROMPT}"),
         ];
         let run_roster: Vec<String> = vec!["claude".into(), "copilot".into()];
-        let now = 1_761_400_000_000_i64;
-        let quota = crate::domain::BenchedSeat {
-            cli: "copilot".into(),
+        let quota = |cli: &str, until: i64| crate::domain::BenchedSeat {
+            cli: cli.into(),
             reason: "quota_exhausted (no success in the run)".into(),
             source: "worker".into(),
             governed_only: false,
-            benched_until: Some(now - 1),
+            benched_until: Some(until),
             strikes: 1,
+            replaced: None,
         };
         let seats = Arc::new(Seats {
-            copilot_ready: Mutex::new(false),
+            answer: Mutex::new(
+                "Error: You have exceeded your monthly quota (Request ID: D7DE:0)".into(),
+            ),
+            work_ms: Mutex::new(0),
             calls: Mutex::new(Vec::new()),
         });
         let runner: Arc<dyn StepRunner> = seats.clone();
-        let noop: &DeltaSink = &|_| {};
-        let judge = |bench: &[crate::domain::BenchedSeat]| {
-            let (after, reprobes) = reprobe_due_benches(&*runner, &registry, bench, now, noop);
+        let judge = |bench: &[crate::domain::BenchedSeat], roster: &[String]| {
+            seats.calls.lock().unwrap().clear();
             let input = input_for(&wt);
-            let (out, verdict, mut evidence) = run_unit_and_judge_with_fallback(
-                &runner,
-                &input,
-                noop,
-                &registry,
-                &run_roster,
-                &after,
-                &[],
-                &[],
-            );
-            evidence.bench_reprobes = reprobes;
+            let (out, verdict, evidence) =
+                run_unit_and_judge_reprobing(&runner, &input, &registry, roster, bench);
+            let mut after = bench.to_vec();
+            crate::seat_bench::apply_reprobes(&mut after, &evidence.bench_reprobes);
             (out, verdict, evidence, after)
         };
 
         // 1. Not due yet: no probe runs, and the gate has no judge (the seat failure the operator
         //    used to answer by judging the work himself).
-        let mut not_due = quota.clone();
-        not_due.benched_until = Some(now + MIN);
-        let (_, v, ev, after) = judge(std::slice::from_ref(&not_due));
-        assert!(ev.bench_reprobes.is_empty() && after == vec![not_due]);
+        let not_due = quota("copilot", crate::seat_bench::now_ms() + 30 * MIN);
+        let (_, v, ev, after) = judge(std::slice::from_ref(&not_due), &run_roster);
+        assert!(ev.bench_reprobes.is_empty() && after == vec![not_due.clone()]);
         let v = v.expect("a seat-failure verdict");
         assert!(
             !v.pass && v.judge_cli.is_none() && v.seat_failure.is_some(),
@@ -6951,26 +7013,31 @@ mod tests {
 
         // 2. Due, and the re-probe is refused again: re-benched with the next backoff (30 min),
         //    still no judge.
-        seats.calls.lock().unwrap().clear();
-        let (_, v, ev, after) = judge(std::slice::from_ref(&quota));
+        let due = quota("copilot", crate::seat_bench::now_ms() - 1);
+        let t0 = crate::seat_bench::now_ms();
+        let (_, v, ev, after) = judge(std::slice::from_ref(&due), &run_roster);
         assert_eq!(
             *seats.calls.lock().unwrap(),
             vec!["probe:copilot".to_string()]
         );
-        assert_eq!(ev.bench_reprobes.len(), 1);
         let r = &ev.bench_reprobes[0];
-        assert!(!r.returned && r.prior_strikes == 1 && r.strikes == 2);
-        assert_eq!(r.benched_until, Some(now + 30 * MIN), "the second backoff");
-        assert_eq!(
-            (after[0].strikes, after[0].benched_until),
-            (2, Some(now + 30 * MIN))
+        assert!(
+            !r.returned && r.prior_strikes == 1 && r.strikes == 2,
+            "{r:?}"
         );
+        let until = r.benched_until.expect("re-benched");
+        assert!(until >= t0 + 30 * MIN && until <= crate::seat_bench::now_ms() + 30 * MIN);
+        assert_eq!((after[0].strikes, after[0].benched_until), (2, Some(until)));
         assert!(v.expect("seat failure").judge_cli.is_none());
 
-        // 3. Due, and the seat answers: back on the roster, and THIS gate's judge is copilot.
-        seats.calls.lock().unwrap().clear();
-        *seats.copilot_ready.lock().unwrap() = true;
-        let (out, v, ev, after) = judge(std::slice::from_ref(&quota));
+        // 3. Anything but the word is not an answer: "not ready" (exit 0) stays benched.
+        *seats.answer.lock().unwrap() = "not ready".into();
+        let (_, _, ev, _) = judge(std::slice::from_ref(&due), &run_roster);
+        assert!(!ev.bench_reprobes[0].returned, "{:?}", ev.bench_reprobes);
+
+        // 4. Due, and the seat answers: back on the roster, and THIS gate's judge is copilot.
+        *seats.answer.lock().unwrap() = "**READY.**".into();
+        let (out, v, ev, after) = judge(std::slice::from_ref(&due), &run_roster);
         assert_eq!(out.status, StepStatus::Ok);
         assert!(
             after.is_empty(),
@@ -6990,32 +7057,53 @@ mod tests {
             "probed once, then seated as the judge"
         );
 
-        // The fold applies the same outcomes to the run's stored bench.
-        let mut run_bench = vec![quota.clone()];
-        let applied = crate::seat_bench::apply_reprobes(&mut run_bench, &ev.bench_reprobes);
-        assert!(run_bench.is_empty() && applied.len() == 1);
+        // 5. A bench that falls due WHILE the unit's own work runs is probed before the judge
+        //    reads the bench, not left out until the next unit.
+        *seats.work_ms.lock().unwrap() = 1_500;
+        let soon = quota("copilot", crate::seat_bench::now_ms() + 700);
+        let (_, v, ev, _) = judge(std::slice::from_ref(&soon), &run_roster);
+        assert!(
+            ev.bench_reprobes.first().is_some_and(|r| r.returned),
+            "{ev:?}"
+        );
+        assert_eq!(
+            v.expect("a judge ran").judge_cli.as_deref(),
+            Some("copilot")
+        );
+        *seats.work_ms.lock().unwrap() = 0;
 
-        // 4. The re-judge readiness counts a due seat as a candidate (its attempt re-probes it).
+        // 6. An instance bench probes THAT instance (its own configuration home), not the
+        //    registry record's primary key.
+        let roster2: Vec<String> = vec!["claude".into(), "copilot#2".into()];
+        let instance = quota("copilot#2", crate::seat_bench::now_ms() - 1);
+        let (_, _, ev, _) = judge(std::slice::from_ref(&instance), &roster2);
+        assert_eq!(ev.bench_reprobes[0].seat, "copilot#2");
+        assert!(
+            seats.calls.lock().unwrap().first().map(String::as_str) == Some("probe:copilot#2"),
+            "{:?}",
+            seats.calls.lock().unwrap()
+        );
+
+        // 7. The re-judge readiness counts a due seat as a candidate (its attempt re-probes it),
+        //    and not one that is still out.
         let mut cursor = crate::domain::WorkUnit::pending("r:u1", "r", 1, "Add a note");
         cursor.assigned_cli = Some("claude".into());
         let (eligible, _) = rejudge_seats(
             &cursor,
             &registry,
             &run_roster,
-            std::slice::from_ref(&quota),
+            std::slice::from_ref(&due),
             &[],
             Some(&[]),
             &[],
             &registry,
         );
         assert_eq!(eligible, vec!["copilot".to_string()]);
-        let mut later = quota.clone();
-        later.benched_until = Some(crate::seat_bench::now_ms() + 60 * MIN);
         let (eligible, _) = rejudge_seats(
             &cursor,
             &registry,
             &run_roster,
-            std::slice::from_ref(&later),
+            std::slice::from_ref(&not_due),
             &[],
             Some(&[]),
             &[],
@@ -8257,6 +8345,7 @@ mod judge_fallback_tests {
             governed_only: false,
             benched_until: None,
             strikes: 0,
+            replaced: None,
         }]
     }
 
@@ -8462,6 +8551,7 @@ mod judge_fallback_tests {
             governed_only: true,
             benched_until: None,
             strikes: 0,
+            replaced: None,
         }];
         // Routing reads the bench: opencode is never handed governed work.
         let reg = registry();
@@ -8500,6 +8590,7 @@ mod judge_fallback_tests {
                 governed_only: false,
                 benched_until: None,
                 strikes: 0,
+                replaced: None,
             }
         ));
         assert_eq!(every_call.len(), 1);
@@ -8545,6 +8636,7 @@ mod judge_fallback_tests {
             governed_only: false,
             benched_until: None,
             strikes: 0,
+            replaced: None,
         });
         let (_, v, _) = run_unit_and_judge_with_fallback(
             &runner,

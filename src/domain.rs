@@ -636,6 +636,12 @@ pub struct BenchedSeat {
     /// on the wire when 0.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub strikes: u32,
+    /// (PRODUCT-WORKS J4) The bench for governed work only ([`Self::governed_only`], the host-floor
+    /// bench) this bench replaced when it took the seat out of every call ([`bench_seat`]). When
+    /// this quota bench lifts, the seat goes back under that one rather than off the bench: the host
+    /// floor still refuses its governed work. Absent on the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced: Option<Box<BenchedSeat>>,
 }
 
 /// The bench an UNGOVERNED engine call reads — the agent judge, triage, a decision ballot: `bench`
@@ -664,7 +670,14 @@ pub fn bench_seat(benched: &mut Vec<BenchedSeat>, seat: BenchedSeat) -> bool {
     let seat = crate::seat_bench::stamp(seat, crate::seat_bench::now_ms());
     match benched.iter_mut().find(|b| b.cli == seat.cli) {
         Some(existing) if existing.governed_only && !seat.governed_only => {
-            *existing = seat;
+            // (PRODUCT-WORKS J4) Under a bench that can lift (quota), the replaced one is kept, so
+            // the lift puts the seat back under it (`seat_bench::apply_reprobes`) instead of off
+            // the bench. A bench that never lifts by itself simply replaces it.
+            let lifts = crate::seat_bench::quota_class(&seat.reason);
+            let under = std::mem::replace(existing, seat);
+            if lifts {
+                existing.replaced = Some(Box::new(under));
+            }
             true
         }
         Some(_) => false,
@@ -2141,6 +2154,7 @@ mod tests {
             governed_only,
             benched_until: None,
             strikes: 0,
+            replaced: None,
         };
         let mut bench = vec![b("host floor", true)];
         assert!(!bench_seat(&mut bench, b("host floor again", true)));

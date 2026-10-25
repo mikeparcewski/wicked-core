@@ -109,18 +109,28 @@ pub fn without_due(bench: &[BenchedSeat], now: i64) -> Vec<BenchedSeat> {
 /// One re-probe of a seat whose quota bench was due, as the worker thread ran it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BenchReprobe {
-    /// The roster key.
+    /// The roster key (an instance key such as `claude#2` stays one: that instance was asked).
     pub seat: String,
-    /// The bench's strikes when it was probed: the fold applies the outcome only to that bench
-    /// (a bench replaced since, by a new refusal, is left alone).
+    /// The bench's strikes when it was probed.
     pub prior_strikes: u32,
+    /// The bench's lift time when it was probed. With `prior_strikes`, it names the bench the
+    /// outcome is about: the fold applies it only while the seat's bench is still that one (a
+    /// fresh refusal since, which starts at strike 1 again, has a later lift time and is left alone).
+    #[serde(default)]
+    pub prior_benched_until: Option<i64>,
     /// `true`: the seat answered, and its bench is dropped.
     pub returned: bool,
-    /// The strikes after a failed probe (`prior_strikes + 1`, at least 2); `prior_strikes` when it
-    /// returned.
+    /// The strikes after a failed probe (`prior_strikes + 1`, at least 2; 0 when the refusal names
+    /// a cause that does not lift, see `reason`); `prior_strikes` when it returned.
     pub strikes: u32,
-    /// After a failed probe, when the new bench lifts (unix millis); `None` when it returned.
+    /// After a failed quota probe, when the new bench lifts (unix millis); `None` when it returned
+    /// or when the bench no longer lifts by itself (`reason`).
     pub benched_until: Option<i64>,
+    /// Set when the probe's refusal names a cause that does not change mid-run (`not_logged_in`,
+    /// `not_installed`, `approval_unavailable`): the bench takes that reason and stops lifting by
+    /// itself. `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// When the probe ran (unix millis).
     pub at: i64,
     /// What the seat said, bounded (or why it could not be asked).
@@ -128,31 +138,86 @@ pub struct BenchReprobe {
 }
 
 /// The outcome of re-probing `seat` at `now`: `answer` is `Ok(words)` when the seat answered the
-/// readiness call, `Err(output)` when it refused or failed (its output, read for a reset time).
+/// readiness call, `Err(output)` when it refused or failed (its output, read for a reset time and
+/// for a cause that does not lift: a probe answered "Not logged in" benches the seat as signed out).
 pub fn reprobe_outcome(seat: &BenchedSeat, answer: Result<&str, &str>, now: i64) -> BenchReprobe {
+    let base = BenchReprobe {
+        seat: seat.cli.clone(),
+        prior_strikes: seat.strikes,
+        prior_benched_until: seat.benched_until,
+        at: now,
+        ..BenchReprobe::default()
+    };
     match answer {
         Ok(words) => BenchReprobe {
-            seat: seat.cli.clone(),
-            prior_strikes: seat.strikes,
             returned: true,
             strikes: seat.strikes,
-            benched_until: None,
-            at: now,
             detail: bounded(words),
+            ..base
         },
         Err(output) => {
-            let strikes = seat.strikes.max(1) + 1;
-            BenchReprobe {
-                seat: seat.cli.clone(),
-                prior_strikes: seat.strikes,
-                returned: false,
-                strikes,
-                benched_until: Some(quota_until(output, strikes, now)),
-                at: now,
-                detail: bounded(output),
+            use wicked_council::types::SeatFailureReason as R;
+            let exited_nonzero =
+                crate::execute_wrapped::wrapped_exit_code(output).is_some_and(|c| c != 0);
+            match R::classify_refusal(output, exited_nonzero) {
+                Some(cause @ (R::NotLoggedIn | R::NotInstalled | R::ApprovalUnavailable)) => {
+                    BenchReprobe {
+                        strikes: 0,
+                        reason: Some(cause.as_str().to_string()),
+                        detail: bounded(output),
+                        ..base
+                    }
+                }
+                _ => failed_quota(base, output, now),
             }
         }
     }
+}
+
+fn failed_quota(base: BenchReprobe, output: &str, now: i64) -> BenchReprobe {
+    let strikes = base.prior_strikes.max(1) + 1;
+    BenchReprobe {
+        returned: false,
+        strikes,
+        benched_until: Some(quota_until(output, strikes, now)),
+        reason: None,
+        detail: bounded(output),
+        ..base
+    }
+}
+
+/// A seat that answered its re-probe and then refused its real call in the same attempt (the judge
+/// call that the probe let it take came back `quota_exhausted`) did not come back: its outcome is
+/// read as a failed probe, with the next backoff (or the reset time the refusal stated). Without
+/// this, the lift and the judge's fresh strike-1 bench would reset the backoff on every expiry.
+/// `refusals` are the attempt's judge refusals: `(seat, cause token, stated reset time)`.
+pub fn reconcile_with_refusals(
+    reprobes: &[BenchReprobe],
+    refusals: &[(String, String, Option<i64>)],
+) -> Vec<BenchReprobe> {
+    let quota_token = wicked_council::types::SeatFailureReason::QuotaExhausted.as_str();
+    reprobes
+        .iter()
+        .map(|r| {
+            let refused = refusals
+                .iter()
+                .find(|(seat, token, _)| seat == &r.seat && token == quota_token);
+            match refused {
+                Some((_, _, reset_at)) if r.returned => {
+                    let mut failed = failed_quota(r.clone(), "", r.at);
+                    if let Some(at) = reset_at.filter(|at| *at > r.at) {
+                        failed.benched_until = Some(at.min(r.at + MAX_RESET_MS));
+                    }
+                    failed.detail = format!(
+                        "answered its re-probe, then refused its judge call for quota ({})",
+                        r.detail
+                    );
+                    failed
+                }
+                _ => r.clone(),
+            }
+        })
+        .collect()
 }
 
 fn bounded(s: &str) -> String {
@@ -169,19 +234,22 @@ fn bounded(s: &str) -> String {
 /// One re-probe outcome the fold applied to the run's bench.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Applied {
-    /// The seat answered and its bench was dropped; `reason` is the bench it had.
+    /// The seat answered and its quota bench was dropped; `reason` is the bench it had. A seat
+    /// whose quota bench had replaced a bench for governed work only (the host-floor bench) keeps
+    /// that one: it is back for the calls that bench allows (judging, triage, ballots).
     Returned { cli: String, reason: String },
-    /// The seat did not answer and stays benched until `until`, with `strikes`.
+    /// The seat did not answer and stays benched: until `until` with `strikes`, or (`until:
+    /// None`) for good under the cause its refusal named (`reason`).
     Rebenched {
         cli: String,
         reason: String,
-        until: i64,
+        until: Option<i64>,
         strikes: u32,
     },
 }
 
 /// Fold re-probe outcomes into a run's bench. Each applies only to the bench it probed: the same
-/// seat, still quota-class, still at `prior_strikes` (a newer bench of the seat is left alone).
+/// seat, still quota-class, with the same strikes and lift time (a newer bench is left alone).
 pub fn apply_reprobes(bench: &mut Vec<BenchedSeat>, reprobes: &[BenchReprobe]) -> Vec<Applied> {
     let mut applied = Vec::new();
     for r in reprobes {
@@ -190,28 +258,70 @@ pub fn apply_reprobes(bench: &mut Vec<BenchedSeat>, reprobes: &[BenchReprobe]) -
                 && !b.governed_only
                 && quota_class(&b.reason)
                 && b.strikes == r.prior_strikes
+                && b.benched_until == r.prior_benched_until
         }) else {
             continue;
         };
         if r.returned {
-            let gone = bench.remove(ix);
+            let gone = match bench[ix].replaced.take() {
+                Some(under) => std::mem::replace(&mut bench[ix], *under),
+                None => bench.remove(ix),
+            };
             applied.push(Applied::Returned {
                 cli: gone.cli,
                 reason: gone.reason,
             });
+            continue;
+        }
+        let b = &mut bench[ix];
+        if let Some(reason) = &r.reason {
+            b.reason = reason.clone();
+            b.strikes = 0;
+            b.benched_until = None;
         } else if let Some(until) = r.benched_until {
-            let b = &mut bench[ix];
             b.strikes = r.strikes;
             b.benched_until = Some(until);
-            applied.push(Applied::Rebenched {
-                cli: b.cli.clone(),
-                reason: b.reason.clone(),
-                until,
-                strikes: b.strikes,
-            });
+        } else {
+            continue;
         }
+        applied.push(Applied::Rebenched {
+            cli: b.cli.clone(),
+            reason: b.reason.clone(),
+            until: b.benched_until,
+            strikes: b.strikes,
+        });
     }
     applied
+}
+
+/// A seat that came back from a launcher quota bench: mark it usable in the run's persisted launch
+/// roster (`team_plan.roster`, the `AgenticCli` records the run was launched with), so a plan
+/// revision that re-reads that roster does not bench it again from the launcher's stale verdict.
+/// Only a quota-class launcher reading is cleared. Returns whether the roster changed.
+pub fn clear_launcher_quota_health(roster: &mut [serde_json::Value], cli: &str) -> bool {
+    let mut changed = false;
+    for seat in roster.iter_mut() {
+        if seat.get("key").and_then(serde_json::Value::as_str) != Some(cli) {
+            continue;
+        }
+        let Some(health) = seat
+            .get_mut("health")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        let unusable = health.get("usable").and_then(serde_json::Value::as_bool) == Some(false);
+        let quota = health
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(quota_class);
+        if unusable && quota {
+            health.insert("usable".into(), serde_json::Value::Bool(true));
+            health.remove("reason");
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// The provider's reset time stated in a refusal, as unix millis, bounded to
@@ -350,6 +460,7 @@ mod tests {
             governed_only: false,
             benched_until: None,
             strikes: 0,
+            replaced: None,
         }
     }
 
@@ -510,10 +621,143 @@ mod tests {
     fn a_stale_outcome_leaves_a_newer_bench_alone() {
         let mut run = vec![stamp(bench("copilot", "quota_exhausted"), NOW)];
         let r = reprobe_outcome(&run[0], Ok("READY"), NOW + 15 * MIN);
-        // A fresh refusal replaced the bench (strike 2) before the outcome was folded.
+        // Another unit's probe failed it first (strike 2) before this outcome was folded.
         run[0].strikes = 2;
-        assert!(apply_reprobes(&mut run, &[r]).is_empty());
+        assert!(apply_reprobes(&mut run, std::slice::from_ref(&r)).is_empty());
         assert_eq!(run.len(), 1);
+        // A parallel unit's probe returned it, it then refused again: a FRESH strike-1 bench with
+        // a later lift time. The stale "returned" outcome must not drop it (it matched on strikes
+        // alone before).
+        let mut fresh = vec![stamp(bench("copilot", "quota_exhausted"), NOW + 16 * MIN)];
+        assert_eq!(fresh[0].strikes, r.prior_strikes);
+        assert!(apply_reprobes(&mut fresh, &[r]).is_empty());
+        assert_eq!(fresh.len(), 1);
+    }
+
+    #[test]
+    fn a_probe_refused_for_a_cause_that_does_not_lift_benches_for_good() {
+        let mut run = vec![stamp(bench("claude", "quota_exhausted"), NOW)];
+        let r = reprobe_outcome(
+            &run[0],
+            Err("Not logged in · Please run /login"),
+            NOW + 15 * MIN,
+        );
+        assert_eq!(
+            (r.returned, r.reason.as_deref(), r.benched_until, r.strikes),
+            (false, Some("not_logged_in"), None, 0)
+        );
+        let applied = apply_reprobes(&mut run, &[r]);
+        assert_eq!(
+            applied,
+            vec![Applied::Rebenched {
+                cli: "claude".into(),
+                reason: "not_logged_in".into(),
+                until: None,
+                strikes: 0
+            }]
+        );
+        assert!(
+            !due_for_reprobe(&run[0], NOW + 365 * 24 * 60 * MIN),
+            "never lifts by itself"
+        );
+    }
+
+    #[test]
+    fn a_quota_bench_over_a_host_floor_bench_lifts_back_to_it() {
+        let host = BenchedSeat {
+            reason: crate::distribute::HOST_FLOOR_BENCH.into(),
+            source: "launcher".into(),
+            governed_only: true,
+            ..bench("opencode", "")
+        };
+        let mut run = vec![host.clone()];
+        // It judges (a governed-only bench allows that), and refuses for quota while judging.
+        assert!(crate::domain::bench_seat(
+            &mut run,
+            BenchedSeat {
+                source: "judge".into(),
+                ..bench("opencode", "quota_exhausted (no success in the run)")
+            }
+        ));
+        assert_eq!(run.len(), 1);
+        assert!(!run[0].governed_only && run[0].replaced.as_deref() == Some(&host));
+        let due_at = run[0].benched_until.expect("stamped");
+        let r = reprobe_outcome(&run[0], Ok("READY"), due_at);
+        let applied = apply_reprobes(&mut run, &[r]);
+        assert!(matches!(&applied[..], [Applied::Returned { .. }]));
+        assert_eq!(
+            run,
+            vec![host],
+            "back under the host-floor bench, not off the bench"
+        );
+    }
+
+    #[test]
+    fn answering_then_refusing_the_judge_call_is_a_failed_probe() {
+        let b = stamp(bench("copilot", "quota_exhausted"), NOW);
+        let r = reprobe_outcome(&b, Ok("READY"), NOW + 15 * MIN);
+        let refusals = vec![
+            ("copilot".to_string(), "quota_exhausted".to_string(), None),
+            ("pi".to_string(), "quota_exhausted".to_string(), None),
+        ];
+        let out = reconcile_with_refusals(std::slice::from_ref(&r), &refusals);
+        assert!(!out[0].returned && out[0].strikes == 2);
+        assert_eq!(
+            out[0].benched_until,
+            Some(NOW + 15 * MIN + 30 * MIN),
+            "the next backoff"
+        );
+        // A stated reset time wins.
+        let stated = vec![(
+            "copilot".to_string(),
+            "quota_exhausted".to_string(),
+            Some(NOW + 90 * MIN),
+        )];
+        assert_eq!(
+            reconcile_with_refusals(std::slice::from_ref(&r), &stated)[0].benched_until,
+            Some(NOW + 90 * MIN)
+        );
+        // Another cause, or no refusal: the outcome stands.
+        let other = vec![("copilot".to_string(), "not_logged_in".to_string(), None)];
+        assert!(reconcile_with_refusals(std::slice::from_ref(&r), &other)[0].returned);
+        assert!(reconcile_with_refusals(std::slice::from_ref(&r), &[])[0].returned);
+        let mut run = vec![b];
+        apply_reprobes(&mut run, &out);
+        assert_eq!(
+            run[0].strikes, 2,
+            "the backoff keeps growing, it is not reset to strike 1"
+        );
+    }
+
+    #[test]
+    fn a_returned_launcher_seat_reads_usable_in_the_launch_roster() {
+        let mut roster = vec![
+            serde_json::json!({"key": "copilot", "health": {"usable": false, "reason": "recent quota_exhausted"}}),
+            serde_json::json!({"key": "pi", "health": {"usable": false, "reason": "signed out"}}),
+            serde_json::json!({"key": "claude"}),
+        ];
+        assert!(clear_launcher_quota_health(&mut roster, "copilot"));
+        assert_eq!(roster[0]["health"], serde_json::json!({"usable": true}));
+        assert!(
+            !clear_launcher_quota_health(&mut roster, "pi"),
+            "a sign-in reading stays"
+        );
+        assert!(!clear_launcher_quota_health(&mut roster, "claude"));
+        // The launcher reads it usable now: a plan revision benches nothing for it.
+        let clis: Vec<crate::AgenticCli> = roster
+            .iter()
+            .filter_map(|v| {
+                let mut c = wicked_council::registry::builtin().into_iter().next()?;
+                c.key = v["key"].as_str()?.to_string();
+                c.health = serde_json::from_value(v.get("health")?.clone()).ok();
+                Some(c)
+            })
+            .collect();
+        let benched: Vec<String> = crate::distribute::launcher_benched(&clis)
+            .into_iter()
+            .map(|b| b.cli)
+            .collect();
+        assert_eq!(benched, vec!["pi".to_string()]);
     }
 
     #[test]

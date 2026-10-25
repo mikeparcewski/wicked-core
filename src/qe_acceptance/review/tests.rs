@@ -329,6 +329,7 @@ fn candidates_come_from_the_runs_own_non_author_seats_in_order() {
         governed_only: false,
         benched_until: None,
         strikes: 0,
+        replaced: None,
     });
     assert_eq!(
         seats(&candidates(&benched, &units, &u)),

@@ -5640,11 +5640,28 @@ fn apply_step_result(
     // (PRODUCT-WORKS J4) The quota benches this attempt's worker thread re-probed, folded before
     // anything below reads or writes the bench: a seat that answered is back on the run's roster
     // (routing, failover and every judge read the session's bench), one that did not stays benched
-    // for longer. Persisted at once, so the gate fold's own read of the session sees it.
+    // for longer. A seat that answered and then refused its judge call for quota in the same attempt
+    // did not come back (`reconcile_with_refusals`). Persisted at once, so the gate fold's own read
+    // of the session sees it.
     if !evidence.bench_reprobes.is_empty() {
-        let applied =
-            crate::seat_bench::apply_reprobes(&mut session.benched_seats, &evidence.bench_reprobes);
+        let refusals: Vec<(String, String, Option<i64>)> = evidence
+            .judge_refusals
+            .iter()
+            .map(|r| (r.seat.clone(), r.reason.clone(), r.reset_at))
+            .collect();
+        let reprobes =
+            crate::seat_bench::reconcile_with_refusals(&evidence.bench_reprobes, &refusals);
+        let applied = crate::seat_bench::apply_reprobes(&mut session.benched_seats, &reprobes);
         if !applied.is_empty() {
+            // A seat back from a launcher quota bench: the run's launch roster says usable, so a
+            // plan revision that re-reads it does not bench the seat again.
+            for a in &applied {
+                if let (crate::seat_bench::Applied::Returned { cli, .. }, Some(tp)) =
+                    (a, session.team_plan.as_mut())
+                {
+                    crate::seat_bench::clear_launcher_quota_health(&mut tp.roster, cli);
+                }
+            }
             put_node(store, session.to_node())?;
             let ord = units.get(output.unit_ix).map_or(0, |u| u.ord);
             for a in applied {
@@ -5667,7 +5684,7 @@ fn apply_step_result(
                             cli,
                             reason,
                             source: "reprobe".to_string(),
-                            benched_until_ms: Some(until),
+                            benched_until_ms: until,
                         },
                     },
                 );
@@ -6209,6 +6226,7 @@ fn apply_step_result(
                                 })
                                 .flatten(),
                             strikes: u32::from(quota),
+                            replaced: None,
                         },
                     ) {
                         put_node(store, session.to_node())?;
@@ -6273,6 +6291,7 @@ fn apply_step_result(
                         governed_only: false,
                         benched_until: None,
                         strikes: 0,
+                        replaced: None,
                     },
                 );
             put_node(store, session.to_node())?;
@@ -21398,6 +21417,7 @@ mod request_changes_tests {
             governed_only: false,
             benched_until: Some(crate::seat_bench::now_ms() + 60 * 60 * 1000),
             strikes: 1,
+            replaced: None,
         }];
         put_node(&mut store, session.to_node()).unwrap();
         // The fallback judges (claude, agy) are no way out here: claude built the work, and agy is
@@ -24331,6 +24351,7 @@ mod def_gate_disclosure_tests {
                 governed_only: false,
                 benched_until: None,
                 strikes: 0,
+                replaced: None,
             }],
         );
         let prompt = run_level_prompt(&mut store);
@@ -27816,6 +27837,7 @@ mod turn_timeout_vs_cancel_tests {
                 governed_only: false,
                 benched_until: None,
                 strikes: 0,
+                replaced: None,
             },
         ));
         assert!(
@@ -27828,6 +27850,7 @@ mod turn_timeout_vs_cancel_tests {
                     governed_only: false,
                     benched_until: None,
                     strikes: 0,
+                    replaced: None,
                 },
             ),
             "the first reason wins"
@@ -28732,6 +28755,7 @@ mod dead_seat_park_tests {
                 governed_only: false,
                 benched_until: None,
                 strikes: 0,
+                replaced: None,
             }],
         };
         let parked = park_at_dead_seat_gate(&mut store, &mut subs, &tx, &run_id, &refusal).unwrap();
@@ -29499,6 +29523,7 @@ mod work_author_tests {
                     governed_only: false,
                     benched_until: None,
                     strikes: 0,
+                    replaced: None,
                 })
                 .collect(),
             team: None,
@@ -29815,6 +29840,7 @@ mod council_ballot_tests {
                 governed_only: false,
                 benched_until: None,
                 strikes: 0,
+                replaced: None,
             }
         ));
         assert_eq!(keys(&run), vec!["claude", "codex"]);

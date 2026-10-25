@@ -1178,6 +1178,7 @@ pub(crate) fn apply_and_finish_unit(
                         governed_only: false,
                         benched_until: reset_at.filter(|_| quota),
                         strikes: u32::from(quota),
+                        replaced: None,
                     },
                 ) {
                     changed = true;

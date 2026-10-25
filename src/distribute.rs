@@ -391,6 +391,7 @@ pub(crate) fn host_floor_benched_with(
             governed_only: true,
             benched_until: None,
             strikes: 0,
+            replaced: None,
         })
         .collect()
 }
@@ -428,6 +429,7 @@ pub(crate) fn worktree_benched_with(
             governed_only: false,
             benched_until: None,
             strikes: 0,
+            replaced: None,
         })
         .collect()
 }
@@ -454,6 +456,7 @@ pub(crate) fn launcher_benched(clis: &[AgenticCli]) -> Vec<BenchedSeat> {
                         governed_only: false,
                         benched_until: None,
                         strikes: 0,
+                        replaced: None,
                     },
                     now,
                 )
@@ -2037,6 +2040,7 @@ mod tests {
             governed_only: false,
             benched_until: None,
             strikes: 0,
+            replaced: None,
         };
         let dists = distribute_units_against_benched(
             &[tool_unit(1, "index")],
@@ -2408,6 +2412,7 @@ mod tests {
             governed_only: false,
             benched_until: None,
             strikes: 0,
+            replaced: None,
         };
         let err = distribute_units_against_benched(
             &build_and_review(),
@@ -3386,6 +3391,7 @@ mod tests {
             governed_only: false,
             benched_until: None,
             strikes: 0,
+            replaced: None,
         }];
         let p = refill_pool(&u, &clis, &bench, Some("claude")).unwrap();
         assert_eq!(p.monitors, ["codex"], "{p:?}");
