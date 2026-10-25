@@ -3192,13 +3192,14 @@ fn run_unit_and_judge_on(
             let mut report = report;
             report.tree = current_tree.clone();
             // (deliver honors an override) The result's exact identity — the tree the checks RAN
-            // on (the guarded checkout's tree, else the live worktree's), the base and the check
-            // set — so an operator's override of it can be stood on at deliver, and only there,
-            // when all three are unchanged.
+            // on, the base and the check set — so an operator's override of it can be stood on at
+            // deliver, and only there, when all three are unchanged. Only a GUARDED floor is
+            // keyed: it ran on a clean checkout of exactly that tree, as deliver's own floor does;
+            // a floor on the live worktree (an untracked or ignored file could have steered it)
+            // is never stood on in place of a clean one (xreview r1).
             let ran_on = match (guarded, guard_tree, git_dir) {
                 (true, Some(tree), Some(_)) => Some(tree),
-                (true, _, _) => None,
-                (false, _, _) => current_tree.as_deref(),
+                _ => None,
             };
             report.key = report.key_for(ran_on, &ctx);
             eprintln!(
@@ -6599,12 +6600,6 @@ mod tests {
             "{:?}",
             evidence.worktree_guard
         );
-        let guarded_tree = match &evidence.worktree_guard {
-            Some(crate::worktree_guard::WorktreeGuardOutcome::Clean { after, .. }) => {
-                after.tree.clone()
-            }
-            other => panic!("{other:?}"),
-        };
         let report = evidence.repo_checks.expect("the floor ran");
         assert_eq!(
             report.rerun,
@@ -6618,14 +6613,9 @@ mod tests {
             );
         } else {
             assert!(report.passed, "the floor judged the FIXED tree: {report:?}");
-            // (deliver honors an override) A GUARDED verify floor is keyed by the tree its
-            // checkout held — the guard's tree (its report's `tree` stays `None`).
-            let key = report
-                .key
-                .as_ref()
-                .expect("a guarded verify floor is keyed");
-            assert_eq!(key.tree, guarded_tree);
-            assert!(key.base.is_some(), "measured against the run base");
+            // (deliver honors an override) An operator's floor re-run (here a floor fix) is never
+            // keyed: nothing stands on it in place of the ordinary floor at deliver.
+            assert!(report.key.is_none(), "a re-run is never keyed");
         }
         let _ = std::fs::remove_dir_all(&base);
     }

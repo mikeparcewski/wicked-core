@@ -1200,9 +1200,20 @@ pub(crate) fn lift_and_reverify(
             &format!("{run_id}-{ord}-deliver"),
         ) {
             Ok(checkout) => {
-                if let Some(o) =
-                    stands_on_override(&overridden, &checkout.dir, &floor_ctx, &now.tree)
-                {
+                // (xreview r1) …and the live worktree is still exactly what was snapshotted: an
+                // edit, a moved HEAD or a switched branch while the checkout was inspected stands
+                // on nothing — the checks below run and their own after-check refuses it.
+                if let Some(o) = stands_on_override(
+                    &overridden,
+                    &checkout.dir,
+                    &floor_ctx,
+                    &now.tree,
+                )
+                .filter(|_| {
+                    crate::worktree_guard::snapshot(&ctx.worktree, &ctx.repo_root).is_ok_and(|a| {
+                        a.tree == now.tree && a.head == now.head && a.head_ref == now.head_ref
+                    })
+                }) {
                     let reused = format!(
                         "checks reused from {}: same tree {}, same base {}, same checks — the \
                          operator overrode that failed floor ({}, \"{}\"); not run again at deliver",
@@ -2455,8 +2466,13 @@ mod tests {
         );
         // A different CHECK SET: the checks run.
         let mut other_checks = key.clone();
-        other_checks.checks =
-            crate::repo_checks::check_set_digest(crate::repo_checks::FloorStage::Creator, &[]);
+        other_checks.checks = crate::repo_checks::check_set_digest(
+            &crate::repo_checks::FloorContext {
+                stage: crate::repo_checks::FloorStage::Creator,
+                ..Default::default()
+            },
+            &[],
+        );
         ctx.floor_overrides = vec![with(other_checks)];
         assert!(lift_and_reverify(&ctx, "override-reuse", 5, 2, &emit).is_err());
         assert_eq!(

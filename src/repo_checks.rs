@@ -737,15 +737,18 @@ impl FloorKey {
         FloorKey {
             tree: tree.to_string(),
             base: ctx.base_head.clone(),
-            checks: check_set_digest(ctx.stage, detected),
+            checks: check_set_digest(ctx, detected),
         }
     }
 }
 
-/// The digest of a floor's check set: the stage, then every check's name, directory, argv and
-/// configured bound, in run order — a reordered, added, removed, re-scoped or re-bounded check is a
-/// different set.
-pub(crate) fn check_set_digest(stage: FloorStage, detected: &[RepoCheck]) -> String {
+/// The digest of a floor's check set: the stage and the package directory, then every check's
+/// name, directory, argv and configured bound, in run order — a reordered, added, removed,
+/// re-scoped or re-bounded check is a different set. A forced install (`force_install`, after a
+/// lockfile drift) acts only through detection — it adds the `install` check — so the set itself
+/// carries it: an attempt that forced the install and its retry that finds the same `install`
+/// check (no `node_modules/` in a fresh checkout) ran the same checks.
+pub(crate) fn check_set_digest(ctx: &FloorContext, detected: &[RepoCheck]) -> String {
     use sha2::Digest;
     let set: Vec<(&str, &str, &[String], Option<u64>)> = detected
         .iter()
@@ -758,17 +761,25 @@ pub(crate) fn check_set_digest(stage: FloorStage, detected: &[RepoCheck]) -> Str
             )
         })
         .collect();
-    let material = serde_json::json!({ "stage": stage.as_wire(), "checks": set });
+    let material = serde_json::json!({
+        "stage": ctx.stage.as_wire(),
+        "packageDir": ctx.package_dir,
+        "checks": set,
+    });
     let digest = sha2::Sha256::digest(material.to_string().as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl RepoChecksReport {
-    /// The [`FloorKey`] of this report when its checks RAN on `tree` (passed, failed or timed out)
-    /// — `None` for a floor that did not run (no boundary, a detection or checkout refusal).
+    /// The [`FloorKey`] of this report when its checks RAN on `tree` as the ordinary floor (passed,
+    /// failed or timed out) — `None` for a floor that did not run (no boundary, a detection or
+    /// checkout refusal) and for an operator's re-run (`extend` / `targeted` / `accept_partial` /
+    /// a floor fix) or a floor with waived checks: those ran a different set than the ordinary
+    /// floor would, so nothing may stand on them in its place (xreview r1).
     pub(crate) fn key_for(&self, tree: Option<&str>, ctx: &FloorContext) -> Option<FloorKey> {
         let tree = tree.filter(|t| !t.is_empty())?;
-        (self.outcome() != "not_run").then(|| FloorKey::of(tree, ctx, &self.detected))
+        (self.outcome() != "not_run" && self.rerun.is_none() && self.waived.is_empty())
+            .then(|| FloorKey::of(tree, ctx, &self.detected))
     }
 
     /// Did the floor stop on a check that hit its bound? A timed-out floor did not FINISH — it is
@@ -9669,6 +9680,88 @@ pub(crate) mod tests {
             logs: Vec::new(),
             load_band: None,
         }
+    }
+
+    /// (deliver honors an override) A floor result's key: only the ordinary floor that RAN is keyed —
+    /// never one that did not run, an operator's re-run or a floor with waived checks — and the
+    /// digest moves with the stage, the package dir and every check's identity (a forced install
+    /// moves it through the `install` check it adds).
+    #[test]
+    fn a_floor_key_is_the_ordinary_floor_that_ran_and_its_exact_check_set() {
+        let check = |name: &str, argv: &[&str]| RepoCheck {
+            name: name.into(),
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+            source: "test".into(),
+            timeout_s: None,
+            dir: String::new(),
+        };
+        let mut r = report_of(Vec::new(), &[]);
+        r.passed = false;
+        r.detected = vec![
+            check("lint", &["npm", "run", "lint"]),
+            check("test", &["npm", "test"]),
+        ];
+        let ctx = FloorContext {
+            stage: FloorStage::Verify,
+            base_head: Some("base".into()),
+            ..Default::default()
+        };
+        let key = r
+            .key_for(Some("tree"), &ctx)
+            .expect("the ordinary floor is keyed");
+        assert_eq!(key.tree, "tree");
+        assert_eq!(key.base.as_deref(), Some("base"));
+        assert!(r.key_for(None, &ctx).is_none(), "no tree, no key");
+        assert!(r.key_for(Some(""), &ctx).is_none());
+        let mut not_run = r.clone();
+        not_run.sandbox_error = Some("no boundary".into());
+        assert!(not_run.key_for(Some("tree"), &ctx).is_none(), "did not run");
+        let mut rerun = r.clone();
+        rerun.rerun = Some(FloorRerunMode::Targeted);
+        assert!(
+            rerun.key_for(Some("tree"), &ctx).is_none(),
+            "an operator's re-run"
+        );
+        let mut waived = r.clone();
+        waived.waived = vec!["lint".into()];
+        assert!(
+            waived.key_for(Some("tree"), &ctx).is_none(),
+            "waived checks"
+        );
+        // The digest: any change to the context or the set is another key.
+        let digest = |c: &FloorContext, d: &[RepoCheck]| check_set_digest(c, d);
+        let base = digest(&ctx, &r.detected);
+        let pkg = FloorContext {
+            package_dir: Some("pkg".into()),
+            ..ctx.clone()
+        };
+        let creator = FloorContext {
+            stage: FloorStage::Creator,
+            ..ctx.clone()
+        };
+        let reordered = vec![r.detected[1].clone(), r.detected[0].clone()];
+        let mut bounded = r.detected.clone();
+        bounded[1].timeout_s = Some(60);
+        let mut moved = r.detected.clone();
+        moved[1].dir = "pkg".into();
+        for (tag, other) in [
+            (
+                "an added install",
+                digest(
+                    &ctx,
+                    &[vec![check("install", &["npm", "ci"])], r.detected.clone()].concat(),
+                ),
+            ),
+            ("package dir", digest(&pkg, &r.detected)),
+            ("stage", digest(&creator, &r.detected)),
+            ("order", digest(&ctx, &reordered)),
+            ("bound", digest(&ctx, &bounded)),
+            ("dir", digest(&ctx, &moved)),
+            ("subset", digest(&ctx, &r.detected[..1])),
+        ] {
+            assert_ne!(other, base, "{tag}");
+        }
+        assert_eq!(digest(&ctx, &r.detected), base, "deterministic");
     }
 
     fn report_of(checks: Vec<CheckRun>, skipped: &[&str]) -> RepoChecksReport {
