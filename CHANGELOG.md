@@ -14,6 +14,25 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A quota bench expires: the seat is re-probed and comes back (PRODUCT-WORKS J4, plain PR).** A seat
+  benched for a run (`session.benched_seats`) stayed benched until the run ended. On the test rig copilot
+  was benched for quota (429) on 10-24 and never re-checked; 27 hours later every review in that run still
+  had no distinct judge, and the operator judged instead. Sign-in, a missing binary and a host-forced
+  approval policy do not change mid-run, and those benches keep their meaning. A quota-class bench
+  (`quota_exhausted`, which covers rate and usage limits) now carries `benched_until` (unix millis): the
+  provider's reset time when the refusal stated one (`Retry-After`, "try again in 20 minutes", "resets at
+  <time>", bounded to one minute .. seven days), else a backoff of 15, then 30, then 60 minutes
+  (`strikes`). Once it is due, the seat answers one cheap call before it is seated again: the judge's own
+  ungoverned one-shot carrier, with no workdir, asked for the single word READY. The worker thread runs that
+  re-probe before the unit's judge reads the bench, so a gate whose only distinct judge was benched picks
+  the returned seat; until it answers, routing never hands it work and no judge draws it. A seat that does
+  not answer is re-benched with the next backoff (or the reset time it now states). A re-judge counts a
+  due seat as a candidate, since its attempt re-probes it. A quota bench persisted before this change (no
+  `benched_until`) is due at once, so a run parked on one recovers on its next attempt. Wire: `seatBenched`
+  gains `benchedUntilMs` (`null` for a bench that never lifts by itself) and `source: "reprobe"`; the new
+  `seatBenchLifted {session, ord, cli, reason}` says a seat is back. `UnitEvidence.bench_reprobes` and
+  `JudgeRefusal.reset_at` are additive and absent when empty.
+
 - **Deliver honors the operator's floor override on the same tree (pipeline-blocker plain PR,
   operator-approved).** A run whose base was already red could not deliver: the operator overrode the
   failed floor at every gate ("floor overridden by operator"), but the deliver phase skipped its re-verify

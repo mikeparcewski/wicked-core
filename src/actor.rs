@@ -5637,6 +5637,43 @@ fn apply_step_result(
     }
     let mut output = output;
     let mut units = crate::domain::session_units(store, &run_id)?;
+    // (PRODUCT-WORKS J4) The quota benches this attempt's worker thread re-probed, folded before
+    // anything below reads or writes the bench: a seat that answered is back on the run's roster
+    // (routing, failover and every judge read the session's bench), one that did not stays benched
+    // for longer. Persisted at once, so the gate fold's own read of the session sees it.
+    if !evidence.bench_reprobes.is_empty() {
+        let applied =
+            crate::seat_bench::apply_reprobes(&mut session.benched_seats, &evidence.bench_reprobes);
+        if !applied.is_empty() {
+            put_node(store, session.to_node())?;
+            let ord = units.get(output.unit_ix).map_or(0, |u| u.ord);
+            for a in applied {
+                emit(
+                    subscribers,
+                    match a {
+                        crate::seat_bench::Applied::Returned { cli, reason } => {
+                            CoreEvent::SeatBenchLifted {
+                                session: run_id.clone(),
+                                ord,
+                                cli,
+                                reason,
+                            }
+                        }
+                        crate::seat_bench::Applied::Rebenched {
+                            cli, reason, until, ..
+                        } => CoreEvent::SeatBenched {
+                            session: run_id.clone(),
+                            ord,
+                            cli,
+                            reason,
+                            source: "reprobe".to_string(),
+                            benched_until_ms: Some(until),
+                        },
+                    },
+                );
+            }
+        }
+    }
     // (F-7R3-001, review F3) The seats with a SUCCESSFUL unit in this run so far — read before
     // `unit` borrows the list; a quota-class refusal below benches only a seat without one.
     let seats_with_a_done_unit: Vec<String> = units
@@ -6153,6 +6190,9 @@ fn apply_step_result(
                 seats_with_a_done_unit.contains(&cli),
             ) {
                 Some(why) => {
+                    // (PRODUCT-WORKS J4) A quota bench lifts at the provider's reset time when the
+                    // refusal stated one; `bench_seat` stamps the backoff otherwise.
+                    let quota = crate::seat_bench::quota_class(&why);
                     if crate::domain::bench_seat(
                         &mut session.benched_seats,
                         crate::domain::BenchedSeat {
@@ -6160,6 +6200,15 @@ fn apply_step_result(
                             reason: why.clone(),
                             source: "worker".to_string(),
                             governed_only: false,
+                            benched_until: quota
+                                .then(|| {
+                                    crate::seat_bench::provider_reset_at(
+                                        &output.output,
+                                        crate::seat_bench::now_ms(),
+                                    )
+                                })
+                                .flatten(),
+                            strikes: u32::from(quota),
                         },
                     ) {
                         put_node(store, session.to_node())?;
@@ -6179,6 +6228,10 @@ fn apply_step_result(
                                 cli: cli.clone(),
                                 reason: why.clone(),
                                 source: "worker".to_string(),
+                                benched_until_ms: crate::seat_bench::until_of(
+                                    &session.benched_seats,
+                                    &cli,
+                                ),
                             },
                         );
                     }
@@ -6218,6 +6271,8 @@ fn apply_step_result(
                         reason: why.clone(),
                         source: "worker".to_string(),
                         governed_only: false,
+                        benched_until: None,
+                        strikes: 0,
                     },
                 );
             put_node(store, session.to_node())?;
@@ -6234,6 +6289,7 @@ fn apply_step_result(
                         cli: cli.clone(),
                         reason: why,
                         source: "worker".to_string(),
+                        benched_until_ms: None,
                     },
                 );
             }
@@ -10516,6 +10572,7 @@ fn dispatch_unit(
                     // stamp is `transport: none` (`team_gate::unit_snapshot`), merged locally.
                     team: None,
                     qe_review: None,
+                    bench_reprobes: Vec::new(),
                 }),
                 process_gen: None, // tool-cmd path — not bus-dispatched
                 // The arm ignores it (a killed child's `Cancelled` result is Stale at the terminal
@@ -16147,6 +16204,7 @@ retry the deliver phase";
             judge_refusals: vec![crate::workflow::JudgeRefusal {
                 seat: "copilot".into(),
                 reason: "quota_exhausted".into(),
+                reset_at: None,
             }],
             ..Default::default()
         };
@@ -21332,11 +21390,14 @@ mod request_changes_tests {
         let mut session = crate::domain::get_session(&store, &run_id)
             .unwrap()
             .unwrap();
+        // (PRODUCT-WORKS J4) A quota bench that is not due yet: a due one would be a candidate.
         session.benched_seats = vec![crate::domain::BenchedSeat {
             cli: "pi".into(),
             reason: "quota_exhausted (no success in the run)".into(),
             source: "judge".into(),
             governed_only: false,
+            benched_until: Some(crate::seat_bench::now_ms() + 60 * 60 * 1000),
+            strikes: 1,
         }];
         put_node(&mut store, session.to_node()).unwrap();
         // The fallback judges (claude, agy) are no way out here: claude built the work, and agy is
@@ -24268,6 +24329,8 @@ mod def_gate_disclosure_tests {
                 reason: "timed_out (2/2 ballots, no vote returned)".into(),
                 source: "ballot".into(),
                 governed_only: false,
+                benched_until: None,
+                strikes: 0,
             }],
         );
         let prompt = run_level_prompt(&mut store);
@@ -27751,6 +27814,8 @@ mod turn_timeout_vs_cancel_tests {
                 reason: "not_logged_in".into(),
                 source: "worker".into(),
                 governed_only: false,
+                benched_until: None,
+                strikes: 0,
             },
         ));
         assert!(
@@ -27761,6 +27826,8 @@ mod turn_timeout_vs_cancel_tests {
                     reason: "again".into(),
                     source: "ballot".into(),
                     governed_only: false,
+                    benched_until: None,
+                    strikes: 0,
                 },
             ),
             "the first reason wins"
@@ -28663,6 +28730,8 @@ mod dead_seat_park_tests {
                 reason: "not_logged_in".into(),
                 source: "ballot".into(),
                 governed_only: false,
+                benched_until: None,
+                strikes: 0,
             }],
         };
         let parked = park_at_dead_seat_gate(&mut store, &mut subs, &tx, &run_id, &refusal).unwrap();
@@ -29428,6 +29497,8 @@ mod work_author_tests {
                     reason: "quota_exhausted".into(),
                     source: "worker".into(),
                     governed_only: false,
+                    benched_until: None,
+                    strikes: 0,
                 })
                 .collect(),
             team: None,
@@ -29742,6 +29813,8 @@ mod council_ballot_tests {
                 reason: "quota_exhausted".into(),
                 source: "ballot".into(),
                 governed_only: false,
+                benched_until: None,
+                strikes: 0,
             }
         ));
         assert_eq!(keys(&run), vec!["claude", "codex"]);

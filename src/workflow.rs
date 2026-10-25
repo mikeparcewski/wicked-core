@@ -383,6 +383,12 @@ pub struct UnitEvidence {
     /// unit that ran no reviewer turn. The fold persists it on the unit and folds its outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qe_review: Option<crate::domain::QeReview>,
+    /// (PRODUCT-WORKS J4) The re-probes this attempt's worker thread ran, before the judge read the
+    /// bench, of seats whose QUOTA bench had fallen due ([`crate::seat_bench`]). The actor folds them
+    /// first: an answer drops the bench, a refusal re-benches the seat for longer. Absent on the
+    /// wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bench_reprobes: Vec<crate::seat_bench::BenchReprobe>,
 }
 
 /// (F-7R3-001) One judge seat's refusal during the agent judge's rotation
@@ -393,6 +399,11 @@ pub struct JudgeRefusal {
     pub seat: String,
     /// The classified cause — `wicked_council::types::SeatFailureReason::as_str`.
     pub reason: String,
+    /// (PRODUCT-WORKS J4) The provider's reset time the refusal stated (unix millis), for a quota
+    /// refusal that stated one ([`crate::seat_bench::provider_reset_at`]): the bench lifts then
+    /// instead of after the backoff. Absent on the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<i64>,
 }
 
 /// (DES-L1 PR-1B, core#465) WHERE an approve's amendment lands: on the unit at the cursor (today's

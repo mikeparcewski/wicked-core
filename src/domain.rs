@@ -623,6 +623,19 @@ pub struct BenchedSeat {
     /// such a seat and nothing else. Absent on the wire when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub governed_only: bool,
+    /// (PRODUCT-WORKS J4) When a QUOTA-class bench falls due for a re-probe (unix millis): the
+    /// provider's reset time when its refusal stated one, else a bounded backoff of 15, 30, then 60
+    /// minutes ([`crate::seat_bench`]). A due seat is re-probed with one cheap call before it is
+    /// seated again, and stays benched until it answers. `None` on a bench of any other cause,
+    /// which never lifts by itself, and on a quota bench persisted before this field, which is due
+    /// at once. Absent on the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benched_until: Option<i64>,
+    /// (PRODUCT-WORKS J4) How many quota benches in a row the seat has taken in this run (1 on the
+    /// first): a failed re-probe adds one and lengthens the backoff. 0 on any other bench. Absent
+    /// on the wire when 0.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub strikes: u32,
 }
 
 /// The bench an UNGOVERNED engine call reads — the agent judge, triage, a decision ballot: `bench`
@@ -644,7 +657,11 @@ impl BenchedSeat {
 /// ([`BenchedSeat::governed_only`]) — a host-floor-benched seat that then fails as a judge, or
 /// that the codex worktree bench also names, is out of every call from then on. Returns whether
 /// `benched` changed.
+/// (PRODUCT-WORKS J4) A quota-class bench added here without a lift time is stamped with the first
+/// backoff ([`crate::seat_bench::stamp`]); a site that read the provider's reset time sets
+/// [`BenchedSeat::benched_until`] itself first.
 pub fn bench_seat(benched: &mut Vec<BenchedSeat>, seat: BenchedSeat) -> bool {
+    let seat = crate::seat_bench::stamp(seat, crate::seat_bench::now_ms());
     match benched.iter_mut().find(|b| b.cli == seat.cli) {
         Some(existing) if existing.governed_only && !seat.governed_only => {
             *existing = seat;
@@ -2122,6 +2139,8 @@ mod tests {
             reason: reason.into(),
             source: "launcher".into(),
             governed_only,
+            benched_until: None,
+            strikes: 0,
         };
         let mut bench = vec![b("host floor", true)];
         assert!(!bench_seat(&mut bench, b("host floor again", true)));

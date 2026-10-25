@@ -3933,9 +3933,28 @@ mod tests {
                 cli: s(),
                 reason: s(),
                 source: s(),
+                benched_until_ms: Some(1),
             },
             "seatBenched",
-            &["type", "session", "ord", "cli", "reason", "source"],
+            &[
+                "type",
+                "session",
+                "ord",
+                "cli",
+                "reason",
+                "source",
+                "benchedUntilMs",
+            ],
+        );
+        check(
+            CoreEvent::SeatBenchLifted {
+                session: s(),
+                ord: 2,
+                cli: s(),
+                reason: s(),
+            },
+            "seatBenchLifted",
+            &["type", "session", "ord", "cli", "reason"],
         );
         check(
             CoreEvent::ToolResultDiscarded {

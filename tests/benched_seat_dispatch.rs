@@ -243,6 +243,7 @@ fn a_seat_benched_mid_run_is_never_dispatched_again_and_its_later_unit_is_re_sea
                 cli,
                 reason,
                 source,
+                ..
             } if session == sid => Some((*ord, cli.clone(), reason.clone(), source.clone())),
             _ => None,
         })

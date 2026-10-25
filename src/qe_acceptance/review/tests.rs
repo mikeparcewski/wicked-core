@@ -327,6 +327,8 @@ fn candidates_come_from_the_runs_own_non_author_seats_in_order() {
         reason: "quota_exhausted".into(),
         source: "worker".into(),
         governed_only: false,
+        benched_until: None,
+        strikes: 0,
     });
     assert_eq!(
         seats(&candidates(&benched, &units, &u)),

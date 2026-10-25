@@ -2479,6 +2479,40 @@ fn agent_validate_in(
 /// The `StepInput` every validator-judge call uses. Extracted so the rotation and the single-runner
 /// fallback cannot drift apart — notably `governance: None`, without which the engine's own judge
 /// would self-govern against an empty scope.
+/// (PRODUCT-WORKS J4) What a seat whose quota bench fell due is asked before it is seated again: one
+/// word, no tools, no files.
+pub(crate) const REPROBE_PROMPT: &str = "Readiness check from the wicked engine. Do not run any \
+     tool or command, and do not read or write any file. Reply with the single word READY and \
+     nothing else.";
+
+/// (PRODUCT-WORKS J4) Re-probe `seat`: one cheap call on the judge's own carrier
+/// ([`build_validator_input`]: ungoverned, no workdir), asking for one word
+/// ([`REPROBE_PROMPT`]). `Ok(answer)` when the seat ran and answered `READY`; `Err(output)` —
+/// what it said, for the provider's reset time — when it refused (quota, sign-in), failed, timed
+/// out, or answered anything else.
+pub(crate) fn reprobe_seat(seat: &AgenticCli, runner: &dyn StepRunner) -> Result<String, String> {
+    let run_id = one_shot_run_id("seat-reprobe");
+    let mut unit = WorkUnit::pending("seat-reprobe", "seat-reprobe", 1, REPROBE_PROMPT);
+    unit.assigned_cli = Some(seat.key.clone());
+    unit.assigned_invocation = Some(seat.headless_invocation.clone());
+    let out = runner.run_unit(&build_validator_input(&run_id, unit));
+    runner.on_run_complete(&run_id);
+    let text = out.output.trim();
+    let exited_nonzero = crate::execute_wrapped::wrapped_exit_code(text).is_some_and(|c| c != 0);
+    let refused =
+        wicked_council::types::SeatFailureReason::classify_refusal(text, exited_nonzero).is_some();
+    let ready = text
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .any(|w| w.eq_ignore_ascii_case("ready"));
+    if out.status == StepStatus::Ok && !refused && ready {
+        Ok(text.to_string())
+    } else if text.is_empty() {
+        Err(format!("{:?} with no output", out.status))
+    } else {
+        Err(text.to_string())
+    }
+}
+
 fn build_validator_input(run_id: &str, unit: WorkUnit) -> StepInput {
     StepInput {
         run_id: run_id.to_string(),
