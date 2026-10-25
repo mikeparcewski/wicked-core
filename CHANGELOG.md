@@ -14,6 +14,13 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **`floor probe` writes the guide back as it was written (plain PR).** The probe re-serializes the whole
+  guide to record `verified`, and every defaulted field came back even where the author left it out: a
+  gate gained `failedExit: []` (refused by the guide's own schema, `minItems: 1`), and `stage: []`,
+  `invalidatedBy: []`, `probes: {}` and a blocks-only parser's `failed: []` appeared on every check.
+  Those fields are now skipped when empty, so the written-back guide re-parses to the same guide and
+  stays schema-valid. Found producing the wicked-garden and wicked-crew build guides.
+
 - **A quota bench expires: the seat is re-probed and comes back (PRODUCT-WORKS J4, plain PR).** A seat
   benched for a run (`session.benched_seats`) stayed benched until the run ended. On the test rig copilot
   was benched for quota (429) on 10-24 and never re-checked; 27 hours later every review in that run still
