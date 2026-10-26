@@ -3967,6 +3967,28 @@ mod tests {
             &["type", "session", "ord", "cli", "reason"],
         );
         check(
+            CoreEvent::ContainerRuntimeWait {
+                session: s(),
+                ord: 2,
+                attempt: 0,
+                cli: s(),
+                phase: "waiting".to_string(),
+                waited_secs: 4,
+                window_secs: 180,
+            },
+            "containerRuntimeWait",
+            &[
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "cli",
+                "phase",
+                "waitedSecs",
+                "windowSecs",
+            ],
+        );
+        check(
             CoreEvent::ToolResultDiscarded {
                 session: s(),
                 unit_ix: 0,

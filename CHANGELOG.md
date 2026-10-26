@@ -14,6 +14,19 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A container runtime blip is an infrastructure fault, never a seat failure (PRODUCT-WORKS J4, plain PR).**
+  On the test rig Rancher Desktop restarted mid-run. Docker was gone for about ten minutes, and claude and
+  then copilot each "failed" the unit with `container_runtime_down`. The failover ladder counted both, and
+  the run parked at a dead-seat card that offered only a quota-benched seat. Now a seat-container unit that
+  fails is read against a fresh runtime probe (the cached answer outlives a restart). While the runtime is
+  down the runner waits with backoff (2 s doubling to 30 s) within a bounded window (`WICKED_RUNTIME_WAIT_SECS`,
+  default 180), then re-runs the unit on the same seat once the runtime answers. Each step is on the wire as
+  the new additive `containerRuntimeWait {session, ord, attempt, cli, phase: waiting|recovered|unavailable,
+  waitedSecs, windowSecs}` frame. When the window runs out, the unit stops at a `failure` gate that names
+  the container runtime (`stepFailed.failureKind: environmentRefused`, so a skin offers no reassign), and
+  Approve retries on the same seat. The seat is never benched, struck, failed over or counted in the unit's
+  `worker_failed_clis` for it. An autonomous run fails as before.
+
 - **The repo-checks floor cache is capped as a whole and dropped at a run's end (#1122, plain PR).** On the
   test rig one wicked-core run's floor cache (`<worker home>/repo-checks`, the head and base cargo targets)
   reached 17.7 GB. That was under the 20 GB per-repository cap, and nothing capped the cache across
