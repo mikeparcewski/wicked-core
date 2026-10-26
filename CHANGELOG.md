@@ -14,6 +14,25 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A daemon restart no longer re-plans a run or throws away its in-flight floor (J4 brick, plain PR).** On the
+  test rig each restart under run 29bcace4 orphaned a 45-50 min repo-checks floor, and the first one also
+  re-planned the run. The resume applied a diff re-score that was held for the next step boundary, so it
+  inserted a step before the fix that had already run, and parked a plan gate. Two changes:
+  - A resume of an orphaned `executing` run whose cursor unit was dispatched and never folded is not a step
+    boundary. Any held plan revision (a floor-raising diff re-score, the PA's or a human's held steps) stays
+    held and applies after that unit folds, where it would have applied without the restart.
+  - The floor keeps a journal in the run's log store (`floor-journal-u<ord>.json`, outside every sandbox
+    write root). Each finished check's result is written as soon as it finishes, and the journal is removed
+    when the floor ends, so only a floor the process died in leaves one. The unit's next floor reuses the
+    checks that had finished, but only on the same tree, base and check set (`FloorKey`, core#1115), the same
+    exclusion switch and the same engine policy, and only while their log blobs are still present. It runs
+    only the checks that had not finished (the base side of a re-run check still comes from the run's base
+    cache). On any other tree or check set it runs every check again. Either way the new `floorResumed`
+    event and the gate's `floorNote` say what happened. An operator's floor re-run never reads or writes a
+    journal. The creator floor, the verify floor and the deliver re-verify are all journaled. The
+    re-dispatched step's seat still runs again before its floor, and when that changes the tree, the floor
+    restarts and says so.
+
 - **The repo-checks floor cache is capped as a whole and dropped at a run's end (#1122, plain PR).** On the
   test rig one wicked-core run's floor cache (`<worker home>/repo-checks`, the head and base cargo targets)
   reached 17.7 GB. That was under the 20 GB per-repository cap, and nothing capped the cache across

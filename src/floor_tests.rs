@@ -3688,3 +3688,215 @@ fn a_base_that_exited_outside_failed_exit_is_never_inventoried() {
     );
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+// ─── J4: a floor a daemon restart interrupted resumes on the same tree ─────────────────────────
+
+/// A repo whose `lint` and `test` checks each append a line to a counter file per run, so a test
+/// can tell which checks a floor actually ran.
+#[cfg(unix)]
+fn counting_repo(tag: &str) -> (PathBuf, FloorContext) {
+    let repo = scratch(tag);
+    std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+    std::fs::write(repo.join(".gitignore"), "tmp/\ncounts.*\n").unwrap();
+    std::fs::write(
+        repo.join(CONFIG_PATH),
+        serde_json::json!({
+            "lint": ["sh", "-c", "echo x >> counts.lint"],
+            "test": ["sh", "-c", "echo x >> counts.test"],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    git_repo_with_commit(&repo);
+    let ctx = FloorContext {
+        stage: FloorStage::Verify,
+        run_id: Some(format!("{tag}-{}", std::process::id())),
+        ..FloorContext::default()
+    };
+    (repo, ctx)
+}
+
+#[cfg(unix)]
+fn runs_of(repo: &Path, name: &str) -> usize {
+    std::fs::read_to_string(repo.join(format!("counts.{name}")))
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+/// Leave behind the journal an interrupted floor of `ord` (attempt `attempt`, on `tree`) would
+/// have: `finished` recorded, the rest not yet run.
+#[cfg(unix)]
+fn interrupted_journal(
+    repo: &Path,
+    ctx: &FloorContext,
+    report: &RepoChecksReport,
+    ord: u32,
+    attempt: u32,
+    tree: &str,
+    finished: &[&str],
+) {
+    let logs = CheckScratch::prepare_for(repo, ctx.run_id.as_deref())
+        .unwrap()
+        .logs
+        .clone();
+    let checks = report
+        .detected
+        .iter()
+        .filter(|c| finished.contains(&c.name.as_str()))
+        .map(|c| JournalEntry {
+            dir: c.dir.clone(),
+            name: c.name.clone(),
+            argv: c.argv.clone(),
+            run: report
+                .checks
+                .iter()
+                .find(|r| r.name == c.name)
+                .unwrap()
+                .clone(),
+        })
+        .collect();
+    let rec = JournalRecord {
+        floor_policy: FLOOR_POLICY_VERSION,
+        key: FloorKey::of(tree, ctx, &report.detected),
+        exclude: exclusion_enabled(),
+        attempt,
+        checks,
+    };
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(
+        journal_path(&logs, ord),
+        serde_json::to_string(&rec).unwrap(),
+    )
+    .unwrap();
+}
+
+/// (J4, rig run 29bcace4) The daemon died mid-floor: `lint` had finished on tree T, `test` had
+/// not. The unit's next floor on T, same base and checks, reuses `lint` (it does not run again)
+/// and runs only `test`; it says so on the report, and its journal is gone once it ends.
+#[cfg(unix)]
+#[test]
+fn a_floor_a_restart_interrupted_resumes_running_only_the_unfinished_checks() {
+    let (repo, ctx) = counting_repo("resume-floor");
+    let tree = "1111111111111111111111111111111111111111";
+    let first = run_floor_journaled(&repo, &ctx, None, None);
+    if first.sandbox_error.is_some() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
+    }
+    assert!(first.passed, "{first:#?}");
+    assert!(first.resumed.is_none());
+    assert_eq!((runs_of(&repo, "lint"), runs_of(&repo, "test")), (1, 1));
+    interrupted_journal(&repo, &ctx, &first, 6, 8, tree, &["lint"]);
+
+    let j = FloorJournal {
+        ord: 6,
+        attempt: 9,
+        tree: tree.to_string(),
+    };
+    let resumed = run_floor_journaled(&repo, &ctx, None, Some(&j));
+    assert!(resumed.passed, "{resumed:#?}");
+    assert_eq!(
+        (runs_of(&repo, "lint"), runs_of(&repo, "test")),
+        (1, 2),
+        "lint finished before the restart and is reused; only test runs again"
+    );
+    assert_eq!(
+        resumed.resumed,
+        Some(FloorResume {
+            from_attempt: 8,
+            reused: vec!["lint".to_string()],
+            restarted: None
+        })
+    );
+    assert_eq!(
+        resumed
+            .checks
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        names(&resumed.detected),
+        "the report still carries every check, reused ones included"
+    );
+    let note = resumed.classification_note().unwrap_or_default();
+    assert!(note.contains("resumed the floor of attempt 8"), "{note}");
+
+    // The journal went with the floor's end: the next floor of the unit resumes nothing.
+    let again = run_floor_journaled(&repo, &ctx, None, Some(&j));
+    assert!(again.resumed.is_none(), "{:?}", again.resumed);
+    assert_eq!((runs_of(&repo, "lint"), runs_of(&repo, "test")), (2, 3));
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// The interrupted floor ran on ANOTHER tree (the re-dispatched step changed the work): nothing is
+/// reused, every check runs, and the report says the floor restarted and why.
+#[cfg(unix)]
+#[test]
+fn an_interrupted_floor_on_another_tree_restarts_and_says_so() {
+    let (repo, ctx) = counting_repo("resume-other-tree");
+    let first = run_floor_journaled(&repo, &ctx, None, None);
+    if first.sandbox_error.is_some() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
+    }
+    interrupted_journal(
+        &repo,
+        &ctx,
+        &first,
+        6,
+        8,
+        "1111111111111111111111111111111111111111",
+        &["lint", "test"],
+    );
+    let j = FloorJournal {
+        ord: 6,
+        attempt: 9,
+        tree: "2222222222222222222222222222222222222222".to_string(),
+    };
+    let r = run_floor_journaled(&repo, &ctx, None, Some(&j));
+    assert_eq!((runs_of(&repo, "lint"), runs_of(&repo, "test")), (2, 2));
+    let resume = r.resumed.clone().expect("the restart is disclosed");
+    assert_eq!(resume.from_attempt, 8);
+    assert!(resume.reused.is_empty());
+    assert!(
+        resume
+            .restarted
+            .as_deref()
+            .unwrap_or_default()
+            .contains("tree"),
+        "{resume:?}"
+    );
+    assert!(r
+        .classification_note()
+        .unwrap_or_default()
+        .contains("could not be resumed"));
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// An operator's re-run never stands on a journal: its check set is not the ordinary floor's.
+#[cfg(unix)]
+#[test]
+fn an_operator_rerun_ignores_an_interrupted_floors_journal() {
+    let (repo, ctx) = counting_repo("resume-rerun");
+    let tree = "1111111111111111111111111111111111111111";
+    let first = run_floor_journaled(&repo, &ctx, None, None);
+    if first.sandbox_error.is_some() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
+    }
+    interrupted_journal(&repo, &ctx, &first, 6, 8, tree, &["lint"]);
+    let rerun = FloorRerun {
+        mode: FloorRerunMode::Extend,
+        waive: Vec::new(),
+        output: String::new(),
+        fix: None,
+    };
+    let j = FloorJournal {
+        ord: 6,
+        attempt: 9,
+        tree: tree.to_string(),
+    };
+    let r = run_floor_journaled(&repo, &ctx, Some(&rerun), Some(&j));
+    assert!(r.resumed.is_none());
+    assert_eq!(runs_of(&repo, "lint"), 2, "the re-run ran lint itself");
+    let _ = std::fs::remove_dir_all(&repo);
+}
