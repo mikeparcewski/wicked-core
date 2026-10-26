@@ -759,6 +759,14 @@ export declare class Core {
    */
   hostBoundary(): Promise<string>
   /**
+   * (core#1122) What the repo-checks floor holds on disk, as a JSON object: `{ path, bytes,
+   * totalCapBytes, repoCapBytes, idleTtlSecs, repos: [{ name, bytes, leaves }], logs: { path,
+   * bytes, capBytes } }` (or `{ error }` with no worker home). `path` is the floor build cache
+   * (`<worker home>/repo-checks`), `repos` largest first. For crew's diagnostics and the Nerve
+   * Center's disk row; read-only, but it walks the cache, so call it on demand.
+   */
+  static floorCacheUsage(): Promise<string>
+  /**
    * Governance rules eval — run an eval corpus through the REAL SELECT→DECIDE gate path and
    * score every sample (the engine seam behind crew's `POST /api/v1/testing/evals/run`).
    * `args_json` is `{ type?, corpus?, knowledgeDb?, memoryDb?, dbPath }` (camelCase keys are the PINNED

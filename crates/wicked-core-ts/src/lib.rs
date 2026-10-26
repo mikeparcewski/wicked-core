@@ -2344,6 +2344,16 @@ impl Core {
         task(move || serde_json::to_string(&wicked_core::host_boundary()).map_err(err))
     }
 
+    /// (core#1122) What the repo-checks floor holds on disk, as a JSON object: `{ path, bytes,
+    /// totalCapBytes, repoCapBytes, idleTtlSecs, repos: [{ name, bytes, leaves }], logs: { path,
+    /// bytes, capBytes } }` (or `{ error }` with no worker home). `path` is the floor build cache
+    /// (`<worker home>/repo-checks`), `repos` largest first. For crew's diagnostics and the Nerve
+    /// Center's disk row; read-only, but it walks the cache, so call it on demand.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn floor_cache_usage() -> AsyncTask<CoreTask> {
+        task(move || serde_json::to_string(&wicked_core::floor_cache_usage()).map_err(err))
+    }
+
     /// Governance rules eval — run an eval corpus through the REAL SELECT→DECIDE gate path and
     /// score every sample (the engine seam behind crew's `POST /api/v1/testing/evals/run`).
     /// `args_json` is `{ type?, corpus?, knowledgeDb?, memoryDb?, dbPath }` (camelCase keys are the PINNED

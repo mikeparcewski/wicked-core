@@ -8297,27 +8297,45 @@ fn sweep_expired_retained_worktrees(store: &dyn GraphStore) {
 /// files and nothing else; tracked and untracked-not-ignored files (the run's work, a leftover
 /// edit) are never touched. Off-thread; best-effort.
 fn clean_retained_worktree(store: &dyn GraphStore, session: &crate::domain::AgentSession) {
-    let Some(repo_id) = session.repo_ref.as_ref() else {
-        return;
-    };
-    let Ok(Some(repo)) = crate::repo::get_repo(store, repo_id) else {
-        return;
-    };
-    let rid = session.id.clone();
-    std::thread::spawn(move || crate::repo::clean_ignored_in_worktree(&repo.root_path, &rid));
+    let repo = run_repo(store, session);
+    let (rid, workdir) = (session.id.clone(), session.workdir.clone());
+    std::thread::spawn(move || {
+        remove_run_floor_cache(workdir.as_deref(), &rid);
+        if let Some(repo) = repo {
+            crate::repo::clean_ignored_in_worktree(&repo.root_path, &rid);
+        }
+    });
 }
 
 fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::AgentSession) {
-    let Some(repo_id) = session.repo_ref.as_ref() else {
-        return;
-    };
-    let Ok(Some(repo)) = crate::repo::get_repo(store, repo_id) else {
-        return;
-    };
-    let rid = session.id.clone();
+    let repo = run_repo(store, session);
+    let (rid, workdir) = (session.id.clone(), session.workdir.clone());
     std::thread::spawn(move || {
-        let _ = crate::repo::reap_worktree_if_clean(&repo.root_path, &rid);
+        remove_run_floor_cache(workdir.as_deref(), &rid);
+        if let Some(repo) = repo {
+            let _ = crate::repo::reap_worktree_if_clean(&repo.root_path, &rid);
+        }
     });
+}
+
+/// The run's registered repository, when it has one that still resolves.
+fn run_repo(
+    store: &dyn GraphStore,
+    session: &crate::domain::AgentSession,
+) -> Option<crate::repo::RepoEntry> {
+    let repo_id = session.repo_ref.as_ref()?;
+    crate::repo::get_repo(store, repo_id).ok().flatten()
+}
+
+/// (core#1122) A terminal run's repo-checks floor build cache goes NOW, keyed by the tree its
+/// floors ran on (`session.workdir`) and its exact id — also for a run with no registered
+/// repository (or one since removed), which the worktree reap never reaches. Only this run's own
+/// leaf: the key is the run id, so no other run's cache is touched. Best-effort; a floor still
+/// holding the leaf leaves it marked orphaned, removed when that floor ends.
+fn remove_run_floor_cache(workdir: Option<&str>, run_id: &str) {
+    if let Some(wd) = workdir {
+        crate::repo_checks::remove_check_scratch(std::path::Path::new(wd), run_id);
+    }
 }
 
 /// core#290 — the other half of [`reap_terminal_worktree`]: give a resuming run its worktree BACK.
@@ -25311,7 +25329,7 @@ mod worker_code_graph_tests {
     /// The redrive runs ONLY in armed exec mode, so on the default path a restart leaves the status
     /// claiming execution forever. Observed live as 35+ minutes of silence that a manual resume
     /// fixed instantly — the recovery worked; nothing announced it was needed.
-    fn session_at(id: &str, status: SessionStatus) -> AgentSession {
+    pub(super) fn session_at(id: &str, status: SessionStatus) -> AgentSession {
         crate::domain::AgentSession {
             intent_amendments: Vec::new(),
             id: id.into(),
@@ -25583,6 +25601,61 @@ mod worker_code_graph_tests {
         let store = open_store(Some(":memory:")).unwrap();
         assert_eq!(repo_code_graph_db(&store, None), None);
         assert_eq!(repo_code_graph_db(&store, Some("never-registered")), None);
+    }
+}
+
+/// (core#1122) A run's repo-checks floor build cache goes when the run reaches a terminal state.
+#[cfg(test)]
+mod floor_cache_terminal_tests {
+    use super::worker_code_graph_tests::session_at;
+    use super::*;
+    use wicked_apps_core::open_store;
+
+    /// The leaf of `run_id` over `wd` in the engine's check cache, filled with build output.
+    fn filled_leaf(wd: &std::path::Path, run_id: &str) -> std::path::PathBuf {
+        let cache = crate::repo_checks::check_cache_root().unwrap();
+        let leaf = crate::repo_checks::scratch_dir_for(&cache, wd, Some(run_id));
+        std::fs::create_dir_all(leaf.join("cargo-target").join("head")).unwrap();
+        std::fs::write(leaf.join("cargo-target/head/blob"), vec![0u8; 64]).unwrap();
+        leaf
+    }
+
+    /// Both terminal paths (the reap of a failed/cancelled/archived run, and a completed run whose
+    /// worktree is RETAINED) drop the run's floor cache, keyed by its workdir — also for a run with
+    /// no registered repository, which the worktree reap never reaches. Another run's cache over
+    /// the same tree, and the tree itself, are never touched.
+    #[test]
+    fn a_terminal_runs_floor_cache_goes_even_without_a_registered_repository() {
+        let store = open_store(Some(":memory:")).unwrap();
+        let wd = std::env::temp_dir().join(format!(
+            "wc-1122-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        std::fs::create_dir_all(&wd).unwrap();
+        let other = filled_leaf(&wd, "run-1122-live");
+        for (rid, retained) in [("run-1122-failed", false), ("run-1122-completed", true)] {
+            let leaf = filled_leaf(&wd, rid);
+            let mut session = session_at(rid, SessionStatus::Failed);
+            session.workdir = Some(wd.to_string_lossy().into_owned());
+            if retained {
+                session.status = SessionStatus::Completed;
+                clean_retained_worktree(&store, &session);
+            } else {
+                reap_terminal_worktree(&store, &session);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while leaf.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(!leaf.exists(), "{rid}: its floor cache is gone");
+        }
+        assert!(
+            other.join("cargo-target/head/blob").is_file(),
+            "another run's floor cache over the same tree is kept"
+        );
+        assert!(wd.is_dir(), "the tree itself is never touched");
+        let _ = std::fs::remove_dir_all(&other);
+        let _ = std::fs::remove_dir_all(&wd);
     }
 }
 

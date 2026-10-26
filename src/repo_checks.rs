@@ -187,13 +187,19 @@
 //!   repo-controlled build script plant artifacts that another run's floor executes. Inside a run
 //!   every floor reuses the leaf, warm, as before; a guarded verify checkout
 //!   ([`checkout_guarded_tree`]) is a tree of its own, and its leaf is removed with it.
-//! - **A per-repository cap.** Before a floor runs, the repository's group is measured; over
-//!   [`CHECK_CACHE_CAP_ENV`] GB (default [`DEFAULT_CHECK_CACHE_CAP_GB`]) the least recently used
-//!   leaves are deleted until it fits, the floor's own last, and each removal is logged. A leaf a
-//!   floor is using is never removed: every floor holds a SHARED lock on `<run key>.lock` for its
-//!   life, and the cap removes a leaf only under an EXCLUSIVE one. Concurrent floors of ONE run
-//!   share the leaf as they shared the worktree scratch, and cargo's own build-directory lock
-//!   serializes their builds.
+//! - **A per-repository cap and a total cap.** Before a floor runs, the whole check cache is
+//!   measured ([`enforce_check_cache_cap`]); over [`CHECK_CACHE_CAP_ENV`] GB for one repository
+//!   (default [`DEFAULT_CHECK_CACHE_CAP_GB`]) or [`CHECK_CACHE_TOTAL_CAP_ENV`] GB for every
+//!   repository together (default [`DEFAULT_CHECK_CACHE_TOTAL_CAP_GB`], core#1122: one core run's
+//!   head + base targets reached 17.7 GB, and a few runs filled the host disk) the least recently
+//!   used leaves are deleted until both fit, the floor's own last, and each removal is logged. A
+//!   leaf a floor is using is never removed: every floor holds a SHARED lock on `<run key>.lock`
+//!   for its life, and the cap removes a leaf only under an EXCLUSIVE one. Concurrent floors of
+//!   ONE run share the leaf as they shared the worktree scratch, and cargo's own build-directory
+//!   lock serializes their builds.
+//! - **An idle retention.** A leaf no floor has used for [`CHECK_CACHE_IDLE_TTL`] (the floor log
+//!   store's TTL) is deleted by the same pass, whatever the caps: the leaf of a run whose terminal
+//!   reap never came, or of a run parked for a week (its next floor rebuilds cold).
 //! - **Reaped when the run ends.** [`remove_check_scratch`] runs wherever the engine removes,
 //!   reaps or cleans a terminal run's worktree (`crate::repo`), so the leaf goes even when the
 //!   tree is kept. Its 0-byte `<run key>.lock` is kept, so a floor already waiting on it never
@@ -272,6 +278,20 @@ pub const CHECK_CACHE_SUBDIR: &str = "repo-checks";
 pub const CHECK_CACHE_CAP_ENV: &str = "WICKED_REPO_CHECKS_CACHE_CAP_GB";
 /// The default of [`CHECK_CACHE_CAP_ENV`]: one large cargo workspace's head + base targets.
 pub const DEFAULT_CHECK_CACHE_CAP_GB: u64 = 20;
+/// (core#1122) The TOTAL size cap on the whole check cache (`<worker home>/repo-checks`, every
+/// repository's group), in GB (10^9 bytes). Over it, the least recently used run leaves of ANY
+/// repository are deleted before the next floor runs, never one a floor holds. A value that does
+/// not parse as a whole number keeps the default.
+pub const CHECK_CACHE_TOTAL_CAP_ENV: &str = "WICKED_REPO_CHECKS_TOTAL_CAP_GB";
+/// The default of [`CHECK_CACHE_TOTAL_CAP_ENV`]: two runs of one large cargo workspace (one
+/// wicked-core run's head + base targets measured 17.7 GB on the rig, core#1122).
+pub const DEFAULT_CHECK_CACHE_TOTAL_CAP_GB: u64 = 40;
+/// (core#1122) The check cache's own retention: a run leaf no floor has used for this long is
+/// deleted at the next cap pass, whatever the caps — a leaf whose run's terminal reap never came
+/// (a crash, a run with no registered repository) or a run parked for a week. A floor holding the
+/// leaf keeps it; a later floor of that run rebuilds cold. The floor log store's TTL, the same
+/// retention ([`crate::floor_log::FLOOR_LOG_TTL`]).
+pub const CHECK_CACHE_IDLE_TTL: Duration = crate::floor_log::FLOOR_LOG_TTL;
 /// The optional per-repo check configuration, relative to the worktree root.
 pub const CONFIG_PATH: &str = ".wicked/checks.json";
 /// (core#767) The check-name prefix of a configured journey (`journey-<name>`).
@@ -2424,7 +2444,7 @@ fn create_private_tmp(base: &Path, mut draw: impl FnMut() -> String) -> std::io:
 
 impl CheckScratch {
     /// The scratch for a floor over `worktree`: its leaf of the engine's check cache, the cache
-    /// first held to the repository's size cap, a shared lease taken, the leaves made.
+    /// first held to its caps ([`enforce_check_cache_cap`]), a shared lease taken, the leaves made.
     #[cfg(test)]
     pub(crate) fn prepare(worktree: &Path) -> std::io::Result<Self> {
         Self::prepare_for(worktree, None)
@@ -2432,20 +2452,32 @@ impl CheckScratch {
 
     /// [`Self::prepare`] for the run `run_id` (keyed by run and tree, [`scratch_dir_for`]).
     pub(crate) fn prepare_for(worktree: &Path, run_id: Option<&str>) -> std::io::Result<Self> {
-        Self::prepare_in(
+        Self::prepare_with(
             &check_cache_root()?,
             worktree,
             run_id,
-            check_cache_cap_bytes(),
+            CacheCaps::from_env(),
         )
     }
 
-    /// [`Self::prepare_for`] against an explicit cache root and cap — the seam the cap tests use.
+    /// [`Self::prepare_for`] against an explicit cache root and ONE cap, per repository and total
+    /// ([`CacheCaps::uniform`]) — the seam most scratch tests use.
+    #[cfg(test)]
     pub(crate) fn prepare_in(
         cache: &Path,
         worktree: &Path,
         run_id: Option<&str>,
         cap: u64,
+    ) -> std::io::Result<Self> {
+        Self::prepare_with(cache, worktree, run_id, CacheCaps::uniform(cap))
+    }
+
+    /// [`Self::prepare_for`] against an explicit cache root and caps — the seam the cap tests use.
+    pub(crate) fn prepare_with(
+        cache: &Path,
+        worktree: &Path,
+        run_id: Option<&str>,
+        caps: CacheCaps,
     ) -> std::io::Result<Self> {
         // (core#1050) The worktree's engine scratch root is still checked FIRST, exactly as when
         // the whole scratch lived under it: the floor writes the run base's export there, and a
@@ -2493,7 +2525,7 @@ impl CheckScratch {
         }
         // The lease FIRST: a floor starting beside this one never evicts this run's leaf.
         let mut lease = take_orphan_free_lease(&root)?;
-        if enforce_check_cache_cap(group, &root, cap).1 {
+        if enforce_check_cache_cap(cache, &root, caps).1 {
             // This run's own scratch alone outgrew the cap: clean it before the checks, unless
             // another floor of the run is building into it (then it is that floor's, for now).
             drop(lease);
@@ -2501,9 +2533,10 @@ impl CheckScratch {
                 match remove_leaf_dir(&root) {
                     Ok(()) => eprintln!(
                         "wicked-core: repo checks floor — this run's check scratch {} alone was \
-                         over the {:.1} GB cap ({CHECK_CACHE_CAP_ENV}); removed it before the checks",
+                         over the {:.1} GB cap ({CHECK_CACHE_CAP_ENV} / \
+                         {CHECK_CACHE_TOTAL_CAP_ENV}); removed it before the checks",
                         root.display(),
-                        cap as f64 / 1e9
+                        caps.repo.min(caps.total) as f64 / 1e9
                     ),
                     Err(e) => eprintln!(
                         "wicked-core: repo checks floor — could not remove the over-cap check \
@@ -2703,10 +2736,15 @@ pub(crate) fn check_cache_root() -> std::io::Result<PathBuf> {
 
 /// [`CHECK_CACHE_CAP_ENV`] in bytes, [`DEFAULT_CHECK_CACHE_CAP_GB`] when unset or unparsable.
 fn check_cache_cap_bytes() -> u64 {
-    std::env::var(CHECK_CACHE_CAP_ENV)
+    gb_env(CHECK_CACHE_CAP_ENV, DEFAULT_CHECK_CACHE_CAP_GB)
+}
+
+/// A whole-GB cap from `var` in bytes, `default_gb` when unset or unparsable.
+fn gb_env(var: &str, default_gb: u64) -> u64 {
+    std::env::var(var)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_CHECK_CACHE_CAP_GB)
+        .unwrap_or(default_gb)
         .saturating_mul(1_000_000_000)
 }
 
@@ -2879,114 +2917,291 @@ fn remove_leaf_dir(leaf: &Path) -> std::io::Result<()> {
     }
 }
 
-/// The cap pass's lock, `<group>/.cap.lock`: one pass per repository at a time, so two floors
-/// starting together never scan and evict against each other (one would read a leaf the other is
-/// mid-way through deleting as "in use" and evict more than the cap needs).
+/// The cap pass's lock, `<cache>/.cap.lock`: one pass over the whole check cache at a time, so two
+/// floors starting together never scan and evict against each other (one would read a leaf the
+/// other is mid-way through deleting as "in use" and evict more than the cap needs). One lock for
+/// the whole cache, not one per repository (core#1122): the total cap evicts across repositories.
 const CAP_PASS_LOCK: &str = ".cap.lock";
 
-/// Hold the repository group `group` to `cap` bytes before a floor runs over `own` (the floor
-/// already holds `own`'s lease). Orphaned leaves ([`orphan_path`]) no floor holds go first,
-/// whatever the cap. Over the cap, the OTHER run leaves go least recently used first
-/// until it fits, skipping any leaf a floor holds a lease on. The floor's own leaf is never
-/// removed here; the second value says whether it ALONE is over the cap (one run outgrew it),
-/// which [`CheckScratch::prepare_in`] then cleans. A leaf is never removed because another
-/// active run is large. Every removal is logged; best-effort, never fails the floor.
-pub(crate) fn enforce_check_cache_cap(group: &Path, own: &Path, cap: u64) -> (Vec<PathBuf>, bool) {
+/// The check cache's limits (core#1122): the per-repository cap ([`CHECK_CACHE_CAP_ENV`]), the
+/// total cap over every repository ([`CHECK_CACHE_TOTAL_CAP_ENV`]), and the idle retention
+/// ([`CHECK_CACHE_IDLE_TTL`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CacheCaps {
+    pub(crate) repo: u64,
+    pub(crate) total: u64,
+    pub(crate) idle: Duration,
+}
+
+impl CacheCaps {
+    /// The caps the daemon's environment sets, the defaults where it sets none.
+    pub(crate) fn from_env() -> Self {
+        Self {
+            repo: check_cache_cap_bytes(),
+            total: gb_env(CHECK_CACHE_TOTAL_CAP_ENV, DEFAULT_CHECK_CACHE_TOTAL_CAP_GB),
+            idle: CHECK_CACHE_IDLE_TTL,
+        }
+    }
+
+    /// One byte cap as both the repository and the total cap, the default retention.
+    #[cfg(test)]
+    pub(crate) fn uniform(cap: u64) -> Self {
+        Self {
+            repo: cap,
+            total: cap,
+            idle: CHECK_CACHE_IDLE_TTL,
+        }
+    }
+}
+
+/// One run leaf the cap pass may remove.
+struct CapCandidate {
+    used: std::time::SystemTime,
+    leaf: PathBuf,
+    group: PathBuf,
+    bytes: u64,
+}
+
+/// Remove `leaf` for the cap pass, only under its EXCLUSIVE lock: `Some(true)` removed (or gone
+/// since the scan), `Some(false)` a floor holds it (never taken), `None` the removal failed (logged).
+fn evict_leaf(leaf: &Path) -> Option<bool> {
+    match lock_leaf(leaf, true) {
+        Ok(Some(_held)) => match remove_leaf_dir(leaf) {
+            Ok(()) => Some(true),
+            Err(e) => {
+                eprintln!(
+                    "wicked-core: repo checks floor — could not remove the check scratch {}: {e}",
+                    leaf.display()
+                );
+                None
+            }
+        },
+        // A floor is building into it right now: it is not this cap's to take.
+        Ok(None) => Some(false),
+        Err(e) => {
+            eprintln!(
+                "wicked-core: repo checks floor — could not lock the check scratch {}: {e}",
+                leaf.display()
+            );
+            None
+        }
+    }
+}
+
+/// Hold the check cache at `cache` (`<worker home>/repo-checks`) to `caps` before a floor runs over
+/// `own` (`<cache>/<repo group>/<run leaf>`; the floor already holds `own`'s lease). Only run
+/// leaves (real directories two levels under `cache`, never a link) are ever considered.
+///
+/// 1. Orphaned leaves ([`orphan_path`]) no floor holds go first, whatever the caps.
+/// 2. (core#1122) A leaf no floor has used for [`CacheCaps::idle`] goes, whatever the caps.
+/// 3. Over the per-repository cap (that repository's leaves) or the TOTAL cap (every
+///    repository's), the OTHER run leaves go least recently used first until both fit.
+///
+/// A leaf a floor holds a lease on is never removed: removal takes the leaf's EXCLUSIVE lock, and
+/// every floor holds a SHARED one for its life. The floor's own leaf is never removed here; the
+/// second value says whether it ALONE is over a cap (one run outgrew it), which
+/// [`CheckScratch::prepare_in`] then cleans. Every removal is logged; best-effort, never fails the
+/// floor.
+pub(crate) fn enforce_check_cache_cap(
+    cache: &Path,
+    own: &Path,
+    caps: CacheCaps,
+) -> (Vec<PathBuf>, bool) {
     let mut removed = Vec::new();
     let pass = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(group.join(CAP_PASS_LOCK));
+        .open(cache.join(CAP_PASS_LOCK));
     let Ok(_pass) = pass.and_then(|f| f.lock().map(|()| f)) else {
         return (removed, false);
     };
-    let Ok(entries) = std::fs::read_dir(group) else {
+    let Ok(groups) = std::fs::read_dir(cache) else {
         return (removed, false);
     };
-    let mut own_bytes = 0u64;
-    let mut others: Vec<(std::time::SystemTime, PathBuf, u64)> = Vec::new();
-    for e in entries.flatten() {
-        if !e.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        let leaf = e.path();
-        // (core#1050) An orphaned leaf goes whatever the cap, once no floor holds it.
-        if leaf != own && orphan_path(&leaf).exists() {
-            if retire_leaf(&leaf) {
-                eprintln!(
-                    "wicked-core: repo checks floor — removed the orphaned check scratch {} \
-                     (its run's worktree is gone)",
-                    leaf.display()
-                );
-                removed.push(leaf);
-            }
-            continue;
-        }
-        let bytes = tree_bytes(&leaf);
-        if leaf == own {
-            own_bytes = bytes;
-            continue;
-        }
-        let used = std::fs::metadata(lease_path(&leaf))
-            .or_else(|_| leaf.symlink_metadata())
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::UNIX_EPOCH);
-        others.push((used, leaf, bytes));
-    }
-    let mut total: u64 = own_bytes + others.iter().map(|l| l.2).sum::<u64>();
-    if total <= cap {
-        return (removed, false);
-    }
-    others.sort_by_key(|l| l.0);
+    let own_group = own.parent().unwrap_or(cache).to_path_buf();
+    let now = std::time::SystemTime::now();
     let gb = |b: u64| b as f64 / 1e9;
-    for (_, leaf, bytes) in others {
-        if total <= cap {
-            break;
-        }
-        match lock_leaf(&leaf, true) {
-            // Gone since the scan (a run's reap): nothing to remove, nothing to log.
-            Ok(Some(_held)) if std::fs::symlink_metadata(&leaf).is_err() => {
-                total = total.saturating_sub(bytes);
-            }
-            Ok(Some(_held)) => match remove_leaf_dir(&leaf) {
-                Ok(()) => {
+    let mut own_bytes = 0u64;
+    let mut others: Vec<CapCandidate> = Vec::new();
+    let dirs = |d: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(d)
+            .into_iter()
+            .flatten()
+            .flatten()
+            // `DirEntry::file_type` never follows a link: a link is never a group or a leaf.
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| e.path())
+            .collect()
+    };
+    for group in groups
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+    {
+        for leaf in dirs(&group) {
+            // (core#1050) An orphaned leaf goes whatever the cap, once no floor holds it.
+            if leaf != own && orphan_path(&leaf).exists() {
+                if retire_leaf(&leaf) {
                     eprintln!(
-                        "wicked-core: repo checks floor — the check cache {} was {:.1} GB, over \
-                         its {:.1} GB cap ({CHECK_CACHE_CAP_ENV}); removed {} ({:.1} GB)",
-                        group.display(),
-                        gb(total),
-                        gb(cap),
-                        leaf.display(),
-                        gb(bytes)
+                        "wicked-core: repo checks floor — removed the orphaned check scratch {} \
+                         (its run's worktree is gone)",
+                        leaf.display()
                     );
-                    total = total.saturating_sub(bytes);
                     removed.push(leaf);
                 }
-                Err(e) => eprintln!(
-                    "wicked-core: repo checks floor — could not remove the over-cap check \
-                     scratch {}: {e}",
-                    leaf.display()
-                ),
-            },
-            // A floor is building into it right now: it is not this cap's to take.
-            Ok(None) => {}
-            Err(e) => eprintln!(
-                "wicked-core: repo checks floor — could not lock the check scratch {}: {e}",
-                leaf.display()
-            ),
+                continue;
+            }
+            let bytes = tree_bytes(&leaf);
+            if leaf == own {
+                own_bytes = bytes;
+                continue;
+            }
+            let used = std::fs::metadata(lease_path(&leaf))
+                .or_else(|_| leaf.symlink_metadata())
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            // (core#1122) The cache's own retention: unused this long, it goes.
+            let idle = now.duration_since(used).unwrap_or_default();
+            if idle > caps.idle && evict_leaf(&leaf) == Some(true) {
+                eprintln!(
+                    "wicked-core: repo checks floor — removed the check scratch {} ({:.1} GB), \
+                     unused for {} day(s)",
+                    leaf.display(),
+                    gb(bytes),
+                    idle.as_secs() / 86_400
+                );
+                removed.push(leaf);
+                continue;
+            }
+            others.push(CapCandidate {
+                used,
+                leaf,
+                group: group.clone(),
+                bytes,
+            });
         }
     }
-    if total > cap && own_bytes <= cap {
+    let mut total: u64 = own_bytes + others.iter().map(|c| c.bytes).sum::<u64>();
+    let mut per_group: std::collections::HashMap<PathBuf, u64> = std::collections::HashMap::new();
+    *per_group.entry(own_group.clone()).or_default() += own_bytes;
+    for c in &others {
+        *per_group.entry(c.group.clone()).or_default() += c.bytes;
+    }
+    let own_over = own_bytes > caps.repo.min(caps.total);
+    if total <= caps.total && per_group.values().all(|&b| b <= caps.repo) {
+        return (removed, own_over);
+    }
+    others.sort_by_key(|c| c.used);
+    for c in others {
+        let in_group = per_group.get(&c.group).copied().unwrap_or_default();
+        let (over_total, over_repo) = (total > caps.total, in_group > caps.repo);
+        if !over_total && !over_repo {
+            continue;
+        }
+        if evict_leaf(&c.leaf) != Some(true) {
+            continue;
+        }
+        let why = if over_total {
+            format!(
+                "the check cache {} was {:.1} GB, over its {:.1} GB total cap \
+                 ({CHECK_CACHE_TOTAL_CAP_ENV})",
+                cache.display(),
+                gb(total),
+                gb(caps.total)
+            )
+        } else {
+            format!(
+                "the check cache {} was {:.1} GB, over its {:.1} GB cap ({CHECK_CACHE_CAP_ENV})",
+                c.group.display(),
+                gb(in_group),
+                gb(caps.repo)
+            )
+        };
         eprintln!(
-            "wicked-core: repo checks floor — the check cache {} is {:.1} GB, over its {:.1} GB \
-             cap ({CHECK_CACHE_CAP_ENV}), held by runs whose floors are running",
-            group.display(),
+            "wicked-core: repo checks floor — {why}; removed {} ({:.1} GB)",
+            c.leaf.display(),
+            gb(c.bytes)
+        );
+        total = total.saturating_sub(c.bytes);
+        if let Some(g) = per_group.get_mut(&c.group) {
+            *g = g.saturating_sub(c.bytes);
+        }
+        removed.push(c.leaf);
+    }
+    let own_group_bytes = per_group.get(&own_group).copied().unwrap_or_default();
+    if !own_over && (total > caps.total || own_group_bytes > caps.repo) {
+        eprintln!(
+            "wicked-core: repo checks floor — the check cache {} is {:.1} GB (this repository's \
+             {:.1} GB), over its caps ({:.1} GB total, {CHECK_CACHE_TOTAL_CAP_ENV}; {:.1} GB per \
+             repository, {CHECK_CACHE_CAP_ENV}), held by runs whose floors are running",
+            cache.display(),
             gb(total),
-            gb(cap)
+            gb(own_group_bytes),
+            gb(caps.total),
+            gb(caps.repo)
         );
     }
-    (removed, own_bytes > cap)
+    (removed, own_over)
+}
+
+/// (core#1122) What the repo-checks floor holds on disk, for an operator's disk view (crew's
+/// diagnostics, the Nerve Center's disk row): the build cache at `<worker home>/repo-checks` (every
+/// run leaf, by repository, largest first) with its caps, and the floor log store beside it. Sizes
+/// are apparent bytes, measured now (a walk of the tree: call it on demand, not on a hot poll).
+/// Read-only. `{ path, bytes, totalCapBytes, repoCapBytes, idleTtlSecs, repos: [{ name, bytes,
+/// leaves }], logs: { path, bytes, capBytes } }`; `error` instead when there is no worker home.
+pub fn floor_cache_usage() -> serde_json::Value {
+    match check_cache_root() {
+        Ok(cache) => floor_cache_usage_in(&cache, CacheCaps::from_env()),
+        Err(e) => serde_json::json!({ "error": e.to_string() }),
+    }
+}
+
+/// [`floor_cache_usage`] against an explicit cache root and caps.
+pub(crate) fn floor_cache_usage_in(cache: &Path, caps: CacheCaps) -> serde_json::Value {
+    let mut repos: Vec<(String, u64, usize)> = std::fs::read_dir(cache)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|g| {
+            let leaves = std::fs::read_dir(g.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .count();
+            (
+                g.file_name().to_string_lossy().into_owned(),
+                tree_bytes(&g.path()),
+                leaves,
+            )
+        })
+        .collect();
+    repos.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let logs = cache
+        .parent()
+        .unwrap_or(cache)
+        .join(crate::floor_log::LOG_SUBDIR);
+    serde_json::json!({
+        "path": cache.to_string_lossy(),
+        "bytes": repos.iter().map(|r| r.1).sum::<u64>(),
+        "totalCapBytes": caps.total,
+        "repoCapBytes": caps.repo,
+        "idleTtlSecs": caps.idle.as_secs(),
+        "repos": repos
+            .iter()
+            .map(|(name, bytes, leaves)| serde_json::json!({
+                "name": name, "bytes": bytes, "leaves": leaves
+            }))
+            .collect::<Vec<_>>(),
+        "logs": {
+            "path": logs.to_string_lossy(),
+            "bytes": tree_bytes(&logs),
+            "capBytes": crate::floor_log::log_cap_bytes(),
+        },
+    })
 }
 
 /// `<leaf>.orphan`: the leaf's run lost its worktree while a floor held the leaf. It is never
@@ -8179,9 +8394,8 @@ pub(crate) mod tests {
         // A floor of the `busy` run is mid-build; it is also the least recently used.
         let held = lock_leaf(&busy, false).unwrap().unwrap();
         held.set_modified(ago(400)).unwrap();
-        let group = own.parent().unwrap().to_path_buf();
         assert_eq!(
-            enforce_check_cache_cap(&group, &own, 10_000),
+            enforce_check_cache_cap(&cache, &own, CacheCaps::uniform(10_000)),
             (vec![], false),
             "under the cap"
         );
@@ -8189,7 +8403,7 @@ pub(crate) mod tests {
         // for the other, and this floor's own leaf (under the cap alone) is not cleaned.
         let own_lease = lock_leaf(&own, false).unwrap().unwrap();
         own_lease.set_modified(ago(10)).unwrap();
-        let (removed, own_over) = enforce_check_cache_cap(&group, &own, 1000);
+        let (removed, own_over) = enforce_check_cache_cap(&cache, &own, CacheCaps::uniform(1000));
         assert!(!own_over);
         assert_eq!(
             removed,
@@ -8220,6 +8434,165 @@ pub(crate) mod tests {
             "and re-made for this floor"
         );
         assert_eq!(prepared.root(), own);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A leaf of run `name` over `<base>/<repo>/wicked-worktrees/<name>` holding `bytes` of build
+    /// output, last used `age_s` seconds ago.
+    fn cap_leaf(
+        base: &Path,
+        repo: &str,
+        name: &str,
+        bytes: usize,
+        age_s: u64,
+    ) -> (PathBuf, PathBuf) {
+        let wt = base.join(repo).join("wicked-worktrees").join(name);
+        std::fs::create_dir_all(&wt).unwrap();
+        let leaf = scratch_dir_for(&base.join("cache"), &wt, Some(name));
+        std::fs::create_dir_all(leaf.join("cargo-target").join("head")).unwrap();
+        std::fs::write(leaf.join("cargo-target/head/blob"), vec![0u8; bytes]).unwrap();
+        let lock = std::fs::File::create(lease_path(&leaf)).unwrap();
+        lock.set_modified(std::time::SystemTime::now() - Duration::from_secs(age_s))
+            .unwrap();
+        (wt, leaf)
+    }
+
+    /// (core#1122) The TOTAL cap evicts across repositories: every repository is under its own
+    /// cap, the cache as a whole is not, and the least recently used leaves of ANY repository go
+    /// first until it fits. A leaf a floor holds (here the oldest of all) is never taken, and the
+    /// floor's own leaf is never taken for the others.
+    #[test]
+    fn the_total_cap_evicts_least_recently_used_across_repositories_never_a_leased_leaf() {
+        let base = scratch("cache-total-cap");
+        let cache = base.join("cache");
+        let (_, running) = cap_leaf(&base, "core", "running", 600, 900);
+        let (_, core_old) = cap_leaf(&base, "core", "old", 600, 500);
+        let (_, crew_old) = cap_leaf(&base, "crew", "older", 600, 700);
+        let (_, crew_new) = cap_leaf(&base, "crew", "new", 600, 100);
+        let (own_wt, own) = cap_leaf(&base, "garden", "own", 600, 10);
+        assert_ne!(running.parent(), crew_old.parent(), "two repositories");
+        // A floor of `running` is mid-build.
+        let held = lock_leaf(&running, false).unwrap().unwrap();
+        held.set_modified(std::time::SystemTime::now() - Duration::from_secs(900))
+            .unwrap();
+        let own_lease = lock_leaf(&own, false).unwrap().unwrap();
+        let caps = CacheCaps {
+            repo: 10_000,
+            total: 2_000,
+            idle: CHECK_CACHE_IDLE_TTL,
+        };
+        let (removed, own_over) = enforce_check_cache_cap(&cache, &own, caps);
+        assert!(!own_over);
+        assert_eq!(
+            removed,
+            vec![crew_old.clone(), core_old.clone()],
+            "LRU across repositories, the leased leaf skipped, then stop once it fits"
+        );
+        assert!(
+            running.join("cargo-target/head/blob").is_file(),
+            "never a leased leaf"
+        );
+        assert!(
+            crew_new.join("cargo-target/head/blob").is_file(),
+            "the cache fits"
+        );
+        assert!(
+            own.join("cargo-target/head/blob").is_file(),
+            "never the floor's own"
+        );
+        drop(own_lease);
+        // The same caps through the floor's own prepare: under them now, nothing more goes.
+        let prepared = CheckScratch::prepare_with(&cache, &own_wt, Some("own"), caps).unwrap();
+        assert!(crew_new.is_dir() && running.is_dir());
+        drop(prepared);
+        drop(held);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#1122) The cache's own retention: a leaf unused past [`CacheCaps::idle`] goes whatever
+    /// the caps (a run whose terminal reap never came), unless a floor holds it; a recent leaf stays.
+    #[test]
+    fn an_idle_leaf_goes_whatever_the_caps_unless_a_floor_holds_it() {
+        let base = scratch("cache-idle");
+        let cache = base.join("cache");
+        let day = 86_400;
+        let (_, stale) = cap_leaf(&base, "core", "stale", 10, 9 * day);
+        let (_, stale_held) = cap_leaf(&base, "crew", "stale-held", 10, 9 * day);
+        let (_, recent) = cap_leaf(&base, "crew", "recent", 10, day);
+        let (_, own) = cap_leaf(&base, "core", "own", 10, 0);
+        let held = lock_leaf(&stale_held, false).unwrap().unwrap();
+        held.set_modified(std::time::SystemTime::now() - Duration::from_secs(9 * day))
+            .unwrap();
+        let caps = CacheCaps {
+            repo: u64::MAX,
+            total: u64::MAX,
+            idle: Duration::from_secs(7 * day),
+        };
+        let (removed, own_over) = enforce_check_cache_cap(&cache, &own, caps);
+        assert_eq!(removed, vec![stale.clone()]);
+        assert!(!own_over);
+        assert!(!stale.exists());
+        assert!(stale_held.is_dir(), "a leaf a floor holds is never taken");
+        assert!(recent.is_dir() && own.is_dir());
+        drop(held);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#1122) The cap pass only ever removes run leaves: real directories two levels under the
+    /// cache. A LINK planted as a group or as a leaf (pointing outside the cache) is never
+    /// followed, so nothing outside the cache is ever measured or removed, even at a 0-byte cap.
+    #[cfg(unix)]
+    #[test]
+    fn the_cap_pass_never_removes_anything_outside_the_cache() {
+        let base = scratch("cache-outside");
+        let cache = base.join("cache");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(outside.join("leafish").join("cargo-target")).unwrap();
+        std::fs::write(outside.join("leafish/cargo-target/blob"), vec![0u8; 600]).unwrap();
+        let (_, own) = cap_leaf(&base, "core", "own", 10, 0);
+        let (_, victim) = cap_leaf(&base, "core", "victim", 600, 100);
+        std::os::unix::fs::symlink(&outside, cache.join("linked-group")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("leafish"),
+            own.parent().unwrap().join("linked-leaf"),
+        )
+        .unwrap();
+        let (removed, _) = enforce_check_cache_cap(&cache, &own, CacheCaps::uniform(0));
+        assert_eq!(removed, vec![victim], "only the real run leaf");
+        assert!(outside.join("leafish/cargo-target/blob").is_file());
+        assert!(own
+            .parent()
+            .unwrap()
+            .join("linked-leaf")
+            .symlink_metadata()
+            .is_ok());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#1122) The disk view crew's diagnostics reads: the cache's path and total, each
+    /// repository's bytes (largest first) and leaf count, the caps, and the log store beside it.
+    #[test]
+    fn the_floor_cache_usage_names_the_path_the_total_and_each_repository() {
+        let base = scratch("cache-usage");
+        let cache = base.join("cache");
+        cap_leaf(&base, "core", "a", 700, 0);
+        cap_leaf(&base, "core", "b", 300, 0);
+        cap_leaf(&base, "crew", "c", 200, 0);
+        std::fs::create_dir_all(base.join(crate::floor_log::LOG_SUBDIR).join("r-x")).unwrap();
+        std::fs::write(
+            base.join(crate::floor_log::LOG_SUBDIR).join("r-x/blob"),
+            [0u8; 50],
+        )
+        .unwrap();
+        let u = floor_cache_usage_in(&cache, CacheCaps::uniform(5_000));
+        assert_eq!(u["path"], cache.to_string_lossy().as_ref());
+        assert_eq!(u["bytes"], 1200);
+        assert_eq!(u["totalCapBytes"], 5000);
+        assert_eq!(u["repos"][0]["bytes"], 1000);
+        assert_eq!(u["repos"][0]["leaves"], 2);
+        assert!(u["repos"][0]["name"].as_str().unwrap().starts_with("core-"));
+        assert_eq!(u["repos"][1]["bytes"], 200);
+        assert_eq!(u["logs"]["bytes"], 50);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -8360,7 +8733,7 @@ pub(crate) mod tests {
         // An orphan no floor could retire is removed by the next cap pass, whatever the cap.
         std::fs::create_dir_all(leaf_a.join("home")).unwrap();
         std::fs::write(orphan_path(&leaf_a), b"").unwrap();
-        let (removed, _) = enforce_check_cache_cap(leaf_b.parent().unwrap(), &leaf_b, u64::MAX);
+        let (removed, _) = enforce_check_cache_cap(&cache, &leaf_b, CacheCaps::uniform(u64::MAX));
         assert_eq!(removed, vec![leaf_a.clone()]);
         assert!(!leaf_a.exists() && leaf_b.is_dir());
         drop(floor_b);
@@ -8394,7 +8767,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(leaf.join("cargo-target").join("head")).unwrap();
         std::fs::write(leaf.join("cargo-target/head/blob"), vec![0u8; 64]).unwrap();
         let own = scratch_dir_for(&cache, &other, None);
-        let (removed, _) = enforce_check_cache_cap(leaf.parent().unwrap(), &own, 0);
+        let (removed, _) = enforce_check_cache_cap(&cache, &own, CacheCaps::uniform(0));
         assert!(removed.is_empty(), "{removed:?}");
         assert!(
             leaf.join("cargo-target/head/blob").is_file(),
