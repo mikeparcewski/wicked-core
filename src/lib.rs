@@ -448,6 +448,13 @@ pub fn host_boundary() -> serde_json::Value {
     crate::worker_sandbox::host_boundary()
 }
 
+/// (core#1122) What the repo-checks floor holds on disk — the build cache at
+/// `<worker home>/repo-checks` (by repository, largest first, with its caps) and the floor log
+/// store — for crew's diagnostics and the Nerve Center's disk row. Read-only; walks the cache.
+pub fn floor_cache_usage() -> serde_json::Value {
+    crate::repo_checks::floor_cache_usage()
+}
+
 /// (core#769, crew Agents page A5) The engine's launch bench as a pure predicate: the seats a run
 /// (BOUND to one repository, or not) benches before routing, with the reason that run would
 /// persist on [`AgentSession::benched_seats`] (source `launcher`). Two rules

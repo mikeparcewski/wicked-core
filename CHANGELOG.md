@@ -14,6 +14,19 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The repo-checks floor cache is capped as a whole and dropped at a run's end (#1122, plain PR).** On the
+  test rig one wicked-core run's floor cache (`<worker home>/repo-checks`, the head and base cargo targets)
+  reached 17.7 GB. That was under the 20 GB per-repository cap, and nothing capped the cache across
+  repositories, so the host disk reached 96% and the daemon died on ENOSPC. The cap pass that runs before
+  every floor now also enforces a total cap over every repository (`WICKED_REPO_CHECKS_TOTAL_CAP_GB`,
+  default 40). The least recently used run leaves of any repository go first, and a leaf a floor holds is
+  never taken. The same pass removes a leaf no floor has used for 7 days (the floor log store's TTL). A
+  terminal run's floor cache is now also dropped by its workdir, which covers runs with no registered
+  repository, which the worktree reap never reached. A new static `Core.floorCacheUsage()` in
+  wicked-core-ts reports the cache's path, its size by repository, its caps and the floor log store, for
+  crew's diagnostics. Sharing one build cache across a run's copies is tracked separately: it would weaken
+  the isolation between copies (#1123).
+
 - **`floor probe` writes the guide back as it was written (plain PR).** The probe re-serializes the whole
   guide to record `verified`, and every defaulted field came back even where the author left it out: a
   gate gained `failedExit: []` (refused by the guide's own schema, `minItems: 1`), and `stage: []`,
