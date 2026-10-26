@@ -2659,12 +2659,16 @@ impl CheckScratch {
             // (core#767) A Python journey must not leave `__pycache__/` in the reviewed tree (the
             // worktree guard would deny the engine's own side effect).
             .env("PYTHONDONTWRITEBYTECODE", "1");
-        // The base export is its OWN git repository ([`BaseTree::export`]): every git call a base
-        // check makes (`git grep`, `git rev-parse`) is pinned to it — never discovered upward
-        // into the head worktree, whose index and untracked `tmp/` it must not reach.
+        // The base export is its OWN git repository ([`BaseTree::export`]): a git call a base
+        // check makes (`git grep`, `git rev-parse`) discovers `<base>/.git` first, and the
+        // export's parent is a discovery ceiling, so it never walks up into the head worktree,
+        // whose index and untracked `tmp/` it must not reach. Not `GIT_DIR`/`GIT_WORK_TREE`: every
+        // descendant inherits those, and a check's own `git init <fixture>` / `git -C <fixture>`
+        // would then act on the base repository instead of its fixture.
         if tree == Tree::Base {
-            cmd.env("GIT_DIR", root.join(".git"))
-                .env("GIT_WORK_TREE", root);
+            if let Some(parent) = root.parent() {
+                cmd.env("GIT_CEILING_DIRECTORIES", parent);
+            }
         }
         // (core#767) Playwright resolves its browsers under the user cache, which moved with
         // HOME: pin the operator's installed browsers (read-only to the check — writes stay
@@ -4238,7 +4242,9 @@ pub(crate) fn checkout_guarded_tree(
 /// against bytes recomputed through attributes a check could since have edited.
 #[derive(Debug, Clone)]
 enum Materialized {
-    /// A symlink entry: the raw target (never converted).
+    /// A symlink entry: the raw target (never converted). Read back on unix only: elsewhere a link
+    /// is written as a regular file and recorded as [`Materialized::File`].
+    #[cfg_attr(not(unix), allow(dead_code))]
     Link(Vec<u8>),
     /// A regular file: the length and sha256 of the bytes written (after eol conversion).
     File { len: u64, digest: [u8; 32] },
@@ -4255,10 +4261,33 @@ pub(crate) struct WrittenEntry {
 /// The "no config file" path for `GIT_CONFIG_GLOBAL`.
 const NULL_CONFIG: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
+/// Variables through which an inherited environment could hand git configuration (a
+/// `filter.<x>.smudge` driver, say) or redirect a private repository to other metadata. A caller
+/// that pins `GIT_DIR`/`GIT_WORK_TREE` sets them itself.
+const INHERITED_GIT_ENV: &[&str] = &[
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_ATTR_SOURCE",
+    "GIT_GRAFT_FILE",
+    "GIT_SHALLOW_FILE",
+    "GIT_REPLACE_REF_BASE",
+];
+
 /// Pin a git command the engine runs on a private repository to that repository's own
-/// configuration: no system file, no global/XDG file (`.hardened()` only strips the engine's own
-/// variables, not these).
+/// configuration: no system file, no global/XDG file, and no configuration or repository
+/// redirection handed down through the environment ([`INHERITED_GIT_ENV`]: `GIT_CONFIG_COUNT` /
+/// `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_PARAMETERS` would otherwise reach `cat-file --filters`).
+/// `.hardened()` only strips the engine's own variables, not these.
 fn isolate_git_config(cmd: &mut Command) {
+    for key in INHERITED_GIT_ENV {
+        cmd.env_remove(key);
+    }
     cmd.env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", NULL_CONFIG);
 }
@@ -4470,6 +4499,16 @@ fn cat_batch(
     answered
 }
 
+/// Whether a path component names the export's `.git` on some filesystem: `.git` in any case,
+/// and its NTFS aliases (trailing dots/spaces, an `:` alternate stream, the `git~1` short name),
+/// which Windows resolves to the same directory (git's own `is_ntfs_dotgit`).
+fn names_git_metadata(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.split(':').next().unwrap_or_default();
+    let stem = stem.trim_end_matches(['.', ' ']);
+    stem == ".git" || stem == "git~1"
+}
+
 /// Write every entry of `tree` into `dir` — `ls-tree -r -z`, then `cat-file --batch --filters`
 /// for regular files and `cat-file --batch` for symlink targets — so nothing repository-controlled
 /// runs (no checkout, no filter/smudge/process driver, no hook, no `export-ignore`). Regular files
@@ -4559,7 +4598,7 @@ fn write_tree_blobs_with(
         if rel.is_absolute()
             || path.contains('\n')
             || rel.components().any(|c| match c {
-                std::path::Component::Normal(n) => n.to_string_lossy().eq_ignore_ascii_case(".git"),
+                std::path::Component::Normal(n) => names_git_metadata(&n.to_string_lossy()),
                 _ => true,
             })
         {
@@ -4737,14 +4776,14 @@ fn same_materialized(held: &HeldDir, rel: &str, exec: bool, len: u64, digest: &[
 /// A symlink entry materialized where there are no symlinks (non-unix: [`write_tree_blobs`]
 /// writes a regular file holding the link's target): unchanged only while it is still that regular
 /// file with exactly `target` as its content.
-#[cfg(any(not(unix), test))]
+#[cfg(test)]
 fn same_placeholder(held: &HeldDir, rel: &str, target: &[u8]) -> bool {
     same_file(held, rel, false, target)
 }
 
 /// Is the entry at `rel` of `held` a regular file (opened through no link) with the executable
 /// bit `exec` (unix; git keys on the OWNER execute bit, codex r3) holding exactly `body`?
-#[cfg(any(not(unix), test))]
+#[cfg(test)]
 fn same_file(held: &HeldDir, rel: &str, exec: bool, body: &[u8]) -> bool {
     use std::io::Read;
     let Ok(mut f) = held.open_read(rel) else {
@@ -4807,8 +4846,9 @@ pub(crate) fn guarded_checkout_refused(
 /// [`write_tree_blobs`]: no checkout, so no filter driver), plus a PRIVATE git context of its own
 /// (`.git`: HEAD the base commit, the source objects as a read-only alternate, an index populated
 /// from the base by `read-tree`, an empty hooks dir, no driver config — [`write_private_git_dir`]).
-/// Every base check runs with `GIT_DIR`/`GIT_WORK_TREE` pinned to it ([`CheckScratch::apply_env`]),
-/// so `git grep` and friends see the base and never the head worktree's index or untracked `tmp/`.
+/// A base check's git discovers it first, under a discovery ceiling at the export's parent
+/// ([`CheckScratch::apply_env`]), so `git grep` and friends see the base and never the head
+/// worktree's index or untracked `tmp/`.
 /// Files come from the PINNED git dir (never the worktree's own `.git` file, which the seat could
 /// have redirected). Lives at `<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`] — inside the OS
 /// write boundary, outside the guard's snapshot — so the sandbox wrapper armed for the worktree

@@ -3711,6 +3711,10 @@ fn a_base_that_exited_outside_failed_exit_is_never_inventoried() {
 #[test]
 fn the_floors_copies_keep_the_declared_line_endings() {
     let _load = seam::pin(0.5, 4);
+    if !git_has_attr_source() {
+        eprintln!("SKIP: this git has no --attr-source (< 2.40); the export writes raw blobs (see without_attr_source_the_export_writes_the_raw_blobs)");
+        return;
+    }
     let repo = scratch("export-eol");
     std::fs::write(repo.join(".gitattributes"), "*.cmd text eol=crlf\n").unwrap();
     std::fs::write(repo.join("run.cmd"), "echo ok\n").unwrap();
@@ -3816,6 +3820,75 @@ fn without_attr_source_the_export_writes_the_raw_blobs() {
     }
 }
 
+/// (codex on #1127, P2) Configuration handed down through the environment (`GIT_CONFIG_COUNT` /
+/// `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_PARAMETERS`) never reaches the export's private git: a
+/// `filter.<x>.smudge` driver injected that way would otherwise run under `cat-file --filters`.
+#[cfg(unix)]
+#[test]
+fn inherited_git_config_never_reaches_the_private_repository() {
+    let repo = scratch("export-env-config");
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    git_repo_with_commit(&repo);
+    let ask = |isolate: bool, key: &str| -> bool {
+        // spawn-audit: hardened — `git config --get` on the test's own scratch repository.
+        let mut cmd = std::process::Command::new("git");
+        cmd.hardened()
+            .args(["config", "--get", key])
+            .current_dir(&repo)
+            .env("GIT_DIR", repo.join(".git"))
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "filter.evil.smudge")
+            .env("GIT_CONFIG_VALUE_0", "touch /nonexistent/ran")
+            .env(
+                "GIT_CONFIG_PARAMETERS",
+                "'filter.evil.process'='touch /nonexistent/ran'",
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if isolate {
+            isolate_git_config(&mut cmd);
+        }
+        cmd.status().unwrap().success()
+    };
+    // Without isolation the environment does hand the driver over (the test's premise)…
+    assert!(ask(false, "filter.evil.smudge"));
+    assert!(ask(false, "filter.evil.process"));
+    // …and isolated, it does not.
+    assert!(!ask(true, "filter.evil.smudge"));
+    assert!(!ask(true, "filter.evil.process"));
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (codex on #1127, P2) A tree entry that Windows would resolve to the export's `.git` (NTFS
+/// aliases, as git's `is_ntfs_dotgit`) is refused like `.git` itself; ordinary names are not.
+#[test]
+fn a_tree_entry_aliasing_dot_git_is_refused() {
+    for alias in [
+        ".git",
+        ".GIT",
+        ".git.",
+        ".git ",
+        ".git. .",
+        "git~1",
+        "GIT~1",
+        ".git::$INDEX_ALLOCATION",
+        "git~1:stream",
+    ] {
+        assert!(names_git_metadata(alias), "{alias:?} aliases .git");
+    }
+    for name in [
+        ".gitignore",
+        ".github",
+        "git",
+        "git~2",
+        ".gitattributes",
+        "x.git",
+        ".git-blame-ignore-revs",
+    ] {
+        assert!(!names_git_metadata(name), "{name:?} is an ordinary entry");
+    }
+}
+
 /// A passing report to hand `hold_to` (it only ever flips `passed` to false).
 #[cfg(unix)]
 fn guarded_report_stub(repo: &Path) -> RepoChecksReport {
@@ -3855,9 +3928,13 @@ fn git_inside_a_base_check_sees_the_base_and_never_the_head() {
     let scratch_dir = CheckScratch::prepare(&repo).unwrap();
     let root = crate::repo_checks::HeldDir::open(&repo).unwrap();
     let base = BaseTree::export(&repo, &root, &repo.join(".git"), &head).unwrap();
+    // The check's own fixture repository (`git init <dir>`, `git -C <dir>`) is ITS repository,
+    // not the base's: nothing pins the base's git dir for descendants (codex on #1127).
     let probe_script = "git rev-parse --show-toplevel && git rev-parse HEAD && \
          git rev-parse --absolute-git-dir && git grep -l BASE_ONLY -- . && \
-         ! git grep -q HEAD_ONLY -- . && ! git grep -q decoy -- .";
+         ! git grep -q HEAD_ONLY -- . && ! git grep -q decoy -- . && \
+         fx=\"$TMPDIR/fixture-$$\" && rm -rf \"$fx\" && mkdir -p \"$fx\" && git init -q \"$fx\" && \
+         test -d \"$fx/.git\" && [ \"$(git -C \"$fx\" rev-parse --absolute-git-dir)\" = \"$(cd \"$fx/.git\" && pwd -P)\" ]";
     for dir in ["", "pkg"] {
         let check = RepoCheck {
             name: "test".into(),
@@ -3900,6 +3977,10 @@ fn git_inside_a_base_check_sees_the_base_and_never_the_head() {
 #[test]
 fn a_sha256_repository_exports_with_its_line_endings() {
     let _load = seam::pin(0.5, 4);
+    if !git_has_attr_source() {
+        eprintln!("SKIP: this git has no --attr-source (< 2.40); the export writes raw blobs");
+        return;
+    }
     let repo = scratch("export-sha256");
     std::fs::write(repo.join(".gitattributes"), "*.cmd text eol=crlf\n").unwrap();
     std::fs::write(repo.join("run.cmd"), "echo ok\n").unwrap();
