@@ -93,12 +93,19 @@ Desktop, `podman machine start`, `colima start`), then retry)\n(seat 'a' could n
 governed unit: its seat container did not arm — container_runtime_down: a container runtime CLI \
 is installed but its engine did not answer)";
 
-/// Seat `a`'s first `fail_first` dispatches end on the runtime-unavailable line, then succeed;
-/// every dispatch's seat is recorded.
+/// The floor's own refusal (`worker_sandbox::floor_refusal_text`), as the runner's first line.
+const FLOOR_REFUSAL: &str = "(seat 'a' could not run this governed unit: its seat container did \
+not arm — container_runtime_down: a container runtime CLI is installed but its engine did not \
+answer (`<runtime> version` failed) — start it and retry; the unit is refused rather than run \
+outside the floor (fail closed) — fix it, or let the run fail over to an eligible seat)";
+
+/// Seat `a`'s first `fail_first` dispatches end on `text` (the runtime-unavailable line unless
+/// set), then succeed; every dispatch's seat is recorded.
 struct RuntimeDown {
     fail_first: u32,
     calls: AtomicU32,
     seats: Mutex<Vec<String>>,
+    text: &'static str,
 }
 impl StepRunner for RuntimeDown {
     fn run_unit(&self, i: &StepInput) -> StepOutput {
@@ -106,7 +113,7 @@ impl StepRunner for RuntimeDown {
         self.seats.lock().unwrap().push(seat);
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         let (output, status) = if n < self.fail_first {
-            (RUNTIME_UNAVAILABLE.to_string(), StepStatus::Failed)
+            (self.text.to_string(), StepStatus::Failed)
         } else {
             ("ok".to_string(), StepStatus::Ok)
         };
@@ -164,6 +171,7 @@ fn a_runtime_that_stayed_down_pauses_as_infrastructure_and_approve_retries_the_s
         fail_first: 1,
         calls: AtomicU32::new(0),
         seats: Mutex::new(Vec::new()),
+        text: RUNTIME_UNAVAILABLE,
     });
     let core = Core::spawn_with_engine(
         ":memory:".to_string(),
@@ -262,6 +270,7 @@ fn an_autonomous_run_fails_on_a_runtime_that_stayed_down_without_touching_the_se
         fail_first: u32::MAX,
         calls: AtomicU32::new(0),
         seats: Mutex::new(Vec::new()),
+        text: RUNTIME_UNAVAILABLE,
     });
     let core = Core::spawn_with_engine(
         ":memory:".to_string(),
@@ -289,6 +298,33 @@ fn an_autonomous_run_fails_on_a_runtime_that_stayed_down_without_touching_the_se
         vec!["a".to_string()],
         "never failed over to b"
     );
+}
+
+/// A raw floor refusal that reaches the actor is the runtime's too: no failover to `b`.
+#[test]
+fn the_floors_raw_runtime_refusal_never_fails_over_to_another_seat() {
+    let sid = "runtime-raw-refusal";
+    let runner = Arc::new(RuntimeDown {
+        fail_first: 1,
+        calls: AtomicU32::new(0),
+        seats: Mutex::new(Vec::new()),
+        text: FLOOR_REFUSAL,
+    });
+    let core = Core::spawn_with_engine(
+        ":memory:".to_string(),
+        Arc::new(NumericDispatcher),
+        runner.clone(),
+    );
+    let ev = core.subscribe();
+    core.launch_run(attended(sid, vec![cli("a"), cli("b")]))
+        .expect("launch");
+    let collected = drain(&ev, sid, true);
+    assert!(
+        collected.iter().any(|e| matches!(e,
+            CoreEvent::AwaitingHuman { session, gate_kind, .. } if session == sid && gate_kind == "failure")),
+        "{collected:?}"
+    );
+    assert_eq!(*runner.seats.lock().unwrap(), vec!["a".to_string()]);
 }
 
 // ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────

@@ -2523,14 +2523,19 @@ impl WrappedCliStepRunner {
                 .is_some_and(|&bound| key.launch_seq <= bound)
     }
 
-    /// (PRODUCT-WORKS J4) [`Self::exec`], riding out a container runtime blip: a seat-container
-    /// unit that failed while the runtime does not answer waits for it (bounded, with backoff,
+    /// (PRODUCT-WORKS J4) [`Self::exec`], riding out a container runtime blip: a governed
+    /// seat-container unit that failed while the runtime does not answer waits for it (bounded, with backoff,
     /// each step on the wire as `containerRuntimeWait`) and re-runs on the SAME seat once it is
     /// back; a runtime that stays down ends as the runner's infrastructure line, never as the
     /// seat's failure ([`crate::runtime_wait`]).
     fn exec_through_runtime_blips(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
         let first = self.exec(input, emit);
+        // A run's governed unit only: the engine's own judge / triage / ballot sessions keep their
+        // own failure handling and budgets, and are never benched for a runtime fault (xreview on
+        // #1129 — a judge rotation would otherwise wait a whole window per judge seat).
         if first.status != StepStatus::Failed
+            || input.governance.is_none()
+            || is_engine_internal(&input.unit)
             || !uses_container_seat(
                 runs_in_seat(input),
                 crate::container_floor::container_mode(),
@@ -2560,6 +2565,7 @@ impl WrappedCliStepRunner {
             }
             !self.launch_cancelled(input)
         };
+        let cancelled = || self.launch_cancelled(input);
         let elapsed = || start.elapsed();
         let mut notify = |phase: crate::runtime_wait::WaitPhase, waited: Duration| {
             eprintln!(
@@ -2592,6 +2598,7 @@ impl WrappedCliStepRunner {
             crate::runtime_wait::Host {
                 down_now: &mut down_now,
                 sleep: &mut sleep,
+                cancelled: &cancelled,
                 elapsed: &elapsed,
                 notify: &mut notify,
             },

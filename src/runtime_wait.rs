@@ -5,9 +5,9 @@
 //! ladder counted both as seat failures, and the run parked at a dead-seat card that offered only
 //! a quota-benched seat. Nothing was wrong with either seat.
 //!
-//! The wrapped runner now reads a failed seat-container unit against a FRESH runtime probe (the
-//! cached [`crate::container_floor::runtime`] answer outlives a restart). While the runtime is
-//! down it waits, with backoff, up to a bounded window ([`WINDOW_ENV`], default
+//! The wrapped runner now reads a failed governed seat-container unit against a FRESH probe of
+//! the runtime the seats use (the cached [`crate::container_floor::runtime`] answer outlives a
+//! restart). While the runtime is down it waits, with backoff, up to a bounded window ([`WINDOW_ENV`], default
 //! [`DEFAULT_WINDOW`]) and re-runs the unit on the SAME seat once the runtime answers again. Each
 //! step is on the wire (`containerRuntimeWait`), so the run says "waiting for the container
 //! runtime". When the window runs out the unit's output is the runner's own
@@ -43,16 +43,14 @@ fn window_from(v: Option<&str>) -> Duration {
         .unwrap_or(DEFAULT_WINDOW)
 }
 
-/// Whether a failed unit's output names the container runtime as the cause: the floor's own
-/// `container_runtime_down` refusal, or the runtime client's words when its engine went away
-/// under a running seat.
-pub(crate) fn names_runtime_fault(output: &str) -> bool {
-    let o = output.to_ascii_lowercase();
-    o.contains("container_runtime_down")
-        || o.contains("cannot connect to the docker daemon")
-        || o.contains("is the docker daemon running")
-        || o.contains("cannot connect to podman")
-        || o.contains("error during connect")
+/// Whether a failed unit's output is the floor's OWN `container_runtime_down` refusal
+/// ([`crate::worker_sandbox::floor_refusal_text`]): the runner's first line, never a substring of
+/// a worker's transcript (a unit that greps this file, or logs an unrelated connection error, is
+/// not a runtime fault — xreview on #1129).
+pub(crate) fn is_floor_runtime_refusal(output: &str) -> bool {
+    let first = output.trim_start().lines().next().unwrap_or("");
+    first.starts_with("(seat '")
+        && first.contains("its seat container did not arm — container_runtime_down")
 }
 
 /// Whether `output` is the runner's "the runtime stayed down" line ([`unavailable_output`]).
@@ -80,10 +78,13 @@ impl WaitPhase {
 
 /// What the wait needs from the host, injected so the policy is testable without a runtime.
 pub(crate) struct Host<'a> {
-    /// A fresh probe: the runtime CLI is installed and its engine does not answer.
+    /// A fresh probe of the runtime the seats use: its CLI is installed and its engine does not
+    /// answer.
     pub(crate) down_now: &'a mut dyn FnMut() -> bool,
     /// Pause for the duration; `false` when the unit's launch was cancelled meanwhile.
     pub(crate) sleep: &'a mut dyn FnMut(Duration) -> bool,
+    /// Whether the unit's launch was cancelled (its run ended, a reassign superseded it).
+    pub(crate) cancelled: &'a dyn Fn() -> bool,
     /// Time since an arbitrary fixed start.
     pub(crate) elapsed: &'a dyn Fn() -> Duration,
     /// Report one step of the wait and the time waited so far.
@@ -91,10 +92,13 @@ pub(crate) struct Host<'a> {
 }
 
 /// Ride a unit's failure out when the container runtime caused it: wait for the runtime, then
-/// re-run the unit (`rerun`) on the same seat. Any other outcome is returned unchanged: a success,
-/// a failure while the runtime answers that does not name it, a cancelled wait. A runtime that
-/// stays down for the whole `window` (summed over the unit's re-runs) yields
-/// [`unavailable_output`].
+/// re-run the unit (`rerun`) on the same seat. It is the runtime's fault when a fresh probe finds
+/// it down, or when the output is the floor's own `container_runtime_down` refusal (a blip already
+/// over by the probe). Any other outcome is returned unchanged: a success, a seat's own failure
+/// while the runtime answers, a cancelled launch. The window bounds the time spent WAITING (summed
+/// over the unit's re-runs; a re-run's own execution never counts against it). A runtime that
+/// stays down for the whole window, or still faults after [`MAX_RERUNS`] re-runs, yields
+/// [`unavailable_output`] — never the raw failure, which the actor would read as the seat's.
 pub(crate) fn ride_out(
     first: StepOutput,
     cli: &str,
@@ -104,20 +108,29 @@ pub(crate) fn ride_out(
 ) -> StepOutput {
     let mut out = first;
     let mut reruns = 0;
-    let mut wait_began: Option<Duration> = None;
+    // Time spent waiting so far, over every wait of this unit.
+    let mut waited = Duration::ZERO;
     loop {
-        if out.status != StepStatus::Failed || reruns >= MAX_RERUNS {
+        if out.status != StepStatus::Failed {
             return out;
         }
         let down = (host.down_now)();
-        if !down && !names_runtime_fault(&out.output) {
+        if !down && !is_floor_runtime_refusal(&out.output) {
             return out;
         }
+        if (host.cancelled)() {
+            return out;
+        }
+        if reruns >= MAX_RERUNS {
+            (host.notify)(WaitPhase::Unavailable, waited);
+            return unavailable_output(&out, cli, waited);
+        }
         if down {
-            let began = *wait_began.get_or_insert_with(|| (host.elapsed)());
+            let began = (host.elapsed)();
+            let before = waited;
             let mut step = FIRST_STEP;
             loop {
-                let waited = (host.elapsed)().saturating_sub(began);
+                waited = before + (host.elapsed)().saturating_sub(began);
                 if waited >= window {
                     (host.notify)(WaitPhase::Unavailable, waited);
                     return unavailable_output(&out, cli, waited);
@@ -127,16 +140,22 @@ pub(crate) fn ride_out(
                     return out;
                 }
                 step = (step * 2).min(MAX_STEP);
-                if !(host.down_now)() {
+                let still_down = (host.down_now)();
+                // A probe can take its own timeout: the launch may have ended meanwhile.
+                if (host.cancelled)() {
+                    return out;
+                }
+                if !still_down {
                     break;
                 }
             }
+            waited = before + (host.elapsed)().saturating_sub(began);
         }
-        // The runtime answers (again): the unit re-runs on the same seat.
-        let waited = wait_began
-            .map(|b| (host.elapsed)().saturating_sub(b))
-            .unwrap_or_default();
-        (host.notify)(WaitPhase::Recovered, waited);
+        // The runtime answers (again): the unit re-runs on the same seat. `recovered` follows a
+        // wait only (a floor refusal the probe already finds healthy re-runs without a frame).
+        if down {
+            (host.notify)(WaitPhase::Recovered, waited);
+        }
         reruns += 1;
         out = rerun();
     }
@@ -186,32 +205,53 @@ mod tests {
         }
     }
 
-    const DOWN: &str =
-        "(seat 'claude' could not run this governed unit: its seat container did not \
-                        arm — container_runtime_down: a container runtime CLI is installed but its \
-                        engine did not answer)";
+    /// The floor's own refusal, exactly as `worker_sandbox::floor_refusal_text` renders it.
+    fn down_text() -> String {
+        crate::worker_sandbox::floor_refusal_text(
+            "claude",
+            crate::worker_sandbox::FloorUnarmed::ContainerRuntimeDown,
+        )
+    }
 
-    /// A fake host: the runtime is down for the first `down_probes` probes; sleeping advances the
-    /// clock; every notify is recorded.
+    /// A fake host: probe `n` answers `down(n)`; sleeping advances the clock, and so can a probe
+    /// (`probe_cost`) and a re-run (`rerun_cost`); every notify is recorded.
     struct Fake {
         probes: Cell<u32>,
-        down_probes: u32,
+        down: Box<dyn Fn(u32) -> bool>,
         clock: Cell<Duration>,
+        probe_cost: Duration,
+        rerun_cost: Duration,
         notes: RefCell<Vec<(WaitPhase, u64)>>,
         cancel_after_sleeps: Option<u32>,
+        cancel_after_probes: Option<u32>,
         sleeps: Cell<u32>,
     }
 
     impl Fake {
         fn new(down_probes: u32) -> Self {
+            Self::with(move |n| n < down_probes)
+        }
+
+        fn with(down: impl Fn(u32) -> bool + 'static) -> Self {
             Fake {
                 probes: Cell::new(0),
-                down_probes,
+                down: Box::new(down),
                 clock: Cell::new(Duration::ZERO),
+                probe_cost: Duration::ZERO,
+                rerun_cost: Duration::ZERO,
                 notes: RefCell::new(Vec::new()),
                 cancel_after_sleeps: None,
+                cancel_after_probes: None,
                 sleeps: Cell::new(0),
             }
+        }
+
+        fn cancelled(&self) -> bool {
+            self.cancel_after_sleeps
+                .is_some_and(|n| self.sleeps.get() >= n)
+                || self
+                    .cancel_after_probes
+                    .is_some_and(|n| self.probes.get() >= n)
         }
 
         fn ride(
@@ -223,20 +263,22 @@ mod tests {
             let mut down_now = || {
                 let n = self.probes.get();
                 self.probes.set(n + 1);
-                n < self.down_probes
+                self.clock.set(self.clock.get() + self.probe_cost);
+                (self.down)(n)
             };
             let mut sleep = |d: Duration| {
                 self.clock.set(self.clock.get() + d);
                 self.sleeps.set(self.sleeps.get() + 1);
-                self.cancel_after_sleeps
-                    .is_none_or(|n| self.sleeps.get() < n)
+                !self.cancelled()
             };
+            let cancelled = || self.cancelled();
             let elapsed = || self.clock.get();
             let mut notify =
                 |p: WaitPhase, w: Duration| self.notes.borrow_mut().push((p, w.as_secs()));
             let mut ran = 0;
             let mut rerun = || {
                 ran += 1;
+                self.clock.set(self.clock.get() + self.rerun_cost);
                 if reruns.is_empty() {
                     out(StepStatus::Ok, "done")
                 } else {
@@ -250,6 +292,7 @@ mod tests {
                 Host {
                     down_now: &mut down_now,
                     sleep: &mut sleep,
+                    cancelled: &cancelled,
                     elapsed: &elapsed,
                     notify: &mut notify,
                 },
@@ -257,13 +300,17 @@ mod tests {
             );
             (got, ran)
         }
+
+        fn phases(&self) -> Vec<WaitPhase> {
+            self.notes.borrow().iter().map(|n| n.0).collect()
+        }
     }
 
     #[test]
     fn a_runtime_that_comes_back_re_runs_the_unit_on_the_same_seat() {
         let fake = Fake::new(3);
         let (got, ran) = fake.ride(
-            out(StepStatus::Failed, DOWN),
+            out(StepStatus::Failed, &down_text()),
             DEFAULT_WINDOW,
             &mut Vec::new(),
         );
@@ -287,7 +334,7 @@ mod tests {
     fn a_runtime_down_for_the_whole_window_escalates_as_infrastructure_not_as_the_seat() {
         let fake = Fake::new(u32::MAX);
         let (got, ran) = fake.ride(
-            out(StepStatus::Failed, DOWN),
+            out(StepStatus::Failed, &down_text()),
             DEFAULT_WINDOW,
             &mut Vec::new(),
         );
@@ -302,10 +349,7 @@ mod tests {
         assert!(got.output.contains("not the seat's"), "{}", got.output);
         // Bounded: the clock never ran past the window.
         assert_eq!(fake.clock.get(), DEFAULT_WINDOW);
-        assert_eq!(
-            fake.notes.borrow().last().map(|n| n.0),
-            Some(WaitPhase::Unavailable)
-        );
+        assert_eq!(fake.phases().last(), Some(&WaitPhase::Unavailable));
         // Backoff capped at 30 s: 2,4,8,16,30,30,30,30,30 = 180.
         assert_eq!(fake.sleeps.get(), 9);
     }
@@ -313,7 +357,7 @@ mod tests {
     #[test]
     fn the_runners_unavailable_line_is_never_read_as_a_seat_refusal() {
         let got = unavailable_output(
-            &out(StepStatus::Failed, DOWN),
+            &out(StepStatus::Failed, &down_text()),
             "copilot",
             Duration::from_secs(180),
         );
@@ -338,6 +382,23 @@ mod tests {
         assert_eq!(fake.probes.get(), 1, "one fresh probe decides");
     }
 
+    /// xreview on #1129 (codex 4, agy 1): runtime words inside a worker's transcript are data, not
+    /// a runtime fault — with the runtime answering, nothing re-runs.
+    #[test]
+    fn runtime_words_in_a_transcript_never_re_run_a_unit_while_the_runtime_answers() {
+        for text in [
+            "(cli `claude` exited 1) application service: error during connect: TLS error",
+            "(cli `claude` exited 1) docker: Cannot connect to the Docker daemon. Is the docker daemon running?",
+            "(cli `claude` exited 1) grep: src/worker_sandbox.rs: container_runtime_down",
+            "test failed\n(seat 'claude' could not run this governed unit: its seat container did not arm — container_runtime_down",
+        ] {
+            let fake = Fake::new(0);
+            let (got, ran) = fake.ride(out(StepStatus::Failed, text), DEFAULT_WINDOW, &mut Vec::new());
+            assert_eq!((ran, got.output.as_str()), (0, text));
+            assert!(fake.notes.borrow().is_empty());
+        }
+    }
+
     #[test]
     fn a_success_is_never_probed() {
         let fake = Fake::new(u32::MAX);
@@ -347,69 +408,61 @@ mod tests {
     }
 
     #[test]
-    fn a_blip_already_over_re_runs_when_the_output_names_the_runtime() {
+    fn the_floors_refusal_re_runs_when_the_blip_is_already_over() {
         let fake = Fake::new(0);
-        let failed = out(
-            StepStatus::Failed,
-            "docker: Cannot connect to the Docker daemon at unix:///x/docker.sock. Is the docker daemon running?",
+        let (got, ran) = fake.ride(
+            out(StepStatus::Failed, &down_text()),
+            DEFAULT_WINDOW,
+            &mut Vec::new(),
         );
-        let (got, ran) = fake.ride(failed, DEFAULT_WINDOW, &mut Vec::new());
         assert_eq!((got.status, ran), (StepStatus::Ok, 1));
+        assert!(
+            fake.notes.borrow().is_empty(),
+            "no wait, no recovered frame"
+        );
     }
 
+    /// xreview on #1129 (codex 2, agy 2): a runtime that keeps faulting through every re-run ends
+    /// as the runner's infrastructure line, never as the raw refusal the actor would bench for.
     #[test]
-    fn re_runs_are_bounded_when_the_output_keeps_naming_the_runtime() {
+    fn re_runs_are_bounded_and_end_as_infrastructure_when_the_runtime_keeps_faulting() {
         let fake = Fake::new(0);
-        let mut reruns: Vec<StepOutput> = (0..10).map(|_| out(StepStatus::Failed, DOWN)).collect();
-        let (got, ran) = fake.ride(out(StepStatus::Failed, DOWN), DEFAULT_WINDOW, &mut reruns);
+        let mut reruns: Vec<StepOutput> = (0..10)
+            .map(|_| out(StepStatus::Failed, &down_text()))
+            .collect();
+        let (got, ran) = fake.ride(
+            out(StepStatus::Failed, &down_text()),
+            DEFAULT_WINDOW,
+            &mut reruns,
+        );
         assert_eq!(ran, MAX_RERUNS);
-        assert_eq!(got.status, StepStatus::Failed);
+        assert!(is_runtime_unavailable(&got.output), "{}", got.output);
     }
 
+    /// agy 3 on #1129: a re-run's own execution never counts against the wait window.
     #[test]
-    fn the_window_is_shared_across_re_runs() {
-        // Down 3 probes, back (re-run fails with the runtime down again), then down for good.
-        let fake = Fake::new(3);
-        let mut reruns = vec![out(StepStatus::Failed, DOWN)];
-        let (got, ran) = {
-            // Probes 0-2 find it down, probe 3 answers (the unit re-runs), every later one is down.
-            let probes = Cell::new(0u32);
-            let mut down_now = || {
-                let n = probes.get();
-                probes.set(n + 1);
-                n != 3
-            };
-            let mut sleep = |d: Duration| {
-                fake.clock.set(fake.clock.get() + d);
-                true
-            };
-            let elapsed = || fake.clock.get();
-            let mut notify = |_: WaitPhase, _: Duration| {};
-            let mut ran = 0;
-            let mut rerun = || {
-                ran += 1;
-                reruns.remove(0)
-            };
-            let got = ride_out(
-                out(StepStatus::Failed, DOWN),
-                "claude",
-                DEFAULT_WINDOW,
-                Host {
-                    down_now: &mut down_now,
-                    sleep: &mut sleep,
-                    elapsed: &elapsed,
-                    notify: &mut notify,
-                },
-                &mut rerun,
-            );
-            (got, ran)
-        };
+    fn the_window_counts_waiting_only_and_is_shared_across_re_runs() {
+        // Probes 0-2 down, probe 3 answers (re-run, which takes 10 minutes and faults again),
+        // then down for good.
+        let mut fake = Fake::with(|n| n != 3);
+        fake.rerun_cost = Duration::from_secs(600);
+        let mut reruns = vec![out(StepStatus::Failed, &down_text())];
+        let (got, ran) = fake.ride(
+            out(StepStatus::Failed, &down_text()),
+            DEFAULT_WINDOW,
+            &mut reruns,
+        );
         assert_eq!(ran, 1);
         assert!(is_runtime_unavailable(&got.output), "{}", got.output);
+        assert!(
+            got.output.contains("did not answer for 180s"),
+            "{}",
+            got.output
+        );
         assert_eq!(
             fake.clock.get(),
-            DEFAULT_WINDOW,
-            "one window in total, not one per re-run"
+            DEFAULT_WINDOW + Duration::from_secs(600),
+            "one 180 s window of waiting in total, plus the re-run's own time"
         );
     }
 
@@ -418,20 +471,36 @@ mod tests {
         let mut fake = Fake::new(u32::MAX);
         fake.cancel_after_sleeps = Some(2);
         let (got, ran) = fake.ride(
-            out(StepStatus::Failed, DOWN),
+            out(StepStatus::Failed, &down_text()),
             DEFAULT_WINDOW,
             &mut Vec::new(),
         );
         assert_eq!(ran, 0);
-        assert_eq!(got.output, DOWN);
+        assert_eq!(got.output, down_text());
         assert_eq!(fake.sleeps.get(), 2);
+    }
+
+    /// codex 3 on #1129: a launch cancelled while a probe ran does not re-run, even once the
+    /// runtime answers.
+    #[test]
+    fn a_launch_cancelled_during_a_probe_never_re_runs() {
+        // Probe 0 finds it down; the launch is cancelled while probe 1 runs, which then answers.
+        let mut fake = Fake::new(1);
+        fake.probe_cost = Duration::from_secs(15);
+        fake.cancel_after_probes = Some(2);
+        let (_, ran) = fake.ride(
+            out(StepStatus::Failed, &down_text()),
+            DEFAULT_WINDOW,
+            &mut Vec::new(),
+        );
+        assert_eq!(ran, 0);
     }
 
     #[test]
     fn a_zero_window_escalates_at_once() {
         let fake = Fake::new(u32::MAX);
         let (got, _) = fake.ride(
-            out(StepStatus::Failed, DOWN),
+            out(StepStatus::Failed, &down_text()),
             Duration::ZERO,
             &mut Vec::new(),
         );
@@ -448,19 +517,16 @@ mod tests {
     }
 
     #[test]
-    fn runtime_fault_words_are_recognised_and_other_failures_are_not() {
-        assert!(names_runtime_fault(DOWN));
-        assert!(names_runtime_fault(
-            "error during connect: Get \"http://%2F%2F.%2Fpipe\": EOF"
+    fn only_the_floors_own_runtime_refusal_is_a_runtime_fault() {
+        assert!(is_floor_runtime_refusal(&down_text()));
+        assert!(!is_floor_runtime_refusal(
+            &crate::worker_sandbox::floor_refusal_text(
+                "claude",
+                crate::worker_sandbox::FloorUnarmed::NoSeatImage,
+            )
         ));
-        assert!(names_runtime_fault(
-            "Cannot connect to Podman. Please verify your connection"
-        ));
-        assert!(!names_runtime_fault(
+        assert!(!is_floor_runtime_refusal(
             "(cli `claude` exited 1) Not logged in"
-        ));
-        assert!(!names_runtime_fault(
-            "no_seat_image: the seat's container image is not defined"
         ));
     }
 }

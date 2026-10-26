@@ -6174,7 +6174,10 @@ fn apply_step_result(
     // reassign is offered); Approve re-dispatches it on the same seat. Autonomous runs fail.
     if output.status == crate::workflow::StepStatus::Failed
         && unit.tool_cmd.is_none()
-        && crate::runtime_wait::is_runtime_unavailable(&output.output)
+        && (crate::runtime_wait::is_runtime_unavailable(&output.output)
+            // The floor's raw refusal reaches here only past the runner's wait (a launch it
+            // saw cancelled); it is still the runtime's, never the seat's (xreview on #1129).
+            || crate::runtime_wait::is_floor_runtime_refusal(&output.output))
     {
         let human_present = !matches!(session.human_confirm, crate::domain::HumanConfirm::None);
         let cli = unit
