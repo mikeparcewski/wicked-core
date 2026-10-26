@@ -2962,28 +2962,40 @@ struct CapCandidate {
     bytes: u64,
 }
 
-/// Remove `leaf` for the cap pass, only under its EXCLUSIVE lock: `Some(true)` removed (or gone
-/// since the scan), `Some(false)` a floor holds it (never taken), `None` the removal failed (logged).
-fn evict_leaf(leaf: &Path) -> Option<bool> {
+/// What the cap pass's removal attempt on one leaf came to ([`evict_leaf`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evicted {
+    /// This pass removed it.
+    Removed,
+    /// Gone since the scan (a run's terminal reap): nothing removed, nothing to log.
+    AlreadyGone,
+    /// A floor holds its lease (never taken), or the removal failed (logged).
+    Kept,
+}
+
+/// Remove `leaf` for the cap pass, only under its EXCLUSIVE lock. A floor holds a SHARED lock for
+/// its life, so a leaf a floor is building into is never removed.
+fn evict_leaf(leaf: &Path) -> Evicted {
     match lock_leaf(leaf, true) {
+        Ok(Some(_held)) if std::fs::symlink_metadata(leaf).is_err() => Evicted::AlreadyGone,
         Ok(Some(_held)) => match remove_leaf_dir(leaf) {
-            Ok(()) => Some(true),
+            Ok(()) => Evicted::Removed,
             Err(e) => {
                 eprintln!(
                     "wicked-core: repo checks floor — could not remove the check scratch {}: {e}",
                     leaf.display()
                 );
-                None
+                Evicted::Kept
             }
         },
         // A floor is building into it right now: it is not this cap's to take.
-        Ok(None) => Some(false),
+        Ok(None) => Evicted::Kept,
         Err(e) => {
             eprintln!(
                 "wicked-core: repo checks floor — could not lock the check scratch {}: {e}",
                 leaf.display()
             );
-            None
+            Evicted::Kept
         }
     }
 }
@@ -3024,6 +3036,7 @@ pub(crate) fn enforce_check_cache_cap(
     let gb = |b: u64| b as f64 / 1e9;
     let mut own_bytes = 0u64;
     let mut others: Vec<CapCandidate> = Vec::new();
+    let mut held_orphans: Vec<(PathBuf, u64)> = Vec::new();
     let dirs = |d: &Path| -> Vec<PathBuf> {
         std::fs::read_dir(d)
             .into_iter()
@@ -3049,6 +3062,10 @@ pub(crate) fn enforce_check_cache_cap(
                         leaf.display()
                     );
                     removed.push(leaf);
+                } else {
+                    // (codex on #1124) Still held by a floor: not removable now, but its bytes
+                    // are on disk and count against both caps.
+                    held_orphans.push((group.clone(), tree_bytes(&leaf)));
                 }
                 continue;
             }
@@ -3063,7 +3080,7 @@ pub(crate) fn enforce_check_cache_cap(
                 .unwrap_or(std::time::UNIX_EPOCH);
             // (core#1122) The cache's own retention: unused this long, it goes.
             let idle = now.duration_since(used).unwrap_or_default();
-            if idle > caps.idle && evict_leaf(&leaf) == Some(true) {
+            if idle > caps.idle && evict_leaf(&leaf) == Evicted::Removed {
                 eprintln!(
                     "wicked-core: repo checks floor — removed the check scratch {} ({:.1} GB), \
                      unused for {} day(s)",
@@ -3082,11 +3099,16 @@ pub(crate) fn enforce_check_cache_cap(
             });
         }
     }
-    let mut total: u64 = own_bytes + others.iter().map(|c| c.bytes).sum::<u64>();
+    let mut total: u64 = own_bytes
+        + others.iter().map(|c| c.bytes).sum::<u64>()
+        + held_orphans.iter().map(|o| o.1).sum::<u64>();
     let mut per_group: std::collections::HashMap<PathBuf, u64> = std::collections::HashMap::new();
     *per_group.entry(own_group.clone()).or_default() += own_bytes;
     for c in &others {
         *per_group.entry(c.group.clone()).or_default() += c.bytes;
+    }
+    for (g, bytes) in &held_orphans {
+        *per_group.entry(g.clone()).or_default() += bytes;
     }
     let own_over = own_bytes > caps.repo.min(caps.total);
     if total <= caps.total && per_group.values().all(|&b| b <= caps.repo) {
@@ -3099,8 +3121,16 @@ pub(crate) fn enforce_check_cache_cap(
         if !over_total && !over_repo {
             continue;
         }
-        if evict_leaf(&c.leaf) != Some(true) {
-            continue;
+        match evict_leaf(&c.leaf) {
+            Evicted::Removed => {}
+            Evicted::AlreadyGone => {
+                total = total.saturating_sub(c.bytes);
+                if let Some(g) = per_group.get_mut(&c.group) {
+                    *g = g.saturating_sub(c.bytes);
+                }
+                continue;
+            }
+            Evicted::Kept => continue,
         }
         let why = if over_total {
             format!(
@@ -8506,6 +8536,40 @@ pub(crate) mod tests {
         assert!(crew_new.is_dir() && running.is_dir());
         drop(prepared);
         drop(held);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (codex on #1124) An orphaned leaf a floor still holds cannot be removed, but its bytes are on
+    /// disk: they count against the total cap, so an unleased leaf of another repository goes.
+    /// A leaf gone since the scan is never reported as this pass's eviction.
+    #[test]
+    fn a_held_orphan_counts_against_the_total_cap_and_a_vanished_leaf_is_not_an_eviction() {
+        let base = scratch("cache-held-orphan");
+        let cache = base.join("cache");
+        let (_, orphan) = cap_leaf(&base, "core", "orphan", 800, 50);
+        let (_, parked) = cap_leaf(&base, "crew", "parked", 600, 100);
+        let (_, own) = cap_leaf(&base, "garden", "own", 400, 0);
+        let held = lock_leaf(&orphan, false).unwrap().unwrap();
+        std::fs::write(orphan_path(&orphan), b"").unwrap();
+        let caps = CacheCaps {
+            repo: u64::MAX,
+            total: 1_200,
+            idle: CHECK_CACHE_IDLE_TTL,
+        };
+        let (removed, own_over) = enforce_check_cache_cap(&cache, &own, caps);
+        assert!(!own_over);
+        assert_eq!(
+            removed,
+            vec![parked.clone()],
+            "800 + 600 + 400 is over 1200"
+        );
+        assert!(
+            orphan.join("cargo-target/head/blob").is_file(),
+            "the held orphan stays"
+        );
+        drop(held);
+        // A leaf whose directory is gone (a reap between scan and lock) is not this pass's removal.
+        assert_eq!(evict_leaf(&parked), Evicted::AlreadyGone);
         let _ = std::fs::remove_dir_all(&base);
     }
 

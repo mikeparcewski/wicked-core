@@ -6067,6 +6067,7 @@ fn apply_step_result(
         session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
         team_gate::run_ended(&*store, &run_id, crate::team::events::PathStatus::Cancelled);
+        drop_run_floor_cache(&session);
         emit(
             subscribers,
             CoreEvent::RunCancelled {
@@ -8325,6 +8326,16 @@ fn run_repo(
 ) -> Option<crate::repo::RepoEntry> {
     let repo_id = session.repo_ref.as_ref()?;
     crate::repo::get_repo(store, repo_id).ok().flatten()
+}
+
+/// [`remove_run_floor_cache`] off the actor thread, for a terminal transition that does not go
+/// through [`reap_terminal_worktree`] (a cancel: its worktree reap is repository-bound).
+fn drop_run_floor_cache(session: &crate::domain::AgentSession) {
+    let Some(workdir) = session.workdir.clone() else {
+        return;
+    };
+    let rid = session.id.clone();
+    std::thread::spawn(move || remove_run_floor_cache(Some(&workdir), &rid));
 }
 
 /// (core#1122) A terminal run's repo-checks floor build cache goes NOW, keyed by the tree its
@@ -14841,6 +14852,9 @@ pub(crate) fn cancel_run(
     session.finished_at = Some(crate::interaction::now_millis());
     put_node(store, session.to_node())?;
     team_gate::run_ended(&*store, run_id, crate::team::events::PathStatus::Cancelled);
+    // (core#1122) The floor build cache goes whether or not the repository still resolves (the
+    // worktree reap below needs it).
+    drop_run_floor_cache(&session);
     // A cancelled run's open prompt is dead state — resolve it `cancelled` so no skin renders a
     // gate nobody can answer (DES-PROJECT-001 §5.3). No-op when the run was answered/never paused.
     // Best-effort by design (the cancel itself already committed), but LOGGED: a prompt stuck
@@ -25627,10 +25641,14 @@ mod floor_cache_terminal_tests {
     #[test]
     fn a_terminal_runs_floor_cache_goes_even_without_a_registered_repository() {
         let store = open_store(Some(":memory:")).unwrap();
-        let wd = std::env::temp_dir().join(format!(
-            "wc-1122-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
+        // A parent of its own: the check cache groups leaves by the tree's PARENT, and this
+        // test removes its whole group at the end.
+        let wd = std::env::temp_dir()
+            .join(format!(
+                "wc-1122-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..8]
+            ))
+            .join("wt");
         std::fs::create_dir_all(&wd).unwrap();
         let other = filled_leaf(&wd, "run-1122-live");
         for (rid, retained) in [("run-1122-failed", false), ("run-1122-completed", true)] {
@@ -25654,8 +25672,61 @@ mod floor_cache_terminal_tests {
             "another run's floor cache over the same tree is kept"
         );
         assert!(wd.is_dir(), "the tree itself is never touched");
-        let _ = std::fs::remove_dir_all(&other);
-        let _ = std::fs::remove_dir_all(&wd);
+        // The test's whole repository group (its kept `.lock` files too), not only the leaf.
+        let _ = std::fs::remove_dir_all(other.parent().unwrap());
+        let _ = std::fs::remove_dir_all(wd.parent().unwrap());
+    }
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> crate::workflow::StepOutput {
+            crate::workflow::StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: crate::workflow::StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    /// (codex on #1124) A CANCEL drops the run's floor cache through the real transition
+    /// ([`cancel_run`]) even when its repository no longer resolves, which the worktree reap needs.
+    #[test]
+    fn a_cancelled_runs_floor_cache_goes_even_when_its_repository_is_gone() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        // A parent of its own: the check cache groups leaves by the tree's PARENT, and this
+        // test removes its whole group at the end.
+        let wd = std::env::temp_dir()
+            .join(format!(
+                "wc-1122c-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..8]
+            ))
+            .join("wt");
+        std::fs::create_dir_all(&wd).unwrap();
+        let rid = "run-1122-cancel";
+        let leaf = filled_leaf(&wd, rid);
+        let mut session = session_at(rid, SessionStatus::AwaitingHuman);
+        session.workdir = Some(wd.to_string_lossy().into_owned());
+        session.repo_ref = Some("unregistered-since".into());
+        crate::domain::put_node(&mut store, session.to_node()).unwrap();
+        let mut sink = crate::event_log::EventSink::default();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let status = cancel_run(&mut store, &mut sink, &runner, &tx, rid, &None).unwrap();
+        assert_eq!(status, SessionStatus::Cancelled);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while leaf.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!leaf.exists(), "the cancelled run's floor cache is gone");
+        assert!(wd.is_dir(), "the tree itself is never touched");
+        let _ = std::fs::remove_dir_all(leaf.parent().unwrap());
+        let _ = std::fs::remove_dir_all(wd.parent().unwrap());
     }
 }
 
