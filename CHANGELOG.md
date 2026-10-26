@@ -14,6 +14,34 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Gates no longer strand good runs on QE results that could not run, on one refused tool call, or on
+  base-red failures (j4-gates, plain PR).** Three bricks from the test rig's batch 2 (runs 64f05d3d,
+  29bcace4, 1940f173):
+  - *An inconclusive QE result is not a FAIL.* When the isolated QE reviewer records a non-PASS and says
+    it could not run its checks (a `QE-INCONCLUSIVE: <what, why>` line, which the reviewer brief now asks
+    for, or garden's own `reason: inconclusive …` lead), the record is `inconclusive` and names what could
+    not run. Its denial (`qe_inconclusive`, class `judge_unavailable`) never outranks another layer and no
+    longer removes "approve as your own judgment" from a failed floor's gate. That judgment still answers
+    the floor only: QE acceptance stays required at delivery. Alone, its gate's approve is the operator's
+    judgment, labelled as for `qe_reviewer_unavailable`.
+  - *The operator can skip QE acceptance at a gate, with a reason* (new action `skip_qe`, `HumanDecision::
+    SkipQe`; wicked-core-ts `confirmGate` takes it with the reason in `amend`). The run's QE decision
+    becomes `skipped` by the operator ("QE acceptance skipped by operator: <reason>"), labelled on the
+    run, every later gate and the delivery, exactly as a launch skip. It answers the gate before the
+    deliver step (approve), the escalation gate of a unit only QE denied (the unit counts), and a failed
+    floor's gate with QE behind it (the QE layers drop and the gate re-opens on the floor alone). A real
+    QE FAIL behind a floor still refuses the floor override until then (deny-dominates).
+  - *A refused boundary write beside a failed floor is reported beside it, not instead of it.* A blocked
+    filesystem-boundary write (the call never ran) is now disclosed, not a denial, when the unit's
+    repository checks RAN, failed as well as passed (it was only on a pass, core#716). A floor that
+    denied names the gate even when a hook also denied (`floor_failed`, not `boundary_deny`), and each
+    other layer behind it is its own `also: …` line in the prompt.
+  - *The worker is told which tests it broke* (core#1113). A failed floor's denial names its HEAD-ONLY
+    failing tests (head minus base, from the floor's structured failure ids), or says every failure also
+    fails on the base. The automatic floor round's note names those tests, or, when every failure is
+    base-red, asks for NO CHANGE NEEDED instead of a fix; and the substance floor accepts a reply that
+    changed nothing when the unit's floor showed only base failures.
+
 - **A container runtime blip is an infrastructure fault, never a seat failure (PRODUCT-WORKS J4, plain PR).**
   On the test rig Rancher Desktop restarted mid-run. Docker was gone for about ten minutes, and claude and
   then copilot each "failed" the unit with `container_runtime_down`. The failover ladder counted both, and

@@ -1398,6 +1398,23 @@ impl Core {
                     };
                     HumanDecision::OperatorJudgment { rationale }
                 }
+                // (j4-gates) Skip QE acceptance at a gate, with a reason (`amend`, required): the
+                // engine refuses it at every gate it does not answer.
+                (Some("skip_qe"), true) => {
+                    if amend_scope.is_some() {
+                        return Err(err(anyhow::anyhow!(
+                            "action `skip_qe` takes no amendScope — it answers the run's QE \
+                             acceptance"
+                        )));
+                    }
+                    let Some(reason) = amend.filter(|t| !t.trim().is_empty()) else {
+                        return Err(err(anyhow::anyhow!(
+                            "action `skip_qe` needs a written reason in `amend` — why QE \
+                             acceptance is skipped for this run"
+                        )));
+                    };
+                    HumanDecision::SkipQe { reason }
+                }
                 // (core#469) The timed-out floor's escalation arms; (core#467) adopt the
                 // evaluator's pinned edit. All approve-shaped, none takes an amendment.
                 (
@@ -1433,22 +1450,22 @@ impl Core {
                     Some(
                         a @ ("approve" | "reject" | "request_changes" | "extend" | "targeted"
                         | "accept_partial" | "accept_suggestion" | "amend_intent" | "rejudge"
-                        | "operator_judgment"),
+                        | "operator_judgment" | "skip_qe"),
                     ),
                     _,
                 ) => {
                     return Err(err(anyhow::anyhow!(
                         "action `{a}` disagrees with approve={approve} (request_changes and \
                          reject require approve=false; approve, extend, targeted, accept_partial, \
-                         accept_suggestion, amend_intent, rejudge and operator_judgment require \
-                         approve=true)"
+                         accept_suggestion, amend_intent, rejudge, operator_judgment and skip_qe \
+                         require approve=true)"
                     )))
                 }
                 (Some(other), _) => {
                     return Err(err(anyhow::anyhow!(
                         "unknown action `{other}` (expected approve | request_changes | reject | \
                          extend | targeted | accept_partial | accept_suggestion | amend_intent | \
-                         rejudge | operator_judgment)"
+                         rejudge | operator_judgment | skip_qe)"
                     )))
                 }
             };

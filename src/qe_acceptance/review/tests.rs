@@ -528,6 +528,22 @@ impl StepRunner for Scripted {
             .map(|(_, a)| *a)
             .unwrap_or("nothing");
         let (status, output) = match answer {
+            "inconclusive" => {
+                write_verdict(
+                    &self.ledger,
+                    &self.qe_run,
+                    "FAIL",
+                    input.unit.qe_review_session.as_deref(),
+                    &input.run_id,
+                    "2099-01-01T00:00:05.000Z",
+                );
+                (
+                    StepStatus::Ok,
+                    "FAIL: inconclusive due to an environment blocker. Vitest exited 1 because a \
+                     Rolldown binding was missing; no test report was produced.\nVERDICT: FAIL"
+                        .to_string(),
+                )
+            }
             "pass" | "fail" => {
                 let verdict = if answer == "pass" { "PASS" } else { "FAIL" };
                 write_verdict(
@@ -671,6 +687,96 @@ fn a_reviewer_fail_binds_as_fail() {
     assert_eq!(got.outcome, OUTCOME_FAIL);
     let d = denial(&got).unwrap();
     assert_eq!(d.source, DENIAL_SOURCE_QE_REVIEW);
+}
+
+/// (j4-gates) The reviewer's own "inconclusive" — the engine's marker line, or garden's
+/// `reason: inconclusive …` lead as the rig's reviewers wrote it — names what could not run; a
+/// reply that only mentions the word, or a plain FAIL, is not inconclusive.
+#[test]
+fn an_inconclusive_reply_names_what_could_not_run() {
+    for (reply, want) in [
+        (
+            "Recorded it.\nQE-INCONCLUSIVE: no OS sandbox tool on PATH, the probe was skipped\nVERDICT: FAIL",
+            "no OS sandbox tool on PATH, the probe was skipped",
+        ),
+        (
+            "FAIL: inconclusive due to an environment blocker. Vitest exited 1 because a Rolldown \
+             binding was missing.\n\nVERDICT: FAIL",
+            "inconclusive due to an environment blocker. Vitest exited 1 because a Rolldown \
+             binding was missing.",
+        ),
+        (
+            "FAIL — inconclusive evidence for STEP-2: the Linux test passed without sandbox \
+             tools.\nVERDICT: FAIL",
+            "inconclusive evidence for STEP-2: the Linux test passed without sandbox tools.",
+        ),
+        (
+            "- **reason:** [scenario-defect] Inconclusive: criterion 3 lacks probe coverage\nVERDICT: FAIL",
+            "Inconclusive: criterion 3 lacks probe coverage",
+        ),
+        (
+            "reason: inconclusive — reviewer not isolated\nVERDICT: FAIL",
+            "inconclusive — reviewer not isolated",
+        ),
+    ] {
+        assert_eq!(parse_inconclusive(reply).as_deref(), Some(want), "{reply}");
+    }
+    for reply in [
+        "FAIL: the endpoint returns 500 on a valid body\nVERDICT: FAIL",
+        "The result is not inconclusive: STEP-2 fails.\nVERDICT: FAIL",
+        "FAILED inconclusive\nVERDICT: FAIL",
+        "inconclusively worded, but it fails\nVERDICT: FAIL",
+        "QE-INCONCLUSIVE:\nVERDICT: FAIL",
+    ] {
+        assert_eq!(parse_inconclusive(reply), None, "{reply}");
+    }
+    // A long account is capped.
+    let long = format!("QE-INCONCLUSIVE: {}", "x".repeat(900));
+    assert!(parse_inconclusive(&long).unwrap().chars().count() <= INCONCLUSIVE_WHAT_MAX + 1);
+}
+
+/// (j4-gates) A reviewer that recorded FAIL but could not run its checks binds as INCONCLUSIVE —
+/// naming what could not run — and its denial is the operator's judgment gate, never a veto: an
+/// approve there records the run's QE decision as skipped by the operator, labelled.
+#[test]
+fn an_inconclusive_fail_binds_as_inconclusive_and_keeps_the_operators_judgment() {
+    let (got, _) = review_with(
+        vec![("claude", "inconclusive")],
+        vec![seat("claude", BASIS_DISTINCT)],
+    );
+    let got = got.unwrap();
+    assert_eq!(got.outcome, OUTCOME_INCONCLUSIVE, "{got:?}");
+    assert_eq!(got.verdict.as_deref(), Some("FAIL"));
+    assert!(
+        got.reason.contains("INCONCLUSIVE") && got.reason.contains("Rolldown binding"),
+        "the record names what could not run: {}",
+        got.reason
+    );
+    let d = denial(&got).unwrap();
+    assert_eq!(d.source, DENIAL_SOURCE_QE_INCONCLUSIVE);
+    assert!(could_not_judge(&d) && is_qe_denial(&d));
+    let mut u = creator(9, "codex");
+    u.qe_review = Some(got);
+    let judged = operator_judged(&u, "mike").expect("an inconclusive record is judged");
+    assert_eq!(
+        (judged.status.as_str(), judged.basis.as_str()),
+        (a::QE_SKIPPED, a::QE_BASIS_OPERATOR)
+    );
+    assert!(
+        judged.reason.contains("could not run its checks"),
+        "{}",
+        judged.reason
+    );
+    // A plain FAIL is still the substantive veto.
+    let (fail, _) = review_with(
+        vec![("claude", "fail")],
+        vec![seat("claude", BASIS_DISTINCT)],
+    );
+    let fail = fail.unwrap();
+    assert!(!could_not_judge(&denial(&fail).unwrap()));
+    let mut u = creator(9, "codex");
+    u.qe_review = Some(fail);
+    assert!(operator_judged(&u, "mike").is_none());
 }
 
 #[test]

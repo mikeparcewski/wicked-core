@@ -1555,6 +1555,23 @@ pub(crate) fn apply_and_finish_unit(
         .is_some_and(|r| r.passed && !r.checks.is_empty());
     let floor_passed =
         deterministic_pass && !guard_denied && (unit.validator.is_some() || checks_passed_for_fold);
+    // (j4-gates) …and the same when the repository's checks RAN and FAILED: the unit is already
+    // denied by its floor, the refused call changed nothing that floor judged, and letting it deny
+    // too only took the floor gate's own answers away (rig run 1940f173: one refused write turned a
+    // failed floor into "a tool call was denied", with no operator judgment). The refusal is
+    // disclosed beside the floor result (`workerToolCallDenied`), never instead of it.
+    let checks_failed_for_fold = checks_denial.is_some()
+        && evidence
+            .repo_checks
+            .as_ref()
+            .or(carried.as_ref())
+            .is_some_and(|r| {
+                !r.passed
+                    && !r.checks.is_empty()
+                    && r.sandbox_error.is_none()
+                    && r.detect_error.is_none()
+            });
+    let floor_judged = floor_passed || (!guard_denied && checks_failed_for_fold);
     let hook_denial = crate::gate_hook::fold_input_denial_after_floor(
         store,
         session_id,
@@ -1562,7 +1579,7 @@ pub(crate) fn apply_and_finish_unit(
         &crate::scope::unit_phase(unit.ord),
         governed,
         tool_activity,
-        floor_passed,
+        floor_judged,
     )?;
     // (DES-QE-EVERY-SEAT, codex r1 on the code) Each engine-run QE reviewer turn wrote its OWN
     // decisions log: folded as that turn's alone (its carrier, its hook proof, its claims), so one
@@ -1582,7 +1599,7 @@ pub(crate) fn apply_and_finish_unit(
             &crate::scope::unit_phase(unit.ord),
             t.governed,
             t.tool_activity,
-            floor_passed,
+            floor_judged,
         )?;
         qe_hook_denial = qe_hook_denial.or(denial);
         // Disclosed under the reviewer's own seat, as the executor's record is under its own —
@@ -1608,7 +1625,7 @@ pub(crate) fn apply_and_finish_unit(
     // floor passed (`fold_input_denial_after_floor`): disclosed here with the tool named, exactly
     // as an advisory refusal is — never silently dropped. Read off the same log the fold read, for
     // every unit the fold discounted one on (governed by its runner or not, as the fold is).
-    if floor_passed {
+    if floor_judged {
         for rec in crate::gate_hook::collect_hook_decisions(
             session_id,
             attempt,
@@ -1631,7 +1648,12 @@ pub(crate) fn apply_and_finish_unit(
                     tool: rec.tool_name.clone(),
                     command,
                     reason,
-                    remedy: crate::gate_hook::BOUNDARY_WRITE_AFTER_FLOOR_NOTE.to_string(),
+                    remedy: if floor_passed {
+                        crate::gate_hook::BOUNDARY_WRITE_AFTER_FLOOR_NOTE
+                    } else {
+                        crate::gate_hook::BOUNDARY_WRITE_BESIDE_FAILED_FLOOR_NOTE
+                    }
+                    .to_string(),
                 });
             }
         }
@@ -1689,11 +1711,9 @@ pub(crate) fn apply_and_finish_unit(
         .as_ref()
         .and_then(crate::qe_acceptance::review::denial)
     {
-        Some(d)
-            if d.source == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE =>
-        {
-            (Some(d), None)
-        }
+        // (j4-gates) …and so does `inconclusive` (the reviewer could not run its checks): no verdict
+        // on the work, so it never outranks a layer that gave one.
+        Some(d) if crate::qe_acceptance::review::could_not_judge(&d) => (Some(d), None),
         other => (None, other),
     };
     // The FIRST layer that denied names the gate; (operator ruling 2026-10-21) every layer
