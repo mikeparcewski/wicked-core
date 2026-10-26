@@ -288,6 +288,16 @@ fn an_unregistered_state_home_entry_refuses_the_launch_at_intake_with_a_typed_co
     for registered in ["workflows", "steering-inbox", "interactive", "chats"] {
         std::fs::create_dir_all(state_home.join(registered)).unwrap();
     }
+    // Finder litter at the state home and the skills root (the operator's 2026-10-25 daemon) is
+    // OS metadata, never a store: it must not refuse the launch.
+    for litter in [
+        state_home.join(".DS_Store"),
+        state_home.join("._foo"),
+        state_home.join("skills").join(".DS_Store"),
+        state_home.join("skills").join("._foo"),
+    ] {
+        std::fs::write(litter, "").unwrap();
+    }
     core.launch_run(spec("intake-admitted", "one-agent-unit"))
         .expect("a fully classified state home admits the launch");
     let events = drain_until_terminal(&ev, "intake-admitted");

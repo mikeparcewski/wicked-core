@@ -71,6 +71,17 @@ Two release tracks share this file, newest entry first regardless of track:
   keyed and the deliver phase re-runs, standing on it only while the tree, base and checks are unchanged.
   The verify floor stays a fresh run on every attempt (its design); the reuse is at deliver. The guarded
   verify floor's override now also names its tree (it was `null`).
+### Fixed
+
+- **A Finder-opened state home no longer refuses every worker launch.** Opening `~/.wicked-crew` in
+  macOS Finder creates `.DS_Store`, and the state-home check then refused the launch with
+  `state-home.unregistered … .DS_Store …`. OS metadata — `.DS_Store`, `._*` (AppleDouble),
+  `.Spotlight-V100`, `.Trashes`, `.fseventsd`, `Thumbs.db`, `desktop.ini`, `Icon\r`, one data list
+  (`OS_METADATA_PATTERNS`) — is now ignored by the survey, the intake fence and the launch-time admission
+  at the state home, the skills root and the read slot. It stays outside the worker Read fence: static
+  deny rules cover each name at those three levels and at any depth below the read slot. Any other
+  unknown entry still refuses. wicked-crew mirrors the list (crew-statehome-os-metadata); both ship in the
+  next release.
 
 - **The repo-checks floor decides by exit codes and interprets a per-repo build guide; no runner knowledge
   in the engine (DES-FLOOR-V2 + DES-BUILD-GUIDE, pipeline-blocker plain PR, operator-approved).** core#1060
