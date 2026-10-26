@@ -2620,7 +2620,7 @@ impl CheckScratch {
     /// every home-shaped variable is set under the scratch, so the check reads none of the
     /// operator's per-user configuration or credentials and writes nothing outside the worktree
     /// but its private `TMPDIR`. `tree` picks the `CARGO_TARGET_DIR` leaf (core#480).
-    fn apply_env(&self, cmd: &mut Command, tree: Tree) {
+    fn apply_env(&self, cmd: &mut Command, tree: Tree, root: &Path) {
         let real_home = std::env::var_os("HOME");
         cmd.env_clear();
         for key in CHECK_ENV_PASSTHROUGH {
@@ -2659,6 +2659,17 @@ impl CheckScratch {
             // (core#767) A Python journey must not leave `__pycache__/` in the reviewed tree (the
             // worktree guard would deny the engine's own side effect).
             .env("PYTHONDONTWRITEBYTECODE", "1");
+        // The base export is its OWN git repository ([`BaseTree::export`]): a git call a base
+        // check makes (`git grep`, `git rev-parse`) discovers `<base>/.git` first, and the
+        // export's parent is a discovery ceiling, so it never walks up into the head worktree,
+        // whose index and untracked `tmp/` it must not reach. Not `GIT_DIR`/`GIT_WORK_TREE`: every
+        // descendant inherits those, and a check's own `git init <fixture>` / `git -C <fixture>`
+        // would then act on the base repository instead of its fixture.
+        if tree == Tree::Base {
+            if let Some(parent) = root.parent() {
+                cmd.env("GIT_CEILING_DIRECTORIES", parent);
+            }
+        }
         // (core#767) Playwright resolves its browsers under the user cache, which moved with
         // HOME: pin the operator's installed browsers (read-only to the check — writes stay
         // confined by the boundary) when the daemon set no location of its own.
@@ -4102,8 +4113,9 @@ pub(crate) struct FloorCheckout {
     pub(crate) dir: PathBuf,
     git_dir: PathBuf,
     worktree: PathBuf,
-    /// Every blob entry written: `(mode, blob id, path)` — what [`Self::hold_to`] re-checks.
-    entries: Vec<(String, String, PathBuf)>,
+    /// Every blob entry written, with the exact bytes materialized (after eol conversion) — what
+    /// [`Self::hold_to`] re-checks.
+    entries: Vec<WrittenEntry>,
     /// `dir`, held before anything ran in it: [`Self::hold_to`] re-reads every entry through it.
     held: Option<HeldDir>,
 }
@@ -4182,13 +4194,12 @@ pub(crate) fn checkout_guarded_tree(
     };
     // `--no-checkout` (codex r1 on the slice): a checkout runs the repository's `post-checkout`
     // hook and its configured smudge filters OUTSIDE the floor's sandbox. The worktree is made
-    // empty, its files are written from the tree's own blobs (no filter, no attribute), and its
-    // index is set with `read-tree`, which touches no file. Every git call here runs with an
-    // engine-owned EMPTY hooks dir (codex r2): `read-tree` alone fires `post-index-change`, and no
-    // repository hook may run outside the floor's sandbox.
-    let no_hooks_dir = parent.join("no-hooks");
-    std::fs::create_dir_all(&no_hooks_dir)
-        .map_err(|e| format!("the floor's empty hooks dir could not be created: {e}"))?;
+    // empty, its files are written by git's own eol conversion run against a PRIVATE repository
+    // that carries no filter driver ([`write_private_git_dir`]), and its index is set with
+    // `read-tree`, which touches no file. Every git call here runs with an engine-owned EMPTY
+    // hooks dir (codex r2): `read-tree` alone fires `post-index-change`, and no repository hook
+    // may run outside the floor's sandbox.
+    let no_hooks_dir = no_hooks_dir()?;
     let no_hooks = format!("core.hooksPath={}", no_hooks_dir.to_string_lossy());
     crate::worktree_guard::git(
         worktree,
@@ -4208,7 +4219,17 @@ pub(crate) fn checkout_guarded_tree(
     // Held before anything runs in it; every blob is written through the held fd.
     let held = HeldDir::open(&dir)
         .map_err(|e| format!("the guarded tree {tree} could not be written for the floor: {e}"))?;
-    checkout.entries = write_tree_blobs(worktree, git_dir, tree, &dir, &held)
+    // The conversion repository lives beside the checkout, engine-owned, and dies with the export.
+    let conv = parent.join(format!("{label}-conv-{}-{nonce}", std::process::id()));
+    let converted = std::fs::create_dir_all(&conv)
+        .map_err(|e| e.to_string())
+        .and_then(|_| HeldDir::open(&conv))
+        .and_then(|conv_held| {
+            write_private_git_dir(&conv_held, "git", git_dir, worktree, &commit, true)
+        })
+        .and_then(|_| write_tree_blobs(worktree, git_dir, tree, &dir, &held, &conv.join("git")));
+    let _ = std::fs::remove_dir_all(&conv);
+    checkout.entries = converted
         .map_err(|e| format!("the guarded tree {tree} could not be written for the floor: {e}"))?;
     checkout.held = Some(held);
     crate::worktree_guard::git(&dir, &["-c", &no_hooks, "read-tree", &commit], &[])
@@ -4216,23 +4237,348 @@ pub(crate) fn checkout_guarded_tree(
     Ok(checkout)
 }
 
-/// Write every entry of `tree` into `dir` from its blob — `ls-tree -r -z` then ONE
-/// `cat-file --batch` — so nothing repository-controlled runs (no checkout, no filter driver, no
-/// `export-ignore`). Regular files keep their executable bit; a symlink entry becomes a symlink
-/// (unix) or a plain file holding its target; a submodule becomes an empty directory. A path that
-/// is absolute or climbs out of `dir` is refused.
+/// What the export materialized for one tree entry — recorded at write time so the integrity
+/// re-check ([`FloorCheckout::hold_to`]) compares against the EXACT bytes the engine wrote, never
+/// against bytes recomputed through attributes a check could since have edited.
+#[derive(Debug, Clone)]
+enum Materialized {
+    /// A symlink entry: the raw target (never converted). Read back on unix only: elsewhere a link
+    /// is written as a regular file and recorded as [`Materialized::File`].
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Link(Vec<u8>),
+    /// A regular file: the length and sha256 of the bytes written (after eol conversion).
+    File { len: u64, digest: [u8; 32] },
+}
+
+/// One entry [`write_tree_blobs`] wrote: its git mode, its path, and what was materialized.
+#[derive(Debug, Clone)]
+pub(crate) struct WrittenEntry {
+    mode: String,
+    path: PathBuf,
+    what: Materialized,
+}
+
+/// The "no config file" path for `GIT_CONFIG_GLOBAL`.
+const NULL_CONFIG: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
+/// Variables through which an inherited environment could hand git configuration (a
+/// `filter.<x>.smudge` driver, say) or redirect a private repository to other metadata. A caller
+/// that pins `GIT_DIR`/`GIT_WORK_TREE` sets them itself.
+const INHERITED_GIT_ENV: &[&str] = &[
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_ATTR_SOURCE",
+    "GIT_GRAFT_FILE",
+    "GIT_SHALLOW_FILE",
+    "GIT_REPLACE_REF_BASE",
+];
+
+/// Pin a git command the engine runs on a private repository to that repository's own
+/// configuration: no system file, no global/XDG file, and no configuration or repository
+/// redirection handed down through the environment ([`INHERITED_GIT_ENV`]: `GIT_CONFIG_COUNT` /
+/// `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_PARAMETERS` would otherwise reach `cat-file --filters`).
+/// `.hardened()` only strips the engine's own variables, not these.
+fn isolate_git_config(cmd: &mut Command) {
+    for key in INHERITED_GIT_ENV {
+        cmd.env_remove(key);
+    }
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", NULL_CONFIG);
+}
+
+/// Quote a value for a git config file.
+fn config_quote(v: &str) -> String {
+    let mut s = String::from("\"");
+    for c in v.chars() {
+        match c {
+            '\\' => s.push_str("\\\\"),
+            '"' => s.push_str("\\\""),
+            '\n' => s.push_str("\\n"),
+            '\t' => s.push_str("\\t"),
+            c => s.push(c),
+        }
+    }
+    s.push('"');
+    s
+}
+
+/// The engine's empty hooks directory (no repository hook may run outside the floor's sandbox).
+fn no_hooks_dir() -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir()
+        .join("wicked-core-floor")
+        .join("no-hooks");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("the floor's empty hooks dir could not be created: {e}"))?;
+    Ok(dir)
+}
+
+/// Write a minimal PRIVATE git directory at `git_rel` under `dest` (through the held directory):
+/// `HEAD` = `commit`, the source repository's objects as a read-only ALTERNATE, an empty `hooks/`
+/// and a `config` that carries the source's effective end-of-line settings
+/// (`core.autocrlf`/`eol`/`safecrlf`) and NOTHING else — no `filter.*` driver, no `core.hooksPath`,
+/// no `include`. So `git cat-file --filters` against it converts exactly as a checkout of the
+/// source repository would (built-in text/eol/working-tree-encoding) yet can execute no
+/// smudge/process driver; and a git command run in it runs no repository hook. `bare` sets
+/// `core.bare` (the base export is a work tree; a conversion-only repository is not).
+fn write_private_git_dir(
+    dest: &HeldDir,
+    git_rel: &str,
+    source_git_dir: &Path,
+    worktree: &Path,
+    commit: &str,
+    bare: bool,
+) -> Result<(), String> {
+    let objects = crate::worktree_guard::git_string(
+        worktree,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ],
+        &[("GIT_DIR", source_git_dir)],
+    )
+    .map_err(|e| format!("the object store could not be located: {e}"))?;
+    // Unset keys make `git config --get-regexp` exit 1: no settings, the defaults.
+    let eol = crate::worktree_guard::git(
+        worktree,
+        &[
+            "config",
+            "-z",
+            "--get-regexp",
+            r"^core\.(autocrlf|eol|safecrlf)$",
+        ],
+        &[("GIT_DIR", source_git_dir)],
+    )
+    .unwrap_or_default();
+    // The private repository must hash like the source, or its alternate object store and HEAD
+    // cannot be read: a SHA-256 source gets format version 1 and `extensions.objectformat`.
+    let sha256 = crate::worktree_guard::git_string(
+        worktree,
+        &["rev-parse", "--show-object-format"],
+        &[("GIT_DIR", source_git_dir)],
+    )
+    .is_ok_and(|f| f == "sha256");
+    let mut config = format!(
+        "[core]\n\trepositoryformatversion = {}\n\tfilemode = true\n\tbare = {bare}\n\tlogallrefupdates = false\n",
+        u8::from(sha256)
+    );
+    for rec in String::from_utf8_lossy(&eol).split('\0') {
+        if let Some((key, value)) = rec.split_once('\n') {
+            if let Some(name) = key.strip_prefix("core.") {
+                if matches!(name, "autocrlf" | "eol" | "safecrlf") {
+                    config.push_str(&format!("\t{name} = {}\n", config_quote(value)));
+                }
+            }
+        }
+    }
+    // The extension section goes last: the eol keys above belong to `[core]`.
+    if sha256 {
+        config.push_str("[extensions]\n\tobjectformat = sha256\n");
+    }
+    dest.write(&format!("{git_rel}/HEAD"), &format!("{commit}\n"))?;
+    dest.write(&format!("{git_rel}/config"), &config)?;
+    dest.write(
+        &format!("{git_rel}/objects/info/alternates"),
+        &format!("{objects}\n"),
+    )?;
+    dest.subdir(&format!("{git_rel}/refs/heads"), true)?;
+    dest.subdir(&format!("{git_rel}/hooks"), true)?;
+    Ok(())
+}
+
+/// The path given to the end-of-body request (any; the object is missing).
+const SENTINEL_PATH: &str = "wicked-end";
+
+/// Stream `inputs` (one line each) through ONE `git cat-file --batch[ --filters]` run against the
+/// private repository `conv_git_dir` and hand each answered body to `each`. With `filtered` an
+/// input is `<blob> <path>` and the body is the blob converted to its working-tree form under the
+/// attributes of `tree` (`--attr-source`: the tree's own `.gitattributes`, never a file of any
+/// working tree) and the private repository's config.
+fn cat_batch(
+    conv_git_dir: &Path,
+    tree: &str,
+    filtered: bool,
+    inputs: Vec<String>,
+    mut each: impl FnMut(usize, Vec<u8>) -> Result<(), String>,
+) -> Result<(), String> {
+    use std::io::{BufRead, Read, Write};
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    let attr_source = format!("--attr-source={tree}");
+    let mut args: Vec<&str> = vec!["-c", "core.bare=true"];
+    if filtered {
+        args.push(&attr_source);
+    }
+    args.extend(["cat-file", "--batch"]);
+    if filtered {
+        args.push("--filters");
+    }
+    // spawn-audit: hardened — git plumbing over a private repository holding no driver config.
+    let mut cat = Command::new("git");
+    cat.hardened()
+        .args(&args)
+        .current_dir(conv_git_dir)
+        .env("GIT_DIR", conv_git_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    isolate_git_config(&mut cat);
+    let mut child = cat.spawn().map_err(|e| format!("git cat-file: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("git cat-file has no stdin")?;
+    let n = inputs.len();
+    // With `--filters` the header's size is the BLOB's, not the converted body's (`echo ok\n`
+    // under `eol=crlf` is announced as 8 and is 9 bytes), so a converted body cannot be framed by
+    // it. Each request is followed by one for a random object id that cannot exist: git answers it
+    // `<id> missing`, and the body ends at that line. The id is drawn per call (random bits from two UUIDs), so no committed content can forge it.
+    let hex_len = if tree.len() == 64 { 64 } else { 40 };
+    let sentinel: String = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )[..hex_len]
+        .to_string();
+    let end = format!("\n{sentinel} missing\n").into_bytes();
+    let feed_sentinel = sentinel.clone();
+    let feeder = std::thread::spawn(move || {
+        for line in inputs {
+            if writeln!(stdin, "{line}").is_err() {
+                break;
+            }
+            if filtered && writeln!(stdin, "{feed_sentinel} {SENTINEL_PATH}").is_err() {
+                break;
+            }
+        }
+    });
+    let mut out = std::io::BufReader::new(child.stdout.take().ok_or("git cat-file has no stdout")?);
+    let mut answer = || -> Result<(), String> {
+        for i in 0..n {
+            let mut header = String::new();
+            out.read_line(&mut header).map_err(|e| e.to_string())?;
+            let mut words = header.split_whitespace();
+            let (_, kind, size) = (words.next(), words.next(), words.next());
+            if kind != Some("blob") {
+                return Err(format!("git cat-file answered {header:?}"));
+            }
+            let body = if filtered {
+                let mut acc: Vec<u8> = Vec::new();
+                loop {
+                    if out.read_until(b'\n', &mut acc).map_err(|e| e.to_string())? == 0 {
+                        return Err("git cat-file ended inside a converted body".to_string());
+                    }
+                    if acc.ends_with(&end) {
+                        acc.truncate(acc.len() - end.len());
+                        break acc;
+                    }
+                }
+            } else {
+                let size: usize = size
+                    .and_then(|n| n.parse().ok())
+                    .ok_or_else(|| format!("git cat-file answered {header:?}"))?;
+                let mut body = vec![0u8; size];
+                out.read_exact(&mut body).map_err(|e| e.to_string())?;
+                let mut nl = [0u8; 1];
+                out.read_exact(&mut nl).map_err(|e| e.to_string())?;
+                body
+            };
+            each(i, body)?;
+        }
+        Ok(())
+    };
+    let answered = answer();
+    drop(out);
+    let _ = feeder.join();
+    let _ = child.wait();
+    answered
+}
+
+/// Whether a path component names the export's `.git` on some filesystem: `.git` in any case,
+/// and its NTFS aliases (trailing dots/spaces, an `:` alternate stream, the `git~1` short name),
+/// which Windows resolves to the same directory (git's own `is_ntfs_dotgit`).
+fn names_git_metadata(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.split(':').next().unwrap_or_default();
+    let stem = stem.trim_end_matches(['.', ' ']);
+    stem == ".git" || stem == "git~1"
+}
+
+/// Write every entry of `tree` into `dir` — `ls-tree -r -z`, then `cat-file --batch --filters`
+/// for regular files and `cat-file --batch` for symlink targets — so nothing repository-controlled
+/// runs (no checkout, no filter/smudge/process driver, no hook, no `export-ignore`). Regular files
+/// are converted exactly as `git checkout` would convert them (`text`/`eol`/`working-tree-encoding`
+/// attributes of `tree` itself, `core.autocrlf`/`eol` of the source repository) by git's own
+/// conversion run against `conv_git_dir`, a private repository with no driver config
+/// ([`write_private_git_dir`]). Regular files keep their executable bit; a symlink entry becomes a
+/// symlink (unix) or a plain file holding its raw target; a submodule becomes an empty directory.
+/// A path that is absolute, climbs out of `dir`, or names `.git` is refused.
 fn write_tree_blobs(
     worktree: &Path,
     git_dir: &Path,
     tree: &str,
     dir: &Path,
     dest: &HeldDir,
-) -> Result<Vec<(String, String, PathBuf)>, String> {
-    use std::io::{BufRead, Read, Write};
+    conv_git_dir: &Path,
+) -> Result<Vec<WrittenEntry>, String> {
+    write_tree_blobs_with(
+        worktree,
+        git_dir,
+        tree,
+        dir,
+        dest,
+        conv_git_dir,
+        git_has_attr_source(),
+    )
+}
+
+/// Whether this host's git has the global `--attr-source` option (git 2.40+), probed once per
+/// process. Without it the export cannot convert under the exported tree's own attributes, so it
+/// writes the raw blobs, as before eol conversion existed, rather than fail every floor export on
+/// an older git (Ubuntu 22.04 ships 2.34).
+fn git_has_attr_source() -> bool {
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS.get_or_init(|| {
+        // spawn-audit: hardened — a capability probe: `git --attr-source=<x> version` exits 0 on a
+        // git that knows the option and 129 ("unknown option") on one that does not.
+        let mut cmd = Command::new("git");
+        cmd.hardened()
+            .args(["--attr-source=HEAD", "version"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        isolate_git_config(&mut cmd);
+        let has = cmd.status().is_ok_and(|s| s.success());
+        if !has {
+            eprintln!(
+                "wicked-core floor: this git has no --attr-source (git < 2.40); the floor's copies \
+                 are written as raw blobs, without .gitattributes eol conversion"
+            );
+        }
+        has
+    })
+}
+
+/// [`write_tree_blobs`] with the conversion chosen: `convert` = false writes regular files as their
+/// raw blobs (the fallback for a git without `--attr-source`).
+fn write_tree_blobs_with(
+    worktree: &Path,
+    git_dir: &Path,
+    tree: &str,
+    dir: &Path,
+    dest: &HeldDir,
+    conv_git_dir: &Path,
+    convert: bool,
+) -> Result<Vec<WrittenEntry>, String> {
     let env: [(&str, &Path); 1] = [("GIT_DIR", git_dir)];
     let listing = crate::worktree_guard::git(worktree, &["ls-tree", "-r", "-z", tree], &env)
         .map_err(|e| e.to_string())?;
-    let mut entries: Vec<(String, String, PathBuf)> = Vec::new();
+    let mut entries: Vec<(String, String, PathBuf, String)> = Vec::new();
     for rec in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
         // Strict (codex r2): a lossy decode can fold two distinct paths into one.
         let rec = std::str::from_utf8(rec)
@@ -4247,17 +4593,19 @@ fn write_tree_blobs(
             parts.next().unwrap_or_default().to_string(),
         );
         let rel = Path::new(path);
+        // `.git` is the engine's own metadata in a base export: a tree entry may never write it.
+        // A newline would split the batch input line.
         if rel.is_absolute()
-            || rel
-                .components()
-                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            || path.contains('\n')
+            || rel.components().any(|c| match c {
+                std::path::Component::Normal(n) => names_git_metadata(&n.to_string_lossy()),
+                _ => true,
+            })
         {
             return Err(format!("the tree holds an unsafe path {path:?}"));
         }
-        entries.push((mode, sha, dir.join(rel)));
+        entries.push((mode, sha, dir.join(rel), path.to_string()));
     }
-    let blobs: Vec<&(String, String, PathBuf)> =
-        entries.iter().filter(|(m, _, _)| m != "160000").collect();
     // An entry's path relative to `dir` (UTF-8: checked above).
     let rel_of = |path: &Path| -> Result<String, String> {
         Ok(path
@@ -4266,57 +4614,68 @@ fn write_tree_blobs(
             .to_string_lossy()
             .into_owned())
     };
-    // spawn-audit: hardened — git plumbing reading the run's own object store.
-    let mut cat = Command::new("git");
-    cat.hardened()
-        .args(["cat-file", "--batch"])
-        .current_dir(worktree)
-        .env("GIT_DIR", git_dir)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let mut child = cat.spawn().map_err(|e| format!("git cat-file: {e}"))?;
-    let mut stdin = child.stdin.take().ok_or("git cat-file has no stdin")?;
-    let shas: Vec<String> = blobs.iter().map(|(_, sha, _)| sha.clone()).collect();
-    let feeder = std::thread::spawn(move || {
-        for sha in shas {
-            if writeln!(stdin, "{sha}").is_err() {
-                break;
+    let mut written: Vec<WrittenEntry> = Vec::new();
+    // Regular files: converted. Through the held directory ([`HeldDir`]): missing directories are
+    // created, and no component under `dir`, nor the entry itself, is ever followed as a link —
+    // even one a process still running in the tree swaps in mid-export.
+    let files: Vec<&(String, String, PathBuf, String)> = entries
+        .iter()
+        .filter(|(m, ..)| m != "160000" && m != "120000")
+        .collect();
+    let inputs = files
+        .iter()
+        .map(|(_, sha, _, path)| {
+            if convert {
+                format!("{sha} {path}")
+            } else {
+                sha.clone()
             }
-        }
-    });
-    let mut out = std::io::BufReader::new(child.stdout.take().ok_or("git cat-file has no stdout")?);
-    for (mode, sha, path) in &blobs {
-        let mut header = String::new();
-        out.read_line(&mut header).map_err(|e| e.to_string())?;
-        let size: usize = header
-            .split_whitespace()
-            .nth(2)
-            .and_then(|n| n.parse().ok())
-            .ok_or_else(|| format!("git cat-file answered {header:?} for {sha}"))?;
-        let mut body = vec![0u8; size];
-        out.read_exact(&mut body).map_err(|e| e.to_string())?;
-        let mut nl = [0u8; 1];
-        out.read_exact(&mut nl).map_err(|e| e.to_string())?;
-        // Through the held directory ([`HeldDir`]): missing directories are created, and no
-        // component under `dir`, nor the entry itself, is ever followed as a link — even one a
-        // process still running in the tree swaps in mid-export.
+        })
+        .collect();
+    cat_batch(conv_git_dir, tree, convert, inputs, |i, body| {
+        use sha2::Digest;
+        let (mode, _, path, _) = files[i];
+        dest.write_bytes(&rel_of(path)?, &body, mode == "100755")?;
+        written.push(WrittenEntry {
+            mode: mode.clone(),
+            path: path.clone(),
+            what: Materialized::File {
+                len: body.len() as u64,
+                digest: sha2::Sha256::digest(&body).into(),
+            },
+        });
+        Ok(())
+    })?;
+    // Symlinks: the raw target, never converted.
+    let links: Vec<&(String, String, PathBuf, String)> =
+        entries.iter().filter(|(m, ..)| m == "120000").collect();
+    let inputs = links.iter().map(|(_, sha, ..)| sha.clone()).collect();
+    cat_batch(conv_git_dir, tree, false, inputs, |i, body| {
+        use sha2::Digest;
+        let (mode, _, path, _) = links[i];
         let rel = rel_of(path)?;
-        match mode.as_str() {
-            #[cfg(unix)]
-            "120000" => dest.symlink(&rel, &body)?,
-            _ => dest.write_bytes(&rel, &body, mode == "100755")?,
-        }
-    }
-    let _ = feeder.join();
-    let _ = child.wait();
-    for (_, _, path) in entries.iter().filter(|(m, _, _)| m == "160000") {
+        #[cfg(unix)]
+        dest.symlink(&rel, &body)?;
+        #[cfg(not(unix))]
+        dest.write_bytes(&rel, &body, false)?;
+        written.push(WrittenEntry {
+            mode: mode.clone(),
+            path: path.clone(),
+            what: if cfg!(unix) {
+                Materialized::Link(body)
+            } else {
+                Materialized::File {
+                    len: body.len() as u64,
+                    digest: sha2::Sha256::digest(&body).into(),
+                }
+            },
+        });
+        Ok(())
+    })?;
+    for (_, _, path, _) in entries.iter().filter(|(m, ..)| m == "160000") {
         dest.subdir(&rel_of(path)?, true)?;
     }
-    Ok(entries
-        .into_iter()
-        .filter(|(m, _, _)| m != "160000")
-        .collect())
+    Ok(written)
 }
 
 impl FloorCheckout {
@@ -4348,95 +4707,83 @@ impl FloorCheckout {
         });
     }
 
-    /// The tree entries whose content no longer matches the blob written, every entry read
+    /// The tree entries whose content no longer matches what the export wrote, every entry read
     /// THROUGH the held checkout ([`HeldDir`]: parents walked through no link, the entry itself
     /// never followed) — a check that swapped a directory of the tree for a link to an outside
     /// copy has every entry under it read as changed, never the copy compared. A regular file
-    /// must still be one, with its executable bit, and hold exactly the blob's bytes (read from
-    /// `git cat-file --batch`, no filter runs); a symlink entry must still be a symlink to the
-    /// SAME target. Untracked files a check created are not entries and are not judged — only
-    /// what ships is.
+    /// must still be one, with its executable bit, and hold exactly the bytes the export
+    /// MATERIALIZED (their length and sha256, recorded at write time — the eol-converted form a
+    /// checkout would have, never recomputed through attributes a check could have edited); a
+    /// symlink entry must still be a symlink to the SAME target. Untracked files a check created
+    /// are not entries and are not judged — only what ships is.
     fn changed_entries(&self) -> Result<Vec<String>, String> {
-        use std::io::{BufRead, Read, Write};
         let held = self
             .held
             .as_ref()
             .ok_or("the floor checkout was never held")?;
         let rel = |p: &Path| p.strip_prefix(&self.dir).unwrap_or(p).display().to_string();
         let mut changed = Vec::new();
-        // spawn-audit: hardened — git plumbing reading the run's own object store.
-        let mut cat = Command::new("git");
-        cat.hardened()
-            .args(["cat-file", "--batch"])
-            .current_dir(&self.worktree)
-            .env("GIT_DIR", &self.git_dir)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
-        let mut child = cat.spawn().map_err(|e| format!("git cat-file: {e}"))?;
-        let mut stdin = child.stdin.take().ok_or("git cat-file has no stdin")?;
-        let shas: Vec<String> = self.entries.iter().map(|(_, sha, _)| sha.clone()).collect();
-        let feeder = std::thread::spawn(move || {
-            for sha in shas {
-                if writeln!(stdin, "{sha}").is_err() {
-                    break;
+        for e in &self.entries {
+            let r = rel(&e.path);
+            let same = match &e.what {
+                // A symlink stays a symlink, to the SAME target (codex r3).
+                #[cfg(unix)]
+                Materialized::Link(target) => {
+                    held.kind(&r) == Ok(Some(EntryKind::Link))
+                        && held.read_link(&r).is_ok_and(|t| &t == target)
                 }
-            }
-        });
-        let mut out =
-            std::io::BufReader::new(child.stdout.take().ok_or("git cat-file has no stdout")?);
-        let mut answer = || -> Result<(), String> {
-            for (mode, sha, path) in &self.entries {
-                let mut header = String::new();
-                out.read_line(&mut header).map_err(|e| e.to_string())?;
-                let size: usize = header
-                    .split_whitespace()
-                    .nth(2)
-                    .and_then(|n| n.parse().ok())
-                    .ok_or_else(|| format!("git cat-file answered {header:?} for {sha}"))?;
-                let mut body = vec![0u8; size];
-                out.read_exact(&mut body).map_err(|e| e.to_string())?;
-                let mut nl = [0u8; 1];
-                out.read_exact(&mut nl).map_err(|e| e.to_string())?;
-                let r = rel(path);
-                let same = if mode == "120000" {
-                    // A symlink stays a symlink, to the SAME target (codex r3).
-                    #[cfg(unix)]
-                    let same = held.kind(&r) == Ok(Some(EntryKind::Link))
-                        && held.read_link(&r).is_ok_and(|t| t == body);
-                    // Without symlinks it was written as a regular file holding the target: the
-                    // same file, with the same bytes (codex on #1066).
-                    #[cfg(not(unix))]
-                    let same = same_placeholder(held, &r, &body);
-                    same
-                } else {
-                    same_file(held, &r, mode == "100755", &body)
-                };
-                if !same {
-                    changed.push(r);
+                #[cfg(not(unix))]
+                Materialized::Link(_) => false,
+                Materialized::File { len, digest } => {
+                    same_materialized(held, &r, e.mode == "100755", *len, digest)
                 }
+            };
+            if !same {
+                changed.push(r);
             }
-            Ok(())
-        };
-        let answered = answer();
-        drop(out);
-        let _ = feeder.join();
-        let _ = child.wait();
-        answered?;
+        }
         Ok(changed)
     }
+}
+
+/// Is the entry at `rel` of `held` a regular file (opened through no link) with the executable
+/// bit `exec` holding exactly `len` bytes whose sha256 is `digest`?
+fn same_materialized(held: &HeldDir, rel: &str, exec: bool, len: u64, digest: &[u8; 32]) -> bool {
+    use sha2::Digest;
+    use std::io::Read;
+    let Ok(mut f) = held.open_read(rel) else {
+        return false;
+    };
+    let Ok(m) = f.metadata() else {
+        return false;
+    };
+    if !m.is_file() || m.len() != len {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if (m.permissions().mode() & 0o100 != 0) != exec {
+            return false;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = exec;
+    let mut now = Vec::with_capacity(len as usize);
+    f.read_to_end(&mut now).is_ok() && sha2::Sha256::digest(&now)[..] == digest[..]
 }
 
 /// A symlink entry materialized where there are no symlinks (non-unix: [`write_tree_blobs`]
 /// writes a regular file holding the link's target): unchanged only while it is still that regular
 /// file with exactly `target` as its content.
-#[cfg(any(not(unix), test))]
+#[cfg(test)]
 fn same_placeholder(held: &HeldDir, rel: &str, target: &[u8]) -> bool {
     same_file(held, rel, false, target)
 }
 
 /// Is the entry at `rel` of `held` a regular file (opened through no link) with the executable
 /// bit `exec` (unix; git keys on the OWNER execute bit, codex r3) holding exactly `body`?
+#[cfg(test)]
 fn same_file(held: &HeldDir, rel: &str, exec: bool, body: &[u8]) -> bool {
     use std::io::Read;
     let Ok(mut f) = held.open_read(rel) else {
@@ -4494,17 +4841,21 @@ pub(crate) fn guarded_checkout_refused(
     }
 }
 
-/// The run base, exported into the checks' scratch for the baseline diff — plain files, no git
-/// metadata, no nested worktree: the base's own blobs, written raw (`ls-tree` + `cat-file
-/// --batch`, [`write_tree_blobs`]: no index, so no hook; no checkout, so no filter driver),
-/// through the PINNED git dir (never the worktree's own `.git` file, which the seat could have
-/// redirected). Lives at `<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`] — inside the OS
+/// The run base, exported into the checks' scratch for the baseline diff — the base's own files,
+/// written through git's own eol conversion (`ls-tree` + `cat-file --batch --filters`,
+/// [`write_tree_blobs`]: no checkout, so no filter driver), plus a PRIVATE git context of its own
+/// (`.git`: HEAD the base commit, the source objects as a read-only alternate, an index populated
+/// from the base by `read-tree`, an empty hooks dir, no driver config — [`write_private_git_dir`]).
+/// A base check's git discovers it first, under a discovery ceiling at the export's parent
+/// ([`CheckScratch::apply_env`]), so `git grep` and friends see the base and never the head
+/// worktree's index or untracked `tmp/`.
+/// Files come from the PINNED git dir (never the worktree's own `.git` file, which the seat could
+/// have redirected). Lives at `<worktree>/tmp/` [`BASE_EXPORT_SUBDIR`] — inside the OS
 /// write boundary, outside the guard's snapshot — so the sandbox wrapper armed for the worktree
 /// covers the base run too. It stays INSIDE the worktree when the rest of the check scratch moved
-/// to the engine's check cache: a base check that calls git (a `build.rs` running `git rev-parse`)
-/// discovers the enclosing worktree's repository from there, exactly as it did from
-/// `tmp/wicked-checks/base`; from the cache it found none and failed before its tests ran, a head
-/// failure the base did not share, read as a regression (codex on #1050). The export is SOURCE
+/// to the engine's check cache (a base check that calls git once discovered the enclosing
+/// worktree's repository from there — codex on #1050; the pinned `.git` now makes that context the
+/// base's own). The export is SOURCE
 /// only (the base's build output goes to the check scratch's `cargo-target/base`) and it is
 /// REMOVED as soon as its check result is cached ([`remove_base_export`]), and at the start of
 /// every floor: it is a full copy of the repo tree inside the worktree, and a HEAD check that
@@ -4664,15 +5015,52 @@ impl BaseTree {
                 crate::worktree_guard::ENGINE_SCRATCH_DIR
             ))
             .map_err(|e| format!("the base export directory could not be created: {e}"))?;
-        // The base's own blobs, written raw (`ls-tree` + `cat-file --batch`, [`write_tree_blobs`]):
-        // no index, so no `post-index-change` hook; no checkout, so no filter driver — nothing
-        // the repository configures runs outside the floor's sandbox (codex round 17).
-        write_tree_blobs(worktree, git_dir, head, &dir, &held).map_err(|e| {
+        let why = |e: String| {
             format!(
                 "the run base {} could not be exported for the baseline diff: {e}",
                 &head[..head.len().min(10)]
             )
-        })?;
+        };
+        // The base is its own repository (PRODUCT-WORKS J4/J5): a private `.git` — HEAD the base commit,
+        // the source objects as a read-only alternate, an empty hooks dir, and no driver config
+        // ([`write_private_git_dir`]) — so a git call inside a base check (`git grep`, a
+        // `build.rs` running `git rev-parse`) resolves HERE, never to the head worktree and its
+        // untracked `tmp/`. Blobs are written through git's own eol conversion against that
+        // metadata (no checkout, so no filter driver; the index below touches no file and runs no
+        // hook): nothing the repository configures runs outside the floor's sandbox (codex round
+        // 17).
+        let commit = crate::worktree_guard::git_string(
+            worktree,
+            &["rev-parse", "--verify", &format!("{head}^{{commit}}")],
+            &[("GIT_DIR", git_dir)],
+        )
+        .map_err(|e| why(e.to_string()))?;
+        write_private_git_dir(&held, ".git", git_dir, worktree, &commit, false).map_err(why)?;
+        write_tree_blobs(worktree, git_dir, head, &dir, &held, &dir.join(".git")).map_err(why)?;
+        // The base's own index, populated from the base tree: nothing of the head's index is
+        // ever read. Hooks: the engine's empty directory.
+        let hooks = format!("core.hooksPath={}", no_hooks_dir().map_err(why)?.display());
+        // spawn-audit: hardened — git plumbing over the private base repository.
+        let mut read_tree = Command::new("git");
+        read_tree
+            .hardened()
+            .args(["-c", &hooks, "read-tree", &commit])
+            .current_dir(&dir)
+            .env("GIT_DIR", dir.join(".git"))
+            .env("GIT_WORK_TREE", &dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        isolate_git_config(&mut read_tree);
+        let out = read_tree
+            .output()
+            .map_err(|e| why(format!("git read-tree: {e}")))?;
+        if !out.status.success() {
+            return Err(why(format!(
+                "the base's index could not be set: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
         Ok(Self {
             dir,
             held,
@@ -4968,7 +5356,7 @@ pub const OUTCOME_COULD_NOT_RUN: &str = "could_not_run";
 pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
 /// The versioned base-cache record (core#1060 r9 keyed the cache by sandbox policy; v4 adds the
 /// base inventory): a record of any other version, or a bare `CheckRun`, is a miss.
-const FLOOR_POLICY_VERSION: u32 = 12;
+const FLOOR_POLICY_VERSION: u32 = 13;
 /// The most base failures the floor confirms one by one (each run alone on the base); more than
 /// this escalates rather than paying for them.
 const MAX_ALONE_CONFIRMATIONS: usize = 16;
@@ -6902,7 +7290,7 @@ pub(crate) fn run_one_with(
     #[cfg(not(unix))]
     cmd.current_dir(worktree.join(&check.dir));
     // The launcher's environment: the floor's sanitized allow-list only (the guide's is in `full`).
-    scratch.apply_env(&mut cmd, tree);
+    scratch.apply_env(&mut cmd, tree, worktree);
     if !env_inside {
         // No launcher: this process is the command itself.
         for (k, v) in &exec.env {

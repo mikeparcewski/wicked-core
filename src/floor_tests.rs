@@ -2231,9 +2231,9 @@ fn the_base_export_runs_no_repository_hook_or_filter() {
     // Configured AFTER the commit, as a repository could carry them.
     let hooks = outside.join("hooks");
     std::fs::create_dir_all(&hooks).unwrap();
-    let hook = hooks.join("post-index-change");
-    std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
-    {
+    for name in ["post-index-change", "post-checkout", "post-commit"] {
+        let hook = hooks.join(name);
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
@@ -2244,6 +2244,8 @@ fn the_base_export_runs_no_repository_hook_or_filter() {
     let smudge = format!("sh -c 'touch {}; cat'", marker.display());
     git(&repo, &["config", "filter.evil.smudge", &smudge]);
     git(&repo, &["config", "filter.evil.clean", "cat"]);
+    git(&repo, &["config", "filter.evil.process", &smudge]);
+    git(&repo, &["config", "filter.evil.required", "true"]);
     let scratch_dir = CheckScratch::prepare(&repo).unwrap();
     let head = git(&repo, &["rev-parse", "HEAD"]);
     let root = crate::repo_checks::HeldDir::open(&repo).unwrap();
@@ -2254,6 +2256,17 @@ fn the_base_export_runs_no_repository_hook_or_filter() {
     );
     let _ = remove_base_export(&root);
     drop(scratch_dir);
+    // The guarded (verify/deliver) checkout exports through the same conversion: it too runs no
+    // configured driver or hook, and still writes the file.
+    let tree_id = git(&repo, &["rev-parse", "HEAD^{tree}"]);
+    let guarded =
+        crate::repo_checks::checkout_guarded_tree(&repo, &repo.join(".git"), &tree_id, "hooks")
+            .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(guarded.dir.join("a.txt")).unwrap(),
+        "plain\n"
+    );
+    drop(guarded);
     // The probe exports through the same path.
     let _ = probe(&repo, stand_in_guide());
     assert!(
@@ -3686,5 +3699,317 @@ fn a_base_that_exited_outside_failed_exit_is_never_inventoried() {
             .is_some_and(|r| r.contains("not one of the guide's `failedExit` codes")),
         "{d:?}"
     );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (PRODUCT-WORKS J4) The floor's copies are what `git checkout` would write: a `.cmd` file stored
+/// LF under `*.cmd text eol=crlf` is CRLF in the base export AND in the guarded (verify/deliver)
+/// checkout — converted under the attributes of the EXPORTED tree (the head's uncommitted,
+/// conflicting `.gitattributes` is never consulted for the base) — and an untouched converted
+/// checkout still passes `hold_to`, while a changed byte does not.
+#[cfg(unix)]
+#[test]
+fn the_floors_copies_keep_the_declared_line_endings() {
+    let _load = seam::pin(0.5, 4);
+    if !git_has_attr_source() {
+        eprintln!("SKIP: this git has no --attr-source (< 2.40); the export writes raw blobs (see without_attr_source_the_export_writes_the_raw_blobs)");
+        return;
+    }
+    let repo = scratch("export-eol");
+    std::fs::write(repo.join(".gitattributes"), "*.cmd text eol=crlf\n").unwrap();
+    std::fs::write(repo.join("run.cmd"), "echo ok\n").unwrap();
+    std::fs::create_dir_all(repo.join("sub")).unwrap();
+    std::fs::write(repo.join("sub/b.cmd"), "a\nb\n").unwrap();
+    std::fs::write(repo.join("plain.txt"), "keep\n").unwrap();
+    std::os::unix::fs::symlink("run.cmd", repo.join("link.cmd")).unwrap();
+    let head = git_repo_with_commit(&repo);
+    // The stored blob is LF.
+    assert_eq!(git(&repo, &["cat-file", "blob", "HEAD:run.cmd"]), "echo ok");
+    let git_dir = repo.join(".git");
+    let tree_id = git(&repo, &["rev-parse", "HEAD^{tree}"]);
+
+    // The head's attributes now say the opposite (uncommitted): the base must not read them.
+    std::fs::write(repo.join(".gitattributes"), "*.cmd -text\n").unwrap();
+    let _scratch = CheckScratch::prepare(&repo).unwrap();
+    let root = crate::repo_checks::HeldDir::open(&repo).unwrap();
+    let base = BaseTree::export(&repo, &root, &git_dir, &head).unwrap();
+    assert_eq!(
+        std::fs::read(base.dir.join("run.cmd")).unwrap(),
+        b"echo ok\r\n"
+    );
+    assert_eq!(
+        std::fs::read(base.dir.join("sub/b.cmd")).unwrap(),
+        b"a\r\nb\r\n"
+    );
+    assert_eq!(
+        std::fs::read(base.dir.join("plain.txt")).unwrap(),
+        b"keep\n"
+    );
+    // A symlink target is never converted.
+    assert_eq!(
+        std::fs::read_link(base.dir.join("link.cmd")).unwrap(),
+        Path::new("run.cmd")
+    );
+    let _ = remove_base_export(&root);
+
+    // The guarded checkout of the committed tree (the verify/deliver copy).
+    std::fs::write(repo.join(".gitattributes"), "*.cmd text eol=crlf\n").unwrap();
+    let checkout = crate::repo_checks::checkout_guarded_tree(&repo, &git_dir, &tree_id, "eol")
+        .expect("guarded checkout");
+    let dir = checkout.dir.clone();
+    assert_eq!(std::fs::read(dir.join("run.cmd")).unwrap(), b"echo ok\r\n");
+    assert_eq!(std::fs::read(dir.join("sub/b.cmd")).unwrap(), b"a\r\nb\r\n");
+    // Untouched, the converted copy passes the integrity re-check…
+    let mut report = guarded_report_stub(&repo);
+    checkout.hold_to(&tree_id, &mut report);
+    assert!(report.passed, "an untouched converted checkout: {report:?}");
+    // …and one changed byte does not.
+    std::fs::write(dir.join("run.cmd"), b"echo no\r\n").unwrap();
+    let mut changed = guarded_report_stub(&repo);
+    checkout.hold_to(&tree_id, &mut changed);
+    assert!(!changed.passed, "a changed byte must fail: {changed:?}");
+    // Even the raw LF blob (what the old export wrote) is a change now.
+    std::fs::write(dir.join("run.cmd"), b"echo ok\n").unwrap();
+    let mut raw = guarded_report_stub(&repo);
+    checkout.hold_to(&tree_id, &mut raw);
+    assert!(
+        !raw.passed,
+        "the unconverted bytes are not the checkout: {raw:?}"
+    );
+    drop(checkout);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// On a git without `--attr-source` (older than 2.40) the export falls back to the raw blobs, as
+/// before eol conversion existed, instead of failing every floor export: every entry is still
+/// written, a regular file holds its stored bytes and a symlink keeps its target.
+#[cfg(unix)]
+#[test]
+fn without_attr_source_the_export_writes_the_raw_blobs() {
+    let _load = seam::pin(0.5, 4);
+    let repo = scratch("export-raw");
+    std::fs::write(repo.join(".gitattributes"), "*.cmd text eol=crlf\n").unwrap();
+    std::fs::write(repo.join("run.cmd"), "echo ok\n").unwrap();
+    std::os::unix::fs::symlink("run.cmd", repo.join("link.cmd")).unwrap();
+    let head = git_repo_with_commit(&repo);
+    let git_dir = repo.join(".git");
+    let tree_id = git(&repo, &["rev-parse", "HEAD^{tree}"]);
+    let out = scratch("export-raw-out");
+    let held = crate::repo_checks::HeldDir::open(&out).unwrap();
+    let conv = scratch("export-raw-conv");
+    let conv_held = crate::repo_checks::HeldDir::open(&conv).unwrap();
+    write_private_git_dir(&conv_held, "git", &git_dir, &repo, &head, true).unwrap();
+    let written = write_tree_blobs_with(
+        &repo,
+        &git_dir,
+        &tree_id,
+        &out,
+        &held,
+        &conv.join("git"),
+        false,
+    )
+    .unwrap();
+    assert_eq!(written.len(), 3, "every entry is written: {written:?}");
+    assert_eq!(std::fs::read(out.join("run.cmd")).unwrap(), b"echo ok\n");
+    assert_eq!(
+        std::fs::read_link(out.join("link.cmd")).unwrap(),
+        Path::new("run.cmd")
+    );
+    for d in [&repo, &out, &conv] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// (codex on #1127, P2) Configuration handed down through the environment (`GIT_CONFIG_COUNT` /
+/// `GIT_CONFIG_KEY_<n>`, `GIT_CONFIG_PARAMETERS`) never reaches the export's private git: a
+/// `filter.<x>.smudge` driver injected that way would otherwise run under `cat-file --filters`.
+#[cfg(unix)]
+#[test]
+fn inherited_git_config_never_reaches_the_private_repository() {
+    let repo = scratch("export-env-config");
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    git_repo_with_commit(&repo);
+    let ask = |isolate: bool, key: &str| -> bool {
+        // spawn-audit: hardened — `git config --get` on the test's own scratch repository.
+        let mut cmd = std::process::Command::new("git");
+        cmd.hardened()
+            .args(["config", "--get", key])
+            .current_dir(&repo)
+            .env("GIT_DIR", repo.join(".git"))
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "filter.evil.smudge")
+            .env("GIT_CONFIG_VALUE_0", "touch /nonexistent/ran")
+            .env(
+                "GIT_CONFIG_PARAMETERS",
+                "'filter.evil.process'='touch /nonexistent/ran'",
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if isolate {
+            isolate_git_config(&mut cmd);
+        }
+        cmd.status().unwrap().success()
+    };
+    // Without isolation the environment does hand the driver over (the test's premise)…
+    assert!(ask(false, "filter.evil.smudge"));
+    assert!(ask(false, "filter.evil.process"));
+    // …and isolated, it does not.
+    assert!(!ask(true, "filter.evil.smudge"));
+    assert!(!ask(true, "filter.evil.process"));
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (codex on #1127, P2) A tree entry that Windows would resolve to the export's `.git` (NTFS
+/// aliases, as git's `is_ntfs_dotgit`) is refused like `.git` itself; ordinary names are not.
+#[test]
+fn a_tree_entry_aliasing_dot_git_is_refused() {
+    for alias in [
+        ".git",
+        ".GIT",
+        ".git.",
+        ".git ",
+        ".git. .",
+        "git~1",
+        "GIT~1",
+        ".git::$INDEX_ALLOCATION",
+        "git~1:stream",
+    ] {
+        assert!(names_git_metadata(alias), "{alias:?} aliases .git");
+    }
+    for name in [
+        ".gitignore",
+        ".github",
+        "git",
+        "git~2",
+        ".gitattributes",
+        "x.git",
+        ".git-blame-ignore-revs",
+    ] {
+        assert!(!names_git_metadata(name), "{name:?} is an ordinary entry");
+    }
+}
+
+/// A passing report to hand `hold_to` (it only ever flips `passed` to false).
+#[cfg(unix)]
+fn guarded_report_stub(repo: &Path) -> RepoChecksReport {
+    let mut r = guarded_checkout_refused(repo, &FloorContext::default(), "stub");
+    r.passed = true;
+    r.detect_error = None;
+    r
+}
+
+/// (PRODUCT-WORKS J5) A git call inside a base check resolves to the BASE: its own toplevel, HEAD
+/// and index — from the root and from a package subdirectory — never the head worktree's index or
+/// its untracked `tmp/`.
+#[cfg(unix)]
+#[test]
+fn git_inside_a_base_check_sees_the_base_and_never_the_head() {
+    let _load = seam::pin(0.5, 4);
+    let repo = scratch("base-git-context");
+    std::fs::create_dir_all(repo.join("pkg")).unwrap();
+    std::fs::write(repo.join("identity.txt"), "BASE_ONLY\n").unwrap();
+    std::fs::write(repo.join("pkg/inner.txt"), "BASE_ONLY inner\n").unwrap();
+    let head = git_repo_with_commit(&repo);
+    // The head diverges and carries an untracked decoy under `tmp/`.
+    std::fs::write(repo.join("identity.txt"), "HEAD_ONLY\n").unwrap();
+    std::fs::write(repo.join("pkg/inner.txt"), "HEAD_ONLY inner\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    std::fs::create_dir_all(repo.join("tmp")).unwrap();
+    std::fs::write(repo.join("tmp/decoy.txt"), "BASE_ONLY HEAD_ONLY decoy\n").unwrap();
+    let head_index = std::fs::read(repo.join(".git/index")).unwrap();
+
+    // About git context, not sandboxing: no launcher, so it also passes inside a sandboxed floor
+    // (a nested sandbox is refused there).
+    let sandbox = crate::validator::WorkerSandbox {
+        wrapper: Vec::new(),
+        level: crate::validator::SandboxLevel::BestEffort,
+        downgrade_reason: Some("test".into()),
+    };
+    let scratch_dir = CheckScratch::prepare(&repo).unwrap();
+    let root = crate::repo_checks::HeldDir::open(&repo).unwrap();
+    let base = BaseTree::export(&repo, &root, &repo.join(".git"), &head).unwrap();
+    // The check's own fixture repository (`git init <dir>`, `git -C <dir>`) is ITS repository,
+    // not the base's: nothing pins the base's git dir for descendants (codex on #1127).
+    let probe_script = "git rev-parse --show-toplevel && git rev-parse HEAD && \
+         git rev-parse --absolute-git-dir && git grep -l BASE_ONLY -- . && \
+         ! git grep -q HEAD_ONLY -- . && ! git grep -q decoy -- . && \
+         fx=\"$TMPDIR/fixture-$$\" && rm -rf \"$fx\" && mkdir -p \"$fx\" && git init -q \"$fx\" && \
+         test -d \"$fx/.git\" && [ \"$(git -C \"$fx\" rev-parse --absolute-git-dir)\" = \"$(cd \"$fx/.git\" && pwd -P)\" ]";
+    for dir in ["", "pkg"] {
+        let check = RepoCheck {
+            name: "test".into(),
+            argv: ["sh", "-c", probe_script].map(String::from).to_vec(),
+            source: "fixture".into(),
+            timeout_s: None,
+            dir: dir.into(),
+        };
+        let r = run_held(
+            &base.dir,
+            Some(&base.held),
+            &check,
+            &sandbox,
+            &scratch_dir,
+            crate::repo_checks::Tree::Base,
+        );
+        assert!(r.passed(), "dir {dir:?}: {r:?}");
+        let out: Vec<&str> = r.stdout_tail.lines().collect();
+        assert_eq!(
+            std::fs::canonicalize(out[0]).unwrap(),
+            std::fs::canonicalize(&base.dir).unwrap(),
+            "the toplevel is the base export: {out:?}"
+        );
+        assert_eq!(out[1], head, "HEAD is the base commit: {out:?}");
+        assert_eq!(
+            std::fs::canonicalize(out[2]).unwrap(),
+            std::fs::canonicalize(base.dir.join(".git")).unwrap(),
+            "{out:?}"
+        );
+    }
+    // The head's index was never read or rewritten.
+    assert_eq!(std::fs::read(repo.join(".git/index")).unwrap(), head_index);
+    let _ = remove_base_export(&root);
+    drop(scratch_dir);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// A SHA-256 repository exports too: the private repository hashes like its source.
+#[cfg(unix)]
+#[test]
+fn a_sha256_repository_exports_with_its_line_endings() {
+    let _load = seam::pin(0.5, 4);
+    if !git_has_attr_source() {
+        eprintln!("SKIP: this git has no --attr-source (< 2.40); the export writes raw blobs");
+        return;
+    }
+    let repo = scratch("export-sha256");
+    std::fs::write(repo.join(".gitattributes"), "*.cmd text eol=crlf\n").unwrap();
+    std::fs::write(repo.join("run.cmd"), "echo ok\n").unwrap();
+    // spawn-audit: hardened — git init on the test's own scratch repository.
+    let mut init_cmd = std::process::Command::new("git");
+    init_cmd
+        .hardened()
+        .args(["init", "-q", "--object-format=sha256"])
+        .current_dir(&repo);
+    let init = init_cmd.output();
+    if !init.is_ok_and(|o| o.status.success())
+        || git(&repo, &["rev-parse", "--show-object-format"]) != "sha256"
+    {
+        let _ = std::fs::remove_dir_all(&repo);
+        return; // this git cannot make a SHA-256 repository
+    }
+    git(&repo, &["config", "user.email", "t@example.invalid"]);
+    git(&repo, &["config", "user.name", "t"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "base"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let _scratch = CheckScratch::prepare(&repo).unwrap();
+    let root = crate::repo_checks::HeldDir::open(&repo).unwrap();
+    let base = BaseTree::export(&repo, &root, &repo.join(".git"), &head).unwrap();
+    assert_eq!(
+        std::fs::read(base.dir.join("run.cmd")).unwrap(),
+        b"echo ok\r\n"
+    );
+    let _ = remove_base_export(&root);
     let _ = std::fs::remove_dir_all(&repo);
 }
