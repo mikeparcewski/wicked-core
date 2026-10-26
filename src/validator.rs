@@ -445,6 +445,8 @@ pub fn nested_sandbox() -> bool {
 
 /// Test gate: print why and return `true` when [`nested_sandbox`] — `if skip_when_nested("t") { return; }`.
 #[cfg(test)]
+// Every caller is a unix-only test: unused on Windows.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn skip_when_nested(test: &str) -> bool {
     let nested = nested_sandbox();
     if nested {
