@@ -30,6 +30,35 @@ Two release tracks share this file, newest entry first regardless of track:
   floor tests) skip with a stated reason when `validator::nested_sandbox()` (`sandbox-exec` on `PATH` but
   not applicable); outside a nested sandbox nothing changes.
 
+- **The floor's copies of a repo behave like a real checkout (PRODUCT-WORKS J4/J5).** The base, verify and
+  deliver copies are written with git's own working-tree conversion (`cat-file --batch --filters`, under the
+  exported tree's own `.gitattributes` and the source's `core.autocrlf`/`eol`), so a `.cmd` file stored LF under
+  `*.cmd text eol=crlf` keeps CRLF in all three; before, the raw blob lost it. The conversion runs against a
+  private repository that carries no `filter.*` driver, so no smudge/process driver or hook runs during export,
+  as before. On a git without `--attr-source` (older than 2.40) the copies fall back to the raw blobs, with
+  a warning, rather than fail every export. The guarded checkout's integrity re-check (`hold_to`) now
+  compares against the length and sha256 of the bytes the export wrote. The base export is also its own git repository (a private `.git`: HEAD the base
+  commit, its own index, the source objects as a read-only alternate, an empty hooks dir) that every base check
+  finds by discovery, under a `GIT_CEILING_DIRECTORIES` at the export's parent, so `git grep` and other git
+  calls in a base check see the base and never the head worktree's index or untracked `tmp/`, while a check's
+  own fixture repository (`git init <dir>`) stays its own. Git configuration handed down through the
+  environment (`GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`) never reaches the export. A tree entry named
+  `.git`, or an NTFS alias of it (`git~1`, trailing dots or spaces), is refused. The
+  internal base-cache policy version is bumped (13), so cached base results from older engines re-run.
+
+- **A container runtime blip is an infrastructure fault, never a seat failure (PRODUCT-WORKS J4, plain PR).**
+  On the test rig Rancher Desktop restarted mid-run. Docker was gone for about ten minutes, and claude and
+  then copilot each "failed" the unit with `container_runtime_down`. The failover ladder counted both, and
+  the run parked at a dead-seat card that offered only a quota-benched seat. Now a seat-container unit that
+  fails is read against a fresh runtime probe (the cached answer outlives a restart). While the runtime is
+  down the runner waits with backoff (2 s doubling to 30 s) within a bounded window (`WICKED_RUNTIME_WAIT_SECS`,
+  default 180), then re-runs the unit on the same seat once the runtime answers. Each step is on the wire as
+  the new additive `containerRuntimeWait {session, ord, attempt, cli, phase: waiting|recovered|unavailable,
+  waitedSecs, windowSecs}` frame. When the window runs out, the unit stops at a `failure` gate that names
+  the container runtime (`stepFailed.failureKind: environmentRefused`, so a skin offers no reassign), and
+  Approve retries on the same seat. The seat is never benched, struck, failed over or counted in the unit's
+  `worker_failed_clis` for it. An autonomous run fails as before.
+
 - **The repo-checks floor cache is capped as a whole and dropped at a run's end (#1122, plain PR).** On the
   test rig one wicked-core run's floor cache (`<worker home>/repo-checks`, the head and base cargo targets)
   reached 17.7 GB. That was under the 20 GB per-repository cap, and nothing capped the cache across

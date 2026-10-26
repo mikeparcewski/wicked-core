@@ -1309,6 +1309,22 @@ pub enum CoreEvent {
         cli: String,
         reason: String,
     },
+    /// (PRODUCT-WORKS J4) A seat-container unit failed while the host's container runtime was
+    /// not answering (a desktop runtime restarting): an infrastructure fault, not the seat's. The
+    /// runner waits for the runtime with backoff, within a bounded window, and re-runs the unit on
+    /// the SAME seat when it is back; the seat is never benched, struck or failed over for it.
+    /// `phase`: `waiting` (each probe that found it down), `recovered` (it answered again; the unit
+    /// re-runs), `unavailable` (the window ran out; the unit stops at a gate as an infrastructure
+    /// problem). `waitedSecs` since the wait began; `windowSecs` the bound. Additive: a new frame.
+    ContainerRuntimeWait {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        cli: String,
+        phase: String,
+        waited_secs: u64,
+        window_secs: u64,
+    },
     /// (core#500) A late `ApplyStepResult` from a killed or superseded tool attempt was silently
     /// discarded with no state change. Fires in two cases: (1) the run is already terminal when the
     /// result arrives — the killed attempt posted back AFTER `RunCancelled`; (2) the session's
@@ -1992,6 +2008,24 @@ impl CoreEvent {
                 "ord": ord,
                 "cli": cli,
                 "reason": reason,
+            }),
+            CoreEvent::ContainerRuntimeWait {
+                session,
+                ord,
+                attempt,
+                cli,
+                phase,
+                waited_secs,
+                window_secs,
+            } => json!({
+                "type": "containerRuntimeWait",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "cli": cli,
+                "phase": phase,
+                "waitedSecs": waited_secs,
+                "windowSecs": window_secs,
             }),
             CoreEvent::ToolResultDiscarded {
                 session,

@@ -6167,6 +6167,78 @@ fn apply_step_result(
     // (ASK-K1a) A team PA step's `timed_out` with another eligible seat enters here too: it is a
     // seat failure the ladder below re-picks the PA for; every other `timed_out` took the
     // backstop above and never reaches this point.
+    // (PRODUCT-WORKS J4) The container runtime stayed down for the runner's whole wait
+    // (`runtime_wait`): an infrastructure fault on the host, not the seat's. Judged FIRST, so
+    // nothing below reads it as the seat's — no bench, no repeated-failure strike, no failover,
+    // no triage judge. On the rig a Rancher Desktop restart failed claude, then copilot, each as a
+    // "seat failure", and the run parked at a dead-seat card offering only a quota-benched seat.
+    // With an operator present the unit pauses at a `failure` gate that names the runtime
+    // (`stepFailed.failureKind: environmentRefused`: another seat meets the same runtime, so no
+    // reassign is offered); Approve re-dispatches it on the same seat. Autonomous runs fail.
+    if output.status == crate::workflow::StepStatus::Failed
+        && unit.tool_cmd.is_none()
+        && (crate::runtime_wait::is_runtime_unavailable(&output.output)
+            // The floor's raw refusal reaches here only past the runner's wait (a launch it
+            // saw cancelled); it is still the runtime's, never the seat's (xreview on #1129).
+            || crate::runtime_wait::is_floor_runtime_refusal(&output.output))
+    {
+        let human_present = !matches!(session.human_confirm, crate::domain::HumanConfirm::None);
+        let cli = unit
+            .assigned_cli
+            .clone()
+            .unwrap_or_else(|| "claude".to_string());
+        let why = format!(
+            "Unit {ord} ({cli}) did not run: container runtime unavailable — the host's container \
+             runtime did not answer within the wait, an infrastructure fault, not seat '{cli}''s \
+             (the seat is not benched)"
+        );
+        emit(
+            subscribers,
+            CoreEvent::StepFailed {
+                session: run_id.clone(),
+                ord,
+                attempt: output.attempt,
+                detail: if human_present {
+                    format!("{why} — pausing for operator decision")
+                } else {
+                    format!("{why} — no operator in the loop; failing")
+                },
+                failure_kind: crate::event::StepFailureKind::EnvironmentRefused,
+            },
+        );
+        let raw_excerpt: String = failure_detail_excerpt(output.output.trim());
+        unit.status = crate::domain::UnitStatus::Rejected;
+        unit.denial_reason = Some(format!("{why}: {raw_excerpt}"));
+        put_node(store, unit.to_node())?;
+        persist_rejected_transcript(store, &session, unit, &output.output);
+        if human_present {
+            let prompt = format!(
+                "{why}. Start the container runtime (Rancher Desktop, Docker Desktop, `podman \
+                 machine start`, `colima start`), then approve to retry on the same seat \
+                 (optionally amend), or reject to stop the run. Every seat runs in the same \
+                 runtime, so reassigning does not fix it."
+            );
+            pause_for_human(
+                store,
+                subscribers,
+                self_tx,
+                &mut session,
+                ord,
+                Some(ord),
+                "failure",
+                prompt,
+            )?;
+            return Ok(StepApplied::Paused);
+        }
+        return Ok(fail_run(
+            store,
+            subscribers,
+            runner,
+            self_tx,
+            &mut session,
+            ord,
+        ));
+    }
     if output.status == crate::workflow::StepStatus::Failed || pa_timed_out {
         // (F-7R2-006) An AUTHENTICATION refusal from the worker (`Not logged in`, `401
         // Unauthorized`, an ACP `unauthenticated`/`auth_failed` handshake refusal — the council's
