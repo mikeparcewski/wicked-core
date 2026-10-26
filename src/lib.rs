@@ -1877,8 +1877,9 @@ impl Core {
     /// actor's queue while a run is mid-flight.
     ///
     /// Empty for a run that emitted nothing, one that predates the log, or an unknown id — an absent
-    /// history is not an error. Streaming chunk events are excluded by design; see
-    /// [`crate::event_log`].
+    /// history is not an error — and always empty for an in-memory core (`:memory:`), which records
+    /// no log ([`crate::event_log::log_root_for`]). Streaming chunk events are excluded by design;
+    /// see [`crate::event_log`].
     pub fn run_events(&self, run_id: &str) -> Vec<serde_json::Value> {
         self.log_root
             .as_deref()

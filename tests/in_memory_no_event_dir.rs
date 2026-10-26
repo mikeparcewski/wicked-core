@@ -10,6 +10,7 @@ fn an_in_memory_core_creates_no_event_log_directory() {
     let cwd = std::env::temp_dir().join(format!("wicked-memdb-noevents-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&cwd);
     std::fs::create_dir_all(&cwd).unwrap();
+    let prior = std::env::current_dir().unwrap();
     std::env::set_current_dir(&cwd).unwrap();
 
     let core = Core::spawn(":memory:");
@@ -54,6 +55,7 @@ fn an_in_memory_core_creates_no_event_log_directory() {
         stray.is_empty(),
         "no sidecar directory expected, saw {stray:?}"
     );
+    std::env::set_current_dir(prior).unwrap();
     let _ = std::fs::remove_dir_all(&cwd);
 }
 

@@ -518,9 +518,8 @@ pub(crate) mod tests {
             .arg("pid=")
             .output()
         {
-            Err(e) => {
-                e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1)
-            }
+            // EPERM (1) only: EACCES (a `ps` that lost its execute bit) still fails the test.
+            Err(e) => e.raw_os_error() == Some(1),
             Ok(_) => false,
         }
     }
