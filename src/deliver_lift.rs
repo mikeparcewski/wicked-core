@@ -507,15 +507,43 @@ fn merge_base(cwd: &Path, env: &[(&str, &Path)], a: &str, b: &str) -> Option<Str
         .filter(|s| !s.is_empty())
 }
 
+/// One conflicted index entry `git merge-tree --write-tree` reports: `stage` 1 is the merge base's
+/// side, 2 the remote tip's (`tip`), 3 the run's (`probe`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConflictEntry {
+    mode: String,
+    oid: String,
+    stage: u8,
+    path: String,
+}
+
+/// A conflicted in-memory merge: the conflict-marked tree `git merge-tree` wrote (every path that
+/// merged cleanly is merged there) and the conflicted entries, by stage.
+#[derive(Debug, Clone)]
+struct MergeConflict {
+    tree: String,
+    entries: Vec<ConflictEntry>,
+}
+
+impl MergeConflict {
+    /// The conflicted paths, sorted and deduplicated.
+    fn paths(&self) -> Vec<String> {
+        let mut files: Vec<String> = self.entries.iter().map(|e| e.path.clone()).collect();
+        files.sort();
+        files.dedup();
+        files
+    }
+}
+
 /// The in-memory merge: the run's content (`probe`, a dangling commit whose parent is the old
-/// base) onto `tip`. `Ok(Ok(tree))` clean; `Ok(Err(conflicted_paths))` conflict; `Err(why)` when
+/// base) onto `tip`. `Ok(Ok(tree))` clean; `Ok(Err(conflict))` conflict; `Err(why)` when
 /// `git merge-tree --write-tree` is unavailable or failed outright.
 fn merge_tree(
     cwd: &Path,
     env: &[(&str, &Path)],
     tip: &str,
     probe: &str,
-) -> Result<Result<String, Vec<String>>, String> {
+) -> Result<Result<String, MergeConflict>, String> {
     // spawn-audit: hardened — git plumbing over the run's own worktree; reads no engine state.
     let mut cmd = Command::new("git");
     cmd.hardened()
@@ -523,7 +551,7 @@ fn merge_tree(
             "merge-tree",
             "--write-tree",
             "--no-messages",
-            "--name-only",
+            "-z",
             tip,
             probe,
         ])
@@ -534,20 +562,28 @@ fn merge_tree(
     let out = cmd
         .output()
         .map_err(|e| format!("could not spawn `git merge-tree`: {e}"))?;
+    // `-z`: `<tree> NUL`, then one `<mode> <object> <stage> TAB <path> NUL` per conflicted entry.
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut lines = stdout.lines().map(str::trim).filter(|l| !l.is_empty());
+    let mut fields = stdout.split('\0');
+    let tree = fields.next().map(str::trim).unwrap_or_default().to_string();
     match out.status.code() {
-        Some(0) => lines
-            .next()
-            .map(|t| Ok(t.to_string()))
-            .ok_or_else(|| "`git merge-tree --write-tree` printed no tree id".to_string()),
+        Some(0) if !tree.is_empty() => Ok(Ok(tree)),
+        Some(0) => Err("`git merge-tree --write-tree` printed no tree id".to_string()),
         Some(1) => {
-            // First line: the (conflict-marked) tree id; the rest: conflicted file names.
-            let _tree = lines.next();
-            let mut files: Vec<String> = lines.map(str::to_string).collect();
-            files.sort();
-            files.dedup();
-            Ok(Err(files))
+            let entries = fields
+                .take_while(|f| !f.is_empty())
+                .filter_map(|f| {
+                    let (info, path) = f.split_once('\t')?;
+                    let mut info = info.split(' ');
+                    Some(ConflictEntry {
+                        mode: info.next()?.to_string(),
+                        oid: info.next()?.to_string(),
+                        stage: info.next()?.parse().ok()?,
+                        path: path.to_string(),
+                    })
+                })
+                .collect();
+            Ok(Err(MergeConflict { tree, entries }))
         }
         other => Err(format!(
             "`git merge-tree --write-tree` exited {} (needs git >= 2.38): {}",
@@ -557,6 +593,124 @@ fn merge_tree(
             String::from_utf8_lossy(&out.stderr).trim()
         )),
     }
+}
+
+/// The changelog file name crew's deliver script union-merges (crew#418 B): a conflicted path
+/// whose LAST component is exactly this, at any depth.
+const CHANGELOG_FILE: &str = "CHANGELOG.md";
+
+fn is_changelog(path: &str) -> bool {
+    path.rsplit('/').next() == Some(CHANGELOG_FILE)
+}
+
+/// A changelog with its `## [Unreleased]` section removed: from the line that starts with
+/// `## [Unreleased]` up to (not including) the next line that starts with `## [`. Byte-for-byte
+/// the `awk` guard in crew's deliver script (`packages/crew/src/core/deliver.ts`).
+fn without_unreleased(text: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut inside = false;
+    for line in text.split_inclusive(|b| *b == b'\n') {
+        if line.starts_with(b"## [Unreleased]") {
+            inside = true;
+            continue;
+        }
+        if inside && line.starts_with(b"## [") {
+            inside = false;
+        }
+        if !inside {
+            out.extend_from_slice(line);
+        }
+    }
+    out
+}
+
+/// (crew#418 B, in the engine) A conflict whose every conflicted path is a `CHANGELOG.md` that the
+/// two sides changed ONLY inside its `## [Unreleased]` section is union-merged — both sides' lines
+/// kept, no markers (`git merge-file --union`, as crew's deliver script does on its rebase) — and
+/// the merged tree is returned. `Ok(None)`: some conflicted path is not a changelog, so the
+/// conflict stands as it is. `Err(why)`: every path is a changelog but one cannot be unioned
+/// safely (a side deleted or added it, a mode differs, the sides differ outside `[Unreleased]`,
+/// git refused) — the conflict stands, and `why` says which. Nothing here touches the worktree:
+/// the blobs and the tree go into the object store only, through a scratch index.
+fn union_changelog_conflict(
+    cwd: &Path,
+    env: &[(&str, &Path)],
+    conflict: &MergeConflict,
+) -> Result<Option<(String, Vec<String>)>, String> {
+    let paths = conflict.paths();
+    if paths.is_empty() || !paths.iter().all(|p| is_changelog(p)) {
+        return Ok(None);
+    }
+    let mut merged: Vec<(String, String, String)> = Vec::new();
+    for path in &paths {
+        let stage = |n: u8| {
+            conflict
+                .entries
+                .iter()
+                .find(|e| &e.path == path && e.stage == n)
+        };
+        let (Some(base), Some(ours), Some(theirs)) = (stage(1), stage(2), stage(3)) else {
+            return Err(format!(
+                "`{path}` was added or deleted on one side, not edited on both"
+            ));
+        };
+        let regular = |m: &str| m == "100644" || m == "100755";
+        if ours.mode != theirs.mode || !regular(&ours.mode) {
+            return Err(format!("`{path}` changed mode or is not a regular file"));
+        }
+        let blob = |oid: &str| {
+            git(cwd, &["cat-file", "blob", oid], env)
+                .map_err(|e| format!("`{path}` could not be read: {e}"))
+        };
+        if without_unreleased(&blob(&ours.oid)?) != without_unreleased(&blob(&theirs.oid)?) {
+            return Err(format!(
+                "`{path}` differs outside its `## [Unreleased]` section"
+            ));
+        }
+        let oid = git_string(
+            cwd,
+            &[
+                "merge-file",
+                "--union",
+                "--object-id",
+                &ours.oid,
+                &base.oid,
+                &theirs.oid,
+            ],
+            env,
+        )
+        .map_err(|e| format!("`{path}` could not be union-merged (needs git >= 2.43): {e}"))?;
+        if oid.is_empty() {
+            return Err(format!("`git merge-file` printed no blob id for `{path}`"));
+        }
+        merged.push((ours.mode.clone(), oid, path.clone()));
+    }
+    // The conflict-marked tree with each changelog replaced by its union, through a scratch index
+    // (never the worktree's own).
+    let index = crate::worktree_guard::scratch_index_path();
+    let mut ienv: Vec<(&str, &Path)> = env.to_vec();
+    ienv.push(("GIT_INDEX_FILE", &index));
+    let built = (|| -> anyhow::Result<String> {
+        git(cwd, &["read-tree", &conflict.tree], &ienv)?;
+        for (mode, oid, path) in &merged {
+            git(
+                cwd,
+                &[
+                    "update-index",
+                    "--cacheinfo",
+                    &format!("{mode},{oid},{path}"),
+                ],
+                &ienv,
+            )?;
+        }
+        git_string(cwd, &["write-tree"], &ienv)
+    })();
+    let _ = std::fs::remove_file(&index);
+    let tree = built.map_err(|e| format!("the unioned tree could not be written: {e}"))?;
+    if tree.is_empty() {
+        return Err("`git write-tree` printed no tree id".to_string());
+    }
+    Ok(Some((tree, paths)))
 }
 
 /// Lift the worktree's UNCOMMITTED work onto the remote default branch's current tip. Pure
@@ -672,21 +826,37 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
             }
         }
     };
-    let lifted_tree = match merged {
-        Ok(tree) => tree,
-        Err(conflicts) => {
-            return LiftReport {
-                outcome: LiftOutcome::Conflict,
-                base_ref: Some(base_ref),
-                base_before: Some(head),
-                base_after: Some(tip),
-                tree_before: Some(before.tree),
-                tree_after: None,
-                conflicts,
-                note: None,
+    // (crew#418 B) A conflict ONLY in changelogs, and only inside their `[Unreleased]` sections,
+    // is union-merged here, in the lift, exactly as crew's deliver script would on its rebase; the
+    // lifted tree then re-verifies like any other. Every other conflict stands.
+    let (lifted_tree, unioned) = match merged {
+        Ok(tree) => (tree, None),
+        Err(conflict) => match union_changelog_conflict(worktree, &env, &conflict) {
+            Ok(Some((tree, paths))) => (tree, Some(paths)),
+            outcome => {
+                return LiftReport {
+                    outcome: LiftOutcome::Conflict,
+                    base_ref: Some(base_ref),
+                    base_before: Some(head),
+                    base_after: Some(tip),
+                    tree_before: Some(before.tree),
+                    tree_after: None,
+                    conflicts: conflict.paths(),
+                    note: outcome
+                        .err()
+                        .map(|why| format!("the changelog conflict was not union-merged: {why}")),
+                }
             }
-        }
+        },
     };
+    let union_note = unioned.map(|paths| {
+        format!(
+            "{} conflicted only inside `## [Unreleased]` and {} union-merged (both sides' lines \
+             kept, as crew's deliver script does); the lifted tree is re-verified",
+            paths.join(", "),
+            if paths.len() == 1 { "was" } else { "were" }
+        )
+    });
     // Apply: content first (index + working tree = the lifted tree, judged against the OLD
     // base), then move the branch pointer under it. Ignored artifacts (node_modules, dist)
     // are in no tree and are untouched.
@@ -737,7 +907,7 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
             tree_before: Some(before.tree),
             tree_after: Some(after.tree),
             conflicts: Vec::new(),
-            note: None,
+            note: union_note,
         },
         Ok(after) => failed(
             Some(after.tree.clone()),
@@ -1065,11 +1235,16 @@ pub(crate) fn lift_and_reverify(
         LiftOutcome::Conflict => {
             return Err(format!(
                 "{LIFT_CONFLICT_MARKER} — lifting the run's work onto {base_ref} ({tip}) would \
-                 conflict in: {}. The worktree was left exactly as verified (base {}); nothing was \
-                 rebased and nothing was pushed. Resolve on the branch (rebase onto {base_ref}, \
-                 regenerate any generated files, re-run the repository's checks) and approve to \
-                 retry the deliver phase.",
+                 conflict in: {}{}. The worktree was left exactly as verified (base {}); nothing \
+                 was rebased and nothing was pushed. Resolve on the branch (rebase onto \
+                 {base_ref}, regenerate any generated files, re-run the repository's checks), \
+                 then deliver it again from the run's delivery card.",
                 report.conflicts.join(", "),
+                report
+                    .note
+                    .as_deref()
+                    .map(|n| format!(" ({n})"))
+                    .unwrap_or_default(),
                 report.base_before.as_deref().map(short).unwrap_or("?"),
             )
             .into())
@@ -1705,6 +1880,11 @@ mod tests {
     /// stale), and a run worktree linked from it with the creator's work UNCOMMITTED. Returns
     /// `(clone, worktree)`; `origin` is `<base>/origin.git`.
     fn stale_base_layout(tag: &str) -> (PathBuf, PathBuf) {
+        stale_base_layout_seeded(tag, &[])
+    }
+
+    /// [`stale_base_layout`] whose base commit also carries `extra` (`(path, content)` pairs).
+    fn stale_base_layout_seeded(tag: &str, extra: &[(&str, &str)]) -> (PathBuf, PathBuf) {
         let base = scratch(tag);
         let seed = base.join("seed");
         std::fs::create_dir_all(seed.join("src")).unwrap();
@@ -1713,6 +1893,11 @@ mod tests {
         std::fs::write(seed.join("src/a.ts"), "export const a = 1;\n").unwrap();
         std::fs::write(seed.join("README.md"), "hello\n").unwrap();
         std::fs::write(seed.join(".gitignore"), "node_modules/\n").unwrap();
+        for (path, content) in extra {
+            let at = seed.join(path);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(at, content).unwrap();
+        }
         run_git(&seed, &["add", "-A"]);
         run_git(&seed, &["commit", "-qm", "base"]);
         let origin = base.join("origin.git");
@@ -2045,6 +2230,209 @@ mod tests {
             "export const a = 2; // fixed\n"
         );
         assert_eq!(run_git(&wt, &["diff", "--cached", "--name-only"]), "");
+    }
+
+    const CHANGELOG_BASE: &str = "# Changelog\n\n## [Unreleased]\n\n## [1.0.0]\n\n- first\n";
+
+    fn changelog_with(unreleased: &str, released: &str) -> String {
+        format!("# Changelog\n\n## [Unreleased]\n\n{unreleased}\n## [1.0.0]\n\n{released}\n")
+    }
+
+    /// (J4 brick, run f3d30829) Main moved its CHANGELOG `[Unreleased]` section while the run added
+    /// its own line there: the merge conflicts ONLY in CHANGELOG.md, inside `[Unreleased]`. The
+    /// lift union-merges it (both lines, no markers) and lifts, as crew's deliver script would.
+    #[test]
+    fn a_changelog_only_conflict_inside_unreleased_is_union_merged_and_lifted() {
+        let (clone, wt) = stale_base_layout_seeded("cl-union", &[("CHANGELOG.md", CHANGELOG_BASE)]);
+        std::fs::write(
+            wt.join("CHANGELOG.md"),
+            changelog_with("- run: fixed a\n", "- first"),
+        )
+        .unwrap();
+        land_on_origin("cl-union", &clone, |o| {
+            std::fs::write(
+                o.join("CHANGELOG.md"),
+                changelog_with("- main: landed\n", "- first"),
+            )
+            .unwrap();
+            std::fs::write(o.join("src/landed.ts"), "export const landed = 1;\n").unwrap();
+        });
+        let r = lift_onto_remote_default(&wt, &clone);
+        assert_eq!(r.outcome, LiftOutcome::Lifted, "{r:?}");
+        assert!(r.conflicts.is_empty(), "{r:?}");
+        let note = r.note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains("CHANGELOG.md") && note.contains("union-merged"),
+            "the union is disclosed: {note}"
+        );
+        let tip = run_git(&wt, &["rev-parse", "origin/main"]);
+        assert_eq!(run_git(&wt, &["rev-parse", "HEAD"]), tip);
+        let cl = std::fs::read_to_string(wt.join("CHANGELOG.md")).unwrap();
+        assert!(
+            cl.contains("- main: landed") && cl.contains("- run: fixed a"),
+            "both sides' lines are kept: {cl}"
+        );
+        assert!(!cl.contains("<<<<<<<") && !cl.contains(">>>>>>>"), "{cl}");
+        assert!(cl.contains("## [1.0.0]\n\n- first\n"), "{cl}");
+        // The run's other work is intact and staged as the diff against the tip.
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/a.ts")).unwrap(),
+            "export const a = 2; // fixed\n"
+        );
+        assert!(wt.join("src/landed.ts").exists());
+        let staged = run_git(&wt, &["diff", "--cached", "--name-status"]);
+        assert!(
+            staged.contains("M\tCHANGELOG.md") && staged.contains("M\tsrc/a.ts"),
+            "{staged}"
+        );
+        assert_eq!(
+            r.tree_after.as_deref(),
+            Some(
+                crate::worktree_guard::snapshot(&wt, &clone)
+                    .unwrap()
+                    .tree
+                    .as_str()
+            )
+        );
+    }
+
+    /// The same changelog collision beside a conflict in CODE is still a lift conflict: nothing is
+    /// union-merged, nothing is lifted, the worktree stays exactly as verified.
+    #[test]
+    fn a_changelog_conflict_beside_a_code_conflict_still_stops_the_lift() {
+        let (clone, wt) = stale_base_layout_seeded("cl-mixed", &[("CHANGELOG.md", CHANGELOG_BASE)]);
+        std::fs::write(
+            wt.join("CHANGELOG.md"),
+            changelog_with("- run: fixed a\n", "- first"),
+        )
+        .unwrap();
+        land_on_origin("cl-mixed", &clone, |o| {
+            std::fs::write(
+                o.join("CHANGELOG.md"),
+                changelog_with("- main: landed\n", "- first"),
+            )
+            .unwrap();
+            std::fs::write(o.join("src/a.ts"), "export const a = 99; // landed\n").unwrap();
+        });
+        let before = crate::worktree_guard::snapshot(&wt, &clone).unwrap();
+        let r = lift_onto_remote_default(&wt, &clone);
+        assert_eq!(r.outcome, LiftOutcome::Conflict, "{r:?}");
+        assert_eq!(
+            r.conflicts,
+            vec!["CHANGELOG.md".to_string(), "src/a.ts".to_string()]
+        );
+        assert!(r.note.is_none(), "{r:?}");
+        let after = crate::worktree_guard::snapshot(&wt, &clone).unwrap();
+        assert_eq!(
+            after.tree, before.tree,
+            "the verified tree is exactly as it was"
+        );
+        assert_eq!(after.head, before.head);
+    }
+
+    /// A changelog whose two sides differ OUTSIDE `[Unreleased]` (both edited a released entry) is
+    /// not unioned — a union there would silently combine two edits of one released line.
+    #[test]
+    fn a_changelog_conflict_outside_unreleased_is_not_unioned() {
+        let (clone, wt) =
+            stale_base_layout_seeded("cl-released", &[("CHANGELOG.md", CHANGELOG_BASE)]);
+        std::fs::write(
+            wt.join("CHANGELOG.md"),
+            changelog_with("", "- first (run's wording)"),
+        )
+        .unwrap();
+        land_on_origin("cl-released", &clone, |o| {
+            std::fs::write(
+                o.join("CHANGELOG.md"),
+                changelog_with("", "- first (main's wording)"),
+            )
+            .unwrap();
+        });
+        let before = crate::worktree_guard::snapshot(&wt, &clone).unwrap();
+        let r = lift_onto_remote_default(&wt, &clone);
+        assert_eq!(r.outcome, LiftOutcome::Conflict, "{r:?}");
+        assert_eq!(r.conflicts, vec!["CHANGELOG.md".to_string()]);
+        assert!(
+            r.note.as_deref().unwrap_or_default().contains("outside"),
+            "{r:?}"
+        );
+        assert_eq!(
+            crate::worktree_guard::snapshot(&wt, &clone).unwrap().tree,
+            before.tree
+        );
+    }
+
+    /// End to end through the deliver unit's lift: the changelog-only conflict no longer fails the
+    /// delivery — it lifts and the lifted tree is re-verified; a mixed conflict still strands with
+    /// the `LIFT-CONFLICT` marker, naming the run's real recovery.
+    #[test]
+    fn a_changelog_only_conflict_delivers_and_a_mixed_one_still_strands() {
+        let (clone, wt) =
+            stale_base_layout_seeded("cl-deliver", &[("CHANGELOG.md", CHANGELOG_BASE)]);
+        std::fs::write(
+            wt.join("CHANGELOG.md"),
+            changelog_with("- run: fixed a\n", "- first"),
+        )
+        .unwrap();
+        land_on_origin("cl-deliver", &clone, |o| {
+            std::fs::write(
+                o.join("CHANGELOG.md"),
+                changelog_with("- main: landed\n", "- first"),
+            )
+            .unwrap();
+        });
+        let events = std::cell::RefCell::new(Vec::new());
+        let emit = |ev: CoreEvent| events.borrow_mut().push(ev);
+        match lift_and_reverify(&ctx_for(&clone, &wt, None), "cl-deliver", 5, 0, &emit) {
+            Ok(c) => assert!(c.checks.is_some(), "the lifted tree was re-verified"),
+            Err(e) if e.contains("no OS write boundary") => {
+                eprintln!("deliver_lift: no sandbox tool here — the re-verify floor cannot run")
+            }
+            Err(e) => panic!("a changelog-only conflict must not refuse the deliver: {e}"),
+        }
+        assert!(events.borrow().iter().any(|e| matches!(
+            e,
+            CoreEvent::DeliverLiftEvaluated { outcome, note: Some(n), .. }
+                if outcome == "lifted" && n.contains("union-merged")
+        )));
+
+        let (clone, wt) =
+            stale_base_layout_seeded("cl-deliver-mixed", &[("CHANGELOG.md", CHANGELOG_BASE)]);
+        std::fs::write(
+            wt.join("CHANGELOG.md"),
+            changelog_with("- run: fixed a\n", "- first"),
+        )
+        .unwrap();
+        land_on_origin("cl-deliver-mixed", &clone, |o| {
+            std::fs::write(
+                o.join("CHANGELOG.md"),
+                changelog_with("- main: landed\n", "- first"),
+            )
+            .unwrap();
+            std::fs::write(o.join("src/a.ts"), "export const a = 99; // landed\n").unwrap();
+        });
+        let err = lift_and_reverify(&ctx_for(&clone, &wt, None), "cl-deliver-mixed", 5, 0, &emit)
+            .err()
+            .expect("a code conflict refuses the deliver");
+        assert!(is_lift_conflict_strand(&err), "{err}");
+        assert!(err.contains("CHANGELOG.md, src/a.ts"), "{err}");
+        assert!(
+            err.contains("deliver it again from the run's delivery card"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_unreleased_strip_matches_the_deliver_scripts_awk_guard() {
+        let text = b"# C\n\n## [Unreleased]\n- a\n## [2.0.0]\n- b\n## [Unreleased-ish]\n";
+        // The heading and its body go; the next `## [` heading ends the section and stays.
+        assert_eq!(
+            without_unreleased(text),
+            b"# C\n\n## [2.0.0]\n- b\n## [Unreleased-ish]\n".to_vec(),
+            "only `## [Unreleased]` itself opens the section, as the awk pattern does"
+        );
+        assert!(is_changelog("CHANGELOG.md") && is_changelog("packages/x/CHANGELOG.md"));
+        assert!(!is_changelog("CHANGELOG.md.bak") && !is_changelog("docs/CHANGELOG.txt"));
     }
 
     /// A run branch that carries its OWN commits (a phase committed) is not the stale-base shape:
