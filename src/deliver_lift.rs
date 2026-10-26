@@ -517,21 +517,65 @@ struct ConflictEntry {
     path: String,
 }
 
+/// One of `git merge-tree`'s informational messages: the paths it is about and its stable
+/// conflict-type string (`Auto-merging`, `CONFLICT (contents)`, `CONFLICT(directory rename unclear
+/// split)`, …).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergeMessage {
+    paths: Vec<String>,
+    kind: String,
+}
+
+/// The message kind of a clean three-way content merge (no conflict of its own).
+const MSG_AUTO_MERGING: &str = "Auto-merging";
+/// The message kind of a textual content conflict — the only conflict a union may resolve.
+const MSG_CONTENTS: &str = "CONFLICT (contents)";
+
 /// A conflicted in-memory merge: the conflict-marked tree `git merge-tree` wrote (every path that
-/// merged cleanly is merged there) and the conflicted entries, by stage.
+/// merged cleanly is merged there), the conflicted entries by stage, and every message — a
+/// structural conflict (a directory rename split, a rename/delete) can carry no staged entry at all
+/// (codex review of #1130), so the entries alone do not say what conflicted. `messages` is `None`
+/// when they could not be read.
 #[derive(Debug, Clone)]
 struct MergeConflict {
     tree: String,
     entries: Vec<ConflictEntry>,
+    messages: Option<Vec<MergeMessage>>,
 }
 
 impl MergeConflict {
-    /// The conflicted paths, sorted and deduplicated.
+    /// The conflicted paths — the staged entries' and every conflict message's — sorted and
+    /// deduplicated.
     fn paths(&self) -> Vec<String> {
         let mut files: Vec<String> = self.entries.iter().map(|e| e.path.clone()).collect();
+        for m in self.messages.iter().flatten() {
+            if m.kind != MSG_AUTO_MERGING {
+                files.extend(m.paths.iter().cloned());
+            }
+        }
         files.sort();
         files.dedup();
         files
+    }
+}
+
+/// `git merge-tree -z`'s informational messages section: per message `<n> NUL <path>×n NUL <kind>
+/// NUL <text> NUL`. `None` when it does not parse.
+fn parse_merge_messages<'a>(
+    mut fields: impl Iterator<Item = &'a str>,
+) -> Option<Vec<MergeMessage>> {
+    let mut out = Vec::new();
+    loop {
+        let n = match fields.next() {
+            None | Some("") => return Some(out),
+            Some(n) => n.trim().parse::<usize>().ok()?,
+        };
+        let paths = (0..n)
+            .map(|_| fields.next().map(str::to_string))
+            .collect::<Option<Vec<_>>>()?;
+        let kind = fields.next()?.to_string();
+        let _text = fields.next()?;
+        out.push(MergeMessage { paths, kind });
     }
 }
 
@@ -547,14 +591,7 @@ fn merge_tree(
     // spawn-audit: hardened — git plumbing over the run's own worktree; reads no engine state.
     let mut cmd = Command::new("git");
     cmd.hardened()
-        .args([
-            "merge-tree",
-            "--write-tree",
-            "--no-messages",
-            "-z",
-            tip,
-            probe,
-        ])
+        .args(["merge-tree", "--write-tree", "--messages", "-z", tip, probe])
         .current_dir(cwd);
     for (k, v) in env {
         cmd.env(k, v);
@@ -562,7 +599,8 @@ fn merge_tree(
     let out = cmd
         .output()
         .map_err(|e| format!("could not spawn `git merge-tree`: {e}"))?;
-    // `-z`: `<tree> NUL`, then one `<mode> <object> <stage> TAB <path> NUL` per conflicted entry.
+    // `-z`: `<tree> NUL`, then one `<mode> <object> <stage> TAB <path> NUL` per conflicted entry,
+    // an empty field, then the informational messages ([`parse_merge_messages`]).
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut fields = stdout.split('\0');
     let tree = fields.next().map(str::trim).unwrap_or_default().to_string();
@@ -571,6 +609,7 @@ fn merge_tree(
         Some(0) => Err("`git merge-tree --write-tree` printed no tree id".to_string()),
         Some(1) => {
             let entries = fields
+                .by_ref()
                 .take_while(|f| !f.is_empty())
                 .filter_map(|f| {
                     let (info, path) = f.split_once('\t')?;
@@ -583,7 +622,12 @@ fn merge_tree(
                     })
                 })
                 .collect();
-            Ok(Err(MergeConflict { tree, entries }))
+            let messages = parse_merge_messages(fields);
+            Ok(Err(MergeConflict {
+                tree,
+                entries,
+                messages,
+            }))
         }
         other => Err(format!(
             "`git merge-tree --write-tree` exited {} (needs git >= 2.38): {}",
@@ -640,6 +684,22 @@ fn union_changelog_conflict(
     let paths = conflict.paths();
     if paths.is_empty() || !paths.iter().all(|p| is_changelog(p)) {
         return Ok(None);
+    }
+    // Every message must be a clean auto-merge, or a CONTENT conflict in a changelog: any other
+    // kind (a directory rename split, a rename or mode conflict — including one with no staged
+    // entry) or messages that could not be read leave the conflict standing (fail closed).
+    let Some(messages) = &conflict.messages else {
+        return Err("git's conflict messages could not be read".to_string());
+    };
+    if let Some(m) = messages.iter().find(|m| {
+        m.kind != MSG_AUTO_MERGING
+            && !(m.kind == MSG_CONTENTS && m.paths.iter().all(|p| is_changelog(p)))
+    }) {
+        return Err(format!(
+            "git also reported `{}` on {}",
+            m.kind,
+            m.paths.join(", ")
+        ));
     }
     let mut merged: Vec<(String, String, String)> = Vec::new();
     for path in &paths {
@@ -2420,6 +2480,62 @@ mod tests {
             err.contains("deliver it again from the run's delivery card"),
             "{err}"
         );
+    }
+
+    /// (codex review of #1130) A structural conflict can carry NO staged entry: here main splits
+    /// directory `z` (its files renamed to `y/` and `w/`) while the run adds `z/d.ts`, and both
+    /// add an `[Unreleased]` line. The only staged conflict is CHANGELOG.md, but git also reports
+    /// the directory-rename split — the lift must not union and ship that.
+    #[test]
+    fn a_changelog_conflict_beside_a_directory_rename_split_still_stops_the_lift() {
+        let (clone, wt) = stale_base_layout_seeded(
+            "cl-dirsplit",
+            &[
+                ("CHANGELOG.md", CHANGELOG_BASE),
+                ("z/b.ts", "b\n"),
+                ("z/c.ts", "c\n"),
+            ],
+        );
+        std::fs::write(
+            wt.join("CHANGELOG.md"),
+            changelog_with("- run: fixed a\n", "- first"),
+        )
+        .unwrap();
+        std::fs::write(wt.join("z/d.ts"), "d\n").unwrap();
+        land_on_origin("cl-dirsplit", &clone, |o| {
+            std::fs::write(
+                o.join("CHANGELOG.md"),
+                changelog_with("- main: landed\n", "- first"),
+            )
+            .unwrap();
+            std::fs::create_dir_all(o.join("y")).unwrap();
+            std::fs::create_dir_all(o.join("w")).unwrap();
+            std::fs::rename(o.join("z/b.ts"), o.join("y/b.ts")).unwrap();
+            std::fs::rename(o.join("z/c.ts"), o.join("w/c.ts")).unwrap();
+        });
+        let before = crate::worktree_guard::snapshot(&wt, &clone).unwrap();
+        let r = lift_onto_remote_default(&wt, &clone);
+        assert_eq!(r.outcome, LiftOutcome::Conflict, "{r:?}");
+        assert!(
+            r.conflicts.contains(&"CHANGELOG.md".to_string())
+                && r.conflicts.contains(&"z".to_string()),
+            "the structural conflict is named too: {r:?}"
+        );
+        let after = crate::worktree_guard::snapshot(&wt, &clone).unwrap();
+        assert_eq!(after.tree, before.tree);
+        assert_eq!(after.head, before.head);
+    }
+
+    #[test]
+    fn merge_tree_messages_parse_and_a_truncated_section_does_not() {
+        let raw = "1\0CHANGELOG.md\0Auto-merging\0Auto-merging CHANGELOG.md\n\0\
+                   1\0z\0CONFLICT(directory rename unclear split)\0text\n\0";
+        let got = parse_merge_messages(raw.split('\0')).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].kind, MSG_AUTO_MERGING);
+        assert_eq!(got[1].paths, vec!["z".to_string()]);
+        assert!(parse_merge_messages("2\0a\0".split('\0')).is_none());
+        assert_eq!(parse_merge_messages(std::iter::empty()), Some(Vec::new()));
     }
 
     #[test]

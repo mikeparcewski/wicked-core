@@ -34,7 +34,8 @@ Two release tracks share this file, newest entry first regardless of track:
   `## [Unreleased]` section (the same guard as crew's deliver script), it keeps both sides' lines
   (`git merge-file --union`, no markers), lifts the work, and says so in `deliverLiftEvaluated.note`. The
   lifted tree is then re-verified like any other lift. Every other conflict still strands the delivery as
-  `LIFT-CONFLICT`, with the worktree left as verified: a conflict in any other file, a changelog that differs
+  `LIFT-CONFLICT`, with the worktree left as verified: a conflict in any other file, any structural conflict
+  git reports (a directory-rename split carries no staged entry, so git's conflict messages are read too), a changelog that differs
   outside `[Unreleased]`, or a changelog that one side added or deleted. The refusal text now names the real
   recovery ("deliver it again from the run's delivery card") instead of an approve that has no gate.
 
