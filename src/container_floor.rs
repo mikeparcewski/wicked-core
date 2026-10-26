@@ -430,15 +430,33 @@ pub(crate) fn runtime() -> Result<Runtime, FloorUnarmed> {
     {
         return Ok(rt);
     }
+    let rt = probe_runtime(choice.as_deref())?;
+    if let Ok(mut g) = OK.lock() {
+        *g = Some((choice.clone(), rt.clone()));
+    }
+    Ok(rt)
+}
+
+/// Ask the runtime engine NOW, never the cache [`runtime`] keeps (PRODUCT-WORKS J4): whether a
+/// container runtime CLI is installed but its engine does not answer `version`. A desktop
+/// runtime that restarts (Rancher Desktop, Docker Desktop) is gone for a while after [`runtime`]
+/// has cached its first answer, so only a fresh probe tells a runtime blip from a seat's own
+/// failure. `false` when it answers, and when no runtime CLI is installed at all (nothing to
+/// wait for).
+pub(crate) fn runtime_down_now() -> bool {
+    matches!(
+        probe_runtime(std::env::var(RUNTIME_ENV).ok().as_deref()),
+        Err(FloorUnarmed::ContainerRuntimeDown)
+    )
+}
+
+/// The first runtime candidate whose engine answers `version`, probed (uncached).
+fn probe_runtime(choice: Option<&str>) -> Result<Runtime, FloorUnarmed> {
     if cfg!(windows) {
         return Err(FloorUnarmed::ContainerUnsupportedHost);
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let cands = runtime_candidates(
-        choice.as_deref(),
-        home.as_deref(),
-        crate::validator::find_on_path,
-    );
+    let cands = runtime_candidates(choice, home.as_deref(), crate::validator::find_on_path);
     if cands.is_empty() {
         return Err(FloorUnarmed::NoContainerRuntime);
     }
@@ -447,9 +465,6 @@ pub(crate) fn runtime() -> Result<Runtime, FloorUnarmed> {
         let mut probe = rt.cmd();
         probe.args(["version", "--format", "{{.Server.Version}}"]);
         if output_within(probe, PROBE_TIMEOUT).is_some_and(|o| o.status.success()) {
-            if let Ok(mut g) = OK.lock() {
-                *g = Some((choice.clone(), rt.clone()));
-            }
             return Ok(rt);
         }
     }
