@@ -7984,6 +7984,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn reassign_cancels_the_matching_wrapped_worker_and_stops_its_worktree_writes() {
+        if crate::validator::skip_when_nested(
+            "reassign_cancels_the_matching_wrapped_worker_and_stops_its_worktree_writes",
+        ) {
+            return;
+        }
         use std::time::{Duration, Instant};
         // Drives the wrapped exec path, which resolves the skills ladder from the process
         // environment: hold the env WRITE lock and pin "no snapshot", or a snapshot another test
@@ -8353,6 +8358,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_seat_wrapper_runs_through_run_bounded_with_its_pipes_and_is_reaped() {
+        if crate::validator::skip_when_nested(
+            "a_seat_wrapper_runs_through_run_bounded_with_its_pipes_and_is_reaped",
+        ) {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("wicked-cf-rb-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

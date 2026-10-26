@@ -14,6 +14,22 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The core suite passes inside the repo-checks floor's sandbox (plain PR).** The rig's base was red
+  with 39 failures that are green on CI. macOS refuses a nested `sandbox_apply` (exit 71), yet the
+  engine treated `sandbox-exec` on `PATH` as a working sandbox: it is now probed once per process by
+  running a trivial command under it, and when it cannot be applied detection takes the existing
+  no-sandbox path (`BestEffort`, empty wrapper) rather than claiming `Sandboxed`. `bwrap` and
+  `firejail` detection is unchanged. The two `outstanding_work` process-table tests and
+  `sign_out_ends_a_still_running_host_login…` skip with a stated reason when `ps` (setuid) is refused
+  with EPERM; production behaviour (`None` for an unreadable table) is unchanged. The host login
+  script's `mktemp -d` now honours `TMPDIR` (it ignored it on macOS and wrote outside the write roots).
+  An in-memory store (`:memory:`) no longer creates a `:memory:.events/` directory: it fans events out
+  live and records none (`event_log::log_root_for`).
+  Tests that need the engine's own sandbox (or a child the floor's profile cannot host unwrapped — the
+  tool-child kill/cancel suite, wrapped-seat, gateway and seat-login process tests, and the repo-checks
+  floor tests) skip with a stated reason when `validator::nested_sandbox()` (`sandbox-exec` on `PATH` but
+  not applicable); outside a nested sandbox nothing changes.
+
 - **The repo-checks floor cache is capped as a whole and dropped at a run's end (#1122, plain PR).** On the
   test rig one wicked-core run's floor cache (`<worker home>/repo-checks`, the head and base cargo targets)
   reached 17.7 GB. That was under the 20 GB per-repository cap, and nothing capped the cache across
