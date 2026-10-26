@@ -418,11 +418,13 @@ pub(crate) fn output_within(mut cmd: Command, limit: Duration) -> Option<std::pr
 
 /// The runtime this host runs seats with, probed (`<cli> version` must reach the engine). A
 /// success is cached for the process; a failure is not, so starting the runtime later is enough.
+/// The runtime [`runtime`] cached, keyed by the operator's choice, so a changed
+/// `WICKED_CONTAINER_RUNTIME` is honoured.
+static RUNTIME_OK: Mutex<Option<(Option<String>, Runtime)>> = Mutex::new(None);
+
 pub(crate) fn runtime() -> Result<Runtime, FloorUnarmed> {
-    // Keyed by the operator's choice, so a changed `WICKED_CONTAINER_RUNTIME` is honoured.
-    static OK: Mutex<Option<(Option<String>, Runtime)>> = Mutex::new(None);
     let choice = std::env::var(RUNTIME_ENV).ok();
-    if let Some((_, rt)) = OK
+    if let Some((_, rt)) = RUNTIME_OK
         .lock()
         .ok()
         .and_then(|g| g.clone())
@@ -430,26 +432,59 @@ pub(crate) fn runtime() -> Result<Runtime, FloorUnarmed> {
     {
         return Ok(rt);
     }
+    let rt = probe_runtime(choice.as_deref())?;
+    if let Ok(mut g) = RUNTIME_OK.lock() {
+        *g = Some((choice.clone(), rt.clone()));
+    }
+    Ok(rt)
+}
+
+/// Ask the runtime engine NOW, never the cache [`runtime`] keeps (PRODUCT-WORKS J4): whether a
+/// container runtime CLI is installed but its engine does not answer `version`. A desktop
+/// runtime that restarts (Rancher Desktop, Docker Desktop) is gone for a while after [`runtime`]
+/// has cached its first answer, so only a fresh probe tells a runtime blip from a seat's own
+/// failure. `false` when it answers, and when no runtime CLI is installed at all (nothing to
+/// wait for).
+pub(crate) fn runtime_down_now() -> bool {
+    let choice = std::env::var(RUNTIME_ENV).ok();
+    // The runtime the seats USE: once [`runtime`] has cached one for this choice, only that one
+    // counts — another healthy candidate (podman beside a restarting docker) runs no seat
+    // (xreview on #1129).
+    let cached = RUNTIME_OK
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .filter(|(c, _)| *c == choice)
+        .map(|(_, rt)| rt);
+    match cached {
+        Some(rt) => !runtime_answers(&rt),
+        None => matches!(
+            probe_runtime(choice.as_deref()),
+            Err(FloorUnarmed::ContainerRuntimeDown)
+        ),
+    }
+}
+
+/// Whether `rt`'s engine answers `version` now.
+fn runtime_answers(rt: &Runtime) -> bool {
+    let mut probe = rt.cmd();
+    probe.args(["version", "--format", "{{.Server.Version}}"]);
+    output_within(probe, PROBE_TIMEOUT).is_some_and(|o| o.status.success())
+}
+
+/// The first runtime candidate whose engine answers `version`, probed (uncached).
+fn probe_runtime(choice: Option<&str>) -> Result<Runtime, FloorUnarmed> {
     if cfg!(windows) {
         return Err(FloorUnarmed::ContainerUnsupportedHost);
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let cands = runtime_candidates(
-        choice.as_deref(),
-        home.as_deref(),
-        crate::validator::find_on_path,
-    );
+    let cands = runtime_candidates(choice, home.as_deref(), crate::validator::find_on_path);
     if cands.is_empty() {
         return Err(FloorUnarmed::NoContainerRuntime);
     }
     for cli in cands {
         let rt = Runtime { cli };
-        let mut probe = rt.cmd();
-        probe.args(["version", "--format", "{{.Server.Version}}"]);
-        if output_within(probe, PROBE_TIMEOUT).is_some_and(|o| o.status.success()) {
-            if let Ok(mut g) = OK.lock() {
-                *g = Some((choice.clone(), rt.clone()));
-            }
+        if runtime_answers(&rt) {
             return Ok(rt);
         }
     }
