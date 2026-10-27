@@ -5743,7 +5743,7 @@ impl FloorCheckout {
         let why = match self.changed_entries() {
             Ok(changed) if changed.is_empty() => return,
             Ok(changed) => format!(
-                "the checks changed the tracked content they ran on ({}{}) — a verify floor \
+                "the checks changed the tracked content they ran on ({}{}) — a guarded floor \
                  certifies only the guarded tree {}, untouched",
                 changed
                     .iter()

@@ -998,10 +998,11 @@ fn a_clean_evaluator_passes_and_the_repo_checks_are_the_gates_evidence() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// Codex review on #414: a "passing" check script that EDITS a tracked file. The evaluator leaves
-/// the tree alone and the repo checks exit 0 — yet the gate must DENY. Since core#417 the guarded
-/// verify floor runs on a clean checkout of the guarded tree, so the write lands there and the
-/// floor's post-check hold denies it; the live worktree is never touched.
+/// Codex review on #414: a "passing" check script that EDITS a tracked file. The repo checks exit
+/// 0 — yet the gate must DENY. Since core#417 the guarded verify floor runs on a clean checkout of
+/// the guarded tree, and since core#1144 the creator (fix) floor does too: the write lands in the
+/// FIX floor's checkout, the first floor to run, and its post-check hold denies the fix step there;
+/// the live worktree is never touched.
 /// Needs `npm` on PATH (every hosted CI runner; developer machines) — otherwise says so.
 #[test]
 fn a_passing_check_that_mutates_source_is_caught_by_the_final_comparison() {
@@ -1038,12 +1039,13 @@ fn a_passing_check_that_mutates_source_is_caught_by_the_final_comparison() {
         "a check that edits the tree must not certify it"
     );
     let evs = drain(&events);
-    let verify = gate_for(&evs, 4);
-    assert!(!verify.combined);
-    if checks_refused_without_a_boundary(&verify) {
+    // The fix step (ord 3) owns the first floor (core#1144: on a clean checkout).
+    let fix = gate_for(&evs, 3);
+    assert!(!fix.combined);
+    if checks_refused_without_a_boundary(&fix) {
         // No boundary ⇒ the mutating script never ran, so there is no write for the final
         // comparison to catch; the floor's refusal is the denial, and the tree stayed clean.
-        assert_fail_closed_without_boundary(&evs, &verify, 4);
+        assert_fail_closed_without_boundary(&evs, &fix, 3);
         assert!(
             !evs.iter()
                 .any(|ev| matches!(ev, CoreEvent::EvaluatorMutatedWorktree { .. })),
@@ -1052,22 +1054,22 @@ fn a_passing_check_that_mutates_source_is_caught_by_the_final_comparison() {
         let _ = std::fs::remove_dir_all(&repo);
         return;
     }
-    // (core#417) A guarded verify floor runs on a clean checkout of the guarded tree, so the
-    // mutating check writes THERE: the live worktree stays clean, and the floor's own hold —
-    // every tree entry re-checked after the checks — catches the write and fails the floor.
+    // (core#417, core#1144) A guarded floor runs on a clean checkout of the tree, so the mutating
+    // check writes THERE: the live worktree stays clean, and the floor's own hold — every tree
+    // entry re-checked after the checks — catches the write and fails the floor.
     assert_eq!(
-        verify.denial_source.as_deref(),
+        fix.denial_source.as_deref(),
         Some("repo_checks"),
         "the floor's hold caught the check's write: {:?}",
-        verify.denial_reason
+        fix.denial_reason
     );
     assert!(
-        verify.denial_reason.as_deref().is_some_and(|r| {
+        fix.denial_reason.as_deref().is_some_and(|r| {
             r.contains("the checks changed the tracked content they ran on")
                 && r.contains("src/app.ts")
         }),
         "{:?}",
-        verify.denial_reason
+        fix.denial_reason
     );
     assert!(
         !evs.iter()

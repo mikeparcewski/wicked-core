@@ -175,7 +175,18 @@ const TEST_FAILS_ON_BROKEN: &str = r#"["sh", "-c", "test ! -f BROKEN"]"#;
 /// host-load factor, at most 9 s — the bound scales with load, so the fast `lint` beside it
 /// still finishes); every later run (a marker under the checks' own HOME, which persists in the run's
 /// scratch) finishes at once.
-const TEST_SLOW_ONCE: &str = r#"["sh", "-c", "test -f \"$HOME/.slow-done\" && exit 0; : > \"$HOME/.slow-done\"; sleep 600"]"#;
+/// A `test` that hangs until `marker` exists, then passes. The TEST creates the marker once the
+/// first floor has timed out: a check cannot leave it itself, because every creator floor runs on a
+/// fresh clean checkout with its own scratch `HOME` (core#1144), so nothing a check writes outlives
+/// its floor.
+fn test_slow_until(marker: &std::path::Path) -> String {
+    serde_json::json!([
+        "sh",
+        "-c",
+        format!("test -f '{}' && exit 0; sleep 600", marker.display())
+    ])
+    .to_string()
+}
 
 /// A throwaway repo whose checks are `.wicked/checks.json` shell commands: `lint` always passes,
 /// `test` is `test_argv`. `markers` are committed files the seat keys on.
@@ -624,7 +635,12 @@ fn a_rework_that_repairs_the_tree_re_runs_the_floor() {
 /// a host with no OS write boundary.
 type TimedOut = (Core, std::sync::mpsc::Receiver<CoreEvent>, Ran, PathBuf);
 fn timed_out_fix(name: &str, sid: &str) -> Option<TimedOut> {
-    let repo = make_repo(name, TEST_SLOW_ONCE, 3, &[]);
+    let marker = std::env::temp_dir().join(format!(
+        "wicked-core-floorgate-{name}-{}-slow-done",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let repo = make_repo(name, &test_slow_until(&marker), 3, &[]);
     let (core, ran) = core_for(name, Rework::ChangesNothing);
     let events = launch(&core, name, &repo, sid);
     let first = until_settled(&events, sid);
@@ -634,6 +650,8 @@ fn timed_out_fix(name: &str, sid: &str) -> Option<TimedOut> {
     }
     let f = floors(&first, 3);
     assert_eq!(f.last().map(|x| x.1.as_str()), Some("timed_out"), "{f:?}");
+    // The slow check finishes from now on: the operator's re-run is the one that passes.
+    std::fs::write(&marker, "").unwrap();
     Some((core, events, ran, repo))
 }
 
