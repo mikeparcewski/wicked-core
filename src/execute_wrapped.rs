@@ -8468,18 +8468,16 @@ mod tests {
         let dir = dir.canonicalize().unwrap();
         // A fake runtime: `run ...` prints its last argument; any other call (the reap) is logged.
         let rt = dir.join("docker");
-        std::fs::write(
+        // Written by a child, never through a descriptor this process holds: a stub written
+        // in-process fails its exec with ETXTBSY on Linux when another test thread forks
+        // meanwhile (seen on ubuntu CI).
+        crate::test_env::install_stub(
             &rt,
-            format!(
+            &format!(
                 "#!/bin/sh\nif [ \"$1\" = run ]; then for a; do last=$a; done; echo \"seat-said:$last\"; exit 0; fi\necho \"$@\" >> {}/reaped\n",
                 dir.display()
             ),
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         let w = crate::container_floor::run_argv(&crate::container_floor::ContainerLaunch {
             runtime: &rt,
             image: "img:1",
