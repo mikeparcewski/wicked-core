@@ -155,13 +155,14 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 /// after the workflow it replaces, so a launch naming that id keeps launching; its steps are the
 /// consumer's §11.2 mapping (`tests/fixtures/catalog/mappings.json`, pinned by a test).
 ///
-/// Seeded here: `feature` (C2's acceptance), `bug` (M1), `chat` (M3), `onboarding` (M4), `migration` (M2),
+/// Seeded here: `analyze` (crew#1157), `feature` (C2's acceptance), `bug` (M1), `chat` (M3), `onboarding` (M4), `migration` (M2),
 /// `capture-learnings` (M7), `steering-author` (M8), `domain-extraction` (M6), `interactive-chat`,
 /// `interactive-draft` and `interactive-edit` (M9), `mcp-server` (M12), `editor-plugin` (X3), `learn` (DES-learn-workflow), `qe-author-tests` (M10) and `demo` (M9b,
 /// which replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping them). Every other consumer's preset is added by its migration seam (§14 M1–M10),
 /// which also deletes the def it replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
     vec![
+        ("analyze", analyze_preset()),
         ("bug", bug_preset()),
         ("capture-learnings", capture_learnings_preset()),
         ("chat", chat_preset()),
@@ -237,6 +238,15 @@ pub struct PresetDescriptor {
 /// store gains it with no rewrite. Every built-in has one (pinned by a test).
 pub fn builtin_preset_descriptor(name: &str) -> Option<PresetDescriptor> {
     let (title, summary, use_when): (&str, &str, &[&str]) = match name {
+        "analyze" => (
+            "Analyze code",
+            "Answer a question about one or more repositories from the code graph and the files, cited, changing nothing.",
+            &[
+                "how does this part of the code work",
+                "who calls this, what breaks if it changes",
+                "a cited answer without changing code",
+            ],
+        ),
         "bug" => (
             "Fix a bug",
             "Find the cause of a bug, reproduce it, fix it and check that the fix holds.",
@@ -380,6 +390,22 @@ pub(crate) fn builtin_preset(name: &str) -> Option<Vec<PlanStep>> {
         .into_iter()
         .find(|(n, _)| *n == name)
         .map(|(_, steps)| steps)
+}
+
+/// `analyze` (crew#1157): answer ONE question about the code in scope, read-only, as data
+/// (`src/presets/analyze.json`). One `understand` step, `answer`: neutral, `executes_code: false`,
+/// no pin, so its write posture is read-only on a bound or unbound run (every write tool and every
+/// shell write is refused at the boundary, [`crate::write_posture`]), the floor is empty, there is
+/// no creator step (no PA scope, no deliver) and no `qe_acceptance` (it is not in
+/// [`builtin_preset_instruments`]). It runs the `wicked-garden-search` skill: grounded in the estate
+/// graph through the read-only shim, confirmed by reading the files, every claim cited (file:line,
+/// symbol or graph path), and a repository with no bound graph is named as not indexed. The gate is
+/// the UNCONDITIONAL turn gate: approve ends the answer, a send-back is the follow-up question.
+/// crew's chat runs each turn of an analysis chat as this step (`POST /chats {workflow: "analyze"}`).
+fn analyze_preset() -> Vec<PlanStep> {
+    let plan: crate::plan::PlanSteps = serde_json::from_str(include_str!("presets/analyze.json"))
+        .expect("src/presets/analyze.json is a valid plan");
+    plan.steps
 }
 
 /// `chat` (§11.2, seam M3): explore → `understand`. One read-only step: no creator step, so the
@@ -1372,6 +1398,112 @@ mod tests {
         .map(|(a, b)| (a.to_string(), b.to_string()))
         .collect();
         assert_eq!(team, want);
+    }
+
+    /// crew#1157: `analyze` can never write. Its one step composes to a neutral, non-code,
+    /// unpinned `understand` unit whose write posture is READ-ONLY on a bound and an unbound run,
+    /// so the boundary refuses every write tool and every shell write into the tree; it has no
+    /// creator (no PA scope, no deliver) and needs no QE acceptance. Its instructions demand the
+    /// grounding (the read-only estate shim), the reading that confirms it, the citations, and the
+    /// not-indexed line with the "Index this repository" offer.
+    #[test]
+    fn analyze_is_one_read_only_cited_answer_step_that_can_never_write() {
+        use crate::write_posture::WritePosture;
+        let steps = builtin_preset("analyze").expect("analyze is a built-in");
+        assert_eq!(steps.len(), 1);
+        let step = &steps[0];
+        assert_eq!(
+            (step.catalog.as_str(), step.id.as_str()),
+            ("understand", "answer")
+        );
+        assert_eq!(step.skill_ref.as_deref(), Some("wicked-garden-search"));
+        assert_eq!(
+            step.gate,
+            Some(GateSpec::HumanConfirm {
+                unconditional: true
+            }),
+            "the turn gate: approve ends it, a send-back is the follow-up"
+        );
+        assert!(step.executor.is_none() && step.executes_code.is_none());
+        assert!(step.required_deliverables.is_none() && step.validator_pin.is_none());
+        let plan = crate::plan::PlanSteps {
+            steps: steps.clone(),
+            ..crate::plan::PlanSteps::default()
+        };
+        assert!(!plan.has_creator(), "no creator: no scope step, no deliver");
+        assert_eq!(
+            builtin_preset_instruments("analyze"),
+            None,
+            "no QE acceptance"
+        );
+
+        let def = crate::plan::compose(catalog(), &plan).expect("analyze composes");
+        assert_eq!(def.phases.len(), 1);
+        assert!(
+            def.phases.iter().all(|p| p.validator_pin.is_none()),
+            "no floor"
+        );
+        let units = crate::plan::plan_from_def(&def, "How does sign-in work?", "ra");
+        assert_eq!(units.len(), 1);
+        let u = &units[0];
+        assert!(!u.executes_code && u.tool_cmd.is_none());
+        assert_eq!(u.role, PhaseRole::Neutral);
+        assert!(u.worktree_guarded, "the worktree guard restores any change");
+        for bound in [true, false] {
+            assert_eq!(
+                WritePosture::of(u, bound),
+                WritePosture::ReadOnly,
+                "bound={bound}"
+            );
+        }
+
+        let posture = WritePosture::of(u, true);
+        let wt = std::path::Path::new("/wt");
+        for tool in ["Write", "Edit", "NotebookEdit"] {
+            let ctx =
+                serde_json::json!({ "path": "/wt/src/app.ts", "file_path": "/wt/src/app.ts" });
+            assert!(
+                crate::gate_hook::phase_scope_denial(false, posture, &ctx, tool, wt, None, &[])
+                    .is_some(),
+                "{tool} is refused"
+            );
+        }
+        for cmd in [
+            "echo x > /wt/src/app.ts",
+            "mkdir -p /wt/evidence",
+            "cat > /wt/a.md <<'EOF'\nx\nEOF",
+        ] {
+            let ctx = serde_json::json!({ "command": cmd });
+            assert!(
+                crate::gate_hook::phase_scope_denial(false, posture, &ctx, "Bash", wt, None, &[])
+                    .is_some(),
+                "a shell write is refused: {cmd}"
+            );
+        }
+        let read = serde_json::json!({ "command": "sed -n 1,40p /wt/src/app.ts" });
+        assert_eq!(
+            crate::gate_hook::phase_scope_denial(false, posture, &read, "Bash", wt, None, &[]),
+            None,
+            "reads are allowed"
+        );
+
+        let text = step.instructions.as_deref().unwrap();
+        for must in [
+            "READ-ONLY",
+            "_estate_client.py --readonly call",
+            "SearchEntity",
+            "BlastRadius",
+            "Lineage",
+            "RankHotspots",
+            "knowledge.recall",
+            "read every file you cite",
+            "`alpha/src/foo.ts:42`",
+            "graph path",
+            "is not indexed",
+            "Index this repository",
+        ] {
+            assert!(text.contains(must), "analyze instructions name `{must}`");
+        }
     }
 
     /// WT-C1 (N5, dormant): no built-in preset references the walkthrough entries — a walkthrough

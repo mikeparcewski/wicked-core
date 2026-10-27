@@ -1,0 +1,15 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "answer",
+   "gate": {
+    "human_confirm": {
+     "unconditional": true
+    }
+   },
+   "skill_ref": "wicked-garden-search",
+   "instructions": "Answer the operator's question about the code in scope, READ-ONLY. Change nothing: create, edit or delete no file, commit nothing, and run no command that writes; every write is refused in this step. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup in your shell: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (outside a crew run the launcher is `wicked-garden`). The same form reaches BlastRadius and Lineage ({\"symbol\":\"<name>\"}) for who depends on what and where data flows, RankHotspots ({\"limit\":20}) for the load-bearing code, the skill's path action for how A reaches B, and knowledge.recall (the wicked-garden-mem skill) for recorded decisions. Always pass --readonly. THEN CONFIRM: open and read every file you cite, at the lines you cite, before you cite it. ANSWER: lead with the answer in plain words, then the evidence. Every claim cites what it rests on: a file and line relative to its repository root and prefixed with the repository name (`alpha/src/foo.ts:42`), a symbol (`alpha::Foo::bar`), or a graph path from the shim (`a -> b -> c`). A claim you could not ground is named as such in one line, never asserted. NOT INDEXED: when no code graph is bound for a repository in scope (the scope statement says so, or the shim refuses or finds nothing for a symbol you read in the files), say so in the answer's first line: `<repository> is not indexed: this answer reads the files directly and may miss callers. Index this repository to ground answers in its code graph.` Then answer from the files. A follow-up question in this conversation is answered the same way. A request for a change is not attempted: say what would change and where, cited, and that a job, not this analysis, makes changes."
+  }
+ ]
+}

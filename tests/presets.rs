@@ -628,6 +628,7 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
     assert_eq!(
         names,
         [
+            "analyze",
             "bug",
             "capture-learnings",
             "chat",
@@ -650,9 +651,10 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
     // its phases, so it has no §11.2 row; `m9b_demo_*` pins its steps.
     // `editor-plugin` (X3) is a new workflow, not a migrated consumer: it has no §11.2 row either;
     // `x3_editor_plugin_*` pins its steps. `learn` (DES-learn-workflow) is new too; `learn_*` pins it.
+    // `analyze` (crew#1157) is new as well; `analyze_*` pins it.
     for (name, steps) in builtins
         .into_iter()
-        .filter(|(n, _)| *n != "demo" && *n != "editor-plugin" && *n != "learn")
+        .filter(|(n, _)| *n != "analyze" && *n != "demo" && *n != "editor-plugin" && *n != "learn")
     {
         let want: Vec<PlanStep> = serde_json::from_value(maps[name]["steps"].clone())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -1431,4 +1433,28 @@ fn learn_launches_the_preset_with_its_skill_and_the_unconditional_walkthrough() 
     }
     let author = units.iter().find(|u| u.id == "rlearn:author").unwrap();
     assert_eq!(author.depends_on, vec!["walkthrough".to_string()]);
+}
+
+/// crew#1157: a launch naming `analyze` runs the built-in preset as ONE read-only unit — the
+/// `answer` step on the neutral `understand` entry behind the unconditional turn gate, the
+/// `wicked-garden-search` skill, no pin — with no PA scope step (no creator), so a one-seat roster
+/// launches it and nothing else is planned.
+#[test]
+fn analyze_launches_one_read_only_answer_unit_on_one_seat() {
+    let dir = tmp_dir("analyze");
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    let rig = spawn(&db);
+    let mut one_seat = spec("ranalyze", "analyze", None);
+    one_seat.clis = vec![cli("a")];
+    rig.core.launch_run(one_seat).unwrap();
+    let units = units_of(&rig.core, "ranalyze");
+    let hu = r#"{"human_confirm":{"unconditional":true}}"#;
+    assert_eq!(
+        rows("ranalyze", &units),
+        vec![r("answer", "recon", "neutral", hu, None)]
+    );
+    let u = &units[0];
+    assert!(!u.executes_code, "analyze is read-only");
+    assert!(u.worktree_guarded);
+    assert_eq!(u.skill_ref.as_deref(), Some("wicked-garden-search"));
 }
