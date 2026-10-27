@@ -890,8 +890,11 @@ pub(crate) fn run(
     // run's evidence no longer depends on someone holding a socket while it happened. Rooted at
     // `<store>.events` — the same sidecar anchor as memory/knowledge above, so a core opened against a
     // scratch db keeps its logs there instead of in a shared global tree.
-    let mut subscribers =
-        crate::event_log::EventSink::persistent(crate::event_log::log_root(&sidecar_base));
+    // An in-memory store has no sidecar anchor: it fans out live and records nothing.
+    let mut subscribers = match crate::event_log::log_root_for(&sidecar_base) {
+        Some(root) => crate::event_log::EventSink::persistent(root),
+        None => crate::event_log::EventSink::default(),
+    };
     // Runs with a worker step in flight — guards against double-dispatch (non-idempotent side effects).
     let mut in_flight: HashSet<String> = HashSet::new();
     // (DES-TEAMING-002 P1) `confirm_gate` replies held while the answer waits on the team
@@ -29481,6 +29484,11 @@ mod tool_cmd_tests {
     #[cfg(unix)]
     #[test]
     fn a_stop_signal_kills_the_child_and_marks_it_cancelled_with_the_observed_reason() {
+        if crate::validator::skip_when_nested(
+            "a_stop_signal_kills_the_child_and_marks_it_cancelled_with_the_observed_reason",
+        ) {
+            return;
+        }
         let marker = std::env::temp_dir().join(format!(
             "wicked-core-toolstop-{}-{}.marker",
             std::process::id(),

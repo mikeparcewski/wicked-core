@@ -129,6 +129,12 @@ mod steering_packs;
 mod team;
 mod terminal;
 mod validator;
+/// Test support for integration tests: whether the engine's sandbox cannot be applied because this
+/// process is already inside one (see `validator::nested_sandbox`).
+#[doc(hidden)]
+pub fn nested_sandbox() -> bool {
+    validator::nested_sandbox()
+}
 mod validator_vault;
 pub mod walkthrough;
 mod worker_sandbox;
@@ -568,7 +574,7 @@ pub struct Core {
     /// the handle rather than fetched from the actor because reading a run's history is a plain file
     /// read: routing it through the command channel would queue an evidence read behind whatever the
     /// single writer is doing.
-    log_root: std::path::PathBuf,
+    log_root: Option<std::path::PathBuf>,
     /// What arming the launch bridge came to at spawn (DES-TEAMING-002 T0) — see
     /// [`Core::bus_bridge_state`].
     bus_bridge_state: crate::bus::BusBridgeState,
@@ -777,7 +783,7 @@ impl Core {
         let core = Core {
             tx: tx.clone(),
             pty,
-            log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
+            log_root: crate::event_log::log_root_for(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
             qe_host,
             team: team_cfg,
@@ -884,7 +890,7 @@ impl Core {
         let core = Core {
             tx: tx.clone(),
             pty,
-            log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
+            log_root: crate::event_log::log_root_for(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
             qe_host,
             team: team_cfg,
@@ -949,7 +955,7 @@ impl Core {
         Core {
             tx: tx.clone(),
             pty,
-            log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
+            log_root: crate::event_log::log_root_for(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
             qe_host,
             team: team_cfg,
@@ -1872,10 +1878,13 @@ impl Core {
     /// actor's queue while a run is mid-flight.
     ///
     /// Empty for a run that emitted nothing, one that predates the log, or an unknown id — an absent
-    /// history is not an error. Streaming chunk events are excluded by design; see
-    /// [`crate::event_log`].
+    /// history is not an error — and always empty for an in-memory core (`:memory:`), which records
+    /// no log ([`crate::event_log::log_root_for`]). Streaming chunk events are excluded by design;
+    /// see [`crate::event_log`].
     pub fn run_events(&self, run_id: &str) -> Vec<serde_json::Value> {
-        crate::event_log::read_run(&self.log_root, run_id)
+        self.log_root
+            .as_deref()
+            .map_or_else(Vec::new, |root| crate::event_log::read_run(root, run_id))
     }
 
     /// Drain a run's out-of-process gate-hook decisions (`decisions.ndjson`) into the store. The

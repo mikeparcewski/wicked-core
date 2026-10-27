@@ -2935,6 +2935,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn timed_out_writer_cleanup_is_confirmed_or_blocks_next_mutation() {
+        if crate::validator::skip_when_nested(
+            "timed_out_writer_cleanup_is_confirmed_or_blocks_next_mutation",
+        ) {
+            return;
+        }
         let dir =
             std::env::temp_dir().join(format!(".c4-helper-test-{}", uuid::Uuid::new_v4().simple()));
         fs::create_dir_all(&dir).unwrap();
@@ -3037,6 +3042,11 @@ rm -f "$base/live"
     #[cfg(unix)]
     #[test]
     fn an_orphaned_runtime_client_is_stopped_before_removal_is_confirmed() {
+        if crate::validator::skip_when_nested(
+            "an_orphaned_runtime_client_is_stopped_before_removal_is_confirmed",
+        ) {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("c4-orphan-{}", uuid::Uuid::new_v4().simple()));
         fs::create_dir_all(&dir).unwrap();
         let runtime = dir.join("runtime");
@@ -3069,6 +3079,11 @@ rm -f "$base/live"
     #[cfg(unix)]
     #[test]
     fn abandoned_helper_is_removed_before_a_new_writer_can_start() {
+        if crate::validator::skip_when_nested(
+            "abandoned_helper_is_removed_before_a_new_writer_can_start",
+        ) {
+            return;
+        }
         let temp = TempDir::new();
         let rt_path = temp.0.join("runtime");
         crate::test_env::install_stub(

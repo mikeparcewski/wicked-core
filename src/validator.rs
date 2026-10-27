@@ -396,15 +396,86 @@ pub fn sandbox_availability() -> (SandboxLevel, Option<&'static str>) {
     // `sandbox-exec` is macOS-only; `bwrap`/`firejail` are Linux — probing by binary name is inherently
     // platform-correct (the wrong-platform tool is simply never on PATH), so no `cfg!` is needed. The
     // level each grants differs: firejail is a WEAKER (network-only) jail, so it reports its own level.
-    for tool in ["sandbox-exec", "bwrap"] {
-        if find_on_path(tool).is_some() {
-            return (SandboxLevel::Sandboxed, Some(tool));
-        }
+    if find_on_path("sandbox-exec").is_some() && sandbox_exec_arms() {
+        return (SandboxLevel::Sandboxed, Some("sandbox-exec"));
+    }
+    if find_on_path("bwrap").is_some() {
+        return (SandboxLevel::Sandboxed, Some("bwrap"));
     }
     if find_on_path("firejail").is_some() {
         return (SandboxLevel::NetworkOnly, Some("firejail"));
     }
     (SandboxLevel::BestEffort, None)
+}
+
+/// Whether `sandbox-exec` is on `PATH` AND can actually be applied by this process, probed once by
+/// running a trivial command under it (cached per process). macOS refuses a nested `sandbox_apply`
+/// (exit 71) — a process already inside a sandbox, such as the repo-checks floor, finds the binary
+/// but cannot arm it, and treating presence as capability would claim a `Sandboxed` level that never
+/// applied. A failing probe takes the existing no-sandbox path (the empty-wrapper `BestEffort`
+/// floor and its disclosure). Only `sandbox-exec` is probed: `bwrap`/`firejail` keep their existing
+/// presence-based detection, so a firejail-only host keeps its network jail.
+///
+/// Only a definite answer is cached: the probe ran and applied (`true`), or `sandbox-exec` itself
+/// refused to apply the profile ([`SANDBOX_APPLY_REFUSED`], `false`). Anything else (the probe could
+/// not be spawned, was killed, or exited otherwise) is NOT cached and answers `true`, so a
+/// transient failure never leaves the rest of the process running unwrapped: the launcher keeps
+/// wrapping, and a sandbox that really cannot apply fails the wrapped command loudly.
+fn sandbox_exec_arms() -> bool {
+    static ARMS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(arms) = ARMS.get() {
+        return *arms;
+    }
+    let Some(tool) = find_on_path("sandbox-exec") else {
+        return false;
+    };
+    // spawn-audit: hardened — a permissive profile around a no-op; any refusal to apply the
+    // sandbox is what this detects, whatever the profile.
+    let probed = std::process::Command::new(tool)
+        .hardened()
+        .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match sandbox_probe_verdict(&probed) {
+        Some(arms) => *ARMS.get_or_init(|| arms),
+        None => true,
+    }
+}
+
+/// `sandbox-exec`'s exit when `sandbox_apply` is refused (EX_OSERR), as inside another sandbox.
+const SANDBOX_APPLY_REFUSED: i32 = 71;
+
+/// The cacheable verdict of one `sandbox-exec` probe: `Some(true)` it applied, `Some(false)` it was
+/// refused ([`SANDBOX_APPLY_REFUSED`]), `None` for anything that says nothing about the sandbox.
+fn sandbox_probe_verdict(probed: &std::io::Result<std::process::ExitStatus>) -> Option<bool> {
+    match probed {
+        Ok(s) if s.success() => Some(true),
+        Ok(s) if s.code() == Some(SANDBOX_APPLY_REFUSED) => Some(false),
+        _ => None,
+    }
+}
+
+/// `sandbox-exec` is on `PATH` but cannot be applied here: this process already runs inside a sandbox
+/// (the repo-checks floor), and macOS refuses a nested `sandbox_apply`. Production never consults
+/// this — detection already takes the empty-wrapper `BestEffort` path — it lets a test that needs
+/// the engine's own sandbox (or a child the floor's profile cannot host unwrapped) skip with a
+/// stated reason instead of failing.
+pub fn nested_sandbox() -> bool {
+    find_on_path("sandbox-exec").is_some() && !sandbox_exec_arms()
+}
+
+/// Test gate: print why and return `true` when [`nested_sandbox`] — `if skip_when_nested("t") { return; }`.
+#[cfg(test)]
+// Every caller is a unix-only test: unused on Windows.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn skip_when_nested(test: &str) -> bool {
+    let nested = nested_sandbox();
+    if nested {
+        eprintln!("SKIP {test}: sandbox-exec cannot be applied here (nested inside a sandbox, e.g. the repo-checks floor)");
+    }
+    nested
 }
 
 /// Find `bin` on the process `PATH` (cross-platform: `PATH` is split with the platform separator, and on
@@ -888,7 +959,7 @@ fn launcher_for_roots_masking(
         wrapper: Vec::new(),
         level: SandboxLevel::BestEffort,
     };
-    if let Some(tool) = find_on_path("sandbox-exec") {
+    if let Some(tool) = find_on_path("sandbox-exec").filter(|_| sandbox_exec_arms()) {
         if let Some(profile) = macos_sandbox_profile_for_roots(write_roots, network, pty) {
             return SandboxLauncher {
                 wrapper: vec![
@@ -3319,6 +3390,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exit_is_observed_unreaped_and_the_status_survives_the_group_kill() {
+        if crate::validator::skip_when_nested(
+            "exit_is_observed_unreaped_and_the_status_survives_the_group_kill",
+        ) {
+            return;
+        }
         use std::os::unix::process::CommandExt;
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "exit 3"]).process_group(0);
@@ -4570,6 +4646,63 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&cwd);
         let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// The capability disclosure and the launcher agree: `sandbox-exec` is claimed (and wrapped) only
+    /// when it can actually be applied, so a nested sandbox (the repo-checks floor) takes the
+    /// empty-wrapper `BestEffort` path instead of claiming a `Sandboxed` level that never armed.
+    #[test]
+    fn sandbox_exec_is_claimed_only_when_it_can_be_applied() {
+        let dir = std::env::temp_dir().join(format!("wicked-val-arms-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let launcher = detect_sandbox_launcher(&dir, None);
+        let wraps_with_sandbox_exec = launcher
+            .wrapper
+            .first()
+            .is_some_and(|w| w.ends_with("sandbox-exec"));
+        assert_eq!(wraps_with_sandbox_exec, sandbox_exec_arms());
+        if !sandbox_exec_arms() && find_on_path("sandbox-exec").is_some() {
+            eprintln!("note: sandbox-exec is present but cannot be applied here (nested sandbox)");
+            assert_ne!(sandbox_availability().1, Some("sandbox-exec"));
+            assert!(!wraps_with_sandbox_exec);
+            if launcher.wrapper.is_empty() {
+                assert_eq!(launcher.level, SandboxLevel::BestEffort);
+            }
+        }
+        // On a hosted CI runner nothing is nested: there the sandbox must actually be applied,
+        // which pins this test to an expectation the probe cannot satisfy by itself.
+        if cfg!(target_os = "macos") && std::env::var_os("GITHUB_ACTIONS").is_some() {
+            assert!(sandbox_exec_arms(), "sandbox-exec must arm on a CI runner");
+            assert!(
+                wraps_with_sandbox_exec,
+                "the launcher must wrap on a CI runner"
+            );
+            assert_eq!(launcher.level, SandboxLevel::Sandboxed);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only a definite probe answer is cached: applied, or refused with `sandbox_apply`'s exit 71.
+    /// A spawn error, a signal or another exit says nothing about the sandbox (`None`: not
+    /// cached, and the launcher keeps wrapping).
+    #[cfg(unix)]
+    #[test]
+    fn only_a_definite_sandbox_probe_answer_is_cached() {
+        use std::os::unix::process::ExitStatusExt;
+        let exited = |code: i32| Ok(std::process::ExitStatus::from_raw(code << 8));
+        assert_eq!(sandbox_probe_verdict(&exited(0)), Some(true));
+        assert_eq!(sandbox_probe_verdict(&exited(71)), Some(false));
+        assert_eq!(sandbox_probe_verdict(&exited(1)), None);
+        assert_eq!(sandbox_probe_verdict(&exited(65)), None);
+        // Killed by SIGKILL.
+        assert_eq!(
+            sandbox_probe_verdict(&Ok(std::process::ExitStatus::from_raw(9))),
+            None
+        );
+        assert_eq!(
+            sandbox_probe_verdict(&Err(std::io::Error::from_raw_os_error(35))),
+            None
+        );
     }
 
     /// The network-deny directive must be present in the built sandbox argv/profile per platform — the

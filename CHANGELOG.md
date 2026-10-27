@@ -40,7 +40,41 @@ Two release tracks share this file, newest entry first regardless of track:
     failing tests (head minus base, from the floor's structured failure ids), or says every failure also
     fails on the base. The automatic floor round's note names those tests, or, when every failure is
     base-red, asks for NO CHANGE NEEDED instead of a fix; and the substance floor accepts a reply that
-    changed nothing when the unit's floor showed only base failures.
+    changed nothing when the unit's floor showed only base failures. "Every failure is the base's" is
+    said only when each denying check's deciding run exited and named its failures; a run that timed out
+    or crashed after printing some names is never read as all base-red.
+
+- **The core suite passes inside the repo-checks floor's sandbox (plain PR).** The rig's base was red
+  with 39 failures that are green on CI. macOS refuses a nested `sandbox_apply` (exit 71), yet the
+  engine treated `sandbox-exec` on `PATH` as a working sandbox: it is now probed once per process by
+  running a trivial command under it, and when it cannot be applied detection takes the existing
+  no-sandbox path (`BestEffort`, empty wrapper) rather than claiming `Sandboxed`. `bwrap` and
+  `firejail` detection is unchanged. The two `outstanding_work` process-table tests and
+  `sign_out_ends_a_still_running_host_login…` skip with a stated reason when `ps` (setuid) is refused
+  with EPERM; production behaviour (`None` for an unreadable table) is unchanged. The host login
+  script's `mktemp -d` now honours `TMPDIR` (it ignored it on macOS and wrote outside the write roots).
+  An in-memory store (`:memory:`) no longer creates a `:memory:.events/` directory: it fans events out
+  live and records none (`event_log::log_root_for`).
+  Tests that need the engine's own sandbox (or a child the floor's profile cannot host unwrapped — the
+  tool-child kill/cancel suite, wrapped-seat, gateway and seat-login process tests, and the repo-checks
+  floor tests) skip with a stated reason when `validator::nested_sandbox()` (`sandbox-exec` on `PATH` but
+  not applicable); outside a nested sandbox nothing changes.
+
+- **The floor's copies of a repo behave like a real checkout (PRODUCT-WORKS J4/J5).** The base, verify and
+  deliver copies are written with git's own working-tree conversion (`cat-file --batch --filters`, under the
+  exported tree's own `.gitattributes` and the source's `core.autocrlf`/`eol`), so a `.cmd` file stored LF under
+  `*.cmd text eol=crlf` keeps CRLF in all three; before, the raw blob lost it. The conversion runs against a
+  private repository that carries no `filter.*` driver, so no smudge/process driver or hook runs during export,
+  as before. On a git without `--attr-source` (older than 2.40) the copies fall back to the raw blobs, with
+  a warning, rather than fail every export. The guarded checkout's integrity re-check (`hold_to`) now
+  compares against the length and sha256 of the bytes the export wrote. The base export is also its own git repository (a private `.git`: HEAD the base
+  commit, its own index, the source objects as a read-only alternate, an empty hooks dir) that every base check
+  finds by discovery, under a `GIT_CEILING_DIRECTORIES` at the export's parent, so `git grep` and other git
+  calls in a base check see the base and never the head worktree's index or untracked `tmp/`, while a check's
+  own fixture repository (`git init <dir>`) stays its own. Git configuration handed down through the
+  environment (`GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS`) never reaches the export. A tree entry named
+  `.git`, or an NTFS alias of it (`git~1`, trailing dots or spaces), is refused. The
+  internal base-cache policy version is bumped (13), so cached base results from older engines re-run.
 
 - **A container runtime blip is an infrastructure fault, never a seat failure (PRODUCT-WORKS J4, plain PR).**
   On the test rig Rancher Desktop restarted mid-run. Docker was gone for about ten minutes, and claude and
@@ -54,6 +88,18 @@ Two release tracks share this file, newest entry first regardless of track:
   the container runtime (`stepFailed.failureKind: environmentRefused`, so a skin offers no reassign), and
   Approve retries on the same seat. The seat is never benched, struck, failed over or counted in the unit's
   `worker_failed_clis` for it. An autonomous run fails as before.
+- **A CHANGELOG-only lift conflict no longer fails the delivery (J4 brick, plain PR).** On the test rig run
+  f3d30829 failed at deliver because core's main had moved its `CHANGELOG.md` `[Unreleased]` section while the
+  run added its own line there. The engine's pre-deliver lift (`src/deliver_lift.rs`) refused on ANY
+  `git merge-tree` conflict, so crew's own CHANGELOG union merge (crew#418) never ran. The lift now does that
+  union itself. When every conflicted path is a `CHANGELOG.md` and the two sides differ only inside its
+  `## [Unreleased]` section (the same guard as crew's deliver script), it keeps both sides' lines
+  (`git merge-file --union`, no markers), lifts the work, and says so in `deliverLiftEvaluated.note`. The
+  lifted tree is then re-verified like any other lift. Every other conflict still strands the delivery as
+  `LIFT-CONFLICT`, with the worktree left as verified: a conflict in any other file, any structural conflict
+  git reports (a directory-rename split carries no staged entry, so git's conflict messages are read too), a changelog that differs
+  outside `[Unreleased]`, or a changelog that one side added or deleted. The refusal text now names the real
+  recovery ("deliver it again from the run's delivery card") instead of an approve that has no gate.
 
 - **The repo-checks floor cache is capped as a whole and dropped at a run's end (#1122, plain PR).** On the
   test rig one wicked-core run's floor cache (`<worker home>/repo-checks`, the head and base cargo targets)
