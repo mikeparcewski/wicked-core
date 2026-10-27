@@ -249,7 +249,7 @@ Two release tracks share this file, newest entry first regardless of track:
   edit, another check set) re-verifies as before. When that re-verify fails, the deliver
   refusal gate now offers "Approve as your own judgment" for exactly that failed result; it is recorded
   keyed and the deliver phase re-runs, standing on it only while the tree, base and checks are unchanged.
-  The verify floor stays a fresh run on every attempt (its design); the reuse is at deliver. The guarded
+  Verify reuses the fix floor's checks on the same tree (core#1144, above); deliver's reuse is as here. The guarded
   verify floor's override now also names its tree (it was `null`).
 ### Fixed
 
