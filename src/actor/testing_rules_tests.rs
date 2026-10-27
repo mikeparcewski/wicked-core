@@ -293,3 +293,133 @@ fn a_held_rescore_that_needs_a_security_review_on_a_non_code_run_fails_the_run()
         assert!(!super::revision_fails_the_run(&e), "{e:#}");
     }
 }
+
+/// (J4, rig run 29bcace4) A daemon restart MID-UNIT is not a step boundary. The run is persisted
+/// `executing` with its cursor unit dispatched and never folded, and a diff re-score that raises
+/// the floor is held for the next boundary. Its resume re-dispatches the unit and leaves the plan
+/// exactly as it was: no revision, no plan gate, the raise still held for after the unit folds.
+/// The control, the same run with the cursor unit not yet dispatched (a real boundary), is
+/// revised on resume as before.
+#[test]
+fn a_restart_mid_unit_resumes_without_a_re_plan() {
+    struct Ok;
+    impl crate::workflow::StepRunner for Ok {
+        fn run_unit(&self, i: &crate::workflow::StepInput) -> crate::workflow::StepOutput {
+            crate::workflow::StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: crate::workflow::StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+    let _ = wicked_apps_core::emit::hermetic_test_spool();
+    let fact = crate::plan_gate::path_scored_diff(
+        "r",
+        1,
+        0,
+        1,
+        Some("t"),
+        &crate::review_scale::assess_intent(
+            true,
+            Some(&["src/lib.rs"]),
+            crate::review_scale::Graph::Unavailable("none".into()),
+            None,
+        ),
+        0,
+    )
+    .unwrap();
+    let seed = |store: &mut dyn GraphStore, run: &str, dispatched: bool| {
+        let mut s = session(run);
+        s.team_plan.as_mut().unwrap().rescored = Some(crate::plan_gate::DiffRescore {
+            ord: 1,
+            attempt: 0,
+            rescore_seq: 1,
+            // High risk (band 70-100): the raise a re-plan would apply.
+            score: 90,
+            destructive: false,
+            fact: crate::plan_gate::queued_facts(std::slice::from_ref(&fact))
+                .unwrap()
+                .pop()
+                .unwrap(),
+            obligations: Vec::new(),
+            recalled: Vec::new(),
+        });
+        put_node(store, s.to_node()).unwrap();
+        let mut build =
+            crate::domain::WorkUnit::pending(format!("{run}:build"), run, 1, "build it");
+        build.status = crate::domain::UnitStatus::Distributed;
+        build.last_attempt = dispatched.then_some(0);
+        put_node(store, build.to_node()).unwrap();
+        let mut review =
+            crate::domain::WorkUnit::pending(format!("{run}:review"), run, 2, "review it");
+        review.status = crate::domain::UnitStatus::Distributed;
+        put_node(store, review.to_node()).unwrap();
+    };
+    let resume = |store: &mut dyn GraphStore, run: &str| {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner: std::sync::Arc<dyn crate::workflow::StepRunner> = std::sync::Arc::new(Ok);
+        let mut sink = crate::event_log::EventSink::default();
+        let mut in_flight = std::collections::HashSet::new();
+        crate::actor::resume_run_inner(
+            store,
+            &mut sink,
+            &runner,
+            &tx,
+            &mut in_flight,
+            run,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+    };
+    let plan_of = |store: &dyn GraphStore, run: &str| {
+        let s = crate::domain::get_session(store, run).unwrap().unwrap();
+        let tp = s.team_plan.unwrap();
+        (
+            tp.rev,
+            tp.rescored.is_some(),
+            tp.pending.is_some(),
+            crate::domain::session_units(store, run).unwrap().len(),
+        )
+    };
+
+    // The orphan: unit 1 was dispatched (attempt 0) and the daemon died before it folded.
+    let mut store = open_store(Some(":memory:")).unwrap();
+    seed(&mut store, "r-mid", true);
+    let status = resume(&mut store, "r-mid").expect("the orphan resumes");
+    assert_ne!(
+        status,
+        SessionStatus::AwaitingHuman,
+        "no plan gate is opened by a restart"
+    );
+    assert_eq!(
+        plan_of(&store, "r-mid"),
+        (1, true, false, 2),
+        "the plan is untouched and the raise is still held for the next boundary"
+    );
+    let s = crate::domain::get_session(&store, "r-mid")
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.unit_ix, 0, "the interrupted unit is the one that resumes");
+    assert_eq!(s.attempt, 1, "under a fresh attempt");
+
+    // The control: the same held raise at a real boundary (unit 1 never dispatched) is taken by
+    // the revision hook on resume, as before (this fixture's plan cannot grow, so the hook takes
+    // the raise and keeps the plan — what matters is that the hook ran at a boundary and did not
+    // on the orphan above).
+    let mut store = open_store(Some(":memory:")).unwrap();
+    seed(&mut store, "r-edge", false);
+    let _ = resume(&mut store, "r-edge");
+    let (_, held, _, _) = plan_of(&store, "r-edge");
+    assert!(
+        !held,
+        "at a boundary the revision hook takes the held raise"
+    );
+}

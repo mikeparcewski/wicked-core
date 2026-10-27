@@ -4913,6 +4913,15 @@ pub(crate) fn resume_run_inner(
     ) {
         return Ok(session.status);
     }
+    // (J4) An orphan: persisted `executing` with no worker in this process (the in-flight check
+    // above), its cursor unit dispatched (`last_attempt`) and never folded (still `distributed`).
+    // Its advance below re-dispatches that unit; it is not a step boundary.
+    let mid_unit = session.status == SessionStatus::Executing
+        && crate::domain::session_units(store, run_id)?
+            .get(session.unit_ix)
+            .is_some_and(|u| {
+                u.status == crate::domain::UnitStatus::Distributed && u.last_attempt.is_some()
+            });
     // core#290 — RE-PROVISION FIRST, before anything mutates the run. A resume of a FAILED run is
     // re-entering a workdir the failure itself may have reaped (see `reprovision_reaped_worktree`).
     // Done here, ahead of the crew#277 cursor reset and the R1 guard, so a re-provision that CANNOT
@@ -5062,7 +5071,7 @@ pub(crate) fn resume_run_inner(
         s.attempt = s.attempt.saturating_add(1);
         put_node(store, s.to_node())?;
     }
-    match advance_or_pause(
+    match advance_or_pause_with(
         store,
         subscribers,
         runner,
@@ -5073,6 +5082,7 @@ pub(crate) fn resume_run_inner(
         actor_maps,
         process_gen,
         is_acp,
+        mid_unit,
     )? {
         Progress::Dispatched | Progress::Deferred => {
             in_flight.insert(run_id.to_string());
@@ -8877,6 +8887,43 @@ fn advance_or_pause(
     process_gen: uuid::Uuid,
     is_acp: bool,
 ) -> anyhow::Result<Progress> {
+    advance_or_pause_with(
+        store,
+        subscribers,
+        runner,
+        self_tx,
+        run_id,
+        unit_ix,
+        lifecycle_maps,
+        actor_maps,
+        process_gen,
+        is_acp,
+        false,
+    )
+}
+
+/// [`advance_or_pause`], told whether the cursor unit was interrupted MID-UNIT (`mid_unit`): a
+/// daemon restart killed its worker after it was dispatched and before its result folded
+/// ([`resume_run_inner`] on an orphaned `executing` run). That advance is NOT a step boundary —
+/// the unit already ran (its worktree edits are on disk) and is only being re-dispatched — so a
+/// plan revision held for the next boundary (a diff re-score that raised the floor, the PA's or a
+/// human's held steps) stays held and applies after the unit folds, exactly where it would have
+/// without the restart. A restart never re-plans the run (J4 brick, rig run 29bcace4: a resume
+/// applied a held re-score and inserted a step BEFORE the fix that had already run).
+#[allow(clippy::too_many_arguments)]
+fn advance_or_pause_with(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    run_id: &str,
+    unit_ix: usize,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
+    mid_unit: bool,
+) -> anyhow::Result<Progress> {
     // (X1) The scope step's boundary: the launch plan is scored from the PA's answer and decided
     // as the initial plan (accepted, or held for its plan_approval gate) before any creator step
     // dispatches. A plan that cannot be decided or planned fails the run: it never runs on with
@@ -8897,19 +8944,26 @@ fn advance_or_pause(
     // (fail closed), never a logged error the run goes on past.
     // (core#846 codex r2) The context carries the cause: `emit_run_error` shows the outermost
     // message only.
-    team_gate::refuse_unholdable_rules(&*store, run_id).map_err(|e| {
-        let cause = format!("{e:#}");
-        e.context(format!(
-            "the diff re-score fired a testing rule the plan cannot honour: {cause}"
-        ))
-    })?;
-    if let Err(e) = team_gate::apply_held_revision(store, subscribers, run_id) {
-        // (core#846) A floor raise that can never be honoured fails the run (fail closed).
-        if team_gate::revision_fails_the_run(&e) {
-            return Err(e);
+    if mid_unit {
+        eprintln!(
+            "wicked-core: run {run_id}: resumed mid-unit after a daemon restart — any held plan \
+             revision waits for the interrupted unit to finish (a restart never re-plans a run)"
+        );
+    } else {
+        team_gate::refuse_unholdable_rules(&*store, run_id).map_err(|e| {
+            let cause = format!("{e:#}");
+            e.context(format!(
+                "the diff re-score fired a testing rule the plan cannot honour: {cause}"
+            ))
+        })?;
+        if let Err(e) = team_gate::apply_held_revision(store, subscribers, run_id) {
+            // (core#846) A floor raise that can never be honoured fails the run (fail closed).
+            if team_gate::revision_fails_the_run(&e) {
+                return Err(e);
+            }
+            // Log it and show it: the run goes on with the plan it has.
+            emit_run_error(subscribers, run_id, e);
         }
-        // Log it and show it: the run goes on with the plan it has.
-        emit_run_error(subscribers, run_id, e);
     }
     let mut session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;

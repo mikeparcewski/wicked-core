@@ -3307,15 +3307,15 @@ fn run_unit_and_judge_on(
                                 tree,
                                 &format!("{}-{}-a{}", input.run_id, input.unit.ord, input.attempt),
                             ) {
-                                Ok(checkout) => {
-                                    let mut r = crate::repo_checks::run_floor_rerun(
-                                        &checkout.dir,
-                                        &ctx,
-                                        floor_rerun,
-                                    );
-                                    checkout.hold_to(tree, &mut r);
-                                    r
-                                }
+                                Ok(checkout) => checkout.run_floor_journaled(
+                                    &ctx,
+                                    floor_rerun,
+                                    &crate::repo_checks::FloorJournal {
+                                        ord: input.unit.ord,
+                                        attempt: input.attempt,
+                                        tree: tree.to_string(),
+                                    },
+                                ),
                                 Err(why) => {
                                     crate::repo_checks::guarded_checkout_refused(wd, &ctx, &why)
                                 }
@@ -3323,7 +3323,21 @@ fn run_unit_and_judge_on(
                         }
                         // No guard tree (a repo-less run: no git, no snapshot) — there is
                         // no guarded tree to check out, so the floor stays where the run is.
-                        _ => crate::repo_checks::run_floor_rerun(wd, &ctx, floor_rerun),
+                        // (J4) Journaled on the tree the worktree holds now, so a floor a
+                        // daemon restart interrupts resumes on the same tree.
+                        _ => crate::repo_checks::run_floor_journaled(
+                            wd,
+                            &ctx,
+                            floor_rerun,
+                            current_tree
+                                .as_ref()
+                                .map(|tree| crate::repo_checks::FloorJournal {
+                                    ord: input.unit.ord,
+                                    attempt: input.attempt,
+                                    tree: tree.clone(),
+                                })
+                                .as_ref(),
+                        ),
                     }
                 },
             );

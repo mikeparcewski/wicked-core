@@ -734,6 +734,250 @@ pub struct RepoChecksReport {
     /// when the checks ran on a known tree; `None` otherwise (never stood on by a later floor).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<FloorKey>,
+    /// (J4) This floor RESUMED one a daemon restart interrupted ([`FloorJournal`]): the checks that
+    /// had finished there on the same tree, base and check set were reused, the rest ran — or the
+    /// interrupted floor could not be resumed and this one ran from its first check, and says why.
+    /// `None` for a floor that resumed nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed: Option<FloorResume>,
+}
+
+/// (J4) A floor's journal identity: the unit whose floor it is, the attempt running it and the tree
+/// its checks run on. A floor given one records each check's result in the run's log store as it
+/// finishes (`floor-journal-u<ord>.json`) and removes the record when the floor ends; a record left
+/// behind is a floor the process died in. The next floor of that unit on the SAME tree, base and
+/// check set ([`FloorKey`]) reuses the finished checks and runs only the rest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloorJournal {
+    pub ord: u32,
+    pub attempt: u32,
+    pub tree: String,
+}
+
+/// The check that provisions the tree's dependencies: never reused from a journal.
+const PROVISIONING_CHECK: &str = "install";
+
+/// (J4) What a floor took from the interrupted one ([`RepoChecksReport::resumed`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FloorResume {
+    /// The attempt whose floor was interrupted.
+    pub from_attempt: u32,
+    /// The checks reused from it (finished there on the same tree, base and check set), in run order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reused: Vec<String>,
+    /// Set when nothing could be reused and the floor ran from its first check: why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restarted: Option<String>,
+}
+
+impl FloorResume {
+    /// The operator's sentence for the gate's `floorNote`.
+    pub fn note(&self) -> String {
+        match &self.restarted {
+            Some(why) => format!(
+                "the floor of attempt {} was interrupted (the daemon restarted) and could not be \
+                 resumed ({why}) — the checks ran again from the first one",
+                self.from_attempt
+            ),
+            None if self.reused.is_empty() => format!(
+                "the floor of attempt {} was interrupted (the daemon restarted) before any check \
+                 finished — the checks ran from the first one",
+                self.from_attempt
+            ),
+            None => {
+                format!(
+                "resumed the floor of attempt {} that a daemon restart interrupted: {} finished \
+                 there on this same tree, base and check set and {} reused, not run again; the \
+                 rest ran",
+                self.from_attempt,
+                self.reused.join(", "),
+                if self.reused.len() == 1 { "was" } else { "were" }
+            )
+            }
+        }
+    }
+}
+
+/// The journal file of `ord`'s floor in the run's log store.
+fn journal_path(logs: &Path, ord: u32) -> PathBuf {
+    logs.join(format!("floor-journal-u{ord}.json"))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct JournalRecord {
+    floor_policy: u32,
+    key: FloorKey,
+    exclude: bool,
+    attempt: u32,
+    #[serde(default)]
+    checks: Vec<JournalEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JournalEntry {
+    dir: String,
+    name: String,
+    argv: Vec<String>,
+    run: CheckRun,
+}
+
+/// An open floor journal ([`FloorJournal`]): the record this floor writes, and what it may reuse
+/// from the interrupted one.
+struct OpenJournal {
+    path: PathBuf,
+    record: JournalRecord,
+    prior: Vec<JournalEntry>,
+    resume: Option<FloorResume>,
+    /// The checks changed the tree the journal is keyed by: nothing more is recorded and the record
+    /// is gone, so no later floor reuses a result that ran on content other than that tree.
+    spoiled: bool,
+}
+
+impl OpenJournal {
+    /// Open `ord`'s journal for a floor on `key`: a record left behind by an interrupted floor of
+    /// the same key (and policy, and exclusion switch) offers its finished checks; any other record
+    /// is discarded and disclosed. The fresh record is written at once.
+    fn open(logs: &Path, j: &FloorJournal, key: FloorKey, exclude: bool) -> Self {
+        let path = journal_path(logs, j.ord);
+        let left: Option<JournalRecord> = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok());
+        let (prior, resume) = match left {
+            None => (Vec::new(), None),
+            Some(rec) => {
+                let why = if rec.floor_policy != FLOOR_POLICY_VERSION {
+                    Some("another engine version ran it".to_string())
+                } else if rec.key.tree != key.tree {
+                    Some(format!(
+                        "it ran on tree {}, this floor runs on {}",
+                        &rec.key.tree[..rec.key.tree.len().min(10)],
+                        &key.tree[..key.tree.len().min(10)]
+                    ))
+                } else if rec.key.base != key.base {
+                    Some("it was measured against another base".to_string())
+                } else if rec.key.checks != key.checks || rec.exclude != exclude {
+                    Some("it ran another check set".to_string())
+                } else {
+                    None
+                };
+                let resume = FloorResume {
+                    from_attempt: rec.attempt,
+                    reused: Vec::new(),
+                    restarted: why.clone(),
+                };
+                let prior = if why.is_none() {
+                    rec.checks
+                } else {
+                    Vec::new()
+                };
+                (prior, Some(resume))
+            }
+        };
+        let open = OpenJournal {
+            path,
+            record: JournalRecord {
+                floor_policy: FLOOR_POLICY_VERSION,
+                key,
+                exclude,
+                attempt: j.attempt,
+                checks: Vec::new(),
+            },
+            prior,
+            resume,
+            spoiled: false,
+        };
+        open.persist();
+        open
+    }
+
+    /// The interrupted floor's FINISHED result of `check`, when it has one whose logs are all still
+    /// in the store: a check that timed out, could not start or could not run is run again. The
+    /// `install` check always runs again: its receipt is not its output (`node_modules`, a venv),
+    /// and a guarded floor runs on a fresh checkout that has none of it (xreview).
+    fn reuse(&mut self, check: &RepoCheck, logs: &Path) -> Option<CheckRun> {
+        if check.name == PROVISIONING_CHECK {
+            return None;
+        }
+        let at = self
+            .prior
+            .iter()
+            .position(|e| e.dir == check.dir && e.name == check.name && e.argv == check.argv)?;
+        let entry = self.prior.remove(at);
+        let run = entry.run;
+        let finished = !run.did_not_finish()
+            && run.spawn_error.is_none()
+            && run.decision.is_some()
+            && outcome_of(&run) != Some(OUTCOME_COULD_NOT_RUN);
+        let mut refs: Vec<&crate::floor_log::LogRef> = Vec::new();
+        fn collect<'a>(r: &'a CheckRun, out: &mut Vec<&'a crate::floor_log::LogRef>) {
+            out.extend(r.logs.iter());
+            // The decision's own streams (the base inventory, each failing test's confirmation)
+            // justify a `pass_excluded`; a decision whose evidence is gone is not reused (xreview).
+            if let Some(d) = &r.decision {
+                out.extend(d.log_refs.iter());
+            }
+            for x in &r.reruns {
+                collect(x, out);
+            }
+            if let Some(run) = r.base.as_ref().and_then(|b| b.run.as_ref()) {
+                collect(run, out);
+            }
+        }
+        collect(&run, &mut refs);
+        let whole = refs
+            .iter()
+            .all(|l| crate::floor_log::refresh(logs, l).is_ok());
+        (finished && whole).then(|| {
+            if let Some(r) = self.resume.as_mut() {
+                r.reused.push(check.name.clone());
+            }
+            run
+        })
+    }
+
+    /// Record a finished check (written through at once: the process may die before the next).
+    /// `untouched` answers whether the checkout still holds exactly the journal's tree; a check
+    /// that changed it spoils the journal (its pass ran on other content: xreview P1).
+    fn record(&mut self, check: &RepoCheck, run: &CheckRun, untouched: Option<&dyn Fn() -> bool>) {
+        if self.spoiled {
+            return;
+        }
+        if untouched.is_some_and(|f| !f()) {
+            self.spoiled = true;
+            self.record.checks.clear();
+            let _ = std::fs::remove_file(&self.path);
+            return;
+        }
+        self.record.checks.push(JournalEntry {
+            dir: check.dir.clone(),
+            name: check.name.clone(),
+            argv: check.argv.clone(),
+            run: run.clone(),
+        });
+        self.persist();
+    }
+
+    fn persist(&self) {
+        let Ok(json) = serde_json::to_string(&self.record) else {
+            return;
+        };
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // Write-then-rename: a record is whole or absent, never half-written by a dying process.
+        let tmp = self.path.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, &self.path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// The floor ended (whatever its verdict): its record goes, so no later floor of the unit
+    /// stands on it — only an interrupted floor leaves one. Returns what this floor resumed.
+    fn finish(self) -> Option<FloorResume> {
+        let _ = std::fs::remove_file(&self.path);
+        self.resume
+    }
 }
 
 /// (deliver honors an override) The exact identity of one floor result inside a run: the tree the
@@ -845,6 +1089,10 @@ impl RepoChecksReport {
             notes.push(self.sandbox_note.clone().unwrap_or_else(|| {
                 format!("{UNSANDBOXED_OPT_IN_ENV}=1 — the checks ran with NO OS write boundary")
             }));
+        }
+        // (J4) A floor that resumed (or had to restart) one a daemon restart interrupted says so.
+        if let Some(r) = &self.resumed {
+            notes.push(r.note());
         }
         for c in &self.checks {
             let Some(d) = &c.decision else { continue };
@@ -3350,16 +3598,43 @@ pub(crate) fn run(worktree: &Path) -> RepoChecksReport {
 /// Detect and run the checks in `worktree` for `ctx`, stopping at the first DENYING failure
 /// ([`CheckRun::denies`]): a failure the run base shares is recorded and the floor moves on
 /// (F-RC2-009). Fail-closed on a detection error and when no OS write boundary can be armed.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn run_floor(worktree: &Path, ctx: &FloorContext) -> RepoChecksReport {
     run_floor_rerun(worktree, ctx, None)
 }
 
 /// [`run_floor`] for an operator's re-run (core#469, [`FloorRerun`]): the same floor with the
 /// check set and bounds the gate's choice asks for. `None` is the ordinary floor.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn run_floor_rerun(
     worktree: &Path,
     ctx: &FloorContext,
     rerun: Option<&FloorRerun>,
+) -> RepoChecksReport {
+    run_floor_journaled(worktree, ctx, rerun, None)
+}
+
+/// [`run_floor_rerun`] with a [`FloorJournal`]: the ordinary floor (no re-run, nothing waived)
+/// records each finished check and resumes one a daemon restart interrupted on the same tree,
+/// base and check set. An operator's re-run never reads or writes a journal.
+pub fn run_floor_journaled(
+    worktree: &Path,
+    ctx: &FloorContext,
+    rerun: Option<&FloorRerun>,
+    journal: Option<&FloorJournal>,
+) -> RepoChecksReport {
+    run_floor_inner(worktree, ctx, rerun, journal, None)
+}
+
+/// [`run_floor_journaled`] with the probe a guarded checkout gives
+/// ([`FloorCheckout::run_floor_journaled`]): a check is journaled only while the checkout still
+/// holds the journal's tree.
+fn run_floor_inner(
+    worktree: &Path,
+    ctx: &FloorContext,
+    rerun: Option<&FloorRerun>,
+    journal: Option<&FloorJournal>,
+    untouched: Option<&dyn Fn() -> bool>,
 ) -> RepoChecksReport {
     // The scratch FIRST: its short `TMPDIR` under the system temp dir is the boundary's SECOND
     // write root (core#489), and the launcher needs it to exist before the probe — bwrap `--bind`s
@@ -3386,7 +3661,8 @@ pub fn run_floor_rerun(
         scratch.root().to_path_buf(),
     ]);
     let sandbox = arm_probed(sandbox, floor_probe());
-    let mut report = run_with_sandbox_ctx(worktree, sandbox, ctx, scratch, rerun);
+    let mut report =
+        run_with_sandbox_ctx(worktree, sandbox, ctx, scratch, rerun, journal, untouched);
     report.rerun = rerun.map(|r| r.mode);
     report
 }
@@ -3478,7 +3754,7 @@ pub(crate) fn run_with_sandbox(worktree: &Path, sandbox: WorkerSandbox) -> RepoC
             } else {
                 sandbox
             };
-            run_with_sandbox_ctx(worktree, sandbox, &ctx, scratch, None)
+            run_with_sandbox_ctx(worktree, sandbox, &ctx, scratch, None, None, None)
         }
         Err(e) => scratch_refused(worktree, &ctx, &sandbox, &e),
     }
@@ -3513,6 +3789,7 @@ fn scratch_refused(
         recheck: None,
         coverage_note: None,
         key: None,
+        resumed: None,
     }
 }
 
@@ -3557,6 +3834,8 @@ pub(crate) fn run_with_sandbox_ctx(
     ctx: &FloorContext,
     scratch: CheckScratch,
     rerun: Option<&FloorRerun>,
+    journal: Option<&FloorJournal>,
+    untouched: Option<&dyn Fn() -> bool>,
 ) -> RepoChecksReport {
     let mut sandbox = sandbox;
     let mut sandbox_level = sandbox.level.as_wire().to_string();
@@ -3613,6 +3892,7 @@ pub(crate) fn run_with_sandbox_ctx(
                     recheck: None,
                     coverage_note: None,
                     key: None,
+                    resumed: None,
                 };
             }
         }
@@ -3639,6 +3919,7 @@ pub(crate) fn run_with_sandbox_ctx(
                 recheck: None,
                 coverage_note: None,
                 key: None,
+                resumed: None,
             }
         }
     };
@@ -3665,6 +3946,7 @@ pub(crate) fn run_with_sandbox_ctx(
                     recheck: None,
                     coverage_note: None,
                     key: None,
+                    resumed: None,
                 }
             }
         },
@@ -3730,9 +4012,36 @@ pub(crate) fn run_with_sandbox_ctx(
     let mut checks = Vec::new();
     let mut skipped = Vec::new();
     let mut failed = false;
+    // (J4) The ordinary floor keeps a journal (a re-run's or a waiver's check set is not the one a
+    // later floor would run, so it neither writes nor reads one).
+    let mut journal = journal
+        .filter(|j| rerun.is_none() && waived.is_empty() && !j.tree.is_empty())
+        .filter(|_| scratch_error.is_none())
+        .map(|j| {
+            OpenJournal::open(
+                &scratch.logs,
+                j,
+                FloorKey::of(&j.tree, ctx, &detected),
+                exclude,
+            )
+        });
     for check in &detected {
         if failed || scratch_error.is_some() {
             skipped.push(check.name.clone());
+            continue;
+        }
+        if let Some(run) = journal.as_mut().and_then(|j| j.reuse(check, &scratch.logs)) {
+            eprintln!(
+                "wicked-core: repo checks floor — `{}` {} on this tree in the floor a daemon \
+                 restart interrupted; reused, not run again",
+                run.name,
+                run.outcome()
+            );
+            failed = run.denies();
+            if let Some(j) = journal.as_mut() {
+                j.record(check, &run, untouched);
+            }
+            checks.push(run);
             continue;
         }
         let present = match &guide {
@@ -3871,8 +4180,12 @@ pub(crate) fn run_with_sandbox_ctx(
                 .unwrap_or_default()
         );
         failed = run.denies();
+        if let Some(j) = journal.as_mut() {
+            j.record(check, &run, untouched);
+        }
         checks.push(run);
     }
+    let resumed = journal.and_then(OpenJournal::finish);
     let claim = judge_claim(ctx, &checks);
     // An engine-written file (absent at detection, present now) is the checks' own side effect —
     // remove it so the guard's final comparison sees the tree the seat left. Never a symlink.
@@ -3914,6 +4227,7 @@ pub(crate) fn run_with_sandbox_ctx(
         recheck: None,
         coverage_note,
         key: None,
+        resumed,
     }
 }
 
@@ -4683,6 +4997,21 @@ impl FloorCheckout {
     /// otherwise pass against code that is not the tree that ships. After the floor, the checkout
     /// must still hash to the guarded `tree` (the engine scratch excluded); a difference fails the
     /// report, naming it.
+    /// (J4) The floor on this checkout, journaled on `journal.tree` and held to it
+    /// ([`Self::hold_to`]). A check is journaled only while the checkout still holds that tree, so
+    /// a later floor on a FRESH checkout never reuses a pass that ran on content the checks changed.
+    pub(crate) fn run_floor_journaled(
+        &self,
+        ctx: &FloorContext,
+        rerun: Option<&FloorRerun>,
+        journal: &FloorJournal,
+    ) -> RepoChecksReport {
+        let untouched = || matches!(self.changed_entries(), Ok(c) if c.is_empty());
+        let mut r = run_floor_inner(&self.dir, ctx, rerun, Some(journal), Some(&untouched));
+        self.hold_to(&journal.tree, &mut r);
+        r
+    }
+
     pub(crate) fn hold_to(&self, tree: &str, report: &mut RepoChecksReport) {
         let why = match self.changed_entries() {
             Ok(changed) if changed.is_empty() => return,
@@ -4838,6 +5167,7 @@ pub(crate) fn guarded_checkout_refused(
         recheck: None,
         coverage_note: None,
         key: None,
+        resumed: None,
     }
 }
 
@@ -7766,6 +8096,7 @@ pub(crate) mod tests {
             recheck: None,
             coverage_note: None,
             key: None,
+            resumed: None,
         };
         let reason = report.denial_reason();
         assert!(
@@ -9482,6 +9813,7 @@ pub(crate) mod tests {
             recheck: None,
             coverage_note: None,
             key: None,
+            resumed: None,
         };
         let denial = report.denial_reason();
         assert!(
@@ -9754,6 +10086,7 @@ pub(crate) mod tests {
             recheck: None,
             coverage_note: None,
             key: None,
+            resumed: None,
         };
         assert!(report.timed_out());
         assert_eq!(report.outcome(), "timed_out");
@@ -10618,6 +10951,7 @@ pub(crate) mod tests {
             recheck: None,
             coverage_note: None,
             key: None,
+            resumed: None,
         }
     }
 
