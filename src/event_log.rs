@@ -130,6 +130,12 @@ pub fn log_root(store_path: &str) -> PathBuf {
     PathBuf::from(format!("{store_path}.events"))
 }
 
+/// [`log_root`], or `None` for an in-memory store (`:memory:`), which has no sidecar anchor and must
+/// create no directory: `:memory:.events/` would land in the process's working directory.
+pub fn log_root_for(store_path: &str) -> Option<PathBuf> {
+    (store_path != ":memory:").then(|| log_root(store_path))
+}
+
 /// `<root>/<encoded-run-id>.ndjson`.
 pub fn run_log_path(root: &Path, run_id: &str) -> PathBuf {
     root.join(format!("{}.ndjson", encode_run_id(run_id)))
@@ -1153,6 +1159,15 @@ mod tests {
     /// it sits beside the store (the `.mem` / `.knowledge` sidecar convention), and it does NOT live
     /// under the temp-dir governance root, which a run's fresh re-launch wipes and the OS clears —
     /// either would silently destroy the trail this module exists to keep.
+    #[test]
+    fn an_in_memory_store_has_no_log_root() {
+        assert_eq!(log_root_for(":memory:"), None);
+        assert_eq!(
+            log_root_for("/var/lib/wicked/core.db"),
+            Some(log_root("/var/lib/wicked/core.db"))
+        );
+    }
+
     #[test]
     fn the_log_root_is_a_sidecar_of_the_store_not_the_wiped_governance_root() {
         let root = log_root("/var/lib/wicked/core.db");

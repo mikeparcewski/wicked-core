@@ -3565,6 +3565,11 @@ fn no_command_starts_in_a_held_tree_swapped_for_a_link() {
 #[cfg(unix)]
 #[test]
 fn a_check_starts_in_the_held_directory_when_its_path_is_swapped_before_spawn() {
+    if crate::validator::skip_when_nested(
+        "a_check_starts_in_the_held_directory_when_its_path_is_swapped_before_spawn",
+    ) {
+        return;
+    }
     let wt = scratch("held-fchdir");
     let outside = scratch("held-fchdir-outside");
     std::fs::create_dir_all(wt.join("pkg")).unwrap();
