@@ -2339,9 +2339,12 @@ mod failure_diagnostics_tests {
         // seat's sleep alone overran by 155ms on a loaded macOS runner. Scheduler delay need not
         // hit the seats equally, so no baseline taken from the other seats cancels it.)
         //
-        // Assertions run after the holders are released and every worker has joined, so a
-        // failure cannot strand a thread on the barrier.
-        use std::sync::{mpsc, Barrier};
+        // Assertions run after the holders are released and every worker has joined. Each holder
+        // waits on its OWN release channel, never a barrier: if the coordinator unwinds before it
+        // releases them (a thread that cannot be spawned, a holder that panicked before it said it
+        // held), its senders drop, every holder's `recv` returns, and the scope joins and reports
+        // the panic instead of hanging the suite.
+        use std::sync::mpsc;
         let permits = SeatPermits {
             free: std::sync::Mutex::new(2),
             returned: std::sync::Condvar::new(),
@@ -2349,16 +2352,21 @@ mod failure_diagnostics_tests {
         const RUN: Duration = Duration::from_millis(300);
         const HOLD: Duration = Duration::from_millis(1200);
 
-        let release = Barrier::new(3); // two holders + the coordinator
         let (held_tx, held_rx) = mpsc::channel::<()>();
         let (waiting_tx, waiting_rx) = mpsc::channel::<()>();
 
         let mut timed: Vec<(u64, u64)> = std::thread::scope(|scope| {
             let mut handles = Vec::new();
+            // One release sender per holder, owned by this closure: dropped on release, or by the
+            // unwind if anything below panics first.
+            let mut release = Vec::new();
             for _ in 0..2 {
                 let held_tx = held_tx.clone();
+                let (release_tx, release_rx) = mpsc::channel::<()>();
+                release.push(release_tx);
                 handles.push(scope.spawn(|| {
                     let held_tx = held_tx;
+                    let release_rx = release_rx;
                     let queue_started = Instant::now();
                     let (queued, ran) = {
                         let _permit = permits.acquire();
@@ -2367,7 +2375,8 @@ mod failure_diagnostics_tests {
                         std::thread::sleep(RUN);
                         let ran = run_started.elapsed();
                         held_tx.send(()).unwrap();
-                        release.wait(); // keep the permit until the coordinator says so
+                        // Keep the permit until the coordinator says so (or is gone).
+                        let _ = release_rx.recv();
                         (queued, ran)
                     };
                     (queued.as_millis() as u64, ran.as_millis() as u64)
@@ -2392,7 +2401,7 @@ mod failure_diagnostics_tests {
             }));
             waiting_rx.recv().unwrap();
             std::thread::sleep(HOLD);
-            release.wait();
+            drop(release);
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
 
