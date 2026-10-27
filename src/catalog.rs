@@ -1547,6 +1547,8 @@ mod tests {
             "knowledge.recall",
             "read every file you cite",
             "`alpha/src/foo.ts:42`",
+            "Every claim cites the file and line it rests on",
+            "never in place of the file and line",
             "graph path",
             "is not indexed",
             "Index this repository",
