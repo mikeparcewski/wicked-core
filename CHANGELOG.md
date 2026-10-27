@@ -1571,6 +1571,12 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.14** — 2026-10-27 — patch release on main 0bfee04, carrying #1141, #1145, #1146 and #1147.
+  - **Verify reuses the fix floor's checks on the same tree and base (#1145, core#1144, J4):** the creator (fix) floor runs on a clean checkout of the seat's tree and records the checks it ran itself; the verify floor on the same tree, base, posture and check identity reuses them suffix-only (never `install`, a timeout, the guide's `affected` subset or a check that could not run) and says so on the gate's floor note and in `RepoChecksReport.reusedFrom`. Each creator floor now builds on a fresh checkout, so a JS repo runs its `install` there.
+  - **An honest "no change" answer to a red floor is accepted (#1146, core#1142, J4):** `NO CHANGE NEEDED` is read anywhere in a line, in any case, unless negated, conditional or quoted; a worded no-edit reply after the unit's own failed floor is a no-change answer and opens the floor's escalation without a re-run; an all-base-red floor takes no automatic round.
+  - **The judge pool never says a reviewer built the work (#1147, core#1143):** the excluded own seat's reason follows its role (built this work, wrote this review, ran this step).
+  - **The queued-seat timing test is stable under CI runner load (#1141, core#1126).**
+  - No seat or floor Dockerfile, no seat package pin and no gate-hook protocol changed since 0.15.13, so the seat and floor image tags and gate protocol 3 are unchanged.
 - **core-ts 0.15.13** — 2026-10-27 — patch release on main bca3cbd, carrying #1135, #1136 and #1140.
   - **A review is no longer refused as a self-review of work its seat never built (#1135, J6):** a guarded read step authors nothing; a worker failure that left the tree unchanged takes its seat back out of the authors (`WorkUnit.author_probe`); a kept guarded edit still authors.
   - **A print-only `sed` after `cd` into a read root is a read, not a boundary write (#1135, J6):** every other `sed` shape fails closed.
