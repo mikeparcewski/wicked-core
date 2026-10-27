@@ -851,7 +851,7 @@ impl FloorReuse {
         format!(
             "checks reused from {} (unit {}, attempt {}): {} ran there on this same tree, against \
              the same base, with the same command and bound, on a clean checkout — not run again \
-             here; the rest ran",
+             here",
             self.phase.as_deref().unwrap_or("the creator floor"),
             self.ord,
             self.attempt,
@@ -916,25 +916,6 @@ fn write_creator_record(logs: &Path, record: &CreatorFloorRecord) {
     if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, &path).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-}
-
-/// Pair each check that ran with the detected check it ran for (`checks` is a run-order
-/// subsequence of `detected`: skipped checks are absent, nothing is reordered).
-fn entries_of(detected: &[RepoCheck], checks: &[CheckRun]) -> Vec<CreatorEntry> {
-    let mut out = Vec::new();
-    let mut d = detected.iter();
-    for run in checks {
-        if let Some(check) = d.by_ref().find(|c| c.name == run.name) {
-            out.push(CreatorEntry {
-                dir: check.dir.clone(),
-                name: check.name.clone(),
-                argv: check.argv.clone(),
-                timeout_s: check.timeout_s,
-                run: run.clone(),
-            });
-        }
-    }
-    out
 }
 
 /// Did `run` FINISH as the declared `check` (not the guide's `affected` subset, not a timeout,
@@ -1006,18 +987,28 @@ impl CreatorSeed {
 
     /// The creator floor's result of `check`, when it ran the identical check (directory, name,
     /// argv and bound) and that result may be reused ([`reusable_run`]).
+    fn entry_for(&self, check: &RepoCheck, logs: &Path) -> Option<&CreatorEntry> {
+        self.record
+            .checks
+            .iter()
+            .find(|e| {
+                e.dir == check.dir
+                    && e.name == check.name
+                    && e.argv == check.argv
+                    && e.timeout_s == check.timeout_s
+            })
+            .filter(|e| reusable_run(check, &e.run, logs))
+    }
+
+    fn can_reuse(&self, check: &RepoCheck, logs: &Path) -> bool {
+        self.entry_for(check, logs).is_some()
+    }
+
+    /// Take the creator floor's result of `check` ([`Self::entry_for`]).
     fn reuse(&mut self, check: &RepoCheck, logs: &Path) -> Option<CheckRun> {
-        let entry = self.record.checks.iter().find(|e| {
-            e.dir == check.dir
-                && e.name == check.name
-                && e.argv == check.argv
-                && e.timeout_s == check.timeout_s
-        })?;
-        if !reusable_run(check, &entry.run, logs) {
-            return None;
-        }
+        let run = self.entry_for(check, logs)?.run.clone();
         self.reused.push(check.name.clone());
-        Some(entry.run.clone())
+        Some(run)
     }
 
     /// The floor log's line for one reused check.
@@ -4657,6 +4648,10 @@ pub(crate) fn run_with_sandbox_ctx(
     let mut failed = false;
     // (J4) The ordinary floor keeps a journal (a re-run's or a waiver's check set is not the one a
     // later floor would run, so it neither writes nor reads one).
+    // (core#1144) The tree this floor runs on, whatever kind of floor it is: a creator floor that
+    // does not leave a record for it removes any earlier one (a re-run, a waiver, the live
+    // worktree or a check that changed the checkout must never leave a stale record standing).
+    let floor_tree = journal.map(|j| j.tree.clone()).filter(|t| !t.is_empty());
     let journal_of = journal.filter(|j| rerun.is_none() && waived.is_empty() && !j.tree.is_empty());
     let mut journal = journal
         .filter(|j| rerun.is_none() && waived.is_empty() && !j.tree.is_empty())
@@ -4683,12 +4678,29 @@ pub(crate) fn run_with_sandbox_ctx(
         }
         _ => None,
     };
-    for check in &detected {
+    // Reuse is SUFFIX-ONLY (xreview r1): no check runs fresh after a reused one, so nothing that
+    // runs here can depend on a file a reused check would have left in this checkout (an emitted
+    // `dist/` a later `e2e` reads). Everything up to the last check the record cannot stand for
+    // runs; only the checks after it are reused.
+    let reuse_from = seed.as_ref().map_or(usize::MAX, |s| {
+        detected
+            .iter()
+            .rposition(|c| !s.can_reuse(c, &scratch.logs))
+            .map_or(0, |i| i + 1)
+    });
+    // The checks this floor RAN itself, for a creator floor's record: never one reused from an
+    // interrupted floor's journal, which may have run in the live worktree (xreview r1).
+    let mut ran_here: Vec<CreatorEntry> = Vec::new();
+    for (ix, check) in detected.iter().enumerate() {
         if failed || scratch_error.is_some() {
             skipped.push(check.name.clone());
             continue;
         }
-        if let Some(run) = seed.as_mut().and_then(|s| s.reuse(check, &scratch.logs)) {
+        if let Some(run) = seed
+            .as_mut()
+            .filter(|_| ix >= reuse_from)
+            .and_then(|s| s.reuse(check, &scratch.logs))
+        {
             if let Some(s) = &seed {
                 eprintln!("{}", s.log_line(&run));
             }
@@ -4852,23 +4864,47 @@ pub(crate) fn run_with_sandbox_ctx(
         if let Some(j) = journal.as_mut() {
             j.record(check, &run, untouched);
         }
+        if ctx.stage == FloorStage::Creator {
+            ran_here.push(CreatorEntry {
+                dir: check.dir.clone(),
+                name: check.name.clone(),
+                argv: check.argv.clone(),
+                timeout_s: check.timeout_s,
+                run: run.clone(),
+            });
+        }
         checks.push(run);
     }
+    // A check that changed the checkout's tracked content (even one a later check restored)
+    // spoiled the journal: nothing this floor ran may stand for the tree (xreview r1).
+    let spoiled = journal.as_ref().is_none_or(|j| j.spoiled);
     let resumed = journal.and_then(OpenJournal::finish);
     let reused_from = seed.and_then(CreatorSeed::finish);
-    // (core#1144) A guarded creator floor leaves what it ran for the verify floor of the same tree
-    // and base — only while the checkout still holds exactly that tree (a check that rewrote it
-    // ran on other content), and never for a floor the scratch refused.
-    if let (FloorStage::Creator, Some(tree), Some(base), None, Some(probe), Some(j)) = (
-        ctx.stage,
-        guarded_tree.as_deref(),
-        ctx.base_head.as_deref(),
-        scratch_error.as_ref(),
-        untouched,
-        journal_of,
-    ) {
-        if probe() {
-            write_creator_record(
+    let claim = judge_claim(ctx, &checks);
+    // An engine-written file (absent at detection, present now) is the checks' own side effect —
+    // remove it so the guard's final comparison sees the tree the seat left. Never a symlink.
+    let mut engine_writes_removed = Vec::new();
+    if let Ok(held) = &held_worktree {
+        for rel in candidates {
+            if held.remove_file(&rel) == Ok(true) {
+                engine_writes_removed.push(rel);
+            }
+        }
+    }
+    // (core#1144) A guarded creator floor leaves the checks it ran for the verify floor of the same
+    // tree and base — only an ordinary floor (no re-run, nothing waived), on a clean checkout, whose
+    // checks never changed it (per check, through the journal) and that still holds exactly that
+    // tree now that the engine's own writes are gone. Any other creator floor of that tree and base
+    // removes an earlier record, so verify never stands on a result this floor superseded.
+    if let (FloorStage::Creator, Some(tree), Some(base)) =
+        (ctx.stage, floor_tree.as_deref(), ctx.base_head.as_deref())
+    {
+        let publish = match (journal_of, untouched) {
+            (Some(j), Some(probe)) if scratch_error.is_none() && !spoiled && probe() => Some(j),
+            _ => None,
+        };
+        match publish {
+            Some(j) => write_creator_record(
                 &scratch.logs,
                 &CreatorFloorRecord {
                     floor_policy: FLOOR_POLICY_VERSION,
@@ -4879,19 +4915,11 @@ pub(crate) fn run_with_sandbox_ctx(
                     phase: j.phase.clone(),
                     sandbox_level: sandbox_level.clone(),
                     exclude,
-                    checks: entries_of(&detected, &checks),
+                    checks: ran_here,
                 },
-            );
-        }
-    }
-    let claim = judge_claim(ctx, &checks);
-    // An engine-written file (absent at detection, present now) is the checks' own side effect —
-    // remove it so the guard's final comparison sees the tree the seat left. Never a symlink.
-    let mut engine_writes_removed = Vec::new();
-    if let Ok(held) = &held_worktree {
-        for rel in candidates {
-            if held.remove_file(&rel) == Ok(true) {
-                engine_writes_removed.push(rel);
+            ),
+            None => {
+                let _ = std::fs::remove_file(creator_record_path(&scratch.logs, tree, base));
             }
         }
     }

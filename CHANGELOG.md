@@ -20,13 +20,18 @@ Two release tracks share this file, newest entry first regardless of track:
   "head-only" that had passed on that exact tree at fix. The creator (fix) floor now runs on a clean
   checkout of the tree the seat left, as the verify floor does. When that checkout cannot be made it runs
   in the live worktree as before, and nothing reuses it. A finished clean-checkout creator floor leaves
-  its per-check results in the run's floor log store, which is outside every sandbox write root. The
+  the checks it ran itself in the run's floor log store, which is outside every sandbox write root. It
+  leaves nothing when it ran from a re-run, with waived checks, or with a check that changed the
+  checkout (even one a later check restored), and never includes a check resumed from an interrupted
+  floor's journal. Such a creator floor removes any earlier record for that tree and base instead. The
   verify floor on the same tree, against the same base, under the same boundary posture and exclusion
-  switch, takes from it each check with the identical directory, name, argv and bound that finished there
-  as the declared command, with its logs whole. The guide's `affected` subset, a timeout, a check that
-  could not run, `install` and a check that changed the checkout are never reused. It runs the rest
-  (verify-only checks such as `e2e`, the builds), says so on the gate's floor note ("checks reused from
-  fix (unit 4, attempt 2): lint, test ran there …") and in the floor log, and records
+  switch, reuses a check from that record only when the directory, name, argv and bound are identical
+  and it finished there as the declared command with its logs whole. The guide's `affected` subset, a
+  timeout, a check that could not run and `install` are never reused. Reuse is suffix-only: no check
+  runs fresh after a reused one, so nothing that runs can need a file a reused check would have left.
+  On core that reuses `test` after the verify-only builds, and on crew everything after `install`. A
+  repo whose verify-only `e2e` runs last reuses nothing. Verify says so on the gate's floor note
+  ("checks reused from fix (unit 4, attempt 2): test ran there …") and in the floor log, and records
   `RepoChecksReport.reusedFrom`. The creator floor's override now carries its key. Its check-set digest
   carries the creator stage, so deliver never stands on it. A reused failure still opens the verify
   gate for the operator's judgment. Each creator floor now builds on a fresh checkout, so a JS repo
