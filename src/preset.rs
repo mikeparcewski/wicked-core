@@ -515,6 +515,7 @@ mod tests {
         assert_eq!(
             seed_builtins(&mut store, 10).unwrap(),
             [
+                "analyze",
                 "bug",
                 "capture-learnings",
                 "chat",
@@ -557,6 +558,7 @@ mod tests {
         assert_eq!(
             seed_builtins(&mut store, 5).unwrap(),
             [
+                "analyze",
                 "bug",
                 "capture-learnings",
                 "chat",
@@ -600,6 +602,7 @@ mod tests {
         assert_eq!(
             seed_builtins(&mut store, 5).unwrap(),
             [
+                "analyze",
                 "bug",
                 "capture-learnings",
                 "demo",
@@ -863,6 +866,7 @@ mod tests {
         assert_eq!(
             listed,
             [
+                ("analyze".to_string(), GLOBAL_SCOPE.to_string()),
                 ("bug".to_string(), GLOBAL_SCOPE.to_string()),
                 ("capture-learnings".to_string(), GLOBAL_SCOPE.to_string()),
                 ("chat".to_string(), GLOBAL_SCOPE.to_string()),

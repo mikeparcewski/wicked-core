@@ -14,6 +14,17 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **New built-in workflow `analyze`: a read-only, cited answer to a question about the code (crew#1157).**
+  One `understand` step, `answer` (`src/presets/analyze.json`), on the `wicked-garden-search` skill behind
+  the unconditional turn gate (approve ends it; a send-back is the follow-up question). It grounds in the
+  estate graph through the read-only shim (SearchEntity, BlastRadius, Lineage, RankHotspots, path,
+  knowledge.recall), reads every file it cites, cites each claim as file:line, symbol or graph path, and
+  names a repository with no bound graph as not indexed, with the "Index this repository" offer. It can
+  never write: the step is neutral and `executes_code: false`, so its write posture is read-only on a bound
+  or unbound run; there is no creator (no PA scope step, no deliver), no pin and no QE acceptance. Pinned
+  by `catalog::tests::analyze_is_one_read_only_cited_answer_step_that_can_never_write` (every write tool and
+  shell write refused, reads allowed) and `presets::analyze_launches_one_read_only_answer_unit_on_one_seat`.
+  crew runs each turn of an analysis chat as this step (`POST /chats {workflow: "analyze"}`).
 - **A review is no longer refused as a self-review of work its seat never built (PRODUCT-WORKS J6, plain
   PR).** Rig run 9bd0f728: claude built the MCP server, and every codex review of it was denied
   `same_seat_evaluator` ("unit 8 checks work built on `codex`"; studio: "Codex built this work"). Codex
