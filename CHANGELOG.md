@@ -19,11 +19,15 @@ Two release tracks share this file, newest entry first regardless of track:
   another crate as "THIS change's" and said "fix those". The worker correctly changed nothing and said
   why, but it did not open a line with `NO CHANGE NEEDED`, so the substance floor refused it. The run
   parked at a card with no approve, and the floor re-ran for 42 min on the unchanged tree. Now:
-  - `NO CHANGE NEEDED` is read anywhere in a line, in any case, as whole words. It is still not read when
-    the clause before it negates it, makes it conditional or quotes it as an instruction (`cannot`, `not`,
-    `if`, `would`, `reply with`, …), or when a `?` follows it.
-  - When the unit's own floor already ran and FAILED, a worded reply that leaves the tree unchanged is a
-    no-change answer even without the marker (core#1113 did this for an all-base-red floor only). The
+  - `NO CHANGE NEEDED` is read anywhere in a line, in any case, as whole words ("The failures are not
+    caused by this change — no change needed"). It is not read when the words just before it negate it
+    or make it conditional (`cannot`, `couldn't`, `not`, `if`, `unless`, `would`, …), when its sentence
+    quotes it as an instruction (`reply with`), when something other than a separator or a reason
+    (`because`, `since`) follows it (`NO CHANGE NEEDED would be false: …`, `… NEEDED? No: …`), or when it
+    is fused into a longer word.
+  - When the unit's own floor already ran, FAILED and named its failing tests, a worded reply that leaves
+    the tree unchanged is a no-change answer even without the marker (core#1113 did this for an
+    all-base-red floor only). A reply that names the marker only to negate or quote it is not one. The
     floor's carried verdict then opens the floor's own escalation, where the operator can approve as their
     own judgment, with no re-run.
   - An all-base-red floor takes no automatic round: there is nothing to fix, so the escalation opens at

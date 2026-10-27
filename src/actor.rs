@@ -7145,7 +7145,7 @@ fn apply_step_result(
     // worktree. Only an explicit declaration ([`declares_no_change`], core#929) exempts it.
     let clean = worktree_is_clean(session.workdir.as_deref());
     // (j4-gates, core#1113; core#1142) When the unit's own floor already ran on its tree and
-    // FAILED, a retry that changes nothing is an answer, not missing work: the failures may be
+    // FAILED naming its tests, a retry that changes nothing is an answer, not missing work: the failures may be
     // the base's, load flakes, or outside the change, and the worker said why. The reply is
     // accepted as a "no change needed" whether or not it carries the marker, and the floor's
     // verdict on the unchanged tree (carried forward, core#544) then denies it into the floor's
@@ -7153,13 +7153,17 @@ fn apply_step_result(
     // Never over a worktree clean at HEAD (nothing was ever changed), never for a unit whose floor
     // passed or never ran (crew#972: a creator whose writes were refused), and only for a reply
     // with words in it.
+    // The floor must have NAMED its failing tests (a structured split): a build or compile
+    // failure has nothing a no-change answer could be about. And a reply that mentions the marker
+    // only to negate, condition or quote it has said it is NOT declaring it (xreview on #1146).
     let floor_red = evidence
         .repo_checks
         .as_ref()
         .or(unit.repo_checks.as_ref())
-        .is_some_and(|r| r.outcome() == "failed");
-    let declared_no_change = declares_no_change(&output.output)
-        || (floor_red && !clean && !output.output.trim().is_empty());
+        .is_some_and(|r| r.outcome() == "failed" && r.failure_split().is_some());
+    let mention = no_change_mention(&output.output);
+    let declared_no_change = mention == Some(true)
+        || (mention.is_none() && floor_red && !clean && !output.output.trim().is_empty());
     let left_no_change = clean || evidence.tree_changed == Some(false);
     // The prose arm rejects only over a clean worktree (a diff is substance of its own) — except
     // under the human-confirm exemption, where `no_prose` already means "no answer at all": an
@@ -11737,38 +11741,99 @@ fn run_tool_cmd_jailed(
 /// code-evidence floor accepts an unchanged tree only with it.
 pub(crate) const NO_CHANGE_NEEDED: &str = "NO CHANGE NEEDED";
 
-/// (core#929, core#1142) Whether `output` declares [`NO_CHANGE_NEEDED`]: the phrase anywhere in a
-/// line, in any case, as whole words, markdown emphasis (`*`, `_`, `` ` ``) ignored (`No change
-/// needed — the fix is already on main`, `Checked the tree. NO CHANGE NEEDED`). A worker should not
-/// have to know a magic line shape to say it changed nothing (rig run 85ddad0d). The phrase does
-/// NOT declare when the clause before it on that line (back to the last `.`, `;`, `!` or `?`)
-/// negates it, makes it conditional or quotes it as an instruction: `not`, `cannot`, `can't`,
-/// `never`, `don't`, `won't`, `unable`, `if`, `would`, `reply with`, `respond with`, `answer with`
-/// (`I cannot declare NO CHANGE NEEDED`, `If no edits are required, reply with: NO CHANGE NEEDED`,
-/// an echo of the retry note's own instruction: codex r1, r2), nor when a `?` follows it
-/// (`NO CHANGE NEEDED? No: I changed tip.mjs`), nor when it is fused into a longer word
-/// (`XNO CHANGE NEEDED`, `NO CHANGE NEEDEDS`). The marker only matters for a tree the attempt
-/// left unchanged; a changed tree is substance of its own.
+/// (core#929, core#1142) Whether `output` declares [`NO_CHANGE_NEEDED`] ([`no_change_mention`]).
+#[cfg(test)]
 pub(crate) fn declares_no_change(output: &str) -> bool {
+    no_change_mention(output) == Some(true)
+}
+
+/// (core#929, core#1142) How `output` uses the [`NO_CHANGE_NEEDED`] phrase: `Some(true)` when a line
+/// DECLARES it, `Some(false)` when it only mentions it, `None` when it never appears. A worker
+/// should not have to know a magic line shape to say it changed nothing (rig run 85ddad0d), so the
+/// phrase is read anywhere in a line, in any case, as whole words, markdown emphasis (`*`, `_`,
+/// `` ` ``) ignored: `No change needed — the fix is already on main`, `Checked the tree. NO CHANGE
+/// NEEDED`, `The failures are not caused by this change — NO CHANGE NEEDED`.
+///
+/// A mention does NOT declare (codex r1, r2; xreview on #1146):
+/// - when the words just before it, back to the last `,`, `—` or `–` of its sentence, negate it
+///   or make it conditional (`not`, `cannot`, `couldn't`, `never`, `isn't`, `unable`, `if`,
+///   `unless`, `would`, … — `I cannot declare NO CHANGE NEEDED`, `I cannot truthfully declare:
+///   NO CHANGE NEEDED`);
+/// - when its sentence quotes it as an instruction (`reply with`, `respond with`, `answer with` —
+///   `If no edits are required, reply with: NO CHANGE NEEDED`, an echo of the retry note);
+/// - when anything but the end of the line, a separator (`—` `–` `-` `:` `.` `;` `,` `(` `)` `!`)
+///   or a reason (`because`, `since`) follows it — the phrase as a subject or object is prose
+///   (`NO CHANGE NEEDED would be false: …`, `NO CHANGE NEEDED is what I would say`,
+///   `NO CHANGE NEEDED? No: …`, `no change needed in foo.rs`);
+/// - when it is fused into a longer word (`XNO CHANGE NEEDED`, `NO CHANGE NEEDEDS`).
+///
+/// A sentence ends at `;`, `!`, `?`, or a `.` followed by a blank or the line's end — never at
+/// the dot of `tip.mjs`.
+pub(crate) fn no_change_mention(output: &str) -> Option<bool> {
     const MARKER: &str = "no change needed";
-    const CUES: [&str; 9] = [
-        "not", "cannot", "can't", "never", "don't", "won't", "unable", "if", "would",
+    const CUES: [&str; 19] = [
+        "not",
+        "cannot",
+        "can't",
+        "couldn't",
+        "never",
+        "don't",
+        "doesn't",
+        "didn't",
+        "won't",
+        "wouldn't",
+        "shouldn't",
+        "isn't",
+        "aren't",
+        "wasn't",
+        "weren't",
+        "unable",
+        "if",
+        "unless",
+        "would",
     ];
     const CUE_PAIRS: [[&str; 2]; 3] = [["reply", "with"], ["respond", "with"], ["answer", "with"]];
-    let hedged = |before: &str| {
-        let clause = before
-            .rfind(['.', ';', '!', '?'])
-            .map_or(before, |i| &before[i + 1..]);
-        let words: Vec<&str> = clause
-            .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+    fn words(text: &str) -> Vec<&str> {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '\''))
             .filter(|w| !w.is_empty())
-            .collect();
-        words.iter().any(|w| CUES.contains(w))
-            || words
+            .collect()
+    }
+    // The start of the sentence `before` ends in.
+    fn sentence_start(before: &str) -> usize {
+        let mut start = 0;
+        let mut it = before.char_indices().peekable();
+        while let Some((i, c)) = it.next() {
+            let ends = match c {
+                ';' | '!' | '?' => true,
+                '.' => it.peek().is_none_or(|(_, n)| n.is_whitespace()),
+                _ => false,
+            };
+            if ends {
+                start = i + c.len_utf8();
+            }
+        }
+        start
+    }
+    let hedged = |before: &str| {
+        let sentence = &before[sentence_start(before)..];
+        let window = sentence
+            .rfind([',', '\u{2014}', '\u{2013}'])
+            .map_or(sentence, |i| &sentence[i..]);
+        words(window).iter().any(|w| CUES.contains(w))
+            || words(sentence)
                 .windows(2)
                 .any(|p| CUE_PAIRS.iter().any(|c| c[..] == *p))
     };
-    output.lines().any(|line| {
+    let closes = |after: &str| {
+        let after = after.trim_start();
+        after.is_empty()
+            || after.starts_with([
+                '\u{2014}', '\u{2013}', '-', ':', '.', ';', ',', '(', ')', '!',
+            ])
+            || matches!(words(after).first(), Some(&("because" | "since")))
+    };
+    let mut mentioned = false;
+    for line in output.lines() {
         let line: String = line
             .chars()
             .filter(|c| !matches!(c, '*' | '_' | '`'))
@@ -11781,13 +11846,16 @@ pub(crate) fn declares_no_change(output: &str) -> bool {
             let (before, after) = (&line[..at], &line[end..]);
             let whole = !before.chars().last().is_some_and(char::is_alphanumeric)
                 && !after.chars().next().is_some_and(char::is_alphanumeric);
-            if whole && !hedged(before) && !after.trim_start().starts_with('?') {
-                return true;
+            if whole {
+                if !hedged(before) && closes(after) {
+                    return Some(true);
+                }
+                mentioned = true;
             }
             from = end;
         }
-        false
-    })
+    }
+    mentioned.then_some(false)
 }
 
 fn worktree_is_clean(workdir: Option<&str>) -> bool {
@@ -22546,6 +22614,11 @@ mod request_changes_tests {
             "No change needed — the fix is already on main",
             "I made no further edits this round. No change needed: the three failures are flakes.",
             "The failures are outside my diff, so no change needed.",
+            "The three floor failures are not caused by this change — NO CHANGE NEEDED",
+            "The failure is not caused by my change, so no change needed",
+            "no change needed because the fix landed on main",
+            "NO CHANGE NEEDED: these tests are not caused by my change",
+            "Edited nothing in tip.mjs. NO CHANGE NEEDED",
         ] {
             assert!(declares_no_change(yes), "{yes:?}");
         }
@@ -22559,6 +22632,12 @@ mod request_changes_tests {
             "If no edits are required, reply with NO CHANGE NEEDED",
             "NO CHANGE NEEDED? No: I changed tip.mjs",
             "It is not a case of no change needed",
+            "NO CHANGE NEEDED would be false: the implementation is still missing.",
+            "NO CHANGE NEEDED is what I would say, but I edited tip.mjs",
+            "I cannot leave tip.mjs as NO CHANGE NEEDED",
+            "I couldn't declare NO CHANGE NEEDED",
+            "I shouldn't say no change needed",
+            "no change needed in foo.rs, but the test still fails",
             "NO CHANGE NEEDEDS",
             "XNO CHANGE NEEDED",
             "I changed tip.mjs and added a test.",
@@ -23460,10 +23539,30 @@ mod code_evidence_floor_tests {
                 Some(&["test b::shared", "test c::other"]),
             ))
         };
-        for (tag, floor, refused) in [
-            ("all base red", red(&["test b::shared"]), false),
-            ("head-only", red(&["test a::mine", "test b::shared"]), false),
-            ("no floor", None, true),
+        // (xreview on #1146) A reply that names the marker only to negate it is not a no-change
+        // answer even after a red floor; nor is a no-edit reply over a floor that named no test
+        // (a build or compile failure); nor a disclaimed marker with no floor behind it.
+        let negated = format!(
+            "{}\nI cannot declare NO CHANGE NEEDED: my edit to src/lib.rs was refused.\n",
+            prose()
+        );
+        let disclaimed = format!(
+            "{}\nNO CHANGE NEEDED would be false: the implementation is still missing.\n",
+            prose()
+        );
+        let unnamed = Some(crate::repo_checks::red_report(&[], None));
+        for (tag, floor, reply, refused) in [
+            ("all base red", red(&["test b::shared"]), &reply, false),
+            (
+                "head-only",
+                red(&["test a::mine", "test b::shared"]),
+                &reply,
+                false,
+            ),
+            ("no floor", None, &reply, true),
+            ("negated", red(&["test a::mine"]), &negated, true),
+            ("unnamed failures", unnamed, &reply, true),
+            ("disclaimed, no floor", None, &disclaimed, true),
         ] {
             let wt = git_worktree(&format!("base-red-{}", tag.replace(' ', "-")));
             std::fs::write(wt.join("design-notes.md"), "plan\n").unwrap();
@@ -23482,7 +23581,7 @@ mod code_evidence_floor_tests {
                 repo_checks: floor,
                 ..Default::default()
             };
-            let (_session, unit) = fold_ev(&mut store, &mut subs, &run_id, &reply, true, evidence);
+            let (_session, unit) = fold_ev(&mut store, &mut subs, &run_id, reply, true, evidence);
             let substance = unit
                 .denial
                 .as_ref()
