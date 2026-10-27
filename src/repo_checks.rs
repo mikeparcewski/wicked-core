@@ -754,6 +754,9 @@ pub struct FloorJournal {
     pub tree: String,
 }
 
+/// The check that provisions the tree's dependencies: never reused from a journal.
+const PROVISIONING_CHECK: &str = "install";
+
 /// (J4) What a floor took from the interrupted one ([`RepoChecksReport::resumed`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -826,6 +829,9 @@ struct OpenJournal {
     record: JournalRecord,
     prior: Vec<JournalEntry>,
     resume: Option<FloorResume>,
+    /// The checks changed the tree the journal is keyed by: nothing more is recorded and the record
+    /// is gone, so no later floor reuses a result that ran on content other than that tree.
+    spoiled: bool,
 }
 
 impl OpenJournal {
@@ -879,14 +885,20 @@ impl OpenJournal {
             },
             prior,
             resume,
+            spoiled: false,
         };
         open.persist();
         open
     }
 
     /// The interrupted floor's FINISHED result of `check`, when it has one whose logs are all still
-    /// in the store: a check that timed out, could not start or could not run is run again.
+    /// in the store: a check that timed out, could not start or could not run is run again. The
+    /// `install` check always runs again: its receipt is not its output (`node_modules`, a venv),
+    /// and a guarded floor runs on a fresh checkout that has none of it (xreview).
     fn reuse(&mut self, check: &RepoCheck, logs: &Path) -> Option<CheckRun> {
+        if check.name == PROVISIONING_CHECK {
+            return None;
+        }
         let at = self
             .prior
             .iter()
@@ -900,6 +912,11 @@ impl OpenJournal {
         let mut refs: Vec<&crate::floor_log::LogRef> = Vec::new();
         fn collect<'a>(r: &'a CheckRun, out: &mut Vec<&'a crate::floor_log::LogRef>) {
             out.extend(r.logs.iter());
+            // The decision's own streams (the base inventory, each failing test's confirmation)
+            // justify a `pass_excluded`; a decision whose evidence is gone is not reused (xreview).
+            if let Some(d) = &r.decision {
+                out.extend(d.log_refs.iter());
+            }
             for x in &r.reruns {
                 collect(x, out);
             }
@@ -920,7 +937,18 @@ impl OpenJournal {
     }
 
     /// Record a finished check (written through at once: the process may die before the next).
-    fn record(&mut self, check: &RepoCheck, run: &CheckRun) {
+    /// `untouched` answers whether the checkout still holds exactly the journal's tree; a check
+    /// that changed it spoils the journal (its pass ran on other content: xreview P1).
+    fn record(&mut self, check: &RepoCheck, run: &CheckRun, untouched: Option<&dyn Fn() -> bool>) {
+        if self.spoiled {
+            return;
+        }
+        if untouched.is_some_and(|f| !f()) {
+            self.spoiled = true;
+            self.record.checks.clear();
+            let _ = std::fs::remove_file(&self.path);
+            return;
+        }
         self.record.checks.push(JournalEntry {
             dir: check.dir.clone(),
             name: check.name.clone(),
@@ -3595,6 +3623,19 @@ pub fn run_floor_journaled(
     rerun: Option<&FloorRerun>,
     journal: Option<&FloorJournal>,
 ) -> RepoChecksReport {
+    run_floor_inner(worktree, ctx, rerun, journal, None)
+}
+
+/// [`run_floor_journaled`] with the probe a guarded checkout gives
+/// ([`FloorCheckout::run_floor_journaled`]): a check is journaled only while the checkout still
+/// holds the journal's tree.
+fn run_floor_inner(
+    worktree: &Path,
+    ctx: &FloorContext,
+    rerun: Option<&FloorRerun>,
+    journal: Option<&FloorJournal>,
+    untouched: Option<&dyn Fn() -> bool>,
+) -> RepoChecksReport {
     // The scratch FIRST: its short `TMPDIR` under the system temp dir is the boundary's SECOND
     // write root (core#489), and the launcher needs it to exist before the probe — bwrap `--bind`s
     // a directory, the SBPL profile canonicalizes it. A scratch that cannot be prepared is the
@@ -3620,7 +3661,8 @@ pub fn run_floor_journaled(
         scratch.root().to_path_buf(),
     ]);
     let sandbox = arm_probed(sandbox, floor_probe());
-    let mut report = run_with_sandbox_ctx(worktree, sandbox, ctx, scratch, rerun, journal);
+    let mut report =
+        run_with_sandbox_ctx(worktree, sandbox, ctx, scratch, rerun, journal, untouched);
     report.rerun = rerun.map(|r| r.mode);
     report
 }
@@ -3712,7 +3754,7 @@ pub(crate) fn run_with_sandbox(worktree: &Path, sandbox: WorkerSandbox) -> RepoC
             } else {
                 sandbox
             };
-            run_with_sandbox_ctx(worktree, sandbox, &ctx, scratch, None, None)
+            run_with_sandbox_ctx(worktree, sandbox, &ctx, scratch, None, None, None)
         }
         Err(e) => scratch_refused(worktree, &ctx, &sandbox, &e),
     }
@@ -3793,6 +3835,7 @@ pub(crate) fn run_with_sandbox_ctx(
     scratch: CheckScratch,
     rerun: Option<&FloorRerun>,
     journal: Option<&FloorJournal>,
+    untouched: Option<&dyn Fn() -> bool>,
 ) -> RepoChecksReport {
     let mut sandbox = sandbox;
     let mut sandbox_level = sandbox.level.as_wire().to_string();
@@ -3996,7 +4039,7 @@ pub(crate) fn run_with_sandbox_ctx(
             );
             failed = run.denies();
             if let Some(j) = journal.as_mut() {
-                j.record(check, &run);
+                j.record(check, &run, untouched);
             }
             checks.push(run);
             continue;
@@ -4138,7 +4181,7 @@ pub(crate) fn run_with_sandbox_ctx(
         );
         failed = run.denies();
         if let Some(j) = journal.as_mut() {
-            j.record(check, &run);
+            j.record(check, &run, untouched);
         }
         checks.push(run);
     }
@@ -4954,6 +4997,21 @@ impl FloorCheckout {
     /// otherwise pass against code that is not the tree that ships. After the floor, the checkout
     /// must still hash to the guarded `tree` (the engine scratch excluded); a difference fails the
     /// report, naming it.
+    /// (J4) The floor on this checkout, journaled on `journal.tree` and held to it
+    /// ([`Self::hold_to`]). A check is journaled only while the checkout still holds that tree, so
+    /// a later floor on a FRESH checkout never reuses a pass that ran on content the checks changed.
+    pub(crate) fn run_floor_journaled(
+        &self,
+        ctx: &FloorContext,
+        rerun: Option<&FloorRerun>,
+        journal: &FloorJournal,
+    ) -> RepoChecksReport {
+        let untouched = || matches!(self.changed_entries(), Ok(c) if c.is_empty());
+        let mut r = run_floor_inner(&self.dir, ctx, rerun, Some(journal), Some(&untouched));
+        self.hold_to(&journal.tree, &mut r);
+        r
+    }
+
     pub(crate) fn hold_to(&self, tree: &str, report: &mut RepoChecksReport) {
         let why = match self.changed_entries() {
             Ok(changed) if changed.is_empty() => return,

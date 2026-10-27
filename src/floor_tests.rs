@@ -4225,3 +4225,189 @@ fn a_sha256_repository_exports_with_its_line_endings() {
     let _ = remove_base_export(&root);
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+// ─── J4 xreview on #1132: what a journal may never hand a later floor ──────────────────────────
+
+/// A journal of `ord` on `tree` whose interrupted floor had finished `entries` (check name and
+/// its decision's extra log refs), opened by the next floor of the same key.
+#[cfg(unix)]
+fn journal_offering(tag: &str, entries: &[(&str, Vec<crate::floor_log::LogRef>)]) -> OpenJournal {
+    let logs = scratch(tag).join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let ctx = FloorContext::default();
+    let check = |name: &str| RepoCheck {
+        name: name.to_string(),
+        argv: vec!["sh".into(), "-c".into(), "true".into()],
+        source: "test".into(),
+        timeout_s: None,
+        dir: String::new(),
+    };
+    let detected: Vec<RepoCheck> = entries.iter().map(|(n, _)| check(n)).collect();
+    let tree = "1111111111111111111111111111111111111111";
+    let key = FloorKey::of(tree, &ctx, &detected);
+    let checks = entries
+        .iter()
+        .map(|(name, refs)| {
+            let mut run: CheckRun = serde_json::from_value(serde_json::json!({
+                "name": name, "argv": ["sh", "-c", "true"], "source": "test",
+                "exit_code": 0, "timed_out": false, "duration_ms": 1,
+                "stdout_tail": "", "stderr_tail": "",
+                "decision": { "outcome": OUTCOME_PASS },
+            }))
+            .unwrap();
+            run.decision.as_mut().unwrap().log_refs = refs.clone();
+            JournalEntry {
+                dir: String::new(),
+                name: name.to_string(),
+                argv: run.argv.clone(),
+                run,
+            }
+        })
+        .collect();
+    let rec = JournalRecord {
+        floor_policy: FLOOR_POLICY_VERSION,
+        key: key.clone(),
+        exclude: true,
+        attempt: 4,
+        checks,
+    };
+    std::fs::write(journal_path(&logs, 2), serde_json::to_string(&rec).unwrap()).unwrap();
+    let j = FloorJournal {
+        ord: 2,
+        attempt: 5,
+        tree: tree.to_string(),
+    };
+    let open = OpenJournal::open(&logs, &j, key, true);
+    assert!(open.resume.as_ref().is_some_and(|r| r.restarted.is_none()));
+    open
+}
+
+/// (xreview P2) `install` finished before the restart, but a guarded floor's fresh checkout has
+/// none of its output (`node_modules`): it runs again. An independent check is still reused.
+#[cfg(unix)]
+#[test]
+fn an_interrupted_floors_install_is_never_reused() {
+    let mut j = journal_offering("journal-install", &[("install", vec![]), ("lint", vec![])]);
+    let logs = j.path.parent().unwrap().to_path_buf();
+    let check = |name: &str| RepoCheck {
+        name: name.to_string(),
+        argv: vec!["sh".into(), "-c".into(), "true".into()],
+        source: "test".into(),
+        timeout_s: None,
+        dir: String::new(),
+    };
+    assert!(
+        j.reuse(&check("install"), &logs).is_none(),
+        "install runs again"
+    );
+    assert!(j.reuse(&check("lint"), &logs).is_some(), "lint is reused");
+    assert_eq!(j.resume.as_ref().unwrap().reused, vec!["lint".to_string()]);
+}
+
+/// (xreview P3) A decision whose own evidence (a base inventory, a failing test's confirmation —
+/// referenced only from `decision.log_refs`) is gone from the store is not reused.
+#[cfg(unix)]
+#[test]
+fn a_journaled_decision_whose_own_log_is_gone_runs_again() {
+    let gone = crate::floor_log::LogRef {
+        attempt: "toc-base".into(),
+        stream: "stdout".into(),
+        sha256: "ab".repeat(32),
+        bytes: 7,
+        truncated: false,
+    };
+    let mut j = journal_offering("journal-gone-log", &[("lint", vec![gone])]);
+    let logs = j.path.parent().unwrap().to_path_buf();
+    let lint = RepoCheck {
+        name: "lint".into(),
+        argv: vec!["sh".into(), "-c".into(), "true".into()],
+        source: "test".into(),
+        timeout_s: None,
+        dir: String::new(),
+    };
+    assert!(
+        j.reuse(&lint, &logs).is_none(),
+        "the missing blob voids the reuse"
+    );
+}
+
+/// (xreview P1) A check that passed after it changed the guarded tree's tracked content is never
+/// journaled, so a fresh checkout of the original tree (the next floor after a restart) cannot
+/// reuse a pass that ran on other content. A check that leaves the tree alone is journaled.
+#[cfg(unix)]
+#[test]
+fn a_check_that_changed_the_guarded_tree_is_never_journaled() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    for (tag, lint) in [
+        ("journal-intact", "true"),
+        ("journal-mutated", "echo v2 > app.txt"),
+    ] {
+        let wt = scratch(tag);
+        std::fs::write(wt.join("app.txt"), "v1\n").unwrap();
+        std::fs::write(wt.join(".gitignore"), "tmp/\ncaptured.json\njournal-path\n").unwrap();
+        std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+        // `test` runs second and copies the journal as it stands mid-floor.
+        std::fs::write(
+            wt.join(CONFIG_PATH),
+            serde_json::json!({
+                "typecheck": false,
+                "lint": ["sh", "-c", lint],
+                "test": ["sh", "-c",
+                    "cp \"$(cat journal-path)\" captured.json 2>/dev/null || echo none > captured.json"],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        git_repo_with_commit(&wt);
+        let git_dir = PathBuf::from(git(&wt, &["rev-parse", "--absolute-git-dir"]));
+        let snap = crate::worktree_guard::snapshot_through(&wt, &git_dir).expect("snapshot");
+        let checkout = checkout_guarded_tree(&wt, &git_dir, &snap.tree, tag).expect("checkout");
+        let ctx = FloorContext {
+            stage: FloorStage::Verify,
+            run_id: Some(format!("{tag}-{}", std::process::id())),
+            ..FloorContext::default()
+        };
+        let logs = CheckScratch::prepare_for(&checkout.dir, ctx.run_id.as_deref())
+            .unwrap()
+            .logs
+            .clone();
+        std::fs::write(
+            checkout.dir.join("journal-path"),
+            journal_path(&logs, 3).to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let j = FloorJournal {
+            ord: 3,
+            attempt: 1,
+            tree: snap.tree.clone(),
+        };
+        let r = checkout.run_floor_journaled(&ctx, None, &j);
+        if r.sandbox_error.is_some() || r.checks.is_empty() {
+            eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+            return;
+        }
+        let captured =
+            std::fs::read_to_string(checkout.dir.join("captured.json")).unwrap_or_default();
+        if lint == "true" {
+            assert!(r.passed, "{r:#?}");
+            assert!(
+                captured.contains("\"name\":\"lint\""),
+                "an untouched pass is journaled (the capture works): {captured}"
+            );
+        } else {
+            assert!(!r.passed, "hold_to refuses the changed tree: {r:#?}");
+            assert!(
+                !captured.contains("\"name\":\"lint\""),
+                "a pass on changed content is never journaled: {captured}"
+            );
+        }
+        assert!(
+            !journal_path(&logs, 3).exists(),
+            "the journal goes with the floor"
+        );
+        drop(checkout);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+}

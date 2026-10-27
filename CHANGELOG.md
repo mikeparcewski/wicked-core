@@ -25,7 +25,10 @@ Two release tracks share this file, newest entry first regardless of track:
     write root). Each finished check's result is written as soon as it finishes, and the journal is removed
     when the floor ends, so only a floor the process died in leaves one. The unit's next floor reuses the
     checks that had finished, but only on the same tree, base and check set (`FloorKey`, core#1115), the same
-    exclusion switch and the same engine policy, and only while their log blobs are still present. It runs
+    exclusion switch and the same engine policy, and only while their log blobs (the decision's own included)
+    are still present. `install` always runs again, since a fresh guarded checkout has none of its output. On
+    a guarded checkout a check is journaled only while the checkout still holds the guarded tree, so a pass
+    that ran on content a check changed is never reused. It runs
     only the checks that had not finished (the base side of a re-run check still comes from the run's base
     cache). On any other tree or check set it runs every check again. Either way the new `floorResumed`
     event and the gate's `floorNote` say what happened. An operator's floor re-run never reads or writes a

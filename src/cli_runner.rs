@@ -3307,20 +3307,15 @@ fn run_unit_and_judge_on(
                                 tree,
                                 &format!("{}-{}-a{}", input.run_id, input.unit.ord, input.attempt),
                             ) {
-                                Ok(checkout) => {
-                                    let mut r = crate::repo_checks::run_floor_journaled(
-                                        &checkout.dir,
-                                        &ctx,
-                                        floor_rerun,
-                                        Some(&crate::repo_checks::FloorJournal {
-                                            ord: input.unit.ord,
-                                            attempt: input.attempt,
-                                            tree: tree.to_string(),
-                                        }),
-                                    );
-                                    checkout.hold_to(tree, &mut r);
-                                    r
-                                }
+                                Ok(checkout) => checkout.run_floor_journaled(
+                                    &ctx,
+                                    floor_rerun,
+                                    &crate::repo_checks::FloorJournal {
+                                        ord: input.unit.ord,
+                                        attempt: input.attempt,
+                                        tree: tree.to_string(),
+                                    },
+                                ),
                                 Err(why) => {
                                     crate::repo_checks::guarded_checkout_refused(wd, &ctx, &why)
                                 }

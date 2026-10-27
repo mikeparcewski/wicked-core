@@ -1232,17 +1232,15 @@ pub(crate) fn lift_and_reverify(
                     });
                 }
                 // (J4) Journaled: a re-verify a daemon restart interrupts resumes on this tree.
-                let mut r = crate::repo_checks::run_floor_journaled(
-                    &checkout.dir,
+                let mut r = checkout.run_floor_journaled(
                     &floor_ctx,
                     None,
-                    Some(&crate::repo_checks::FloorJournal {
+                    &crate::repo_checks::FloorJournal {
                         ord,
                         attempt,
                         tree: now.tree.clone(),
-                    }),
+                    },
                 );
-                checkout.hold_to(&now.tree, &mut r);
                 // The result's identity, so an operator's override of it at this gate is keyed
                 // by exactly the tree, base and check set it judged.
                 r.key = r.key_for(Some(&now.tree), &floor_ctx);
