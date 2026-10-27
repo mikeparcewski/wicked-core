@@ -2325,73 +2325,101 @@ mod failure_diagnostics_tests {
         // run is budgeted, and only the run says anything about how fast that CLI is - so the
         // two must come back separately, not summed.
         //
-        // Every threshold below sits MIDWAY between the two outcomes it separates, never on the
-        // boundary. Timings are measured, so a threshold equal to the expected value decides on
-        // scheduler jitter and `as_millis` truncation, not on behaviour: this test failed on a CI
-        // runner reading 119ms for a wait of exactly RUN. Midpoints leave RUN/2 of slack on both
-        // sides, which is the widest margin the two hypotheses allow.
+        // The two holder seats take both permits and keep them until the coordinator releases
+        // them, HOLD after the queued seat started waiting. The queue wait is therefore ~HOLD by
+        // construction, however the scheduler orders thread start-up, and HOLD is far longer
+        // than RUN. That puts the two outcomes this test separates a long way apart:
+        //   correct: queued run ~RUN       summed (the bug): queued run ~RUN + HOLD
+        // Every threshold sits MIDWAY at HOLD/2 (600ms), never on a boundary. The run threshold
+        // RUN + HOLD/2 = 900ms tolerates the queued seat's own sleep overrunning by HOLD/2 =
+        // 600ms (two full runs), while a summed timing is at least HOLD + RUN = 1500ms, so a
+        // loaded runner cannot fake the bug. The wait thresholds at HOLD/2 likewise leave HOLD/2
+        // of slack on each side. (An earlier version compared the queued run against the
+        // unqueued seats' runs plus half the wait; that margin was only RUN/2, and the queued
+        // seat's sleep alone overran by 155ms on a loaded macOS runner. Scheduler delay need not
+        // hit the seats equally, so no baseline taken from the other seats cancels it.)
         //
-        // The run-time assertion is additionally SELF-CALIBRATING: it compares the queued seat's
-        // run against the UNQUEUED seats' runs, measured on the same machine in the same scope,
-        // rather than against a constant derived from RUN. Every seat sleeps the same RUN, so
-        // whatever the scheduler adds on top is common-mode and cancels. A constant does not
-        // cancel it - `ran < RUN * 3/2` failed on a contended CI runner at ran=333ms for
-        // RUN=200ms, i.e. the runner's fixed overhead ate a margin sized for a quiet machine and
-        // the test reported the summed-timing bug against code that does not have it.
+        // Assertions run after the holders are released and every worker has joined, so a
+        // failure cannot strand a thread on the barrier.
+        use std::sync::{mpsc, Barrier};
         let permits = SeatPermits {
             free: std::sync::Mutex::new(2),
             returned: std::sync::Condvar::new(),
         };
         const RUN: Duration = Duration::from_millis(300);
+        const HOLD: Duration = Duration::from_millis(1200);
+
+        let release = Barrier::new(3); // two holders + the coordinator
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let (waiting_tx, waiting_rx) = mpsc::channel::<()>();
 
         let mut timed: Vec<(u64, u64)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..3)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let queue_started = Instant::now();
-                        let (queued, ran) = {
-                            let _permit = permits.acquire();
-                            let queued = queue_started.elapsed();
-                            let run_started = Instant::now();
-                            std::thread::sleep(RUN);
-                            (queued, run_started.elapsed())
-                        };
-                        (queued.as_millis() as u64, ran.as_millis() as u64)
-                    })
-                })
-                .collect();
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let held_tx = held_tx.clone();
+                handles.push(scope.spawn(|| {
+                    let held_tx = held_tx;
+                    let queue_started = Instant::now();
+                    let (queued, ran) = {
+                        let _permit = permits.acquire();
+                        let queued = queue_started.elapsed();
+                        let run_started = Instant::now();
+                        std::thread::sleep(RUN);
+                        let ran = run_started.elapsed();
+                        held_tx.send(()).unwrap();
+                        release.wait(); // keep the permit until the coordinator says so
+                        (queued, ran)
+                    };
+                    (queued.as_millis() as u64, ran.as_millis() as u64)
+                }));
+            }
+            drop(held_tx);
+            // Both permits are held before the third seat exists, so it must queue.
+            held_rx.recv().unwrap();
+            held_rx.recv().unwrap();
+            handles.push(scope.spawn(|| {
+                let waiting_tx = waiting_tx;
+                let queue_started = Instant::now();
+                waiting_tx.send(()).unwrap();
+                let (queued, ran) = {
+                    let _permit = permits.acquire();
+                    let queued = queue_started.elapsed();
+                    let run_started = Instant::now();
+                    std::thread::sleep(RUN);
+                    (queued, run_started.elapsed())
+                };
+                (queued.as_millis() as u64, ran.as_millis() as u64)
+            }));
+            waiting_rx.recv().unwrap();
+            std::thread::sleep(HOLD);
+            release.wait();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
 
-        // A seat that got a permit immediately waits ~0; the one that queued waits ~RUN. Longest
+        // A seat that got a permit immediately waits ~0; the one that queued waits ~HOLD. Longest
         // wait first, so the head IS the queued seat and the tail is the comparison group.
         timed.sort_by_key(|(queued, _)| std::cmp::Reverse(*queued));
         let (&(queued_wait, queued_ran), unqueued) = timed
             .split_first()
             .expect("three seats were spawned, so three timings come back");
+        let hold_ms = HOLD.as_millis() as u64;
         let run_ms = RUN.as_millis() as u64;
         assert!(
-            queued_wait > run_ms / 2,
-            "two permits and three seats: one seat must have queued for about a run: {timed:?}"
+            queued_wait > hold_ms / 2,
+            "two permits and three seats: one seat must have queued for about HOLD: {timed:?}"
         );
         assert!(
-            unqueued.iter().all(|(queued, _)| *queued <= run_ms / 2),
+            unqueued.iter().all(|(queued, _)| *queued <= hold_ms / 2),
             "only one seat should have queued: {timed:?}"
         );
 
-        // Correct: the queued seat's run matches the unqueued seats' - it slept the same RUN.
-        // Summed (the bug): it exceeds them by its whole queue wait, ~RUN more. Half the measured
-        // wait is the midpoint between those two outcomes, and it scales with what was measured
-        // rather than with what was expected.
-        let baseline = unqueued
-            .iter()
-            .map(|(_, ran)| *ran)
-            .max()
-            .expect("two seats ran without queueing");
+        // Correct: the queued seat's run is ~RUN. Summed (the bug): at least HOLD + RUN. The
+        // threshold is the midpoint, RUN + HOLD/2 (see the margin note at the top).
         assert!(
-            queued_ran < baseline + queued_wait / 2,
+            queued_ran < run_ms + hold_ms / 2,
             "run time must exclude the queue wait: the queued seat ran={queued_ran}ms after \
-             waiting {queued_wait}ms, while unqueued seats ran at most {baseline}ms ({timed:?})"
+             waiting {queued_wait}ms (a summed timing would be at least {}ms) ({timed:?})",
+            hold_ms + run_ms
         );
     }
 
