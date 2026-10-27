@@ -6840,6 +6840,42 @@ fn apply_step_result(
                 .assigned_cli
                 .clone()
                 .unwrap_or_else(|| "claude".to_string());
+            // (PRODUCT-WORKS J6) A worker failure that left the tree exactly as its attempt found
+            // it authored nothing: the seat it made a new author is taken back out, so a later
+            // review on that seat is not refused as a self-review (run 9bd0f728, codex's 3-second
+            // failed build attempt). An unreadable tree keeps the stamp.
+            let probe_git_dir = unit
+                .author_probe
+                .as_ref()
+                .filter(|p| p.seat == failed_cli && p.attempt == output.attempt)
+                .map(|p| p.git_dir.clone());
+            if let Some(git_dir) = probe_git_dir {
+                let tree_now = session.workdir.as_deref().and_then(|wd| {
+                    crate::worktree_guard::snapshot_through(
+                        std::path::Path::new(wd),
+                        std::path::Path::new(&git_dir),
+                    )
+                    .ok()
+                    .map(|snap| snap.tree)
+                });
+                let had = unit.authored_by.contains(&failed_cli);
+                if crate::domain::retract_unproductive_author(
+                    unit,
+                    &failed_cli,
+                    output.attempt,
+                    tree_now.as_deref(),
+                ) {
+                    if had && !unit.authored_by.contains(&failed_cli) {
+                        eprintln!(
+                            "wicked-core: unit {ord} of run {run_id}: '{failed_cli}' failed attempt \
+                             {} without changing the tree; it is not an author of the work \
+                             (PRODUCT-WORKS J6)",
+                            output.attempt
+                        );
+                    }
+                    put_node(store, unit.to_node())?;
+                }
+            }
             // Record BEFORE selecting, and persist even when the roster turns out exhausted:
             // the terminal path below re-persists the unit, and a later RESUME reads this
             // list so it never hands the unit straight back to a seat that already failed it.
@@ -10055,15 +10091,27 @@ fn dispatch_unit(
     // reassigned or failed-over creator stays one of the work's authors — but not a member's
     // read step, which authors nothing (`pipeline::authors_by_dispatch`).
     let builds = crate::pipeline::authors_by_dispatch(&unit);
+    // (PRODUCT-WORKS J6) A seat this dispatch makes a NEW author, with the binaries before it: the
+    // probe below records the tree the attempt starts on, so a worker failure that changes nothing
+    // takes the stamp back (`domain::retract_unproductive_author`).
+    let mut new_author: Option<(String, Vec<String>)> = None;
     if builds {
         if let Some(seat) = unit.assigned_cli.clone() {
             // …and every binary that dispatch may run (the fallback judge never shares one).
             let binaries =
                 crate::cli_runner::launched_identities(&seat, unit.assigned_invocation.clone());
+            let before = (!unit.authored_by.contains(&seat))
+                .then(|| (seat.clone(), unit.authored_binaries.clone()));
             if crate::domain::stamp_author(&mut unit, seat, binaries) {
                 team_changed = true;
             }
+            new_author = before;
         }
+    }
+    // A probe from an earlier attempt never outlives the next dispatch.
+    if unit.author_probe.is_some() {
+        unit.author_probe = None;
+        team_changed = true;
     }
     // …and a Review/Test agent unit never dispatches onto an author's seat: it moves to the first
     // run seat (unbenched, in roster order) that authored nothing. With none left it stays put and
@@ -10139,6 +10187,7 @@ fn dispatch_unit(
     // thread compares against to know whether the unit CHANGED the tree — the trigger for the
     // default repo-checks floor and the default judge. A Tool unit is the engine's own command
     // and takes none.
+    let mut baseline_fresh = false;
     if unit.tool_cmd.is_none()
         && (crate::worktree_guard::applies_to(&unit) || unit.default_floor)
         && unit.worktree_baseline.is_none()
@@ -10169,6 +10218,7 @@ fn dispatch_unit(
             match snap {
                 Ok(snap) => {
                     unit.worktree_baseline = Some(snap);
+                    baseline_fresh = true;
                     put_node(store, unit.to_node())?;
                 }
                 Err(e) => eprintln!(
@@ -10178,6 +10228,35 @@ fn dispatch_unit(
                     unit.ord
                 ),
             }
+        }
+    }
+    // (PRODUCT-WORKS J6) The tree a NEW author's attempt starts on: the baseline just taken, or a
+    // fresh snapshot through the baseline's pinned git dir. No baseline or a failed snapshot leaves
+    // no probe, and the stamp then stays whatever happens (fail toward "authored").
+    if let (Some((seat, binaries_before)), Some(wd)) = (new_author, session.workdir.as_deref()) {
+        let tree = unit.worktree_baseline.as_ref().and_then(|b| {
+            let git_dir = b.git_dir.clone()?;
+            let tree = if baseline_fresh {
+                Some(b.tree.clone())
+            } else {
+                crate::worktree_guard::snapshot_through(
+                    std::path::Path::new(wd),
+                    std::path::Path::new(&git_dir),
+                )
+                .map(|s| s.tree)
+                .ok()
+            }?;
+            Some((tree, git_dir))
+        });
+        if let Some((tree, git_dir)) = tree {
+            unit.author_probe = Some(crate::domain::AuthorProbe {
+                seat,
+                attempt: session.attempt,
+                tree,
+                git_dir,
+                binaries_before,
+            });
+            put_node(store, unit.to_node())?;
         }
     }
     // (QE acceptance) The run's binding QE decision: scored from the run's diff when its QE unit
@@ -24541,6 +24620,120 @@ mod seat_failover_tests {
             e,
             CoreEvent::SeatBenched { cli, .. } if cli == "codex"
         )));
+    }
+
+    /// PRODUCT-WORKS J6 (run 9bd0f728): a build attempt that fails as a WORKER and leaves the tree
+    /// exactly as it found it authored nothing — the failover takes its seat back out of
+    /// `authored_by` (and its binaries out of `authored_binaries`), so a later review on that seat
+    /// is not refused `same_seat_evaluator`. An attempt that changed the tree keeps the stamp.
+    #[test]
+    fn a_worker_failure_that_changed_nothing_is_not_an_author_j6() {
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            // spawn-audit: test-only — a git fixture building the repo under test; it reads no engine state.
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        }
+        for (tag, edit) in [("unchanged", false), ("edited", true)] {
+            let run_id = format!("j6-author-{tag}-{}", std::process::id());
+            let base = std::env::temp_dir().join(format!("wicked-{run_id}"));
+            let _ = std::fs::remove_dir_all(&base);
+            let repo = base.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            git(&repo, &["init", "-q", "."]);
+            git(
+                &repo,
+                &[
+                    "-c",
+                    "user.email=t@example.invalid",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "base",
+                ],
+            );
+            std::fs::write(repo.join("a.txt"), "claude's work\n").unwrap();
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_session(
+                &mut store,
+                &run_id,
+                &["claude", "codex", "agy"],
+                SessionStatus::Executing,
+                0,
+            );
+            let mut session = crate::domain::get_session(&store, &run_id)
+                .unwrap()
+                .unwrap();
+            session.workdir = Some(repo.to_string_lossy().into_owned());
+            session.attempt = 3;
+            put_node(&mut store, session.to_node()).unwrap();
+            let git_dir = repo.join(".git");
+            let start = crate::worktree_guard::snapshot_through(&repo, &git_dir).unwrap();
+            let mut u = WorkUnit::pending(format!("{run_id}:build"), &run_id, 1, "work");
+            u.stage = crate::domain::StageKind::Build;
+            u.role = PhaseRole::Creator;
+            u.status = UnitStatus::Distributed;
+            u.assigned_cli = Some("codex".into());
+            u.worker_failed_clis = vec!["claude".into()];
+            u.authored_by = vec!["claude".into(), "codex".into()];
+            u.authored_binaries = vec!["/bin/claude".into(), "/bin/codex".into()];
+            // What `dispatch_unit` recorded when attempt 3 made codex a new author.
+            u.author_probe = Some(crate::domain::AuthorProbe {
+                seat: "codex".into(),
+                attempt: 3,
+                tree: start.tree.clone(),
+                git_dir: git_dir.to_string_lossy().into_owned(),
+                binaries_before: vec!["/bin/claude".into()],
+            });
+            put_node(&mut store, u.to_node()).unwrap();
+            if edit {
+                std::fs::write(repo.join("b.txt"), "codex wrote this before it died\n").unwrap();
+            }
+            let (applied, _session, units) =
+                fold_failed(&mut store, &run_id, "(cli `codex` exited 1) boom");
+            assert!(matches!(applied, StepApplied::Continuing), "{tag}");
+            assert_eq!(
+                units[0].assigned_cli.as_deref(),
+                Some("agy"),
+                "{tag}: failed over"
+            );
+            assert!(
+                units[0]
+                    .author_probe
+                    .as_ref()
+                    .is_none_or(|p| p.seat == "agy"),
+                "{tag}: codex's probe is consumed"
+            );
+            // The failover's own dispatch makes agy an author; codex is one only if it changed the tree.
+            let authors = &units[0].authored_by;
+            assert!(
+                authors.contains(&"claude".to_string()) && authors.contains(&"agy".to_string()),
+                "{tag}: {authors:?}"
+            );
+            assert_eq!(
+                authors.contains(&"codex".to_string()),
+                edit,
+                "{tag}: {authors:?}"
+            );
+            assert_eq!(
+                units[0]
+                    .authored_binaries
+                    .contains(&"/bin/codex".to_string()),
+                edit,
+                "{tag}: {:?}",
+                units[0].authored_binaries
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 
     /// THE required behavior: failover walks the roster IN ORDER, never repeats a seat that

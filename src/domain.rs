@@ -563,6 +563,46 @@ pub struct PoolSeating {
     pub shortfall: Option<String>,
 }
 
+/// [`WorkUnit::author_probe`]: who became an author on which attempt, from which tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorProbe {
+    /// The seat the dispatch stamped as a new author.
+    pub seat: String,
+    /// The attempt that dispatch minted.
+    pub attempt: u32,
+    /// The worktree's content tree id when that attempt started.
+    pub tree: String,
+    /// The pinned git dir the tree was taken through (the unit's baseline's).
+    pub git_dir: String,
+    /// [`WorkUnit::authored_binaries`] before the stamp, restored if the seat is taken back out.
+    pub binaries_before: Vec<String>,
+}
+
+/// (PRODUCT-WORKS J6) Take back the author stamp of a failed attempt that changed nothing: when
+/// `unit`'s probe is for `seat` on `attempt` and `tree_now` is the tree it started on. Returns
+/// whether the unit changed. A probe for another attempt or seat is left alone; a matching probe
+/// whose tree moved is consumed and the stamp kept.
+pub fn retract_unproductive_author(
+    unit: &mut WorkUnit,
+    seat: &str,
+    attempt: u32,
+    tree_now: Option<&str>,
+) -> bool {
+    let Some(probe) = unit.author_probe.as_ref() else {
+        return false;
+    };
+    if probe.seat != seat || probe.attempt != attempt {
+        return false;
+    }
+    let unchanged = tree_now.is_some_and(|t| t == probe.tree);
+    let probe = unit.author_probe.take().expect("checked above");
+    if unchanged {
+        unit.authored_by.retain(|s| s != seat);
+        unit.authored_binaries = probe.binaries_before;
+    }
+    true
+}
+
 /// (operator ruling 2026-10-14, the fallback judge) The [`WorkUnit::authored_binaries`] entry that
 /// marks an INCOMPLETE history: the unit had authors before binaries were recorded (persisted before
 /// the record existed), so some author's binary can never be established. Kept across later
@@ -1197,8 +1237,9 @@ pub struct WorkUnit {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub worker_failed_clis: Vec<String>,
     /// (crew#972) EVERY seat this Build/Recon unit was dispatched on — its first seat and each seat
-    /// a reassign, failover or bench reseat moved it to. Stamped at dispatch, never cleared: a seat
-    /// that built any attempt of the work is one of its authors, so no Review/Test unit or judge of
+    /// a reassign, failover or bench reseat moved it to. Stamped at dispatch and kept, except for a
+    /// worker failure that changed nothing ([`Self::author_probe`]): a seat that built any attempt
+    /// of the work is one of its authors, so no Review/Test unit or judge of
     /// that work may run on it (run 7d8c9c98: after the build was reassigned codex -> claude, the
     /// test and security-review units were dispatched onto claude, then codex).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1211,6 +1252,15 @@ pub struct WorkUnit {
     /// whose binaries cannot be established, and no fallback judge is seated for its work.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub authored_binaries: Vec<String>,
+    /// (PRODUCT-WORKS J6) The dispatch that made its seat a NEW author of this unit, with the tree
+    /// that attempt started on. An attempt that then fails as a WORKER (the CLI exited, timed out
+    /// or refused before doing anything) and left the tree exactly as it found it produced nothing:
+    /// the failure path takes that seat back out of [`Self::authored_by`] (and its binaries out of
+    /// [`Self::authored_binaries`]) before the failover. Run 9bd0f728: codex's 3-second failed
+    /// attempt on the build left codex an "author" of claude's work, and every codex review of it
+    /// was denied `same_seat_evaluator`. Any other ending keeps the stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_probe: Option<AuthorProbe>,
     /// The PHASE IDS this unit's work depends on — carried verbatim from the backing phase's
     /// [`depends_on`](crate::workflow::PhaseDef::depends_on) at plan time (FINDING-024).
     ///
@@ -1684,6 +1734,7 @@ impl WorkUnit {
             worker_failed_clis: Vec::new(),
             authored_by: Vec::new(),
             authored_binaries: Vec::new(),
+            author_probe: None,
             depends_on: Vec::new(),
             pre_build_scope: false,
             team_run: false,

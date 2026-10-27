@@ -3558,6 +3558,7 @@ mod tests {
             worker_failed_clis: Vec::new(),
             authored_by: Vec::new(),
             authored_binaries: Vec::new(),
+            author_probe: None,
             depends_on: Vec::new(),
             required_deliverables: Vec::new(),
             executes_code: false,

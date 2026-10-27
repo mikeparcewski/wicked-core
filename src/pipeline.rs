@@ -2786,7 +2786,28 @@ pub(crate) fn authors_by_dispatch(u: &crate::domain::WorkUnit) -> bool {
     use crate::domain::StageKind;
     u.tool_cmd.is_none()
         && matches!(u.stage, StageKind::Build | StageKind::Recon)
-        && !is_member_read_step(u)
+        && !is_read_step(u)
+}
+
+/// A step whose own seat authors nothing a later review or test checks: a team member's read step
+/// ([`is_member_read_step`]) or a GUARDED read step ([`is_guarded_read_step`]).
+pub(crate) fn is_read_step(u: &crate::domain::WorkUnit) -> bool {
+    is_member_read_step(u) || is_guarded_read_step(u)
+}
+
+/// (PRODUCT-WORKS J6) A read-only recon step the worktree guard held to the tree — a recon stage,
+/// a neutral role, no code, `worktree_guarded` — that left the tree as it found it (no mutation
+/// recorded, or one the guard restored). Its seat produced nothing in the tree a review checks:
+/// counting it as an author made run 9bd0f728's floor-added `architecture` recon on codex read as
+/// "codex built this work", and every codex review of claude's build was denied
+/// `same_seat_evaluator`. A guarded step whose edit was KEPT (the operator approved retrying on the
+/// changed tree) did change the tree, and stays an author.
+pub(crate) fn is_guarded_read_step(u: &crate::domain::WorkUnit) -> bool {
+    u.stage == crate::domain::StageKind::Recon
+        && u.role == crate::workflow::PhaseRole::Neutral
+        && !u.executes_code
+        && u.worktree_guarded
+        && u.worktree_mutation.as_ref().is_none_or(|m| m.restored)
 }
 
 /// Whether `u` has an author whose seat a later review or test must avoid: every unit
@@ -2795,8 +2816,7 @@ pub(crate) fn authors_by_dispatch(u: &crate::domain::WorkUnit) -> bool {
 /// [`work_authors`] (the gate's `same_seat_evaluator`, the dispatch re-seat) and the evaluator
 /// relation's builders.
 pub(crate) fn authors_work(u: &crate::domain::WorkUnit) -> bool {
-    authors_by_dispatch(u)
-        || (u.tool_cmd.is_none() && is_member_read_step(u) && !u.authored_by.is_empty())
+    authors_by_dispatch(u) || (u.tool_cmd.is_none() && is_read_step(u) && !u.authored_by.is_empty())
 }
 
 /// The seats that authored `u`: its recorded authors, and — unless it is a member read step,
@@ -2804,7 +2824,7 @@ pub(crate) fn authors_work(u: &crate::domain::WorkUnit) -> bool {
 fn author_seats(u: &crate::domain::WorkUnit) -> impl Iterator<Item = &String> {
     u.assigned_cli
         .iter()
-        .filter(|_| !is_member_read_step(u))
+        .filter(|_| !is_read_step(u))
         .chain(u.authored_by.iter())
 }
 
@@ -5060,6 +5080,138 @@ mod member_read_step_tests {
         for u in [member_build, member_code, pa_recon] {
             assert!(super::authors_by_dispatch(&u), "{u:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod guarded_read_step_tests {
+    use crate::domain::{StageKind, WorkUnit};
+    use crate::workflow::PhaseRole;
+
+    fn unit(ord: u32, stage: StageKind, role: PhaseRole, seat: &str) -> WorkUnit {
+        let mut u = WorkUnit::pending(format!("r:{ord}"), "r", ord, "x");
+        u.stage = stage;
+        u.role = role;
+        u.assigned_cli = Some(seat.to_string());
+        u
+    }
+
+    fn snap() -> crate::worktree_guard::WorktreeSnapshot {
+        crate::worktree_guard::WorktreeSnapshot {
+            head: "h".into(),
+            head_ref: None,
+            tree: "t".into(),
+            taken_at_ms: 0,
+            git_dir: None,
+        }
+    }
+
+    /// PRODUCT-WORKS J6 (run 9bd0f728): claude built (unit 6), the floor-added `architecture`
+    /// recon ran read-only on codex (unit 7), and the test on codex (unit 8) was denied
+    /// `same_seat_evaluator` — "codex built this work". A guarded read step that left the tree as
+    /// it found it authors nothing; one whose edit was kept does; an unguarded recon still does.
+    #[test]
+    fn a_guarded_read_step_is_not_an_author_of_the_work_j6() {
+        let mut build = unit(6, StageKind::Build, PhaseRole::Creator, "claude");
+        build.authored_by = vec!["claude".into()];
+        let mut arch = unit(7, StageKind::Recon, PhaseRole::Neutral, "codex");
+        arch.worktree_guarded = true;
+        let test = unit(8, StageKind::Test, PhaseRole::Evaluator, "codex");
+        assert!(super::is_guarded_read_step(&arch));
+        assert!(
+            !super::authors_by_dispatch(&arch),
+            "no author stamp at dispatch"
+        );
+        let units = [build.clone(), arch.clone(), test.clone()];
+        assert_eq!(super::work_authors(&units, 8), vec!["claude".to_string()]);
+        let rel = super::evaluator_relation(&units, &test).expect("a builder precedes it");
+        assert!(!rel.on_builder_seat, "codex built nothing the test checks");
+        assert_eq!(rel.creator.as_deref(), Some("claude"));
+        assert!(!super::fallback_work_authors(&units, 8).contains(&"codex".to_string()));
+
+        // A mutation the guard RESTORED changed nothing either.
+        let mut restored = arch.clone();
+        restored.worktree_mutation = Some(crate::worktree_guard::WorktreeMutation {
+            before: snap(),
+            after: snap(),
+            changed: Vec::new(),
+            head_moved: false,
+            restored: true,
+            restore_error: None,
+            suggestion_ref: None,
+        });
+        assert!(super::is_guarded_read_step(&restored));
+
+        // A kept edit (the operator retried on the changed tree) authored it.
+        let mut kept = restored.clone();
+        kept.worktree_mutation.as_mut().unwrap().restored = false;
+        assert!(super::authors_by_dispatch(&kept));
+        let with_kept = [build.clone(), kept, test.clone()];
+        assert!(super::work_authors(&with_kept, 8).contains(&"codex".to_string()));
+
+        // Unguarded recon, and a recon that executes code, keep their author rule.
+        let mut unguarded = arch.clone();
+        unguarded.worktree_guarded = false;
+        let mut runs_code = arch;
+        runs_code.executes_code = true;
+        for u in [unguarded, runs_code] {
+            assert!(super::authors_by_dispatch(&u), "{u:?}");
+        }
+    }
+
+    /// The failure-side retraction (`domain::retract_unproductive_author`): only the probe's own
+    /// seat and attempt, only when the tree is the one the attempt started on.
+    #[test]
+    fn an_unproductive_author_is_retracted_only_on_its_own_unchanged_attempt() {
+        let probe = || crate::domain::AuthorProbe {
+            seat: "codex".into(),
+            attempt: 3,
+            tree: "t0".into(),
+            git_dir: "/g".into(),
+            binaries_before: vec!["/bin/claude".into()],
+        };
+        let base = || {
+            let mut u = unit(6, StageKind::Build, PhaseRole::Creator, "codex");
+            u.authored_by = vec!["claude".into(), "codex".into()];
+            u.authored_binaries = vec!["/bin/claude".into(), "/bin/codex".into()];
+            u.author_probe = Some(probe());
+            u
+        };
+        let mut u = base();
+        assert!(crate::domain::retract_unproductive_author(
+            &mut u,
+            "codex",
+            3,
+            Some("t0")
+        ));
+        assert_eq!(u.authored_by, vec!["claude".to_string()]);
+        assert_eq!(u.authored_binaries, vec!["/bin/claude".to_string()]);
+        assert_eq!(u.author_probe, None);
+        // The tree moved, or could not be read: the stamp stays, the probe is consumed.
+        for now in [Some("t1"), None] {
+            let mut u = base();
+            assert!(crate::domain::retract_unproductive_author(
+                &mut u, "codex", 3, now
+            ));
+            assert_eq!(u.authored_by.len(), 2, "{now:?}");
+            assert_eq!(u.author_probe, None);
+        }
+        // Another attempt or seat: untouched.
+        let mut u = base();
+        assert!(!crate::domain::retract_unproductive_author(
+            &mut u,
+            "codex",
+            4,
+            Some("t0")
+        ));
+        assert!(!crate::domain::retract_unproductive_author(
+            &mut u,
+            "claude",
+            3,
+            Some("t0")
+        ));
+        assert_eq!(u.author_probe, Some(probe()));
+        assert_eq!(u.authored_by.len(), 2);
     }
 }
 
