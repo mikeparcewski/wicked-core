@@ -3466,12 +3466,33 @@ pub(crate) enum DiskProbe {
     /// nearly full CI runner) must never decide.
     #[cfg(test)]
     Off,
-    /// A fixed reading — the floor tests' simulated volume.
+    /// The floor tests' simulated volume: `space` at the first reading, then a removal of N
+    /// apparent bytes gives back `reclaim_pct` percent of them (under 100: hard-linked outputs).
     #[cfg(test)]
-    Simulated(VolumeSpace),
+    Simulated {
+        space: VolumeSpace,
+        reclaim_pct: u64,
+    },
 }
 
 impl DiskProbe {
+    /// The free bytes on `cache`'s volume after the cap pass removed `freed` apparent bytes since
+    /// the `first` reading: a FRESH reading, since a removal can give back less than its apparent
+    /// bytes (hard links, sparse or still-open files); the credited estimate only when the volume
+    /// cannot be read again.
+    fn free_after(self, cache: &Path, first: VolumeSpace, freed: u64) -> u64 {
+        let credited = first.free.saturating_add(freed);
+        match self {
+            Self::Volume => volume_space(cache).map_or(credited, |s| s.free),
+            #[cfg(test)]
+            Self::Off => credited,
+            #[cfg(test)]
+            Self::Simulated { reclaim_pct, .. } => first
+                .free
+                .saturating_add((u128::from(freed) * u128::from(reclaim_pct) / 100) as u64),
+        }
+    }
+
     /// The space on `cache`'s volume, `None` when it cannot be read (the floor is then not held).
     fn space(self, cache: &Path) -> Option<VolumeSpace> {
         match self {
@@ -3479,7 +3500,7 @@ impl DiskProbe {
             #[cfg(test)]
             Self::Off => None,
             #[cfg(test)]
-            Self::Simulated(s) => Some(s),
+            Self::Simulated { space, .. } => Some(space),
         }
     }
 }
@@ -3585,11 +3606,11 @@ fn evict_leaf(leaf: &Path) -> Evicted {
 /// 2. (core#1122) A leaf no floor has used for [`CacheCaps::idle`] goes, whatever the caps.
 /// 3. Over the per-repository cap (that repository's leaves) or the TOTAL cap (every
 ///    repository's), the OTHER run leaves go least recently used first until both fit.
-///    (core#1138) The total cap is the smaller of [`CacheCaps::total`] and what keeps the
-///    free-disk floor ([`CacheCaps::free_floor`]) free on the cache's volume
-///    ([`effective_total_cap`]): on a nearly full disk, leaves go below the fixed cap until the
-///    floor holds again or only leaves floors hold are left, and that shortfall is logged (and
-///    reported by [`floor_cache_usage`]).
+///    (core#1138) While a reading of the cache's volume is below its free-disk floor
+///    ([`CacheCaps::free_floor`]), leaves go the same way, below the fixed cap
+///    ([`effective_total_cap`]), until a fresh reading after a removal shows the floor holds
+///    again, or only leaves floors hold are left. That shortfall is logged
+///    ([`floor_shortfall`]) and reported by [`floor_cache_usage`].
 ///
 /// A leaf a floor holds a lease on is never removed: removal takes the leaf's EXCLUSIVE lock, and
 /// every floor holds a SHARED one for its life. The floor's own leaf is never removed here; the
@@ -3694,19 +3715,24 @@ pub(crate) fn enforce_check_cache_cap(
         *per_group.entry(g.clone()).or_default() += bytes;
     }
     let own_over = own_bytes > caps.repo.min(caps.total);
-    // (core#1138) Read AFTER the scan's own removals, so the free space already counts them.
+    // (core#1138) Read AFTER the scan's own removals, so the free space already counts them. The
+    // floor is held on READINGS of the volume, never on the leaves' apparent bytes (codex on
+    // #1140): cargo hard-links its outputs, a file may be sparse or still open, so a leaf can give
+    // back less than it measures. Re-read after every removal while the volume is short.
     let space = caps.disk.space(cache);
-    let limit = effective_total_cap(caps, total, space);
-    let floor_bound = limit < caps.total;
-    let cache_before = total;
-    if total <= limit && per_group.values().all(|&b| b <= caps.repo) {
+    let floor = space.map(|s| caps.free_floor.bytes(s.total));
+    let mut free = space.map(|s| s.free);
+    let mut freed = 0u64;
+    let short = |free: Option<u64>| matches!((floor, free), (Some(f), Some(fr)) if fr < f);
+    if !short(free) && total <= caps.total && per_group.values().all(|&b| b <= caps.repo) {
         return (removed, own_over);
     }
     others.sort_by_key(|c| c.used);
     for c in others {
         let in_group = per_group.get(&c.group).copied().unwrap_or_default();
-        let (over_total, over_repo) = (total > limit, in_group > caps.repo);
-        if !over_total && !over_repo {
+        let floor_short = short(free);
+        let (over_total, over_repo) = (total > caps.total, in_group > caps.repo);
+        if !floor_short && !over_total && !over_repo {
             continue;
         }
         match evict_leaf(&c.leaf) {
@@ -3720,14 +3746,13 @@ pub(crate) fn enforce_check_cache_cap(
             }
             Evicted::Kept => continue,
         }
-        let why = if over_total && floor_bound {
-            let s = space.unwrap_or(VolumeSpace { total: 0, free: 0 });
+        let why = if floor_short {
             format!(
                 "free disk on the check cache's volume was {:.1} GB, under its {:.1} GB floor \
                  ({CHECK_CACHE_FREE_FLOOR_PCT_ENV} / {CHECK_CACHE_FREE_FLOOR_GB_ENV}), with the \
                  check cache {} at {:.1} GB",
-                gb(s.free.saturating_add(cache_before.saturating_sub(total))),
-                gb(caps.free_floor.bytes(s.total)),
+                gb(free.unwrap_or_default()),
+                gb(floor.unwrap_or_default()),
                 cache.display(),
                 gb(total)
             )
@@ -3756,24 +3781,17 @@ pub(crate) fn enforce_check_cache_cap(
         if let Some(g) = per_group.get_mut(&c.group) {
             *g = g.saturating_sub(c.bytes);
         }
+        freed = freed.saturating_add(c.bytes);
+        if let Some(first) = space.filter(|_| floor_short) {
+            free = Some(caps.disk.free_after(cache, first, freed));
+        }
         removed.push(c.leaf);
     }
     let own_group_bytes = per_group.get(&own_group).copied().unwrap_or_default();
-    if let (true, Some(s)) = (floor_bound && total > limit, space) {
-        // Only leaves floors hold (and this floor's own) are left: the floor stays short.
-        let floor = caps.free_floor.bytes(s.total);
-        let free = s.free.saturating_add(cache_before.saturating_sub(total));
-        eprintln!(
-            "wicked-core: repo checks floor — free disk on the check cache's volume is {:.1} GB, \
-             {:.1} GB short of its {:.1} GB floor ({CHECK_CACHE_FREE_FLOOR_PCT_ENV} / \
-             {CHECK_CACHE_FREE_FLOOR_GB_ENV}); the check cache {} is {:.1} GB, held by runs whose \
-             floors are running",
-            gb(free),
-            gb(floor.saturating_sub(free)),
-            gb(floor),
-            cache.display(),
-            gb(total)
-        );
+    if let Some(why) = floor_shortfall(cache, floor, free, total) {
+        // Every leaf no floor holds is gone and the volume is still short (codex on #1140: also
+        // when the cache is empty, or was before the pass).
+        eprintln!("wicked-core: repo checks floor — {why}");
     } else if !own_over && (total > caps.total || own_group_bytes > caps.repo) {
         eprintln!(
             "wicked-core: repo checks floor — the check cache {} is {:.1} GB (this repository's \
@@ -3787,6 +3805,40 @@ pub(crate) fn enforce_check_cache_cap(
         );
     }
     (removed, own_over)
+}
+
+/// (core#1138) The cap pass's closing line when the volume is still below its free-disk floor:
+/// `floor` and the latest `free` reading (`None` when unread: no floor), and the `total` bytes the
+/// check cache at `cache` still holds. `None` when the floor holds. An empty cache is never blamed
+/// on running floors.
+fn floor_shortfall(
+    cache: &Path,
+    floor: Option<u64>,
+    free: Option<u64>,
+    total: u64,
+) -> Option<String> {
+    let (floor, free) = (floor?, free?);
+    if free >= floor {
+        return None;
+    }
+    let gb = |b: u64| b as f64 / 1e9;
+    let left = if total == 0 {
+        "holds nothing more to remove".to_string()
+    } else {
+        format!(
+            "is {:.1} GB, held by runs whose floors are running",
+            gb(total)
+        )
+    };
+    Some(format!(
+        "free disk on the check cache's volume is {:.1} GB, {:.1} GB short of its {:.1} GB floor \
+         ({CHECK_CACHE_FREE_FLOOR_PCT_ENV} / {CHECK_CACHE_FREE_FLOOR_GB_ENV}); the check cache {} \
+         {left}",
+        gb(free),
+        gb(floor - free),
+        gb(floor),
+        cache.display()
+    ))
 }
 
 /// (core#1122) What the repo-checks floor holds on disk, for an operator's disk view (crew's
@@ -9750,10 +9802,13 @@ pub(crate) mod tests {
     fn floor_caps(floor: u64, volume: u64, free: u64) -> CacheCaps {
         CacheCaps {
             free_floor: FreeFloor { pct: 0, min: floor },
-            disk: DiskProbe::Simulated(VolumeSpace {
-                total: volume,
-                free,
-            }),
+            disk: DiskProbe::Simulated {
+                space: VolumeSpace {
+                    total: volume,
+                    free,
+                },
+                reclaim_pct: 100,
+            },
             ..CacheCaps::uniform(u64::MAX)
         }
     }
@@ -9806,6 +9861,75 @@ pub(crate) mod tests {
         drop(own_lease);
         drop(held);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (codex on #1140) A removal can give back less than its leaf's apparent bytes (cargo
+    /// hard-links its outputs): the floor is held on fresh readings of the volume, so the pass
+    /// keeps going until a reading shows the floor holds. Here each 600-byte leaf gives back 300,
+    /// so the 1000-byte shortfall takes four leaves, not the two apparent bytes would credit; the
+    /// leased leaf is still never taken.
+    #[test]
+    fn the_free_floor_is_held_on_fresh_readings_not_on_apparent_bytes() {
+        let base = scratch("cache-free-floor-reclaim");
+        let cache = base.join("cache");
+        let (_, running) = cap_leaf(&base, "core", "running", 600, 900);
+        let (_, old) = cap_leaf(&base, "core", "old", 600, 500);
+        let (_, mid) = cap_leaf(&base, "crew", "mid", 600, 300);
+        let (_, recent) = cap_leaf(&base, "crew", "recent", 600, 100);
+        let (_, newest) = cap_leaf(&base, "crew", "newest", 600, 50);
+        let (_, own) = cap_leaf(&base, "garden", "own", 600, 10);
+        let held = lock_leaf(&running, false).unwrap().unwrap();
+        held.set_modified(std::time::SystemTime::now() - Duration::from_secs(900))
+            .unwrap();
+        let caps = CacheCaps {
+            disk: DiskProbe::Simulated {
+                space: VolumeSpace {
+                    total: 100_000,
+                    free: 9_000,
+                },
+                reclaim_pct: 50,
+            },
+            ..floor_caps(10_000, 100_000, 9_000)
+        };
+        let (removed, own_over) = enforce_check_cache_cap(&cache, &own, caps);
+        assert!(!own_over);
+        assert_eq!(
+            removed,
+            vec![old, mid, recent, newest],
+            "three give back 900 of the 1000 short, so a fourth goes"
+        );
+        assert!(
+            running.join("cargo-target/head/blob").is_file(),
+            "never a leased leaf"
+        );
+        assert!(own.join("cargo-target/head/blob").is_file());
+        drop(held);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (codex on #1140) The closing shortfall line fires whenever the latest reading is below the
+    /// floor, even when the cache is empty, and never blames an empty cache on running floors.
+    #[test]
+    fn the_shortfall_line_fires_on_the_reading_even_for_an_empty_cache() {
+        let cache = Path::new("cache");
+        assert_eq!(
+            floor_shortfall(cache, Some(5_000), Some(5_000), 1_000),
+            None
+        );
+        assert_eq!(
+            floor_shortfall(cache, None, None, 1_000),
+            None,
+            "no reading, no floor"
+        );
+        let empty = floor_shortfall(cache, Some(1_000_000), Some(100), 0).unwrap();
+        assert!(empty.contains("holds nothing more to remove"), "{empty}");
+        assert!(!empty.contains("running"), "{empty}");
+        let held = floor_shortfall(cache, Some(1_000_000_000), Some(0), 2_000_000_000).unwrap();
+        assert!(
+            held.contains("held by runs whose floors are running"),
+            "{held}"
+        );
+        assert!(held.contains("1.0 GB short of its 1.0 GB floor"), "{held}");
     }
 
     /// (core#1138) A volume so full no eviction restores the floor: every leaf no floor holds goes,
