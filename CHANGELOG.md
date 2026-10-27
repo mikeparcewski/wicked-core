@@ -14,6 +14,23 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **An honest "no change" answer to a red floor is accepted, and the automatic round says how to give it
+  (core#1142).** On rig run 85ddad0d the creator's automatic floor round named three load flakes in
+  another crate as "THIS change's" and said "fix those". The worker correctly changed nothing and said
+  why, but it did not open a line with `NO CHANGE NEEDED`, so the substance floor refused it. The run
+  parked at a card with no approve, and the floor re-ran for 42 min on the unchanged tree. Now:
+  - `NO CHANGE NEEDED` is read anywhere in a line, in any case, as whole words. It is still not read when
+    the clause before it negates it, makes it conditional or quotes it as an instruction (`cannot`, `not`,
+    `if`, `would`, `reply with`, …), or when a `?` follows it.
+  - When the unit's own floor already ran and FAILED, a worded reply that leaves the tree unchanged is a
+    no-change answer even without the marker (core#1113 did this for an all-base-red floor only). The
+    floor's carried verdict then opens the floor's own escalation, where the operator can approve as their
+    own judgment, with no re-run.
+  - An all-base-red floor takes no automatic round: there is nothing to fix, so the escalation opens at
+    once.
+  - The head-only round's note says the failures "may be" the change's. It tells the worker to fix the
+    ones its change caused, and to change nothing and say NO CHANGE NEEDED with the reason when a failure
+    is outside its change or load-sensitive. The fallback note says the same.
 - **The floor cache keeps a free-disk floor on its volume (core#1138).** The rig's floor cache reached
   25 GB, inside its 40 GB total cap, on a volume 95% full (23 GB free). The cap pass before every floor
   now holds the cache to the smaller of that cap and what keeps the larger of 15% of the cache's volume

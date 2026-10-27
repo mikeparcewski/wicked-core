@@ -7144,19 +7144,22 @@ fn apply_step_result(
     // writes were all denied passed its gate because EARLIER phases had already changed the
     // worktree. Only an explicit declaration ([`declares_no_change`], core#929) exempts it.
     let clean = worktree_is_clean(session.workdir.as_deref());
-    // (j4-gates, core#1113) When the unit's floor showed ONLY base failures (every failing test
-    // also fails on the run base), changing nothing IS the correct answer to its retry: the
-    // reply is accepted as a "no change needed" whether or not it opens a line with the marker,
-    // and the floor's gate then rules on the base's failures. Never over a worktree clean at
-    // HEAD (nothing was ever changed), and only for a reply with words in it.
-    let base_red_only = evidence
+    // (j4-gates, core#1113; core#1142) When the unit's own floor already ran on its tree and
+    // FAILED, a retry that changes nothing is an answer, not missing work: the failures may be
+    // the base's, load flakes, or outside the change, and the worker said why. The reply is
+    // accepted as a "no change needed" whether or not it carries the marker, and the floor's
+    // verdict on the unchanged tree (carried forward, core#544) then denies it into the floor's
+    // own escalation, where the operator rules on those failures — nothing red passes here.
+    // Never over a worktree clean at HEAD (nothing was ever changed), never for a unit whose floor
+    // passed or never ran (crew#972: a creator whose writes were refused), and only for a reply
+    // with words in it.
+    let floor_red = evidence
         .repo_checks
         .as_ref()
         .or(unit.repo_checks.as_ref())
-        .and_then(crate::repo_checks::RepoChecksReport::failure_split)
-        .is_some_and(|s| s.all_base_red);
+        .is_some_and(|r| r.outcome() == "failed");
     let declared_no_change = declares_no_change(&output.output)
-        || (base_red_only && !clean && !output.output.trim().is_empty());
+        || (floor_red && !clean && !output.output.trim().is_empty());
     let left_no_change = clean || evidence.tree_changed == Some(false);
     // The prose arm rejects only over a clean worktree (a diff is substance of its own) — except
     // under the human-confirm exemption, where `no_prose` already means "no answer at all": an
@@ -7169,9 +7172,9 @@ fn apply_step_result(
         const NO_DIFF: &str = "executes-code phase reported done but left no change in the \
                                worktree (done is re-derived from the diff, never asserted)";
         const NO_OWN_DIFF: &str = "the build step changed nothing in the worktree (its writes \
-                                   may have been refused); it did not declare NO CHANGE NEEDED \
-                                   (a line that starts with it), so done is not accepted — retry \
-                                   it on a seat that can write, or reassign";
+                                   may have been refused); it did not say NO CHANGE NEEDED, so \
+                                   done is not accepted — retry it on a seat that can write, or \
+                                   reassign";
         // `no_prose` wins the tie so the pre-existing rejection keeps its exact record shape —
         // the new arm only ever rejects folds that previously passed.
         let why: &'static str = if prose_rejects {
@@ -7668,34 +7671,32 @@ pub(crate) const FLOOR_AUTO_RETRY_SCOPE: &str = "floor_auto_retry";
 /// (which already names each failing check with its stdout/stderr tails).
 const FLOOR_AUTO_RETRY_NOTE: &str = "[automatic floor retry — round 1 of 1 (core#651)] Your own \
      repo-checks floor ran on the tree you left and FAILED (the checks and their tails are above). \
-     Fix those failures in this round; a second red floor opens the escalation gate for a human.";
+     Fix the failures your change caused in this round. If a failure is not caused by your change, \
+     do not edit anything to chase it: change nothing and reply with NO CHANGE NEEDED and the \
+     reason. Either way, a second red floor opens the escalation gate for a human.";
 
-/// (j4-gates, core#1113) The automatic round's note, from the floor's structured results
-/// ([`crate::repo_checks::RepoChecksReport::failure_split`]): it names the HEAD-ONLY failures (head
-/// minus base) the worker must fix and says the base's own are not its; when EVERY failure is
-/// base-red it says so and asks for NO CHANGE NEEDED instead of a fix (the batch-1 trap: told to
-/// "fix those", the worker chased the base's reds and a correct no-edit answer tripped the
-/// substance floor). With no structured result it is [`FLOOR_AUTO_RETRY_NOTE`].
+/// (j4-gates, core#1113; core#1142) The automatic round's note, from the floor's structured
+/// results ([`crate::repo_checks::RepoChecksReport::failure_split`]): it names the HEAD-ONLY
+/// failures (head minus base) and says the base's own are not the worker's. Head-only is one head
+/// run against one base run, often under different host load, so a head-only test can still be a
+/// flake or sit outside the change: the note says how to answer then (change nothing, say NO
+/// CHANGE NEEDED and why) instead of only "fix those" (rig run 85ddad0d: the worker chased three
+/// load flakes in another crate, then its honest no-edit answer was refused). An all-base-red
+/// floor takes no automatic round at all ([`floor_auto_retry_applies`]). With no structured result
+/// it is [`FLOOR_AUTO_RETRY_NOTE`].
 fn floor_auto_retry_note(report: Option<&crate::repo_checks::RepoChecksReport>) -> String {
     let Some(split) = report.and_then(crate::repo_checks::RepoChecksReport::failure_split) else {
         return FLOOR_AUTO_RETRY_NOTE.to_string();
     };
-    if split.all_base_red {
-        return format!(
-            "[automatic floor retry — round 1 of 1 (core#651)] Your own repo-checks floor ran on \
-             the tree you left and FAILED, but every failing test ({}) also fails on the run base: \
-             none of them is this change's. Do NOT try to fix them and change nothing; reply with \
-             a line that starts with {NO_CHANGE_NEEDED} and why. The floor's gate then opens for a \
-             human to rule on the base's failures.",
-            split.base_shared
-        );
-    }
     if !split.head_only.is_empty() {
         return format!(
             "[automatic floor retry — round 1 of 1 (core#651)] Your own repo-checks floor ran on \
-             the tree you left and FAILED. These failing tests are THIS change's (they do not fail \
-             on the run base): {}. Fix those in this round{}; a second red floor opens the \
-             escalation gate for a human.",
+             the tree you left and FAILED. These failing tests do not fail on the run base, so \
+             they may be this change's: {}. Fix the ones your change caused{}. If a failure is not \
+             caused by your change (it tests code you did not touch, or it is timing- or \
+             load-sensitive and fails intermittently), do not edit anything to chase it: change \
+             nothing and reply with {NO_CHANGE_NEEDED} and the reason. Either way, a second red \
+             floor opens the escalation gate for a human.",
             split.head_only.join(", "),
             if split.base_shared > 0 {
                 format!(
@@ -7732,6 +7733,14 @@ fn floor_auto_retry_applies(
             .repo_checks
             .as_ref()
             .is_some_and(|r| r.outcome() == "failed")
+        // (core#1142) Every failing test fails on the run base too: there is nothing for the
+        // worker to fix, so a round only costs a worker turn before the same gate opens — the
+        // escalation opens now, for the operator to rule on the base's failures.
+        && !evidence
+            .repo_checks
+            .as_ref()
+            .and_then(crate::repo_checks::RepoChecksReport::failure_split)
+            .is_some_and(|s| s.all_base_red)
 }
 
 /// (core#464) The DENIAL CLASS a denied unit opens the escalation gate under — the token
@@ -11728,27 +11737,56 @@ fn run_tool_cmd_jailed(
 /// code-evidence floor accepts an unchanged tree only with it.
 pub(crate) const NO_CHANGE_NEEDED: &str = "NO CHANGE NEEDED";
 
-/// (core#929) Whether `output` declares [`NO_CHANGE_NEEDED`]: a line that STARTS with the marker,
-/// its markdown emphasis (`*`, `_`, `` ` ``) and surrounding blanks stripped, followed by nothing or
-/// by its reason after a separator (`**NO CHANGE NEEDED** — the fix is already in the tree`,
-/// `NO CHANGE NEEDED: attempt 0 landed it`). Case-sensitive. A line that only MENTIONS the marker
-/// (`reply with: NO CHANGE NEEDED`, `I cannot declare NO CHANGE NEEDED`) never declares it (codex
-/// r1, r2): only the line's opening is read, so no wording before it can turn prose into the
-/// declaration. A marker a carrier fused onto the previous sentence (`state:NO CHANGE NEEDED`, the
-/// ACP carrier joining two agent messages, run 24590a4b) is not read either; the floor's refusal
-/// names the form.
+/// (core#929, core#1142) Whether `output` declares [`NO_CHANGE_NEEDED`]: the phrase anywhere in a
+/// line, in any case, as whole words, markdown emphasis (`*`, `_`, `` ` ``) ignored (`No change
+/// needed — the fix is already on main`, `Checked the tree. NO CHANGE NEEDED`). A worker should not
+/// have to know a magic line shape to say it changed nothing (rig run 85ddad0d). The phrase does
+/// NOT declare when the clause before it on that line (back to the last `.`, `;`, `!` or `?`)
+/// negates it, makes it conditional or quotes it as an instruction: `not`, `cannot`, `can't`,
+/// `never`, `don't`, `won't`, `unable`, `if`, `would`, `reply with`, `respond with`, `answer with`
+/// (`I cannot declare NO CHANGE NEEDED`, `If no edits are required, reply with: NO CHANGE NEEDED`,
+/// an echo of the retry note's own instruction: codex r1, r2), nor when a `?` follows it
+/// (`NO CHANGE NEEDED? No: I changed tip.mjs`), nor when it is fused into a longer word
+/// (`XNO CHANGE NEEDED`, `NO CHANGE NEEDEDS`). The marker only matters for a tree the attempt
+/// left unchanged; a changed tree is substance of its own.
 pub(crate) fn declares_no_change(output: &str) -> bool {
-    let m = NO_CHANGE_NEEDED;
-    output.lines().any(|l| {
-        let s: String = l
+    const MARKER: &str = "no change needed";
+    const CUES: [&str; 9] = [
+        "not", "cannot", "can't", "never", "don't", "won't", "unable", "if", "would",
+    ];
+    const CUE_PAIRS: [[&str; 2]; 3] = [["reply", "with"], ["respond", "with"], ["answer", "with"]];
+    let hedged = |before: &str| {
+        let clause = before
+            .rfind(['.', ';', '!', '?'])
+            .map_or(before, |i| &before[i + 1..]);
+        let words: Vec<&str> = clause
+            .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+            .filter(|w| !w.is_empty())
+            .collect();
+        words.iter().any(|w| CUES.contains(w))
+            || words
+                .windows(2)
+                .any(|p| CUE_PAIRS.iter().any(|c| c[..] == *p))
+    };
+    output.lines().any(|line| {
+        let line: String = line
             .chars()
             .filter(|c| !matches!(c, '*' | '_' | '`'))
-            .collect();
-        let s = s.trim();
-        s.strip_prefix(m).is_some_and(|rest| {
-            let rest = rest.trim_start();
-            rest.is_empty() || rest.starts_with(['—', '–', '-', ':', '.', ';', ',', '('])
-        })
+            .map(|c| if c == '\u{2019}' { '\'' } else { c })
+            .collect::<String>()
+            .to_lowercase();
+        let mut from = 0;
+        while let Some(i) = line[from..].find(MARKER) {
+            let (at, end) = (from + i, from + i + MARKER.len());
+            let (before, after) = (&line[..at], &line[end..]);
+            let whole = !before.chars().last().is_some_and(char::is_alphanumeric)
+                && !after.chars().next().is_some_and(char::is_alphanumeric);
+            if whole && !hedged(before) && !after.trim_start().starts_with('?') {
+                return true;
+            }
+            from = end;
+        }
+        false
     })
 }
 
@@ -17943,6 +17981,43 @@ mod substance_gate_tests {
         );
     }
 
+    /// (core#1142) A creator floor whose every failing test also fails on the run base takes NO
+    /// automatic round: there is nothing for the worker to fix, so the `floor_failed` escalation
+    /// opens at once for the operator to rule on the base's failures.
+    #[test]
+    fn an_all_base_red_creator_floor_escalates_without_an_automatic_round_1142() {
+        let run_id = format!("floor-auto-retry-base-red-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Creator);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let evidence = crate::workflow::UnitEvidence {
+            repo_checks: Some(crate::repo_checks::red_report(
+                &["test b::shared"],
+                Some(&["test b::shared"]),
+            )),
+            ..Default::default()
+        };
+        let (applied, session, unit) = fold_at(&mut store, &mut subs, &run_id, 0, evidence);
+        assert!(matches!(applied, StepApplied::Paused));
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+        assert_eq!(unit.floor_auto_retries, 0, "no automatic round was taken");
+        let evs = drain_events(&erx);
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                CoreEvent::UnitReworkAmended { scope, .. } if scope == FLOOR_AUTO_RETRY_SCOPE
+            )),
+            "{evs:?}"
+        );
+        let (escalated, _) = gate_shape(&evs);
+        assert_eq!(
+            (escalated.0.as_str(), escalated.1.as_str()),
+            ("floor_failed", "repo_checks")
+        );
+    }
+
     /// core#651: a floor that did not FINISH is not something the creator can fix — a timed-out
     /// creator floor opens the gate at once; and an evaluator's red floor never auto-retries.
     #[test]
@@ -18275,7 +18350,7 @@ mod substance_gate_tests {
             })
             .expect("the automatic round's amendment");
         assert!(
-            amendment.contains("THIS change's")
+            amendment.contains("may be this change's")
                 && amendment.contains("test repo_checks::tests::mine")
                 && amendment.contains("the other 1 fail on the base too"),
             "the note names the head-only failure: {amendment}"
@@ -22455,8 +22530,9 @@ mod request_changes_tests {
         );
     }
 
-    /// core#929: the NO CHANGE NEEDED declaration opens its line, decorated or followed by a reason;
-    /// a mention anywhere else is prose (codex r1, r2).
+    /// core#929, core#1142: the NO CHANGE NEEDED declaration is read anywhere in a line, in any
+    /// case, decorated or followed by a reason; a negated, conditional, questioned or quoted
+    /// mention, or one fused into a longer word, is prose (codex r1, r2).
     #[test]
     fn core_929_no_change_needed_is_read_decorated_or_fused() {
         for yes in [
@@ -22465,19 +22541,24 @@ mod request_changes_tests {
             "**NO CHANGE NEEDED** — the fix is already in the tree",
             "`NO CHANGE NEEDED`",
             "NO CHANGE NEEDED: attempt 0 landed it",
+            "Checked the tree. NO CHANGE NEEDED",
+            "no change needed",
+            "No change needed — the fix is already on main",
+            "I made no further edits this round. No change needed: the three failures are flakes.",
+            "The failures are outside my diff, so no change needed.",
         ] {
             assert!(declares_no_change(yes), "{yes:?}");
         }
         for no in [
             "Change nothing; reply with the line NO CHANGE NEEDED.",
+            "change nothing and reply with NO CHANGE NEEDED and the reason",
             "I cannot declare NO CHANGE NEEDED",
+            "I can’t say no change needed",
             "I cannot truthfully declare: NO CHANGE NEEDED",
             "If no edits are required, reply with: NO CHANGE NEEDED",
-            "Checked the tree. NO CHANGE NEEDED",
             "If no edits are required, reply with NO CHANGE NEEDED",
             "NO CHANGE NEEDED? No: I changed tip.mjs",
-            "NO CHANGE NEEDED is what I would say, but I edited tip.mjs",
-            "no change needed",
+            "It is not a case of no change needed",
             "NO CHANGE NEEDEDS",
             "XNO CHANGE NEEDED",
             "I changed tip.mjs and added a test.",
@@ -23360,20 +23441,29 @@ mod code_evidence_floor_tests {
         );
     }
 
-    /// (j4-gates, core#1113 — the batch-1 trap) When every failing test of the unit's floor also
-    /// fails on the run base, changing nothing is the correct answer to its retry: a reply that
-    /// changed nothing passes the substance floor even without the marker line (the floor's gate
-    /// then rules on the base's reds), and the automatic round's note asks for exactly that. A
-    /// head-only failure keeps today's rule: no diff and no NO CHANGE NEEDED line is refused.
+    /// (j4-gates, core#1113; core#1142, rig run 85ddad0d) When the unit's own floor ran and FAILED,
+    /// a retry that changes nothing is an answer: the reply passes the substance floor without the
+    /// marker, whether the failures are all the base's or head-only (load flakes outside the
+    /// change), and the floor's carried verdict then rules. With no red floor behind it (the
+    /// floor passed or never ran: crew#972) an unmarked no-edit reply is still refused.
     #[test]
-    fn a_no_change_reply_on_an_all_base_red_floor_passes_the_substance_check() {
+    fn a_no_change_reply_after_a_red_floor_passes_the_substance_check() {
+        // The worker's own words on the rig: no marker anywhere.
         let reply = format!(
-            "{}\nNo change needed: every failure is red on the base too.\n",
+            "{}\nI made no further edits this round. The three floor failures are not caused by \
+             this change.\n",
             prose()
         );
-        for (tag, head, refused) in [
-            ("all base red", vec!["test b::shared"], false),
-            ("head-only", vec!["test a::mine", "test b::shared"], true),
+        let red = |head: &[&str]| {
+            Some(crate::repo_checks::red_report(
+                head,
+                Some(&["test b::shared", "test c::other"]),
+            ))
+        };
+        for (tag, floor, refused) in [
+            ("all base red", red(&["test b::shared"]), false),
+            ("head-only", red(&["test a::mine", "test b::shared"]), false),
+            ("no floor", None, true),
         ] {
             let wt = git_worktree(&format!("base-red-{}", tag.replace(' ', "-")));
             std::fs::write(wt.join("design-notes.md"), "plan\n").unwrap();
@@ -23389,10 +23479,7 @@ mod code_evidence_floor_tests {
             let mut subs = crate::event_log::EventSink::default();
             let evidence = crate::workflow::UnitEvidence {
                 tree_changed: Some(false),
-                repo_checks: Some(crate::repo_checks::red_report(
-                    &head,
-                    Some(&["test b::shared", "test c::other"]),
-                )),
+                repo_checks: floor,
                 ..Default::default()
             };
             let (_session, unit) = fold_ev(&mut store, &mut subs, &run_id, &reply, true, evidence);
@@ -23402,14 +23489,29 @@ mod code_evidence_floor_tests {
                 .is_some_and(|d| d.source == "substance");
             assert_eq!(substance, refused, "{tag}: {:?}", unit.denial);
         }
-        let note = floor_auto_retry_note(Some(&crate::repo_checks::red_report(
-            &["test b::shared"],
+    }
+
+    /// (core#1142) Every automatic round's note says how to answer when a named failure is not
+    /// the change's — change nothing and say NO CHANGE NEEDED with the reason — and an echo of
+    /// that instruction never reads as the declaration itself.
+    #[test]
+    fn the_automatic_round_note_offers_the_no_change_answer() {
+        let head_only = floor_auto_retry_note(Some(&crate::repo_checks::red_report(
+            &["test a::mine", "test b::shared"],
             Some(&["test b::shared"]),
         )));
-        assert!(
-            note.contains("Do NOT try to fix them") && note.contains(NO_CHANGE_NEEDED),
-            "{note}"
-        );
+        for note in [head_only.as_str(), FLOOR_AUTO_RETRY_NOTE] {
+            assert!(
+                note.contains("not caused by your change") && note.contains(NO_CHANGE_NEEDED),
+                "{note}"
+            );
+            assert!(
+                !declares_no_change(note),
+                "the note is not a declaration: {note}"
+            );
+        }
+        assert!(head_only.contains("`test a::mine`") || head_only.contains("test a::mine"));
+        assert!(!head_only.contains("THIS change's"), "{head_only}");
         assert_eq!(floor_auto_retry_note(None), FLOOR_AUTO_RETRY_NOTE);
     }
 
