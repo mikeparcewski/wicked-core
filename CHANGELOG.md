@@ -253,6 +253,7 @@ Two release tracks share this file, newest entry first regardless of track:
   verify floor's override now also names its tree (it was `null`).
 ### Fixed
 
+- **Anthropic usage exhaustion (core#1069).** Anthropic's "out of extra usage" refusal benches the seat as out of quota.
 - Stabilize the queued-seat timing test under CI runner load (#1126).
 - **An honest "no change" answer to a red floor is accepted, and the automatic round says how to give it
   (core#1142).** On rig run 85ddad0d the creator's automatic floor round named three load flakes in
