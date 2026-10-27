@@ -14,6 +14,17 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The floor cache keeps a free-disk floor on its volume (core#1138).** The rig's floor cache reached
+  25 GB, inside its 40 GB total cap, on a volume 95% full (23 GB free). The cap pass before every floor
+  now holds the cache to the smaller of that cap and what keeps the larger of 15% of the cache's volume
+  and 20 GB free (`WICKED_REPO_CHECKS_FREE_FLOOR_PCT`, `WICKED_REPO_CHECKS_FREE_FLOOR_GB`; both `0`
+  turns it off). Below the floor it takes the least recently used leaves no floor holds until a fresh
+  reading of the volume shows the floor is back (a leaf's apparent bytes overstate what it gives back:
+  cargo hard-links its outputs), through the same exclusive-lock eviction, so a leased leaf and anything outside the cache
+  root are never touched; the floor's own leaf is never cleaned for it. A shortfall left once only
+  held leaves remain is logged, and `Core.floorCacheUsage()` gains `freeDisk` (`floorBytes`,
+  `freeBytes`, `effectiveCapBytes`, `shortfallBytes`, and a `note` naming the floor cache) for crew's
+  disk row.
 - **New built-in workflow `analyze`: a read-only, cited answer to a question about the code (crew#1157).**
   One `understand` step, `answer` (`src/presets/analyze.json`), on the `wicked-garden-search` skill behind
   the unconditional turn gate (approve ends it; a send-back is the follow-up question). It grounds in the
