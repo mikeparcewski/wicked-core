@@ -2508,15 +2508,114 @@ impl WrappedCliStepRunner {
     }
 }
 
+impl WrappedCliStepRunner {
+    /// Whether the launch `input` describes was cancelled: its run ended, the engine is shutting
+    /// down, or a reassign superseded it — the same reading [`Self::register_token`] arms a fresh
+    /// token from.
+    fn launch_cancelled(&self, input: &StepInput) -> bool {
+        let key = Self::worker_key(input);
+        let guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
+        guard.shutdown
+            || guard.reassigned.contains(&key)
+            || guard
+                .ended
+                .get(&key.run_id)
+                .is_some_and(|&bound| key.launch_seq <= bound)
+    }
+
+    /// (PRODUCT-WORKS J4) [`Self::exec`], riding out a container runtime blip: a governed
+    /// seat-container unit that failed while the runtime does not answer waits for it (bounded, with backoff,
+    /// each step on the wire as `containerRuntimeWait`) and re-runs on the SAME seat once it is
+    /// back; a runtime that stays down ends as the runner's infrastructure line, never as the
+    /// seat's failure ([`crate::runtime_wait`]).
+    fn exec_through_runtime_blips(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
+        let first = self.exec(input, emit);
+        // A run's governed unit only: the engine's own judge / triage / ballot sessions keep their
+        // own failure handling and budgets, and are never benched for a runtime fault (xreview on
+        // #1129 — a judge rotation would otherwise wait a whole window per judge seat).
+        if first.status != StepStatus::Failed
+            || input.governance.is_none()
+            || is_engine_internal(&input.unit)
+            || !uses_container_seat(
+                runs_in_seat(input),
+                crate::container_floor::container_mode(),
+            )
+        {
+            return first;
+        }
+        let cli = input
+            .unit
+            .assigned_cli
+            .clone()
+            .unwrap_or_else(|| "claude".to_string());
+        let window = crate::runtime_wait::window();
+        let start = std::time::Instant::now();
+        let mut down_now = crate::container_floor::runtime_down_now;
+        let mut sleep = |d: Duration| {
+            let until = std::time::Instant::now() + d;
+            while std::time::Instant::now() < until {
+                if self.launch_cancelled(input) {
+                    return false;
+                }
+                std::thread::sleep(
+                    until
+                        .saturating_duration_since(std::time::Instant::now())
+                        .min(Duration::from_millis(250)),
+                );
+            }
+            !self.launch_cancelled(input)
+        };
+        let cancelled = || self.launch_cancelled(input);
+        let elapsed = || start.elapsed();
+        let mut notify = |phase: crate::runtime_wait::WaitPhase, waited: Duration| {
+            eprintln!(
+                "wicked-core: unit {} of {} ({cli}): container runtime {} ({}s of {}s)",
+                input.unit.ord,
+                input.run_id,
+                match phase {
+                    crate::runtime_wait::WaitPhase::Waiting => "not answering; waiting",
+                    crate::runtime_wait::WaitPhase::Recovered => "answers again; re-running",
+                    crate::runtime_wait::WaitPhase::Unavailable =>
+                        "stayed down; escalating as infrastructure",
+                },
+                waited.as_secs(),
+                window.as_secs()
+            );
+            self.emit_event(crate::event::CoreEvent::ContainerRuntimeWait {
+                session: input.run_id.clone(),
+                ord: input.unit.ord,
+                attempt: input.attempt,
+                cli: cli.clone(),
+                phase: phase.as_str().to_string(),
+                waited_secs: waited.as_secs(),
+                window_secs: window.as_secs(),
+            });
+        };
+        crate::runtime_wait::ride_out(
+            first,
+            &cli,
+            window,
+            crate::runtime_wait::Host {
+                down_now: &mut down_now,
+                sleep: &mut sleep,
+                cancelled: &cancelled,
+                elapsed: &elapsed,
+                notify: &mut notify,
+            },
+            &mut || self.exec(input, emit),
+        )
+    }
+}
+
 impl StepRunner for WrappedCliStepRunner {
     fn run_unit(&self, input: &StepInput) -> StepOutput {
         // No live sink → a no-op emit (non-streaming callers).
         let noop = |_: &str| {};
-        self.exec(input, &noop)
+        self.exec_through_runtime_blips(input, &noop)
     }
 
     fn run_unit_streaming(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
-        self.exec(input, emit)
+        self.exec_through_runtime_blips(input, emit)
     }
 
     fn on_run_resumed(&self, run_id: &str, min_launch_seq: u64) {
