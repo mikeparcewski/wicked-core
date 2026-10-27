@@ -1392,8 +1392,10 @@ pub(crate) fn rejudge_seats(
     // when the unit is one that builds (a Build/Recon author or a Creator). An evaluator's seat
     // wrote the review; a neutral test step's seat ran it. Rig run 85ddad0d's review gate said
     // "Codex (built this work)" of the seat that wrote the review while Claude built the fix.
+    // `authors_by_dispatch`, not `authors_work`: a read step with a recorded floor-fix author
+    // counts as authoring work, but its own seat wrote nothing (xreview on #1147).
     let own_why: &'static str = if unit.role == crate::workflow::PhaseRole::Creator
-        || crate::pipeline::authors_work(unit)
+        || crate::pipeline::authors_by_dispatch(unit)
     {
         BUILT_THIS_WORK
     } else if unit.role == crate::workflow::PhaseRole::Evaluator {
@@ -5762,6 +5764,25 @@ mod tests {
         // A reviewer recorded as an author (a floor fix changed the tree on it) did build part.
         review.authored_by = vec!["codex".into()];
         assert_eq!(why(&review, "codex"), BUILT_THIS_WORK);
+
+        // (xreview on #1147) A guarded read step on codex whose tree claude's floor fix changed:
+        // claude built that, codex only ran the step.
+        let mut recon = crate::domain::WorkUnit::pending("r:scope", "r", 1, "scope the change");
+        recon.stage = crate::domain::StageKind::Recon;
+        recon.role = crate::workflow::PhaseRole::Neutral;
+        recon.executes_code = false;
+        recon.worktree_guarded = true;
+        recon.assigned_cli = Some("codex".into());
+        recon.authored_by = vec!["claude".into()];
+        assert!(
+            crate::pipeline::authors_work(&recon),
+            "the step has a recorded author"
+        );
+        assert_eq!(
+            why(&recon, "codex"),
+            "ran this step, so it never judges its own output"
+        );
+        assert_eq!(why(&recon, "claude"), BUILT_THIS_WORK);
     }
 
     /// (#539) When the pinned-validator path skips the judge (no distinct seat), the DEFAULT floor
