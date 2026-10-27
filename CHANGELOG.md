@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The judge pool no longer says a reviewer "built this work" (core#1143).** At rig run 85ddad0d's review
+  gate the judge-unavailable card read "Codex (built this work)" while Claude built the fix. Codex was the
+  review's own seat. The run's authorship record was right (core#1135); the pool labelled the judged
+  unit's own seat "built this work" whatever its role. Excluding that seat stays correct (a seat never
+  judges its own output), and the reason now matches the record. A building unit's seat (Creator, or a
+  Build/Recon author) "built this work". An evaluator's seat "wrote this review, so it never judges its own
+  verdict". Any other step's seat "ran this step, so it never judges its own output". A seat recorded in
+  the unit's `authored_by` still "built this work".
 - **The floor cache keeps a free-disk floor on its volume (core#1138).** The rig's floor cache reached
   25 GB, inside its 40 GB total cap, on a volume 95% full (23 GB free). The cap pass before every floor
   now holds the cache to the smaller of that cap and what keeps the larger of 15% of the cache's volume

@@ -1343,6 +1343,9 @@ pub(crate) fn unit_team_monitors(unit: &crate::domain::WorkUnit) -> Vec<String> 
 /// they follow it (a preferred judge that fails as a seat falls back to them). Pure over its
 /// inputs: `roster` is [`crate::registry_roster`], `pool` / `registry` the fallback context
 /// ([`judge_fallback_pool`] / [`full_registry`]).
+/// The judge pool's reason for a seat recorded as having built the work.
+const BUILT_THIS_WORK: &str = "built this work";
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rejudge_seats(
     unit: &crate::domain::WorkUnit,
@@ -1385,20 +1388,31 @@ pub(crate) fn rejudge_seats(
             "authors the pinned validator, so it never judges against it",
         );
     }
-    party(&mut parties, &work_author, "built this work");
+    // (core#1143) The unit's OWN seat never judges its own output — but it built the work only
+    // when the unit is one that builds (a Build/Recon author or a Creator). An evaluator's seat
+    // wrote the review; a neutral test step's seat ran it. Rig run 85ddad0d's review gate said
+    // "Codex (built this work)" of the seat that wrote the review while Claude built the fix.
+    let own_why: &'static str = if unit.role == crate::workflow::PhaseRole::Creator
+        || crate::pipeline::authors_work(unit)
+    {
+        BUILT_THIS_WORK
+    } else if unit.role == crate::workflow::PhaseRole::Evaluator {
+        "wrote this review, so it never judges its own verdict"
+    } else {
+        "ran this step, so it never judges its own output"
+    };
+    party(&mut parties, &work_author, own_why);
     for a in &unit.authored_by {
-        party(&mut parties, a, "built this work");
+        party(&mut parties, a, BUILT_THIS_WORK);
     }
-    // A seat that built the work is said to have built it, whatever else it is.
+    // A seat that built the work (it is recorded as this unit's author) is said to have built it,
+    // whatever else it is; the unit's own seat is said to be what it is here.
+    let built = |k: &str| unit.authored_by.iter().any(|a| a == k || seat_key(a) == k);
     for (k, why) in parties.iter_mut() {
-        if *k == work_author
-            || seat_key(k) == seat_key(&work_author)
-            || unit
-                .authored_by
-                .iter()
-                .any(|a| a == k || seat_key(a) == k.as_str())
-        {
-            *why = "built this work";
+        if built(k) {
+            *why = BUILT_THIS_WORK;
+        } else if *k == work_author || seat_key(k) == seat_key(&work_author) {
+            *why = own_why;
         }
     }
     for a in &unit.exclude_seats {
@@ -5687,6 +5701,67 @@ mod tests {
             &roster,
         );
         assert!(unknown.is_empty(), "{unknown:?}");
+    }
+
+    /// (core#1143, rig run 85ddad0d) The judge pool states each excluded seat's reason as the run
+    /// records it: at a REVIEW gate, the reviewer's own seat wrote the review (it never judges its
+    /// own verdict) and did not build the work; the creator built it. A neutral test step's seat
+    /// ran that step. Only a building unit's own seat "built this work".
+    #[test]
+    fn the_judge_pool_never_says_a_reviewer_built_the_work_1143() {
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+            seat("pi", "pi ask {PROMPT}"),
+        ];
+        let run: Vec<String> = ["claude", "codex", "pi"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let why = |unit: &crate::domain::WorkUnit, k: &str| {
+            let (_, missing) = rejudge_seats(
+                unit,
+                &roster,
+                &run,
+                &[],
+                &["claude".to_string()],
+                Some(&["claude".to_string()]),
+                &[],
+                &roster,
+            );
+            missing
+                .iter()
+                .find(|m| m.seat == k)
+                .map(|m| m.reason.clone())
+                .unwrap_or_else(|| panic!("{k} missing: {missing:?}"))
+        };
+        let mut review = crate::domain::WorkUnit::pending("r:review", "r", 5, "review the fix");
+        review.stage = crate::domain::StageKind::Review;
+        review.role = crate::workflow::PhaseRole::Evaluator;
+        review.assigned_cli = Some("codex".into());
+        assert_eq!(
+            why(&review, "codex"),
+            "wrote this review, so it never judges its own verdict"
+        );
+        assert_eq!(why(&review, "claude"), "created the work this review reads");
+
+        let mut reproduce = crate::domain::WorkUnit::pending("r:reproduce", "r", 3, "reproduce it");
+        reproduce.stage = crate::domain::StageKind::Test;
+        reproduce.role = crate::workflow::PhaseRole::Neutral;
+        reproduce.assigned_cli = Some("codex".into());
+        assert_eq!(
+            why(&reproduce, "codex"),
+            "ran this step, so it never judges its own output"
+        );
+
+        let mut fix = crate::domain::WorkUnit::pending("r:fix", "r", 4, "fix the flake");
+        fix.stage = crate::domain::StageKind::Build;
+        fix.role = crate::workflow::PhaseRole::Creator;
+        fix.assigned_cli = Some("claude".into());
+        assert_eq!(why(&fix, "claude"), BUILT_THIS_WORK);
+        // A reviewer recorded as an author (a floor fix changed the tree on it) did build part.
+        review.authored_by = vec!["codex".into()];
+        assert_eq!(why(&review, "codex"), BUILT_THIS_WORK);
     }
 
     /// (#539) When the pinned-validator path skips the judge (no distinct seat), the DEFAULT floor
