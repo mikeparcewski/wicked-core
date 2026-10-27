@@ -431,6 +431,8 @@ impl Campaign {
                     // (operator ruling 2026-10-21) The rationale is the record, not a unit
                     // instruction — mirrored like an intent amendment's text.
                     HumanDecision::OperatorJudgment { rationale } => Some(rationale.clone()),
+                    // (j4-gates) So is a QE skip's reason.
+                    HumanDecision::SkipQe { reason } => Some(reason.clone()),
                     // (core#555) A campaign step's amendment is the run's acceptance list, not
                     // a unit instruction — the persisted mirror carries the text either way.
                     HumanDecision::AmendIntent { text } => Some(text.clone()),

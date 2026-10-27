@@ -2143,7 +2143,8 @@ pub(super) fn answer_dispute_gate(
         | crate::workflow::HumanDecision::AmendIntent { .. }
         | crate::workflow::HumanDecision::ConsentChoice { .. }
         | crate::workflow::HumanDecision::Rejudge
-        | crate::workflow::HumanDecision::OperatorJudgment { .. } => {
+        | crate::workflow::HumanDecision::OperatorJudgment { .. }
+        | crate::workflow::HumanDecision::SkipQe { .. } => {
             anyhow::bail!("run {run_id} is paused team_dispute: approve, request changes or reject")
         }
     };

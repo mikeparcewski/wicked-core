@@ -5933,6 +5933,13 @@ pub(crate) const BOUNDARY_WRITE_AFTER_FLOOR_NOTE: &str =
     "the write outside the unit's boundary was refused and never ran; the unit's deterministic \
      floor passed on the tree it left, so the refusal is disclosed, not a denial (core#716)";
 
+/// (j4-gates) The `workerToolCallDenied.remedy` of a blocked boundary write on a unit whose floor
+/// RAN and FAILED: the floor already denies the unit, so the refusal is reported beside it.
+pub(crate) const BOUNDARY_WRITE_BESIDE_FAILED_FLOOR_NOTE: &str =
+    "the write outside the unit's boundary was refused and never ran; the unit's deterministic \
+     floor ran on the tree it left and failed, so the floor result decides its gate and this \
+     refusal is reported beside it, not instead of it (j4-gates)";
+
 /// (core#716) Whether a Deny claim is a BLOCKED filesystem-boundary WRITE — the call was refused
 /// before it ran (the carrier never executed it), recorded by [`append_boundary_deny`] under
 /// [`BOUNDARY_WRITE_RULE_ID`]. Keyed on the evaluator identity, the claim-id prefix AND the rule id,
@@ -6291,7 +6298,9 @@ pub fn fold_input_denial_with_activity(
 /// build floor passed (`npm ci`, the repo's pytest runner) and one exploratory `Bash` probe of a
 /// path outside the worktree, refused, denied the unit. The claim is still conformed (audit) and the
 /// unit gate discloses it as `workerToolCallDenied`. Every other deny keeps its weight, and with no
-/// floor (or a failing one) a blocked write denies exactly as before.
+/// floor a blocked write denies exactly as before. (j4-gates) `floor_passed` is true too when the
+/// repository's checks RAN and FAILED (the pipeline's `floor_judged`): the floor already denies the
+/// unit, so the refusal is reported beside it rather than taking the floor gate's answers away.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fold_input_denial_after_floor(
     store: &mut dyn GraphStore,

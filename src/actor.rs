@@ -7102,7 +7102,19 @@ fn apply_step_result(
     // writes were all denied passed its gate because EARLIER phases had already changed the
     // worktree. Only an explicit declaration ([`declares_no_change`], core#929) exempts it.
     let clean = worktree_is_clean(session.workdir.as_deref());
-    let declared_no_change = declares_no_change(&output.output);
+    // (j4-gates, core#1113) When the unit's floor showed ONLY base failures (every failing test
+    // also fails on the run base), changing nothing IS the correct answer to its retry: the
+    // reply is accepted as a "no change needed" whether or not it opens a line with the marker,
+    // and the floor's gate then rules on the base's failures. Never over a worktree clean at
+    // HEAD (nothing was ever changed), and only for a reply with words in it.
+    let base_red_only = evidence
+        .repo_checks
+        .as_ref()
+        .or(unit.repo_checks.as_ref())
+        .and_then(crate::repo_checks::RepoChecksReport::failure_split)
+        .is_some_and(|s| s.all_base_red);
+    let declared_no_change = declares_no_change(&output.output)
+        || (base_red_only && !clean && !output.output.trim().is_empty());
     let left_no_change = clean || evidence.tree_changed == Some(false);
     // The prose arm rejects only over a clean worktree (a diff is substance of its own) — except
     // under the human-confirm exemption, where `no_prose` already means "no answer at all": an
@@ -7400,7 +7412,7 @@ fn apply_step_result(
                 &mut scratch_in_flight,
                 session.clone(),
                 &run_id,
-                Some(FLOOR_AUTO_RETRY_NOTE.to_string()),
+                Some(floor_auto_retry_note(evidence.repo_checks.as_ref())),
                 FLOOR_AUTO_RETRY_SCOPE,
                 lifecycle_maps,
                 actor_maps,
@@ -7616,6 +7628,46 @@ const FLOOR_AUTO_RETRY_NOTE: &str = "[automatic floor retry — round 1 of 1 (co
      repo-checks floor ran on the tree you left and FAILED (the checks and their tails are above). \
      Fix those failures in this round; a second red floor opens the escalation gate for a human.";
 
+/// (j4-gates, core#1113) The automatic round's note, from the floor's structured results
+/// ([`crate::repo_checks::RepoChecksReport::failure_split`]): it names the HEAD-ONLY failures (head
+/// minus base) the worker must fix and says the base's own are not its; when EVERY failure is
+/// base-red it says so and asks for NO CHANGE NEEDED instead of a fix (the batch-1 trap: told to
+/// "fix those", the worker chased the base's reds and a correct no-edit answer tripped the
+/// substance floor). With no structured result it is [`FLOOR_AUTO_RETRY_NOTE`].
+fn floor_auto_retry_note(report: Option<&crate::repo_checks::RepoChecksReport>) -> String {
+    let Some(split) = report.and_then(crate::repo_checks::RepoChecksReport::failure_split) else {
+        return FLOOR_AUTO_RETRY_NOTE.to_string();
+    };
+    if split.all_base_red {
+        return format!(
+            "[automatic floor retry — round 1 of 1 (core#651)] Your own repo-checks floor ran on \
+             the tree you left and FAILED, but every failing test ({}) also fails on the run base: \
+             none of them is this change's. Do NOT try to fix them and change nothing; reply with \
+             a line that starts with {NO_CHANGE_NEEDED} and why. The floor's gate then opens for a \
+             human to rule on the base's failures.",
+            split.base_shared
+        );
+    }
+    if !split.head_only.is_empty() {
+        return format!(
+            "[automatic floor retry — round 1 of 1 (core#651)] Your own repo-checks floor ran on \
+             the tree you left and FAILED. These failing tests are THIS change's (they do not fail \
+             on the run base): {}. Fix those in this round{}; a second red floor opens the \
+             escalation gate for a human.",
+            split.head_only.join(", "),
+            if split.base_shared > 0 {
+                format!(
+                    " — the other {} fail on the base too and are not yours to fix",
+                    split.base_shared
+                )
+            } else {
+                String::new()
+            }
+        );
+    }
+    FLOOR_AUTO_RETRY_NOTE.to_string()
+}
+
 /// (core#651) Whether a denied unit takes the one automatic creator-floor round instead of the
 /// escalation gate: an agent CREATOR unit, not hook-denied, whose denial is the repo-checks floor
 /// (`repo_checks`, never `repo_checks_timeout`), on a floor report of this attempt that RAN and
@@ -7666,9 +7718,14 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
         Some(crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE) => {
             "judge_unavailable"
         }
-        _ if hook_denied => "boundary_deny",
+        // (j4-gates) The QE reviewer could not run its checks: no verdict on the work either — the
+        // operator's approve is the judgment, labelled, exactly as when no reviewer could run.
+        Some(crate::qe_acceptance::review::DENIAL_SOURCE_QE_INCONCLUSIVE) => "judge_unavailable",
         // (core#469) A floor that did not FINISH is booked under `repo_checks_timeout` — a floor
         // class too, never a verdict: the gate keys extend / targeted / accept on it (S4b).
+        // (j4-gates) A floor that DENIED names the gate even when a hook also denied the attempt:
+        // the hook's refusal is reported beside it (`denials_behind`, its own line in the prompt),
+        // never instead of it — so the floor card keeps its own answers.
         Some(
             "repo_checks"
             | "repo_checks_timeout"
@@ -7676,6 +7733,7 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
             | "substance"
             | "deliverables",
         ) => "floor_failed",
+        _ if hook_denied => "boundary_deny",
         _ => "verdict_not_pass",
     }
 }
@@ -7684,7 +7742,18 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
 /// over that floor stand: KNOWN (`Some`), and nothing in it but the judge's no-verdict hold
 /// ([`pipeline::judge_absent_behind_floor`]). `None` (unknown) never does.
 fn floor_override_record_allows(behind: Option<&[crate::domain::UnitDenial]>) -> bool {
-    behind.is_some_and(|b| b.iter().all(pipeline::judge_absent_behind_floor))
+    behind.is_some_and(|b| b.iter().all(tolerated_behind_floor))
+}
+
+/// (j4-gates) A layer recorded behind a failed floor that does not refuse the operator's judgment
+/// over it: the judge's no-verdict hold ([`pipeline::judge_absent_behind_floor`], which the same
+/// judgment then answers as the judge), and an INCONCLUSIVE QE record (the reviewer ran and could
+/// not run its checks) — which the judgment does NOT answer: QE acceptance stays required at
+/// delivery, where the operator can still skip it with a reason. A QE layer that could not seat a
+/// reviewer at all, or that failed, still refuses it (`skip_qe` answers those explicitly).
+fn tolerated_behind_floor(d: &crate::domain::UnitDenial) -> bool {
+    pipeline::judge_absent_behind_floor(d)
+        || d.source == crate::qe_acceptance::review::DENIAL_SOURCE_QE_INCONCLUSIVE
 }
 
 /// (operator ruling 2026-10-21) The floor gate's prompt clause offering the operator's judgment
@@ -7764,16 +7833,80 @@ fn deliver_floor_overridable(unit: &crate::domain::WorkUnit) -> bool {
 /// override is offered AND the judge could not rule either: the same judgment then stands in for
 /// the judge too, labelled as such. Empty when the override is not offered or nothing but the
 /// floor denied.
-fn floor_override_judge_note(unit: &crate::domain::WorkUnit, source: &str) -> &'static str {
-    if !floor_override_offer(unit, source).is_empty()
-        && unit.denials_behind.as_ref().is_some_and(|b| !b.is_empty())
-    {
-        ". No judge seat could rule on this step either (`judge_unavailable`, no verdict): that \
-         judgment also stands in for the judge, labelled \"judge: operator (no judge seat \
-         available)\"; later gates still run"
-    } else {
-        ""
+fn floor_override_judge_note(unit: &crate::domain::WorkUnit, source: &str) -> String {
+    let offered = !floor_override_offer(unit, source).is_empty();
+    let behind = unit.denials_behind.as_deref().unwrap_or_default();
+    let mut out = String::new();
+    if offered && behind.iter().any(pipeline::judge_absent_behind_floor) {
+        out.push_str(
+            ". No judge seat could rule on this step either (`judge_unavailable`, no verdict): \
+             that judgment also stands in for the judge, labelled \"judge: operator (no judge seat \
+             available)\"; later gates still run",
+        );
     }
+    out.push_str(&layers_behind_note(unit, offered));
+    out
+}
+
+/// (j4-gates) Every layer recorded behind a failed floor that the operator's judgment does NOT
+/// answer, each on its own line of the prompt — so a hook refusal or a QE record is reported BESIDE
+/// the floor, never instead of it — and, for a QE layer on a run that still requires QE acceptance,
+/// the operator's labelled skip (action `skip_qe`). Empty when nothing else denied.
+fn layers_behind_note(unit: &crate::domain::WorkUnit, override_offered: bool) -> String {
+    let behind = unit.denials_behind.as_deref().unwrap_or_default();
+    let mut lines: Vec<String> = Vec::new();
+    for d in behind
+        .iter()
+        .filter(|d| !pipeline::judge_absent_behind_floor(d))
+    {
+        let what = match d.source.as_str() {
+            "input_governance" => {
+                let tool = d
+                    .denied_tool
+                    .as_deref()
+                    .map(|t| format!(" (`{t}`)"))
+                    .unwrap_or_default();
+                format!("a tool call was refused{tool}")
+            }
+            crate::qe_acceptance::review::DENIAL_SOURCE_QE_INCONCLUSIVE => {
+                "QE acceptance is inconclusive (its checks could not run)".to_string()
+            }
+            crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE => {
+                "no isolated QE reviewer could run".to_string()
+            }
+            crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEW => {
+                "QE acceptance did not pass".to_string()
+            }
+            other => format!("`{other}` denied"),
+        };
+        lines.push(format!("also: {what} — {}", reason_head(&d.reason)));
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    let qe_behind = behind
+        .iter()
+        .any(crate::qe_acceptance::review::is_qe_denial);
+    let qe_required = unit.qe_acceptance.as_ref().is_some_and(|q| q.required());
+    // What `skip_qe` takes here ([`skip_qe_plan`]): every layer but QE's is one the floor's own
+    // override tolerates.
+    let skip_reopens = behind
+        .iter()
+        .filter(|d| !crate::qe_acceptance::review::is_qe_denial(d))
+        .all(tolerated_behind_floor);
+    let mut note = format!(". {}", lines.join("; "));
+    if qe_behind && qe_required && (override_offered || skip_reopens) {
+        note.push_str(if override_offered {
+            ". Your judgment answers the floor only: QE acceptance stays required at delivery, \
+             where you can skip it with a reason (action `skip_qe`, labelled \"QE acceptance \
+             skipped by operator\")"
+        } else {
+            ". Skip QE acceptance with a reason (action `skip_qe`, labelled \"QE acceptance \
+             skipped by operator\" on the run, every gate and the delivery) and this gate \
+             re-opens on the floor alone"
+        });
+    }
+    note
 }
 
 /// (core#464, FINDING-023's sibling) The disclosure an ENGINE-authored denial gate appends under
@@ -7984,13 +8117,14 @@ fn denial_gate_prompt(
                 (
                     "The refused call never ran; the phase's output was captured.",
                     "A refused write outside the unit's boundary denies a unit whose deterministic \
-                     floor did not pass or did not run, as here (a refused read is only disclosed).",
+                     floor did not run, as here (a refused read is only disclosed, and so is a \
+                     refused write beside a floor that ran).",
                 )
             } else if refused_call {
                 (
                     "The refused call never ran; the phase's output was captured.",
                     "This refusal denies the unit whatever its floor said (only a refused read, or \
-                     a refused boundary write on a unit whose floor passed, is disclosed instead).",
+                     a refused boundary write on a unit whose floor ran, is disclosed instead).",
                 )
             } else {
                 (
@@ -8069,6 +8203,21 @@ fn denial_gate_prompt(
              or reject to cancel the run{note}",
             reason_head(reason)
         ),
+        // (j4-gates) The QE reviewer ran but could not run its checks on its seat: its words say
+        // what could not run. Approve is the operator's judgment, and the run's QE decision becomes
+        // theirs (`qe_acceptance::review::operator_judged`), labelled on every later surface.
+        "judge_unavailable"
+            if source == crate::qe_acceptance::review::DENIAL_SOURCE_QE_INCONCLUSIVE =>
+        {
+            format!(
+            "Unit {ord}'s QE acceptance is INCONCLUSIVE — the isolated reviewer could not run its \
+             checks: {}. No product failure was found and none was ruled out. Approve to judge it \
+             yourself (it counts; the run's QE acceptance becomes skipped by operator, labelled \
+             \"QE acceptance: skipped by operator\" on the run, every gate and the delivery), \
+             request changes to send it back for rework, or reject to cancel the run{note}",
+            reason_head(reason)
+        )
+        }
         "judge_unavailable" => format!(
             "Unit {ord} could not be judged — no eligible judge seat remained: {}. The work was \
              not rejected. Approve to judge it yourself (it counts, labelled \"judged by \
@@ -8082,15 +8231,26 @@ fn denial_gate_prompt(
         // — and, when the evaluator's OWN verdict denied (`evaluator_verdict`), leads with what it
         // said (the head line; the full findings ride `gateEscalated.verdictSummary`).
         _ => {
-            let said = if source == "evaluator_verdict" {
+            let said = if source == "evaluator_verdict"
+                || source == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEW
+            {
                 format!(" ({})", reason_head(reason))
             } else {
                 String::new()
             };
+            // (j4-gates) A QE acceptance that did not pass, on a run that requires it, and
+            // nothing else denying: the operator may skip QE acceptance here, with a reason.
+            let skip = if skip_qe_takes_unit(unit) {
+                " skip QE acceptance with a written reason (action `skip_qe`: the step counts, \
+                 labelled \"QE acceptance skipped by operator\" on the run, every gate and the \
+                 delivery),"
+            } else {
+                ""
+            };
             format!(
                 "Unit {ord} verdict is NOT PASS{said} — confirm to retry the phase, request \
-                 changes to send the review back to the creator phase, or reject to cancel the \
-                 run{note}"
+                 changes to send the review back to the creator phase,{skip} or reject to cancel \
+                 the run{note}"
             )
         }
     }
@@ -11984,9 +12144,11 @@ fn confirm_plan_gate(
         | HumanDecision::AmendIntent { .. }
         | HumanDecision::ConsentChoice { .. }
         | HumanDecision::Rejudge
-        | HumanDecision::OperatorJudgment { .. } => anyhow::bail!(
+        | HumanDecision::OperatorJudgment { .. }
+        | HumanDecision::SkipQe { .. } => anyhow::bail!(
             "a plan_approval gate reviews a plan, not a floor, an evaluator's edit, an intent \
-             amendment or a judge re-run — approve, approve with an edited plan, or reject"
+             amendment, a judge re-run or a QE skip — approve, approve with an edited plan, or \
+             reject"
         ),
     }
     let answer = match &decision {
@@ -12732,6 +12894,10 @@ pub(crate) fn confirm_gate_as(
             crate::workflow::HumanDecision::OperatorJudgment { rationale } => {
                 floor_override_for(&session, cursor, rationale, adjudication_open, run_id)?;
             }
+            // (j4-gates) A QE skip: refused HERE, before the row resolves, unless it applies.
+            crate::workflow::HumanDecision::SkipQe { reason } => {
+                skip_qe_plan(&session, cursor, reason, adjudication_open, run_id)?;
+            }
             // (core#555) An amendment with no text amends nothing: refuse HERE, before the row
             // resolves, so the gate stays open and re-answerable rather than resolving as an
             // approve that silently changed no acceptance list.
@@ -12818,6 +12984,13 @@ pub(crate) fn confirm_gate_as(
                 "amend": rationale,
             })
             .to_string(),
+            // (j4-gates) The reason rides `amend`, so the durable answer says WHY QE was skipped.
+            crate::workflow::HumanDecision::SkipQe { reason } => serde_json::json!({
+                "approve": true,
+                "action": crate::workflow::SKIP_QE_ACTION,
+                "amend": reason,
+            })
+            .to_string(),
             // (core#555) The amendment text rides `amend` so the durable prompt's answer carries
             // WHAT was amended, not just that the gate was approved.
             crate::workflow::HumanDecision::AmendIntent { text } => serde_json::json!({
@@ -12897,8 +13070,7 @@ pub(crate) fn confirm_gate_as(
             u.status == crate::domain::UnitStatus::Rejected
                 && u.denial.as_ref().is_some_and(|d| {
                     d.source == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE
-                        || d.source
-                            == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE
+                        || crate::qe_acceptance::review::could_not_judge(d)
                 })
         });
     // A team MEMBER's step owes its team accounting (the PA's review of it, the member's record):
@@ -12949,6 +13121,51 @@ pub(crate) fn confirm_gate_as(
             crate::workflow::HumanDecision::Approve {
                 amend: None,
                 amend_scope: crate::workflow::AmendScope::Cursor,
+            }
+        }
+        d => d,
+    };
+    // (j4-gates) SKIP QE ACCEPTANCE: the run's QE decision becomes the operator's (labelled), then
+    // the gate is answered as the plan says — an approve before delivery, the unit counted when
+    // only QE denied it, or its gate re-opened on the floor alone.
+    let decision = match decision {
+        crate::workflow::HumanDecision::SkipQe { reason } => {
+            match answer_skip_qe(
+                store,
+                subscribers,
+                self_tx,
+                &mut session,
+                run_id,
+                &reason,
+                actor.as_deref(),
+                adjudication_open,
+            )? {
+                SkipQePlan::Approve => crate::workflow::HumanDecision::Approve {
+                    amend: None,
+                    amend_scope: crate::workflow::AmendScope::Cursor,
+                },
+                SkipQePlan::UnitCounts => {
+                    return judge_by_operator(
+                        store,
+                        subscribers,
+                        runner,
+                        self_tx,
+                        in_flight,
+                        session,
+                        run_id,
+                        actor,
+                        Some(format!("{SKIP_QE_LABEL}: {}", reason.trim())),
+                        None,
+                        lifecycle_maps,
+                        actor_maps,
+                        process_gen,
+                        is_acp,
+                    );
+                }
+                SkipQePlan::ReopenFloor => {
+                    in_flight.remove(run_id);
+                    return Ok(SessionStatus::AwaitingHuman);
+                }
             }
         }
         d => d,
@@ -13089,6 +13306,10 @@ pub(crate) fn confirm_gate_as(
         // Answered above (`judge_by_operator`), never a re-dispatch.
         crate::workflow::HumanDecision::OperatorJudgment { .. } => {
             anyhow::bail!("run {run_id}: an operator judgment is answered before any re-dispatch")
+        }
+        // Answered above (`answer_skip_qe`): it became an approve, a judgment or a re-opened gate.
+        crate::workflow::HumanDecision::SkipQe { .. } => {
+            anyhow::bail!("run {run_id}: a QE skip is answered before any re-dispatch")
         }
     };
     {
@@ -13906,6 +14127,260 @@ fn apply_suggestion(
     ))
 }
 
+/// (j4-gates) The words every surface shows for an operator's QE skip at a gate — the launch
+/// skip's own prefix (`assurance::RunAssurance::with_qe_override`), so studio's
+/// "QE acceptance: skipped by operator (…)" reads both the same way.
+const SKIP_QE_LABEL: &str = "QE acceptance skipped by operator";
+
+/// (j4-gates) What a [`crate::workflow::HumanDecision::SkipQe`] does at the open gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipQePlan {
+    /// The gate before the deliver step: record the skip, then approve.
+    Approve,
+    /// A unit only the QE reviewer denied: record the skip, and the unit counts.
+    UnitCounts,
+    /// A failed repo-checks floor with QE layers behind it: record the skip, drop those layers and
+    /// re-open the gate on the floor alone.
+    ReopenFloor,
+}
+
+/// (j4-gates) The shape a denied unit's record gives a QE skip, from the record alone: `Some` only
+/// when a QE layer denied it and the record is KNOWN (`denials_behind` set). [`SkipQePlan::UnitCounts`]
+/// when every layer that denied is QE's; [`SkipQePlan::ReopenFloor`] when the winner is a repo-checks
+/// floor on an agent step and every other layer is QE's or one the floor's override tolerates.
+fn skip_qe_shape(u: &crate::domain::WorkUnit) -> Option<SkipQePlan> {
+    use crate::qe_acceptance::review::is_qe_denial;
+    let winner = u.denial.as_ref()?;
+    let behind = u.denials_behind.as_deref()?;
+    if !is_qe_denial(winner) && !behind.iter().any(is_qe_denial) {
+        return None;
+    }
+    if is_qe_denial(winner) {
+        return behind
+            .iter()
+            .all(is_qe_denial)
+            .then_some(SkipQePlan::UnitCounts);
+    }
+    let floor = winner.source == crate::repo_checks::DENIAL_SOURCE
+        || winner.source == crate::repo_checks::DENIAL_SOURCE_TIMEOUT;
+    (floor
+        && u.tool_cmd.is_none()
+        && !crate::deliver_lift::is_deliver_unit(u)
+        && behind
+            .iter()
+            .all(|d| is_qe_denial(d) || tolerated_behind_floor(d)))
+    .then_some(SkipQePlan::ReopenFloor)
+}
+
+/// (j4-gates) Whether a verdict gate's prompt offers `skip_qe` for this unit: a QE layer is all that
+/// denied it, on a run whose QE decision (as stamped on the unit) still requires QE acceptance.
+fn skip_qe_takes_unit(u: &crate::domain::WorkUnit) -> bool {
+    u.member_step.is_none()
+        && u.qe_acceptance.as_ref().is_some_and(|q| q.required())
+        && skip_qe_shape(u) == Some(SkipQePlan::UnitCounts)
+}
+
+/// (j4-gates) What a QE skip does at `session`'s open gate — refused, naming why, unless it applies
+/// ([`crate::workflow::HumanDecision::SkipQe`]).
+fn skip_qe_plan(
+    session: &crate::domain::AgentSession,
+    cursor: Option<&crate::domain::WorkUnit>,
+    reason: &str,
+    adjudication_open: bool,
+    run_id: &str,
+) -> anyhow::Result<SkipQePlan> {
+    let action = crate::workflow::SKIP_QE_ACTION;
+    if reason.trim().is_empty() {
+        anyhow::bail!(
+            "action `{action}` needs a written reason in `amend` — why QE acceptance is skipped \
+             for this run; an empty one is refused"
+        );
+    }
+    if adjudication_open {
+        anyhow::bail!(
+            "a review_adjudication gate takes approve (land with carried items), request changes \
+             (one more round) or reject (stop) — not `{action}`"
+        );
+    }
+    if team_gate::transport_gate_open(session) || team_gate::dispute_gate_open(session) {
+        anyhow::bail!("a team pause takes approve, request changes or reject — not `{action}`");
+    }
+    match session.assurance.qe.as_ref() {
+        None => anyhow::bail!(
+            "run {run_id} does not require QE acceptance ({}), so there is nothing to skip",
+            crate::assurance::QE_ACCEPTANCE
+        ),
+        Some(q) if !q.required() => anyhow::bail!(
+            "run {run_id}'s QE acceptance is already {} ({}), so there is nothing to skip",
+            q.status,
+            q.reason
+        ),
+        Some(_) => {}
+    }
+    let u = cursor.ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor"))?;
+    if u.member_step.is_some() {
+        anyhow::bail!(
+            "unit {} is a team member's step: its team answers its gate, not `{action}`",
+            u.ord
+        );
+    }
+    let paused_on_unit = session.status == SessionStatus::AwaitingHuman
+        && u.status == crate::domain::UnitStatus::Rejected;
+    if !paused_on_unit {
+        if crate::deliver_lift::is_deliver_unit(u) {
+            return Ok(SkipQePlan::Approve);
+        }
+        anyhow::bail!(
+            "`{action}` answers the gate before the deliver step, or the escalation gate of a unit \
+             the QE reviewer denied; the open gate is before unit {}",
+            u.ord
+        );
+    }
+    skip_qe_shape(u).ok_or_else(|| {
+        let layers = u
+            .denial
+            .iter()
+            .chain(u.denials_behind.iter().flatten())
+            .filter(|d| {
+                !crate::qe_acceptance::review::is_qe_denial(d) && !tolerated_behind_floor(d)
+            })
+            .map(|d| format!("`{}` ({})", d.source, reason_head(&d.reason)))
+            .collect::<Vec<_>>();
+        if u.denials_behind.is_none() {
+            anyhow::anyhow!(
+                "unit {}'s gate did not record which layers denied it, so `{action}` cannot tell \
+                 that QE acceptance is all it would answer — approve (retry), request changes or \
+                 reject",
+                u.ord
+            )
+        } else if layers.is_empty() {
+            anyhow::anyhow!(
+                "unit {} was not denied by QE acceptance — `{action}` answers a QE denial, or the \
+                 gate before the deliver step",
+                u.ord
+            )
+        } else {
+            anyhow::anyhow!(
+                "unit {}'s gate was ALSO denied by {} — `{action}` skips QE acceptance only, and \
+                 every other layer still denies (deny-dominates): approve (retry), request changes \
+                 or reject",
+                u.ord,
+                layers.join("; ")
+            )
+        }
+    })
+}
+
+/// (j4-gates) Record an operator's QE skip on the run (persisted, `qeAcceptanceDecided`) and on the
+/// gated unit's receipt, and — for [`SkipQePlan::ReopenFloor`] — drop the QE layers from its record
+/// and re-open its escalation gate on the floor alone. Returns what the caller still does.
+#[allow(clippy::too_many_arguments)]
+fn answer_skip_qe(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    self_tx: &Sender<Command>,
+    session: &mut crate::domain::AgentSession,
+    run_id: &str,
+    reason: &str,
+    actor: Option<&str>,
+    adjudication_open: bool,
+) -> anyhow::Result<SkipQePlan> {
+    let mut units = crate::domain::session_units(store, run_id)?;
+    let plan = skip_qe_plan(
+        session,
+        units.get(session.unit_ix),
+        reason,
+        adjudication_open,
+        run_id,
+    )?;
+    let ix = session.unit_ix;
+    let u = units
+        .get_mut(ix)
+        .ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor"))?;
+    let by = actor
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .unwrap_or("operator")
+        .to_string();
+    let prior = session.assurance.qe.clone();
+    let qe = crate::assurance::QeAcceptance {
+        status: crate::assurance::QE_SKIPPED.to_string(),
+        basis: crate::assurance::QE_BASIS_OPERATOR.to_string(),
+        score: None,
+        threshold: prior
+            .as_ref()
+            .map(|q| q.threshold)
+            .unwrap_or(crate::review_scale::THRESHOLDS.qe_waiver_max_score),
+        reason: format!(
+            "{SKIP_QE_LABEL}: {} ({by}, at the gate before unit {})",
+            reason.trim(),
+            u.ord
+        ),
+        reasons: Vec::new(),
+        ord: Some(u.ord),
+        tree: u
+            .qe_review
+            .as_ref()
+            .and_then(|r| r.tree.clone())
+            .or_else(|| prior.as_ref().and_then(|q| q.tree.clone())),
+    };
+    session.assurance.qe = Some(qe.clone());
+    // The gated unit's receipt says so too: QE acceptance skipped, in the decision's words.
+    if let Some(r) = u.assurance.as_mut() {
+        r.qe = Some(Box::new(qe.clone()));
+        r.skip(
+            crate::assurance::QE_ACCEPTANCE,
+            crate::assurance::SKIP_QE_OPERATOR,
+            Some(qe.reason.clone()),
+        );
+    }
+    let at = crate::interaction::now_millis();
+    u.operator_rulings.push(crate::domain::OperatorRuling {
+        action: crate::workflow::SKIP_QE_ACTION.to_string(),
+        text: format!("{SKIP_QE_LABEL} ({by}): {}", reason.trim()),
+        attempt: u.last_attempt.unwrap_or(0),
+        at,
+    });
+    if plan == SkipQePlan::ReopenFloor {
+        u.denials_behind = u.denials_behind.take().map(|b| {
+            b.into_iter()
+                .filter(|d| !crate::qe_acceptance::review::is_qe_denial(d))
+                .collect()
+        });
+    }
+    let ord = u.ord;
+    let unit = u.clone();
+    crate::domain::put_nodes(store, &[unit.to_node(), session.to_node()])?;
+    eprintln!(
+        "wicked-core: run {run_id}: {SKIP_QE_LABEL} (`{by}`) at the gate before unit {ord} \
+         ({plan:?})"
+    );
+    emit(
+        subscribers,
+        CoreEvent::QeAcceptanceDecided {
+            session: run_id.to_string(),
+            ord,
+            qe: Box::new(qe),
+        },
+    );
+    if plan == SkipQePlan::ReopenFloor {
+        let note = denial_gate_note(session.human_confirm);
+        escalate_denied_unit(
+            store,
+            subscribers,
+            self_tx,
+            session,
+            &unit,
+            unit.last_attempt.unwrap_or(0),
+            false,
+            true,
+            false,
+            note,
+        )?;
+    }
+    Ok(plan)
+}
+
 /// (operator ruling 2026-10-21) What an operator's judgment over a failed floor answers: the floor
 /// result, and (operator ruling 2026-10-20) the judge's no-verdict hold(s) recorded behind it
 /// ([`pipeline::judge_absent_behind_floor`]) — empty when nothing but the floor denied.
@@ -14009,7 +14484,7 @@ fn floor_override_for(
         Some(behind) if !floor_override_record_allows(Some(behind)) => {
             let layers = behind
                 .iter()
-                .filter(|d| !pipeline::judge_absent_behind_floor(d))
+                .filter(|d| !tolerated_behind_floor(d))
                 .map(|d| format!("`{}` ({})", d.source, reason_head(&d.reason)))
                 .collect::<Vec<_>>()
                 .join("; ");
@@ -14039,10 +14514,17 @@ fn floor_override_for(
         },
         // Every record behind the floor is the judge's no-verdict hold here (checked above); a
         // deliver refusal has none.
+        // (j4-gates) Only the judge's holds: a QE "could not judge" record tolerated beside it is
+        // not answered by this judgment (QE acceptance stays as the run decided it).
         judge_absent: if deliver_floor {
             Vec::new()
         } else {
-            u.denials_behind.clone().unwrap_or_default()
+            u.denials_behind
+                .iter()
+                .flatten()
+                .filter(|d| pipeline::judge_absent_behind_floor(d))
+                .cloned()
+                .collect()
         },
     })
 }
@@ -17607,6 +18089,96 @@ mod substance_gate_tests {
         assert_eq!(
             unit.denial.as_ref().map(|d| d.source.as_str()),
             Some("input_governance")
+        );
+    }
+
+    /// (j4-gates, rig run 1940f173) One refused boundary WRITE beside a floor that RAN and FAILED
+    /// no longer turns the floor's gate into "a tool call was denied": the floor names the gate
+    /// (so the automatic floor round, and later the floor card's override, stay available), the
+    /// refusal is disclosed as its own `workerToolCallDenied` line, and the round's note names the
+    /// head-only failure (head minus base), not the base's.
+    #[test]
+    fn a_refused_boundary_write_beside_a_failed_floor_keeps_the_floor_gate() {
+        let run_id = format!("boundary-failed-floor-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Creator);
+        let claim = wicked_apps_core::ConformanceClaim {
+            claim_id: "boundary-deny:unit-1".into(),
+            scope: format!("wicked-agent/{run_id}/unit/x"),
+            phase: "unit-1".into(),
+            policy_ids: vec!["engine:filesystem-boundary-write".into()],
+            decision: wicked_apps_core::Decision::Deny,
+            obligations: vec!["path outside this unit's boundary: /tmp/exp/MARK (write)".into()],
+            evaluated_context_ref: "sha256:boundary".into(),
+            criteria: "filesystem boundary: outside (write)".into(),
+            evaluator_identity: "wicked-governance-boundary".into(),
+            evaluated_at: 1_750_000_000,
+        };
+        let path = crate::gate_hook::decisions_path_for(&run_id, 0);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&claim).unwrap()),
+        )
+        .unwrap();
+        let report = crate::repo_checks::red_report(
+            &[
+                "test repo_checks::tests::mine",
+                "test deliver_lift::tests::base_red",
+            ],
+            Some(&["test deliver_lift::tests::base_red"]),
+        );
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let (applied, _session, unit) = fold_inner(
+            &mut store,
+            &mut subs,
+            &run_id,
+            &"built the fix; the floor will judge the tree I left. ".repeat(6),
+            false,
+            crate::workflow::UnitEvidence {
+                repo_checks: Some(report),
+                ..Default::default()
+            },
+        );
+        let evs = drain_events(&erx);
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                CoreEvent::GateEscalated { condition, .. } if condition == "boundary_deny"
+            )),
+            "never a boundary_deny gate over a failed floor: {evs:?}"
+        );
+        assert!(
+            matches!(applied, StepApplied::Continuing),
+            "the floor's own automatic round runs (a hook denial used to block it)"
+        );
+        assert_eq!(unit.floor_auto_retries, 1);
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                CoreEvent::WorkerToolCallDenied { remedy, reason, .. }
+                    if remedy.contains("j4-gates") && reason.contains("(write)")
+            )),
+            "the refusal is reported beside the floor: {evs:?}"
+        );
+        let amendment = evs
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::UnitReworkAmended {
+                    amendment, scope, ..
+                } if scope == FLOOR_AUTO_RETRY_SCOPE => Some(amendment.clone()),
+                _ => None,
+            })
+            .expect("the automatic round's amendment");
+        assert!(
+            amendment.contains("THIS change's")
+                && amendment.contains("test repo_checks::tests::mine")
+                && amendment.contains("the other 1 fail on the base too"),
+            "the note names the head-only failure: {amendment}"
         );
     }
 
@@ -22048,6 +22620,300 @@ mod request_changes_tests {
             .is_none_or(|r| r.operator_judges.is_empty())));
         assert_ne!(units[3].status, UnitStatus::Done);
     }
+
+    // ── j4-gates: QE inconclusive keeps the override; skip_qe at verify and deliver ──────────────
+
+    fn qe_required() -> crate::assurance::QeAcceptance {
+        crate::assurance::QeAcceptance {
+            status: crate::assurance::QE_REQUIRED.into(),
+            basis: crate::assurance::QE_BASIS_DIFF.into(),
+            score: Some(60),
+            threshold: 20,
+            reason: "required".into(),
+            reasons: Vec::new(),
+            ord: Some(3),
+            tree: Some("t".into()),
+        }
+    }
+
+    fn require_qe(store: &mut dyn GraphStore, run_id: &str) {
+        let mut session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        session.assurance.qe = Some(qe_required());
+        put_node(store, session.to_node()).unwrap();
+        let mut units = crate::domain::session_units(store, run_id).unwrap();
+        for u in units.iter_mut() {
+            u.qe_acceptance = Some(qe_required());
+            put_node(store, u.to_node()).unwrap();
+        }
+    }
+
+    fn qe_inconclusive() -> UnitDenial {
+        UnitDenial::new(
+            crate::qe_acceptance::review::DENIAL_SOURCE_QE_INCONCLUSIVE,
+            "QE acceptance: the isolated QE reviewer on `codex` (distinct) recorded FAIL on QE run \
+             dd76 as INCONCLUSIVE — it could not run its checks: no macOS sandbox tool on the seat",
+        )
+    }
+
+    fn qe_fail() -> UnitDenial {
+        UnitDenial::new(
+            crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEW,
+            "QE acceptance: the isolated QE reviewer on `codex` (distinct) recorded FAIL on QE run \
+             dd77",
+        )
+    }
+
+    fn answer(
+        store: &mut dyn GraphStore,
+        run_id: &str,
+        decision: HumanDecision,
+    ) -> (anyhow::Result<SessionStatus>, Vec<CoreEvent>) {
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        let r = confirm_gate_as(
+            store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            run_id,
+            decision,
+            Some("mike".into()),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        );
+        (r, drain(&erx))
+    }
+
+    fn skip_qe(reason: &str) -> HumanDecision {
+        HumanDecision::SkipQe {
+            reason: reason.into(),
+        }
+    }
+
+    /// (j4-gates) A QE result whose reviewer could not run its checks is no veto behind a failed
+    /// floor: the floor gate keeps "approve as your own judgment" (the clause, verbatim, before the
+    /// closer), names the QE record on its own line, and the judgment answers the floor ONLY — QE
+    /// acceptance stays required for delivery.
+    #[test]
+    fn an_inconclusive_qe_result_keeps_the_floor_override() {
+        let run_id = format!("j4-inconclusive-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_floor_failed_fix(&mut store, &run_id, Some(vec![qe_inconclusive()]));
+        require_qe(&mut store, &run_id);
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let fix = &units[2];
+        assert_eq!(
+            floor_override_offer(fix, crate::repo_checks::DENIAL_SOURCE),
+            FLOOR_OVERRIDE_OFFER
+        );
+        let prompt = denial_gate_prompt(
+            fix,
+            "floor_failed",
+            fix.denial_reason.as_deref().unwrap(),
+            None,
+            "",
+        );
+        assert!(
+            prompt.contains(&format!(
+                "{FLOOR_OVERRIDE_OFFER} or reject to cancel the run"
+            )),
+            "the offer sits right before the closer: {prompt}"
+        );
+        assert!(
+            prompt.contains("also: QE acceptance is inconclusive")
+                && prompt.contains("QE acceptance stays required at delivery"),
+            "{prompt}"
+        );
+        let (r, _) = operator_judgment(&mut store, &run_id, "the 3 reds are the base's");
+        r.expect("the override applies over an inconclusive QE record");
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.unit_ix, 3, "the run moved on");
+        assert!(
+            session.assurance.qe.as_ref().is_some_and(|q| q.required()),
+            "the judgment answers the floor only: {:?}",
+            session.assurance.qe
+        );
+    }
+
+    /// (j4-gates) A REAL QE FAIL behind a failed floor still refuses the override
+    /// (deny-dominates). The operator's explicit `skip_qe` with a reason records the skip —
+    /// labelled exactly as a launch skip — drops the QE layer and re-opens the gate on the floor
+    /// alone, which then offers the override.
+    #[test]
+    fn a_real_qe_fail_still_denies_until_the_operator_skips_qe_with_a_reason() {
+        let run_id = format!("j4-qe-fail-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_floor_failed_fix(&mut store, &run_id, Some(vec![qe_fail()]));
+        require_qe(&mut store, &run_id);
+        let (r, _) = operator_judgment(&mut store, &run_id, "the reds are the base's");
+        let err = r
+            .expect_err("a real QE FAIL refuses the override")
+            .to_string();
+        assert!(err.contains("qe_review"), "{err}");
+        // An empty reason is refused, the gate still open.
+        let (r, _) = answer(&mut store, &run_id, skip_qe("  "));
+        assert!(r.is_err());
+        let (r, evs) = answer(
+            &mut store,
+            &run_id,
+            skip_qe("the sandbox probe cannot run on Linux seats"),
+        );
+        assert_eq!(
+            r.unwrap(),
+            SessionStatus::AwaitingHuman,
+            "the gate re-opens"
+        );
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        let qe = session.assurance.qe.as_ref().unwrap();
+        assert_eq!(
+            (qe.status.as_str(), qe.basis.as_str()),
+            (
+                crate::assurance::QE_SKIPPED,
+                crate::assurance::QE_BASIS_OPERATOR
+            )
+        );
+        assert!(
+            qe.reason
+                .starts_with("QE acceptance skipped by operator: the sandbox probe")
+                && qe.reason.contains("mike"),
+            "{}",
+            qe.reason
+        );
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e, CoreEvent::QeAcceptanceDecided { .. })));
+        let reopened = evs.iter().find_map(|e| match e {
+            CoreEvent::AwaitingHuman { prompt, ord: 3, .. } => Some(prompt.clone()),
+            _ => None,
+        });
+        let reopened = reopened.expect("the floor gate re-opened");
+        assert!(reopened.contains(FLOOR_OVERRIDE_OFFER), "{reopened}");
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(units[2].denials_behind.as_deref(), Some(&[][..]));
+        let r = units[2].assurance.as_ref();
+        assert!(r.is_none_or(|r| r
+            .skipped
+            .iter()
+            .any(|s| s.reason == crate::assurance::SKIP_QE_OPERATOR)));
+        // Now the floor's own override applies.
+        let (r, _) = operator_judgment(&mut store, &run_id, "the reds are the base's");
+        r.expect("the override applies on the floor alone");
+        // A second skip is refused: QE is already skipped.
+        let (r, _) = answer(&mut store, &run_id, skip_qe("again"));
+        assert!(r.is_err());
+    }
+
+    /// (j4-gates) At the verify gate of a unit ONLY QE denied, the prompt offers `skip_qe`, and
+    /// the skip counts the unit, labelled; a skip on a run that does not require QE is refused.
+    #[test]
+    fn skip_qe_at_a_qe_only_verify_gate_counts_the_unit_labelled() {
+        let run_id = format!("j4-qe-only-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_judge_unavailable_verify(&mut store, &run_id);
+        require_qe(&mut store, &run_id);
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        units[3].denial = Some(qe_fail());
+        units[3].denial_reason = Some(qe_fail().reason);
+        units[3].denials_behind = Some(vec![qe_fail()]);
+        put_node(&mut store, units[3].to_node()).unwrap();
+        let p = denial_gate_prompt(&units[3], "verdict_not_pass", &qe_fail().reason, None, "");
+        assert!(p.contains("action `skip_qe`"), "{p}");
+        let (r, _) = answer(&mut store, &run_id, skip_qe("QE reviewed by hand"));
+        r.unwrap();
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.unit_ix, 4, "the run moved on");
+        assert_eq!(
+            session.assurance.qe.as_ref().map(|q| q.status.as_str()),
+            Some(crate::assurance::QE_SKIPPED)
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(units[3].status, UnitStatus::Done);
+        assert!(units[3]
+            .operator_rulings
+            .iter()
+            .any(|r| r.action == crate::workflow::SKIP_QE_ACTION
+                && r.text
+                    .starts_with("QE acceptance skipped by operator (mike)")));
+
+        // A run that does not require QE acceptance has nothing to skip.
+        let other = format!("j4-qe-none-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_judge_unavailable_verify(&mut store, &other);
+        let mut s = crate::domain::get_session(&store, &other).unwrap().unwrap();
+        s.assurance.qe = None;
+        put_node(&mut store, s.to_node()).unwrap();
+        let (r, _) = answer(&mut store, &other, skip_qe("x"));
+        assert!(r
+            .unwrap_err()
+            .to_string()
+            .contains("does not require QE acceptance"));
+    }
+
+    /// (j4-gates) At the gate before the deliver step, `skip_qe` records the skip (labelled on
+    /// the run) and approves; at a floor gate a hook refusal behind the floor still refuses it.
+    #[test]
+    fn skip_qe_at_the_deliver_gate_is_recorded_and_approves() {
+        let run_id = format!("j4-qe-deliver-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug_with_deliver(&mut store, &run_id);
+        require_qe(&mut store, &run_id);
+        let (r, evs) = answer(&mut store, &run_id, skip_qe("verified by hand on macOS"));
+        r.expect("the deliver gate takes a QE skip");
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.assurance.qe.as_ref().map(|q| q.status.as_str()),
+            Some(crate::assurance::QE_SKIPPED)
+        );
+        assert_ne!(
+            session.status,
+            SessionStatus::AwaitingHuman,
+            "the gate was approved"
+        );
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e, CoreEvent::QeAcceptanceDecided { .. })));
+
+        let other = format!("j4-qe-hook-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut hook = UnitDenial::new("input_governance", "a policy denied a tool call");
+        hook.rule_ids = vec!["pol-x".into()];
+        seed_floor_failed_fix(&mut store, &other, Some(vec![qe_fail(), hook]));
+        require_qe(&mut store, &other);
+        let (r, _) = answer(&mut store, &other, skip_qe("x"));
+        assert!(r.unwrap_err().to_string().contains("input_governance"));
+    }
+
+    /// (j4-gates) A hook refusal beside a failed floor is reported beside it: the gate's class is
+    /// the floor's, and the prompt names the refusal on its own line.
+    #[test]
+    fn a_hook_refusal_beside_a_failed_floor_keeps_the_floor_class_and_its_own_line() {
+        let floor = UnitDenial::new(crate::repo_checks::DENIAL_SOURCE, "repo checks failed");
+        assert_eq!(denial_class(Some(&floor), true), "floor_failed");
+        let mut hook = UnitDenial::new("input_governance", "a tool call was refused");
+        hook.denied_tool = Some("Bash".into());
+        let mut u = WorkUnit::pending("r:fix", "r", 3, "fix");
+        u.status = UnitStatus::Rejected;
+        u.denial = Some(floor);
+        u.denials_behind = Some(vec![hook]);
+        let p = denial_gate_prompt(&u, "floor_failed", "repo checks failed", None, "");
+        assert!(p.contains("also: a tool call was refused (`Bash`)"), "{p}");
+        assert!(!p.contains("DENIED by input governance"), "{p}");
+    }
 }
 
 /// crew#311 / core#297 §2 — the CODE-EVIDENCE floor: a governed `executes_code` CREATOR phase of
@@ -22392,6 +23258,59 @@ mod code_evidence_floor_tests {
             "{:?}",
             unit.denial
         );
+    }
+
+    /// (j4-gates, core#1113 — the batch-1 trap) When every failing test of the unit's floor also
+    /// fails on the run base, changing nothing is the correct answer to its retry: a reply that
+    /// changed nothing passes the substance floor even without the marker line (the floor's gate
+    /// then rules on the base's reds), and the automatic round's note asks for exactly that. A
+    /// head-only failure keeps today's rule: no diff and no NO CHANGE NEEDED line is refused.
+    #[test]
+    fn a_no_change_reply_on_an_all_base_red_floor_passes_the_substance_check() {
+        let reply = format!(
+            "{}\nNo change needed: every failure is red on the base too.\n",
+            prose()
+        );
+        for (tag, head, refused) in [
+            ("all base red", vec!["test b::shared"], false),
+            ("head-only", vec!["test a::mine", "test b::shared"], true),
+        ] {
+            let wt = git_worktree(&format!("base-red-{}", tag.replace(' ', "-")));
+            std::fs::write(wt.join("design-notes.md"), "plan\n").unwrap();
+            let run_id = format!("code-floor-base-red-{}", tag.replace(' ', "-"));
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed(
+                &mut store,
+                &run_id,
+                PhaseRole::Creator,
+                true,
+                Some(wt.to_string_lossy().into_owned()),
+            );
+            let mut subs = crate::event_log::EventSink::default();
+            let evidence = crate::workflow::UnitEvidence {
+                tree_changed: Some(false),
+                repo_checks: Some(crate::repo_checks::red_report(
+                    &head,
+                    Some(&["test b::shared", "test c::other"]),
+                )),
+                ..Default::default()
+            };
+            let (_session, unit) = fold_ev(&mut store, &mut subs, &run_id, &reply, true, evidence);
+            let substance = unit
+                .denial
+                .as_ref()
+                .is_some_and(|d| d.source == "substance");
+            assert_eq!(substance, refused, "{tag}: {:?}", unit.denial);
+        }
+        let note = floor_auto_retry_note(Some(&crate::repo_checks::red_report(
+            &["test b::shared"],
+            Some(&["test b::shared"]),
+        )));
+        assert!(
+            note.contains("Do NOT try to fix them") && note.contains(NO_CHANGE_NEEDED),
+            "{note}"
+        );
+        assert_eq!(floor_auto_retry_note(None), FLOOR_AUTO_RETRY_NOTE);
     }
 
     /// An UNCOMMITTED change is evidence (instrument 1, porcelain): the same fold passes the

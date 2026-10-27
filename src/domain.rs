@@ -1462,7 +1462,8 @@ pub struct QeReviewerSeat {
 /// (DES-QE-EVERY-SEAT §3.5) The isolated QE reviewer's record for one attempt of the QE unit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QeReview {
-    /// `pass` | `fail` | `invalid` | `unavailable`.
+    /// `pass` | `fail` | `invalid` | `unavailable` | `inconclusive` (j4-gates: a non-PASS the
+    /// reviewer said it could not judge — its checks could not run on its seat).
     pub outcome: String,
     /// Why, in words (the gate's denial reason for every outcome but `pass`).
     pub reason: String,

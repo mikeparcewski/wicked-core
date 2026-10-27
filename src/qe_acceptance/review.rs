@@ -32,6 +32,15 @@ pub(crate) const OUTCOME_PASS: &str = "pass";
 pub(crate) const OUTCOME_FAIL: &str = "fail";
 pub(crate) const OUTCOME_INVALID: &str = "invalid";
 pub(crate) const OUTCOME_UNAVAILABLE: &str = "unavailable";
+/// (j4-gates) The reviewer recorded a non-PASS verdict and said it could not run the checks it was
+/// asked to judge (a missing tool, binding or runtime on its seat): no product failure was found,
+/// and none was ruled out. Not a FAIL: the gate keeps the operator's judgment, as for `unavailable`.
+pub(crate) const OUTCOME_INCONCLUSIVE: &str = "inconclusive";
+
+/// (j4-gates) The line the reviewer names what could not run on, before its VERDICT line.
+pub(crate) const INCONCLUSIVE_MARKER: &str = "QE-INCONCLUSIVE:";
+/// The longest "what could not run" the record keeps.
+const INCONCLUSIVE_WHAT_MAX: usize = 300;
 
 pub(crate) const BASIS_DISTINCT: &str = "distinct";
 pub(crate) const BASIS_EXECUTOR: &str = "executor_seat";
@@ -42,6 +51,22 @@ pub(crate) const DENIAL_SOURCE_QE_REVIEW: &str = "qe_review";
 /// The fold's denial source for `unavailable` (class `judge_unavailable`: the operator's approve
 /// is the judgment, labelled).
 pub const DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE: &str = "qe_reviewer_unavailable";
+/// (j4-gates) The fold's denial source for `inconclusive` (class `judge_unavailable`): the reviewer
+/// could not run its checks. It never outranks another layer, and it does not refuse the operator's
+/// judgment over a failed floor (QE acceptance stays required at delivery).
+pub const DENIAL_SOURCE_QE_INCONCLUSIVE: &str = "qe_inconclusive";
+
+/// (j4-gates) Whether a denial is the QE reviewer's "could not judge" record: no seat could review
+/// (`qe_reviewer_unavailable`) or the reviewer could not run its checks (`qe_inconclusive`). Neither
+/// is a verdict on the work.
+pub(crate) fn could_not_judge(d: &crate::domain::UnitDenial) -> bool {
+    d.source == DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE || d.source == DENIAL_SOURCE_QE_INCONCLUSIVE
+}
+
+/// (j4-gates) Every denial source the isolated QE reviewer's record produces.
+pub(crate) fn is_qe_denial(d: &crate::domain::UnitDenial) -> bool {
+    d.source == DENIAL_SOURCE_QE_REVIEW || could_not_judge(d)
+}
 
 /// Whether this unit's attempt runs the engine's reviewer: the run's QE unit carrying its ledger
 /// root, with a `required` decision — and never the reviewer turn itself.
@@ -94,7 +119,8 @@ pub(crate) fn reviewer_brief(dir: &str, scratch: Option<&Path>) -> String {
          wicked-core started this session for this review alone, so you hold no plan writing or \
          test execution: open the acceptance reviewer here, judge only the scenario, plan and \
          evidence files in that directory, record the verdict in the QE ledger (stamped with \
-         ${REVIEW_SESSION_ENV} and WICKED_RUN_ID), and change nothing else.{stage}"
+         ${REVIEW_SESSION_ENV} and WICKED_RUN_ID), and change nothing else. If a check \
+         could not run here, put `{INCONCLUSIVE_MARKER} <what, why>` before VERDICT.{stage}"
     )
 }
 
@@ -235,6 +261,70 @@ pub(crate) fn parse_marker(output: &str) -> Option<String> {
             .trim_matches(|c: char| c == '`' || c == '*' || c == '"' || c == '\'')
             .trim();
         (!rest.is_empty()).then(|| rest.to_string())
+    })
+}
+
+/// (j4-gates) What the reviewer said it could NOT run, when its reply says its verdict is
+/// inconclusive: the LAST [`INCONCLUSIVE_MARKER`] line's text (the engine's own contract, in the
+/// reviewer brief), else garden's convention (the acceptance reviewer's `reason: inconclusive — …`):
+/// the last line whose first word, past decoration, a `reason:` label, a `FAIL` token, `[tag]`s and
+/// separators, is `inconclusive`. `None` for every other reply — a reply that only MENTIONS the word
+/// mid-sentence never counts. Capped at [`INCONCLUSIVE_WHAT_MAX`] chars.
+pub(crate) fn parse_inconclusive(output: &str) -> Option<String> {
+    let cap = |t: &str| -> String {
+        let t = t.trim();
+        if t.chars().count() <= INCONCLUSIVE_WHAT_MAX {
+            t.to_string()
+        } else {
+            format!(
+                "{}…",
+                t.chars().take(INCONCLUSIVE_WHAT_MAX).collect::<String>()
+            )
+        }
+    };
+    let decoration = |c: char| c.is_whitespace() || "*-_>#`\"'".contains(c);
+    if let Some(what) = output.lines().rev().find_map(|l| {
+        let at = l.find(INCONCLUSIVE_MARKER)?;
+        let rest = l[at + INCONCLUSIVE_MARKER.len()..].trim_matches(decoration);
+        (!rest.is_empty()).then(|| cap(rest))
+    }) {
+        return Some(what);
+    }
+    output.lines().rev().find_map(|l| {
+        let mut t = l.trim_start_matches(decoration);
+        loop {
+            let before = t;
+            for label in ["reason:", "verdict:", "fail"] {
+                if t.get(..label.len())
+                    .is_some_and(|h| h.eq_ignore_ascii_case(label))
+                {
+                    let rest = &t[label.len()..];
+                    // A whole word only: `FAILED` / `failure` are not the token.
+                    if rest.chars().next().is_none_or(|c| !c.is_alphanumeric()) {
+                        t = rest;
+                    }
+                }
+            }
+            if let Some(rest) = t.strip_prefix('[') {
+                if let Some(end) = rest.find(']') {
+                    t = &rest[end + 1..];
+                }
+            }
+            t = t.trim_start_matches(|c: char| {
+                decoration(c) || matches!(c, ':' | '—' | '–' | '-' | '=' | '(' | ')')
+            });
+            if t == before {
+                break;
+            }
+        }
+        let word = "inconclusive";
+        (t.get(..word.len())
+            .is_some_and(|h| h.eq_ignore_ascii_case(word))
+            && t[word.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric()))
+        .then(|| cap(t))
     })
 }
 
@@ -586,16 +676,34 @@ pub(crate) fn run(
         match bind_verdict(ledger, &id, &input.run_id, &nonce, &token) {
             Ok(v) => {
                 review.attempts.push(attempt("verdict".to_string()));
-                review.outcome = if v == "PASS" {
-                    OUTCOME_PASS
-                } else {
-                    OUTCOME_FAIL
+                // (j4-gates) A non-PASS the reviewer itself calls inconclusive — it could not run
+                // the checks it judges on this seat — is no FAIL of the work: it names what could
+                // not run, and the gate keeps the operator's judgment. So is a ledger verdict that
+                // means "not evaluated" (INCONCLUSIVE / N-A / SKIP).
+                let not_evaluated = matches!(v.as_str(), "INCONCLUSIVE" | "N-A" | "SKIP");
+                let inconclusive = (v != "PASS")
+                    .then(|| parse_inconclusive(&out.output))
+                    .flatten()
+                    .or_else(|| {
+                        not_evaluated.then(|| format!("the reviewer recorded {v} (not evaluated)"))
+                    });
+                review.outcome = match (&inconclusive, v == "PASS") {
+                    (_, true) => OUTCOME_PASS,
+                    (Some(_), false) => OUTCOME_INCONCLUSIVE,
+                    (None, false) => OUTCOME_FAIL,
                 }
                 .to_string();
-                review.reason = format!(
-                    "the isolated QE reviewer on `{}` ({}) recorded {v} on QE run {id}",
-                    c.seat, c.basis
-                );
+                review.reason = match &inconclusive {
+                    Some(what) => format!(
+                        "the isolated QE reviewer on `{}` ({}) recorded {v} on QE run {id} as \
+                         INCONCLUSIVE — it could not run its checks: {what}",
+                        c.seat, c.basis
+                    ),
+                    None => format!(
+                        "the isolated QE reviewer on `{}` ({}) recorded {v} on QE run {id}",
+                        c.seat, c.basis
+                    ),
+                };
                 review.verdict = Some(v);
             }
             Err(why) => {
@@ -651,12 +759,13 @@ pub(crate) fn on_floor_rerun(unit: &WorkUnit, fix: bool) -> Option<QeReview> {
 }
 
 /// The fold's denial for a reviewer record: `fail` / `invalid` → [`DENIAL_SOURCE_QE_REVIEW`] (a
-/// substantive veto), `unavailable` → [`DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE`] (the operator's
-/// judgment gate). `None` for `pass`.
+/// substantive veto), `unavailable` → [`DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE`] and (j4-gates)
+/// `inconclusive` → [`DENIAL_SOURCE_QE_INCONCLUSIVE`] (the operator's judgment gate). `None` for `pass`.
 pub(crate) fn denial(review: &QeReview) -> Option<crate::domain::UnitDenial> {
     let source = match review.outcome.as_str() {
         OUTCOME_PASS => return None,
         OUTCOME_UNAVAILABLE => DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE,
+        OUTCOME_INCONCLUSIVE => DENIAL_SOURCE_QE_INCONCLUSIVE,
         _ => DENIAL_SOURCE_QE_REVIEW,
     };
     Some(crate::domain::UnitDenial::new(
@@ -673,14 +782,19 @@ pub(crate) fn operator_judged(unit: &WorkUnit, by: &str) -> Option<crate::assura
     let review = unit
         .qe_review
         .as_ref()
-        .filter(|r| r.outcome == OUTCOME_UNAVAILABLE)?;
+        .filter(|r| r.outcome == OUTCOME_UNAVAILABLE || r.outcome == OUTCOME_INCONCLUSIVE)?;
+    let what = if review.outcome == OUTCOME_INCONCLUSIVE {
+        "the QE reviewer could not run its checks"
+    } else {
+        "no isolated QE reviewer could run"
+    };
     Some(a::QeAcceptance {
         status: a::QE_SKIPPED.to_string(),
         basis: a::QE_BASIS_OPERATOR.to_string(),
         score: None,
         threshold: crate::review_scale::THRESHOLDS.qe_waiver_max_score,
         reason: format!(
-            "judged by operator ({by}): no isolated QE reviewer could run ({}); evidence at {}",
+            "judged by operator ({by}): {what} ({}); evidence at {}",
             review.reason,
             review.evidence_dir.as_deref().unwrap_or("(none bound)")
         ),

@@ -508,7 +508,25 @@ pub enum HumanDecision {
     /// A judge that RULED still refuses it. QE acceptance is never waived by it, and no later
     /// gate is pre-approved.
     OperatorJudgment { rationale: String },
+    /// (j4-gates) SKIP QE ACCEPTANCE at a gate, wire token [`SKIP_QE_ACTION`], the reason in the
+    /// gate body's `amend` (required, never empty) — the launch's skip, given later: the run's QE
+    /// decision becomes `skipped` by the operator ("QE acceptance skipped by operator: <reason>"),
+    /// labelled on the run, every later gate and the delivery, exactly as a launch skip is. It
+    /// answers three gates and refuses every other:
+    /// - the escalation gate of a unit that ONLY the isolated QE reviewer denied (a FAIL, an
+    ///   invalid record, an inconclusive one, or no reviewer): the unit counts, labelled;
+    /// - the escalation gate of a failed repo-checks floor with a QE layer behind it, and nothing
+    ///   else the floor's own override would refuse: the QE layers are dropped and the gate
+    ///   re-opens on the floor alone (approve as your own judgment, retry, or reject);
+    /// - the gate before the deliver step: the run then delivers without a QE PASS, labelled.
+    ///
+    /// Refused on a run that does not require QE acceptance (or already skipped or waived it), at a
+    /// plan, team or adjudication pause, and on a team member's step.
+    SkipQe { reason: String },
 }
+
+/// The wire token of [`HumanDecision::SkipQe`]. Its reason rides the gate body's `amend`.
+pub const SKIP_QE_ACTION: &str = "skip_qe";
 
 /// The wire token of [`HumanDecision::Rejudge`].
 pub const REJUDGE_ACTION: &str = "rejudge";
