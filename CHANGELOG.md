@@ -1519,6 +1519,12 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.13** — 2026-10-27 — patch release on main bca3cbd, carrying #1135, #1136 and #1140.
+  - **A review is no longer refused as a self-review of work its seat never built (#1135, J6):** a guarded read step authors nothing; a worker failure that left the tree unchanged takes its seat back out of the authors (`WorkUnit.author_probe`); a kept guarded edit still authors.
+  - **A print-only `sed` after `cd` into a read root is a read, not a boundary write (#1135, J6):** every other `sed` shape fails closed.
+  - **New built-in workflow `analyze` (#1136, crew#1157):** one read-only `understand` step, `answer`, on the `wicked-garden-search` skill that cites file:line beside every symbol or graph path and names an unbound repository as not indexed; it can never write and has no creator, deliver or QE acceptance. crew runs analysis chats on it.
+  - **The floor cache keeps a free-disk floor on its volume (#1140, core#1138):** the cap pass before every floor holds the cache to the smaller of the total cap and what keeps the larger of 15% of its volume and 20 GB free (`WICKED_REPO_CHECKS_FREE_FLOOR_PCT`, `WICKED_REPO_CHECKS_FREE_FLOOR_GB`; both `0` turns it off), taking least recently used leaves no floor holds; `Core.floorCacheUsage()` gains `freeDisk`.
+  - No seat or floor Dockerfile, no seat package pin and no gate-hook protocol changed since 0.15.12, so the seat and floor image tags and gate protocol 3 are unchanged.
 - **core-ts 0.15.12** — 2026-10-27 — patch release on main 9fee2f1, carrying #1117, #1127, #1128, #1129, #1130, #1132 and #1133.
   - **A Finder-opened state home no longer refuses every worker launch (#1117, J1/J4):** OS metadata (`.DS_Store`, `._*`, `.Spotlight-V100`, `.Trashes`, `.fseventsd`, `Thumbs.db`, `desktop.ini`, `Icon\r`) is ignored by the unregistered check at every level and stays outside the worker Read fence; any other unknown entry still refuses launches.
   - **The floor's copies of a repo behave like a real checkout (#1127, J4/J5):** the base, verify and deliver copies honour the repo's eol attributes, and the base copy has its own git context.
