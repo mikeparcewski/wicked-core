@@ -172,6 +172,10 @@ fn spec(session_id: &str, workflow: &str) -> LaunchSpec {
 
 #[test]
 fn a_tool_command_first_unit_does_not_execute_when_a_later_unit_s_skill_is_missing() {
+    if wicked_core::nested_sandbox() {
+        eprintln!("SKIP a_tool_command_first_unit_does_not_execute_when_a_later_unit_s_skill_is_missing: sandbox-exec cannot be applied here (nested inside a sandbox, e.g. the repo-checks floor)");
+        return;
+    }
     let base = std::fs::canonicalize(std::env::temp_dir())
         .unwrap()
         .join(format!("wicked-core-planadm-{}", std::process::id()));

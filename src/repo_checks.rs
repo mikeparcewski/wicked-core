@@ -8165,6 +8165,11 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn a_malformed_or_symlinked_manifest_fails_the_floor_by_name() {
+        if crate::validator::skip_when_nested(
+            "a_malformed_or_symlinked_manifest_fails_the_floor_by_name",
+        ) {
+            return;
+        }
         let wt = scratch("detect-bad");
         std::fs::write(wt.join("package.json"), "not a manifest").unwrap();
         let err = detect(&wt).expect_err("malformed package.json must not read as no checks");
@@ -9417,6 +9422,9 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn an_uninspectable_base_export_refuses_the_floor() {
+        if crate::validator::skip_when_nested("an_uninspectable_base_export_refuses_the_floor") {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         let base = scratch("tmp-noperm");
         let wt = base.join("wt");

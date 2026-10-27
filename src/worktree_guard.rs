@@ -277,7 +277,7 @@ pub(crate) fn git_string(
 
 /// A scratch path for the temporary index — pid + thread + counter scoped so concurrent snapshots
 /// (parallel runs, parallel tests) never share one, and never inside the worktree (it would count).
-fn scratch_index_path() -> PathBuf {
+pub(crate) fn scratch_index_path() -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     std::env::temp_dir().join(format!(

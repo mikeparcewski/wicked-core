@@ -648,7 +648,7 @@ sys.exit(main(*sys.argv[1:4]))
 /// left to type. Echo stays off, so keys pressed while ingest runs are never echoed.
 const CLAUDE_SETUP_TOKEN_LOGIN: &str = concat!(
     "td=; trap '[ -z \"$td\" ] || rm -rf \"$td\"' EXIT; trap 'exit 1' HUP INT TERM; \
-[ -t 0 ] && case $(script -V 2>/dev/null) in *util-linux*) td=$(umask 077 && mktemp -d) || td=;; esac; \
+[ -t 0 ] && case $(script -V 2>/dev/null) in *util-linux*) td=$(umask 077 && mktemp -d \"${TMPDIR:-/tmp}/wicked-login.XXXXXX\") || td=;; esac; \
 if [ -n \"$td\" ]; then (umask 077 && exec script -q -e -c 'claude setup-token' \"$td/claude.out\") || exit 1; \
 else claude setup-token || exit 1; fi; stty sane -echo 2>/dev/null; \
 printf '\\033[?1000l\\033[?1002l\\033[?1003l\\033[?1005l\\033[?1006l\\033[?1015l\\033[<u\\033[=0;1u\\033[>4;0m\\033[?2026l'; \
@@ -3377,6 +3377,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn credential_containers_all_disable_runtime_logging_and_keep_stdio() {
+        if crate::validator::skip_when_nested(
+            "credential_containers_all_disable_runtime_logging_and_keep_stdio",
+        ) {
+            return;
+        }
         for cli in ["claude", "codex", "pi", "opencode", "copilot"] {
             let mut argvs = vec![
                 login_argv(
@@ -3439,6 +3444,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn login_bridge_and_first_ingest_preserve_live_keys_without_gateway_takeover() {
+        if crate::validator::skip_when_nested(
+            "login_bridge_and_first_ingest_preserve_live_keys_without_gateway_takeover",
+        ) {
+            return;
+        }
         use crate::seat_gateway::{configure_gateway, register_unit, GatewayConfig, UnitKey};
         let fake = FakeRuntime::new();
         configure_gateway(&fake.dir, &GatewayConfig::default()).unwrap();
@@ -3492,6 +3502,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn refresh_recovery_prefers_rescue_and_refuses_an_unstored_rotation() {
+        if crate::validator::skip_when_nested(
+            "refresh_recovery_prefers_rescue_and_refuses_an_unstored_rotation",
+        ) {
+            return;
+        }
         let fake = FakeRuntime::new();
         let _lock = crate::seat_refresh::mutation_lock(&fake.dir).unwrap();
         let old = oauth(1000);
@@ -3582,6 +3597,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn interrupted_sign_out_tombstone_wins_over_every_recovery_source() {
+        if crate::validator::skip_when_nested(
+            "interrupted_sign_out_tombstone_wins_over_every_recovery_source",
+        ) {
+            return;
+        }
         for recovery in 0..3 {
             let fake = FakeRuntime::new();
             new_session(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
@@ -3671,6 +3691,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn ingest_validates_account_before_mutation_and_keeps_session_on_publish_failure() {
+        if crate::validator::skip_when_nested(
+            "ingest_validates_account_before_mutation_and_keeps_session_on_publish_failure",
+        ) {
+            return;
+        }
         let fake = FakeRuntime::new();
         let session = new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
         std::fs::write(fake.dir.join("calls"), "").unwrap();
@@ -3766,6 +3791,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn ingest_and_sign_out_block_behind_refresh_and_do_not_mutate_early() {
+        if crate::validator::skip_when_nested(
+            "ingest_and_sign_out_block_behind_refresh_and_do_not_mutate_early",
+        ) {
+            return;
+        }
         for sign_out in [false, true] {
             let fake = FakeRuntime::new();
             new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
@@ -3798,6 +3828,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn sign_out_returns_error_when_config_application_cannot_be_confirmed() {
+        if crate::validator::skip_when_nested(
+            "sign_out_returns_error_when_config_application_cannot_be_confirmed",
+        ) {
+            return;
+        }
         let fake = FakeRuntime::new();
         std::fs::write(fake.dir.join("fail_probe"), "").unwrap();
         let error = sign_out_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap_err();
@@ -3888,6 +3923,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn sign_out_stopped_absent_and_unknown_gateway_never_mints_probe() {
+        if crate::validator::skip_when_nested(
+            "sign_out_stopped_absent_and_unknown_gateway_never_mints_probe",
+        ) {
+            return;
+        }
         for state in ["stopped", "absent", "unknown"] {
             let fake = FakeRuntime::new();
             std::fs::write(fake.dir.join("state"), state).unwrap();
@@ -3917,6 +3957,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn refresh_recovery_prefers_next_generation_and_status_becomes_signed_in() {
+        if crate::validator::skip_when_nested(
+            "refresh_recovery_prefers_next_generation_and_status_becomes_signed_in",
+        ) {
+            return;
+        }
         let fake = FakeRuntime::new();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3975,6 +4020,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn sign_out_refuses_unsettled_writer_before_emptying_any_credentials() {
+        if crate::validator::skip_when_nested(
+            "sign_out_refuses_unsettled_writer_before_emptying_any_credentials",
+        ) {
+            return;
+        }
         let fake = FakeRuntime::new();
         std::fs::create_dir_all(fake.dir.join("refresh")).unwrap();
         // Unique: cleanup `pkill -f`s / `pgrep -f`s the name host-wide, so a fixed one would hit
@@ -3998,6 +4048,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn sign_out_absent_volumes_succeeds_and_existing_config_volume_is_published() {
+        if crate::validator::skip_when_nested(
+            "sign_out_absent_volumes_succeeds_and_existing_config_volume_is_published",
+        ) {
+            return;
+        }
         for config_exists in [false, true] {
             let fake = FakeRuntime::new();
             std::fs::write(fake.dir.join("state"), "absent").unwrap();
@@ -4104,6 +4159,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn a_claude_setup_token_sign_in_is_brokered_for_pass_through() {
+        if crate::validator::skip_when_nested(
+            "a_claude_setup_token_sign_in_is_brokered_for_pass_through",
+        ) {
+            return;
+        }
         // Line mode with echo off before the prompt shows, so a paste typed at once is never
         // echoed and Enter ends the line whatever mode the TUI left the terminal in.
         assert!(CLAUDE_SETUP_TOKEN_LOGIN.contains("script -q -e -c 'claude setup-token'"));
@@ -4334,6 +4394,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn the_claude_login_script_captures_a_wrapped_token_pasted_in_a_pty() {
+        if crate::validator::skip_when_nested(
+            "the_claude_login_script_captures_a_wrapped_token_pasted_in_a_pty",
+        ) {
+            return;
+        }
         use portable_pty::{CommandBuilder, PtySize};
         use std::io::{Read, Write};
         let token = fake_setup_token();
@@ -4810,6 +4875,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn the_claude_login_script_reads_the_token_from_claudes_output_in_a_pty() {
+        if crate::validator::skip_when_nested(
+            "the_claude_login_script_reads_the_token_from_claudes_output_in_a_pty",
+        ) {
+            return;
+        }
         use portable_pty::{CommandBuilder, PtySize};
         use std::io::{Read, Write};
         use std::os::unix::fs::PermissionsExt;
@@ -5284,6 +5354,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn host_login_sessions_own_a_private_home_and_remove_it() {
+        if crate::validator::skip_when_nested(
+            "host_login_sessions_own_a_private_home_and_remove_it",
+        ) {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         let fake = FakeRuntime::new();
         let first = new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
@@ -5353,6 +5428,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn host_login_argv_needs_the_cli_on_path_answering_a_version() {
+        if crate::validator::skip_when_nested(
+            "host_login_argv_needs_the_cli_on_path_answering_a_version",
+        ) {
+            return;
+        }
         let fake = FakeRuntime::new();
         let bin = fake.dir.join("bin");
         std::fs::create_dir(&bin).unwrap();
@@ -5420,6 +5500,15 @@ esac
     #[cfg(unix)]
     #[test]
     fn sign_out_ends_a_still_running_host_login_before_removing_its_home() {
+        if crate::validator::skip_when_nested(
+            "sign_out_ends_a_still_running_host_login_before_removing_its_home",
+        ) {
+            return;
+        }
+        if crate::outstanding_work::tests::ps_exec_denied() {
+            eprintln!("SKIP: `ps` cannot run here (EPERM — setuid binary under a sandbox)");
+            return;
+        }
         use std::os::unix::process::CommandExt;
         let fake = FakeRuntime::new();
         let session = new_session(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap();
@@ -5471,6 +5560,11 @@ esac
     #[cfg(unix)]
     #[test]
     fn a_pre_upgrade_container_session_of_a_host_login_agent_is_still_removed() {
+        if crate::validator::skip_when_nested(
+            "a_pre_upgrade_container_session_of_a_host_login_agent_is_still_removed",
+        ) {
+            return;
+        }
         let fake = FakeRuntime::new();
         let legacy = format!("{}-login-codex-0000abcd", fake.gw.name);
         let mut volumes = std::fs::read_to_string(fake.dir.join("volumes")).unwrap();

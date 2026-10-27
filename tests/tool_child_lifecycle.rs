@@ -218,6 +218,10 @@ fn tool_def(id: &str, script: &str) -> String {
 /// killed attempt and no second terminal frame.
 #[test]
 fn cancel_run_kills_the_live_tool_child_and_its_group_and_the_frame_follows_run_cancelled() {
+    if wicked_core::nested_sandbox() {
+        eprintln!("SKIP cancel_run_kills_the_live_tool_child_and_its_group_and_the_frame_follows_run_cancelled: sandbox-exec cannot be applied here (nested inside a sandbox, e.g. the repo-checks floor)");
+        return;
+    }
     let dir = fixture_dir("cancel");
     let leader = dir.join("leader.pid");
     let bg = dir.join("bg.pid");
@@ -471,6 +475,10 @@ fn reject_at_a_def_gate_before_a_tool_unit_kills_nothing_and_dispatches_nothing(
 /// `runCancelled.toolChildrenKilled >= 1` is on the wire.
 #[test]
 fn cancel_kills_entire_process_group_including_grandchild() {
+    if wicked_core::nested_sandbox() {
+        eprintln!("SKIP cancel_kills_entire_process_group_including_grandchild: sandbox-exec cannot be applied here (nested inside a sandbox, e.g. the repo-checks floor)");
+        return;
+    }
     let dir = fixture_dir("grandchild");
     let leader = dir.join("leader.pid");
     let bg = dir.join("bg.pid");
@@ -566,6 +574,10 @@ fn cancel_kills_entire_process_group_including_grandchild() {
 /// This test WOULD FAIL on the pre-fix code 3/5 runs (reproduced empirically).
 #[test]
 fn supersede_then_cancel_kills_replacement_attempt_child() {
+    if wicked_core::nested_sandbox() {
+        eprintln!("SKIP supersede_then_cancel_kills_replacement_attempt_child: sandbox-exec cannot be applied here (nested inside a sandbox, e.g. the repo-checks floor)");
+        return;
+    }
     let dir = fixture_dir("supersede-cancel");
     let leader0 = dir.join("leader0.pid");
     let leader1 = dir.join("leader1.pid");
@@ -664,6 +676,10 @@ fn supersede_then_cancel_kills_replacement_attempt_child() {
 /// replacement. The old process group is dead; `unitReassigned.previousAttemptReaped: true`.
 #[test]
 fn supersede_kills_old_attempt_and_previous_attempt_reaped_is_on_wire() {
+    if wicked_core::nested_sandbox() {
+        eprintln!("SKIP supersede_kills_old_attempt_and_previous_attempt_reaped_is_on_wire: sandbox-exec cannot be applied here (nested inside a sandbox, e.g. the repo-checks floor)");
+        return;
+    }
     let dir = fixture_dir("supersede");
     let leader = dir.join("leader.pid");
     let script = format!("echo $$ > '{}'; sleep 300", leader.display());
@@ -733,6 +749,10 @@ fn supersede_kills_old_attempt_and_previous_attempt_reaped_is_on_wire() {
 /// `Cancelled` result posts back and fires `ToolResultDiscarded{reason:"superseded"}`.
 #[test]
 fn superseded_attempt_late_result_emits_tool_result_discarded() {
+    if wicked_core::nested_sandbox() {
+        eprintln!("SKIP superseded_attempt_late_result_emits_tool_result_discarded: sandbox-exec cannot be applied here (nested inside a sandbox, e.g. the repo-checks floor)");
+        return;
+    }
     let dir = fixture_dir("discarded");
     let leader = dir.join("leader.pid");
     let script = format!("echo $$ > '{}'; sleep 300", leader.display());
@@ -794,6 +814,10 @@ fn superseded_attempt_late_result_emits_tool_result_discarded() {
 /// process are dead after `cancel_campaign`, and `runCancelled.toolChildrenKilled >= 1`.
 #[test]
 fn campaign_cancel_kills_the_live_tool_child_through_cancel_campaign() {
+    if wicked_core::nested_sandbox() {
+        eprintln!("SKIP campaign_cancel_kills_the_live_tool_child_through_cancel_campaign: sandbox-exec cannot be applied here (nested inside a sandbox, e.g. the repo-checks floor)");
+        return;
+    }
     let cid = "toolkill-campaign-cancel";
     let node_id = "node1";
     let dir = fixture_dir("campaign-cancel");
