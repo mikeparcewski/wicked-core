@@ -107,6 +107,7 @@ mod tests {
             worker_failed_clis: Vec::new(),
             authored_by: Vec::new(),
             authored_binaries: Vec::new(),
+            author_probe: None,
             team_run: false,
             team: None,
             member_step: None,

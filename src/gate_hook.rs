@@ -2987,13 +2987,182 @@ fn command_contains_write_capable_program(command: &str) -> bool {
                         }
                     }
                 }
-                if matches!(basename, "ln" | "sed" | "rm" | "truncate" | "patch") {
+                if matches!(basename, "ln" | "rm" | "truncate" | "patch") {
+                    return true;
+                }
+                // (PRODUCT-WORKS J6) `sed` writes only in-place, from a script file this scan
+                // cannot read, or through a script command that writes (`w`, `s///w`, `e`). A
+                // print-only read (`sed -n 1,40p SKILL.md`, the shape seats use to read a file
+                // after `cd`-ing into a read root) is not write-capable: counting it made a design
+                // step's `cd <skill dir> && ls && sed -n …p` a boundary WRITE that denied the unit.
+                if basename == "sed" && sed_may_write(&words[idx + 1..]) {
                     return true;
                 }
             }
         }
     }
     false
+}
+
+/// Whether a `sed` invocation (its arguments, after the program word, as `shell_tokens` spells
+/// them) may write a file. Fails toward "may write" on anything it cannot settle (codex/agy review
+/// on #1135): a word whose quoting or expansion is not plain ([`plain_sed_word`]); in-place
+/// (`-i…`, `--in-place…`, an `i` anywhere in a short-option cluster); a script file (`-f…`,
+/// `--file…`, an `f` in a cluster); any option it does not know; a script that is not print-only
+/// ([`sed_script_reads_only`]). `-e` in a cluster takes the cluster's rest, or the next word, as
+/// a script; with no `-e`, the first operand is the script, as sed reads it.
+fn sed_may_write(args: &[&str]) -> bool {
+    let mut words: Vec<String> = Vec::with_capacity(args.len());
+    for a in args {
+        match plain_sed_word(a) {
+            Some(w) => words.push(w),
+            None => return true,
+        }
+    }
+    const LONG_FLAGS: [&str; 10] = [
+        "--quiet",
+        "--silent",
+        "--regexp-extended",
+        "--posix",
+        "--separate",
+        "--unbuffered",
+        "--null-data",
+        "--zero-terminated",
+        "--debug",
+        "--sandbox",
+    ];
+    let mut scripts: Vec<String> = Vec::new();
+    let mut operands: Vec<String> = Vec::new();
+    let mut options_done = false;
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i].as_str();
+        i += 1;
+        if options_done || w == "-" || !w.starts_with('-') {
+            operands.push(w.to_string());
+            continue;
+        }
+        if w == "--" {
+            options_done = true;
+            continue;
+        }
+        if let Some(long) = w.strip_prefix("--") {
+            if LONG_FLAGS.contains(&w) || long.starts_with("line-length=") {
+                continue;
+            }
+            if let Some(v) = long.strip_prefix("expression=") {
+                scripts.push(v.to_string());
+                continue;
+            }
+            if long == "expression" {
+                match words.get(i) {
+                    Some(v) => scripts.push(v.clone()),
+                    None => return true,
+                }
+                i += 1;
+                continue;
+            }
+            return true; // --in-place, --file, or an option this scan does not know
+        }
+        // A short-option cluster: `-n`, `-nE`, `-ne SCRIPT`, `-neSCRIPT`, `-l 5` ….
+        let cluster = &w[1..];
+        for (at, c) in cluster.char_indices() {
+            match c {
+                'n' | 'E' | 'r' | 's' | 'u' | 'z' => continue,
+                'e' | 'l' => {
+                    let rest = &cluster[at + 1..];
+                    let value = if rest.is_empty() {
+                        let v = words.get(i).cloned();
+                        i += 1;
+                        v
+                    } else {
+                        Some(rest.to_string())
+                    };
+                    let Some(value) = value else { return true };
+                    if c == 'e' {
+                        scripts.push(value);
+                    }
+                    break;
+                }
+                _ => return true, // `i` (in place), `f` (a script file), or unknown
+            }
+        }
+    }
+    if scripts.is_empty() {
+        match operands.first() {
+            Some(script) => scripts.push(script.clone()),
+            None => return true,
+        }
+    }
+    !scripts.iter().all(|s| sed_script_reads_only(s))
+}
+
+/// One `sed` argument as the shell hands it over, when that is certain: a word with no quoting or
+/// expansion at all, a whole single-quoted word, or a whole double-quoted word with nothing the
+/// shell would expand or unescape inside. `None` otherwise — the caller fails toward "may write".
+fn plain_sed_word(w: &str) -> Option<String> {
+    const SPECIAL: &[char] = &[
+        '\'', '"', '$', '`', '\\', '(', ')', '{', '}', '*', '?', '[', ']', '~', '!',
+    ];
+    if let Some(inner) = w.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+        return (!inner.contains('\'')).then(|| inner.to_string());
+    }
+    if let Some(inner) = w.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        return (!inner.contains(['"', '$', '`', '\\'])).then(|| inner.to_string());
+    }
+    (!w.contains(SPECIAL)).then(|| w.to_string())
+}
+
+/// A `sed` script made only of print/inspect commands — each `;`/newline-separated command an
+/// optional address (`N`, `$`, `/re/`, `N~M`, a `,`-range of those, optionally `!`) followed by
+/// one of `p P l = q Q d n N` — writes nothing. Anything else (`w`, `s…/w file`, `e`, `r`, braces)
+/// is judged as possibly writing.
+fn sed_script_reads_only(script: &str) -> bool {
+    fn addr(s: &str) -> Option<&str> {
+        if let Some(rest) = s.strip_prefix('$') {
+            return Some(rest);
+        }
+        if let Some(rest) = s.strip_prefix('/') {
+            let end = rest.find('/')?;
+            // (agy review on #1135) An escaped delimiter (`/\/,/`) moves where the address ends;
+            // this scan does not model escapes, so a regex holding one is not judged read-only.
+            if rest[..end].contains('\\') {
+                return None;
+            }
+            return Some(&rest[end + 1..]);
+        }
+        let digits = s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits == 0 {
+            return None;
+        }
+        let rest = &s[digits..];
+        if let Some(step) = rest.strip_prefix('~') {
+            let n = step.len() - step.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            return (n > 0).then(|| &step[n..]);
+        }
+        Some(rest)
+    }
+    let commands: Vec<&str> = script
+        .split([';', '\n'])
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect();
+    !commands.is_empty()
+        && commands.iter().all(|cmd| {
+            let mut rest = *cmd;
+            if let Some(r) = addr(rest) {
+                rest = r;
+                if let Some(r2) = rest.strip_prefix(',') {
+                    let r2 = r2.strip_prefix('+').unwrap_or(r2);
+                    match addr(r2) {
+                        Some(r3) => rest = r3,
+                        None => return false,
+                    }
+                }
+            }
+            let rest = rest.trim_start().strip_prefix('!').unwrap_or(rest).trim();
+            matches!(rest, "p" | "P" | "l" | "=" | "q" | "Q" | "d" | "n" | "N")
+        })
 }
 
 /// Resolve the collected directory destinations for the BOUNDARY check (issue #540).
@@ -7303,6 +7472,125 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// PRODUCT-WORKS J6 (run 6f11390c unit 4, a design step): `cd <skill dir> && ls && sed -n 1,40p
+    /// SKILL.md` read a skill and was refused as a boundary WRITE ("Bash `cd` leaves the unit
+    /// boundary … (write)"), denying the unit: every `sed` counted as write-capable, so the `cd`
+    /// into a read root was judged as a write destination. A print-only `sed` reads; `sed -i`, a
+    /// script file and a writing script command still make the `cd` a write escape.
+    #[test]
+    fn a_cd_into_a_read_root_then_a_print_only_sed_is_a_read_not_a_boundary_write() {
+        use crate::path_policy::AllowedRoots;
+        // Outside the system temp, as the rig's skills snapshot is: a refusal there is FATAL.
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("j6-cd-sed-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let skill = base.join("skills").join("editor-scaffold");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "x").unwrap();
+        let roots = AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![base.join("skills")],
+        };
+        let check = |cmd: &str| {
+            boundary_denial_with(
+                &roots,
+                &wt,
+                None,
+                None,
+                &serde_json::json!({ "command": cmd }),
+                "Bash",
+            )
+        };
+        let s = shell_read_951_path(&skill);
+        for read in [
+            format!("cd {s} && ls && sed -n 1,40p SKILL.md"),
+            format!("cd {s} && ls && sed -n '1,40p' SKILL.md"),
+            format!("cd {s} && sed -n -e '/^## /p' -e '$p' SKILL.md"),
+            format!("cd {s} && sed -n '10,+5p;20q' SKILL.md"),
+            format!("cd {s} && sed 1,5d SKILL.md | head"),
+            format!("cd {s} && ls -la && sed -E -n '1~2p' SKILL.md"),
+        ] {
+            assert_eq!(check(&read), None, "a read: {read}");
+        }
+        for write in [
+            format!("cd {s} && sed -i 's/a/b/' SKILL.md"),
+            format!("cd {s} && sed -i.bak 's/a/b/' SKILL.md"),
+            format!("cd {s} && sed -ni 'p' SKILL.md"),
+            format!("cd {s} && sed -n 'w copy.md' SKILL.md"),
+            format!("cd {s} && sed 's/a/b/w changed.md' SKILL.md"),
+            format!("cd {s} && sed -f edit.sed SKILL.md"),
+            format!("cd {s} && sed -n '1e touch x' SKILL.md"),
+            format!("cd {s} && sed -ne 'w escaped.txt' -e p SKILL.md"),
+            format!("cd {s} && sed -nfops.sed p SKILL.md"),
+            format!("cd {s} && sed '-i.bak' -e p SKILL.md"),
+            format!("cd {s} && sed -n '/\\/,/w out/p' SKILL.md"),
+        ] {
+            let (reason, fatal) =
+                check(&write).unwrap_or_else(|| panic!("a write escape: {write}"));
+            // `sed -i`'s file is a write target itself; the others make the `cd` the escape.
+            assert!(
+                reason.contains("leaves the unit boundary"),
+                "{write}: {reason}"
+            );
+            assert!(fatal, "{write}: a write escape outside the temp is fatal");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sed_may_write_reads_print_only_scripts_and_fails_toward_writing() {
+        for read in [
+            &["-n", "1,40p", "f"][..],
+            &["-n", "'$p'", "f"],
+            &["-n", "-e", "/x/p", "f"],
+            &["--expression=5q", "f"],
+            &["-n", "/a/,/b/p", "f"],
+            &["-n", "'/a/!p'", "f"],
+            &["=", "f"],
+            &["-nE", "'1~2p'", "f"],
+            &["-ne", "'1,40p'", "f"],
+            &["-n", "-l", "80", "'l'", "f"],
+            &["--quiet", "--", "'$p'", "f"],
+            &["\"1,5p\"", "f"],
+        ] {
+            assert!(!sed_may_write(read), "{read:?}");
+        }
+        for write in [
+            &["-i", "s/a/b/", "f"][..],
+            &["--in-place=.bak", "s/a/b/", "f"],
+            &["-f", "x.sed", "f"],
+            &["s/a/b/", "f"],
+            &["-n", "w out", "f"],
+            &["-n", "1r other", "f"],
+            &["-n", "{p}", "f"],
+            &["-n"],
+            &["-e"],
+            &["-n", "1,40p;w out", "f"],
+            // codex/agy review on #1135: clusters, quoted flags, escaped delimiters.
+            &["-ne", "'w escaped.txt'", "-e", "p", "f"],
+            &["-ne'1w out.md'", "p", "f"],
+            &["-nfops.sed", "p", "f"],
+            &["-nf", "edit.sed", "-e", "p", "f"],
+            &["-Ef", "x.sed", "f"],
+            &["'-i.bak'", "-e", "p", "f"],
+            &["-n", "'1,40p'", "'-i'", "f"],
+            &["\"-i\"", "-e", "'1,40p'", "f"],
+            &["-n", "'/\\/,/w out/p'", "f"],
+            &["-n", "'/\\/,/e touch out/p'", "f"],
+            &["--file=x.sed", "f"],
+            &["--made-up", "p", "f"],
+            &["-n", "$SCRIPT", "f"],
+            // An unquoted `!` (history expansion) or glob is not a plain word: fail toward writing.
+            &["-n", "/a/!p", "f"],
+        ] {
+            assert!(sed_may_write(write), "{write:?}");
+        }
     }
 
     /// issue #540 — boundary: `git -C <sibling>` with a write subcommand and

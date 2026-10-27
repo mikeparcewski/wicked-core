@@ -14,6 +14,33 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A review is no longer refused as a self-review of work its seat never built (PRODUCT-WORKS J6, plain
+  PR).** Rig run 9bd0f728: claude built the MCP server, and every codex review of it was denied
+  `same_seat_evaluator` ("unit 8 checks work built on `codex`"; studio: "Codex built this work"). Codex
+  was an "author" twice over, and neither produced the tree. (1) A GUARDED read step (a recon stage, a
+  neutral role, no code, `worktree_guarded`, the floor-added `architecture` recon here) authors nothing,
+  like a team member's read step: the guard holds it to the tree, so its seat is never stamped. A guarded
+  step whose edit was kept (no restore) still authors. (2) A dispatch that makes a seat a NEW author now
+  records the tree its attempt starts on (`WorkUnit.author_probe`); a WORKER failure (codex's 3-second
+  exit on the build) that leaves the tree exactly as it found it takes that seat back out of
+  `authored_by`/`authored_binaries`, first thing on the failed-step path (before triage, a refusal gate
+  or the failover can re-dispatch). A unit with no baseline gets a pinned snapshot of its own. A tree
+  that moved, or cannot be read, keeps the stamp (fail toward "authored"). A guarded step whose edit
+  stays in the tree (no restore) is stamped an author at the fold, before a reassign can replace its
+  seat. Tests: `a_guarded_read_step_is_not_an_author_of_the_work_j6`,
+  `an_unproductive_author_is_retracted_only_on_its_own_unchanged_attempt`,
+  `a_worker_failure_that_changed_nothing_is_not_an_author_j6` (real git tree, both outcomes).
+- **A read-only `cd <read root> && ls && sed -n 1,40p FILE` is a read, not a boundary write (PRODUCT-WORKS
+  J6).** Rig run 6f11390c's design step read a skill that way and was denied "Bash `cd` leaves the unit
+  boundary … (write)": the `cd`-escape check counted every `sed` as write-capable, so the `cd` into the
+  skills snapshot (a read root) was judged as a write destination. `sed` is write-capable there unless
+  every argument is a plain word, every option is a known read-only one (short-option clusters parsed:
+  an `i` or `f` anywhere, or an unknown option, fails closed; `-e` takes the cluster's rest or the next
+  word as a script) and every script is print-only (`w`, `s///w`, `e`, `r`, braces, or a regex address
+  holding a backslash fail closed). Test:
+  `a_cd_into_a_read_root_then_a_print_only_sed_is_a_read_not_a_boundary_write` (fatal-path reproduction,
+  outside the system temp) and `sed_may_write_reads_print_only_scripts_and_fails_toward_writing`.
+
 - **Gates no longer strand good runs on QE results that could not run, on one refused tool call, or on
   base-red failures (j4-gates, plain PR).** Three bricks from the test rig's batch 2 (runs 64f05d3d,
   29bcace4, 1940f173):
