@@ -2362,10 +2362,14 @@ impl Core {
     }
 
     /// (core#1122) What the repo-checks floor holds on disk, as a JSON object: `{ path, bytes,
-    /// totalCapBytes, repoCapBytes, idleTtlSecs, repos: [{ name, bytes, leaves }], logs: { path,
-    /// bytes, capBytes } }` (or `{ error }` with no worker home). `path` is the floor build cache
-    /// (`<worker home>/repo-checks`), `repos` largest first. For crew's diagnostics and the Nerve
-    /// Center's disk row; read-only, but it walks the cache, so call it on demand.
+    /// totalCapBytes, repoCapBytes, idleTtlSecs, freeDisk, repos: [{ name, bytes, leaves }], logs:
+    /// { path, bytes, capBytes } }` (or `{ error }` with no worker home). `path` is the floor build
+    /// cache (`<worker home>/repo-checks`), `repos` largest first. (core#1138) `freeDisk: {
+    /// floorPct, floorMinBytes, volumeBytes, freeBytes, floorBytes, effectiveCapBytes,
+    /// shortfallBytes, note }` is the cache volume's free-disk floor (measured fields `null` when
+    /// unreadable); `shortfallBytes > 0` means free disk is below the floor, and `note` names the
+    /// floor cache as the consumer. For crew's diagnostics and the Nerve Center's disk row;
+    /// read-only, but it walks the cache, so call it on demand.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn floor_cache_usage() -> AsyncTask<CoreTask> {
         task(move || serde_json::to_string(&wicked_core::floor_cache_usage()).map_err(err))
