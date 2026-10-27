@@ -231,6 +231,7 @@ Two release tracks share this file, newest entry first regardless of track:
   verify floor's override now also names its tree (it was `null`).
 ### Fixed
 
+- Stabilize the queued-seat timing test under CI runner load (#1126).
 - **A Finder-opened state home no longer refuses every worker launch.** Opening `~/.wicked-crew` in
   macOS Finder creates `.DS_Store`, and the state-home check then refused the launch with
   `state-home.unregistered … .DS_Store …`. OS metadata — `.DS_Store`, `._*` (AppleDouble),
