@@ -1157,6 +1157,25 @@ pub enum CoreEvent {
         /// The re-run's `passed`.
         passed: bool,
     },
+    /// (J4) A unit's floor RESUMED one a daemon restart interrupted (`RepoChecksReport::resumed`):
+    /// the checks that had finished there on the same tree, base and check set were reused and
+    /// only the rest ran — or the interrupted floor could not be resumed (`restarted` says why) and
+    /// the checks ran from the first one. Emitted right after the `repoChecksEvaluated` it
+    /// explains. Additive: a new frame, no existing shape changes.
+    FloorResumed {
+        session: String,
+        ord: u32,
+        /// The attempt whose floor resumed.
+        attempt: u32,
+        /// The attempt whose floor the restart interrupted.
+        from_attempt: u32,
+        /// The tree both floors ran on (`RepoChecksReport::tree`).
+        tree: Option<String>,
+        /// The checks reused from the interrupted floor, in run order.
+        reused: Vec<String>,
+        /// Why nothing could be reused, when the floor restarted from its first check.
+        restarted: Option<String>,
+    },
     /// The operator re-armed the JUDGE of a unit denied `judge_unavailable`
     /// ([`crate::workflow::HumanDecision::Rejudge`]): the next attempt (`attempt`) does not run
     /// the seat; it hands the output captured on `fromAttempt` to the judge again, drawn by the
@@ -2678,6 +2697,24 @@ impl CoreEvent {
                 "outcome": outcome,
                 "passed": passed,
             }),
+            CoreEvent::FloorResumed {
+                session,
+                ord,
+                attempt,
+                from_attempt,
+                tree,
+                reused,
+                restarted,
+            } => json!({
+                "type": "floorResumed",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "fromAttempt": from_attempt,
+                "tree": tree,
+                "reused": reused,
+                "restarted": restarted,
+            }),
             CoreEvent::JudgeRerunRequested {
                 session,
                 ord,
@@ -3243,6 +3280,28 @@ mod tests {
         assert_eq!(j["previousOutcome"], "failed");
         assert_eq!(j["outcome"], "passed");
         assert_eq!(j["passed"], true);
+    }
+
+    /// `floorResumed` names the interrupted attempt, the tree and the reused checks.
+    #[test]
+    fn floor_resumed_to_json_names_the_interrupted_attempt_and_the_reused_checks() {
+        let j = CoreEvent::FloorResumed {
+            session: "run-1".into(),
+            ord: 6,
+            attempt: 9,
+            from_attempt: 8,
+            tree: Some("abc123".into()),
+            reused: vec!["fmt".into(), "typecheck".into()],
+            restarted: None,
+        }
+        .to_json();
+        assert_eq!(j["type"], "floorResumed");
+        assert_eq!(j["ord"], 6);
+        assert_eq!(j["attempt"], 9);
+        assert_eq!(j["fromAttempt"], 8);
+        assert_eq!(j["tree"], "abc123");
+        assert_eq!(j["reused"], serde_json::json!(["fmt", "typecheck"]));
+        assert!(j["restarted"].is_null());
     }
 
     /// `judgeRerunRequested` names the attempt that re-judges, the attempt whose output it reads,

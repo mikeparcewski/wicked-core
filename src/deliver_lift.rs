@@ -1466,8 +1466,16 @@ pub(crate) fn lift_and_reverify(
                         reused: Some(reused),
                     });
                 }
-                let mut r = crate::repo_checks::run_floor(&checkout.dir, &floor_ctx);
-                checkout.hold_to(&now.tree, &mut r);
+                // (J4) Journaled: a re-verify a daemon restart interrupts resumes on this tree.
+                let mut r = checkout.run_floor_journaled(
+                    &floor_ctx,
+                    None,
+                    &crate::repo_checks::FloorJournal {
+                        ord,
+                        attempt,
+                        tree: now.tree.clone(),
+                    },
+                );
                 // The result's identity, so an operator's override of it at this gate is keyed
                 // by exactly the tree, base and check set it judged.
                 r.key = r.key_for(Some(&now.tree), &floor_ctx);
@@ -1510,6 +1518,17 @@ pub(crate) fn lift_and_reverify(
             changed: Vec::new(),
             changed_truncated: false,
         });
+        if let Some(r) = &checks.resumed {
+            emit(CoreEvent::FloorResumed {
+                session: run_id.to_string(),
+                ord,
+                attempt,
+                from_attempt: r.from_attempt,
+                tree: checks.tree.clone(),
+                reused: r.reused.clone(),
+                restarted: r.restarted.clone(),
+            });
+        }
         Err(LiftRefusal { text, checks: None })
     };
     if !checks.passed {

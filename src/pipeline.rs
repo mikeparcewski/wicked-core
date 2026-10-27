@@ -1347,6 +1347,18 @@ pub(crate) fn apply_and_finish_unit(
                         passed: report.passed,
                     });
                 }
+                // (J4) A floor that resumed one a daemon restart interrupted says what it reused.
+                if let Some(r) = &report.resumed {
+                    emit(CoreEvent::FloorResumed {
+                        session: session_id.to_string(),
+                        ord: unit.ord,
+                        attempt,
+                        from_attempt: r.from_attempt,
+                        tree: report.tree.clone(),
+                        reused: r.reused.clone(),
+                        restarted: r.restarted.clone(),
+                    });
+                }
                 if default_floor_refused_unsandboxed {
                     eprintln!(
                     "wicked-core: unit {} changed the worktree tree but the default repo-checks \
