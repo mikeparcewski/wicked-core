@@ -6403,6 +6403,48 @@ fn apply_step_result(
         // (HumanConfirm::None — the campaign/fail-fast contract) keep mechanical
         // self-heal only; unknown failures fail exactly as they always did.
         let human_present = !matches!(session.human_confirm, crate::domain::HumanConfirm::None);
+        // (PRODUCT-WORKS J6) A FAILED attempt that left the tree exactly as it found it authored
+        // nothing: the seat it made a new author is taken back out, so a later review on that seat
+        // is not refused as a self-review (run 9bd0f728, codex's 3-second failed build attempt).
+        // Judged FIRST, before every arm below can return or re-dispatch — triage, a refusal gate,
+        // the failover — so no path keeps an unproductive stamp (codex review on #1135). An
+        // unreadable tree keeps the stamp.
+        let failed_cli = unit
+            .assigned_cli
+            .clone()
+            .unwrap_or_else(|| "claude".to_string());
+        let probe_git_dir = unit
+            .author_probe
+            .as_ref()
+            .filter(|p| p.seat == failed_cli && p.attempt == output.attempt)
+            .map(|p| p.git_dir.clone());
+        if let Some(git_dir) = probe_git_dir {
+            let tree_now = session.workdir.as_deref().and_then(|wd| {
+                crate::worktree_guard::snapshot_through(
+                    std::path::Path::new(wd),
+                    std::path::Path::new(&git_dir),
+                )
+                .ok()
+                .map(|snap| snap.tree)
+            });
+            let had = unit.authored_by.contains(&failed_cli);
+            if crate::domain::retract_unproductive_author(
+                unit,
+                &failed_cli,
+                output.attempt,
+                tree_now.as_deref(),
+            ) {
+                if had && !unit.authored_by.contains(&failed_cli) {
+                    eprintln!(
+                        "wicked-core: unit {ord} of run {run_id}: '{failed_cli}' failed attempt \
+                         {} without changing the tree; it is not an author of the work \
+                         (PRODUCT-WORKS J6)",
+                        output.attempt
+                    );
+                }
+                put_node(store, unit.to_node())?;
+            }
+        }
         // (DES-L9 F1 arm, BC-58; crew #549 / #550, the crew#432 class) A DELIVER refusal is
         // deterministic: the crew-composed `deliver` Tool script printed WHY it would not push
         // (an identity mismatch, a moved PR head, nothing to deliver, a moved verified base, a
@@ -6840,42 +6882,6 @@ fn apply_step_result(
                 .assigned_cli
                 .clone()
                 .unwrap_or_else(|| "claude".to_string());
-            // (PRODUCT-WORKS J6) A worker failure that left the tree exactly as its attempt found
-            // it authored nothing: the seat it made a new author is taken back out, so a later
-            // review on that seat is not refused as a self-review (run 9bd0f728, codex's 3-second
-            // failed build attempt). An unreadable tree keeps the stamp.
-            let probe_git_dir = unit
-                .author_probe
-                .as_ref()
-                .filter(|p| p.seat == failed_cli && p.attempt == output.attempt)
-                .map(|p| p.git_dir.clone());
-            if let Some(git_dir) = probe_git_dir {
-                let tree_now = session.workdir.as_deref().and_then(|wd| {
-                    crate::worktree_guard::snapshot_through(
-                        std::path::Path::new(wd),
-                        std::path::Path::new(&git_dir),
-                    )
-                    .ok()
-                    .map(|snap| snap.tree)
-                });
-                let had = unit.authored_by.contains(&failed_cli);
-                if crate::domain::retract_unproductive_author(
-                    unit,
-                    &failed_cli,
-                    output.attempt,
-                    tree_now.as_deref(),
-                ) {
-                    if had && !unit.authored_by.contains(&failed_cli) {
-                        eprintln!(
-                            "wicked-core: unit {ord} of run {run_id}: '{failed_cli}' failed attempt \
-                             {} without changing the tree; it is not an author of the work \
-                             (PRODUCT-WORKS J6)",
-                            output.attempt
-                        );
-                    }
-                    put_node(store, unit.to_node())?;
-                }
-            }
             // Record BEFORE selecting, and persist even when the roster turns out exhausted:
             // the terminal path below re-persists the unit, and a later RESUME reads this
             // list so it never hands the unit straight back to a seat that already failed it.
@@ -10234,7 +10240,7 @@ fn dispatch_unit(
     // fresh snapshot through the baseline's pinned git dir. No baseline or a failed snapshot leaves
     // no probe, and the stamp then stays whatever happens (fail toward "authored").
     if let (Some((seat, binaries_before)), Some(wd)) = (new_author, session.workdir.as_deref()) {
-        let tree = unit.worktree_baseline.as_ref().and_then(|b| {
+        let from_baseline = unit.worktree_baseline.as_ref().and_then(|b| {
             let git_dir = b.git_dir.clone()?;
             let tree = if baseline_fresh {
                 Some(b.tree.clone())
@@ -10247,6 +10253,21 @@ fn dispatch_unit(
                 .ok()
             }?;
             Some((tree, git_dir))
+        });
+        // (agy review on #1135) A unit with no baseline (no default floor) gets a snapshot of its
+        // own, pinned to the registered repository exactly as a baseline is.
+        let tree = from_baseline.or_else(|| {
+            let root = session
+                .repo_ref
+                .as_deref()
+                .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())?
+                .root_path;
+            let snap = crate::worktree_guard::snapshot(
+                std::path::Path::new(wd),
+                std::path::Path::new(&root),
+            )
+            .ok()?;
+            Some((snap.tree, snap.git_dir?))
         });
         if let Some((tree, git_dir)) = tree {
             unit.author_probe = Some(crate::domain::AuthorProbe {
@@ -24640,7 +24661,13 @@ mod seat_failover_tests {
                 .success();
             assert!(ok, "git {args:?}");
         }
-        for (tag, edit) in [("unchanged", false), ("edited", true)] {
+        // (codex review on #1135) …on attempt 0 with an operator present too, where an unclassified
+        // failure goes to TRIAGE before any failover: the retraction runs before that arm.
+        for (tag, edit, attempt, human) in [
+            ("unchanged", false, 3u32, false),
+            ("edited", true, 3, false),
+            ("triage-unchanged", false, 0, true),
+        ] {
             let run_id = format!("j6-author-{tag}-{}", std::process::id());
             let base = std::env::temp_dir().join(format!("wicked-{run_id}"));
             let _ = std::fs::remove_dir_all(&base);
@@ -24674,7 +24701,10 @@ mod seat_failover_tests {
                 .unwrap()
                 .unwrap();
             session.workdir = Some(repo.to_string_lossy().into_owned());
-            session.attempt = 3;
+            session.attempt = attempt;
+            if human {
+                session.human_confirm = HumanConfirm::All;
+            }
             put_node(&mut store, session.to_node()).unwrap();
             let git_dir = repo.join(".git");
             let start = crate::worktree_guard::snapshot_through(&repo, &git_dir).unwrap();
@@ -24689,7 +24719,7 @@ mod seat_failover_tests {
             // What `dispatch_unit` recorded when attempt 3 made codex a new author.
             u.author_probe = Some(crate::domain::AuthorProbe {
                 seat: "codex".into(),
-                attempt: 3,
+                attempt,
                 tree: start.tree.clone(),
                 git_dir: git_dir.to_string_lossy().into_owned(),
                 binaries_before: vec!["/bin/claude".into()],
@@ -24698,8 +24728,23 @@ mod seat_failover_tests {
             if edit {
                 std::fs::write(repo.join("b.txt"), "codex wrote this before it died\n").unwrap();
             }
-            let (applied, _session, units) =
-                fold_failed(&mut store, &run_id, "(cli `codex` exited 1) boom");
+            // The triage variant's failure is unclassified (not a worker crash): it takes the
+            // triage arm, never reaching the failover.
+            let text = if human {
+                "something odd happened"
+            } else {
+                "(cli `codex` exited 1) boom"
+            };
+            let (applied, _session, units) = fold_failed(&mut store, &run_id, text);
+            if human {
+                let authors = &units[0].authored_by;
+                assert!(
+                    !authors.contains(&"codex".to_string()),
+                    "{tag}: {authors:?}"
+                );
+                let _ = std::fs::remove_dir_all(&base);
+                continue;
+            }
             assert!(matches!(applied, StepApplied::Continuing), "{tag}");
             assert_eq!(
                 units[0].assigned_cli.as_deref(),

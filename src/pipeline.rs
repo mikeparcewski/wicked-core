@@ -1063,6 +1063,18 @@ pub(crate) fn apply_and_finish_unit(
             Some(G::Clean { .. }) => None,
             Some(G::Mutated(m)) => {
                 unit.worktree_mutation = Some(m.clone());
+                // (codex/agy review on #1135) A guarded step whose edit stays in the tree (no
+                // restore) authored it: its seat and binaries are stamped NOW, before a reassign
+                // can replace the only reference to it (`assigned_cli`).
+                if !m.restored && unit.tool_cmd.is_none() {
+                    if let Some(seat) = unit.assigned_cli.clone() {
+                        let binaries = crate::cli_runner::launched_identities(
+                            &seat,
+                            unit.assigned_invocation.clone(),
+                        );
+                        crate::domain::stamp_author(unit, seat, binaries);
+                    }
+                }
                 emit(CoreEvent::EvaluatorMutatedWorktree {
                     session: session_id.to_string(),
                     ord: unit.ord,
@@ -4745,6 +4757,113 @@ mod judge_bench_tests {
             outcome.denial.map(|d| d.source),
             persisted,
         )
+    }
+
+    /// (codex/agy review on #1135) A guarded read step whose edit STAYS in the tree (the guard could
+    /// not restore it) authored that edit: the fold stamps its seat and binaries at once, so a later
+    /// reassign cannot erase the only reference to it. A restored edit stamps nothing.
+    #[test]
+    fn a_kept_guarded_edit_stamps_its_author_at_the_fold_a_restored_one_does_not() {
+        for restored in [false, true] {
+            let sid = format!("kept-guarded-{restored}-{}", std::process::id());
+            let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+            let mut sink = |_e: CoreEvent| {};
+            let Planned {
+                mut units,
+                workflow_id,
+                cli_keys,
+                ..
+            } = plan_and_distribute(
+                &mut store,
+                &[cli("a")],
+                "Do step one.",
+                EntityMode::Shared,
+                &sid,
+                crate::domain::HumanConfirm::None,
+                false,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                &mut sink,
+                None,
+                false,
+                false,
+                Vec::new(),
+                None,
+                true,
+                &crate::assurance::QeOverride::Auto,
+            )
+            .expect("plan");
+            let mut session = crate::domain::get_session(&store, &sid).unwrap().unwrap();
+            session.workdir = Some("/nonexistent/wt".into());
+            crate::domain::put_node(&mut store, session.to_node()).unwrap();
+            let u = &mut units[0];
+            u.stage = crate::domain::StageKind::Recon;
+            u.role = crate::workflow::PhaseRole::Neutral;
+            u.executes_code = false;
+            u.worktree_guarded = true;
+            u.assigned_cli = Some("codex".into());
+            u.authored_by.clear();
+            u.authored_binaries.clear();
+            let snap = |tree: &str| crate::worktree_guard::WorktreeSnapshot {
+                head: "h".into(),
+                head_ref: None,
+                tree: tree.into(),
+                taken_at_ms: 0,
+                git_dir: None,
+            };
+            let evidence = crate::workflow::UnitEvidence {
+                worktree_guard: Some(crate::worktree_guard::WorktreeGuardOutcome::Mutated(
+                    crate::worktree_guard::WorktreeMutation {
+                        before: snap("t0"),
+                        after: snap("t1"),
+                        changed: vec![crate::worktree_guard::ChangedPath {
+                            status: "M".into(),
+                            path: "a.txt".into(),
+                        }],
+                        head_moved: false,
+                        restored,
+                        restore_error: None,
+                        suggestion_ref: None,
+                    },
+                )),
+                ..Default::default()
+            };
+            let output = crate::workflow::stub_output(&units[0]);
+            let _ = apply_and_finish_unit(
+                &mut store,
+                &mut units[0],
+                &output,
+                &workflow_id,
+                EntityMode::Shared,
+                &sid,
+                0,
+                false,
+                false,
+                &cli_keys,
+                None,
+                &evidence,
+                &mut |_e| {},
+                None,
+            )
+            .expect("apply");
+            let persisted = crate::domain::session_units(&store, &sid).unwrap()[0].clone();
+            assert_eq!(
+                persisted.authored_by.contains(&"codex".to_string()),
+                !restored,
+                "restored={restored}: {:?}",
+                persisted.authored_by
+            );
+            assert_eq!(
+                !persisted.authored_binaries.is_empty(),
+                !restored,
+                "restored={restored}"
+            );
+        }
     }
 
     /// (DES-QE-EVERY-SEAT §3.4) A reviewer FAIL or a broken binding is a substantive veto under
