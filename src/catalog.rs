@@ -1487,6 +1487,55 @@ mod tests {
             "reads are allowed"
         );
 
+        // xreview on #1136 (codex P2): with the roots dispatch actually arms. A bound unit gets a
+        // notes root (minted outside the tree, core#464 / R7) and it is the ONLY admitted root:
+        // every write to the tree is still refused with it armed, and a write under it never
+        // touches a repository.
+        let base =
+            std::env::temp_dir().join(format!("wicked-analyze-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (tree, notes) = (base.join("wt"), base.join("notes").join("answer"));
+        std::fs::create_dir_all(tree.join("src")).unwrap();
+        std::fs::create_dir_all(&notes).unwrap();
+        let mut dispatched = u.clone();
+        dispatched.notes_root = Some(notes.to_string_lossy().into_owned());
+        let roots = crate::write_posture::unit_admitted_roots(posture, &dispatched, &[]);
+        assert_eq!(
+            roots,
+            vec![notes.clone()],
+            "the notes root is the only admitted root"
+        );
+        assert!(
+            !notes.starts_with(&tree),
+            "the notes root is outside the tree"
+        );
+        let w = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let in_tree = w(&tree.join("src").join("app.ts"));
+        for tool in ["Write", "Edit", "NotebookEdit"] {
+            let ctx = serde_json::json!({ "path": in_tree, "file_path": in_tree });
+            assert!(
+                crate::gate_hook::phase_scope_denial(
+                    false, posture, &ctx, tool, &tree, None, &roots
+                )
+                .is_some(),
+                "{tool} into the tree is refused with the notes root armed"
+            );
+        }
+        for cmd in [
+            format!("echo x > {in_tree}"),
+            format!("mkdir -p {}", w(&tree.join("evidence"))),
+        ] {
+            let ctx = serde_json::json!({ "command": cmd });
+            assert!(
+                crate::gate_hook::phase_scope_denial(
+                    false, posture, &ctx, "Bash", &tree, None, &roots
+                )
+                .is_some(),
+                "a shell write into the tree is refused with the notes root armed: {cmd}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+
         let text = step.instructions.as_deref().unwrap();
         for must in [
             "READ-ONLY",
@@ -1501,9 +1550,18 @@ mod tests {
             "graph path",
             "is not indexed",
             "Index this repository",
+            "only when no code graph is bound",
+            "finds nothing for a symbol",
+            "keep using the graph",
         ] {
             assert!(text.contains(must), "analyze instructions name `{must}`");
         }
+        // The instructions never promise more than the boundary enforces (xreview on #1136).
+        assert!(!text.contains("every write is refused"), "{text}");
+        assert!(
+            text.contains("every write to the code is refused"),
+            "{text}"
+        );
     }
 
     /// WT-C1 (N5, dormant): no built-in preset references the walkthrough entries — a walkthrough
