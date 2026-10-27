@@ -232,6 +232,27 @@ Two release tracks share this file, newest entry first regardless of track:
 ### Fixed
 
 - Stabilize the queued-seat timing test under CI runner load (#1126).
+- **An honest "no change" answer to a red floor is accepted, and the automatic round says how to give it
+  (core#1142).** On rig run 85ddad0d the creator's automatic floor round named three load flakes in
+  another crate as "THIS change's" and said "fix those". The worker correctly changed nothing and said
+  why, but it did not open a line with `NO CHANGE NEEDED`, so the substance floor refused it. The run
+  parked at a card with no approve, and the floor re-ran for 42 min on the unchanged tree. Now:
+  - `NO CHANGE NEEDED` is read anywhere in a line, in any case, as whole words ("The failures are not
+    caused by this change — no change needed"). It is not read when the words just before it negate it
+    or make it conditional (`cannot`, `couldn't`, `not`, `if`, `unless`, `would`, …), when its sentence
+    quotes it as an instruction (`reply with`), when something other than a separator or a reason
+    (`because`, `since`) follows it (`NO CHANGE NEEDED would be false: …`, `… NEEDED? No: …`), or when it
+    is fused into a longer word.
+  - When the unit's own floor already ran, FAILED and named its failing tests, a worded reply that leaves
+    the tree unchanged is a no-change answer even without the marker (core#1113 did this for an
+    all-base-red floor only). A reply that names the marker only to negate or quote it is not one. The
+    floor's carried verdict then opens the floor's own escalation, where the operator can approve as their
+    own judgment, with no re-run.
+  - An all-base-red floor takes no automatic round: there is nothing to fix, so the escalation opens at
+    once.
+  - The head-only round's note says the failures "may be" the change's. It tells the worker to fix the
+    ones its change caused, and to change nothing and say NO CHANGE NEEDED with the reason when a failure
+    is outside its change or load-sensitive. The fallback note says the same.
 - **A Finder-opened state home no longer refuses every worker launch.** Opening `~/.wicked-crew` in
   macOS Finder creates `.DS_Store`, and the state-home check then refused the launch with
   `state-home.unregistered … .DS_Store …`. OS metadata — `.DS_Store`, `._*` (AppleDouble),
