@@ -352,7 +352,7 @@ pub fn settle(worktree: &Path) -> WaitOutcome {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The overwhelming common case: nothing backgrounded, one table read, no waiting.
@@ -507,9 +507,30 @@ mod tests {
         );
     }
 
+    /// Whether this process may not run `ps` at all: a setuid binary under a sandbox (the repo-checks
+    /// floor) fails to exec with EPERM. ONLY that refusal counts — any other failure still fails the
+    /// test that hits it. Production is untouched: an unreadable table stays `None`/unknown.
+    #[cfg(unix)]
+    pub(crate) fn ps_exec_denied() -> bool {
+        // spawn-audit: test-only — a no-argument capability probe of `ps`.
+        match std::process::Command::new("ps")
+            .arg("-o")
+            .arg("pid=")
+            .output()
+        {
+            // EPERM (1) only: EACCES (a `ps` that lost its execute bit) still fails the test.
+            Err(e) => e.raw_os_error() == Some(1),
+            Ok(_) => false,
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_counter_does_not_count_itself() {
+        if ps_exec_denied() {
+            eprintln!("SKIP: `ps` cannot run here (EPERM — setuid binary under a sandbox)");
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("wicked-outstanding-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let n = outstanding_in(&dir).expect("the process table is readable in tests");
@@ -592,6 +613,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn core_936_a_registered_bridge_is_not_counted_while_registered() {
+        if ps_exec_denied() {
+            eprintln!("SKIP: `ps` cannot run here (EPERM — setuid binary under a sandbox)");
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("wicked-936-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // `read` is a shell builtin, so the shell is the only process (no grandchild to leak); it
