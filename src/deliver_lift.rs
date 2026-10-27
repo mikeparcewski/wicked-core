@@ -1474,6 +1474,7 @@ pub(crate) fn lift_and_reverify(
                         ord,
                         attempt,
                         tree: now.tree.clone(),
+                        phase: None,
                     },
                 );
                 // The result's identity, so an operator's override of it at this gate is keyed

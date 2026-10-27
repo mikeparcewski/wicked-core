@@ -175,7 +175,18 @@ const TEST_FAILS_ON_BROKEN: &str = r#"["sh", "-c", "test ! -f BROKEN"]"#;
 /// host-load factor, at most 9 s — the bound scales with load, so the fast `lint` beside it
 /// still finishes); every later run (a marker under the checks' own HOME, which persists in the run's
 /// scratch) finishes at once.
-const TEST_SLOW_ONCE: &str = r#"["sh", "-c", "test -f \"$HOME/.slow-done\" && exit 0; : > \"$HOME/.slow-done\"; sleep 600"]"#;
+/// A `test` that hangs until `marker` exists, then passes. The TEST creates the marker once the
+/// first floor has timed out: a check cannot leave it itself, because every creator floor runs on a
+/// fresh clean checkout with its own scratch `HOME` (core#1144), so nothing a check writes outlives
+/// its floor.
+fn test_slow_until(marker: &std::path::Path) -> String {
+    serde_json::json!([
+        "sh",
+        "-c",
+        format!("test -f '{}' && exit 0; sleep 600", marker.display())
+    ])
+    .to_string()
+}
 
 /// A throwaway repo whose checks are `.wicked/checks.json` shell commands: `lint` always passes,
 /// `test` is `test_argv`. `markers` are committed files the seat keys on.
@@ -535,9 +546,17 @@ fn an_approve_retry_that_changes_nothing_re_runs_the_floor_once() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// The fix's `test` check of a FLAKY repo: fails its first run, passes every later one (a marker
-/// under the checks' own HOME, which persists in the run's scratch).
-const TEST_FAILS_ONCE: &str = r#"["sh", "-c", "test -f \"$HOME/.failed-once\" && exit 0; : > \"$HOME/.failed-once\"; exit 1"]"#;
+/// The fix's `test` check of a FLAKY repo: fails until `marker` exists, then passes. The TEST
+/// creates the marker after the first floor failed: since core#1144 every creator floor runs on a
+/// fresh clean checkout with its own scratch `HOME`, so nothing a check writes outlives its floor.
+fn test_fails_until(marker: &std::path::Path) -> String {
+    serde_json::json!([
+        "sh",
+        "-c",
+        format!("test -f '{}' && exit 0; exit 1", marker.display())
+    ])
+    .to_string()
+}
 
 /// The flaky shape (run a74f51ac): the floor failed once on a tree, the automatic rework changed
 /// nothing and carried it, so no retry could ever clear it. Now the operator's retry re-runs the
@@ -545,7 +564,12 @@ const TEST_FAILS_ONCE: &str = r#"["sh", "-c", "test -f \"$HOME/.failed-once\" &&
 /// proceeds to verify.
 #[test]
 fn an_operator_retry_clears_a_flaky_floor_on_an_unchanged_tree() {
-    let repo = make_repo("ap-flaky", TEST_FAILS_ONCE, 60, &[]);
+    let marker = std::env::temp_dir().join(format!(
+        "wicked-core-floorgate-ap-flaky-{}-failed-once",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let repo = make_repo("ap-flaky", &test_fails_until(&marker), 60, &[]);
     let (core, ran) = core_for("ap-flaky", Rework::ChangesNothing);
     let sid = "fg-ap-flaky";
     let events = launch(&core, "ap-flaky", &repo, sid);
@@ -555,6 +579,8 @@ fn an_operator_retry_clears_a_flaky_floor_on_an_unchanged_tree() {
         return;
     }
     automatic_rework_reused_the_floor(&first);
+    // The flake is over: the operator's retry is the run that passes.
+    std::fs::write(&marker, "").unwrap();
     core.confirm_gate(
         sid,
         HumanDecision::Approve {
@@ -624,7 +650,12 @@ fn a_rework_that_repairs_the_tree_re_runs_the_floor() {
 /// a host with no OS write boundary.
 type TimedOut = (Core, std::sync::mpsc::Receiver<CoreEvent>, Ran, PathBuf);
 fn timed_out_fix(name: &str, sid: &str) -> Option<TimedOut> {
-    let repo = make_repo(name, TEST_SLOW_ONCE, 3, &[]);
+    let marker = std::env::temp_dir().join(format!(
+        "wicked-core-floorgate-{name}-{}-slow-done",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let repo = make_repo(name, &test_slow_until(&marker), 3, &[]);
     let (core, ran) = core_for(name, Rework::ChangesNothing);
     let events = launch(&core, name, &repo, sid);
     let first = until_settled(&events, sid);
@@ -634,6 +665,8 @@ fn timed_out_fix(name: &str, sid: &str) -> Option<TimedOut> {
     }
     let f = floors(&first, 3);
     assert_eq!(f.last().map(|x| x.1.as_str()), Some("timed_out"), "{f:?}");
+    // The slow check finishes from now on: the operator's re-run is the one that passes.
+    std::fs::write(&marker, "").unwrap();
     Some((core, events, ran, repo))
 }
 
