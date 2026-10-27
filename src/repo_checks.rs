@@ -1128,28 +1128,39 @@ impl RepoChecksReport {
     }
 
     /// (j4-gates) The denying checks' failing tests split against the run base, from the floor's
-    /// structured results ([`CheckRun::failure_ids`] of the deciding run — the identical retry's
-    /// when it named any, else the first run's — against the base run's failure ids and the base's
-    /// own failing inventory). `None` when no denying check named a failing test (a lint, a type
-    /// error, a timeout: the tail is all there is).
+    /// structured results (every [`CheckRun::failure_ids`] the check's head runs named — first
+    /// run, excluded run, identical retry — against the base run's failure ids and the base's own
+    /// failing inventory). `all_base_red` needs the deciding (last) run of every denying check to
+    /// have finished with an exit code and named its failures. `None` when no denying check named
+    /// a failing test (a lint, a type error, a timeout: the tail is all there is).
     pub fn failure_split(&self) -> Option<FailureSplit> {
         let mut split = FailureSplit::default();
         let mut named_any = false;
         let mut every_check_known = true;
         for c in self.checks.iter().filter(|c| c.denies()) {
-            let deciding = c
-                .reruns
-                .last()
-                .filter(|r| !r.failure_ids.is_empty())
-                .unwrap_or(c);
+            // The deciding run is the LAST one the decision made, whether or not it printed ids.
+            // It is a complete account only when it ran to an exit code and named its failures; a
+            // timed-out, crashed or unnamed run may hide a failure of the change's own (xreview).
+            let deciding = c.reruns.last().unwrap_or(c);
+            let deciding_complete = !deciding.failure_ids.is_empty()
+                && deciding.exit_code.is_some()
+                && !deciding.timed_out
+                && deciding.spawn_error.is_none()
+                && !c.did_not_finish();
+            if !deciding_complete {
+                every_check_known = false;
+            }
+            // Every failure any head run of this check named (first run, excluded run, retry):
+            // a failure the head showed once is never dropped because a later run named nothing.
             let mut head: Vec<&str> = Vec::new();
-            for id in &deciding.failure_ids {
-                if !head.contains(&id.as_str()) {
-                    head.push(id.as_str());
+            for run in std::iter::once(c).chain(c.reruns.iter()) {
+                for id in &run.failure_ids {
+                    if !head.contains(&id.as_str()) {
+                        head.push(id.as_str());
+                    }
                 }
             }
             if head.is_empty() {
-                every_check_known = false;
                 continue;
             }
             named_any = true;
@@ -11104,5 +11115,35 @@ mod failure_split_tests {
         );
         // No names (a lint, a type error): nothing to split.
         assert!(red_report(&[], Some(&["x"])).failure_split().is_none());
+    }
+
+    /// (xreview) A run that printed a base failure and then hung is not a complete account: the
+    /// split lists the shared failure but never says "none of them is this change's".
+    #[test]
+    fn a_timed_out_run_with_partial_names_is_never_all_base_red() {
+        let mut r = red_report(&["test b::shared"], Some(&["test b::shared"]));
+        r.checks[0].timed_out = true;
+        r.checks[0].exit_code = None;
+        let s = r.failure_split().unwrap();
+        assert_eq!(s.base_shared, 1);
+        assert!(!s.all_base_red, "{s:?}");
+        assert!(!r.denial_reason().contains("none of them is this change's"));
+    }
+
+    /// (xreview) An excluded run named a head-only failure and the retry after it named nothing:
+    /// the head-only failure is still named, and the split is not "all base red".
+    #[test]
+    fn an_unnamed_retry_never_erases_a_head_only_failure_an_earlier_run_named() {
+        let mut r = red_report(&["test b::shared"], Some(&["test b::shared"]));
+        let mut excluded = r.checks[0].clone();
+        excluded.decision = None;
+        excluded.base = None;
+        excluded.failure_ids = vec!["test a::mine".to_string()];
+        let mut retry = excluded.clone();
+        retry.failure_ids = Vec::new();
+        r.checks[0].reruns = vec![excluded, retry];
+        let s = r.failure_split().unwrap();
+        assert_eq!(s.head_only, vec!["test: test a::mine".to_string()], "{s:?}");
+        assert!(!s.all_base_red, "{s:?}");
     }
 }
