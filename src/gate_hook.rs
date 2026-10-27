@@ -3081,7 +3081,7 @@ fn sed_script_reads_only(script: &str) -> bool {
         Some(rest)
     }
     let commands: Vec<&str> = script
-        .split(|c| c == ';' || c == '\n')
+        .split([';', '\n'])
         .map(str::trim)
         .filter(|c| !c.is_empty())
         .collect();
