@@ -3291,7 +3291,23 @@ fn run_unit_and_judge_on(
                 }
                 _ => None,
             };
-            let report = with_floor_heartbeat(
+            // (core#1144) The CREATOR floor runs on a clean checkout of the tree the seat left
+            // too, whenever that tree and the pinned git dir are known — so its results are as
+            // trustworthy as the verify floor's, and the verify floor of the same tree and base
+            // reuses them instead of running the same checks again. A checkout that cannot be made
+            // falls back to the live worktree (the creator floor's historical place, unkeyed and
+            // never reused); the verify floor stays fail-closed.
+            let creator_tree = (stage == crate::repo_checks::FloorStage::Creator)
+                .then_some(current_tree.as_deref())
+                .flatten();
+            let phase = input.unit.phase_id().map(str::to_string);
+            let journal_for = |tree: &str| crate::repo_checks::FloorJournal {
+                ord: input.unit.ord,
+                attempt: input.attempt,
+                tree: tree.to_string(),
+                phase: phase.clone(),
+            };
+            let (report, ran_on) = with_floor_heartbeat(
                 emit_delta,
                 &format!(
                     "repo checks floor ({}): running the repository's own checks",
@@ -3299,44 +3315,61 @@ fn run_unit_and_judge_on(
                 ),
                 FLOOR_HEARTBEAT_EVERY,
                 || {
-                    match (guarded, guard_tree, git_dir) {
-                        (true, Some(tree), Some(git_dir)) => {
-                            match crate::repo_checks::checkout_guarded_tree(
-                                wd,
-                                std::path::Path::new(git_dir),
-                                tree,
-                                &format!("{}-{}-a{}", input.run_id, input.unit.ord, input.attempt),
-                            ) {
-                                Ok(checkout) => checkout.run_floor_journaled(
-                                    &ctx,
-                                    floor_rerun,
-                                    &crate::repo_checks::FloorJournal {
-                                        ord: input.unit.ord,
-                                        attempt: input.attempt,
-                                        tree: tree.to_string(),
-                                    },
-                                ),
-                                Err(why) => {
-                                    crate::repo_checks::guarded_checkout_refused(wd, &ctx, &why)
-                                }
+                    let checkout = |tree: &str, git_dir: &str| {
+                        crate::repo_checks::checkout_guarded_tree(
+                            wd,
+                            std::path::Path::new(git_dir),
+                            tree,
+                            &format!("{}-{}-a{}", input.run_id, input.unit.ord, input.attempt),
+                        )
+                    };
+                    match (guarded, guard_tree, creator_tree, git_dir) {
+                        (true, Some(tree), _, Some(git_dir)) => match checkout(tree, git_dir) {
+                            Ok(checkout) => (
+                                checkout.run_floor_journaled(&ctx, floor_rerun, &journal_for(tree)),
+                                Some(tree),
+                            ),
+                            Err(why) => (
+                                crate::repo_checks::guarded_checkout_refused(wd, &ctx, &why),
+                                None,
+                            ),
+                        },
+                        (false, _, Some(tree), Some(git_dir)) => match checkout(tree, git_dir) {
+                            Ok(checkout) => (
+                                checkout.run_floor_journaled(&ctx, floor_rerun, &journal_for(tree)),
+                                Some(tree),
+                            ),
+                            Err(why) => {
+                                eprintln!(
+                                    "wicked-core: repo checks floor (creator) for unit {}: the \
+                                     tree could not be checked out clean ({why}); the checks run \
+                                     in the live worktree, and the verify floor will not reuse \
+                                     them",
+                                    input.unit.ord
+                                );
+                                (
+                                    crate::repo_checks::run_floor_journaled(
+                                        wd,
+                                        &ctx,
+                                        floor_rerun,
+                                        Some(&journal_for(tree)),
+                                    ),
+                                    None,
+                                )
                             }
-                        }
+                        },
                         // No guard tree (a repo-less run: no git, no snapshot) — there is
                         // no guarded tree to check out, so the floor stays where the run is.
                         // (J4) Journaled on the tree the worktree holds now, so a floor a
                         // daemon restart interrupts resumes on the same tree.
-                        _ => crate::repo_checks::run_floor_journaled(
-                            wd,
-                            &ctx,
-                            floor_rerun,
-                            current_tree
-                                .as_ref()
-                                .map(|tree| crate::repo_checks::FloorJournal {
-                                    ord: input.unit.ord,
-                                    attempt: input.attempt,
-                                    tree: tree.clone(),
-                                })
-                                .as_ref(),
+                        _ => (
+                            crate::repo_checks::run_floor_journaled(
+                                wd,
+                                &ctx,
+                                floor_rerun,
+                                current_tree.as_deref().map(journal_for).as_ref(),
+                            ),
+                            None,
                         ),
                     }
                 },
@@ -3350,11 +3383,8 @@ fn run_unit_and_judge_on(
             // deliver, and only there, when all three are unchanged. Only a GUARDED floor is
             // keyed: it ran on a clean checkout of exactly that tree, as deliver's own floor does;
             // a floor on the live worktree (an untracked or ignored file could have steered it)
-            // is never stood on in place of a clean one (xreview r1).
-            let ran_on = match (guarded, guard_tree, git_dir) {
-                (true, Some(tree), Some(_)) => Some(tree),
-                _ => None,
-            };
+            // is never stood on in place of a clean one (xreview r1). The creator floor's key
+            // carries the creator stage in its check-set digest, so deliver never stands on it.
             report.key = report.key_for(ran_on, &ctx);
             eprintln!(
                 "wicked-core: repo checks floor ({}) for unit {}: {} — {}",

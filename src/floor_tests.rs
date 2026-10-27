@@ -3810,6 +3810,7 @@ fn a_floor_a_restart_interrupted_resumes_running_only_the_unfinished_checks() {
         ord: 6,
         attempt: 9,
         tree: tree.to_string(),
+        phase: None,
     };
     let resumed = run_floor_journaled(&repo, &ctx, None, Some(&j));
     assert!(resumed.passed, "{resumed:#?}");
@@ -3869,6 +3870,7 @@ fn an_interrupted_floor_on_another_tree_restarts_and_says_so() {
         ord: 6,
         attempt: 9,
         tree: "2222222222222222222222222222222222222222".to_string(),
+        phase: None,
     };
     let r = run_floor_journaled(&repo, &ctx, None, Some(&j));
     assert_eq!((runs_of(&repo, "lint"), runs_of(&repo, "test")), (2, 2));
@@ -3912,6 +3914,7 @@ fn an_operator_rerun_ignores_an_interrupted_floors_journal() {
         ord: 6,
         attempt: 9,
         tree: tree.to_string(),
+        phase: None,
     };
     let r = run_floor_journaled(&repo, &ctx, Some(&rerun), Some(&j));
     assert!(r.resumed.is_none());
@@ -4281,6 +4284,7 @@ fn journal_offering(tag: &str, entries: &[(&str, Vec<crate::floor_log::LogRef>)]
         ord: 2,
         attempt: 5,
         tree: tree.to_string(),
+        phase: None,
     };
     let open = OpenJournal::open(&logs, &j, key, true);
     assert!(open.resume.as_ref().is_some_and(|r| r.restarted.is_none()));
@@ -4387,6 +4391,7 @@ fn a_check_that_changed_the_guarded_tree_is_never_journaled() {
             ord: 3,
             attempt: 1,
             tree: snap.tree.clone(),
+            phase: None,
         };
         let r = checkout.run_floor_journaled(&ctx, None, &j);
         if r.sandbox_error.is_some() || r.checks.is_empty() {
@@ -4415,4 +4420,163 @@ fn a_check_that_changed_the_guarded_tree_is_never_journaled() {
         drop(checkout);
         let _ = std::fs::remove_dir_all(&wt);
     }
+}
+
+/// (core#1144) The verify floor reuses the checks the guarded creator floor already ran on the
+/// same tree against the same base, and says so ("checks reused from fix"); a check only verify
+/// runs (`e2e`) still runs. Each check prints a fresh nonce, so a reused result carries the
+/// creator's nonce and a fresh run does not. Another base, or a creator floor on the live
+/// worktree (no clean checkout, so no record), reuses nothing.
+#[cfg(unix)]
+#[test]
+fn core_1144_verify_reuses_the_guarded_creator_floor_of_the_same_tree_and_base() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let nonce = [
+        "sh",
+        "-c",
+        "echo nonce-$$-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')",
+    ];
+    let wt = scratch("core-1144-reuse");
+    std::fs::write(wt.join("app.txt"), "v1\n").unwrap();
+    std::fs::write(wt.join(".gitignore"), "tmp/\n").unwrap();
+    std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+    std::fs::write(
+        wt.join(CONFIG_PATH),
+        serde_json::json!({
+            "typecheck": false,
+            "lint": nonce,
+            "test": nonce,
+            "e2e": nonce,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let base = git_repo_with_commit(&wt);
+    let git_dir = PathBuf::from(git(&wt, &["rev-parse", "--absolute-git-dir"]));
+    let snap = crate::worktree_guard::snapshot_through(&wt, &git_dir).expect("snapshot");
+    let run_id = format!("core-1144-{}", std::process::id());
+    let ctx = |stage: FloorStage, base: &str| FloorContext {
+        stage,
+        base_head: Some(base.to_string()),
+        git_dir: Some(git_dir.clone()),
+        run_id: Some(run_id.clone()),
+        ..FloorContext::default()
+    };
+    let journal = |ord: u32, phase: &str| FloorJournal {
+        ord,
+        attempt: 1,
+        tree: snap.tree.clone(),
+        phase: Some(phase.to_string()),
+    };
+    let stdout_of = |r: &RepoChecksReport, name: &str| {
+        r.checks
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.stdout_tail.clone())
+            .unwrap_or_else(|| panic!("`{name}` ran: {r:#?}"))
+    };
+
+    // The creator floor on a clean checkout of the tree the seat left.
+    let creator = {
+        let checkout = checkout_guarded_tree(&wt, &git_dir, &snap.tree, "c1144-fix").unwrap();
+        checkout.run_floor_journaled(&ctx(FloorStage::Creator, &base), None, &journal(4, "fix"))
+    };
+    if creator.sandbox_error.is_some() || creator.checks.is_empty() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
+    }
+    assert!(creator.passed, "{creator:#?}");
+    assert!(
+        creator.checks.iter().all(|c| c.name != "e2e"),
+        "e2e is a verify-stage check: {creator:#?}"
+    );
+
+    // The verify floor on the same tree and base: lint and test are the creator's, e2e runs.
+    let verify = {
+        let checkout = checkout_guarded_tree(&wt, &git_dir, &snap.tree, "c1144-verify").unwrap();
+        checkout.run_floor_journaled(&ctx(FloorStage::Verify, &base), None, &journal(6, "verify"))
+    };
+    assert!(verify.passed, "{verify:#?}");
+    let reuse = verify
+        .reused_from
+        .clone()
+        .expect("verify reused the creator floor");
+    assert_eq!(
+        reuse,
+        FloorReuse {
+            phase: Some("fix".into()),
+            ord: 4,
+            attempt: 1,
+            reused: vec!["lint".into(), "test".into()],
+        }
+    );
+    for name in ["lint", "test"] {
+        assert_eq!(
+            stdout_of(&verify, name),
+            stdout_of(&creator, name),
+            "`{name}` reused"
+        );
+    }
+    assert!(stdout_of(&verify, "e2e").contains("nonce-"), "e2e ran here");
+    let note = verify.classification_note().unwrap_or_default();
+    assert!(
+        note.contains("checks reused from fix (unit 4, attempt 1): lint, test ran there"),
+        "the gate's floor note says where the checks came from: {note}"
+    );
+    // The floor log's own line for a reused check.
+    let record: CreatorFloorRecord = serde_json::from_str(
+        &std::fs::read_to_string(creator_record_path(
+            &CheckScratch::prepare_for(&wt, Some(&run_id)).unwrap().logs,
+            &snap.tree,
+            &base,
+        ))
+        .expect("the creator floor left its record in the run's log store"),
+    )
+    .unwrap();
+    let seed = CreatorSeed {
+        record,
+        reused: Vec::new(),
+    };
+    let test_run = verify.checks.iter().find(|c| c.name == "test").unwrap();
+    assert_eq!(
+        seed.log_line(test_run),
+        "wicked-core: repo checks floor — `test` passed on this same tree and base at fix (unit \
+         4, attempt 1); checks reused from that floor, not run again"
+    );
+
+    // Another base (a real commit of the same tree): nothing is reused, every check runs fresh.
+    let other = git(&wt, &["commit-tree", "HEAD^{tree}", "-m", "another base"]);
+    assert_ne!(other, base);
+    let other_base = {
+        let checkout = checkout_guarded_tree(&wt, &git_dir, &snap.tree, "c1144-other").unwrap();
+        checkout.run_floor_journaled(
+            &ctx(FloorStage::Verify, &other),
+            None,
+            &journal(6, "verify"),
+        )
+    };
+    assert!(other_base.reused_from.is_none(), "{other_base:#?}");
+    assert_ne!(stdout_of(&other_base, "test"), stdout_of(&creator, "test"));
+
+    // A creator floor on the LIVE worktree leaves no record: a later verify floor of another run
+    // (its own log store) reuses nothing.
+    let live_run = format!("core-1144-live-{}", std::process::id());
+    let live_ctx = |stage| FloorContext {
+        run_id: Some(live_run.clone()),
+        ..ctx(stage, &base)
+    };
+    let _ = run_floor_journaled(
+        &wt,
+        &live_ctx(FloorStage::Creator),
+        None,
+        Some(&journal(4, "fix")),
+    );
+    let after_live = {
+        let checkout = checkout_guarded_tree(&wt, &git_dir, &snap.tree, "c1144-live").unwrap();
+        checkout.run_floor_journaled(&live_ctx(FloorStage::Verify), None, &journal(6, "verify"))
+    };
+    assert!(after_live.reused_from.is_none(), "{after_live:#?}");
+    let _ = std::fs::remove_dir_all(&wt);
 }

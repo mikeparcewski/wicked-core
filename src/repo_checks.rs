@@ -763,6 +763,11 @@ pub struct RepoChecksReport {
     /// `None` for a floor that resumed nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumed: Option<FloorResume>,
+    /// (core#1144) The checks this VERIFY floor took from the creator floor that already ran them
+    /// on the same guarded tree against the same base ([`CreatorFloorRecord`]), instead of running
+    /// them again. `None` when it reused nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reused_from: Option<FloorReuse>,
 }
 
 /// (J4) A floor's journal identity: the unit whose floor it is, the attempt running it and the tree
@@ -775,6 +780,9 @@ pub struct FloorJournal {
     pub ord: u32,
     pub attempt: u32,
     pub tree: String,
+    /// (core#1144) The unit's phase (`fix`, `verify`, …), named when a later floor reuses this
+    /// one's results ([`FloorReuse::note`]). `None` when the caller does not know it.
+    pub phase: Option<String>,
 }
 
 /// The check that provisions the tree's dependencies: never reused from a journal.
@@ -819,6 +827,219 @@ impl FloorResume {
             )
             }
         }
+    }
+}
+
+/// (core#1144) What a verify floor took from the creator floor of the same tree
+/// ([`RepoChecksReport::reused_from`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FloorReuse {
+    /// The creator unit's phase (`fix`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// The creator unit and the attempt whose floor ran the reused checks.
+    pub ord: u32,
+    pub attempt: u32,
+    /// The checks reused, in run order.
+    pub reused: Vec<String>,
+}
+
+impl FloorReuse {
+    /// The operator's sentence for the gate's `floorNote`.
+    pub fn note(&self) -> String {
+        format!(
+            "checks reused from {} (unit {}, attempt {}): {} ran there on this same tree, against \
+             the same base, with the same command and bound, on a clean checkout — not run again \
+             here; the rest ran",
+            self.phase.as_deref().unwrap_or("the creator floor"),
+            self.ord,
+            self.attempt,
+            self.reused.join(", "),
+        )
+    }
+}
+
+/// (core#1144) A GUARDED creator floor's finished checks, kept in the run's log store (outside
+/// every sandbox write root, so no check can plant one) for the verify floor of the same tree. One
+/// record per tree and base: a later creator floor of that tree replaces it. A verify floor reuses
+/// a check from it only when the tree, the base, the check's directory, name, argv and bound, the
+/// boundary posture and the exclusion switch all match, and the check finished there with its
+/// evidence whole — the same rule a resumed journal follows ([`reusable_run`]).
+#[derive(Debug, Serialize, Deserialize)]
+struct CreatorFloorRecord {
+    floor_policy: u32,
+    tree: String,
+    base: String,
+    ord: u32,
+    attempt: u32,
+    #[serde(default)]
+    phase: Option<String>,
+    sandbox_level: String,
+    exclude: bool,
+    #[serde(default)]
+    checks: Vec<CreatorEntry>,
+}
+
+/// One finished check of a [`CreatorFloorRecord`]: the detected check (with its configured bound)
+/// and its run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CreatorEntry {
+    dir: String,
+    name: String,
+    argv: Vec<String>,
+    #[serde(default)]
+    timeout_s: Option<u64>,
+    run: CheckRun,
+}
+
+/// The creator-floor record of `tree` measured against `base` in the run's log store.
+fn creator_record_path(logs: &Path, tree: &str, base: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for part in [tree, base] {
+        h.update(part.as_bytes());
+        h.update([0u8]);
+    }
+    let key: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    logs.join(format!("creator-floor-{key}.json"))
+}
+
+/// Write `record` to its place in the run's log store (write-then-rename: whole or absent).
+fn write_creator_record(logs: &Path, record: &CreatorFloorRecord) {
+    let Ok(json) = serde_json::to_string(record) else {
+        return;
+    };
+    let path = creator_record_path(logs, &record.tree, &record.base);
+    let _ = std::fs::create_dir_all(logs);
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Pair each check that ran with the detected check it ran for (`checks` is a run-order
+/// subsequence of `detected`: skipped checks are absent, nothing is reordered).
+fn entries_of(detected: &[RepoCheck], checks: &[CheckRun]) -> Vec<CreatorEntry> {
+    let mut out = Vec::new();
+    let mut d = detected.iter();
+    for run in checks {
+        if let Some(check) = d.by_ref().find(|c| c.name == run.name) {
+            out.push(CreatorEntry {
+                dir: check.dir.clone(),
+                name: check.name.clone(),
+                argv: check.argv.clone(),
+                timeout_s: check.timeout_s,
+                run: run.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Did `run` FINISH as the declared `check` (not the guide's `affected` subset, not a timeout,
+/// not a spawn or could-not-run failure) with every log it names still whole in `logs`? Only such
+/// a result stands in for running the check again. The `install` check never does: its receipt is
+/// not its output (`node_modules`, a venv), and a guarded floor runs on a fresh checkout.
+fn reusable_run(check: &RepoCheck, run: &CheckRun, logs: &Path) -> bool {
+    check.name != PROVISIONING_CHECK && run.argv == check.argv && finished_whole(run, logs)
+}
+
+/// Did `run` finish (not a timeout, not a spawn or could-not-run failure, a decision recorded)
+/// with every log it names — its own streams, its decision's, its retries' and its base run's —
+/// still whole in `logs` (each blob's age restarts)?
+fn finished_whole(run: &CheckRun, logs: &Path) -> bool {
+    let finished = !run.did_not_finish()
+        && run.spawn_error.is_none()
+        && run.decision.is_some()
+        && outcome_of(run) != Some(OUTCOME_COULD_NOT_RUN);
+    let mut refs: Vec<&crate::floor_log::LogRef> = Vec::new();
+    fn collect<'a>(r: &'a CheckRun, out: &mut Vec<&'a crate::floor_log::LogRef>) {
+        out.extend(r.logs.iter());
+        // The decision's own streams (the base inventory, each failing test's confirmation)
+        // justify a `pass_excluded`; a decision whose evidence is gone is not reused (xreview).
+        if let Some(d) = &r.decision {
+            out.extend(d.log_refs.iter());
+        }
+        for x in &r.reruns {
+            collect(x, out);
+        }
+        if let Some(run) = r.base.as_ref().and_then(|b| b.run.as_ref()) {
+            collect(run, out);
+        }
+    }
+    collect(run, &mut refs);
+    finished
+        && refs
+            .iter()
+            .all(|l| crate::floor_log::refresh(logs, l).is_ok())
+}
+
+/// The creator floor's checks a verify floor on the same tree and base may take
+/// ([`CreatorFloorRecord`]); `None` when there is no record, or one of another engine version,
+/// boundary posture or exclusion switch.
+struct CreatorSeed {
+    record: CreatorFloorRecord,
+    reused: Vec<String>,
+}
+
+impl CreatorSeed {
+    fn load(
+        logs: &Path,
+        tree: &str,
+        base: &str,
+        sandbox_level: &str,
+        exclude: bool,
+    ) -> Option<Self> {
+        let raw = std::fs::read_to_string(creator_record_path(logs, tree, base)).ok()?;
+        let record: CreatorFloorRecord = serde_json::from_str(&raw).ok()?;
+        (record.floor_policy == FLOOR_POLICY_VERSION
+            && record.tree == tree
+            && record.base == base
+            && record.sandbox_level == sandbox_level
+            && record.exclude == exclude)
+            .then_some(CreatorSeed {
+                record,
+                reused: Vec::new(),
+            })
+    }
+
+    /// The creator floor's result of `check`, when it ran the identical check (directory, name,
+    /// argv and bound) and that result may be reused ([`reusable_run`]).
+    fn reuse(&mut self, check: &RepoCheck, logs: &Path) -> Option<CheckRun> {
+        let entry = self.record.checks.iter().find(|e| {
+            e.dir == check.dir
+                && e.name == check.name
+                && e.argv == check.argv
+                && e.timeout_s == check.timeout_s
+        })?;
+        if !reusable_run(check, &entry.run, logs) {
+            return None;
+        }
+        self.reused.push(check.name.clone());
+        Some(entry.run.clone())
+    }
+
+    /// The floor log's line for one reused check.
+    fn log_line(&self, run: &CheckRun) -> String {
+        format!(
+            "wicked-core: repo checks floor — `{}` {} on this same tree and base at {} (unit {}, \
+             attempt {}); checks reused from that floor, not run again",
+            run.name,
+            run.outcome(),
+            self.record.phase.as_deref().unwrap_or("the creator floor"),
+            self.record.ord,
+            self.record.attempt,
+        )
+    }
+
+    fn finish(self) -> Option<FloorReuse> {
+        (!self.reused.is_empty()).then_some(FloorReuse {
+            phase: self.record.phase,
+            ord: self.record.ord,
+            attempt: self.record.attempt,
+            reused: self.reused,
+        })
     }
 }
 
@@ -928,30 +1149,7 @@ impl OpenJournal {
             .position(|e| e.dir == check.dir && e.name == check.name && e.argv == check.argv)?;
         let entry = self.prior.remove(at);
         let run = entry.run;
-        let finished = !run.did_not_finish()
-            && run.spawn_error.is_none()
-            && run.decision.is_some()
-            && outcome_of(&run) != Some(OUTCOME_COULD_NOT_RUN);
-        let mut refs: Vec<&crate::floor_log::LogRef> = Vec::new();
-        fn collect<'a>(r: &'a CheckRun, out: &mut Vec<&'a crate::floor_log::LogRef>) {
-            out.extend(r.logs.iter());
-            // The decision's own streams (the base inventory, each failing test's confirmation)
-            // justify a `pass_excluded`; a decision whose evidence is gone is not reused (xreview).
-            if let Some(d) = &r.decision {
-                out.extend(d.log_refs.iter());
-            }
-            for x in &r.reruns {
-                collect(x, out);
-            }
-            if let Some(run) = r.base.as_ref().and_then(|b| b.run.as_ref()) {
-                collect(run, out);
-            }
-        }
-        collect(&run, &mut refs);
-        let whole = refs
-            .iter()
-            .all(|l| crate::floor_log::refresh(logs, l).is_ok());
-        (finished && whole).then(|| {
+        finished_whole(&run, logs).then(|| {
             if let Some(r) = self.resume.as_mut() {
                 r.reused.push(check.name.clone());
             }
@@ -1193,6 +1391,10 @@ impl RepoChecksReport {
         }
         // (J4) A floor that resumed (or had to restart) one a daemon restart interrupted says so.
         if let Some(r) = &self.resumed {
+            notes.push(r.note());
+        }
+        // (core#1144) A verify floor that reused the creator floor's checks says which, and where.
+        if let Some(r) = &self.reused_from {
             notes.push(r.note());
         }
         for c in &self.checks {
@@ -4227,6 +4429,7 @@ fn scratch_refused(
         coverage_note: None,
         key: None,
         resumed: None,
+        reused_from: None,
     }
 }
 
@@ -4330,6 +4533,7 @@ pub(crate) fn run_with_sandbox_ctx(
                     coverage_note: None,
                     key: None,
                     resumed: None,
+                    reused_from: None,
                 };
             }
         }
@@ -4357,6 +4561,7 @@ pub(crate) fn run_with_sandbox_ctx(
                 coverage_note: None,
                 key: None,
                 resumed: None,
+                reused_from: None,
             }
         }
     };
@@ -4384,6 +4589,7 @@ pub(crate) fn run_with_sandbox_ctx(
                     coverage_note: None,
                     key: None,
                     resumed: None,
+                    reused_from: None,
                 }
             }
         },
@@ -4451,6 +4657,7 @@ pub(crate) fn run_with_sandbox_ctx(
     let mut failed = false;
     // (J4) The ordinary floor keeps a journal (a re-run's or a waiver's check set is not the one a
     // later floor would run, so it neither writes nor reads one).
+    let journal_of = journal.filter(|j| rerun.is_none() && waived.is_empty() && !j.tree.is_empty());
     let mut journal = journal
         .filter(|j| rerun.is_none() && waived.is_empty() && !j.tree.is_empty())
         .filter(|_| scratch_error.is_none())
@@ -4462,9 +4669,34 @@ pub(crate) fn run_with_sandbox_ctx(
                 exclude,
             )
         });
+    // (core#1144) The tree an ORDINARY guarded floor runs on (the checkout's probe is present only
+    // there): a creator floor leaves its results for it, a verify floor reuses them. A floor on
+    // the live worktree neither writes nor reads one — an untracked or ignored file there could
+    // have steered it (core#417).
+    let guarded_tree = journal
+        .as_ref()
+        .filter(|_| untouched.is_some())
+        .map(|j| j.record.key.tree.clone());
+    let mut seed = match (ctx.stage, guarded_tree.as_deref(), ctx.base_head.as_deref()) {
+        (FloorStage::Verify, Some(tree), Some(base)) => {
+            CreatorSeed::load(&scratch.logs, tree, base, &sandbox_level, exclude)
+        }
+        _ => None,
+    };
     for check in &detected {
         if failed || scratch_error.is_some() {
             skipped.push(check.name.clone());
+            continue;
+        }
+        if let Some(run) = seed.as_mut().and_then(|s| s.reuse(check, &scratch.logs)) {
+            if let Some(s) = &seed {
+                eprintln!("{}", s.log_line(&run));
+            }
+            failed = run.denies();
+            if let Some(j) = journal.as_mut() {
+                j.record(check, &run, untouched);
+            }
+            checks.push(run);
             continue;
         }
         if let Some(run) = journal.as_mut().and_then(|j| j.reuse(check, &scratch.logs)) {
@@ -4623,6 +4855,35 @@ pub(crate) fn run_with_sandbox_ctx(
         checks.push(run);
     }
     let resumed = journal.and_then(OpenJournal::finish);
+    let reused_from = seed.and_then(CreatorSeed::finish);
+    // (core#1144) A guarded creator floor leaves what it ran for the verify floor of the same tree
+    // and base — only while the checkout still holds exactly that tree (a check that rewrote it
+    // ran on other content), and never for a floor the scratch refused.
+    if let (FloorStage::Creator, Some(tree), Some(base), None, Some(probe), Some(j)) = (
+        ctx.stage,
+        guarded_tree.as_deref(),
+        ctx.base_head.as_deref(),
+        scratch_error.as_ref(),
+        untouched,
+        journal_of,
+    ) {
+        if probe() {
+            write_creator_record(
+                &scratch.logs,
+                &CreatorFloorRecord {
+                    floor_policy: FLOOR_POLICY_VERSION,
+                    tree: tree.to_string(),
+                    base: base.to_string(),
+                    ord: j.ord,
+                    attempt: j.attempt,
+                    phase: j.phase.clone(),
+                    sandbox_level: sandbox_level.clone(),
+                    exclude,
+                    checks: entries_of(&detected, &checks),
+                },
+            );
+        }
+    }
     let claim = judge_claim(ctx, &checks);
     // An engine-written file (absent at detection, present now) is the checks' own side effect —
     // remove it so the guard's final comparison sees the tree the seat left. Never a symlink.
@@ -4665,6 +4926,7 @@ pub(crate) fn run_with_sandbox_ctx(
         coverage_note,
         key: None,
         resumed,
+        reused_from,
     }
 }
 
@@ -5605,6 +5867,7 @@ pub(crate) fn guarded_checkout_refused(
         coverage_note: None,
         key: None,
         resumed: None,
+        reused_from: None,
     }
 }
 
@@ -8534,6 +8797,7 @@ pub(crate) mod tests {
             coverage_note: None,
             key: None,
             resumed: None,
+            reused_from: None,
         };
         let reason = report.denial_reason();
         assert!(
@@ -10571,6 +10835,7 @@ pub(crate) mod tests {
             coverage_note: None,
             key: None,
             resumed: None,
+            reused_from: None,
         };
         let denial = report.denial_reason();
         assert!(
@@ -10844,6 +11109,7 @@ pub(crate) mod tests {
             coverage_note: None,
             key: None,
             resumed: None,
+            reused_from: None,
         };
         assert!(report.timed_out());
         assert_eq!(report.outcome(), "timed_out");
@@ -11709,6 +11975,7 @@ pub(crate) mod tests {
             coverage_note: None,
             key: None,
             resumed: None,
+            reused_from: None,
         }
     }
 

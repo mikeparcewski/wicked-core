@@ -14,6 +14,23 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Verify reuses the fix floor's checks on the same tree and base (core#1144).** The verify floor re-ran
+  the whole repository floor on the tree the fix floor had just checked: on rig run 85ddad0d that was 47
+  min for the same two base-red failures, and on d3a380b0 it was 25 min, with 4 load flakes called
+  "head-only" that had passed on that exact tree at fix. The creator (fix) floor now runs on a clean
+  checkout of the tree the seat left, as the verify floor does. When that checkout cannot be made it runs
+  in the live worktree as before, and nothing reuses it. A finished clean-checkout creator floor leaves
+  its per-check results in the run's floor log store, which is outside every sandbox write root. The
+  verify floor on the same tree, against the same base, under the same boundary posture and exclusion
+  switch, takes from it each check with the identical directory, name, argv and bound that finished there
+  as the declared command, with its logs whole. The guide's `affected` subset, a timeout, a check that
+  could not run, `install` and a check that changed the checkout are never reused. It runs the rest
+  (verify-only checks such as `e2e`, the builds), says so on the gate's floor note ("checks reused from
+  fix (unit 4, attempt 2): lint, test ran there …") and in the floor log, and records
+  `RepoChecksReport.reusedFrom`. The creator floor's override now carries its key. Its check-set digest
+  carries the creator stage, so deliver never stands on it. A reused failure still opens the verify
+  gate for the operator's judgment. Each creator floor now builds on a fresh checkout, so a JS repo
+  also runs its `install` there.
 - **The floor cache keeps a free-disk floor on its volume (core#1138).** The rig's floor cache reached
   25 GB, inside its 40 GB total cap, on a volume 95% full (23 GB free). The cap pass before every floor
   now holds the cache to the smaller of that cap and what keeps the larger of 15% of the cache's volume
