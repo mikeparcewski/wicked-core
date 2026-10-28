@@ -14,6 +14,19 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A failed floor's gate keeps the operator's judgment when QE has no bound verdict, and a no-change floor
+  fix keeps the QE record (core#1153).** On rig run c5320434 (wicked-core, red base) the verify gate offered
+  no "approve as your own judgment" because the isolated QE reviewer's verdict could not be bound, so the
+  only ways on were a skip or a full verify re-run: two extra ~37-min floors after every failure was
+  base-shared. A QE layer with no bound verdict (outcome `invalid`, no verdict: none recorded, no VERDICT
+  line, a stale record) is no FAIL of the work, so it now sits behind a failed floor like an INCONCLUSIVE
+  record: the judgment is offered, labelled "floor overridden by operator", and QE acceptance stays
+  required at delivery, where the operator can skip it with a reason. The gate names it ("QE acceptance
+  has no bound verdict"). A real FAIL still withholds the judgment, and the gate now says why ("Your own
+  judgment is not offered while the QE reviewer's FAIL stands on this step"). A floor fix that made no
+  edit (`NO CHANGE NEEDED`, the same tree) keeps the QE record the review took on that tree instead of
+  marking it stale; a fix that changed the tree still invalidates it.
+
 - **Verify reuses the fix floor's checks in any order (core#1152).** core#1145's reuse was suffix-only:
   no check could run fresh after a reused one. wicked-core's own verify-only core-ts checks run after
   `test`, so its verify floor reused nothing. On rig run c5320434 that meant three verify floors of
