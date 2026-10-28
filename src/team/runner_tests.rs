@@ -742,7 +742,9 @@ fn t5_d_inline_default_judge_excludes_ledger_authors() {
     let _ = std::fs::remove_dir_all(&wd);
 }
 
-/// DES-001 #14 (e): excluding the monitors leaves no eligible seat → `judge_skipped` names them.
+/// DES-001 #14 (e), revised by crew#972: excluding the monitors leaves no eligible seat → a
+/// monitor judges, disclosed as a team-monitor fallback that names them (before crew#972 the
+/// judge was skipped; with the judge required that held the gate for the operator).
 #[test]
 fn t5_d_no_seat_left_after_excluding_the_monitors_names_them() {
     let rig = rig("t5d3");
@@ -765,15 +767,18 @@ fn t5_d_no_seat_left_after_excluding_the_monitors_names_them() {
         None,
         Some(&tr),
     );
-    assert!(verdict.is_none());
     assert!(
-        worker.judges().is_empty(),
-        "no monitor grades its own finding"
+        evidence.judge_skipped.is_none(),
+        "{:?}",
+        evidence.judge_skipped
     );
-    let why = evidence.judge_skipped.expect("the skip is disclosed");
+    let judges = worker.judges();
+    assert_eq!(judges.len(), 1, "one monitor judges");
+    let v = verdict.expect("the monitor ruled");
+    let fb = v.judge_fallback.expect("a monitor judge is disclosed");
     assert!(
-        why.contains("claude#2") && why.contains("claude#3"),
-        "{why}"
+        fb.label.contains("team-monitor fallback") && fb.reason.contains("claude"),
+        "{fb:?}"
     );
     let _ = std::fs::remove_dir_all(&wd);
 }
