@@ -19,12 +19,15 @@ Two release tracks share this file, newest entry first regardless of track:
   (pi) ended its reply on `VERDICT: PASS`, but it recorded no verdict in the ledger ("the engine binds
   this verdict"). The newest verdict on the QE run was still attempt 0's FAIL, so the engine reported
   "the newest verdict … was not recorded by the isolated reviewer session", and crew's delivery check
-  refused on that stale FAIL until the operator skipped QE. Now, when the reviewer's turn ends on a
-  ledger verdict and no verdict on the QE run carries its session nonce, the engine records the reply's
-  verdict itself as canonical JSON. The record is stamped with the nonce, the crew run, the reviewer's seat
+  refused on that stale FAIL until the operator skipped QE. Now, when the reviewer's reply ENDS on a
+  ledger verdict (its last line, not quoted and not in a code fence) and no verdict on the QE run carries
+  its session nonce, the engine records the reply's verdict itself as canonical JSON. When the reviewer
+  did record it, but an earlier verdict is dated at or after it (a skewed seat clock), the engine
+  re-states it. The record is stamped with the nonce, the crew run, the reviewer's seat
   and `recorded_by: wicked-core`, and it is dated after every verdict already on the QE run, so an
-  earlier attempt's verdict never outranks it. The engine also writes the ledger's `index-drift.json`,
-  so wicked-ledger rebuilds its SQLite index on its next open. The binding then runs as before. A PASS
+  earlier attempt's verdict never outranks it, both by time and as text. Before the verdict, the
+  engine writes the ledger's `index-drift.json` (and refuses one that is not a plain file), so
+  wicked-ledger rebuilds its SQLite index on its next open. The binding then runs as before. A PASS
   after an earlier FAIL is bound and delivers, and a FAIL after an earlier PASS is bound and refuses.
   When binding still fails, the reason names the newest verdict (its id, verdict and time) and who
   recorded it: another review session, or a writer outside every review session.

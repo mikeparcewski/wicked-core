@@ -565,6 +565,12 @@ impl StepRunner for Scripted {
             // (core#1162) The 115fabdb reviewer: it ends on its verdict and records none itself.
             "pass-unrecorded" => (StepStatus::Ok, "reviewed\nVERDICT: PASS".to_string()),
             "fail-unrecorded" => (StepStatus::Ok, "reviewed\nVERDICT: FAIL".to_string()),
+            // (xreview codex P2) A reply whose only verdict is one it quotes from the evidence.
+            "quoted-unrecorded" => (
+                StepStatus::Ok,
+                "The executor's evidence contains:\n> VERDICT: PASS\nI cannot judge this evidence."
+                    .to_string(),
+            ),
             "signed-out" => (
                 StepStatus::Failed,
                 "Error: not logged in. Run /login".to_string(),
@@ -1181,7 +1187,7 @@ fn a_reused_qe_run_binds_a_pass_after_an_earlier_fail_and_delivery_reads_it() {
             "{n:?}"
         );
         assert_eq!(
-            got.reason.contains("the engine recorded its reply"),
+            got.reason.contains("the engine recorded the reviewer's reply"),
             by_engine
         );
         assert_eq!(l.root.join(LEDGER_DRIFT_MARKER).is_file(), by_engine);
@@ -1205,29 +1211,82 @@ fn a_reused_qe_run_refuses_on_a_fail_after_an_earlier_pass() {
     }
 }
 
-/// (core#1162) An earlier attempt's verdict never outranks the latest attempt's: even one stamped
-/// later than the host clock (a skewed seat clock) is older than the verdict the engine records.
+/// (core#1162) An earlier attempt's verdict never outranks the latest attempt's: not one stamped
+/// later than the host clock (a skewed seat clock), whether the reviewer recorded its own verdict
+/// (xreview agy P3: the engine re-states it) or not, and (xreview codex P2) not one written
+/// without a fraction, which sorts after `….001Z` as text.
 #[test]
 fn an_earlier_attempts_verdict_never_outranks_the_latest_bound_one() {
-    let (got, l, id) = resumed_review("FAIL", "2099-06-01T00:00:00.000Z", "pass-unrecorded");
-    assert_eq!(got.outcome, OUTCOME_PASS, "{got:?}");
-    let n = newest(&l, &id);
-    assert_eq!(field(&n, "verdict"), Some("PASS"));
-    assert_eq!(field(&n, "created_at"), Some("2099-06-01T00:00:00.001Z"));
+    for (prior_at, want) in [
+        ("2099-06-01T00:00:00.000Z", "2099-06-01T00:00:00.001Z"),
+        ("2099-06-01T00:00:00Z", "2099-06-01T00:00:01.000Z"),
+    ] {
+        for answer in ["pass", "pass-unrecorded"] {
+            let (got, l, id) = resumed_review("FAIL", prior_at, answer);
+            assert_eq!(got.outcome, OUTCOME_PASS, "{answer} {prior_at}: {got:?}");
+            let n = newest(&l, &id);
+            assert_eq!(field(&n, "verdict"), Some("PASS"));
+            assert_eq!(field(&n, "created_at"), Some(want), "{answer}");
+            assert_eq!(field(&n, "recorded_by"), Some("wicked-core"));
+        }
+    }
 }
 
-/// (core#1162) The engine records only a ledger verdict, and never twice for one session.
+/// (xreview codex P2) A reply whose only verdict is quoted evidence is not a reviewer verdict: the
+/// engine records nothing, and the review is invalid.
+#[test]
+fn a_quoted_verdict_is_never_recorded_for_the_reviewer() {
+    let (got, l, id) = resumed_review("FAIL", "2026-10-28T02:26:40.485Z", "quoted-unrecorded");
+    assert_eq!(got.outcome, OUTCOME_INVALID, "{got:?}");
+    assert!(
+        got.reason.contains("does not end on its VERDICT"),
+        "{got:?}"
+    );
+    assert_eq!(
+        verdicts_of(&l.root, &id).unwrap().len(),
+        1,
+        "nothing written"
+    );
+    assert_eq!(
+        terminal_verdict("judged\n\n**VERDICT: PASS**\n\n").as_deref(),
+        Some("PASS")
+    );
+    assert_eq!(terminal_verdict("```\nVERDICT: PASS\n"), None);
+    assert_eq!(terminal_verdict("VERDICT: PASS\nthen more"), None);
+}
+
+/// (xreview agy P2) A drift marker that is not a plain file (a dangling link reads as "no marker"
+/// to wicked-ledger) is refused, and no verdict is written.
+#[cfg(unix)]
+#[test]
+fn a_drift_marker_that_is_not_a_plain_file_refuses_the_write() {
+    let l = Ledger::new("marker");
+    let (id, dir) = l.evidence(RUN, &now_iso());
+    std::os::unix::fs::symlink(l.base.join("nowhere"), l.root.join(LEDGER_DRIFT_MARKER)).unwrap();
+    let e =
+        record_reply_verdict(&l.root, &id, &dir, RUN, "n1", "FAIL", true, "pi", "r").unwrap_err();
+    assert!(e.contains("not a plain file"), "{e}");
+    assert!(verdicts_of(&l.root, &id).unwrap().is_empty());
+}
+
+/// (core#1162) The engine records only a ledger verdict, never twice for one session, and only for
+/// a reply that ends on its verdict.
 #[test]
 fn the_engine_records_a_reply_once_and_only_a_ledger_verdict() {
     let l = Ledger::new("record");
     let (id, dir) = l.evidence(RUN, &now_iso());
+    let rec = |token: &str, terminal: bool| {
+        record_reply_verdict(&l.root, &id, &dir, RUN, "n1", token, terminal, "pi", "r")
+    };
+    assert!(rec("MAYBE", true)
+        .unwrap_err()
+        .contains("not a QE ledger verdict"));
+    assert!(rec("PASS", false).unwrap_err().contains("does not end on"));
+    assert!(rec("PASS", true).unwrap());
     assert!(
-        record_reply_verdict(&l.root, &id, &dir, RUN, "n1", "MAYBE", "pi", "r")
-            .unwrap_err()
-            .contains("not a QE ledger verdict")
+        !rec("PASS", true).unwrap(),
+        "the session's record is already newest"
     );
-    assert!(record_reply_verdict(&l.root, &id, &dir, RUN, "n1", "PASS", "pi", "r").unwrap());
-    assert!(!record_reply_verdict(&l.root, &id, &dir, RUN, "n1", "PASS", "pi", "r").unwrap());
     assert_eq!(verdicts_of(&l.root, &id).unwrap().len(), 1);
     assert_eq!(
         bind_verdict(&l.root, &id, RUN, "n1", "PASS").unwrap(),

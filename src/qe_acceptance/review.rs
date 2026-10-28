@@ -637,15 +637,40 @@ fn write_new(path: &Path, content: &[u8]) -> std::io::Result<()> {
     f.sync_all()
 }
 
-/// (core#1162) The isolated reviewer's turn ended on `VERDICT <token>` but recorded no verdict
-/// under its own session (rig run 115fabdb: on a resumed same-tree QE run the reviewer said "the
-/// engine binds this verdict" and wrote none, so the newest verdict was the earlier attempt's FAIL
-/// and delivery was refused on it). The reply IS the reviewer's judgment, captured by the engine
-/// from the session it started, so the engine records it in the ledger the way garden's step 6
-/// would: stamped with the nonce, this crew run and `recorded_by: wicked-core`, and newer than
-/// every verdict already on the QE run, so an earlier attempt's verdict can never outrank it.
-/// `Ok(false)`: a verdict carrying the nonce exists (the reviewer recorded it; nothing written).
-/// `Ok(true)`: written. `Err(why)`: it could not be written safely (nothing counts then).
+/// (core#1162, xreview codex P2) The verdict the reply ENDS on, as the reviewer contract asks
+/// ("end your reply with the reviewer's VERDICT line"): its last non-blank line, outside any code
+/// fence and not a `>` quote. `None` otherwise — a verdict quoted from the evidence, or one the
+/// reply went on past, is never recorded on the reviewer's behalf.
+pub(crate) fn terminal_verdict(output: &str) -> Option<String> {
+    let lines: Vec<&str> = output.lines().collect();
+    let last = lines.iter().rposition(|l| !l.trim().is_empty())?;
+    let fences = lines[..last]
+        .iter()
+        .filter(|l| l.trim_start().starts_with("```"))
+        .count();
+    let line = lines[last].trim_start();
+    if fences % 2 == 1 || line.starts_with('>') || line.starts_with("```") {
+        return None;
+    }
+    crate::validator::parse_evaluator_verdict(line).token
+}
+
+/// (core#1162) Make the latest attempt's verdict the one that governs its QE run. The isolated
+/// reviewer's reply IS its judgment, captured by the engine from the session it started (rig run
+/// 115fabdb: on a resumed same-tree QE run the reviewer ended on `VERDICT: PASS`, said "the
+/// engine binds this verdict", and wrote none, so the newest verdict was the earlier attempt's
+/// FAIL and delivery was refused on it). So the engine records it in the ledger the way garden's
+/// step 6 would — stamped with the nonce, this crew run, the seat and `recorded_by: wicked-core`,
+/// and dated after every verdict already on the QE run — when:
+///
+/// - the reviewer recorded no verdict under its nonce, and its reply ENDS on `VERDICT <token>`
+///   (`terminal`, see [`terminal_verdict`]); or
+/// - (xreview agy P3) it did record `token`, but an earlier verdict is dated at or after it (a
+///   skewed seat clock): the engine re-states it, so the stale one never outranks it.
+///
+/// `Ok(false)`: nothing written (the reviewer's own record is newest, or it recorded another token,
+/// which the bind then reports). `Ok(true)`: written. `Err(why)`: it could not be written safely
+/// (nothing counts then).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_reply_verdict(
     ledger_root: &Path,
@@ -654,16 +679,37 @@ pub(crate) fn record_reply_verdict(
     crew_run: &str,
     nonce: &str,
     token: &str,
+    terminal: bool,
     seat: &str,
     reason: &str,
 ) -> Result<bool, String> {
     let existing = verdicts_of(ledger_root, id)?;
-    if existing
+    let mine = |r: &Record| field(r, "review_session") == Some(nonce);
+    let reason = match existing
         .iter()
-        .any(|(_, r)| field(r, "review_session") == Some(nonce))
+        .filter(|(_, r)| mine(r))
+        .max_by(|a, b| a.0.cmp(&b.0))
     {
-        return Ok(false);
-    }
+        Some((at, own)) => {
+            let outranked = existing.iter().any(|(o, r)| !mine(r) && o >= at);
+            let same = field(own, "verdict").is_some_and(|v| v.eq_ignore_ascii_case(token));
+            if !outranked || !same {
+                return Ok(false);
+            }
+            format!(
+                "re-stated by wicked-core: the isolated reviewer on `{seat}` recorded {token} as \
+                 verdict {}, dated {at}, at or before an earlier verdict on this QE run",
+                field(own, "id").unwrap_or("?")
+            )
+        }
+        None if !terminal => {
+            return Err(format!(
+                "its reply does not end on its VERDICT {token} line (a quoted or mid-reply \
+                 verdict is never recorded for it)"
+            ))
+        }
+        None => reason.to_string(),
+    };
     if !LEDGER_VERDICTS.contains(&token) {
         return Err(format!(
             "the reply's VERDICT {token} is not a QE ledger verdict"
@@ -679,13 +725,55 @@ pub(crate) fn record_reply_verdict(
             .map_err(|e| format!("the QE ledger's verdicts could not be created: {e}"))?,
         Err(e) => return Err(format!("the QE ledger's verdicts could not be read: {e}")),
     }
+    // (xreview codex P2) Newer than every verdict chronologically AND as text: crew's reader and
+    // the bind order by the `created_at` string, and a writer may omit the fraction
+    // (`…:00Z` sorts after `…:00.001Z`).
     let newest = existing
         .iter()
         .filter_map(|(at, _)| iso_millis(at))
         .max()
         .unwrap_or(i64::MIN);
-    let at = millis_iso(now_millis().max(newest.saturating_add(1)));
+    let mut ms = now_millis().max(newest.saturating_add(1));
+    let mut at = millis_iso(ms);
+    for _ in 0..1000 {
+        if !existing.iter().any(|(o, _)| *o >= at) {
+            break;
+        }
+        ms += 1;
+        at = millis_iso(ms);
+    }
+    if existing.iter().any(|(o, _)| *o >= at) {
+        return Err("no timestamp sorts after the QE run's newest verdict".to_string());
+    }
     let vid = uuid::Uuid::new_v4().to_string();
+    // (xreview codex P2) The ledger's SQLite index will not see this write: mark it behind FIRST,
+    // so its next open rebuilds from the JSON records even if the engine stops right after the
+    // verdict lands. A marker with no new verdict only costs a rebuild. (xreview agy P2) A marker
+    // already there must be a plain file: a dangling link or a directory reads as "no marker" to
+    // wicked-ledger, so it is refused rather than trusted.
+    let marker_path = root.join(LEDGER_DRIFT_MARKER);
+    let marker = serde_json::json!({
+        "reason": format!("wicked-core recorded verdict {vid} as canonical JSON"),
+        "marked_at": at,
+    });
+    match write_new(&marker_path, marker.to_string().as_bytes()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            match std::fs::symlink_metadata(&marker_path) {
+                Ok(m) if m.is_file() => {}
+                _ => {
+                    return Err(format!(
+                        "the ledger's `{LEDGER_DRIFT_MARKER}` is not a plain file"
+                    ))
+                }
+            }
+        }
+        Err(e) => {
+            return Err(format!(
+                "the ledger's index drift marker could not be written: {e}"
+            ))
+        }
+    }
     let rec = serde_json::json!({
         "id": vid,
         "run_id": id,
@@ -711,24 +799,6 @@ pub(crate) fn record_reply_verdict(
             let _ = std::fs::remove_file(&tmp);
             format!("the verdict could not be written: {e}")
         })?;
-    // The ledger's SQLite index did not see this write: mark it behind, so its next open rebuilds
-    // from the JSON records (an existing marker already says so).
-    let marker = serde_json::json!({
-        "reason": format!("wicked-core recorded verdict {vid} as canonical JSON"),
-        "marked_at": at,
-    });
-    match write_new(
-        &root.join(LEDGER_DRIFT_MARKER),
-        marker.to_string().as_bytes(),
-    ) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => {
-            return Err(format!(
-                "the ledger's index drift marker could not be written: {e}"
-            ))
-        }
-    }
     Ok(true)
 }
 
@@ -869,6 +939,7 @@ pub(crate) fn run(
             &input.run_id,
             &nonce,
             &token,
+            terminal_verdict(&out.output).as_deref() == Some(token.as_str()),
             &c.seat,
             &reply_reason,
         ) {
@@ -876,8 +947,8 @@ pub(crate) fn run(
             Err(why) => {
                 review.attempts.push(attempt(OUTCOME_INVALID.to_string()));
                 review.reason = format!(
-                    "the reviewer on `{}` recorded no verdict, and the engine could not record \
-                     its reply's VERDICT {token}: {why}",
+                    "the reviewer on `{}` did not record its verdict as the newest on QE run \
+                     {id}, and the engine could not record its reply's VERDICT {token}: {why}",
                     c.seat
                 );
                 emit(&format!("QE reviewer: {}", review.reason));
@@ -886,8 +957,8 @@ pub(crate) fn run(
         };
         if recorded_by_engine {
             emit(&format!(
-                "QE reviewer: `{}` recorded no verdict in the QE ledger; the engine recorded its \
-                 reply's VERDICT {token} on QE run {id} (session {nonce})",
+                "QE reviewer: the engine recorded `{}`'s VERDICT {token} on QE run {id} (session \
+                 {nonce}): the reviewer's own record was missing or outranked by an earlier one",
                 c.seat
             ));
         }
@@ -924,7 +995,8 @@ pub(crate) fn run(
                 };
                 if recorded_by_engine {
                     review.reason.push_str(
-                        " (the reviewer recorded no verdict itself; the engine recorded its reply)",
+                        " (the engine recorded the reviewer's reply: its own record was missing or \
+                         outranked)",
                     );
                 }
                 review.verdict = Some(v);
