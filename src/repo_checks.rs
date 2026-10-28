@@ -1029,6 +1029,22 @@ impl CreatorSeed {
         Some(run)
     }
 
+    /// (core#1152) Why the reuse is set aside when `run` — a check that ran here (or in the pass a
+    /// daemon restart interrupted) after reused ones — denied: it may have needed something a
+    /// reused check leaves in the checkout. Not a timeout: a missing input fails, it does not
+    /// hang, and a second hour-long bound would only repeat it.
+    fn set_aside_by(&self, check: &RepoCheck, run: &CheckRun) -> Option<String> {
+        (run.denies() && !run.timed_out && !self.reused.is_empty()).then(|| {
+            format!(
+                "`{}` ran fresh after the reused {} and {} — it may need something a reused \
+                 check leaves in the checkout",
+                check.name,
+                self.reused.join(", "),
+                run.outcome()
+            )
+        })
+    }
+
     /// The floor log's line for one reused check.
     fn log_line(&self, run: &CheckRun) -> String {
         format!(
@@ -4564,9 +4580,9 @@ pub(crate) fn run_with_sandbox_ctx(
         rerun,
         journal,
         untouched,
-        true,
+        None,
     );
-    let Some(why) = again else {
+    let Some((why, inputs)) = again else {
         return first;
     };
     eprintln!(
@@ -4583,7 +4599,7 @@ pub(crate) fn run_with_sandbox_ctx(
         rerun,
         journal,
         untouched,
-        false,
+        Some(inputs),
     );
     report.reused_from = first.reused_from.map(|r| FloorReuse {
         fresh: Vec::new(),
@@ -4595,10 +4611,30 @@ pub(crate) fn run_with_sandbox_ctx(
     report
 }
 
-/// One pass of the floor over the detected checks ([`run_with_sandbox_ctx`]). `allow_reuse` lets a
-/// verify floor take the creator floor's results ([`CreatorSeed`]); the second value is set when a
-/// check that ran fresh after reused ones failed, and says why (the caller then runs the checks
-/// again with nothing reused).
+/// (core#1152) Everything a floor reads from the tree before its first check runs: the checks, the
+/// base's build guide, the change's files and each package's config. The no-reuse re-run
+/// ([`run_with_sandbox_ctx`]) takes them exactly as the first pass read them.
+#[derive(Clone)]
+struct FloorInputs {
+    detected: Vec<RepoCheck>,
+    waived: Vec<String>,
+    exclude: bool,
+    guide: Result<Option<crate::floor_guide::BuildGuide>, String>,
+    touched: Vec<String>,
+    changed: Result<Vec<String>, String>,
+    removed: Result<Vec<String>, String>,
+    candidates: Vec<String>,
+    baseline_diff: bool,
+    package_baseline: std::collections::HashMap<String, bool>,
+    package_note: Option<String>,
+    e2e_paths: Option<Vec<String>>,
+}
+
+/// One pass of the floor over the detected checks ([`run_with_sandbox_ctx`]). With no `frozen`
+/// inputs it reads them from the tree and lets a verify floor take the creator floor's results
+/// ([`CreatorSeed`]); the second value is set when a check that ran (or was resumed) after reused
+/// ones failed, with why and the inputs it read, and the caller then runs the checks again on
+/// those inputs with nothing reused.
 #[allow(clippy::too_many_arguments)]
 fn run_detected(
     worktree: &Path,
@@ -4610,73 +4646,148 @@ fn run_detected(
     rerun: Option<&FloorRerun>,
     journal: Option<&FloorJournal>,
     untouched: Option<&dyn Fn() -> bool>,
-    allow_reuse: bool,
-) -> (RepoChecksReport, Option<String>) {
+    frozen: Option<FloorInputs>,
+) -> (RepoChecksReport, Option<(String, FloorInputs)>) {
     let sandbox_level = sandbox_level.to_string();
     let sandbox_note = sandbox_note.map(str::to_string);
-    let detected = match detect_with(worktree, ctx) {
-        Ok(d) => d,
-        Err(e) => {
-            return (
-                RepoChecksReport {
-                    detected: Vec::new(),
-                    checks: Vec::new(),
-                    skipped: Vec::new(),
-                    passed: false,
-                    detect_error: Some(e),
-                    sandbox_level,
-                    sandbox_note,
-                    sandbox_error: None,
-                    engine_writes_removed: Vec::new(),
-                    claim: None,
-                    env: None,
-                    tree: None,
-                    rerun: None,
-                    waived: Vec::new(),
-                    requested_rerun: None,
-                    recheck: None,
-                    coverage_note: None,
-                    key: None,
-                    resumed: None,
-                    reused_from: None,
+    // (core#1152, xreview) What the floor reads from the tree is read before its first check runs —
+    // and, on the no-reuse re-run, taken as the first pass read it: by then repository commands
+    // have run in this checkout, and an untracked file one left (a `.wicked/checks.json` turning
+    // every check off) must never steer which checks run or how they decide.
+    let allow_reuse = frozen.is_none();
+    let inputs = match frozen {
+        Some(f) => f,
+        None => {
+            let detected = match detect_with(worktree, ctx) {
+                Ok(d) => d,
+                Err(e) => {
+                    return (
+                        RepoChecksReport {
+                            detected: Vec::new(),
+                            checks: Vec::new(),
+                            skipped: Vec::new(),
+                            passed: false,
+                            detect_error: Some(e),
+                            sandbox_level,
+                            sandbox_note,
+                            sandbox_error: None,
+                            engine_writes_removed: Vec::new(),
+                            claim: None,
+                            env: None,
+                            tree: None,
+                            rerun: None,
+                            waived: Vec::new(),
+                            requested_rerun: None,
+                            recheck: None,
+                            coverage_note: None,
+                            key: None,
+                            resumed: None,
+                            reused_from: None,
+                        },
+                        None,
+                    )
+                }
+            };
+            let (detected, waived) = match rerun {
+                Some(r) => match apply_rerun(worktree, ctx, r, detected) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        return (
+                            RepoChecksReport {
+                                detected: Vec::new(),
+                                checks: Vec::new(),
+                                skipped: Vec::new(),
+                                passed: false,
+                                detect_error: Some(e),
+                                sandbox_level,
+                                sandbox_note,
+                                sandbox_error: None,
+                                engine_writes_removed: Vec::new(),
+                                claim: None,
+                                env: None,
+                                tree: None,
+                                rerun: None,
+                                waived: Vec::new(),
+                                requested_rerun: None,
+                                recheck: None,
+                                coverage_note: None,
+                                key: None,
+                                resumed: None,
+                                reused_from: None,
+                            },
+                            None,
+                        )
+                    }
                 },
-                None,
-            )
+                None => (detected, Vec::new()),
+            };
+            // (DES-BUILD-GUIDE) The BASE tree's build guide — a head edit to it never applies to its own
+            // run — and the files the change touched (for `invalidatedBy` and `affected`).
+            // Read once per floor run: every check of it decides under the same switch.
+            let exclude = exclusion_enabled();
+            // `removed` (deleted, renamed away, type-changed: git's own D/T list) is read directly, never
+            // inferred from `changed` minus `touched` — a path removed from the index but still on disk
+            // is in both.
+            let (guide, touched, changed, removed) =
+                match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
+                    (Some(base), Some(git_dir)) => (
+                        crate::floor_guide::load_base(worktree, git_dir, base),
+                        touched_files(worktree, ctx).unwrap_or_default(),
+                        changed_files(worktree, ctx),
+                        removed_files(worktree, ctx),
+                    ),
+                    _ => (Ok(None), Vec::new(), Ok(Vec::new()), Ok(Vec::new())),
+                };
+            let candidates = engine_generated_candidates(worktree, &detected);
+            // (core#817) Per package: a subdirectory package's own `baseline_diff: false` holds for it.
+            // The root's opt-out covers the whole repo; a package's own opt-out covers the package.
+            // Every package's config is read HERE, before the first check runs: no `.wicked/checks.json`
+            // is read from the tree after a command could have rewritten (or re-pointed) it.
+            let baseline_diff = baseline_diff_enabled(worktree);
+            let package_baseline: std::collections::HashMap<String, bool> = detected
+                .iter()
+                .filter(|c| !c.dir.is_empty())
+                .map(|c| (c.dir.clone(), baseline_diff_enabled(&worktree.join(&c.dir))))
+                .collect();
+            // The coverage notes' reads of the tree (the change's files, the packages' manifests) happen
+            // here too, before any check runs.
+            let package_note = package_coverage_note(worktree, ctx, &detected);
+            let e2e_paths = (ctx.stage == FloorStage::Verify)
+                .then(|| e2e_paths(worktree, ctx))
+                .flatten();
+            FloorInputs {
+                detected,
+                waived,
+                exclude,
+                guide,
+                touched,
+                changed,
+                removed,
+                candidates,
+                baseline_diff,
+                package_baseline,
+                package_note,
+                e2e_paths,
+            }
         }
     };
-    let (detected, waived) = match rerun {
-        Some(r) => match apply_rerun(worktree, ctx, r, detected) {
-            Ok(pair) => pair,
-            Err(e) => {
-                return (
-                    RepoChecksReport {
-                        detected: Vec::new(),
-                        checks: Vec::new(),
-                        skipped: Vec::new(),
-                        passed: false,
-                        detect_error: Some(e),
-                        sandbox_level,
-                        sandbox_note,
-                        sandbox_error: None,
-                        engine_writes_removed: Vec::new(),
-                        claim: None,
-                        env: None,
-                        tree: None,
-                        rerun: None,
-                        waived: Vec::new(),
-                        requested_rerun: None,
-                        recheck: None,
-                        coverage_note: None,
-                        key: None,
-                        resumed: None,
-                        reused_from: None,
-                    },
-                    None,
-                )
-            }
-        },
-        None => (detected, Vec::new()),
-    };
+    let rerun_inputs = (allow_reuse && ctx.stage == FloorStage::Verify).then(|| inputs.clone());
+    let FloorInputs {
+        detected,
+        waived,
+        exclude,
+        guide,
+        touched,
+        changed,
+        removed,
+        candidates,
+        baseline_diff,
+        package_baseline,
+        package_note,
+        e2e_paths,
+    } = inputs;
+    let baseline_diff_for =
+        |dir: &str| dir.is_empty() || package_baseline.get(dir).copied().unwrap_or(false);
     // (F-RC2-009) Never run a HEAD process beside a copy of the base — a crash mid-floor could
     // have left one; the export lives only between its creation and the caching of its result.
     // (core#1050) A base export that cannot be cleared (a linked or non-directory `tmp`, a link
@@ -4691,49 +4802,8 @@ fn run_detected(
         .and_then(remove_base_export)
         .err()
         .map(|e| format!("the checks' scratch could not be made safe: {e}"));
-    // (DES-BUILD-GUIDE) The BASE tree's build guide — a head edit to it never applies to its own
-    // run — and the files the change touched (for `invalidatedBy` and `affected`).
-    // Read once per floor run: every check of it decides under the same switch.
-    let exclude = exclusion_enabled();
-    // `removed` (deleted, renamed away, type-changed: git's own D/T list) is read directly, never
-    // inferred from `changed` minus `touched` — a path removed from the index but still on disk
-    // is in both.
-    let (guide, touched, changed, removed) =
-        match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
-            (Some(base), Some(git_dir)) => (
-                crate::floor_guide::load_base(worktree, git_dir, base),
-                touched_files(worktree, ctx).unwrap_or_default(),
-                changed_files(worktree, ctx),
-                removed_files(worktree, ctx),
-            ),
-            _ => (Ok(None), Vec::new(), Ok(Vec::new()), Ok(Vec::new())),
-        };
-    let candidates = engine_generated_candidates(worktree, &detected);
     let held_head = held_worktree.as_ref().ok();
     let env = scratch.env_record(&sandbox_level);
-    // (core#817) Per package: a subdirectory package's own `baseline_diff: false` holds for it.
-    // The root's opt-out covers the whole repo; a package's own opt-out covers the package.
-    // Every package's config is read HERE, before the first check runs: no `.wicked/checks.json`
-    // is read from the tree after a command could have rewritten (or re-pointed) it.
-    let baseline_diff = baseline_diff_enabled(worktree);
-    let package_baseline: std::collections::HashMap<&str, bool> = detected
-        .iter()
-        .filter(|c| !c.dir.is_empty())
-        .map(|c| {
-            (
-                c.dir.as_str(),
-                baseline_diff_enabled(&worktree.join(&c.dir)),
-            )
-        })
-        .collect();
-    let baseline_diff_for =
-        |dir: &str| dir.is_empty() || package_baseline.get(dir).copied().unwrap_or(false);
-    // The coverage notes' reads of the tree (the change's files, the packages' manifests) happen
-    // here too, before any check runs.
-    let package_note = package_coverage_note(worktree, ctx, &detected);
-    let e2e_paths = (ctx.stage == FloorStage::Verify)
-        .then(|| e2e_paths(worktree, ctx))
-        .flatten();
     let mut checks = Vec::new();
     let mut skipped = Vec::new();
     let mut failed = false;
@@ -4802,6 +4872,11 @@ fn run_detected(
                 run.outcome()
             );
             failed = run.denies();
+            // (xreview) A failure the interrupted pass ran after reused checks sends the floor
+            // round again just as it would have there.
+            if again.is_none() {
+                again = seed.as_ref().and_then(|s| s.set_aside_by(check, &run));
+            }
             if let Some(j) = journal.as_mut() {
                 j.record(check, &run, untouched);
             }
@@ -4944,16 +5019,8 @@ fn run_detected(
         );
         failed = run.denies();
         if let Some(s) = seed.as_mut() {
-            // A fresh failure after reused checks (not a timeout: a missing input fails, it does
-            // not hang, and a second hour-long bound would only repeat it).
-            if failed && !run.timed_out && !s.reused.is_empty() && again.is_none() {
-                again = Some(format!(
-                    "`{}` ran fresh after the reused {} and {} — it may need something a reused \
-                     check leaves in the checkout",
-                    check.name,
-                    s.reused.join(", "),
-                    run.outcome()
-                ));
+            if again.is_none() {
+                again = s.set_aside_by(check, &run);
             }
             s.fresh.push(check.name.clone());
         }
@@ -5089,7 +5156,7 @@ fn run_detected(
             resumed,
             reused_from,
         },
-        again,
+        again.zip(rerun_inputs),
     )
 }
 

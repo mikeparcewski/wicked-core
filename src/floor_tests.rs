@@ -4761,6 +4761,181 @@ fn core_1152_a_fresh_check_failing_after_reuse_runs_the_floor_again_without_reus
     let _ = std::fs::remove_dir_all(&r.wt);
 }
 
+/// (core#1152, xreview) The no-reuse re-run runs the checks the first pass read, never ones read
+/// again from a checkout repository commands have run in: a failing test that leaves an untracked
+/// `.wicked/checks.json` turning every check off must not leave a re-run with no checks (green).
+#[cfg(unix)]
+#[test]
+fn core_1152_the_rerun_never_re_reads_the_checks_from_the_checkout() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let r = Core1144::with("core-1152-frozen", |wt| {
+        std::fs::remove_dir_all(wt.join(".wicked")).unwrap();
+        std::fs::write(wt.join(".gitignore"), "tmp/\ntarget/\nCargo.lock\n").unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(
+            wt.join("Cargo.toml"),
+            "[package]\nname = \"core1152_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wt.join("src/lib.rs"),
+            "#[test]\nfn poisons_and_fails() {\n    std::fs::create_dir_all(\".wicked\").unwrap();\n    \
+             std::fs::write(\".wicked/checks.json\", r#\"{\"formatter\":false,\"test\":false}\"#).unwrap();\n    \
+             panic!(\"red\");\n}\n",
+        )
+        .unwrap();
+    });
+    let first = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
+    if first.sandbox_error.is_some() || first.checks.is_empty() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
+    }
+    let names = |rep: &RepoChecksReport| -> Vec<String> {
+        rep.checks.iter().map(|c| c.name.clone()).collect()
+    };
+    assert_eq!(
+        names(&first),
+        ["cargo-fmt-check", "cargo-test"],
+        "{first:#?}"
+    );
+    // The creator floor resumes `cargo-test` from an interrupted journal, so its record holds only
+    // `cargo-fmt-check` and verify runs `cargo-test` fresh after a reused check.
+    let ctx = r.ctx(FloorStage::Creator, &r.base);
+    let test_run = first
+        .checks
+        .iter()
+        .find(|c| c.name == "cargo-test")
+        .unwrap();
+    let check = first
+        .detected
+        .iter()
+        .find(|c| c.name == "cargo-test")
+        .unwrap();
+    let record = JournalRecord {
+        floor_policy: FLOOR_POLICY_VERSION,
+        key: FloorKey::of(&r.tree, &ctx, &first.detected),
+        exclude: exclusion_enabled(),
+        attempt: 1,
+        checks: vec![JournalEntry {
+            dir: check.dir.clone(),
+            name: check.name.clone(),
+            argv: check.argv.clone(),
+            run: test_run.clone(),
+        }],
+    };
+    std::fs::write(
+        journal_path(&r.logs(), 4),
+        serde_json::to_string(&record).unwrap(),
+    )
+    .unwrap();
+    let resumed = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
+    assert_eq!(
+        resumed.resumed.as_ref().map(|x| x.reused.clone()),
+        Some(vec!["cargo-test".to_string()]),
+        "{resumed:#?}"
+    );
+    assert!(r.record_exists(), "{resumed:#?}");
+    let verify = r.guarded(FloorStage::Verify, &r.base, 6, "verify");
+    assert!(
+        !verify.passed,
+        "the re-run ran the failing test again: {verify:#?}"
+    );
+    assert_eq!(
+        names(&verify),
+        ["cargo-fmt-check", "cargo-test"],
+        "{verify:#?}"
+    );
+    let why = verify
+        .reused_from
+        .as_ref()
+        .and_then(|r| r.voided.clone())
+        .unwrap_or_default();
+    assert!(
+        why.contains("`cargo-test` ran fresh after the reused cargo-fmt-check and failed"),
+        "{verify:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&r.wt);
+}
+
+/// (core#1152, xreview) A failure that the pass a daemon restart interrupted ran after reused checks
+/// (restored from the verify floor's journal) sends the floor round again, as it would have there.
+#[cfg(unix)]
+#[test]
+fn core_1152_a_journal_restored_failure_after_reuse_runs_the_floor_again() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let e2e = serde_json::json!(["sh", "-c", "test -f out/marker"]);
+    let r = Core1144::new(
+        "core-1152-journal",
+        serde_json::json!({
+            "typecheck": false,
+            "lint": ["sh", "-c", "mkdir -p out && echo m > out/marker && echo nonce-$$-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')"],
+            "test": Core1144::NONCE,
+            "e2e": e2e,
+        }),
+    );
+    let creator = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
+    if creator.sandbox_error.is_some() || creator.checks.is_empty() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
+    }
+    assert!(creator.passed && r.record_exists(), "{creator:#?}");
+    // A failing `e2e` run in this run's log store: the same check on a repo whose `lint` leaves no
+    // marker (another tree, the same run id).
+    let mut other = Core1144::new(
+        "core-1152-journal-red",
+        serde_json::json!({"typecheck": false, "lint": Core1144::NONCE, "e2e": e2e}),
+    );
+    other.run_id = r.run_id.clone();
+    let red = other.guarded(FloorStage::Verify, &other.base, 6, "verify");
+    let red_e2e = red
+        .checks
+        .iter()
+        .find(|c| c.name == "e2e")
+        .expect("{red:#?}");
+    assert!(red_e2e.denies(), "{red:#?}");
+    // The interrupted verify pass had journaled that failure after reusing `lint` and `test`.
+    let ctx = r.ctx(FloorStage::Verify, &r.base);
+    let detected = detect_with(&r.wt, &ctx).unwrap();
+    let check = detected.iter().find(|c| c.name == "e2e").unwrap();
+    let record = JournalRecord {
+        floor_policy: FLOOR_POLICY_VERSION,
+        key: FloorKey::of(&r.tree, &ctx, &detected),
+        exclude: exclusion_enabled(),
+        attempt: 1,
+        checks: vec![JournalEntry {
+            dir: check.dir.clone(),
+            name: check.name.clone(),
+            argv: check.argv.clone(),
+            run: red_e2e.clone(),
+        }],
+    };
+    std::fs::write(
+        journal_path(&r.logs(), 6),
+        serde_json::to_string(&record).unwrap(),
+    )
+    .unwrap();
+    let verify = r.guarded(FloorStage::Verify, &r.base, 6, "verify");
+    assert!(
+        verify.passed,
+        "the floor ran again in order and passed: {verify:#?}"
+    );
+    let why = verify
+        .reused_from
+        .as_ref()
+        .and_then(|x| x.voided.clone())
+        .unwrap_or_default();
+    assert!(
+        why.contains("`e2e` ran fresh after the reused lint, test and failed"),
+        "{verify:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&r.wt);
+    let _ = std::fs::remove_dir_all(&other.wt);
+}
+
 /// (core#1152) The direct guard that replaces the suffix rule: a fresh check that changes the
 /// checkout's tracked content voids the reused results, even when a later fresh check restores it
 /// (the final comparison alone would pass), and the floor fails.
