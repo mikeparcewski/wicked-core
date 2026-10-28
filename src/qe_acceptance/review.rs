@@ -497,21 +497,19 @@ pub(crate) fn bind_evidence(
     Ok((id, real))
 }
 
-/// (§3.1 step 4) Bind the reviewer's verdict: the NEWEST live verdict of QE run `id` (the one crew
-/// reads as that run's judgment) must carry this reviewer turn's nonce, this crew run, and the
-/// token the reviewer's own reply ended on. Returns that verdict.
-pub(crate) fn bind_verdict(
-    ledger_root: &Path,
-    id: &str,
-    crew_run: &str,
-    nonce: &str,
-    reply_token: &str,
-) -> Result<String, String> {
+/// One ledger record: its canonical JSON object.
+type Record = serde_json::Map<String, serde_json::Value>;
+
+/// Every live verdict of QE run `id`, with its `created_at` (validated): the rows crew's reader
+/// would weigh for that run.
+fn verdicts_of(ledger_root: &Path, id: &str) -> Result<Vec<(String, Record)>, String> {
     let dir = ledger_root.join("verdicts");
-    let names = std::fs::read_dir(&dir).map_err(|e| {
-        format!("the QE ledger's verdicts could not be read ({e}): the reviewer recorded none")
-    })?;
-    let mut newest: Option<(String, serde_json::Map<String, serde_json::Value>)> = None;
+    let names = match std::fs::read_dir(&dir) {
+        Ok(n) => n,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("the QE ledger's verdicts could not be read: {e}")),
+    };
+    let mut out = Vec::new();
     for entry in names {
         let entry =
             entry.map_err(|e| format!("the QE ledger's verdicts could not be read: {e}"))?;
@@ -530,16 +528,43 @@ pub(crate) fn bind_verdict(
                 field(&rec, "id").unwrap_or("?")
             ));
         }
+        out.push((at, rec));
+    }
+    Ok(out)
+}
+
+/// (§3.1 step 4) Bind the reviewer's verdict: the NEWEST live verdict of QE run `id` (the one crew
+/// reads as that run's judgment) must carry this reviewer turn's nonce, this crew run, and the
+/// token the reviewer's own reply ended on. Returns that verdict. (core#1162) When it does not,
+/// the error names the verdict that is newest and who recorded it.
+pub(crate) fn bind_verdict(
+    ledger_root: &Path,
+    id: &str,
+    crew_run: &str,
+    nonce: &str,
+    reply_token: &str,
+) -> Result<String, String> {
+    let mut newest: Option<(String, Record)> = None;
+    for (at, rec) in verdicts_of(ledger_root, id)? {
         if newest.as_ref().is_none_or(|(n, _)| at > *n) {
             newest = Some((at, rec));
         }
     }
-    let Some((_, rec)) = newest else {
+    let Some((at, rec)) = newest else {
         return Err(format!("the reviewer recorded no verdict on QE run {id}"));
     };
     if field(&rec, "review_session") != Some(nonce) {
+        let by = match field(&rec, "review_session") {
+            Some(other) => format!("another review session ({other})"),
+            None => "a writer outside every isolated review session (no review_session stamp: \
+                     the QE executor, or another tool)"
+                .to_string(),
+        };
         return Err(format!(
-            "the newest verdict on QE run {id} was not recorded by the isolated reviewer session"
+            "the newest verdict on QE run {id} (verdict {}, {}, recorded {at}) was not recorded by \
+             the isolated reviewer session ({nonce}): it was recorded by {by}",
+            field(&rec, "id").unwrap_or("?"),
+            field(&rec, "verdict").unwrap_or("?"),
         ));
     }
     if field(&rec, "crew_run_id") != Some(crew_run) {
@@ -554,6 +579,157 @@ pub(crate) fn bind_verdict(
         ));
     }
     Ok(verdict)
+}
+
+/// The verdict values wicked-ledger's index accepts (its migration 002 `CHECK`).
+const LEDGER_VERDICTS: [&str; 7] = [
+    "PASS",
+    "FAIL",
+    "PARTIAL",
+    "CONDITIONAL",
+    "INCONCLUSIVE",
+    "N-A",
+    "SKIP",
+];
+
+/// The file wicked-ledger reads as "the index is behind canonical JSON": its next open rebuilds
+/// the SQLite index from the JSON records (wicked-ledger `domain-store.mjs`, `DRIFT_MARKER`).
+const LEDGER_DRIFT_MARKER: &str = "index-drift.json";
+
+/// `YYYY-MM-DDTHH:MM:SS.fffZ` for unix millis, as `Date.prototype.toISOString` writes it (the
+/// inverse of [`iso_millis`]).
+pub(crate) fn millis_iso(ms: i64) -> String {
+    let (days, rem) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000));
+    // Civil date from days since the epoch (H. Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rem / 3_600_000,
+        rem / 60_000 % 60,
+        rem / 1000 % 60,
+        rem % 1000
+    )
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Create `path` with `content`, refusing to follow or replace anything already there.
+fn write_new(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    f.write_all(content)?;
+    f.sync_all()
+}
+
+/// (core#1162) The isolated reviewer's turn ended on `VERDICT <token>` but recorded no verdict
+/// under its own session (rig run 115fabdb: on a resumed same-tree QE run the reviewer said "the
+/// engine binds this verdict" and wrote none, so the newest verdict was the earlier attempt's FAIL
+/// and delivery was refused on it). The reply IS the reviewer's judgment, captured by the engine
+/// from the session it started, so the engine records it in the ledger the way garden's step 6
+/// would: stamped with the nonce, this crew run and `recorded_by: wicked-core`, and newer than
+/// every verdict already on the QE run, so an earlier attempt's verdict can never outrank it.
+/// `Ok(false)`: a verdict carrying the nonce exists (the reviewer recorded it; nothing written).
+/// `Ok(true)`: written. `Err(why)`: it could not be written safely (nothing counts then).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_reply_verdict(
+    ledger_root: &Path,
+    id: &str,
+    evidence_dir: &Path,
+    crew_run: &str,
+    nonce: &str,
+    token: &str,
+    seat: &str,
+    reason: &str,
+) -> Result<bool, String> {
+    let existing = verdicts_of(ledger_root, id)?;
+    if existing
+        .iter()
+        .any(|(_, r)| field(r, "review_session") == Some(nonce))
+    {
+        return Ok(false);
+    }
+    if !LEDGER_VERDICTS.contains(&token) {
+        return Err(format!(
+            "the reply's VERDICT {token} is not a QE ledger verdict"
+        ));
+    }
+    let root = std::fs::canonicalize(ledger_root)
+        .map_err(|e| format!("the run's QE ledger could not be resolved: {e}"))?;
+    let dir = root.join("verdicts");
+    match std::fs::symlink_metadata(&dir) {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+        Ok(_) => return Err("the QE ledger's verdicts is not a plain directory".to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&dir)
+            .map_err(|e| format!("the QE ledger's verdicts could not be created: {e}"))?,
+        Err(e) => return Err(format!("the QE ledger's verdicts could not be read: {e}")),
+    }
+    let newest = existing
+        .iter()
+        .filter_map(|(at, _)| iso_millis(at))
+        .max()
+        .unwrap_or(i64::MIN);
+    let at = millis_iso(now_millis().max(newest.saturating_add(1)));
+    let vid = uuid::Uuid::new_v4().to_string();
+    let rec = serde_json::json!({
+        "id": vid,
+        "run_id": id,
+        "verdict": token,
+        "evidence_path": evidence_dir.to_string_lossy(),
+        "reviewer": "acceptance-test-reviewer",
+        "reason": reason,
+        "crew_run_id": crew_run,
+        "review_session": nonce,
+        "recorded_by": "wicked-core",
+        "reviewer_seat": seat,
+        "created_at": at,
+        "updated_at": at,
+        "deleted": 0,
+        "deleted_at": serde_json::Value::Null,
+    });
+    let body = serde_json::to_string_pretty(&rec).map_err(|e| e.to_string())?;
+    let file = dir.join(format!("{vid}.json"));
+    let tmp = dir.join(format!("{vid}.json.tmp.{}", now_millis()));
+    write_new(&tmp, body.as_bytes())
+        .and_then(|()| std::fs::rename(&tmp, &file))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("the verdict could not be written: {e}")
+        })?;
+    // The ledger's SQLite index did not see this write: mark it behind, so its next open rebuilds
+    // from the JSON records (an existing marker already says so).
+    let marker = serde_json::json!({
+        "reason": format!("wicked-core recorded verdict {vid} as canonical JSON"),
+        "marked_at": at,
+    });
+    match write_new(
+        &root.join(LEDGER_DRIFT_MARKER),
+        marker.to_string().as_bytes(),
+    ) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(format!(
+                "the ledger's index drift marker could not be written: {e}"
+            ))
+        }
+    }
+    Ok(true)
 }
 
 /// A reviewer turn that failed AS A SEAT — a FAILED launch or turn whose output the judge
@@ -673,6 +849,48 @@ pub(crate) fn run(
             review.reason = format!("the reviewer on `{}` ended with no VERDICT line", c.seat);
             return Some(review);
         };
+        // (core#1162) A reviewer that ended on a verdict but recorded none under its session has
+        // its reply recorded by the engine, so the latest attempt's judgment is the newest verdict.
+        let inconclusive_what = (token != "PASS")
+            .then(|| parse_inconclusive(&out.output))
+            .flatten();
+        let reply_reason = match &inconclusive_what {
+            Some(what) => format!("inconclusive — {what}"),
+            None => format!(
+                "recorded by wicked-core from the isolated reviewer's reply on `{}`: it ended \
+                 VERDICT {token} and recorded no verdict itself",
+                c.seat
+            ),
+        };
+        let recorded_by_engine = match record_reply_verdict(
+            ledger,
+            &id,
+            &dir,
+            &input.run_id,
+            &nonce,
+            &token,
+            &c.seat,
+            &reply_reason,
+        ) {
+            Ok(written) => written,
+            Err(why) => {
+                review.attempts.push(attempt(OUTCOME_INVALID.to_string()));
+                review.reason = format!(
+                    "the reviewer on `{}` recorded no verdict, and the engine could not record \
+                     its reply's VERDICT {token}: {why}",
+                    c.seat
+                );
+                emit(&format!("QE reviewer: {}", review.reason));
+                return Some(review);
+            }
+        };
+        if recorded_by_engine {
+            emit(&format!(
+                "QE reviewer: `{}` recorded no verdict in the QE ledger; the engine recorded its \
+                 reply's VERDICT {token} on QE run {id} (session {nonce})",
+                c.seat
+            ));
+        }
         match bind_verdict(ledger, &id, &input.run_id, &nonce, &token) {
             Ok(v) => {
                 review.attempts.push(attempt("verdict".to_string()));
@@ -704,6 +922,11 @@ pub(crate) fn run(
                         c.seat, c.basis
                     ),
                 };
+                if recorded_by_engine {
+                    review.reason.push_str(
+                        " (the reviewer recorded no verdict itself; the engine recorded its reply)",
+                    );
+                }
                 review.verdict = Some(v);
             }
             Err(why) => {

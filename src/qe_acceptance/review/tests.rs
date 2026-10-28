@@ -292,11 +292,17 @@ fn the_verdict_binds_only_when_the_reviewer_session_recorded_it() {
         .unwrap_err()
         .contains("not the reviewer's own"));
     // A newer verdict without the nonce (the executor grading itself) is the governing one, so
-    // it does not bind.
+    // it does not bind — and (core#1162) the error says who recorded it.
     l.verdict(&id, "PASS", None, RUN, "2099-01-01T00:00:02.000Z");
-    assert!(bind_verdict(&l.root, &id, RUN, "n1", "PASS")
-        .unwrap_err()
-        .contains("not recorded by the isolated reviewer"));
+    let e = bind_verdict(&l.root, &id, RUN, "n1", "PASS").unwrap_err();
+    assert!(e.contains("not recorded by the isolated reviewer"), "{e}");
+    assert!(e.contains("no review_session stamp"), "{e}");
+    l.verdict(&id, "FAIL", Some("n0"), RUN, "2099-01-01T00:00:02.500Z");
+    let e = bind_verdict(&l.root, &id, RUN, "n1", "PASS").unwrap_err();
+    assert!(
+        e.contains("another review session (n0)") && e.contains("FAIL"),
+        "{e}"
+    );
     // A newer nonced verdict stamped with another crew run.
     l.verdict(&id, "PASS", Some("n1"), "other", "2099-01-01T00:00:03.000Z");
     assert!(bind_verdict(&l.root, &id, RUN, "n1", "PASS")
@@ -556,6 +562,9 @@ impl StepRunner for Scripted {
                 );
                 (StepStatus::Ok, format!("reviewed\nVERDICT: {verdict}"))
             }
+            // (core#1162) The 115fabdb reviewer: it ends on its verdict and records none itself.
+            "pass-unrecorded" => (StepStatus::Ok, "reviewed\nVERDICT: PASS".to_string()),
+            "fail-unrecorded" => (StepStatus::Ok, "reviewed\nVERDICT: FAIL".to_string()),
             "signed-out" => (
                 StepStatus::Failed,
                 "Error: not logged in. Run /login".to_string(),
@@ -1092,4 +1101,148 @@ fn a_no_change_floor_fix_keeps_the_qe_record_and_a_real_fix_invalidates_it() {
     );
     // The stale record keeps the verdict its review recorded (it is not an unbound one).
     assert_eq!(stale.verdict.as_deref(), Some("PASS"));
+}
+
+/// (core#1162) A same-tree retry RESUMES the QE run its earlier attempt judged: `prior` is that
+/// attempt's verdict on it (stamped with the earlier session `n0`, recorded at `prior_at`). The
+/// reviewer answers `answer`. Returns the review and the ledger.
+fn resumed_review(prior: &str, prior_at: &str, answer: &'static str) -> (QeReview, Ledger, String) {
+    let l = Ledger::new("resumed");
+    let (id, dir) = l.evidence(RUN, "2026-10-28T02:18:26.610Z");
+    l.verdict(&id, prior, Some("n0"), RUN, prior_at);
+    let mut u = qe_unit("claude", &l.root);
+    u.qe_review = Some(QeReview {
+        outcome: if prior == "PASS" {
+            OUTCOME_PASS
+        } else {
+            OUTCOME_FAIL
+        }
+        .into(),
+        reason: "attempt 0".into(),
+        evidence_dir: Some(dir.to_string_lossy().into_owned()),
+        qe_run_id: Some(id.clone()),
+        tree: Some("t1".into()),
+        verdict: Some(prior.into()),
+        attempts: Vec::new(),
+    });
+    u.qe_reviewer_seats = vec![seat("pi", BASIS_DISTINCT)];
+    let runner: Arc<dyn StepRunner> = Arc::new(Scripted {
+        ledger: l.root.clone(),
+        qe_run: id.clone(),
+        answers: vec![("pi", answer)],
+        seen: Mutex::new(Vec::new()),
+    });
+    // Dispatched long after the QE run was created: only the resume lets its evidence bind.
+    let got = run(
+        &runner,
+        &input_for(u),
+        &executor_output(&dir.to_string_lossy()),
+        iso_millis("2026-10-28T09:32:00.000Z").unwrap(),
+        &|_: &str| {},
+    )
+    .expect("the QE unit runs a reviewer");
+    (got, l, id)
+}
+
+/// The QE run's verdict as crew's acceptance reader takes it: the newest live one.
+fn newest(l: &Ledger, id: &str) -> Record {
+    verdicts_of(&l.root, id)
+        .unwrap()
+        .into_iter()
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .unwrap()
+        .1
+}
+
+/// (core#1162, rig run 115fabdb) Re-used QE run: attempt 0's reviewer recorded FAIL; attempt 1's
+/// reviewer PASSes. Whether it records the PASS itself or (as pi did on the rig) only ends its
+/// reply on it, the PASS is bound to attempt 1's session and is the verdict delivery reads.
+#[test]
+fn a_reused_qe_run_binds_a_pass_after_an_earlier_fail_and_delivery_reads_it() {
+    for answer in ["pass", "pass-unrecorded"] {
+        let (got, l, id) = resumed_review("FAIL", "2026-10-28T02:26:40.485Z", answer);
+        assert_eq!(got.outcome, OUTCOME_PASS, "{answer}: {got:?}");
+        assert_eq!(got.verdict.as_deref(), Some("PASS"));
+        assert!(denial(&got).is_none(), "{answer}: no QE denial at the gate");
+        assert_eq!(
+            got.qe_run_id.as_deref(),
+            Some(id.as_str()),
+            "the same QE run"
+        );
+        let session = &got.attempts[0].session;
+        let n = newest(&l, &id);
+        assert_eq!(field(&n, "verdict"), Some("PASS"), "{answer}: {n:?}");
+        assert_eq!(field(&n, "review_session"), Some(session.as_str()));
+        assert_eq!(field(&n, "crew_run_id"), Some(RUN));
+        let by_engine = answer == "pass-unrecorded";
+        assert_eq!(
+            field(&n, "recorded_by") == Some("wicked-core"),
+            by_engine,
+            "{n:?}"
+        );
+        assert_eq!(
+            got.reason.contains("the engine recorded its reply"),
+            by_engine
+        );
+        assert_eq!(l.root.join(LEDGER_DRIFT_MARKER).is_file(), by_engine);
+    }
+}
+
+/// (core#1162) The converse: attempt 0 PASSed, attempt 1's reviewer FAILs. The FAIL is newest and
+/// bound, so the gate denies and delivery refuses on it.
+#[test]
+fn a_reused_qe_run_refuses_on_a_fail_after_an_earlier_pass() {
+    for answer in ["fail", "fail-unrecorded"] {
+        let (got, l, id) = resumed_review("PASS", "2026-10-28T02:26:40.485Z", answer);
+        assert_eq!(got.outcome, OUTCOME_FAIL, "{answer}: {got:?}");
+        assert_eq!(denial(&got).unwrap().source, DENIAL_SOURCE_QE_REVIEW);
+        let n = newest(&l, &id);
+        assert_eq!(field(&n, "verdict"), Some("FAIL"), "{answer}: {n:?}");
+        assert_eq!(
+            field(&n, "review_session"),
+            Some(got.attempts[0].session.as_str())
+        );
+    }
+}
+
+/// (core#1162) An earlier attempt's verdict never outranks the latest attempt's: even one stamped
+/// later than the host clock (a skewed seat clock) is older than the verdict the engine records.
+#[test]
+fn an_earlier_attempts_verdict_never_outranks_the_latest_bound_one() {
+    let (got, l, id) = resumed_review("FAIL", "2099-06-01T00:00:00.000Z", "pass-unrecorded");
+    assert_eq!(got.outcome, OUTCOME_PASS, "{got:?}");
+    let n = newest(&l, &id);
+    assert_eq!(field(&n, "verdict"), Some("PASS"));
+    assert_eq!(field(&n, "created_at"), Some("2099-06-01T00:00:00.001Z"));
+}
+
+/// (core#1162) The engine records only a ledger verdict, and never twice for one session.
+#[test]
+fn the_engine_records_a_reply_once_and_only_a_ledger_verdict() {
+    let l = Ledger::new("record");
+    let (id, dir) = l.evidence(RUN, &now_iso());
+    assert!(
+        record_reply_verdict(&l.root, &id, &dir, RUN, "n1", "MAYBE", "pi", "r")
+            .unwrap_err()
+            .contains("not a QE ledger verdict")
+    );
+    assert!(record_reply_verdict(&l.root, &id, &dir, RUN, "n1", "PASS", "pi", "r").unwrap());
+    assert!(!record_reply_verdict(&l.root, &id, &dir, RUN, "n1", "PASS", "pi", "r").unwrap());
+    assert_eq!(verdicts_of(&l.root, &id).unwrap().len(), 1);
+    assert_eq!(
+        bind_verdict(&l.root, &id, RUN, "n1", "PASS").unwrap(),
+        "PASS"
+    );
+}
+
+#[test]
+fn millis_format_as_node_writes_them_and_round_trip() {
+    for s in [
+        "1970-01-01T00:00:00.000Z",
+        "2026-10-28T02:26:40.485Z",
+        "2024-02-29T23:59:59.999Z",
+        "2099-12-31T00:00:00.001Z",
+    ] {
+        assert_eq!(millis_iso(iso_millis(s).unwrap()), s);
+    }
 }
