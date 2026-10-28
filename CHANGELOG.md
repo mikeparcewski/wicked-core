@@ -14,6 +14,29 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A JS run's seats find the worktree's dependencies installed, for the platform they run on (core#1155).**
+  On rig run 115fabdb (wicked-crew) no seat could run the repository's tests: the verify evaluator's
+  `vitest`, `tsc` and `eslint` exited 127, the isolated QE reviewer recorded INCONCLUSIVE, and delivery
+  was refused. Since core#1144 the creator floor installs in its own clean checkout, never in the run's
+  worktree. A container seat cannot install there (its only egress is the gateway's CONNECT allowlist,
+  which named no npm registry, so `npm ci` saw its TLS handshake cut), and a read-only seat may not
+  install at all. Before core#1144 the floor installed into the worktree for the host, whose native
+  bindings a Linux seat cannot load (`rolldown native binding is missing`, run d3a380b0). Now, before a
+  seat's turn on a worktree with a root `package.json` and `package-lock.json`, the engine runs `npm ci
+  --ignore-scripts --no-audit --no-fund` in the worktree, under the floor's own sandbox and isolated
+  homes, and adds `--os=linux --cpu=<host arch> --libc=glibc` when seats run in containers. A marker in
+  `node_modules/` names the platform and the lockfile's digest, so later units install nothing until the
+  lockfile, the platform or the tree changes (a seat's own `npm ci` removes it). The seat is told its
+  dependencies are in place and not to reinstall. The install heartbeats like the floor, so the stall
+  watchdog never reads a slow install as a wedged seat. Nothing is installed when a `node_modules/` (at
+  the root or beside any tracked `package.json`) is not git-ignored, holds a tracked file or is a link,
+  for pnpm/yarn lockfiles, for the pre-build scope unit, without the run's pinned git dir, or when the
+  floor's sandbox cannot arm; the unit's stream says which. Every git command goes through the pinned git
+  dir and runs no hook or filter. The tree is snapshotted (content and modes) before and after: the
+  executable bit npm sets on a linked package's tracked bin is put back on the file and named on the
+  stream; any other change is reported, never repaired by a checkout. A floor running in the live
+  worktree treats an install made for another platform as a gap and installs for the host.
+
 - **A failed floor's gate keeps the operator's judgment when QE has no bound verdict, and a no-change floor
   fix keeps the QE record (core#1153).** On rig run c5320434 (wicked-core, red base) the verify gate offered
   no "approve as your own judgment" because the isolated QE reviewer's verdict could not be bound, so the

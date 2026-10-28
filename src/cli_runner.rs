@@ -2231,6 +2231,51 @@ fn run_unit_and_judge_on(
             );
         }
     };
+    // (core#1155) SEAT DEPENDENCIES: before any seat of this attempt works in a JS worktree (the
+    // phase's seat, a floor fix's, the QE reviewer, a judge), the engine installs its dependencies
+    // there for the platform the seats run on (`crate::seat_deps`): the floor's own install lands
+    // in its clean checkout, and a seat cannot install (no registry egress in a container, no
+    // install at all on a read-only seat). Cheap once in place (a marker). Not for the pre-build
+    // scope unit, which runs no code. The install heartbeats like the floor, so the stall watchdog
+    // never reads a slow install as a wedged seat. The seats are told (one context block, on the
+    // input every seat below is built from).
+    let with_deps: Option<StepInput> = match input.workdir.as_deref() {
+        Some(wd) if !input.unit.pre_build_scope && input.unit.tool_cmd.is_none() => {
+            let git_dir = input
+                .unit
+                .worktree_baseline
+                .as_ref()
+                .and_then(|b| b.git_dir.as_deref())
+                .map(std::path::Path::new);
+            let provisioned = with_floor_heartbeat(
+                emit_delta,
+                "dependencies: checking the worktree's node_modules for the seats",
+                FLOOR_HEARTBEAT_EVERY,
+                || {
+                    crate::seat_deps::provision(
+                        wd,
+                        git_dir,
+                        &input.run_id,
+                        &crate::seat_deps::SeatPlatform::for_seats(),
+                    )
+                },
+            );
+            if let Some(note) = provisioned.note() {
+                eprintln!("wicked-core: unit {}: {note}", input.unit.ord);
+                engine_note(emit_delta, &note);
+            }
+            provisioned.seat_context().map(|context| {
+                let mut i = input.clone();
+                i.prior_outputs.push(crate::workflow::PriorUnitOutput {
+                    label: crate::seat_deps::CONTEXT_LABEL.into(),
+                    output: context,
+                });
+                i
+            })
+        }
+        _ => None,
+    };
+    let input = with_deps.as_ref().unwrap_or(input);
     // The step-boundary injector (§8.9): the advice every carrier receives, as prior context.
     // (ASK-K3c) Whether the boundary's team answers reached a seat turn: the stream read
     // succeeded and the seat ran (not a repo-checks re-run). Stamped on `step.completed`.
@@ -5231,6 +5276,119 @@ mod tests {
         );
         assert!(judge.contains("walkthrough.mjs lint"), "{judge}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#1155: a seat's turn on a JS worktree starts with the worktree's dependencies installed
+    /// by the engine, and the seat is told so; the pre-build scope unit installs nothing.
+    #[test]
+    fn a_seat_on_a_crew_shaped_worktree_finds_its_dependencies_installed() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::sync::Mutex;
+        if !crate::seat_deps::tests::npm_available() || !crate::seat_deps::tests::sandbox_arms() {
+            eprintln!("skipped: npm or the floor sandbox is not available on this host");
+            return;
+        }
+        #[derive(Default)]
+        struct DepsProbe {
+            seen: Mutex<Vec<(bool, bool)>>,
+        }
+        impl StepRunner for DepsProbe {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let wd = input.workdir.clone().unwrap();
+                let installed = wd.join("node_modules/fake-vitest/package.json").is_file();
+                let told = input.prior_outputs.iter().any(|p| {
+                    p.label == crate::seat_deps::CONTEXT_LABEL && p.output.contains("npm ci")
+                });
+                self.seen.lock().unwrap().push((installed, told));
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "done".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let (_tmp, wt) = crate::seat_deps::tests::crew_shaped("cli-seat-deps");
+        let input_for = |ord: u32, scope: bool| {
+            let mut unit = crate::domain::WorkUnit::pending(format!("r:u{ord}"), "r", ord, "work");
+            unit.assigned_cli = Some("claude".into());
+            unit.pre_build_scope = scope;
+            // The baseline the actor takes at dispatch: it carries the pinned git dir.
+            unit.worktree_baseline = Some(
+                crate::worktree_guard::snapshot_through(
+                    &wt,
+                    &crate::seat_deps::tests::git_dir_of(&wt),
+                )
+                .unwrap(),
+            );
+            StepInput {
+                run_id: "r-1155".into(),
+                unit_ix: 0,
+                attempt: 0,
+                unit,
+                workflow_id: "wf-r".into(),
+                entity_mode: EntityMode::Isolated,
+                workdir: Some(wt.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            }
+        };
+        let notes: &'static Mutex<Vec<String>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+        let sink = move |s: &str| notes.lock().unwrap().push(s.to_string());
+        let sink: &DeltaSink = &sink;
+        let probe = Arc::new(DepsProbe::default());
+        let runner: Arc<dyn StepRunner> = probe.clone();
+        let roster = vec![seat("claude", "claude -p {PROMPT}")];
+        // The scope unit: no install, no word.
+        let _ = run_unit_and_judge_with_roster(
+            &runner,
+            &input_for(1, true),
+            None,
+            sink,
+            &roster,
+            &[],
+            &[],
+        );
+        // The fix unit: installed before the seat, the seat told.
+        let _ = run_unit_and_judge_with_roster(
+            &runner,
+            &input_for(2, false),
+            None,
+            sink,
+            &roster,
+            &[],
+            &[],
+        );
+        // The next unit of the run: still in place, nothing installed again.
+        let _ = run_unit_and_judge_with_roster(
+            &runner,
+            &input_for(3, false),
+            None,
+            sink,
+            &roster,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            *probe.seen.lock().unwrap(),
+            vec![(false, false), (true, true), (true, true)]
+        );
+        let installs = notes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| n.contains("the engine installed the worktree's node_modules"))
+            .count();
+        assert_eq!(installs, 1, "one install for the run");
     }
 
     #[test]

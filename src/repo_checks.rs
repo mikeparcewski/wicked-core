@@ -2493,7 +2493,13 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
             // the `install` check's `source` says WHY it ran.
             let gap = match probe(worktree, "node_modules")? {
                 None => Some("node_modules absent".to_string()),
-                Some(_) => node_modules_gap(worktree, &json)?,
+                // (core#1155) An install the engine made for the SEATS' platform (a container
+                // seat's Linux) does not run this host's checks: its native bindings are not the
+                // host's.
+                Some(_) => match crate::seat_deps::foreign_platform_gap(worktree) {
+                    Some(why) => Some(why),
+                    None => node_modules_gap(worktree, &json)?,
+                },
             };
             if gap.is_some() || ctx.force_install {
                 let why = gap.unwrap_or_else(|| "forced: lockfile drift".to_string());
@@ -2865,6 +2871,16 @@ fn cargo_package_name(raw: &str) -> Option<String> {
         return None;
     }
     None
+}
+
+/// (core#1155) Whether every dependency `worktree`'s root `package.json` declares is present in
+/// its `node_modules/` ([`node_modules_gap`] finds none missing).
+pub(crate) fn declared_deps_present(worktree: &Path) -> Result<bool, String> {
+    let raw = std::fs::read(worktree.join("package.json"))
+        .map_err(|e| format!("`package.json` could not be read: {e}"))?;
+    let json: serde_json::Value =
+        serde_json::from_slice(&raw).map_err(|e| format!("`package.json` is not JSON: {e}"))?;
+    Ok(node_modules_gap(worktree, &json)?.is_none())
 }
 
 /// Why the worktree's `node_modules/` does NOT provision the checks, or `None` when it does.
@@ -8957,6 +8973,43 @@ pub(crate) mod tests {
         std::fs::write(wt.join("node_modules/vitest/package.json"), "{}").unwrap();
         let names: Vec<String> = detect(&wt).unwrap().into_iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["test".to_string()], "provisioned ⇒ no install");
+    }
+
+    /// core#1155: a live worktree whose node_modules the engine installed for the SEATS' platform
+    /// (a container seat's Linux) does not provision this host's checks: the floor installs.
+    #[test]
+    fn a_node_modules_installed_for_the_seats_platform_is_a_gap_on_the_host() {
+        let wt = scratch("seat-platform-deps");
+        std::fs::write(
+            wt.join("package.json"),
+            r#"{"scripts":{"test":"vitest run"},"devDependencies":{"vitest":"3.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(wt.join("package-lock.json"), "{}").unwrap();
+        std::fs::create_dir_all(wt.join("node_modules/vitest")).unwrap();
+        std::fs::write(wt.join("node_modules/vitest/package.json"), "{}").unwrap();
+        let names = |wt: &Path| -> Vec<String> {
+            detect(wt).unwrap().into_iter().map(|c| c.name).collect()
+        };
+        assert_eq!(
+            names(&wt),
+            vec!["test".to_string()],
+            "provisioned for the host"
+        );
+        // The marker names the host's own platform: still provisioned.
+        let host = crate::seat_deps::SeatPlatform::host().label();
+        let marker = wt.join("node_modules").join(crate::seat_deps::MARKER);
+        std::fs::write(&marker, format!(r#"{{"platform":"{host}","lock":"x"}}"#)).unwrap();
+        assert_eq!(names(&wt), vec!["test".to_string()]);
+        // Another platform's install: the floor installs for the host first.
+        std::fs::write(&marker, r#"{"platform":"plan9-mips","lock":"x"}"#).unwrap();
+        let detected = detect(&wt).unwrap();
+        assert_eq!(detected[0].name, "install", "{detected:?}");
+        assert!(
+            detected[0].source.contains("plan9-mips"),
+            "{}",
+            detected[0].source
+        );
     }
 
     #[cfg(unix)]

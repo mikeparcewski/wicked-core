@@ -116,6 +116,7 @@ mod review_scale;
 mod scope;
 mod seat_bench;
 mod seat_credentials;
+mod seat_deps;
 mod seat_gateway;
 mod seat_login;
 mod seat_refresh;
