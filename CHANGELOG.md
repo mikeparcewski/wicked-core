@@ -14,6 +14,22 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A release cut no longer strands in-flight runs that added a changelog entry (core#1161).** On rig run
+  115fabdb the deliver lift refused `CHANGELOG.md`: the run had added a `### Fixed` entry under
+  `## [Unreleased]`, and main had meanwhile cut a release (`[Unreleased]` became `[0.16.7]`, link-refs
+  were added). The lift used to resolve a changelog conflict only when both sides were identical outside
+  `[Unreleased]`, so every release cut stranded every run that added a changelog line, and the operator
+  had to rebase by hand. Now, when every conflicted path is a changelog (`CHANGELOG.md` or `CHANGES.md`,
+  any case, at any depth), the lift resolves it the way a person would: main's copy is kept as it is, and
+  the run's new `[Unreleased]` entries are placed under main's current `## [Unreleased]` heading, each in
+  the `### …` subsection it was written under (a missing subsection is added; an entry main already has
+  is kept once). The lifted tree is then re-verified by the floor and delivered as before, and the
+  `deliverLiftEvaluated` note says the changelog was resolved. The resolution is refused, and the
+  recoverable `LIFT-CONFLICT` card stands as before, when any other path conflicts, when the run changed
+  the changelog outside `[Unreleased]` in a way main did not, when it rewrote or removed an
+  `[Unreleased]` line, or when main's copy has no `[Unreleased]` heading. The lift no longer needs
+  `git merge-file --union` (git 2.43).
+
 - **A JS run's seats find the worktree's dependencies installed, for the platform they run on (core#1155).**
   On rig run 115fabdb (wicked-crew) no seat could run the repository's tests: the verify evaluator's
   `vitest`, `tsc` and `eslint` exited 127, the isolated QE reviewer recorded INCONCLUSIVE, and delivery
