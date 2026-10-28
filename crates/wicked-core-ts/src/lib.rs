@@ -3374,6 +3374,7 @@ mod tests {
             env: None,
             changed: vec![],
             changed_truncated: false,
+            reused_from: None,
         });
         let check = &ev["checks"][0];
         let decision = &check["decision"];
@@ -4564,6 +4565,8 @@ mod tests {
                 // (TR-W1b) Absent on the wire when empty: the key set is unchanged.
                 changed: vec![],
                 changed_truncated: false,
+                // (crew#1180) Absent on the wire when nothing was reused: the key set is unchanged.
+                reused_from: None,
             },
             "repoChecksEvaluated",
             &[

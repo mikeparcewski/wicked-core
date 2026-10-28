@@ -843,19 +843,38 @@ pub struct FloorReuse {
     pub attempt: u32,
     /// The checks reused, in run order.
     pub reused: Vec<String>,
+    /// (core#1152) The checks this floor ran itself, in run order: the ones the creator floor did
+    /// not run (or could not stand for), wherever they sit in the check order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fresh: Vec<String>,
+    /// (core#1152) Set when the reused results did not stand, saying why and what the floor did
+    /// instead: a check that ran fresh after them failed (the floor ran every check again from
+    /// the first one, nothing reused), or a fresh check changed the checkout (the floor fails).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voided: Option<String>,
 }
 
 impl FloorReuse {
     /// The operator's sentence for the gate's `floorNote`.
     pub fn note(&self) -> String {
-        format!(
-            "checks reused from {} (unit {}, attempt {}): {} ran there on this same tree, against \
-             the same base, with the same command and bound, on a clean checkout — not run again \
-             here",
+        let from = format!(
+            "checks reused from {} (unit {}, attempt {})",
             self.phase.as_deref().unwrap_or("the creator floor"),
             self.ord,
             self.attempt,
+        );
+        if let Some(why) = &self.voided {
+            return format!("{from} were set aside: {why}");
+        }
+        format!(
+            "{from}: {} ran there on this same tree, against the same base, with the same command \
+             and bound, on a clean checkout — not run again here{}",
             self.reused.join(", "),
+            if self.fresh.is_empty() {
+                String::new()
+            } else {
+                format!("; ran fresh here: {}", self.fresh.join(", "))
+            }
         )
     }
 }
@@ -962,6 +981,8 @@ fn finished_whole(run: &CheckRun, logs: &Path) -> bool {
 struct CreatorSeed {
     record: CreatorFloorRecord,
     reused: Vec<String>,
+    /// (core#1152) The checks the verify floor ran itself beside the reused ones.
+    fresh: Vec<String>,
 }
 
 impl CreatorSeed {
@@ -982,6 +1003,7 @@ impl CreatorSeed {
             .then_some(CreatorSeed {
                 record,
                 reused: Vec::new(),
+                fresh: Vec::new(),
             })
     }
 
@@ -1000,15 +1022,27 @@ impl CreatorSeed {
             .filter(|e| reusable_run(check, &e.run, logs))
     }
 
-    fn can_reuse(&self, check: &RepoCheck, logs: &Path) -> bool {
-        self.entry_for(check, logs).is_some()
-    }
-
     /// Take the creator floor's result of `check` ([`Self::entry_for`]).
     fn reuse(&mut self, check: &RepoCheck, logs: &Path) -> Option<CheckRun> {
         let run = self.entry_for(check, logs)?.run.clone();
         self.reused.push(check.name.clone());
         Some(run)
+    }
+
+    /// (core#1152) Why the reuse is set aside when `run` — a check that ran here (or in the pass a
+    /// daemon restart interrupted) after reused ones — denied: it may have needed something a
+    /// reused check leaves in the checkout. Not a timeout: a missing input fails, it does not
+    /// hang, and a second hour-long bound would only repeat it.
+    fn set_aside_by(&self, check: &RepoCheck, run: &CheckRun) -> Option<String> {
+        (run.denies() && !run.timed_out && !self.reused.is_empty()).then(|| {
+            format!(
+                "`{}` ran fresh after the reused {} and {} — it may need something a reused \
+                 check leaves in the checkout",
+                check.name,
+                self.reused.join(", "),
+                run.outcome()
+            )
+        })
     }
 
     /// The floor log's line for one reused check.
@@ -1024,12 +1058,14 @@ impl CreatorSeed {
         )
     }
 
-    fn finish(self) -> Option<FloorReuse> {
+    fn finish(self, voided: Option<String>) -> Option<FloorReuse> {
         (!self.reused.is_empty()).then_some(FloorReuse {
             phase: self.record.phase,
             ord: self.record.ord,
             attempt: self.record.attempt,
             reused: self.reused,
+            fresh: self.fresh,
+            voided,
         })
     }
 }
@@ -4529,63 +4565,229 @@ pub(crate) fn run_with_sandbox_ctx(
             }
         }
     }
-    let detected = match detect_with(worktree, ctx) {
-        Ok(d) => d,
-        Err(e) => {
-            return RepoChecksReport {
-                detected: Vec::new(),
-                checks: Vec::new(),
-                skipped: Vec::new(),
-                passed: false,
-                detect_error: Some(e),
-                sandbox_level,
-                sandbox_note,
-                sandbox_error: None,
-                engine_writes_removed: Vec::new(),
-                claim: None,
-                env: None,
-                tree: None,
-                rerun: None,
-                waived: Vec::new(),
-                requested_rerun: None,
-                recheck: None,
-                coverage_note: None,
-                key: None,
-                resumed: None,
-                reused_from: None,
+    // (core#1152) One pass over the checks, reusing what the creator floor ran on this tree in
+    // whatever order it sits. When a check that ran fresh AFTER reused ones fails, it may have
+    // needed something a reused check leaves in the checkout (an emitted `dist/` an `e2e` reads):
+    // the reuse is set aside and the checks run again from the first one with nothing reused —
+    // the floor exactly as it ran before reuse existed.
+    let (first, again) = run_detected(
+        worktree,
+        &sandbox,
+        &sandbox_level,
+        sandbox_note.as_deref(),
+        ctx,
+        &scratch,
+        rerun,
+        journal,
+        untouched,
+        None,
+    );
+    let Some((why, inputs)) = again else {
+        return first;
+    };
+    eprintln!(
+        "wicked-core: repo checks floor — the reused checks were set aside: {why}; running every \
+         check again from the first one, nothing reused"
+    );
+    let (mut report, _) = run_detected(
+        worktree,
+        &sandbox,
+        &sandbox_level,
+        sandbox_note.as_deref(),
+        ctx,
+        &scratch,
+        rerun,
+        journal,
+        untouched,
+        Some(inputs),
+    );
+    report.reused_from = first.reused_from.map(|r| FloorReuse {
+        fresh: Vec::new(),
+        voided: Some(format!(
+            "{why} — every check ran again here from the first one, nothing reused"
+        )),
+        ..r
+    });
+    report
+}
+
+/// (core#1152) Everything a floor reads from the tree before its first check runs: the checks, the
+/// base's build guide, the change's files and each package's config. The no-reuse re-run
+/// ([`run_with_sandbox_ctx`]) takes them exactly as the first pass read them.
+#[derive(Clone)]
+struct FloorInputs {
+    detected: Vec<RepoCheck>,
+    waived: Vec<String>,
+    exclude: bool,
+    guide: Result<Option<crate::floor_guide::BuildGuide>, String>,
+    touched: Vec<String>,
+    changed: Result<Vec<String>, String>,
+    removed: Result<Vec<String>, String>,
+    candidates: Vec<String>,
+    baseline_diff: bool,
+    package_baseline: std::collections::HashMap<String, bool>,
+    package_note: Option<String>,
+    e2e_paths: Option<Vec<String>>,
+}
+
+/// One pass of the floor over the detected checks ([`run_with_sandbox_ctx`]). With no `frozen`
+/// inputs it reads them from the tree and lets a verify floor take the creator floor's results
+/// ([`CreatorSeed`]); the second value is set when a check that ran (or was resumed) after reused
+/// ones failed, with why and the inputs it read, and the caller then runs the checks again on
+/// those inputs with nothing reused.
+#[allow(clippy::too_many_arguments)]
+fn run_detected(
+    worktree: &Path,
+    sandbox: &WorkerSandbox,
+    sandbox_level: &str,
+    sandbox_note: Option<&str>,
+    ctx: &FloorContext,
+    scratch: &CheckScratch,
+    rerun: Option<&FloorRerun>,
+    journal: Option<&FloorJournal>,
+    untouched: Option<&dyn Fn() -> bool>,
+    frozen: Option<FloorInputs>,
+) -> (RepoChecksReport, Option<(String, FloorInputs)>) {
+    let sandbox_level = sandbox_level.to_string();
+    let sandbox_note = sandbox_note.map(str::to_string);
+    // (core#1152, xreview) What the floor reads from the tree is read before its first check runs —
+    // and, on the no-reuse re-run, taken as the first pass read it: by then repository commands
+    // have run in this checkout, and an untracked file one left (a `.wicked/checks.json` turning
+    // every check off) must never steer which checks run or how they decide.
+    let allow_reuse = frozen.is_none();
+    let inputs = match frozen {
+        Some(f) => f,
+        None => {
+            let detected = match detect_with(worktree, ctx) {
+                Ok(d) => d,
+                Err(e) => {
+                    return (
+                        RepoChecksReport {
+                            detected: Vec::new(),
+                            checks: Vec::new(),
+                            skipped: Vec::new(),
+                            passed: false,
+                            detect_error: Some(e),
+                            sandbox_level,
+                            sandbox_note,
+                            sandbox_error: None,
+                            engine_writes_removed: Vec::new(),
+                            claim: None,
+                            env: None,
+                            tree: None,
+                            rerun: None,
+                            waived: Vec::new(),
+                            requested_rerun: None,
+                            recheck: None,
+                            coverage_note: None,
+                            key: None,
+                            resumed: None,
+                            reused_from: None,
+                        },
+                        None,
+                    )
+                }
+            };
+            let (detected, waived) = match rerun {
+                Some(r) => match apply_rerun(worktree, ctx, r, detected) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        return (
+                            RepoChecksReport {
+                                detected: Vec::new(),
+                                checks: Vec::new(),
+                                skipped: Vec::new(),
+                                passed: false,
+                                detect_error: Some(e),
+                                sandbox_level,
+                                sandbox_note,
+                                sandbox_error: None,
+                                engine_writes_removed: Vec::new(),
+                                claim: None,
+                                env: None,
+                                tree: None,
+                                rerun: None,
+                                waived: Vec::new(),
+                                requested_rerun: None,
+                                recheck: None,
+                                coverage_note: None,
+                                key: None,
+                                resumed: None,
+                                reused_from: None,
+                            },
+                            None,
+                        )
+                    }
+                },
+                None => (detected, Vec::new()),
+            };
+            // (DES-BUILD-GUIDE) The BASE tree's build guide — a head edit to it never applies to its own
+            // run — and the files the change touched (for `invalidatedBy` and `affected`).
+            // Read once per floor run: every check of it decides under the same switch.
+            let exclude = exclusion_enabled();
+            // `removed` (deleted, renamed away, type-changed: git's own D/T list) is read directly, never
+            // inferred from `changed` minus `touched` — a path removed from the index but still on disk
+            // is in both.
+            let (guide, touched, changed, removed) =
+                match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
+                    (Some(base), Some(git_dir)) => (
+                        crate::floor_guide::load_base(worktree, git_dir, base),
+                        touched_files(worktree, ctx).unwrap_or_default(),
+                        changed_files(worktree, ctx),
+                        removed_files(worktree, ctx),
+                    ),
+                    _ => (Ok(None), Vec::new(), Ok(Vec::new()), Ok(Vec::new())),
+                };
+            let candidates = engine_generated_candidates(worktree, &detected);
+            // (core#817) Per package: a subdirectory package's own `baseline_diff: false` holds for it.
+            // The root's opt-out covers the whole repo; a package's own opt-out covers the package.
+            // Every package's config is read HERE, before the first check runs: no `.wicked/checks.json`
+            // is read from the tree after a command could have rewritten (or re-pointed) it.
+            let baseline_diff = baseline_diff_enabled(worktree);
+            let package_baseline: std::collections::HashMap<String, bool> = detected
+                .iter()
+                .filter(|c| !c.dir.is_empty())
+                .map(|c| (c.dir.clone(), baseline_diff_enabled(&worktree.join(&c.dir))))
+                .collect();
+            // The coverage notes' reads of the tree (the change's files, the packages' manifests) happen
+            // here too, before any check runs.
+            let package_note = package_coverage_note(worktree, ctx, &detected);
+            let e2e_paths = (ctx.stage == FloorStage::Verify)
+                .then(|| e2e_paths(worktree, ctx))
+                .flatten();
+            FloorInputs {
+                detected,
+                waived,
+                exclude,
+                guide,
+                touched,
+                changed,
+                removed,
+                candidates,
+                baseline_diff,
+                package_baseline,
+                package_note,
+                e2e_paths,
             }
         }
     };
-    let (detected, waived) = match rerun {
-        Some(r) => match apply_rerun(worktree, ctx, r, detected) {
-            Ok(pair) => pair,
-            Err(e) => {
-                return RepoChecksReport {
-                    detected: Vec::new(),
-                    checks: Vec::new(),
-                    skipped: Vec::new(),
-                    passed: false,
-                    detect_error: Some(e),
-                    sandbox_level,
-                    sandbox_note,
-                    sandbox_error: None,
-                    engine_writes_removed: Vec::new(),
-                    claim: None,
-                    env: None,
-                    tree: None,
-                    rerun: None,
-                    waived: Vec::new(),
-                    requested_rerun: None,
-                    recheck: None,
-                    coverage_note: None,
-                    key: None,
-                    resumed: None,
-                    reused_from: None,
-                }
-            }
-        },
-        None => (detected, Vec::new()),
-    };
+    let rerun_inputs = (allow_reuse && ctx.stage == FloorStage::Verify).then(|| inputs.clone());
+    let FloorInputs {
+        detected,
+        waived,
+        exclude,
+        guide,
+        touched,
+        changed,
+        removed,
+        candidates,
+        baseline_diff,
+        package_baseline,
+        package_note,
+        e2e_paths,
+    } = inputs;
+    let baseline_diff_for =
+        |dir: &str| dir.is_empty() || package_baseline.get(dir).copied().unwrap_or(false);
     // (F-RC2-009) Never run a HEAD process beside a copy of the base — a crash mid-floor could
     // have left one; the export lives only between its creation and the caching of its result.
     // (core#1050) A base export that cannot be cleared (a linked or non-directory `tmp`, a link
@@ -4600,49 +4802,8 @@ pub(crate) fn run_with_sandbox_ctx(
         .and_then(remove_base_export)
         .err()
         .map(|e| format!("the checks' scratch could not be made safe: {e}"));
-    // (DES-BUILD-GUIDE) The BASE tree's build guide — a head edit to it never applies to its own
-    // run — and the files the change touched (for `invalidatedBy` and `affected`).
-    // Read once per floor run: every check of it decides under the same switch.
-    let exclude = exclusion_enabled();
-    // `removed` (deleted, renamed away, type-changed: git's own D/T list) is read directly, never
-    // inferred from `changed` minus `touched` — a path removed from the index but still on disk
-    // is in both.
-    let (guide, touched, changed, removed) =
-        match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
-            (Some(base), Some(git_dir)) => (
-                crate::floor_guide::load_base(worktree, git_dir, base),
-                touched_files(worktree, ctx).unwrap_or_default(),
-                changed_files(worktree, ctx),
-                removed_files(worktree, ctx),
-            ),
-            _ => (Ok(None), Vec::new(), Ok(Vec::new()), Ok(Vec::new())),
-        };
-    let candidates = engine_generated_candidates(worktree, &detected);
     let held_head = held_worktree.as_ref().ok();
     let env = scratch.env_record(&sandbox_level);
-    // (core#817) Per package: a subdirectory package's own `baseline_diff: false` holds for it.
-    // The root's opt-out covers the whole repo; a package's own opt-out covers the package.
-    // Every package's config is read HERE, before the first check runs: no `.wicked/checks.json`
-    // is read from the tree after a command could have rewritten (or re-pointed) it.
-    let baseline_diff = baseline_diff_enabled(worktree);
-    let package_baseline: std::collections::HashMap<&str, bool> = detected
-        .iter()
-        .filter(|c| !c.dir.is_empty())
-        .map(|c| {
-            (
-                c.dir.as_str(),
-                baseline_diff_enabled(&worktree.join(&c.dir)),
-            )
-        })
-        .collect();
-    let baseline_diff_for =
-        |dir: &str| dir.is_empty() || package_baseline.get(dir).copied().unwrap_or(false);
-    // The coverage notes' reads of the tree (the change's files, the packages' manifests) happen
-    // here too, before any check runs.
-    let package_note = package_coverage_note(worktree, ctx, &detected);
-    let e2e_paths = (ctx.stage == FloorStage::Verify)
-        .then(|| e2e_paths(worktree, ctx))
-        .flatten();
     let mut checks = Vec::new();
     let mut skipped = Vec::new();
     let mut failed = false;
@@ -4673,34 +4834,26 @@ pub(crate) fn run_with_sandbox_ctx(
         .filter(|_| untouched.is_some())
         .map(|j| j.record.key.tree.clone());
     let mut seed = match (ctx.stage, guarded_tree.as_deref(), ctx.base_head.as_deref()) {
-        (FloorStage::Verify, Some(tree), Some(base)) => {
+        (FloorStage::Verify, Some(tree), Some(base)) if allow_reuse => {
             CreatorSeed::load(&scratch.logs, tree, base, &sandbox_level, exclude)
         }
         _ => None,
     };
-    // Reuse is SUFFIX-ONLY (xreview r1): no check runs fresh after a reused one, so nothing that
-    // runs here can depend on a file a reused check would have left in this checkout (an emitted
-    // `dist/` a later `e2e` reads). Everything up to the last check the record cannot stand for
-    // runs; only the checks after it are reused.
-    let reuse_from = seed.as_ref().map_or(usize::MAX, |s| {
-        detected
-            .iter()
-            .rposition(|c| !s.can_reuse(c, &scratch.logs))
-            .map_or(0, |i| i + 1)
-    });
+    // (core#1152) Reuse is in ANY order: every check the record stands for is reused, wherever it
+    // sits, and only the rest run here. Two guards replace core#1145's suffix-only rule: a check
+    // that runs fresh after reused ones and fails sends the floor round again with nothing reused
+    // (`again`), and after the fresh checks the checkout must still hold exactly the tree the
+    // reused results stand for (below), or they are void and the floor fails.
+    let mut again: Option<String> = None;
     // The checks this floor RAN itself, for a creator floor's record: never one reused from an
     // interrupted floor's journal, which may have run in the live worktree (xreview r1).
     let mut ran_here: Vec<CreatorEntry> = Vec::new();
-    for (ix, check) in detected.iter().enumerate() {
+    for check in detected.iter() {
         if failed || scratch_error.is_some() {
             skipped.push(check.name.clone());
             continue;
         }
-        if let Some(run) = seed
-            .as_mut()
-            .filter(|_| ix >= reuse_from)
-            .and_then(|s| s.reuse(check, &scratch.logs))
-        {
+        if let Some(run) = seed.as_mut().and_then(|s| s.reuse(check, &scratch.logs)) {
             if let Some(s) = &seed {
                 eprintln!("{}", s.log_line(&run));
             }
@@ -4719,6 +4872,11 @@ pub(crate) fn run_with_sandbox_ctx(
                 run.outcome()
             );
             failed = run.denies();
+            // (xreview) A failure the interrupted pass ran after reused checks sends the floor
+            // round again just as it would have there.
+            if again.is_none() {
+                again = seed.as_ref().and_then(|s| s.set_aside_by(check, &run));
+            }
             if let Some(j) = journal.as_mut() {
                 j.record(check, &run, untouched);
             }
@@ -4730,7 +4888,7 @@ pub(crate) fn run_with_sandbox_ctx(
             _ => None,
         };
         let gcheck = guide_for(&guide, check, ctx, worktree, &changed).and_then(|g| {
-            runner_current(worktree, held_head, check, g, &sandbox, &scratch).map(|()| g)
+            runner_current(worktree, held_head, check, g, sandbox, scratch).map(|()| g)
         });
         let status = GuideStatus {
             present: present.is_some(),
@@ -4754,14 +4912,14 @@ pub(crate) fn run_with_sandbox_ctx(
                     source: format!("`{}`'s affected set (DES-BUILD-GUIDE)", check.name),
                     ..check.clone()
                 };
-                let r = run_held(worktree, held_head, &a, &sandbox, &scratch, Tree::Head);
+                let r = run_held(worktree, held_head, &a, sandbox, scratch, Tree::Head);
                 if r.passed() {
                     r
                 } else {
-                    run_held(worktree, held_head, check, &sandbox, &scratch, Tree::Head)
+                    run_held(worktree, held_head, check, sandbox, scratch, Tree::Head)
                 }
             }
-            None => run_held(worktree, held_head, check, &sandbox, &scratch, Tree::Head),
+            None => run_held(worktree, held_head, check, sandbox, scratch, Tree::Head),
         };
         // (DES-FLOOR-V2) A check that passed, timed out or could not start decides alone. A
         // FAILURE is compared with the run base (the install and the formatter never are: they
@@ -4799,7 +4957,7 @@ pub(crate) fn run_with_sandbox_ctx(
                 (Some(head), Some(git_dir)) => {
                     // This run's cache first; on a miss the base is exported, run (and, red,
                     // inventoried), cached, and the export removed before the next HEAD run.
-                    Some(match BaseTree::cached(&scratch, head, check, excluding) {
+                    Some(match BaseTree::cached(scratch, head, check, excluding) {
                         Some(cached) => cached,
                         None => {
                             let export = held_worktree
@@ -4807,7 +4965,7 @@ pub(crate) fn run_with_sandbox_ctx(
                                 .map_err(String::clone)
                                 .and_then(|root| BaseTree::export(worktree, root, git_dir, head));
                             let side = match export {
-                                Ok(t) => t.run_check(check, ctx, &sandbox, &scratch, excluding),
+                                Ok(t) => t.run_check(check, ctx, sandbox, scratch, excluding),
                                 Err(e) => BaseSide {
                                     base: BaseRun {
                                         head: head.to_string(),
@@ -4842,8 +5000,7 @@ pub(crate) fn run_with_sandbox_ctx(
                 });
             } else {
                 decide(
-                    worktree, held_head, check, &mut run, side, &gcheck, exclude, &sandbox,
-                    &scratch,
+                    worktree, held_head, check, &mut run, side, &gcheck, exclude, sandbox, scratch,
                 );
             }
         }
@@ -4861,6 +5018,12 @@ pub(crate) fn run_with_sandbox_ctx(
                 .unwrap_or_default()
         );
         failed = run.denies();
+        if let Some(s) = seed.as_mut() {
+            if again.is_none() {
+                again = s.set_aside_by(check, &run);
+            }
+            s.fresh.push(check.name.clone());
+        }
         if let Some(j) = journal.as_mut() {
             j.record(check, &run, untouched);
         }
@@ -4879,7 +5042,6 @@ pub(crate) fn run_with_sandbox_ctx(
     // spoiled the journal: nothing this floor ran may stand for the tree (xreview r1).
     let spoiled = journal.as_ref().is_none_or(|j| j.spoiled);
     let resumed = journal.and_then(OpenJournal::finish);
-    let reused_from = seed.and_then(CreatorSeed::finish);
     let claim = judge_claim(ctx, &checks);
     // An engine-written file (absent at detection, present now) is the checks' own side effect —
     // remove it so the guard's final comparison sees the tree the seat left. Never a symlink.
@@ -4890,6 +5052,35 @@ pub(crate) fn run_with_sandbox_ctx(
                 engine_writes_removed.push(rel);
             }
         }
+    }
+    // (core#1152) The direct guard for reusing out of order: the reused results stand for the tree
+    // the creator floor ran on, so once checks ran fresh beside them this checkout must still hold
+    // exactly that tree — after every check (the journal's spoil) and now, with the engine's own
+    // writes gone. A change voids them, and the floor fails, as any guarded floor whose check
+    // changed its tracked content does ([`FloorCheckout::hold_to`]); they are not run again on
+    // content that is not the tree that ships.
+    let reuse_error = seed
+        .as_ref()
+        .filter(|s| !s.reused.is_empty() && !s.fresh.is_empty())
+        .filter(|_| spoiled || !untouched.is_some_and(|probe| probe()))
+        .map(|s| {
+            format!(
+                "a check that ran fresh here ({}) changed the checkout's tracked content, so the \
+                 results reused from the creator floor ({}) no longer stand for it — void, and \
+                 the floor fails",
+                s.fresh.join(", "),
+                s.reused.join(", ")
+            )
+        });
+    if reuse_error.is_some() {
+        again = None;
+    }
+    let reused_from = seed.and_then(|s| s.finish(reuse_error.clone()));
+    if let Some(r) = reused_from
+        .as_ref()
+        .filter(|r| r.voided.is_none() && again.is_none())
+    {
+        eprintln!("wicked-core: repo checks floor — {}", r.note());
     }
     // (core#1144) A guarded creator floor leaves the checks it ran for the verify floor of the same
     // tree and base — only an ordinary floor (no re-run, nothing waived), on a clean checkout, whose
@@ -4934,28 +5125,39 @@ pub(crate) fn run_with_sandbox_ctx(
     if let Some(e) = &scratch_error {
         eprintln!("wicked-core: repo checks floor — refused: {e}");
     }
-    RepoChecksReport {
-        passed: !failed && scratch_error.is_none(),
-        detected,
-        checks,
-        skipped,
-        detect_error: scratch_error,
-        sandbox_level,
-        sandbox_note,
-        sandbox_error: None,
-        engine_writes_removed,
-        claim,
-        env: Some(env),
-        tree: None,
-        rerun: None,
-        waived,
-        requested_rerun: None,
-        recheck: None,
-        coverage_note,
-        key: None,
-        resumed,
-        reused_from,
+    if let Some(e) = &reuse_error {
+        eprintln!("wicked-core: repo checks floor — {e}");
     }
+    let passed = !failed && scratch_error.is_none() && reuse_error.is_none();
+    let detect_error = match (scratch_error, reuse_error) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
+    };
+    (
+        RepoChecksReport {
+            passed,
+            detected,
+            checks,
+            skipped,
+            detect_error,
+            sandbox_level,
+            sandbox_note,
+            sandbox_error: None,
+            engine_writes_removed,
+            claim,
+            env: Some(env),
+            tree: None,
+            rerun: None,
+            waived,
+            requested_rerun: None,
+            recheck: None,
+            coverage_note,
+            key: None,
+            resumed,
+            reused_from,
+        },
+        again.zip(rerun_inputs),
+    )
 }
 
 /// (core#817) A changed subdirectory package the floor detected NO checks for is named, so a

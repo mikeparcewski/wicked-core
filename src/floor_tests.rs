@@ -210,6 +210,7 @@ fn wire_decision(c: &CheckRun) -> serde_json::Value {
         env: None,
         changed: Vec::new(),
         changed_truncated: false,
+        reused_from: None,
     }
     .to_json()["checks"][0]["decision"]
         .clone()
@@ -4436,11 +4437,38 @@ struct Core1144 {
 #[cfg(unix)]
 impl Core1144 {
     fn new(tag: &str, checks: serde_json::Value) -> Self {
+        Self::with(tag, |wt| {
+            std::fs::write(wt.join(CONFIG_PATH), checks.to_string()).unwrap();
+        })
+    }
+
+    /// (core#1152) A repo whose checks come from a build guide committed in the base: `checks` in
+    /// order, each `{"name", "run", "stage"?, "cwd"?}` (no `version` piece: nothing to go stale).
+    fn guided(tag: &str, checks: &[serde_json::Value]) -> Self {
+        Self::with(tag, |wt| {
+            for c in checks {
+                if let Some(cwd) = c["cwd"].as_str() {
+                    std::fs::create_dir_all(wt.join(cwd)).unwrap();
+                    std::fs::write(wt.join(cwd).join("keep.txt"), "k\n").unwrap();
+                }
+            }
+            std::fs::write(
+                wt.join(crate::floor_guide::GUIDE_PATH),
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"version": 1, "derivedFrom": [], "checks": checks}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        })
+    }
+
+    fn with(tag: &str, files: impl FnOnce(&Path)) -> Self {
         let wt = scratch(tag);
         std::fs::write(wt.join("app.txt"), "v1\n").unwrap();
-        std::fs::write(wt.join(".gitignore"), "tmp/\n").unwrap();
+        std::fs::write(wt.join(".gitignore"), "tmp/\nout/\n").unwrap();
         std::fs::create_dir_all(wt.join(".wicked")).unwrap();
-        std::fs::write(wt.join(CONFIG_PATH), checks.to_string()).unwrap();
+        files(&wt);
         let base = git_repo_with_commit(&wt);
         let git_dir = PathBuf::from(git(&wt, &["rev-parse", "--absolute-git-dir"]));
         let tree = crate::worktree_guard::snapshot_through(&wt, &git_dir)
@@ -4540,6 +4568,8 @@ fn core_1144_verify_reuses_the_guarded_creator_floor_of_the_same_tree_and_base()
             ord: 4,
             attempt: 1,
             reused: vec!["lint".into(), "test".into()],
+            fresh: Vec::new(),
+            voided: None,
         })
     );
     for name in ["lint", "test"] {
@@ -4562,6 +4592,7 @@ fn core_1144_verify_reuses_the_guarded_creator_floor_of_the_same_tree_and_base()
     let seed = CreatorSeed {
         record,
         reused: Vec::new(),
+        fresh: Vec::new(),
     };
     let test_run = verify.checks.iter().find(|c| c.name == "test").unwrap();
     assert_eq!(
@@ -4594,17 +4625,18 @@ fn core_1144_verify_reuses_the_guarded_creator_floor_of_the_same_tree_and_base()
     let _ = std::fs::remove_dir_all(&r.wt);
 }
 
-/// (core#1144, xreview r1) Reuse is suffix-only: a verify-only check that runs LAST (`e2e`) may read
-/// what an earlier check left in the checkout, so nothing before it is reused.
+/// (core#1152) Reuse is in any order: a verify-only check that runs LAST (`e2e`) runs fresh, and the
+/// checks before it are still reused. The note and log name both lists, and the
+/// `repoChecksEvaluated` frame carries them as `reusedFrom` (crew#1180).
 #[cfg(unix)]
 #[test]
-fn core_1144_no_check_is_reused_before_one_that_runs_fresh() {
+fn core_1152_a_verify_only_check_ordered_last_runs_fresh_and_the_rest_is_reused() {
     let _env = crate::test_env::ENV_LOCK
         .read()
         .unwrap_or_else(|p| p.into_inner());
     let n = Core1144::NONCE;
     let r = Core1144::new(
-        "core-1144-suffix",
+        "core-1152-last",
         serde_json::json!({"typecheck": false, "lint": n, "test": n, "e2e": n}),
     );
     let creator = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
@@ -4613,10 +4645,457 @@ fn core_1144_no_check_is_reused_before_one_that_runs_fresh() {
         return;
     }
     assert!(creator.passed && r.record_exists(), "{creator:#?}");
+    assert!(
+        creator.checks.iter().all(|c| c.name != "e2e"),
+        "e2e is verify-only"
+    );
     let verify = r.guarded(FloorStage::Verify, &r.base, 6, "verify");
-    assert!(verify.reused_from.is_none(), "{verify:#?}");
-    assert_ne!(stdout_of(&verify, "test"), stdout_of(&creator, "test"));
+    assert!(verify.passed, "{verify:#?}");
+    let reuse = FloorReuse {
+        phase: Some("fix".into()),
+        ord: 4,
+        attempt: 1,
+        reused: vec!["lint".into(), "test".into()],
+        fresh: vec!["e2e".into()],
+        voided: None,
+    };
+    assert_eq!(verify.reused_from.as_ref(), Some(&reuse), "{verify:#?}");
+    for name in ["lint", "test"] {
+        assert_eq!(stdout_of(&verify, name), stdout_of(&creator, name));
+    }
+    assert!(stdout_of(&verify, "e2e").contains("nonce-"), "e2e ran here");
+    let note = verify.classification_note().unwrap_or_default();
+    assert!(
+        note.contains(
+            "checks reused from fix (unit 4, attempt 1): lint, test ran there on this same tree"
+        ) && note.contains("not run again here; ran fresh here: e2e"),
+        "the note names the reused and the fresh checks: {note}"
+    );
+    // (crew#1180) The event stream carries it.
+    let frame = |reused_from: Option<FloorReuse>| {
+        crate::event::CoreEvent::RepoChecksEvaluated {
+            session: "s".into(),
+            ord: 6,
+            attempt: 0,
+            passed: true,
+            criterion: CRITERION.into(),
+            checks: verify.checks.clone(),
+            skipped: Vec::new(),
+            sandbox_level: verify.sandbox_level.clone(),
+            sandbox_error: None,
+            detect_error: None,
+            outcome: verify.outcome().into(),
+            floor: "verify".into(),
+            claim: None,
+            env: None,
+            changed: Vec::new(),
+            changed_truncated: false,
+            reused_from,
+        }
+        .to_json()
+    };
+    assert_eq!(
+        frame(verify.reused_from.clone())["reusedFrom"],
+        serde_json::json!({
+            "phase": "fix", "ord": 4, "attempt": 1,
+            "reused": ["lint", "test"], "fresh": ["e2e"],
+        })
+    );
+    assert!(frame(None).get("reusedFrom").is_none());
     let _ = std::fs::remove_dir_all(&r.wt);
+}
+
+/// (core#1152, the reason core#1145 was suffix-only) A fresh check that needs what a reused check
+/// leaves in the checkout (`lint` writes an ignored `out/marker` that `e2e` reads) fails after the
+/// reuse; the floor then runs every check again from the first one with nothing reused, and passes
+/// as it did before reuse existed — saying so.
+#[cfg(unix)]
+#[test]
+fn core_1152_a_fresh_check_failing_after_reuse_runs_the_floor_again_without_reuse() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let r = Core1144::new(
+        "core-1152-again",
+        serde_json::json!({
+            "typecheck": false,
+            "lint": ["sh", "-c", "mkdir -p out && echo m > out/marker && echo nonce-$$-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')"],
+            "test": Core1144::NONCE,
+            "e2e": ["sh", "-c", "test -f out/marker"],
+        }),
+    );
+    let creator = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
+    if creator.sandbox_error.is_some() || creator.checks.is_empty() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
+    }
+    assert!(creator.passed && r.record_exists(), "{creator:#?}");
+    let verify = r.guarded(FloorStage::Verify, &r.base, 6, "verify");
+    assert!(
+        verify.passed,
+        "the floor ran again in order and passed: {verify:#?}"
+    );
+    for name in ["lint", "test"] {
+        assert_ne!(
+            stdout_of(&verify, name),
+            stdout_of(&creator, name),
+            "`{name}` ran again here"
+        );
+    }
+    let reuse = verify
+        .reused_from
+        .as_ref()
+        .expect("the set-aside reuse is disclosed");
+    assert_eq!(reuse.reused, vec!["lint".to_string(), "test".to_string()]);
+    let why = reuse.voided.as_deref().unwrap_or_default();
+    assert!(
+        why.contains("`e2e` ran fresh after the reused lint, test and failed")
+            && why.contains("every check ran again here from the first one, nothing reused"),
+        "{why}"
+    );
+    let note = verify.classification_note().unwrap_or_default();
+    assert!(
+        note.contains("checks reused from fix (unit 4, attempt 1) were set aside: `e2e`"),
+        "{note}"
+    );
+    let _ = std::fs::remove_dir_all(&r.wt);
+}
+
+/// (core#1152, xreview) The no-reuse re-run runs the checks the first pass read, never ones read
+/// again from a checkout repository commands have run in: a failing test that leaves an untracked
+/// `.wicked/checks.json` turning every check off must not leave a re-run with no checks (green).
+#[cfg(unix)]
+#[test]
+fn core_1152_the_rerun_never_re_reads_the_checks_from_the_checkout() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let r = Core1144::with("core-1152-frozen", |wt| {
+        std::fs::remove_dir_all(wt.join(".wicked")).unwrap();
+        std::fs::write(wt.join(".gitignore"), "tmp/\ntarget/\nCargo.lock\n").unwrap();
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::write(
+            wt.join("Cargo.toml"),
+            "[package]\nname = \"core1152_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wt.join("src/lib.rs"),
+            "#[test]\nfn poisons_and_fails() {\n    std::fs::create_dir_all(\".wicked\").unwrap();\n    \
+             std::fs::write(\".wicked/checks.json\", r#\"{\"formatter\":false,\"test\":false}\"#).unwrap();\n    \
+             panic!(\"red\");\n}\n",
+        )
+        .unwrap();
+    });
+    let first = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
+    if first.sandbox_error.is_some() || first.checks.is_empty() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
+    }
+    let names = |rep: &RepoChecksReport| -> Vec<String> {
+        rep.checks.iter().map(|c| c.name.clone()).collect()
+    };
+    assert_eq!(
+        names(&first),
+        ["cargo-fmt-check", "cargo-test"],
+        "{first:#?}"
+    );
+    // The creator floor resumes `cargo-test` from an interrupted journal, so its record holds only
+    // `cargo-fmt-check` and verify runs `cargo-test` fresh after a reused check.
+    let ctx = r.ctx(FloorStage::Creator, &r.base);
+    let test_run = first
+        .checks
+        .iter()
+        .find(|c| c.name == "cargo-test")
+        .unwrap();
+    let check = first
+        .detected
+        .iter()
+        .find(|c| c.name == "cargo-test")
+        .unwrap();
+    let record = JournalRecord {
+        floor_policy: FLOOR_POLICY_VERSION,
+        key: FloorKey::of(&r.tree, &ctx, &first.detected),
+        exclude: exclusion_enabled(),
+        attempt: 1,
+        checks: vec![JournalEntry {
+            dir: check.dir.clone(),
+            name: check.name.clone(),
+            argv: check.argv.clone(),
+            run: test_run.clone(),
+        }],
+    };
+    std::fs::write(
+        journal_path(&r.logs(), 4),
+        serde_json::to_string(&record).unwrap(),
+    )
+    .unwrap();
+    let resumed = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
+    assert_eq!(
+        resumed.resumed.as_ref().map(|x| x.reused.clone()),
+        Some(vec!["cargo-test".to_string()]),
+        "{resumed:#?}"
+    );
+    assert!(r.record_exists(), "{resumed:#?}");
+    let verify = r.guarded(FloorStage::Verify, &r.base, 6, "verify");
+    assert!(
+        !verify.passed,
+        "the re-run ran the failing test again: {verify:#?}"
+    );
+    assert_eq!(
+        names(&verify),
+        ["cargo-fmt-check", "cargo-test"],
+        "{verify:#?}"
+    );
+    let why = verify
+        .reused_from
+        .as_ref()
+        .and_then(|r| r.voided.clone())
+        .unwrap_or_default();
+    assert!(
+        why.contains("`cargo-test` ran fresh after the reused cargo-fmt-check and failed"),
+        "{verify:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&r.wt);
+}
+
+/// (core#1152, xreview) A failure that the pass a daemon restart interrupted ran after reused checks
+/// (restored from the verify floor's journal) sends the floor round again, as it would have there.
+#[cfg(unix)]
+#[test]
+fn core_1152_a_journal_restored_failure_after_reuse_runs_the_floor_again() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let e2e = serde_json::json!(["sh", "-c", "test -f out/marker"]);
+    let r = Core1144::new(
+        "core-1152-journal",
+        serde_json::json!({
+            "typecheck": false,
+            "lint": ["sh", "-c", "mkdir -p out && echo m > out/marker && echo nonce-$$-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')"],
+            "test": Core1144::NONCE,
+            "e2e": e2e,
+        }),
+    );
+    let creator = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
+    if creator.sandbox_error.is_some() || creator.checks.is_empty() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
+    }
+    assert!(creator.passed && r.record_exists(), "{creator:#?}");
+    // A failing `e2e` run in this run's log store: the same check on a repo whose `lint` leaves no
+    // marker (another tree, the same run id).
+    let mut other = Core1144::new(
+        "core-1152-journal-red",
+        serde_json::json!({"typecheck": false, "lint": Core1144::NONCE, "e2e": e2e}),
+    );
+    other.run_id = r.run_id.clone();
+    let red = other.guarded(FloorStage::Verify, &other.base, 6, "verify");
+    let red_e2e = red
+        .checks
+        .iter()
+        .find(|c| c.name == "e2e")
+        .expect("{red:#?}");
+    assert!(red_e2e.denies(), "{red:#?}");
+    // The interrupted verify pass had journaled that failure after reusing `lint` and `test`.
+    let ctx = r.ctx(FloorStage::Verify, &r.base);
+    let detected = detect_with(&r.wt, &ctx).unwrap();
+    let check = detected.iter().find(|c| c.name == "e2e").unwrap();
+    let record = JournalRecord {
+        floor_policy: FLOOR_POLICY_VERSION,
+        key: FloorKey::of(&r.tree, &ctx, &detected),
+        exclude: exclusion_enabled(),
+        attempt: 1,
+        checks: vec![JournalEntry {
+            dir: check.dir.clone(),
+            name: check.name.clone(),
+            argv: check.argv.clone(),
+            run: red_e2e.clone(),
+        }],
+    };
+    std::fs::write(
+        journal_path(&r.logs(), 6),
+        serde_json::to_string(&record).unwrap(),
+    )
+    .unwrap();
+    let verify = r.guarded(FloorStage::Verify, &r.base, 6, "verify");
+    assert!(
+        verify.passed,
+        "the floor ran again in order and passed: {verify:#?}"
+    );
+    let why = verify
+        .reused_from
+        .as_ref()
+        .and_then(|x| x.voided.clone())
+        .unwrap_or_default();
+    assert!(
+        why.contains("`e2e` ran fresh after the reused lint, test and failed"),
+        "{verify:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&r.wt);
+    let _ = std::fs::remove_dir_all(&other.wt);
+}
+
+/// (core#1152) The direct guard that replaces the suffix rule: a fresh check that changes the
+/// checkout's tracked content voids the reused results, even when a later fresh check restores it
+/// (the final comparison alone would pass), and the floor fails.
+#[cfg(unix)]
+#[test]
+fn core_1152_a_fresh_check_that_changes_the_tree_voids_the_reuse() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let n = Core1144::NONCE;
+    let verify_only = |name: &str, run: serde_json::Value| serde_json::json!({"name": name, "cwd": ".", "run": run, "stage": ["verify"]});
+    let r = Core1144::guided(
+        "core-1152-mutate",
+        &[
+            serde_json::json!({"name": "lint", "cwd": ".", "run": n}),
+            verify_only(
+                "prepare",
+                serde_json::json!(["sh", "-c", "echo v2 > app.txt"]),
+            ),
+            serde_json::json!({"name": "test", "cwd": ".", "run": n}),
+            verify_only(
+                "restore",
+                serde_json::json!(["sh", "-c", "echo v1 > app.txt"]),
+            ),
+        ],
+    );
+    let creator = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
+    if creator.sandbox_error.is_some() || creator.checks.is_empty() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
+    }
+    let names: Vec<&str> = creator.checks.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["lint", "test"], "{creator:#?}");
+    assert!(creator.passed && r.record_exists(), "{creator:#?}");
+    let verify = r.guarded(FloorStage::Verify, &r.base, 6, "verify");
+    assert_eq!(
+        std::fs::read_to_string(r.wt.join("app.txt")).unwrap(),
+        "v1\n",
+        "the seat's tree is never the one the checks ran in"
+    );
+    assert!(!verify.passed, "{verify:#?}");
+    let reuse = verify.reused_from.as_ref().expect("{verify:#?}");
+    assert_eq!(reuse.reused, vec!["lint".to_string(), "test".to_string()]);
+    assert_eq!(
+        reuse.fresh,
+        vec!["prepare".to_string(), "restore".to_string()]
+    );
+    let why = reuse.voided.as_deref().unwrap_or_default();
+    assert!(
+        why.contains(
+            "a check that ran fresh here (prepare, restore) changed the checkout's tracked content"
+        ) && why.contains("void, and the floor fails"),
+        "{why}"
+    );
+    assert!(
+        verify
+            .detect_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains(why),
+        "the failure says why: {verify:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&r.wt);
+}
+
+/// (core#1152) wicked-core's own check order (its `.wicked/build-guide.json`): the verify-only
+/// builds sit before `test` and the core-ts checks after it. Verify reuses every shared check,
+/// `test` included, and runs only the verify-only ones; a reused failing `test` (the base fails it
+/// too, as on rig run c5320434) stops the floor there, as a fresh one does.
+#[cfg(unix)]
+#[test]
+fn core_1152_cores_real_check_order_reuses_every_shared_check() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let guide = |test: serde_json::Value| -> Vec<serde_json::Value> {
+        let n = serde_json::json!(Core1144::NONCE);
+        let both = |name: &str, run: &serde_json::Value| serde_json::json!({"name": name, "cwd": ".", "run": run});
+        let verify = |name: &str, cwd: &str| serde_json::json!({"name": name, "cwd": cwd, "run": Core1144::NONCE, "stage": ["verify"]});
+        let ts = "crates/wicked-core-ts";
+        vec![
+            both("cargo-fmt-check", &n),
+            both("typecheck", &n),
+            both("lint", &n),
+            verify("build-workspace", "."),
+            verify("build-postgres", "."),
+            serde_json::json!({"name": "test", "cwd": ".", "run": test, "stage": ["creator", "verify"]}),
+            verify("core-ts-fmt", ts),
+            verify("core-ts-clippy", ts),
+            verify("core-ts-test", ts),
+            verify("core-ts-finalize-dts", ts),
+            verify("install", ts),
+            verify("core-ts-tsc", ts),
+        ]
+    };
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+    let r = Core1144::guided("core-1152-core", &guide(serde_json::json!(Core1144::NONCE)));
+    let creator = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
+    if creator.sandbox_error.is_some() || creator.checks.is_empty() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
+    }
+    assert!(creator.passed && r.record_exists(), "{creator:#?}");
+    let verify = r.guarded(FloorStage::Verify, &r.base, 6, "verify");
+    assert!(verify.passed, "{verify:#?}");
+    let reuse = verify.reused_from.as_ref().expect("{verify:#?}");
+    assert_eq!(
+        reuse.reused,
+        s(&["cargo-fmt-check", "typecheck", "lint", "test"])
+    );
+    assert_eq!(
+        reuse.fresh,
+        s(&[
+            "build-workspace",
+            "build-postgres",
+            "core-ts-fmt",
+            "core-ts-clippy",
+            "core-ts-test",
+            "core-ts-finalize-dts",
+            "install",
+            "core-ts-tsc",
+        ])
+    );
+    assert_eq!(reuse.voided, None);
+    assert_eq!(stdout_of(&verify, "test"), stdout_of(&creator, "test"));
+    let _ = std::fs::remove_dir_all(&r.wt);
+
+    // The J4 shape: `test` fails at fix on a red base; verify reuses that failure and stops there.
+    let red = Core1144::guided(
+        "core-1152-core-red",
+        &guide(serde_json::json!(["sh", "-c", "echo FAILED-$$; exit 1"])),
+    );
+    let creator = red.guarded(FloorStage::Creator, &red.base, 4, "fix");
+    assert!(!creator.passed && red.record_exists(), "{creator:#?}");
+    let verify = red.guarded(FloorStage::Verify, &red.base, 6, "verify");
+    assert!(!verify.passed, "{verify:#?}");
+    let reuse = verify.reused_from.as_ref().expect("{verify:#?}");
+    assert_eq!(
+        reuse.reused,
+        s(&["cargo-fmt-check", "typecheck", "lint", "test"])
+    );
+    assert_eq!(reuse.fresh, s(&["build-workspace", "build-postgres"]));
+    assert_eq!(
+        reuse.voided, None,
+        "a reused failure is the fix floor's own word"
+    );
+    assert_eq!(stdout_of(&verify, "test"), stdout_of(&creator, "test"));
+    assert_eq!(
+        verify.skipped,
+        s(&[
+            "core-ts-fmt",
+            "core-ts-clippy",
+            "core-ts-test",
+            "core-ts-finalize-dts",
+            "install",
+            "core-ts-tsc",
+        ])
+    );
+    let _ = std::fs::remove_dir_all(&red.wt);
 }
 
 /// (core#1144, xreview r1) A creator floor whose check changed the checkout's tracked content
