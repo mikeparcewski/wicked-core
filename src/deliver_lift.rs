@@ -528,7 +528,8 @@ struct MergeMessage {
 
 /// The message kind of a clean three-way content merge (no conflict of its own).
 const MSG_AUTO_MERGING: &str = "Auto-merging";
-/// The message kind of a textual content conflict — the only conflict a union may resolve.
+/// The message kind of a textual content conflict — the only conflict the changelog
+/// resolution may resolve.
 const MSG_CONTENTS: &str = "CONFLICT (contents)";
 
 /// A conflicted in-memory merge: the conflict-marked tree `git merge-tree` wrote (every path that
@@ -639,44 +640,34 @@ fn merge_tree(
     }
 }
 
-/// The changelog file name crew's deliver script union-merges (crew#418 B): a conflicted path
-/// whose LAST component is exactly this, at any depth.
-const CHANGELOG_FILE: &str = "CHANGELOG.md";
+mod changelog;
+use changelog::is_changelog;
 
-fn is_changelog(path: &str) -> bool {
-    path.rsplit('/').next() == Some(CHANGELOG_FILE)
-}
-
-/// A changelog with its `## [Unreleased]` section removed: from the line that starts with
-/// `## [Unreleased]` up to (not including) the next line that starts with `## [`. Byte-for-byte
-/// the `awk` guard in crew's deliver script (`packages/crew/src/core/deliver.ts`).
-fn without_unreleased(text: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len());
-    let mut inside = false;
-    for line in text.split_inclusive(|b| *b == b'\n') {
-        if line.starts_with(b"## [Unreleased]") {
-            inside = true;
-            continue;
-        }
-        if inside && line.starts_with(b"## [") {
-            inside = false;
-        }
-        if !inside {
-            out.extend_from_slice(line);
-        }
+/// Write `content` into the object store as a blob, byte for byte (no filters); its id.
+fn write_blob(cwd: &Path, env: &[(&str, &Path)], content: &[u8]) -> anyhow::Result<String> {
+    let file = crate::worktree_guard::scratch_index_path().with_extension("blob");
+    std::fs::write(&file, content)?;
+    let path = file.to_string_lossy().into_owned();
+    let oid = git_string(cwd, &["hash-object", "-w", "--no-filters", &path], env);
+    let _ = std::fs::remove_file(&file);
+    let oid = oid?;
+    if oid.is_empty() {
+        anyhow::bail!("`git hash-object` printed no blob id");
     }
-    out
+    Ok(oid)
 }
 
-/// (crew#418 B, in the engine) A conflict whose every conflicted path is a `CHANGELOG.md` that the
-/// two sides changed ONLY inside its `## [Unreleased]` section is union-merged — both sides' lines
-/// kept, no markers (`git merge-file --union`, as crew's deliver script does on its rebase) — and
-/// the merged tree is returned. `Ok(None)`: some conflicted path is not a changelog, so the
-/// conflict stands as it is. `Err(why)`: every path is a changelog but one cannot be unioned
-/// safely (a side deleted or added it, a mode differs, the sides differ outside `[Unreleased]`,
-/// git refused) — the conflict stands, and `why` says which. Nothing here touches the worktree:
-/// the blobs and the tree go into the object store only, through a scratch index.
-fn union_changelog_conflict(
+/// (crew#418 B, core#1161) A conflict whose every conflicted path is a changelog
+/// ([`changelog::is_changelog`]) is resolved the way a person would: main's copy, with the run's
+/// new `[Unreleased]` entries placed under main's current `## [Unreleased]` heading
+/// ([`changelog::resolve`]) — so a release cut between the run's base and its delivery no longer
+/// strands it. The resolved tree is returned. `Ok(None)`: some conflicted path is not a changelog,
+/// so the conflict stands as it is. `Err(why)`: every path is a changelog but one cannot be
+/// resolved safely (a side deleted or added it, a mode differs, the run changed it outside
+/// `[Unreleased]` or rewrote an entry, git refused) — the conflict stands, and `why` says which.
+/// Nothing here touches the worktree: the blobs and the tree go into the object store only,
+/// through a scratch index.
+fn resolve_changelog_conflict(
     cwd: &Path,
     env: &[(&str, &Path)],
     conflict: &MergeConflict,
@@ -722,30 +713,14 @@ fn union_changelog_conflict(
             git(cwd, &["cat-file", "blob", oid], env)
                 .map_err(|e| format!("`{path}` could not be read: {e}"))
         };
-        if without_unreleased(&blob(&ours.oid)?) != without_unreleased(&blob(&theirs.oid)?) {
-            return Err(format!(
-                "`{path}` differs outside its `## [Unreleased]` section"
-            ));
-        }
-        let oid = git_string(
-            cwd,
-            &[
-                "merge-file",
-                "--union",
-                "--object-id",
-                &ours.oid,
-                &base.oid,
-                &theirs.oid,
-            ],
-            env,
-        )
-        .map_err(|e| format!("`{path}` could not be union-merged (needs git >= 2.43): {e}"))?;
-        if oid.is_empty() {
-            return Err(format!("`git merge-file` printed no blob id for `{path}`"));
-        }
+        let resolved =
+            changelog::resolve(&blob(&base.oid)?, &blob(&ours.oid)?, &blob(&theirs.oid)?)
+                .map_err(|why| format!("`{path}`: {why}"))?;
+        let oid = write_blob(cwd, env, &resolved)
+            .map_err(|e| format!("`{path}` could not be written: {e}"))?;
         merged.push((ours.mode.clone(), oid, path.clone()));
     }
-    // The conflict-marked tree with each changelog replaced by its union, through a scratch index
+    // The conflict-marked tree with each changelog replaced by its resolution, through a scratch index
     // (never the worktree's own).
     let index = crate::worktree_guard::scratch_index_path();
     let mut ienv: Vec<(&str, &Path)> = env.to_vec();
@@ -766,7 +741,7 @@ fn union_changelog_conflict(
         git_string(cwd, &["write-tree"], &ienv)
     })();
     let _ = std::fs::remove_file(&index);
-    let tree = built.map_err(|e| format!("the unioned tree could not be written: {e}"))?;
+    let tree = built.map_err(|e| format!("the resolved tree could not be written: {e}"))?;
     if tree.is_empty() {
         return Err("`git write-tree` printed no tree id".to_string());
     }
@@ -886,12 +861,12 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
             }
         }
     };
-    // (crew#418 B) A conflict ONLY in changelogs, and only inside their `[Unreleased]` sections,
-    // is union-merged here, in the lift, exactly as crew's deliver script would on its rebase; the
-    // lifted tree then re-verifies like any other. Every other conflict stands.
-    let (lifted_tree, unioned) = match merged {
+    // (crew#418 B, core#1161) A conflict ONLY in changelogs is resolved here, in the lift: the
+    // run's new `[Unreleased]` entries go under main's current `[Unreleased]`, main's copy kept
+    // otherwise. The lifted tree then re-verifies like any other. Every other conflict stands.
+    let (lifted_tree, resolved) = match merged {
         Ok(tree) => (tree, None),
-        Err(conflict) => match union_changelog_conflict(worktree, &env, &conflict) {
+        Err(conflict) => match resolve_changelog_conflict(worktree, &env, &conflict) {
             Ok(Some((tree, paths))) => (tree, Some(paths)),
             outcome => {
                 return LiftReport {
@@ -904,15 +879,16 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
                     conflicts: conflict.paths(),
                     note: outcome
                         .err()
-                        .map(|why| format!("the changelog conflict was not union-merged: {why}")),
+                        .map(|why| format!("the changelog conflict was not resolved: {why}")),
                 }
             }
         },
     };
-    let union_note = unioned.map(|paths| {
+    let resolved_note = resolved.map(|paths| {
         format!(
-            "{} conflicted only inside `## [Unreleased]` and {} union-merged (both sides' lines \
-             kept, as crew's deliver script does); the lifted tree is re-verified",
+            "{} conflicted only as a changelog and {} resolved: the run's new `[Unreleased]` \
+             entries were placed under main's current `## [Unreleased]`, main's other sections \
+             kept as main has them; the lifted tree is re-verified",
             paths.join(", "),
             if paths.len() == 1 { "was" } else { "were" }
         )
@@ -967,7 +943,7 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
             tree_before: Some(before.tree),
             tree_after: Some(after.tree),
             conflicts: Vec::new(),
-            note: union_note,
+            note: resolved_note,
         },
         Ok(after) => failed(
             Some(after.tree.clone()),
@@ -2319,11 +2295,11 @@ mod tests {
         format!("# Changelog\n\n## [Unreleased]\n\n{unreleased}\n## [1.0.0]\n\n{released}\n")
     }
 
-    /// (J4 brick, run f3d30829) Main moved its CHANGELOG `[Unreleased]` section while the run added
-    /// its own line there: the merge conflicts ONLY in CHANGELOG.md, inside `[Unreleased]`. The
-    /// lift union-merges it (both lines, no markers) and lifts, as crew's deliver script would.
+    /// (J4 brick, run f3d30829; core#1161) Both sides added a line to the CHANGELOG's
+    /// `[Unreleased]`: the merge conflicts ONLY in CHANGELOG.md. The lift keeps both entries under
+    /// `[Unreleased]` (main's first, then the run's, no markers) and lifts.
     #[test]
-    fn a_changelog_only_conflict_inside_unreleased_is_union_merged_and_lifted() {
+    fn both_sides_adding_to_unreleased_is_resolved_with_both_entries_and_lifted() {
         let (clone, wt) = stale_base_layout_seeded("cl-union", &[("CHANGELOG.md", CHANGELOG_BASE)]);
         std::fs::write(
             wt.join("CHANGELOG.md"),
@@ -2343,18 +2319,17 @@ mod tests {
         assert!(r.conflicts.is_empty(), "{r:?}");
         let note = r.note.as_deref().unwrap_or_default();
         assert!(
-            note.contains("CHANGELOG.md") && note.contains("union-merged"),
-            "the union is disclosed: {note}"
+            note.contains("CHANGELOG.md") && note.contains("resolved"),
+            "the resolution is disclosed: {note}"
         );
         let tip = run_git(&wt, &["rev-parse", "origin/main"]);
         assert_eq!(run_git(&wt, &["rev-parse", "HEAD"]), tip);
         let cl = std::fs::read_to_string(wt.join("CHANGELOG.md")).unwrap();
-        assert!(
-            cl.contains("- main: landed") && cl.contains("- run: fixed a"),
-            "both sides' lines are kept: {cl}"
+        assert_eq!(
+            cl,
+            changelog_with("- main: landed\n- run: fixed a\n", "- first"),
+            "both sides' lines are kept under `[Unreleased]`"
         );
-        assert!(!cl.contains("<<<<<<<") && !cl.contains(">>>>>>>"), "{cl}");
-        assert!(cl.contains("## [1.0.0]\n\n- first\n"), "{cl}");
         // The run's other work is intact and staged as the diff against the tip.
         assert_eq!(
             std::fs::read_to_string(wt.join("src/a.ts")).unwrap(),
@@ -2377,8 +2352,60 @@ mod tests {
         );
     }
 
+    /// (core#1161, rig run 115fabdb) A release cut landed between the run's base and its delivery:
+    /// main renamed its `[Unreleased]` entries to `[1.1.0]` and added link-refs, while the run added
+    /// a `### Fixed` entry to the then-empty `[Unreleased]`. The deliver lift resolves the changelog
+    /// (the run's entry under main's new `[Unreleased]`, the release kept as main cut it), re-runs
+    /// the floor on the lifted tree and delivers.
+    #[test]
+    fn a_release_cut_during_the_run_delivers_with_both_entries() {
+        let base = "# Changelog\n\n## [Unreleased]\n\n## [1.0.0] — 2026-10-01\n\n- first\n\n\
+                    [Unreleased]: https://example.invalid/compare/v1.0.0...HEAD\n";
+        let (clone, wt) = stale_base_layout_seeded("cl-cut", &[("CHANGELOG.md", base)]);
+        std::fs::write(
+            wt.join("CHANGELOG.md"),
+            base.replace(
+                "## [Unreleased]\n\n",
+                "## [Unreleased]\n\n### Fixed\n\n- run: fixed a (#1)\n\n",
+            ),
+        )
+        .unwrap();
+        let cut = "# Changelog\n\n## [Unreleased]\n\n## [1.1.0] — 2026-10-28\n\n### Fixed\n\n\
+                   - main: landed (#2)\n\n## [1.0.0] — 2026-10-01\n\n- first\n\n\
+                   [Unreleased]: https://example.invalid/compare/v1.1.0...HEAD\n\
+                   [1.1.0]: https://example.invalid/compare/v1.0.0...v1.1.0\n";
+        land_on_origin("cl-cut", &clone, |o| {
+            std::fs::write(o.join("CHANGELOG.md"), cut).unwrap();
+        });
+        // A plain merge conflicts on it: this is the shape that stranded 115fabdb.
+        let events = std::cell::RefCell::new(Vec::new());
+        let emit = |ev: CoreEvent| events.borrow_mut().push(ev);
+        match lift_and_reverify(&ctx_for(&clone, &wt, None), "cl-cut", 5, 0, &emit) {
+            Ok(c) => assert!(c.checks.is_some(), "the lifted tree was re-verified"),
+            Err(e) if e.contains("no OS write boundary") => {
+                eprintln!("deliver_lift: no sandbox tool here — the re-verify floor cannot run")
+            }
+            Err(e) => panic!("a release cut must not strand the delivery: {e}"),
+        }
+        assert!(events.borrow().iter().any(|e| matches!(
+            e,
+            CoreEvent::DeliverLiftEvaluated { outcome, note: Some(n), .. }
+                if outcome == "lifted" && n.contains("CHANGELOG.md") && n.contains("resolved")
+        )));
+        assert_eq!(
+            std::fs::read_to_string(wt.join("CHANGELOG.md")).unwrap(),
+            cut.replace(
+                "## [Unreleased]\n\n",
+                "## [Unreleased]\n\n### Fixed\n\n- run: fixed a (#1)\n\n",
+            ),
+            "the run's entry is under the new `[Unreleased]`; main's release and link-refs stand"
+        );
+        let tip = run_git(&wt, &["rev-parse", "origin/main"]);
+        assert_eq!(run_git(&wt, &["rev-parse", "HEAD"]), tip);
+    }
+
     /// The same changelog collision beside a conflict in CODE is still a lift conflict: nothing is
-    /// union-merged, nothing is lifted, the worktree stays exactly as verified.
+    /// resolved, nothing is lifted, the worktree stays exactly as verified.
     #[test]
     fn a_changelog_conflict_beside_a_code_conflict_still_stops_the_lift() {
         let (clone, wt) = stale_base_layout_seeded("cl-mixed", &[("CHANGELOG.md", CHANGELOG_BASE)]);
@@ -2412,9 +2439,9 @@ mod tests {
     }
 
     /// A changelog whose two sides differ OUTSIDE `[Unreleased]` (both edited a released entry) is
-    /// not unioned — a union there would silently combine two edits of one released line.
+    /// not resolved — that would silently combine two edits of one released line.
     #[test]
-    fn a_changelog_conflict_outside_unreleased_is_not_unioned() {
+    fn a_changelog_conflict_outside_unreleased_is_not_resolved() {
         let (clone, wt) =
             stale_base_layout_seeded("cl-released", &[("CHANGELOG.md", CHANGELOG_BASE)]);
         std::fs::write(
@@ -2474,7 +2501,7 @@ mod tests {
         assert!(events.borrow().iter().any(|e| matches!(
             e,
             CoreEvent::DeliverLiftEvaluated { outcome, note: Some(n), .. }
-                if outcome == "lifted" && n.contains("union-merged")
+                if outcome == "lifted" && n.contains("resolved")
         )));
 
         let (clone, wt) =
@@ -2506,7 +2533,7 @@ mod tests {
     /// (codex review of #1130) A structural conflict can carry NO staged entry: here main splits
     /// directory `z` (its files renamed to `y/` and `w/`) while the run adds `z/d.ts`, and both
     /// add an `[Unreleased]` line. The only staged conflict is CHANGELOG.md, but git also reports
-    /// the directory-rename split — the lift must not union and ship that.
+    /// the directory-rename split — the lift must not resolve and ship that.
     #[test]
     fn a_changelog_conflict_beside_a_directory_rename_split_still_stops_the_lift() {
         let (clone, wt) = stale_base_layout_seeded(
@@ -2557,19 +2584,6 @@ mod tests {
         assert_eq!(got[1].paths, vec!["z".to_string()]);
         assert!(parse_merge_messages("2\0a\0".split('\0')).is_none());
         assert_eq!(parse_merge_messages(std::iter::empty()), Some(Vec::new()));
-    }
-
-    #[test]
-    fn the_unreleased_strip_matches_the_deliver_scripts_awk_guard() {
-        let text = b"# C\n\n## [Unreleased]\n- a\n## [2.0.0]\n- b\n## [Unreleased-ish]\n";
-        // The heading and its body go; the next `## [` heading ends the section and stays.
-        assert_eq!(
-            without_unreleased(text),
-            b"# C\n\n## [2.0.0]\n- b\n## [Unreleased-ish]\n".to_vec(),
-            "only `## [Unreleased]` itself opens the section, as the awk pattern does"
-        );
-        assert!(is_changelog("CHANGELOG.md") && is_changelog("packages/x/CHANGELOG.md"));
-        assert!(!is_changelog("CHANGELOG.md.bak") && !is_changelog("docs/CHANGELOG.txt"));
     }
 
     /// A run branch that carries its OWN commits (a phase committed) is not the stale-base shape:
