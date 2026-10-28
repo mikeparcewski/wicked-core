@@ -1109,6 +1109,9 @@ const QUOTA_SELF_FRAMED: &[&str] = &[
     "usage limit reached",
     "exceed your account's rate limit",
     "resource has been exhausted",
+    // Anthropic: "You're out of extra usage. Add more at claude.ai/settings/usage ..." (core#1069).
+    "out of extra usage",
+    "out of usage",
     // API / RPC error codes (Anthropic, OpenAI, gRPC).
     "insufficient_quota",
     "quota_exceeded",
@@ -2632,5 +2635,40 @@ mod failure_reason_tests {
             serde_json::from_str(&serde_json::to_string(&f.with_stdout("Not logged in")).unwrap())
                 .unwrap();
         assert_eq!(round.reason, Some(SeatFailureReason::NotLoggedIn));
+    }
+
+    /// (core#1069) Anthropic's usage-exhaustion refusal (run 290a7fee, pi seat) benches the seat.
+    #[test]
+    fn anthropic_out_of_usage_is_quota_exhausted() {
+        let pi = r#"400 {"type":"error","error":{"type":"invalid_request_error","message":"You're out of extra usage. Add more at claude.ai/settings/usage and keep going."}}"#;
+        for line in [pi, "You're out of usage."] {
+            let q = Some(SeatFailureReason::QuotaExhausted);
+            assert_eq!(SeatFailureReason::classify(line, "", true), q, "{line}");
+            assert_eq!(SeatFailureReason::classify("", line, true), q, "{line}");
+            assert_eq!(SeatFailureReason::classify_refusal(line, true), q, "{line}");
+        }
+    }
+
+    /// (core#1069) The same words inside a long transcript body, with a normal ending, are the
+    /// unit's subject matter; identifier-adjacent variants and a CLI usage line do not classify.
+    #[test]
+    fn out_of_usage_phrases_as_subject_matter_do_not_classify() {
+        let filler = "x".repeat(REFUSAL_TAIL_BYTES * 2);
+        let body = format!(
+            "the error said \"You're out of extra usage\" and also \"out of usage\"\n{filler}\nAll done."
+        );
+        assert_eq!(SeatFailureReason::classify_refusal(&body, true), None);
+        for text in [
+            "fooout of usage",
+            "out of usages",
+            "out of extra usage_x",
+            "usage: agy [options]",
+        ] {
+            assert_eq!(
+                SeatFailureReason::classify_refusal(text, true),
+                None,
+                "{text}"
+            );
+        }
     }
 }
