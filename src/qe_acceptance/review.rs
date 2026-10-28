@@ -727,9 +727,9 @@ pub(crate) fn run(
     Some(review)
 }
 
-/// (§3.6) A floor re-run's record: no reviewer turn runs (the seat does not run again). A floor
-/// FIX changed the tree after the evidence — `invalid`; a plain re-run carries the last record
-/// only when this dispatch starts on the tree it was taken on.
+/// (§3.6) A floor re-run's record: no reviewer turn runs (the seat does not run again). The last
+/// record is carried only when this dispatch starts on the tree it was taken on — after a floor
+/// fix too, when the fix made no edit (core#1153); otherwise it is `invalid`.
 pub(crate) fn on_floor_rerun(unit: &WorkUnit, fix: bool) -> Option<QeReview> {
     if !applies(unit) {
         return None;
@@ -744,14 +744,15 @@ pub(crate) fn on_floor_rerun(unit: &WorkUnit, fix: bool) -> Option<QeReview> {
         verdict: None,
         attempts: Vec::new(),
     };
-    if fix {
-        return Some(invalid(
+    match unit.qe_review.as_ref() {
+        // (core#1153) A floor fix that made no edit (`NO CHANGE NEEDED`) left the tree the review
+        // judged: its record stands, as for a plain re-run. `unit` is the fixed input, re-baselined
+        // on the tree the fix left.
+        Some(r) if tree.is_some() && r.tree == tree => Some(r.clone()),
+        _ if fix => Some(invalid(
             "the floor fix changed the tree after the QE evidence was taken; approve to re-run QE \
              on the fixed tree",
-        ));
-    }
-    match unit.qe_review.as_ref() {
-        Some(r) if tree.is_some() && r.tree == tree => Some(r.clone()),
+        )),
         _ => Some(invalid(
             "the floor re-run is not on the tree the last QE review judged; approve to re-run QE",
         )),

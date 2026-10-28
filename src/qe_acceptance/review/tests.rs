@@ -863,7 +863,7 @@ fn no_marker_or_no_requirement_runs_no_reviewer() {
 }
 
 #[test]
-fn a_floor_rerun_carries_on_the_same_tree_and_a_floor_fix_invalidates() {
+fn a_floor_rerun_carries_on_the_same_tree_and_a_floor_fix_that_changed_it_invalidates() {
     let ledger = Path::new("/l/.wicked-qe");
     let mut u = qe_unit("pi", ledger);
     let pass = QeReview {
@@ -876,10 +876,12 @@ fn a_floor_rerun_carries_on_the_same_tree_and_a_floor_fix_invalidates() {
         attempts: Vec::new(),
     };
     u.qe_review = Some(pass.clone());
-    assert_eq!(on_floor_rerun(&u, false), Some(pass));
-    assert_eq!(on_floor_rerun(&u, true).unwrap().outcome, OUTCOME_INVALID);
+    assert_eq!(on_floor_rerun(&u, false), Some(pass.clone()));
+    // (core#1153) A floor fix that left the tree as it was keeps the record too.
+    assert_eq!(on_floor_rerun(&u, true), Some(pass));
     u.worktree_baseline = Some(baseline("t2"));
     assert_eq!(on_floor_rerun(&u, false).unwrap().outcome, OUTCOME_INVALID);
+    assert_eq!(on_floor_rerun(&u, true).unwrap().outcome, OUTCOME_INVALID);
 }
 
 /// A seat that answers the EXECUTOR turn with the evidence marker and every reviewer turn per
@@ -1059,4 +1061,33 @@ fn the_reviewer_turns_decisions_log_is_its_own() {
     );
     assert_ne!(exec_log, rev_log);
     assert!(rev_log.starts_with(exec_log.parent().unwrap()));
+}
+
+/// core#1153: a floor fix that made no edit (the fixed input re-baselined on the SAME tree) keeps
+/// the QE record the review took on that tree; a fix that changed the tree still invalidates it.
+#[test]
+fn a_no_change_floor_fix_keeps_the_qe_record_and_a_real_fix_invalidates_it() {
+    let ledger = Ledger::new("c1153");
+    let mut u = qe_unit("pi", &ledger.root);
+    let record = QeReview {
+        outcome: OUTCOME_PASS.into(),
+        reason: "the isolated QE reviewer recorded PASS".into(),
+        evidence_dir: None,
+        qe_run_id: Some("2f3abb52".into()),
+        tree: Some("t1".into()),
+        verdict: Some("PASS".into()),
+        attempts: Vec::new(),
+    };
+    u.qe_review = Some(record.clone());
+    // `NO CHANGE NEEDED`: the tree the fix left is the one the review judged.
+    assert_eq!(on_floor_rerun(&u, true), Some(record));
+    // The fix edited the tree: the evidence is stale.
+    u.worktree_baseline = Some(baseline("t2"));
+    let stale = on_floor_rerun(&u, true).unwrap();
+    assert_eq!(stale.outcome, OUTCOME_INVALID);
+    assert!(
+        stale.reason.contains("the floor fix changed the tree"),
+        "{}",
+        stale.reason
+    );
 }
