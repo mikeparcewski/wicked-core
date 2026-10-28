@@ -32,7 +32,6 @@ Two release tracks share this file, newest entry first regardless of track:
   When binding still fails, the reason names the newest verdict (its id, verdict and time) and who
   recorded it: another review session, or a writer outside every review session.
 
-
 - **A release cut no longer strands in-flight runs that added a changelog entry (core#1161).** On rig run
   115fabdb the deliver lift refused `CHANGELOG.md`: the run had added a `### Fixed` entry under
   `## [Unreleased]`, and main had meanwhile cut a release (`[Unreleased]` became `[0.16.7]`, link-refs
