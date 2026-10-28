@@ -741,7 +741,10 @@ pub(crate) fn on_floor_rerun(unit: &WorkUnit, fix: bool) -> Option<QeReview> {
         evidence_dir: unit.qe_review.as_ref().and_then(|r| r.evidence_dir.clone()),
         qe_run_id: unit.qe_review.as_ref().and_then(|r| r.qe_run_id.clone()),
         tree: tree.clone(),
-        verdict: None,
+        // (core#1153, xreview) A stale record keeps the verdict its review recorded: a FAIL (or a
+        // PASS) taken on another tree is not "no bound verdict", so it never unlocks the
+        // operator's judgment over the floor the way an unbound record does.
+        verdict: unit.qe_review.as_ref().and_then(|r| r.verdict.clone()),
         attempts: Vec::new(),
     };
     match unit.qe_review.as_ref() {

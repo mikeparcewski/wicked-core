@@ -1090,4 +1090,6 @@ fn a_no_change_floor_fix_keeps_the_qe_record_and_a_real_fix_invalidates_it() {
         "{}",
         stale.reason
     );
+    // The stale record keeps the verdict its review recorded (it is not an unbound one).
+    assert_eq!(stale.verdict.as_deref(), Some("PASS"));
 }

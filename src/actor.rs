@@ -7972,14 +7972,25 @@ fn layers_behind_note(unit: &crate::domain::WorkUnit, override_offered: bool) ->
         .iter()
         .filter(|d| !crate::qe_acceptance::review::is_qe_denial(d))
         .all(|d| tolerated_behind_floor(unit, d));
+    // (core#1153) A recorded FAIL (or a stale verdict) is what holds the judgment back, named as
+    // such; any other QE layer (no reviewer could run) is named neutrally.
+    let qe_failed = behind.iter().any(|d| {
+        d.source == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEW
+            && !qe_unbound_behind_floor(unit, d)
+    });
     let mut note = format!(". {}", lines.join("; "));
     if qe_behind && qe_required && (override_offered || skip_reopens) {
         note.push_str(if override_offered {
             ". Your judgment answers the floor only: QE acceptance stays required at delivery, \
              where you can skip it with a reason (action `skip_qe`, labelled \"QE acceptance \
              skipped by operator\")"
-        } else {
+        } else if qe_failed {
             ". Your own judgment is not offered while the QE reviewer's FAIL stands on this step \
+             (deny-dominates). Skip QE acceptance with a reason (action `skip_qe`, labelled \"QE \
+             acceptance skipped by operator\" on the run, every gate and the delivery) and this \
+             gate re-opens on the floor alone"
+        } else {
+            ". Your own judgment is not offered while the QE layer denies this step \
              (deny-dominates). Skip QE acceptance with a reason (action `skip_qe`, labelled \"QE \
              acceptance skipped by operator\" on the run, every gate and the delivery) and this \
              gate re-opens on the floor alone"
@@ -23091,6 +23102,38 @@ mod request_changes_tests {
         );
         assert!(
             prompt.contains("Your own judgment is not offered while the QE reviewer's FAIL stands"),
+            "{prompt}"
+        );
+        // A STALE FAIL (a floor fix changed the tree after it) carries its verdict: still no
+        // offer, never "no bound verdict".
+        let mut stale = fix.clone();
+        let mut r = record(crate::qe_acceptance::review::OUTCOME_INVALID, Some("FAIL"));
+        r.reason = "the floor fix changed the tree after the QE evidence was taken".into();
+        stale.qe_review = Some(r);
+        assert_eq!(
+            floor_override_offer(&stale, crate::repo_checks::DENIAL_SOURCE),
+            ""
+        );
+        // No reviewer could run: no offer, and no FAIL is claimed.
+        let mut unavailable = fix.clone();
+        unavailable.denials_behind = Some(vec![UnitDenial::new(
+            crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE,
+            "QE acceptance: every reviewer seat failed as a seat",
+        )]);
+        unavailable.qe_review = Some(record(
+            crate::qe_acceptance::review::OUTCOME_UNAVAILABLE,
+            None,
+        ));
+        let prompt = denial_gate_prompt(
+            &unavailable,
+            "floor_failed",
+            unavailable.denial_reason.as_deref().unwrap(),
+            None,
+            "",
+        );
+        assert!(
+            prompt.contains("not offered while the QE layer denies this step")
+                && !prompt.contains("FAIL stands"),
             "{prompt}"
         );
         // The judgment over the unbound record applies; QE stays required.
