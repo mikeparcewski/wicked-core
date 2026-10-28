@@ -1134,6 +1134,11 @@ pub enum CoreEvent {
         changed: Vec<crate::worktree_guard::ChangedPath>,
         /// (TR-W1b, additive) `true` when `changed` was cut at the cap.
         changed_truncated: bool,
+        /// (core#1144/crew#1180, additive) On a VERIFY floor: the checks it took from the creator
+        /// floor of the same tree and base instead of running them, the ones it ran fresh, and
+        /// why the reuse was set aside when it was (`RepoChecksReport::reused_from`). `None`
+        /// (absent on the wire) when it reused nothing.
+        reused_from: Option<crate::repo_checks::FloorReuse>,
     },
     /// An operator retry re-ran a unit's floor on the SAME tree its last floor judged — the one
     /// exception to core#544's carry-forward (`RepoChecksReport::recheck`). Emitted right after
@@ -2651,6 +2656,7 @@ impl CoreEvent {
                 env,
                 changed,
                 changed_truncated,
+                reused_from,
             } => {
                 let mut v = json!({
                 "type": "repoChecksEvaluated",
@@ -2674,6 +2680,11 @@ impl CoreEvent {
                 if !changed.is_empty() {
                     v["changed"] = json!(changed.iter().map(changed_path_json).collect::<Vec<_>>());
                     v["changedTruncated"] = json!(changed_truncated);
+                }
+                // (crew#1180) Absent when nothing was reused, so a fresh floor's frame reads as
+                // before the field.
+                if let Some(r) = reused_from {
+                    v["reusedFrom"] = serde_json::to_value(r).unwrap_or(serde_json::Value::Null);
                 }
                 v
             }
@@ -2969,6 +2980,7 @@ mod tests {
                 env: None,
                 changed,
                 changed_truncated: cut,
+                reused_from: None,
             }
             .to_json()
         };

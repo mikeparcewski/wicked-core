@@ -14,6 +14,24 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Verify reuses the fix floor's checks in any order (core#1152).** core#1145's reuse was suffix-only:
+  no check could run fresh after a reused one. wicked-core's own verify-only core-ts checks run after
+  `test`, so its verify floor reused nothing. On rig run c5320434 that meant three verify floors of
+  36.5-38.5 min on the tree the fix floor had already checked. The verify floor now reuses every check
+  the creator floor's record stands for, wherever it sits, and runs only the rest. Two direct guards
+  replace the suffix rule. (1) The reused results stand for the tree the creator floor ran on, so once
+  checks ran fresh beside them the checkout must still hold exactly that tree, after every check and at
+  the end. If it does not, the reused results are void and the floor fails, naming the fresh checks.
+  (2) A check that runs fresh after reused ones and fails (not on a timeout) may have needed something a
+  reused check leaves in the checkout, such as an emitted `dist/` an `e2e` reads. The floor then runs
+  every check again from the first one with nothing reused, which is the floor as it ran before reuse
+  existed, and says so ("checks reused from fix (…) were set aside: …"). The floor note and log now
+  also list the fresh checks ("checks reused from fix (unit 4, attempt 1): … not run again here; ran
+  fresh here: …"), and `repoChecksEvaluated` carries `reusedFrom` (absent when nothing was reused,
+  crew#1180). The other #1145 guards are unchanged: no record from a floor whose check changed its
+  checkout, none from a check resumed after a daemon restart, and a non-publishing creator floor clears
+  the earlier record.
+
 - **Verify reuses the fix floor's checks on the same tree and base (core#1144).** The verify floor re-ran
   the whole repository floor on the tree the fix floor had just checked: on rig run 85ddad0d that was 47
   min for the same two base-red failures, and on d3a380b0 it was 25 min, with 4 load flakes called

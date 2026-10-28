@@ -1340,6 +1340,7 @@ pub(crate) fn apply_and_finish_unit(
                     env: report.env.clone(),
                     changed,
                     changed_truncated,
+                    reused_from: report.reused_from.clone(),
                 });
                 // The re-run an operator retry armed, on the SAME tree the replaced result
                 // judged: said on the wire beside the fresh frame, so the gate history holds both

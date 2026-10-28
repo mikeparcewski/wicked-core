@@ -1518,6 +1518,7 @@ pub(crate) fn lift_and_reverify(
             // (TR-W1b) Changed paths ride the CREATOR floor only.
             changed: Vec::new(),
             changed_truncated: false,
+            reused_from: checks.reused_from.clone(),
         });
         if let Some(r) = &checks.resumed {
             emit(CoreEvent::FloorResumed {
