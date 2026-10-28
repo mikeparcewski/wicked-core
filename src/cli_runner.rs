@@ -1477,7 +1477,19 @@ pub(crate) fn rejudge_seats(
     if preferred.is_empty() && base_len > monitors_from {
         parties.drain(monitors_from..base_len);
         base_len = monitors_from;
-        (preferred, lost, ids) = preferred_for(&parties, &creator_bins);
+        // A creator that also monitored was deduplicated into the monitor slice: it stays out as a
+        // creator, with its binaries (xreview on #1165).
+        let mut bins = creator_bins.clone();
+        if evaluator {
+            let before = parties.len();
+            for a in work_authors {
+                party(&mut parties, a, "created the work this review reads");
+            }
+            if parties.len() > before && bins.is_empty() {
+                bins = author_binaries.map(<[String]>::to_vec).unwrap_or_default();
+            }
+        }
+        (preferred, lost, ids) = preferred_for(&parties, &bins);
     }
     if preferred.is_empty() && parties.len() > base_len {
         parties.truncate(base_len);
@@ -1734,6 +1746,7 @@ fn disclose_monitor_judge(
     mut av: crate::validator::AgentVerdict,
     monitor_fallback: Option<&str>,
     monitors: &[String],
+    roster: &[crate::AgenticCli],
     emit_delta: &DeltaSink,
 ) -> crate::validator::AgentVerdict {
     let (Some(why), Some(seat), None) =
@@ -1742,9 +1755,14 @@ fn disclose_monitor_judge(
         return av;
     };
     let cli = crate::team::runner::seat_key(&seat);
+    // By key AND by the identity the seat runs, as the exclusion matched it (xreview on #1165): a
+    // judge registered under another key that invokes a monitor's CLI is that monitor.
+    let keys: Vec<&str> = monitors.iter().map(String::as_str).collect();
+    let ids = author_identities(&keys, roster);
     if !monitors
         .iter()
         .any(|m| m == &seat || crate::team::runner::seat_key(m) == cli)
+        && !ids.contains(&crate::validator::excluded_identity(&seat, roster))
     {
         return av;
     }
@@ -3392,7 +3410,13 @@ fn run_unit_and_judge_on(
         None
     };
     let agent_verdict = agent_verdict.map(|av| {
-        disclose_monitor_judge(av, monitor_fallback.as_deref(), &team_monitors, emit_delta)
+        disclose_monitor_judge(
+            av,
+            monitor_fallback.as_deref(),
+            &team_monitors,
+            roster,
+            emit_delta,
+        )
     });
     // F-039 REPO CHECKS FLOOR — the engine runs the repository's own checks LAST (slowest, and
     // its build artifacts must not colour the guard's comparison or the judge's evidence above),
@@ -5785,6 +5809,36 @@ mod tests {
             "{}",
             fb.label
         );
+        // (xreview on #1165) The disclosure matches the monitor by the identity it runs, as the
+        // exclusion does: `watcher` monitored and invokes pi, `pi` is the only other judge left.
+        let mut aliased = input.clone();
+        aliased.unit.requested_rejudge.as_mut().unwrap().monitors = vec!["watcher".into()];
+        let alias_roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("agy", "agy run {PROMPT}"),
+            seat("watcher", "pi ask {PROMPT}"),
+            seat("pi", "pi ask {PROMPT}"),
+        ];
+        let judge = Arc::new(Judge {
+            answer: "PASS\nok\nPASS",
+            seen: Mutex::new(Vec::new()),
+        });
+        let runner: Arc<dyn StepRunner> = judge.clone();
+        let (_, verdict, _) = run_unit_and_judge_with_roster(
+            &runner,
+            &aliased,
+            None,
+            noop,
+            &alias_roster,
+            &[],
+            &["watcher".to_string()],
+        );
+        let v = verdict.expect("ruled");
+        assert_eq!(v.judge_cli.as_deref(), Some("pi"));
+        let fb = v
+            .judge_fallback
+            .expect("pi runs the monitor's CLI: disclosed");
+        assert!(fb.label.contains("team-monitor fallback"), "{}", fb.label);
         // A consumed basis is never honored as a re-judge (the seat runs), but its monitors still
         // never judge.
         let mut basis = monitored.clone();
@@ -6118,6 +6172,37 @@ mod tests {
             &roster,
         );
         assert_eq!(seats, ["codex"], "the monitor is re-admitted: {missing:?}");
+
+        // (xreview on #1165) A creator that also monitored stays out as a creator when the
+        // monitors are re-admitted: codex built the work and monitored, agy monitored.
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+            seat("pi", "pi ask {PROMPT}"),
+            seat("agy", "agy run {PROMPT}"),
+        ];
+        let run: Vec<String> = ["claude", "codex", "pi", "agy"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        review.requested_rejudge.as_mut().unwrap().monitors = vec!["codex".into(), "agy".into()];
+        let (seats, missing) = rejudge_seats(
+            &review,
+            &roster,
+            &run,
+            &[],
+            &["codex".to_string()],
+            Some(&["codex".to_string()]),
+            &[],
+            &roster,
+        );
+        assert_eq!(seats, ["agy"], "never the creator: {missing:?}");
+        assert!(
+            missing
+                .iter()
+                .any(|m| m.seat == "codex" && m.reason == "created the work this review reads"),
+            "{missing:?}"
+        );
     }
 
     /// (core#1143, rig run 85ddad0d) The judge pool states each excluded seat's reason as the run
