@@ -8,9 +8,12 @@
 //! `[Unreleased]`, so any release cut between a run's base and its delivery stranded every
 //! in-flight run that added a changelog line (rig run 115fabdb).
 //!
+//! The sections are compared ENTRY by entry ([`Entry`]: a bullet with its indented
+//! continuation), never line by line, so an added entry is placed whole.
+//!
 //! Fail-closed: the resolution is refused (and the conflict stands, recoverable) when the run
 //! changed the file outside its `[Unreleased]` section in a way main did not, when the run
-//! removed or rewrote an `[Unreleased]` line instead of only adding lines, or when main's file
+//! removed or rewrote an `[Unreleased]` entry instead of only adding entries, or when main's file
 //! has no `## [Unreleased]` heading to place the entries under.
 
 /// A changelog file, by name: `CHANGELOG.md` or `CHANGES.md` in any case, at any depth.
@@ -81,93 +84,87 @@ impl<'a> Split<'a> {
     }
 }
 
-/// The longest common subsequence of `a` and `b`, as `kept[i]` = whether `b[i]` is matched
-/// (not inserted), and whether every non-blank line of `a` was matched (nothing removed).
-/// `None` when the sections are too large to compare in memory.
-fn insertions(a: &[&[u8]], b: &[&[u8]]) -> Option<(Vec<bool>, bool)> {
-    const MAX_CELLS: usize = 16_000_000;
-    let (n, m) = (a.len(), b.len());
-    if (n + 1).saturating_mul(m + 1) > MAX_CELLS {
-        return None;
-    }
-    let eq = |x: &[u8], y: &[u8]| x.trim_ascii_end() == y.trim_ascii_end();
-    // lcs[i][j] = LCS length of a[i..] and b[j..].
-    let w = m + 1;
-    let mut lcs = vec![0u32; (n + 1) * w];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            lcs[i * w + j] = if eq(a[i], b[j]) {
-                lcs[(i + 1) * w + j + 1] + 1
-            } else {
-                lcs[(i + 1) * w + j].max(lcs[i * w + j + 1])
-            };
-        }
-    }
-    let (mut i, mut j) = (0, 0);
-    let mut matched_b = vec![false; m];
-    let mut removed_content = false;
-    while i < n && j < m {
-        if eq(a[i], b[j]) {
-            matched_b[j] = true;
-            i += 1;
-            j += 1;
-        } else if lcs[(i + 1) * w + j] >= lcs[i * w + j + 1] {
-            removed_content |= !is_blank(a[i]);
-            i += 1;
-        } else {
-            j += 1;
-        }
-    }
-    removed_content |= a[i..].iter().any(|l| !is_blank(l));
-    Some((matched_b, !removed_content))
+/// One changelog entry: a line that starts at the margin (a bullet, or a line of prose) with
+/// its continuation — every following indented line, and the blank lines between them (a
+/// multi-paragraph entry). Entries, not lines, are what the resolution compares and places, so an
+/// entry is never split and a continuation shared by two entries never merges them.
+struct Entry {
+    /// The `### …` subsection it sits under (`None` = directly under `## [Unreleased]`).
+    heading: Option<String>,
+    lines: Vec<Vec<u8>>,
+    /// Its text for comparison: the non-blank lines, trailing whitespace trimmed.
+    key: Vec<u8>,
+    /// A blank line separates it from the entry before it.
+    spaced: bool,
 }
 
-/// The run's new entries, grouped by the `### …` subsection they sit under in the run's
-/// `[Unreleased]` (`None` = directly under the `## [Unreleased]` heading), in the run's order.
-struct Group {
+fn is_indented(line: &[u8]) -> bool {
+    matches!(line.first(), Some(b' ' | b'\t'))
+}
+
+fn owned(line: &[u8]) -> Vec<u8> {
+    let mut l = line.to_vec();
+    if !l.ends_with(b"\n") {
+        l.push(b'\n');
+    }
+    l
+}
+
+/// The entries of an `[Unreleased]` body, in order.
+fn entries(body: &[&[u8]]) -> Vec<Entry> {
+    let mut out: Vec<Entry> = Vec::new();
+    let mut heading: Option<String> = None;
+    let (mut blank_before, mut after_entry) = (false, false);
+    let mut i = 0;
+    while i < body.len() {
+        let line = body[i];
+        if let Some(h) = subsection(line) {
+            heading = Some(h);
+            (blank_before, after_entry) = (false, false);
+            i += 1;
+            continue;
+        }
+        if is_blank(line) {
+            blank_before = true;
+            i += 1;
+            continue;
+        }
+        let mut lines = vec![owned(line)];
+        i += 1;
+        loop {
+            let mut j = i;
+            while j < body.len() && is_blank(body[j]) {
+                j += 1;
+            }
+            if j < body.len() && is_indented(body[j]) {
+                lines.extend(body[i..=j].iter().map(|l| owned(l)));
+                i = j + 1;
+            } else {
+                break;
+            }
+        }
+        let key = lines
+            .iter()
+            .filter(|l| !is_blank(l))
+            .flat_map(|l| l.trim_ascii_end().iter().copied().chain(*b"\n"))
+            .collect();
+        out.push(Entry {
+            heading: heading.clone(),
+            lines,
+            key,
+            spaced: blank_before && after_entry,
+        });
+        (blank_before, after_entry) = (false, true);
+    }
+    out
+}
+
+/// The run's new entries under one subsection, in the run's order.
+struct Group<'e> {
     heading: Option<String>,
     /// The run wrote a blank line between this subsection's heading and its first entry.
     blank_after_heading: bool,
-    lines: Vec<Vec<u8>>,
-}
-
-fn groups(body: &[&[u8]], kept: &[bool]) -> Vec<Group> {
-    let mut out: Vec<Group> = Vec::new();
-    let mut current: Option<String> = None;
-    let mut blank_after: bool = false;
-    for (i, line) in body.iter().enumerate() {
-        if let Some(h) = subsection(line) {
-            current = Some(h);
-            blank_after = body.get(i + 1).is_some_and(|l| is_blank(l));
-            continue;
-        }
-        if kept[i] {
-            continue;
-        }
-        let mut owned = line.to_vec();
-        if !owned.ends_with(b"\n") {
-            owned.push(b'\n');
-        }
-        match out.iter_mut().find(|g| g.heading == current) {
-            Some(g) => g.lines.push(owned),
-            None => out.push(Group {
-                heading: current.clone(),
-                blank_after_heading: blank_after,
-                lines: vec![owned],
-            }),
-        }
-    }
-    for g in &mut out {
-        // Blank lines only separate entries: none leads or trails a group.
-        while g.lines.first().is_some_and(|l| is_blank(l)) {
-            g.lines.remove(0);
-        }
-        while g.lines.last().is_some_and(|l| is_blank(l)) {
-            g.lines.pop();
-        }
-    }
-    out.retain(|g| !g.lines.is_empty());
-    out
+    entries: Vec<&'e Entry>,
 }
 
 /// The index just past the last non-blank line of `body[from..to]` (`from` when all blank).
@@ -193,56 +190,70 @@ fn into_empty(body: &mut Vec<Vec<u8>>, mut block: Vec<Vec<u8>>) {
     }
 }
 
-/// Place one group of the run's entries into main's `[Unreleased]` body.
-fn place(body: &mut Vec<Vec<u8>>, group: &Group) {
-    // An entry main already has in its `[Unreleased]` (both sides added the same line) is kept once.
-    let present = |l: &[u8]| {
-        body.iter()
-            .any(|b| !is_blank(b) && b.trim_ascii_end() == l.trim_ascii_end())
+/// Place one group of the run's entries into main's `[Unreleased]` body. `spaced`: the file
+/// separates entries with a blank line.
+fn place(body: &mut Vec<Vec<u8>>, group: &Group, spaced: bool) {
+    let sep = |block: &mut Vec<Vec<u8>>| {
+        if spaced {
+            block.push(b"\n".to_vec());
+        }
     };
-    let lines: Vec<Vec<u8>> = group
-        .lines
-        .iter()
-        .filter(|l| is_blank(l) || !present(l))
-        .cloned()
-        .collect();
-    if lines.iter().all(|l| is_blank(l)) {
-        return;
+    let mut entries = Vec::new();
+    for (k, e) in group.entries.iter().enumerate() {
+        if k > 0 {
+            sep(&mut entries);
+        }
+        entries.extend(e.lines.iter().cloned());
     }
     let first_sub = body.iter().position(|l| subsection(l).is_some());
     match &group.heading {
-        // Directly under `## [Unreleased]`: after main's own lines there, before its first `###`.
+        // Directly under `## [Unreleased]`: after main's own entries there, before its first `###`.
         None => {
             let to = first_sub.unwrap_or(body.len());
             let at = content_end(body, 0, to);
-            if at == 0 && first_sub.is_none() {
-                into_empty(body, lines);
-                return;
-            }
-            let mut block = lines;
-            if first_sub == Some(at) {
-                // Entries placed right above main's first subsection: a blank line between.
+            if at > 0 {
+                let mut block = Vec::new();
+                sep(&mut block);
+                block.extend(entries);
+                body.splice(at..at, block);
+            } else if first_sub.is_none() {
+                into_empty(body, entries);
+            } else {
+                // Nothing directly under the heading yet, then main's first subsection: one blank
+                // line under the heading, the entries, one blank line before the subsection.
+                let ins = usize::from(body.first().is_some_and(|l| is_blank(l)));
+                let mut block = Vec::new();
+                if ins == 0 {
+                    block.push(b"\n".to_vec());
+                }
+                block.extend(entries);
                 block.push(b"\n".to_vec());
+                body.splice(ins..ins, block);
             }
-            if at == 0 && body.first().is_some_and(|l| is_blank(l)) {
-                // Keep the blank line under the heading above the entries.
-                body.splice(1..1, block);
-                return;
-            }
-            body.splice(at..at, block);
         }
         Some(h) => {
             let found = body
                 .iter()
                 .position(|l| subsection(l).as_deref() == Some(h.as_str()));
             match found {
-                // Main has the subsection: at the end of its entries.
+                // Main has the subsection: after its last entry.
                 Some(i) => {
                     let next = (i + 1..body.len())
                         .find(|&k| subsection(&body[k]).is_some())
                         .unwrap_or(body.len());
                     let at = content_end(body, i + 1, next);
-                    body.splice(at..at, lines);
+                    let mut block = Vec::new();
+                    if at > i + 1 {
+                        sep(&mut block);
+                    } else if group.blank_after_heading {
+                        block.push(b"\n".to_vec());
+                    }
+                    block.extend(entries);
+                    if at == next && next < body.len() {
+                        // An empty subsection right above the next one: keep them apart.
+                        block.push(b"\n".to_vec());
+                    }
+                    body.splice(at..at, block);
                 }
                 // A subsection main lacks: a new one after main's last entry.
                 None => {
@@ -255,12 +266,12 @@ fn place(body: &mut Vec<Vec<u8>>, group: &Group) {
                     if group.blank_after_heading {
                         block.push(b"\n".to_vec());
                     }
-                    block.extend(lines);
+                    block.extend(entries);
                     if at == 0 {
                         into_empty(body, block);
-                        return;
+                    } else {
+                        body.splice(at..at, block);
                     }
-                    body.splice(at..at, block);
                 }
             }
         }
@@ -285,15 +296,55 @@ pub(super) fn resolve(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<Vec<u8>
                 .to_string(),
         );
     };
-    let (kept, additions_only) = insertions(&b.body, &t.body)
-        .ok_or_else(|| "its `[Unreleased]` section is too large to compare".to_string())?;
-    if !additions_only {
+    // The run's additions: its entries less the base's (as a multiset, by text). A base entry the
+    // run no longer has was removed or rewritten — refused.
+    let (b_entries, o_entries, t_entries) = (entries(&b.body), entries(&o.body), entries(&t.body));
+    let mut unmatched: Vec<&Entry> = b_entries.iter().collect();
+    let mut added: Vec<&Entry> = Vec::new();
+    for e in &t_entries {
+        match unmatched.iter().position(|u| u.key == e.key) {
+            Some(k) => {
+                unmatched.remove(k);
+            }
+            None => added.push(e),
+        }
+    }
+    if !unmatched.is_empty() {
         return Err(
-            "the run removed or rewrote a line of its `[Unreleased]` section (only added lines \
-             are placed)"
+            "the run removed or rewrote an entry of its `[Unreleased]` section (only added \
+             entries are placed)"
                 .to_string(),
         );
     }
+    // An entry main already has under the same subsection (both sides added it) is kept once.
+    added.retain(|e| {
+        !o_entries
+            .iter()
+            .any(|m| m.heading == e.heading && m.key == e.key)
+    });
+    let mut groups: Vec<Group> = Vec::new();
+    for e in added {
+        match groups.iter_mut().find(|g| g.heading == e.heading) {
+            Some(g) => g.entries.push(e),
+            None => {
+                let blank_after_heading = e.heading.as_ref().is_some_and(|h| {
+                    t.body
+                        .iter()
+                        .position(|l| subsection(l).as_deref() == Some(h.as_str()))
+                        .and_then(|i| t.body.get(i + 1))
+                        .is_some_and(|l| is_blank(l))
+                });
+                groups.push(Group {
+                    heading: e.heading.clone(),
+                    blank_after_heading,
+                    entries: vec![e],
+                })
+            }
+        }
+    }
+    let spaced = [&b_entries, &o_entries, &t_entries]
+        .iter()
+        .any(|es| es.iter().any(|e| e.spaced));
     let mut body: Vec<Vec<u8>> = o.body.iter().map(|l| l.to_vec()).collect();
     // A body that ends the file without a newline gets one before entries are placed after it.
     if let Some(last) = body.last_mut() {
@@ -301,8 +352,8 @@ pub(super) fn resolve(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<Vec<u8>
             last.push(b'\n');
         }
     }
-    for g in groups(&t.body, &kept) {
-        place(&mut body, &g);
+    for g in &groups {
+        place(&mut body, g, spaced);
     }
     let mut out = Vec::with_capacity(ours.len() + theirs.len());
     for l in &o.before {
@@ -424,7 +475,7 @@ mod tests {
             "## [Unreleased]\n\n- a (reworded)\n\n## [1.0.0]\n- first\n",
         )
         .unwrap_err();
-        assert!(e.contains("removed or rewrote"), "{e}");
+        assert!(e.contains("removed or rewrote an entry"), "{e}");
         // Main dropped the `[Unreleased]` heading altogether.
         let e = r(
             base,
@@ -443,6 +494,72 @@ mod tests {
         assert_eq!(
             r(base, both, theirs).unwrap(),
             "## [Unreleased]\n\n- main\n- run\n\n## [1.0.0]\n- first (fixed)\n"
+        );
+    }
+
+    /// (xreview codex P2 #1) Two distinct entries that share a continuation line are both kept
+    /// whole; an identical entry in ANOTHER subsection is not taken for a duplicate.
+    #[test]
+    fn a_shared_continuation_or_a_same_text_entry_elsewhere_is_not_dropped() {
+        let base = "## [Unreleased]\n\n## [1.0.0]\n";
+        let ours = "## [Unreleased]\n\n### Fixed\n- main: corrected X\n  for all users.\n- same\n\n## [1.0.0]\n";
+        let theirs = "## [Unreleased]\n\n### Fixed\n- run: corrected Y\n  for all users.\n\n### Added\n- same\n\n## [1.0.0]\n";
+        assert_eq!(
+            r(base, ours, theirs).unwrap(),
+            "## [Unreleased]\n\n### Fixed\n- main: corrected X\n  for all users.\n- same\n- run: corrected Y\n  for all users.\n\n### Added\n- same\n\n## [1.0.0]\n"
+        );
+    }
+
+    /// (xreview codex P2 #2) A new entry whose first line repeats an existing one is placed whole,
+    /// never as fragments of the two.
+    #[test]
+    fn a_new_entry_repeating_an_existing_bullet_is_placed_whole() {
+        let base =
+            "## [Unreleased]\n\n### Fixed\n- Fix startup\n  on Linux.\n\n## [1.0.0]\n- one\n";
+        let ours = "## [Unreleased]\n\n## [1.1.0]\n\n### Fixed\n- Fix startup correctly\n  on Linux.\n\n## [1.0.0]\n- one\n";
+        let theirs = "## [Unreleased]\n\n### Fixed\n- Fix startup\n  on Windows.\n\n- Fix startup\n  on Linux.\n\n## [1.0.0]\n- one\n";
+        assert_eq!(
+            r(base, ours, theirs).unwrap(),
+            "## [Unreleased]\n\n### Fixed\n- Fix startup\n  on Windows.\n\n## [1.1.0]\n\n### Fixed\n- Fix startup correctly\n  on Linux.\n\n## [1.0.0]\n- one\n"
+        );
+    }
+
+    /// (xreview agy P2) Blank lines are not entries: a run that only moved a blank line while adding
+    /// an entry is not refused, and a multi-paragraph entry keeps its inner blank line.
+    #[test]
+    fn blank_lines_neither_refuse_an_addition_nor_split_a_multi_paragraph_entry() {
+        let base = "## [Unreleased]\n\n### Fixed\n- old fix\n\n## [1.0.0]\n";
+        let ours = "## [Unreleased]\n\n## [1.1.0]\n\n### Fixed\n- old fix\n\n## [1.0.0]\n";
+        let theirs = "## [Unreleased]\n\n### Fixed\n\n- old fix\n- run fix\n  first paragraph\n\n  second paragraph\n## [1.0.0]\n";
+        assert_eq!(
+            r(base, ours, theirs).unwrap(),
+            "## [Unreleased]\n\n### Fixed\n\n- run fix\n  first paragraph\n\n  second paragraph\n\n## [1.1.0]\n\n### Fixed\n- old fix\n\n## [1.0.0]\n"
+        );
+    }
+
+    /// (xreview agy P3) An entry placed directly under the heading, above main's first subsection,
+    /// keeps a blank line before that subsection.
+    #[test]
+    fn an_entry_above_mains_first_subsection_keeps_a_blank_line_before_it() {
+        let base = "## [Unreleased]\n\n## [1.0.0]\n";
+        let ours = "## [Unreleased]\n\n### Fixed\n\n- main fix\n\n## [1.0.0]\n";
+        let theirs = "## [Unreleased]\n\n- run entry\n\n## [1.0.0]\n";
+        assert_eq!(
+            r(base, ours, theirs).unwrap(),
+            "## [Unreleased]\n\n- run entry\n\n### Fixed\n\n- main fix\n\n## [1.0.0]\n"
+        );
+    }
+
+    /// A changelog that separates its entries with blank lines (this repository's own) gets the
+    /// run's entry separated the same way.
+    #[test]
+    fn blank_separated_entries_stay_blank_separated() {
+        let base = "## [Unreleased]\n\n- **a**\n  more a\n\n- **b**\n\n## [1.0.0]\n";
+        let ours = "## [Unreleased]\n\n- **main**\n\n- **a**\n  more a\n\n- **b**\n\n## [1.0.0]\n";
+        let theirs = "## [Unreleased]\n\n- **run**\n  more run\n\n- **a**\n  more a\n\n- **b**\n\n## [1.0.0]\n";
+        assert_eq!(
+            r(base, ours, theirs).unwrap(),
+            "## [Unreleased]\n\n- **main**\n\n- **a**\n  more a\n\n- **b**\n\n- **run**\n  more run\n\n## [1.0.0]\n"
         );
     }
 }
