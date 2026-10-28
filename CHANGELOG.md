@@ -30,6 +30,17 @@ Two release tracks share this file, newest entry first regardless of track:
   `[Unreleased]` line, or when main's copy has no `[Unreleased]` heading. The lift no longer needs
   `git merge-file --union` (git 2.43).
 
+- **A step whose only other seat monitored it still gets a judge (crew#972).** On rig run 115fabdb
+  (wicked-crew) the review and security gates held `judge_unavailable`, and the operator had to judge
+  them, although codex and pi were signed in. The judge's rotation dropped every team monitor that
+  raised a finding on the step (DES-TEAMING-001 §6.2), unconditionally. With claude the validator's
+  author and the creator, the step's own seat out and copilot benched for quota, the one seat left was
+  the monitor. After the stall reassign codex -> pi on the review, codex had become that monitor.
+  Run c5320434 (wicked-core) held its first verify gate the same way. Now the monitors are excluded
+  only while a judge distinct from them and from the work's creators remains. Otherwise a monitor may
+  judge, disclosed in the run's output and labelled on the gate, its receipt and the delivery as
+  `judge: <seat> (team-monitor fallback; …)`. Monitors are re-admitted before creators are (core#954).
+  The re-judge readiness (`rejudge_seats`) follows the same order. The bus path is unchanged.
 - **A JS run's seats find the worktree's dependencies installed, for the platform they run on (core#1155).**
   On rig run 115fabdb (wicked-crew) no seat could run the repository's tests: the verify evaluator's
   `vitest`, `tsc` and `eslint` exited 127, the isolated QE reviewer recorded INCONCLUSIVE, and delivery
