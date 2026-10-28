@@ -1187,7 +1187,8 @@ fn a_reused_qe_run_binds_a_pass_after_an_earlier_fail_and_delivery_reads_it() {
             "{n:?}"
         );
         assert_eq!(
-            got.reason.contains("the engine recorded the reviewer's reply"),
+            got.reason
+                .contains("the engine recorded the reviewer's reply"),
             by_engine
         );
         assert_eq!(l.root.join(LEDGER_DRIFT_MARKER).is_file(), by_engine);
