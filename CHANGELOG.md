@@ -14,6 +14,24 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **On a re-used QE run, the latest attempt's reviewer verdict is the one delivery reads (core#1162).** On
+  rig run 115fabdb, verify attempt 1 resumed QE run 4ad3ef0b on the same tree. The isolated reviewer
+  (pi) ended its reply on `VERDICT: PASS`, but it recorded no verdict in the ledger ("the engine binds
+  this verdict"). The newest verdict on the QE run was still attempt 0's FAIL, so the engine reported
+  "the newest verdict … was not recorded by the isolated reviewer session", and crew's delivery check
+  refused on that stale FAIL until the operator skipped QE. Now, when the reviewer's reply ENDS on a
+  ledger verdict (its last line, not quoted and not in a code fence) and no verdict on the QE run carries
+  its session nonce, the engine records the reply's verdict itself as canonical JSON. When the reviewer
+  did record it, but an earlier verdict is dated at or after it (a skewed seat clock), the engine
+  re-states it. The record is stamped with the nonce, the crew run, the reviewer's seat
+  and `recorded_by: wicked-core`, and it is dated after every verdict already on the QE run, so an
+  earlier attempt's verdict never outranks it, both by time and as text. Before the verdict, the
+  engine writes the ledger's `index-drift.json` (and refuses one that is not a plain file), so
+  wicked-ledger rebuilds its SQLite index on its next open. The binding then runs as before. A PASS
+  after an earlier FAIL is bound and delivers, and a FAIL after an earlier PASS is bound and refuses.
+  When binding still fails, the reason names the newest verdict (its id, verdict and time) and who
+  recorded it: another review session, or a writer outside every review session.
+
 - **A release cut no longer strands in-flight runs that added a changelog entry (core#1161).** On rig run
   115fabdb the deliver lift refused `CHANGELOG.md`: the run had added a `### Fixed` entry under
   `## [Unreleased]`, and main had meanwhile cut a release (`[Unreleased]` became `[0.16.7]`, link-refs
