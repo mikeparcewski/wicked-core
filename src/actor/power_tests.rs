@@ -208,6 +208,10 @@ fn a_phased_launch_carries_no_power_record_and_keeps_its_preset_steps() {
     release_all(&w);
 }
 
+// The hand-off's floor runs the repo's checks in an OS write boundary; Windows has none the
+// engine can arm, so there a code-verifying phase fails closed before any verdict (see the floor's
+// own NOT_RUN). The send-back path is exercised where the floor can run.
+#[cfg(not(windows))]
 #[test]
 fn a_hand_off_not_pass_goes_back_to_the_orchestrator_on_its_own() {
     let fix_turns = Arc::new(AtomicUsize::new(0));
@@ -301,6 +305,10 @@ fn power_engine(name: &str, w: Arc<Worker>, run: &str) -> Engine {
     e
 }
 
+// The hand-off's floor runs the repo's checks in an OS write boundary; Windows has none the
+// engine can arm, so there a code-verifying phase fails closed before any verdict (see the floor's
+// own NOT_RUN). The send-back path is exercised where the floor can run.
+#[cfg(not(windows))]
 #[test]
 fn a_hand_off_that_keeps_failing_goes_back_three_rounds_then_waits_for_the_operator() {
     let w = Worker::scripted(move |i, _| {
