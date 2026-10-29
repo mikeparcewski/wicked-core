@@ -14,6 +14,19 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A conflict in a declared generated file beside the changelog no longer strands delivery (core#1173).**
+  On rig run 62c4f0ff, main moved mid-run (crew#1197) and the deliver lift conflicted in `CHANGELOG.md`
+  and in crew's generated `tests/generated/api-sample.generated.test.ts`, so the run stranded. A repository
+  can now declare its generated files in `.wicked/checks.json`:
+  `"generated": [{"paths": ["path", "dir/**"], "command": ["npm", "run", "generate"]}]`. When every
+  conflicted path of the lift is a changelog or a file the TIP declares as generated, the lift merges the
+  changelog as before (core#1161), takes main's copy of each generated file, runs every declared command
+  (in order, after the floor's dependency install) in the floor's sandbox on a guarded checkout of the
+  lifted tree, and writes back what they produced for the declared paths. The lifted tree is then
+  re-verified by the normal floor. An undeclared or other conflict still strands, and so does a declaration
+  only the run's own tree carries. A generator that fails strands with its command, exit and output tail on
+  the card. The floor's config parse validates `generated` strictly (repo-relative paths, a real command).
+
 - **The verify floor stands on a fix-floor override on the same tree (core#1168).** On rig run 24103407 the
   operator overrode the fix floor (base-red tests), and the verify floor then reused exactly those failing
   checks on the unchanged tree and base, yet opened a second `floor_failed` escalation for the same result.
