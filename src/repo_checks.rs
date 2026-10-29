@@ -2732,11 +2732,11 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
     if let Resolved::Command(argv) = &r_targeted {
         let argv = argv.clone();
         // (program DES-POWER-MODE) A power run at high rigor or above hands off on the FULL suite.
-        let power_full = ctx
-            .run_id
-            .as_deref()
-            .is_some_and(crate::power::full_suite_required);
-        let full_here = ctx.stage == FloorStage::Verify && (cfg.full || power_full);
+        let power_full = power_full_suite(ctx);
+        // (power-speed) At the creator stage too: the verify floor of the same tree then REUSES
+        // that full run instead of running the suite a second time after the targeted one
+        // (rig run b6f7968b, highest: a 33 min targeted run at hand-off, then the full suite).
+        let full_here = power_full || (ctx.stage == FloorStage::Verify && cfg.full);
         let anchored = argv
             .iter()
             .any(|a| a.contains("{files}") || a.contains("{base}"));
@@ -2757,6 +2757,7 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
     // change-scoped set derived from the touched files at the CREATOR stage — the verify floor
     // keeps the full suite, so an unconfigured repo pays for one full run, not three.
     if ctx.stage == FloorStage::Creator
+        && !power_full_suite(ctx)
         && matches!(r_targeted, Resolved::Default)
         && matches!(r_test, Resolved::Default)
         && ctx.base_head.is_some()
@@ -5036,7 +5037,12 @@ fn run_detected(
         let affected = gcheck
             .as_ref()
             .ok()
-            .filter(|_| ctx.stage == FloorStage::Creator && !touched.is_empty() && !deletes)
+            .filter(|_| {
+                ctx.stage == FloorStage::Creator
+                    && !touched.is_empty()
+                    && !deletes
+                    && !power_full_suite(ctx)
+            })
             .and_then(|g| g.affected_argv(&package_relative(touched.clone(), &check.dir)));
         let mut run = match affected {
             Some(argv) => {
@@ -5072,8 +5078,27 @@ fn run_detected(
             let compare = check.name != "install" && !is_formatter_check(&check.name);
             // With exclusion off the base runs plainly: no results, no list, no alone runs.
             let excluding = gcheck.as_ref().ok().copied().filter(|_| exclude);
+            // (power-speed) A decision that cannot exclude is decided by the head's own runs, so
+            // its identical retry (DES-FLOOR-V2 §4) goes FIRST. A pass decides alone (`passed on
+            // retry (flaky)` reads no base), and the base run it would never have read — a whole
+            // suite, 19.5 min on rig run bc2366e1, 30 min on b6f7968b — is not paid for. A retry
+            // that fails is the decision's retry; the base then runs as before.
+            let early_retry = (compare && excluding.is_none())
+                .then(|| {
+                    retry_if_loaded(
+                        worktree,
+                        held_head,
+                        check,
+                        &ExecOpts::default(),
+                        &run,
+                        sandbox,
+                        scratch,
+                    )
+                })
+                .flatten();
+            let retry_passed = early_retry.as_ref().is_some_and(CheckRun::passed);
             let side = match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
-                _ if !compare => None,
+                _ if !compare || retry_passed => None,
                 (Some(head), _) if !(baseline_diff && baseline_diff_for(&check.dir)) => {
                     Some(BaseSide {
                         base: BaseRun {
@@ -5133,7 +5158,16 @@ fn run_detected(
                 });
             } else {
                 decide(
-                    worktree, held_head, check, &mut run, side, &gcheck, exclude, sandbox, scratch,
+                    worktree,
+                    held_head,
+                    check,
+                    &mut run,
+                    side,
+                    &gcheck,
+                    exclude,
+                    sandbox,
+                    scratch,
+                    early_retry,
                 );
             }
         }
@@ -7952,12 +7986,14 @@ fn retry_if_loaded(
         }
         std::thread::sleep(Duration::from_secs(1).min(bound));
     }
+    // The wait alone: measured before the retry runs, not after it (rig run b6f7968b's label
+    // said "after waiting 1916s" for a 30 s bound — the retry's own run time).
+    let waited_s = waited.elapsed().as_secs_f64();
     let mut r = run_one_with(worktree, held, one, exec, sandbox, scratch, Tree::Head);
     r.logs = relabel(r.logs, "retry");
     r.source = format!(
         "the identical retry of `{}` after waiting {:.0}s for headroom (DES-FLOOR-V2)",
-        one.name,
-        waited.elapsed().as_secs_f64()
+        one.name, waited_s
     );
     eprintln!(
         "wicked-core: repo checks floor — `{}` failed under load; its identical retry {}",
@@ -7965,6 +8001,14 @@ fn retry_if_loaded(
         if r.passed() { "passed" } else { "failed" }
     );
     Some(r)
+}
+
+/// (program DES-POWER-MODE) A power run at high rigor or above hands off on the FULL suite, at the
+/// creator floor as at verify: no targeted or affected narrowing for it.
+fn power_full_suite(ctx: &FloorContext) -> bool {
+    ctx.run_id
+        .as_deref()
+        .is_some_and(crate::power::full_suite_required)
 }
 
 fn retry_headroom_wait() -> Duration {
@@ -8000,6 +8044,7 @@ fn decide(
     exclude: bool,
     sandbox: &WorkerSandbox,
     scratch: &CheckScratch,
+    early_retry: Option<CheckRun>,
 ) {
     let mut logs = head.logs.clone();
     let base_sha = side.as_ref().map(|s| s.base.head.clone());
@@ -8168,19 +8213,24 @@ fn decide(
     let mut twice = false;
     // A deselected run that crashed is decided as it stands (`could_not_run`): no retry.
     let crashed_out = excluded_run && crashed(&deciding, guide.as_ref().ok().copied()).is_some();
-    let retry = (!crashed_out)
-        .then(|| {
-            retry_if_loaded(
-                worktree,
-                held,
-                &deciding_check,
-                &deciding_exec,
-                &deciding,
-                sandbox,
-                scratch,
-            )
-        })
-        .flatten();
+    // The head's identical retry already ran before the base (see the caller): it is this
+    // decision's retry. Only when the decision could not exclude, so the deciding run is the head.
+    let early_retry = early_retry.filter(|_| !excluded_run);
+    let retry = early_retry.or_else(|| {
+        (!crashed_out)
+            .then(|| {
+                retry_if_loaded(
+                    worktree,
+                    held,
+                    &deciding_check,
+                    &deciding_exec,
+                    &deciding,
+                    sandbox,
+                    scratch,
+                )
+            })
+            .flatten()
+    });
     if let Some(r) = retry {
         logs.extend(r.logs.iter().cloned());
         head.reruns.push(r.clone());
@@ -11845,6 +11895,59 @@ exit 1
             !denial.contains("repo checks floor failed:"),
             "a timeout is never worded as a failure: {denial}"
         );
+    }
+
+    /// (power-speed) A power run at high rigor or above hands off on the FULL suite at the creator
+    /// floor too, with the same argv the verify floor runs, so verify reuses it rather than
+    /// running the suite after a targeted pass. Below high, and outside power mode, the creator
+    /// keeps its targeted set.
+    #[test]
+    fn a_power_run_at_high_rigor_runs_the_full_suite_at_the_creator_floor_too() {
+        let wt = scratch("power-full");
+        std::fs::write(
+            wt.join("package.json"),
+            r#"{"scripts":{"typecheck":"tsc --noEmit","test":"vitest run"}}"#,
+        )
+        .unwrap();
+        std::fs::write(wt.join(".gitignore"), "node_modules/\ntmp/\n").unwrap();
+        std::fs::create_dir_all(wt.join("node_modules")).unwrap();
+        std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+        std::fs::write(
+            wt.join(CONFIG_PATH),
+            r#"{"test_targeted":["npx","vitest","related","--run","{files}"],"lint":false}"#,
+        )
+        .unwrap();
+        let base = git_repo_with_commit(&wt);
+        std::fs::write(wt.join("src.ts"), "changed\n").unwrap();
+        let run = "power-full-creator-run";
+        let ctx = FloorContext {
+            stage: FloorStage::Creator,
+            base_head: Some(base),
+            git_dir: Some(wt.join(".git")),
+            run_id: Some(run.to_string()),
+            ..FloorContext::default()
+        };
+        let verify_ctx = FloorContext {
+            stage: FloorStage::Verify,
+            ..ctx.clone()
+        };
+        crate::power::set_full_suite(run, false);
+        assert_eq!(
+            names(&detect_with(&wt, &ctx).unwrap()),
+            vec!["typecheck", "test_targeted"],
+            "below high the creator floor stays targeted"
+        );
+        crate::power::set_full_suite(run, true);
+        let creator = detect_with(&wt, &ctx).unwrap();
+        let verify = detect_with(&wt, &verify_ctx).unwrap();
+        crate::power::set_full_suite(run, false);
+        assert_eq!(names(&creator), vec!["typecheck", "test"]);
+        assert_eq!(names(&verify), vec!["typecheck", "test"]);
+        assert_eq!(
+            creator[1].argv, verify[1].argv,
+            "the same command, so the verify floor can reuse the creator's run"
+        );
+        let _ = std::fs::remove_dir_all(&wt);
     }
 
     /// core#469: `.wicked/checks.json` speaks over the manifests — a targeted test command is
