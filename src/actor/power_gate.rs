@@ -136,9 +136,10 @@ pub(super) fn on_checkpoint(
         None => (0, false, None),
     };
     let actual_rigor = Rigor::of(actual, destructive);
-    let elapsed = power.build_started_at.map_or(0, |t| {
-        u32::try_from((now - t).max(0) / 60_000).unwrap_or(u32::MAX)
-    });
+    // Time against the estimate is the ORCHESTRATOR's own time: its turns, not the floor's checks,
+    // a reviewer's turn or a wait on a person between them (rig run bc2366e1 paused on "80 min
+    // against an estimate of 20" after a 10-minute build and a 70-minute floor).
+    let elapsed = crate::power::orchestrator_minutes(&power.turn_log, now);
     let estimate = power.plan.as_ref().and_then(|p| p.estimate_minutes);
     let mut struggle = crate::power::Struggle {
         failed_runs: report.failed_runs,

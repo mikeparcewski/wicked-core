@@ -465,6 +465,16 @@ impl PowerState {
     }
 }
 
+/// The orchestrator's own working minutes: the sum of its turns (a turn still running counts up to
+/// `now`). Floors, reviewers and waits on a person between turns are not the orchestrator's time.
+pub fn orchestrator_minutes(turns: &[PowerTurnRecord], now: i64) -> u32 {
+    let ms: i64 = turns
+        .iter()
+        .map(|t| (t.ended_at.unwrap_or(now) - t.started_at).max(0))
+        .sum();
+    u32::try_from(ms / 60_000).unwrap_or(u32::MAX)
+}
+
 /// Build a history row from `from` to `to`.
 #[allow(clippy::too_many_arguments)]
 pub fn change(
@@ -2138,6 +2148,33 @@ mod tests {
             TurnEnd::Checkpoint("then more".into())
         );
         assert_eq!(turn_end("no marker"), TurnEnd::Checkpoint(String::new()));
+    }
+
+    #[test]
+    fn the_estimate_is_measured_against_the_orchestrators_turns_only() {
+        let t = |turn, start: i64, end: Option<i64>| PowerTurnRecord {
+            turn,
+            attempt: 0,
+            cli: "claude".into(),
+            started_at: start,
+            ended_at: end,
+            outcome: None,
+            summary: None,
+        };
+        let min = 60_000;
+        // A 10-minute turn, a 70-minute floor, then a 1-minute rework turn still running.
+        let turns = [t(1, 0, Some(10 * min)), t(1, 80 * min, None)];
+        assert_eq!(orchestrator_minutes(&turns, 81 * min), 11);
+        assert_eq!(orchestrator_minutes(&[], 5 * min), 0);
+        let s = Struggle {
+            elapsed_minutes: orchestrator_minutes(&turns, 81 * min),
+            estimate_minutes: Some(20),
+            ..Default::default()
+        };
+        assert!(
+            struggle_score(&s).1.is_empty(),
+            "no struggle: 11 of 20 minutes"
+        );
     }
 
     #[test]
