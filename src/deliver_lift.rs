@@ -3317,6 +3317,11 @@ mod tests {
     /// running no checks, instead of re-running them into the same refusal.
     #[test]
     fn a_verify_override_on_the_unchanged_tree_delivers_without_rerunning_the_checks() {
+        if crate::validator::skip_when_nested(
+            "a_verify_override_on_the_unchanged_tree_delivers_without_rerunning_the_checks",
+        ) {
+            return;
+        }
         // spawn-audit: test-only — probes for `npm` on PATH to decide whether the fixture can run; reads no engine state.
         if Command::new("npm").arg("--version").output().is_err() {
             eprintln!("npm not on PATH — the brick test cannot run here");
@@ -3398,6 +3403,11 @@ mod tests {
     /// tree runs the checks again (and refuses again).
     #[test]
     fn an_override_is_stood_on_only_for_the_same_tree_base_and_checks() {
+        if crate::validator::skip_when_nested(
+            "an_override_is_stood_on_only_for_the_same_tree_base_and_checks",
+        ) {
+            return;
+        }
         // spawn-audit: test-only — probes for `npm` on PATH to decide whether the fixture can run; reads no engine state.
         if Command::new("npm").arg("--version").output().is_err() {
             eprintln!("npm not on PATH — the override reuse test cannot run here");

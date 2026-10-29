@@ -1007,6 +1007,10 @@ fn a_clean_evaluator_passes_and_the_repo_checks_are_the_gates_evidence() {
 /// Needs `npm` on PATH (every hosted CI runner; developer machines) — otherwise says so.
 #[test]
 fn a_passing_check_that_mutates_source_is_caught_by_the_final_comparison() {
+    if wicked_core::nested_sandbox() {
+        eprintln!("SKIP a_passing_check_that_mutates_source_is_caught_by_the_final_comparison: sandbox-exec cannot be applied here (nested inside a sandbox, e.g. the repo-checks floor)");
+        return;
+    }
     if Command::new("npm").arg("--version").output().is_err() {
         eprintln!("npm not on PATH — the mutating-check test cannot run here");
         return;
