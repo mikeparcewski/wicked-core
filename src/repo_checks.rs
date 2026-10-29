@@ -9744,6 +9744,7 @@ pub(crate) mod tests {
     /// The J4 shape (rig run 62c4f0ff, crew's `scripts/test-related.mjs`): the first pass fails
     /// two files, the check's own retry re-runs them serially and only the shared one fails again.
     /// The marker line goes to both streams (vitest prints its failures on stderr).
+    #[cfg(unix)]
     const RETRY_SHAPE_SH: &str = "\
 echo ' RUN  v3.2.4'
 echo ' FAIL  tests/a.test.ts > first pass only' >&2
