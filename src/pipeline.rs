@@ -1610,7 +1610,7 @@ pub(crate) fn apply_and_finish_unit(
     // too only took the floor gate's own answers away (rig run 1940f173: one refused write turned a
     // failed floor into "a tool call was denied", with no operator judgment). The refusal is
     // disclosed beside the floor result (`workerToolCallDenied`), never instead of it.
-    let checks_failed_for_fold = (checks_denial.is_some() || carried_override.is_some())
+    let checks_failed_for_fold = checks_denial.is_some()
         && evidence
             .repo_checks
             .as_ref()
@@ -2148,6 +2148,12 @@ pub(crate) fn apply_and_finish_unit(
         receipt.ran(crate::assurance::OPERATOR_JUDGE);
         receipt.operator_judges.push(j.clone());
         if let Some(mut s) = crate::domain::get_session(store, session_id)? {
+            // One carried record per unit: a re-run of this verify unit replaces its earlier one.
+            s.assurance.floor_overrides.retain(|prev| {
+                prev.floor_override
+                    .as_ref()
+                    .is_none_or(|f| f.carried_from.is_none() || f.ord != unit.ord)
+            });
             s.assurance.floor_overrides.push(j);
             put_node(store, s.to_node())?;
         }
@@ -2976,8 +2982,9 @@ pub(crate) fn author_binaries_known(u: &crate::domain::WorkUnit) -> bool {
 /// (core#1168) The operator's override of a CREATOR floor result, carried onto the verify floor that
 /// reused it: `Some` only when this verify floor failed on checks it ALL took from that creator floor
 /// (`reused_from`, not voided — so the failing set is that floor's own results), on the same tree and
-/// base as the overridden result's key, and the operator overrode that unit's floor on that key. Any
-/// fresh failure, a changed tree or base, a voided reuse, or no recorded key asks again (`None`).
+/// base as the overridden result's key, and the operator overrode that unit's floor at the very
+/// attempt whose result was reused. Any fresh failure or timeout, a changed tree or base, a voided
+/// reuse, another attempt's override, or no recorded key asks again (`None`).
 /// The carried judgment keeps the operator's name and rationale, names this verify floor's result and
 /// key (so the deliver phase can stand on it), and says where it came from.
 pub(crate) fn carried_floor_override(
@@ -2996,10 +3003,20 @@ pub(crate) fn carried_floor_override(
         .filter(|c| c.denies())
         .map(|c| c.name.as_str())
         .collect();
+    // Every failing check must be one the verify floor REUSED. Names are not unique across
+    // directories, so a name that also ran fresh here is not taken as reused; and a check that did
+    // not finish is never a reused result (the creator record keeps finished checks only).
     if failing.is_empty()
         || report.sandbox_error.is_some()
         || report.detect_error.is_some()
-        || !failing.iter().all(|n| reuse.reused.iter().any(|r| r == n))
+        || report.timed_out()
+        || report
+            .checks
+            .iter()
+            .any(|c| c.denies() && c.did_not_finish())
+        || !failing
+            .iter()
+            .all(|n| reuse.reused.iter().any(|r| r == n) && !reuse.fresh.iter().any(|f| f == n))
     {
         return None;
     }
@@ -3013,6 +3030,7 @@ pub(crate) fn carried_floor_override(
             let k = f.key.as_ref()?;
             (f.carried_from.is_none()
                 && f.ord == reuse.ord
+                && f.attempt == reuse.attempt
                 && k.tree == key.tree
                 && k.base == key.base)
                 .then_some((j, f))
@@ -4647,6 +4665,31 @@ mod judge_bench_tests {
         crate::assurance::AssuranceReceipt,
         Vec<crate::assurance::OperatorJudgment>,
     ) {
+        fold_verify_floor_n(sid, report, 1)
+    }
+
+    /// The same, the verify unit folded at attempts 0 and 1 (a re-run on the same tree).
+    fn fold_verify_floor_twice(
+        sid: &str,
+    ) -> (
+        bool,
+        Option<String>,
+        crate::assurance::AssuranceReceipt,
+        Vec<crate::assurance::OperatorJudgment>,
+    ) {
+        fold_verify_floor_n(sid, verify_floor_report(&["typecheck", "test"]), 2)
+    }
+
+    fn fold_verify_floor_n(
+        sid: &str,
+        report: crate::repo_checks::RepoChecksReport,
+        times: u32,
+    ) -> (
+        bool,
+        Option<String>,
+        crate::assurance::AssuranceReceipt,
+        Vec<crate::assurance::OperatorJudgment>,
+    ) {
         let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
         let mut sink = |_e: CoreEvent| {};
         let Planned {
@@ -4712,23 +4755,29 @@ mod judge_bench_tests {
             ..Default::default()
         };
         let output = crate::workflow::stub_output(&units[0]);
-        let outcome = apply_and_finish_unit(
-            &mut store,
-            &mut units[0],
-            &output,
-            &workflow_id,
-            EntityMode::Shared,
-            sid,
-            0,
-            false,
-            false,
-            &cli_keys,
-            None,
-            &evidence,
-            &mut |_e| {},
-            None,
-        )
-        .expect("apply");
+        let mut outcome = None;
+        for attempt in 0..times {
+            outcome = Some(
+                apply_and_finish_unit(
+                    &mut store,
+                    &mut units[0],
+                    &output,
+                    &workflow_id,
+                    EntityMode::Shared,
+                    sid,
+                    attempt,
+                    false,
+                    false,
+                    &cli_keys,
+                    None,
+                    &evidence,
+                    &mut |_e| {},
+                    None,
+                )
+                .expect("apply"),
+            );
+        }
+        let outcome = outcome.expect("folded");
         let receipt = crate::domain::session_units(&store, sid).unwrap()[0]
             .assurance
             .clone()
@@ -4778,6 +4827,20 @@ mod judge_bench_tests {
             "keyed as the verify result, which the deliver phase stands on"
         );
         assert_eq!(overrides[1].by, "local (human)");
+
+        let (approved, _, _, overrides) = fold_verify_floor_twice("carry-1168-r");
+        assert!(approved);
+        assert_eq!(
+            overrides
+                .iter()
+                .filter(|j| j
+                    .floor_override
+                    .as_ref()
+                    .is_some_and(|f| f.carried_from.is_some()))
+                .count(),
+            1,
+            "a re-run of the verify unit replaces its carried record (xreview on #1170)"
+        );
 
         let (approved, denial, receipt, overrides) =
             fold_verify_floor("carry-1168-b", verify_floor_report(&["typecheck"]));

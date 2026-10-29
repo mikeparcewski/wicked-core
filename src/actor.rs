@@ -7405,11 +7405,9 @@ fn apply_step_result(
         for seat in stored.benched_seats {
             crate::domain::bench_seat(&mut session.benched_seats, seat);
         }
-        for j in stored.assurance.floor_overrides {
-            if !session.assurance.floor_overrides.contains(&j) {
-                session.assurance.floor_overrides.push(j);
-            }
-        }
+        // The fold appends (or replaces) only carried records, and nothing on this thread touched
+        // the overrides since this copy was read: the stored list is the current one.
+        session.assurance.floor_overrides = stored.assurance.floor_overrides;
     }
     // T5: the unit-review decision on the bus, and the `team_dispute` pause when the gate
     // approved a teamed unit whose ledger does not let the run continue unattended.
@@ -21994,6 +21992,52 @@ mod request_changes_tests {
             )
             .is_none(),
             "an override of another unit's floor is not this result's"
+        );
+        // (xreview on #1170) A failing name that ALSO ran fresh here (names are not unique across
+        // directories), a failing check that timed out, and an override given at another attempt
+        // than the one whose result was reused: each asks again.
+        let mut name_clash = verify_report.clone();
+        name_clash.reused_from.as_mut().unwrap().fresh = vec!["test".into()];
+        let mut timed_out = verify_report.clone();
+        let t = timed_out
+            .checks
+            .iter_mut()
+            .find(|c| c.name == "test")
+            .unwrap();
+        t.exit_code = None;
+        t.timed_out = true;
+        for (what, report) in [
+            ("a name that also ran fresh", &name_clash),
+            ("a timeout", &timed_out),
+        ] {
+            assert!(
+                crate::pipeline::carried_floor_override(
+                    Some(&session),
+                    &run_id,
+                    &verify,
+                    0,
+                    report
+                )
+                .is_none(),
+                "{what}: asks again"
+            );
+        }
+        let mut other_attempt = session.clone();
+        other_attempt.assurance.floor_overrides[0]
+            .floor_override
+            .as_mut()
+            .unwrap()
+            .attempt = 1;
+        assert!(
+            crate::pipeline::carried_floor_override(
+                Some(&other_attempt),
+                &run_id,
+                &verify,
+                0,
+                &verify_report
+            )
+            .is_none(),
+            "an override given at another attempt is not the reused result's"
         );
 
         // On the run's contract (as the verify fold records it — `pipeline` tests cover the fold),
