@@ -139,7 +139,7 @@ pub(super) fn on_checkpoint(
     // Time against the estimate is the ORCHESTRATOR's own time: its turns, not the floor's checks,
     // a reviewer's turn or a wait on a person between them (rig run bc2366e1 paused on "80 min
     // against an estimate of 20" after a 10-minute build and a 70-minute floor).
-    let elapsed = crate::power::orchestrator_minutes(&power.turn_log, now);
+    let elapsed = crate::power::orchestrator_minutes(power, now);
     let estimate = power.plan.as_ref().and_then(|p| p.estimate_minutes);
     let mut struggle = crate::power::Struggle {
         failed_runs: report.failed_runs,

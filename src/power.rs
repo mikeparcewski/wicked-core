@@ -384,6 +384,10 @@ pub struct PowerState {
     /// `sensitive_dependency`, `struggle`): the cumulative diff never re-raises them. Engine-internal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acknowledged: Vec<String>,
+    /// The orchestrator's completed turn time, milliseconds (never trimmed with the turn log).
+    /// Engine-internal.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub turn_ms: u64,
     /// When the build started (unix millis), for elapsed-against-estimate. Engine-internal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_started_at: Option<i64>,
@@ -396,6 +400,10 @@ pub struct PowerState {
 }
 
 fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_zero_u64(n: &u64) -> bool {
     *n == 0
 }
 
@@ -425,6 +433,7 @@ impl PowerState {
             floors: Vec::new(),
             turn_start_rigor: None,
             acknowledged: Vec::new(),
+            turn_ms: 0,
             build_started_at: None,
             launched_at: Some(now),
             operator_gates: 0,
@@ -465,14 +474,66 @@ impl PowerState {
     }
 }
 
-/// The orchestrator's own working minutes: the sum of its turns (a turn still running counts up to
-/// `now`). Floors, reviewers and waits on a person between turns are not the orchestrator's time.
-pub fn orchestrator_minutes(turns: &[PowerTurnRecord], now: i64) -> u32 {
-    let ms: i64 = turns
-        .iter()
-        .map(|t| (t.ended_at.unwrap_or(now) - t.started_at).max(0))
-        .sum();
-    u32::try_from(ms / 60_000).unwrap_or(u32::MAX)
+/// The orchestrator's own working minutes: every completed turn's duration (kept as a running
+/// total, [`PowerState::turn_ms`], so the bounded turn log never drops time), plus the turn
+/// running now (the log's last record, still open). Floors, reviewers and waits on a person are
+/// not the orchestrator's time, and a turn a daemon restart interrupted counts nothing (its end is
+/// unknown; it is closed `interrupted` when the next turn starts).
+pub fn orchestrator_minutes(state: &PowerState, now: i64) -> u32 {
+    let running = state
+        .turn_log
+        .last()
+        .filter(|t| t.ended_at.is_none())
+        .map_or(0, |t| {
+            u64::try_from((now - t.started_at).max(0)).unwrap_or(0)
+        });
+    u32::try_from((state.turn_ms + running) / 60_000).unwrap_or(u32::MAX)
+}
+
+/// Record a turn start on the state: an earlier turn still open was interrupted (a restart) and is
+/// closed with no time; the log keeps its last [`TURN_LOG_CAP`] records.
+pub fn turn_started(state: &mut PowerState, turn: u32, attempt: u32, cli: &str, now: i64) {
+    if let Some(open) = state.turn_log.last_mut().filter(|t| t.ended_at.is_none()) {
+        open.ended_at = Some(open.started_at);
+        open.outcome = Some("interrupted".into());
+    }
+    state.orchestrator.turns = state.orchestrator.turns.max(turn);
+    state.turn_start_rigor = state.rigor;
+    state.turn_log.push(PowerTurnRecord {
+        turn,
+        attempt,
+        cli: cli.to_string(),
+        started_at: now,
+        ended_at: None,
+        outcome: None,
+        summary: None,
+    });
+    let n = state.turn_log.len();
+    if n > TURN_LOG_CAP {
+        state.turn_log.drain(..n - TURN_LOG_CAP);
+    }
+}
+
+/// Record a turn end on the state, adding its duration to the running total.
+pub fn turn_completed(
+    state: &mut PowerState,
+    turn: u32,
+    attempt: u32,
+    outcome: &str,
+    summary: Option<String>,
+    now: i64,
+) {
+    if let Some(r) = state
+        .turn_log
+        .iter_mut()
+        .rev()
+        .find(|r| r.turn == turn && r.attempt == attempt && r.ended_at.is_none())
+    {
+        r.ended_at = Some(now);
+        r.outcome = Some(outcome.to_string());
+        r.summary = summary;
+        state.turn_ms += u64::try_from((now - r.started_at).max(0)).unwrap_or(0);
+    }
 }
 
 /// Build a history row from `from` to `to`.
@@ -2152,22 +2213,15 @@ mod tests {
 
     #[test]
     fn the_estimate_is_measured_against_the_orchestrators_turns_only() {
-        let t = |turn, start: i64, end: Option<i64>| PowerTurnRecord {
-            turn,
-            attempt: 0,
-            cli: "claude".into(),
-            started_at: start,
-            ended_at: end,
-            outcome: None,
-            summary: None,
-        };
         let min = 60_000;
-        // A 10-minute turn, a 70-minute floor, then a 1-minute rework turn still running.
-        let turns = [t(1, 0, Some(10 * min)), t(1, 80 * min, None)];
-        assert_eq!(orchestrator_minutes(&turns, 81 * min), 11);
-        assert_eq!(orchestrator_minutes(&[], 5 * min), 0);
+        let mut st = PowerState::launched(true, 0);
+        // A 10-minute turn, then a 70-minute floor, then a rework turn running for 1 minute.
+        turn_started(&mut st, 1, 0, "claude", 0);
+        turn_completed(&mut st, 1, 0, "handoff", None, 10 * min);
+        turn_started(&mut st, 1, 1, "claude", 80 * min);
+        assert_eq!(orchestrator_minutes(&st, 81 * min), 11);
         let s = Struggle {
-            elapsed_minutes: orchestrator_minutes(&turns, 81 * min),
+            elapsed_minutes: orchestrator_minutes(&st, 81 * min),
             estimate_minutes: Some(20),
             ..Default::default()
         };
@@ -2175,6 +2229,25 @@ mod tests {
             struggle_score(&s).1.is_empty(),
             "no struggle: 11 of 20 minutes"
         );
+        // A restart interrupts the running turn: it counts nothing, and the next turn counts alone.
+        let mut r = PowerState::launched(true, 0);
+        turn_started(&mut r, 1, 0, "claude", 0);
+        turn_completed(&mut r, 1, 0, "checkpoint", None, 10 * min);
+        turn_started(&mut r, 2, 0, "claude", 10 * min); // interrupted by a crash
+        turn_started(&mut r, 1, 1, "claude", 80 * min); // the redriven attempt
+        assert_eq!(r.turn_log[1].outcome.as_deref(), Some("interrupted"));
+        assert_eq!(orchestrator_minutes(&r, 81 * min), 11);
+        // The bounded log never drops time: 1 x 10 min + 50 x 1 min = 60 min.
+        let mut c = PowerState::launched(true, 0);
+        turn_started(&mut c, 1, 0, "claude", 0);
+        turn_completed(&mut c, 1, 0, "checkpoint", None, 10 * min);
+        for k in 0..50i64 {
+            let at = (11 + 2 * k) * min;
+            turn_started(&mut c, 2 + k as u32, 0, "claude", at);
+            turn_completed(&mut c, 2 + k as u32, 0, "checkpoint", None, at + min);
+        }
+        assert_eq!(c.turn_log.len(), TURN_LOG_CAP);
+        assert_eq!(orchestrator_minutes(&c, 200 * min), 60);
     }
 
     #[test]

@@ -4054,41 +4054,21 @@ pub(crate) fn run(
                             match event.as_ref() {
                                 CoreEvent::PowerTurnStarted {
                                     turn, attempt, cli, ..
-                                } => {
-                                    p.orchestrator.turns = p.orchestrator.turns.max(*turn);
-                                    p.turn_start_rigor = p.rigor;
-                                    p.turn_log.push(crate::power::PowerTurnRecord {
-                                        turn: *turn,
-                                        attempt: *attempt,
-                                        cli: cli.clone(),
-                                        started_at: now,
-                                        ended_at: None,
-                                        outcome: None,
-                                        summary: None,
-                                    });
-                                    let n = p.turn_log.len();
-                                    if n > crate::power::TURN_LOG_CAP {
-                                        p.turn_log.drain(..n - crate::power::TURN_LOG_CAP);
-                                    }
-                                }
+                                } => crate::power::turn_started(p, *turn, *attempt, cli, now),
                                 CoreEvent::PowerTurnCompleted {
                                     turn,
                                     attempt,
                                     outcome,
                                     summary,
                                     ..
-                                } => {
-                                    if let Some(r) = p
-                                        .turn_log
-                                        .iter_mut()
-                                        .rev()
-                                        .find(|r| r.turn == *turn && r.attempt == *attempt)
-                                    {
-                                        r.ended_at = Some(now);
-                                        r.outcome = Some(outcome.clone());
-                                        r.summary = summary.clone();
-                                    }
-                                }
+                                } => crate::power::turn_completed(
+                                    p,
+                                    *turn,
+                                    *attempt,
+                                    outcome,
+                                    summary.clone(),
+                                    now,
+                                ),
                                 _ => {}
                             }
                             let _ = put_node(&mut store, s.to_node());
