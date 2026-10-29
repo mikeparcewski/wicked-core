@@ -8627,39 +8627,52 @@ fn starts_retry_block(line: &str) -> bool {
 }
 
 /// (core#1172) The failure ids a failed check's output names ([`failure_id_of_line`], both streams,
-/// first sight order, at most [`MAX_FAILURE_IDS`]) and the ids its own retry cleared. With no
-/// retry block every id is a failure, as before. With one, a stream that carries the marker counts
-/// only what it printed after its last one, and a stream without it counts everything (it cannot
-/// be split). The ids printed only before the marker are flaky (passed on retry). When the final
-/// pass names nothing, nothing can be told apart and every id stays a failure.
+/// first sight order, at most [`MAX_FAILURE_IDS`]) and the ids its own retry cleared. A stream is
+/// SPLIT only when it carries the retry-block marker and names a failure after its last one: it
+/// then counts only what follows the marker, and what it named only before is flaky (passed on
+/// retry). Every other stream (no marker, or a final pass that named nothing there) is read whole.
+/// No split stream ⇒ every id is a failure, as before. Membership is decided over every id the
+/// output names; the cap applies only to the lists returned, so a failure the final pass names
+/// past the cap is never called flaky.
 pub(crate) fn split_retry_ids(stdout: &str, stderr: &str) -> (Vec<String>, Vec<String>) {
-    fn push(into: &mut Vec<String>, id: String) {
-        if into.len() < MAX_FAILURE_IDS && !into.contains(&id) {
-            into.push(id);
+    fn push(into: &mut Vec<String>, id: &str) {
+        if !into.iter().any(|x| x == id) {
+            into.push(id.to_string());
         }
     }
     let (mut first, mut last, mut all) = (Vec::new(), Vec::new(), Vec::new());
-    let mut retried = false;
+    let mut split_any = false;
     for stream in [stdout, stderr] {
         let lines: Vec<&str> = stream.lines().collect();
         let start = lines.iter().rposition(|l| starts_retry_block(l));
-        retried |= start.is_some();
         let mut eslint_file = None;
+        let (mut before, mut after) = (Vec::new(), Vec::new());
         for (i, line) in lines.iter().enumerate() {
             let Some(id) = failure_id_of_line(line, &mut eslint_file) else {
                 continue;
             };
-            push(&mut all, id.clone());
+            push(&mut all, &id);
             match start {
-                Some(s) if i < s => push(&mut first, id),
-                _ => push(&mut last, id),
+                Some(s) if i < s => push(&mut before, &id),
+                _ => push(&mut after, &id),
             }
         }
+        if start.is_some() && !after.is_empty() {
+            split_any = true;
+            before.iter().for_each(|id| push(&mut first, id));
+        } else {
+            // Not splittable: everything this stream named is a failure.
+            after.splice(0..0, before);
+        }
+        after.iter().for_each(|id| push(&mut last, id));
     }
-    if !retried || last.is_empty() {
+    if !split_any {
+        all.truncate(MAX_FAILURE_IDS);
         return (all, Vec::new());
     }
-    let flaky = first.into_iter().filter(|id| !last.contains(id)).collect();
+    let mut flaky: Vec<String> = first.into_iter().filter(|id| !last.contains(id)).collect();
+    last.truncate(MAX_FAILURE_IDS);
+    flaky.truncate(MAX_FAILURE_IDS);
     (last, flaky)
 }
 
@@ -9818,6 +9831,23 @@ exit 1
             split_retry_ids("", &format!("{a}\n{start}\n")),
             (ids(&["FAIL tests/a.test.ts > a"]), Vec::new())
         );
+        // (xreview on #1176) …even when another, unmarked stream names a failure: the marked
+        // stream's pre-marker id is not cleared by ids that were never in a final pass.
+        assert_eq!(
+            split_retry_ids(&format!("{a}\n{start}\n"), &format!("{b}\n")),
+            (
+                ids(&["FAIL tests/a.test.ts > a", "FAIL tests/b.test.ts > b"]),
+                Vec::new()
+            )
+        );
+        // (xreview on #1176) A failure the final pass names past the id cap reproduced: it is a
+        // failure, never flaky.
+        let many: String = (0..MAX_FAILURE_IDS + 5)
+            .map(|n| format!(" FAIL  tests/m{n}.test.ts > m\n"))
+            .collect();
+        let (failing, flaky) = split_retry_ids("", &format!("{a}\n{start}\n{many}{a}\n"));
+        assert_eq!(failing.len(), MAX_FAILURE_IDS);
+        assert!(flaky.is_empty(), "{flaky:?}");
         // A "none —" line or the verdict line starts no block.
         for other in [
             "WICKED-RETRY none — the failure carries no deadline marker",
