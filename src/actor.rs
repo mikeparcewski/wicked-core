@@ -6507,7 +6507,9 @@ fn apply_step_result(
             );
             // (No `fold_input_denial` here — a Tool unit is never `governed`: `dispatch_unit`
             // hands `run_tool_cmd` no gate hook and reports `governed: false`; review N6.)
-            let prompt = deliver_refusal_prompt(
+            let prompt = deliver_refusal_prompt_for(
+                unit,
+                &session,
                 if raw.is_empty() {
                     "the deliver script exited non-zero with no output"
                 } else {
@@ -7880,6 +7882,68 @@ fn deliver_refusal_prompt(detail: &str, offer: &str) -> String {
         "The deliver phase refused: {detail}. Approve to re-run the deliver phase now (the engine \
          re-lifts and re-verifies first; no second deliver gate),{} reject to cancel the run and \
          keep the worktree.",
+        if offer.is_empty() {
+            String::new()
+        } else {
+            format!("{offer} or")
+        }
+    )
+}
+
+/// (core#1114) The tree an earlier floor override on this run covered, when it is NOT the tree the
+/// deliver checks just failed on: `Some((previous, current))` (full identities) only when `unit`'s
+/// refusal is an overridable failed re-verify, an override with a known tree is recorded, and none
+/// of them covers the current tree. The most recently recorded different tree wins. A record names
+/// its tree directly or through its key; one naming neither is ignored.
+fn deliver_override_changed_tree(
+    unit: &crate::domain::WorkUnit,
+    session: &crate::domain::AgentSession,
+) -> Option<(String, String)> {
+    if !deliver_floor_overridable(unit) {
+        return None;
+    }
+    let current = unit.repo_checks.as_ref()?.key.as_ref()?.tree.as_str();
+    let mut previous = None;
+    for fo in session
+        .assurance
+        .floor_overrides
+        .iter()
+        .filter_map(|j| j.floor_override.as_ref())
+    {
+        let tree = fo
+            .tree
+            .as_deref()
+            .or_else(|| fo.key.as_ref().map(|k| k.tree.as_str()));
+        match tree {
+            Some(t) if t == current => return None,
+            Some(t) => previous = Some(t),
+            None => {}
+        }
+    }
+    previous.map(|p| (p.to_string(), current.to_string()))
+}
+
+/// (core#1114) [`deliver_refusal_prompt`] for a refusal on a tree the lift changed after the
+/// operator overrode the floor on the previous one: one sentence before the options says the
+/// earlier override covered the previous tree only, and approve says it re-runs the checks on this
+/// same tree. Every other refusal gets [`deliver_refusal_prompt`] byte for byte; the offer clause
+/// stays right before "or reject".
+fn deliver_refusal_prompt_for(
+    unit: &crate::domain::WorkUnit,
+    session: &crate::domain::AgentSession,
+    detail: &str,
+    offer: &str,
+) -> String {
+    let Some((was, now)) = deliver_override_changed_tree(unit, session) else {
+        return deliver_refusal_prompt(detail, offer);
+    };
+    let short = |t: &str| t.chars().take(10).collect::<String>();
+    let (was, now) = (short(&was), short(&now));
+    format!(
+        "The deliver phase refused: {detail}. The tree changed since the floor was overridden \
+         (was `{was}`, now `{now}`); that earlier override covered `{was}` only. Approve to \
+         re-run the checks on this same tree (`{now}`) now (the engine re-lifts and re-verifies \
+         first; no second deliver gate),{} reject to cancel the run and keep the worktree.",
         if offer.is_empty() {
             String::new()
         } else {
@@ -21433,6 +21497,194 @@ mod request_changes_tests {
         ] {
             assert_eq!(deliver_floor_override_offer(&x), "", "{tag}");
         }
+    }
+
+    /// A session shell carrying only the floor overrides under test.
+    fn session_with_overrides(overrides: Vec<crate::assurance::FloorOverride>) -> AgentSession {
+        let mut s = AgentSession {
+            intent_amendments: Vec::new(),
+            id: "r".into(),
+            workflow_id: "wf".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::AwaitingHuman,
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            project_id: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            seat_failures: Vec::new(),
+            benched_seats: Vec::new(),
+            team: None,
+            team_plan: None,
+            exclude_seats: Vec::new(),
+            evidence_root: None,
+            assurance: Default::default(),
+        };
+        s.assurance.floor_overrides = overrides
+            .into_iter()
+            .map(|f| crate::assurance::OperatorJudgment {
+                by: "op".into(),
+                at: 1,
+                note: Some("not the work's".into()),
+                reason: None,
+                floor_override: Some(f),
+                judge_stand_in: None,
+            })
+            .collect();
+        s
+    }
+
+    fn floor_override_on(
+        tree: Option<&str>,
+        key_tree: Option<&str>,
+    ) -> crate::assurance::FloorOverride {
+        crate::assurance::FloorOverride {
+            layer: "repo_checks".into(),
+            result_id: "r:unit-5:attempt-0:repo_checks".into(),
+            ord: 5,
+            attempt: 0,
+            tree: tree.map(str::to_string),
+            label: crate::assurance::FLOOR_OVERRIDE_LABEL.into(),
+            key: key_tree.map(|t| crate::repo_checks::FloorKey {
+                tree: t.into(),
+                base: None,
+                checks: "d".into(),
+            }),
+        }
+    }
+
+    fn deliver_unit_on_lifted_tree() -> WorkUnit {
+        let mut u = WorkUnit::pending("r:deliver", "r", 5, "deliver");
+        u.tool_cmd = Some(vec!["deliver.sh".into()]);
+        u.status = UnitStatus::Rejected;
+        u.denial = Some(UnitDenial::new(
+            crate::deliver_lift::DENIAL_SOURCE_DELIVER_REFUSAL,
+            "refused",
+        ));
+        u.repo_checks = Some(failed_deliver_floor(Some(lifted_key())));
+        u
+    }
+
+    /// (core#1114) A deliver refusal on a tree the lift changed, after the operator overrode the
+    /// floor on the previous tree, says so before the options, and approve names the same tree.
+    /// The offer clause stays byte-identical, right before "or reject".
+    #[test]
+    fn the_deliver_refusal_says_why_a_changed_tree_needs_a_new_override() {
+        let u = deliver_unit_on_lifted_tree();
+        let offer = deliver_floor_override_offer(&u);
+        let s = session_with_overrides(vec![floor_override_on(Some("tree-earlier-A"), None)]);
+        let p = deliver_refusal_prompt_for(&u, &s, "deliver: the checks FAILED", offer);
+        assert!(
+            p.contains(
+                "The tree changed since the floor was overridden (was `tree-earli`, now \
+                 `tree-lifte`); that earlier override covered `tree-earli` only."
+            ),
+            "{p}"
+        );
+        assert!(
+            p.contains(
+                "Approve to re-run the checks on this same tree (`tree-lifte`) now (the engine"
+            ),
+            "{p}"
+        );
+        assert!(
+            p.ends_with(&format!(
+                "{FLOOR_OVERRIDE_OFFER} or reject to cancel the run and keep the worktree."
+            )),
+            "{p}"
+        );
+        // The sentence precedes the options.
+        assert!(
+            p.find("tree changed").unwrap() < p.find("Approve").unwrap(),
+            "{p}"
+        );
+    }
+
+    /// (core#1114) No earlier override, an override on the same tree, or a refusal that is not an
+    /// overridable re-verify keeps today's prompt byte for byte.
+    #[test]
+    fn the_deliver_refusal_prompt_is_unchanged_without_a_different_overridden_tree() {
+        let u = deliver_unit_on_lifted_tree();
+        let offer = deliver_floor_override_offer(&u);
+        let today = deliver_refusal_prompt("deliver: the checks FAILED", offer);
+        for (tag, overrides) in [
+            ("no override", vec![]),
+            (
+                "same tree",
+                vec![floor_override_on(Some("tree-lifted"), None)],
+            ),
+            (
+                "same tree via key",
+                vec![floor_override_on(None, Some("tree-lifted"))],
+            ),
+            ("no tree recorded", vec![floor_override_on(None, None)]),
+            (
+                "a different then the same tree",
+                vec![
+                    floor_override_on(Some("tree-earlier-A"), None),
+                    floor_override_on(Some("tree-lifted"), None),
+                ],
+            ),
+        ] {
+            let s = session_with_overrides(overrides);
+            assert_eq!(
+                deliver_refusal_prompt_for(&u, &s, "deliver: the checks FAILED", offer),
+                today,
+                "{tag}"
+            );
+        }
+        // Not overridable (a script refusal: no keyed floor): the generic prompt, even with a
+        // different-tree override recorded.
+        let mut none = u.clone();
+        none.repo_checks = None;
+        let s = session_with_overrides(vec![floor_override_on(Some("tree-earlier-A"), None)]);
+        assert_eq!(
+            deliver_refusal_prompt_for(&none, &s, "deliver: gh: 403", ""),
+            deliver_refusal_prompt("deliver: gh: 403", "")
+        );
+        assert_eq!(
+            deliver_refusal_prompt("deliver: gh: 403", ""),
+            "The deliver phase refused: deliver: gh: 403. Approve to re-run the deliver phase now \
+             (the engine re-lifts and re-verifies first; no second deliver gate), reject to cancel \
+             the run and keep the worktree."
+        );
+    }
+
+    /// (core#1114) The previous tree is the override's own tree, else its key's; a record with
+    /// neither is ignored; among several different trees the most recently recorded wins.
+    #[test]
+    fn the_deliver_refusal_names_the_most_recent_known_overridden_tree() {
+        let u = deliver_unit_on_lifted_tree();
+        let from = |o: Vec<crate::assurance::FloorOverride>| {
+            deliver_override_changed_tree(&u, &session_with_overrides(o))
+        };
+        assert_eq!(
+            from(vec![floor_override_on(None, Some("tree-via-key"))]),
+            Some(("tree-via-key".into(), "tree-lifted".into()))
+        );
+        assert_eq!(
+            from(vec![
+                floor_override_on(Some("tree-old"), None),
+                floor_override_on(None, None),
+                floor_override_on(Some("tree-newer"), None),
+                floor_override_on(None, None),
+            ]),
+            Some(("tree-newer".into(), "tree-lifted".into()))
+        );
     }
 
     /// (deliver honors an override) The judgment at the deliver refusal gate is recorded on the

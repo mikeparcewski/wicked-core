@@ -14,6 +14,13 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The deliver refusal gate says why a changed tree needs a new override (core#1114).** When deliver's own
+  re-verify fails on a tree the lift changed, and the run recorded a floor override on a different tree,
+  the prompt now says, in one sentence before the options, that the tree changed since the floor was
+  overridden (naming both short trees) and that the earlier override covered the previous tree only; the
+  approve option says it re-runs the checks on this same tree. The operator-judgment offer clause is
+  unchanged and still right before "or reject". Every other deliver refusal prompt is unchanged.
+
 - **On a re-used QE run, the latest attempt's reviewer verdict is the one delivery reads (core#1162).** On
   rig run 115fabdb, verify attempt 1 resumed QE run 4ad3ef0b on the same tree. The isolated reviewer
   (pi) ended its reply on `VERDICT: PASS`, but it recorded no verdict in the ledger ("the engine binds
