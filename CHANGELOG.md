@@ -1750,6 +1750,20 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.18** — 2026-10-29 — minor feature release, carrying #1174 (power mode), #1175 (core#1173) and #1176 (core#1172).
+  - **Power mode (#1174, program DES-POWER-MODE):** `LaunchOptions.power` and `Core.supportsPowerMode`; the intake QE plan
+    on the PA scope step (`RIGOR` line, rigor record on `AgentSession.power`); the `build` step as one multi-turn
+    orchestrator session with checkpoints at turn ends, commits and a 15 min timer; rigor history rows
+    (`rigorRescored`), raises held for the plan's next boundary, evidence-based lowering only before hand-off; the
+    checkpoint pause and `answerPowerPause`; hand-off NOT-PASS sent back to the same session up to 3 rounds;
+    `setPowerMode`, `raiseRigor`; the full suite at the verify floor from high rigor; operator messages queued for
+    headless runs (a broadcast inject was dropped before); the opt-in `wicked.run.*` bus mirror
+    (`WICKED_RUN_MIRROR=1`); `powerActivity`, `powerTurnStarted/Completed`, `powerCheckpointReached`,
+    `powerHandoffStepped`, `powerToggled`, `powerIntakePlanned` frames.
+  - **The deliver lift regenerates a declared generated file beside a changelog conflict (#1175, core#1173).**
+  - **A failure the check's own retry cleared is reported as flaky, not the change's (#1176, core#1172).**
+  - No seat or floor Dockerfile, no seat package pin and no gate-hook protocol changed since 0.15.17, so the seat and
+    floor image tags and gate protocol 3 are unchanged.
 - **core-ts 0.15.17** — 2026-10-29 — patch release on main da3143e, carrying #1169 and #1170.
   - **The verify floor stands on a fix-floor override on the same tree (#1170, core#1168, J4):** a verify floor whose failing checks were all reused from the creator floor result the operator overrode (same unit and attempt, same tree and base, the reuse not set aside, no failing name that also ran fresh, no timeout) carries that override instead of escalating again, labelled "override carried from fix (unit N), same tree" on the gate's receipt, the run's contract and the delivery (`floorOverride.carriedFrom` names the original result; additive), and keyed as the verify result so the deliver phase stands on it.
   - **The deliver refusal gate says why a changed tree needs a new override (#1169, core#1114).**
