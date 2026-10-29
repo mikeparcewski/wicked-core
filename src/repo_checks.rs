@@ -99,7 +99,11 @@
 //! floor never pays for it; the deliver re-verify is a verify-stage floor and runs it too;
 //! nothing is auto-detected, so it runs only where declared),
 //! `timeout_s` (the per-check base bound, replacing the 20-minute default), `full` (run the FULL
-//! `test` at verify even when `test_targeted` exists) and `baseline_diff` (default `true`). The
+//! `test` at verify even when `test_targeted` exists), `baseline_diff` (default `true`) and
+//! `generated` (core#1173: `[{"paths": [...], "command": [...]}]`, the files the repository
+//! generates and the command that regenerates each set; the floor runs none of them, and the
+//! deliver lift regenerates a declared file that conflicts beside a changelog, see
+//! [`crate::deliver_lift`]). The
 //! floor PREFERS `test_targeted` — at the creator stage always, at verify unless `full: true` —
 //! substituting `{files}` (the paths the change touched relative to the base commit, one argv
 //! element each) and `{base}` (the base commit id) so a runner's own change-aware mode can be used
@@ -1973,6 +1977,100 @@ struct ChecksConfig {
     /// Compare a failing check against the run base before denying (F-RC2-009). Default on.
     #[serde(default = "default_true")]
     baseline_diff: bool,
+    /// (core#1173) The files the repository GENERATES and the command that regenerates each set
+    /// ([`GeneratedFiles`]). The floor runs none of them; the deliver lift reads them from the tip
+    /// it lifts onto, so a conflict in a declared file beside a changelog is regenerated, not
+    /// stranded.
+    #[serde(default)]
+    generated: Vec<GeneratedDecl>,
+}
+
+/// (core#1173) One `generated` entry of [`CONFIG_PATH`] as written:
+/// `{"paths": ["packages/x/manifest.json", "packages/x/tests/generated/**"], "command": [...]}`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GeneratedDecl {
+    paths: Vec<String>,
+    command: CheckCommand,
+}
+
+/// (core#1173) A set of generated files and the command that regenerates them, validated: every
+/// path is repo-relative (`/`-separated, no `..`, no leading `/`) and may use `*` inside a segment
+/// and `**` for any number of segments; the command is an argv (no shell). The deliver lift runs
+/// the commands in the order declared (a later one may read an earlier one's output), in the
+/// floor's sandbox, after the floor's own dependency install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeneratedFiles {
+    pub paths: Vec<String>,
+    pub argv: Vec<String>,
+}
+
+impl GeneratedFiles {
+    /// Is `path` one of this set's files?
+    pub(crate) fn covers(&self, path: &str) -> bool {
+        self.paths.iter().any(|p| workspace_glob_matches(p, path))
+    }
+}
+
+/// (core#1173) The declared generated files of a [`CONFIG_PATH`] body, and its `timeout_s`. The
+/// same strict parse the floor applies: a malformed file is an error, never "nothing declared".
+pub(crate) fn generated_from_config(
+    raw: &str,
+) -> Result<(Vec<GeneratedFiles>, Option<u64>), String> {
+    let cfg = parse_config(raw)?;
+    Ok((generated_of(&cfg)?, cfg.timeout_s))
+}
+
+fn generated_of(cfg: &ChecksConfig) -> Result<Vec<GeneratedFiles>, String> {
+    cfg.generated
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let key = format!("generated[{i}]");
+            if g.paths.is_empty() {
+                return Err(format!("`{CONFIG_PATH}` `{key}`: `paths` is empty"));
+            }
+            for p in &g.paths {
+                let bad = p.trim().is_empty()
+                    || p != p.trim()
+                    || p.starts_with('/')
+                    || p.contains('\\')
+                    || p.split('/').any(|s| s.is_empty() || s == "." || s == "..");
+                if bad {
+                    return Err(format!(
+                        "`{CONFIG_PATH}` `{key}`: `{p}` is not a repo-relative path \
+                         (`/`-separated, no empty, `.` or `..` segment)"
+                    ));
+                }
+            }
+            match resolve(&Some(g.command.clone()), &format!("{key}.command"))? {
+                Resolved::Command(argv) => Ok(GeneratedFiles {
+                    paths: g.paths.clone(),
+                    argv,
+                }),
+                _ => Err(format!(
+                    "`{CONFIG_PATH}` `{key}`: `command` must be a command (an argv array or a \
+                     string)"
+                )),
+            }
+        })
+        .collect()
+}
+
+/// Parse and validate a [`CONFIG_PATH`] body (unknown keys, a bad `timeout_s` or a bad
+/// `generated` entry are errors).
+fn parse_config(raw: &str) -> Result<ChecksConfig, String> {
+    let cfg: ChecksConfig =
+        serde_json::from_str(raw).map_err(|e| format!("`{CONFIG_PATH}` is not valid: {e}"))?;
+    if let Some(t) = cfg.timeout_s {
+        if t == 0 || t > MAX_CONFIG_TIMEOUT_S {
+            return Err(format!(
+                "`{CONFIG_PATH}` `timeout_s` must be 1..={MAX_CONFIG_TIMEOUT_S} seconds, got {t}"
+            ));
+        }
+    }
+    generated_of(&cfg)?;
+    Ok(cfg)
 }
 
 /// Read [`CONFIG_PATH`] when present. Fail-closed: a malformed file, an unknown key, a bad value,
@@ -1993,16 +2091,7 @@ fn read_config(worktree: &Path) -> Result<Option<ChecksConfig>, String> {
     let mut raw = String::new();
     file.read_to_string(&mut raw)
         .map_err(|e| format!("`{CONFIG_PATH}` could not be read: {e}"))?;
-    let cfg: ChecksConfig =
-        serde_json::from_str(&raw).map_err(|e| format!("`{CONFIG_PATH}` is not valid: {e}"))?;
-    if let Some(t) = cfg.timeout_s {
-        if t == 0 || t > MAX_CONFIG_TIMEOUT_S {
-            return Err(format!(
-                "`{CONFIG_PATH}` `timeout_s` must be 1..={MAX_CONFIG_TIMEOUT_S} seconds, got {t}"
-            ));
-        }
-    }
-    Ok(Some(cfg))
+    parse_config(&raw).map(Some)
 }
 
 /// Does the repo opt out of the baseline diff? Read separately from detection so the run loop
@@ -6080,6 +6169,144 @@ fn same_file(held: &HeldDir, rel: &str, exec: bool, body: &[u8]) -> bool {
     let _ = exec;
     let mut now = Vec::with_capacity(body.len());
     f.read_to_end(&mut now).is_ok() && now == body
+}
+
+impl FloorCheckout {
+    /// (core#1173) Regenerate declared generated files in this checkout, as the floor would run a
+    /// check: the floor's write boundary (or the operator's disclosed unsandboxed opt-in, never an
+    /// unannounced bare run), the isolated scratch homes, the floor's own dependency install
+    /// first, then each set's command in the order declared under the check bound (`timeout_s`).
+    /// `Err` says which step failed and why, with the end of its output.
+    pub(crate) fn regenerate(
+        &self,
+        sets: &[GeneratedFiles],
+        timeout_s: Option<u64>,
+    ) -> Result<(), String> {
+        let scratch = CheckScratch::prepare_for(&self.dir, None)
+            .map_err(|e| format!("the checks' isolated scratch could not be prepared: {e}"))?;
+        let mut sandbox = floor_sandbox(&[
+            self.dir.clone(),
+            scratch.tmp.path().to_path_buf(),
+            scratch.root().to_path_buf(),
+        ]);
+        if sandbox.level != crate::validator::SandboxLevel::Sandboxed || sandbox.wrapper.is_empty()
+        {
+            match unsandboxed_opt_in_note(sandbox.downgrade_reason.as_deref()) {
+                Some(note) => {
+                    eprintln!("wicked-core: deliver lift regenerate — {note}");
+                    sandbox = WorkerSandbox {
+                        wrapper: Vec::new(),
+                        level: sandbox.level,
+                        downgrade_reason: Some(note),
+                    };
+                }
+                None => {
+                    return Err(format!(
+                        "no OS write boundary could be armed for the generator ({}); the \
+                         repository's own commands never run unsandboxed unless \
+                         {UNSANDBOXED_OPT_IN_ENV}=1",
+                        sandbox
+                            .downgrade_reason
+                            .as_deref()
+                            .unwrap_or("no OS-sandbox tool on PATH")
+                    ))
+                }
+            }
+        }
+        let ctx = FloorContext::default();
+        let installs: Vec<RepoCheck> = detect_with(&self.dir, &ctx)
+            .map_err(|e| format!("the checkout's checks could not be detected: {e}"))?
+            .into_iter()
+            .filter(|c| c.name == PROVISIONING_CHECK)
+            .collect();
+        let commands = sets.iter().map(|g| RepoCheck {
+            name: "regenerate".to_string(),
+            argv: g.argv.clone(),
+            source: format!("{CONFIG_PATH} generated ({})", g.paths.join(", ")),
+            timeout_s,
+            dir: String::new(),
+        });
+        for check in installs.into_iter().chain(commands) {
+            let run = run_held(
+                &self.dir,
+                self.held.as_ref(),
+                &check,
+                &sandbox,
+                &scratch,
+                Tree::Head,
+            );
+            if !run.passed() {
+                let tail = match last_lines(&run.stderr_tail) {
+                    t if t.is_empty() => last_lines(&run.stdout_tail),
+                    t => t,
+                };
+                return Err(format!(
+                    "`{}` ({}) — {}{}",
+                    check.argv.join(" "),
+                    check.source,
+                    run.summary(),
+                    if tail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {tail}")
+                    }
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// (core#1173) The regular file at `rel` in this checkout — its bytes and whether it is
+    /// executable — read without following a link; `None` when nothing is there. Anything else (a
+    /// link, a directory) is an error: a generated file is a file.
+    pub(crate) fn read_generated(&self, rel: &str) -> Result<Option<(Vec<u8>, bool)>, String> {
+        let held = self
+            .held
+            .as_ref()
+            .ok_or_else(|| "the checkout is not held".to_string())?;
+        // A parent the generator removed means the file is gone (codex on #1175); a parent that is
+        // not a directory (a link) is refused.
+        let names: Vec<&str> = rel.split('/').collect();
+        for depth in 1..names.len() {
+            match held.kind(&names[..depth].join("/"))? {
+                None => return Ok(None),
+                Some(EntryKind::Dir) => {}
+                Some(_) => {
+                    return Err(format!(
+                        "`{rel}`: `{}` is not a directory after regenerating",
+                        names[..depth].join("/")
+                    ))
+                }
+            }
+        }
+        match held.kind(rel)? {
+            None => Ok(None),
+            Some(EntryKind::File) => {
+                let mut f = held.open_read(rel)?;
+                let exec = {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        f.metadata()
+                            .map_err(|e| format!("`{rel}`: {e}"))?
+                            .permissions()
+                            .mode()
+                            & 0o111
+                            != 0
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        false
+                    }
+                };
+                let mut body = Vec::new();
+                f.read_to_end(&mut body)
+                    .map_err(|e| format!("`{rel}` could not be read: {e}"))?;
+                Ok(Some((body, exec)))
+            }
+            Some(_) => Err(format!("`{rel}` is not a regular file after regenerating")),
+        }
+    }
 }
 
 /// The fail-closed report for a verify floor whose guarded checkout could not be made: nothing
@@ -12949,6 +13176,48 @@ pub(crate) fn red_report(head: &[&str], base: Option<&[&str]>) -> RepoChecksRepo
 #[cfg(test)]
 mod failure_split_tests {
     use super::red_report;
+
+    /// (core#1173) `generated` parses strictly: paths and an argv (array or line), in order; a
+    /// path that escapes the repo, an empty set, an unknown key or a non-command is an error, never
+    /// "nothing declared". Globs match by segment.
+    #[test]
+    fn generated_declarations_parse_strictly() {
+        let (sets, timeout) = crate::repo_checks::generated_from_config(
+            r#"{"timeout_s": 600, "generated": [
+                {"paths": ["packages/crew/endpoint-manifest.json"], "command": "npm run manifest"},
+                {"paths": ["packages/crew/tests/generated/**"], "command": ["npm", "run", "gen"]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(timeout, Some(600));
+        assert_eq!(sets.len(), 2);
+        assert_eq!(
+            sets[0].argv,
+            vec!["npm".to_string(), "run".to_string(), "manifest".to_string()]
+        );
+        assert!(sets[0].covers("packages/crew/endpoint-manifest.json"));
+        assert!(!sets[0].covers("packages/crew/endpoint-manifest.json.bak"));
+        assert!(sets[1].covers("packages/crew/tests/generated/api-sample.generated.test.ts"));
+        assert!(!sets[1].covers("packages/crew/tests/other.test.ts"));
+        assert_eq!(
+            crate::repo_checks::generated_from_config("{}").unwrap().0,
+            Vec::new()
+        );
+        for bad in [
+            r#"{"generated": [{"paths": ["../x"], "command": "a"}]}"#,
+            r#"{"generated": [{"paths": ["/abs"], "command": "a"}]}"#,
+            r#"{"generated": [{"paths": ["a//b"], "command": "a"}]}"#,
+            r#"{"generated": [{"paths": [], "command": "a"}]}"#,
+            r#"{"generated": [{"paths": ["a"], "command": false}]}"#,
+            r#"{"generated": [{"paths": ["a"], "command": []}]}"#,
+            r#"{"generated": [{"paths": ["a"], "command": "a", "shell": true}]}"#,
+        ] {
+            assert!(
+                crate::repo_checks::generated_from_config(bad).is_err(),
+                "{bad}"
+            );
+        }
+    }
 
     /// (j4-gates) The floor names the change's own failures — head minus base — and says when
     /// every failure is the base's; with no names it says nothing it does not know.
