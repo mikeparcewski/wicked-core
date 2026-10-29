@@ -17,8 +17,9 @@ Two release tracks share this file, newest entry first regardless of track:
 - The automatic creator-floor retry (core#651) no longer runs when no failing test is head-only (every failure is shared with the base or could not be separated from it), so the worker is never told to fix the base's failures; the floor escalates at once. A head-only regression keeps the retry (core#1113).
 - **Power mode: "spread into another product" means past the planned scope (core#1174 follow-up).** The
   checkpoint pause fired on any diff spanning two products, so rig run b6f7968b (crew + its api-types, the intake's
-  own scope) paused on its first turn end. The intake's product count (else the first checkpoint's) is now the
-  baseline, and only a spread past it pauses.
+  own scope) paused on its first turn end. The intake's product count is now the baseline (none, or zero, counts as
+  one); only a diff spanning at least two products and more than the baseline pauses, and answering that pause moves
+  the baseline to the spread the operator accepted.
 
 - **Power mode: time against the estimate is the orchestrator's own (core#1174 follow-up).** The struggle signal
   measured wall time since the build started, so a long hand-off floor read as the orchestrator struggling: rig run
