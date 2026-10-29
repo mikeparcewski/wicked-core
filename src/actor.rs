@@ -7889,8 +7889,8 @@ const FLOOR_AUTO_RETRY_NOTE: &str = "[automatic floor retry — round 1 of 1 (co
 /// run against one base run, often under different host load, so a head-only test can still be a
 /// flake or sit outside the change: the note says how to answer then (change nothing, say NO
 /// CHANGE NEEDED and why) instead of only "fix those" (rig run 85ddad0d: the worker chased three
-/// load flakes in another crate, then its honest no-edit answer was refused). An all-base-red
-/// floor takes no automatic round at all ([`floor_auto_retry_applies`]). With no structured result
+/// load flakes in another crate, then its honest no-edit answer was refused). A floor with no
+/// head-only failure (all base-shared or unseparated) takes no automatic round at all ([`floor_auto_retry_applies`]). With no structured result
 /// it is [`FLOOR_AUTO_RETRY_NOTE`].
 fn floor_auto_retry_note(report: Option<&crate::repo_checks::RepoChecksReport>) -> String {
     let Some(split) = report.and_then(crate::repo_checks::RepoChecksReport::failure_split) else {
@@ -7941,14 +7941,15 @@ fn floor_auto_retry_applies(
             .repo_checks
             .as_ref()
             .is_some_and(|r| r.outcome() == "failed")
-        // (core#1142) Every failing test fails on the run base too: there is nothing for the
-        // worker to fix, so a round only costs a worker turn before the same gate opens — the
-        // escalation opens now, for the operator to rule on the base's failures.
+        // (core#1142, core#1113) No failing test is head-only: every one fails on the run base too
+        // or the floor could not separate it from the base (no base run, a timed-out one). There
+        // is nothing the worker is known to have caused, so a round only costs a worker turn
+        // before the same gate opens — the escalation opens now, for the operator to rule.
         && !evidence
             .repo_checks
             .as_ref()
             .and_then(crate::repo_checks::RepoChecksReport::failure_split)
-            .is_some_and(|s| s.all_base_red)
+            .is_some_and(|s| s.head_only.is_empty())
 }
 
 /// (core#464) The DENIAL CLASS a denied unit opens the escalation gate under — the token
@@ -18610,6 +18611,67 @@ mod substance_gate_tests {
         assert_eq!(
             (escalated.0.as_str(), escalated.1.as_str()),
             ("floor_failed", "repo_checks")
+        );
+    }
+
+    /// (core#1113) A floor whose failures are base-shared AND unseparated (no base run to compare)
+    /// has no head-only failure: no automatic round, so the worker is never told to "fix those".
+    #[test]
+    fn a_floor_with_no_head_only_failure_takes_no_automatic_round_1113() {
+        let run_id = format!("floor-auto-retry-unseparated-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Creator);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let evidence = crate::workflow::UnitEvidence {
+            repo_checks: Some(crate::repo_checks::red_report(
+                &["test a::unseparated"],
+                None,
+            )),
+            ..Default::default()
+        };
+        let (applied, _session, unit) = fold_at(&mut store, &mut subs, &run_id, 0, evidence);
+        assert!(matches!(applied, StepApplied::Paused));
+        assert_eq!(unit.floor_auto_retries, 0);
+        assert!(!drain_events(&erx).iter().any(|e| matches!(
+            e,
+            CoreEvent::UnitReworkAmended { scope, .. } if scope == FLOOR_AUTO_RETRY_SCOPE
+        )));
+    }
+
+    /// (core#1113) One head-only failure among base-shared ones keeps the automatic round, and its
+    /// note names only the head-only one and says the rest are not the worker's.
+    #[test]
+    fn a_head_only_failure_keeps_the_automatic_round_note_1113() {
+        let run_id = format!("floor-auto-retry-head-only-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Creator);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let evidence = crate::workflow::UnitEvidence {
+            repo_checks: Some(crate::repo_checks::red_report(
+                &["test a::mine", "test b::shared"],
+                Some(&["test b::shared"]),
+            )),
+            ..Default::default()
+        };
+        let (applied, _session, unit) = fold_at(&mut store, &mut subs, &run_id, 0, evidence);
+        assert!(matches!(applied, StepApplied::Continuing));
+        assert_eq!(unit.floor_auto_retries, 1);
+        let note = drain_events(&erx)
+            .into_iter()
+            .find_map(|e| match e {
+                CoreEvent::UnitReworkAmended {
+                    amendment, scope, ..
+                } if scope == FLOOR_AUTO_RETRY_SCOPE => Some(amendment),
+                _ => None,
+            })
+            .expect("the round's amendment");
+        assert!(
+            note.contains("test a::mine") && note.contains("not yours to fix"),
+            "{note}"
         );
     }
 
