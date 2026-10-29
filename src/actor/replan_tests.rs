@@ -1743,6 +1743,9 @@ fn t8_r4_the_preview_does_not_fetch_the_remote() {
 #[path = "scope_tests.rs"]
 mod scope_tests;
 
+#[path = "power_tests.rs"]
+mod power_tests;
+
 // ── ASK-K2b (codex review of #738, round 2): "Not now" at the first-creator gate, end to end ───
 
 /// The PA's `PLAN+` at `answer-1`'s boundary adds the path's first creator step (`produce`, an

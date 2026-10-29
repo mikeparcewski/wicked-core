@@ -372,6 +372,18 @@ pub struct PowerState {
     pub handoff: Option<Handoff>,
     pub pause: Option<PowerPause>,
     pub outcome: Option<PowerOutcome>,
+    /// Floors set after launch (an operator's or a plugin's raise), kept whether or not intake
+    /// planned anything; [`PowerState::floor`] reads them with the intake plan's.
+    #[serde(default)]
+    pub floors: Vec<RigorFloor>,
+    /// The rigor when the current turn started: a turn end compares against it, so a mid-turn
+    /// checkpoint's raise never hides a two-band jump. Engine-internal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_start_rigor: Option<Rigor>,
+    /// Pause triggers the operator already answered (`jump`, `destructive`, `spread`,
+    /// `sensitive_dependency`, `struggle`): the cumulative diff never re-raises them. Engine-internal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acknowledged: Vec<String>,
     /// When the build started (unix millis), for elapsed-against-estimate. Engine-internal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_started_at: Option<i64>,
@@ -410,6 +422,9 @@ impl PowerState {
             handoff: None,
             pause: None,
             outcome: None,
+            floors: Vec::new(),
+            turn_start_rigor: None,
+            acknowledged: Vec::new(),
             build_started_at: None,
             launched_at: Some(now),
             operator_gates: 0,
@@ -418,12 +433,21 @@ impl PowerState {
 
     /// The highest floor's rigor (light when there is none).
     pub fn floor(&self) -> Rigor {
-        self.plan
+        self.all_floors()
             .iter()
-            .flat_map(|p| p.floors.iter())
             .map(|f| f.rigor)
             .max()
             .unwrap_or(Rigor::Light)
+    }
+
+    /// Every floor: the intake plan's and those set since.
+    pub fn all_floors(&self) -> Vec<RigorFloor> {
+        self.plan
+            .iter()
+            .flat_map(|p| p.floors.iter())
+            .chain(self.floors.iter())
+            .cloned()
+            .collect()
     }
 
     /// The intake score (0 before intake).
@@ -1015,25 +1039,36 @@ pub fn sudden_complexity(
     spread_new: bool,
     sensitive_new_dependency: bool,
     struggle_reasons: &[String],
-) -> Vec<String> {
+) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     if to.rank() - from.rank() >= 2 {
-        out.push(format!(
-            "rigor jumped two bands at once ({} -> {})",
-            from.as_str(),
-            to.as_str()
+        out.push((
+            "jump",
+            format!(
+                "rigor jumped two bands at once ({} -> {})",
+                from.as_str(),
+                to.as_str()
+            ),
         ));
     }
     if destructive_new {
-        out.push("a destructive change appeared".into());
+        out.push(("destructive", "a destructive change appeared".into()));
     }
     if spread_new {
-        out.push("the change spread into another product".into());
+        out.push(("spread", "the change spread into another product".into()));
     }
     if sensitive_new_dependency {
-        out.push("a new dependency in a sensitive area".into());
+        out.push((
+            "sensitive_dependency",
+            "a new dependency in a sensitive area".into(),
+        ));
     }
-    out.extend(struggle_reasons.iter().map(|r| format!("struggling: {r}")));
+    if !struggle_reasons.is_empty() {
+        out.push((
+            "struggle",
+            format!("struggling: {}", struggle_reasons.join("; ")),
+        ));
+    }
     out
 }
 
@@ -1107,6 +1142,30 @@ pub fn take_operator_messages(run_id: &str, cli: &str) -> Vec<QueuedMessage> {
     take
 }
 
+fn full_suites() -> &'static Mutex<std::collections::HashSet<String>> {
+    static F: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    F.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// The actor says whether `run_id`'s hand-off runs the full suite (its rigor is high or above):
+/// the verify floor then runs the repo's full `test` set, not its declared `test_targeted`.
+pub fn set_full_suite(run_id: &str, full: bool) {
+    let mut g = full_suites().lock().unwrap_or_else(|p| p.into_inner());
+    if full {
+        g.insert(run_id.to_string());
+    } else {
+        g.remove(run_id);
+    }
+}
+
+/// Whether `run_id`'s verify floor must run the full suite (power mode at high rigor).
+pub fn full_suite_required(run_id: &str) -> bool {
+    full_suites()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(run_id)
+}
+
 /// Drop a finished run's queue.
 pub fn forget_run(run_id: &str) {
     queue()
@@ -1115,6 +1174,7 @@ pub fn forget_run(run_id: &str) {
         .remove(run_id);
     // A worker waiting at a pause of an ended run stops waiting.
     answer_pause(run_id, PauseDecision::Stop);
+    set_full_suite(run_id, false);
 }
 
 fn actors() -> &'static Mutex<HashMap<uuid::Uuid, std::sync::mpsc::Sender<crate::command::Command>>>
@@ -1508,6 +1568,30 @@ fn timer_secs() -> u64 {
         .unwrap_or(TIMER_SECS_DEFAULT)
 }
 
+/// Wait at a checkpoint pause for its answer, saying so every minute (the stall watchdog reads the
+/// output as liveness). A shut-down engine (its generation unregistered) or a superseded attempt
+/// (the actor answers `Stop` on a reassign or an ended run) ends the wait.
+fn wait_for_pause(
+    run_id: &str,
+    gen: Option<uuid::Uuid>,
+    emit: &crate::workflow::DeltaSink,
+) -> PauseDecision {
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        if let Some(d) = take_pause_answer(run_id) {
+            return d;
+        }
+        if actor_tx(gen).is_none() {
+            return PauseDecision::Stop;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        waited += std::time::Duration::from_secs(2);
+        if waited.as_secs().is_multiple_of(60) {
+            emit("[power mode] still paused, waiting for the operator\n");
+        }
+    }
+}
+
 /// Run a power build: turns of the same seat session until the orchestrator hands off, with a
 /// checkpoint at every turn end (and, during a turn, at every new commit and every
 /// [`TIMER_SECS_DEFAULT`]). Returns ONE step output for the hand-off: every turn's files, tools
@@ -1690,28 +1774,25 @@ pub fn orchestrate(
             .map(|w| measure(w, start.as_deref(), trigger, turn, 0, &summary))
             .and_then(|r| send_checkpoint(&tx, &turn_input, r, true))
             .unwrap_or_default();
-        if handoff || last {
-            completed(if handoff { "handoff" } else { "cap" }, Some(summary));
-            return finish(StepStatus::Ok, &out.output, &summaries);
-        }
         let mut answer = answer;
+        let final_turn = handoff || last;
         if answer.pause.is_some() {
             completed("paused", Some(summary.clone()));
             emit(
                 "\n[power mode] paused at a checkpoint: waiting for the operator (split, switch \
                  to phased, continue at high rigor, or stop)\n",
             );
-            let mut waited = std::time::Duration::ZERO;
-            let decision = loop {
-                if let Some(d) = take_pause_answer(&input.run_id) {
-                    break d;
+            let decision = wait_for_pause(&input.run_id, input.process_gen, emit);
+            match decision {
+                PauseDecision::Stop => {
+                    return finish(StepStatus::Cancelled, &out.output, &summaries);
                 }
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                waited += std::time::Duration::from_secs(2);
-                if waited.as_secs().is_multiple_of(60) {
-                    emit("[power mode] still paused, waiting for the operator\n");
+                // A pause at the final checkpoint: once answered, the build hands off.
+                _ if final_turn => {
+                    return finish(StepStatus::Ok, &out.output, &summaries);
                 }
-            };
+                _ => {}
+            }
             match decision {
                 PauseDecision::Stop => {
                     return finish(StepStatus::Cancelled, &out.output, &summaries);
@@ -1728,6 +1809,9 @@ pub fn orchestrate(
                 }
                 PauseDecision::Continue => {}
             }
+        } else if final_turn {
+            completed(if handoff { "handoff" } else { "cap" }, Some(summary));
+            return finish(StepStatus::Ok, &out.output, &summaries);
         } else {
             completed("checkpoint", Some(summary.clone()));
         }
@@ -2118,7 +2202,8 @@ mod tests {
                 &["3 failed test runs".into()]
             )
             .len(),
-            4
+            4,
+            "jump excluded; destructive, spread, dependency, struggle"
         );
     }
 

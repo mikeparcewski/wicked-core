@@ -33,6 +33,41 @@ fn live(session: &AgentSession) -> bool {
     )
 }
 
+fn absorbs_design_of(absorbs: &[String]) -> bool {
+    absorbs.iter().any(|a| a == "design")
+}
+
+/// The run's band `design` is satisfied by the hand-off review (power mode absorbed it).
+pub(super) fn absorbs_design(session: &AgentSession) -> bool {
+    session
+        .team_plan
+        .as_ref()
+        .is_some_and(|t| t.power_absorbs.iter().any(|a| a == "design"))
+}
+
+/// The hand-off requirements follow the current rigor: its test set, and — from high, when power
+/// mode absorbed the band's `design` — the review's design check. A lowering keeps every review
+/// (fewer tests, never fewer reviewers).
+pub(super) fn retarget_handoff(
+    h: &mut crate::power::HandoffRequirements,
+    rigor: Rigor,
+    absorbs_design: bool,
+) {
+    h.tests = rigor.tests().into();
+    if absorbs_design
+        && rigor >= Rigor::High
+        && h.reviews.iter().any(|r| r.kind == "distinct_seat")
+        && !h.reviews.iter().any(|r| r.kind == "design")
+    {
+        h.reviews.push(crate::power::ReviewRequirement {
+            kind: "design".into(),
+            why: "the review on another seat also checks the orchestrator's approach; it counts \
+                  as this band's design phase (power mode)"
+                .into(),
+        });
+    }
+}
+
 /// A checkpoint the orchestrator's worker measured: score it, append the history row, raise
 /// (and hold the raise for the plan's next boundary through the team re-score), lower only at
 /// the final checkpoint from evidence, and pause on sudden complexity at a turn end.
@@ -83,6 +118,7 @@ pub(super) fn on_checkpoint(
         return Ok(CheckpointAnswer::default());
     };
     let now = crate::interaction::now_millis();
+    let absorbs_design = absorbs_design(&session);
     let Some(power) = session.power.as_mut() else {
         return Ok(CheckpointAnswer::default());
     };
@@ -166,11 +202,7 @@ pub(super) fn on_checkpoint(
     } else if is_final {
         // (operator ruling 2026-10-29) Lowering only here, from evidence, one band, within the
         // hand-off only (fewer tests, never fewer reviewers), never below a floor.
-        let floors = power
-            .plan
-            .as_ref()
-            .map(|p| p.floors.clone())
-            .unwrap_or_default();
+        let floors = power.all_floors();
         match crate::power::lowering(current, actual_rigor, struggle_score, &plan_gaps, &floors) {
             Ok(Some(down)) => {
                 to = down;
@@ -199,7 +231,9 @@ pub(super) fn on_checkpoint(
             }
         }
     }
-    // Sudden complexity pauses only at a turn end (the worker can wait there), once per pause.
+    // Sudden complexity pauses only at a turn end (the worker can wait there). The jump is read
+    // against the rigor the TURN started at, so a mid-turn checkpoint's raise never hides it; a
+    // trigger the operator already answered is never raised again by the cumulative diff.
     let turn_end = matches!(report.trigger.as_str(), "turn" | "pre_handoff");
     let destructive_new = destructive
         && !power.plan.as_ref().is_some_and(|p| {
@@ -207,18 +241,24 @@ pub(super) fn on_checkpoint(
                 .iter()
                 .any(|f| f.by == "policy" && f.rigor == Rigor::Highest)
         });
-    let pause_reasons = if turn_end && power.pause.is_none() {
+    let turn_from = power.turn_start_rigor.unwrap_or(current).min(current);
+    let pause_reasons: Vec<(&'static str, String)> = if turn_end && power.pause.is_none() {
         crate::power::sudden_complexity(
-            current,
+            turn_from,
             to,
             destructive_new,
-            false,
+            signals.spread >= 2,
             report.new_dependencies > 0 && !sensitive.is_empty(),
             &struggle_reasons,
         )
+        .into_iter()
+        .filter(|(k, _)| !power.acknowledged.iter().any(|a| a == k))
+        .collect()
     } else {
         Vec::new()
     };
+    let pause_keys: Vec<String> = pause_reasons.iter().map(|(k, _)| k.to_string()).collect();
+    let pause_reasons: Vec<String> = pause_reasons.into_iter().map(|(_, r)| r).collect();
     let paused_before = power.history.iter().filter(|r| r.paused).count();
     let pause =
         (!pause_reasons.is_empty() && paused_before < 3).then(|| crate::power::PowerPause {
@@ -249,8 +289,15 @@ pub(super) fn on_checkpoint(
     row.turn = Some(report.turn);
     row.paused = pause.is_some();
     power.rigor = Some(to);
+    if turn_end {
+        power.turn_start_rigor = Some(to);
+    }
+    if pause.is_some() {
+        // Answering this pause acknowledges its triggers.
+        power.acknowledged.extend(pause_keys);
+    }
     if let Some(p) = power.plan.as_mut() {
-        p.handoff.tests = to.tests().into();
+        retarget_handoff(&mut p.handoff, to, absorbs_design);
     }
     power.pause = pause.clone();
     if is_final {
@@ -270,6 +317,7 @@ pub(super) fn on_checkpoint(
             at: now,
         });
     }
+    crate::power::set_full_suite(run_id, to.tests() == "full");
     let on = power.on;
     let row = power.push_change(row);
     put_node(store, session.to_node())?;
@@ -414,6 +462,12 @@ pub(super) fn raise_rigor(
         anyhow::bail!("conflict: run {run_id} has ended");
     }
     let now = crate::interaction::now_millis();
+    let session_absorbs = session
+        .team_plan
+        .as_ref()
+        .map(|t| t.power_absorbs.clone())
+        .unwrap_or_default();
+    let cursor = (session.unit_ix, session.attempt);
     let Some(power) = session.power.as_mut() else {
         anyhow::bail!("refused: run {run_id} is not a power run");
     };
@@ -426,13 +480,16 @@ pub(super) fn raise_rigor(
         );
     }
     power.rigor = Some(at_least);
+    // The raise is a floor whether or not intake planned anything (a declared-scope launch has
+    // no intake plan; a raise before intake must survive it).
+    power.floors.push(crate::power::RigorFloor {
+        rigor: at_least,
+        by: "operator".into(),
+        why: format!("{actor}: {reason}"),
+    });
+    let absorbs = absorbs_design_of(&session_absorbs);
     if let Some(p) = power.plan.as_mut() {
-        p.floors.push(crate::power::RigorFloor {
-            rigor: at_least,
-            by: "operator".into(),
-            why: format!("{actor}: {reason}"),
-        });
-        p.handoff.tests = at_least.tests().into();
+        retarget_handoff(&mut p.handoff, at_least, absorbs);
     }
     let planned = power.planned_score();
     let row = crate::power::change(
@@ -448,11 +505,54 @@ pub(super) fn raise_rigor(
     );
     let row = power.push_change(row);
     let out = power.clone();
-    // The plan's floor follows: the ratcheted score rises to the band's minimum, held for the
-    // next step boundary like a diff re-score.
+    crate::power::set_full_suite(run_id, at_least.tests() == "full");
+    // The plan follows: the raise is HELD for the next step boundary exactly as a diff re-score's
+    // is (`plan.revised{reason:"floor_raised"}`), so the band's phases (a security review at
+    // highest) join the plan and the ratcheted score moves with them.
+    let ord = crate::domain::session_units(&*store, run_id)?
+        .get(cursor.0)
+        .map_or(0, |u| u.ord);
     if let Some(tp) = session.team_plan.as_mut() {
         if crate::plan_gate::floor_rises(tp, at_least.min_score(), false) {
-            tp.max_score = tp.max_score.max(at_least.min_score());
+            let score = at_least.min_score();
+            let assessment = crate::review_scale::Assessment {
+                deterministic: score,
+                score,
+                reasons: vec![format!(
+                    "rigor raised to {} by {actor}: {reason}",
+                    at_least.as_str()
+                )],
+                model: None,
+                signals: None,
+                plan: crate::review_scale::plan_for(score),
+            };
+            let seq = 2000u32.saturating_add(tp.rev);
+            let fact = crate::plan_gate::path_scored_diff(
+                run_id,
+                ord,
+                cursor.1,
+                seq,
+                None,
+                &assessment,
+                now,
+            )?;
+            let held = crate::plan_gate::hold_rescore(
+                tp.rescored.as_ref(),
+                crate::plan_gate::DiffRescore {
+                    ord,
+                    attempt: cursor.1,
+                    rescore_seq: seq,
+                    score,
+                    destructive: false,
+                    fact: crate::plan_gate::queued_facts(&[fact])?
+                        .pop()
+                        .ok_or_else(|| anyhow::anyhow!("no path.scored fact"))?,
+                    obligations: Vec::new(),
+                    recalled: Vec::new(),
+                },
+                true,
+            );
+            tp.rescored = Some(held);
         }
     }
     put_node(store, session.to_node())?;
@@ -633,11 +733,15 @@ pub(super) fn on_dispatch(
             .ord
             .and_then(|b| units.iter().find(|u| u.ord == b))
         {
-            let floored = power
-                .handoff
-                .iter()
-                .flat_map(|h| h.steps.iter())
-                .any(|s| s.step == "checks" && s.ord == Some(b.ord) && s.status == "passed");
+            // This round's checks only (a round 1 pass does not stand for round 2).
+            let floored = power.handoff.iter().any(|h| {
+                h.steps.iter().any(|s| {
+                    s.round == h.round
+                        && s.step == "checks"
+                        && s.ord == Some(b.ord)
+                        && s.status == "passed"
+                })
+            });
             if !floored {
                 let b = b.clone();
                 handoff_step(store, subscribers, run_id, &b, "passed", None);
@@ -654,14 +758,16 @@ pub(super) fn on_dispatch(
 /// its session — up to [`crate::power::MAX_HANDOFF_ROUNDS`]; the next asks the operator. `Some`
 /// is the note the send-back carries; `None` leaves the gate to the operator.
 pub(super) fn auto_send_back(
-    store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
-    session: &AgentSession,
+    session: &mut AgentSession,
     unit: &crate::domain::WorkUnit,
     class: &str,
     reason: &str,
 ) -> Option<String> {
-    let power = session.power.as_ref().filter(|p| p.on)?;
+    // Mutates `session` only: the caller (`escalate_denied_unit`) persists it with the pause, so
+    // nothing written here can be overwritten by the caller's copy.
+    let run_id = session.id.clone();
+    let power = session.power.as_mut().filter(|p| p.on)?;
     let build = power.orchestrator.ord?;
     if unit.ord < build {
         return None;
@@ -680,37 +786,55 @@ pub(super) fn auto_send_back(
     if !evaluator_fail && !floor_fail {
         return None;
     }
-    let round = power.handoff.as_ref().map_or(1, |h| h.round.max(1));
-    handoff_step(
-        store,
-        subscribers,
-        &session.id,
-        unit,
-        "failed",
-        Some(
-            reason
-                .lines()
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take(300)
-                .collect(),
-        ),
-    );
-    if round >= crate::power::MAX_HANDOFF_ROUNDS {
+    let step = if unit.ord == build {
+        Some("checks")
+    } else {
+        handoff_step_of(unit.catalog.as_deref())
+    };
+    let now = crate::interaction::now_millis();
+    let handoff = power.handoff.get_or_insert_with(|| crate::power::Handoff {
+        round: 1,
+        max_rounds: crate::power::MAX_HANDOFF_ROUNDS,
+        steps: Vec::new(),
+    });
+    let round = handoff.round.max(1);
+    let max_rounds = handoff.max_rounds;
+    if let Some(step) = step {
+        let row = crate::power::HandoffStep {
+            round,
+            step: step.into(),
+            ord: Some(unit.ord),
+            status: "failed".into(),
+            seat: unit.assigned_cli.clone(),
+            summary: Some(
+                reason
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(300)
+                    .collect(),
+            ),
+            at: now,
+        };
+        handoff.steps.push(row.clone());
+        emit(
+            subscribers,
+            CoreEvent::PowerHandoffStepped {
+                session: run_id,
+                round,
+                max_rounds,
+                step: Box::new(row),
+            },
+        );
+    }
+    if round >= max_rounds {
         return None;
     }
-    let mut s = crate::domain::get_session(&*store, &session.id).ok()??;
-    if let Some(p) = s.power.as_mut() {
-        if let Some(h) = p.handoff.as_mut() {
-            h.round = round + 1;
-        }
-    }
-    put_node(store, s.to_node()).ok()?;
+    handoff.round = round + 1;
     Some(format!(
-        "Power mode hand-off round {round} of {}: {} did not pass. The findings go back to the \
-         orchestrator's session; fix them, commit, and hand off again.",
-        crate::power::MAX_HANDOFF_ROUNDS,
+        "Power mode hand-off round {round} of {max_rounds}: {} did not pass. The findings go back \
+         to the orchestrator's session; fix them, commit, and hand off again.",
         if floor_fail {
             "the repository's checks"
         } else {
@@ -724,6 +848,8 @@ pub(super) fn auto_send_back(
 /// when the run's deliver step is done.
 pub(super) fn set_outcome(store: &dyn GraphStore, session: &mut AgentSession, outcome: &str) {
     let run_id = session.id.clone();
+    // Every run's queue goes with it (a phased run's undelivered messages too).
+    crate::power::forget_run(&run_id);
     let Some(power) = session.power.as_mut() else {
         return;
     };

@@ -3351,6 +3351,9 @@ pub(crate) fn run(
                 // `(run, ·, 0)` could born-cancel an unrelated future worker (Copilot, #361).
                 if old_launch_seq > 0 {
                     runner.cancel_reassigned_worker(&run_id, old_epoch, old_launch_seq);
+                    // (program DES-POWER-MODE) A power build waiting at a checkpoint pause is the
+                    // superseded worker too: it stops waiting (its result is stale).
+                    crate::power::answer_pause(&run_id, crate::power::PauseDecision::Stop);
                 }
                 // ── close the PTY session (if any) ──────────────────────────────────────────
                 if let Some(session_entries) = run_sessions.remove(&run_id) {
@@ -4053,6 +4056,7 @@ pub(crate) fn run(
                                     turn, attempt, cli, ..
                                 } => {
                                     p.orchestrator.turns = p.orchestrator.turns.max(*turn);
+                                    p.turn_start_rigor = p.rigor;
                                     p.turn_log.push(crate::power::PowerTurnRecord {
                                         turn: *turn,
                                         attempt: *attempt,
@@ -4152,6 +4156,17 @@ pub(crate) fn run(
                         eprintln!("wicked-core: run {run_id}: stop at the pause failed ({e:#})");
                     }
                 }
+                // A stop cancelled the run: answer with the state as the cancel left it.
+                let res = match res {
+                    Ok(st) if decision == crate::power::PauseDecision::Stop => {
+                        Ok(crate::domain::get_session(&store, &run_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|s| s.power)
+                            .unwrap_or(st))
+                    }
+                    other => other,
+                };
                 let _ = reply.send(res);
             }
             Command::TeamRescored {
@@ -8319,13 +8334,21 @@ fn escalate_denied_unit(
     // `MAX_REVIEW_SENDBACKS` times, its next NOT-PASS opens `review_adjudication` — land with
     // carried items / one more round / stop — instead of offering another send-back.
     let mut adjudication: Option<String> = None;
+    // (program DES-POWER-MODE §6) A power run's hand-off has its own round budget: until its last
+    // round, a NOT-PASS goes back to the orchestrator (below) instead of opening the review's
+    // adjudication; the last round's NOT-PASS opens it, as on a phased run.
+    let power_rounds_left = session.power.as_ref().is_some_and(|p| {
+        p.on && p.orchestrator.ord.is_some_and(|b| unit.ord >= b)
+            && p.handoff.as_ref().map_or(1, |h| h.round) < crate::power::MAX_HANDOFF_ROUNDS
+    });
     if class == "verdict_not_pass"
         && unit.role == crate::workflow::PhaseRole::Evaluator
         && unit.tool_cmd.is_none()
     {
         let rounds = record_review_round(store, &session.id, &unit.id, attempt, &reason)?;
-        if crate::review_context::sent_back_count(&rounds)
-            >= crate::review_context::MAX_REVIEW_SENDBACKS
+        if !power_rounds_left
+            && crate::review_context::sent_back_count(&rounds)
+                >= crate::review_context::MAX_REVIEW_SENDBACKS
         {
             let units = crate::domain::session_units(store, &session.id)?;
             if let Some(creator) = pipeline::most_recent_prior_creator(&units, unit.ord) {
@@ -8367,11 +8390,10 @@ fn escalate_denied_unit(
     // (program DES-POWER-MODE §6) A power run's hand-off NOT-PASS goes back to the SAME
     // orchestrator session on its own (a `request_changes` rewind to the build), a bounded number
     // of rounds; the gate still opens first, so the answer is the ordinary, audited arm.
-    let send_back = if adjudication.is_none() {
-        power_gate::auto_send_back(store, subscribers, session, unit, class, &reason)
-    } else {
-        None
-    };
+    // The failed hand-off step is recorded either way; past the review's own rework cap
+    // (`review_adjudication`, core#761) the operator decides, never the engine.
+    let send_back = power_gate::auto_send_back(subscribers, session, unit, class, &reason)
+        .filter(|_| adjudication.is_none());
     let (gate_kind, prompt) = match adjudication {
         Some(p) => (crate::review_context::REVIEW_ADJUDICATION_GATE, p),
         None => (
@@ -10339,18 +10361,75 @@ fn unsuppressed_gate_note(human_confirm: crate::domain::HumanConfirm) -> &'stati
 /// record's orchestrator fields are written here.
 fn power_dispatch(
     store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
     session: &crate::domain::AgentSession,
     mut unit: crate::domain::WorkUnit,
     pa_review: bool,
 ) -> anyhow::Result<crate::domain::WorkUnit> {
-    let Some(power) = session.power.as_ref().filter(|p| p.on) else {
+    let Some(power) = session.power.as_ref() else {
         return Ok(unit);
     };
+    // The hand-off's test set follows the rigor (re-armed at every dispatch, so a restart keeps it).
+    crate::power::set_full_suite(
+        &session.id,
+        power.rigor.is_some_and(|r| r.tests() == "full"),
+    );
     if unit.tool_cmd.is_some() || pa_review || unit.member_step.is_some() {
         return Ok(unit);
     }
     match unit.catalog.as_deref() {
-        Some("build") if unit.role == crate::workflow::PhaseRole::Creator => {
+        Some("build") if unit.role == crate::workflow::PhaseRole::Creator && power.on => {
+            let mut s = session.clone();
+            let mut intake: Option<(crate::power::RigorPlan, crate::power::RigorChange)> = None;
+            if let (Some(p), Some(tp)) = (s.power.as_mut(), session.team_plan.as_ref()) {
+                // A launch that declared its own scope skipped the PA's scope step, so it had no
+                // intake QE plan: its rigor record is built here, from the accepted plan.
+                if p.plan.is_none() {
+                    if let Some(a) = tp.accepted.as_ref() {
+                        let qe = crate::power::QePlan {
+                            unread: Some(
+                                "the launch declared its own scope, so no intake QE plan ran"
+                                    .into(),
+                            ),
+                            ..Default::default()
+                        };
+                        let now = crate::interaction::now_millis();
+                        let plan = crate::power::intake_plan(
+                            &qe,
+                            tp.max_score,
+                            tp.destructive,
+                            &a.band,
+                            a.high_risk,
+                            &a.steps.steps,
+                            &tp.obligations,
+                            &tp.power_absorbs,
+                            tp.requires_qe,
+                            vec![format!(
+                                "intent score {} of the declared scope",
+                                tp.max_score
+                            )],
+                            unit.assigned_cli.as_deref().unwrap_or("engine"),
+                            now,
+                        );
+                        let rigor = p.rigor.map_or(plan.rigor, |r| r.max(plan.rigor));
+                        p.rigor = Some(rigor);
+                        let row = p.push_change(crate::power::change(
+                            "intake",
+                            plan.rigor,
+                            rigor,
+                            plan.score,
+                            plan.score,
+                            plan.reasons.clone(),
+                            None,
+                            "engine",
+                            now,
+                        ));
+                        p.plan = Some(plan.clone());
+                        intake = Some((plan, row));
+                    }
+                }
+            }
+            let power = s.power.as_ref().unwrap_or(power);
             let round = power.handoff.as_ref().map_or(1, |h| h.round.max(1));
             let task = unit.description.clone();
             unit.description.push_str(&crate::power::orchestrator_brief(
@@ -10369,7 +10448,6 @@ fn power_dispatch(
                     base: session.base_commit.clone(),
                 },
             );
-            let mut s = session.clone();
             if let Some(p) = s.power.as_mut() {
                 p.orchestrator.cli = unit.assigned_cli.clone();
                 p.orchestrator.ord = Some(unit.ord);
@@ -10378,20 +10456,42 @@ fn power_dispatch(
                 }
             }
             put_node(store, s.to_node())?;
+            if let Some((plan, row)) = intake {
+                emit(
+                    subscribers,
+                    CoreEvent::PowerIntakePlanned {
+                        session: session.id.clone(),
+                        ord: unit.ord,
+                        plan: Box::new(plan),
+                    },
+                );
+                emit(
+                    subscribers,
+                    CoreEvent::RigorRescored {
+                        session: session.id.clone(),
+                        change: Box::new(row),
+                    },
+                );
+            }
         }
         Some("review") | Some("critique") | Some("security_review")
             if unit.role == crate::workflow::PhaseRole::Evaluator =>
         {
-            let design = power
-                .plan
-                .as_ref()
-                .is_some_and(|p| p.handoff.reviews.iter().any(|r| r.kind == "design"));
+            // The design check rides the review whenever power mode absorbed the band's
+            // `design` and the run is at high rigor now — also after a raise, and also when the
+            // switch went off after the plan was composed without a design step.
+            let design = power_gate::absorbs_design(session)
+                && power.rigor.is_some_and(|r| r >= crate::power::Rigor::High);
             unit.description.push_str(
-                "\n\n[power mode hand-off] One orchestrator session built this change in many                  turns (its commits are in the worktree's log). You review it on a seat distinct                  from the orchestrator's.",
+                "\n\n[power mode hand-off] One orchestrator session built this change in many \
+                 turns (its commits are in the worktree's log). You review it on a seat distinct \
+                 from the orchestrator's.",
             );
             if design && unit.catalog.as_deref() != Some("security_review") {
                 unit.description.push_str(
-                    " Also judge its APPROACH, as a design review would: is the chosen design                      sound for the intent, simpler alternatives, and risks it introduces. This                      review counts as the run's design check.",
+                    " Also judge its APPROACH, as a design review would: is the chosen design \
+                     sound for the intent, simpler alternatives, and risks it introduces. This \
+                     review counts as the run's design check.",
                 );
             }
         }
@@ -11042,7 +11142,13 @@ fn dispatch_unit(
         None => unit.clone(),
     };
     // (program DES-POWER-MODE) The power run's orchestrator build and its hand-off reviewers.
-    let dispatched_unit = power_dispatch(store, &session, dispatched_unit, review_of.is_some())?;
+    let dispatched_unit = power_dispatch(
+        store,
+        subscribers,
+        &session,
+        dispatched_unit,
+        review_of.is_some(),
+    )?;
     if session.power.is_some() && review_of.is_none() {
         power_gate::on_dispatch(store, subscribers, run_id, &dispatched_unit);
     }

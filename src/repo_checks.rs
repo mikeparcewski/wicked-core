@@ -2708,7 +2708,12 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
     // anchored on `{files}` / `{base}` needs a known base; without one the full set runs.
     if let Resolved::Command(argv) = &r_targeted {
         let argv = argv.clone();
-        let full_here = ctx.stage == FloorStage::Verify && cfg.full;
+        // (program DES-POWER-MODE) A power run at high rigor or above hands off on the FULL suite.
+        let power_full = ctx
+            .run_id
+            .as_deref()
+            .is_some_and(crate::power::full_suite_required);
+        let full_here = ctx.stage == FloorStage::Verify && (cfg.full || power_full);
         let anchored = argv
             .iter()
             .any(|a| a.contains("{files}") || a.contains("{base}"));
