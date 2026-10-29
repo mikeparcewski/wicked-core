@@ -433,6 +433,11 @@ pub fn append(root: &Path, ev: &CoreEvent) -> bool {
     };
     let enqueued = writer().send(LogMsg::Record { path, line }).is_ok();
     drop(touched);
+    // (program DES-PLUGIN-EVENTS §3.1) The lifecycle set is mirrored onto the bus, stamped with
+    // the same seq, so a bus row and the log record it mirrors name one event.
+    if enqueued {
+        crate::run_mirror::mirror(&json, seq, ts);
+    }
     enqueued
 }
 

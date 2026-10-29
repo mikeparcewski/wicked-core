@@ -2499,7 +2499,21 @@ fn run_unit_and_judge_on(
                     governed: false,
                 }
             }
-            None => runner.run_unit_streaming(advised.as_ref().unwrap_or(input), emit_delta),
+            // (program DES-POWER-MODE) A power run's orchestrator build: turns of the same seat
+            // session until it hands off, a checkpoint at each turn end.
+            None => {
+                match crate::power::take_armed_build(&input.run_id, input.unit.ord, input.attempt) {
+                    Some(arm) => crate::power::orchestrate(
+                        runner,
+                        advised.as_ref().unwrap_or(input),
+                        emit_delta,
+                        arm,
+                    ),
+                    None => {
+                        runner.run_unit_streaming(advised.as_ref().unwrap_or(input), emit_delta)
+                    }
+                }
+            }
         },
     };
     // (DES-QE-EVERY-SEAT) THE ISOLATED QE REVIEWER. For the run's QE unit with a `required`

@@ -260,6 +260,13 @@ pub struct AgentSession {
     /// persisted before this field reads back `full` with the default requirements (fail-closed).
     #[serde(default)]
     pub assurance: crate::assurance::RunAssurance,
+    /// (program DES-POWER-MODE) The run's power-mode state: the switch, the intake rigor plan,
+    /// the rigor history, toggles, the orchestrator's turns and the hand-off rounds
+    /// ([`crate::power::PowerState`], camelCase inside). `None` on a run launched phased.
+    /// `#[serde(default)]` + skip-if-none: older sessions deserialize and a phased run
+    /// serializes byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power: Option<crate::power::PowerState>,
 }
 
 /// (EP-K3) A launch's `exclude_seats` as the session keeps it: trimmed, empties dropped, first-seen
@@ -2360,6 +2367,7 @@ mod tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         }
     }
 

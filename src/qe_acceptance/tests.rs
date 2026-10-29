@@ -38,6 +38,7 @@ fn session(assurance: RunAssurance) -> AgentSession {
         exclude_seats: Vec::new(),
         evidence_root: None,
         assurance,
+        power: None,
     }
 }
 

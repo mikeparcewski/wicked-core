@@ -548,6 +548,46 @@ pub(crate) enum Command {
         tree: String,
         paths: Vec<String>,
     },
+    /// (program DES-POWER-MODE) An orchestrator checkpoint, measured by the build's worker: the
+    /// actor scores it, records the rigor-history row and answers (raise note, pause, stop).
+    PowerCheckpoint {
+        run_id: String,
+        ord: u32,
+        attempt: u32,
+        report: crate::power::CheckpointReport,
+        /// `None` for a mid-turn (timer / commit) checkpoint nobody waits on.
+        reply: Option<Sender<crate::power::CheckpointAnswer>>,
+    },
+    /// (program DES-POWER-MODE) A power-orchestrator turn started or ended, for the record and
+    /// the frames (`PowerTurnStarted` / `PowerTurnCompleted`).
+    PowerTurn {
+        event: Box<crate::event::CoreEvent>,
+        in_turn: bool,
+    },
+    /// (program DES-POWER-MODE) Flip the run's power switch (`POST /runs/:id/power`).
+    SetPowerMode {
+        run_id: String,
+        on: bool,
+        actor: String,
+        reason: Option<String>,
+        reply: Sender<anyhow::Result<crate::power::PowerState>>,
+    },
+    /// (program DES-POWER-MODE) Raise a power run's rigor (`POST /runs/:id/rigor`); never lower.
+    RaiseRigor {
+        run_id: String,
+        at_least: crate::power::Rigor,
+        actor: String,
+        reason: String,
+        reply: Sender<anyhow::Result<crate::power::PowerState>>,
+    },
+    /// (program DES-POWER-MODE) Answer a checkpoint pause (`POST /runs/:id/power/pause`).
+    AnswerPowerPause {
+        run_id: String,
+        decision: crate::power::PauseDecision,
+        note: Option<String>,
+        actor: String,
+        reply: Sender<anyhow::Result<crate::power::PowerState>>,
+    },
     /// Register the engine's own composed per-run def (`"<run>:plan-<rev>"`).
     RegisterComposed {
         def: Box<crate::workflow::WorkflowDef>,

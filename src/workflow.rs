@@ -273,7 +273,7 @@ pub enum StepStatus {
 /// directly (claude's `total_cost_usd`) or a price table resolves it, else `None`. Mid-stream totals are
 /// out of scope — this is the end-of-run total. `Serialize`/`Deserialize` so it survives the exec-mediation
 /// bus round-trip (`CompletedTask`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Usage {
     /// TOTAL input tokens presented to the model — fresh + cache-read + cache-creation. This is the
     /// number `cost_usd` is billed against (FINDING-058); the cache split below is a breakdown OF it,

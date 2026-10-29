@@ -826,6 +826,10 @@ pub struct LaunchOptions {
     /// `false`) and a creator-seat evaluator is refused at distribution (`NoEligibleSeat`) and a gate
     /// whose required judge was skipped holds (`judge_unavailable`).
     pub reduced_assurance: Option<bool>,
+    /// (program DES-POWER-MODE) Run in POWER MODE: an intake QE plan sizes the rigor, the `build`
+    /// step runs as one multi-turn orchestrator session, and a hand-off NOT-PASS goes back to that
+    /// session on its own. Only for a plan or preset launch. Omit (or `false`) for a phased run.
+    pub power: Option<bool>,
     /// (X-MIG M9, core#649) The run's DECLARED DELIVERABLES on a plan or preset launch (`plan` or a
     /// preset `workflow`): absolute paths inside a declared write root (or worktree-relative paths)
     /// the run must write. They join the `required_deliverables` of the plan's last creator step, so
@@ -900,6 +904,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         evidence_root: o.evidence_root,
         primary: o.primary,
         reduced_assurance: o.reduced_assurance.unwrap_or(false),
+        power: o.power.unwrap_or(false),
         deliverables: o.deliverables.unwrap_or_default(),
         qe_acceptance,
     })
@@ -1022,6 +1027,14 @@ impl Core {
     /// drop the plan and run the launch unplanned and ungated.
     #[napi]
     pub fn supports_plan_launch() -> bool {
+        true
+    }
+
+    /// (program DES-POWER-MODE) Whether this addon runs power mode: `LaunchOptions.power`,
+    /// `setPowerMode`, `raiseRigor`, `answerPowerPause` and the power events. An older addon
+    /// ignores `power` (napi drops an undeclared field), so a launcher keys on this first.
+    #[napi]
+    pub fn supports_power_mode() -> bool {
         true
     }
 
@@ -2827,6 +2840,68 @@ impl Core {
         })
     }
 
+    /// (program DES-POWER-MODE) Flip a run's power switch. Resolves to the run's power state as
+    /// JSON (`PowerState`, camelCase). Rejects with `not_found:` / `conflict:` / `refused:`.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn set_power_mode(
+        &self,
+        run_id: String,
+        on: bool,
+        actor: String,
+        reason: Option<String>,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let st = core
+                .set_power_mode(&run_id, on, &actor, reason)
+                .map_err(err)?;
+            serde_json::to_string(&st).map_err(err)
+        })
+    }
+
+    /// (program DES-POWER-MODE) Raise a power run's rigor to at least `atLeast` (`light` |
+    /// `standard` | `high` | `highest`); never lowers. Resolves to the power state as JSON.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn raise_rigor(
+        &self,
+        run_id: String,
+        at_least: String,
+        actor: String,
+        reason: String,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let r = wicked_core::power::Rigor::parse(&at_least)
+                .ok_or_else(|| err(anyhow::anyhow!("bad_request: unknown rigor `{at_least}`")))?;
+            let st = core.raise_rigor(&run_id, r, &actor, &reason).map_err(err)?;
+            serde_json::to_string(&st).map_err(err)
+        })
+    }
+
+    /// (program DES-POWER-MODE) Answer a power run's checkpoint pause: `continue_high` |
+    /// `continue` | `switch_phased` | `stop`. Resolves to the power state as JSON.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn answer_power_pause(
+        &self,
+        run_id: String,
+        decision: String,
+        note: Option<String>,
+        actor: String,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let d = wicked_core::power::PauseDecision::parse(&decision).ok_or_else(|| {
+                err(anyhow::anyhow!(
+                    "bad_request: unknown decision `{decision}`"
+                ))
+            })?;
+            let st = core
+                .answer_power_pause(&run_id, d, note, &actor)
+                .map_err(err)?;
+            serde_json::to_string(&st).map_err(err)
+        })
+    }
+
     /// Stop the current worker for `ord` in run `run_id` and re-dispatch it.
     ///
     /// `newCli` is either a CLI key string (re-dispatch immediately to that CLI) or `null` (re-run
@@ -3926,6 +4001,102 @@ mod tests {
                 "known",
                 "detail",
             ],
+        );
+        check(
+            CoreEvent::RigorRescored {
+                session: s(),
+                change: Box::new(wicked_core::power::change(
+                    "turn",
+                    wicked_core::power::Rigor::Standard,
+                    wicked_core::power::Rigor::High,
+                    30,
+                    45,
+                    vec![s()],
+                    None,
+                    "engine",
+                    1,
+                )),
+            },
+            "rigorRescored",
+            &["type", "session", "change"],
+        );
+        check(
+            CoreEvent::PowerCheckpointReached {
+                session: s(),
+                ord: 2,
+                checkpoint: 1,
+                turn: 1,
+                trigger: "turn".into(),
+                head: None,
+                picked: 0,
+                rigor: "high".into(),
+                paused: false,
+                pause: None,
+                at: 1,
+            },
+            "powerCheckpointReached",
+            &[
+                "type",
+                "session",
+                "ord",
+                "checkpoint",
+                "turn",
+                "trigger",
+                "head",
+                "picked",
+                "rigor",
+                "paused",
+                "pause",
+                "at",
+            ],
+        );
+        check(
+            CoreEvent::PowerTurnCompleted {
+                session: s(),
+                ord: 2,
+                attempt: 1,
+                turn: 1,
+                cli: s(),
+                outcome: "checkpoint".into(),
+                summary: None,
+            },
+            "powerTurnCompleted",
+            &[
+                "type", "session", "ord", "attempt", "turn", "cli", "outcome", "summary",
+            ],
+        );
+        check(
+            CoreEvent::PowerActivity {
+                session: s(),
+                ord: 2,
+                turn: 1,
+                at: 1,
+                kind: "commit".into(),
+                path: None,
+                added: Some(3),
+                removed: Some(1),
+                sha: Some(s()),
+                subject: Some(s()),
+            },
+            "powerActivity",
+            &[
+                "type", "session", "ord", "turn", "at", "kind", "path", "added", "removed", "sha",
+                "subject",
+            ],
+        );
+        check(
+            CoreEvent::PowerToggled {
+                session: s(),
+                toggle: Box::new(wicked_core::power::PowerToggle {
+                    at: 1,
+                    on: false,
+                    by: s(),
+                    reason: None,
+                    stay_phased: vec![],
+                }),
+            },
+            "powerToggled",
+            &["type", "session", "toggle"],
         );
         check(
             CoreEvent::WorkerMessageQueued {

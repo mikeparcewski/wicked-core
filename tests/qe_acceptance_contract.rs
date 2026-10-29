@@ -140,6 +140,7 @@ fn spec(sid: &str, workflow: &str, qe: QeOverride) -> LaunchSpec {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        power: false,
         qe_acceptance: qe,
         deliverables: Vec::new(),
     }

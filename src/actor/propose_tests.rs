@@ -74,6 +74,7 @@ fn fixture(
         exclude_seats: Vec::new(),
         evidence_root: None,
         assurance: Default::default(),
+        power: None,
     };
     put_node(store, session.to_node()).unwrap();
     for (i, (phase, st, last)) in units.iter().enumerate() {

@@ -46,6 +46,7 @@ fn session(clis: &[&str], reduced: bool) -> AgentSession {
         exclude_seats: Vec::new(),
         evidence_root: None,
         assurance: RunAssurance::new(Some(&declared), reduced),
+        power: None,
     }
 }
 

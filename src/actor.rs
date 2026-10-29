@@ -35,6 +35,7 @@ use crate::workflow::{PriorUnitOutput, StepInput, StepRunner};
 use crate::{pipeline, resolve_scope, EntityMode, LaunchSpec};
 use wicked_apps_core::HardenedCommand;
 
+mod power_gate;
 mod team_gate;
 pub use team_gate::{CONTINUE_WITHOUT_TEAM, TEAM_TRANSPORT_GATE};
 
@@ -972,6 +973,8 @@ pub(crate) fn run(
     // so bus consumers can discard completions from a prior daemon restart (stale-result guard).
     // NOT a global singleton: each actor lifetime gets a fresh token.
     let process_gen: uuid::Uuid = uuid::Uuid::new_v4();
+    // (program DES-POWER-MODE) A power build's worker reaches this actor by its generation.
+    crate::power::register_actor(process_gen, self_tx.clone());
     // (DES-TEAMING-002 P1) A `team_transport` reject recorded before the restart is finished here,
     // now that the actor's seams exist: the run tombstone is already written (boot reconcile), so
     // the cancel publishes only `path.ended`.
@@ -1256,6 +1259,8 @@ pub(crate) fn run(
                     reduced_assurance,
                     deliverables,
                     qe_acceptance,
+                    // The legacy straight-through path runs no plan, so no power build.
+                    power: _,
                 } = spec;
                 // (DES-TEAMING-002 T3) A plan — user-composed, or a preset's steps — must reach
                 // its approval gate; this straight-through path honours no gate, so it refuses one
@@ -1629,6 +1634,7 @@ pub(crate) fn run(
                         ),
                         team: None,
                         team_plan: None,
+                        power: None,
                         exclude_seats: crate::domain::normalize_exclude_seats(&spec.exclude_seats),
                         // (WT-C2) Validated with the write roots above; in the launch record.
                         evidence_root: spec.evidence_root.clone(),
@@ -2351,6 +2357,18 @@ pub(crate) fn run(
                 actor,
                 reply,
             } => {
+                // (program DES-POWER-MODE) A gate a person answered on a power run counts for
+                // the run's planned-vs-actual record ("did the operator only answer deliver?").
+                if actor.as_deref() != Some(crate::power::HANDOFF_ACTOR) {
+                    if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
+                        if s.status == SessionStatus::AwaitingHuman {
+                            if let Some(p) = s.power.as_mut() {
+                                p.operator_gates = p.operator_gates.saturating_add(1);
+                                let _ = put_node(&mut store, s.to_node());
+                            }
+                        }
+                    }
+                }
                 let res = confirm_gate_as(
                     &mut store,
                     &mut subscribers,
@@ -3119,20 +3137,39 @@ pub(crate) fn run(
                             },
                         );
                         let _ = reply.send(Ok(()));
-                    } else if matches!(&target, InjectTarget::Cli(_)) {
-                        // Runner without queueing support: preserve the historical contract —
-                        // a targeted inject with nowhere to deliver is an error.
-                        let _ = reply.send(Err(anyhow::anyhow!(
-                            "run {run_id} has no active PTY sessions and the runner cannot \
-                             queue; targeted inject undeliverable"
-                        )));
                     } else {
-                        // Broadcast with nowhere to deliver — the historical skip-with-warning.
-                        eprintln!(
-                            "[wicked-core] inject: run {run_id} has no active PTY sessions \
-                             and the runner cannot queue; skipping"
-                        );
-                        let _ = reply.send(Ok(()));
+                        // (program DES-POWER-MODE) The headless carrier keeps no live process to
+                        // write into (C5 removed the ACP inject queue), so the ENGINE queues the
+                        // message: it rides the next turn of a power orchestrator, or the next
+                        // unit this target's seat runs (`dispatch_unit`). Before this, a broadcast
+                        // was dropped with a log line while the inject answered OK.
+                        let live = crate::domain::get_session(&store, &run_id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|s| {
+                                !matches!(
+                                    s.status,
+                                    SessionStatus::Completed
+                                        | SessionStatus::Cancelled
+                                        | SessionStatus::Failed
+                                )
+                            });
+                        if live {
+                            crate::power::queue_operator_message(&run_id, &target_str, &message);
+                            emit(
+                                &mut subscribers,
+                                CoreEvent::WorkerMessageQueued {
+                                    session: run_id.clone(),
+                                    message,
+                                    target: target_str,
+                                },
+                            );
+                            let _ = reply.send(Ok(()));
+                        } else {
+                            let _ = reply.send(Err(anyhow::anyhow!(
+                                "run {run_id} is not live; the message would never be heard"
+                            )));
+                        }
                     }
                     continue;
                 }
@@ -3977,6 +4014,146 @@ pub(crate) fn run(
             Command::HeldTeamReplies { reply } => {
                 let _ = reply.send(team_replies.len());
             }
+            Command::PowerCheckpoint {
+                run_id,
+                ord,
+                attempt,
+                report,
+                reply,
+            } => {
+                let answer = power_gate::on_checkpoint(
+                    &mut store,
+                    &mut subscribers,
+                    &run_id,
+                    ord,
+                    attempt,
+                    &report,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("wicked-core: run {run_id}: power checkpoint failed ({e:#})");
+                    crate::power::CheckpointAnswer::default()
+                });
+                if let Some(reply) = reply {
+                    let _ = reply.send(answer);
+                }
+            }
+            Command::PowerTurn { event, in_turn } => {
+                let run_id = match event.as_ref() {
+                    CoreEvent::PowerTurnStarted { session, .. }
+                    | CoreEvent::PowerTurnCompleted { session, .. } => Some(session.clone()),
+                    _ => None,
+                };
+                if let Some(run_id) = run_id {
+                    if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
+                        if let Some(p) = s.power.as_mut() {
+                            p.orchestrator.in_turn = in_turn;
+                            let now = crate::interaction::now_millis();
+                            match event.as_ref() {
+                                CoreEvent::PowerTurnStarted {
+                                    turn, attempt, cli, ..
+                                } => {
+                                    p.orchestrator.turns = p.orchestrator.turns.max(*turn);
+                                    p.turn_log.push(crate::power::PowerTurnRecord {
+                                        turn: *turn,
+                                        attempt: *attempt,
+                                        cli: cli.clone(),
+                                        started_at: now,
+                                        ended_at: None,
+                                        outcome: None,
+                                        summary: None,
+                                    });
+                                    let n = p.turn_log.len();
+                                    if n > crate::power::TURN_LOG_CAP {
+                                        p.turn_log.drain(..n - crate::power::TURN_LOG_CAP);
+                                    }
+                                }
+                                CoreEvent::PowerTurnCompleted {
+                                    turn,
+                                    attempt,
+                                    outcome,
+                                    summary,
+                                    ..
+                                } => {
+                                    if let Some(r) = p
+                                        .turn_log
+                                        .iter_mut()
+                                        .rev()
+                                        .find(|r| r.turn == *turn && r.attempt == *attempt)
+                                    {
+                                        r.ended_at = Some(now);
+                                        r.outcome = Some(outcome.clone());
+                                        r.summary = summary.clone();
+                                    }
+                                }
+                                _ => {}
+                            }
+                            let _ = put_node(&mut store, s.to_node());
+                        }
+                    }
+                }
+                emit(&mut subscribers, *event);
+            }
+            Command::SetPowerMode {
+                run_id,
+                on,
+                actor,
+                reason,
+                reply,
+            } => {
+                let _ = reply.send(power_gate::set_power(
+                    &mut store,
+                    &mut subscribers,
+                    &run_id,
+                    on,
+                    &actor,
+                    reason,
+                ));
+            }
+            Command::RaiseRigor {
+                run_id,
+                at_least,
+                actor,
+                reason,
+                reply,
+            } => {
+                let _ = reply.send(power_gate::raise_rigor(
+                    &mut store,
+                    &mut subscribers,
+                    &run_id,
+                    at_least,
+                    &actor,
+                    &reason,
+                ));
+            }
+            Command::AnswerPowerPause {
+                run_id,
+                decision,
+                note,
+                actor,
+                reply,
+            } => {
+                let res = power_gate::answer_pause(
+                    &mut store,
+                    &mut subscribers,
+                    &run_id,
+                    decision,
+                    note,
+                    &actor,
+                );
+                if res.is_ok() && decision == crate::power::PauseDecision::Stop {
+                    if let Err(e) = cancel_run(
+                        &mut store,
+                        &mut subscribers,
+                        &runner,
+                        &self_tx,
+                        &run_id,
+                        &lifecycle_maps,
+                    ) {
+                        eprintln!("wicked-core: run {run_id}: stop at the pause failed ({e:#})");
+                    }
+                }
+                let _ = reply.send(res);
+            }
             Command::TeamRescored {
                 run_id,
                 ord,
@@ -4008,6 +4185,7 @@ pub(crate) fn run(
                 );
             }
             Command::Shutdown => {
+                crate::power::unregister_actor(process_gen);
                 subscribers.close_asks();
                 // Stop ACP workers before dropping the actor channel. Ordinary prompt waits
                 // do not poll the elicitation tombstone, so they must be interrupted through
@@ -4332,6 +4510,14 @@ fn team_plan_at_launch(
         }
         return Ok(None);
     };
+    // (program DES-POWER-MODE) A power launch drops the pre-build phases the orchestrator does in
+    // its own session (or that power mode satisfies another way) before the PA scopes the plan.
+    let power = spec.power && spec.repo_ref.is_some();
+    let plan = if power {
+        crate::power::launch_plan(&plan)
+    } else {
+        plan
+    };
     // (QE acceptance) A built-in preset that makes application changes requires QE acceptance:
     // the per-run def carries its declaration, so every path that reads the def's contract (the
     // campaign launch builds the session from it) sees the same requirement.
@@ -4372,6 +4558,15 @@ fn team_plan_at_launch(
         deliverables: spec.deliverables.clone(),
         requires_evaluator: assurance.enforces(crate::assurance::DISTINCT_EVALUATOR),
         requires_qe: assurance.enforces(crate::assurance::QE_ACCEPTANCE),
+        power,
+        power_absorbs: if power {
+            crate::power::ABSORBED
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            Vec::new()
+        },
         ..Default::default()
     };
     // (X1) A plan with a creator step and no declared touch set is scored by the PA: rev 1 is its
@@ -4464,6 +4659,13 @@ fn register_launch_plan(
         let mut s = crate::domain::get_session(&*store, run_id)?
             .ok_or_else(|| anyhow::anyhow!("run {run_id} has no launch record"))?;
         s.team_plan = Some(state.clone());
+        // (program DES-POWER-MODE) The run's power record starts with the launch's switch.
+        if state.power && s.power.is_none() {
+            s.power = Some(crate::power::PowerState::launched(
+                true,
+                crate::interaction::now_millis(),
+            ));
+        }
         put_node(store, s.to_node())?;
     }
     Ok((state, def.id, scoped))
@@ -8162,6 +8364,14 @@ fn escalate_denied_unit(
             suggestion_ref: mutation.and_then(|m| m.suggestion_ref.clone()),
         },
     );
+    // (program DES-POWER-MODE §6) A power run's hand-off NOT-PASS goes back to the SAME
+    // orchestrator session on its own (a `request_changes` rewind to the build), a bounded number
+    // of rounds; the gate still opens first, so the answer is the ordinary, audited arm.
+    let send_back = if adjudication.is_none() {
+        power_gate::auto_send_back(store, subscribers, session, unit, class, &reason)
+    } else {
+        None
+    };
     let (gate_kind, prompt) = match adjudication {
         Some(p) => (crate::review_context::REVIEW_ADJUDICATION_GATE, p),
         None => (
@@ -8169,7 +8379,7 @@ fn escalate_denied_unit(
             denial_gate_prompt(unit, class, &reason, mutation, note),
         ),
     };
-    pause_for_human(
+    let paused = pause_for_human(
         store,
         subscribers,
         self_tx,
@@ -8180,7 +8390,19 @@ fn escalate_denied_unit(
         Some(ord),
         gate_kind,
         prompt,
-    )
+    );
+    if paused.is_ok() {
+        if let Some(note) = send_back {
+            let (reply, _rx) = std::sync::mpsc::channel();
+            let _ = self_tx.send(Command::ConfirmGate {
+                run_id: session.id.clone(),
+                decision: crate::workflow::HumanDecision::RequestChanges { note: Some(note) },
+                actor: Some(crate::power::HANDOFF_ACTOR.to_string()),
+                reply,
+            });
+        }
+    }
+    paused
 }
 
 /// (core#760) Append the NOT-PASS verdict an evaluator unit returned at `attempt` to its
@@ -8465,6 +8687,7 @@ fn fail_run(
 ) -> StepApplied {
     session.status = SessionStatus::Failed;
     session.finished_at = Some(crate::interaction::now_millis());
+    power_gate::set_outcome(&*store, session, "failed");
     let _ = put_node(store, session.to_node());
     team_gate::run_ended(
         &*store,
@@ -10109,6 +10332,74 @@ fn unsuppressed_gate_note(human_confirm: crate::domain::HumanConfirm) -> &'stati
     }
 }
 
+/// (program DES-POWER-MODE) What a power run changes at dispatch: its `build` creator unit is
+/// ARMED as the multi-turn orchestrator (the worker loops its turns, `crate::power::orchestrate`)
+/// and handed the orchestrator brief; a hand-off reviewer is told it also checks the approach (the
+/// band's `design`, operator ruling 2026-10-29). Everything else dispatches unchanged. The power
+/// record's orchestrator fields are written here.
+fn power_dispatch(
+    store: &mut dyn GraphStore,
+    session: &crate::domain::AgentSession,
+    mut unit: crate::domain::WorkUnit,
+    pa_review: bool,
+) -> anyhow::Result<crate::domain::WorkUnit> {
+    let Some(power) = session.power.as_ref().filter(|p| p.on) else {
+        return Ok(unit);
+    };
+    if unit.tool_cmd.is_some() || pa_review || unit.member_step.is_some() {
+        return Ok(unit);
+    }
+    match unit.catalog.as_deref() {
+        Some("build") if unit.role == crate::workflow::PhaseRole::Creator => {
+            let round = power.handoff.as_ref().map_or(1, |h| h.round.max(1));
+            let task = unit.description.clone();
+            unit.description.push_str(&crate::power::orchestrator_brief(
+                power.rigor,
+                power.plan.as_ref(),
+                round,
+            ));
+            crate::power::arm_build(
+                &session.id,
+                unit.ord,
+                session.attempt,
+                crate::power::BuildArm {
+                    task,
+                    cli: unit.assigned_cli.clone().unwrap_or_default(),
+                    round,
+                    base: session.base_commit.clone(),
+                },
+            );
+            let mut s = session.clone();
+            if let Some(p) = s.power.as_mut() {
+                p.orchestrator.cli = unit.assigned_cli.clone();
+                p.orchestrator.ord = Some(unit.ord);
+                if p.build_started_at.is_none() {
+                    p.build_started_at = Some(crate::interaction::now_millis());
+                }
+            }
+            put_node(store, s.to_node())?;
+        }
+        Some("review") | Some("critique") | Some("security_review")
+            if unit.role == crate::workflow::PhaseRole::Evaluator =>
+        {
+            let design = power
+                .plan
+                .as_ref()
+                .is_some_and(|p| p.handoff.reviews.iter().any(|r| r.kind == "design"));
+            unit.description.push_str(
+                "\n\n[power mode hand-off] One orchestrator session built this change in many                  turns (its commits are in the worktree's log). You review it on a seat distinct                  from the orchestrator's.",
+            );
+            if design && unit.catalog.as_deref() != Some("security_review") {
+                unit.description.push_str(
+                    " Also judge its APPROACH, as a design review would: is the chosen design                      sound for the intent, simpler alternatives, and risks it introduces. This                      review counts as the run's design check.",
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(unit)
+}
+
 /// Read the next unit at `unit_ix`, emit `UnitExecuting`, and spawn a worker that runs its slow work
 /// (no store handle) and posts an `ApplyStepResult` back to the actor. Returns `Ok(false)` if
 /// `unit_ix` is past the last unit (nothing to dispatch — the run is done).
@@ -10660,6 +10951,39 @@ fn dispatch_unit(
             ),
         });
     }
+    // (program DES-POWER-MODE) OPERATOR MESSAGES queued while no turn could hear them (the
+    // headless carrier has no live process to write into): this unit's seat hears every one
+    // addressed to it or to all, once, as an operator context block.
+    if unit.tool_cmd.is_none() && review_of.is_none() {
+        let queued = crate::power::take_operator_messages(run_id, current_cli);
+        if !queued.is_empty() {
+            let text = queued
+                .iter()
+                .map(|m| format!("- {}", m.message.trim()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let label = "[operator messages — said while the run worked; act on them]".to_string();
+            context_items.push(crate::event::InjectedContext::new(
+                unit.ord,
+                label.clone(),
+                text.len(),
+            ));
+            prior_outputs.push(PriorUnitOutput {
+                label,
+                output: text,
+            });
+            for m in queued {
+                emit(
+                    subscribers,
+                    CoreEvent::WorkerMessageInjected {
+                        session: run_id.to_string(),
+                        message: m.message,
+                        target: m.target,
+                    },
+                );
+            }
+        }
+    }
     // (EVT-007) Emit UnitContextInjected when prior outputs are being injected — a cross-CLI carry-over
     // or a declared `depends_on` handoff (FINDING-024). Before that fix this fired only on multi-CLI
     // runs, so its ABSENCE was the observable that proved every single-CLI phase ran context-free.
@@ -10717,6 +11041,11 @@ fn dispatch_unit(
         }
         None => unit.clone(),
     };
+    // (program DES-POWER-MODE) The power run's orchestrator build and its hand-off reviewers.
+    let dispatched_unit = power_dispatch(store, &session, dispatched_unit, review_of.is_some())?;
+    if session.power.is_some() && review_of.is_none() {
+        power_gate::on_dispatch(store, subscribers, run_id, &dispatched_unit);
+    }
     let input = StepInput {
         run_id: run_id.to_string(),
         unit_ix,
@@ -12288,6 +12617,7 @@ fn finalize_run(
             );
         }
         session.status = SessionStatus::Completed;
+        power_gate::set_outcome(&*store, &mut session, "completed");
         session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
         team_gate::run_ended(&*store, run_id, crate::team::events::PathStatus::Completed);
@@ -15771,6 +16101,7 @@ pub(crate) fn cancel_run(
         }
     };
     session.status = SessionStatus::Cancelled;
+    power_gate::set_outcome(&*store, &mut session, "cancelled");
     session.finished_at = Some(crate::interaction::now_millis());
     put_node(store, session.to_node())?;
     team_gate::run_ended(&*store, run_id, crate::team::events::PathStatus::Cancelled);
@@ -16256,6 +16587,7 @@ mod sessions_detail_fold_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         }
     }
 
@@ -16355,6 +16687,7 @@ mod gate_pause_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         }
     }
     fn unit(ord: u32, gate: GateSpec, status: UnitStatus) -> WorkUnit {
@@ -16678,6 +17011,7 @@ mod terminal_gate_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(store, session.to_node()).unwrap();
         // One APPROVED terminal unit whose OWN gate is `terminal_gate`.
@@ -16976,6 +17310,7 @@ retry the deliver phase";
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(
@@ -17684,6 +18019,7 @@ mod substance_gate_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -19387,6 +19723,7 @@ mod request_changes_tests {
             evidence_root: None,
             // (core#850) One seat: its review rides the creator's seat by the explicit opt-in.
             assurance: crate::assurance::RunAssurance::new(None, true),
+            power: None,
         };
         put_node(store, session.to_node()).unwrap();
         let phases = [
@@ -19468,6 +19805,7 @@ mod request_changes_tests {
             evidence_root: None,
             // (core#850) One seat: its review rides the creator's seat by the explicit opt-in.
             assurance: crate::assurance::RunAssurance::new(None, true),
+            power: None,
         };
         put_node(store, session.to_node()).unwrap();
         let phases = [
@@ -20704,6 +21042,7 @@ mod request_changes_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: crate::assurance::RunAssurance::new(None, true),
+            power: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         for (ix, (phase, role)) in [
@@ -20850,6 +21189,7 @@ mod request_changes_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: crate::assurance::RunAssurance::new(None, true),
+            power: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         for (ix, (phase, role)) in [
@@ -21539,6 +21879,7 @@ mod request_changes_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         s.assurance.floor_overrides = overrides
             .into_iter()
@@ -23980,6 +24321,7 @@ mod code_evidence_floor_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:build"), run_id, 1, "build the feature");
@@ -24561,6 +24903,7 @@ mod deliverable_floor_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -25088,6 +25431,7 @@ mod seat_failover_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(store, session.to_node()).unwrap();
     }
@@ -26280,6 +26624,7 @@ mod def_gate_disclosure_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u1 = WorkUnit::pending("d:u1", "d", 1, "clarify the problem");
@@ -26392,6 +26737,7 @@ mod def_gate_disclosure_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending("d:u1", "d", 1, "the verdict phase");
@@ -26493,6 +26839,7 @@ mod def_gate_disclosure_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(store, session.to_node()).unwrap();
         let u1 = WorkUnit::pending("rl:u1", "rl", 1, "build the feature");
@@ -26853,6 +27200,7 @@ mod terminal_worktree_reap_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(store, session.to_node()).unwrap();
         (root, wt)
@@ -27358,6 +27706,7 @@ mod terminal_worktree_reap_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         let term_session = AgentSession {
             id: "s-term".into(),
@@ -27535,6 +27884,7 @@ mod worker_code_graph_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         }
     }
 
@@ -27976,6 +28326,7 @@ mod project_graph_binding_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         }
     }
 
@@ -28729,6 +29080,7 @@ mod phase_boundary_governance_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(store, session.to_node()).unwrap();
         // One unit at ord=1 (phase "unit-1").
@@ -28983,6 +29335,7 @@ mod prior_context_tests {
                 ran: &[],
                 requires_evaluator: false,
                 requires_qe: false,
+                power_absorbs: &[],
             },
         )
         .unwrap();
@@ -29196,6 +29549,7 @@ mod turn_timeout_vs_cancel_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "work");
@@ -29981,6 +30335,7 @@ mod turn_timeout_vs_cancel_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "work");
@@ -30046,6 +30401,7 @@ mod turn_timeout_vs_cancel_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         let archived = AgentSession {
             id: "s-archived".into(),
@@ -30129,6 +30485,7 @@ mod turn_timeout_vs_cancel_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         assert_eq!(eligible_roster_keys(&session), vec!["a", "b", "c"]);
         assert!(crate::domain::bench_seat(
@@ -31038,6 +31395,7 @@ mod dead_seat_park_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(store, session.to_node()).unwrap();
         let u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -31185,6 +31543,7 @@ mod plan_gate_confirm_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u1 = WorkUnit::pending("r:understand", "r", 1, "understand the problem");
@@ -31430,6 +31789,7 @@ mod catalog_alias_governance_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("r:{phase_id}"), "r", 1, "a unit");
@@ -31555,6 +31915,7 @@ mod consent_plan_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut plan = WorkUnit::pending(format!("{run_id}:install-plan"), run_id, 1, "plan");
@@ -31839,6 +32200,7 @@ mod work_author_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         }
     }
 
@@ -32053,6 +32415,7 @@ mod council_ballot_tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         }
     }
 

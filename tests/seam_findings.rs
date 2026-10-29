@@ -240,6 +240,7 @@ fn sync_launch_halts_as_failed_on_a_governance_deny() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        power: false,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     });
@@ -293,6 +294,7 @@ fn a_conditional_gate_pauses_on_a_not_pass_verdict() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        power: false,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })
@@ -363,6 +365,7 @@ fn t_d4b_conditional_gate_retry_bumps_attempt() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        power: false,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })
@@ -447,6 +450,7 @@ fn an_evaluator_second_pass_deny_halts_the_run_and_leaks_no_output() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        power: false,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })
@@ -571,6 +575,7 @@ fn a_triage_fail_rejection_persists_the_full_failure_transcript() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        power: false,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })

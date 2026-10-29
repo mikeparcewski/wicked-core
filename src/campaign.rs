@@ -122,6 +122,7 @@ impl RunSpec {
             evidence_root: None,
             primary: None,
             reduced_assurance: false,
+            power: false,
             deliverables: Vec::new(),
             qe_acceptance,
         })
@@ -2385,6 +2386,7 @@ mod tests {
             exclude_seats: Vec::new(),
             evidence_root: None,
             assurance: Default::default(),
+            power: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         put_node(
@@ -2555,6 +2557,7 @@ mod tests {
                 exclude_seats: Vec::new(),
                 evidence_root: None,
                 assurance: Default::default(),
+                power: None,
             };
             put_node(&mut store, session.to_node()).unwrap();
             put_node(

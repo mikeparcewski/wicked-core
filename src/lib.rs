@@ -101,6 +101,7 @@ pub mod path_policy;
 mod pipeline;
 mod plan;
 mod plan_gate;
+pub mod power;
 mod preset;
 mod project;
 mod qe_acceptance;
@@ -109,6 +110,7 @@ mod repo;
 mod repo_checks;
 mod repo_intel;
 mod review_context;
+mod run_mirror;
 mod runtime_wait;
 // S4 of #590: summoned by S2 (monitors) and S5 (teamed mode); unused until they land.
 #[allow(dead_code)]
@@ -446,6 +448,12 @@ pub struct LaunchSpec {
     /// decide at its QE phase. Either word on a run whose workflow does not require QE acceptance
     /// refuses the launch.
     pub qe_acceptance: crate::assurance::QeOverride,
+    /// (program DES-POWER-MODE) Run in POWER MODE: the PA's scope step also plans the run's rigor
+    /// (the intake QE plan), the `build` step runs as one multi-turn orchestrator session, the
+    /// band's `test_plan` and `design` are satisfied by the intake plan and the hand-off review,
+    /// and a hand-off NOT-PASS goes back to the same session on its own ([`crate::power`]). Only
+    /// for a plan or preset launch (a team run); ignored, with a log line, on any other.
+    pub power: bool,
 }
 
 /// (core#678 item 1) What this host can contain, known before any run (the boot probe, cached):
@@ -2103,6 +2111,74 @@ impl Core {
                 run_id: run_id.to_string(),
                 message: message.to_string(),
                 target,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (program DES-POWER-MODE) Flip a run's power switch. On -> Off is always allowed; Off -> On
+    /// only when the run is available for it (`refused: …` otherwise). Errors carry a `not_found:`
+    /// / `conflict:` / `refused:` prefix the HTTP layer maps.
+    pub fn set_power_mode(
+        &self,
+        run_id: &str,
+        on: bool,
+        actor: &str,
+        reason: Option<String>,
+    ) -> anyhow::Result<power::PowerState> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::SetPowerMode {
+                run_id: run_id.to_string(),
+                on,
+                actor: actor.to_string(),
+                reason,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (program DES-POWER-MODE) Raise a power run's rigor to at least `at_least` (never lower).
+    pub fn raise_rigor(
+        &self,
+        run_id: &str,
+        at_least: power::Rigor,
+        actor: &str,
+        reason: &str,
+    ) -> anyhow::Result<power::PowerState> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::RaiseRigor {
+                run_id: run_id.to_string(),
+                at_least,
+                actor: actor.to_string(),
+                reason: reason.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (program DES-POWER-MODE) Answer a power run's checkpoint pause.
+    pub fn answer_power_pause(
+        &self,
+        run_id: &str,
+        decision: power::PauseDecision,
+        note: Option<String>,
+        actor: &str,
+    ) -> anyhow::Result<power::PowerState> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::AnswerPowerPause {
+                run_id: run_id.to_string(),
+                decision,
+                note,
+                actor: actor.to_string(),
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;

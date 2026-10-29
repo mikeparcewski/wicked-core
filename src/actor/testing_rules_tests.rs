@@ -65,6 +65,7 @@ fn session(run: &str) -> AgentSession {
         exclude_seats: Vec::new(),
         evidence_root: None,
         assurance: Default::default(),
+        power: None,
     }
 }
 

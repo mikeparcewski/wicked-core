@@ -102,6 +102,7 @@ fn spec(sid: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        power: false,
         qe_acceptance: Default::default(),
         deliverables: Vec::new(),
     }

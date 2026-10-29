@@ -471,6 +471,7 @@ pub(crate) fn pre_distribute(
         benched_seats: worktree_bench,
         team: None,
         team_plan: None,
+        power: None,
         exclude_seats,
         evidence_root,
         assurance: crate::assurance::RunAssurance::new(
@@ -516,6 +517,8 @@ pub(crate) fn pre_distribute(
             // (or re-planned at an edit) keeps them.
             session.team = existing.team;
             session.team_plan = existing.team_plan;
+            // (program DES-POWER-MODE) …and so is its power record.
+            session.power = existing.power;
         }
     } else {
         put_node(store, session.to_node())?;

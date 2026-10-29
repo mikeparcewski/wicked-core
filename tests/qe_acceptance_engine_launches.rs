@@ -640,6 +640,7 @@ fn the_straight_through_path_refuses_every_qe_word() {
             evidence_root: None,
             primary: None,
             reduced_assurance: false,
+            power: false,
             deliverables: Vec::new(),
             qe_acceptance: word.clone(),
         });

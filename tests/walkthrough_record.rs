@@ -180,6 +180,7 @@ fn run(name: &str, mode: Option<&str>) -> Run {
         evidence_root: Some(evidence.to_string_lossy().into_owned()),
         primary: None,
         reduced_assurance: false,
+        power: false,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })
