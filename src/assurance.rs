@@ -131,6 +131,19 @@ pub struct FloorOverride {
     /// did not run on a known tree) is never stood on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<crate::repo_checks::FloorKey>,
+    /// (core#1168) Set when this override was CARRIED, not given here: a verify floor that failed on
+    /// exactly the result the operator overrode at the creator's floor (same tree and base, every
+    /// failing check reused from it) stands on that override. The overridden result's id
+    /// ([`FloorOverride::result_id`] of the original); `label` then reads
+    /// [`carried_override_label`]. Absent on an override the operator gave at this gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_from: Option<String>,
+}
+
+/// (core#1168) The label of a carried override ([`FloorOverride::carried_from`]): the gate, its
+/// receipt and the delivery show it as-is — "override carried from fix (unit 6), same tree".
+pub fn carried_override_label(phase: &str, ord: u32) -> String {
+    format!("override carried from {phase} (unit {ord}), same tree")
 }
 
 /// (operator ruling 2026-10-14) A judge seated IN PLACE of the run's preferred judge, because

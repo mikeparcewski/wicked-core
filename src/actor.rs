@@ -7399,10 +7399,15 @@ fn apply_step_result(
     // refused on the STORED session. This copy was read before the fold, and every write of it
     // below would drop that bench, so the next unit's judge rotated onto the benched seat again.
     // Adopt the fold's benches before any write (first reason wins, as `bench_seat` keeps it).
+    // (core#1168) …and the floor override the fold CARRIED onto a verify floor, which it recorded on
+    // the stored contract: a write of this copy without it would drop it from the delivery.
     if let Some(stored) = crate::domain::get_session(store, &run_id)? {
         for seat in stored.benched_seats {
             crate::domain::bench_seat(&mut session.benched_seats, seat);
         }
+        // The fold appends (or replaces) only carried records, and nothing on this thread touched
+        // the overrides since this copy was read: the stored list is the current one.
+        session.assurance.floor_overrides = stored.assurance.floor_overrides;
     }
     // T5: the unit-review decision on the bus, and the `team_dispute` pause when the gate
     // approved a teamed unit whose ledger does not let the run continue unattended.
@@ -14816,6 +14821,7 @@ fn floor_override_for(
             }),
             label: crate::assurance::FLOOR_OVERRIDE_LABEL.to_string(),
             key: u.repo_checks.as_ref().and_then(|r| r.key.clone()),
+            carried_from: None,
         },
         // Every record behind the floor is the judge's no-verdict hold here (checked above); a
         // deliver refusal has none.
@@ -21564,6 +21570,7 @@ mod request_changes_tests {
                 base: None,
                 checks: "d".into(),
             }),
+            carried_from: None,
         }
     }
 
@@ -21793,6 +21800,273 @@ mod request_changes_tests {
     /// (operator ruling 2026-10-21) With a rationale the unit counts, and the gate receipt records
     /// an operator judgment OVERRIDING THE FLOOR (who, the rationale, the floor result id, the
     /// label); the run's contract and the delivery receipt carry "floor overridden by operator".
+    /// (core#1168) A floor report as the engine records it: `failing` exits 1, the rest 0; keyed on
+    /// `tree` / `base` with the stage's digest; `reused` names the creator floor's checks it took.
+    fn floor_report(
+        checks: &[&str],
+        failing: &[&str],
+        tree: &str,
+        base: &str,
+        digest: &str,
+        reused: Option<(&[&str], Option<&str>)>,
+    ) -> crate::repo_checks::RepoChecksReport {
+        let runs: Vec<serde_json::Value> = checks
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "name": c, "argv": ["npm", "run", c], "source": "t",
+                    "exit_code": if failing.contains(c) { 1 } else { 0 }, "timed_out": false,
+                    "duration_ms": 1, "stdout_tail": "", "stderr_tail": "",
+                })
+            })
+            .collect();
+        let mut v = serde_json::json!({
+            "detected": [], "checks": runs, "skipped": [], "passed": failing.is_empty(),
+            "sandbox_level": "sandboxed", "tree": tree,
+            "key": {"tree": tree, "base": base, "checks": digest},
+        });
+        if let Some((names, voided)) = reused {
+            v["reused_from"] = serde_json::json!({
+                "phase": "fix", "ord": 3, "attempt": 0, "reused": names, "voided": voided,
+            });
+        }
+        serde_json::from_value(v).expect("a report")
+    }
+
+    /// (core#1168, rig run 24103407) The operator overrode the fix floor (base-red tests); the verify
+    /// floor reused exactly those failing checks on the same tree and base. The override is CARRIED:
+    /// the verify fold does not deny on the floor, the gate's receipt and the run's contract carry it
+    /// labelled "override carried from fix (unit 3), same tree", and the deliver phase can stand on it.
+    /// Anything different (a fresh failure, another tree or base, a voided reuse) asks again.
+    #[test]
+    fn a_verify_floor_on_the_overridden_fix_result_carries_the_override() {
+        let run_id = format!("floor-carry-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_floor_failed_fix(&mut store, &run_id, Some(Vec::new()));
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        units[2].repo_checks = Some(floor_report(
+            &["typecheck", "test"],
+            &["test"],
+            "T",
+            "B",
+            "creator-digest",
+            None,
+        ));
+        put_node(&mut store, units[2].to_node()).unwrap();
+        let why = "the 3 failing tests fail on the base too";
+        let (r, _) = operator_judgment(&mut store, &run_id, why);
+        r.expect("the fix floor override applies");
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        let original = session.assurance.floor_overrides[0]
+            .floor_override
+            .clone()
+            .unwrap();
+        assert_eq!(original.key.as_ref().map(|k| k.tree.as_str()), Some("T"));
+
+        let reused: &[&str] = &["typecheck", "test"];
+        let verify_report = floor_report(
+            &["typecheck", "test"],
+            &["test"],
+            "T",
+            "B",
+            "verify-digest",
+            Some((reused, None)),
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let mut verify = units[3].clone();
+        verify.repo_checks_floor = true;
+        let carry = crate::pipeline::carried_floor_override(
+            Some(&session),
+            &run_id,
+            &verify,
+            0,
+            &verify_report,
+        )
+        .expect("same tree, base and failing set: carried");
+        let f = carry.floor_override.as_ref().unwrap();
+        assert_eq!(f.label, "override carried from fix (unit 3), same tree");
+        assert_eq!(f.carried_from.as_deref(), Some(original.result_id.as_str()));
+        assert_eq!(
+            f.result_id,
+            format!("{run_id}:unit-4:attempt-0:repo_checks")
+        );
+        assert_eq!(f.ord, 4);
+        assert_eq!(
+            f.key, verify_report.key,
+            "keyed as the verify result, for deliver"
+        );
+        assert_eq!(carry.by, "coordinator-agent");
+        assert_eq!(carry.note.as_deref(), Some(why));
+
+        // Anything different asks again.
+        let fresh: &[&str] = &["typecheck"];
+        let differs = [
+            (
+                "a failing check ran fresh here",
+                floor_report(
+                    &["typecheck", "test"],
+                    &["test"],
+                    "T",
+                    "B",
+                    "v",
+                    Some((fresh, None)),
+                ),
+            ),
+            (
+                "another tree",
+                floor_report(
+                    &["typecheck", "test"],
+                    &["test"],
+                    "T2",
+                    "B",
+                    "v",
+                    Some((reused, None)),
+                ),
+            ),
+            (
+                "another base",
+                floor_report(
+                    &["typecheck", "test"],
+                    &["test"],
+                    "T",
+                    "B2",
+                    "v",
+                    Some((reused, None)),
+                ),
+            ),
+            (
+                "a voided reuse",
+                floor_report(
+                    &["typecheck", "test"],
+                    &["test"],
+                    "T",
+                    "B",
+                    "v",
+                    Some((reused, Some("a fresh check failed"))),
+                ),
+            ),
+            (
+                "nothing reused",
+                floor_report(&["typecheck", "test"], &["test"], "T", "B", "v", None),
+            ),
+            (
+                "a passing floor",
+                floor_report(
+                    &["typecheck", "test"],
+                    &[],
+                    "T",
+                    "B",
+                    "v",
+                    Some((reused, None)),
+                ),
+            ),
+        ];
+        for (what, report) in &differs {
+            assert!(
+                crate::pipeline::carried_floor_override(
+                    Some(&session),
+                    &run_id,
+                    &verify,
+                    0,
+                    report
+                )
+                .is_none(),
+                "{what}: asks again"
+            );
+        }
+        let mut other_unit = session.clone();
+        other_unit.assurance.floor_overrides[0]
+            .floor_override
+            .as_mut()
+            .unwrap()
+            .ord = 2;
+        assert!(
+            crate::pipeline::carried_floor_override(
+                Some(&other_unit),
+                &run_id,
+                &verify,
+                0,
+                &verify_report
+            )
+            .is_none(),
+            "an override of another unit's floor is not this result's"
+        );
+        // (xreview on #1170) A failing name that ALSO ran fresh here (names are not unique across
+        // directories), a failing check that timed out, and an override given at another attempt
+        // than the one whose result was reused: each asks again.
+        let mut name_clash = verify_report.clone();
+        name_clash.reused_from.as_mut().unwrap().fresh = vec!["test".into()];
+        let mut timed_out = verify_report.clone();
+        let t = timed_out
+            .checks
+            .iter_mut()
+            .find(|c| c.name == "test")
+            .unwrap();
+        t.exit_code = None;
+        t.timed_out = true;
+        for (what, report) in [
+            ("a name that also ran fresh", &name_clash),
+            ("a timeout", &timed_out),
+        ] {
+            assert!(
+                crate::pipeline::carried_floor_override(
+                    Some(&session),
+                    &run_id,
+                    &verify,
+                    0,
+                    report
+                )
+                .is_none(),
+                "{what}: asks again"
+            );
+        }
+        let mut other_attempt = session.clone();
+        other_attempt.assurance.floor_overrides[0]
+            .floor_override
+            .as_mut()
+            .unwrap()
+            .attempt = 1;
+        assert!(
+            crate::pipeline::carried_floor_override(
+                Some(&other_attempt),
+                &run_id,
+                &verify,
+                0,
+                &verify_report
+            )
+            .is_none(),
+            "an override given at another attempt is not the reused result's"
+        );
+
+        // On the run's contract (as the verify fold records it — `pipeline` tests cover the fold),
+        // the delivery shows both labels and the deliver phase can stand on the carried one.
+        let mut session = session;
+        session.assurance.floor_overrides.push(carry.clone());
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        units[3].repo_checks = Some(verify_report.clone());
+        let delivery = crate::deliver_lift::delivery_receipt(&session, &units);
+        let labels: Vec<&str> = delivery
+            .operator_judges
+            .iter()
+            .filter_map(|j| j.floor_override.as_ref())
+            .map(|o| o.label.as_str())
+            .collect();
+        assert!(
+            labels.contains(&"floor overridden by operator"),
+            "{labels:?}"
+        );
+        assert!(
+            labels.contains(&"override carried from fix (unit 3), same tree"),
+            "{labels:?}"
+        );
+        // The deliver phase may stand on it: its key is the verify floor's.
+        assert!(crate::deliver_lift::overridden_floors(&session, &units)
+            .iter()
+            .any(|o| Some(&o.key) == verify_report.key.as_ref() && o.phase == "verify"));
+    }
+
     #[test]
     fn a_floor_override_is_recorded_on_the_receipt_the_run_and_the_delivery() {
         let run_id = format!("floor-over-ok-{}", std::process::id());

@@ -14,6 +14,17 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The verify floor stands on a fix-floor override on the same tree (core#1168).** On rig run 24103407 the
+  operator overrode the fix floor (base-red tests), and the verify floor then reused exactly those failing
+  checks on the unchanged tree and base, yet opened a second `floor_failed` escalation for the same result.
+  Now a verify floor whose failing checks were ALL reused from a creator floor the operator overrode (same
+  unit, same tree, same base; the reuse not set aside) carries that override instead of asking again. It
+  is labelled "override carried from fix (unit N), same tree" on the gate's receipt (an operator judgment
+  whose `floorOverride.carriedFrom` names the original result), on the run's contract and on the delivery,
+  and it is keyed as the verify result, so the deliver phase stands on it as on any verify override. A
+  failing check that ran fresh at verify, another tree or base, or a voided reuse still escalates.
+  `FloorOverride` gains `carriedFrom` (additive, absent on an override given at its own gate).
+
 - **The deliver refusal gate says why a changed tree needs a new override (core#1114).** When deliver's own
   re-verify fails on a tree the lift changed, and the run recorded a floor override on a different tree,
   the prompt now says, in one sentence before the options, that the tree changed since the floor was
