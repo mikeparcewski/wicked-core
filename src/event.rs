@@ -1491,6 +1491,8 @@ fn check_run_json(c: &crate::repo_checks::CheckRun) -> serde_json::Value {
         "boundS": c.bound_s,
         "boundNote": c.bound_note,
         "failureIds": c.failure_ids,
+        // core#1172 (additive): what the check's own retry cleared — flaky, passed on retry.
+        "flakyIds": c.flaky_ids,
         "classification": c.classification,
         "preExisting": c.pre_existing,
         "regressions": c.regressions,
