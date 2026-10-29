@@ -14,6 +14,12 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Power mode: time against the estimate is the orchestrator's own (core#1174 follow-up).** The struggle signal
+  measured wall time since the build started, so a long hand-off floor read as the orchestrator struggling: rig run
+  bc2366e1 paused at its pre-hand-off checkpoint on "80 min against an estimate of 20 min" after a 10-minute build and
+  a 70-minute floor. It now sums the orchestrator's turns (`power::orchestrator_minutes`); floors, reviewers and
+  waits on a person are not counted.
+
 - **Power mode (program DES-POWER-MODE).** `LaunchSpec.power` (core-ts `LaunchOptions.power`, static
   `Core.supportsPowerMode`) on a plan or preset launch with a repo:
   - **Intake.** The PA's scope step is also the run's QE plan: it runs garden's qe-risk-assessor and
