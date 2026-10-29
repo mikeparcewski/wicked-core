@@ -27,6 +27,16 @@ Two release tracks share this file, newest entry first regardless of track:
   only the run's own tree carries. A generator that fails strands with its command, exit and output tail on
   the card. The floor's config parse validates `generated` strictly (repo-relative paths, a real command).
 
+- **A failure the check's own retry cleared is flaky, not the change's (core#1172).** On rig run 62c4f0ff the
+  fix floor's `test_targeted` failed; crew's `scripts/test-related.mjs` re-ran the deadline-failed files
+  serially and only a base-shared test failed again, yet the gate said 4 tests failed "only with this change",
+  all of which had passed on that retry. A check's output that carries a retry block (a
+  `WICKED-RETRY … re-running …` line, in each stream it writes) now has its `failureIds` read from the final
+  pass only: a stream that names a failure after its last such line counts only what follows it. Ids only the first pass named are
+  `flakyIds` (new, additive on the `repoChecksEvaluated` wire), named on the gate as "flaky (passed on retry),
+  not counted as this change's" and kept out of the HEAD-ONLY list. A stream without the line, or a final
+  pass that names nothing, is read whole as before. The verdict is unchanged: no outcome reads the ids.
+
 - **The verify floor stands on a fix-floor override on the same tree (core#1168).** On rig run 24103407 the
   operator overrode the fix floor (base-red tests), and the verify floor then reused exactly those failing
   checks on the unchanged tree and base, yet opened a second `floor_failed` escalation for the same result.

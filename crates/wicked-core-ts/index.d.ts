@@ -1409,8 +1409,11 @@ export interface RepoCheckRunJson {
   stderrTail: string
   /** The runner-native names the head's excluded run deselected. */
   preExisting: string[]
-  /** Head failure ids — an annotation; never what decided. */
+  /** Head failure ids — an annotation; never what decided. With a retry block (`WICKED-RETRY`) the
+   *  final pass's only (core#1172). */
   failureIds: string[]
+  /** Failure ids the check's own retry cleared — flaky (passed on retry), not the change's (core#1172). */
+  flakyIds: string[]
   regressions: string[]
   /** DEPRECATED: always `[]`. */
   envCannotRun: string[]

@@ -523,6 +523,12 @@ pub struct CheckRun {
     /// reads them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failure_ids: Vec<String>,
+    /// (core#1172) Failure ids the check's OWN retry cleared: the output carried a retry block
+    /// ([`RETRY_BLOCK_MARKER`]) and these failed only before it, so they are flaky (passed on
+    /// retry), never in [`Self::failure_ids`] nor the change-only list. An annotation like
+    /// `failure_ids`: no outcome reads them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flaky_ids: Vec<String>,
     /// The compatible token of [`Self::decision`] for readers of the older field: `regression`
     /// (`new_failure` against a base, `flaky_twice`), `pre_existing_in_sandbox` (`pass_excluded`),
     /// `flaky_under_load` (passed on its identical retry), [`BASE_RED_UNSEPARATED`]; `None` when it
@@ -1245,6 +1251,9 @@ pub struct FailureSplit {
     pub all_base_red: bool,
     /// The base commit compared against, when one ran.
     pub base: Option<String>,
+    /// (core#1172) `<check>: <test>` for failures the check's own retry cleared (flaky, passed on
+    /// retry): never head-only, never shared.
+    pub flaky: Vec<String>,
 }
 
 /// The most test names a floor sentence lists before `(+N more)`.
@@ -1304,6 +1313,12 @@ impl FailureSplit {
             parts.push(format!(
                 "failing with no base to compare: {}",
                 Self::names(&self.unknown)
+            ));
+        }
+        if !self.flaky.is_empty() {
+            parts.push(format!(
+                "flaky (passed on retry), not counted as this change's: {}",
+                Self::names(&self.flaky)
             ));
         }
         parts.join("; ")
@@ -1661,6 +1676,14 @@ impl RepoChecksReport {
                 for id in &run.failure_ids {
                     if !head.contains(&id.as_str()) {
                         head.push(id.as_str());
+                    }
+                }
+            }
+            for run in std::iter::once(c).chain(c.reruns.iter()) {
+                for id in &run.flaky_ids {
+                    let named = format!("{}: {id}", c.name);
+                    if !head.contains(&id.as_str()) && !split.flaky.contains(&named) {
+                        split.flaky.push(named);
                     }
                 }
             }
@@ -8589,6 +8612,57 @@ pub(crate) fn failure_id_of_line(line: &str, eslint_file: &mut Option<String>) -
     None
 }
 
+/// (core#1172) The line a check's own retry prints, in each stream it writes, as it starts
+/// re-running its first pass's failures (crew's `scripts/test-related.mjs`, crew#649):
+/// `WICKED-RETRY <why> — re-running …`. What a stream prints after its LAST such line is the final
+/// pass.
+pub(crate) const RETRY_BLOCK_MARKER: &str = "WICKED-RETRY";
+
+/// Does `line` announce a retry's re-run ([`RETRY_BLOCK_MARKER`])? Its other lines (`none — …`,
+/// `the re-run passed`, `the re-run FAILED too`) start nothing.
+fn starts_retry_block(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix(RETRY_BLOCK_MARKER)
+        .is_some_and(|rest| rest.starts_with(' ') && rest.contains(" re-running "))
+}
+
+/// (core#1172) The failure ids a failed check's output names ([`failure_id_of_line`], both streams,
+/// first sight order, at most [`MAX_FAILURE_IDS`]) and the ids its own retry cleared. With no
+/// retry block every id is a failure, as before. With one, a stream that carries the marker counts
+/// only what it printed after its last one, and a stream without it counts everything (it cannot
+/// be split). The ids printed only before the marker are flaky (passed on retry). When the final
+/// pass names nothing, nothing can be told apart and every id stays a failure.
+pub(crate) fn split_retry_ids(stdout: &str, stderr: &str) -> (Vec<String>, Vec<String>) {
+    fn push(into: &mut Vec<String>, id: String) {
+        if into.len() < MAX_FAILURE_IDS && !into.contains(&id) {
+            into.push(id);
+        }
+    }
+    let (mut first, mut last, mut all) = (Vec::new(), Vec::new(), Vec::new());
+    let mut retried = false;
+    for stream in [stdout, stderr] {
+        let lines: Vec<&str> = stream.lines().collect();
+        let start = lines.iter().rposition(|l| starts_retry_block(l));
+        retried |= start.is_some();
+        let mut eslint_file = None;
+        for (i, line) in lines.iter().enumerate() {
+            let Some(id) = failure_id_of_line(line, &mut eslint_file) else {
+                continue;
+            };
+            push(&mut all, id.clone());
+            match start {
+                Some(s) if i < s => push(&mut first, id),
+                _ => push(&mut last, id),
+            }
+        }
+    }
+    if !retried || last.is_empty() {
+        return (all, Vec::new());
+    }
+    let flaky = first.into_iter().filter(|id| !last.contains(id)).collect();
+    (last, flaky)
+}
+
 /// Run one check in `worktree` under its timeout, inside `sandbox`'s write boundary with the
 /// isolated `scratch` homes (`tree` picks the cargo target leaf). Both streams go to the run's log
 /// store ([`crate::floor_log`]) whole, up to the per-stream cap; the run carries their refs
@@ -8663,6 +8737,7 @@ pub(crate) fn run_one_with(
         bound_s: 0,
         bound_note: None,
         failure_ids: Vec::new(),
+        flaky_ids: Vec::new(),
         classification: None,
         pre_existing: Vec::new(),
         regressions: Vec::new(),
@@ -8946,17 +9021,10 @@ pub(crate) fn run_one_with(
         }
     }
     // ANNOTATION only (DES-FLOOR-V2): the ids a runner printed, both streams, first sight order.
-    // They name failures for the reader; no outcome reads them.
-    let mut eslint_file = None;
-    for line in stdout.lines().chain(stderr.lines()).filter(|_| failed) {
-        if result.failure_ids.len() >= MAX_FAILURE_IDS {
-            break;
-        }
-        if let Some(id) = failure_id_of_line(line, &mut eslint_file) {
-            if !result.failure_ids.contains(&id) {
-                result.failure_ids.push(id);
-            }
-        }
+    // They name failures for the reader; no outcome reads them. (core#1172) When the check retried
+    // on its own, the final pass names the failures, and what only the first pass named is flaky.
+    if failed {
+        (result.failure_ids, result.flaky_ids) = split_retry_ids(&stdout, &stderr);
     }
     result.duration_ms = started.elapsed().as_millis() as u64;
     result
@@ -9280,6 +9348,7 @@ pub(crate) mod tests {
                 bound_s: 0,
                 bound_note: None,
                 failure_ids: Vec::new(),
+                flaky_ids: Vec::new(),
                 classification: None,
                 pre_existing: Vec::new(),
                 regressions: Vec::new(),
@@ -9657,6 +9726,109 @@ pub(crate) mod tests {
             c.stderr_tail
         );
         assert!(c.stdout_tail.contains("NPM BOOM"), "{}", c.stdout_tail);
+    }
+
+    /// The J4 shape (rig run 62c4f0ff, crew's `scripts/test-related.mjs`): the first pass fails
+    /// two files, the check's own retry re-runs them serially and only the shared one fails again.
+    /// The marker line goes to both streams (vitest prints its failures on stderr).
+    const RETRY_SHAPE_SH: &str = "\
+echo ' RUN  v3.2.4'
+echo ' FAIL  tests/a.test.ts > first pass only' >&2
+echo ' FAIL  tests/s.test.ts > shared' >&2
+M='WICKED-RETRY a worker died — re-running the 2 named file(s) ONCE, serially, before recording any failure: tests/a.test.ts, tests/s.test.ts'
+echo \"$M\"
+echo \"$M\" >&2
+echo ' FAIL  tests/s.test.ts > shared' >&2
+echo 'WICKED-RETRY the re-run FAILED too — a reproducing failure is this change'\\''s, recorded as exit 1.'
+exit 1
+";
+
+    /// (core#1172) A check whose own retry cleared some first-pass failures: those are flaky
+    /// (passed on retry), kept out of `failure_ids` (so out of the change-only list), and the
+    /// check still fails exactly as before — its exit decides, not the ids.
+    #[cfg(unix)]
+    #[test]
+    fn a_failure_the_checks_own_retry_cleared_is_flaky_not_the_changes() {
+        let wt = scratch("retry-cleared");
+        std::fs::write(wt.join("retry.sh"), RETRY_SHAPE_SH).unwrap();
+        let scratch = CheckScratch::prepare(&wt).unwrap();
+        let check = RepoCheck {
+            name: "test_targeted".into(),
+            argv: s(&["sh", "retry.sh"]),
+            source: "fixture".into(),
+            timeout_s: None,
+            dir: String::new(),
+        };
+        let no_wrapper = WorkerSandbox {
+            wrapper: Vec::new(),
+            level: crate::validator::SandboxLevel::BestEffort,
+            downgrade_reason: None,
+        };
+        let r = run_one(&wt, &check, &no_wrapper, &scratch, Tree::Head);
+        assert_eq!(r.exit_code, Some(1), "{r:?}");
+        assert!(!r.passed(), "the check's verdict is its exit: {r:?}");
+        assert_eq!(
+            r.failure_ids,
+            s(&["FAIL tests/s.test.ts > shared"]),
+            "{r:?}"
+        );
+        assert_eq!(
+            r.flaky_ids,
+            s(&["FAIL tests/a.test.ts > first pass only"]),
+            "{r:?}"
+        );
+    }
+
+    /// (core#1172) The split itself: no retry block keeps every id; a stream that carries no
+    /// marker cannot be split (old scripts printed it on stdout only, failures on stderr); a final
+    /// pass that names nothing tells nothing apart; the LAST marker starts the final pass; the
+    /// marker's other lines start nothing.
+    #[test]
+    fn the_retry_split_reads_each_stream_after_its_last_re_run_marker() {
+        let start = "WICKED-RETRY deadline — re-running the 1 named file(s) ONCE: tests/a.test.ts";
+        let a = " FAIL  tests/a.test.ts > a";
+        let b = " FAIL  tests/b.test.ts > b";
+        let ids = |v: &[&str]| s(v);
+        // No block.
+        assert_eq!(
+            split_retry_ids("", &format!("{a}\n{b}\n")),
+            (
+                ids(&["FAIL tests/a.test.ts > a", "FAIL tests/b.test.ts > b"]),
+                Vec::new()
+            )
+        );
+        // A marker on stdout only, failures on stderr: nothing split.
+        assert_eq!(
+            split_retry_ids(&format!("{start}\n"), &format!("{a}\n{b}\n")),
+            (
+                ids(&["FAIL tests/a.test.ts > a", "FAIL tests/b.test.ts > b"]),
+                Vec::new()
+            )
+        );
+        // Both streams marked: b reproduced, a cleared.
+        assert_eq!(
+            split_retry_ids(&format!("{start}\n"), &format!("{a}\n{b}\n{start}\n{b}\n")),
+            (
+                ids(&["FAIL tests/b.test.ts > b"]),
+                ids(&["FAIL tests/a.test.ts > a"])
+            )
+        );
+        // The final pass named nothing: every id stays a failure.
+        assert_eq!(
+            split_retry_ids("", &format!("{a}\n{start}\n")),
+            (ids(&["FAIL tests/a.test.ts > a"]), Vec::new())
+        );
+        // A "none —" line or the verdict line starts no block.
+        for other in [
+            "WICKED-RETRY none — the failure carries no deadline marker",
+            "WICKED-RETRY the re-run FAILED too — recorded as exit 1.",
+        ] {
+            assert_eq!(
+                split_retry_ids("", &format!("{a}\n{other}\n{b}\n")).1,
+                Vec::<String>::new(),
+                "{other}"
+            );
+        }
     }
 
     /// Codex review on #414: a check is repo-controlled code and NEVER runs without an OS write
@@ -12369,6 +12541,7 @@ pub(crate) mod tests {
             bound_s: 1,
             bound_note: None,
             failure_ids: Vec::new(),
+            flaky_ids: Vec::new(),
             classification: None,
             pre_existing: Vec::new(),
             regressions: Vec::new(),
@@ -12606,6 +12779,7 @@ pub(crate) mod tests {
             bound_s: 1200,
             bound_note: None,
             failure_ids: ids.iter().map(|x| x.to_string()).collect(),
+            flaky_ids: Vec::new(),
             classification: None,
             pre_existing: Vec::new(),
             regressions: Vec::new(),
@@ -12646,6 +12820,7 @@ pub(crate) mod tests {
         let denial = |head_band: u32, base: BaseRun| {
             let mut head = CheckRun {
                 failure_ids: vec!["FAIL tests/chord.test.ts > scans".to_string()],
+                flaky_ids: Vec::new(),
                 ..at(head_band, "1200s × 3.00 (1-min load 100.9 / 14 cpus)")
             };
             head.base = Some(Box::new(base));
@@ -13279,6 +13454,33 @@ mod failure_split_tests {
 
     /// (xreview) An excluded run named a head-only failure and the retry after it named nothing:
     /// the head-only failure is still named, and the split is not "all base red".
+    /// (core#1172) The gate's split on the J4 shape: the check's final pass failed only a test the
+    /// base fails too, and four first-pass failures cleared on its own retry. They are named as
+    /// flaky (passed on retry), never as this change's, and the check still denies as before.
+    #[test]
+    fn failures_the_checks_retry_cleared_are_named_flaky_not_head_only() {
+        let shared = "FAIL tests/system-route.test.ts > gateway";
+        let mut r = red_report(&[shared], Some(&[shared]));
+        r.checks[0].flaky_ids = vec![
+            "FAIL tests/deliver-e2e.test.ts > delivers".to_string(),
+            "FAIL tests/run-diff-790.test.ts > 500".to_string(),
+        ];
+        let denies = r.checks[0].denies();
+        let s = r.failure_split().unwrap();
+        assert!(s.head_only.is_empty(), "{s:?}");
+        assert!(s.all_base_red, "{s:?}");
+        assert_eq!(s.flaky.len(), 2, "{s:?}");
+        let why = r.denial_reason();
+        assert!(
+            why.contains("flaky (passed on retry), not counted as this change's")
+                && why.contains("`test: FAIL tests/deliver-e2e.test.ts > delivers`"),
+            "{why}"
+        );
+        assert!(!why.contains("HEAD-ONLY"), "{why}");
+        assert_eq!(r.checks[0].denies(), denies, "the verdict is untouched");
+        assert!(!r.passed);
+    }
+
     #[test]
     fn an_unnamed_retry_never_erases_a_head_only_failure_an_earlier_run_named() {
         let mut r = red_report(&["test b::shared"], Some(&["test b::shared"]));
