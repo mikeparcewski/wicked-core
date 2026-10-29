@@ -2736,7 +2736,10 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
         // (power-speed) At the creator stage too: the verify floor of the same tree then REUSES
         // that full run instead of running the suite a second time after the targeted one
         // (rig run b6f7968b, highest: a 33 min targeted run at hand-off, then the full suite).
-        let full_here = power_full || (ctx.stage == FloorStage::Verify && cfg.full);
+        // Only when there IS a full test command: a repo whose only test is its targeted one keeps
+        // it at every stage, rather than a floor that runs no test at all (xreview on #1184).
+        let has_full = test.is_some() || cargo.is_some();
+        let full_here = has_full && (power_full || (ctx.stage == FloorStage::Verify && cfg.full));
         let anchored = argv
             .iter()
             .any(|a| a.contains("{files}") || a.contains("{base}"));
@@ -5456,10 +5459,14 @@ fn apply_rerun(
             Vec::new(),
         )),
         FloorRerunMode::Targeted => {
+            // The operator asked for the TARGETED set: the creator-stage selection without a power
+            // run's full-suite policy, which would hand back the full set and waive every test
+            // (xreview on #1184).
             let creator = detect_with(
                 worktree,
                 &FloorContext {
                     stage: FloorStage::Creator,
+                    run_id: None,
                     ..ctx.clone()
                 },
             )?;
@@ -11947,6 +11954,18 @@ exit 1
             creator[1].argv, verify[1].argv,
             "the same command, so the verify floor can reuse the creator's run"
         );
+        // (xreview on #1184) A repo whose ONLY test is its targeted one keeps it at both floors.
+        std::fs::write(
+            wt.join("package.json"),
+            r#"{"scripts":{"typecheck":"tsc --noEmit"}}"#,
+        )
+        .unwrap();
+        crate::power::set_full_suite(run, true);
+        let creator = detect_with(&wt, &ctx).unwrap();
+        let verify = detect_with(&wt, &verify_ctx).unwrap();
+        crate::power::set_full_suite(run, false);
+        assert_eq!(names(&creator), vec!["typecheck", "test_targeted"]);
+        assert_eq!(names(&verify), vec!["typecheck", "test_targeted"]);
         let _ = std::fs::remove_dir_all(&wt);
     }
 
@@ -12895,10 +12914,27 @@ exit 1
         .unwrap();
         let detected = detect_with(&wt, &ctx).unwrap();
         assert_eq!(names(&detected), vec!["lint", "test"], "verify, full: true");
-        let (run, waived) =
-            apply_rerun(&wt, &ctx, &rerun(FloorRerunMode::Targeted, &[]), detected).unwrap();
+        let (run, waived) = apply_rerun(
+            &wt,
+            &ctx,
+            &rerun(FloorRerunMode::Targeted, &[]),
+            detected.clone(),
+        )
+        .unwrap();
         assert_eq!(names(&run), vec!["lint", "test_targeted"]);
         assert_eq!(waived, vec!["test"], "the replaced full set is disclosed");
+        // (xreview on #1184) A power run at high rigor: the operator's targeted rerun still runs
+        // the targeted command, never the full set waived down to nothing.
+        let power = FloorContext {
+            run_id: Some("power-rerun-targeted".into()),
+            ..ctx.clone()
+        };
+        crate::power::set_full_suite("power-rerun-targeted", true);
+        let got = apply_rerun(&wt, &power, &rerun(FloorRerunMode::Targeted, &[]), detected);
+        crate::power::set_full_suite("power-rerun-targeted", false);
+        let (run, waived) = got.unwrap();
+        assert_eq!(names(&run), vec!["lint", "test_targeted"]);
+        assert_eq!(waived, vec!["test"]);
         let _ = std::fs::remove_dir_all(&wt);
     }
 
