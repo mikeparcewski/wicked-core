@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The floor-dependent engine tests skip inside the repo-checks floor, so core's base is green under its own floor.**
+  Five tests need the engine to arm its own floor sandbox (the power hand-off send-back pair, the two deliver-lift
+  override tests and the mutating-check guard test). Inside the floor, macOS refuses a nested `sandbox_apply`, so they
+  failed on every core floor, head and base alike. Each core floor then paid a full identical retry and a full base
+  run, and escalated `base_red_unseparated`: rig run bc2366e1 spent 68 min of its 2 h on that (head 20, retry 25,
+  base 19.5). They now skip with a stated reason through `skip_when_nested` / `nested_sandbox()`, as 30 other tests
+  already do. They still run in CI and on a developer machine, where nothing is nested.
+
 - The automatic creator-floor retry (core#651) no longer runs when no failing test is head-only (every failure is shared with the base or could not be separated from it), so the worker is never told to fix the base's failures; the floor escalates at once. A head-only regression keeps the retry (core#1113).
 - **Power mode: "spread into another product" means past the planned scope (core#1174 follow-up).** The
   checkpoint pause fired on any diff spanning two products, so rig run b6f7968b (crew + its api-types, the intake's

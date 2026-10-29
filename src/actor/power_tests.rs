@@ -214,6 +214,11 @@ fn a_phased_launch_carries_no_power_record_and_keeps_its_preset_steps() {
 #[cfg(not(windows))]
 #[test]
 fn a_hand_off_not_pass_goes_back_to_the_orchestrator_on_its_own() {
+    if crate::validator::skip_when_nested(
+        "a_hand_off_not_pass_goes_back_to_the_orchestrator_on_its_own",
+    ) {
+        return;
+    }
     let fix_turns = Arc::new(AtomicUsize::new(0));
     let reviews = Arc::new(AtomicUsize::new(0));
     let (turns, revs) = (fix_turns.clone(), reviews.clone());
@@ -311,6 +316,11 @@ fn power_engine(name: &str, w: Arc<Worker>, run: &str) -> Engine {
 #[cfg(not(windows))]
 #[test]
 fn a_hand_off_that_keeps_failing_goes_back_three_rounds_then_waits_for_the_operator() {
+    if crate::validator::skip_when_nested(
+        "a_hand_off_that_keeps_failing_goes_back_three_rounds_then_waits_for_the_operator",
+    ) {
+        return;
+    }
     let w = Worker::scripted(move |i, _| {
         let phase = i.unit.id.rsplit(':').next().unwrap_or("").to_string();
         match phase.as_str() {
