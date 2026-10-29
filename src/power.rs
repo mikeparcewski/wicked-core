@@ -496,16 +496,13 @@ pub fn orchestrator_minutes(state: &PowerState, now: i64) -> u32 {
     u32::try_from((state.turn_ms + running) / 60_000).unwrap_or(u32::MAX)
 }
 
-/// Whether the change spread past the products it spanned when first measured: a growing
-/// spread, never the intake's own multi-product scope. The first reading becomes the baseline.
-pub fn spread_grew(state: &mut PowerState, spread: u32) -> bool {
-    match state.baseline_spread {
-        Some(base) => spread > base,
-        None => {
-            state.baseline_spread = Some(spread);
-            false
-        }
-    }
+/// Whether the change spread past the products it was planned (or last accepted) to span: at
+/// least two products and more than the baseline — the intake's own product count, or one when
+/// intake gave none (a zero reading counts as one). Answering a spread pause moves the baseline to
+/// the spread the operator accepted, so further growth pauses again.
+pub fn spread_grew(state: &PowerState, spread: u32) -> bool {
+    let base = state.baseline_spread.unwrap_or(1).max(1);
+    spread >= 2 && spread > base
 }
 
 /// Record a turn start on the state: an earlier turn still open was interrupted (a restart) and is
@@ -2273,13 +2270,17 @@ mod tests {
         let mut st = PowerState::launched(true, 0);
         // An intake scope over two products (crew and its api-types) is the baseline, not growth.
         st.baseline_spread = Some(2);
-        assert!(!spread_grew(&mut st, 2));
-        assert!(spread_grew(&mut st, 3), "a third product is growth");
-        // With no intake reading, the first checkpoint's spread is the baseline.
-        let mut fresh = PowerState::launched(true, 0);
-        assert!(!spread_grew(&mut fresh, 2));
-        assert_eq!(fresh.baseline_spread, Some(2));
-        assert!(!spread_grew(&mut fresh, 1));
+        assert!(!spread_grew(&st, 2));
+        assert!(spread_grew(&st, 3), "a third product is growth");
+        // No intake reading: a single product never pauses; a second one does.
+        let fresh = PowerState::launched(true, 0);
+        assert!(!spread_grew(&fresh, 1));
+        assert!(spread_grew(&fresh, 2));
+        // A zero reading is no baseline below one product.
+        let mut zero = PowerState::launched(true, 0);
+        zero.baseline_spread = Some(0);
+        assert!(!spread_grew(&zero, 1));
+        assert!(spread_grew(&zero, 2));
     }
 
     #[test]
