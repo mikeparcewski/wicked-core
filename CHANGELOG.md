@@ -14,6 +14,8 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- The automatic creator-floor retry (core#651) no longer runs when no failing test is head-only (every failure is shared with the base or could not be separated from it), so the worker is never told to fix the base's failures; the floor escalates at once. A head-only regression keeps the retry (core#1113).
+
 - **Power mode: time against the estimate is the orchestrator's own (core#1174 follow-up).** The struggle signal
   measured wall time since the build started, so a long hand-off floor read as the orchestrator struggling: rig run
   bc2366e1 paused at its pre-hand-off checkpoint on "80 min against an estimate of 20 min" after a 10-minute build and
