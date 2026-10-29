@@ -1341,6 +1341,11 @@ pub struct FloorInput<'a> {
     /// creator owes a `test` step after its last code-work creator whatever its band, so a QE
     /// acceptance unit is reachable after the final code change.
     pub requires_qe: bool,
+    /// (program DES-POWER-MODE) Band-floor types the run satisfies without a phased step (power
+    /// mode: `test_plan` is the intake QE plan, `design` the distinct-seat review of the
+    /// orchestrator's approach at hand-off). Removed from the BAND floor only: a held rule that
+    /// requires one still adds it. Empty on every phased run.
+    pub power_absorbs: &'a [String],
 }
 
 /// (core#934) The floor reason of the evaluator step a run's assurance contract adds.
@@ -1557,7 +1562,8 @@ pub fn floor_fill(
     // §8.5: a plan with no creator step has an empty floor and is never high risk.
     let creator = plan.has_creator_in(catalog);
     let high_risk = creator && row.high_risk;
-    let band_floor = floor_types(catalog, plan, &row.phases, input.deliver.is_some());
+    let mut band_floor = floor_types(catalog, plan, &row.phases, input.deliver.is_some());
+    band_floor.retain(|t| !input.power_absorbs.iter().any(|a| a == t));
     // (WT-C3) Every obligation token is judged (an unknown one refuses the plan, naming its
     // rule); its types join the floor of a plan that changes something.
     let mut policy_floor: Vec<(String, String)> = Vec::new();
@@ -3195,6 +3201,7 @@ mod tests {
                     ran: &[],
                     requires_evaluator: false,
                     requires_qe: false,
+                    power_absorbs: &[],
                 },
             )
         }
@@ -3251,6 +3258,7 @@ mod tests {
                     ran: &[],
                     requires_evaluator,
                     requires_qe: false,
+                    power_absorbs: &[],
                 },
             )
         }
@@ -3365,6 +3373,7 @@ mod tests {
                     ran: &[],
                     requires_evaluator: true,
                     requires_qe: false,
+                    power_absorbs: &[],
                 },
             )
             .expect("the band's review still reviews the plan");
@@ -3417,6 +3426,7 @@ mod tests {
                     ran,
                     requires_evaluator: true,
                     requires_qe,
+                    power_absorbs: &[],
                 },
             )
         }
@@ -4052,6 +4062,7 @@ mod tests {
                     ran: &[],
                     requires_evaluator: false,
                     requires_qe: false,
+                    power_absorbs: &[],
                 },
             )
             .expect_err("refused");
@@ -4077,6 +4088,7 @@ mod tests {
                     ran: &[],
                     requires_evaluator: false,
                     requires_qe: false,
+                    power_absorbs: &[],
                 },
             )
             .expect("a code plan keeps its security_review");
@@ -4283,6 +4295,7 @@ mod tests {
                     ran: &[],
                     requires_evaluator: false,
                     requires_qe: false,
+                    power_absorbs: &[],
                 },
             )
             .unwrap();
@@ -4677,6 +4690,7 @@ mod tests {
                     ran,
                     requires_evaluator: false,
                     requires_qe: false,
+                    power_absorbs: &[],
                 },
             )
         }

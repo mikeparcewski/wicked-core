@@ -139,6 +139,7 @@ fn spec(
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        power: false,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     }

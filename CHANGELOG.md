@@ -14,6 +14,44 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Power mode (program DES-POWER-MODE).** `LaunchSpec.power` (core-ts `LaunchOptions.power`, static
+  `Core.supportsPowerMode`) on a plan or preset launch with a repo:
+  - **Intake.** The PA's scope step is also the run's QE plan: it runs garden's qe-risk-assessor and
+    qe-test-strategist and answers one `RIGOR {…}` line after `SCOPE`. The band is the engine's intent score;
+    the QE plan can only raise it (`atLeast`), keep `design` / `test_plan` phased, estimate, or require phased
+    (`phased`, which turns the switch off and unavailable). The rigor record (`AgentSession.power.plan`:
+    rigor, score, band, hand-off requirements, mandatory phases, floors) is emitted as `powerIntakePlanned`.
+  - **Plan shape.** The launch drops `understand` / `test_plan` / `design` steps; the floor fill no longer adds the
+    band's `test_plan` (the intake plan) or `design` (the distinct-seat hand-off review also judges the approach;
+    the review is told so). A held rule that requires either still adds it.
+  - **The orchestrator build.** The `build` unit runs as many turns of ONE seat session (the headless carrier
+    resumes it) until the orchestrator writes `HANDOFF:`; each turn ends at a commit with `CHECKPOINT:`. The
+    per-turn ceiling is unchanged. A checkpoint at every turn end, every new commit and every 15 min
+    (`WICKED_POWER_TIMER_SECS`) re-scores the whole diff from the run's base (blast radius, sensitive areas,
+    size, spread, new dependencies, reverts, time against the estimate, paths outside the intake scope),
+    writes a rigor-history row (`rigorRescored`, also when nothing changed) and holds a raise for the next step
+    boundary through the team re-score, so the plan grows. Lowering happens only at the pre-hand-off checkpoint,
+    one band, from evidence, within the hand-off (the test set, never a reviewer), never below a floor. A
+    two-band jump, a new destructive change, a new dependency in a sensitive area or struggle past its line
+    pauses the session at its turn end until `Core.answer_power_pause` (continue at high rigor, continue,
+    switch to phased, stop). Turns emit `powerTurnStarted` / `powerTurnCompleted`; checkpoints
+    `powerCheckpointReached`.
+  - **Hand-off.** The build's floor, the distinct-seat review, security at highest and QE acceptance run as
+    planned with no human gate; a NOT-PASS (or a red floor that is not a red base) is sent back to the same
+    orchestrator session as a `request_changes` answered by `engine:power-handoff`, up to 3 rounds, then the
+    gate waits for the operator. Steps emit `powerHandoffStepped`. Deliver stays a human gate.
+  - **Switch and raise.** `Core.set_power_mode` (On -> Off always; Off -> On when available) and
+    `Core.raise_rigor` (never lower; the raise is a floor), each a history row; `powerToggled`.
+  - **Outcome.** When the run ends, `power.outcome` records planned vs actual (rigor, score, estimate, minutes,
+    turns, checkpoints, hand-off rounds, gates a person answered).
+- **Operator messages reach a headless run.** Since C5 an inject to a run with no PTY returned OK and the engine
+  dropped a broadcast with a log line (crew's working-document steers included). The engine now queues it: the
+  next power turn, or the next unit its target seat runs, carries it as an operator context block
+  (`workerMessageInjected` when delivered). An inject to an ended run is refused.
+- **The `wicked.run.*` bus mirror (DES-PLUGIN-EVENTS §3.1).** With `WICKED_RUN_MIRROR=1` and a bus, the engine
+  re-publishes a run's lifecycle and power events as 4-segment `wicked.run.<noun>.<verb>` rows (domain
+  `wicked-core`, payload = the frame plus `runId`, the run log's `seq` and `at`, bulky output dropped,
+  idempotency key `run:<run>:<seq>`).
 - **A conflict in a declared generated file beside the changelog no longer strands delivery (core#1173).**
   On rig run 62c4f0ff, main moved mid-run (crew#1197) and the deliver lift conflicted in `CHANGELOG.md`
   and in crew's generated `tests/generated/api-sample.generated.test.ts`, so the run stranded. A repository

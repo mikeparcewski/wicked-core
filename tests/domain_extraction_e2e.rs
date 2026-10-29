@@ -460,6 +460,7 @@ fn launch(core: &Core, run_id: &str, repo_ref: &str) {
         primary: None,
         // (core#850) One seat: the review rides the creator's seat by the explicit opt-in.
         reduced_assurance: true,
+        power: false,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })

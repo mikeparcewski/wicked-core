@@ -155,6 +155,16 @@ pub struct TeamPlanState {
     /// A state persisted before this reads `false`, preserving its prior planning behavior.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub requires_qe: bool,
+    /// (program DES-POWER-MODE) The run was launched in power mode: its scope step is also the
+    /// intake QE plan ([`crate::power::intake_instructions`]). Stamped at launch; a later toggle
+    /// does not change how the run was planned.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub power: bool,
+    /// (program DES-POWER-MODE) The band-floor types power mode satisfies without a phased step
+    /// on this run ([`crate::power::ABSORBED`] less what a rule or the QE plan keeps): every plan
+    /// this run decides fills its floor without them ([`crate::plan::FloorInput::power_absorbs`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub power_absorbs: Vec<String>,
 }
 
 /// (WT-C3, DES-walkthrough-proof §4.12) The testing rules the engine read for one proposal at
@@ -1027,6 +1037,7 @@ pub(crate) fn decide(
             ran: &[],
             requires_evaluator: prior.requires_evaluator,
             requires_qe: prior.requires_qe,
+            power_absorbs: &prior.power_absorbs,
         },
     ) {
         Ok(f) => f,

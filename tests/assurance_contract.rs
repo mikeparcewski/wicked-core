@@ -145,6 +145,7 @@ fn spec(sid: &str, workflow: &str, reduced: bool) -> LaunchSpec {
         evidence_root: None,
         primary: None,
         reduced_assurance: reduced,
+        power: false,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     }

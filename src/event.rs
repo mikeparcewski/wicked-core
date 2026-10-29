@@ -1268,6 +1268,83 @@ pub enum CoreEvent {
         /// `"all"` or the cli_key that was targeted.
         target: String,
     },
+    /// (program DES-POWER-MODE) The intake QE plan sized the run's rigor (`wicked.run.intake.planned`).
+    PowerIntakePlanned {
+        session: String,
+        /// The scope (intake) step's ord.
+        ord: u32,
+        plan: Box<crate::power::RigorPlan>,
+    },
+    /// (program DES-POWER-MODE) A power run was re-scored, raised, lowered or toggled: one
+    /// rigor-history row (`wicked.run.rigor.rescored`), also when nothing changed.
+    RigorRescored {
+        session: String,
+        change: Box<crate::power::RigorChange>,
+    },
+    /// (program DES-POWER-MODE) An orchestrator checkpoint ran (`wicked.run.checkpoint.reached`).
+    PowerCheckpointReached {
+        session: String,
+        ord: u32,
+        checkpoint: u32,
+        turn: u32,
+        /// `commit` | `turn` | `timer` | `pre_handoff`.
+        trigger: String,
+        head: Option<String>,
+        /// Operator messages the next turn carries.
+        picked: u32,
+        rigor: String,
+        paused: bool,
+        /// The pause this checkpoint opened, if any.
+        pause: Option<Box<crate::power::PowerPause>>,
+        at: i64,
+    },
+    /// (program DES-POWER-MODE) An orchestrator turn started (`wicked.run.turn.started`).
+    PowerTurnStarted {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        turn: u32,
+        cli: String,
+    },
+    /// (program DES-POWER-MODE) An orchestrator turn ended (`wicked.run.turn.completed`):
+    /// `checkpoint` | `handoff` | `paused` | `failed` | `cap`.
+    PowerTurnCompleted {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        turn: u32,
+        cli: String,
+        outcome: String,
+        summary: Option<String>,
+    },
+    /// (program DES-POWER-MODE) What the orchestrator did in the worktree, read off git by the
+    /// engine (`wicked.run.activity.recorded`): `edit` (a file's +/- against the run base changed
+    /// since the last look) or `commit` (a new commit: short sha, subject, +/-). Polled, not live.
+    PowerActivity {
+        session: String,
+        ord: u32,
+        turn: u32,
+        at: i64,
+        /// `edit` | `commit`.
+        kind: String,
+        path: Option<String>,
+        added: Option<u32>,
+        removed: Option<u32>,
+        sha: Option<String>,
+        subject: Option<String>,
+    },
+    /// (program DES-POWER-MODE) A hand-off step changed (`wicked.run.handoff.stepped`).
+    PowerHandoffStepped {
+        session: String,
+        round: u32,
+        max_rounds: u32,
+        step: Box<crate::power::HandoffStep>,
+    },
+    /// (program DES-POWER-MODE) The power switch flipped (`wicked.run.power.toggled`).
+    PowerToggled {
+        session: String,
+        toggle: Box<crate::power::PowerToggle>,
+    },
     /// An operator message had no live PTY to write to (ACP-backed run) and was QUEUED —
     /// it rides the next matching unit's prompt as an operator context block.
     WorkerMessageQueued {
@@ -1969,6 +2046,116 @@ impl CoreEvent {
             CoreEvent::SessionCompleted { session } => {
                 json!({ "type": "sessionCompleted", "session": session })
             }
+            CoreEvent::PowerIntakePlanned { session, ord, plan } => json!({
+                "type": "powerIntakePlanned",
+                "session": session,
+                "ord": ord,
+                "plan": serde_json::to_value(plan.as_ref()).unwrap_or(serde_json::Value::Null),
+            }),
+            CoreEvent::RigorRescored { session, change } => json!({
+                "type": "rigorRescored",
+                "session": session,
+                "change": serde_json::to_value(change.as_ref()).unwrap_or(serde_json::Value::Null),
+            }),
+            CoreEvent::PowerCheckpointReached {
+                session,
+                ord,
+                checkpoint,
+                turn,
+                trigger,
+                head,
+                picked,
+                rigor,
+                paused,
+                pause,
+                at,
+            } => json!({
+                "type": "powerCheckpointReached",
+                "session": session,
+                "ord": ord,
+                "checkpoint": checkpoint,
+                "turn": turn,
+                "trigger": trigger,
+                "head": head,
+                "picked": picked,
+                "rigor": rigor,
+                "paused": paused,
+                "pause": pause.as_ref().and_then(|p| serde_json::to_value(p.as_ref()).ok()),
+                "at": at,
+            }),
+            CoreEvent::PowerTurnStarted {
+                session,
+                ord,
+                attempt,
+                turn,
+                cli,
+            } => json!({
+                "type": "powerTurnStarted",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "turn": turn,
+                "cli": cli,
+            }),
+            CoreEvent::PowerTurnCompleted {
+                session,
+                ord,
+                attempt,
+                turn,
+                cli,
+                outcome,
+                summary,
+            } => json!({
+                "type": "powerTurnCompleted",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "turn": turn,
+                "cli": cli,
+                "outcome": outcome,
+                "summary": summary,
+            }),
+            CoreEvent::PowerActivity {
+                session,
+                ord,
+                turn,
+                at,
+                kind,
+                path,
+                added,
+                removed,
+                sha,
+                subject,
+            } => json!({
+                "type": "powerActivity",
+                "session": session,
+                "ord": ord,
+                "turn": turn,
+                "at": at,
+                "kind": kind,
+                "path": path,
+                "added": added,
+                "removed": removed,
+                "sha": sha,
+                "subject": subject,
+            }),
+            CoreEvent::PowerHandoffStepped {
+                session,
+                round,
+                max_rounds,
+                step,
+            } => json!({
+                "type": "powerHandoffStepped",
+                "session": session,
+                "round": round,
+                "maxRounds": max_rounds,
+                "step": serde_json::to_value(step.as_ref()).unwrap_or(serde_json::Value::Null),
+            }),
+            CoreEvent::PowerToggled { session, toggle } => json!({
+                "type": "powerToggled",
+                "session": session,
+                "toggle": serde_json::to_value(toggle.as_ref()).unwrap_or(serde_json::Value::Null),
+            }),
             CoreEvent::WorkerMessageQueued {
                 session,
                 message,

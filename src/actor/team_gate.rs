@@ -3075,6 +3075,24 @@ pub(super) fn apply_scope(
     }
     let root = repo_root(&*store, &session);
     let now = crate::interaction::now_millis();
+    // (program DES-POWER-MODE) INTAKE: the scope step was also the QE plan. Its RIGOR line can
+    // only raise the score the plan is decided on, and may keep `design` / `test_plan` phased.
+    let qe = prior.power.then(|| {
+        crate::power::parse_rigor_line(
+            prior
+                .scope
+                .as_ref()
+                .and_then(|h| h.answer.as_ref())
+                .map_or("", |a| a.lines.as_str()),
+        )
+    });
+    let mut prior = prior;
+    if let Some(qe) = &qe {
+        if let Some(r) = qe.at_least {
+            prior.max_score = prior.max_score.max(r.min_score());
+        }
+        prior.power_absorbs = crate::power::absorbs_after(qe, &prior.power_absorbs);
+    }
     let decided = crate::plan_gate::decide_scoped(
         run_id,
         &prior,
@@ -3105,11 +3123,80 @@ pub(super) fn apply_scope(
         }
     };
     let mut next = session.clone();
+    let intake = match (&qe, next.power.as_mut(), decided.filled.as_ref()) {
+        (Some(qe), Some(power), Some(filled)) => {
+            let st = &decided.state;
+            let reasons: Vec<String> = decided
+                .events
+                .iter()
+                .filter(|e| e.event_type() == crate::team::events::PATH_SCORED)
+                .filter_map(|e| e.to_payload().ok())
+                .filter_map(|p| p.get("reasons").and_then(|r| r.as_array()).cloned())
+                .flatten()
+                .filter_map(|r| r.as_str().map(str::to_string))
+                .collect();
+            let plan = crate::power::intake_plan(
+                qe,
+                st.max_score,
+                st.destructive,
+                &filled.band,
+                filled.high_risk,
+                &filled.steps.steps,
+                &st.obligations,
+                &st.power_absorbs,
+                st.requires_qe,
+                reasons,
+                &pa_seat(&session),
+                now,
+            );
+            if let Some(why) = &plan.phased_required {
+                // The QE plan says this change must not run in power mode: the switch goes off
+                // and stays unavailable; the run is planned phased (nothing absorbed).
+                power.on = false;
+                power.available = false;
+                power.refused_reason = Some(format!("Phased is required: {why}"));
+                power.toggles.push(crate::power::PowerToggle {
+                    at: now,
+                    on: false,
+                    by: "engine".into(),
+                    reason: Some(format!("the intake QE plan requires phased: {why}")),
+                    stay_phased: Vec::new(),
+                });
+            }
+            power.rigor = Some(plan.rigor);
+            let row = crate::power::change(
+                "intake",
+                plan.rigor,
+                plan.rigor,
+                plan.score,
+                plan.score,
+                plan.reasons.clone(),
+                None,
+                "engine",
+                now,
+            );
+            power.plan = Some(plan.clone());
+            let row = power.push_change(row);
+            Some((scope.ord, plan, row))
+        }
+        _ => None,
+    };
     next.team_plan = Some(decided.state);
     revise_units(store, subscribers, &next, def)?;
     let session = crate::domain::get_session(&*store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     publish_plan_facts(&session, decided.events);
+    if let Some((ord, plan, change)) = intake {
+        subscribers.emit(CoreEvent::PowerIntakePlanned {
+            session: run_id.to_string(),
+            ord,
+            plan: Box::new(plan),
+        });
+        subscribers.emit(CoreEvent::RigorRescored {
+            session: run_id.to_string(),
+            change: Box::new(change),
+        });
+    }
     Ok(())
 }
 

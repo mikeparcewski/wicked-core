@@ -587,6 +587,7 @@ pub(crate) fn revise(
             ran: done,
             requires_evaluator: prior.requires_evaluator,
             requires_qe: prior.requires_qe,
+            power_absorbs: &prior.power_absorbs,
         },
     ) {
         Ok(f) => f,

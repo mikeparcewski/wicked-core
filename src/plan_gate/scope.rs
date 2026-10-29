@@ -121,6 +121,18 @@ pub(crate) fn scope_step(plan: &PlanSteps, unbound: bool) -> PlanStep {
     }
 }
 
+/// [`scope_step`] for a power-mode launch: the same step, also the run's intake QE plan
+/// ([`crate::power::intake_instructions`]). A repo-less run has no intake plan (no graph).
+pub(crate) fn power_scope_step(plan: &PlanSteps, unbound: bool) -> PlanStep {
+    let mut step = scope_step(plan, unbound);
+    if !unbound {
+        if let Some(i) = step.instructions.as_mut() {
+            i.push_str(crate::power::intake_instructions());
+        }
+    }
+    step
+}
+
 /// `plan` as the launch runs it: the scope step first when the PA scopes it, else unchanged.
 pub(crate) fn with_scope_step(plan: &PlanSteps, unbound: bool) -> PlanSteps {
     if !needs_pa_scope(plan) {
@@ -153,7 +165,11 @@ pub(crate) fn scope_rev(
         );
     }
     let steps = PlanSteps {
-        steps: vec![scope_step(plan, unbound)],
+        steps: vec![if prior.power {
+            power_scope_step(plan, unbound)
+        } else {
+            scope_step(plan, unbound)
+        }],
         monitors: None,
         touch: None,
         floor_override: None,
@@ -195,7 +211,12 @@ pub(crate) fn scope_lines_of(output: &str) -> String {
     output
         .lines()
         .map(str::trim_start)
-        .filter(|l| l.starts_with(SCOPE_PREFIX) || l.starts_with(RISK_PREFIX))
+        .filter(|l| {
+            l.starts_with(SCOPE_PREFIX)
+                || l.starts_with(RISK_PREFIX)
+                // (power mode) The intake QE plan's line rides the answer to the boundary.
+                || l.starts_with(crate::power::RIGOR_PREFIX)
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

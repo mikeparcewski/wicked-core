@@ -270,6 +270,7 @@ fn spec(run: &str, clis: Vec<AgenticCli>, primary: Option<&str>) -> LaunchSpec {
         evidence_root: None,
         primary: primary.map(str::to_string),
         reduced_assurance: false,
+        power: false,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     }

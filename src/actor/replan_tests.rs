@@ -302,6 +302,7 @@ fn launch_on(e: &Engine, run: &str, hc: HumanConfirm, p: PlanSteps, seats: &[&st
             evidence_root: None,
             primary: seats.first().map(|k| k.to_string()), // (ASK-K1a) the PA is the roster's first,
             reduced_assurance: false,
+            power: false,
             deliverables: Vec::new(),
             qe_acceptance: Default::default(),
         })
@@ -1623,6 +1624,7 @@ fn t8_r3_the_preview_scores_against_the_launch_repo_graph() {
             evidence_root: None,
             primary: Some("a".into()), // (ASK-K1a) the test reads the PA as `a`,
             reduced_assurance: false,
+            power: false,
             deliverables: Vec::new(),
             qe_acceptance: Default::default(),
         })
@@ -1740,6 +1742,9 @@ fn t8_r4_the_preview_does_not_fetch_the_remote() {
 
 #[path = "scope_tests.rs"]
 mod scope_tests;
+
+#[path = "power_tests.rs"]
+mod power_tests;
 
 // ── ASK-K2b (codex review of #738, round 2): "Not now" at the first-creator gate, end to end ───
 

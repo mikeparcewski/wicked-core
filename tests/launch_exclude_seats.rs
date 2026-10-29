@@ -114,6 +114,7 @@ fn run_with(name: &str, exclude_seats: Vec<String>) -> Vec<Vec<String>> {
             evidence_root: None,
             primary: None,
             reduced_assurance: false,
+            power: false,
             deliverables: Vec::new(),
             qe_acceptance: Default::default(),
         })
@@ -185,6 +186,7 @@ fn the_straight_through_path_refuses_an_exclusion_instead_of_dropping_it() {
         evidence_root: None,
         primary: None,
         reduced_assurance: false,
+        power: false,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     });
