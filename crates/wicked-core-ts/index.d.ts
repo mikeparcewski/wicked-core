@@ -145,6 +145,12 @@ export interface LaunchOptions {
    */
   reducedAssurance?: boolean
   /**
+   * (program DES-POWER-MODE) Run in POWER MODE: an intake QE plan sizes the rigor, the `build`
+   * step runs as one multi-turn orchestrator session, and a hand-off NOT-PASS goes back to that
+   * session on its own. Only for a plan or preset launch. Omit (or `false`) for a phased run.
+   */
+  power?: boolean
+  /**
    * (X-MIG M9, core#649) The run's DECLARED DELIVERABLES on a plan or preset launch (`plan` or a
    * preset `workflow`): absolute paths inside a declared write root (or worktree-relative paths)
    * the run must write. They join the `required_deliverables` of the plan's last creator step, so
@@ -219,6 +225,12 @@ export declare class Core {
    * drop the plan and run the launch unplanned and ungated.
    */
   static supportsPlanLaunch(): boolean
+  /**
+   * (program DES-POWER-MODE) Whether this addon runs power mode: `LaunchOptions.power`,
+   * `setPowerMode`, `raiseRigor`, `answerPowerPause` and the power events. An older addon
+   * ignores `power` (napi drops an undeclared field), so a launcher keys on this first.
+   */
+  static supportsPowerMode(): boolean
   /**
    * What this process's engine knows about its connection to the bus file at `path`
    * (DES-TEAMING-002 T0 connection rule: one connection per bus file per process, opened by a bus
@@ -1033,6 +1045,21 @@ export declare class Core {
    * warning. Fires [`CoreEvent::WorkerMessageInjected`] for each successful write.
    */
   injectWorkerMessage(runId: string, message: string, target: string): Promise<unknown>
+  /**
+   * (program DES-POWER-MODE) Flip a run's power switch. Resolves to the run's power state as
+   * JSON (`PowerState`, camelCase). Rejects with `not_found:` / `conflict:` / `refused:`.
+   */
+  setPowerMode(runId: string, on: boolean, actor: string, reason?: string | undefined | null): Promise<string>
+  /**
+   * (program DES-POWER-MODE) Raise a power run's rigor to at least `atLeast` (`light` |
+   * `standard` | `high` | `highest`); never lowers. Resolves to the power state as JSON.
+   */
+  raiseRigor(runId: string, atLeast: string, actor: string, reason: string): Promise<string>
+  /**
+   * (program DES-POWER-MODE) Answer a power run's checkpoint pause: `continue_high` |
+   * `continue` | `switch_phased` | `stop`. Resolves to the power state as JSON.
+   */
+  answerPowerPause(runId: string, decision: string, note: string | undefined | null, actor: string): Promise<string>
   /**
    * Stop the current worker for `ord` in run `run_id` and re-dispatch it.
    *
