@@ -184,6 +184,7 @@ pub(super) fn on_checkpoint(
         struggle,
         plan_gaps: plan_gaps.clone(),
     };
+    let signals_spread = signals.spread;
     let floor = power.floor();
     let mut to = current.max(actual_rigor).max(floor);
     let mut reasons: Vec<String> = scored
@@ -243,12 +244,13 @@ pub(super) fn on_checkpoint(
                 .any(|f| f.by == "policy" && f.rigor == Rigor::Highest)
         });
     let turn_from = power.turn_start_rigor.unwrap_or(current).min(current);
+    let spread_grew = crate::power::spread_grew(power, signals.spread);
     let pause_reasons: Vec<(&'static str, String)> = if turn_end && power.pause.is_none() {
         crate::power::sudden_complexity(
             turn_from,
             to,
             destructive_new,
-            signals.spread >= 2,
+            spread_grew,
             report.new_dependencies > 0 && !sensitive.is_empty(),
             &struggle_reasons,
         )
@@ -294,8 +296,14 @@ pub(super) fn on_checkpoint(
         power.turn_start_rigor = Some(to);
     }
     if pause.is_some() {
-        // Answering this pause acknowledges its triggers.
-        power.acknowledged.extend(pause_keys);
+        // Answering this pause acknowledges its triggers — except spread, whose baseline moves to
+        // the spread the operator now accepts, so a further product pauses again.
+        if pause_keys.iter().any(|k| k == "spread") {
+            power.baseline_spread = Some(signals_spread);
+        }
+        power
+            .acknowledged
+            .extend(pause_keys.into_iter().filter(|k| k != "spread"));
     }
     if let Some(p) = power.plan.as_mut() {
         retarget_handoff(&mut p.handoff, to, absorbs_design);
