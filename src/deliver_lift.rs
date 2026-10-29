@@ -663,6 +663,33 @@ fn write_blob(cwd: &Path, env: &[(&str, &Path)], content: &[u8]) -> anyhow::Resu
     Ok(oid)
 }
 
+/// (core#1173) Write `content` as the blob `git add` would make of it at `path` in this worktree —
+/// the tree's text/eol/encoding attributes applied (xreview on #1175: a byte-for-byte blob of a
+/// file the checkout wrote with `eol=crlf` is not the blob the post-lift snapshot computes, and the
+/// lift would then fail after moving the branch). The same conversion the worktree guard's own
+/// `git add -A` snapshot applies to this file once it is in the worktree.
+fn write_blob_at(
+    cwd: &Path,
+    env: &[(&str, &Path)],
+    content: &[u8],
+    path: &str,
+) -> anyhow::Result<String> {
+    let file = crate::worktree_guard::scratch_index_path().with_extension("blob");
+    std::fs::write(&file, content)?;
+    let tmp = file.to_string_lossy().into_owned();
+    let oid = git_string(
+        cwd,
+        &["hash-object", "-w", &format!("--path={path}"), &tmp],
+        env,
+    );
+    let _ = std::fs::remove_file(&file);
+    let oid = oid?;
+    if oid.is_empty() {
+        anyhow::bail!("`git hash-object` printed no blob id");
+    }
+    Ok(oid)
+}
+
 /// (core#1173) The generated files the tip declares ([`crate::repo_checks::GeneratedFiles`], the
 /// `generated` key of its `.wicked/checks.json`) and the config's `timeout_s`. Read from the TIP
 /// the work is lifted onto, never from the run's tree: a run cannot declare its own way past a
@@ -806,6 +833,11 @@ fn edit_tree(
     ienv.push(("GIT_INDEX_FILE", &index));
     let built = (|| -> anyhow::Result<String> {
         git(cwd, &["read-tree", tree], &ienv)?;
+        // Removals first (agy on #1175): a generator that replaced file `a/b` by `a/b/c` would
+        // otherwise collide with the old entry when the new one is added.
+        for path in remove {
+            git(cwd, &["update-index", "--force-remove", "--", path], &ienv)?;
+        }
         for (mode, oid, path) in set {
             git(
                 cwd,
@@ -817,9 +849,6 @@ fn edit_tree(
                 ],
                 &ienv,
             )?;
-        }
-        for path in remove {
-            git(cwd, &["update-index", "--force-remove", "--", path], &ienv)?;
         }
         git_string(cwd, &["write-tree"], &ienv)
     })();
@@ -837,8 +866,11 @@ fn edit_tree(
 /// ([`crate::repo_checks::FloorCheckout::regenerate`]), and write back what the commands produced
 /// for every declared path — a tree entry the declaration covers is replaced by the regenerated
 /// file (or removed when the generator no longer writes it), and a declared literal path the tree
-/// lacks is added. Nothing else the commands wrote is taken. The new tree's id; `Err(why)` when
-/// any step failed (the conflict then stands, with `why` on the card).
+/// lacks is added. Nothing else the commands wrote is taken: a NEW file a generator writes under a
+/// glob is not picked up (the re-verify then judges the tree, and a repo whose generator adds files
+/// declares them by literal path). The install is the root's (a workspace root installs its
+/// packages; an independent subdirectory package's own install does not run here). The new tree's
+/// id; `Err(why)` when any step failed (the conflict then stands, with `why` on the card).
 fn regenerate_lifted(
     worktree: &Path,
     git_dir: &Path,
@@ -870,7 +902,7 @@ fn regenerate_lifted(
     for path in paths {
         match checkout.read_generated(&path)? {
             Some((body, exec)) => {
-                let oid = write_blob(worktree, env, &body)
+                let oid = write_blob_at(worktree, env, &body, &path)
                     .map_err(|e| format!("`{path}` could not be written: {e}"))?;
                 let mode = if exec { "100755" } else { "100644" };
                 set.push((mode.to_string(), oid, path));
@@ -2725,16 +2757,25 @@ mod tests {
         checks: &str,
         run_checks: Option<&str>,
     ) -> (PathBuf, PathBuf) {
-        let (clone, wt) = stale_base_layout_seeded(
-            tag,
-            &[
-                ("CHANGELOG.md", CHANGELOG_BASE),
-                (".wicked/checks.json", checks),
-                ("gen/a.txt", "a0\n"),
-                ("gen/b.txt", "b0\n"),
-                ("gen/out.txt", "a0\nb0\n"),
-            ],
-        );
+        generated_conflict_layout_with(tag, checks, run_checks, &[])
+    }
+
+    /// [`generated_conflict_layout`] whose base also carries `extra`.
+    fn generated_conflict_layout_with(
+        tag: &str,
+        checks: &str,
+        run_checks: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> (PathBuf, PathBuf) {
+        let mut seed: Vec<(&str, &str)> = vec![
+            ("CHANGELOG.md", CHANGELOG_BASE),
+            (".wicked/checks.json", checks),
+            ("gen/a.txt", "a0\n"),
+            ("gen/b.txt", "b0\n"),
+            ("gen/out.txt", "a0\nb0\n"),
+        ];
+        seed.extend_from_slice(extra);
+        let (clone, wt) = stale_base_layout_seeded(tag, &seed);
         std::fs::write(
             wt.join("CHANGELOG.md"),
             changelog_with("- run: fixed a\n", "- first"),
@@ -2829,6 +2870,49 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(wt.join("gen/out.txt")).unwrap(),
             "run-a\nmain-b\n"
+        );
+    }
+
+    /// (xreview on #1175) A generated file the checkout writes through an `eol=crlf` attribute is
+    /// stored as `git add` would store it (LF in the blob), so the post-lift snapshot proves the
+    /// lifted tree instead of failing after the branch moved; and a generator that removes a whole
+    /// generated directory has its old entries removed, not a refusal.
+    #[test]
+    fn regenerated_files_are_stored_as_git_add_would_and_a_removed_directory_is_removed() {
+        let cmd = r#"["sh", "-c", "rm -rf gen/old && cat gen/a.txt gen/b.txt > gen/out.txt"]"#;
+        let decl = format!(r#"{{"paths": ["gen/**"], "command": {cmd}}}"#);
+        let (clone, wt) = generated_conflict_layout_with(
+            "gen-crlf",
+            &checks_json(&decl),
+            None,
+            &[
+                (".gitattributes", "gen/** text eol=crlf\n"),
+                ("gen/old/stale.txt", "stale\n"),
+            ],
+        );
+        let r = lift_onto_remote_default(&wt, &clone);
+        if no_boundary(&r) {
+            return;
+        }
+        assert_eq!(r.outcome, LiftOutcome::Lifted, "{r:?}");
+        let tree = r.tree_after.clone().unwrap();
+        assert_eq!(
+            run_git(&wt, &["cat-file", "blob", &format!("{tree}:gen/out.txt")]),
+            "run-a\nmain-b",
+            "the blob is LF, as `git add` stores it"
+        );
+        assert!(
+            std::fs::read_to_string(wt.join("gen/out.txt"))
+                .unwrap()
+                .contains("\r\n"),
+            "the worktree file is checked out with CRLF"
+        );
+        assert!(!wt.join("gen/old/stale.txt").exists());
+        assert!(
+            run_git(&wt, &["ls-tree", "-r", "--name-only", &tree])
+                .lines()
+                .all(|p| p != "gen/old/stale.txt"),
+            "the removed directory's entries are gone from the lifted tree"
         );
     }
 

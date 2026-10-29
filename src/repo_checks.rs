@@ -6264,6 +6264,21 @@ impl FloorCheckout {
             .held
             .as_ref()
             .ok_or_else(|| "the checkout is not held".to_string())?;
+        // A parent the generator removed means the file is gone (codex on #1175); a parent that is
+        // not a directory (a link) is refused.
+        let names: Vec<&str> = rel.split('/').collect();
+        for depth in 1..names.len() {
+            match held.kind(&names[..depth].join("/"))? {
+                None => return Ok(None),
+                Some(EntryKind::Dir) => {}
+                Some(_) => {
+                    return Err(format!(
+                        "`{rel}`: `{}` is not a directory after regenerating",
+                        names[..depth].join("/")
+                    ))
+                }
+            }
+        }
         match held.kind(rel)? {
             None => Ok(None),
             Some(EntryKind::File) => {
