@@ -388,6 +388,11 @@ pub struct PowerState {
     /// Engine-internal.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub turn_ms: u64,
+    /// How many products (top-level areas) the change spanned when rigor was first measured — the
+    /// intake's own scope, else the first checkpoint's diff. "Spread into another product" means
+    /// more than this, never a scope the intake already planned. Engine-internal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_spread: Option<u32>,
     /// When the build started (unix millis), for elapsed-against-estimate. Engine-internal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_started_at: Option<i64>,
@@ -434,6 +439,7 @@ impl PowerState {
             turn_start_rigor: None,
             acknowledged: Vec::new(),
             turn_ms: 0,
+            baseline_spread: None,
             build_started_at: None,
             launched_at: Some(now),
             operator_gates: 0,
@@ -488,6 +494,18 @@ pub fn orchestrator_minutes(state: &PowerState, now: i64) -> u32 {
             u64::try_from((now - t.started_at).max(0)).unwrap_or(0)
         });
     u32::try_from((state.turn_ms + running) / 60_000).unwrap_or(u32::MAX)
+}
+
+/// Whether the change spread past the products it spanned when first measured: a growing
+/// spread, never the intake's own multi-product scope. The first reading becomes the baseline.
+pub fn spread_grew(state: &mut PowerState, spread: u32) -> bool {
+    match state.baseline_spread {
+        Some(base) => spread > base,
+        None => {
+            state.baseline_spread = Some(spread);
+            false
+        }
+    }
 }
 
 /// Record a turn start on the state: an earlier turn still open was interrupted (a restart) and is
@@ -2248,6 +2266,20 @@ mod tests {
         }
         assert_eq!(c.turn_log.len(), TURN_LOG_CAP);
         assert_eq!(orchestrator_minutes(&c, 200 * min), 60);
+    }
+
+    #[test]
+    fn spread_means_past_the_first_measured_scope() {
+        let mut st = PowerState::launched(true, 0);
+        // An intake scope over two products (crew and its api-types) is the baseline, not growth.
+        st.baseline_spread = Some(2);
+        assert!(!spread_grew(&mut st, 2));
+        assert!(spread_grew(&mut st, 3), "a third product is growth");
+        // With no intake reading, the first checkpoint's spread is the baseline.
+        let mut fresh = PowerState::launched(true, 0);
+        assert!(!spread_grew(&mut fresh, 2));
+        assert_eq!(fresh.baseline_spread, Some(2));
+        assert!(!spread_grew(&mut fresh, 1));
     }
 
     #[test]

@@ -243,12 +243,14 @@ pub(super) fn on_checkpoint(
                 .any(|f| f.by == "policy" && f.rigor == Rigor::Highest)
         });
     let turn_from = power.turn_start_rigor.unwrap_or(current).min(current);
+    // Read every checkpoint (so the baseline is set early), raised only at a turn end.
+    let spread_grew = crate::power::spread_grew(power, signals.spread);
     let pause_reasons: Vec<(&'static str, String)> = if turn_end && power.pause.is_none() {
         crate::power::sudden_complexity(
             turn_from,
             to,
             destructive_new,
-            signals.spread >= 2,
+            spread_grew,
             report.new_dependencies > 0 && !sensitive.is_empty(),
             &struggle_reasons,
         )
