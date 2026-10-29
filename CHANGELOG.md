@@ -1763,6 +1763,14 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.19** — 2026-10-29 — patch release on main 0ce5c39, carrying #1179, #1180 (core#1113) and #1181.
+  - **Power mode: time against the estimate is the orchestrator's own turns (#1179).** Floors, reviewers and waits on
+    a person no longer count towards the struggle signal.
+  - **The automatic creator-floor retry is skipped when no failure is head-only (#1180, core#1113).**
+  - **Power mode: a spread pause needs a spread past the intake's planned scope (#1181).** Answering it moves the
+    baseline to the accepted spread.
+  - No seat or floor Dockerfile, no seat package pin and no gate-hook protocol changed since 0.15.18, so the seat and
+    floor image tags and gate protocol 3 are unchanged.
 - **core-ts 0.15.18** — 2026-10-29 — minor feature release, carrying #1174 (power mode), #1175 (core#1173) and #1176 (core#1172).
   - **Power mode (#1174, program DES-POWER-MODE):** `LaunchOptions.power` and `Core.supportsPowerMode`; the intake QE plan
     on the PA scope step (`RIGOR` line, rigor record on `AgentSession.power`); the `build` step as one multi-turn
