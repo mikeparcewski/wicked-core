@@ -2,5 +2,11 @@
   "typecheck": ["cargo", "check", "--locked", "--workspace", "--all-targets"],
   "lint": ["cargo", "clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"],
   "test": ["cargo", "test", "--locked", "--workspace", "--no-fail-fast"],
-  "timeout_s": 3600
+  "timeout_s": 3600,
+  "rerun": {
+    "test": {
+      "command": ["cargo", "test", "--locked", "--workspace", "--no-fail-fast", "--", "{names}", "--exact"],
+      "by": "name"
+    }
+  }
 }
