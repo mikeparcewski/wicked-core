@@ -2209,7 +2209,10 @@ mod tests {
             // push, so no seat could run these tests. The fence's own stated limit (a git with its
             // environment scrubbed) is what this uses; it reaches only the fixture's local repo.
             if args.first() == Some(&"push") {
-                let empty = std::env::temp_dir().join(".wicked-fixture-empty.gitconfig");
+                let empty = std::env::temp_dir().join(format!(
+                    ".wicked-fixture-empty-{}.gitconfig",
+                    std::process::id()
+                ));
                 let _ = std::fs::write(&empty, "");
                 cmd.env_remove("GIT_CONFIG_COUNT")
                     .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -2393,7 +2396,10 @@ mod tests {
             // push, so no seat could run these tests. The fence's own stated limit (a git with its
             // environment scrubbed) is what this uses; it reaches only the fixture's local repo.
             if args.first() == Some(&"push") {
-                let empty = std::env::temp_dir().join(".wicked-fixture-empty.gitconfig");
+                let empty = std::env::temp_dir().join(format!(
+                    ".wicked-fixture-empty-{}.gitconfig",
+                    std::process::id()
+                ));
                 let _ = std::fs::write(&empty, "");
                 cmd.env_remove("GIT_CONFIG_COUNT")
                     .env("GIT_CONFIG_NOSYSTEM", "1")
