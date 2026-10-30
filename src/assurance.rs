@@ -138,6 +138,14 @@ pub struct FloorOverride {
     /// [`carried_override_label`]. Absent on an override the operator gave at this gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carried_from: Option<String>,
+    /// (core#1186) The failing tests the overridden result named, as `<check>: <failure id>`
+    /// ([`crate::repo_checks::RepoChecksReport::failing_set`]). A later floor on the same tree and
+    /// base whose failing tests are all in this list stands on the override (carried, labelled);
+    /// any test not in it asks again. `None`: a result whose denying checks did not all name their
+    /// failures (a lint, a type error, a timeout), or an override recorded before the list existed.
+    /// Such an override carries only onto the very result it overrode (core#1168).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failing: Option<Vec<String>>,
 }
 
 /// (core#1168) The label of a carried override ([`FloorOverride::carried_from`]): the gate, its

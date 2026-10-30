@@ -15316,6 +15316,12 @@ fn floor_override_for(
             label: crate::assurance::FLOOR_OVERRIDE_LABEL.to_string(),
             key: u.repo_checks.as_ref().and_then(|r| r.key.clone()),
             carried_from: None,
+            // (core#1186) What the operator ruled on, test by test: a later floor on the same
+            // tree and base stands on this override only while it fails within this list.
+            failing: u
+                .repo_checks
+                .as_ref()
+                .and_then(crate::repo_checks::RepoChecksReport::failing_set),
         },
         // Every record behind the floor is the judge's no-verdict hold here (checked above); a
         // deliver refusal has none.
@@ -22139,6 +22145,7 @@ mod request_changes_tests {
                 checks: "d".into(),
             }),
             carried_from: None,
+            failing: None,
         }
     }
 
@@ -22401,6 +22408,212 @@ mod request_changes_tests {
         serde_json::from_value(v).expect("a report")
     }
 
+    /// (core#1186) [`floor_report`] whose failing check named `ids` (head run, exit 1).
+    fn named_failures(
+        mut r: crate::repo_checks::RepoChecksReport,
+        check: &str,
+        ids: &[&str],
+    ) -> crate::repo_checks::RepoChecksReport {
+        for c in r.checks.iter_mut().filter(|c| c.name == check) {
+            c.failure_ids = ids.iter().map(|s| s.to_string()).collect();
+        }
+        r
+    }
+
+    /// (core#1186, rig runs acf30461 and ea73afc0) The operator overrode the fix floor at attempt 1
+    /// (after the automatic round, whose floor result was attempt 0's on the unchanged tree). The
+    /// verify floor that reused attempt 0, and the next fix floor on the same tree, fail on a SUBSET
+    /// of the tests the operator ruled on: the override is carried, labelled, keyed as the new
+    /// result. A test the override did not name, a check failing without naming its tests, another
+    /// tree or base, and a carried record as the only source all ask again.
+    #[test]
+    fn core_1186_an_override_carries_to_a_later_floor_on_the_same_tree_within_its_failing_set() {
+        let run_id = format!("floor-carry-1186-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_floor_failed_fix(&mut store, &run_id, Some(Vec::new()));
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        units[2].last_attempt = Some(1);
+        units[2].repo_checks = Some(named_failures(
+            floor_report(
+                &["typecheck", "test"],
+                &["test"],
+                "T",
+                "B",
+                "creator-digest",
+                None,
+            ),
+            "test",
+            &[
+                "test a ... FAILED",
+                "test b ... FAILED",
+                "test c ... FAILED",
+            ],
+        ));
+        put_node(&mut store, units[2].to_node()).unwrap();
+        let (r, _) = operator_judgment(&mut store, &run_id, "load-bound tests, not this change's");
+        r.expect("the fix floor override applies");
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        let original = session.assurance.floor_overrides[0]
+            .floor_override
+            .clone()
+            .unwrap();
+        assert_eq!(original.attempt, 1);
+        assert_eq!(
+            original.failing.as_deref(),
+            Some(
+                &[
+                    "test: test a ... FAILED".to_string(),
+                    "test: test b ... FAILED".to_string(),
+                    "test: test c ... FAILED".to_string(),
+                ][..]
+            ),
+            "the override records what it ruled on"
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let mut verify = units[3].clone();
+        verify.repo_checks_floor = true;
+        let phase = |_: u32| Some("fix".to_string());
+        let reused: &[&str] = &["typecheck", "test"];
+
+        // The verify floor reused attempt 0 (the exact rule would not carry: another attempt).
+        let verify_report = named_failures(
+            floor_report(
+                reused,
+                &["test"],
+                "T",
+                "B",
+                "verify-digest",
+                Some((reused, None)),
+            ),
+            "test",
+            &["test b ... FAILED", "test a ... FAILED"],
+        );
+        let carry = crate::pipeline::carried_floor_override(
+            Some(&session),
+            &run_id,
+            &verify,
+            0,
+            &verify_report,
+            &phase,
+        )
+        .expect("same tree and base, failing within the ruled set: carried");
+        let f = carry.floor_override.as_ref().unwrap();
+        assert_eq!(f.label, "override carried from fix (unit 3), same tree");
+        assert_eq!(f.carried_from.as_deref(), Some(original.result_id.as_str()));
+        assert_eq!(f.ord, 4);
+        assert_eq!(
+            f.key.as_ref().map(|k| k.checks.as_str()),
+            Some("verify-digest")
+        );
+        assert_eq!(
+            carry.by, session.assurance.floor_overrides[0].by,
+            "the operator who ruled"
+        );
+        assert_eq!(
+            carry.note.as_deref(),
+            Some("load-bound tests, not this change's")
+        );
+
+        // The next creator floor on the same tree (fresh, nothing reused), one test of the three.
+        let next = named_failures(
+            floor_report(
+                &["typecheck", "test"],
+                &["test"],
+                "T",
+                "B",
+                "creator-digest",
+                None,
+            ),
+            "test",
+            &["test c ... FAILED"],
+        );
+        assert!(
+            crate::pipeline::carried_floor_override(
+                Some(&session),
+                &run_id,
+                &units[2],
+                2,
+                &next,
+                &phase
+            )
+            .is_some(),
+            "the next floor on the same tree carries it"
+        );
+
+        let asks: Vec<(&str, crate::repo_checks::RepoChecksReport)> = vec![
+            (
+                "a test the override did not name",
+                named_failures(
+                    floor_report(&["test"], &["test"], "T", "B", "d", None),
+                    "test",
+                    &["test a ... FAILED", "test d ... FAILED"],
+                ),
+            ),
+            (
+                "another tree",
+                named_failures(
+                    floor_report(&["test"], &["test"], "T2", "B", "d", None),
+                    "test",
+                    &["test a ... FAILED"],
+                ),
+            ),
+            (
+                "another base",
+                named_failures(
+                    floor_report(&["test"], &["test"], "T", "B2", "d", None),
+                    "test",
+                    &["test a ... FAILED"],
+                ),
+            ),
+            (
+                "a check failing without naming its tests",
+                named_failures(
+                    floor_report(
+                        &["typecheck", "test"],
+                        &["typecheck", "test"],
+                        "T",
+                        "B",
+                        "d",
+                        None,
+                    ),
+                    "test",
+                    &["test a ... FAILED"],
+                ),
+            ),
+        ];
+        for (what, report) in &asks {
+            assert!(
+                crate::pipeline::carried_floor_override(
+                    Some(&session),
+                    &run_id,
+                    &units[2],
+                    2,
+                    report,
+                    &phase
+                )
+                .is_none(),
+                "{what}: asks again"
+            );
+        }
+        // A carried record is never a source of another carry.
+        let mut only_carried = session.clone();
+        only_carried.assurance.floor_overrides = vec![crate::assurance::OperatorJudgment {
+            floor_override: Some(f.clone()),
+            ..carry.clone()
+        }];
+        assert!(crate::pipeline::carried_floor_override(
+            Some(&only_carried),
+            &run_id,
+            &units[2],
+            2,
+            &next,
+            &phase
+        )
+        .is_none());
+    }
+
     /// (core#1168, rig run 24103407) The operator overrode the fix floor (base-red tests); the verify
     /// floor reused exactly those failing checks on the same tree and base. The override is CARRIED:
     /// the verify fold does not deny on the floor, the gate's receipt and the run's contract carry it
@@ -22451,6 +22664,7 @@ mod request_changes_tests {
             &verify,
             0,
             &verify_report,
+            &|_| Some("fix".to_string()),
         )
         .expect("same tree, base and failing set: carried");
         let f = carry.floor_override.as_ref().unwrap();
@@ -22538,7 +22752,8 @@ mod request_changes_tests {
                     &run_id,
                     &verify,
                     0,
-                    report
+                    report,
+                    &|_| Some("fix".to_string()),
                 )
                 .is_none(),
                 "{what}: asks again"
@@ -22556,7 +22771,8 @@ mod request_changes_tests {
                 &run_id,
                 &verify,
                 0,
-                &verify_report
+                &verify_report,
+                &|_| Some("fix".to_string()),
             )
             .is_none(),
             "an override of another unit's floor is not this result's"
@@ -22584,7 +22800,8 @@ mod request_changes_tests {
                     &run_id,
                     &verify,
                     0,
-                    report
+                    report,
+                    &|_| Some("fix".to_string()),
                 )
                 .is_none(),
                 "{what}: asks again"
@@ -22602,7 +22819,8 @@ mod request_changes_tests {
                 &run_id,
                 &verify,
                 0,
-                &verify_report
+                &verify_report,
+                &|_| Some("fix".to_string()),
             )
             .is_none(),
             "an override given at another attempt is not the reused result's"

@@ -1758,6 +1758,37 @@ impl RepoChecksReport {
         s
     }
 
+    /// (core#1186) Every failing test this report's denying checks named, as `<check>: <id>`, in
+    /// first-seen order: each head run of each denying check (first run, excluded run, retry).
+    /// `None` unless EVERY denying check's deciding run finished with an exit code and named its
+    /// failures ([`Self::failure_split`]'s completeness rule): a lint, a type error, a timeout or a
+    /// crash has no list a later result could be compared against. `None` too when nothing denies.
+    pub fn failing_set(&self) -> Option<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        let mut any = false;
+        for c in self.checks.iter().filter(|c| c.denies()) {
+            any = true;
+            let deciding = c.reruns.last().unwrap_or(c);
+            if deciding.failure_ids.is_empty()
+                || deciding.exit_code.is_none()
+                || deciding.timed_out
+                || deciding.spawn_error.is_some()
+                || c.did_not_finish()
+            {
+                return None;
+            }
+            for run in std::iter::once(c).chain(c.reruns.iter()) {
+                for id in &run.failure_ids {
+                    let named = format!("{}: {id}", c.name);
+                    if !out.contains(&named) {
+                        out.push(named);
+                    }
+                }
+            }
+        }
+        any.then_some(out)
+    }
+
     /// (j4-gates) The denying checks' failing tests split against the run base, from the floor's
     /// structured results (every [`CheckRun::failure_ids`] the check's head runs named — first
     /// run, excluded run, identical retry — against the base run's failure ids and the base's own
