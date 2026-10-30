@@ -26,15 +26,6 @@ Two release tracks share this file, newest entry first regardless of track:
   do not name their target. A test not ruled on, a list not shown complete, a timeout, another tree or base, the
   deliver unit, a tool step and an operator's explicit re-run still ask. Rig run acf30461 asked again at verify
   because the verify floor reused attempt 0 while the operator had overridden attempt 1.
-- **A floor override carries to a later floor on the same tree when it fails within what the operator ruled on
-  (core#1186).** The override now records the failing tests it ruled on (`floorOverride.failing`, additive). A later
-  failed floor of the same run on the same tree and base, whose failing tests are all in that list, stands on the
-  override instead of asking again: the verify floor (whichever attempt it reused), the next creator floor, and an
-  unchanged-tree rework round (only when nothing else denied behind the floor last time). It is labelled "override
-  carried from <phase> (unit N), same tree" and keeps the operator's name and rationale. A test the override did not
-  name, a check failing without naming its tests, a timeout, another tree or base, or an operator's explicit re-run
-  still asks. Rig runs acf30461 (verify reused attempt 0 while the operator overrode attempt 1) and ea73afc0 asked again
-  for the same failures.
 - **Live tool activity for codex and pi seats, and a heartbeat for every quiet seat.** On rig run 1d372696 a codex QE
   step read "Codex Working on Check…" with no activity for 20+ s: `toolActivity` came only from claude's stream
   (#1195). The same frames (and the same `wicked.run.tool.*` bus mirror) now come from codex's `exec --json` items
