@@ -14,6 +14,10 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Core's own floor re-runs only the failing tests (core#1198).** `.wicked/checks.json` declares
+  `rerun.test = {"command": ["cargo", "test", "--locked", "--workspace", "--no-fail-fast", "--", "{names}", "--exact"], "by": "name"}`,
+  so a failed `test` check is retried and compared on the base by the failing test names instead of the
+  whole workspace suite. Needs an engine with core#1198: an older engine refuses the unknown key.
 - **The creator floor runs a cargo workspace's affected tests first, chosen by the engine (core#1187).** Core has no
   build-guide `affected` piece, so the creator floor ran `cargo test --workspace` on every change (20 min of the core
   proof run's 68 min floor). For a `cargo test … --workspace` check at the creator floor, the engine now computes
