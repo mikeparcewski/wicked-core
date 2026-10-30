@@ -978,7 +978,8 @@ pub fn turn_end(output: &str) -> TurnEnd {
 pub fn orchestrator_brief(rigor: Option<Rigor>, plan: Option<&RigorPlan>, round: u32) -> String {
     let rigor_line = match (rigor, plan) {
         (Some(r), Some(p)) => format!(
-            "Rigor now: {} (score {}). Hand-off will run the {} test set, {}{}.",
+            "Rigor now: {} (score {}). Hand-off will run the {} test set itself, on a clean \
+             checkout, {}{}.",
             r.as_str(),
             p.score,
             r.tests(),
@@ -1016,7 +1017,9 @@ pub fn orchestrator_brief(rigor: Option<Rigor>, plan: Option<&RigorPlan>, round:
          coherent step. Work in TURNS: after each commit, end your turn with exactly one line \
          `{CHECKPOINT_PREFIX} <what you did; what is next>`. The engine re-scores the change, \
          and your next turn (this same session) carries anything the operator said meanwhile. \
-         When the change is complete, committed and its tests pass, end with exactly one line \
+         Run the tests that cover your change; do not run the repository's whole suite here, \
+         because the hand-off runs the repository's own checks itself. When the change is \
+         complete, committed and the tests that cover it pass, end with exactly one line \
          `{HANDOFF_PREFIX} <one-line summary>`. Never push or open a pull request: delivery is \
          the engine's. {rigor_line}{rework}"
     )
@@ -1935,6 +1938,19 @@ pub fn orchestrate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (power-speed) The orchestrator is told the hand-off runs the repository's checks itself, so
+    /// it runs the tests covering its change and not the whole suite (rig run b6f7968b spent its
+    /// second turn, 10 min, on a full suite the hand-off then ran again).
+    #[test]
+    fn the_brief_says_the_hand_off_runs_the_suite_so_the_orchestrator_does_not() {
+        let b = orchestrator_brief(Some(Rigor::Standard), None, 1);
+        assert!(
+            b.contains("do not run the repository's whole suite here"),
+            "{b}"
+        );
+        assert!(b.contains("the tests that cover it pass"), "{b}");
+    }
 
     #[test]
     fn a_power_launch_drops_the_pre_build_phases_and_repoints_their_dependents() {

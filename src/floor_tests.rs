@@ -2507,6 +2507,103 @@ fn with_exclusion_off_a_red_base_escalates_and_nothing_is_deselected() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
+/// (power-speed) When the decision cannot exclude, the deciding run is the head itself, so its
+/// identical retry runs BEFORE the base. A retry that passes decides alone, and the base, a whole
+/// suite the decision would never read, is not run. A retry that fails is the decision's only
+/// retry, and the base then runs as before: the outcome is the one the old order gave.
+#[cfg(unix)]
+#[test]
+fn without_exclusion_the_retry_runs_before_the_base_and_a_pass_skips_the_base() {
+    let cpus = 4;
+    let _off = seam::exclude(false);
+    let (repo, ctx, argv) = red_base("retry-first");
+    let counters = repo.join("tmp/counters");
+    std::fs::write(
+        repo.join("counters.dir"),
+        counters.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "count the runs"]);
+    let ctx = FloorContext {
+        base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+        ..ctx
+    };
+    let runs = |c: &Path| {
+        std::fs::read_to_string(c.join("run"))
+            .map(|t| t.lines().count())
+            .unwrap_or(0)
+    };
+    // A flake under load: red once, green on the identical retry. The red base never runs.
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.out", "test old ... FAILED\n"),
+            ("run.exit", "0"),
+            ("flake", ""),
+            ("toc.txt", &toc_of(&["old", "new", "fine"])),
+        ],
+    );
+    {
+        let _load = seam::pin(cpus as f64 * 2.5, cpus);
+        let Some((report, c)) = floor_test(&repo, &ctx) else {
+            return;
+        };
+        let d = c.decision.as_ref().expect("decided");
+        assert_eq!(d.outcome, OUTCOME_PASS, "{d:?}");
+        assert!(d.flaky && report.passed && !c.denies(), "{d:?}");
+        assert_eq!(c.classification.as_deref(), Some(FLAKY_UNDER_LOAD));
+        assert_eq!(c.reruns.len(), 1, "one identical retry");
+        assert_eq!(c.reruns[0].argv, c.argv, "the SAME argv");
+        assert!(c.base.is_none(), "the base was not run: {:?}", c.base);
+        assert!(
+            d.log_refs.iter().all(|l| l.attempt != "base"),
+            "{:?}",
+            d.log_refs
+        );
+        assert_eq!(runs(&counters), 2, "the head and its retry, no base run");
+        // The label says the wait, not the wait plus the retry's own run (none in tests).
+        assert!(
+            c.reruns[0].source.contains("after waiting 0s for headroom"),
+            "{}",
+            c.reruns[0].source
+        );
+    }
+    // Red twice: the base runs after the retry, and the outcome is the old one.
+    let _ = std::fs::remove_dir_all(&counters);
+    write_tree(
+        &repo,
+        &argv,
+        &[
+            ("run.out", "test old ... FAILED\n"),
+            ("run.exit", "101"),
+            ("toc.txt", &toc_of(&["old", "new", "fine"])),
+        ],
+    );
+    {
+        let _load = seam::pin(cpus as f64 * 2.5, cpus);
+        let Some((report, c)) = floor_test(&repo, &ctx) else {
+            return;
+        };
+        let d = c.decision.as_ref().expect("decided");
+        assert_eq!(d.outcome, OUTCOME_BASE_RED_UNSEPARATED, "{d:?}");
+        assert!(!report.passed && !d.flaky);
+        assert_eq!(
+            c.reruns.len(),
+            1,
+            "one retry, never a second one after the base"
+        );
+        assert!(
+            c.base.as_ref().is_some_and(|b| b.run.is_some()),
+            "the base ran: {:?}",
+            c.base
+        );
+        assert_eq!(runs(&counters), 3, "the head, its retry, then the base");
+    }
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
 /// The switch reads exactly `on` or `1`: nothing trimmed, nothing case-folded.
 #[test]
 fn the_exclusion_switch_reads_exactly_on_or_1() {

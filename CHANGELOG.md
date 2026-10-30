@@ -14,6 +14,22 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The floor and power mode stop running suites twice (power-speed).** Both power proof runs (bc2366e1, b6f7968b)
+  spent most of their time running test suites again.
+  - **The retry comes before the base when nothing can be excluded.** When the floor can't exclude (exclusion is off,
+    the shipped default, or there is no usable build guide), the deciding run is the head itself. Its identical retry
+    (DES-FLOOR-V2 §4) now runs first. A pass decides alone (`passed on retry (flaky)`), and the base run, a whole suite
+    the decision would never read, is skipped. A retry that fails is the decision's only retry, and the base runs as
+    before, with the same outcome as the old order.
+  - **The retry's label says how long it waited.** It used to measure after the retry ran, so a 30 s bound read
+    "after waiting 1916s".
+  - **A power run at high rigor or above runs the full suite at the creator floor too.** It uses the verify floor's
+    exact command, so the verify floor reuses the result. Before, it ran a targeted pass at hand-off and then the full
+    suite again at verify. On b6f7968b the targeted pass alone took 33 min. No floor is lowered: this only raises the
+    creator stage to the set the verify floor already required.
+  - **The orchestrator brief says the hand-off runs the repository's checks itself.** The orchestrator runs the tests
+    that cover its change, not the whole suite. On b6f7968b its second turn spent 10 min on a full suite the hand-off
+    then ran again.
 - **The floor-dependent engine tests skip inside the repo-checks floor, so core's base is green under its own floor.**
   Five tests need the engine to arm its own floor sandbox (the power hand-off send-back pair, the two deliver-lift
   override tests and the mutating-check guard test). Inside the floor, macOS refuses a nested `sandbox_apply`, so they
