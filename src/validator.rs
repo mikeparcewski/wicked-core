@@ -610,6 +610,9 @@ fn sbpl_quote(p: &Path) -> String {
     out
 }
 
+/// The one program a jail may exec outside its profile: setuid `/bin/ps` (crew#1221).
+const PS_EXEC_RULE: &str = "(allow process-exec (with no-sandbox) (literal \"/bin/ps\"))\n";
+
 /// Build the macOS `sandbox-exec` profile: deny network, deny all writes EXCEPT the (canonical) run dir,
 /// the system temp dir, and the std stdio devices; reads/exec stay open (`allow default`). `None` if the
 /// run dir can't be canonicalized (→ caller degrades to the floor). Canonicalization matters on macOS
@@ -707,6 +710,14 @@ fn macos_sandbox_profile_for_roots(
     p.push_str("(allow file-write-data (literal \"/dev/null\"))\n");
     p.push_str("(allow file-write-data (literal \"/dev/stdout\"))\n");
     p.push_str("(allow file-write-data (literal \"/dev/stderr\"))\n");
+    // (crew#1221) `/bin/ps` is setuid root on macOS, and the kernel refuses to exec a setuid binary
+    // inside a sandbox ("execvp() of '/bin/ps' failed: Operation not permitted"), so every
+    // process-table read in a jailed check came back empty and failed on base and head alike.
+    // `ps` alone runs outside the profile. It writes nothing but its inherited stdout and has no
+    // option that writes a file or runs another program, so the write boundary is unchanged.
+    // `(allow default)` already lets a jailed process read the process table (sysctl), so
+    // this is no new read either.
+    p.push_str(PS_EXEC_RULE);
     if pty == PtyPolicy::Own {
         // See [`PtyPolicy`]: a NEW pair through the multiplexer, and only the slaves this jail
         // allocated (the kernel's per-allocation extension) — never an existing terminal.
@@ -6644,6 +6655,71 @@ mod worker_sandbox_tests {
                     ))
                     .exists());
             }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (crew#1221) Every profile lets `/bin/ps` (setuid root on macOS) run outside the jail, by
+    /// its literal path and nothing else: no other program, and no subpath.
+    #[test]
+    fn every_profile_admits_only_bin_ps_outside_the_jail() {
+        let root = std::env::temp_dir().join(format!("wicked-ps-rule-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for network in [
+            NetworkPolicy::Allow,
+            NetworkPolicy::Deny,
+            NetworkPolicy::LoopbackOnly,
+        ] {
+            for pty in [PtyPolicy::Deny, PtyPolicy::Own] {
+                let p = macos_sandbox_profile_for_roots(&[root.as_path()], network, pty).unwrap();
+                assert_eq!(p.matches("no-sandbox").count(), 1, "{p}");
+                assert_eq!(p.matches(PS_EXEC_RULE).count(), 1, "{p}");
+                assert!(!p.contains("process-exec*"), "{p}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// (crew#1221) Inside the floor's and the worker's jail, `ps` (found on `PATH`, as a check
+    /// calls it) lists the process table and names the jailed shell's parent, and a write outside
+    /// the roots is still refused in the same jail.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ps_runs_inside_the_jail_and_the_write_boundary_still_holds() {
+        let base = std::env::temp_dir().join(format!("wicked-ps-jail-{}", std::process::id()));
+        let (inside, outside) = (base.join("wt"), base.join("outside"));
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let (inside, outside) = (
+            inside.canonicalize().unwrap(),
+            outside.canonicalize().unwrap(),
+        );
+        let roots = [inside.clone()];
+        for (label, sandbox) in [
+            ("floor", detect_floor_sandbox(&roots)),
+            ("worker", detect_worker_sandbox(&roots)),
+        ] {
+            if sandbox.level != SandboxLevel::Sandboxed || sandbox.wrapper.is_empty() {
+                eprintln!("no sandbox-exec here — the ps rule is not exercised");
+                return;
+            }
+            let script =
+                "ps -o ppid= -p $$ || exit 7; n=$(ps -A -o pid=,ppid=,args= | wc -l) || exit 8; \
+                          [ \"$n\" -gt 1 ] || exit 9; echo x > \"$0/f\" 2>/dev/null && exit 10; \
+                          echo y > ./f || exit 11; exit 0";
+            let out = jailed_with(
+                &sandbox,
+                &inside,
+                &["/bin/sh", "-c", script, &outside.to_string_lossy()],
+                &[("PATH", "/usr/bin:/bin")],
+            );
+            assert!(out.status.success(), "{label}: {out:?}");
+            assert!(
+                !outside.join("f").exists(),
+                "{label}: the outside write was refused"
+            );
+            let ppid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+            assert!(ppid > 0, "{label}: ps named a parent");
         }
         let _ = std::fs::remove_dir_all(&base);
     }
