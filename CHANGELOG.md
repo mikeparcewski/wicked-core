@@ -51,6 +51,15 @@ Two release tracks share this file, newest entry first regardless of track:
   profile (floor, worker and validator) now lets the literal `/bin/ps`, and nothing else, run outside the profile.
   `ps` writes only to its inherited stdout and runs no other program, so the write boundary is unchanged. Under
   `(allow default)` the jail could already read the process table.
+- **Core's own git fixtures run in a fenced seat, so QE can run them.** On rig run acf30461 (core#1166) the QE
+  reviewer could not run core's `deliver_lift` tests: the fixtures push to a bare remote they make, and the seat's
+  push kill (`url.wicked-nopush://.pushInsteadOf`, in its `GIT_CONFIG_*` and its global gitconfig) refused all 21
+  ("remote helper 'wicked-nopush' aborted session"). QE recorded INCONCLUSIVE and delivery was refused until the
+  operator skipped QE. Each fixture's `git push` (`deliver_lift`, `repo`, `tests/deliver_refusal_gate.rs`) now runs
+  without the inherited config entries and with an empty global config: the fence's own stated limit (a git whose
+  environment is scrubbed), used only for the fixture's local remote. The seat fence itself is unchanged: a seat-wide
+  "push into your own temp dir" allowance was reviewed and dropped, because a prefix rule cannot tell where a spelled
+  path lands (`<tmp>/..`, a symlinked `tmp`).
 - **Core's own floor re-runs only the failing tests (core#1198).** `.wicked/checks.json` declares
   `rerun.test = {"command": ["cargo", "test", "--locked", "--workspace", "--no-fail-fast", "--", "{names}", "--exact"], "by": "name"}`,
   so a failed `test` check is retried and compared on the base by the failing test names instead of the
