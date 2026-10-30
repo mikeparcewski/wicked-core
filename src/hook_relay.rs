@@ -1769,11 +1769,13 @@ mod tests {
                 if mode != "linger" || dir.join("linger.pid").exists() {
                     break;
                 }
+                // (xreview) The budget doubles up to 300 s, half the hook's 600 s hold, so a stub
+                // whose start takes minutes still gets a run that reaches its lingering child.
                 assert!(
-                    attempts < 6,
+                    attempts < 12,
                     "the linger hook never started within {budget:?}"
                 );
-                budget *= 2;
+                budget = (budget * 2).min(Duration::from_secs(300));
             }
         }
         // The unit's lifecycle lock held past the deadline (a contended registry): an allow
