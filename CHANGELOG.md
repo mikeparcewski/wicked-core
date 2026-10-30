@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Live tool activity for codex and pi seats, and a heartbeat for every quiet seat.** On rig run 1d372696 a codex QE
+  step read "Codex Working on Check…" with no activity for 20+ s: `toolActivity` came only from claude's stream
+  (#1195). The same frames (and the same `wicked.run.tool.*` bus mirror) now come from codex's `exec --json` items
+  (a command's start and exit, its `bash -lc` wrapper unwrapped; a file change; an MCP call; a web search) and pi's
+  `--mode json` tool executions, in claude's tool words and under the same budget and redaction. A seat that sends no
+  frame for 15 s, whatever its stream (copilot's `-p` text, opencode, agy, a thinking claude), gets one
+  `toolActivity {state: "working", kind: "working", id: "working-<attempt>", target: "last output N s ago"}` per 15 s
+  while it stays quiet, sent from the runner's poll loop (bus `wicked.run.tool.working`; crew api-types 0.151.0).
 - **The automatic floor-retry round is scoped to the failing checks, and a no-change answer is checked against the
   tree.** Rig run ea73afc0's retry turn answered NO CHANGE NEEDED for the failures but also applied a team member's
   unrelated Windows advice: the tree changed, the whole floor ran again (27 min), and the review then failed on that
