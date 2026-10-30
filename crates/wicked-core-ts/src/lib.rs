@@ -3429,6 +3429,11 @@ mod tests {
                 "excluded": ["t::a"], "flaky": false, "reason": "1 pre-existing excluded: t::a",
                 "log_refs": [{"attempt": "excluded", "stream": "stdout", "sha256": "0", "bytes": 0}],
                 "guide": {"present": true, "usable": false, "reason": "probe `run` never ran"}
+            },
+            "selection": {
+                "mode": "affected", "reason": "1 changed symbol(s) reach 2", "packages": ["p"],
+                "targets": ["p --lib (1 tests)"], "tests": ["p: a"], "test_count": 1,
+                "changed_symbols": 1, "reached_symbols": 2
             }
         }))
         .expect("a check run with a decision deserializes");
@@ -3459,6 +3464,7 @@ mod tests {
             ("FloorCheckDecisionJson", decision),
             ("FloorLogRefJson", log_ref),
             ("FloorGuideStatusJson", &decision["guide"]),
+            ("FloorTestSelectionJson", &check["selection"]),
         ] {
             let declared = iface(name);
             for key in obj.as_object().expect("object").keys() {
