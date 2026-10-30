@@ -494,6 +494,10 @@ pub struct FloorContext {
     /// name) never share a leaf, and never each other's build output. `None` (a floor built
     /// without a run: tests) keys by the tree alone.
     pub run_id: Option<String>,
+    /// (core#1187) The repo's code graph (estate), as the run's governance context resolved it:
+    /// the creator floor's engine-computed affected set reads it. `None` (no graph, or a floor
+    /// built without a run) runs the full suite.
+    pub code_graph: Option<PathBuf>,
 }
 
 /// The evidence of one check having run.
@@ -557,6 +561,10 @@ pub struct CheckRun {
     /// counted by [`CheckRun::other_passes`] only; nothing decides on it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub earlier_passes: Vec<(String, u64)>,
+    /// (core#1187) What the engine selected for a cargo workspace test at the creator floor, and
+    /// why ([`crate::floor_affected`]); `None` for every other check and floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<crate::floor_affected::TestSelection>,
     /// (core#781) The host's load band as the check started: `floor(1-min load / cpus)` — 0 has
     /// headroom, N is N× oversubscribed. `None` where the load is unknown. A head failure compared
     /// against a CACHED base from another band says so ([`cached_base_load_note`]).
@@ -644,9 +652,17 @@ impl CheckRun {
             _ => String::new(),
         };
         let more = self.other_passes();
+        let picked = self
+            .selection
+            .as_ref()
+            .map(|s| format!(" — {}", s.note()))
+            .unwrap_or_default();
         match self.exit_code {
-            Some(c) => format!("{}: exit {c} ({secs:.1}s{more}){cls}", self.name),
-            None => format!("{}: no exit status ({secs:.1}s{more}){cls}", self.name),
+            Some(c) => format!("{}: exit {c} ({secs:.1}s{more}){cls}{picked}", self.name),
+            None => format!(
+                "{}: no exit status ({secs:.1}s{more}){cls}{picked}",
+                self.name
+            ),
         }
     }
 
@@ -5163,7 +5179,7 @@ fn run_detected(
         // A deleted, renamed-away or type-changed file (git's D/T list): what it left behind
         // cannot be mapped — the full check. A list that cannot be read: the full check too.
         let deletes = removed.as_ref().map_or(true, |r| !r.is_empty());
-        let affected = gcheck
+        let guided = gcheck
             .as_ref()
             .ok()
             .filter(|_| {
@@ -5173,11 +5189,36 @@ fn run_detected(
                     && !power_full_suite(ctx)
             })
             .and_then(|g| g.affected_argv(&package_relative(touched.clone(), &check.dir)));
+        // (core#1187) Without a guide's piece, the ENGINE computes a cargo workspace's affected
+        // set from the diff (cargo's package graph + the code graph at the base): never the
+        // creator's seat or the intake model. Recorded on the check either way.
+        let engine = (guided.is_none() && ctx.stage == FloorStage::Creator)
+            .then(|| {
+                engine_affected(
+                    worktree, held_head, check, ctx, &touched, &removed, sandbox, scratch,
+                )
+            })
+            .flatten();
+        let affected = match guided {
+            Some(argv) => Some((
+                argv,
+                format!("`{}`'s affected set (DES-BUILD-GUIDE)", check.name),
+            )),
+            None => engine.as_ref().and_then(|p| p.argv.clone()).map(|argv| {
+                (
+                    argv,
+                    format!(
+                        "`{}`'s affected set, computed by the engine (core#1187)",
+                        check.name
+                    ),
+                )
+            }),
+        };
         let mut run = match affected {
-            Some(argv) => {
+            Some((argv, source)) => {
                 let a = RepoCheck {
                     argv,
-                    source: format!("`{}`'s affected set (DES-BUILD-GUIDE)", check.name),
+                    source,
                     ..check.clone()
                 };
                 let r = run_held(worktree, held_head, &a, sandbox, scratch, Tree::Head);
@@ -5193,6 +5234,7 @@ fn run_detected(
             }
             None => run_held(worktree, held_head, check, sandbox, scratch, Tree::Head),
         };
+        run.selection = engine.map(|p| p.selection);
         // (DES-FLOOR-V2) A check that passed, timed out or could not start decides alone. A
         // FAILURE is compared with the run base (the install and the formatter never are: they
         // say nothing about the base, and a formatting diff is deterministic, core#551); the
@@ -7997,6 +8039,89 @@ impl HeldDir {
     }
 }
 
+/// (core#1187) The engine's affected set for `check` at the creator floor
+/// ([`crate::floor_affected`]), or `None` when `check` is not a cargo workspace test at the root.
+#[allow(clippy::too_many_arguments)]
+fn engine_affected(
+    worktree: &Path,
+    held: Option<&HeldDir>,
+    check: &RepoCheck,
+    ctx: &FloorContext,
+    touched: &[String],
+    removed: &Result<Vec<String>, String>,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+) -> Option<crate::floor_affected::Plan> {
+    use crate::floor_affected::Plan;
+    let cargo = crate::floor_affected::cargo_workspace_test(&check.argv)?;
+    if !(check.dir.is_empty() || check.dir == ".") {
+        return None;
+    }
+    if power_full_suite(ctx) {
+        return Some(Plan::full(
+            "a power run at high rigor or above hands off on the full suite (DES-POWER-MODE)",
+        ));
+    }
+    let (Some(base), Some(git_dir)) = (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) else {
+        return Some(Plan::full(
+            "the run has no base to measure the change against",
+        ));
+    };
+    let removed = match removed {
+        Ok(r) => r.clone(),
+        Err(e) => {
+            return Some(Plan::full(format!(
+                "the change's removed files could not be listed: {e}"
+            )))
+        }
+    };
+    // Cargo's own description of the workspace, run like every check (sandboxed, isolated home).
+    let mut metadata = || {
+        let meta = RepoCheck {
+            name: format!("{} (cargo metadata)", check.name),
+            argv: crate::floor_affected::METADATA_ARGV
+                .iter()
+                .map(|a| a.to_string())
+                .collect(),
+            source: "the engine's affected set (core#1187)".into(),
+            timeout_s: Some(300),
+            dir: String::new(),
+        };
+        let r = as_probe(|| {
+            run_one_with(
+                worktree,
+                held,
+                &meta,
+                &merged(false),
+                sandbox,
+                scratch,
+                Tree::Head,
+            )
+        });
+        if !r.passed() {
+            return Err(format!("`cargo metadata` did not pass ({})", r.summary()));
+        }
+        r.logs
+            .iter()
+            .find(|l| l.stream == "stdout")
+            .ok_or_else(|| "cargo metadata left no output".to_string())
+            .and_then(|l| crate::floor_log::read_blob(&scratch.logs, l))
+            .and_then(|b| crate::floor_affected::parse_metadata(&String::from_utf8_lossy(&b)))
+    };
+    Some(crate::floor_affected::plan_for_tree(
+        &crate::floor_affected::Tree {
+            worktree,
+            git_dir,
+            base,
+            touched,
+            removed: &removed,
+            graph: ctx.code_graph.as_deref(),
+        },
+        &cargo,
+        &mut metadata,
+    ))
+}
+
 /// (DES-BUILD-GUIDE) The base guide's check for `check`, when its pieces may be relied on for
 /// this head; `Err` says why not (no guide, no such check, a probe not passed, stale, invalidated).
 fn guide_for<'g>(
@@ -8973,6 +9098,7 @@ pub(crate) fn run_one_with(
         env_cannot_run: Vec::new(),
         reruns: Vec::new(),
         earlier_passes: Vec::new(),
+        selection: None,
         load_band: None,
         decision: None,
         logs: Vec::new(),
@@ -9586,6 +9712,7 @@ pub(crate) mod tests {
                 env_cannot_run: Vec::new(),
                 reruns: Vec::new(),
                 earlier_passes: Vec::new(),
+                selection: None,
                 decision: None,
                 logs: Vec::new(),
                 load_band: None,
@@ -12874,6 +13001,7 @@ exit 1
             env_cannot_run: Vec::new(),
             reruns: Vec::new(),
             earlier_passes: Vec::new(),
+            selection: None,
             decision: None,
             logs: Vec::new(),
             load_band: None,
@@ -13130,6 +13258,7 @@ exit 1
             env_cannot_run: env.iter().map(|x| x.to_string()).collect(),
             reruns: Vec::new(),
             earlier_passes: Vec::new(),
+            selection: None,
             decision: None,
             logs: Vec::new(),
             load_band: None,
@@ -13870,6 +13999,7 @@ mod floor_pass_tests {
             env_cannot_run: Vec::new(),
             reruns: Vec::new(),
             earlier_passes: Vec::new(),
+            selection: None,
             decision: None,
             logs: Vec::new(),
             load_band: None,

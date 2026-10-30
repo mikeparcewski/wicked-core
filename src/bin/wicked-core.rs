@@ -427,6 +427,11 @@ fn main() {
         Some("floor") if args.get(2).map(String::as_str) == Some("probe") => {
             std::process::exit(wicked_core::floor_probe::probe_cli(&args[3..]))
         }
+        // `floor affected --repo <dir> --base <commit> [--graph <db>]` (core#1187): the test set
+        // the creator floor would select for this tree, as JSON.
+        Some("floor") if args.get(2).map(String::as_str) == Some("affected") => {
+            std::process::exit(wicked_core::floor_affected::affected_cli(&args[3..]))
+        }
         // `rules ingest <dir>` populates a run's store with governance policies + conformance rules so
         // the output guardrail has something to deny/recall against (core#26). Opens the store directly.
         Some("rules") if args.get(2).map(String::as_str) == Some("ingest") => {

@@ -3505,6 +3505,13 @@ fn run_unit_and_judge_on(
                     .then(|| output.output.clone()),
                 package_dir: None,
                 run_id: Some(input.run_id.clone()),
+                // (core#1187) The creator floor's affected set reads the repo's code graph.
+                code_graph: input
+                    .governance
+                    .as_ref()
+                    .and_then(|g| g.code_graph_db.as_deref())
+                    .filter(|p| !p.is_empty())
+                    .map(std::path::PathBuf::from),
             };
             // crew #581 (F-BM-010): the floor runs on THIS thread after the runner returned, so
             // the unit's live-output stream went silent for its whole duration (run 8: crew's
