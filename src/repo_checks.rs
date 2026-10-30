@@ -5207,14 +5207,6 @@ fn run_detected(
             if let Some(d) = run.decision.as_mut() {
                 d.reason = Some(why);
             }
-        } else if let Some(why) = seed.as_ref().and_then(|s| s.set_aside_by(check, &run)) {
-            // (core#1191) A fresh check that failed after reused ones sends the floor round again
-            // with nothing reused (core#1152), and that pass classifies it. Classifying it HERE
-            // too (the base run, the identical retry: whole-suite passes each) would be paid
-            // twice — rig run b6f7968b spent 2 h 27 min on this pass's classification before the
-            // set-aside started the suite over. Decided now, unclassified; the next pass decides.
-            decide_alone(&mut run);
-            again = Some(why);
         } else {
             let compare = check.name != "install" && !is_formatter_check(&check.name);
             // With exclusion off the base runs plainly: no results, no list, no alone runs.
@@ -5238,78 +5230,96 @@ fn run_detected(
                 })
                 .flatten();
             let retry_passed = early_retry.as_ref().is_some_and(CheckRun::passed);
-            let side = match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
-                _ if !compare || retry_passed => None,
-                (Some(head), _) if !(baseline_diff && baseline_diff_for(&check.dir)) => {
-                    Some(BaseSide {
-                        base: BaseRun {
-                            head: head.to_string(),
-                            cached: false,
-                            run: None,
-                            error: Some(format!(
+            // (core#1191) A fresh check that failed after reused ones sends the floor round again
+            // with nothing reused (core#1152), and that pass classifies it. Classifying it HERE
+            // too (the base run: a whole suite) would be paid twice — rig run b6f7968b spent
+            // 2 h 27 min on this pass's classification before the set-aside started the suite
+            // over. Only where nothing left could accept the failure: no exclusion can apply and
+            // the identical retry (when due) has already failed. A retry that passed, or a base
+            // a precise exclusion could still read, is decided below as before (xreview on #1192).
+            let set_aside_now = (compare && excluding.is_none() && !retry_passed)
+                .then(|| seed.as_ref().and_then(|s| s.set_aside_by(check, &run)))
+                .flatten();
+            if let Some(why) = set_aside_now {
+                if let Some(r) = early_retry {
+                    run.reruns.push(r);
+                }
+                decide_alone(&mut run);
+                again = Some(why);
+            } else {
+                let side = match (ctx.base_head.as_deref(), ctx.git_dir.as_deref()) {
+                    _ if !compare || retry_passed => None,
+                    (Some(head), _) if !(baseline_diff && baseline_diff_for(&check.dir)) => {
+                        Some(BaseSide {
+                            base: BaseRun {
+                                head: head.to_string(),
+                                cached: false,
+                                run: None,
+                                error: Some(format!(
                                 "baseline diff disabled by `{CONFIG_PATH}` (baseline_diff: false)"
                             )),
-                        },
-                        toc: None,
-                    })
-                }
-                (Some(head), Some(git_dir)) => {
-                    // This run's cache first; on a miss the base is exported, run (and, red,
-                    // inventoried), cached, and the export removed before the next HEAD run.
-                    Some(match BaseTree::cached(scratch, head, check, excluding) {
-                        Some(cached) => cached,
-                        None => {
-                            let export = held_worktree
-                                .as_ref()
-                                .map_err(String::clone)
-                                .and_then(|root| BaseTree::export(worktree, root, git_dir, head));
-                            let side = match export {
-                                Ok(t) => t.run_check(check, ctx, sandbox, scratch, excluding),
-                                Err(e) => BaseSide {
-                                    base: BaseRun {
-                                        head: head.to_string(),
-                                        cached: false,
-                                        run: None,
-                                        error: Some(e),
+                            },
+                            toc: None,
+                        })
+                    }
+                    (Some(head), Some(git_dir)) => {
+                        // This run's cache first; on a miss the base is exported, run (and, red,
+                        // inventoried), cached, and the export removed before the next HEAD run.
+                        Some(match BaseTree::cached(scratch, head, check, excluding) {
+                            Some(cached) => cached,
+                            None => {
+                                let export =
+                                    held_worktree.as_ref().map_err(String::clone).and_then(
+                                        |root| BaseTree::export(worktree, root, git_dir, head),
+                                    );
+                                let side = match export {
+                                    Ok(t) => t.run_check(check, ctx, sandbox, scratch, excluding),
+                                    Err(e) => BaseSide {
+                                        base: BaseRun {
+                                            head: head.to_string(),
+                                            cached: false,
+                                            run: None,
+                                            error: Some(e),
+                                        },
+                                        toc: None,
                                     },
-                                    toc: None,
-                                },
-                            };
-                            let removed = held_worktree
-                                .as_ref()
-                                .map_err(String::clone)
-                                .and_then(remove_base_export);
-                            if let Err(e) = removed {
-                                scratch_error = Some(format!(
-                                    "the base export could not be removed before the next \
+                                };
+                                let removed = held_worktree
+                                    .as_ref()
+                                    .map_err(String::clone)
+                                    .and_then(remove_base_export);
+                                if let Err(e) = removed {
+                                    scratch_error = Some(format!(
+                                        "the base export could not be removed before the next \
                                      check: {e}"
-                                ));
+                                    ));
+                                }
+                                side
                             }
-                            side
-                        }
-                    })
+                        })
+                    }
+                    _ => None,
+                };
+                if scratch_error.is_some() {
+                    decide_alone(&mut run);
+                    run.decision = Some(CheckDecision {
+                        outcome: OUTCOME_COULD_NOT_RUN.to_string(),
+                        ..run.decision.take().expect("set above")
+                    });
+                } else {
+                    decide(
+                        worktree,
+                        held_head,
+                        check,
+                        &mut run,
+                        side,
+                        &gcheck,
+                        exclude,
+                        sandbox,
+                        scratch,
+                        early_retry,
+                    );
                 }
-                _ => None,
-            };
-            if scratch_error.is_some() {
-                decide_alone(&mut run);
-                run.decision = Some(CheckDecision {
-                    outcome: OUTCOME_COULD_NOT_RUN.to_string(),
-                    ..run.decision.take().expect("set above")
-                });
-            } else {
-                decide(
-                    worktree,
-                    held_head,
-                    check,
-                    &mut run,
-                    side,
-                    &gcheck,
-                    exclude,
-                    sandbox,
-                    scratch,
-                    early_retry,
-                );
             }
         }
         if let Some(d) = run.decision.as_mut() {

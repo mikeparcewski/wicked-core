@@ -4812,6 +4812,8 @@ fn core_1152_a_fresh_check_failing_after_reuse_runs_the_floor_again_without_reus
     let _env = crate::test_env::ENV_LOCK
         .read()
         .unwrap_or_else(|p| p.into_inner());
+    // Headroom: no identical retry, so the e2e run count below is exact (core#1191).
+    let _load = seam::pin(0.5, 4);
     let r = Core1144::new(
         "core-1152-again",
         serde_json::json!({
@@ -4869,6 +4871,51 @@ fn core_1152_a_fresh_check_failing_after_reuse_runs_the_floor_again_without_reus
         })
         .unwrap_or(0);
     assert_eq!(e2e_runs, 2, "e2e ran on the first pass, then on the second");
+    let _ = std::fs::remove_dir_all(&r.wt);
+}
+
+/// (core#1191, xreview on #1192) A fresh check after reused ones that fails once under load and
+/// passes its identical retry is ACCEPTED (`passed on retry (flaky)`), as before: the set-aside is
+/// decided early only when nothing left could accept the failure, so the reuse stands.
+#[cfg(unix)]
+#[test]
+fn core_1191_a_fresh_check_that_passes_its_retry_after_reuse_keeps_the_reuse() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let r = Core1144::new(
+        "core-1191-flaky",
+        serde_json::json!({
+            "typecheck": false,
+            "lint": Core1144::NONCE,
+            "test": Core1144::NONCE,
+            // Red the first time in this floor, green after (the check's private TMPDIR persists
+            // across one floor's runs).
+            "e2e": ["sh", "-c", "if [ -f \"$TMPDIR/e2e-tried\" ]; then exit 0; fi; touch \"$TMPDIR/e2e-tried\"; exit 1"],
+        }),
+    );
+    let creator = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
+    if creator.sandbox_error.is_some() || creator.checks.is_empty() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
+    }
+    let verify = {
+        let _load = seam::pin(10.0, 4);
+        r.guarded(FloorStage::Verify, &r.base, 6, "verify")
+    };
+    let reuse = verify.reused_from.as_ref().expect("the reuse is disclosed");
+    assert_eq!(reuse.voided, None, "the reuse stands: {reuse:?}");
+    assert_eq!(reuse.reused, vec!["lint".to_string(), "test".to_string()]);
+    let e2e = verify
+        .checks
+        .iter()
+        .find(|c| c.name == "e2e")
+        .expect("e2e ran");
+    let d = e2e.decision.as_ref().expect("decided");
+    assert!(
+        verify.passed && d.outcome == OUTCOME_PASS && d.flaky,
+        "{verify:#?}"
+    );
     let _ = std::fs::remove_dir_all(&r.wt);
 }
 
