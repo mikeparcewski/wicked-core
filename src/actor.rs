@@ -7908,11 +7908,11 @@ const FLOOR_AUTO_RETRY_NOTE: &str = "[automatic floor retry — round 1 of 1 (co
 /// advice, so the tree changed, the whole floor ran again (27 min) and the review then failed on
 /// that very edit (another 32-min floor). The round is for the failing checks only.
 const FLOOR_AUTO_RETRY_SCOPE_NOTE: &str = " This round is ONLY for these failing checks: make no \
-     edit they do not require — no reviewer's or team member's advice, no refactor, no follow-up, \
-     no other platform — because any edit makes the floor run again on a new tree. Answer team \
-     advice that arrives in this round with `ADVICE <id>: DECLINE — not needed for the failing \
-     checks; left for the review`. If you answer that no change is needed, leave the tree exactly \
-     as it is: the engine compares the tree, and an attempt that changed it is read as a change.";
+     edit they do not require — no refactor, no follow-up, no other platform, and no reviewer's or \
+     team member's advice unless the failing checks need it — because any edit makes the floor run \
+     again on a new tree. Other advice waits for the hand-off's review, which reads it with your \
+     answer. If you answer that no change is needed, leave the tree exactly as it is: the engine \
+     compares the tree, and an attempt that changed it is read as a change.";
 
 /// (j4-gates, core#1113; core#1142) The automatic round's note, from the floor's structured
 /// results ([`crate::repo_checks::RepoChecksReport::failure_split`]): it names the HEAD-ONLY
@@ -24829,11 +24829,13 @@ mod code_evidence_floor_tests {
             assert!(note.ends_with(FLOOR_AUTO_RETRY_SCOPE_NOTE), "{note}");
             assert!(
                 note.contains("make no edit they do not require")
-                    && note.contains("team member's advice")
-                    && note.contains("DECLINE")
+                    && note.contains("team member's advice unless the failing checks need it")
                     && note.contains("read as a change"),
                 "{note}"
             );
+            // (xreview on #1204) No prescribed DECLINE: a declined finding opens the hold round
+            // (and a council for a held HIGH) at once; the engine has no "defer to review" answer.
+            assert!(!note.contains("DECLINE"), "{note}");
             assert!(
                 crate::team::parse_advice_lines(note).is_empty(),
                 "the note's advice example is not an answer"
