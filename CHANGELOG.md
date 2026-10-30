@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **`ps` works inside the macOS jail, so a check's process-table tests stop failing on every base (crew#1221).**
+  `/bin/ps` is setuid root, and macOS refuses to exec a setuid binary inside a sandbox
+  (`execvp() of '/bin/ps' failed: Operation not permitted`). Every `ps` call in a jailed check read empty, so crew's
+  process-table tests (`bridge-reaper`, `stall-seat-liveness`, `integration/interactive-bridge-pool`) failed on base
+  and head alike, and a power hand-off floor could not separate them (`base_red_unseparated`). The `sandbox-exec`
+  profile (floor, worker and validator) now lets the literal `/bin/ps`, and nothing else, run outside the profile.
+  `ps` writes only to its inherited stdout and runs no other program, so the write boundary is unchanged. Under
+  `(allow default)` the jail could already read the process table.
 - **Core's own floor re-runs only the failing tests (core#1198).** `.wicked/checks.json` declares
   `rerun.test = {"command": ["cargo", "test", "--locked", "--workspace", "--no-fail-fast", "--", "{names}", "--exact"], "by": "name"}`,
   so a failed `test` check is retried and compared on the base by the failing test names instead of the
