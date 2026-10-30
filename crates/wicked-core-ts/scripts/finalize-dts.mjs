@@ -345,6 +345,12 @@ export interface RepoChecksEvaluatedEventJson extends CoreEventJson {
   skipped: string[]
 }
 
+/** (core#1198) What a run limited to a failing set ran. */
+export interface RepoCheckScopeJson {
+  by: 'file' | 'name'
+  ids: string[]
+}
+
 /** One check the floor ran ({@link RepoChecksEvaluatedEventJson.checks}). */
 export interface RepoCheckRunJson {
   name: string
@@ -374,6 +380,22 @@ export interface RepoCheckRunJson {
   failureIds: string[]
   /** Failure ids the check's own retry cleared — flaky (passed on retry), not the change's (core#1172). */
   flakyIds: string[]
+  /** (core#1198) Set on a run of a failing set only (a scoped retry or base run): \`by\` is \`'file'\` or
+   *  \`'name'\`, \`ids\` the files or test names it ran. \`null\`: the check as declared. */
+  scope: RepoCheckScopeJson | null
+  /** (core#1198) The engine's retry of this failed check, with its own duration, so a timeline can place
+   *  it; \`null\` when the engine did not retry it. */
+  retry: {
+    durationMs: number
+    exitCode: number | null
+    timedOut: boolean
+    failureIds: string[]
+    scope: RepoCheckScopeJson | null
+    /** Why it ran the whole check although the repo declares a \`rerun\`. */
+    wholeBecause: string | null
+  } | null
+  /** (core#1198) The repo declares that the check retries its own failures: the engine did not retry it. */
+  selfRetry: boolean
   regressions: string[]
   /** DEPRECATED: always \`[]\`. */
   envCannotRun: string[]

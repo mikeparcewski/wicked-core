@@ -321,6 +321,9 @@ pub const DEFAULT_CHECK_CACHE_FREE_FLOOR_GB: u64 = 20;
 pub const CHECK_CACHE_IDLE_TTL: Duration = crate::floor_log::FLOOR_LOG_TTL;
 /// The optional per-repo check configuration, relative to the worktree root.
 pub const CONFIG_PATH: &str = ".wicked/checks.json";
+
+#[path = "floor_scoped.rs"]
+mod floor_scoped;
 /// (core#767) The check-name prefix of a configured journey (`journey-<name>`).
 pub const JOURNEY_PREFIX: &str = "journey-";
 
@@ -533,6 +536,19 @@ pub struct CheckRun {
     /// `failure_ids`: no outcome reads them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flaky_ids: Vec<String>,
+    /// (core#1198) Set on a run that ran ONLY a failing set (a scoped retry, a scoped base run):
+    /// how the set was spelled and what it held. `None`: the check as declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<RunScope>,
+    /// (core#1198) The engine's retry of this failed check (the run that decided, when it was a
+    /// retry): its own duration, exit, failures and scope, so a timeline can place it. `None`
+    /// when the engine did not retry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetrySummary>,
+    /// (core#1198) The repo declares that this check re-runs its own failures (`rerun.<check>.
+    /// self_retry`): the engine did not retry it again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub self_retry: bool,
     /// The compatible token of [`Self::decision`] for readers of the older field: `regression`
     /// (`new_failure` against a base, `flaky_twice`), `pre_existing_in_sandbox` (`pass_excluded`),
     /// `flaky_under_load` (passed on its identical retry), [`BASE_RED_UNSEPARATED`]; `None` when it
@@ -700,6 +716,44 @@ impl CheckRun {
             total as f64 / 1000.0,
             parts.len() + 1
         )
+    }
+}
+
+/// (core#1198) What a run limited to a failing set ran: `by` is `file` or `name`, `ids` the files
+/// or test names handed to the repo's declared `rerun` command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunScope {
+    pub by: String,
+    pub ids: Vec<String>,
+}
+
+/// (core#1198) The engine's retry of a failed check, as `checks[].retry` on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrySummary {
+    pub duration_ms: u64,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    #[serde(default)]
+    pub failure_ids: Vec<String>,
+    /// The failing set the retry ran; `None` when it ran the whole check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<RunScope>,
+    /// Why the retry ran the whole check although the repo declares a `rerun`: the failing set
+    /// could not be read, or a scoped pass could not stand for the whole check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_because: Option<String>,
+}
+
+impl RetrySummary {
+    fn of(r: &CheckRun) -> Self {
+        Self {
+            duration_ms: r.duration_ms,
+            exit_code: r.exit_code,
+            timed_out: r.timed_out,
+            failure_ids: r.failure_ids.clone(),
+            scope: r.scope.clone(),
+            whole_because: None,
+        }
     }
 }
 
@@ -2064,6 +2118,10 @@ struct ChecksConfig {
     /// stranded.
     #[serde(default)]
     generated: Vec<GeneratedDecl>,
+    /// (core#1198) How a failing test check re-runs ONLY its failing set (retry and base), and
+    /// which checks retry their own failures ([`floor_scoped`]). Keyed by check name.
+    #[serde(default)]
+    rerun: std::collections::BTreeMap<String, floor_scoped::RerunEntry>,
 }
 
 /// (core#1173) One `generated` entry of [`CONFIG_PATH`] as written:
@@ -2151,7 +2209,18 @@ fn parse_config(raw: &str) -> Result<ChecksConfig, String> {
         }
     }
     generated_of(&cfg)?;
+    floor_scoped::rerun_of(&cfg.rerun)?;
     Ok(cfg)
+}
+
+/// (core#1198) The declared `rerun` entries of the package at `dir` (validated at detection; a
+/// config that does not parse declares nothing here, and already failed detection).
+fn rerun_decls(dir: &Path) -> std::collections::BTreeMap<String, floor_scoped::RerunDecl> {
+    read_config(dir)
+        .ok()
+        .flatten()
+        .and_then(|c| floor_scoped::rerun_of(&c.rerun).ok())
+        .unwrap_or_default()
 }
 
 /// Read [`CONFIG_PATH`] when present. Fail-closed: a malformed file, an unknown key, a bad value,
@@ -4907,6 +4976,8 @@ struct FloorInputs {
     package_baseline: std::collections::HashMap<String, bool>,
     package_note: Option<String>,
     e2e_paths: Option<Vec<String>>,
+    /// (core#1198) Each detected check's `rerun` entry, by `(dir, name)`, read before any check ran.
+    reruns: std::collections::HashMap<(String, String), floor_scoped::RerunDecl>,
 }
 
 /// One pass of the floor over the detected checks ([`run_with_sandbox_ctx`]). With no `frozen`
@@ -5034,6 +5105,14 @@ fn run_detected(
             let e2e_paths = (ctx.stage == FloorStage::Verify)
                 .then(|| e2e_paths(worktree, ctx))
                 .flatten();
+            // (core#1198) Read here too, before the first check runs. A build guide's check is the
+            // guide's, not the config's: no entry applies to it.
+            let mut reruns = std::collections::HashMap::new();
+            for c in detected.iter().filter(|c| c.source != GUIDE_SOURCE) {
+                if let Some(d) = rerun_decls(&worktree.join(&c.dir)).remove(&c.name) {
+                    reruns.insert((c.dir.clone(), c.name.clone()), d);
+                }
+            }
             FloorInputs {
                 detected,
                 waived,
@@ -5047,6 +5126,7 @@ fn run_detected(
                 package_baseline,
                 package_note,
                 e2e_paths,
+                reruns,
             }
         }
     };
@@ -5064,6 +5144,7 @@ fn run_detected(
         package_baseline,
         package_note,
         e2e_paths,
+        reruns,
     } = inputs;
     let baseline_diff_for =
         |dir: &str| dir.is_empty() || package_baseline.get(dir).copied().unwrap_or(false);
@@ -5258,19 +5339,38 @@ fn run_detected(
             // retry (flaky)` reads no base), and the base run it would never have read — a whole
             // suite, 19.5 min on rig run bc2366e1, 30 min on b6f7968b — is not paid for. A retry
             // that fails is the decision's retry; the base then runs as before.
-            let early_retry = (compare && excluding.is_none())
-                .then(|| {
-                    retry_if_loaded(
+            // (core#1198) The repo's `rerun` entry for this check: retry and compare only its failing
+            // set, and do not retry a check that retries its own failures.
+            let decl = reruns.get(&(check.dir.clone(), check.name.clone()));
+            let self_retry = compare && decl.is_some_and(|d| d.self_retry);
+            run.self_retry = self_retry;
+            let scoped = decl
+                .filter(|_| compare && excluding.is_none())
+                .and_then(|d| Scoped::of(check, d, &run, scratch));
+            if let Some(Err(why)) = &scoped {
+                eprintln!(
+                    "wicked-core: repo checks floor — `{}`: the whole check is retried and \
+                     compared ({why})",
+                    check.name
+                );
+            }
+            let (early_retry, retry_extra, whole_because) =
+                if compare && excluding.is_none() && !self_retry {
+                    retry_failing(
                         worktree,
                         held_head,
                         check,
-                        &ExecOpts::default(),
+                        scoped.as_ref(),
                         &run,
                         sandbox,
                         scratch,
                     )
-                })
-                .flatten();
+                } else {
+                    (None, Vec::new(), None)
+                };
+            // A failing-set retry ran and passed, so the whole retry decided.
+            let retried_whole = !retry_extra.is_empty();
+            run.reruns.extend(retry_extra);
             let retry_passed = early_retry.as_ref().is_some_and(CheckRun::passed);
             // (core#1191) A fresh check that failed after reused ones sends the floor round again
             // with nothing reused (core#1152), and that pass classifies it. Classifying it HERE
@@ -5284,6 +5384,10 @@ fn run_detected(
                 .flatten();
             if let Some(why) = set_aside_now {
                 if let Some(r) = early_retry {
+                    run.retry = Some(RetrySummary {
+                        whole_because: whole_because.clone(),
+                        ..RetrySummary::of(&r)
+                    });
                     run.reruns.push(r);
                 }
                 decide_alone(&mut run);
@@ -5307,7 +5411,33 @@ fn run_detected(
                     (Some(head), Some(git_dir)) => {
                         // This run's cache first; on a miss the base is exported, run (and, red,
                         // inventoried), cached, and the export removed before the next HEAD run.
-                        Some(match BaseTree::cached(scratch, head, check, excluding) {
+                        // (core#1198) A cached WHOLE base answers a failing set too; then the
+                        // set's own record; then the set runs on the base.
+                        // Only a set that accounts for every failure of the run that decides: the
+                        // head's own count must match it, and a whole retry that decided is the
+                        // whole check's failure, not the set's (xreview on #1199).
+                        let failing_set =
+                            scoped.as_ref().and_then(|r| r.as_ref().ok()).filter(|s| {
+                                match (&s.complete, retried_whole) {
+                                    (Ok(()), false) => true,
+                                    (Err(why), _) => {
+                                        eprintln!(
+                                        "wicked-core: repo checks floor — `{}`: the whole check \
+                                         runs on the base ({why})",
+                                        check.name
+                                    );
+                                        false
+                                    }
+                                    (Ok(()), true) => false,
+                                }
+                            });
+                        let cached =
+                            BaseTree::cached(scratch, head, check, excluding).or_else(|| {
+                                failing_set.and_then(|s| {
+                                    BaseTree::cached_of(scratch, head, &s.check, None, true)
+                                })
+                            });
+                        Some(match cached {
                             Some(cached) => cached,
                             None => {
                                 let export =
@@ -5315,7 +5445,22 @@ fn run_detected(
                                         |root| BaseTree::export(worktree, root, git_dir, head),
                                     );
                                 let side = match export {
-                                    Ok(t) => t.run_check(check, ctx, sandbox, scratch, excluding),
+                                    Ok(t) => match failing_set {
+                                        Some(s) => {
+                                            let (side, cost) =
+                                                t.run_failing_set(check, s, ctx, sandbox, scratch);
+                                            if let Some(c) = cost {
+                                                run.earlier_passes.push((
+                                                    "base failing set".to_string(),
+                                                    c.duration_ms,
+                                                ));
+                                            }
+                                            side
+                                        }
+                                        None => {
+                                            t.run_check(check, ctx, sandbox, scratch, excluding)
+                                        }
+                                    },
                                     Err(e) => BaseSide {
                                         base: BaseRun {
                                             head: head.to_string(),
@@ -5360,7 +5505,11 @@ fn run_detected(
                         sandbox,
                         scratch,
                         early_retry,
+                        self_retry,
                     );
+                    if let Some(r) = run.retry.as_mut() {
+                        r.whole_because = whole_because;
+                    }
                 }
             }
         }
@@ -6698,7 +6847,19 @@ pub(crate) fn remove_base_export(root: &HeldDir) -> Result<(), String> {
 }
 
 impl BaseTree {
+    #[cfg(test)]
     fn cache_path(scratch: &CheckScratch, head: &str, check: &RepoCheck) -> PathBuf {
+        Self::cache_path_of(scratch, head, check, false)
+    }
+
+    /// [`Self::cache_path`]; `failing_set` (core#1198) names the record of a run of a failing set
+    /// only, never the whole check's.
+    fn cache_path_of(
+        scratch: &CheckScratch,
+        head: &str,
+        check: &RepoCheck,
+        failing_set: bool,
+    ) -> PathBuf {
         // ONE file name, whatever the head, the `dir` (core#817: a subdirectory package's check
         // is its own entry) or the check's `name` (a guide's, repo-controlled) say: a sha256 over
         // the three, NUL-separated (injective, a fixed length, never a path separator). It lives
@@ -6710,6 +6871,9 @@ impl BaseTree {
         for part in [head, check.dir.as_str(), check.name.as_str()] {
             h.update(part.as_bytes());
             h.update([0u8]);
+        }
+        if failing_set {
+            h.update(b"failing-set\0");
         }
         let key: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
         scratch.logs.join(format!("base-{key}.json"))
@@ -6724,7 +6888,20 @@ impl BaseTree {
         check: &RepoCheck,
         guide: Option<&GuideCheck>,
     ) -> Option<BaseSide> {
-        let raw = std::fs::read_to_string(Self::cache_path(scratch, head, check)).ok()?;
+        Self::cached_of(scratch, head, check, guide, false)
+    }
+
+    /// [`Self::cached`] of the whole check, or (`failing_set`, core#1198) of the failing set
+    /// `check` runs: a record for the same set only (its argv names the set).
+    fn cached_of(
+        scratch: &CheckScratch,
+        head: &str,
+        check: &RepoCheck,
+        guide: Option<&GuideCheck>,
+        failing_set: bool,
+    ) -> Option<BaseSide> {
+        let raw =
+            std::fs::read_to_string(Self::cache_path_of(scratch, head, check, failing_set)).ok()?;
         let rec = serde_json::from_str::<BaseRecord>(&raw).ok()?;
         // A record taken under another guide (or none: no inventory) is not this comparison.
         if rec.guide != guide_id(guide) {
@@ -6847,7 +7024,66 @@ impl BaseTree {
         scratch: &CheckScratch,
         guide: Option<&GuideCheck>,
     ) -> BaseSide {
-        let cache = Self::cache_path(scratch, &self.head, check);
+        self.run_check_as(check, ctx, sandbox, scratch, guide, None)
+    }
+
+    /// (core#1198) The base side of the failing set `s` of `check`: the set run on the base. A
+    /// base that FAILS it is red, as the whole base would be. A base that PASSES it stands only when
+    /// its output shows every selected test running and passing (a FILE the base does not have was
+    /// added by the change and is not needed); otherwise the whole check runs on the base and
+    /// decides, and the failing-set run is returned beside it (its cost). A passing record is
+    /// cached only here, once it stands: a floor interrupted before the proof leaves none.
+    fn run_failing_set(
+        &self,
+        check: &RepoCheck,
+        s: &Scoped,
+        ctx: &FloorContext,
+        sandbox: &WorkerSandbox,
+        scratch: &CheckScratch,
+    ) -> (BaseSide, Option<CheckRun>) {
+        let side = self.run_check_as(&s.check, ctx, sandbox, scratch, None, Some(s));
+        let Some(run) = side.base.run.as_ref().filter(|r| r.passed()) else {
+            return (side, None);
+        };
+        // A libtest name must be shown passing: nothing establishes that the base lacks it.
+        let present = |id: &str| match s.by {
+            floor_scoped::RerunBy::Name => true,
+            floor_scoped::RerunBy::File => {
+                let rel: Vec<&str> = [check.dir.as_str(), s.root.as_str(), id]
+                    .into_iter()
+                    .filter(|p| !p.is_empty())
+                    .collect();
+                // Unknown (an error inspecting it) is treated as present: it must be shown.
+                !matches!(self.held.kind(&rel.join("/")), Ok(None))
+            }
+        };
+        let Err(why) = s.proven_in(run, scratch, present) else {
+            self.store(scratch, &s.check, None, run.clone(), None, true);
+            return (side, None);
+        };
+        eprintln!(
+            "wicked-core: repo checks floor — `{}`'s failing set passed on the base, but {why}: \
+             running the whole check on the base",
+            check.name
+        );
+        let scoped_run = side.base.run;
+        (
+            self.run_check(check, ctx, sandbox, scratch, None),
+            scoped_run,
+        )
+    }
+
+    /// [`Self::run_check`]; `scoped` (core#1198) runs `check` as a failing-set run: recorded with
+    /// its scope, and cached under the failing-set record.
+    fn run_check_as(
+        &self,
+        check: &RepoCheck,
+        ctx: &FloorContext,
+        sandbox: &WorkerSandbox,
+        scratch: &CheckScratch,
+        guide: Option<&GuideCheck>,
+        scoped: Option<&Scoped>,
+    ) -> BaseSide {
         let fail = |e: String| BaseSide {
             base: BaseRun {
                 head: self.head.clone(),
@@ -7013,6 +7249,41 @@ impl BaseTree {
             }
             toc = Some(t);
         }
+        run.scope = scoped.map(|s| s.scope.clone());
+        // (core#1198) A failing set's PASS is cached only once it stands ([`Self::run_failing_set`]).
+        if scoped.is_none() || !run.passed() {
+            self.store(
+                scratch,
+                check,
+                guide,
+                run.clone(),
+                toc.clone(),
+                scoped.is_some(),
+            );
+        }
+        BaseSide {
+            base: BaseRun {
+                head: self.head.clone(),
+                cached: false,
+                run: Some(run),
+                error: None,
+            },
+            toc,
+        }
+    }
+
+    /// Cache `run` (and its inventory) as the base result of `check` for the rest of the run: the
+    /// whole check's record, or (`failing_set`) the failing set's. A base run (or its inventory, or
+    /// an alone run) that did not finish or could not start is not cached: it says nothing lasting.
+    fn store(
+        &self,
+        scratch: &CheckScratch,
+        check: &RepoCheck,
+        guide: Option<&GuideCheck>,
+        run: CheckRun,
+        toc: Option<Toc>,
+        failing_set: bool,
+    ) {
         let rec = BaseRecord {
             floor_policy: FLOOR_POLICY_VERSION,
             head_argv: check.argv.clone(),
@@ -7020,25 +7291,18 @@ impl BaseTree {
             run,
             toc,
         };
-        // A base run (or its inventory, or an alone run) that did not finish or could not start is
-        // not cached: it says nothing lasting.
-        if !rec.run.timed_out
-            && rec.run.spawn_error.is_none()
-            && !rec.toc.as_ref().is_some_and(|t| t.transient)
+        if rec.run.timed_out
+            || rec.run.spawn_error.is_some()
+            || rec.toc.as_ref().is_some_and(|t| t.transient)
         {
-            let _ = std::fs::create_dir_all(&scratch.logs);
-            if let Ok(json) = serde_json::to_string(&rec) {
-                let _ = std::fs::write(&cache, json);
-            }
+            return;
         }
-        BaseSide {
-            base: BaseRun {
-                head: self.head.clone(),
-                cached: false,
-                run: Some(rec.run),
-                error: None,
-            },
-            toc: rec.toc,
+        let _ = std::fs::create_dir_all(&scratch.logs);
+        if let Ok(json) = serde_json::to_string(&rec) {
+            let _ = std::fs::write(
+                Self::cache_path_of(scratch, &self.head, check, failing_set),
+                json,
+            );
         }
     }
 }
@@ -8259,6 +8523,22 @@ fn retry_if_loaded(
     sandbox: &WorkerSandbox,
     scratch: &CheckScratch,
 ) -> Option<CheckRun> {
+    retry_labelled(worktree, held, one, exec, first, sandbox, scratch, None)
+}
+
+/// [`retry_if_loaded`], running `one` (the failing set, when `scope` says so) once the HEAD run
+/// `first` is due a retry.
+#[allow(clippy::too_many_arguments)]
+fn retry_labelled(
+    worktree: &Path,
+    held: Option<&HeldDir>,
+    one: &RepoCheck,
+    exec: &ExecOpts,
+    first: &CheckRun,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+    scope: Option<&RunScope>,
+) -> Option<CheckRun> {
     if first.passed() || first.timed_out || first.spawn_error.is_some() || !ran_loaded(first) {
         return None;
     }
@@ -8276,16 +8556,178 @@ fn retry_if_loaded(
     let waited_s = waited.elapsed().as_secs_f64();
     let mut r = run_one_with(worktree, held, one, exec, sandbox, scratch, Tree::Head);
     r.logs = relabel(r.logs, "retry");
-    r.source = format!(
-        "the identical retry of `{}` after waiting {:.0}s for headroom (DES-FLOOR-V2)",
-        one.name, waited_s
-    );
+    r.source = match scope {
+        None => format!(
+            "the identical retry of `{}` after waiting {:.0}s for headroom (DES-FLOOR-V2)",
+            one.name, waited_s
+        ),
+        Some(s) => format!(
+            "the retry of `{}`'s {} failing {}{} only, after waiting {:.0}s for headroom (core#1198)",
+            one.name,
+            s.ids.len(),
+            s.by,
+            if s.ids.len() == 1 { "" } else { "s" },
+            waited_s
+        ),
+    };
+    r.scope = scope.cloned();
     eprintln!(
-        "wicked-core: repo checks floor — `{}` failed under load; its identical retry {}",
+        "wicked-core: repo checks floor — `{}` failed under load; its {} retry {}",
         one.name,
+        if scope.is_some() {
+            "failing-set"
+        } else {
+            "identical"
+        },
         if r.passed() { "passed" } else { "failed" }
     );
     Some(r)
+}
+
+/// (core#1198) A failed check's failing set, ready to re-run through the repo's declared `rerun`
+/// command ([`floor_scoped`]).
+struct Scoped {
+    by: floor_scoped::RerunBy,
+    /// The directory the set's files are relative to, below the check's own.
+    root: String,
+    /// The check with the declared command over the failing set (same name, dir and bound).
+    check: RepoCheck,
+    scope: RunScope,
+    /// Does the head's own count account for every failure the set names?
+    complete: Result<(), String>,
+}
+
+/// A run's two streams, read back whole from the log store (`Err`: unreadable or cut at the cap).
+fn run_text(run: &CheckRun, scratch: &CheckScratch) -> Result<(String, String), String> {
+    let (Some(out), Some(err)) = (run.logs.first(), run.logs.get(1)) else {
+        return Err("its output was not stored".into());
+    };
+    if out.truncated || err.truncated {
+        return Err("its output was cut at the log cap".into());
+    }
+    Ok((
+        crate::floor_log::text(&scratch.logs, out)?,
+        crate::floor_log::text(&scratch.logs, err)?,
+    ))
+}
+
+impl Scoped {
+    /// The failing set of the failed head run `head`, when the repo declares a `rerun` command for
+    /// `check`; `Some(Err(why))` when it does but the set cannot be read off the head.
+    fn of(
+        check: &RepoCheck,
+        decl: &floor_scoped::RerunDecl,
+        head: &CheckRun,
+        scratch: &CheckScratch,
+    ) -> Option<Result<Self, String>> {
+        let (command, by) = decl.command.as_ref()?;
+        let by = *by;
+        Some((|| {
+            let ids = floor_scoped::select(by, &head.failure_ids)?;
+            let (out, err) = run_text(head, scratch).map_err(|e| format!("the head: {e}"))?;
+            let complete = floor_scoped::head_complete(by, &out, &err, &ids);
+            Ok(Scoped {
+                by,
+                root: decl.root.clone(),
+                check: RepoCheck {
+                    argv: floor_scoped::scoped_argv(command, by, &ids),
+                    source: format!(
+                        "{CONFIG_PATH} rerun.{} over the {} failing {}{}",
+                        check.name,
+                        ids.len(),
+                        by.as_wire(),
+                        if ids.len() == 1 { "" } else { "s" }
+                    ),
+                    ..check.clone()
+                },
+                scope: floor_scoped::scope_of(by, &ids),
+                complete,
+            })
+        })())
+    }
+
+    /// Does the PASSING run `run` show each of the set's tests that `present` says the tree has
+    /// running and passing?
+    fn proven_in(
+        &self,
+        run: &CheckRun,
+        scratch: &CheckScratch,
+        present: impl Fn(&str) -> bool,
+    ) -> Result<(), String> {
+        let (out, err) = run_text(run, scratch)?;
+        match self
+            .scope
+            .ids
+            .iter()
+            .find(|id| present(id) && !floor_scoped::proven(self.by, &out, &err, id))
+        {
+            Some(id) => Err(format!(
+                "its output does not show `{id}` running and passing"
+            )),
+            None => Ok(()),
+        }
+    }
+}
+
+/// (core#1198) The engine's retry of the failed head run `first` of `check`, when one is due
+/// ([`retry_if_loaded`]): first only the failing set when the repo declares how. A failing-set
+/// retry that FAILS decides (the failure reproduced). One that PASSES does not: a test that passes
+/// alone may still fail beside the others, so the whole identical retry runs at once and decides.
+/// Returns the deciding retry, the passes it cost before it, and why it ran the whole check
+/// although a `rerun` is declared.
+fn retry_failing(
+    worktree: &Path,
+    held: Option<&HeldDir>,
+    check: &RepoCheck,
+    scoped: Option<&Result<Scoped, String>>,
+    first: &CheckRun,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+) -> (Option<CheckRun>, Vec<CheckRun>, Option<String>) {
+    let exec = ExecOpts::default();
+    let s = match scoped {
+        Some(Ok(s)) => s,
+        other => {
+            let r = retry_if_loaded(worktree, held, check, &exec, first, sandbox, scratch);
+            let why = match other {
+                Some(Err(e)) if r.is_some() => Some(e.clone()),
+                _ => None,
+            };
+            return (r, Vec::new(), why);
+        }
+    };
+    let Some(mut r) = retry_labelled(
+        worktree,
+        held,
+        &s.check,
+        &exec,
+        first,
+        sandbox,
+        scratch,
+        Some(&s.scope),
+    ) else {
+        return (None, Vec::new(), None);
+    };
+    if !r.passed() {
+        return (Some(r), Vec::new(), None);
+    }
+    let why = "the failing set passed alone, which does not show the whole check passes (a test \
+               can fail only beside the others)"
+        .to_string();
+    eprintln!(
+        "wicked-core: repo checks floor — `{}`'s failing-set retry passed: retrying the whole \
+         check, which decides",
+        check.name
+    );
+    r.logs = relabel(r.logs, "retry-scoped");
+    let mut whole = run_one_with(worktree, held, check, &exec, sandbox, scratch, Tree::Head);
+    whole.logs = relabel(whole.logs, "retry");
+    whole.source = format!(
+        "the identical retry of `{}`: its failing-set retry passed, and only the whole check \
+         decides a pass (core#1198)",
+        check.name
+    );
+    (Some(whole), vec![r], Some(why))
 }
 
 /// (program DES-POWER-MODE) A power run at high rigor or above hands off on the FULL suite, at the
@@ -8330,6 +8772,7 @@ fn decide(
     sandbox: &WorkerSandbox,
     scratch: &CheckScratch,
     early_retry: Option<CheckRun>,
+    no_retry: bool,
 ) {
     let mut logs = head.logs.clone();
     let base_sha = side.as_ref().map(|s| s.base.head.clone());
@@ -8501,8 +8944,9 @@ fn decide(
     // The head's identical retry already ran before the base (see the caller): it is this
     // decision's retry. Only when the decision could not exclude, so the deciding run is the head.
     let early_retry = early_retry.filter(|_| !excluded_run);
+    // (core#1198) A check that retries its own failures is not retried again.
     let retry = early_retry.or_else(|| {
-        (!crashed_out)
+        (!crashed_out && !no_retry)
             .then(|| {
                 retry_if_loaded(
                     worktree,
@@ -8518,6 +8962,7 @@ fn decide(
     });
     if let Some(r) = retry {
         logs.extend(r.logs.iter().cloned());
+        head.retry = Some(RetrySummary::of(&r));
         head.reruns.push(r.clone());
         decision.flaky = r.passed();
         twice = !r.passed() && !r.timed_out && r.spawn_error.is_none() && ran_loaded(&r);
@@ -9091,6 +9536,9 @@ pub(crate) fn run_one_with(
         bound_note: None,
         failure_ids: Vec::new(),
         flaky_ids: Vec::new(),
+        scope: None,
+        retry: None,
+        self_retry: false,
         classification: None,
         pre_existing: Vec::new(),
         regressions: Vec::new(),
@@ -9705,6 +10153,9 @@ pub(crate) mod tests {
                 bound_note: None,
                 failure_ids: Vec::new(),
                 flaky_ids: Vec::new(),
+                scope: None,
+                retry: None,
+                self_retry: false,
                 classification: None,
                 pre_existing: Vec::new(),
                 regressions: Vec::new(),
@@ -12994,6 +13445,9 @@ exit 1
             bound_note: None,
             failure_ids: Vec::new(),
             flaky_ids: Vec::new(),
+            scope: None,
+            retry: None,
+            self_retry: false,
             classification: None,
             pre_existing: Vec::new(),
             regressions: Vec::new(),
@@ -13251,6 +13705,9 @@ exit 1
             bound_note: None,
             failure_ids: ids.iter().map(|x| x.to_string()).collect(),
             flaky_ids: Vec::new(),
+            scope: None,
+            retry: None,
+            self_retry: false,
             classification: None,
             pre_existing: Vec::new(),
             regressions: Vec::new(),
@@ -13294,6 +13751,9 @@ exit 1
             let mut head = CheckRun {
                 failure_ids: vec!["FAIL tests/chord.test.ts > scans".to_string()],
                 flaky_ids: Vec::new(),
+                scope: None,
+                retry: None,
+                self_retry: false,
                 ..at(head_band, "1200s × 3.00 (1-min load 100.9 / 14 cpus)")
             };
             head.base = Some(Box::new(base));
@@ -13786,6 +14246,10 @@ exit 1
 #[path = "floor_tests.rs"]
 pub(crate) mod floor_tests;
 
+#[cfg(test)]
+#[path = "floor_scoped_tests.rs"]
+mod floor_scoped_tests;
+
 /// (j4-gates) A failed floor report for tests: one `test` check that exited 1 naming `head`, with a
 /// base run (`base`: `Some(ids)` — red naming those, or green when empty) or none, decided
 /// `base_red_unseparated` on a red base and `new_failure` otherwise.
@@ -13992,6 +14456,9 @@ mod floor_pass_tests {
             bound_note: None,
             failure_ids: Vec::new(),
             flaky_ids: Vec::new(),
+            scope: None,
+            retry: None,
+            self_retry: false,
             classification: None,
             pre_existing: Vec::new(),
             regressions: Vec::new(),

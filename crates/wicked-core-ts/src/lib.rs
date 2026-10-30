@@ -3424,6 +3424,9 @@ mod tests {
         let run: wicked_core::CheckRun = serde_json::from_value(serde_json::json!({
             "name": "test", "argv": ["cargo", "test"], "source": "Cargo.toml", "exit_code": 101,
             "timed_out": false, "duration_ms": 1, "stdout_tail": "", "stderr_tail": "",
+            "scope": {"by": "file", "ids": ["tests/a.test.ts"]},
+            "retry": {"duration_ms": 2, "exit_code": 1, "timed_out": false, "failure_ids": [],
+                      "scope": {"by": "file", "ids": ["tests/a.test.ts"]}},
             "decision": {
                 "outcome": "pass_excluded", "base_sha": "abc", "base_failing": ["t::a"],
                 "excluded": ["t::a"], "flaky": false, "reason": "1 pre-existing excluded: t::a",
@@ -3465,6 +3468,8 @@ mod tests {
             ("FloorLogRefJson", log_ref),
             ("FloorGuideStatusJson", &decision["guide"]),
             ("FloorTestSelectionJson", &check["selection"]),
+            ("RepoCheckScopeJson", &check["scope"]),
+            ("RepoCheckScopeJson", &check["retry"]["scope"]),
         ] {
             let declared = iface(name);
             for key in obj.as_object().expect("object").keys() {
@@ -3487,6 +3492,14 @@ mod tests {
             assert!(
                 outcomes.contains(&format!("'{o}'")),
                 "outcome {o} is declared"
+            );
+        }
+        // core#1198: the retry's own keys, declared inline on `RepoCheckRunJson.retry`.
+        let declared = iface("RepoCheckRunJson");
+        for key in check["retry"].as_object().expect("the retry").keys() {
+            assert!(
+                declared.contains(&format!("\n    {key}:")),
+                "`retry.{key}` is on the wire but not declared"
             );
         }
         assert_eq!(decision["outcome"], "pass_excluded");
