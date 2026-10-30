@@ -1019,10 +1019,22 @@ fn with_floor_heartbeat<R>(
     every: Duration,
     work: impl FnOnce() -> R,
 ) -> R {
+    // The floor's passes are recorded on this thread and named by the ticker, so a floor that runs
+    // the suite on the change, the base and the change again says which one it is in.
+    let now: crate::repo_checks::FloorNow = Default::default();
+    let passes = std::sync::Arc::clone(&now);
     std::thread::scope(|s| {
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         s.spawn(move || {
             let t0 = std::time::Instant::now();
+            let doing = || {
+                passes
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .describe()
+                    .map(|d| format!("; {d}"))
+                    .unwrap_or_default()
+            };
             engine_note(emit, &format!("{label} — 0 min"));
             // Tick ONLY on a timeout. `Disconnected` means `stop_tx` was dropped without a send —
             // `work` panicked and the closure unwound — and the ticker must exit so the scope can
@@ -1034,11 +1046,11 @@ fn with_floor_heartbeat<R>(
             ) {
                 engine_note(
                     emit,
-                    &format!("{label} — {} min", t0.elapsed().as_secs() / 60),
+                    &format!("{label} — {} min{}", t0.elapsed().as_secs() / 60, doing()),
                 );
             }
         });
-        let r = work();
+        let r = crate::repo_checks::with_floor_now(&now, work);
         let _ = stop_tx.send(());
         r
     })
@@ -8360,6 +8372,43 @@ mod floor_heartbeat_tests {
         std::thread::sleep(Duration::from_millis(300));
         let after = seen.lock().unwrap_or_else(|p| p.into_inner()).len();
         assert_eq!(after, at_return, "no heartbeat after the panic");
+    }
+
+    /// Rig run b6f7968b: the heartbeat names the pass the floor is in, so a floor that runs the
+    /// suite on the change, the base and the change again does not read as two silent hours.
+    #[test]
+    fn the_floor_heartbeat_names_the_pass_in_progress() {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let t0 = Instant::now();
+        let sink = recording_sink(&seen, t0);
+        with_floor_heartbeat(&sink, "floor", Duration::from_millis(100), || {
+            crate::repo_checks::note_pass("test", crate::repo_checks::Tree::Head);
+            std::thread::sleep(Duration::from_millis(350));
+            crate::repo_checks::note_pass("test", crate::repo_checks::Tree::Base);
+            std::thread::sleep(Duration::from_millis(350));
+        });
+        let lines: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, s)| s.clone())
+            .collect();
+        assert_eq!(
+            lines[0], "\nfloor — 0 min\n",
+            "the start beat precedes any pass: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("; now `test` on the change (pass 1 of `test`)")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("; now `test` on the base (pass 2 of `test`)")),
+            "{lines:?}"
+        );
     }
 
     /// Work that returns at once emits exactly the start heartbeat, and the call returns

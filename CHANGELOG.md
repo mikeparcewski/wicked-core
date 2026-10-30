@@ -14,6 +14,13 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A running floor says which pass it is in, and its result counts every pass.** Rig run b6f7968b's verify floor
+  ran the full suite on the change, the base and the change again, about three hours in all. All the while the unit's
+  heartbeat read only "running the repository's own checks — N min", so studio showed no output for 95 minutes. Its
+  creator floor's result read `test_targeted: exit 1 (1977.6s)` for 97 minutes of passes. The heartbeat now adds the
+  pass in progress ("now `test` on the base (pass 2 of `test`), 31 min in"). `CheckRun::summary` and the floor's result
+  line add the other passes ("; + re-run 1890.2s, base 1900.0s = 5767.8s over 3 passes"); a cached base is not counted.
+
 - **Three load-sensitive engine tests no longer race a tight clock (power-speed).** These tests flaked inside the
   repo-checks floor at load 30+. Each flake sent a core floor into its retry and base path.
   - `a_backgrounded_writer_dies_with_the_seat_it_belongs_to`: the backgrounded writer records its pid, then waits for a

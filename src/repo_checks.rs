@@ -638,10 +638,46 @@ impl CheckRun {
             (None, Some(c)) if !self.passed() => format!(" [{c}]"),
             _ => String::new(),
         };
+        let more = self.other_passes();
         match self.exit_code {
-            Some(c) => format!("{}: exit {c} ({secs:.1}s){cls}", self.name),
-            None => format!("{}: no exit status ({secs:.1}s){cls}", self.name),
+            Some(c) => format!("{}: exit {c} ({secs:.1}s{more}){cls}", self.name),
+            None => format!("{}: no exit status ({secs:.1}s{more}){cls}", self.name),
         }
+    }
+
+    /// The other passes this check's verdict cost, beyond the first run's own time (a re-run is the
+    /// excluded run or the identical retry, see `reruns`):
+    /// `; + re-run 1890.2s, base 1900.0s = 5767.8s over 3 passes`. Empty when the first run was the
+    /// only pass. A cached base cost nothing here and is not counted. Rig run b6f7968b reported
+    /// `test_targeted: exit 1 (1977.6s)` for a floor that ran 97 minutes.
+    pub fn other_passes(&self) -> String {
+        let mut parts: Vec<(String, u64)> = self
+            .reruns
+            .iter()
+            .map(|r| ("re-run".to_string(), r.duration_ms))
+            .collect();
+        if let Some(run) = self
+            .base
+            .as_deref()
+            .filter(|b| !b.cached)
+            .and_then(|b| b.run.as_ref())
+        {
+            parts.push(("base".to_string(), run.duration_ms));
+        }
+        if parts.is_empty() {
+            return String::new();
+        }
+        let total: u64 = self.duration_ms + parts.iter().map(|(_, ms)| ms).sum::<u64>();
+        let list = parts
+            .iter()
+            .map(|(what, ms)| format!("{what} {:.1}s", *ms as f64 / 1000.0))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "; + {list} = {:.1}s over {} passes",
+            total as f64 / 1000.0,
+            parts.len() + 1
+        )
     }
 }
 
@@ -3165,6 +3201,67 @@ impl Drop for PrivateTmp {
     }
 }
 
+/// What a running floor is doing, for its heartbeat. Crew rig run b6f7968b spent two hours on
+/// "running the repository's own checks — N min" while the floor ran the suite three times over
+/// (the change, the base, the change again), and nothing said which. Each check pass records itself
+/// here ([`note_pass`]), and the heartbeat names the latest one ([`FloorPasses::describe`]).
+#[derive(Debug, Default)]
+pub(crate) struct FloorPasses {
+    started: Vec<(String, Tree, Instant)>,
+}
+
+/// The slot one floor's passes are recorded into, shared with its heartbeat thread.
+pub(crate) type FloorNow = std::sync::Arc<std::sync::Mutex<FloorPasses>>;
+
+thread_local! {
+    static FLOOR_NOW: std::cell::RefCell<Option<FloorNow>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `work` with `now` as this thread's floor slot: every check pass `work` starts on this
+/// thread is recorded into it. The previous slot is restored afterwards, even on a panic.
+pub(crate) fn with_floor_now<R>(now: &FloorNow, work: impl FnOnce() -> R) -> R {
+    struct Restore(Option<FloorNow>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            FLOOR_NOW.with(|c| *c.borrow_mut() = prev);
+        }
+    }
+    let _restore = Restore(FLOOR_NOW.with(|c| c.replace(Some(std::sync::Arc::clone(now)))));
+    work()
+}
+
+/// Record that `check` starts a pass on `tree`, when a floor slot is installed on this thread.
+pub(crate) fn note_pass(check: &str, tree: Tree) {
+    FLOOR_NOW.with(|c| {
+        if let Some(now) = c.borrow().as_ref() {
+            now.lock().unwrap_or_else(|p| p.into_inner()).started.push((
+                check.to_string(),
+                tree,
+                Instant::now(),
+            ));
+        }
+    });
+}
+
+impl FloorPasses {
+    /// The latest pass, in words: ``now `test` on the base (pass 2 of `test`), 31 min in``.
+    /// `None` before the first pass starts.
+    pub(crate) fn describe(&self) -> Option<String> {
+        let (name, tree, at) = self.started.last()?;
+        let pass = self.started.iter().filter(|(n, _, _)| n == name).count();
+        let on = match (tree, pass) {
+            (Tree::Base, _) => "on the base",
+            (Tree::Head, 1) => "on the change",
+            (Tree::Head, _) => "on the change again",
+        };
+        Some(format!(
+            "now `{name}` {on} (pass {pass} of `{name}`), {} min in",
+            at.elapsed().as_secs() / 60
+        ))
+    }
+}
+
 /// Which tree a check runs on — selects the `CARGO_TARGET_DIR` leaf (`cargo-target/head` vs
 /// `cargo-target/base`, core#480): with ONE shared target dir cargo's mtime freshness check could
 /// hand a head check the base's test binaries (the contamination the program saw as a false
@@ -5178,11 +5275,12 @@ fn run_detected(
             d.guide = Some(status);
         }
         eprintln!(
-            "wicked-core: repo checks floor — `{}` {} in {:.1}s (bound {}s){}",
+            "wicked-core: repo checks floor — `{}` {} in {:.1}s (bound {}s{}){}",
             run.name,
             run.outcome(),
             run.duration_ms as f64 / 1000.0,
             run.bound_s,
+            run.other_passes(),
             outcome_of(&run)
                 .map(|c| format!(" — {c}"))
                 .unwrap_or_default()
@@ -8841,6 +8939,7 @@ pub(crate) fn run_one_with(
             .unwrap_or_default(),
         worktree.display()
     );
+    note_pass(&check.name, tree);
     let Some(bin) = check.argv.first() else {
         result.spawn_error = Some("empty argv".into());
         return result;
@@ -13669,5 +13768,106 @@ mod failure_split_tests {
         let s = r.failure_split().unwrap();
         assert_eq!(s.head_only, vec!["test: test a::mine".to_string()], "{s:?}");
         assert!(!s.all_base_red, "{s:?}");
+    }
+}
+
+/// Rig run b6f7968b: a floor that ran its suite three times said only "running the repository's
+/// own checks — N min", and its result read `test_targeted: exit 1 (1977.6s)` for 97 minutes of
+/// passes. The heartbeat now names the pass in progress, and the summary counts every pass.
+#[cfg(test)]
+mod floor_pass_tests {
+    use super::*;
+
+    fn run(name: &str, exit_code: i32, duration_ms: u64) -> CheckRun {
+        CheckRun {
+            name: name.into(),
+            argv: vec!["sh".into()],
+            source: "t".into(),
+            exit_code: Some(exit_code),
+            timed_out: false,
+            spawn_error: None,
+            duration_ms,
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            bound_s: 1,
+            bound_note: None,
+            failure_ids: Vec::new(),
+            flaky_ids: Vec::new(),
+            classification: None,
+            pre_existing: Vec::new(),
+            regressions: Vec::new(),
+            base: None,
+            env_cannot_run: Vec::new(),
+            reruns: Vec::new(),
+            decision: None,
+            logs: Vec::new(),
+            load_band: None,
+        }
+    }
+
+    #[test]
+    fn the_summary_counts_every_pass_the_verdict_cost() {
+        let mut r = run("test_targeted", 1, 1_977_600);
+        assert_eq!(r.other_passes(), "", "a single pass adds nothing");
+        assert_eq!(r.summary(), "test_targeted: exit 1 (1977.6s)");
+
+        r.reruns.push(run("test_targeted", 1, 1_890_200));
+        r.base = Some(Box::new(BaseRun {
+            head: "562a49e".into(),
+            cached: false,
+            run: Some(run("test_targeted", 1, 1_900_000)),
+            error: None,
+        }));
+        assert_eq!(
+            r.summary(),
+            "test_targeted: exit 1 (1977.6s; + re-run 1890.2s, base 1900.0s = 5767.8s over 3 passes)"
+        );
+
+        // A base read back from the cache cost this floor nothing.
+        r.base.as_mut().unwrap().cached = true;
+        assert_eq!(
+            r.other_passes(),
+            "; + re-run 1890.2s = 3867.8s over 2 passes"
+        );
+    }
+
+    #[test]
+    fn a_floor_slot_records_each_pass_and_names_the_latest() {
+        let now: FloorNow = Default::default();
+        assert_eq!(
+            now.lock().unwrap().describe(),
+            None,
+            "nothing before a pass"
+        );
+
+        // Outside a slot, a pass is not recorded anywhere.
+        note_pass("test", Tree::Head);
+        assert_eq!(now.lock().unwrap().describe(), None);
+
+        let got = with_floor_now(&now, || {
+            note_pass("test", Tree::Head);
+            let first = now.lock().unwrap().describe();
+            note_pass("test", Tree::Base);
+            let base = now.lock().unwrap().describe();
+            note_pass("test", Tree::Head);
+            let again = now.lock().unwrap().describe();
+            (first, base, again)
+        });
+        assert_eq!(
+            got.0.as_deref(),
+            Some("now `test` on the change (pass 1 of `test`), 0 min in")
+        );
+        assert_eq!(
+            got.1.as_deref(),
+            Some("now `test` on the base (pass 2 of `test`), 0 min in")
+        );
+        assert_eq!(
+            got.2.as_deref(),
+            Some("now `test` on the change again (pass 3 of `test`), 0 min in")
+        );
+
+        // The slot is removed when the work returns: a later pass is not recorded into it.
+        note_pass("lint", Tree::Head);
+        assert!(now.lock().unwrap().describe().unwrap().contains("`test`"));
     }
 }
