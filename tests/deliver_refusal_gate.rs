@@ -86,14 +86,13 @@ fn sh(cwd: &Path, args: &[&str]) -> String {
     // push, so no seat could run these tests. The fence's own stated limit (a git with its
     // environment scrubbed) is what this uses; it reaches only the fixture's local repo.
     if args.first() == Some(&"push") {
-        let empty = std::env::temp_dir().join(format!(
-            ".wicked-fixture-empty-{}.gitconfig",
-            std::process::id()
-        ));
-        let _ = std::fs::write(&empty, "");
+        // The null device, never a temp file (xreview: a predictable temp path can be a
+        // planted symlink that the write would truncate). Both env-config channels go.
+        let empty = if cfg!(windows) { "NUL" } else { "/dev/null" };
         cmd.env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS")
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", &empty);
+            .env("GIT_CONFIG_GLOBAL", empty);
     }
     let out = cmd.output().expect("git runs");
     assert!(out.status.success(), "git {args:?}: {out:?}");
