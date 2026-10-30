@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A search that excludes the worktrees is no longer refused as a read of them (core#1188).** On the J3 sweep a
+  chat's first question about wicked-crew failed: Claude's `grep -r … --exclude-dir=wicked-worktrees .` was denied
+  by `engine:filesystem-boundary-read` as a read of another run's worktree, so the answer was a refusal. The shell
+  read scan took the option's value as a path operand, and `<repo>/wicked-worktrees` is the worktrees listing. An
+  option whose value names what a program skips (`--exclude=`, `--exclude-dir=`, `--ignore-dir=`; the spaced form for
+  grep, tar, rsync, du, ag and ack; `find`'s `-name`/`-path`/`-regex` family) is no longer judged as a read. What the
+  command does read is still judged: a search rooted in the listing, `--exclude-from=<file>`, and the operand after a
+  boolean flag such as `rg --ignore`.
 - **The reuse set-aside no longer classifies the failure it is about to re-run (core#1191).** When a check that runs
   fresh after reused ones fails, the floor goes round again with nothing reused (core#1152), and that pass classifies
   the failure. The first pass used to classify it as well, running the base and the identical retry (whole suites)
