@@ -22498,6 +22498,7 @@ mod request_changes_tests {
             &verify,
             0,
             &verify_report,
+            false,
             &phase,
         )
         .expect("the very failure overridden: carried");
@@ -22534,6 +22535,7 @@ mod request_changes_tests {
             &units[2],
             2,
             &fresh,
+            false,
             &phase
         )
         .is_none());
@@ -22559,6 +22561,7 @@ mod request_changes_tests {
                     &verify,
                     0,
                     &r,
+                    false,
                     &phase
                 )
                 .is_none(),
@@ -22637,6 +22640,7 @@ mod request_changes_tests {
                 Some("packages/crew"),
                 "T",
             ),
+            false,
             &phase,
         )
         .expect("within the ruled set: carried");
@@ -22671,6 +22675,7 @@ mod request_changes_tests {
                     &units[2],
                     2,
                     &report,
+                    false,
                     &phase
                 )
                 .is_none(),
@@ -22685,6 +22690,7 @@ mod request_changes_tests {
             &units[2],
             2,
             &fresh(&["tests/a.test.ts"], Some("packages/crew"), "T"),
+            false,
             &phase
         )
         .is_none());
@@ -22699,8 +22705,16 @@ mod request_changes_tests {
             ("an operator's re-run", &units[2], &rechecked),
         ] {
             assert!(
-                crate::pipeline::carried_floor_override(Some(&session), &run_id, u, 2, r, &phase)
-                    .is_none(),
+                crate::pipeline::carried_floor_override(
+                    Some(&session),
+                    &run_id,
+                    u,
+                    2,
+                    r,
+                    false,
+                    &phase
+                )
+                .is_none(),
                 "{what}"
             );
         }
@@ -22775,6 +22789,7 @@ mod request_changes_tests {
             &verify,
             0,
             &verify_report,
+            false,
             &|_| Some("fix".to_string()),
         )
         .expect("same tree, base and failing set: carried");
@@ -22864,7 +22879,8 @@ mod request_changes_tests {
                     &verify,
                     0,
                     report,
-                    &|_| Some("fix".to_string()),
+                    false,
+                    &|_| Some("fix".to_string())
                 )
                 .is_none(),
                 "{what}: asks again"
@@ -22883,7 +22899,8 @@ mod request_changes_tests {
                 &verify,
                 0,
                 &verify_report,
-                &|_| Some("fix".to_string()),
+                false,
+                &|_| Some("fix".to_string())
             )
             .is_none(),
             "an override of another unit's floor is not this result's"
@@ -22912,18 +22929,23 @@ mod request_changes_tests {
                     &verify,
                     0,
                     report,
-                    &|_| Some("fix".to_string()),
+                    false,
+                    &|_| Some("fix".to_string())
                 )
                 .is_none(),
                 "{what}: asks again"
             );
         }
+        // (core#1186) An override given at another attempt carries only when it judged this very
+        // result (its fingerprint): a reassign that replaced the creator record on the same tree
+        // and base (the #1170 review's case) is another result, so it asks again.
         let mut other_attempt = session.clone();
-        other_attempt.assurance.floor_overrides[0]
+        let f = other_attempt.assurance.floor_overrides[0]
             .floor_override
             .as_mut()
-            .unwrap()
-            .attempt = 1;
+            .unwrap();
+        f.attempt = 1;
+        f.fingerprint = Some("another result".into());
         assert!(
             crate::pipeline::carried_floor_override(
                 Some(&other_attempt),
@@ -22931,7 +22953,8 @@ mod request_changes_tests {
                 &verify,
                 0,
                 &verify_report,
-                &|_| Some("fix".to_string()),
+                false,
+                &|_| Some("fix".to_string())
             )
             .is_none(),
             "an override given at another attempt is not the reused result's"

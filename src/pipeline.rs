@@ -1413,6 +1413,7 @@ pub(crate) fn apply_and_finish_unit(
                         unit,
                         attempt,
                         report,
+                        false,
                         &phase_of,
                     )
                 })
@@ -1479,6 +1480,7 @@ pub(crate) fn apply_and_finish_unit(
                             unit,
                             attempt,
                             r,
+                            true,
                             &phase_of,
                         )
                     })
@@ -3092,6 +3094,8 @@ pub(crate) fn carried_floor_override(
     unit: &crate::domain::WorkUnit,
     attempt: u32,
     report: &crate::repo_checks::RepoChecksReport,
+    // The report is this unit's last result carried onto an unchanged tree (a copy, not a run).
+    copy: bool,
     phase_of: &dyn Fn(u32) -> Option<String>,
 ) -> Option<crate::assurance::OperatorJudgment> {
     let session = session?;
@@ -3158,7 +3162,30 @@ pub(crate) fn carried_floor_override(
         });
     // (core#1186) The identity rule: this floor holds a copy of the very failure overridden (a
     // verify floor's reuse, an unchanged-tree carry), whichever attempt the override was given at.
+    // Only for a report that IS a copy of an earlier result: every failing check reused (not
+    // voided, not also fresh) from a creator record, or the caller's unchanged-tree carry
+    // (`copy`). A fresh run is never compared by identity.
+    let all_reused = report
+        .reused_from
+        .as_ref()
+        .filter(|r| r.voided.is_none())
+        .is_some_and(|reuse| {
+            failing
+                .iter()
+                .all(|n| reuse.reused.iter().any(|r| r == n) && !reuse.fresh.iter().any(|f| f == n))
+        });
+    // The unit whose result this is: the creator unit a verify floor reused, or this unit for an
+    // unchanged-tree carry. An override of another unit's floor is never this result's.
+    let source_ord = if copy {
+        Some(unit.ord)
+    } else {
+        report.reused_from.as_ref().map(|r| r.ord)
+    };
     let identity = || {
+        if !(copy || all_reused) {
+            return None;
+        }
+        let source_ord = source_ord?;
         let now = report.result_fingerprint()?;
         session
             .assurance
@@ -3171,6 +3198,7 @@ pub(crate) fn carried_floor_override(
                 f.key
                     .as_ref()
                     .is_some_and(|k| k.tree == key.tree && k.base == key.base)
+                    && f.ord == source_ord
                     && f.fingerprint.as_deref() == Some(now.as_str())
             })
             .map(|j| {
