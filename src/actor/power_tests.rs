@@ -472,6 +472,7 @@ fn a_counted_hand_off_step_reads_passed_before_the_next_unit_dispatches() {
     release_all(&w);
 }
 
+#[cfg(not(windows))]
 fn handoff_unit(u: &crate::domain::WorkUnit) -> bool {
     matches!(
         u.catalog.as_deref(),
