@@ -14,6 +14,18 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Live tool activity and the orchestrator's working notes (power mode, operator ask 2026-10-30).**
+  - `toolActivity` frames are emitted live from a claude seat's stream: a `tool_use` starts a call and the
+    `tool_result` that answers it finishes it. The shape is `{session, ord, attempt, at, id, state, kind, tool,
+    target, ok, durationMs}`: `kind` is read / search / run / test / edit / write / skill / task / other, and `target`
+    is a repo-relative path or a redacted command (at most 160 characters). Frames are capped at 24 per 2 s and 4000 per
+    attempt, and every call shown starting is shown finishing. Rig run b6f7968b's 26 tool calls had all landed at the
+    unit's end.
+  - The power orchestrator now writes `APPROACH:` and `DECISION: … WHY: …` lines. The actor reads them off the live
+    stream and emits `powerWorkingNotes {session, ord, attempt, turn, seat, at, approach, decisions[{text, why}]}`, each
+    new note once. Crew writes them into the run's working document as `agent:<seat>`; they never steer.
+  - The bus mirror adds `wicked.run.tool.started` / `wicked.run.tool.finished` and `wicked.run.notes.recorded`.
+
 - **A search that excludes the worktrees is no longer refused as a read of them (core#1188).** On the J3 sweep a
   chat's first question about wicked-crew failed: Claude's `grep -r … --exclude-dir=wicked-worktrees .` was denied
   by `engine:filesystem-boundary-read` as a read of another run's worktree, so the answer was a refusal. The shell

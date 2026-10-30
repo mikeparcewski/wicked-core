@@ -1320,6 +1320,37 @@ pub enum CoreEvent {
     /// (program DES-POWER-MODE) What the orchestrator did in the worktree, read off git by the
     /// engine (`wicked.run.activity.recorded`): `edit` (a file's +/- against the run base changed
     /// since the last look) or `commit` (a new commit: short sha, subject, +/-). Polled, not live.
+    /// (program DES-POWER-MODE) New working notes from the power orchestrator's stream: its
+    /// approach (`Some` when it was stated or restated) and the decisions it recorded, with why.
+    /// Crew writes them into the run's working document as an agent-authored version
+    /// (`agent:<seat>`); they never steer.
+    PowerWorkingNotes {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        turn: u32,
+        seat: String,
+        at: i64,
+        approach: Option<String>,
+        decisions: Vec<(String, Option<String>)>,
+    },
+    /// A seat's tool call started or finished, live from its stream (operator ask 2026-10-30; the
+    /// shape power-mode-ui renders). `state` is `started` | `finished`; `kind` is `read` | `search`
+    /// | `run` | `test` | `edit` | `write` | `skill` | `task` | `other`; `target` is a
+    /// repo-relative path or a redacted command (<= 160 chars). See [`crate::tool_activity`].
+    ToolActivity {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        at: i64,
+        id: String,
+        state: String,
+        kind: String,
+        tool: String,
+        target: Option<String>,
+        ok: Option<bool>,
+        duration_ms: Option<u64>,
+    },
     PowerActivity {
         session: String,
         ord: u32,
@@ -2114,6 +2145,55 @@ impl CoreEvent {
                 "cli": cli,
                 "outcome": outcome,
                 "summary": summary,
+            }),
+            CoreEvent::PowerWorkingNotes {
+                session,
+                ord,
+                attempt,
+                turn,
+                seat,
+                at,
+                approach,
+                decisions,
+            } => json!({
+                "type": "powerWorkingNotes",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "turn": turn,
+                "seat": seat,
+                "at": at,
+                "approach": approach,
+                "decisions": decisions
+                    .iter()
+                    .map(|(text, why)| json!({ "text": text, "why": why }))
+                    .collect::<Vec<_>>(),
+            }),
+            CoreEvent::ToolActivity {
+                session,
+                ord,
+                attempt,
+                at,
+                id,
+                state,
+                kind,
+                tool,
+                target,
+                ok,
+                duration_ms,
+            } => json!({
+                "type": "toolActivity",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "at": at,
+                "id": id,
+                "state": state,
+                "kind": kind,
+                "tool": tool,
+                "target": target,
+                "ok": ok,
+                "durationMs": duration_ms,
             }),
             CoreEvent::PowerActivity {
                 session,

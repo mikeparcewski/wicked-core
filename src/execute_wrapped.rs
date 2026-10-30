@@ -81,9 +81,30 @@ impl OutputAdapter for Passthrough {
 pub(crate) struct ClaudeStreamJson {
     /// Whether any assistant text delta was emitted this run — gates the terminal `result` fallback.
     emitted_text: bool,
+    /// Live per-tool frames for the unit (`toolActivity`), when its actor is reachable.
+    pub(crate) activity: Option<crate::tool_activity::ToolActivitySink>,
+}
+
+impl ClaudeStreamJson {
+    /// The adapter with live per-tool frames sent to `activity` (none when `None`).
+    pub(crate) fn with_activity(activity: Option<crate::tool_activity::ToolActivitySink>) -> Self {
+        Self {
+            emitted_text: false,
+            activity,
+        }
+    }
 }
 
 impl OutputAdapter for ClaudeStreamJson {
+    /// Stdout closed: a call still open (the seat ended, crashed, timed out or was cancelled
+    /// before its result) is shown finishing, not ok (review on #1195).
+    fn finish(&mut self) -> AdapterOut {
+        if let Some(a) = self.activity.as_mut() {
+            a.close();
+        }
+        AdapterOut::default()
+    }
+
     fn on_line(&mut self, line: &str) -> AdapterOut {
         if line.trim().is_empty() {
             return AdapterOut::default();
@@ -130,6 +151,17 @@ impl OutputAdapter for ClaudeStreamJson {
                                     if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
                                         if !name.is_empty() {
                                             out.tools.push(name.to_string());
+                                        }
+                                        if let (Some(a), Some(id)) = (
+                                            self.activity.as_mut(),
+                                            block.get("id").and_then(|i| i.as_str()),
+                                        ) {
+                                            let none = serde_json::Value::Null;
+                                            a.started(
+                                                id,
+                                                name,
+                                                block.get("input").unwrap_or(&none),
+                                            );
                                         }
                                     }
                                     if let Some(fp) = block
@@ -195,7 +227,25 @@ impl OutputAdapter for ClaudeStreamJson {
                     }
                 }
             }
-            // system / user / rate_limit_event / anything else → no readable output, no signals.
+            // A `tool_result` answers a call: the live frame's finish (no readable output).
+            Some("user") => {
+                if let (Some(a), Some(blocks)) = (
+                    self.activity.as_mut(),
+                    v.get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_array()),
+                ) {
+                    for b in blocks {
+                        if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                            if let Some(id) = b.get("tool_use_id").and_then(|i| i.as_str()) {
+                                let err = b.get("is_error").and_then(|e| e.as_bool()) == Some(true);
+                                a.finished(id, !err);
+                            }
+                        }
+                    }
+                }
+            }
+            // system / rate_limit_event / anything else → no readable output, no signals.
             _ => {}
         }
         out
@@ -3328,7 +3378,9 @@ impl WrappedCliStepRunner {
             )
         } else {
             let mut adapter: Box<dyn OutputAdapter> = if is_claude {
-                Box::<ClaudeStreamJson>::default()
+                Box::new(ClaudeStreamJson::with_activity(
+                    crate::tool_activity::ToolActivitySink::for_input(input, &cwd),
+                ))
             } else if codex_json {
                 Box::<CodexJsonl>::default()
             } else if pi_json {

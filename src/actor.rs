@@ -2546,6 +2546,11 @@ pub(crate) fn run(
                 // mislabel a superseded attempt's late chunks (PR #279 review).
                 let flushed =
                     output_throttle.push(&run_id, ord, attempt, &chunk, std::time::Instant::now());
+                // (program DES-POWER-MODE) An orchestrator's APPROACH / DECISION lines reach the
+                // run's working document as they stream.
+                if let Some(notes) = crate::power::scan_notes(&run_id, ord, attempt, &chunk) {
+                    emit(&mut subscribers, notes);
+                }
                 // The single emit point fans a worker's live output chunk out to subscribers.
                 emit(
                     &mut subscribers,
@@ -4041,6 +4046,17 @@ pub(crate) fn run(
                 }
             }
             Command::PowerTurn { event, in_turn } => {
+                // The turn's notes registration rides this channel, ordered with its output chunks.
+                if let CoreEvent::PowerTurnStarted {
+                    session,
+                    ord,
+                    attempt,
+                    turn,
+                    cli,
+                } = event.as_ref()
+                {
+                    crate::power::notes_turn(session, *ord, *attempt, cli, *turn);
+                }
                 let run_id = match event.as_ref() {
                     CoreEvent::PowerTurnStarted { session, .. }
                     | CoreEvent::PowerTurnCompleted { session, .. } => Some(session.clone()),

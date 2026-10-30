@@ -4085,6 +4085,60 @@ mod tests {
             ],
         );
         check(
+            CoreEvent::ToolActivity {
+                session: s(),
+                ord: 2,
+                attempt: 0,
+                at: 1,
+                id: s(),
+                state: "finished".into(),
+                kind: "test".into(),
+                tool: "Bash".into(),
+                target: Some(s()),
+                ok: Some(true),
+                duration_ms: Some(5),
+            },
+            "toolActivity",
+            &[
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "at",
+                "id",
+                "state",
+                "kind",
+                "tool",
+                "target",
+                "ok",
+                "durationMs",
+            ],
+        );
+        check(
+            CoreEvent::PowerWorkingNotes {
+                session: s(),
+                ord: 2,
+                attempt: 0,
+                turn: 1,
+                seat: "claude".into(),
+                at: 1,
+                approach: Some(s()),
+                decisions: vec![(s(), None)],
+            },
+            "powerWorkingNotes",
+            &[
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "turn",
+                "seat",
+                "at",
+                "approach",
+                "decisions",
+            ],
+        );
+        check(
             CoreEvent::PowerToggled {
                 session: s(),
                 toggle: Box::new(wicked_core::power::PowerToggle {
