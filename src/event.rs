@@ -1612,6 +1612,23 @@ fn check_run_json(c: &crate::repo_checks::CheckRun) -> serde_json::Value {
         // DES-FLOOR-V2 (additive): the floor's machine-readable decision — `null` on a nested
         // run and on a record from before it.
         "decision": c.decision.as_ref().map(check_decision_json),
+        // core#1187 (additive): what the engine selected for a cargo workspace test at the
+        // creator floor, and why — `null` for every other check.
+        "selection": c.selection.as_ref().map(test_selection_json),
+    })
+}
+
+/// The wire form of the engine's affected-set selection (`checks[].selection`, core#1187).
+fn test_selection_json(s: &crate::floor_affected::TestSelection) -> serde_json::Value {
+    serde_json::json!({
+        "mode": s.mode,
+        "reason": s.reason,
+        "packages": s.packages,
+        "targets": s.targets,
+        "tests": s.tests,
+        "testCount": s.test_count,
+        "changedSymbols": s.changed_symbols,
+        "reachedSymbols": s.reached_symbols,
     })
 }
 

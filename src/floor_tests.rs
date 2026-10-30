@@ -5349,3 +5349,178 @@ fn core_1144_a_journal_resumed_check_is_never_published() {
     assert_ne!(stdout_of(&verify, "lint"), stdout_of(&first, "lint"));
     let _ = std::fs::remove_dir_all(&r.wt);
 }
+
+/// (core#1187) Through the real floor, with real cargo: a creator floor's `cargo test --workspace`
+/// check runs the ENGINE's affected set first. The change edits `add` in `calc.rs`; the code
+/// graph at the base says only `adds` reaches it. `subs`, in another module, is red on the base
+/// and the head alike, so only the narrowed run can pass: it does, and the selection rides the
+/// check. Without a code graph the same floor runs the declared suite and says why.
+#[cfg(unix)]
+#[test]
+fn a_creator_floor_runs_the_engines_affected_set_and_records_it() {
+    use wicked_apps_core::{
+        Descriptor, Edge, EdgeKind, GraphWrite, Language, Location, Node, NodeKind, ResolutionTier,
+        Span, Symbol,
+    };
+    if crate::validator::find_on_path("cargo").is_none() {
+        eprintln!("repo_checks: cargo not on PATH — skipping the affected-set floor test");
+        return;
+    }
+    let _load = seam::pin(0.5, 4);
+    let repo = scratch("affected-engine");
+    let w = |f: &str, body: &str| {
+        let p = repo.join(f);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    };
+    w(
+        "Cargo.toml",
+        "[package]\nname = \"affected_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+         [workspace]\n",
+    );
+    w("src/lib.rs", "pub mod calc;\npub mod other;\n");
+    const CALC: &str = "pub fn add(a: u32, b: u32) -> u32 {\n    a + b\n}\n\n#[test]\nfn adds() {\n    assert_eq!(add(1, 2), 3);\n}\n";
+    w("src/calc.rs", CALC);
+    w(
+        "src/other.rs",
+        "pub fn sub(a: u32, b: u32) -> u32 {\n    a - b\n}\n\n#[test]\nfn subs() {\n    assert_eq!(sub(2, 1), 7);\n}\n",
+    );
+    w(".gitignore", "target/\n");
+    w(
+        CONFIG_PATH,
+        &serde_json::json!({
+            "test": ["cargo", "test", "--offline", "--workspace"],
+            "timeout_s": 600,
+        })
+        .to_string(),
+    );
+    // The lockfile is part of the base: a lockfile the run writes is shared infrastructure.
+    // spawn-audit: test-only — writes the fixture's lockfile before its base commit.
+    let lock = std::process::Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(lock.status.success(), "{lock:?}");
+    let base = git_repo_with_commit(&repo);
+    // The graph at the base, outside the tree: `adds` calls `add`, `subs` calls `sub` (estate's 0-based spans).
+    let graph_dir = scratch("affected-engine-graph");
+    let db = graph_dir.join("estate.db");
+    {
+        let sym = |n: &str| Symbol::global("t", None, vec![Descriptor::method(n, None)]).id();
+        let node = |n: &str, file: &str, from: u32, to: u32| {
+            Node::new(
+                sym(n),
+                NodeKind::Function,
+                n,
+                Language::new("rust"),
+                Location::new(
+                    file,
+                    Span {
+                        start_byte: 0,
+                        end_byte: 0,
+                        start_line: from,
+                        start_col: 0,
+                        end_line: to,
+                        end_col: 0,
+                    },
+                ),
+            )
+        };
+        let mut g = wicked_apps_core::open_store(Some(&db.to_string_lossy())).unwrap();
+        g.begin_batch().unwrap();
+        g.upsert_nodes(&[
+            node("add", "src/calc.rs", 0, 2),
+            node("adds", "src/calc.rs", 5, 7),
+            node("sub", "src/other.rs", 0, 2),
+            node("subs", "src/other.rs", 5, 7),
+        ])
+        .unwrap();
+        let calls = |a: &str, b: &str| {
+            Edge::new(sym(a), sym(b), EdgeKind::Calls, ResolutionTier::Parsed, "t")
+        };
+        g.upsert_edges(&[calls("adds", "add"), calls("subs", "sub")])
+            .unwrap();
+        g.commit_batch().unwrap();
+        g.set_repo_info(&wicked_estate_core::RepoInfo {
+            commit: Some(base.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    w("src/calc.rs", &CALC.replace("    a + b\n", "    b + a\n"));
+    let ctx = FloorContext {
+        base_head: Some(base.clone()),
+        stage: FloorStage::Creator,
+        git_dir: Some(repo.join(".git")),
+        code_graph: Some(db.clone()),
+        ..FloorContext::default()
+    };
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    let sel = c
+        .selection
+        .clone()
+        .expect("the engine's selection is recorded");
+    assert_eq!(
+        sel.mode,
+        crate::floor_affected::MODE_AFFECTED,
+        "{sel:?} / {c:?}"
+    );
+    assert_eq!(
+        sel.tests,
+        vec!["affected_fixture: adds".to_string()],
+        "{sel:?}"
+    );
+    assert!(c.source.contains("computed by the engine"), "{}", c.source);
+    assert!(
+        report.passed,
+        "only `adds` ran, and it passes: {}",
+        report.denial_reason()
+    );
+    assert!(c.summary().contains("affected set:"), "{}", c.summary());
+    // The event wire carries it (xreview: `repoChecksEvaluated` has its own serializer).
+    let frame = crate::event::CoreEvent::RepoChecksEvaluated {
+        session: "s".into(),
+        ord: 1,
+        attempt: 0,
+        passed: report.passed,
+        criterion: "c".into(),
+        checks: report.checks.clone(),
+        skipped: Vec::new(),
+        sandbox_level: report.sandbox_level.clone(),
+        sandbox_error: None,
+        detect_error: None,
+        outcome: report.outcome().into(),
+        floor: "creator".into(),
+        claim: None,
+        env: None,
+        changed: Vec::new(),
+        changed_truncated: false,
+        reused_from: None,
+    }
+    .to_json();
+    let wire = frame["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "test")
+        .unwrap()["selection"]
+        .clone();
+    assert_eq!(wire["mode"], "affected", "{wire}");
+    assert_eq!(wire["tests"], serde_json::json!(["affected_fixture: adds"]));
+    assert_eq!(wire["testCount"], 1);
+    // No graph: the declared suite runs, and the record says why.
+    let ctx = FloorContext {
+        code_graph: None,
+        ..ctx
+    };
+    let (_, c) = floor_test(&repo, &ctx).unwrap();
+    let sel = c.selection.clone().expect("recorded when it widens too");
+    assert_eq!(sel.mode, crate::floor_affected::MODE_FULL);
+    assert!(sel.reason.contains("no code graph"), "{sel:?}");
+    assert!(!c.source.contains("affected set"), "{}", c.source);
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&graph_dir);
+}

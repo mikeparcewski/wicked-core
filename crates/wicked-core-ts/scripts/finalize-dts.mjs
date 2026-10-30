@@ -381,6 +381,25 @@ export interface RepoCheckRunJson {
   reruns: RepoCheckRunJson[]
   /** The floor's decision; \`null\` on a nested run (a re-run, a base run). */
   decision: FloorCheckDecisionJson | null
+  /** (core#1187) What the engine selected for a cargo workspace test at the creator floor, and
+   * why; null for every other check. */
+  selection: FloorTestSelectionJson | null
+}
+
+/** (core#1187) The engine's affected-set selection for one cargo workspace test check. */
+export interface FloorTestSelectionJson {
+  /** 'affected': the subset ran first and its pass decides; 'full': the check ran as declared. */
+  mode: 'affected' | 'full'
+  /** How the subset was reached, or what made the full suite run. */
+  reason: string
+  packages: string[]
+  /** One line per invocation, e.g. 'wicked-core --lib (12 tests)'. */
+  targets: string[]
+  /** The first 100 lib tests selected by name; testCount is whole. */
+  tests: string[]
+  testCount: number
+  changedSymbols: number
+  reachedSymbols: number
 }
 
 /**

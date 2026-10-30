@@ -14,6 +14,22 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The creator floor runs a cargo workspace's affected tests first, chosen by the engine (core#1187).** Core has no
+  build-guide `affected` piece, so the creator floor ran `cargo test --workspace` on every change (20 min of the core
+  proof run's 68 min floor). For a `cargo test … --workspace` check at the creator floor, the engine now computes
+  the affected set from the run's diff: cargo's package graph (`cargo metadata`, run like any check) plus the
+  repo's code graph indexed at the run base. It takes the symbols the changed lines sit in and their blast radius
+  (resolved edges, call sites estate matched only by name, and the lines that name a changed constant or type).
+  It runs the tests that radius reaches, the touched files' own tests, the tests that name a touched file, and the
+  integration tests of a reached binary. Its pass decides; its failure runs the check as declared, the same
+  contract as a guide's `affected` piece (which still wins when the base has one). It widens to the full suite on
+  shared infrastructure (a `Cargo.toml`, `Cargo.lock`, `build.rs`, `.cargo/`, a toolchain file, a crate root), on
+  a deletion or rename, on a changed line outside every symbol the graph knows, on a data file no source names, on
+  a path the base's `.wicked/affected.json` lists under `full`, without a graph indexed at the base, and when the
+  selection would name no test. A radius past 3000 symbols runs every affected package whole. The selection and
+  its reason ride the check on `repoChecksEvaluated` (`checks[].selection`). The creator's seat and the intake plan
+  never narrow it. The verify floor still runs the declared suite. `wicked-core floor affected --repo <dir> --base
+  <commit> --graph <db>` prints the selection for a tree.
 - **Core's own suite no longer fails on a loaded host's clock (core#1194).** Inside the repo-checks floor, at host
   load 30-50, lib tests whose stand-in scripts must answer failed because they were bounded by production deadlines
   (the login and gateway runtime's 15 s, the hook relay's 60 s, a floor check's 60 s). Those stand-ins now get a
