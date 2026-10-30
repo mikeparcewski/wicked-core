@@ -7377,8 +7377,12 @@ fn apply_step_result(
         .or(unit.repo_checks.as_ref())
         .is_some_and(|r| r.outcome() == "failed" && r.failure_split().is_some());
     let mention = no_change_mention(&output.output);
-    let declared_no_change = mention == Some(true)
-        || (mention.is_none() && floor_red && !clean && !output.output.trim().is_empty());
+    // (rig run ea73afc0) A no-change answer is one only while the tree IS unchanged: the engine
+    // compares it (`evidence.tree_changed`) and never takes the reply's word. An attempt that said
+    // NO CHANGE NEEDED and changed the tree anyway is a change (its floor runs on the new tree).
+    let declared_no_change = evidence.tree_changed != Some(true)
+        && (mention == Some(true)
+            || (mention.is_none() && floor_red && !clean && !output.output.trim().is_empty()));
     let left_no_change = clean || evidence.tree_changed == Some(false);
     // The prose arm rejects only over a clean worktree (a diff is substance of its own) — except
     // under the human-confirm exemption, where `no_prose` already means "no answer at all": an
@@ -7899,6 +7903,17 @@ const FLOOR_AUTO_RETRY_NOTE: &str = "[automatic floor retry — round 1 of 1 (co
      do not edit anything to chase it: change nothing and reply with NO CHANGE NEEDED and the \
      reason. Either way, a second red floor opens the escalation gate for a human.";
 
+/// (rig run ea73afc0) The automatic round's SCOPE, on every variant of its note: its retry turn
+/// answered NO CHANGE NEEDED for the failures but also applied a team member's unrelated Windows
+/// advice, so the tree changed, the whole floor ran again (27 min) and the review then failed on
+/// that very edit (another 32-min floor). The round is for the failing checks only.
+const FLOOR_AUTO_RETRY_SCOPE_NOTE: &str = " This round is ONLY for these failing checks: make no \
+     edit they do not require — no reviewer's or team member's advice, no refactor, no follow-up, \
+     no other platform — because any edit makes the floor run again on a new tree. Answer team \
+     advice that arrives in this round with `ADVICE <id>: DECLINE — not needed for the failing \
+     checks; left for the review`. If you answer that no change is needed, leave the tree exactly \
+     as it is: the engine compares the tree, and an attempt that changed it is read as a change.";
+
 /// (j4-gates, core#1113; core#1142) The automatic round's note, from the floor's structured
 /// results ([`crate::repo_checks::RepoChecksReport::failure_split`]): it names the HEAD-ONLY
 /// failures (head minus base) and says the base's own are not the worker's. Head-only is one head
@@ -7910,7 +7925,7 @@ const FLOOR_AUTO_RETRY_NOTE: &str = "[automatic floor retry — round 1 of 1 (co
 /// it is [`FLOOR_AUTO_RETRY_NOTE`].
 fn floor_auto_retry_note(report: Option<&crate::repo_checks::RepoChecksReport>) -> String {
     let Some(split) = report.and_then(crate::repo_checks::RepoChecksReport::failure_split) else {
-        return FLOOR_AUTO_RETRY_NOTE.to_string();
+        return format!("{FLOOR_AUTO_RETRY_NOTE}{FLOOR_AUTO_RETRY_SCOPE_NOTE}");
     };
     if !split.head_only.is_empty() {
         return format!(
@@ -7920,7 +7935,7 @@ fn floor_auto_retry_note(report: Option<&crate::repo_checks::RepoChecksReport>) 
              caused by your change (it tests code you did not touch, or it is timing- or \
              load-sensitive and fails intermittently), do not edit anything to chase it: change \
              nothing and reply with {NO_CHANGE_NEEDED} and the reason. Either way, a second red \
-             floor opens the escalation gate for a human.",
+             floor opens the escalation gate for a human.{FLOOR_AUTO_RETRY_SCOPE_NOTE}",
             split.head_only.join(", "),
             if split.base_shared > 0 {
                 format!(
@@ -7932,7 +7947,7 @@ fn floor_auto_retry_note(report: Option<&crate::repo_checks::RepoChecksReport>) 
             }
         );
     }
-    FLOOR_AUTO_RETRY_NOTE.to_string()
+    format!("{FLOOR_AUTO_RETRY_NOTE}{FLOOR_AUTO_RETRY_SCOPE_NOTE}")
 }
 
 /// (core#651) Whether a denied unit takes the one automatic creator-floor round instead of the
@@ -24795,7 +24810,12 @@ mod code_evidence_floor_tests {
             &["test a::mine", "test b::shared"],
             Some(&["test b::shared"]),
         )));
-        for note in [head_only.as_str(), FLOOR_AUTO_RETRY_NOTE] {
+        let plain = floor_auto_retry_note(None);
+        let all_shared = floor_auto_retry_note(Some(&crate::repo_checks::red_report(
+            &["test b::shared"],
+            Some(&["test b::shared"]),
+        )));
+        for note in [head_only.as_str(), plain.as_str(), all_shared.as_str()] {
             assert!(
                 note.contains("not caused by your change") && note.contains(NO_CHANGE_NEEDED),
                 "{note}"
@@ -24804,10 +24824,24 @@ mod code_evidence_floor_tests {
                 !declares_no_change(note),
                 "the note is not a declaration: {note}"
             );
+            // (rig run ea73afc0) Every variant scopes the round to the failing checks: no other
+            // edit, team advice declined for the review, and a no-change answer leaves the tree.
+            assert!(note.ends_with(FLOOR_AUTO_RETRY_SCOPE_NOTE), "{note}");
+            assert!(
+                note.contains("make no edit they do not require")
+                    && note.contains("team member's advice")
+                    && note.contains("DECLINE")
+                    && note.contains("read as a change"),
+                "{note}"
+            );
+            assert!(
+                crate::team::parse_advice_lines(note).is_empty(),
+                "the note's advice example is not an answer"
+            );
         }
         assert!(head_only.contains("`test a::mine`") || head_only.contains("test a::mine"));
         assert!(!head_only.contains("THIS change's"), "{head_only}");
-        assert_eq!(floor_auto_retry_note(None), FLOOR_AUTO_RETRY_NOTE);
+        assert!(plain.starts_with(FLOOR_AUTO_RETRY_NOTE));
     }
 
     /// An UNCOMMITTED change is evidence (instrument 1, porcelain): the same fold passes the
