@@ -11,7 +11,7 @@ use super::*;
 
 /// A stand-in `vitest` in the shape the floor reads: ` ✓ <file> (1 test)` per passing file,
 /// ` FAIL  <file> > t` per failing one, the `Test Files` summary, exit 1 on any failure. `suite.txt`
-/// holds `<file> <pass|fail|flake>` lines (`flake`: fails the first time this tree runs it in a floor,
+/// holds `<file> <pass|fail|flake|whole>` lines (`whole`: fails beside the others, passes alone) (`flake`: fails the first time this tree runs it in a floor,
 /// passes after). File arguments run only those files (one the suite does not list is skipped:
 /// `--passWithNoTests`); none runs the whole suite. `unhandled` present: an error outside any test on
 /// a whole-suite run, exit 1. Every invocation appends the number of files it ran to `$counters/calls`.
@@ -27,6 +27,7 @@ fn fake_vitest(tag: &str) -> String {
            [ -z \"$f\" ] && continue\n\
            [ \"$want\" = ' ' ] || case \"$want\" in *\" $f \"*) ;; *) continue;; esac\n\
            ran=$((ran+1))\n\
+           [ \"$o\" = whole ] && { [ \"$want\" = ' ' ] && o=fail || o=pass; }\n\
            if [ \"$o\" = flake ]; then k=\"$TMPDIR/fl-$(pwd | cksum | cut -d' ' -f1)-$(echo $f | cksum | cut -d' ' -f1)\"; \
              if [ -f \"$k\" ]; then o=pass; else : > \"$k\"; o=fail; fi; fi\n\
            if [ \"$o\" = pass ]; then echo \" ✓ $f (1 test) 1ms\"; passed=$((passed+1)); \
@@ -245,7 +246,7 @@ const B: &str = "tests/t03.test.ts";
 const C: &str = "tests/t07.test.ts";
 
 #[test]
-fn a_flake_passes_on_a_retry_of_its_failing_file_only() {
+fn a_flake_passes_only_on_the_whole_retry_after_its_failing_file_passes() {
     let head = suite(&[(B, "flake")]);
     let Some(((cs, ns), (cw, nw))) = both(
         "fs-flake",
@@ -257,25 +258,39 @@ fn a_flake_passes_on_a_retry_of_its_failing_file_only() {
     ) else {
         return;
     };
+    // A failing set that passes alone never passes the check: the whole retry decides.
     assert_eq!(nw, vec![12, 12], "whole: the head and the identical retry");
-    assert_eq!(ns, vec![12, 1], "scoped: the head and ONE file");
+    assert_eq!(
+        ns,
+        vec![12, 1, 12],
+        "scoped: the head, ONE file, the whole retry"
+    );
     let r = cs.retry.as_ref().expect("the retry is recorded");
     assert_eq!(r.exit_code, Some(0));
-    assert_eq!(r.scope.as_ref().unwrap().ids, vec![B.to_string()]);
-    assert_eq!(r.whole_because, None);
-    assert_eq!(cs.reruns.len(), 1);
+    assert!(r.scope.is_none(), "the whole retry decided");
+    assert!(
+        r.whole_because
+            .as_deref()
+            .is_some_and(|w| w.contains("passed alone")),
+        "{r:?}"
+    );
+    assert_eq!(cs.reruns.len(), 2);
     assert_eq!(cs.reruns[0].argv.last().map(String::as_str), Some(B));
+    assert_eq!(cs.reruns[1].argv, cs.argv);
     assert!(
         cs.base.is_none() && cw.base.is_none(),
         "a pass reads no base"
     );
-    assert!(cw.retry.as_ref().is_some_and(|r| r.scope.is_none()));
+    assert!(cw
+        .retry
+        .as_ref()
+        .is_some_and(|r| r.scope.is_none() && r.whole_because.is_none()));
     // The wire carries the retry with its own duration.
     let wire = wire_check(&cs);
     assert_eq!(wire["retry"]["exitCode"], 0);
     assert!(wire["retry"]["durationMs"].is_u64(), "{wire}");
-    assert_eq!(wire["retry"]["scope"]["by"], "file");
-    assert_eq!(wire["retry"]["scope"]["ids"][0], B);
+    assert!(wire["retry"]["scope"].is_null(), "{wire}");
+    assert_eq!(wire["reruns"][0]["scope"]["by"], "file");
     assert_eq!(wire["reruns"][0]["scope"]["ids"][0], B);
     assert_eq!(wire["selfRetry"], false);
 }
@@ -325,9 +340,9 @@ fn a_failure_the_base_shares_escalates_as_before() {
 }
 
 #[test]
-fn an_error_outside_any_test_makes_a_passing_scoped_retry_run_the_whole_check() {
+fn an_error_outside_any_test_is_retried_and_compared_whole() {
     // The head fails a flaky file AND has an unhandled error its ids do not name: the failing file
-    // passes alone, but the whole check would still fail. The whole retry decides.
+    // passes alone, the whole retry decides (and fails), and the base runs whole.
     let Some(((cs, ns), (_, nw))) = both(
         "fs-unhandled",
         &suite(&[]),
@@ -341,23 +356,102 @@ fn an_error_outside_any_test_makes_a_passing_scoped_retry_run_the_whole_check() 
     assert_eq!(nw, vec![12, 12, 12], "whole: head, retry, base");
     assert_eq!(
         ns,
-        vec![12, 1, 12, 1],
-        "head, the set, the whole retry, base set"
+        vec![12, 1, 12, 12],
+        "head, the set, the whole retry, the whole base"
     );
     let r = cs.retry.as_ref().unwrap();
     assert!(r.scope.is_none(), "the deciding retry was the whole check");
-    assert!(
-        r.whole_because
-            .as_deref()
-            .is_some_and(|w| w.contains("errors outside any test")),
-        "{r:?}"
-    );
     assert_eq!(
         cs.reruns.len(),
         2,
         "the failing-set retry, then the whole one"
     );
     assert!(cs.reruns[0].scope.is_some() && cs.reruns[1].scope.is_none());
+    assert!(cs
+        .base
+        .as_ref()
+        .unwrap()
+        .run
+        .as_ref()
+        .unwrap()
+        .scope
+        .is_none());
+}
+
+#[test]
+fn a_test_that_fails_only_beside_the_others_denies_as_the_whole_retry_does() {
+    // codex on #1199: `B` fails in the whole suite (shared state) and passes alone. Its failing-set
+    // retry passes; the whole retry decides and fails, and the whole base (the deciding run was the
+    // whole check) is green.
+    let Some(((cs, ns), (_, nw))) = both(
+        "fs-order",
+        &suite(&[]),
+        &suite(&[(B, "whole")]),
+        &[],
+        declared(false),
+        (false, OUTCOME_FLAKY_TWICE, Some(REGRESSION), false),
+    ) else {
+        return;
+    };
+    assert_eq!(nw, vec![12, 12, 12]);
+    assert_eq!(
+        ns,
+        vec![12, 1, 12, 12],
+        "the set passes alone; the whole retry and base decide"
+    );
+    assert!(cs
+        .base
+        .as_ref()
+        .unwrap()
+        .run
+        .as_ref()
+        .unwrap()
+        .scope
+        .is_none());
+}
+
+#[test]
+fn an_error_outside_any_test_the_base_shares_still_escalates() {
+    // codex on #1199: both trees carry an error outside any test, and the head also fails a flaky
+    // file. The set never stands for the base: the whole base reproduces the shared error.
+    let _off = seam::exclude(false);
+    for (tag, decl) in [
+        ("fs-shared-err-s", Some(declared(false))),
+        ("fs-shared-err-w", None),
+    ] {
+        let t = twin(
+            tag,
+            &suite(&[]),
+            &suite(&[(B, "flake")]),
+            &[("unhandled", "")],
+            decl,
+        );
+        // The base carries the error too: commit it (alone) as the new base.
+        git(&t.repo, &["add", "unhandled"]);
+        git(
+            &t.repo,
+            &["commit", "-qm", "the shared error", "--", "unhandled"],
+        );
+        let ctx = FloorContext {
+            base_head: Some(git(&t.repo, &["rev-parse", "HEAD"])),
+            ..t.ctx.clone()
+        };
+        let t = Twin { ctx, ..t };
+        let Some((r, c, _)) = floor(&t) else {
+            return;
+        };
+        assert_eq!(
+            verdict(&r, &c),
+            (
+                false,
+                OUTCOME_BASE_RED_UNSEPARATED.into(),
+                Some(BASE_RED_UNSEPARATED.into()),
+                false
+            ),
+            "{tag}: {c:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&t.repo);
+    }
 }
 
 #[test]
@@ -640,7 +734,9 @@ fn real_cargo_retries_and_compares_only_the_failing_test_names() {
         };
         assert_eq!(verdict(&rw, &w), want, "{tag} whole: {w:#?}");
         assert_eq!(verdict(&rs, &s), want, "{tag} scoped: {s:#?}");
-        let retry = s.reruns.last().expect("retried");
+        // The failing-set retry ran first. One that fails decides; one that passes alone hands the
+        // decision to the whole retry.
+        let retry = s.reruns.first().expect("retried");
         let names: Vec<&str> = if a_red { vec!["t::a", "c"] } else { vec!["c"] };
         assert_eq!(
             retry.argv,
@@ -651,10 +747,10 @@ fn real_cargo_retries_and_compares_only_the_failing_test_names() {
                 .collect::<Vec<_>>(),
             "{tag}"
         );
-        assert_eq!(s.reruns.len(), 1, "{tag}: no whole retry after it");
+        assert_eq!(s.reruns.len(), if a_red { 1 } else { 2 }, "{tag}");
         assert_eq!(
-            s.retry.as_ref().and_then(|r| r.whole_because.clone()),
-            None,
+            s.retry.as_ref().unwrap().whole_because.is_some(),
+            !a_red,
             "{tag}"
         );
         if a_red {

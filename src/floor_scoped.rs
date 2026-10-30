@@ -17,22 +17,25 @@
 //! ```
 //!
 //! gets the retry and the base run of ONLY the head's failing set (its parsed `failureIds`). The
-//! exit codes still decide; the head's text only chooses what is re-run. Each scoped result has to
-//! be one the whole check would have given, or the whole check runs instead, as before:
+//! exit codes still decide; the head's text only chooses what is re-run. A scoped result never
+//! passes what the whole check would not:
 //!
-//! * **A scoped run that FAILS stands.** The failure reproduced: the retry denies, the base is red.
-//! * **A scoped RETRY that passes stands only when** the head's own failure count matches the
-//!   selection ([`head_complete`]: nothing failed that the ids do not name, such as an unhandled
-//!   error or a crashed test binary) **and** the retry shows each selected test ran and passed
-//!   ([`proven`]). Otherwise the whole identical retry runs and decides.
-//! * **A scoped BASE run that passes stands only when** every selected test the base has is shown
-//!   to have run and passed there. A selected file the base does not have was added by the change,
-//!   so the base cannot fail it, and the whole base would not have run it either. Otherwise the
-//!   whole base runs and decides.
+//! * **A failing-set RETRY that fails stands.** The failure reproduced: the retry denies. One that
+//!   PASSES never stands: a test that passes alone may still fail beside the others (shared state,
+//!   order), so the whole identical retry runs and decides, as before.
+//! * **The BASE runs the failing set only when** the head's own count accounts for every failure
+//!   the set names ([`head_complete`]: nothing failed that the ids do not name, such as an unhandled
+//!   error or a crashed test binary), and the deciding retry (if any) was the failing set, not the
+//!   whole check. Otherwise the whole base runs.
+//! * **A failing-set base run that fails stands** (the base is red). One that PASSES stands only
+//!   when it shows each selected test running and passing ([`proven`]); a selected FILE the base
+//!   does not have was added by the change and is not needed. Otherwise the whole base runs and
+//!   decides. A passing failing-set record is cached only once it has been shown to stand.
 //!
 //! The base answers "do THESE failures happen without the change?". A base that is red only on
 //! tests the head passes does not make the head's own failures inseparable: they are compared
-//! test by test.
+//! test by test. Every scoped outcome denies where the whole one would; what can differ is only
+//! which denial (a change's failure or a base-shared one) for an order-dependent test.
 //!
 //! `self_retry: true` says the check already re-runs its own failures (crew's
 //! `scripts/test-related.mjs`, crew#649). The engine then skips its own retry and goes straight to
@@ -323,16 +326,49 @@ fn count_before(line: &str, word: &str) -> Option<usize> {
         .and_then(|w| w[0].parse().ok())
 }
 
-/// Does the head's output account for EVERY failure in `ids`, by the runner's own count? Only
-/// then can a scoped retry that passes stand for the whole check: a failure the ids do not name
-/// (an unhandled error, a crashed test binary, a build error) would otherwise go un-retried.
+/// What a stream printed after its last retry-block marker ([`super::RETRY_BLOCK_MARKER`]), or
+/// all of it.
+fn final_pass(stream: &str) -> &str {
+    let mut at = 0;
+    let mut offset = 0;
+    for line in stream.split_inclusive('\n') {
+        offset += line.len();
+        if super::starts_retry_block(line) {
+            at = offset;
+        }
+    }
+    &stream[at..]
+}
+
+/// Do the failures the plain text names equal the set `ids`?
+fn same_set<'a>(named: impl Iterator<Item = &'a str>, ids: &[String]) -> Result<(), String> {
+    let named: std::collections::BTreeSet<&str> = named.collect();
+    let set: std::collections::BTreeSet<&str> = ids.iter().map(String::as_str).collect();
+    match named.symmetric_difference(&set).next() {
+        None => Ok(()),
+        Some(odd) => Err(format!(
+            "`{odd}` is not named the same way by the runner's text and the failure ids"
+        )),
+    }
+}
+
+/// Does the head's output account for EVERY failure, by the runner's own count, and name exactly
+/// the set `ids`? Only then can the base compare the set alone: a failure the ids do not name (an
+/// unhandled error, a crashed test binary, a build error, a line the raw parse missed) would go
+/// uncompared.
 pub(crate) fn head_complete(
     by: RerunBy,
     stdout: &str,
     stderr: &str,
     ids: &[String],
 ) -> Result<(), String> {
-    let text = plain(&format!("{stdout}\n{stderr}"));
+    // A check that retried on its own: each stream's final pass is what follows its last retry
+    // marker, as the failure ids were read (core#1172).
+    let text = format!(
+        "{}\n{}",
+        final_pass(&plain(stdout)),
+        final_pass(&plain(stderr))
+    );
     let lines: Vec<&str> = text.lines().map(str::trim).collect();
     match by {
         RerunBy::File => {
@@ -347,7 +383,13 @@ pub(crate) fn head_complete(
                 return Err("the runner printed no `Test Files … failed` count".into());
             };
             match count_before(summary, "failed") {
-                Some(n) if n == ids.len() => Ok(()),
+                Some(n) if n == ids.len() => same_set(
+                    lines
+                        .iter()
+                        .filter(|l| l.starts_with("FAIL "))
+                        .filter_map(|l| file_of(l)),
+                    ids,
+                ),
                 Some(n) => Err(format!(
                     "the runner counted {n} failed files, the ids name {}",
                     ids.len()
@@ -398,7 +440,15 @@ pub(crate) fn head_complete(
                     "the runner counted {counted} failed tests, its output names {failed_lines}"
                 ));
             }
-            Ok(())
+            // The names the plain text fails must be exactly the set (a coloured line the raw
+            // parse missed is a failure the set does not hold).
+            same_set(
+                lines
+                    .iter()
+                    .filter_map(|l| l.strip_prefix("test ")?.strip_suffix(" ... FAILED"))
+                    .map(str::trim),
+                ids,
+            )
         }
     }
 }
@@ -593,7 +643,7 @@ mod tests {
             .contains("no `Test Files"));
         // A check that retried on its own: the LAST summary is the final pass's.
         let retried =
-            format!("{out}WICKED-RETRY … re-running\n Test Files  1 failed | 1 passed (2)\n");
+            format!("{out}WICKED-RETRY a deadline — re-running the 1 named file(s) ONCE: tests/a.test.ts\n FAIL  tests/a.test.ts > x\n Test Files  1 failed (1)\n");
         assert_eq!(
             head_complete(RerunBy::File, &retried, "", &two[..1]),
             Ok(())
@@ -622,6 +672,19 @@ mod tests {
             .unwrap_err()
             .contains("build failed"));
         assert!(head_complete(RerunBy::Name, "", "error: could not compile `a`\n", &[]).is_err());
+        // codex on #1199: the counts agree, but a failing name (a coloured line the raw parse
+        // missed) is not in the set.
+        let coloured = stdout.replacen(
+            "test bad2 ... FAILED",
+            "\x1b[1mtest bad2 ... FAILED\x1b[0m",
+            1,
+        );
+        let err = head_complete(RerunBy::Name, &coloured, stderr, &ids(&["t::bad1"])).unwrap_err();
+        assert!(err.contains("`bad2`"), "{err}");
+        // The same for files: the count matches, the names do not.
+        let other = ids(&["tests/a.test.ts", "tests/z.test.ts"]);
+        let err = head_complete(RerunBy::File, out, "", &other).unwrap_err();
+        assert!(err.contains("tests/"), "{err}");
     }
 
     #[test]

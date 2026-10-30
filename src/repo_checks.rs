@@ -5368,6 +5368,8 @@ fn run_detected(
                 } else {
                     (None, Vec::new(), None)
                 };
+            // A failing-set retry ran and passed, so the whole retry decided.
+            let retried_whole = !retry_extra.is_empty();
             run.reruns.extend(retry_extra);
             let retry_passed = early_retry.as_ref().is_some_and(CheckRun::passed);
             // (core#1191) A fresh check that failed after reused ones sends the floor round again
@@ -5411,7 +5413,24 @@ fn run_detected(
                         // inventoried), cached, and the export removed before the next HEAD run.
                         // (core#1198) A cached WHOLE base answers a failing set too; then the
                         // set's own record; then the set runs on the base.
-                        let failing_set = scoped.as_ref().and_then(|r| r.as_ref().ok());
+                        // Only a set that accounts for every failure of the run that decides: the
+                        // head's own count must match it, and a whole retry that decided is the
+                        // whole check's failure, not the set's (xreview on #1199).
+                        let failing_set =
+                            scoped.as_ref().and_then(|r| r.as_ref().ok()).filter(|s| {
+                                match (&s.complete, retried_whole) {
+                                    (Ok(()), false) => true,
+                                    (Err(why), _) => {
+                                        eprintln!(
+                                        "wicked-core: repo checks floor — `{}`: the whole check \
+                                         runs on the base ({why})",
+                                        check.name
+                                    );
+                                        false
+                                    }
+                                    (Ok(()), true) => false,
+                                }
+                            });
                         let cached =
                             BaseTree::cached(scratch, head, check, excluding).or_else(|| {
                                 failing_set.and_then(|s| {
@@ -7010,10 +7029,10 @@ impl BaseTree {
 
     /// (core#1198) The base side of the failing set `s` of `check`: the set run on the base. A
     /// base that FAILS it is red, as the whole base would be. A base that PASSES it stands only when
-    /// its output shows every selected test the base has running and passing (a file the base does
-    /// not have was added by the change; a libtest name is taken as run: doc tests are never
-    /// selected); otherwise the whole check runs on the base and decides, and the failing-set run is
-    /// returned beside it (its cost).
+    /// its output shows every selected test running and passing (a FILE the base does not have was
+    /// added by the change and is not needed); otherwise the whole check runs on the base and
+    /// decides, and the failing-set run is returned beside it (its cost). A passing record is
+    /// cached only here, once it stands: a floor interrupted before the proof leaves none.
     fn run_failing_set(
         &self,
         check: &RepoCheck,
@@ -7026,8 +7045,9 @@ impl BaseTree {
         let Some(run) = side.base.run.as_ref().filter(|r| r.passed()) else {
             return (side, None);
         };
+        // A libtest name must be shown passing: nothing establishes that the base lacks it.
         let present = |id: &str| match s.by {
-            floor_scoped::RerunBy::Name => false,
+            floor_scoped::RerunBy::Name => true,
             floor_scoped::RerunBy::File => {
                 let rel: Vec<&str> = [check.dir.as_str(), s.root.as_str(), id]
                     .into_iter()
@@ -7038,6 +7058,7 @@ impl BaseTree {
             }
         };
         let Err(why) = s.proven_in(run, scratch, present) else {
+            self.store(scratch, &s.check, None, run.clone(), None, true);
             return (side, None);
         };
         eprintln!(
@@ -7045,7 +7066,6 @@ impl BaseTree {
              running the whole check on the base",
             check.name
         );
-        let _ = std::fs::remove_file(Self::cache_path_of(scratch, &self.head, &s.check, true));
         let scoped_run = side.base.run;
         (
             self.run_check(check, ctx, sandbox, scratch, None),
@@ -7064,7 +7084,6 @@ impl BaseTree {
         guide: Option<&GuideCheck>,
         scoped: Option<&Scoped>,
     ) -> BaseSide {
-        let cache = Self::cache_path_of(scratch, &self.head, check, scoped.is_some());
         let fail = |e: String| BaseSide {
             base: BaseRun {
                 head: self.head.clone(),
@@ -7231,6 +7250,40 @@ impl BaseTree {
             toc = Some(t);
         }
         run.scope = scoped.map(|s| s.scope.clone());
+        // (core#1198) A failing set's PASS is cached only once it stands ([`Self::run_failing_set`]).
+        if scoped.is_none() || !run.passed() {
+            self.store(
+                scratch,
+                check,
+                guide,
+                run.clone(),
+                toc.clone(),
+                scoped.is_some(),
+            );
+        }
+        BaseSide {
+            base: BaseRun {
+                head: self.head.clone(),
+                cached: false,
+                run: Some(run),
+                error: None,
+            },
+            toc,
+        }
+    }
+
+    /// Cache `run` (and its inventory) as the base result of `check` for the rest of the run: the
+    /// whole check's record, or (`failing_set`) the failing set's. A base run (or its inventory, or
+    /// an alone run) that did not finish or could not start is not cached: it says nothing lasting.
+    fn store(
+        &self,
+        scratch: &CheckScratch,
+        check: &RepoCheck,
+        guide: Option<&GuideCheck>,
+        run: CheckRun,
+        toc: Option<Toc>,
+        failing_set: bool,
+    ) {
         let rec = BaseRecord {
             floor_policy: FLOOR_POLICY_VERSION,
             head_argv: check.argv.clone(),
@@ -7238,25 +7291,18 @@ impl BaseTree {
             run,
             toc,
         };
-        // A base run (or its inventory, or an alone run) that did not finish or could not start is
-        // not cached: it says nothing lasting.
-        if !rec.run.timed_out
-            && rec.run.spawn_error.is_none()
-            && !rec.toc.as_ref().is_some_and(|t| t.transient)
+        if rec.run.timed_out
+            || rec.run.spawn_error.is_some()
+            || rec.toc.as_ref().is_some_and(|t| t.transient)
         {
-            let _ = std::fs::create_dir_all(&scratch.logs);
-            if let Ok(json) = serde_json::to_string(&rec) {
-                let _ = std::fs::write(&cache, json);
-            }
+            return;
         }
-        BaseSide {
-            base: BaseRun {
-                head: self.head.clone(),
-                cached: false,
-                run: Some(rec.run),
-                error: None,
-            },
-            toc: rec.toc,
+        let _ = std::fs::create_dir_all(&scratch.logs);
+        if let Ok(json) = serde_json::to_string(&rec) {
+            let _ = std::fs::write(
+                Self::cache_path_of(scratch, &self.head, check, failing_set),
+                json,
+            );
         }
     }
 }
@@ -8624,11 +8670,11 @@ impl Scoped {
 }
 
 /// (core#1198) The engine's retry of the failed head run `first` of `check`, when one is due
-/// ([`retry_if_loaded`]): only the failing set when the repo declares how, else the whole check.
-/// A failing-set retry that FAILS decides (the failure reproduced). One that PASSES decides only
-/// when the head's count accounts for every failure and the retry shows each test passing;
-/// otherwise the whole identical retry runs at once and decides. Returns the deciding retry, the
-/// passes it cost before it, and why it ran the whole check although a `rerun` is declared.
+/// ([`retry_if_loaded`]): first only the failing set when the repo declares how. A failing-set
+/// retry that FAILS decides (the failure reproduced). One that PASSES does not: a test that passes
+/// alone may still fail beside the others, so the whole identical retry runs at once and decides.
+/// Returns the deciding retry, the passes it cost before it, and why it ran the whole check
+/// although a `rerun` is declared.
 fn retry_failing(
     worktree: &Path,
     held: Option<&HeldDir>,
@@ -8665,24 +8711,20 @@ fn retry_failing(
     if !r.passed() {
         return (Some(r), Vec::new(), None);
     }
-    let stands = s
-        .complete
-        .clone()
-        .map_err(|e| format!("the head's output may not name every failure ({e})"))
-        .and_then(|()| s.proven_in(&r, scratch, |_| true));
-    let Err(why) = stands else {
-        return (Some(r), Vec::new(), None);
-    };
+    let why = "the failing set passed alone, which does not show the whole check passes (a test \
+               can fail only beside the others)"
+        .to_string();
     eprintln!(
-        "wicked-core: repo checks floor — `{}`'s failing-set retry passed, but {why}: retrying the \
-         whole check",
+        "wicked-core: repo checks floor — `{}`'s failing-set retry passed: retrying the whole \
+         check, which decides",
         check.name
     );
     r.logs = relabel(r.logs, "retry-scoped");
     let mut whole = run_one_with(worktree, held, check, &exec, sandbox, scratch, Tree::Head);
     whole.logs = relabel(whole.logs, "retry");
     whole.source = format!(
-        "the identical retry of `{}`: its failing-set retry passed, but {why} (core#1198)",
+        "the identical retry of `{}`: its failing-set retry passed, and only the whole check \
+         decides a pass (core#1198)",
         check.name
     );
     (Some(whole), vec![r], Some(why))
