@@ -3006,6 +3006,19 @@ mod failure_diagnostics_tests {
         );
     }
 
+    /// The same seat-health record as `d`, with a budget no host load can exhaust: a dispatch
+    /// that must ANSWER (exit 0 or exit 1) is judged on its answer, never on whether a 100 ms
+    /// budget held on a loaded host (it timed out at load 30+ inside the repo-checks floor).
+    fn patient(d: &RealDispatcher) -> RealDispatcher {
+        RealDispatcher {
+            timeout: Duration::from_secs(60),
+            local_runner_timeout: Duration::from_secs(60),
+            load_source: d.load_source.clone(),
+            seats: d.seats.clone(),
+            ..RealDispatcher::default()
+        }
+    }
+
     #[test]
     fn a_successful_vote_between_load_timeouts_resets_the_exemption_counter() {
         // A seat that answers between load-induced timeouts has its exemption streak cleared
@@ -3041,7 +3054,7 @@ mod failure_diagnostics_tests {
             }
         }
         // A successful vote clears the exemption counter and the failure streak to zero.
-        d.dispatch_prompt(&fast, &task(), "ignored");
+        patient(&d).dispatch_prompt(&fast, &task(), "ignored");
         let seats = d.seats.lock().unwrap();
         match seats.get(key) {
             Some(SeatHealth::Healthy {
@@ -3109,7 +3122,7 @@ mod failure_diagnostics_tests {
             ..RealDispatcher::default()
         };
         // Dispatch 1: NonZeroExit — not load-induced → consecutive_failures becomes 1.
-        d.dispatch_prompt(&failing, &task(), "ignored");
+        patient(&d).dispatch_prompt(&failing, &task(), "ignored");
         {
             let seats = d.seats.lock().unwrap();
             match seats.get(key) {
@@ -3139,7 +3152,7 @@ mod failure_diagnostics_tests {
             }
         }
         // Dispatch 3: NonZeroExit → streak = 1+1 = 2 ≥ threshold → seat must bench.
-        d.dispatch_prompt(&failing, &task(), "ignored");
+        patient(&d).dispatch_prompt(&failing, &task(), "ignored");
         let seats = d.seats.lock().unwrap();
         assert!(
             matches!(seats.get(key), Some(SeatHealth::Benched { .. })),

@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Three load-sensitive engine tests no longer depend on the clock (power-speed).** These tests flaked inside the
+  repo-checks floor at load 30+. Each flake sent a core floor into its retry and base path.
+  - `a_backgrounded_writer_dies_with_the_seat_it_belongs_to`: the backgrounded writer now waits for a release file the
+    test writes after `run_unit` returns, instead of a 1 s sleep that a slow reap could outlast.
+  - The two council load-timeout tests: the dispatches that must answer (exit 0 or exit 1) run with a 60 s budget on
+    the same seat-health record. Only the dispatch meant to time out keeps the 100 ms budget.
+  - The power intake prompt now says `estimateMinutes` is the orchestrator's own build time, which is what the struggle
+    signal measures (core#1179), not the hand-off.
+
 - **The floor and power mode stop running suites twice (power-speed).** Both power proof runs (bc2366e1, b6f7968b)
   spent most of their time running test suites again.
   - **The retry comes before the base when nothing can be excluded.** When the floor can't exclude (exclusion is off,

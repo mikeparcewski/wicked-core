@@ -11535,13 +11535,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let late = dir.join("late.txt");
         let script = dir.join("seat.sh");
-        // The seat: start a background job that writes AFTER a delay, then exit immediately —
-        // exactly the "delayed write after seat exit" shape.
+        // The seat: start a background job that writes LATE, then exit immediately — exactly the
+        // "delayed write after seat exit" shape. "Late" is a condition, not a clock: the job writes
+        // only once the test releases it, after `run_unit` has returned, so a loaded host that is
+        // slow to reap the seat cannot make the write land early (it did, inside the repo-checks
+        // floor at load 30+, with a 1 s sleep).
+        let release = dir.join("release");
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\n(sleep 1; echo late > \"{}\") &\nexit 0\n",
-                late.display()
+                "#!/bin/sh\n(while [ ! -f \"{rel}\" ]; do sleep 0.05; done; echo late > \"{late}\") &\nexit 0\n",
+                rel = release.display(),
+                late = late.display()
             ),
         )
         .unwrap();
@@ -11565,6 +11570,9 @@ mod tests {
         };
         let out = WrappedCliStepRunner::default().run_unit(&input);
         assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        // Release the writer. Were it alive, it would write within one 50 ms poll; give it far
+        // longer than that before asserting it never did.
+        std::fs::write(&release, "go").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2500));
         assert!(
             !late.exists(),
