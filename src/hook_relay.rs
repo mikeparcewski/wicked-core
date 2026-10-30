@@ -59,7 +59,7 @@ macro_rules! relay_log {
 /// The gateway port the seat's gate hook posts to (not a browser-blocked port).
 pub(crate) const HOOK_PORT: u16 = 8711;
 /// How long one tool call's judgement may take before it is denied.
-const HOOK_TIMEOUT: Duration = Duration::from_secs(60);
+const HOOK_TIMEOUT: Duration = crate::answer_deadline(Duration::from_secs(60));
 /// The largest hook payload the relay reads (a tool call's input).
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
@@ -1493,8 +1493,8 @@ mod tests {
         // reads its payload is counted.
         std::fs::write(
             &fake,
-            "#!/bin/sh\n[ \"$WICKED_TEST_MODE\" = stall ] && exec sleep 8\n\
-             [ \"$WICKED_TEST_MODE\" = linger ] && { sleep 8 & echo $! > \"$WICKED_TEST_DIR/linger.pid\"; \
+            "#!/bin/sh\n[ \"$WICKED_TEST_MODE\" = stall ] && exec sleep 600\n\
+             [ \"$WICKED_TEST_MODE\" = linger ] && { sleep 600 & echo $! > \"$WICKED_TEST_DIR/linger.pid\"; \
              cat > /dev/null; exit 0; }\n\
              cat > /dev/null\necho run >> \"$WICKED_TEST_DIR/runs-$WICKED_TEST_MODE\"\n\
              case \"$WICKED_TEST_MODE\" in\n\
@@ -1724,35 +1724,57 @@ mod tests {
             what()
         };
         for mode in ["stall", "linger", "late"] {
-            let (t, _r, log) = unit(mode);
-            let reg = super::unit(&t).expect("registered");
-            let call = reg.life.enter().expect("live");
-            let started = std::time::Instant::now();
             // `late` is a hook that allows at once, on a budget already spent: an answer after
             // the deadline is a timeout too, never an allow.
-            let budget = if mode == "late" {
+            let mut budget = if mode == "late" {
                 Duration::ZERO
             } else {
                 Duration::from_secs(2)
             };
-            let a: serde_json::Value =
-                serde_json::from_str(&judge(&reg, &call, "Write", big.as_bytes(), budget)).unwrap();
-            let took = started.elapsed();
-            assert_eq!(decision(&a), "deny", "{mode}: {a}");
-            assert!(reason(&a).contains("did not answer within"), "{mode}: {a}");
-            // The budget plus a loaded host's scheduling slack, far under the 8 s the hook holds.
-            assert!(
-                took < budget + Duration::from_secs(4),
-                "{mode}: refused in {took:?}"
-            );
-            assert_eq!(records(&log).len(), 1, "{mode}: {:?}", records(&log));
-            drop(call);
-            // Nothing of the run outlives its refusal: its group (the lingering child included)
-            // is killed, and its I/O threads end and give their slots back.
-            assert!(
-                settles(&|| IO_ACTIVE.load(Ordering::SeqCst) <= baseline),
-                "{mode}: relay I/O threads still running"
-            );
+            // (core#1194) `linger` proves something only once its hook has left the lingering
+            // child before the deadline. On a loaded host the stub may not have started within
+            // 2 s, so the call is judged again on a doubled budget until that condition holds.
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                if mode == "linger" {
+                    let _ = std::fs::remove_file(dir.join("linger.pid"));
+                }
+                let (t, _r, log) = unit(mode);
+                let _ = std::fs::remove_file(&log);
+                let reg = super::unit(&t).expect("registered");
+                let call = reg.life.enter().expect("live");
+                let started = std::time::Instant::now();
+                let a: serde_json::Value =
+                    serde_json::from_str(&judge(&reg, &call, "Write", big.as_bytes(), budget))
+                        .unwrap();
+                let took = started.elapsed();
+                assert_eq!(decision(&a), "deny", "{mode}: {a}");
+                assert!(reason(&a).contains("did not answer within"), "{mode}: {a}");
+                // Refused without waiting out the 600 s the hook holds (core#1194: the refusal
+                // came 245 s after a 2 s budget in a nested floor at host load 45, where starting
+                // the stub alone took minutes; the hold, not a clock, is the condition).
+                assert!(
+                    took < Duration::from_secs(600),
+                    "{mode}: refused in {took:?}"
+                );
+                assert_eq!(records(&log).len(), 1, "{mode}: {:?}", records(&log));
+                drop(call);
+                // Nothing of the run outlives its refusal: its group (the lingering child
+                // included) is killed, and its I/O threads end and give their slots back.
+                assert!(
+                    settles(&|| IO_ACTIVE.load(Ordering::SeqCst) <= baseline),
+                    "{mode}: relay I/O threads still running"
+                );
+                if mode != "linger" || dir.join("linger.pid").exists() {
+                    break;
+                }
+                assert!(
+                    attempts < 6,
+                    "the linger hook never started within {budget:?}"
+                );
+                budget *= 2;
+            }
         }
         // The unit's lifecycle lock held past the deadline (a contended registry): an allow
         // the gate hook would give is not committed after the deadline.

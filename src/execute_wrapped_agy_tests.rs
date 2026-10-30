@@ -477,9 +477,11 @@ fn run_bounded_cuts_one_oversized_delta_to_the_retained_cap() {
     // spawn-audit: test-only — a fixture that prints 10 MiB on one line.
     let mut cmd = Command::new("sh");
     cmd.args(["-c", "head -c 10485760 /dev/zero | tr '\\0' a; echo"]);
+    // (core#1194) A stand-in that must ANSWER: a failure guard, not a clock (60 s ran out in a
+    // nested floor at host load 35).
     let (code, out, ..) = run_bounded(
         cmd,
-        Duration::from_secs(60),
+        crate::test_env::PATIENT,
         &|_| {},
         Box::<HoldAll>::default(),
         None,

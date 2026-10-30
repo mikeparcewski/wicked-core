@@ -359,7 +359,7 @@ impl SandboxLevel {
 
 /// Per-validator wall-clock bound. A validator check (`test`/`grep`/`find` …) is fast; a script that
 /// hangs or loops is KILLED at this bound and the run reports a fail-closed [`ValidatorOutcome::TimedOut`].
-pub(crate) const VALIDATOR_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const VALIDATOR_TIMEOUT: Duration = crate::answer_deadline(Duration::from_secs(120));
 
 /// The environment variables PASSED THROUGH to the (otherwise cleared) child: enough for the shell +
 /// standard tools to resolve and run, and nothing that carries a secret. Everything else — API keys,

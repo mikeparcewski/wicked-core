@@ -1209,7 +1209,10 @@ mod tests {
                 fresh.display()
             ),
         );
-        assert_eq!(run(&indexer, 30), Ok(BaseIndex::Indexed));
+        // (core#1194) A stand-in that must ANSWER gets a failure guard, not a clock: inside the
+        // repo-checks floor at load 40-60 this four-line script outlived a 30 s bound.
+        let patient = crate::test_env::PATIENT.as_secs();
+        assert_eq!(run(&indexer, patient), Ok(BaseIndex::Indexed));
         assert_eq!(
             std::fs::read_to_string(&argv).unwrap().trim(),
             format!("index {} --db {}", wt.display(), db.display())
@@ -1221,14 +1224,15 @@ mod tests {
 
         // A failing or hung indexer is an error, and the hung one is killed at the bound.
         graph_at(&db, OLD);
-        assert!(run(&script("fails", "exit 3"), 30)
+        assert!(run(&script("fails", "exit 3"), patient)
             .unwrap_err()
             .contains("failed"));
         let started = std::time::Instant::now();
-        assert!(run(&script("hangs", "sleep 30"), 1)
+        assert!(run(&script("hangs", "sleep 600"), 1)
             .unwrap_err()
             .contains("exceeded 1s"));
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // Killed at the bound, never waited out: far under the hang's own 600 s on any host.
+        assert!(started.elapsed() < std::time::Duration::from_secs(300));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
