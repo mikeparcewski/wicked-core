@@ -295,6 +295,8 @@ impl Runtime {
 }
 
 #[cfg(test)]
+// Every caller is a unix-only test (stub shell scripts).
+#[cfg_attr(not(unix), allow(dead_code))]
 impl Runtime {
     /// A test stand-in that always answers (core#1194): its commands are bounded only by
     /// [`crate::test_env::PATIENT`], a failure guard no host load exhausts.
