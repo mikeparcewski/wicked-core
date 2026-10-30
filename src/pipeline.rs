@@ -1410,7 +1410,16 @@ pub(crate) fn apply_and_finish_unit(
                     carried_override = Some(carry);
                     None
                 } else {
-                    (!report.passed).then(|| (report.denial_source(), report.denial_reason()))
+                    (!report.passed).then(|| {
+                        (
+                            report.denial_source(),
+                            format!(
+                                "{}{}",
+                                no_change_contradicted_note(output, evidence),
+                                report.denial_reason()
+                            ),
+                        )
+                    })
                 }
             }
             None if unit.repo_checks_floor
@@ -2981,6 +2990,26 @@ pub(crate) fn author_binaries_known(u: &crate::domain::WorkUnit) -> bool {
             .iter()
             .any(|b| b == crate::domain::UNKNOWN_AUTHOR_BINARY)
 }
+
+/// (rig run ea73afc0) The lead of a floor denial whose attempt said NO CHANGE NEEDED but changed
+/// the tree anyway: the engine read it as a change (the floor ran on the new tree), and the gate
+/// says so, so the operator sees why the floor ran again. Empty otherwise.
+pub(crate) fn no_change_contradicted_note(
+    output: &str,
+    evidence: &crate::workflow::UnitEvidence,
+) -> &'static str {
+    if evidence.tree_changed == Some(true) && crate::actor::no_change_mention(output) == Some(true)
+    {
+        NO_CHANGE_CONTRADICTED
+    } else {
+        ""
+    }
+}
+
+/// [`no_change_contradicted_note`]'s words.
+pub(crate) const NO_CHANGE_CONTRADICTED: &str =
+    "the attempt said no change was needed but changed \
+     the tree, so it was read as a change and the floor ran on the new tree: ";
 
 /// (core#1168) The operator's override of a CREATOR floor result, carried onto the verify floor that
 /// reused it: `Some` only when this verify floor failed on checks it ALL took from that creator floor
@@ -4954,6 +4983,97 @@ mod judge_bench_tests {
             outcome.denial.map(|d| d.source),
             units[0].clone(),
         )
+    }
+
+    /// (rig run ea73afc0) A creator attempt's fold with a fresh FAILED floor report: `reply` is the
+    /// seat's answer and `tree_changed` what the engine measured. Returns the unit's denial reason.
+    fn fold_retry_answer(sid: &str, reply: &str, tree_changed: Option<bool>) -> Option<String> {
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let mut sink = |_e: CoreEvent| {};
+        let Planned {
+            mut units,
+            workflow_id,
+            cli_keys,
+            ..
+        } = plan_and_distribute(
+            &mut store,
+            &[cli("a"), cli("b")],
+            "Do step one.",
+            EntityMode::Shared,
+            sid,
+            crate::domain::HumanConfirm::None,
+            false,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            &mut sink,
+            None,
+            false,
+            false,
+            Vec::new(),
+            None,
+            true,
+            &crate::assurance::QeOverride::Auto,
+        )
+        .expect("plan");
+        let unit = &mut units[0];
+        unit.default_floor = true;
+        let report: crate::repo_checks::RepoChecksReport =
+            serde_json::from_value(serde_json::json!({
+                "detected": [], "skipped": [], "passed": false, "sandbox_level": "sandboxed",
+                "tree": "t2", "checks": [{"name": "test", "argv": ["npm", "test"], "source": "t",
+                    "exit_code": 1, "timed_out": false, "duration_ms": 1,
+                    "stdout_tail": "", "stderr_tail": "", "failure_ids": ["FAIL a.test.ts > x"]}],
+            }))
+            .unwrap();
+        let evidence = crate::workflow::UnitEvidence {
+            tree_changed,
+            repo_checks: Some(report),
+            ..Default::default()
+        };
+        apply_and_finish_unit(
+            &mut store,
+            unit,
+            reply,
+            &workflow_id,
+            EntityMode::Shared,
+            sid,
+            1,
+            false,
+            false,
+            &cli_keys,
+            None,
+            &evidence,
+            &mut |_| {},
+            None,
+        )
+        .expect("apply");
+        units[0].denial_reason.clone()
+    }
+
+    /// (rig run ea73afc0) An automatic retry turn that said NO CHANGE NEEDED but changed the tree
+    /// (it applied a team member's unrelated advice) is a change: its floor ran on the new tree,
+    /// and the floor's denial says so first. Without the declaration, or on an unchanged tree,
+    /// the denial reads as before.
+    #[test]
+    fn a_no_change_answer_that_changed_the_tree_is_read_as_a_change() {
+        let said = "NO CHANGE NEEDED: the failures are load-bound. Also tried PATHEXT on Windows.";
+        let reason = fold_retry_answer("nochange-contradicted", said, Some(true)).expect("denied");
+        assert!(reason.starts_with(NO_CHANGE_CONTRADICTED), "{reason}");
+        assert!(reason.contains("repo checks floor failed"), "{reason}");
+        assert!(
+            crate::actor::no_change_mention(&reason) != Some(true),
+            "the disclosure is not itself a declaration a later fold could read"
+        );
+        let plain =
+            fold_retry_answer("nochange-plain", "Fixed the test.", Some(true)).expect("denied");
+        assert!(!plain.contains(NO_CHANGE_CONTRADICTED), "{plain}");
+        let unknown = fold_retry_answer("nochange-unknown", said, None).expect("denied");
+        assert!(!unknown.contains(NO_CHANGE_CONTRADICTED), "{unknown}");
     }
 
     /// (rejudge) Deny-dominates holds on a re-judge attempt: the judge's PASS does not admit a

@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The automatic floor-retry round is scoped to the failing checks, and a no-change answer is checked against the
+  tree.** Rig run ea73afc0's retry turn answered NO CHANGE NEEDED for the failures but also applied a team member's
+  unrelated Windows advice: the tree changed, the whole floor ran again (27 min), and the review then failed on that
+  edit (another 32-min floor). Every variant of the round's note now says the round is only for the failing checks
+  (no refactor or follow-up, and no reviewer or team advice unless the failing checks need it; other advice waits
+  for the hand-off's review) and that a no-change answer must leave the tree as it is. The fold reads a NO CHANGE NEEDED answer as one only while
+  the measured tree is unchanged; an attempt that said it and changed the tree is a change, and its floor denial now
+  opens with "the attempt said no change was needed but changed the tree, so it was read as a change".
+
 - **`ps` works inside the macOS jail, so a check's process-table tests stop failing on every base (crew#1221).**
   `/bin/ps` is setuid root, and macOS refuses to exec a setuid binary inside a sandbox
   (`execvp() of '/bin/ps' failed: Operation not permitted`). Every `ps` call in a jailed check read empty, so crew's
