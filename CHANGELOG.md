@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Core's own git fixtures run in a fenced seat, so QE can run them.** On rig run acf30461 (core#1166) the QE
+  reviewer could not run core's `deliver_lift` tests: the fixtures push to a bare remote they make, and the seat's
+  push kill (`url.wicked-nopush://.pushInsteadOf`, in its `GIT_CONFIG_*` and its global gitconfig) refused all 21
+  ("remote helper 'wicked-nopush' aborted session"). QE recorded INCONCLUSIVE and delivery was refused until the
+  operator skipped QE. Each fixture's `git push` (`deliver_lift`, `repo`, `tests/deliver_refusal_gate.rs`) now runs
+  without the inherited config entries and with an empty global config: the fence's own stated limit (a git whose
+  environment is scrubbed), used only for the fixture's local remote. The seat fence itself is unchanged: a seat-wide
+  "push into your own temp dir" allowance was reviewed and dropped, because a prefix rule cannot tell where a spelled
+  path lands (`<tmp>/..`, a symlinked `tmp`).
 - **Live tool activity for codex and pi seats, and a heartbeat for every quiet seat.** On rig run 1d372696 a codex QE
   step read "Codex Working on Check…" with no activity for 20+ s: `toolActivity` came only from claude's stream
   (#1195). The same frames (and the same `wicked.run.tool.*` bus mirror) now come from codex's `exec --json` items

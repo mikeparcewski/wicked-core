@@ -2267,11 +2267,21 @@ mod tests {
 
     fn run_git(cwd: &Path, args: &[&str]) -> String {
         // spawn-audit: test-only — a git fixture building the layout under test; reads no engine state.
-        let out = Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .expect("git runs");
+        let mut cmd = Command::new("git");
+        cmd.args(args).current_dir(cwd);
+        // (rig run acf30461) A fixture's push to the bare remote it made is hermetic: a fenced
+        // seat (QE, the creator) carries the engine's push kill in `GIT_CONFIG_*` and in its
+        // global gitconfig (`url.wicked-nopush://.pushInsteadOf`), which refused every fixture
+        // push, so no seat could run these tests. The fence's own stated limit (a git with its
+        // environment scrubbed) is what this uses; it reaches only the fixture's local repo.
+        if args.first() == Some(&"push") {
+            let empty = std::env::temp_dir().join(".wicked-fixture-empty.gitconfig");
+            let _ = std::fs::write(&empty, "");
+            cmd.env_remove("GIT_CONFIG_COUNT")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", &empty);
+        }
+        let out = cmd.output().expect("git runs");
         assert!(out.status.success(), "git {args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
