@@ -316,6 +316,20 @@ fn a_change_only_failure_compares_its_file_on_the_base_and_denies() {
         vec![B.to_string()]
     );
     assert_eq!(cs.regressions, vec![format!("FAIL {B} > suite > t")]);
+    // (core#1186) The runner's own count accounts for the one failing file: a complete,
+    // file-qualified list an override may later be compared with. Without the declaration the
+    // list is never shown complete.
+    assert_eq!(cs.failures_complete_in.as_deref(), Some(""));
+    assert_eq!(wire_check(&cs)["failuresCompleteIn"], "", "on the wire");
+    assert_eq!(complete_count(&cs), 1);
+}
+
+/// (core#1186) How many failing tests the head's complete list names (0 when not shown complete).
+fn complete_count(c: &CheckRun) -> usize {
+    c.failures_complete_in
+        .as_ref()
+        .map(|_| c.failure_ids.len())
+        .unwrap_or(0)
 }
 
 #[test]
@@ -367,6 +381,8 @@ fn an_error_outside_any_test_is_retried_and_compared_whole() {
         "the failing-set retry, then the whole one"
     );
     assert!(cs.reruns[0].scope.is_some() && cs.reruns[1].scope.is_none());
+    // (core#1186) An error outside any test: the ids are not the whole account.
+    assert_eq!(cs.failures_complete_in, None);
     assert!(cs
         .base
         .as_ref()
@@ -748,6 +764,9 @@ fn real_cargo_retries_and_compares_only_the_failing_test_names() {
             "{tag}"
         );
         assert_eq!(s.reruns.len(), if a_red { 1 } else { 2 }, "{tag}");
+        // (core#1186) libtest names do not say which target failed: never a qualified list.
+        assert_eq!(s.failures_complete_in, None, "{tag}");
+        assert_eq!(w.failures_complete_in, None, "{tag}");
         assert_eq!(
             s.retry.as_ref().unwrap().whole_because.is_some(),
             !a_red,

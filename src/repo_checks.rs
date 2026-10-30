@@ -545,6 +545,15 @@ pub struct CheckRun {
     /// when the engine did not retry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetrySummary>,
+    /// (core#1186) Set to the check's directory when this run's failure ids were shown to be a
+    /// complete, file-qualified account of its failures: a `rerun … by: "file"` check whose own
+    /// runner summary counts exactly the failing files the ids name, with no error outside a test
+    /// ([`crate::floor_scoped::head_complete`]) and nothing cut at the id cap. Only such a list may
+    /// stand for "the tests the operator ruled on" when a later fresh floor is compared with an
+    /// override ([`RepoChecksReport::failing_set`]). `None`: not shown (libtest names, which do not
+    /// name their target; an unhandled error; a capped list; no `rerun` entry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failures_complete_in: Option<String>,
     /// (core#1198) The repo declares that this check re-runs its own failures (`rerun.<check>.
     /// self_retry`): the engine did not retry it again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1758,35 +1767,67 @@ impl RepoChecksReport {
         s
     }
 
-    /// (core#1186) Every failing test this report's denying checks named, as `<check>: <id>`, in
-    /// first-seen order: each head run of each denying check (first run, excluded run, retry).
-    /// `None` unless EVERY denying check's deciding run finished with an exit code and named its
-    /// failures ([`Self::failure_split`]'s completeness rule): a lint, a type error, a timeout or a
-    /// crash has no list a later result could be compared against. `None` too when nothing denies.
+    /// (core#1186) Every failing test this report's denying checks named, qualified by the check's
+    /// directory and name (`<dir>|<check>: <id>`), in first-seen order — the list an operator's
+    /// override is recorded as having ruled on, and that a later FRESH floor on the same tree is
+    /// compared with. `None` unless every denying check's head run named a complete, file-qualified
+    /// account of its failures ([`CheckRun::failures_complete_in`]) and no later run of it (the
+    /// retry, the excluded run) failed a test that list does not name. `None` too when nothing
+    /// denies. A libtest name (`test tests::smoke`) does not say which target failed, so a cargo
+    /// check never has one: it carries only onto the very result overridden
+    /// ([`Self::result_fingerprint`]).
     pub fn failing_set(&self) -> Option<Vec<String>> {
         let mut out: Vec<String> = Vec::new();
         let mut any = false;
         for c in self.checks.iter().filter(|c| c.denies()) {
             any = true;
-            let deciding = c.reruns.last().unwrap_or(c);
-            if deciding.failure_ids.is_empty()
-                || deciding.exit_code.is_none()
-                || deciding.timed_out
-                || deciding.spawn_error.is_some()
-                || c.did_not_finish()
+            let dir = c.failures_complete_in.as_ref()?;
+            let named_failure = |r: &CheckRun| {
+                !r.failure_ids.is_empty()
+                    && r.exit_code.is_some()
+                    && !r.timed_out
+                    && r.spawn_error.is_none()
+                    && r.failure_ids.iter().all(|id| c.failure_ids.contains(id))
+            };
+            // Every run of the check that failed (the head, the retry, the excluded run) named
+            // its failures within the head's complete list: a later run failing without naming
+            // one, or failing something the head did not, is not accounted for.
+            if c.did_not_finish()
+                || !named_failure(c)
+                || c.reruns.iter().any(|r| !r.passed() && !named_failure(r))
             {
                 return None;
             }
-            for run in std::iter::once(c).chain(c.reruns.iter()) {
-                for id in &run.failure_ids {
-                    let named = format!("{}: {id}", c.name);
-                    if !out.contains(&named) {
-                        out.push(named);
-                    }
+            // What the floor DECIDED on: the deciding run's failures (a test that failed on the
+            // head and passed its retry was flaky there, not part of the failure ruled on).
+            let deciding = c.reruns.last().unwrap_or(c);
+            if deciding.passed() {
+                return None;
+            }
+            for id in &deciding.failure_ids {
+                let named = format!("{dir}|{}: {id}", c.name);
+                if !out.contains(&named) {
+                    out.push(named);
                 }
             }
         }
         any.then_some(out)
+    }
+
+    /// (core#1186) The identity of this report's FAILURE: a digest of every denying check's whole
+    /// record (argv, exit, duration, tails, failure ids, log digests, decision). A verify floor that
+    /// reused a creator result, or an unchanged-tree round that carries one, holds a byte-identical
+    /// copy of it, so the digest says "the very result the operator overrode" whichever attempt
+    /// the override was given at. A fresh run never matches. `None` when nothing denies.
+    pub fn result_fingerprint(&self) -> Option<String> {
+        use sha2::Digest;
+        let denying: Vec<&CheckRun> = self.checks.iter().filter(|c| c.denies()).collect();
+        if denying.is_empty() {
+            return None;
+        }
+        let material = serde_json::to_string(&denying).ok()?;
+        let digest = sha2::Sha256::digest(material.as_bytes());
+        Some(digest.iter().map(|b| format!("{b:02x}")).collect())
     }
 
     /// (j4-gates) The denying checks' failing tests split against the run base, from the floor's
@@ -5378,6 +5419,15 @@ fn run_detected(
             let scoped = decl
                 .filter(|_| compare && excluding.is_none())
                 .and_then(|d| Scoped::of(check, d, &run, scratch));
+            // (core#1186) A complete, file-qualified failing set is recorded on the head run.
+            if let Some(Ok(s)) = &scoped {
+                if s.by == floor_scoped::RerunBy::File
+                    && s.complete.is_ok()
+                    && run.failure_ids.len() < MAX_FAILURE_IDS
+                {
+                    run.failures_complete_in = Some(check.dir.clone());
+                }
+            }
             if let Some(Err(why)) = &scoped {
                 eprintln!(
                     "wicked-core: repo checks floor — `{}`: the whole check is retried and \
@@ -9554,6 +9604,7 @@ pub(crate) fn run_one_with(
 ) -> CheckRun {
     let started = Instant::now();
     let mut result = CheckRun {
+        failures_complete_in: None,
         name: check.name.clone(),
         argv: check.argv.clone(),
         source: check.source.clone(),
@@ -10171,6 +10222,7 @@ pub(crate) mod tests {
                 dir: String::new(),
             }],
             checks: vec![CheckRun {
+                failures_complete_in: None,
                 name: "install".into(),
                 argv: s(&["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]),
                 source: "package-lock.json (node_modules absent)".into(),
@@ -13463,6 +13515,7 @@ exit 1
 
     fn run_named(name: &str, exit_code: Option<i32>, timed_out: bool) -> CheckRun {
         CheckRun {
+            failures_complete_in: None,
             name: name.into(),
             argv: vec!["sh".into()],
             source: "t".into(),
@@ -13723,6 +13776,7 @@ exit 1
 
     fn failed_run(ids: &[&str], env: &[&str]) -> CheckRun {
         CheckRun {
+            failures_complete_in: None,
             name: "cargo-test".to_string(),
             argv: s(&["cargo", "test", "--locked", "--workspace"]),
             source: "Cargo.toml".to_string(),
@@ -14474,6 +14528,7 @@ mod floor_pass_tests {
 
     fn run(name: &str, exit_code: i32, duration_ms: u64) -> CheckRun {
         CheckRun {
+            failures_complete_in: None,
             name: name.into(),
             argv: vec!["sh".into()],
             source: "t".into(),

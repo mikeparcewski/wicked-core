@@ -3104,7 +3104,14 @@ pub(crate) fn carried_floor_override(
         .collect();
     // A check that did not finish is never a reused result (the creator record keeps finished
     // checks only) and has no complete list of failing tests.
+    // Never the deliver unit (its own override rule keys on the shipped tree, base and checks), a
+    // tool step, or an operator's explicit re-run (a fresh word was asked for) — on every path
+    // into this function, the unchanged-tree carry included (xreview on #1203).
     if failing.is_empty()
+        || crate::deliver_lift::is_deliver_unit(unit)
+        || unit.tool_cmd.is_some()
+        || report.recheck.is_some()
+        || report.requested_rerun.is_some()
         || report.sandbox_error.is_some()
         || report.detect_error.is_some()
         || report.timed_out()
@@ -3149,7 +3156,30 @@ pub(crate) fn carried_floor_override(
                 })
                 .map(|j| (j, reuse.phase.clone()))
         });
-    // (core#1186) The subset rule: the same tree and base, and every failing test already ruled on.
+    // (core#1186) The identity rule: this floor holds a copy of the very failure overridden (a
+    // verify floor's reuse, an unchanged-tree carry), whichever attempt the override was given at.
+    let identity = || {
+        let now = report.result_fingerprint()?;
+        session
+            .assurance
+            .floor_overrides
+            .iter()
+            .rev()
+            .filter(own)
+            .find(|j| {
+                let f = j.floor_override.as_ref().expect("own");
+                f.key
+                    .as_ref()
+                    .is_some_and(|k| k.tree == key.tree && k.base == key.base)
+                    && f.fingerprint.as_deref() == Some(now.as_str())
+            })
+            .map(|j| {
+                let ord = j.floor_override.as_ref().expect("own").ord;
+                (j, phase_of(ord))
+            })
+    };
+    // (core#1186) The subset rule: the same tree and base, and every failing test already ruled on
+    // (both lists complete and file-qualified, `failing_set`).
     let subset = || {
         let now = report.failing_set()?;
         session
@@ -3172,7 +3202,7 @@ pub(crate) fn carried_floor_override(
                 (j, phase_of(ord))
             })
     };
-    let (judgment, phase) = exact.or_else(subset)?;
+    let (judgment, phase) = exact.or_else(identity).or_else(subset)?;
     let overridden = judgment.floor_override.as_ref().expect("own");
     let layer = report.denial_source().to_string();
     let phase = phase.unwrap_or_else(|| "the creator floor".to_string());
@@ -3191,6 +3221,7 @@ pub(crate) fn carried_floor_override(
             key: Some(key.clone()),
             carried_from: Some(overridden.result_id.clone()),
             failing: report.failing_set(),
+            fingerprint: report.result_fingerprint(),
         }),
         judge_stand_in: None,
     })
@@ -4885,6 +4916,7 @@ mod judge_bench_tests {
                     }),
                     carried_from: None,
                     failing: None,
+                    fingerprint: None,
                 }),
                 judge_stand_in: None,
             });
@@ -5168,7 +5200,8 @@ mod judge_bench_tests {
                     label: crate::assurance::FLOOR_OVERRIDE_LABEL.into(),
                     key: report(ruled).key,
                     carried_from: None,
-                    failing: report(ruled).failing_set(),
+                    failing: None,
+                    fingerprint: report(ruled).result_fingerprint(),
                 }),
                 judge_stand_in: None,
             });
@@ -5212,18 +5245,14 @@ mod judge_bench_tests {
     }
 
     /// (core#1186) On an unchanged tree the floor's last result stands; when the operator already
-    /// overrode that failure on that tree (the failing tests within the ones ruled on) and nothing
-    /// else denied behind it, the override is carried instead of asking again. A test the override
-    /// did not name, or a layer that denied behind the floor last time, still denies.
+    /// overrode that very failure on that tree (its identity) and nothing else denied behind it,
+    /// the override is carried instead of asking again. Another failure, or a layer that denied
+    /// behind the floor last time, still denies.
     #[test]
     fn core_1186_an_unchanged_tree_stands_on_the_override_of_its_failure() {
         let ruled = ["test a ... FAILED", "test b ... FAILED"];
-        let (approved, denial, receipt) = fold_unchanged_tree_after_override(
-            "carry-1186-a",
-            &["test a ... FAILED"],
-            &ruled,
-            Some(Vec::new()),
-        );
+        let (approved, denial, receipt) =
+            fold_unchanged_tree_after_override("carry-1186-a", &ruled, &ruled, Some(Vec::new()));
         assert!(approved, "carried: {denial:?}");
         let r = receipt.expect("a receipt");
         let labels: Vec<&str> = r
@@ -5245,12 +5274,15 @@ mod judge_bench_tests {
             &ruled,
             Some(Vec::new()),
         );
-        assert!(!approved, "a test the operator did not rule on asks again");
+        assert!(
+            !approved,
+            "a failure the operator did not rule on asks again"
+        );
         assert_eq!(denial.as_deref(), Some(crate::repo_checks::DENIAL_SOURCE));
 
         let (approved, _, _) = fold_unchanged_tree_after_override(
             "carry-1186-c",
-            &["test a ... FAILED"],
+            &ruled,
             &ruled,
             Some(vec![crate::domain::UnitDenial::new(
                 "agent_validator",
