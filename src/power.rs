@@ -711,7 +711,8 @@ pub fn intake_instructions() -> &'static str {
      \"checks\":[\"...\"],\"estimateMinutes\":30,\"mandatoryPhases\":[],\"phased\":null}\n\
      `atLeast` (light|standard|high|highest or null) can only RAISE the engine's own score; \
      `scenarios` are the tests the change needs; `checks` are named checks beyond the repo's own; \
-     `estimateMinutes` is your estimate of the build; `mandatoryPhases` lists catalog phases that \
+     `estimateMinutes` is your estimate, in minutes, of the orchestrator's own build time (not \
+     the hand-off's checks, review or QE); `mandatoryPhases` lists catalog phases that \
      must stay a separate gated step ({\"phase\":\"design\",\"why\":\"...\"}); `phased` is a \
      one-line reason when this change must not run in power mode at all (else null)."
 }

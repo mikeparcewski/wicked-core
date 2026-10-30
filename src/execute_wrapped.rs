@@ -11535,13 +11535,23 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let late = dir.join("late.txt");
         let script = dir.join("seat.sh");
-        // The seat: start a background job that writes AFTER a delay, then exit immediately —
-        // exactly the "delayed write after seat exit" shape.
+        // The seat: start a background job that writes LATE, then exit — exactly the "delayed
+        // write after seat exit" shape. "Late" is a condition, not a clock: the job writes only
+        // once the test releases it, after `run_unit` has returned. Its stdio is detached from the
+        // seat's pipes (a surviving job must not hold them open and hang `run_unit`), and the seat
+        // exits only after the job has recorded its pid, so the test can watch that very process.
+        let release = dir.join("release");
+        let pid_file = dir.join("writer.pid");
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\n(sleep 1; echo late > \"{}\") &\nexit 0\n",
-                late.display()
+                "#!/bin/sh\n\
+                 sh -c 'echo $$ > \"{pid}\"; while [ ! -f \"{rel}\" ]; do sleep 0.05; done; echo late > \"{late}\"' </dev/null >/dev/null 2>&1 &\n\
+                 while [ ! -s \"{pid}\" ]; do sleep 0.05; done\n\
+                 exit 0\n",
+                pid = pid_file.display(),
+                rel = release.display(),
+                late = late.display()
             ),
         )
         .unwrap();
@@ -11565,9 +11575,35 @@ mod tests {
         };
         let out = WrappedCliStepRunner::default().run_unit(&input);
         assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
-        std::thread::sleep(std::time::Duration::from_millis(2500));
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("the seat exits only after its writer recorded its pid")
+            .trim()
+            .to_string();
+        let alive = || {
+            // spawn-audit: test-only — `kill -0` asks whether the writer process still exists;
+            // reads no engine state.
+            std::process::Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        // The group kill is the condition: wait for it, bounded only as a failure guard.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while alive() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let survived = alive();
+        // Release (and, if it survived, reap) the writer either way, so a failure leaves nothing.
+        std::fs::write(&release, "go").unwrap();
+        if survived {
+            // spawn-audit: test-only — cleans up the writer this test started.
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid])
+                .status();
+        }
         assert!(
-            !late.exists(),
+            !survived && !late.exists(),
             "the backgrounded writer must have died with the seat's process group"
         );
         let _ = std::fs::remove_dir_all(&dir);
