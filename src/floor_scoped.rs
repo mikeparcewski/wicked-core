@@ -496,6 +496,17 @@ mod tests {
         rerun_of(&raw)
     }
 
+    /// Core's own floor declares how its failing tests re-run, and the declaration parses.
+    #[test]
+    fn cores_own_checks_config_declares_its_rerun() {
+        let cfg = super::super::parse_config(include_str!("../.wicked/checks.json")).unwrap();
+        let decls = rerun_of(&cfg.rerun).unwrap();
+        let (argv, by) = decls["test"].command.clone().unwrap();
+        assert_eq!(by, RerunBy::Name);
+        assert_eq!(argv.last().map(String::as_str), Some("--exact"));
+        assert!(argv.iter().any(|a| a == NAMES_PLACEHOLDER));
+    }
+
     #[test]
     fn a_rerun_entry_is_validated_strictly() {
         let ok = entry(serde_json::json!({
