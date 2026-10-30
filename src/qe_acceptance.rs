@@ -491,29 +491,35 @@ pub(crate) fn floor_note(units: &[WorkUnit], ord: u32, tree: &str) -> Option<Str
         .filter(|(_, r)| r.tree.as_deref() == Some(tree) && !r.checks.is_empty())
         .filter(|(_, r)| r.sandbox_error.is_none() && r.detect_error.is_none())
         .max_by_key(|(u, _)| u.ord)?;
-    let checks: Vec<String> = r
-        .checks
-        .iter()
-        .take(12)
-        .map(|c| {
-            let n = c.failure_ids.len();
-            if n > 0 {
-                format!("{} {} ({n} failing)", c.name, c.outcome())
-            } else {
-                format!("{} {}", c.name, c.outcome())
-            }
-        })
-        .collect();
+    // Bounded whatever the check list (xreview on #1211: twelve checks made it 428 bytes): the
+    // checks are named while they fit FLOOR_NOTE_CHECKS bytes, then counted.
+    let mut named: Vec<String> = Vec::new();
+    let mut len = 0;
+    for c in &r.checks {
+        let n = c.failure_ids.len();
+        let one = if n > 0 {
+            format!("{} {} ({n} failing)", c.name, c.outcome())
+        } else {
+            format!("{} {}", c.name, c.outcome())
+        };
+        if len + one.len() + 2 > FLOOR_NOTE_CHECKS {
+            named.push(format!("{} more", r.checks.len() - named.len()));
+            break;
+        }
+        len += one.len() + 2;
+        named.push(one);
+    }
     let short: String = tree.chars().take(10).collect();
     Some(format!(
-        "The engine's own floor already ran the repository's checks on this exact tree ({short}, \
-         unit {}): {}. Do not run those suites again: cite them as evidence (its \
-         repoChecksEvaluated record), and run only what your scenario needs that they do not \
-         cover.",
+        "The floor already ran on this tree ({short}, unit {}): {}. Do not rerun those; cite \
+         them, and run only what your scenario adds.",
         u.ord,
-        checks.join(", ")
+        named.join(", ")
     ))
 }
+
+/// The most bytes [`floor_note`] spends naming checks.
+const FLOOR_NOTE_CHECKS: usize = 160;
 
 pub(crate) mod review;
 

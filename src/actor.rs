@@ -10853,10 +10853,20 @@ fn dispatch_unit(
             Vec::new()
         };
         // (rig run 1d372696) What the run's own floor proved on the tree this QE unit starts on.
+        // The tree is read FRESH here (xreview on #1211): the baseline is kept across a
+        // restart's redispatch, so it may not be the tree this attempt starts on. No reading, no note.
         stamped.qe_floor_note = if qe_unit {
-            unit.worktree_baseline
-                .as_ref()
-                .and_then(|b| crate::qe_acceptance::floor_note(&units, unit.ord, &b.tree))
+            let fresh = match (session.workdir.as_deref(), unit.worktree_baseline.as_ref()) {
+                (Some(wd), Some(b)) => b.git_dir.as_deref().and_then(|g| {
+                    crate::worktree_guard::snapshot_through(
+                        std::path::Path::new(wd),
+                        std::path::Path::new(g),
+                    )
+                    .ok()
+                }),
+                _ => None,
+            };
+            fresh.and_then(|t| crate::qe_acceptance::floor_note(&units, unit.ord, &t.tree))
         } else {
             None
         };

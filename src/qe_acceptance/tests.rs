@@ -637,7 +637,7 @@ fn the_qe_directive_carries_the_floors_evidence_on_its_own_tree() {
         note.contains("install passed, test_targeted passed")
             && note.contains("unit 2")
             && note.contains("1c55725e57")
-            && note.contains("Do not run those suites again"),
+            && note.contains("Do not rerun those"),
         "{note}"
     );
     assert!(

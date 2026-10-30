@@ -1008,7 +1008,7 @@ const FLOOR_HEARTBEAT_EVERY: Duration = Duration::from_secs(300);
 
 /// (rig run 1d372696) The unit's live note while a distinct seat judges the change, before the
 /// repository's checks run (the hand-off to floor gap read as 1.5 min with no event).
-const JUDGE_NOTE: &str = "judge: a distinct seat is reviewing the change before the checks run";
+const JUDGE_NOTE: &str = "judge: a judge seat is reviewing the change before the checks run";
 
 /// Run `work` while a scoped side thread emits `"<label> — N min"` through `emit` at `t = 0` and
 /// then every `every` until `work` returns — liveness for a long, otherwise silent phase on the
