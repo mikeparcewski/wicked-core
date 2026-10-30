@@ -5207,6 +5207,14 @@ fn run_detected(
             if let Some(d) = run.decision.as_mut() {
                 d.reason = Some(why);
             }
+        } else if let Some(why) = seed.as_ref().and_then(|s| s.set_aside_by(check, &run)) {
+            // (core#1191) A fresh check that failed after reused ones sends the floor round again
+            // with nothing reused (core#1152), and that pass classifies it. Classifying it HERE
+            // too (the base run, the identical retry: whole-suite passes each) would be paid
+            // twice — rig run b6f7968b spent 2 h 27 min on this pass's classification before the
+            // set-aside started the suite over. Decided now, unclassified; the next pass decides.
+            decide_alone(&mut run);
+            again = Some(why);
         } else {
             let compare = check.name != "install" && !is_formatter_check(&check.name);
             // With exclusion off the base runs plainly: no results, no list, no alone runs.

@@ -4818,7 +4818,8 @@ fn core_1152_a_fresh_check_failing_after_reuse_runs_the_floor_again_without_reus
             "typecheck": false,
             "lint": ["sh", "-c", "mkdir -p out && echo m > out/marker && echo nonce-$$-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')"],
             "test": Core1144::NONCE,
-            "e2e": ["sh", "-c", "test -f out/marker"],
+            // A unique line per run, so the run log store counts the e2e runs (core#1191).
+            "e2e": ["sh", "-c", "echo e2e-run-$$-$(od -An -N8 -tx8 /dev/urandom | tr -d ' '); test -f out/marker"],
         }),
     );
     let creator = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
@@ -4855,6 +4856,19 @@ fn core_1152_a_fresh_check_failing_after_reuse_runs_the_floor_again_without_reus
         note.contains("checks reused from fix (unit 4, attempt 1) were set aside: `e2e`"),
         "{note}"
     );
+    // (core#1191) The set-aside pass did not classify the failure first: `e2e` ran once there
+    // (no base run, no retry) and once in the pass without reuse, where it passed.
+    let e2e_runs = std::fs::read_dir(r.logs())
+        .map(|d| {
+            d.filter_map(Result::ok)
+                .filter(|e| {
+                    std::fs::read(e.path())
+                        .is_ok_and(|b| String::from_utf8_lossy(&b).starts_with("e2e-run-"))
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(e2e_runs, 2, "e2e ran on the first pass, then on the second");
     let _ = std::fs::remove_dir_all(&r.wt);
 }
 

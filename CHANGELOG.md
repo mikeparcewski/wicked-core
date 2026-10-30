@@ -14,6 +14,11 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The reuse set-aside no longer classifies the failure it is about to re-run (core#1191).** When a check that runs
+  fresh after reused ones fails, the floor goes round again with nothing reused (core#1152), and that pass classifies
+  the failure. The first pass used to classify it as well, running the base and the identical retry (whole suites)
+  first. Rig run b6f7968b spent 2 h 27 min there before a fourth full `test` began. The set-aside is now decided at the
+  first failed run, so each suite pass is paid once. Outcomes are unchanged: the pass without reuse decides, as before.
 - **A running floor says which pass it is in, and its result counts every pass.** Rig run b6f7968b's verify floor
   ran the full suite on the change, the base and the change again, about three hours in all. All the while the unit's
   heartbeat read only "running the repository's own checks — N min", so studio showed no output for 95 minutes. Its
