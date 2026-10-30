@@ -49,7 +49,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use wicked_apps_core::{GraphRead, Node, NodeKind};
+use wicked_apps_core::{GraphRead, NodeKind};
 use wicked_estate_core::{Direction, EdgeKind};
 
 /// The base tree's optional widening list: `{"full": ["src/actor.rs", "src/actor/**"]}`. Read
@@ -173,6 +173,20 @@ pub(crate) fn cargo_workspace_test(argv: &[String]) -> Option<CargoTest> {
             s if s.starts_with("--jobs=") || (s.starts_with("-j") && s.len() > 2) => {
                 opts.push(a.clone())
             }
+            _ => return None,
+        }
+    }
+    // (xreview) Only test-binary options that keep a selected name a substring filter and a run
+    // a run: `--exact`, `--skip`, `--ignored` or a filter of the check's own would change what
+    // the subset means (`--exact adds` matches no `calc::adds` and passes on zero tests).
+    let mut args = tail.iter();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--nocapture" | "--show-output" | "-q" | "--quiet" | "--include-ignored" => {}
+            "--test-threads" | "--color" => {
+                args.next()?;
+            }
+            s if s.starts_with("--test-threads=") || s.starts_with("--color=") => {}
             _ => return None,
         }
     }
@@ -397,7 +411,12 @@ fn place(ws: &Workspace, manifest_dirs: &BTreeSet<String>, file: &str) -> Place 
         return Place::Unmapped(String::new());
     };
     let Some(pkg) = ws.packages.iter().find(|p| p.dir == owner) else {
-        return Place::Outside;
+        // (xreview) A virtual workspace root is no package, yet not outside the workspace.
+        return if owner.is_empty() {
+            Place::Unmapped(String::new())
+        } else {
+            Place::Outside
+        };
     };
     for t in &pkg.targets {
         if t.src == file {
@@ -416,18 +435,37 @@ fn place(ws: &Workspace, manifest_dirs: &BTreeSet<String>, file: &str) -> Place 
             format!("{owner}/{p}")
         }
     };
-    // A binary's own directory (`src/bin/<name>/…`) or file.
+    // A binary's own directory: `…/<name>/` for `src/bin/<name>.rs`, the root's directory for
+    // `src/bin/<name>/main.rs` (xreview: never the whole `src/bin/`).
+    let src_dir = prefix("src");
     for t in pkg.targets.iter().filter(|t| t.kind == TargetKind::Bin) {
-        let dir = dir_of(&t.src);
-        if dir != dir_of(&prefix("src/lib.rs")) && file.starts_with(&format!("{dir}/")) {
+        let own = if base_name(&t.src) == "main.rs" {
+            dir_of(&t.src).to_string()
+        } else {
+            format!(
+                "{}/{}",
+                dir_of(&t.src),
+                base_name(&t.src).trim_end_matches(".rs")
+            )
+        };
+        if own != src_dir && file.starts_with(&format!("{own}/")) {
             return Place::Bin(pkg.name.clone(), t.name.clone());
         }
     }
+    let bins = prefix("src/bin/");
     if let Some(lib) = pkg.targets.iter().find(|t| t.kind == TargetKind::Lib) {
         let dir = dir_of(&lib.src);
-        let bins = prefix("src/bin/");
         if file.starts_with(&format!("{dir}/")) && !file.starts_with(&bins) {
             return Place::Lib(pkg.name.clone());
+        }
+    } else if let Some(main) = pkg
+        .targets
+        .iter()
+        .find(|t| t.kind == TargetKind::Bin && t.src == prefix("src/main.rs"))
+    {
+        // (xreview) A package with no lib: its `src/` modules are its binary's.
+        if file.starts_with(&format!("{src_dir}/")) && !file.starts_with(&bins) {
+            return Place::Bin(pkg.name.clone(), main.name.clone());
         }
     }
     if file.starts_with(&prefix("tests/")) {
@@ -463,14 +501,19 @@ pub(crate) fn is_test_fn(lines: &[&str], line: usize) -> bool {
     if lines.get(line).is_some_and(|l| is_attr(l)) {
         return true;
     }
+    // Up through the item's preamble: attributes (a multi-line one's continuation lines too,
+    // xreview), comments and blank lines. A line that ends a statement or an item ends it.
     let mut i = line;
-    while i > 0 {
+    while i > 0 && line - i < 40 {
         i -= 1;
         let t = lines[i].trim();
         if is_attr(t) {
             return true;
         }
-        if !(t.starts_with("#[") || t.starts_with("//") || t.is_empty()) {
+        if t.starts_with("#[") || t.starts_with("//") || t.is_empty() {
+            continue;
+        }
+        if t.ends_with(';') || t.ends_with('{') || t.ends_with('}') {
             return false;
         }
     }
@@ -507,28 +550,125 @@ fn fn_name(line: &str) -> Option<String> {
     (!name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit())).then_some(name)
 }
 
-/// A base-side line that changes no behaviour a symbol carries: blank, comment, attribute, `use`,
-/// a `mod x;` declaration, an `impl` header or a lone brace (structure; a method inserted beside
-/// one is new, so nothing else can call it yet). The compiler checks what these change.
-fn structural_line(line: &str) -> bool {
-    let t = line.trim();
-    let vis = t
-        .strip_prefix("pub(crate) ")
+/// What a line outside every symbol the graph knows is (a symbol's own lines are its own).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outside {
+    /// Blank, a comment, a lone brace, a `mod x;` declaration: nothing runs it.
+    Skip,
+    /// A `use`: it decides what the file's names mean.
+    Use,
+    /// An outer attribute: it belongs to the item below it.
+    Attr,
+    /// An inner attribute (`#![…]`): it applies to the whole module or crate.
+    InnerAttr,
+    /// An `impl` header: it belongs to the methods of its block and to its type.
+    ImplHeader,
+    /// Anything else (a macro body, a `where` clause): it cannot be tied to a symbol.
+    Other,
+}
+
+fn strip_vis(t: &str) -> &str {
+    t.strip_prefix("pub(crate) ")
         .or_else(|| t.strip_prefix("pub(super) "))
         .or_else(|| t.strip_prefix("pub "))
-        .unwrap_or(t);
-    t.is_empty()
-        || t.starts_with("//")
+        .unwrap_or(t)
+}
+
+fn is_comment(t: &str) -> bool {
+    // (xreview) `*` alone or followed by a space or `/` continues a block comment;
+    // `*out = 1;` is code.
+    t.starts_with("//")
         || t.starts_with("/*")
-        || t.starts_with('*')
-        || t.starts_with("#[")
-        || t.starts_with("#![")
-        || vis.starts_with("use ")
+        || t == "*"
+        || t.starts_with("* ")
+        || t.starts_with("*/")
+}
+
+fn outside_kind(line: &str) -> Outside {
+    let t = line.trim();
+    let vis = strip_vis(t);
+    if t.is_empty()
+        || is_comment(t)
         || (vis.starts_with("mod ") && t.ends_with(';'))
-        || vis.starts_with("impl ")
-        || vis.starts_with("impl<")
-        || vis.starts_with("unsafe impl")
         || matches!(t, "{" | "}" | "};" | "})" | "});")
+    {
+        Outside::Skip
+    } else if vis.starts_with("use ") {
+        Outside::Use
+    } else if t.starts_with("#![") {
+        Outside::InnerAttr
+    } else if t.starts_with("#[") {
+        Outside::Attr
+    } else if impl_header(t) {
+        Outside::ImplHeader
+    } else {
+        Outside::Other
+    }
+}
+
+fn impl_header(t: &str) -> bool {
+    let v = strip_vis(t.trim());
+    let v = v.strip_prefix("unsafe ").unwrap_or(v);
+    v.starts_with("impl ") || v.starts_with("impl<")
+}
+
+/// The type an `impl` header implements for: `impl<T> Trait for a::Type<T> {` gives `Type`.
+fn impl_type(header: &str) -> Option<String> {
+    let v = strip_vis(header.trim());
+    let v = v.strip_prefix("unsafe ").unwrap_or(v);
+    let mut rest = v.strip_prefix("impl")?;
+    if rest.starts_with('<') {
+        let mut depth = 0i32;
+        let mut end = rest.len();
+        for (i, c) in rest.char_indices() {
+            match c {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        rest = &rest[end..];
+    }
+    let rest = rest.split('{').next().unwrap_or("");
+    let rest = rest.split(" where").next().unwrap_or("");
+    let ty = rest.rsplit(" for ").next().unwrap_or(rest).trim();
+    let ty = ty.trim_start_matches('&').trim_start_matches("dyn ").trim();
+    let head = ty.split('<').next().unwrap_or(ty);
+    let name = head.rsplit("::").next().unwrap_or(head).trim();
+    (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .then(|| name.to_string())
+}
+
+/// The 1-based last line of the block a header at 1-based `from` opens (naive brace count).
+fn block_end(lines: &[&str], from: u32) -> Option<u32> {
+    let mut depth = 0i32;
+    let mut opened = false;
+    for (i, l) in lines
+        .iter()
+        .enumerate()
+        .skip(from.saturating_sub(1) as usize)
+    {
+        for c in l.chars() {
+            match c {
+                '{' => {
+                    depth += 1;
+                    opened = true;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if opened && depth <= 0 {
+            return Some(i as u32 + 1);
+        }
+    }
+    None
 }
 
 /// Identifier tokens of `text`.
@@ -563,31 +703,71 @@ fn has_word(line: &str, word: &str) -> bool {
     false
 }
 
-/// The base-side lines a unified `-U0` diff touches, per old path: each removed line, and the
-/// lines either side of a pure insertion.
-pub(crate) fn old_lines(diff: &str) -> BTreeMap<String, BTreeSet<u32>> {
-    let mut out: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
-    let mut cur: Option<String> = None;
+/// One file's side of a unified `-U0` diff.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Hunks {
+    /// Base-side lines removed or rewritten.
+    pub changed: BTreeSet<u32>,
+    /// Base-side lines either side of a pure insertion.
+    pub neighbors: BTreeSet<u32>,
+    /// The lines the head adds (a new file's included).
+    pub added: Vec<String>,
+}
+
+/// Parse a `git diff -U0 --src-prefix=a/ --dst-prefix=b/` by its hunk counts, so a content line
+/// that looks like a header (`--- x`, `+++ y`) is read as content. Changed and neighbouring
+/// lines are keyed by the old path, added lines by the new one.
+pub(crate) fn hunks(diff: &str) -> BTreeMap<String, Hunks> {
+    let mut out: BTreeMap<String, Hunks> = BTreeMap::new();
+    let (mut old_path, mut new_path): (Option<String>, Option<String>) = (None, None);
+    let (mut rem_old, mut rem_new) = (0u32, 0u32);
+    let count = |s: &str| -> (u32, u32) {
+        match s.split_once(',') {
+            Some((a, c)) => (a.parse().unwrap_or(0), c.parse().unwrap_or(1)),
+            None => (s.parse().unwrap_or(0), 1),
+        }
+    };
     for l in diff.lines() {
-        if let Some(p) = l.strip_prefix("--- ") {
-            cur = p.strip_prefix("a/").map(str::to_string);
+        if rem_old > 0 || rem_new > 0 {
+            match l.as_bytes().first() {
+                Some(b'-') => rem_old = rem_old.saturating_sub(1),
+                Some(b'+') => {
+                    rem_new = rem_new.saturating_sub(1);
+                    if let Some(p) = &new_path {
+                        out.entry(p.clone())
+                            .or_default()
+                            .added
+                            .push(l[1..].to_string());
+                    }
+                }
+                Some(b' ') => {
+                    rem_old = rem_old.saturating_sub(1);
+                    rem_new = rem_new.saturating_sub(1);
+                }
+                _ => {}
+            }
             continue;
         }
-        let Some(rest) = l.strip_prefix("@@ -") else {
-            continue;
-        };
-        let Some(f) = cur.clone() else { continue };
-        let old = rest.split(' ').next().unwrap_or("");
-        let (start, count) = match old.split_once(',') {
-            Some((s, c)) => (s.parse::<u32>().unwrap_or(0), c.parse::<u32>().unwrap_or(1)),
-            None => (old.parse::<u32>().unwrap_or(0), 1),
-        };
-        let set = out.entry(f).or_default();
-        if count == 0 {
-            set.insert(start);
-            set.insert(start + 1);
-        } else {
-            set.extend(start..start + count);
+        if l.starts_with("diff --git ") {
+            (old_path, new_path) = (None, None);
+        } else if let Some(p) = l.strip_prefix("--- ") {
+            old_path = p.strip_prefix("a/").map(str::to_string);
+        } else if let Some(p) = l.strip_prefix("+++ ") {
+            new_path = p.strip_prefix("b/").map(str::to_string);
+        } else if let Some(rest) = l.strip_prefix("@@ -") {
+            let mut parts = rest.split(' ');
+            let (start, n_old) = count(parts.next().unwrap_or(""));
+            let (_, n_new) = count(parts.next().unwrap_or("").trim_start_matches('+'));
+            (rem_old, rem_new) = (n_old, n_new);
+            if let Some(f) = &old_path {
+                let h = out.entry(f.clone()).or_default();
+                if n_old == 0 {
+                    h.neighbors.insert(start);
+                    h.neighbors.insert(start + 1);
+                } else {
+                    h.changed.extend(start..start + n_old);
+                }
+            }
         }
     }
     out
@@ -639,7 +819,17 @@ pub(crate) fn plan_for_tree(
     let env: [(&str, &Path); 2] = [("GIT_DIR", t.git_dir), ("GIT_WORK_TREE", t.worktree)];
     let diff = match crate::worktree_guard::git(
         t.worktree,
-        &["diff", "--no-color", "--no-ext-diff", "-U0", t.base, "--"],
+        &[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "-U0",
+            t.base,
+            "--",
+        ],
         &env,
     ) {
         Ok(d) => String::from_utf8_lossy(&d).into_owned(),
@@ -922,28 +1112,158 @@ pub(crate) fn plan(i: &Inputs) -> Plan {
             .push(ix);
         by_id.insert(n.symbol.0.as_str(), ix);
     }
-    let innermost = |file: &str, line1: u32| -> Option<usize> {
-        by_file.get(file).and_then(|v| {
-            v.iter()
-                .copied()
-                .filter(|&ix| {
-                    let n = &nodes[ix];
-                    !matches!(n.kind, NodeKind::File | NodeKind::Import)
-                        && n.location.span.start_line < line1
-                        && line1 <= n.location.span.end_line + 1
-                })
-                .min_by_key(|&ix| {
-                    let s = &nodes[ix].location.span;
-                    s.end_line - s.start_line
-                })
-        })
+    // A workspace source the graph holds nothing for (the indexer skipped it: core's 1.5 MB
+    // `src/actor.rs`) is a blind spot: what it calls and names cannot be traced, so a package
+    // whose blind file names anything the change reaches runs whole.
+    let pkg_of = |f: &str| match place(ws, &manifest_dirs, f) {
+        Place::Lib(p) | Place::Bin(p, _) | Place::TestRoot(p, _) | Place::TestModule(p) => Some(p),
+        Place::Outside | Place::Unmapped(_) => None,
     };
-
-    // 1. What each touched file is, and the seeds its changed lines name.
-    let old = old_lines(i.diff);
+    let unindexed: BTreeSet<&str> = rs_files
+        .iter()
+        .map(|f| f.as_str())
+        .filter(|f| !by_file.contains_key(f) && pkg_of(f).is_some())
+        .collect();
+    let mut blind: BTreeMap<String, String> = BTreeMap::new();
+    // The symbols whose span holds a 1-based line, innermost first. A file or a module is no
+    // symbol here: a line only they hold is classified instead ([`Outside`]).
+    let holding = |file: &str, line1: u32| -> Vec<usize> {
+        let mut v: Vec<usize> = by_file
+            .get(file)
+            .map(|v| {
+                v.iter()
+                    .copied()
+                    .filter(|&ix| {
+                        let n = &nodes[ix];
+                        !matches!(
+                            n.kind,
+                            NodeKind::File
+                                | NodeKind::Import
+                                | NodeKind::Module
+                                | NodeKind::Namespace
+                        ) && n.location.span.start_line < line1
+                            && line1 <= n.location.span.end_line + 1
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort_by_key(|&ix| {
+            let s = &nodes[ix].location.span;
+            s.end_line - s.start_line
+        });
+        v
+    };
+    // A line in a symbol seeds that symbol, and for a member (a field, a variant) the type that
+    // holds it too (xreview: a new field changes every place that builds its type).
+    let symbol_seeds = |file: &str, line1: u32| -> Vec<usize> {
+        let h = holding(file, line1);
+        let mut out = Vec::new();
+        if let Some(&first) = h.first() {
+            out.push(first);
+            if is_member(&nodes[first].kind) {
+                out.extend(h.get(1).copied());
+            }
+        }
+        out
+    };
+    let types_named = |name: &str| -> Vec<usize> {
+        nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.name == name && is_type(&n.kind))
+            .map(|(ix, _)| ix)
+            .collect()
+    };
+    // An `impl` block: the methods in it and the type it is for.
+    let impl_block = |file: &str, lines: &[&str], header: u32| -> Result<Vec<usize>, String> {
+        let Some(end) = block_end(lines, header) else {
+            return Err(format!(
+                "the `impl` block at line {header} of `{file}` could not be delimited"
+            ));
+        };
+        let mut v: Vec<usize> = by_file
+            .get(file)
+            .map(|v| {
+                v.iter()
+                    .copied()
+                    .filter(|&ix| {
+                        let s = &nodes[ix].location.span;
+                        is_callable(&nodes[ix].kind)
+                            && s.start_line + 1 > header
+                            && s.start_line < end
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(t) = lines.get(header as usize - 1).and_then(|h| impl_type(h)) {
+            v.extend(types_named(&t));
+        }
+        Ok(v)
+    };
+    // A line outside every symbol: what it reaches, or why nothing can be said (the full suite).
+    let outside = |file: &str, lines: &[&str], line1: u32| -> Result<Vec<usize>, String> {
+        let src = lines.get(line1 as usize - 1).copied().unwrap_or("");
+        match outside_kind(src) {
+            Outside::Skip => Ok(Vec::new()),
+            // A `use` decides what every name in its file means.
+            Outside::Use => Ok(by_file
+                .get(file)
+                .map(|v| {
+                    v.iter()
+                        .copied()
+                        .filter(|&ix| is_callable(&nodes[ix].kind) || is_type(&nodes[ix].kind))
+                        .collect()
+                })
+                .unwrap_or_default()),
+            Outside::InnerAttr => Err(format!(
+                "line {line1} of `{file}` is an inner attribute, which applies to its whole module"
+            )),
+            Outside::Attr => {
+                let mut l = line1 + 1;
+                while (l as usize) <= lines.len() {
+                    let s = symbol_seeds(file, l);
+                    if !s.is_empty() {
+                        return Ok(s);
+                    }
+                    match outside_kind(lines[l as usize - 1]) {
+                        Outside::Attr | Outside::Skip => l += 1,
+                        Outside::ImplHeader => return impl_block(file, lines, l),
+                        _ => break,
+                    }
+                }
+                Err(format!(
+                    "line {line1} of `{file}` is an attribute on nothing the code graph knows"
+                ))
+            }
+            Outside::ImplHeader => impl_block(file, lines, line1),
+            Outside::Other => Err(format!(
+                "line {line1} of `{file}` is outside every symbol the code graph knows"
+            )),
+        }
+    };
     let mut seeds: Vec<usize> = Vec::new();
     let mut seed_set: HashSet<usize> = HashSet::new();
+    let mut seed = |v: Vec<usize>, seeds: &mut Vec<usize>| {
+        for ix in v {
+            if seed_set.insert(ix) {
+                seeds.push(ix);
+            }
+        }
+    };
+
+    // 1. What each touched file is, and the seeds its changes name.
+    let diff = hunks(i.diff);
     for f in i.touched {
+        // (xreview) An excluded path dependency is checked before its files are set aside.
+        if let Some(d) = ws
+            .outside_path_deps
+            .iter()
+            .find(|d| f.starts_with(&format!("{d}/")))
+        {
+            return Plan::full(format!(
+                "`{f}` is in `{d}`, a path dependency outside the workspace"
+            ));
+        }
         let p = place(ws, &manifest_dirs, f);
         let pkg = match &p {
             Place::Outside => continue,
@@ -957,15 +1277,6 @@ pub(crate) fn plan(i: &Inputs) -> Plan {
                 ))
             }
         };
-        if let Some(d) = ws
-            .outside_path_deps
-            .iter()
-            .find(|d| f.starts_with(&format!("{d}/")))
-        {
-            return Plan::full(format!(
-                "`{f}` is in `{d}`, a path dependency outside the workspace"
-            ));
-        }
         if !pkg.is_empty() {
             owners.insert(pkg.clone());
         }
@@ -979,6 +1290,11 @@ pub(crate) fn plan(i: &Inputs) -> Plan {
                 .any(|t| t.src == **f && t.kind != TargetKind::Test)
         }) {
             return Plan::full(format!("the change touches the crate root `{f}`"));
+        }
+        if let Place::Lib(_) = &p {
+            if let Some(b) = bin_declaring(ws, &pkg, f, &mut text) {
+                plans.entry(pkg.clone()).or_default().bins.insert(b);
+            }
         }
         let plan = plans.entry(pkg.clone()).or_default();
         // Every test the touched file declares runs (a new or edited test included).
@@ -1017,26 +1333,51 @@ pub(crate) fn plan(i: &Inputs) -> Plan {
             }
             _ => {}
         }
-        // The seeds: the innermost symbol under each changed base line.
-        if let (Some(lines), Some(base)) = (old.get(f.as_str()), text(f, true)) {
+        // The seeds, on the base side the graph indexed.
+        if let Some(base) = text(f, true) {
+            if unindexed.contains(f.as_str()) && !base.trim().is_empty() {
+                return Plan::full(format!(
+                    "`{f}` is not in the code graph (the indexer skipped it), so what its change \
+                     reaches cannot be traced"
+                ));
+            }
             let base_lines: Vec<&str> = base.lines().collect();
-            for &l in lines {
-                let Some(src) = base_lines.get(l.saturating_sub(1) as usize) else {
-                    continue;
-                };
-                if structural_line(src) {
-                    continue;
-                }
-                match innermost(f, l) {
-                    Some(ix) => {
-                        if seed_set.insert(ix) {
-                            seeds.push(ix);
-                        }
+            // (xreview) A tracked file the diff names no line of cannot be read.
+            let Some(h) = diff.get(f.as_str()) else {
+                return Plan::full(format!(
+                    "the diff names no line of `{f}`, so what changed in it cannot be read"
+                ));
+            };
+            for &l in &h.changed {
+                let s = symbol_seeds(f, l);
+                let v = if s.is_empty() {
+                    match outside(f, &base_lines, l) {
+                        Ok(v) => v,
+                        Err(why) => return Plan::full(why),
                     }
-                    None => {
-                        return Plan::full(format!(
-                            "line {l} of `{f}` is outside every symbol the code graph knows"
-                        ))
+                } else {
+                    s
+                };
+                seed(v, &mut seeds);
+            }
+            // An insertion beside a symbol's line is inside it; between items it is a new item.
+            for &l in &h.neighbors {
+                seed(symbol_seeds(f, l), &mut seeds);
+            }
+        }
+        // What the head adds can change what already exists: an `impl` for an existing type
+        // (a `Drop`, a `Default`), an inner attribute.
+        if let Some(h) = diff.get(f.as_str()) {
+            for a in &h.added {
+                let t = a.trim();
+                if t.starts_with("#![") {
+                    return Plan::full(format!(
+                        "`{f}` gains an inner attribute, which applies to its whole module"
+                    ));
+                }
+                if impl_header(t) {
+                    if let Some(ty) = impl_type(t) {
+                        seed(types_named(&ty), &mut seeds);
                     }
                 }
             }
@@ -1048,24 +1389,19 @@ pub(crate) fn plan(i: &Inputs) -> Plan {
         let name = base_name(f);
         let mut named = false;
         for g in &rs_files {
+            if g.as_str() == f.as_str() {
+                continue;
+            }
             let Some(head) = text(g, false) else { continue };
             if !head.contains(name) {
                 continue;
             }
-            let base = if touched.contains(g.as_str()) {
-                None
-            } else {
-                Some(head.clone())
-            };
-            for (ix, l) in head.lines().enumerate() {
-                if !l.contains(name) || g.as_str() == f.as_str() {
-                    continue;
-                }
+            for l in head.lines().filter(|l| l.contains(name)) {
                 // A comment reads no file: a plain one names nothing that runs. A doc comment can
-                // hold a doc test, so that package's doc tests run (a fixture test that writes its
-                // own `CHANGELOG.md` is documented above its function, outside every span).
+                // hold a doc test, so that package's doc tests run (a fixture test that writes
+                // its own `CHANGELOG.md` is documented above its function, outside every span).
                 let t = l.trim_start();
-                if t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') {
+                if is_comment(t) {
                     if t.starts_with("///") || t.starts_with("//!") || t.starts_with("/**") {
                         if let Place::Lib(pkg) = place(ws, &manifest_dirs, g) {
                             named = true;
@@ -1075,20 +1411,42 @@ pub(crate) fn plan(i: &Inputs) -> Plan {
                     continue;
                 }
                 named = true;
-                // A touched file's own tests already run; its lines do not match the base graph.
-                let Some(_) = base else { continue };
-                match innermost(g, ix as u32 + 1) {
-                    Some(n) => {
-                        if seed_set.insert(n) {
-                            seeds.push(n);
+            }
+            if unindexed.contains(g.as_str()) {
+                if let Some(p) = pkg_of(g) {
+                    blind.entry(p).or_insert_with(|| g.to_string());
+                }
+                continue;
+            }
+            // The seeds, on the text the graph indexed: a touched file's base (xreview: its
+            // unchanged functions that read the file still reach their callers). A new file has
+            // none; its own tests run.
+            let src = if touched.contains(g.as_str()) {
+                text(g, true)
+            } else {
+                Some(head.clone())
+            };
+            let Some(src) = src else { continue };
+            let src_lines: Vec<&str> = src.lines().collect();
+            for (ix, l) in src_lines.iter().enumerate() {
+                if !l.contains(name) || is_comment(l.trim_start()) {
+                    continue;
+                }
+                let line1 = ix as u32 + 1;
+                let s = symbol_seeds(g, line1);
+                let v = if s.is_empty() {
+                    match outside(g, &src_lines, line1) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return Plan::full(format!(
+                                "`{g}` names `{name}` outside every symbol the code graph knows"
+                            ))
                         }
                     }
-                    None => {
-                        return Plan::full(format!(
-                            "`{g}` names `{name}` outside every symbol the code graph knows"
-                        ))
-                    }
-                }
+                } else {
+                    s
+                };
+                seed(v, &mut seeds);
             }
         }
         if !f.ends_with(".rs") && !named && !f.ends_with(".md") {
@@ -1098,7 +1456,10 @@ pub(crate) fn plan(i: &Inputs) -> Plan {
         }
     }
 
-    // 3. The blast radius.
+    // 3. The blast radius. Resolved edges are always followed. Sites matched by NAME only (a
+    // call estate could not resolve, a line naming a type or constant) are followed when there
+    // are at most FAN_IN of them outside the symbol's own file; past that the name cannot say
+    // which sites are this symbol's, so every package holding one runs whole (never narrower).
     let mut token_cache: HashMap<String, HashSet<String>> = HashMap::new();
     let mut names_file =
         |file: &str, word: &str, text: &mut dyn FnMut(&str, bool) -> Option<String>| {
@@ -1108,9 +1469,11 @@ pub(crate) fn plan(i: &Inputs) -> Plan {
                 .contains(word)
         };
     let mut reached: Vec<usize> = seeds.clone();
-    let mut seen: HashSet<usize> = seed_set.clone();
+    let mut seen: HashSet<usize> = seeds.iter().copied().collect();
     let mut queue: Vec<usize> = seeds.clone();
     let mut unres_cache: HashMap<String, Vec<String>> = HashMap::new();
+    let mut ambiguous: BTreeSet<String> = BTreeSet::new();
+    let mut ambiguous_names: BTreeSet<String> = BTreeSet::new();
     let mut capped = false;
     while let Some(ix) = queue.pop() {
         if seen.len() > MAX_REACH {
@@ -1118,18 +1481,18 @@ pub(crate) fn plan(i: &Inputs) -> Plan {
             break;
         }
         let n = &nodes[ix];
-        // Candidate dependents as (file, symbol index).
-        let mut cands: Vec<usize> = Vec::new();
+        let mut next: Vec<usize> = Vec::new();
         if let Ok(edges) = graph.neighbors(&n.symbol, Direction::Dependents) {
             for e in edges {
                 if matches!(e.kind, EdgeKind::Contains | EdgeKind::Defines) {
                     continue;
                 }
                 if let Some(&d) = by_id.get(e.source.0.as_str()) {
-                    cands.push(d);
+                    next.push(d);
                 }
             }
         }
+        let mut by_name: Vec<usize> = Vec::new();
         if is_callable(&n.kind) {
             let froms = unres_cache.entry(n.name.clone()).or_insert_with(|| {
                 graph
@@ -1137,41 +1500,89 @@ pub(crate) fn plan(i: &Inputs) -> Plan {
                     .map(|v| v.into_iter().map(|r| r.from.0).collect())
                     .unwrap_or_default()
             });
-            cands.extend(froms.iter().filter_map(|s| by_id.get(s.as_str()).copied()));
-        } else if !matches!(n.kind, NodeKind::File | NodeKind::Module) {
-            // A constant, a type, a field: the lines that name it.
+            by_name.extend(froms.iter().filter_map(|s| by_id.get(s.as_str()).copied()));
+        } else if !matches!(
+            n.kind,
+            NodeKind::File | NodeKind::Module | NodeKind::Namespace | NodeKind::Import
+        ) {
             for g in &rs_files {
                 if !names_file(g, &n.name, &mut text) {
                     continue;
                 }
-                let base = if touched.contains(g.as_str()) {
+                if unindexed.contains(g.as_str()) {
+                    if let Some(p) = pkg_of(g) {
+                        blind.entry(p).or_insert_with(|| g.to_string());
+                    }
+                    continue;
+                }
+                let src = if touched.contains(g.as_str()) {
                     text(g, true)
                 } else {
                     text(g, false)
                 };
-                let Some(base) = base else { continue };
-                for (l, line) in base.lines().enumerate() {
-                    if has_word(line, &n.name) {
-                        if let Some(d) = innermost(g, l as u32 + 1) {
-                            cands.push(d);
+                let Some(src) = src else { continue };
+                let src_lines: Vec<&str> = src.lines().collect();
+                for (l, line) in src_lines.iter().enumerate() {
+                    if !has_word(line, &n.name) || is_comment(line.trim_start()) {
+                        continue;
+                    }
+                    let line1 = l as u32 + 1;
+                    let s = symbol_seeds(g, line1);
+                    if !s.is_empty() {
+                        by_name.extend(s);
+                        continue;
+                    }
+                    // A plain `use` only brings the name in: the lines that use it are scanned
+                    // themselves. A renaming one (`as`) hides it, so its whole file counts.
+                    if outside_kind(line) == Outside::Use && !line.contains(" as ") {
+                        continue;
+                    }
+                    match outside(g, &src_lines, line1) {
+                        Ok(v) => by_name.extend(v),
+                        Err(_) => {
+                            return Plan::full(format!(
+                                "`{g}` names `{}` at line {line1}, outside every symbol the code \
+                                 graph knows",
+                                n.name
+                            ))
                         }
                     }
                 }
             }
         }
-        cands.sort_unstable();
-        cands.dedup();
-        cands.retain(|d| *d != ix);
-        if cands.len() > FAN_IN {
-            let owner = owner_token(n);
-            let home = n.location.file.clone();
-            cands.retain(|&d| {
-                let f = nodes[d].location.file.clone();
-                f == home || names_file(&f, &owner, &mut text)
-            });
+        by_name.sort_unstable();
+        by_name.dedup();
+        // A Rust name matched in another language's file says nothing about this symbol.
+        by_name.retain(|&d| d != ix && nodes[d].location.file.ends_with(".rs"));
+        let home = n.location.file.as_str();
+        let foreign = by_name
+            .iter()
+            .filter(|&&d| nodes[d].location.file != home)
+            .count();
+        if foreign > FAN_IN {
+            for &d in &by_name {
+                match place(ws, &manifest_dirs, &nodes[d].location.file) {
+                    Place::Lib(p)
+                    | Place::Bin(p, _)
+                    | Place::TestRoot(p, _)
+                    | Place::TestModule(p) => {
+                        ambiguous.insert(p);
+                    }
+                    Place::Outside => {}
+                    Place::Unmapped(_) => {
+                        return Plan::full(format!(
+                        "`{}` is matched by name in `{}`, which belongs to no target cargo knows",
+                        n.name, nodes[d].location.file
+                    ))
+                    }
+                }
+            }
+            ambiguous_names.insert(n.name.clone());
+            by_name.retain(|&d| nodes[d].location.file == home);
         }
-        for d in cands {
-            if seen.insert(d) {
+        next.extend(by_name);
+        for d in next {
+            if d != ix && seen.insert(d) {
                 reached.push(d);
                 queue.push(d);
             }
@@ -1180,28 +1591,38 @@ pub(crate) fn plan(i: &Inputs) -> Plan {
 
     let changed_symbols = seeds.len() as u32;
     let reached_symbols = seen.len() as u32;
-    if capped {
-        // Every affected package runs whole.
-        let affected = ws.reverse_closure(&owners);
+    let widen = |pkgs: &BTreeSet<String>, why: String, plans: &mut BTreeMap<String, PkgPlan>| {
+        let affected = ws.reverse_closure(pkgs);
         if affected.len() >= ws.packages.len() {
-            let mut p = Plan::full(format!(
-                "the blast radius passed {MAX_REACH} symbols and reaches every workspace package"
-            ));
+            let mut p = Plan::full(format!("{why}, and that reaches every workspace package"));
             p.selection.changed_symbols = changed_symbols;
             p.selection.reached_symbols = reached_symbols;
-            return p;
+            return Some(p);
         }
         for a in &affected {
             plans.entry(a.clone()).or_default().whole = true;
         }
+        None
+    };
+    let mut notes: Vec<String> = Vec::new();
+    if capped {
+        let why = format!("the blast radius passed {MAX_REACH} symbols");
+        if let Some(p) = widen(&owners, why.clone(), &mut plans) {
+            return p;
+        }
+        notes.push(format!(
+            "{why}; the affected packages run whole (cargo's package graph)"
+        ));
     } else {
         // 4. The tests the radius reaches.
         for &ix in &reached {
             let n = &nodes[ix];
             let file = n.location.file.as_str();
-            let p = place(ws, &manifest_dirs, file);
-            match p {
+            match place(ws, &manifest_dirs, file) {
                 Place::Lib(pkg) => {
+                    if let Some(b) = bin_declaring(ws, &pkg, file, &mut text) {
+                        plans.entry(pkg.clone()).or_default().bins.insert(b);
+                    }
                     if !is_callable(&n.kind) {
                         continue;
                     }
@@ -1235,25 +1656,81 @@ pub(crate) fn plan(i: &Inputs) -> Plan {
                     let targets = including_targets(ws, &pkg, file, &mut text);
                     plans.entry(pkg).or_default().tests.extend(targets);
                 }
-                Place::Outside | Place::Unmapped(_) => {}
+                Place::Outside => {}
+                // Another language's node (a seed script the graph indexed too): cargo runs no
+                // test of it; a Rust test that reads it is found when the file is touched.
+                Place::Unmapped(_) if !file.ends_with(".rs") => {}
+                // (xreview) Never dropped silently.
+                Place::Unmapped(_) => {
+                    return Plan::full(format!(
+                        "the change reaches `{file}`, which belongs to no target cargo knows"
+                    ))
+                }
             }
         }
     }
-    // 5. A binary the change reaches: the integration tests that run it.
+    // A blind file that names anything the change reaches (a call, a type) holds a caller the
+    // graph cannot show.
+    for u in &unindexed {
+        let Some(p) = pkg_of(u) else { continue };
+        if blind.contains_key(&p) {
+            continue;
+        }
+        let names = text(u, false).map(|t| tokens(&t)).unwrap_or_default();
+        if seen.iter().any(|&ix| names.contains(&nodes[ix].name)) {
+            blind.insert(p, u.to_string());
+        }
+    }
+    if !blind.is_empty() {
+        let files: Vec<&str> = blind.values().map(String::as_str).collect();
+        let why = format!(
+            "`{}` is not in the code graph (the indexer skipped it) and names what the change \
+             reaches",
+            files.join("`, `")
+        );
+        let pkgs: BTreeSet<String> = blind.keys().cloned().collect();
+        if let Some(p) = widen(&pkgs, why.clone(), &mut plans) {
+            return p;
+        }
+        notes.push(format!("{why}; its package runs whole"));
+    }
+    if !ambiguous.is_empty() {
+        let names: Vec<&str> = ambiguous_names.iter().map(String::as_str).take(5).collect();
+        let why = format!(
+            "`{}` is matched by name at more than {FAN_IN} sites",
+            names.join("`, `")
+        );
+        if let Some(p) = widen(&ambiguous, why.clone(), &mut plans) {
+            return p;
+        }
+        notes.push(format!("{why}; the packages holding them run whole"));
+    }
+    // 5. A binary the change reaches: the integration tests that run it, wherever the target
+    // names it (its root or a helper module it includes, xreview).
     for (pkg, bin) in &boundary_bins {
         let marker = format!("CARGO_BIN_EXE_{bin}");
         let Some(pk) = ws.package(pkg) else { continue };
-        for t in pk.targets.iter().filter(|t| t.kind == TargetKind::Test) {
-            if text(&t.src, false).is_some_and(|s| s.contains(&marker)) {
-                plans
-                    .entry(pkg.clone())
-                    .or_default()
-                    .tests
-                    .insert(t.name.clone());
+        let tests_dir = if pk.dir.is_empty() {
+            "tests/".to_string()
+        } else {
+            format!("{}/tests/", pk.dir)
+        };
+        for g in rs_files.iter().filter(|g| g.starts_with(&tests_dir)) {
+            if !text(g, false).is_some_and(|s| s.contains(&marker)) {
+                continue;
             }
+            let targets = match pk
+                .targets
+                .iter()
+                .find(|t| t.kind == TargetKind::Test && t.src == **g)
+            {
+                Some(t) => vec![t.name.clone()],
+                None => including_targets(ws, pkg, g, &mut text),
+            };
+            plans.entry(pkg.clone()).or_default().tests.extend(targets);
         }
     }
-    compose(i.check, ws, plans, changed_symbols, reached_symbols, capped)
+    compose(i.check, ws, plans, changed_symbols, reached_symbols, &notes)
 }
 
 fn is_callable(k: &NodeKind) -> bool {
@@ -1263,32 +1740,59 @@ fn is_callable(k: &NodeKind) -> bool {
     )
 }
 
-/// The name a caller of `n` would have to write to reach it from another module: its type
-/// (`…/Type#method().` in estate's symbol id) or its module (the file stem; a `mod.rs`/`lib.rs`
-/// stands for its directory).
-fn owner_token(n: &Node) -> String {
-    let sym = n.symbol.0.as_str();
-    if let Some(hash) = sym.rfind('#') {
-        let head = &sym[..hash];
-        let ty: String = head
-            .chars()
-            .rev()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        if !ty.is_empty() {
-            return ty;
-        }
-    }
-    let file = n.location.file.as_str();
-    let stem = base_name(file).trim_end_matches(".rs");
-    if matches!(stem, "mod" | "lib" | "main") {
-        base_name(dir_of(file)).to_string()
+fn is_type(k: &NodeKind) -> bool {
+    matches!(
+        k,
+        NodeKind::Struct
+            | NodeKind::Enum
+            | NodeKind::Class
+            | NodeKind::Interface
+            | NodeKind::Trait
+            | NodeKind::TypeAlias
+    )
+}
+
+/// A node that is part of another (a field, a variant, a binding): its holder is affected too.
+fn is_member(k: &NodeKind) -> bool {
+    matches!(
+        k,
+        NodeKind::Field
+            | NodeKind::Parameter
+            | NodeKind::Variable
+            | NodeKind::Constant
+            | NodeKind::Other(_)
+    )
+}
+
+/// The binary of `pkg` whose `src/main.rs` declares the module `file` (`mod <stem>`): a module
+/// a binary declares is compiled into it, not only into the lib.
+fn bin_declaring(
+    ws: &Workspace,
+    pkg: &str,
+    file: &str,
+    text: &mut dyn FnMut(&str, bool) -> Option<String>,
+) -> Option<String> {
+    let pk = ws.package(pkg)?;
+    let main_src = if pk.dir.is_empty() {
+        "src/main.rs".to_string()
     } else {
-        stem.to_string()
-    }
+        format!("{}/src/main.rs", pk.dir)
+    };
+    let main = pk
+        .targets
+        .iter()
+        .find(|t| t.kind == TargetKind::Bin && t.src == main_src)?;
+    // The top-level module the file belongs to: `src/x.rs`, `src/x/mod.rs`, `src/x/y.rs` are `x`.
+    let rel = file.strip_prefix(&format!("{}/", dir_of(&main_src)))?;
+    let stem = rel.split('/').next()?.trim_end_matches(".rs");
+    let src = text(&main_src, false)?;
+    src.lines()
+        .any(|l| {
+            let v = strip_vis(l.trim());
+            v.strip_prefix("mod ")
+                .is_some_and(|r| r.trim_end_matches([';', ' ', '{']) == stem)
+        })
+        .then(|| main.name.clone())
 }
 
 /// The integration targets of `pkg` that include the module file `file` (their root names it by
@@ -1318,8 +1822,12 @@ fn including_targets(
         .filter(|t| {
             text(&t.src, false).is_some_and(|s| {
                 s.contains(name)
-                    || s.lines()
-                        .any(|l| l.trim_start().starts_with(&format!("mod {stem}")))
+                    || s.lines().any(|l| {
+                        // (xreview) `pub mod common;` includes it as well as `mod common;`.
+                        strip_vis(l.trim())
+                            .strip_prefix("mod ")
+                            .is_some_and(|r| r.trim_end_matches([';', ' ', '{']) == stem)
+                    })
             })
         })
         .map(|t| t.name.clone())
@@ -1345,7 +1853,7 @@ fn compose(
     plans: BTreeMap<String, PkgPlan>,
     changed_symbols: u32,
     reached_symbols: u32,
-    capped: bool,
+    notes: &[String],
 ) -> Plan {
     let mut cmds: Vec<Vec<String>> = Vec::new();
     let mut targets = Vec::new();
@@ -1432,18 +1940,14 @@ fn compose(
         .join(" && ");
     let test_count = tests.len() as u32;
     tests.truncate(RECORDED_TESTS);
-    let reason = if capped {
-        format!(
-            "the blast radius passed {MAX_REACH} symbols; the affected packages run whole \
-             (cargo's package graph)"
-        )
-    } else {
-        format!(
-            "{changed_symbols} changed symbol(s) reach {reached_symbols} symbol(s) in the code \
-             graph at the base; their tests, the touched files' tests and the tests that name a \
-             touched file"
-        )
-    };
+    let mut reason = format!(
+        "{changed_symbols} changed symbol(s) reach {reached_symbols} symbol(s) in the code graph \
+         at the base; their tests, the touched files' tests and the tests that name a touched file"
+    );
+    for n in notes {
+        reason.push_str("; ");
+        reason.push_str(n);
+    }
     Plan {
         selection: TestSelection {
             mode: MODE_AFFECTED.into(),

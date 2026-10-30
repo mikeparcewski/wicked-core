@@ -5395,6 +5395,7 @@ fn a_creator_floor_runs_the_engines_affected_set_and_records_it() {
         .to_string(),
     );
     // The lockfile is part of the base: a lockfile the run writes is shared infrastructure.
+    // spawn-audit: test-only — writes the fixture's lockfile before its base commit.
     let lock = std::process::Command::new("cargo")
         .args(["generate-lockfile", "--offline"])
         .current_dir(&repo)
@@ -5479,9 +5480,37 @@ fn a_creator_floor_runs_the_engines_affected_set_and_records_it() {
         report.denial_reason()
     );
     assert!(c.summary().contains("affected set:"), "{}", c.summary());
-    // The wire carries it.
-    let wire = serde_json::to_value(&c).unwrap();
-    assert_eq!(wire["selection"]["mode"], "affected");
+    // The event wire carries it (xreview: `repoChecksEvaluated` has its own serializer).
+    let frame = crate::event::CoreEvent::RepoChecksEvaluated {
+        session: "s".into(),
+        ord: 1,
+        attempt: 0,
+        passed: report.passed,
+        criterion: "c".into(),
+        checks: report.checks.clone(),
+        skipped: Vec::new(),
+        sandbox_level: report.sandbox_level.clone(),
+        sandbox_error: None,
+        detect_error: None,
+        outcome: report.outcome().into(),
+        floor: "creator".into(),
+        claim: None,
+        env: None,
+        changed: Vec::new(),
+        changed_truncated: false,
+        reused_from: None,
+    }
+    .to_json();
+    let wire = frame["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "test")
+        .unwrap()["selection"]
+        .clone();
+    assert_eq!(wire["mode"], "affected", "{wire}");
+    assert_eq!(wire["tests"], serde_json::json!(["affected_fixture: adds"]));
+    assert_eq!(wire["testCount"], 1);
     // No graph: the declared suite runs, and the record says why.
     let ctx = FloorContext {
         code_graph: None,

@@ -1,7 +1,7 @@
 use super::*;
 use wicked_apps_core::{
-    Descriptor, Edge, EdgeKind, GraphWrite, Language, Location, ResolutionTier, Span, SqliteStore,
-    Symbol,
+    Descriptor, Edge, EdgeKind, GraphWrite, Language, Location, Node, ResolutionTier, Span,
+    SqliteStore, Symbol,
 };
 use wicked_estate_core::{SymbolId, UnresolvedRef};
 
@@ -516,6 +516,9 @@ fn only_a_whole_workspace_cargo_test_with_carried_options_is_narrowed() {
         &["cargo", "test", "--locked"][..],
         &["cargo", "test", "--workspace", "-p", "x"],
         &["cargo", "test", "--workspace", "--features", "postgres"],
+        // (xreview) `--exact adds` matches no `calc::adds`: a pass on zero tests.
+        &["cargo", "test", "--workspace", "--", "--exact"],
+        &["cargo", "test", "--workspace", "--", "--skip", "slow"],
         &["cargo", "nextest", "run", "--workspace"],
         &["npm", "test"],
     ] {
@@ -525,17 +528,23 @@ fn only_a_whole_workspace_cargo_test_with_carried_options_is_narrowed() {
 
 #[test]
 fn the_diff_names_removed_lines_and_both_sides_of_an_insertion() {
-    let d = "--- a/x.rs\n+++ b/x.rs\n@@ -3,2 +3,0 @@\n-a\n-b\n@@ -10,0 +9,4 @@\n+c\n--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1 @@\n";
-    let o = old_lines(d);
-    assert_eq!(o.len(), 1, "a new file has no base side");
-    assert_eq!(o["x.rs"], [3, 4, 10, 11].into_iter().collect());
+    // Hunks are read by their counts: a removed `-- b` and an added `++ d` are content, never a
+    // file header (xreview).
+    let d = "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ -3,2 +3,0 @@\n-a\n--- b\n@@ -10,0 +9,4 @@\n+c\n+++ d\n+e\n+f\ndiff --git a/new.rs b/new.rs\n--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1 @@\n+impl Drop for X {}\n";
+    let h = hunks(d);
+    assert_eq!(h["x.rs"].changed, [3, 4].into_iter().collect());
+    assert_eq!(h["x.rs"].neighbors, [10, 11].into_iter().collect());
+    assert_eq!(h["x.rs"].added, s(&["c", "++ d", "e", "f"]));
+    assert!(h["new.rs"].changed.is_empty() && h["new.rs"].neighbors.is_empty());
+    assert_eq!(h["new.rs"].added, s(&["impl Drop for X {}"]));
 }
 
 #[test]
 fn test_functions_are_found_by_their_attribute() {
-    let src = "#[test]\nfn a() {}\n#[tokio::test]\n#[ignore]\nasync fn b() {}\nfn helper() {}\n/// doc\n#[cfg(test)]\nfn not_a_test() {}\n#[test] fn c() {}\n";
+    let src = "#[test]\nfn a() {}\n#[tokio::test]\n#[ignore]\nasync fn b() {}\nfn helper() {}\n/// doc\n#[cfg(test)]\nfn not_a_test() {}\n#[test] fn c() {}\n#[tokio::test(\n    flavor = \"multi_thread\"\n)]\nasync fn d() {}\n#[test]\n#[should_panic(\n    expected = \"x\"\n)]\nfn e() {}\n";
     let names: Vec<String> = test_fns(src).into_iter().map(|(_, n)| n).collect();
-    assert_eq!(names, s(&["a", "b", "c"]));
+    // (xreview) A multi-line attribute's continuation lines do not end the preamble.
+    assert_eq!(names, s(&["a", "b", "c", "d", "e"]));
 }
 
 #[test]
@@ -577,6 +586,7 @@ fn cargo_metadata_is_read_into_members_targets_and_path_dependencies() {
 
 #[cfg(unix)]
 fn git_in(dir: &Path, args: &[&str]) -> String {
+    // spawn-audit: test-only — builds the fixture repo the selection reads.
     let out = std::process::Command::new("git")
         .args([
             "-c",
@@ -688,4 +698,282 @@ fn a_real_tree_is_read_against_its_base_and_a_graph_at_another_commit_runs_the_f
         p.selection
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── review round (xreview on #1197): widen, never narrow ─────────────────────────────────────
+
+#[test]
+fn lines_outside_every_symbol_are_classified_and_a_dereference_is_code() {
+    assert_eq!(
+        outside_kind("    *out = 1;"),
+        Outside::Other,
+        "code, not a comment"
+    );
+    assert_eq!(outside_kind(" * a block comment line"), Outside::Skip);
+    assert_eq!(outside_kind("use crate::one as value;"), Outside::Use);
+    assert_eq!(outside_kind("pub(crate) use a::b;"), Outside::Use);
+    assert_eq!(outside_kind("#[derive(Default)]"), Outside::Attr);
+    assert_eq!(outside_kind("#![allow(dead_code)]"), Outside::InnerAttr);
+    assert_eq!(
+        outside_kind("impl<T> Drop for Hot<T> {"),
+        Outside::ImplHeader
+    );
+    assert_eq!(outside_kind("pub mod x;"), Outside::Skip);
+    assert_eq!(
+        impl_type("impl<T: X> fmt::Display for a::Foo<T> where T: Y {").as_deref(),
+        Some("Foo")
+    );
+    assert_eq!(impl_type("impl Foo {").as_deref(), Some("Foo"));
+    assert_eq!(
+        impl_type("unsafe impl Send for Bar {}").as_deref(),
+        Some("Bar")
+    );
+    let lines: Vec<&str> = "impl A {\n    fn f() {\n    }\n}\nfn g() {}\n"
+        .lines()
+        .collect();
+    assert_eq!(block_end(&lines, 1), Some(4));
+}
+
+/// A `use` changed outside every symbol decides what its file's names mean: every symbol there
+/// is a seed. An attribute belongs to the item below it.
+#[test]
+fn a_use_or_an_attribute_outside_every_symbol_seeds_what_it_applies_to() {
+    let g = graph();
+    let w = workspace();
+    let c = check();
+    let files = files();
+    // `other.rs` with an import on line 6, below everything the graph knows (lines 1, 3, 5).
+    let other = format!("{OTHER}use crate::core::hot;\n");
+    let base = |f: &str| {
+        (f == "src/other.rs")
+            .then(|| other.clone())
+            .or_else(|| text(f))
+    };
+    let touched = s(&["src/other.rs"]);
+    let d = diff("src/other.rs", "@@ -6 +6 @@");
+    let p = plan(&Inputs {
+        check: &c,
+        touched: &touched,
+        removed: &[],
+        diff: &d,
+        workspace: Ok(&w),
+        graph: Ok(&g),
+        base_text: &base,
+        head_text: &base,
+        files: &files,
+        full_when: &[],
+    });
+    assert_eq!(p.selection.mode, MODE_AFFECTED, "{:?}", p.selection);
+    assert_eq!(
+        p.selection.changed_symbols, 3,
+        "every symbol of the file: {:?}",
+        p.selection
+    );
+}
+
+/// A name matched at more than FAN_IN sites outside its own file cannot say which are this
+/// symbol's: the packages holding them run whole, never a guess at the subset.
+#[test]
+fn a_name_matched_at_too_many_sites_runs_the_packages_holding_them_whole() {
+    let g = graph();
+    {
+        let mut g2 = g;
+        g2.begin_batch().unwrap();
+        let callers: Vec<Node> = (0..=FAN_IN)
+            .map(|k| node(&format!("caller{k}"), &format!("src/m{k}.rs"), 0, 0))
+            .collect();
+        g2.upsert_nodes(&callers).unwrap();
+        let refs: Vec<UnresolvedRef> = (0..=FAN_IN)
+            .map(|k| {
+                UnresolvedRef::new(
+                    sym(&format!("caller{k}")),
+                    "hot",
+                    EdgeKind::Calls,
+                    Location::new(
+                        format!("src/m{k}.rs"),
+                        Span {
+                            start_byte: 0,
+                            end_byte: 0,
+                            start_line: 0,
+                            start_col: 0,
+                            end_line: 0,
+                            end_col: 0,
+                        },
+                    ),
+                )
+            })
+            .collect();
+        g2.upsert_unresolved_refs(&refs).unwrap();
+        g2.commit_batch().unwrap();
+        let w = workspace();
+        let c = check();
+        let mut files = files();
+        files.extend((0..=FAN_IN).map(|k| format!("src/m{k}.rs")));
+        let touched = s(&["src/core.rs"]);
+        let d = diff("src/core.rs", "@@ -2 +2 @@");
+        let p = plan(&Inputs {
+            check: &c,
+            touched: &touched,
+            removed: &[],
+            diff: &d,
+            workspace: Ok(&w),
+            graph: Ok(&g2),
+            base_text: &text,
+            head_text: &text,
+            files: &files,
+            full_when: &[],
+        });
+        assert_eq!(p.selection.mode, MODE_AFFECTED, "{:?}", p.selection);
+        assert_eq!(script(&p), "cargo test --locked --no-fail-fast -p app");
+        assert!(
+            p.selection
+                .reason
+                .contains("`hot` is matched by name at more than 20 sites"),
+            "{:?}",
+            p.selection
+        );
+    }
+}
+
+/// An excluded path dependency is checked before its files are set aside, so a change beside an
+/// ordinary module still runs the full suite.
+#[test]
+fn a_change_in_an_excluded_path_dependency_runs_the_full_suite() {
+    let g = graph();
+    let mut w = workspace();
+    w.outside_path_deps = s(&["vendor/ext"]);
+    let c = check();
+    let mut files = files();
+    files.extend(s(&["vendor/ext/Cargo.toml", "vendor/ext/src/lib.rs"]));
+    let touched = s(&["vendor/ext/src/lib.rs", "src/core.rs"]);
+    let d = diff("src/core.rs", "@@ -2 +2 @@");
+    let p = plan(&Inputs {
+        check: &c,
+        touched: &touched,
+        removed: &[],
+        diff: &d,
+        workspace: Ok(&w),
+        graph: Ok(&g),
+        base_text: &text,
+        head_text: &text,
+        files: &files,
+        full_when: &[],
+    });
+    assert_eq!(p.selection.mode, MODE_FULL);
+    assert!(
+        p.selection.reason.contains("path dependency"),
+        "{:?}",
+        p.selection
+    );
+}
+
+/// A binary's own directory is `src/bin/<name>/` (not all of `src/bin/`), and its integration
+/// tests are found where a target names it: its root or a helper module the root includes.
+#[test]
+fn a_binarys_module_runs_that_binary_and_the_tests_whose_helper_spawns_it() {
+    let g = graph();
+    let mut w = workspace();
+    w.packages[0].targets.extend([
+        target(TargetKind::Bin, "alpha", "src/bin/alpha.rs"),
+        target(TargetKind::Bin, "tool", "src/bin/tool/main.rs"),
+        target(TargetKind::Test, "cli", "tests/cli.rs"),
+    ]);
+    let c = check();
+    let mut files = files();
+    files.extend(s(&[
+        "src/bin/alpha.rs",
+        "src/bin/tool/main.rs",
+        "src/bin/tool/args.rs",
+        "tests/cli.rs",
+        "tests/support/mod.rs",
+    ]));
+    let t = |f: &str| match f {
+        "tests/cli.rs" => Some("pub mod support;\n#[test]\nfn runs() {}\n".to_string()),
+        "tests/support/mod.rs" => {
+            Some("pub fn bin() -> &'static str { env!(\"CARGO_BIN_EXE_tool\") }\n".to_string())
+        }
+        "src/bin/tool/args.rs" => Some("pub fn parse() {}\n".to_string()),
+        _ => text(f),
+    };
+    let touched = s(&["src/bin/tool/args.rs"]);
+    let p = plan(&Inputs {
+        check: &c,
+        touched: &touched,
+        removed: &[],
+        diff: "",
+        workspace: Ok(&w),
+        graph: Ok(&g),
+        base_text: &|_: &str| None,
+        head_text: &t,
+        files: &files,
+        full_when: &[],
+    });
+    assert_eq!(
+        script(&p),
+        "cargo test --locked --no-fail-fast -p app --bin tool --test cli",
+        "{:?}",
+        p.selection
+    );
+}
+
+/// (proof on core 3cd2463) A workspace source the graph holds nothing for (the indexer skipped
+/// core's 1.5 MB `src/actor.rs`) hides its callers: when it names anything the change reaches,
+/// its package runs whole; a change inside it runs the full suite.
+#[test]
+fn a_source_the_graph_skipped_runs_its_package_whole_when_it_names_the_reach() {
+    let g = graph();
+    let w = workspace();
+    let c = check();
+    let mut files = files();
+    files.push("src/big.rs".into());
+    let t = |f: &str| {
+        (f == "src/big.rs")
+            .then(|| "pub fn drive() -> u32 { crate::core::hot() }\n".to_string())
+            .or_else(|| text(f))
+    };
+    let run_on = |touched: &[&str], d: &str| {
+        plan(&Inputs {
+            check: &c,
+            touched: &s(touched),
+            removed: &[],
+            diff: d,
+            workspace: Ok(&w),
+            graph: Ok(&g),
+            base_text: &t,
+            head_text: &t,
+            files: &files,
+            full_when: &[],
+        })
+    };
+    let p = run_on(&["src/core.rs"], &diff("src/core.rs", "@@ -2 +2 @@"));
+    assert_eq!(
+        script(&p),
+        "cargo test --locked --no-fail-fast -p app",
+        "{:?}",
+        p.selection
+    );
+    assert!(
+        p.selection
+            .reason
+            .contains("`src/big.rs` is not in the code graph"),
+        "{:?}",
+        p.selection
+    );
+    // A change in the leaf crate reaches nothing `big.rs` names: still narrow.
+    let p = run_on(
+        &["crates/leaf/src/calc.rs"],
+        &diff("crates/leaf/src/calc.rs", "@@ -1 +1 @@"),
+    );
+    assert_eq!(
+        script(&p),
+        "cargo test --locked --no-fail-fast -p leaf --lib -- adds"
+    );
+    // A change inside it cannot be traced at all.
+    let p = run_on(&["src/big.rs"], &diff("src/big.rs", "@@ -1 +1 @@"));
+    assert_eq!(p.selection.mode, MODE_FULL);
+    assert!(
+        p.selection.reason.contains("indexer skipped"),
+        "{:?}",
+        p.selection
+    );
 }
