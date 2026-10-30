@@ -50,11 +50,35 @@ pub trait OutputAdapter: Send {
     fn finish(&mut self) -> AdapterOut {
         AdapterOut::default()
     }
+    /// The seat's "still working" frames ([`crate::tool_activity::Heartbeat`]), ticked by the
+    /// runner's poll loop while the seat is quiet; `None` when the adapter sends no live frames.
+    fn heartbeat(&self) -> Option<crate::tool_activity::Heartbeat> {
+        None
+    }
+}
+
+/// A stream with no tool events of its own (copilot's `-p` text, opencode, agy): its lines as
+/// `inner` reads them, plus the attempt's heartbeat so the page still shows the seat working.
+pub(crate) struct QuietSeat {
+    pub(crate) inner: Box<dyn OutputAdapter>,
+    pub(crate) activity: Option<crate::tool_activity::ToolActivitySink>,
+}
+
+impl OutputAdapter for QuietSeat {
+    fn on_line(&mut self, line: &str) -> AdapterOut {
+        self.inner.on_line(line)
+    }
+    fn finish(&mut self) -> AdapterOut {
+        self.inner.finish()
+    }
+    fn heartbeat(&self) -> Option<crate::tool_activity::Heartbeat> {
+        self.activity.as_ref().map(|a| a.heartbeat())
+    }
 }
 
 /// Default adapter when no structured mode is selected: each raw line is exactly one readable delta,
 /// no usage or files. Byte-identical to the original raw-line streaming.
-struct Passthrough;
+pub(crate) struct Passthrough;
 
 impl OutputAdapter for Passthrough {
     fn on_line(&mut self, line: &str) -> AdapterOut {
@@ -103,6 +127,10 @@ impl OutputAdapter for ClaudeStreamJson {
             a.close();
         }
         AdapterOut::default()
+    }
+
+    fn heartbeat(&self) -> Option<crate::tool_activity::Heartbeat> {
+        self.activity.as_ref().map(|a| a.heartbeat())
     }
 
     fn on_line(&mut self, line: &str) -> AdapterOut {
@@ -272,9 +300,24 @@ pub(crate) struct CodexJsonl {
     last_message: Option<String>,
     /// Usage summed over every `turn.completed` seen so far.
     usage: Option<Usage>,
+    /// Live per-tool frames from codex's own items (commands, file changes, MCP calls, searches).
+    pub(crate) activity: Option<crate::tool_activity::ToolActivitySink>,
+}
+
+impl CodexJsonl {
+    pub(crate) fn with_activity(activity: Option<crate::tool_activity::ToolActivitySink>) -> Self {
+        Self {
+            activity,
+            ..Self::default()
+        }
+    }
 }
 
 impl OutputAdapter for CodexJsonl {
+    fn heartbeat(&self) -> Option<crate::tool_activity::Heartbeat> {
+        self.activity.as_ref().map(|a| a.heartbeat())
+    }
+
     fn on_line(&mut self, line: &str) -> AdapterOut {
         if line.trim().is_empty() {
             return AdapterOut::default();
@@ -286,6 +329,11 @@ impl OutputAdapter for CodexJsonl {
             };
         };
         let mut out = AdapterOut::default();
+        if let (Some(a), Some(call)) =
+            (self.activity.as_mut(), crate::tool_activity::codex_item(&v))
+        {
+            a.call(&call);
+        }
         match v.get("type").and_then(|t| t.as_str()) {
             Some("item.completed") => {
                 let item = v.get("item");
@@ -347,6 +395,9 @@ impl OutputAdapter for CodexJsonl {
     }
 
     fn finish(&mut self) -> AdapterOut {
+        if let Some(a) = self.activity.as_mut() {
+            a.close();
+        }
         AdapterOut {
             text: self.last_message.take().into_iter().collect(),
             ..AdapterOut::default()
@@ -365,9 +416,24 @@ impl OutputAdapter for CodexJsonl {
 pub(crate) struct PiJson {
     last_message: Option<String>,
     usage: Option<Usage>,
+    /// Live per-tool frames from pi's own `tool_execution_*` events.
+    pub(crate) activity: Option<crate::tool_activity::ToolActivitySink>,
+}
+
+impl PiJson {
+    pub(crate) fn with_activity(activity: Option<crate::tool_activity::ToolActivitySink>) -> Self {
+        Self {
+            activity,
+            ..Self::default()
+        }
+    }
 }
 
 impl OutputAdapter for PiJson {
+    fn heartbeat(&self) -> Option<crate::tool_activity::Heartbeat> {
+        self.activity.as_ref().map(|a| a.heartbeat())
+    }
+
     fn on_line(&mut self, line: &str) -> AdapterOut {
         if line.trim().is_empty() {
             return AdapterOut::default();
@@ -379,6 +445,10 @@ impl OutputAdapter for PiJson {
             };
         };
         let mut out = AdapterOut::default();
+        if let (Some(a), Some(call)) = (self.activity.as_mut(), crate::tool_activity::pi_event(&v))
+        {
+            a.call(&call);
+        }
         let msg = v.get("message");
         let is_assistant_end = v.get("type").and_then(|t| t.as_str()) == Some("message_end")
             && msg.and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("assistant");
@@ -438,6 +508,9 @@ impl OutputAdapter for PiJson {
     }
 
     fn finish(&mut self) -> AdapterOut {
+        if let Some(a) = self.activity.as_mut() {
+            a.close();
+        }
         AdapterOut {
             text: self.last_message.take().into_iter().collect(),
             ..AdapterOut::default()
@@ -3377,20 +3450,30 @@ impl WrappedCliStepRunner {
                 Vec::new(),
             )
         } else {
+            // Every seat's live activity from its own stream (claude, codex, pi); a stream with no
+            // tool events gets the heartbeat only (coordinator 2026-10-30, rig run 1d372696).
+            let activity = || crate::tool_activity::ToolActivitySink::for_input(input, &cwd);
             let mut adapter: Box<dyn OutputAdapter> = if is_claude {
-                Box::new(ClaudeStreamJson::with_activity(
-                    crate::tool_activity::ToolActivitySink::for_input(input, &cwd),
-                ))
+                Box::new(ClaudeStreamJson::with_activity(activity()))
             } else if codex_json {
-                Box::<CodexJsonl>::default()
+                Box::new(CodexJsonl::with_activity(activity()))
             } else if pi_json {
-                Box::<PiJson>::default()
+                Box::new(PiJson::with_activity(activity()))
             } else if container && opencode_json_mode(&binary, &argv) {
-                Box::<OpencodeJson>::default()
+                Box::new(QuietSeat {
+                    inner: Box::<OpencodeJson>::default(),
+                    activity: activity(),
+                })
             } else if agy_json {
-                Box::<AgyStreamJson>::default()
+                Box::new(QuietSeat {
+                    inner: Box::<AgyStreamJson>::default(),
+                    activity: activity(),
+                })
             } else {
-                Box::new(Passthrough)
+                Box::new(QuietSeat {
+                    inner: Box::new(Passthrough),
+                    activity: activity(),
+                })
             };
             // Whether the launch speaks the CLI's headless JSON protocol: only then is a turn's
             // session or end-of-turn event read off its stream (codex hl-r1: `pi --mode text`
@@ -6776,6 +6859,12 @@ pub(crate) fn run_bounded(
     // `emit` is unaffected (every delta still streams); only the retained string is bounded.
     const MAX_OUT: usize = 8 * 1024 * 1024;
 
+    // The seat's "still working" frames, ticked below while it is quiet, and when it last printed.
+    let heartbeat = adapter.heartbeat();
+    let last_line = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        crate::interaction::now_millis().max(0) as u64,
+    ));
+    let last_line_w = std::sync::Arc::clone(&last_line);
     let (code, killed_by, out, usage, files, tools, err) = std::thread::scope(|scope| {
         // Stdout: read line-by-line, route through `adapter`, stream each readable delta through `emit`,
         // accumulate the readable text (bounded) + the structured signals (usage/files).
@@ -6807,6 +6896,10 @@ pub(crate) fn run_bounded(
                 retain_tools_capped(&mut tools, ao.tools);
             };
             for line in std::io::BufReader::new(so).lines().map_while(Result::ok) {
+                last_line_w.store(
+                    crate::interaction::now_millis().max(0) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 let ao = adapter.on_line(&line);
                 absorb(ao, &mut s, &mut capped);
             }
@@ -6856,6 +6949,9 @@ pub(crate) fn run_bounded(
                         crate::validator::kill_child_tree(child_ref);
                         crate::validator::reap_bounded(child_ref);
                         break (-1, Some(TIMED_OUT));
+                    }
+                    if let Some(h) = heartbeat.as_ref() {
+                        h.tick(last_line.load(std::sync::atomic::Ordering::Relaxed));
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }

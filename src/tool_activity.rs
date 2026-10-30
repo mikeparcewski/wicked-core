@@ -10,10 +10,19 @@
 //!
 //! A target is a repo-relative path or a redacted command, at most 160 characters. Nothing here
 //! decides anything: a frame that cannot be sent is dropped.
+//!
+//! Every seat's own stream feeds it (coordinator 2026-10-30, rig run 1d372696: a codex QE step read
+//! "Codex Working on Check…" with no activity for 20+ s): claude's `stream-json` blocks, codex's
+//! `exec --json` items ([`codex_item`]) and pi's `--mode json` tool executions ([`pi_event`]). A
+//! seat whose stream says nothing about its tools (copilot's `-p` text) still shows it is alive:
+//! after [`HEARTBEAT_MS`] with no frame, a [`Heartbeat`] sends one `working` frame per interval,
+//! `target: "last output N s ago"` (bus `wicked.run.tool.working`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::Value;
@@ -31,6 +40,12 @@ pub const WINDOW_MS: u128 = 2_000;
 /// Calls one unit attempt may show in all, across every turn of a multi-turn orchestrator (a
 /// looping seat cannot flood the log): at most twice this many frames.
 pub const MAX_CALLS: usize = 2_000;
+/// A seat quiet this long (no tool frame, no heartbeat) gets one `working` frame, and one per
+/// interval after that while it stays quiet.
+pub const HEARTBEAT_MS: u64 = 15_000;
+
+/// The emitter every frame of one unit attempt goes through (the sink's and its heartbeat's).
+type Emit = Arc<dyn Fn(CoreEvent) + Send + Sync>;
 
 struct Open {
     at: Instant,
@@ -62,9 +77,13 @@ pub struct ToolActivitySink {
     ord: u32,
     attempt: u32,
     root: PathBuf,
-    tx: Box<dyn Fn(CoreEvent) + Send>,
+    tx: Emit,
     open: HashMap<String, Open>,
     window: (Instant, usize),
+    /// The seat (`codex`, `pi`, …), named on a heartbeat.
+    seat: String,
+    /// When this attempt last sent any frame (epoch ms), shared with its [`Heartbeat`].
+    last_frame: Arc<AtomicU64>,
 }
 
 impl ToolActivitySink {
@@ -72,17 +91,25 @@ impl ToolActivitySink {
     pub fn for_input(input: &crate::workflow::StepInput, root: &Path) -> Option<Self> {
         let tx: Sender<Command> = crate::power::actor_tx(input.process_gen)?;
         let tx = std::sync::Mutex::new(tx);
-        Some(Self::new(
-            &input.run_id,
-            input.unit.ord,
-            input.attempt,
-            root,
-            Box::new(move |ev| {
-                if let Ok(t) = tx.lock() {
-                    let _ = t.send(Command::EmitEvent(ev));
-                }
-            }),
-        ))
+        let seat = input
+            .unit
+            .assigned_cli
+            .clone()
+            .unwrap_or_else(|| "seat".to_string());
+        Some(
+            Self::new(
+                &input.run_id,
+                input.unit.ord,
+                input.attempt,
+                root,
+                Box::new(move |ev| {
+                    if let Ok(t) = tx.lock() {
+                        let _ = t.send(Command::EmitEvent(ev));
+                    }
+                }),
+            )
+            .seat(&seat),
+        )
     }
 
     pub fn new(
@@ -90,17 +117,42 @@ impl ToolActivitySink {
         ord: u32,
         attempt: u32,
         root: &Path,
-        tx: Box<dyn Fn(CoreEvent) + Send>,
+        tx: Box<dyn Fn(CoreEvent) + Send + Sync>,
     ) -> Self {
         Self {
             run_id: run_id.to_string(),
             ord,
             attempt,
             root: root.to_path_buf(),
-            tx,
+            tx: Arc::from(tx),
             open: HashMap::new(),
             window: (Instant::now(), 0),
+            seat: "seat".to_string(),
+            last_frame: Arc::new(AtomicU64::new(now_ms())),
         }
+    }
+
+    /// The seat a heartbeat names.
+    pub fn seat(mut self, seat: &str) -> Self {
+        self.seat = seat.to_string();
+        self
+    }
+
+    /// The heartbeat of this attempt: it shares the emitter and the time of the last frame.
+    pub fn heartbeat(&self) -> Heartbeat {
+        Heartbeat {
+            run_id: self.run_id.clone(),
+            ord: self.ord,
+            attempt: self.attempt,
+            seat: self.seat.clone(),
+            tx: Arc::clone(&self.tx),
+            last_frame: Arc::clone(&self.last_frame),
+        }
+    }
+
+    fn send(&self, ev: CoreEvent) {
+        self.last_frame.store(now_ms(), Ordering::Relaxed);
+        (self.tx)(ev);
     }
 
     /// Room to show one more call now. A shown call's finish needs no room: it was reserved.
@@ -130,7 +182,7 @@ impl ToolActivitySink {
         }
         let kind = kind_of(tool, input);
         let target = target_of(tool, input, &self.root);
-        (self.tx)(self.frame(id, "started", kind, tool, target.clone(), None, None));
+        self.send(self.frame(id, "started", kind, tool, target.clone(), None, None));
         self.open.insert(
             id.to_string(),
             Open {
@@ -149,7 +201,7 @@ impl ToolActivitySink {
             return;
         };
         let ms = o.at.elapsed().as_millis() as u64;
-        (self.tx)(self.frame(
+        self.send(self.frame(
             id,
             "finished",
             o.kind,
@@ -193,6 +245,251 @@ impl ToolActivitySink {
             target,
             ok,
             duration_ms,
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    crate::interaction::now_millis().max(0) as u64
+}
+
+/// A seat attempt's "still working" frame: sent from the runner's poll loop (never from the
+/// stream, which says nothing while the seat is quiet) when no frame went out for
+/// [`HEARTBEAT_MS`]. One frame per interval at most, `id` `working-<attempt>` (a subscriber updates
+/// one row), `kind`/`state` `working`, `tool` the seat, `target` how long ago the seat last
+/// printed anything, `durationMs` that same silence.
+pub struct Heartbeat {
+    run_id: String,
+    ord: u32,
+    attempt: u32,
+    seat: String,
+    tx: Emit,
+    last_frame: Arc<AtomicU64>,
+}
+
+impl Heartbeat {
+    /// One poll-loop tick: `last_output_ms` is when the seat last wrote a line (epoch ms).
+    pub fn tick(&self, last_output_ms: u64) {
+        self.tick_at(now_ms(), last_output_ms);
+    }
+
+    fn tick_at(&self, now: u64, last_output_ms: u64) {
+        if now.saturating_sub(self.last_frame.load(Ordering::Relaxed)) < HEARTBEAT_MS {
+            return;
+        }
+        self.last_frame.store(now, Ordering::Relaxed);
+        let quiet = now.saturating_sub(last_output_ms);
+        (self.tx)(CoreEvent::ToolActivity {
+            session: self.run_id.clone(),
+            ord: self.ord,
+            attempt: self.attempt,
+            at: now as i64,
+            id: format!("working-{}", self.attempt),
+            state: "working".to_string(),
+            kind: "working".to_string(),
+            tool: self.seat.clone(),
+            target: Some(format!("last output {} s ago", quiet / 1000)),
+            ok: None,
+            duration_ms: Some(quiet),
+        });
+    }
+}
+
+/// A `codex exec --json` item event as a tool call: `(started, id, tool, input)` for an
+/// `item.started` / `item.completed` whose item is a command, a file change, an MCP tool call or a
+/// web search, in the claude tool words the frame already speaks (`Bash` + `command`, `Edit` +
+/// `file_path`, `WebSearch` + `query`). `ok` on a completion: exit 0 / not failed. `None` for every
+/// other event (reasoning, messages, turns).
+pub fn codex_item(v: &Value) -> Option<CodexCall> {
+    let started = match v.get("type").and_then(Value::as_str)? {
+        "item.started" => true,
+        "item.completed" => false,
+        _ => return None,
+    };
+    let item = v.get("item")?;
+    let id = item.get("id").and_then(Value::as_str)?.to_string();
+    let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+    let failed = status == "failed" || status == "declined";
+    let (tool, input, ok) = match item.get("type").and_then(Value::as_str)? {
+        "command_execution" => {
+            let cmd = match item.get("command") {
+                Some(Value::String(c)) => c.clone(),
+                Some(Value::Array(a)) => a
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => String::new(),
+            };
+            let exit_ok = item
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .map(|c| c == 0);
+            (
+                "Bash".to_string(),
+                serde_json::json!({ "command": unwrap_shell(&cmd) }),
+                exit_ok.unwrap_or(!failed) && !failed,
+            )
+        }
+        "file_change" => {
+            let path = item
+                .get("changes")
+                .and_then(Value::as_array)
+                .and_then(|c| c.first())
+                .and_then(|c| c.get("path"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            (
+                "Edit".to_string(),
+                serde_json::json!({ "file_path": path }),
+                !failed,
+            )
+        }
+        "mcp_tool_call" => {
+            let server = item.get("server").and_then(Value::as_str).unwrap_or("mcp");
+            let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            (
+                format!("mcp__{server}__{tool}"),
+                Value::Null,
+                !failed && item.get("error").is_none_or(Value::is_null),
+            )
+        }
+        "web_search" => (
+            "WebSearch".to_string(),
+            serde_json::json!({ "query": item.get("query").and_then(Value::as_str).unwrap_or("") }),
+            !failed,
+        ),
+        _ => return None,
+    };
+    Some(CodexCall {
+        started,
+        id,
+        tool,
+        input,
+        ok,
+    })
+}
+
+/// One codex item as a call ([`codex_item`]).
+pub struct CodexCall {
+    pub started: bool,
+    pub id: String,
+    pub tool: String,
+    pub input: Value,
+    pub ok: bool,
+}
+
+/// codex runs every command as `bash -lc '<script>'` (or `/bin/zsh -lc …`): the frame shows the
+/// script, as claude's `Bash` does.
+fn unwrap_shell(cmd: &str) -> String {
+    for lead in [
+        "bash -lc ",
+        "/bin/bash -lc ",
+        "zsh -lc ",
+        "/bin/zsh -lc ",
+        "sh -c ",
+        "/bin/sh -c ",
+    ] {
+        if let Some(rest) = cmd.strip_prefix(lead) {
+            let rest = rest.trim();
+            let unq = rest
+                .strip_prefix('\'')
+                .and_then(|r| r.strip_suffix('\''))
+                .or_else(|| rest.strip_prefix('"').and_then(|r| r.strip_suffix('"')))
+                .unwrap_or(rest);
+            return unq.to_string();
+        }
+    }
+    cmd.to_string()
+}
+
+/// A `pi --mode json` tool event as a call: `tool_execution_start` (`toolCallId`, `toolName`,
+/// `args`) starts it and `tool_execution_end` (`isError`) finishes it. pi's tool names (`read`,
+/// `bash`, `edit`, `write`, `grep`, `find`, `ls`) are said in the claude words the frame speaks.
+/// `None` for every other event.
+pub fn pi_event(v: &Value) -> Option<CodexCall> {
+    let started = match v.get("type").and_then(Value::as_str)? {
+        "tool_execution_start" => true,
+        "tool_execution_end" => false,
+        _ => return None,
+    };
+    let id = v
+        .get("toolCallId")
+        .or_else(|| v.get("id"))
+        .and_then(Value::as_str)?
+        .to_string();
+    let name = v
+        .get("toolName")
+        .or_else(|| v.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("tool");
+    let args = v
+        .get("args")
+        .or_else(|| v.get("input"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let s = |k: &str| {
+        args.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let path = || {
+        let p = s("path");
+        if p.is_empty() {
+            s("file_path")
+        } else {
+            p
+        }
+    };
+    let (tool, input) = match name {
+        "read" => (
+            "Read".to_string(),
+            serde_json::json!({ "file_path": path() }),
+        ),
+        "edit" => (
+            "Edit".to_string(),
+            serde_json::json!({ "file_path": path() }),
+        ),
+        "write" => (
+            "Write".to_string(),
+            serde_json::json!({ "file_path": path() }),
+        ),
+        "bash" => (
+            "Bash".to_string(),
+            serde_json::json!({ "command": s("command") }),
+        ),
+        "grep" => (
+            "Grep".to_string(),
+            serde_json::json!({ "pattern": s("pattern"), "path": path() }),
+        ),
+        "find" | "ls" => (
+            "Glob".to_string(),
+            serde_json::json!({ "pattern": s("pattern"), "path": path() }),
+        ),
+        other => (other.to_string(), Value::Null),
+    };
+    let ok = !v.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    Some(CodexCall {
+        started,
+        id,
+        tool,
+        input,
+        ok,
+    })
+}
+
+impl ToolActivitySink {
+    /// A call read off a non-claude stream ([`codex_item`], [`pi_event`]). A completion whose start
+    /// was never seen (codex emits a file change only when done) is shown starting and finishing.
+    pub fn call(&mut self, c: &CodexCall) {
+        if c.started {
+            self.started(&c.id, &c.tool, &c.input);
+        } else {
+            if !self.open.contains_key(&c.id) {
+                self.started(&c.id, &c.tool, &c.input);
+            }
+            self.finished(&c.id, c.ok);
         }
     }
 }
@@ -394,6 +691,149 @@ mod tests {
         assert_eq!(b["target"], "src/api/routes.ts");
         assert_eq!(b["ok"], true);
         assert!(b["durationMs"].as_u64().is_some(), "{b}");
+    }
+
+    /// (rig run 1d372696) codex's `exec --json` items drive the same frames: a command's start and
+    /// its exit (its `bash -lc` wrapper unwrapped, so a test run reads as one), a file change seen
+    /// only when done (started and finished at once), an MCP call; reasoning and messages say
+    /// nothing. The unit's text is unchanged.
+    #[test]
+    fn the_codex_stream_sends_a_frame_per_item_as_it_arrives() {
+        use crate::execute_wrapped::{CodexJsonl, OutputAdapter};
+        let (s, seen) = sink("/w/repo", "run-1");
+        let mut a = CodexJsonl::with_activity(Some(s));
+        assert!(a.heartbeat().is_some());
+        a.on_line(r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"bash -lc 'cargo test --lib deliver_lift'","aggregated_output":"","exit_code":null,"status":"in_progress"}}"#);
+        assert_eq!(seen.lock().unwrap().len(), 1, "the start is sent at once");
+        a.on_line(r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"bash -lc 'cargo test --lib deliver_lift'","aggregated_output":"1 failed","exit_code":101,"status":"failed"}}"#);
+        a.on_line(r#"{"type":"item.completed","item":{"id":"item_2","type":"reasoning","text":"thinking"}}"#);
+        a.on_line(r#"{"type":"item.completed","item":{"id":"item_3","type":"file_change","changes":[{"path":"/w/repo/src/lib.rs","kind":"update"}],"status":"completed"}}"#);
+        a.on_line(r#"{"type":"item.started","item":{"id":"item_4","type":"mcp_tool_call","server":"estate","tool":"search","status":"in_progress"}}"#);
+        a.on_line(r#"{"type":"item.completed","item":{"id":"item_5","type":"agent_message","text":"VERDICT: PASS"}}"#);
+        let out = a.finish();
+        assert_eq!(
+            out.text,
+            vec!["VERDICT: PASS".to_string()],
+            "the unit's text is as before"
+        );
+        let seen = seen.lock().unwrap();
+        let rows: Vec<(String, String, String, String)> = seen
+            .iter()
+            .map(|f| {
+                (
+                    f["id"].as_str().unwrap().into(),
+                    f["state"].as_str().unwrap().into(),
+                    f["kind"].as_str().unwrap().into(),
+                    f["target"].as_str().unwrap_or("").into(),
+                )
+            })
+            .collect();
+        let cmd = "cargo test --lib deliver_lift".to_string();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "item_1".into(),
+                    "started".into(),
+                    "test".into(),
+                    cmd.clone()
+                ),
+                ("item_1".into(), "finished".into(), "test".into(), cmd),
+                (
+                    "item_3".into(),
+                    "started".into(),
+                    "edit".into(),
+                    "src/lib.rs".into()
+                ),
+                (
+                    "item_3".into(),
+                    "finished".into(),
+                    "edit".into(),
+                    "src/lib.rs".into()
+                ),
+                ("item_4".into(), "started".into(), "other".into(), "".into()),
+                // stdout closed with the MCP call still open: shown finishing, not ok.
+                (
+                    "item_4".into(),
+                    "finished".into(),
+                    "other".into(),
+                    "".into()
+                ),
+            ]
+        );
+        assert_eq!(seen[1]["ok"], false, "exit 101");
+        assert_eq!(seen[3]["ok"], true);
+        assert_eq!(seen[4]["tool"], "mcp__estate__search");
+        assert_eq!(seen[5]["ok"], false);
+    }
+
+    /// pi's `--mode json` tool executions drive the same frames, in claude's tool words.
+    #[test]
+    fn the_pi_stream_sends_a_frame_per_tool_execution() {
+        use crate::execute_wrapped::{OutputAdapter, PiJson};
+        let (s, seen) = sink("/w/repo", "run-1");
+        let mut a = PiJson::with_activity(Some(s));
+        a.on_line(r#"{"type":"tool_execution_start","toolCallId":"c1","toolName":"read","args":{"path":"/w/repo/README.md"}}"#);
+        a.on_line(r#"{"type":"tool_execution_end","toolCallId":"c1","toolName":"read","result":{},"isError":false}"#);
+        a.on_line(r#"{"type":"tool_execution_start","toolCallId":"c2","toolName":"bash","args":{"command":"npx vitest run tests/a.test.ts"}}"#);
+        a.on_line(r#"{"type":"tool_execution_end","toolCallId":"c2","toolName":"bash","result":{},"isError":true}"#);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4, "{seen:?}");
+        assert_eq!(seen[0]["kind"], "read");
+        assert_eq!(seen[0]["tool"], "Read");
+        assert_eq!(seen[0]["target"], "README.md");
+        assert_eq!(seen[1]["ok"], true);
+        assert_eq!(seen[2]["kind"], "test");
+        assert_eq!(seen[3]["state"], "finished");
+        assert_eq!(seen[3]["ok"], false);
+    }
+
+    /// A quiet seat shows it is alive: after 15 s with no frame, one `working` frame per interval
+    /// saying how long ago it last printed; a tool frame resets the clock. A stream with no tool
+    /// events (copilot's text) gets it through `QuietSeat`.
+    #[test]
+    fn a_quiet_seat_sends_one_working_frame_per_interval() {
+        let (s, seen) = sink("/w/repo", "run-1");
+        let s = s.seat("copilot");
+        let hb = s.heartbeat();
+        let t0 = now_ms();
+        hb.tick_at(t0 + 5_000, t0);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "quiet for 5 s: nothing yet"
+        );
+        hb.tick_at(t0 + HEARTBEAT_MS + 1_000, t0 + 4_000);
+        hb.tick_at(t0 + HEARTBEAT_MS + 2_000, t0 + 4_000);
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one per interval: {seen:?}");
+            let f = &seen[0];
+            assert_eq!(f["type"], "toolActivity");
+            assert_eq!(f["state"], "working");
+            assert_eq!(f["kind"], "working");
+            assert_eq!(f["tool"], "copilot");
+            assert_eq!(f["id"], "working-0");
+            assert_eq!(f["target"], "last output 12 s ago");
+            assert_eq!(f["durationMs"], 12_000);
+        }
+        hb.tick_at(t0 + 2 * HEARTBEAT_MS + 1_000, t0 + 4_000);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "and again a full interval later"
+        );
+        // A tool frame resets the clock: a heartbeat waits a full interval after it.
+        let mut s = s;
+        s.started("t1", "Read", &json!({"file_path": "/w/repo/a"}));
+        hb.tick(now_ms());
+        assert_eq!(seen.lock().unwrap().len(), 3, "the tool frame only");
+        use crate::execute_wrapped::{OutputAdapter, QuietSeat};
+        let (q, _) = sink("/w/repo", "run-2");
+        let quiet = QuietSeat {
+            inner: Box::new(crate::execute_wrapped::CodexJsonl::default()),
+            activity: Some(q),
+        };
+        assert!(quiet.heartbeat().is_some());
     }
 
     /// The claude stream adapter drives the sink live: a `tool_use` line starts a call, the

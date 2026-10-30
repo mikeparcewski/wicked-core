@@ -61,6 +61,8 @@ pub fn row(json: &serde_json::Value, seq: u64, at: u64) -> Option<crate::bus::Bu
         match json.get("state").and_then(|s| s.as_str()) {
             Some("started") => "wicked.run.tool.started",
             Some("finished") => "wicked.run.tool.finished",
+            // A quiet seat's "still working" frame (tool_activity::Heartbeat).
+            Some("working") => "wicked.run.tool.working",
             _ => return None,
         }
     } else {
@@ -220,6 +222,10 @@ mod tests {
         assert_eq!(
             row(&f("finished"), 2, 1).unwrap().event_type,
             "wicked.run.tool.finished"
+        );
+        assert_eq!(
+            row(&f("working"), 3, 1).unwrap().event_type,
+            "wicked.run.tool.working"
         );
         assert!(row(&f("weird"), 3, 1).is_none());
         let n = serde_json::json!({"type": "powerWorkingNotes", "session": "r1", "ord": 3});
