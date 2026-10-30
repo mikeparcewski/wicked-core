@@ -415,3 +415,67 @@ fn an_operator_raise_is_a_floor_held_for_the_plan_and_rigor_is_never_lowered_on_
     );
     release_all(&w);
 }
+
+/// (wicked-core#1209, rig run 1d372696) A hand-off step whose unit COUNTED reads "passed" at once,
+/// not when the next unit dispatches: the QE step read "running" for the whole deliver-gate wait.
+#[cfg(not(windows))]
+#[test]
+fn a_counted_hand_off_step_reads_passed_before_the_next_unit_dispatches() {
+    if crate::validator::skip_when_nested(
+        "a_counted_hand_off_step_reads_passed_before_the_next_unit_dispatches",
+    ) {
+        return;
+    }
+    let w = Worker::scripted(move |i, _| {
+        let phase = i.unit.id.rsplit(':').next().unwrap_or("").to_string();
+        match phase.as_str() {
+            "pa-scope" => turn(&pa_output("SCOPE {\"touch\":[\"README.md\"]}"), None),
+            "fix" => {
+                let wd = i.workdir.as_ref().expect("a worktree");
+                std::fs::write(wd.join("README.md"), "hello, power\n").unwrap();
+                turn("changed README.md\nHANDOFF: done", None)
+            }
+            "validator-agent" => turn("PASS", None),
+            p if p.starts_with("review") || p == "verify" => turn(
+                "ITEM 1: PASS — the heading is right (README.md:1)\nVERDICT: PASS",
+                None,
+            ),
+            _ => hold(),
+        }
+    });
+    let e = power_engine("pw9", w.clone(), "pk");
+    wait_for("a hand-off step to count", || {
+        let v = view(&e, "pk");
+        v.units
+            .iter()
+            .any(|u| handoff_unit(u) && u.status == crate::domain::UnitStatus::Done)
+    });
+    let v = view(&e, "pk");
+    let p = v.session.power.clone().expect("power");
+    let steps = &p.handoff.as_ref().expect("a hand-off").steps;
+    for u in v
+        .units
+        .iter()
+        .filter(|u| handoff_unit(u) && u.status == crate::domain::UnitStatus::Done)
+    {
+        let last = steps
+            .iter()
+            .rev()
+            .find(|s| s.ord == Some(u.ord))
+            .unwrap_or_else(|| panic!("unit {} has a step: {steps:?}", u.ord));
+        assert_eq!(
+            last.status, "passed",
+            "unit {} counted, so its step passed: {steps:?}",
+            u.ord
+        );
+    }
+    release_all(&w);
+}
+
+#[cfg(not(windows))]
+fn handoff_unit(u: &crate::domain::WorkUnit) -> bool {
+    matches!(
+        u.catalog.as_deref(),
+        Some("review" | "critique" | "security_review" | "test")
+    )
+}

@@ -7412,8 +7412,14 @@ const MIN_USEFUL_LAYOUT: usize = 40;
 /// so the directive resolves by convention alone; `form` still spells it for the session's CLI.
 pub(crate) fn pty_unit_prompt(input: &StepInput, form: SkillForm) -> Result<String, String> {
     // `+ 1` for the newline the runner appends to submit the turn — it occupies the same buffer.
-    let unit = author_directed(input);
-    let plain = skill_prompt(&unit, None, form, None);
+    let mut unit = author_directed(input);
+    let mut plain = skill_prompt(&unit, None, form, None);
+    // (xreview on #1211) The QE unit's floor note is optional evidence: a pty turn that would not fit
+    // with it runs without it, never refused for it.
+    if plain.len() + 1 > PTY_PROMPT_LIMIT && unit.qe_floor_note.is_some() {
+        unit.to_mut().qe_floor_note = None;
+        plain = skill_prompt(&unit, None, form, None);
+    }
     // FINDING-011: a pty turn is submitted line-based — the runner appends one `\n` to end the turn,
     // so ANY newline the prompt itself carries submits the turn EARLY. The worker then gets only the
     // text up to that byte and the remainder lands as a stray follow-up that desyncs the reused
@@ -13550,6 +13556,44 @@ mod tests {
             !ok.contains('\n'),
             "the accepted prompt is single-line: {ok}"
         );
+    }
+
+    /// (xreview on #1211) The QE unit's floor note is optional: a pty turn that fits without it
+    /// runs without it, never refused for it; one that fits with it keeps it.
+    #[test]
+    fn a_pty_qe_prompt_drops_the_floor_note_rather_than_refuse_the_turn() {
+        let mut unit = WorkUnit::pending("s:verify", "s", 4, "Verify");
+        unit.qe_acceptance = Some(crate::assurance::QeAcceptance {
+            status: crate::assurance::QE_REQUIRED.into(),
+            basis: crate::assurance::QE_BASIS_DIFF.into(),
+            score: Some(60),
+            threshold: 20,
+            reason: "required".into(),
+            reasons: Vec::new(),
+            ord: Some(4),
+            tree: None,
+        });
+        unit.qe_floor_note = Some(format!("FLOORNOTE {}", "x".repeat(900)));
+        let mut input = StepInput {
+            run_id: "pty-qe-note".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: None,
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let p = pty_unit_prompt(&input, SkillForm::ClaudePlugin).expect("runs without the note");
+        assert!(!p.contains("FLOORNOTE"), "{p}");
+        input.unit.qe_floor_note = Some("FLOORNOTE short".into());
+        let p = pty_unit_prompt(&input, SkillForm::ClaudePlugin).expect("fits with it");
+        assert!(p.contains("FLOORNOTE short"), "{p}");
     }
 
     #[test]

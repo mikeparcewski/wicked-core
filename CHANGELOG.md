@@ -43,6 +43,17 @@ Two release tracks share this file, newest entry first regardless of track:
   `rerun.test = {"command": ["cargo", "test", "--locked", "--workspace", "--no-fail-fast", "--", "{names}", "--exact"], "by": "name"}`,
   so a failed `test` check is retried and compared on the base by the failing test names instead of the
   whole workspace suite. Needs an engine with core#1198: an older engine refuses the unknown key.
+- **The judge before the floor says it is running.** On rig run 1d372696 the 1.5 min between the orchestrator's hand-off
+  and the floor's start had no event: a distinct seat was judging the change. The judge now writes
+  "judge: a distinct seat is reviewing the change before the checks run — N min" on the unit's stream as it starts
+  and every 5 min.
+- **A hand-off step reads "passed" when its unit counts, not when the next unit starts (wicked-core#1209).** The QE
+  step read "running" through the whole deliver-gate wait. `power_gate::on_counted` marks a counted review, security
+  or QE step passed at its gate.
+- **The QE unit is told what the floor already proved.** On rig run 1d372696 the codex QE agent spent 6.4 min
+  re-running a test file the floor had passed. A QE unit's dispatch now stamps `qe_floor_note`: the latest earlier
+  floor that ran on the exact tree it starts on, each check and its outcome. Its prompt says to cite those results
+  and run only what its scenario needs beyond them.
 - **The creator floor runs a cargo workspace's affected tests first, chosen by the engine (core#1187).** Core has no
   build-guide `affected` piece, so the creator floor ran `cargo test --workspace` on every change (20 min of the core
   proof run's 68 min floor). For a `cargo test … --workspace` check at the creator floor, the engine now computes

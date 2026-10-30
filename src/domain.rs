@@ -1478,6 +1478,12 @@ pub struct WorkUnit {
     /// run's own seats only. Empty for every other unit (skipped on the wire).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub qe_reviewer_seats: Vec<QeReviewerSeat>,
+    /// (rig run 1d372696) What the engine's own floor already proved on the tree this QE unit
+    /// starts on — stamped at dispatch from the run's latest creator floor on that exact tree
+    /// ([`crate::qe_acceptance::floor_note`]), so the QE executor runs only the checks its
+    /// scenario needs beyond them, never the same suite again. `None` when no floor judged it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qe_floor_note: Option<String>,
     /// (DES-QE-EVERY-SEAT §3.1) Set ONLY on the engine's reviewer turn (a fresh worker session):
     /// the nonce its child receives as `WICKED_QE_REVIEW_SESSION` and stamps on the verdict it
     /// records. Never persisted on a stored unit (the reviewer input is built on the worker).
@@ -1774,6 +1780,7 @@ impl WorkUnit {
             assurance: None,
             qe_acceptance: None,
             qe_reviewer_seats: Vec::new(),
+            qe_floor_note: None,
             qe_review_session: None,
             qe_review: None,
             read_view: None,

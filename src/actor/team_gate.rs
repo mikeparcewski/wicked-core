@@ -2337,6 +2337,7 @@ fn emit_counted(act: &mut Act<'_>, run_id: &str, ord: u32) {
             ord,
         },
     );
+    super::power_gate::on_counted(act.store, act.subscribers, run_id, ord);
 }
 
 /// Move the cursor past unit `ix` and advance (dispatch, pause at the next gate, or finish).

@@ -460,14 +460,66 @@ pub(crate) fn directive(qe: &QeAcceptance, skill: &str) -> String {
 /// ([`review::applies`]) the evidence-only directive (resuming the last QE run on a same-tree
 /// retry), else [`directive`].
 pub(crate) fn unit_directive(unit: &WorkUnit, skill: &str) -> String {
+    let floor = unit
+        .qe_floor_note
+        .as_deref()
+        .filter(|_| unit.qe_acceptance.as_ref().is_some_and(|q| q.required()))
+        .map(|n| format!(" {n}"))
+        .unwrap_or_default();
     if review::applies(unit) {
-        return review::evidence_directive(skill, review::resume_dir(unit));
+        return format!(
+            "{}{floor}",
+            review::evidence_directive(skill, review::resume_dir(unit))
+        );
     }
     unit.qe_acceptance
         .as_ref()
-        .map(|q| directive(q, skill))
+        .map(|q| format!("{}{floor}", directive(q, skill)))
         .unwrap_or_default()
 }
+
+/// (rig run 1d372696: the codex QE agent spent 6.4 min re-running a test file the floor had already
+/// passed) What the run's own floor proved on `tree`, for the QE unit's prompt: the LATEST creator
+/// or verify floor of an earlier unit that ran on exactly that tree and ran its checks, each check
+/// with its outcome (and failing-test count). Short by contract (it rides the unit prompt). `None`
+/// when no earlier floor ran on that tree.
+pub(crate) fn floor_note(units: &[WorkUnit], ord: u32, tree: &str) -> Option<String> {
+    let (u, r) = units
+        .iter()
+        .filter(|u| u.ord < ord)
+        .filter_map(|u| u.repo_checks.as_ref().map(|r| (u, r)))
+        .filter(|(_, r)| r.tree.as_deref() == Some(tree) && !r.checks.is_empty())
+        .filter(|(_, r)| r.sandbox_error.is_none() && r.detect_error.is_none())
+        .max_by_key(|(u, _)| u.ord)?;
+    // Bounded whatever the check list (xreview on #1211: twelve checks made it 428 bytes): the
+    // checks are named while they fit FLOOR_NOTE_CHECKS bytes, then counted.
+    let mut named: Vec<String> = Vec::new();
+    let mut len = 0;
+    for c in &r.checks {
+        let n = c.failure_ids.len();
+        let one = if n > 0 {
+            format!("{} {} ({n} failing)", c.name, c.outcome())
+        } else {
+            format!("{} {}", c.name, c.outcome())
+        };
+        if len + one.len() + 2 > FLOOR_NOTE_CHECKS {
+            named.push(format!("{} more", r.checks.len() - named.len()));
+            break;
+        }
+        len += one.len() + 2;
+        named.push(one);
+    }
+    let short: String = tree.chars().take(10).collect();
+    Some(format!(
+        "The floor already ran on this tree ({short}, unit {}): {}. Do not rerun those; cite \
+         them, and run only what your scenario adds.",
+        u.ord,
+        named.join(", ")
+    ))
+}
+
+/// The most bytes [`floor_note`] spends naming checks.
+const FLOOR_NOTE_CHECKS: usize = 160;
 
 pub(crate) mod review;
 
