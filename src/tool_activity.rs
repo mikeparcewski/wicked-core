@@ -379,28 +379,84 @@ pub struct CodexCall {
     pub ok: bool,
 }
 
-/// codex runs every command as `bash -lc '<script>'` (or `/bin/zsh -lc …`): the frame shows the
-/// script, as claude's `Bash` does.
+/// codex runs every command as `bash -lc '<script>'` (formatted with `shlex::try_join`, so the
+/// script may carry `'\''`-style or `"\""`-style escapes): the frame shows the script, decoded, as
+/// claude's `Bash` does — so the redactor sees exactly what the shell would run (xreview on #1207:
+/// stripping only the outer quotes left `\"alice:secret\"` past the `--user` rule). Anything that
+/// is not exactly `<sh|bash|zsh> -c|-lc <one script>` is shown as given.
 fn unwrap_shell(cmd: &str) -> String {
-    for lead in [
-        "bash -lc ",
-        "/bin/bash -lc ",
-        "zsh -lc ",
-        "/bin/zsh -lc ",
-        "sh -c ",
-        "/bin/sh -c ",
-    ] {
-        if let Some(rest) = cmd.strip_prefix(lead) {
-            let rest = rest.trim();
-            let unq = rest
-                .strip_prefix('\'')
-                .and_then(|r| r.strip_suffix('\''))
-                .or_else(|| rest.strip_prefix('"').and_then(|r| r.strip_suffix('"')))
-                .unwrap_or(rest);
-            return unq.to_string();
+    let Some(words) = shell_words(cmd) else {
+        return cmd.to_string();
+    };
+    match words.as_slice() {
+        [shell, flag, script]
+            if matches!(
+                shell.rsplit('/').next().unwrap_or(shell),
+                "bash" | "zsh" | "sh"
+            ) && matches!(flag.as_str(), "-c" | "-lc") =>
+        {
+            script.clone()
+        }
+        _ => cmd.to_string(),
+    }
+}
+
+/// POSIX shell word splitting, no expansion: single quotes are literal, double quotes take `\` before
+/// `"`, `\`, `$`, `` ` `` and a newline, a bare `\` escapes the next character. `None` on an
+/// unterminated quote or a trailing `\`.
+fn shell_words(s: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut have = false;
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\'' => {
+                have = true;
+                loop {
+                    match it.next()? {
+                        '\'' => break,
+                        ch => cur.push(ch),
+                    }
+                }
+            }
+            '"' => {
+                have = true;
+                loop {
+                    match it.next()? {
+                        '"' => break,
+                        '\\' => match it.next()? {
+                            e @ ('"' | '\\' | '$' | '`') => cur.push(e),
+                            '\n' => {}
+                            e => {
+                                cur.push('\\');
+                                cur.push(e);
+                            }
+                        },
+                        ch => cur.push(ch),
+                    }
+                }
+            }
+            '\\' => {
+                have = true;
+                cur.push(it.next()?);
+            }
+            ch if ch.is_whitespace() => {
+                if have {
+                    out.push(std::mem::take(&mut cur));
+                    have = false;
+                }
+            }
+            ch => {
+                have = true;
+                cur.push(ch);
+            }
         }
     }
-    cmd.to_string()
+    if have {
+        out.push(cur);
+    }
+    Some(out)
 }
 
 /// A `pi --mode json` tool event as a call: `tool_execution_start` (`toolCallId`, `toolName`,
@@ -767,6 +823,41 @@ mod tests {
         assert_eq!(seen[5]["ok"], false);
     }
 
+    /// (xreview on #1207) codex's `bash -lc` script is DECODED before redaction, so a credential
+    /// inside mixed quotes is cut as in the script itself; anything not `sh -c <script>` is kept.
+    #[test]
+    fn a_codex_command_is_decoded_before_it_is_redacted() {
+        // shlex::try_join of ["bash", "-lc", script] for a script holding both quote kinds.
+        let script = r#"curl --user "alice:example-secret" -H 'Accept: application/json' https://example.invalid"#;
+        let joined = format!("bash -lc '{}'", script.replace('\'', r#"'"'"'"#));
+        assert_eq!(unwrap_shell(&joined), script);
+        let target = target_of(
+            "Bash",
+            &json!({"command": unwrap_shell(&joined)}),
+            Path::new("/w"),
+        )
+        .unwrap();
+        assert!(!target.contains("example-secret"), "{target}");
+        let dq = r#"/bin/zsh -lc "TOKEN=\"s3cr3t\" npm test""#;
+        assert_eq!(unwrap_shell(dq), r#"TOKEN="s3cr3t" npm test"#);
+        assert!(!target_of(
+            "Bash",
+            &json!({"command": unwrap_shell(dq)}),
+            Path::new("/w")
+        )
+        .unwrap()
+        .contains("s3cr3t"));
+        for kept in [
+            "cargo test --lib",
+            "bash -lc",
+            "bash -x 'ls'",
+            "bash -lc 'unterminated",
+            "python -c 'print(1)'",
+        ] {
+            assert_eq!(unwrap_shell(kept), kept);
+        }
+    }
+
     /// pi's `--mode json` tool executions drive the same frames, in claude's tool words.
     #[test]
     fn the_pi_stream_sends_a_frame_per_tool_execution() {
@@ -834,6 +925,14 @@ mod tests {
             activity: Some(q),
         };
         assert!(quiet.heartbeat().is_some());
+        // (xreview on #1207) A structured (container) launch is wrapped in `SessionTap`, which is
+        // the adapter the runner asks: it hands the inner adapter's heartbeat through.
+        let (c, _) = sink("/w/repo", "run-3");
+        let (tap, _) = crate::headless::SessionTap::new(
+            Box::new(crate::execute_wrapped::CodexJsonl::with_activity(Some(c))),
+            wicked_apps_core::spawn::SeatCli::Codex,
+        );
+        assert!(tap.heartbeat().is_some());
     }
 
     /// The claude stream adapter drives the sink live: a `tool_use` line starts a call, the

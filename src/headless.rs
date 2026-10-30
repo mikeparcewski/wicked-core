@@ -349,6 +349,12 @@ impl OutputAdapter for SessionTap {
     fn finish(&mut self) -> AdapterOut {
         self.inner.finish()
     }
+
+    /// The wrapped adapter's heartbeat: a structured (container) launch is wrapped here, and the
+    /// runner reads the heartbeat off the outermost adapter (xreview on #1207).
+    fn heartbeat(&self) -> Option<crate::tool_activity::Heartbeat> {
+        self.inner.heartbeat()
+    }
 }
 
 /// The id to remember after a turn that exited 0: the engine's own id when it chose one (a
