@@ -1601,6 +1601,19 @@ fn check_run_json(c: &crate::repo_checks::CheckRun) -> serde_json::Value {
         "failureIds": c.failure_ids,
         // core#1172 (additive): what the check's own retry cleared — flaky, passed on retry.
         "flakyIds": c.flaky_ids,
+        // core#1198 (additive): a run of a failing set only (`{by, ids}`), the engine's retry of
+        // this check (`{durationMs, exitCode, timedOut, failureIds, scope, wholeBecause}`), and
+        // whether the repo declares that the check retries its own failures.
+        "scope": c.scope.as_ref().map(run_scope_json),
+        "retry": c.retry.as_ref().map(|r| serde_json::json!({
+            "durationMs": r.duration_ms,
+            "exitCode": r.exit_code,
+            "timedOut": r.timed_out,
+            "failureIds": r.failure_ids,
+            "scope": r.scope.as_ref().map(run_scope_json),
+            "wholeBecause": r.whole_because,
+        })),
+        "selfRetry": c.self_retry,
         "classification": c.classification,
         "preExisting": c.pre_existing,
         "regressions": c.regressions,
@@ -1630,6 +1643,11 @@ fn test_selection_json(s: &crate::floor_affected::TestSelection) -> serde_json::
         "changedSymbols": s.changed_symbols,
         "reachedSymbols": s.reached_symbols,
     })
+}
+
+/// The wire form of a failing-set run's scope (core#1198).
+fn run_scope_json(s: &crate::repo_checks::RunScope) -> serde_json::Value {
+    serde_json::json!({ "by": s.by, "ids": s.ids })
 }
 
 /// The wire form of the floor's decision on one check (`checks[].decision`).

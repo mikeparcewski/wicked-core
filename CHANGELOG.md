@@ -36,6 +36,27 @@ Two release tracks share this file, newest entry first regardless of track:
   600 s failure guard: a test `Runtime` that answers carries it, the floor fixtures declare it, and a production
   deadline reads it only under `cfg(test)`. Stand-ins that must stall keep their short deadlines, and waits on a
   child or a file wait on that condition. Release builds are unchanged.
+- **A failed test check is retried and compared on the base for its failing tests only (core#1198).** Rig run
+  ea73afc0 (a crew change to `routes.ts`) ran the whole suite three times per hand-off floor: the head (12 min),
+  the identical retry (8–13 min) and the base (9 min), for 17–21 failing files out of 409. A repo now declares
+  how to re-run a set of tests in `.wicked/checks.json`:
+  `"rerun": {"test": {"command": [..., "{files}"], "by": "file", "root": "packages/crew"}}` (or `"{names}"` with
+  `"by": "name"` for libtest's `--exact`), keyed by `test`, `test_targeted` or `cargo-test`, validated as strictly
+  as `generated`. The failing set comes from the head's parsed `failureIds`. The exit codes still decide:
+  - a failing-set run that fails stands (the retry denies; the base is red);
+  - a failing-set retry that passes stands only when the head's own failure count matches the set (no unhandled
+    error, no crashed test binary, no build error) and the retry shows each test passing. Otherwise the whole
+    identical retry runs and decides;
+  - a failing-set base run that passes stands only when it shows each selected test the base has passing (a
+    file the change added is not on the base). Otherwise the whole base runs and decides. A cached whole base
+    still answers a failing set.
+
+  The base is compared test by test, so a base that is red only on tests the head passes no longer hides the
+  head's own failures as `base_red_unseparated`. `"self_retry": true` marks a check that re-runs its own failures
+  (crew's `test-related.mjs`): the engine skips its second retry and goes straight to the base comparison.
+  Without a declaration nothing changes. `repoChecksEvaluated.checks[]` gains `retry`
+  (`{durationMs, exitCode, timedOut, failureIds, scope, wholeBecause}`), `selfRetry`, and `scope` (`{by, ids}`)
+  on a failing-set run (`reruns[]`, `base.run`).
 - **Live tool activity and the orchestrator's working notes (power mode, operator ask 2026-10-30).**
   - `toolActivity` frames are emitted live from a claude seat's stream: a `tool_use` starts a call and the
     `tool_result` that answers it finishes it. The shape is `{session, ord, attempt, at, id, state, kind, tool,
