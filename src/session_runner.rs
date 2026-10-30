@@ -877,6 +877,7 @@ mod tests {
             assurance: None,
             qe_acceptance: None,
             qe_reviewer_seats: Vec::new(),
+            qe_floor_note: None,
             qe_review_session: None,
             qe_review: None,
             read_view: None,

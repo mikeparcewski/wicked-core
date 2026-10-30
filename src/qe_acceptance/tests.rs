@@ -607,3 +607,57 @@ fn whole_files_see_what_the_hunk_window_cannot() {
         signals.new_public_symbols
     );
 }
+
+/// (rig run 1d372696: the codex QE agent spent 6.4 min re-running a file the floor had passed) The
+/// QE unit is told what the run's own floor proved on the exact tree it starts on, and to run only
+/// what its scenario needs beyond that. Another tree, a later unit, or no floor says nothing.
+#[test]
+fn the_qe_directive_carries_the_floors_evidence_on_its_own_tree() {
+    let mut build = qe_unit(2);
+    build.repo_checks = Some(
+        serde_json::from_value(serde_json::json!({
+            "detected": [], "skipped": [], "passed": true, "sandbox_level": "sandboxed",
+            "tree": "1c55725e574acc24d5",
+            "checks": [
+                {"name": "install", "argv": ["npm", "ci"], "source": "t", "exit_code": 0,
+                 "timed_out": false, "duration_ms": 1, "stdout_tail": "", "stderr_tail": ""},
+                {"name": "test_targeted", "argv": ["node", "x"], "source": "t", "exit_code": 0,
+                 "timed_out": false, "duration_ms": 1, "stdout_tail": "", "stderr_tail": ""}
+            ],
+        }))
+        .unwrap(),
+    );
+    let later = WorkUnit {
+        ord: 5,
+        ..build.clone()
+    };
+    let units = vec![build.clone(), later];
+    let note = floor_note(&units, 4, "1c55725e574acc24d5").expect("a floor on this tree");
+    assert!(
+        note.contains("install passed, test_targeted passed")
+            && note.contains("unit 2")
+            && note.contains("1c55725e57")
+            && note.contains("Do not run those suites again"),
+        "{note}"
+    );
+    assert!(
+        note.len() < 400,
+        "short: it rides the unit prompt ({})",
+        note.len()
+    );
+    assert_eq!(floor_note(&units, 4, "another-tree"), None);
+    assert_eq!(
+        floor_note(&units, 2, "1c55725e574acc24d5"),
+        None,
+        "only earlier units"
+    );
+    let mut qe = qe_unit(4);
+    qe.qe_floor_note = Some(note.clone());
+    let mut q = waived_at(4);
+    q.status = a::QE_REQUIRED.into();
+    qe.qe_acceptance = Some(q.clone());
+    assert!(unit_directive(&qe, "wicked-garden:qe").ends_with(&note));
+    q.status = a::QE_WAIVED.into();
+    qe.qe_acceptance = Some(q);
+    assert!(!unit_directive(&qe, "wicked-garden:qe").contains(&note));
+}

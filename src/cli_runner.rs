@@ -1006,6 +1006,10 @@ fn run_floor_fix(
 /// floor as stalled (disclosed; the engine does not read crew settings).
 const FLOOR_HEARTBEAT_EVERY: Duration = Duration::from_secs(300);
 
+/// (rig run 1d372696) The unit's live note while a distinct seat judges the change, before the
+/// repository's checks run (the hand-off to floor gap read as 1.5 min with no event).
+const JUDGE_NOTE: &str = "judge: a distinct seat is reviewing the change before the checks run";
+
 /// Run `work` while a scoped side thread emits `"<label> — N min"` through `emit` at `t = 0` and
 /// then every `every` until `work` returns — liveness for a long, otherwise silent phase on the
 /// unit's EXISTING live-output stream (`Command::CliOutputDelta` → the coalesced, durable,
@@ -3154,13 +3158,18 @@ fn run_unit_and_judge_on(
                 judge_skipped = Some(why);
                 break 'pinned None;
             }
-            let (verdict, refused) = crate::validator::agent_validate_with_refusals(
-                &judge_criterion,
-                work_for_agent,
-                &excluded,
-                roster,
-                &**runner,
-            );
+            // (rig run 1d372696) The judge runs between the seat's hand-off and the floor: without
+            // a note the run showed 1.5 min with no event at all. Said on the unit's own stream.
+            let (verdict, refused) =
+                with_floor_heartbeat(emit_delta, JUDGE_NOTE, FLOOR_HEARTBEAT_EVERY, || {
+                    crate::validator::agent_validate_with_refusals(
+                        &judge_criterion,
+                        work_for_agent,
+                        &excluded,
+                        roster,
+                        &**runner,
+                    )
+                });
             note_refusals(&refused);
             // (crew main red 2026-10-11) An outside seat is a LAST RESORT that replaces a skipped
             // judge: when only outside seats could judge and every one of them failed as a seat
@@ -3339,13 +3348,16 @@ fn run_unit_and_judge_on(
                      (F-7R2-005)",
                     input.unit.ord
                 );
-                let (verdict, refused) = crate::validator::agent_validate_with_refusals(
-                    &criterion,
-                    work_for_agent,
-                    &excluded,
-                    roster,
-                    &**runner,
-                );
+                let (verdict, refused) =
+                    with_floor_heartbeat(emit_delta, JUDGE_NOTE, FLOOR_HEARTBEAT_EVERY, || {
+                        crate::validator::agent_validate_with_refusals(
+                            &criterion,
+                            work_for_agent,
+                            &excluded,
+                            roster,
+                            &**runner,
+                        )
+                    });
                 note_refusals(&refused);
                 Some(match verdict {
                     Ok(av) => {
@@ -10149,6 +10161,14 @@ mod judge_fallback_tests {
         );
         assert!(
             deltas.iter().any(|d| d == &format!("\n{}\n", fb.label)),
+            "{deltas:?}"
+        );
+        // (rig run 1d372696) The judge's run is said on the unit's stream as it starts, so the
+        // hand-off to floor gap is never silent.
+        assert!(
+            deltas
+                .iter()
+                .any(|d| d.contains(&format!("{JUDGE_NOTE} — 0 min"))),
             "{deltas:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);

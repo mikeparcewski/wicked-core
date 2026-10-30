@@ -14,6 +14,17 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The judge before the floor says it is running.** On rig run 1d372696 the 1.5 min between the orchestrator's hand-off
+  and the floor's start had no event: a distinct seat was judging the change. The judge now writes
+  "judge: a distinct seat is reviewing the change before the checks run — N min" on the unit's stream as it starts
+  and every 5 min.
+- **A hand-off step reads "passed" when its unit counts, not when the next unit starts (wicked-core#1209).** The QE
+  step read "running" through the whole deliver-gate wait. `power_gate::on_counted` marks a counted review, security
+  or QE step passed at its gate.
+- **The QE unit is told what the floor already proved.** On rig run 1d372696 the codex QE agent spent 6.4 min
+  re-running a test file the floor had passed. A QE unit's dispatch now stamps `qe_floor_note`: the latest earlier
+  floor that ran on the exact tree it starts on, each check and its outcome. Its prompt says to cite those results
+  and run only what its scenario needs beyond them.
 - **Live tool activity for codex and pi seats, and a heartbeat for every quiet seat.** On rig run 1d372696 a codex QE
   step read "Codex Working on Check…" with no activity for 20+ s: `toolActivity` came only from claude's stream
   (#1195). The same frames (and the same `wicked.run.tool.*` bus mirror) now come from codex's `exec --json` items

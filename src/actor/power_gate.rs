@@ -762,6 +762,41 @@ pub(super) fn on_dispatch(
     }
 }
 
+/// (wicked-core#1209, rig run 1d372696) A hand-off step's unit COUNTED (its gate allowed it): the
+/// step passed now, not when the next unit dispatches. The QE step read "running" for the whole
+/// deliver-gate wait because only [`on_dispatch`] marked it. Only a step whose latest row is still
+/// `running` (a power run's review, security or QE unit) is marked; the build's checks keep their
+/// own rule in `on_dispatch` (its gate is the floor's, and a round may still send it back).
+pub(super) fn on_counted(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    run_id: &str,
+    ord: u32,
+) {
+    let Ok(Some(session)) = crate::domain::get_session(&*store, run_id) else {
+        return;
+    };
+    let Some(power) = session.power.as_ref() else {
+        return;
+    };
+    let running = power
+        .handoff
+        .iter()
+        .flat_map(|h| h.steps.iter())
+        .rev()
+        .find(|s| s.ord == Some(ord))
+        .is_some_and(|s| s.status == "running" && s.step != "checks");
+    if !running {
+        return;
+    }
+    let Ok(units) = crate::domain::session_units(&*store, run_id) else {
+        return;
+    };
+    if let Some(u) = units.into_iter().find(|u| u.ord == ord) {
+        handoff_step(store, subscribers, run_id, &u, "passed", None);
+    }
+}
+
 /// (program DES-POWER-MODE §6) A hand-off NOT-PASS on a power run goes back to the SAME
 /// orchestrator session on its own — a `request_changes` rewind to the build, whose seat resumes
 /// its session — up to [`crate::power::MAX_HANDOFF_ROUNDS`]; the next asks the operator. `Some`

@@ -7775,6 +7775,10 @@ fn apply_step_result(
     session.unit_ix = output.unit_ix + 1;
     session.attempt = units.get(session.unit_ix).map(next_attempt).unwrap_or(0);
     put_node(store, session.to_node())?;
+    // (wicked-core#1209) A counted power hand-off step passed now, not at the next dispatch (the
+    // QE step read "running" through the whole deliver-gate wait). After the session write above,
+    // which would otherwise overwrite the step row with this fold's copy of the session.
+    power_gate::on_counted(store, subscribers, &run_id, unit_ord);
 
     // Advance (a held revision is applied first, in `advance_or_pause`): dispatch the next unit, pause at its human-confirm gate, or finalize.
     match advance_or_pause(
@@ -10837,14 +10841,28 @@ fn dispatch_unit(
         // reviewer on — from the run's own seats, stamped here (the worker has no store).
         let mut stamped = unit.clone();
         stamped.qe_acceptance = stamp;
+        let qe_unit = stamped.qe_acceptance.is_some();
+        let units = if qe_unit {
+            crate::domain::session_units(&*store, run_id)?
+        } else {
+            Vec::new()
+        };
         stamped.qe_reviewer_seats = if crate::qe_acceptance::review::applies(&stamped) {
-            let units = crate::domain::session_units(&*store, run_id)?;
             crate::qe_acceptance::review::candidates(&session, &units, &stamped)
         } else {
             Vec::new()
         };
+        // (rig run 1d372696) What the run's own floor proved on the tree this QE unit starts on.
+        stamped.qe_floor_note = if qe_unit {
+            unit.worktree_baseline
+                .as_ref()
+                .and_then(|b| crate::qe_acceptance::floor_note(&units, unit.ord, &b.tree))
+        } else {
+            None
+        };
         if unit.qe_acceptance != stamped.qe_acceptance
             || unit.qe_reviewer_seats != stamped.qe_reviewer_seats
+            || unit.qe_floor_note != stamped.qe_floor_note
         {
             unit = stamped;
             put_node(store, unit.to_node())?;
@@ -15641,6 +15659,7 @@ fn judge_by_operator(
             ord,
         },
     );
+    power_gate::on_counted(store, subscribers, run_id, ord);
     in_flight.insert(run_id.to_string());
     match advance_or_pause(
         store,
@@ -15751,6 +15770,7 @@ fn land_with_carried_items(
             ord,
         },
     );
+    power_gate::on_counted(store, subscribers, run_id, ord);
     in_flight.insert(run_id.to_string());
     match advance_or_pause(
         store,

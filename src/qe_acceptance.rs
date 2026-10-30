@@ -460,13 +460,59 @@ pub(crate) fn directive(qe: &QeAcceptance, skill: &str) -> String {
 /// ([`review::applies`]) the evidence-only directive (resuming the last QE run on a same-tree
 /// retry), else [`directive`].
 pub(crate) fn unit_directive(unit: &WorkUnit, skill: &str) -> String {
+    let floor = unit
+        .qe_floor_note
+        .as_deref()
+        .filter(|_| unit.qe_acceptance.as_ref().is_some_and(|q| q.required()))
+        .map(|n| format!(" {n}"))
+        .unwrap_or_default();
     if review::applies(unit) {
-        return review::evidence_directive(skill, review::resume_dir(unit));
+        return format!(
+            "{}{floor}",
+            review::evidence_directive(skill, review::resume_dir(unit))
+        );
     }
     unit.qe_acceptance
         .as_ref()
-        .map(|q| directive(q, skill))
+        .map(|q| format!("{}{floor}", directive(q, skill)))
         .unwrap_or_default()
+}
+
+/// (rig run 1d372696: the codex QE agent spent 6.4 min re-running a test file the floor had already
+/// passed) What the run's own floor proved on `tree`, for the QE unit's prompt: the LATEST creator
+/// or verify floor of an earlier unit that ran on exactly that tree and ran its checks, each check
+/// with its outcome (and failing-test count). Short by contract (it rides the unit prompt). `None`
+/// when no earlier floor ran on that tree.
+pub(crate) fn floor_note(units: &[WorkUnit], ord: u32, tree: &str) -> Option<String> {
+    let (u, r) = units
+        .iter()
+        .filter(|u| u.ord < ord)
+        .filter_map(|u| u.repo_checks.as_ref().map(|r| (u, r)))
+        .filter(|(_, r)| r.tree.as_deref() == Some(tree) && !r.checks.is_empty())
+        .filter(|(_, r)| r.sandbox_error.is_none() && r.detect_error.is_none())
+        .max_by_key(|(u, _)| u.ord)?;
+    let checks: Vec<String> = r
+        .checks
+        .iter()
+        .take(12)
+        .map(|c| {
+            let n = c.failure_ids.len();
+            if n > 0 {
+                format!("{} {} ({n} failing)", c.name, c.outcome())
+            } else {
+                format!("{} {}", c.name, c.outcome())
+            }
+        })
+        .collect();
+    let short: String = tree.chars().take(10).collect();
+    Some(format!(
+        "The engine's own floor already ran the repository's checks on this exact tree ({short}, \
+         unit {}): {}. Do not run those suites again: cite them as evidence (its \
+         repoChecksEvaluated record), and run only what your scenario needs that they do not \
+         cover.",
+        u.ord,
+        checks.join(", ")
+    ))
 }
 
 pub(crate) mod review;
