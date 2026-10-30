@@ -1306,8 +1306,23 @@ pub(crate) fn apply_and_finish_unit(
         .and_then(|r| r.requested_rerun.as_ref())
         .is_none()
         && !unit.requested_rejudge.as_ref().is_some_and(|r| !r.consumed);
-    // (core#1168) The operator's override of the creator floor, carried onto this verify floor.
+    // (core#1168, core#1186) An operator's floor override carried onto this floor's failure.
     let mut carried_override: Option<crate::assurance::OperatorJudgment> = None;
+    // The phase of a unit of this run, for a carried override's label ("from fix (unit 3)").
+    // Read only when a failed floor result could carry one.
+    let run_units = if evidence.repo_checks.as_ref().is_some_and(|r| !r.passed)
+        || carried.as_ref().is_some_and(|r| !r.passed)
+    {
+        crate::domain::session_units(store, session_id).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let phase_of = |ord: u32| -> Option<String> {
+        run_units
+            .iter()
+            .find(|u| u.ord == ord)
+            .and_then(|u| u.phase_id().map(str::to_string))
+    };
     let checks_denial: Option<(&'static str, String)> =
         match &evidence.repo_checks {
             Some(report) => {
@@ -1387,18 +1402,29 @@ pub(crate) fn apply_and_finish_unit(
                 );
                     None
                 } else if let Some(carry) = (!report.passed
-                    && unit.repo_checks_floor
-                    && !crate::deliver_lift::is_deliver_unit(unit))
+                    && !crate::deliver_lift::is_deliver_unit(unit)
+                    && unit.tool_cmd.is_none()
+                    // An operator's explicit re-run asks for a fresh word on this tree.
+                    && recheck.is_none())
                 .then(|| {
-                    carried_floor_override(run_session.as_ref(), session_id, unit, attempt, report)
+                    carried_floor_override(
+                        run_session.as_ref(),
+                        session_id,
+                        unit,
+                        attempt,
+                        report,
+                        false,
+                        &phase_of,
+                    )
                 })
                 .flatten()
                 {
-                    // (core#1168) The operator already overrode exactly this result at the creator's
-                    // floor: same tree, same base, and every failing check reused from that floor.
-                    // The override stands here too, labelled as carried; nothing is asked again.
+                    // (core#1168, core#1186) The operator already overrode this failure on this
+                    // tree and base: the very result this verify floor reused, or a result whose
+                    // failing tests include every one failing here. The override stands, labelled
+                    // as carried; nothing is asked again.
                     eprintln!(
-                        "wicked-core: unit {} verify floor: {} — {}",
+                        "wicked-core: unit {} floor: {} — {}",
                         unit.ord,
                         carry
                             .floor_override
@@ -1440,15 +1466,49 @@ pub(crate) fn apply_and_finish_unit(
             None if carried.as_ref().is_some_and(|r| !r.passed) => {
                 floor_carried = true;
                 let r = carried.as_ref().expect("checked");
-                Some((
-                    r.denial_source(),
-                    format!(
-                        "the rework left the tree unchanged; this unit's last floor result on \
+                // (core#1186) The rework left the tree unchanged and the operator already
+                // overrode this failure on it: the override stands (carried, labelled) — only
+                // when nothing else denied behind that floor last time (the judge does not run
+                // again on an unchanged tree, so its last word must have been clear).
+                let carry = prior_denials_behind
+                    .as_ref()
+                    .is_some_and(|b| b.is_empty())
+                    .then(|| {
+                        carried_floor_override(
+                            run_session.as_ref(),
+                            session_id,
+                            unit,
+                            attempt,
+                            r,
+                            true,
+                            &phase_of,
+                        )
+                    })
+                    .flatten();
+                if let Some(carry) = carry {
+                    eprintln!(
+                        "wicked-core: unit {} floor on the unchanged tree: {} — {}",
+                        unit.ord,
+                        carry
+                            .floor_override
+                            .as_ref()
+                            .map(|f| f.label.as_str())
+                            .unwrap_or_default(),
+                        r.summary()
+                    );
+                    carried_override = Some(carry);
+                }
+                carried_override.is_none().then(|| {
+                    (
+                        r.denial_source(),
+                        format!(
+                            "the rework left the tree unchanged; this unit's last floor result on \
                          this tree stands ({}): {}",
-                        r.outcome(),
-                        r.denial_reason()
-                    ),
-                ))
+                            r.outcome(),
+                            r.denial_reason()
+                        ),
+                    )
+                })
             }
             // (F-7R2-005) The DEFAULT floor: an agent unit that CHANGED the tree it was handed owes
             // the repository's own checks — a changed tree with no report is the same fail-closed
@@ -3011,23 +3071,34 @@ pub(crate) const NO_CHANGE_CONTRADICTED: &str =
     "the attempt said no change was needed but changed \
      the tree, so it was read as a change and the floor ran on the new tree: ";
 
-/// (core#1168) The operator's override of a CREATOR floor result, carried onto the verify floor that
-/// reused it: `Some` only when this verify floor failed on checks it ALL took from that creator floor
-/// (`reused_from`, not voided — so the failing set is that floor's own results), on the same tree and
-/// base as the overridden result's key, and the operator overrode that unit's floor at the very
-/// attempt whose result was reused. Any fresh failure or timeout, a changed tree or base, a voided
-/// reuse, another attempt's override, or no recorded key asks again (`None`).
-/// The carried judgment keeps the operator's name and rationale, names this verify floor's result and
-/// key (so the deliver phase can stand on it), and says where it came from.
+/// (core#1168, core#1186) An operator's floor override CARRIED onto a later failed floor of this
+/// run, so the identical (or a narrower) failure does not ask the operator again. `Some` when the
+/// report ran its checks (no sandbox or detection error, nothing timed out or unfinished), is keyed,
+/// and EITHER:
+/// - (core#1168, exact) this is a verify floor whose every failing check it REUSED (not voided)
+///   from a creator floor, and the operator overrode that unit's floor at the very attempt whose
+///   result was reused, on the same tree and base; OR
+/// - (core#1186, subset) an override given at a gate of this run, on the SAME tree and base, named
+///   its failing tests ([`crate::assurance::FloorOverride::failing`]), every check that fails here
+///   named its failures too, and each of them is in that list. Another attempt, a reused or a
+///   fresh result, the next floor or the verify floor: the tree, the base and the tests decide.
+///
+/// Anything new asks again: a test the override did not name, a check that failed without naming
+/// its tests, another tree or base, a timeout. Overrides that were themselves carried are never a
+/// source. The carried judgment keeps the operator's name and rationale, names THIS floor's result
+/// and key (so a deliver phase on a verify key can stand on it) and says where it came from.
+/// `phase_of` names a unit's phase for the label.
 pub(crate) fn carried_floor_override(
     session: Option<&crate::domain::AgentSession>,
     session_id: &str,
     unit: &crate::domain::WorkUnit,
     attempt: u32,
     report: &crate::repo_checks::RepoChecksReport,
+    // The report is this unit's last result carried onto an unchanged tree (a copy, not a run).
+    copy: bool,
+    phase_of: &dyn Fn(u32) -> Option<String>,
 ) -> Option<crate::assurance::OperatorJudgment> {
     let session = session?;
-    let reuse = report.reused_from.as_ref().filter(|r| r.voided.is_none())?;
     let key = report.key.as_ref()?;
     let failing: Vec<&str> = report
         .checks
@@ -3035,10 +3106,16 @@ pub(crate) fn carried_floor_override(
         .filter(|c| c.denies())
         .map(|c| c.name.as_str())
         .collect();
-    // Every failing check must be one the verify floor REUSED. Names are not unique across
-    // directories, so a name that also ran fresh here is not taken as reused; and a check that did
-    // not finish is never a reused result (the creator record keeps finished checks only).
+    // A check that did not finish is never a reused result (the creator record keeps finished
+    // checks only) and has no complete list of failing tests.
+    // Never the deliver unit (its own override rule keys on the shipped tree, base and checks), a
+    // tool step, or an operator's explicit re-run (a fresh word was asked for) — on every path
+    // into this function, the unchanged-tree carry included (xreview on #1203).
     if failing.is_empty()
+        || crate::deliver_lift::is_deliver_unit(unit)
+        || unit.tool_cmd.is_some()
+        || report.recheck.is_some()
+        || report.requested_rerun.is_some()
         || report.sandbox_error.is_some()
         || report.detect_error.is_some()
         || report.timed_out()
@@ -3046,29 +3123,117 @@ pub(crate) fn carried_floor_override(
             .checks
             .iter()
             .any(|c| c.denies() && c.did_not_finish())
-        || !failing
-            .iter()
-            .all(|n| reuse.reused.iter().any(|r| r == n) && !reuse.fresh.iter().any(|f| f == n))
     {
         return None;
     }
-    let (judgment, overridden) = session
-        .assurance
-        .floor_overrides
-        .iter()
-        .rev()
-        .find_map(|j| {
-            let f = j.floor_override.as_ref()?;
-            let k = f.key.as_ref()?;
-            (f.carried_from.is_none()
-                && f.ord == reuse.ord
-                && f.attempt == reuse.attempt
-                && k.tree == key.tree
-                && k.base == key.base)
-                .then_some((j, f))
-        })?;
+    let own = |j: &&crate::assurance::OperatorJudgment| {
+        j.floor_override
+            .as_ref()
+            .is_some_and(|f| f.carried_from.is_none())
+    };
+    // (core#1168) The exact rule: every failing check reused from the overridden creator result.
+    // Names are not unique across directories, so a name that also ran fresh here is not reused.
+    let exact = report
+        .reused_from
+        .as_ref()
+        .filter(|r| r.voided.is_none())
+        .filter(|reuse| {
+            failing
+                .iter()
+                .all(|n| reuse.reused.iter().any(|r| r == n) && !reuse.fresh.iter().any(|f| f == n))
+        })
+        .and_then(|reuse| {
+            session
+                .assurance
+                .floor_overrides
+                .iter()
+                .rev()
+                .filter(own)
+                .find(|j| {
+                    let f = j.floor_override.as_ref().expect("own");
+                    f.key.as_ref().is_some_and(|k| {
+                        f.ord == reuse.ord
+                            && f.attempt == reuse.attempt
+                            && k.tree == key.tree
+                            && k.base == key.base
+                    })
+                })
+                .map(|j| (j, reuse.phase.clone()))
+        });
+    // (core#1186) The identity rule: this floor holds a copy of the very failure overridden (a
+    // verify floor's reuse, an unchanged-tree carry), whichever attempt the override was given at.
+    // Only for a report that IS a copy of an earlier result: every failing check reused (not
+    // voided, not also fresh) from a creator record, or the caller's unchanged-tree carry
+    // (`copy`). A fresh run is never compared by identity.
+    let all_reused = report
+        .reused_from
+        .as_ref()
+        .filter(|r| r.voided.is_none())
+        .is_some_and(|reuse| {
+            failing
+                .iter()
+                .all(|n| reuse.reused.iter().any(|r| r == n) && !reuse.fresh.iter().any(|f| f == n))
+        });
+    // The unit whose result this is: the creator unit a verify floor reused, or this unit for an
+    // unchanged-tree carry. An override of another unit's floor is never this result's.
+    let source_ord = if copy {
+        Some(unit.ord)
+    } else {
+        report.reused_from.as_ref().map(|r| r.ord)
+    };
+    let identity = || {
+        if !(copy || all_reused) {
+            return None;
+        }
+        let source_ord = source_ord?;
+        let now = report.result_fingerprint()?;
+        session
+            .assurance
+            .floor_overrides
+            .iter()
+            .rev()
+            .filter(own)
+            .find(|j| {
+                let f = j.floor_override.as_ref().expect("own");
+                f.key
+                    .as_ref()
+                    .is_some_and(|k| k.tree == key.tree && k.base == key.base)
+                    && f.ord == source_ord
+                    && f.fingerprint.as_deref() == Some(now.as_str())
+            })
+            .map(|j| {
+                let ord = j.floor_override.as_ref().expect("own").ord;
+                (j, phase_of(ord))
+            })
+    };
+    // (core#1186) The subset rule: the same tree and base, and every failing test already ruled on
+    // (both lists complete and file-qualified, `failing_set`).
+    let subset = || {
+        let now = report.failing_set()?;
+        session
+            .assurance
+            .floor_overrides
+            .iter()
+            .rev()
+            .filter(own)
+            .find(|j| {
+                let f = j.floor_override.as_ref().expect("own");
+                f.key
+                    .as_ref()
+                    .is_some_and(|k| k.tree == key.tree && k.base == key.base)
+                    && f.failing
+                        .as_ref()
+                        .is_some_and(|ruled| now.iter().all(|t| ruled.contains(t)))
+            })
+            .map(|j| {
+                let ord = j.floor_override.as_ref().expect("own").ord;
+                (j, phase_of(ord))
+            })
+    };
+    let (judgment, phase) = exact.or_else(identity).or_else(subset)?;
+    let overridden = judgment.floor_override.as_ref().expect("own");
     let layer = report.denial_source().to_string();
-    let phase = reuse.phase.as_deref().unwrap_or("the creator floor");
+    let phase = phase.unwrap_or_else(|| "the creator floor".to_string());
     Some(crate::assurance::OperatorJudgment {
         by: judgment.by.clone(),
         at: crate::interaction::now_millis(),
@@ -3080,9 +3245,11 @@ pub(crate) fn carried_floor_override(
             ord: unit.ord,
             attempt,
             tree: report.tree.clone().or_else(|| Some(key.tree.clone())),
-            label: crate::assurance::carried_override_label(phase, reuse.ord),
+            label: crate::assurance::carried_override_label(&phase, overridden.ord),
             key: Some(key.clone()),
             carried_from: Some(overridden.result_id.clone()),
+            failing: report.failing_set(),
+            fingerprint: report.result_fingerprint(),
         }),
         judge_stand_in: None,
     })
@@ -4776,6 +4943,8 @@ mod judge_bench_tests {
                         checks: "creator-digest".into(),
                     }),
                     carried_from: None,
+                    failing: None,
+                    fingerprint: None,
                 }),
                 judge_stand_in: None,
             });
@@ -4983,6 +5152,182 @@ mod judge_bench_tests {
             outcome.denial.map(|d| d.source),
             units[0].clone(),
         )
+    }
+
+    /// (core#1186) The fold of a creator attempt that left the tree `t1` unchanged (a hand-off or
+    /// retry round answered with no edit), its last floor result on `t1` failed naming `now`, and
+    /// the operator had overridden a floor on `t1` / base `b1` that named `ruled`. `behind`: what
+    /// denied behind the floor last time. Returns the approval, the denial source and the receipt.
+    fn fold_unchanged_tree_after_override(
+        sid: &str,
+        now: &[&str],
+        ruled: &[&str],
+        behind: Option<Vec<crate::domain::UnitDenial>>,
+    ) -> (
+        bool,
+        Option<String>,
+        Option<crate::assurance::AssuranceReceipt>,
+    ) {
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let mut sink = |_e: CoreEvent| {};
+        let Planned {
+            mut units,
+            workflow_id,
+            cli_keys,
+            ..
+        } = plan_and_distribute(
+            &mut store,
+            &[cli("a"), cli("b")],
+            "Do step one.",
+            EntityMode::Shared,
+            sid,
+            crate::domain::HumanConfirm::None,
+            false,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            &mut sink,
+            None,
+            false,
+            false,
+            Vec::new(),
+            None,
+            true,
+            &crate::assurance::QeOverride::Auto,
+        )
+        .expect("plan");
+        let report = |ids: &[&str]| -> crate::repo_checks::RepoChecksReport {
+            serde_json::from_value(serde_json::json!({
+                "detected": [], "skipped": [], "passed": false, "sandbox_level": "sandboxed",
+                "tree": "t1", "key": {"tree": "t1", "base": "b1", "checks": "creator-digest"},
+                "checks": [{"name": "test", "argv": ["cargo", "test"], "source": "t",
+                    "exit_code": 101, "timed_out": false, "duration_ms": 1,
+                    "stdout_tail": "", "stderr_tail": "", "failure_ids": ids}],
+            }))
+            .unwrap()
+        };
+        let mut session = crate::domain::get_session(&store, sid).unwrap().unwrap();
+        session
+            .assurance
+            .floor_overrides
+            .push(crate::assurance::OperatorJudgment {
+                by: "local (human)".into(),
+                at: 1,
+                note: Some("load-bound tests".into()),
+                reason: None,
+                floor_override: Some(crate::assurance::FloorOverride {
+                    layer: "repo_checks".into(),
+                    result_id: format!("{sid}:unit-{}:attempt-1:repo_checks", units[0].ord),
+                    ord: units[0].ord,
+                    attempt: 1,
+                    tree: Some("t1".into()),
+                    label: crate::assurance::FLOOR_OVERRIDE_LABEL.into(),
+                    key: report(ruled).key,
+                    carried_from: None,
+                    failing: None,
+                    fingerprint: report(ruled).result_fingerprint(),
+                }),
+                judge_stand_in: None,
+            });
+        put_node(&mut store, session.to_node()).unwrap();
+        let unit = &mut units[0];
+        unit.default_floor = true;
+        unit.worktree_baseline = Some(
+            serde_json::from_value(
+                serde_json::json!({"head": "h1", "tree": "t1", "taken_at_ms": 0}),
+            )
+            .unwrap(),
+        );
+        unit.repo_checks = Some(report(now));
+        unit.denials_behind = behind;
+        let evidence = crate::workflow::UnitEvidence {
+            tree_changed: Some(false),
+            ..Default::default()
+        };
+        let outcome = apply_and_finish_unit(
+            &mut store,
+            unit,
+            "the step's output, unchanged tree: NO CHANGE NEEDED, the failures are load-bound",
+            &workflow_id,
+            EntityMode::Shared,
+            sid,
+            2,
+            false,
+            false,
+            &cli_keys,
+            None,
+            &evidence,
+            &mut |_| {},
+            None,
+        )
+        .expect("apply");
+        (
+            outcome.approved,
+            outcome.denial.map(|d| d.source),
+            units[0].assurance.clone(),
+        )
+    }
+
+    /// (core#1186) On an unchanged tree the floor's last result stands; when the operator already
+    /// overrode that very failure on that tree (its identity) and nothing else denied behind it,
+    /// the override is carried instead of asking again. Another failure, or a layer that denied
+    /// behind the floor last time, still denies.
+    #[test]
+    fn core_1186_an_unchanged_tree_stands_on_the_override_of_its_failure() {
+        let ruled = ["test a ... FAILED", "test b ... FAILED"];
+        let (approved, denial, receipt) =
+            fold_unchanged_tree_after_override("carry-1186-a", &ruled, &ruled, Some(Vec::new()));
+        assert!(approved, "carried: {denial:?}");
+        let r = receipt.expect("a receipt");
+        let labels: Vec<&str> = r
+            .operator_judges
+            .iter()
+            .filter_map(|j| j.floor_override.as_ref())
+            .map(|o| o.label.as_str())
+            .collect();
+        assert_eq!(labels.len(), 1, "{labels:?}");
+        assert!(
+            labels[0].starts_with("override carried from "),
+            "{labels:?}"
+        );
+        assert!(r.ran.iter().any(|i| i == crate::assurance::OPERATOR_JUDGE));
+
+        let (approved, denial, _) = fold_unchanged_tree_after_override(
+            "carry-1186-b",
+            &["test a ... FAILED", "test z ... FAILED"],
+            &ruled,
+            Some(Vec::new()),
+        );
+        assert!(
+            !approved,
+            "a failure the operator did not rule on asks again"
+        );
+        assert_eq!(denial.as_deref(), Some(crate::repo_checks::DENIAL_SOURCE));
+
+        let (approved, _, _) = fold_unchanged_tree_after_override(
+            "carry-1186-c",
+            &ruled,
+            &ruled,
+            Some(vec![crate::domain::UnitDenial::new(
+                "agent_validator",
+                "REJECT: wrong",
+            )]),
+        );
+        assert!(
+            !approved,
+            "a judge REJECT behind the floor last time still stands"
+        );
+        let (approved, _, _) = fold_unchanged_tree_after_override(
+            "carry-1186-d",
+            &["test a ... FAILED"],
+            &ruled,
+            None,
+        );
+        assert!(!approved, "no record of what denied behind it: fail-closed");
     }
 
     /// (rig run ea73afc0) A creator attempt's fold with a fresh FAILED floor report: `reply` is the

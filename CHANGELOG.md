@@ -14,6 +14,18 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A floor override carries to a later floor on the same tree when it fails on what the operator ruled on
+  (core#1186).** The override now records the failure's identity (`floorOverride.fingerprint`) and, where the floor
+  showed it complete and file-qualified, the failing tests (`floorOverride.failing`, `<dir>|<check>: <test>`), both
+  additive. A later failed floor of the same run on the same tree and base stands on the override, labelled
+  "override carried from <phase> (unit N), same tree", when it holds a copy of that very failure (a verify floor
+  that reused it, whichever attempt the override was given at; an unchanged-tree rework round, only when nothing
+  else denied behind the floor) or, for a fresh run, when both lists are complete and every test failing now was
+  ruled on. A list is complete only for a `rerun … by: "file"` check whose runner's own count matches its ids, with
+  no error outside a test and nothing capped (`checks[].failuresCompleteIn`); libtest names never are, because they
+  do not name their target. A test not ruled on, a list not shown complete, a timeout, another tree or base, the
+  deliver unit, a tool step and an operator's explicit re-run still ask. Rig run acf30461 asked again at verify
+  because the verify floor reused attempt 0 while the operator had overridden attempt 1.
 - **Live tool activity for codex and pi seats, and a heartbeat for every quiet seat.** On rig run 1d372696 a codex QE
   step read "Codex Working on Check…" with no activity for 20+ s: `toolActivity` came only from claude's stream
   (#1195). The same frames (and the same `wicked.run.tool.*` bus mirror) now come from codex's `exec --json` items

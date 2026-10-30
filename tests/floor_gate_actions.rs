@@ -885,8 +885,9 @@ fn accept_suggestion_applies_the_evaluators_edit_and_reworks_the_creator() {
 /// `operator_judgment` with a blank rationale is refused and the gate stays open; with one, the fix
 /// counts as it stands (the seat does not run again), its receipt records the operator judgment
 /// that overrode the floor (the rationale, the floor result id, the label), and the run carries
-/// the label. It overrides THAT floor only: QE acceptance stays required, and the verify phase's
-/// own floor — over the same still-failing tree — denies again (deny-dominates downstream).
+/// the label. It overrides THAT floor only: QE acceptance stays required. (core#1186) The verify
+/// phase's floor, which reused this very failure on the same tree and base, stands on it, labelled
+/// as carried, instead of asking again.
 #[test]
 fn operator_judgment_overrides_a_failed_floor_only_with_a_rationale_and_keeps_qe_required() {
     let repo = make_repo("opjudge", TEST_FAILS_ON_BROKEN, 60, &[".break-in-fix"]);
@@ -1002,8 +1003,24 @@ fn operator_judgment_overrides_a_failed_floor_only_with_a_rationale_and_keeps_qe
             .is_some_and(|j| j.starts_with("operator:")),
         "the floor override does not stand in for the judge: {r:?}"
     );
-    // The run's own label.
-    assert_eq!(s.session.assurance.floor_overrides.len(), 1);
+    // The run's own label — and (core#1186) the verify floor's carry of it: verify reused this
+    // very failure on the same tree and base, so the override stands there too, labelled as carried.
+    assert_eq!(
+        s.session.assurance.floor_overrides.len(),
+        2,
+        "{:?}",
+        s.session.assurance.floor_overrides
+    );
+    assert!(
+        s.session.assurance.floor_overrides[1]
+            .floor_override
+            .as_ref()
+            .is_some_and(
+                |o| o.label.starts_with("override carried from ") && o.carried_from.is_some()
+            ),
+        "{:?}",
+        s.session.assurance.floor_overrides[1]
+    );
     assert_eq!(
         s.session.assurance.floor_overrides[0]
             .floor_override
@@ -1026,10 +1043,14 @@ fn operator_judgment_overrides_a_failed_floor_only_with_a_rationale_and_keeps_qe
         ),
         "no QE decision but required: {second:?}"
     );
-    // Deny-dominates downstream: the verify phase checks the same failing tree and denies.
-    let (_, _, combined, source, _) = gate(&second, 4).expect("verify's gate");
-    assert!(!combined, "verify's floor still denies the failing tree");
-    assert_eq!(source.as_deref(), Some("repo_checks"));
+    // (core#1186) The verify phase reused the same failing result on the same tree: it stands on
+    // the operator's override (carried, labelled) instead of asking again for the same failure.
+    let (_, _, _combined, source, _) = gate(&second, 4).expect("verify's gate");
+    assert_ne!(
+        source.as_deref(),
+        Some("repo_checks"),
+        "verify's floor stands on the carried override"
+    );
     let _ = std::fs::remove_dir_all(&repo);
 }
 

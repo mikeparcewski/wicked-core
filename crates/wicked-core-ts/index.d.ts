@@ -1463,6 +1463,10 @@ export interface RepoCheckRunJson {
   } | null
   /** (core#1198) The repo declares that the check retries its own failures: the engine did not retry it. */
   selfRetry: boolean
+  /** (core#1186, additive) The check's directory when its failure ids were shown to be the whole,
+   *  file-qualified account of its failures (a `rerun … by: "file"` check whose runner's count matches
+   *  its ids, no error outside a test, under the id cap); `null` otherwise. */
+  failuresCompleteIn: string | null
   regressions: string[]
   /** DEPRECATED: always `[]`. */
   envCannotRun: string[]

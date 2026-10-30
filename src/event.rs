@@ -1614,6 +1614,9 @@ fn check_run_json(c: &crate::repo_checks::CheckRun) -> serde_json::Value {
             "wholeBecause": r.whole_because,
         })),
         "selfRetry": c.self_retry,
+        // core#1186 (additive): the check's directory when its failure ids were shown to be the
+        // whole, file-qualified account of its failures; `null` otherwise.
+        "failuresCompleteIn": c.failures_complete_in,
         "classification": c.classification,
         "preExisting": c.pre_existing,
         "regressions": c.regressions,
