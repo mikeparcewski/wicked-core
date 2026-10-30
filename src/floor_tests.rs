@@ -1084,13 +1084,15 @@ fn each_outcome_rides_the_wire_as_a_typed_decision() {
         );
     }
     assert!(report.passed);
-    // timed_out: the excluded run outlives its bound.
+    // timed_out: the excluded run outlives its bound. (core#1194) The bound is every run's, so
+    // the head, base and inventory runs must answer inside it: 2 s ran out on the inventory at
+    // host load 45 (`base_red_unseparated`). 20 s answers there; the excluded run holds 600.
     std::fs::write(
         repo.join(CONFIG_PATH),
-        serde_json::json!({ "test": argv, "timeout_s": 2 }).to_string(),
+        serde_json::json!({ "test": argv, "timeout_s": 20 }).to_string(),
     )
     .unwrap();
-    std::fs::write(repo.join("excluded.sleep"), "30").unwrap();
+    std::fs::write(repo.join("excluded.sleep"), "600").unwrap();
     let Some((report, c)) = floor_test(&repo, &ctx) else {
         return;
     };
