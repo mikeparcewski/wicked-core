@@ -61,6 +61,7 @@ Two release tracks share this file, newest entry first regardless of track:
   Without a declaration nothing changes. `repoChecksEvaluated.checks[]` gains `retry`
   (`{durationMs, exitCode, timedOut, failureIds, scope, wholeBecause}`), `selfRetry`, and `scope` (`{by, ids}`)
   on a failing-set run (`reruns[]`, `base.run`).
+- **Fixed: the deliver lift no longer misfiles a run's changelog entry under a just-cut release (core#1166).** A changelog that both main and the run changed now goes through the `[Unreleased]` resolver even when git merges it cleanly; git's result is kept only when the resolver refuses.
 - **Live tool activity and the orchestrator's working notes (power mode, operator ask 2026-10-30).**
   - `toolActivity` frames are emitted live from a claude seat's stream: a `tool_use` starts a call and the
     `tool_result` that answers it finishes it. The shape is `{session, ord, attempt, at, id, state, kind, tool,
