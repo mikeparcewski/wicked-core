@@ -552,6 +552,11 @@ pub struct CheckRun {
     /// deselected), then the identical retry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reruns: Vec<CheckRun>,
+    /// Passes that ran before the deciding run and are not in `reruns`: today the creator's failed
+    /// `affected` pre-pass, which hands over to the check as declared. `(label, duration_ms)`,
+    /// counted by [`CheckRun::other_passes`] only; nothing decides on it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub earlier_passes: Vec<(String, u64)>,
     /// (core#781) The host's load band as the check started: `floor(1-min load / cpus)` — 0 has
     /// headroom, N is N× oversubscribed. `None` where the load is unknown. A head failure compared
     /// against a CACHED base from another band says so ([`cached_base_load_note`]).
@@ -651,11 +656,12 @@ impl CheckRun {
     /// only pass. A cached base cost nothing here and is not counted. Rig run b6f7968b reported
     /// `test_targeted: exit 1 (1977.6s)` for a floor that ran 97 minutes.
     pub fn other_passes(&self) -> String {
-        let mut parts: Vec<(String, u64)> = self
-            .reruns
-            .iter()
-            .map(|r| ("re-run".to_string(), r.duration_ms))
-            .collect();
+        let mut parts: Vec<(String, u64)> = self.earlier_passes.clone();
+        parts.extend(
+            self.reruns
+                .iter()
+                .map(|r| ("re-run".to_string(), r.duration_ms)),
+        );
         if let Some(run) = self
             .base
             .as_deref()
@@ -3231,8 +3237,31 @@ pub(crate) fn with_floor_now<R>(now: &FloorNow, work: impl FnOnce() -> R) -> R {
     work()
 }
 
-/// Record that `check` starts a pass on `tree`, when a floor slot is installed on this thread.
+thread_local! {
+    static IN_PROBE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `work` as a guide probe (the runner's version, the test list, one test confirmed alone):
+/// the commands it runs carry the check's name but are not passes of the check, so the heartbeat
+/// does not count them (review on #1190).
+fn as_probe<R>(work: impl FnOnce() -> R) -> R {
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            IN_PROBE.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+    IN_PROBE.with(|d| d.set(d.get() + 1));
+    let _leave = Leave;
+    work()
+}
+
+/// Record that `check` starts a pass on `tree`, when a floor slot is installed on this thread and
+/// the run is not a guide probe ([`as_probe`]).
 pub(crate) fn note_pass(check: &str, tree: Tree) {
+    if IN_PROBE.with(|d| d.get()) > 0 {
+        return;
+    }
     FLOOR_NOW.with(|c| {
         if let Some(now) = c.borrow().as_ref() {
             now.lock().unwrap_or_else(|p| p.into_inner()).started.push((
@@ -5155,7 +5184,11 @@ fn run_detected(
                 if r.passed() {
                     r
                 } else {
-                    run_held(worktree, held_head, check, sandbox, scratch, Tree::Head)
+                    let mut full =
+                        run_held(worktree, held_head, check, sandbox, scratch, Tree::Head);
+                    full.earlier_passes
+                        .push(("affected".to_string(), r.duration_ms));
+                    full
                 }
             }
             None => run_held(worktree, held_head, check, sandbox, scratch, Tree::Head),
@@ -6888,15 +6921,17 @@ impl BaseTree {
                         source: format!("`{}` alone on the base (DES-BUILD-GUIDE)", n.id),
                         ..target.clone()
                     };
-                    let r = run_one_with(
-                        &self.dir,
-                        Some(&self.held),
-                        &one,
-                        &ExecOpts::default(),
-                        sandbox,
-                        scratch,
-                        Tree::Base,
-                    );
+                    let r = as_probe(|| {
+                        run_one_with(
+                            &self.dir,
+                            Some(&self.held),
+                            &one,
+                            &ExecOpts::default(),
+                            sandbox,
+                            scratch,
+                            Tree::Base,
+                        )
+                    });
                     t.logs.extend(relabel(r.logs.clone(), "alone-base"));
                     // (agy r6) One that did not finish or start confirms nothing: the
                     // inventory is incomplete (escalates) and not cached.
@@ -7134,15 +7169,17 @@ pub(crate) fn inventory(
         source: format!("the list of `{}` (DES-BUILD-GUIDE)", check.name),
         ..check.clone()
     };
-    let r = run_one_with(
-        dir,
-        held,
-        &probe,
-        &merged(list.merge),
-        sandbox,
-        scratch,
-        tree,
-    );
+    let r = as_probe(|| {
+        run_one_with(
+            dir,
+            held,
+            &probe,
+            &merged(list.merge),
+            sandbox,
+            scratch,
+            tree,
+        )
+    });
     let attempt = match (tree, ids.is_empty()) {
         (Tree::Base, _) => "toc-base",
         (Tree::Head, true) => "toc-head",
@@ -8031,7 +8068,7 @@ pub(crate) fn runner_version(
         timeout_s: Some(120),
         ..check.clone()
     };
-    let r = run_one_with(dir, held, &rc, &merged(true), sandbox, scratch, tree);
+    let r = as_probe(|| run_one_with(dir, held, &rc, &merged(true), sandbox, scratch, tree));
     if !r.passed() {
         return Err(format!(
             "the version command did not pass ({})",
@@ -8917,6 +8954,7 @@ pub(crate) fn run_one_with(
         base: None,
         env_cannot_run: Vec::new(),
         reruns: Vec::new(),
+        earlier_passes: Vec::new(),
         load_band: None,
         decision: None,
         logs: Vec::new(),
@@ -9529,6 +9567,7 @@ pub(crate) mod tests {
                 base: None,
                 env_cannot_run: Vec::new(),
                 reruns: Vec::new(),
+                earlier_passes: Vec::new(),
                 decision: None,
                 logs: Vec::new(),
                 load_band: None,
@@ -12805,6 +12844,7 @@ exit 1
             base: None,
             env_cannot_run: Vec::new(),
             reruns: Vec::new(),
+            earlier_passes: Vec::new(),
             decision: None,
             logs: Vec::new(),
             load_band: None,
@@ -13060,6 +13100,7 @@ exit 1
             base: None,
             env_cannot_run: env.iter().map(|x| x.to_string()).collect(),
             reruns: Vec::new(),
+            earlier_passes: Vec::new(),
             decision: None,
             logs: Vec::new(),
             load_band: None,
@@ -13799,6 +13840,7 @@ mod floor_pass_tests {
             base: None,
             env_cannot_run: Vec::new(),
             reruns: Vec::new(),
+            earlier_passes: Vec::new(),
             decision: None,
             logs: Vec::new(),
             load_band: None,
@@ -13821,6 +13863,14 @@ mod floor_pass_tests {
         assert_eq!(
             r.summary(),
             "test_targeted: exit 1 (1977.6s; + re-run 1890.2s, base 1900.0s = 5767.8s over 3 passes)"
+        );
+
+        // A failed `affected` pre-pass that handed over to the full check counts too (review on #1190).
+        let mut full = run("test", 0, 600_000);
+        full.earlier_passes.push(("affected".into(), 1_800_000));
+        assert_eq!(
+            full.summary(),
+            "test: exit 0 (600.0s; + affected 1800.0s = 2400.0s over 2 passes)"
         );
 
         // A base read back from the cache cost this floor nothing.
@@ -13864,6 +13914,17 @@ mod floor_pass_tests {
         assert_eq!(
             got.2.as_deref(),
             Some("now `test` on the change again (pass 3 of `test`), 0 min in")
+        );
+
+        // A guide probe under the check's name is not a pass of it (review on #1190).
+        let probed = with_floor_now(&now, || {
+            as_probe(|| note_pass("test", Tree::Head));
+            now.lock().unwrap().describe()
+        });
+        assert_eq!(
+            probed.as_deref(),
+            Some("now `test` on the change again (pass 3 of `test`), 0 min in"),
+            "the probe added no pass"
         );
 
         // The slot is removed when the work returns: a later pass is not recorded into it.
