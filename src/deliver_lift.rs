@@ -854,6 +854,11 @@ fn tree_entry(
 /// takes its result; the resolver refusing leaves git's merged file as it is, and a changelog only
 /// one side changed is untouched. Best effort: any git failure keeps git's tree. The new tree and
 /// the paths the resolver rewrote.
+///
+/// Only a changelog the run changed by ADDING lines is re-placed: git's clean merge carries any
+/// other edit of the run's (a subsection heading renamed above an existing entry, say), which the
+/// entry-by-text resolver would silently drop. `skip` names paths already settled elsewhere (the
+/// conflicted ones, resolved by the conflict path).
 fn place_clean_changelogs(
     cwd: &Path,
     env: &[(&str, &Path)],
@@ -861,6 +866,7 @@ fn place_clean_changelogs(
     tip: &str,
     run_tree: &str,
     tree: &str,
+    skip: &[String],
 ) -> (String, Vec<String>) {
     let kept = || (tree.to_string(), Vec::new());
     let (Some(theirs), Some(ours)) = (
@@ -873,7 +879,7 @@ fn place_clean_changelogs(
     let mut set: Vec<(String, String, String)> = Vec::new();
     for path in theirs
         .iter()
-        .filter(|p| is_changelog(p) && ours.contains(p))
+        .filter(|p| is_changelog(p) && ours.contains(p) && !skip.contains(p))
     {
         let (Some(b), Some(o), Some(t), Some(m)) = (
             tree_entry(cwd, env, base, path),
@@ -889,6 +895,9 @@ fn place_clean_changelogs(
         let (Some(b), Some(o), Some(t)) = (blob(&b.1), blob(&o.1), blob(&t.1)) else {
             continue;
         };
+        if !only_adds_lines(&b, &t) {
+            continue;
+        }
         let Ok(resolved) = changelog::resolve(&b, &o, &t) else {
             continue;
         };
@@ -905,6 +914,13 @@ fn place_clean_changelogs(
         Ok(new) => (new, set.into_iter().map(|(_, _, p)| p).collect()),
         Err(_) => kept(),
     }
+}
+
+/// Whether `theirs` is `base` with lines only added: every line of `base`, in order, is still in
+/// `theirs`.
+fn only_adds_lines(base: &[u8], theirs: &[u8]) -> bool {
+    let mut t = theirs.split(|&c| c == b'\n');
+    base.split(|&c| c == b'\n').all(|line| t.any(|l| l == line))
 }
 
 /// `tree` with each `(mode, oid, path)` of `set` written in and each path of `remove` taken out,
@@ -1124,7 +1140,7 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
     let (lifted_tree, resolved) = match merged {
         Ok(tree) => {
             let (tree, placed) =
-                place_clean_changelogs(worktree, &env, &head, &tip, &before.tree, &tree);
+                place_clean_changelogs(worktree, &env, &head, &tip, &before.tree, &tree, &[]);
             if !placed.is_empty() {
                 clean_note = Some(format!(
                     "{} merged cleanly, but both sides changed it, so the run's new `[Unreleased]` \
@@ -1167,7 +1183,29 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
                     Ok(Some((tree, r)))
                 });
             match resolution {
-                Ok(Some((tree, r))) => (tree, Some(r)),
+                Ok(Some((tree, r))) => {
+                    // A changelog that merged cleanly beside the resolved conflict gets the same
+                    // placement as on an all-clean merge (codex on #1201); the conflicted paths
+                    // were settled by the conflict path above.
+                    let (tree, placed) = place_clean_changelogs(
+                        worktree,
+                        &env,
+                        &head,
+                        &tip,
+                        &before.tree,
+                        &tree,
+                        &conflict.paths(),
+                    );
+                    if !placed.is_empty() {
+                        clean_note = Some(format!(
+                            "{} merged cleanly, but both sides changed it, so the run's new \
+                             `[Unreleased]` entries were placed under main's current \
+                             `## [Unreleased]`; the lifted tree is re-verified",
+                            placed.join(", ")
+                        ));
+                    }
+                    (tree, Some(r))
+                }
                 Ok(None) => return strand(None),
                 Err(why) => return strand(Some(why)),
             }
@@ -1253,7 +1291,10 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
             tree_before: Some(before.tree),
             tree_after: Some(after.tree),
             conflicts: Vec::new(),
-            note: resolved_note.or(clean_note),
+            note: match (resolved_note, clean_note) {
+                (Some(r), Some(c)) => Some(format!("{r}; {c}")),
+                (r, c) => r.or(c),
+            },
         },
         Ok(after) => failed(
             Some(after.tree.clone()),
@@ -2767,6 +2808,87 @@ mod tests {
             "git's clean merge stands"
         );
         assert!(r.note.is_none(), "{r:?}");
+    }
+
+    /// (codex on #1201) A clean merge where the run renamed a subsection heading above an existing
+    /// entry: the entry-by-text resolver would drop that edit, so git's merged file stands.
+    #[test]
+    fn a_cleanly_merged_changelog_the_run_reclassified_keeps_gits_result() {
+        let base = "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- old\n\n## [1.0.0]\n\n- first\n- b\n- c\n- d\n";
+        let (clone, wt) = stale_base_layout_seeded("cl-clean-reclass", &[("CHANGELOG.md", base)]);
+        std::fs::write(
+            wt.join("CHANGELOG.md"),
+            base.replace("### Fixed", "### Security"),
+        )
+        .unwrap();
+        land_on_origin("cl-clean-reclass", &clone, |o| {
+            std::fs::write(
+                o.join("CHANGELOG.md"),
+                base.replace("- d\n", "- d (main)\n"),
+            )
+            .unwrap();
+        });
+        let r = lift_onto_remote_default(&wt, &clone);
+        assert_eq!(r.outcome, LiftOutcome::Lifted, "{r:?}");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("CHANGELOG.md")).unwrap(),
+            base.replace("### Fixed", "### Security")
+                .replace("- d\n", "- d (main)\n"),
+            "both sides' edits stand, as git merged them"
+        );
+        assert!(r.note.is_none(), "{r:?}");
+    }
+
+    /// (codex on #1201) One changelog conflicts (resolved as a changelog) while another merges
+    /// cleanly in the release-cut shape: the clean one is placed too.
+    #[test]
+    fn a_clean_changelog_beside_a_resolved_changelog_conflict_is_placed_too() {
+        let root = "# Changelog\n\n## [Unreleased]\n\n- old\n\n## [1.0.0]\n";
+        let pkg = "# Changelog\n\n## [Unreleased]\n\n- p\n\n## [1.0.0]\n";
+        let (clone, wt) = stale_base_layout_seeded(
+            "cl-clean-beside",
+            &[("CHANGELOG.md", root), ("pkg/CHANGELOG.md", pkg)],
+        );
+        std::fs::write(
+            wt.join("CHANGELOG.md"),
+            root.replace("- old\n", "- old\n- run\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            wt.join("pkg/CHANGELOG.md"),
+            pkg.replace("- p\n", "- p\n- run-pkg\n"),
+        )
+        .unwrap();
+        land_on_origin("cl-clean-beside", &clone, |o| {
+            std::fs::write(
+                o.join("CHANGELOG.md"),
+                root.replace("## [Unreleased]\n\n", "## [Unreleased]\n\n## [1.1.0]\n\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                o.join("pkg/CHANGELOG.md"),
+                pkg.replace("- p\n", "- p\n- main-pkg\n"),
+            )
+            .unwrap();
+        });
+        let r = lift_onto_remote_default(&wt, &clone);
+        assert_eq!(r.outcome, LiftOutcome::Lifted, "{r:?}");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("CHANGELOG.md")).unwrap(),
+            "# Changelog\n\n## [Unreleased]\n\n- run\n\n## [1.1.0]\n\n- old\n\n## [1.0.0]\n",
+            "the clean root changelog's `- run` is under `[Unreleased]`"
+        );
+        let p = std::fs::read_to_string(wt.join("pkg/CHANGELOG.md")).unwrap();
+        let unreleased = &p[..p.find("## [1.0.0]").unwrap()];
+        assert!(
+            unreleased.contains("- main-pkg") && unreleased.contains("- run-pkg"),
+            "{p}"
+        );
+        let note = r.note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains("pkg/CHANGELOG.md") && note.contains("merged cleanly"),
+            "{note}"
+        );
     }
 
     /// The same changelog collision beside a conflict in CODE is still a lift conflict: nothing is
