@@ -317,7 +317,7 @@ fn short(id: &str) -> &str {
 /// Hard wall-clock bound on `git fetch origin` (F-433-004): the fetch sits on the run's critical
 /// path (worktree mint) and on the deliver unit; a remote that hangs must degrade to a disclosed
 /// "fetch failed", never wedge the run.
-pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const FETCH_TIMEOUT: Duration = crate::answer_deadline(Duration::from_secs(120));
 
 /// `git fetch origin`, NON-INTERACTIVE and BOUNDED (F-433-004): no credential prompt
 /// (`core.askPass=` + `GIT_TERMINAL_PROMPT=0`), no host-key/passphrase prompt

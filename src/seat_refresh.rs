@@ -736,7 +736,7 @@ mod live {
         if !crate::container_floor::image_present(rt, REFRESH_IMAGE) {
             let mut pull = rt.cmd();
             pull.args(["pull", "-q", REFRESH_IMAGE]);
-            match output_within(pull, POST_TIMEOUT) {
+            match output_within(pull, rt.bound(POST_TIMEOUT)) {
                 Some(o) if o.status.success() => {}
                 _ => {
                     return Err(format!(
@@ -1845,7 +1845,7 @@ case "$*" in
 esac
 "#,
         );
-        let rt = crate::container_floor::Runtime { cli: runtime };
+        let rt = crate::container_floor::Runtime::answering(runtime);
         let _lock = mutation_lock(&dir).unwrap();
         let read = |url: &str| {
             live::send(
@@ -1959,9 +1959,7 @@ esac
         let dir =
             std::env::temp_dir().join(format!("c4-refresh-lock-{}", uuid::Uuid::new_v4().simple()));
         let lock = mutation_lock(&dir).unwrap();
-        let rt = crate::container_floor::Runtime {
-            cli: "/nonexistent-FAKE-runtime".into(),
-        };
+        let rt = crate::container_floor::Runtime::answering("/nonexistent-FAKE-runtime".into());
         let gw = crate::seat_gateway::Gateway::for_dir(&dir);
         assert_eq!(
             refresh(&rt, &gw, &dir, "claude", true).unwrap(),

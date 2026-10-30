@@ -14,6 +14,12 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Core's own suite no longer fails on a loaded host's clock (core#1194).** Inside the repo-checks floor, at host
+  load 30-50, lib tests whose stand-in scripts must answer failed because they were bounded by production deadlines
+  (the login and gateway runtime's 15 s, the hook relay's 60 s, a floor check's 60 s). Those stand-ins now get a
+  600 s failure guard: a test `Runtime` that answers carries it, the floor fixtures declare it, and a production
+  deadline reads it only under `cfg(test)`. Stand-ins that must stall keep their short deadlines, and waits on a
+  child or a file wait on that condition. Release builds are unchanged.
 - **Live tool activity and the orchestrator's working notes (power mode, operator ask 2026-10-30).**
   - `toolActivity` frames are emitted live from a claude seat's stream: a `tool_use` starts a call and the
     `tool_result` that answers it finishes it. The shape is `{session, ord, attempt, at, id, state, kind, tool,

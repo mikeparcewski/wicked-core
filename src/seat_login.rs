@@ -1808,7 +1808,7 @@ const COPILOT_SETTINGS: &str = r#"{"storeTokenPlaintext":true}"#;
 fn execute(rt: &Runtime, argv: &[String]) -> Result<std::process::Output, String> {
     let mut cmd = rt.cmd();
     cmd.args(argv);
-    output_within(cmd, TIMEOUT)
+    output_within(cmd, rt.bound(TIMEOUT))
         .ok_or_else(|| "login runtime command could not start or timed out".into())
 }
 
@@ -3335,7 +3335,7 @@ esac
             std::fs::write(dir.join("volumes"), format!("{}\n", volumes(&gw).1)).unwrap();
             Self {
                 dir,
-                rt: Runtime { cli: path },
+                rt: Runtime::answering(path),
                 gw,
             }
         }
@@ -4542,7 +4542,8 @@ esac
                 }
             });
             let shown = |what: &str| {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                // (core#1194) A failure guard: the wait is on the output (20 s ran out at load 20).
+                let deadline = std::time::Instant::now() + crate::test_env::PATIENT;
                 while std::time::Instant::now() < deadline {
                     if String::from_utf8_lossy(&seen.lock().unwrap()).contains(what) {
                         return true;
@@ -5006,7 +5007,8 @@ esac
             });
             let text = || String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
             let shown = |what: &str| {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                // (core#1194) A failure guard: the wait is on the output (20 s ran out at load 20).
+                let deadline = std::time::Instant::now() + crate::test_env::PATIENT;
                 while std::time::Instant::now() < deadline {
                     if text().contains(what) {
                         return true;
@@ -5515,12 +5517,15 @@ esac
         let pid_file = login_pid_file(&fake.dir, &session);
         // spawn-audit: test-only — a stand-in login: records its pid as the login shell does.
         let mut login = std::process::Command::new("/bin/sh")
-            .args(["-c", "printf '%s' \"$$\" > \"$1\"; exec sleep 60", "sh"])
+            .args(["-c", "printf '%s' \"$$\" > \"$1\"; exec sleep 600", "sh"])
             .arg(&pid_file)
             .process_group(0)
             .spawn()
             .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // (core#1194) Conditions, not clocks: the login records its pid before the sign-out
+        // (bounded only as a failure guard), and both stand-ins live until signalled, so a slow
+        // sign-out on a loaded host never reads a stand-in that simply ran out as "ended".
+        let deadline = std::time::Instant::now() + crate::test_env::PATIENT;
         while !pid_file.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -5534,7 +5539,7 @@ esac
         let pid_file = login_pid_file(&fake.dir, &session);
         // spawn-audit: test-only — an unrelated process that happens to lead its group.
         let mut other = std::process::Command::new("sleep")
-            .arg("30")
+            .arg("600")
             .process_group(0)
             .spawn()
             .unwrap();

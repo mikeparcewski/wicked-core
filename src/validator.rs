@@ -359,7 +359,7 @@ impl SandboxLevel {
 
 /// Per-validator wall-clock bound. A validator check (`test`/`grep`/`find` …) is fast; a script that
 /// hangs or loops is KILLED at this bound and the run reports a fail-closed [`ValidatorOutcome::TimedOut`].
-pub(crate) const VALIDATOR_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const VALIDATOR_TIMEOUT: Duration = crate::answer_deadline(Duration::from_secs(120));
 
 /// The environment variables PASSED THROUGH to the (otherwise cleared) child: enough for the shell +
 /// standard tools to resolve and run, and nothing that carries a secret. Everything else — API keys,
@@ -3400,7 +3400,8 @@ mod tests {
         cmd.args(["-c", "exit 3"]).process_group(0);
         cmd.hardened();
         let mut child = cmd.spawn().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // (core#1194) A failure guard: the exit is the condition.
+        let deadline = Instant::now() + crate::test_env::PATIENT;
         loop {
             match has_exited_unreaped(&mut child) {
                 Ok(true) => break,
@@ -5088,8 +5089,9 @@ mod tests {
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]).current_dir(&wt);
         apply_minimal_env(&mut cmd);
+        // (core#1194) A failure guard: `/bin/true` under the wrapper always answers.
         let (status, stderr_head) =
-            run_bounded_status_capturing_stderr(cmd, Duration::from_secs(20));
+            run_bounded_status_capturing_stderr(cmd, crate::test_env::PATIENT);
         let status = status.expect("bwrap spawns");
         assert!(
             matches!(status, Some(s) if s.success()),
@@ -5194,7 +5196,8 @@ mod tests {
             .arg("echo 'bwrap: fake launcher line' >&2; echo second >&2; exit 1")
             .current_dir(&dir);
         apply_minimal_env(&mut cmd);
-        let (status, head) = run_bounded_status_capturing_stderr(cmd, Duration::from_secs(20));
+        // (core#1194) A failure guard: 20 s ran out in a nested floor at host load 50.
+        let (status, head) = run_bounded_status_capturing_stderr(cmd, crate::test_env::PATIENT);
         assert!(
             matches!(status, Ok(Some(s)) if s.code() == Some(1)),
             "{status:?}"

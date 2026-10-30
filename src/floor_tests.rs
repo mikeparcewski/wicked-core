@@ -84,7 +84,10 @@ fn write_tree(repo: &Path, argv: &[String], files: &[(&str, &str)]) {
     std::fs::create_dir_all(repo.join(".wicked")).unwrap();
     std::fs::write(
         repo.join(CONFIG_PATH),
-        serde_json::json!({ "test": argv, "timeout_s": 60 }).to_string(),
+        // (core#1194) A failure guard: the fake runner always answers (60 s timed out in a
+        // nested floor at host load 45). The timeout test sets its own short bound.
+        serde_json::json!({ "test": argv, "timeout_s": crate::test_env::PATIENT.as_secs() })
+            .to_string(),
     )
     .unwrap();
     for f in [
@@ -1081,13 +1084,15 @@ fn each_outcome_rides_the_wire_as_a_typed_decision() {
         );
     }
     assert!(report.passed);
-    // timed_out: the excluded run outlives its bound.
+    // timed_out: the excluded run outlives its bound. (core#1194) The bound is every run's, so
+    // the head, base and inventory runs must answer inside it: 2 s ran out on the inventory at
+    // host load 45 (`base_red_unseparated`). 20 s answers there; the excluded run holds 600.
     std::fs::write(
         repo.join(CONFIG_PATH),
-        serde_json::json!({ "test": argv, "timeout_s": 2 }).to_string(),
+        serde_json::json!({ "test": argv, "timeout_s": 20 }).to_string(),
     )
     .unwrap();
-    std::fs::write(repo.join("excluded.sleep"), "30").unwrap();
+    std::fs::write(repo.join("excluded.sleep"), "600").unwrap();
     let Some((report, c)) = floor_test(&repo, &ctx) else {
         return;
     };
@@ -2039,7 +2044,7 @@ fn the_identical_retry_keeps_the_deciding_runs_env() {
         name: "test".into(),
         argv: s(&["sh", "-c", "[ \"$FLOOR_ENV\" = 1 ]"]),
         source: "test".into(),
-        timeout_s: Some(30),
+        timeout_s: Some(crate::test_env::PATIENT.as_secs()), // core#1194: a guard
         dir: String::new(),
     };
     let exec = ExecOpts {
@@ -3306,7 +3311,9 @@ fn run_with_env(
         name: "gate".into(),
         argv: argv.iter().map(|a| a.to_string()).collect(),
         source: String::new(),
-        timeout_s: Some(30),
+        // (core#1194) A failure guard: these commands must answer (a 30 s bound timed out at
+        // load 80 inside the floor).
+        timeout_s: Some(crate::test_env::PATIENT.as_secs()),
         dir: String::new(),
     };
     let exec = ExecOpts {
@@ -3614,7 +3621,7 @@ fn no_command_starts_in_a_held_tree_swapped_for_a_link() {
         name: "test".into(),
         argv: s(&["sh", "-c", &format!("touch '{}'", marker.display())]),
         source: "test".into(),
-        timeout_s: Some(30),
+        timeout_s: Some(crate::test_env::PATIENT.as_secs()), // core#1194: a guard
         dir: dir.into(),
     };
     let run = |c: &RepoCheck| {
@@ -3683,7 +3690,7 @@ fn a_check_starts_in_the_held_directory_when_its_path_is_swapped_before_spawn() 
         name: "test".into(),
         argv: s(&["sh", "-c", "touch here"]),
         source: "test".into(),
-        timeout_s: Some(30),
+        timeout_s: Some(crate::test_env::PATIENT.as_secs()), // core#1194: a guard
         dir: "pkg".into(),
     };
     let (w, o) = (wt.clone(), outside.clone());

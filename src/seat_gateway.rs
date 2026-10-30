@@ -1448,7 +1448,8 @@ pub(crate) fn confirm_sign_out(
         GwState::Stopped | GwState::Absent => {
             let mut cmd = rt.cmd();
             cmd.args(["volume", "ls", "--format", "{{.Name}}"]);
-            let out = output_within(cmd, CLI_TIMEOUT).ok_or("could not inspect config volumes")?;
+            let out = output_within(cmd, rt.bound(CLI_TIMEOUT))
+                .ok_or("could not inspect config volumes")?;
             if !out.status.success() {
                 return Err("could not inspect config volumes".into());
             }
@@ -1651,10 +1652,10 @@ fn remove_helper(rt: &Runtime, name: &str) -> Result<(), String> {
     let absent = || {
         let mut rm = rt.cmd();
         rm.args(["rm", "--force", name]);
-        let _ = output_within(rm, CLI_TIMEOUT);
+        let _ = output_within(rm, rt.bound(CLI_TIMEOUT));
         let mut inspect = rt.cmd();
         inspect.args(["container", "inspect", name]);
-        output_within(inspect, CLI_TIMEOUT).is_some_and(|out| {
+        output_within(inspect, rt.bound(CLI_TIMEOUT)).is_some_and(|out| {
             !out.status.success()
                 && String::from_utf8_lossy(&out.stderr)
                     .to_ascii_lowercase()
@@ -1707,6 +1708,7 @@ pub(crate) fn mutation_helper(
     timeout: Duration,
 ) -> Result<Vec<u8>, String> {
     use std::io::Read;
+    let timeout = rt.bound(timeout);
     cleanup_unsettled(rt, dir, scope)?;
     let name = format!("wicked-mutation-{}", uuid::Uuid::new_v4().simple());
     // codex lg-r3 R5: the lock's next owner must find even a helper whose owner died at spawn.
@@ -2031,7 +2033,7 @@ fn init_volumes(
 fn cli(rt: &Runtime, argv: &[String], limit: Duration) -> Option<Output> {
     let mut cmd = rt.cmd();
     cmd.args(argv);
-    output_within(cmd, limit)
+    output_within(cmd, rt.bound(limit))
 }
 
 fn checked(rt: &Runtime, argv: &[String]) -> Result<(), String> {
@@ -2970,7 +2972,7 @@ cat > /dev/null
 rm -f "$base/live"
 "#,
         );
-        let rt = Runtime { cli: runtime };
+        let rt = Runtime::stalling(runtime);
         let _lock = crate::seat_refresh::mutation_lock(&dir).unwrap();
         fs::write(dir.join("fail_cleanup"), "").unwrap();
         // Larger than a pipe: this exercises the stdin deadline too (codex lg-r2 C6).
@@ -3008,13 +3010,15 @@ rm -f "$base/live"
         assert!(calls.contains(&format!("rm --force {marker}")));
         assert!(calls.contains(&format!("container inspect {marker}")));
         fs::remove_file(dir.join("fail_cleanup")).unwrap();
+        // (core#1194) A helper that must ANSWER gets a failure guard, not a clock: 10 s ran out
+        // at host load 20.
         mutation_helper(
             &rt,
             &dir,
             "claude",
             &["run".into(), "ok".into()],
             b"FAKE",
-            Duration::from_secs(10),
+            crate::test_env::PATIENT,
         )
         .unwrap();
         assert!(!unsettled_path(&dir, "claude").exists());
@@ -3054,7 +3058,7 @@ rm -f "$base/live"
             &runtime,
             "#!/bin/sh\nprintf 'No such container\\n' >&2; exit 1\n",
         );
-        let rt = Runtime { cli: runtime };
+        let rt = Runtime::answering(runtime);
         let name = format!("wicked-mutation-{}", uuid::Uuid::new_v4().simple());
         // A stand-in for the dead owner's client: a live host process whose argv names it.
         // spawn-audit: test-only — a stand-in orphan client for the cleanup test; never a production spawn.
@@ -3102,7 +3106,7 @@ fi
 cat > "$base/written"
 "#,
         );
-        let rt = Runtime { cli: rt_path };
+        let rt = Runtime::answering(rt_path);
         let _lock = crate::seat_refresh::mutation_lock(&temp.0).unwrap();
         // Model a dead process: its runtime-owned writer and pre-spawn marker survive it. The
         // name is unique: cleanup `pkill -f`s and `pgrep -f`s it across the whole host, so a name
@@ -3153,7 +3157,7 @@ cat > "$base/written"
         let runtime = temp.0.join("runtime");
         crate::test_env::install_stub(&runtime, "#!/bin/sh\ncat > /dev/null\n");
         route_sign_in(
-            &Runtime { cli: runtime },
+            &Runtime::answering(runtime),
             &Gateway::for_dir(&temp.0),
             &temp.0,
             "codex",
@@ -3200,8 +3204,14 @@ cat > "$base/written"
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        // (core#1194) Wait on the child, not a clock: re-running this test binary took more than
+        // 10 s to start in a nested floor at host load 40. The guard only stops a child that
+        // ended without starting from hanging the test.
         let start = Instant::now();
-        while !temp.0.join("child-started").exists() && start.elapsed() < Duration::from_secs(10) {
+        while !temp.0.join("child-started").exists()
+            && start.elapsed() < crate::test_env::PATIENT
+            && child.try_wait().ok().flatten().is_none()
+        {
             std::thread::sleep(Duration::from_millis(10));
         }
         let started = temp.0.join("child-started").exists();
@@ -3314,7 +3324,7 @@ case "$last" in
 esac
 "#,
         );
-        let rt = Runtime { cli: rt_path };
+        let rt = Runtime::answering(rt_path);
         ensure_gateway(&rt, &temp.0).unwrap();
         let calls = fs::read_to_string(temp.0.join("calls")).unwrap();
         assert!(

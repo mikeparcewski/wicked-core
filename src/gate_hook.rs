@@ -8903,6 +8903,11 @@ mod tests {
     /// Bash call in any phase and on no other tool, however the other call's raw input is spelled.
     #[test]
     fn a_tool_token_selects_a_rule_for_that_tool_only_707() {
+        // (core#1194) The hook reads the process env (`WICKED_HOOK_INVOCATION` decides its exit code);
+        // a test that sets it holds the write lock. Seen in a nested repro: exit 3, not 2.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         use crate::path_policy::AllowedRoots;
         use crate::write_posture::WritePosture;
         assert_eq!(tool_selection_token("Bash").as_deref(), Some("tool:Bash"));
@@ -8991,6 +8996,11 @@ mod tests {
     /// through `evaluate_tool_call` end to end: allowed Bash (snapshot), mutate, next Bash.
     #[test]
     fn witness_ignores_engine_graph_store_but_catches_worktree_write() {
+        // (core#1194) The hook reads the process env (`WICKED_HOOK_INVOCATION` decides its exit code);
+        // a test that sets it holds the write lock. Seen in a nested repro: exit 3, not 2.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         use crate::path_policy::AllowedRoots;
         use crate::write_posture::WritePosture;
         let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
@@ -9076,6 +9086,11 @@ mod tests {
 
     #[test]
     fn ask_mcp_exemption_is_exact_on_every_posture_and_records_allow() {
+        // (core#1194) The hook reads the process env (`WICKED_HOOK_INVOCATION` decides its exit code);
+        // a test that sets it holds the write lock. Seen in a nested repro: exit 3, not 2.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         use crate::path_policy::AllowedRoots;
         use crate::write_posture::WritePosture;
         let base =
@@ -9144,6 +9159,11 @@ mod tests {
     /// seat continues without it. A normal tool on the same unit is still allowed.
     #[test]
     fn an_mcp_call_is_refused_by_the_gate_hook_on_every_posture_and_recorded_advisory() {
+        // (core#1194) The hook reads the process env (`WICKED_HOOK_INVOCATION` decides its exit code);
+        // a test that sets it holds the write lock. Seen in a nested repro: exit 3, not 2.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         use crate::path_policy::AllowedRoots;
         use crate::write_posture::WritePosture;
         let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
@@ -10137,6 +10157,11 @@ mod tests {
 
     #[test]
     fn hook_fails_closed_on_postgres_or_missing_store() {
+        // (core#1194) The hook reads the process env (`WICKED_HOOK_INVOCATION` decides its exit code);
+        // a test that sets it holds the write lock. Seen in a nested repro: exit 3, not 2.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         // postgres:// → deny (SQLite-only for now).
         assert!(store_unavailable(Some("postgres://h/db")).is_some());
         assert!(store_unavailable(Some("postgresql://h/db")).is_some());
@@ -10824,6 +10849,11 @@ mod boundary_tests {
 
     #[test]
     fn shell_read_951_r8_advisory_preserves_policy_denial() {
+        // (core#1194) The hook reads the process env (`WICKED_HOOK_INVOCATION` decides its exit code);
+        // a test that sets it holds the write lock. Seen in a nested repro: exit 3, not 2.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let (dir, scratch, outside) = shell_read_951_r2_fixture("r8-policy");
         let sibling = dir.join("wicked-worktrees/run-2");
         std::fs::create_dir_all(&sibling).unwrap();
@@ -11659,6 +11689,11 @@ mod boundary_tests {
     #[cfg(unix)]
     #[test]
     fn shell_read_951_r3_in_process_carriers_include_prior_root_cwds() {
+        // (core#1194) The hook reads the process env (`WICKED_HOOK_INVOCATION` decides its exit code);
+        // a test that sets it holds the write lock. Seen in a nested repro: exit 3, not 2.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let (dir, scratch, _) = shell_read_951_r2_fixture("r3-in-process");
         let prior = dir.join("prior");
         let secret = dir.join("secret");

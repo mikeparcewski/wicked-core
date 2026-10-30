@@ -157,9 +157,29 @@ mod write_posture;
 /// mutator might change (a real spawn resolving `HOME`/`WICKED_WORKER_HOME`) hold `read()`.
 /// Poison-tolerant on purpose (`unwrap_or_else(|p| p.into_inner())`): one panicking test must not
 /// cascade.
+/// (core#1194) A production deadline that no unit test provokes on purpose: `production` in a
+/// build, and under `cfg(test)` [`test_env::PATIENT`]'s failure guard. A unit test's stand-in
+/// must ANSWER and is judged on the answer, never on how long a loaded host (the repo-checks
+/// floor runs at load 40-60) took to start it. The tests of each deadline pass their own short
+/// one.
+pub(crate) const fn answer_deadline(production: std::time::Duration) -> std::time::Duration {
+    if cfg!(test) {
+        std::time::Duration::from_secs(600)
+    } else {
+        production
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_env {
     pub(crate) static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// (core#1194) The bound a test gives an operation that must ANSWER: a failure guard, never
+    /// the condition. Inside the repo-checks floor at host load 40-60 a freshly written stub
+    /// shell script took more than 15 s to start, so a test bounded by the production deadline
+    /// failed on the clock, not on the behaviour it checks. A test that needs a deadline to FIRE
+    /// keeps a short one of its own.
+    pub(crate) const PATIENT: std::time::Duration = std::time::Duration::from_secs(600);
 
     /// Install an executable test stub (mode 0700) at `path` WITHOUT this process ever holding a
     /// writable descriptor to it. A stub written in-process can fail its first exec with

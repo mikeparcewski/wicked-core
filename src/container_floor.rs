@@ -270,9 +270,20 @@ pub(crate) fn container_mode_from(v: Option<&str>) -> bool {
 pub(crate) struct Runtime {
     /// The CLI the engine runs (absolute when found by search).
     pub(crate) cli: PathBuf,
+    /// (core#1194) `None` for every real runtime: each command keeps its caller's deadline. A unit
+    /// test's stand-in that always ANSWERS sets a failure guard here, so the test is judged on the
+    /// answer and never on how long a loaded host took to start a shell script. A stand-in that
+    /// stalls on purpose leaves it `None` and keeps the short deadline its test relies on.
+    pub(crate) answer_bound: Option<Duration>,
 }
 
 impl Runtime {
+    /// The bound for one command of this runtime whose caller allows `declared`: the longer of
+    /// `declared` and [`Self::answer_bound`].
+    pub(crate) fn bound(&self, declared: Duration) -> Duration {
+        self.answer_bound.map_or(declared, |b| b.max(declared))
+    }
+
     pub(crate) fn cmd(&self) -> Command {
         let mut c = Command::new(&self.cli);
         c.hardened().stdin(Stdio::null());
@@ -280,6 +291,28 @@ impl Runtime {
             c.env("PATH", path);
         }
         c
+    }
+}
+
+#[cfg(test)]
+// Every caller is a unix-only test (stub shell scripts).
+#[cfg_attr(not(unix), allow(dead_code))]
+impl Runtime {
+    /// A test stand-in that always answers (core#1194): its commands are bounded only by
+    /// [`crate::test_env::PATIENT`], a failure guard no host load exhausts.
+    pub(crate) fn answering(cli: PathBuf) -> Self {
+        Runtime {
+            cli,
+            answer_bound: Some(crate::test_env::PATIENT),
+        }
+    }
+
+    /// A test stand-in that stalls on purpose: every caller's own deadline holds.
+    pub(crate) fn stalling(cli: PathBuf) -> Self {
+        Runtime {
+            cli,
+            answer_bound: None,
+        }
     }
 }
 
@@ -469,7 +502,7 @@ pub(crate) fn runtime_down_now() -> bool {
 fn runtime_answers(rt: &Runtime) -> bool {
     let mut probe = rt.cmd();
     probe.args(["version", "--format", "{{.Server.Version}}"]);
-    output_within(probe, PROBE_TIMEOUT).is_some_and(|o| o.status.success())
+    output_within(probe, rt.bound(PROBE_TIMEOUT)).is_some_and(|o| o.status.success())
 }
 
 /// The first runtime candidate whose engine answers `version`, probed (uncached).
@@ -483,7 +516,10 @@ fn probe_runtime(choice: Option<&str>) -> Result<Runtime, FloorUnarmed> {
         return Err(FloorUnarmed::NoContainerRuntime);
     }
     for cli in cands {
-        let rt = Runtime { cli };
+        let rt = Runtime {
+            cli,
+            answer_bound: None,
+        };
         if runtime_answers(&rt) {
             return Ok(rt);
         }
@@ -598,7 +634,7 @@ pub(crate) fn image_override(cli: &str) -> Option<String> {
 fn image_id(rt: &Runtime, tag: &str) -> Option<String> {
     let mut c = rt.cmd();
     c.args(["image", "inspect", "--format", "{{.Id}}", tag]);
-    output_within(c, PROBE_TIMEOUT)
+    output_within(c, rt.bound(PROBE_TIMEOUT))
         .filter(|o| o.status.success())
         .and_then(|o| valid_image_id(String::from_utf8_lossy(&o.stdout).trim()))
 }
@@ -613,7 +649,7 @@ fn valid_image_id(id: &str) -> Option<String> {
 pub(crate) fn image_present(rt: &Runtime, tag: &str) -> bool {
     let mut c = rt.cmd();
     c.args(["image", "inspect", "--format", "{{.Id}}", tag]);
-    output_within(c, PROBE_TIMEOUT).is_some_and(|o| o.status.success())
+    output_within(c, rt.bound(PROBE_TIMEOUT)).is_some_and(|o| o.status.success())
 }
 
 /// Build `cli`'s seat image from the seat Dockerfile alone (no build context).
@@ -673,7 +709,7 @@ pub(crate) fn inspect_seat_image(
         "{{.Id}} {{json .Config}}",
         image,
     ]);
-    let out = output_within(c, PROBE_TIMEOUT)
+    let out = output_within(c, rt.bound(PROBE_TIMEOUT))
         .filter(|o| o.status.success())
         .ok_or_else(|| format!("could not inspect seat image {image}"))?;
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -729,7 +765,7 @@ pub(crate) fn inspect_seat_image(
         "l",
         "-print0",
     ]);
-    let out = output_within(c, Duration::from_secs(120))
+    let out = output_within(c, rt.bound(Duration::from_secs(120)))
         .ok_or_else(|| format!("inspecting seat image {image} did not finish"))?;
     if !out.status.success() {
         return Err(format!(
@@ -933,7 +969,7 @@ pub(crate) fn ensure_seat_network(rt: &Runtime, name: &str) -> Result<String, St
         &format!("{SEAT_LABEL}=1"),
         name,
     ]);
-    match output_within(create, PROBE_TIMEOUT) {
+    match output_within(create, rt.bound(PROBE_TIMEOUT)) {
         Some(o) if o.status.success() => Ok(name.to_string()),
         Some(o) => Err(format!(
             "could not create the seat network `{name}`: {}",
@@ -1652,6 +1688,7 @@ pub(crate) fn mount_argv_paths(mounts: &mut Vec<Mount>, argv: &mut [String], pro
 pub(crate) fn reap(seat: &SeatContainer) {
     let rt = Runtime {
         cli: seat.runtime.clone(),
+        answer_bound: None,
     };
     let name = seat.name.as_str();
     let mut c = rt.cmd();
@@ -1726,7 +1763,7 @@ pub(crate) fn sweep(rt: &Runtime, older_than: Duration) {
     for argv in sweep_argv(older_than) {
         let mut c = rt.cmd();
         c.args(&argv);
-        let _ = output_within(c, REAP_TIMEOUT);
+        let _ = output_within(c, rt.bound(REAP_TIMEOUT));
     }
 }
 
@@ -2851,7 +2888,7 @@ pub(crate) fn gateway_ip(rt: &Runtime, container: &str, network: &str) -> Result
         &format!("{{{{(index .NetworkSettings.Networks \"{network}\").IPAddress}}}}"),
         container,
     ]);
-    let o = output_within(c, PROBE_TIMEOUT).ok_or("inspecting the gateway timed out")?;
+    let o = output_within(c, rt.bound(PROBE_TIMEOUT)).ok_or("inspecting the gateway timed out")?;
     let ip = String::from_utf8_lossy(&o.stdout).trim().to_string();
     if o.status.success() && ip.parse::<std::net::IpAddr>().is_ok() {
         Ok(ip)
@@ -2914,7 +2951,8 @@ pub(crate) fn start_netns_sidecar(
     let argv = netns_argv(&rt.cli, &image, seat, network, gw_ip);
     let mut c = rt.cmd();
     c.args(&argv[1..]);
-    let o = output_within(c, PROBE_TIMEOUT).ok_or("starting the network sidecar timed out")?;
+    let o = output_within(c, rt.bound(PROBE_TIMEOUT))
+        .ok_or("starting the network sidecar timed out")?;
     if !o.status.success() {
         return Err(format!(
             "the network sidecar did not start: {}",
@@ -2925,7 +2963,7 @@ pub(crate) fn start_netns_sidecar(
     while start.elapsed() < PROBE_TIMEOUT {
         let mut l = rt.cmd();
         l.args(["logs", &netns_name(seat)]);
-        if output_within(l, PROBE_TIMEOUT)
+        if output_within(l, rt.bound(PROBE_TIMEOUT))
             .is_some_and(|o| String::from_utf8_lossy(&o.stdout).contains("wicked-netns-ready"))
         {
             return Ok(());
@@ -3329,7 +3367,7 @@ mod tests {
         crate::test_env::install_stub(&runtime, "#!/bin/sh\ncat > /dev/null\n[ /dev/stdout -ef /dev/null ] || exit 77\nprintf 'FAKE-build-progress\n'\n");
         assert_eq!(
             build_image(
-                &Runtime { cli: runtime },
+                &Runtime::answering(runtime),
                 "FAKE-dockerfile",
                 "FAKE-tag",
                 &[]

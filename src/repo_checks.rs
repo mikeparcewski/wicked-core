@@ -10447,9 +10447,14 @@ exit 1
             .as_ref()
             .expect("the env record rides a floor that ran");
         let tmpdir = Path::new(&env.tmpdir);
+        // One short level under the system temp dir (`wc-` + 6). Measured against that dir, not
+        // as a fixed 60 bytes (core#1194): nested inside a repo-checks floor, the system temp dir
+        // is that floor's own `…/T/wc-xxxxxx`, and the macOS per-user one alone is 49 bytes.
+        let base = std::env::temp_dir();
+        let base_len = base.to_string_lossy().trim_end_matches('/').len();
         assert!(
-            env.tmpdir.len() < 60,
-            "TMPDIR must stay short: {} ({} bytes)",
+            env.tmpdir.trim_end_matches('/').len() <= base_len + "/wc-123456".len(),
+            "TMPDIR must stay short: {} ({} bytes over a {base_len}-byte temp dir)",
             env.tmpdir,
             env.tmpdir.len()
         );
@@ -10612,24 +10617,30 @@ exit 1
         let wt = scratch("pipe-holder");
         let sandbox = sandbox_for(&wt);
         let scratch = CheckScratch::prepare(&wt).unwrap();
-        // The check prints, then leaves a setsid'd perl holding stdout for 60 s, and exits 0.
+        // The check prints, then leaves a setsid'd perl holding stdout, and exits 0. (core#1194)
+        // The holder is a CONDITION, not a clock: it holds until the test releases it (a 600 s
+        // guard ends it if the test never does), and it marks `held-to-end` only when it lets go.
+        // The check returning while that mark is absent is the proof the drain did not wait for
+        // the holder; a time limit on the check said nothing at load 80, where it took 192 s.
         let holder = RepoCheck {
             name: "test".into(),
             argv: s(&[
                 "sh",
                 "-c",
-                "echo before-holder; perl -e 'use POSIX; POSIX::setsid(); sleep 60' & exit 0",
+                "echo before-holder; perl -e 'use POSIX; POSIX::setsid(); \
+                 for (1..6000) { last if -e \"release\"; select(undef, undef, undef, 0.1) } \
+                 open(my $f, \">\", \"held-to-end\"); close($f)' & exit 0",
             ]),
             source: "fixture".into(),
             timeout_s: None,
             dir: String::new(),
         };
-        let started = Instant::now();
         let r = run_one(&wt, &holder, &sandbox, &scratch, Tree::Head);
+        let held = !wt.join("held-to-end").exists();
+        std::fs::write(wt.join("release"), "go").unwrap();
         assert!(
-            started.elapsed() < Duration::from_secs(30),
-            "the drain must be bounded (took {:?})",
-            started.elapsed()
+            held,
+            "the check returned only once the holder let go of its stdout"
         );
         assert!(r.passed(), "{r:?}");
         assert!(r.stdout_tail.contains("before-holder"), "{r:?}");
