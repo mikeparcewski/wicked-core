@@ -12018,6 +12018,24 @@ pub(crate) const STOP_SHUTDOWN: &str = "shutdown";
 #[cfg(unix)]
 const ACTOR_KILL_GRACE: std::time::Duration = std::time::Duration::from_millis(1000);
 
+// (core#1194) A test whose stand-in actor must land its SIGTERM inside the grace sets a longer one
+// for its own thread (the worker loop polls on the caller's thread): on a loaded host the trap
+// can take longer than 1 s to run. The backstop test keeps the production grace.
+#[cfg(all(test, unix))]
+thread_local! {
+    static TEST_KILL_GRACE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(unix)]
+fn kill_grace() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(g) = TEST_KILL_GRACE.with(|g| g.get()) {
+        return g;
+    }
+    ACTOR_KILL_GRACE
+}
+
 /// The grace [`run_tool_cmd`] allows before force-killing a stopped child — `Some` only when
 /// ANOTHER thread is already driving a graceful kill of this group (core#576).
 ///
@@ -12030,7 +12048,7 @@ fn actor_kill_grace(reason: &str) -> Option<std::time::Duration> {
     #[cfg(unix)]
     {
         match reason {
-            STOP_CANCELLED | STOP_SUPERSEDED => Some(ACTOR_KILL_GRACE),
+            STOP_CANCELLED | STOP_SUPERSEDED => Some(kill_grace()),
             _ => None,
         }
     }
@@ -31433,7 +31451,12 @@ mod tool_cmd_tests {
             }
         });
 
+        // (core#1194) The grace is the window under test, not a clock on the trap: a nested repro
+        // at host load 45 SIGKILLed before the trap ran inside the production 1 s. The pre-fix arm
+        // SIGKILLs in the same breath whatever the grace is, so this still tells them apart.
+        super::TEST_KILL_GRACE.with(|g| g.set(Some(crate::test_env::PATIENT)));
         let (out, st, k) = run_tool_cmd(&sh(&script), None, &[], &stop, &on_spawn, &noop_done);
+        super::TEST_KILL_GRACE.with(|g| g.set(None));
         assert!(
             actor.join().expect("actor thread"),
             "the stand-in actor never got a pgid to signal"
