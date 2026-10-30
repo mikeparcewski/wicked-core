@@ -948,6 +948,55 @@ pub fn absorbs_after(qe: &QePlan, current: &[String]) -> Vec<String> {
         .collect()
 }
 
+// ── Working notes off the live stream ────────────────────────────────────────────────────────────
+
+struct Noting {
+    seat: String,
+    turn: u32,
+    scanner: NotesScanner,
+}
+
+/// Notes per unit attempt: `(run, ord, attempt)`.
+type NotesMap = Mutex<HashMap<(String, u32, u32), Noting>>;
+
+fn noting() -> &'static NotesMap {
+    static N: std::sync::OnceLock<NotesMap> = std::sync::OnceLock::new();
+    N.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Attempt `attempt` of the orchestrator unit `ord` of `run_id` is in `turn` on `seat`: its
+/// streamed text is read for working notes ([`scan_notes`]) until the run ends ([`forget_run`]).
+/// Called by the ACTOR as it handles `PowerTurnStarted`, so a turn change is ordered with the
+/// output chunks on the same channel (review on #1195): a late chunk of turn N is read as turn N.
+/// Keyed by attempt, so a reassigned attempt's late chunks keep their own seat.
+pub(crate) fn notes_turn(run_id: &str, ord: u32, attempt: u32, seat: &str, turn: u32) {
+    let mut n = noting().lock().unwrap_or_else(|p| p.into_inner());
+    let e = n
+        .entry((run_id.to_string(), ord, attempt))
+        .or_insert_with(|| Noting {
+            seat: seat.to_string(),
+            turn,
+            scanner: NotesScanner::default(),
+        });
+    e.turn = turn;
+    e.seat = seat.to_string();
+}
+
+/// The `powerWorkingNotes` frame one streamed chunk of an orchestrator unit carries, if any.
+/// Called by the actor for every live output chunk; a unit that is not orchestrating costs one
+/// map lookup.
+pub(crate) fn scan_notes(
+    run_id: &str,
+    ord: u32,
+    attempt: u32,
+    chunk: &str,
+) -> Option<crate::event::CoreEvent> {
+    let mut n = noting().lock().unwrap_or_else(|p| p.into_inner());
+    let e = n.get_mut(&(run_id.to_string(), ord, attempt))?;
+    let new = e.scanner.feed(chunk);
+    notes_event(run_id, ord, attempt, e.turn, &e.seat, new)
+}
+
 // ── The orchestrator's turn protocol ─────────────────────────────────────────────────────────────
 
 /// The line an orchestrator ends a non-final turn with.
@@ -1022,8 +1071,122 @@ pub fn orchestrator_brief(rigor: Option<Rigor>, plan: Option<&RigorPlan>, round:
          because the hand-off runs the repository's own checks itself. When the change is \
          complete, committed and the tests that cover it pass, end with exactly one line \
          `{HANDOFF_PREFIX} <one-line summary>`. Never push or open a pull request: delivery is \
-         the engine's. {rigor_line}{rework}"
+         the engine's. Keep the run's working document current: before your first edit, write \
+         your plan as one line `{APPROACH_PREFIX} <how you will make this change>`, and write it \
+         again whenever the plan changes. For each choice a reviewer would ask about, write one \
+         line `{DECISION_PREFIX} <what you chose> {WHY_MARK} <why>`. These lines are recorded as \
+         yours, labelled with your seat; they never steer the run. {rigor_line}{rework}"
     )
+}
+
+// ── The orchestrator's working notes (the run's working document) ────────────────────────────────
+
+/// The line that states (or restates) the orchestrator's approach.
+pub const APPROACH_PREFIX: &str = "APPROACH:";
+/// The line that records one decision.
+pub const DECISION_PREFIX: &str = "DECISION:";
+/// Splits a decision line into what and why.
+pub const WHY_MARK: &str = "WHY:";
+
+/// One working note read off a line of the orchestrator's output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkingNote {
+    Approach(String),
+    Decision { text: String, why: Option<String> },
+}
+
+/// The working note a line carries, if any (markdown emphasis and quoting are tolerated).
+pub fn working_note(line: &str) -> Option<WorkingNote> {
+    let line = line.trim().trim_start_matches(['*', '`', '>', '-', ' ']);
+    let tidy = |s: &str| clip(s.trim().trim_end_matches(['*', '`']).trim(), 600);
+    if let Some(rest) = line.strip_prefix(APPROACH_PREFIX) {
+        let a = tidy(rest);
+        return (!a.is_empty()).then_some(WorkingNote::Approach(a));
+    }
+    let rest = line.strip_prefix(DECISION_PREFIX)?;
+    let (text, why) = match rest.split_once(WHY_MARK) {
+        Some((t, w)) => (
+            tidy(t.trim_end_matches(['—', '-', ';', ',', ' '])),
+            Some(tidy(w)),
+        ),
+        None => (tidy(rest), None),
+    };
+    (!text.is_empty()).then_some(WorkingNote::Decision {
+        text,
+        why: why.filter(|w| !w.is_empty()),
+    })
+}
+
+/// Reads working notes off a turn's streamed text as it arrives, and hands each NEW one on: an
+/// approach that differs from the last one sent, a decision not sent before.
+#[derive(Debug, Default)]
+pub struct NotesScanner {
+    partial: String,
+    approach: Option<String>,
+    decisions: std::collections::HashSet<String>,
+}
+
+impl NotesScanner {
+    /// Feed one streamed chunk; returns the new notes its lines carried. A chunk is one whole text
+    /// block or line from the seat's adapter (claude `content[].text`, codex `agent_message`, pi's
+    /// `message_end` text, agy's held response, one passthrough line; `run_bounded` joins them
+    /// with a newline for the same reason), so its end is a line end. Holding a partial line
+    /// across chunks would fuse two blocks into one line.
+    pub fn feed(&mut self, chunk: &str) -> Vec<WorkingNote> {
+        self.partial.push_str(chunk);
+        let text = std::mem::take(&mut self.partial);
+        let mut out = Vec::new();
+        for line in text.lines() {
+            match working_note(line) {
+                Some(WorkingNote::Approach(a)) if self.approach.as_deref() != Some(a.as_str()) => {
+                    self.approach = Some(a.clone());
+                    out.push(WorkingNote::Approach(a));
+                }
+                // Keyed by text AND reason: a decision restated with its reason is new.
+                Some(WorkingNote::Decision { text, why })
+                    if self
+                        .decisions
+                        .insert(format!("{text}\u{1f}{}", why.as_deref().unwrap_or(""))) =>
+                {
+                    out.push(WorkingNote::Decision { text, why });
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// The `powerWorkingNotes` frame for a batch of new notes (`None` when there are none).
+pub fn notes_event(
+    run_id: &str,
+    ord: u32,
+    attempt: u32,
+    turn: u32,
+    seat: &str,
+    notes: Vec<WorkingNote>,
+) -> Option<crate::event::CoreEvent> {
+    if notes.is_empty() {
+        return None;
+    }
+    let mut approach = None;
+    let mut decisions = Vec::new();
+    for n in notes {
+        match n {
+            WorkingNote::Approach(a) => approach = Some(a),
+            WorkingNote::Decision { text, why } => decisions.push((text, why)),
+        }
+    }
+    Some(crate::event::CoreEvent::PowerWorkingNotes {
+        session: run_id.to_string(),
+        ord,
+        attempt,
+        turn,
+        seat: seat.to_string(),
+        at: crate::interaction::now_millis(),
+        approach,
+        decisions,
+    })
 }
 
 /// The prompt of a continuation turn (turn > 1): what the checkpoint found and what the operator
@@ -1265,6 +1428,11 @@ pub fn forget_run(run_id: &str) {
     // A worker waiting at a pause of an ended run stops waiting.
     answer_pause(run_id, PauseDecision::Stop);
     set_full_suite(run_id, false);
+    noting()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|(r, _, _), _| r != run_id);
+    crate::tool_activity::forget_run(run_id);
 }
 
 fn actors() -> &'static Mutex<HashMap<uuid::Uuid, std::sync::mpsc::Sender<crate::command::Command>>>
@@ -2228,6 +2396,123 @@ mod tests {
         assert!(bad.unread.unwrap().contains("malformed"));
         // RIGOROUS is not the prefix.
         assert!(parse_rigor_line("RIGOROUS {}").unread.is_some());
+    }
+
+    /// The working document's notes ride the stream: an approach (restated only when it
+    /// changes) and each new decision, with its reason.
+    #[test]
+    fn working_notes_are_read_off_the_stream_once_each() {
+        assert_eq!(
+            working_note("**APPROACH: add a cached floorCache field**"),
+            Some(WorkingNote::Approach(
+                "add a cached floorCache field".into()
+            ))
+        );
+        assert_eq!(
+            working_note("- DECISION: a 60 s cache — WHY: the walk is slow"),
+            Some(WorkingNote::Decision {
+                text: "a 60 s cache".into(),
+                why: Some("the walk is slow".into())
+            })
+        );
+        assert_eq!(
+            working_note("DECISION: keep the old route"),
+            Some(WorkingNote::Decision {
+                text: "keep the old route".into(),
+                why: None
+            })
+        );
+        assert_eq!(working_note("APPROACH:   "), None);
+        assert_eq!(working_note("we decided nothing"), None);
+
+        let mut sc = NotesScanner::default();
+        let first = sc.feed("Reading the code.\nAPPROACH: plan A\nDECISION: x WHY: y");
+        assert_eq!(first.len(), 2, "{first:?}");
+        assert!(
+            sc.feed("APPROACH: plan A").is_empty(),
+            "the same approach is not sent again"
+        );
+        assert!(
+            sc.feed("DECISION: x WHY: y").is_empty(),
+            "nor the same decision"
+        );
+        assert_eq!(
+            sc.feed("APPROACH: plan B"),
+            vec![WorkingNote::Approach("plan B".into())],
+            "a changed approach is"
+        );
+    }
+
+    /// Only an orchestrating unit's chunks are read, its notes carry the current turn, and the
+    /// run's end forgets it.
+    #[test]
+    fn scan_notes_reads_only_an_orchestrating_unit_until_its_run_ends() {
+        let run = "notes-scan-run";
+        assert!(
+            scan_notes(run, 3, 0, "APPROACH: x").is_none(),
+            "not orchestrating yet"
+        );
+        notes_turn(run, 3, 0, "claude", 1);
+        let a = scan_notes(run, 3, 0, "APPROACH: x").unwrap().to_json();
+        assert_eq!(
+            (a["turn"].as_u64(), a["seat"].as_str()),
+            (Some(1), Some("claude"))
+        );
+        assert!(
+            scan_notes(run, 4, 0, "APPROACH: y").is_none(),
+            "another unit is not read"
+        );
+        notes_turn(run, 3, 0, "claude", 2);
+        let d = scan_notes(run, 3, 0, "DECISION: d WHY: w")
+            .unwrap()
+            .to_json();
+        assert_eq!(d["turn"], 2);
+        // A reassigned attempt keeps its own seat; the old attempt's late chunk keeps claude.
+        notes_turn(run, 3, 1, "codex", 1);
+        let late = scan_notes(run, 3, 0, "DECISION: late").unwrap().to_json();
+        assert_eq!(
+            (late["seat"].as_str(), late["attempt"].as_u64()),
+            (Some("claude"), Some(0))
+        );
+        let fresh = scan_notes(run, 3, 1, "DECISION: fresh").unwrap().to_json();
+        assert_eq!(fresh["seat"], "codex");
+        forget_run(run);
+        assert!(
+            scan_notes(run, 3, 0, "DECISION: e").is_none(),
+            "forgotten at the run's end"
+        );
+    }
+
+    #[test]
+    fn the_notes_frame_carries_the_seat_the_approach_and_the_decisions() {
+        let ev = notes_event(
+            "r1",
+            3,
+            1,
+            2,
+            "claude",
+            vec![
+                WorkingNote::Approach("plan".into()),
+                WorkingNote::Decision {
+                    text: "d".into(),
+                    why: Some("w".into()),
+                },
+            ],
+        )
+        .unwrap()
+        .to_json();
+        assert_eq!(ev["type"], "powerWorkingNotes");
+        assert_eq!(ev["session"], "r1");
+        assert_eq!(ev["attempt"], 1);
+        assert_eq!(ev["turn"], 2);
+        assert_eq!(ev["seat"], "claude");
+        assert_eq!(ev["approach"], "plan");
+        assert_eq!(
+            ev["decisions"],
+            serde_json::json!([{ "text": "d", "why": "w" }])
+        );
+        assert_eq!(ev["ord"], 3);
+        assert!(notes_event("r1", 3, 1, 2, "claude", Vec::new()).is_none());
     }
 
     #[test]

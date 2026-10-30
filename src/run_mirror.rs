@@ -25,6 +25,7 @@ pub fn bus_type(event_type: &str) -> Option<&'static str> {
         "powerHandoffStepped" => "wicked.run.handoff.stepped",
         "powerToggled" => "wicked.run.power.toggled",
         "powerActivity" => "wicked.run.activity.recorded",
+        "powerWorkingNotes" => "wicked.run.notes.recorded",
         "unitExecuting" => "wicked.run.unit.started",
         "unitDone" | "unitDenied" | "stepFailed" => "wicked.run.unit.finished",
         "repoChecksEvaluated" => "wicked.run.checks.evaluated",
@@ -55,7 +56,16 @@ fn strip(v: &mut serde_json::Value) {
 /// `None` when the event is not mirrored or carries no run.
 pub fn row(json: &serde_json::Value, seq: u64, at: u64) -> Option<crate::bus::BusEmit> {
     let ty = json.get("type")?.as_str()?;
-    let bus = bus_type(ty)?;
+    // A live tool frame mirrors by its state (power-mode-ui contract).
+    let bus = if ty == "toolActivity" {
+        match json.get("state").and_then(|s| s.as_str()) {
+            Some("started") => "wicked.run.tool.started",
+            Some("finished") => "wicked.run.tool.finished",
+            _ => return None,
+        }
+    } else {
+        bus_type(ty)?
+    };
     let run_id = json.get("session")?.as_str()?.to_string();
     let mut payload = json.clone();
     if let Some(m) = payload.as_object_mut() {
@@ -194,5 +204,28 @@ mod tests {
         .unwrap();
         assert_eq!(done.payload["outcome"], "denied");
         assert!(row(&serde_json::json!({"type": "unitDone"}), 1, 1).is_none());
+    }
+
+    /// A live tool frame mirrors by its state; the notes frame has its own type.
+    #[test]
+    fn tool_frames_mirror_as_started_or_finished_and_notes_as_recorded() {
+        let f = |state: &str| {
+            serde_json::json!({"type": "toolActivity", "session": "r1", "ord": 3, "state": state,
+                "id": "t1", "kind": "read", "tool": "Read"})
+        };
+        assert_eq!(
+            row(&f("started"), 1, 1).unwrap().event_type,
+            "wicked.run.tool.started"
+        );
+        assert_eq!(
+            row(&f("finished"), 2, 1).unwrap().event_type,
+            "wicked.run.tool.finished"
+        );
+        assert!(row(&f("weird"), 3, 1).is_none());
+        let n = serde_json::json!({"type": "powerWorkingNotes", "session": "r1", "ord": 3});
+        assert_eq!(
+            row(&n, 4, 1).unwrap().event_type,
+            "wicked.run.notes.recorded"
+        );
     }
 }
