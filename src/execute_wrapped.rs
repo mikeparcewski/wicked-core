@@ -11579,9 +11579,9 @@ mod tests {
             .expect("the seat exits only after its writer recorded its pid")
             .trim()
             .to_string();
-        // spawn-audit: test-only — `kill -0` asks whether the writer process still exists; reads
-        // no engine state.
         let alive = || {
+            // spawn-audit: test-only — `kill -0` asks whether the writer process still exists;
+            // reads no engine state.
             std::process::Command::new("kill")
                 .args(["-0", &pid])
                 .stderr(std::process::Stdio::null())
