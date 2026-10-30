@@ -10447,9 +10447,14 @@ exit 1
             .as_ref()
             .expect("the env record rides a floor that ran");
         let tmpdir = Path::new(&env.tmpdir);
+        // One short level under the system temp dir (`wc-` + 6). Measured against that dir, not
+        // as a fixed 60 bytes (core#1194): nested inside a repo-checks floor, the system temp dir
+        // is that floor's own `…/T/wc-xxxxxx`, and the macOS per-user one alone is 49 bytes.
+        let base = std::env::temp_dir();
+        let base_len = base.to_string_lossy().trim_end_matches('/').len();
         assert!(
-            env.tmpdir.len() < 60,
-            "TMPDIR must stay short: {} ({} bytes)",
+            env.tmpdir.trim_end_matches('/').len() <= base_len + "/wc-123456".len(),
+            "TMPDIR must stay short: {} ({} bytes over a {base_len}-byte temp dir)",
             env.tmpdir,
             env.tmpdir.len()
         );
