@@ -3445,7 +3445,8 @@ mod tests {
                 "mode": "affected", "reason": "1 changed symbol(s) reach 2", "packages": ["p"],
                 "targets": ["p --lib (1 tests)"], "tests": ["p: a"], "test_count": 1,
                 "changed_symbols": 1, "reached_symbols": 2
-            }
+            },
+            "reused_from": {"phase": "fix", "ord": 2, "attempt": 0}
         }))
         .expect("a check run with a decision deserializes");
         let ev = event_to_json(&CoreEvent::RepoChecksEvaluated {
@@ -3483,7 +3484,8 @@ mod tests {
             let declared = iface(name);
             for key in obj.as_object().expect("object").keys() {
                 assert!(
-                    declared.contains(&format!("\n  {key}:")),
+                    declared.contains(&format!("\n  {key}:"))
+                        || declared.contains(&format!("\n  {key}?:")),
                     "`{key}` is on the wire but not declared on {name}"
                 );
             }

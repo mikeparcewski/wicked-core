@@ -595,6 +595,11 @@ pub struct CheckRun {
     /// against a CACHED base from another band says so ([`cached_base_load_note`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_band: Option<u32>,
+    /// (power-speed-2) Set on a check this floor did NOT run: a verify floor took the result from
+    /// the creator floor of the same tree and base ([`RepoChecksReport::reused_from`]), so its
+    /// duration, exit and retries are that floor's. `None` on every check that ran here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reused_from: Option<CheckReuse>,
     /// (DES-FLOOR-V2) The floor's decision on this check; `None` on a nested run (a re-run, a base
     /// run) and on a stored record from before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -990,6 +995,17 @@ pub struct FloorReuse {
     pub voided: Option<String>,
 }
 
+/// (power-speed-2) Where one reused check's result came from ([`CheckRun::reused_from`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckReuse {
+    /// The creator unit's phase (`fix`), when known.
+    pub phase: Option<String>,
+    /// The creator unit and the attempt whose floor ran it.
+    pub ord: u32,
+    pub attempt: u32,
+}
+
 impl FloorReuse {
     /// The operator's sentence for the gate's `floorNote`.
     pub fn note(&self) -> String {
@@ -1160,8 +1176,13 @@ impl CreatorSeed {
 
     /// Take the creator floor's result of `check` ([`Self::entry_for`]).
     fn reuse(&mut self, check: &RepoCheck, logs: &Path) -> Option<CheckRun> {
-        let run = self.entry_for(check, logs)?.run.clone();
+        let mut run = self.entry_for(check, logs)?.run.clone();
         self.reused.push(check.name.clone());
+        run.reused_from = Some(CheckReuse {
+            phase: self.record.phase.clone(),
+            ord: self.record.ord,
+            attempt: self.record.attempt,
+        });
         Some(run)
     }
 
@@ -9822,6 +9843,7 @@ pub(crate) fn run_one_with(
         load_band: None,
         decision: None,
         logs: Vec::new(),
+        reused_from: None,
     };
     let (load1, cpus) = host_load();
     result.load_band = load_band(load1, cpus);
@@ -10498,6 +10520,7 @@ pub(crate) mod tests {
                 decision: None,
                 logs: Vec::new(),
                 load_band: None,
+                reused_from: None,
             }],
             skipped: vec!["typecheck".into(), "test".into()],
             passed: false,
@@ -13804,7 +13827,73 @@ exit 1
             decision: None,
             logs: Vec::new(),
             load_band: None,
+            reused_from: None,
         }
+    }
+
+    /// (power-speed-2, rig run 5a88dcb6) A verify floor that reused the creator floor's checks
+    /// says so on each reused row, not only at the frame's top: the row's duration and retries
+    /// are the creator floor's. The mark rides the run itself, so a check that ran here carries
+    /// none even when it shares its name with a reused one (a root `test` run fresh beside a
+    /// subpackage's reused `test`, xreview on #1224).
+    #[test]
+    fn each_reused_check_row_names_the_floor_it_was_reused_from() {
+        let reused = |mut r: CheckRun, dir: &str| {
+            r.reused_from = Some(CheckReuse {
+                phase: Some("fix".into()),
+                ord: 2,
+                attempt: 0,
+            });
+            r.argv = vec!["sh".into(), dir.into()];
+            r
+        };
+        let frame = crate::event::CoreEvent::RepoChecksEvaluated {
+            session: "s".into(),
+            ord: 4,
+            attempt: 0,
+            passed: true,
+            criterion: "c".into(),
+            checks: vec![
+                run_named("install", Some(0), false),
+                reused(run_named("typecheck", Some(0), false), "."),
+                run_named("test", Some(0), false),
+                reused(run_named("test", Some(0), false), "packages/a"),
+            ],
+            skipped: Vec::new(),
+            sandbox_level: "sandboxed".into(),
+            sandbox_error: None,
+            detect_error: None,
+            outcome: "passed".into(),
+            floor: "verify".into(),
+            claim: None,
+            env: None,
+            changed: Vec::new(),
+            changed_truncated: false,
+            reused_from: Some(FloorReuse {
+                phase: Some("fix".into()),
+                ord: 2,
+                attempt: 0,
+                reused: vec!["typecheck".into(), "test".into()],
+                fresh: vec!["install".into(), "test".into()],
+                voided: None,
+            }),
+            floor_runner: None,
+        }
+        .to_json();
+        let rows = frame["checks"].as_array().unwrap();
+        let from = serde_json::json!({"phase": "fix", "ord": 2, "attempt": 0});
+        let marks: Vec<Option<&serde_json::Value>> =
+            rows.iter().map(|r| r.get("reusedFrom")).collect();
+        assert_eq!(
+            marks,
+            vec![None, Some(&from), None, Some(&from)],
+            "only the reused runs are marked: {frame:#}"
+        );
+        // A stored run from before the field reads as not reused.
+        let mut stored = serde_json::to_value(run_named("lint", Some(0), false)).unwrap();
+        stored.as_object_mut().unwrap().remove("reused_from");
+        let back: CheckRun = serde_json::from_value(stored).unwrap();
+        assert_eq!(back.reused_from, None);
     }
 
     /// (deliver honors an override) A floor result's key: only the ordinary floor that RAN is keyed —
@@ -14066,6 +14155,7 @@ exit 1
             decision: None,
             logs: Vec::new(),
             load_band: None,
+            reused_from: None,
         }
     }
 
@@ -14819,6 +14909,7 @@ mod floor_pass_tests {
             decision: None,
             logs: Vec::new(),
             load_band: None,
+            reused_from: None,
         }
     }
 

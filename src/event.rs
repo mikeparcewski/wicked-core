@@ -1612,6 +1612,17 @@ fn changed_path_json(c: &crate::worktree_guard::ChangedPath) -> serde_json::Valu
 /// The wire form of one check run on `repoChecksEvaluated` — camelCase like every other event
 /// field, tails included verbatim (already bounded by `repo_checks::TAIL_BYTES`).
 fn check_run_json(c: &crate::repo_checks::CheckRun) -> serde_json::Value {
+    let mut v = check_run_fields(c);
+    // (power-speed-2, additive) A check this floor did NOT run — its duration, exit and retries are
+    // the creator floor's it was reused from. Absent on every check that ran here.
+    if let Some(r) = &c.reused_from {
+        v["reusedFrom"] =
+            serde_json::json!({ "phase": r.phase, "ord": r.ord, "attempt": r.attempt });
+    }
+    v
+}
+
+fn check_run_fields(c: &crate::repo_checks::CheckRun) -> serde_json::Value {
     serde_json::json!({
         "name": c.name,
         "argv": c.argv,

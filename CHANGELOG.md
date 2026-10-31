@@ -14,6 +14,22 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A unit's floor, QE reviewer, team and judge no longer wait on each other.** After the seat's turn the engine
+  ran the rest of a unit one step at a time: the isolated QE reviewer, then the team's final pass, then the judge,
+  then the repository's checks. On rig run 5a88dcb6 (crew#1244) that put 86 s of team and judge in front of the
+  creator's 4.7-min floor, and the team's 1.5-min final pass behind QE's 3-min reviewer. Now a floor that runs on a
+  clean checkout of a known tree (the guarded verify tree, or the creator's tree through the pinned git dir) starts
+  on its own thread as soon as the turn ends, and the QE reviewer runs alongside the team's final pass. The judge
+  still follows the team (it reads the team's ledger and leaves its monitors out), the final worktree guard is
+  still the last comparison, and a floor that would run in the live worktree still runs last. The same checks,
+  judges and gates run; only the order changed. The judge's live note now reads "judge: a judge seat is reviewing
+  the change"; once the judge is done, the floor's own note says it is still running.
+- **Each reused check says so on its own row.** A verify floor that reused the creator floor's checks said so at
+  the top of `repoChecksEvaluated` (`reusedFrom`), but each reused row repeated the creator floor's `durationMs`
+  and retries unmarked, so a reader of one row saw the test suite run again. Each reused run now carries where
+  it came from (`CheckRun.reused_from`; on the wire `checks[].reusedFrom: {phase, ord, attempt}`, declared on
+  core-ts's `RepoCheckRunJson`). A check that ran on this floor carries none, even beside a reused check of the
+  same name.
 - **domain-extraction reviews the page it mapped, not the whole repository.** A run maps one page of a
   repository (the hub-first worklist, up to 300 behaviours by default), but the floor's generic `critique` judged
   that page as an incomplete domain model and failed every run of a large repository (rig run 7588cff1 on
