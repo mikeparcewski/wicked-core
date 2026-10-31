@@ -210,6 +210,7 @@ fn spec(session_id: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     }
@@ -287,6 +288,7 @@ fn session_started_cli_count_matches_spec() {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })
@@ -331,6 +333,7 @@ fn session_started_entity_mode_is_serialized() {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })
@@ -368,6 +371,7 @@ fn session_started_entity_mode_is_serialized() {
             primary: None,
             reduced_assurance: false,
             power: false,
+            voice: None,
             deliverables: Vec::new(),
             qe_acceptance: Default::default(),
         })
@@ -407,6 +411,7 @@ fn session_started_workflow_id_is_none_for_free_text() {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })
@@ -477,6 +482,7 @@ fn unit_planned_role_and_gate_from_phase_def() {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })
@@ -565,6 +571,7 @@ fn unit_planned_skill_ref_and_has_validator_pin() {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })
@@ -648,6 +655,7 @@ fn unit_planned_executor_type_is_tool_for_tool_phases() {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })
@@ -709,6 +717,7 @@ fn unit_planned_free_text_defaults() {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })
@@ -771,6 +780,7 @@ fn unit_distributed_teamed_routing_carries_no_council_fields() {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })
@@ -855,6 +865,7 @@ fn unit_distributed_evaluator_distinct_routing() {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })
@@ -929,6 +940,7 @@ fn unit_distributed_names_the_bench_on_the_teamed_arm() {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })
@@ -1090,6 +1102,7 @@ fn workflow_selected_fires_for_structured_run_only() {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })
@@ -1279,6 +1292,7 @@ fn unit_rework_amended_fires_on_non_empty_amend_and_precedes_resumed() {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })
@@ -1390,6 +1404,7 @@ fn unit_rework_amended_fires_on_non_empty_amend_and_precedes_resumed() {
             primary: None,
             reduced_assurance: false,
             power: false,
+            voice: None,
             deliverables: Vec::new(),
             qe_acceptance: Default::default(),
         })

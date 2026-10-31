@@ -109,6 +109,7 @@ fn launch(core: &Core, id: &str, sid: &str) -> anyhow::Result<String> {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })

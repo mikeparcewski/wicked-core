@@ -830,6 +830,13 @@ pub struct LaunchOptions {
     /// step runs as one multi-turn orchestrator session, and a hand-off NOT-PASS goes back to that
     /// session on its own. Only for a plan or preset launch. Omit (or `false`) for a phased run.
     pub power: Option<bool>,
+    /// (core#1216) The person's VOICE BLOCK (their personality, resolved for the run's project):
+    /// how the power-mode ORCHESTRATOR talks to them. Tone only: appended last to the
+    /// orchestrator's brief under a governance line (and to its restart statement); the PA's scope
+    /// step, the hand-off's reviewers, judges and QE never receive it, and no gate reads it. At
+    /// most 4096 bytes (a longer one REJECTS the launch). Ignored on a phased run. An older addon
+    /// drops the field, so the orchestrator simply runs without a voice.
+    pub voice: Option<String>,
     /// (X-MIG M9, core#649) The run's DECLARED DELIVERABLES on a plan or preset launch (`plan` or a
     /// preset `workflow`): absolute paths inside a declared write root (or worktree-relative paths)
     /// the run must write. They join the `required_deliverables` of the plan's last creator step, so
@@ -905,6 +912,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         primary: o.primary,
         reduced_assurance: o.reduced_assurance.unwrap_or(false),
         power: o.power.unwrap_or(false),
+        voice: o.voice,
         deliverables: o.deliverables.unwrap_or_default(),
         qe_acceptance,
     })

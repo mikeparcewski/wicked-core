@@ -103,6 +103,7 @@ fn spec(sid: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         qe_acceptance: Default::default(),
         deliverables: Vec::new(),
     }

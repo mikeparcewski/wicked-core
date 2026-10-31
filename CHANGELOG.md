@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The power-mode orchestrator hears the person's personality: `LaunchOptions.voice` (core#1216).** A launcher
+  passes the person's voice block (their personality for the run's project) on a power launch; the engine keeps it
+  on the run (`power.voice`) and appends it LAST to the orchestrator's brief, behind a governance line: it shapes
+  only tone and habits, never the rigor, the gates, the checks, the reviews, QE or what the seat may do, and the
+  CHECKPOINT / HANDOFF / APPROACH / DECISION formats stay as given. A rework round hears it again; a turn whose
+  session could not be resumed gets it in the restart statement. The PA's scope step, the hand-off's reviewers,
+  judges and QE are briefed without it, so evaluator independence never depends on it. Ignored on a phased run;
+  over 4096 bytes refuses the launch (nothing persisted); an older addon drops the field.
+
 - **A live token meter for a working step: `usageProgress`.** A unit's `cliUsage` lands when the attempt ends, so a
   long chat turn or a power build showed no tokens until it was over. The seat's own stream now feeds the attempt's
   running TOTAL to the run as `usageProgress {session, ord, attempt, at, inputTokens, outputTokens, costUsd}` (fresh

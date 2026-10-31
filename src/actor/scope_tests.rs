@@ -57,6 +57,7 @@ fn launch_preset_with_qe(
             primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
             reduced_assurance: false,
             power: false,
+            voice: None,
             deliverables: Vec::new(),
             qe_acceptance,
         })
@@ -347,6 +348,7 @@ fn a_scoped_launch_refuses_an_authored_step_named_pa_scope() {
         primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     };
@@ -403,6 +405,7 @@ fn the_campaign_launch_path_refuses_an_authored_pa_scope_step() {
         primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     };
@@ -1092,6 +1095,7 @@ fn launch_preset_into(e: &Engine, run: &str, workflow: &str, inbox: &std::path::
             primary: Some("a".into()), // (ASK-K1a) the tests read the PA as `a`,
             reduced_assurance: false,
             power: false,
+            voice: None,
             deliverables: Vec::new(),
             qe_acceptance: Default::default(),
         })

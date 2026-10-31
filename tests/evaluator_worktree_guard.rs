@@ -495,6 +495,7 @@ fn bug_run(session_id: &str, repo_ref: &str) -> LaunchSpec {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     }

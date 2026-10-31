@@ -175,6 +175,7 @@ fn validation_pin_attached_fires_for_a_pinned_validator_unit() {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })
@@ -263,6 +264,7 @@ fn tool_executor_dispatched_fires_for_a_tool_phase() {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })

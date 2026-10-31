@@ -7,6 +7,10 @@
 use super::*;
 
 fn launch_power(e: &Engine, run: &str, repo_ref: &str) {
+    launch_power_voiced(e, run, repo_ref, None);
+}
+
+fn launch_power_voiced(e: &Engine, run: &str, repo_ref: &str, voice: Option<String>) {
     e.core
         .launch_run(LaunchSpec {
             base_ref: None,
@@ -29,6 +33,7 @@ fn launch_power(e: &Engine, run: &str, repo_ref: &str) {
             primary: Some("a".into()),
             reduced_assurance: false,
             power: true,
+            voice,
             deliverables: Vec::new(),
             qe_acceptance: Default::default(),
         })
@@ -191,6 +196,7 @@ fn a_phased_launch_carries_no_power_record_and_keeps_its_preset_steps() {
             primary: Some("a".into()),
             reduced_assurance: false,
             power: false,
+            voice: None,
             deliverables: Vec::new(),
             qe_acceptance: Default::default(),
         })
@@ -292,6 +298,156 @@ fn a_hand_off_not_pass_goes_back_to_the_orchestrator_on_its_own() {
         "{:?}",
         p.handoff
     );
+    release_all(&w);
+}
+
+/// (core#1216) The person's voice reaches the ORCHESTRATOR and nobody else: its first brief and
+/// its rework round carry it; the PA's scope step, the hand-off's reviewers and the gate judges
+/// are briefed without it (evaluator independence never depends on the person's tone settings).
+#[test]
+fn only_the_orchestrator_hears_the_voice_never_the_pa_reviewers_or_judges() {
+    if crate::validator::skip_when_nested(
+        "only_the_orchestrator_hears_the_voice_never_the_pa_reviewers_or_judges",
+    ) {
+        return;
+    }
+    const MARK: &str = "Your name with the person is \"Rook\"";
+    let prompts: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let fix_turns = Arc::new(AtomicUsize::new(0));
+    let reviews = Arc::new(AtomicUsize::new(0));
+    let (seen, turns, revs) = (prompts.clone(), fix_turns.clone(), reviews.clone());
+    let w = Worker::scripted(move |i, _| {
+        let phase = i.unit.id.rsplit(':').next().unwrap_or("").to_string();
+        seen.lock()
+            .unwrap()
+            .push((phase.clone(), i.unit.description.clone()));
+        match phase.as_str() {
+            "pa-scope" => turn(&pa_output("SCOPE {\"touch\":[\"README.md\"]}"), None),
+            "fix" => match turns.fetch_add(1, AtomicOrdering::SeqCst) {
+                0 => {
+                    let wd = i.workdir.as_ref().expect("a worktree");
+                    std::fs::write(wd.join("README.md"), "hello, voice\n").unwrap();
+                    turn("changed README.md\nHANDOFF: first try", None)
+                }
+                _ => hold(),
+            },
+            "validator-agent" => turn("PASS", None),
+            p if p.starts_with("review") || p == "verify" => {
+                match revs.fetch_add(1, AtomicOrdering::SeqCst) {
+                    0 => turn(
+                        "ITEM 1: FAIL — the heading is gone (README.md:1)\nVERDICT: FAIL",
+                        None,
+                    ),
+                    _ => hold(),
+                }
+            }
+            _ => hold(),
+        }
+    });
+    let e = engine("pwv", w.clone());
+    let (path, _head) = git_repo(&e.rig.dir);
+    let repo = e
+        .core
+        .register_repo(crate::RepoSpec {
+            name: "pwv".into(),
+            root_path: path.to_string_lossy().into_owned(),
+            registered_at: 0,
+        })
+        .unwrap();
+    let voice = format!("## Voice\n\n- {MARK}.\n- Keep it short.\n");
+    launch_power_voiced(&e, "pv", &repo.id, Some(voice));
+    wait_for("the rework round after the review's NOT-PASS", || {
+        e.worker.calls().iter().filter(|c| c.2 == "pv:fix").count() >= 2
+    });
+    let prompts = prompts.lock().unwrap().clone();
+    let fixes: Vec<&String> = prompts
+        .iter()
+        .filter(|(p, _)| p == "fix")
+        .map(|(_, d)| d)
+        .collect();
+    assert_eq!(fixes.len(), 2, "{prompts:?}");
+    for f in &fixes {
+        assert!(f.contains(MARK), "the orchestrator hears the voice: {f}");
+        assert!(
+            f.contains(crate::power::VOICE_GOVERNANCE),
+            "behind its governance line: {f}"
+        );
+    }
+    let others: Vec<&(String, String)> = prompts.iter().filter(|(p, _)| p != "fix").collect();
+    assert!(
+        others.iter().any(|(p, _)| p == "pa-scope"),
+        "the PA's scope step ran: {prompts:?}"
+    );
+    assert!(
+        others
+            .iter()
+            .any(|(p, _)| p.starts_with("review") || p == "verify" || p == "validator-agent"),
+        "a hand-off reviewer or judge ran: {prompts:?}"
+    );
+    for (p, d) in others {
+        assert!(!d.contains(MARK), "{p} must not hear the voice: {d}");
+        assert!(!d.contains("## Voice"), "{p} must not hear the voice: {d}");
+    }
+    assert_eq!(
+        view(&e, "pv").session.power.unwrap().voice.as_deref(),
+        Some(format!("## Voice\n\n- {MARK}.\n- Keep it short.").as_str()),
+        "kept on the run (trimmed) for a rework round or a restart"
+    );
+    release_all(&w);
+}
+
+/// (core#1216) A voice over the bound refuses the launch with nothing persisted.
+#[test]
+fn an_oversized_voice_refuses_the_launch() {
+    let w = Worker::scripted(|_, _| hold());
+    let e = engine("pwvx", w.clone());
+    let (path, _head) = git_repo(&e.rig.dir);
+    let repo = e
+        .core
+        .register_repo(crate::RepoSpec {
+            name: "pwvx".into(),
+            root_path: path.to_string_lossy().into_owned(),
+            registered_at: 0,
+        })
+        .unwrap();
+    let err = e
+        .core
+        .launch_run(LaunchSpec {
+            base_ref: None,
+            project_id: None,
+            problem: "too much voice".into(),
+            clis: vec![cli("a"), cli("b")],
+            entity_mode: crate::EntityMode::Shared,
+            session_id: "pvx".into(),
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            repo_ref: Some(repo.id.clone()),
+            workflow: Some("bug".into()),
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            plan: None,
+            deliver_step: None,
+            exclude_seats: Vec::new(),
+            evidence_root: None,
+            primary: Some("a".into()),
+            reduced_assurance: false,
+            power: true,
+            voice: Some("x".repeat(crate::power::VOICE_MAX_BYTES + 1)),
+            deliverables: Vec::new(),
+            qe_acceptance: Default::default(),
+        })
+        .expect_err("refused");
+    assert!(err.to_string().contains("voice"), "{err}");
+    assert!(
+        !e.core
+            .sessions_detail()
+            .unwrap()
+            .iter()
+            .any(|v| v.session.id == "pvx"),
+        "nothing persisted"
+    );
+    assert!(e.worker.calls().is_empty(), "nothing ran");
     release_all(&w);
 }
 

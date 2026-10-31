@@ -140,6 +140,7 @@ fn a_feature_launch_on_one_seat_fails_at_the_scope_boundary_naming_the_cause() {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })

@@ -476,6 +476,14 @@ pub struct LaunchSpec {
     /// and a hand-off NOT-PASS goes back to the same session on its own ([`crate::power`]). Only
     /// for a plan or preset launch (a team run); ignored, with a log line, on any other.
     pub power: bool,
+    /// (core#1216) The person's VOICE BLOCK — their personality as the launcher resolved it for
+    /// the run's project (the project's override, else the person's own): how the power-mode
+    /// ORCHESTRATOR talks to them. Tone only: appended last to the orchestrator's brief under a
+    /// governance line, and to its restart statement; the PA's scope step, the hand-off's
+    /// reviewers, judges and QE never receive it, and no gate, check or rule reads it. At most
+    /// [`power::VOICE_MAX_BYTES`] (a longer one refuses the launch, nothing persisted). Ignored
+    /// on a phased run (there is no orchestrator). `None` ⇒ no voice section.
+    pub voice: Option<String>,
 }
 
 /// (core#678 item 1) What this host can contain, known before any run (the boot probe, cached):
