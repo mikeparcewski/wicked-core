@@ -70,14 +70,17 @@ pub const RULES_REVIEW_INSTRUCTIONS: &str = "Review the rules the extract step s
 `.wicked/domain/rules.json` against the units of `.wicked/domain/worklist.json`. This run maps the \
 repository one page at a time: the worklist is the current page, hub-first. Completeness is not \
 your question. The host measures the mapped share after each page and maps the next page from the \
-frontier until the target is reached; grouping by domain happens in the domain-graph step. Judge each stated rule: it names a \
-unit of the worklist, it states what the business requires rather than describing the code, it is \
-grounded in that unit's source, and its confidence is not inflated. An empty statement is right \
-where the source supports no rule (the host records it as a risk). You judge work another seat did; \
-change no file. List each problem as `ITEM n: FAIL — <symbol> — <why>`. End with `VERDICT: PASS` \
-when the stated rules are sound (the host re-checks every rule and flags weak ones as risks), or \
-`VERDICT: FAIL` when rules are invented, name symbols outside the worklist, or describe code \
-instead of requirements.";
+frontier until the target is reached; grouping by domain happens in the domain-graph step. Judge \
+each stated rule: it names a unit of the worklist, it states what the business requires rather \
+than describing the code, it is grounded in that unit's source, and its confidence is not \
+inflated. An empty statement is right where the source supports no rule (the host records it as a \
+risk). You judge work another seat did; change no file. List each problem as `ITEM n: FAIL — \
+<symbol> — <why>`. Judge the PAGE: a weak or code-describing statement is a problem you list, and \
+the host records every statement under its confidence threshold as a risk, never as a validated \
+requirement. End with `VERDICT: PASS` when the page is sound as a whole (most stated rules are \
+grounded in their unit's source and name worklist units), or `VERDICT: FAIL` when it is not: \
+rules are invented, name symbols outside the worklist, were composed by a script from names \
+rather than read from the source, or most of them describe code instead of requirements.";
 
 /// The argv of a host step that runs a garden domain script on the run's repository: through the
 /// garden generation the run was admitted against (`WICKED_GARDEN_ROOT`, handed to every generic
