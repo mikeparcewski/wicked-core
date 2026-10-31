@@ -1351,6 +1351,22 @@ pub enum CoreEvent {
         ok: Option<bool>,
         duration_ms: Option<u64>,
     },
+    /// A seat's running token total for one unit attempt, live from its stream while it works
+    /// (operator 2026-10-30: a live token and cost meter on a working chat turn or step). Claude's
+    /// `stream-json` assistant messages, pi's `message_end` and codex's `turn.completed` each carry
+    /// usage; the frame is the attempt's TOTAL so far (fresh + cache input, as [`CoreEvent::CliUsage`]
+    /// counts it), sent when it changed, at most one per [`crate::tool_activity::USAGE_EVERY_MS`].
+    /// `cost_usd` only where the seat's stream states one (pi), else `None`: the unit's
+    /// `CliUsage` at its end stays the record. See [`crate::tool_activity`].
+    UsageProgress {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        at: i64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_usd: Option<f64>,
+    },
     PowerActivity {
         session: String,
         ord: u32,
@@ -2232,6 +2248,24 @@ impl CoreEvent {
                 "target": target,
                 "ok": ok,
                 "durationMs": duration_ms,
+            }),
+            CoreEvent::UsageProgress {
+                session,
+                ord,
+                attempt,
+                at,
+                input_tokens,
+                output_tokens,
+                cost_usd,
+            } => json!({
+                "type": "usageProgress",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "at": at,
+                "inputTokens": input_tokens,
+                "outputTokens": output_tokens,
+                "costUsd": cost_usd,
             }),
             CoreEvent::PowerActivity {
                 session,
