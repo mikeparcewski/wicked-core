@@ -1008,6 +1008,15 @@ fn a_clean_evaluator_passes_and_the_repo_checks_are_the_gates_evidence() {
 /// Needs `npm` on PATH (every hosted CI runner; developer machines) — otherwise says so.
 #[test]
 fn a_passing_check_that_mutates_source_is_caught_by_the_final_comparison() {
+    // DES-FLOOR-CONTAINER: inside the container checks floor no OS write boundary can arm; CI
+    // (ubuntu with bwrap, macOS, Windows) runs this.
+    if std::env::var("WICKED_CHECKS_FLOOR").is_ok_and(|v| v.trim() == "container") {
+        eprintln!(
+            "SKIP a_passing_check_that_mutates_source_is_caught_by_the_final_comparison: needs an \
+             OS write boundary inside the floor (WICKED_CHECKS_FLOOR=container) — CI covers it"
+        );
+        return;
+    }
     if wicked_core::nested_sandbox() {
         eprintln!("SKIP a_passing_check_that_mutates_source_is_caught_by_the_final_comparison: sandbox-exec cannot be applied here (nested inside a sandbox, e.g. the repo-checks floor)");
         return;

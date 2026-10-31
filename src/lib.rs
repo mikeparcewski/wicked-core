@@ -39,6 +39,7 @@ mod builtin_floors;
 mod bus;
 mod campaign;
 mod catalog;
+pub mod checks_container;
 mod cli_runner;
 mod clock;
 mod code_graph;

@@ -434,6 +434,11 @@ fn main() {
         }
         // `floor affected --repo <dir> --base <commit> [--graph <db>]` (core#1187): the test set
         // the creator floor would select for this tree, as JSON.
+        // `floor run --repo <dir> --base <commit> [--stage creator|verify]` (DES-FLOOR-CONTAINER):
+        // the floor once, under the runner WICKED_FLOOR_RUNNER picks; the report as JSON.
+        Some("floor") if args.get(2).map(String::as_str) == Some("run") => {
+            std::process::exit(wicked_core::checks_container::run_cli(&args[3..]))
+        }
         Some("floor") if args.get(2).map(String::as_str) == Some("affected") => {
             std::process::exit(wicked_core::floor_affected::affected_cli(&args[3..]))
         }

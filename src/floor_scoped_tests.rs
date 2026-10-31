@@ -237,6 +237,7 @@ fn wire_check(c: &CheckRun) -> serde_json::Value {
         changed: Vec::new(),
         changed_truncated: false,
         reused_from: None,
+        floor_runner: None,
     }
     .to_json()["checks"][0]
         .clone()

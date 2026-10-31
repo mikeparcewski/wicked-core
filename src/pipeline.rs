@@ -1361,6 +1361,7 @@ pub(crate) fn apply_and_finish_unit(
                     changed,
                     changed_truncated,
                     reused_from: report.reused_from.clone(),
+                    floor_runner: report.runner.clone().map(Box::new),
                 });
                 // The re-run an operator retry armed, on the SAME tree the replaced result
                 // judged: said on the wire beside the fresh frame, so the gate history holds both

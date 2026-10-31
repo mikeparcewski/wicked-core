@@ -3466,6 +3466,7 @@ mod tests {
             changed: vec![],
             changed_truncated: false,
             reused_from: None,
+            floor_runner: None,
         });
         let check = &ev["checks"][0];
         let decision = &check["decision"];
@@ -4819,6 +4820,7 @@ mod tests {
                 changed_truncated: false,
                 // (crew#1180) Absent on the wire when nothing was reused: the key set is unchanged.
                 reused_from: None,
+                floor_runner: None,
             },
             "repoChecksEvaluated",
             &[

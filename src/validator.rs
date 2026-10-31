@@ -478,6 +478,22 @@ pub(crate) fn skip_when_nested(test: &str) -> bool {
     nested
 }
 
+/// Test gate for a test that runs the engine's own floor and needs its OS write boundary to ARM:
+/// print why and return `true` inside the container checks floor (`WICKED_CHECKS_FLOOR=container`,
+/// DES-FLOOR-CONTAINER), where `bwrap` cannot arm under the runtime's default seccomp and the floor
+/// does not loosen it. The repository's CI runs these on ubuntu (with `bwrap`), macOS and Windows.
+#[cfg(test)]
+pub(crate) fn skip_in_container_floor(test: &str) -> bool {
+    let inside = std::env::var("WICKED_CHECKS_FLOOR").is_ok_and(|v| v.trim() == "container");
+    if inside {
+        eprintln!(
+            "SKIP {test}: needs an OS write boundary inside the floor; the container checks floor \
+             has none (WICKED_CHECKS_FLOOR=container) — CI covers it on ubuntu/macos/windows"
+        );
+    }
+    inside
+}
+
 /// Find `bin` on the process `PATH` (cross-platform: `PATH` is split with the platform separator, and on
 /// Windows each `PATHEXT` suffix is tried). `Some(path)` if an executable file is found, else `None`.
 pub(crate) fn find_on_path(bin: &str) -> Option<std::path::PathBuf> {
