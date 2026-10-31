@@ -308,6 +308,8 @@ pub(crate) fn deferred_to_delivery(
                 .find(|r| r.outcome.as_deref() == Some(REVIEW_LANDED))?;
             verdict_of(u, Some(landed.attempt)).or_else(|| Some(landed.findings.clone()))
         });
+        // (domain-graph-3) What the review deferred on a loop's earlier passes, then this pass's.
+        deferred.extend(u.carried_deferred.iter().map(|l| (u.ord, l.clone())));
         deferred.extend(
             verdict
                 .as_deref()
@@ -315,6 +317,7 @@ pub(crate) fn deferred_to_delivery(
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|i| i.status == DEFERRED)
+                .filter(|i| !u.carried_deferred.contains(&i.line))
                 .map(|i| (u.ord, i.line)),
         );
     }
@@ -992,6 +995,20 @@ mod tests {
         assert_eq!(
             deferred_to_delivery(&units, 6, tail_only)[2..],
             [(3, "ITEM 6: DEFERRED — merge".to_string())]
+        );
+        // (domain-graph-3) What a loop's earlier pass deferred is listed before this pass's, once.
+        let mut looped = units.clone();
+        looped[1].carried_deferred = vec![
+            "ITEM 2: DEFERRED — page-one CI".to_string(),
+            "ITEM 5: DEFERRED — CI on the opened PR".to_string(),
+        ];
+        assert_eq!(
+            deferred_to_delivery(&looped, 6, outputs)[..3],
+            [
+                (2, "ITEM 2: DEFERRED — page-one CI".to_string()),
+                (2, "ITEM 5: DEFERRED — CI on the opened PR".to_string()),
+                (2, "ITEM 6: DEFERRED — PR body".to_string()),
+            ]
         );
         let d = deferred_to_delivery(&units, 6, outputs);
         let note = delivery_checks_note(&d);

@@ -212,6 +212,12 @@ pub fn event_fields(signal: &Signal) -> serde_json::Map<String, serde_json::Valu
         labels.insert(t.clone(), json!(c.label));
         tokens.push(t);
     }
+    // An ask with no choice of its own is answered approve (the step runs again) or stop: both
+    // are advertised (codex r2 on #1226), and stop is never the recommendation.
+    if signal.choices.is_empty() {
+        labels.insert("approve".into(), json!("Run it again"));
+        tokens.push("approve".into());
+    }
     labels.insert("reject".into(), json!("Stop here"));
     tokens.push("reject".into());
     m.insert("choices".into(), json!(tokens));
@@ -295,7 +301,8 @@ mod tests {
     fn an_ask_with_no_choice_recommends_nothing_and_says_approve_runs_it_again() {
         let s = parse_signal(r#"wicked-repeat {"next":"ask","line":"pause"}"#).unwrap();
         let f = event_fields(&s);
-        assert_eq!(f["choices"], serde_json::json!(["reject"]));
+        assert_eq!(f["choices"], serde_json::json!(["approve", "reject"]));
+        assert_eq!(f["choiceLabels"]["approve"], "Run it again");
         assert!(
             f.get("recommended").is_none(),
             "stop is never the recommendation"

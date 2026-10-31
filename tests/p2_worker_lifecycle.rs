@@ -103,6 +103,7 @@ mod tests {
             repeat_from: None,
             repeat_passes: 0,
             repeat_choice: None,
+            carried_deferred: Vec::new(),
             validator: None,
             required_deliverables: Vec::new(),
             executes_code: false,

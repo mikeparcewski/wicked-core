@@ -7898,6 +7898,15 @@ pub(crate) fn apply_rework_marker(description: &str, round: u32, head: &str) -> 
     format!("{base}{lead}{head})")
 }
 
+/// `description` without its rework marker (domain-graph-3: a loop's new pass starts with the step's
+/// own words, not the previous pass's send-back, codex r2 on #1226).
+pub(crate) fn strip_rework_marker(description: &str) -> String {
+    match description.rfind(REWORK_MARKER_PREFIX) {
+        Some(ix) => description[..ix].to_string(),
+        None => description.to_string(),
+    }
+}
+
 /// The last `cap` chars of `s` (elision marked) — the rework context block's clip.
 fn tail_chars(s: &str, cap: usize) -> String {
     let n = s.chars().count();

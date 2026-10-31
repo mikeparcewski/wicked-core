@@ -3556,6 +3556,7 @@ mod tests {
             repeat_from: None,
             repeat_passes: 0,
             repeat_choice: None,
+            carried_deferred: Vec::new(),
             validator: None,
             tool_cmd: None,
             worker_failed_clis: Vec::new(),

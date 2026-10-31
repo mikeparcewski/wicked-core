@@ -1195,6 +1195,12 @@ pub struct WorkUnit {
     /// re-run command as `WICKED_REPEAT_CHOICE` and cleared when the loop goes on. `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat_choice: Option<String>,
+    /// (domain-graph-3) The `DEFERRED` items this review accepted on earlier passes of a loop: a new
+    /// pass reviews different work, so what an earlier pass deferred to delivery is kept here and
+    /// the deliver gate lists it beside the current pass's (codex r2 on #1226). Empty (skipped on
+    /// the wire) for every unit outside a loop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carried_deferred: Vec<String>,
     /// The APPROVED, pinned deterministic validator for this unit's phase (rev0.4 gate layer-1). When
     /// present, the gate RE-VERIFIES it against the worktree after the governance pass — a fail denies
     /// the unit (deny-dominates). Authored + approved out of band; `None` ⇒ no validator (the pre-gate
@@ -1754,6 +1760,7 @@ impl WorkUnit {
             repeat_from: None,
             repeat_passes: 0,
             repeat_choice: None,
+            carried_deferred: Vec::new(),
             validator: None,
             required_deliverables: Vec::new(),
             executes_code: false,

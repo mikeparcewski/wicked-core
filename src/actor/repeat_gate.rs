@@ -153,6 +153,24 @@ pub(super) fn after_pass(
             let mut nodes = Vec::new();
             for (ix, u) in units.iter().enumerate().take(unit_ix + 1).skip(from_ix) {
                 let mut u = u.clone();
+                // What this pass's review deferred to delivery stays owed after the next pass
+                // reviews different work (codex r2 on #1226): kept on the unit, which the
+                // deliver gate lists beside the current pass's.
+                if u.role == crate::workflow::PhaseRole::Evaluator
+                    && u.tool_cmd.is_none()
+                    && u.status == crate::domain::UnitStatus::Done
+                {
+                    let out = crate::domain::get_work_output(&*store, &u.id).unwrap_or_default();
+                    for item in crate::review_context::parse_review_items(&out) {
+                        if item.status == crate::review_context::DEFERRED
+                            && !u.carried_deferred.contains(&item.line)
+                        {
+                            u.carried_deferred.push(item.line);
+                        }
+                    }
+                }
+                // The previous pass's send-back marker is not this pass's instruction (codex r2).
+                u.description = crate::actor::strip_rework_marker(&u.description);
                 u.status = if ix == from_ix {
                     crate::domain::UnitStatus::Distributed
                 } else {
@@ -493,21 +511,53 @@ mod tests {
         );
     }
 
-    /// codex r1 on #1226: a new pass carries nothing of the last pass's reviews or failed seats,
-    /// and the range, counter and cursor move together.
+    /// codex r1/r2 on #1226: a new pass carries nothing of the last pass's reviews, send-back or
+    /// failed seats, keeps what its review deferred to delivery, and the range, counter and cursor
+    /// move together.
     #[test]
     fn continue_starts_a_fresh_pass_of_the_range() {
         let mut store = open_store(Some(":memory:")).unwrap();
-        let ix = seed(&mut store, "fresh", Vec::new(), |_| {});
+        let mut critique = WorkUnit::pending("fresh:critique", "fresh", 0, "critique");
+        critique.role = crate::workflow::PhaseRole::Evaluator;
+        let ix = seed(&mut store, "fresh", vec![critique], |_| {});
+        let review = unit(&store, "fresh", 2);
+        let o = crate::execute::apply_unit(
+            &mut store,
+            &review,
+            "ITEM 1: PASS — rule a\nITEM 2: DEFERRED — confirm page-one CI\nVERDICT: PASS",
+            "wf-fresh",
+            EntityMode::Shared,
+            "fresh",
+            None,
+            0,
+        )
+        .unwrap();
+        assert!(o.approved);
+        let mut review = unit(&store, "fresh", 2);
+        review.status = UnitStatus::Done;
+        review.last_attempt = Some(0);
+        put_node(&mut store, review.to_node()).unwrap();
+        let mut page = unit(&store, "fresh", 1);
+        page.description =
+            crate::actor::apply_rework_marker(&page.description, 1, "replace page-one-symbol");
+        put_node(&mut store, page.to_node()).unwrap();
         let (r, evs) = run(&mut store, "fresh", ix, CONTINUE);
         assert!(r.is_some());
-        assert!(evs.iter().any(|e| matches!(e, CoreEvent::StepRepeated { ord: 2, from_ord: 1, pass: 1, line, .. } if line == "page 2")), "{evs:?}");
+        assert!(
+            evs.iter().any(|e| matches!(e, CoreEvent::StepRepeated { ord: 3, from_ord: 1, pass: 1, line, .. } if line == "page 2")),
+            "{evs:?}"
+        );
         let page = unit(&store, "fresh", 1);
         assert!(
             page.review_rounds.is_empty() && page.worker_failed_clis.is_empty(),
             "{page:?}"
         );
-        let next = unit(&store, "fresh", 2);
+        assert_eq!(page.description, "page", "the send-back marker is gone");
+        assert_eq!(
+            unit(&store, "fresh", 2).carried_deferred,
+            ["ITEM 2: DEFERRED — confirm page-one CI"]
+        );
+        let next = unit(&store, "fresh", 3);
         assert_eq!((next.status, next.repeat_passes), (UnitStatus::Pending, 1));
         let s = crate::domain::get_session(&store, "fresh")
             .unwrap()
