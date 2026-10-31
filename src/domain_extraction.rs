@@ -252,13 +252,16 @@ mod tests {
             .iter()
             .find(|p| p.role == PhaseRole::Creator)
             .unwrap();
-        let evaluator = def
+        // Two evaluators: the page's review of the stated rules, then the coverage judge.
+        let evaluators: Vec<&str> = def
             .phases
             .iter()
-            .find(|p| p.role == PhaseRole::Evaluator && p.id == "coverage")
-            .unwrap();
+            .filter(|p| p.role == PhaseRole::Evaluator)
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(evaluators, ["critique", "coverage"]);
+        let evaluator = def.phases.iter().find(|p| p.id == "coverage").unwrap();
         assert_eq!(creator.id, "extract");
-        assert_eq!(evaluator.id, "coverage");
         // coverage runs after extract (structural ordering — the DAG makes it non-negotiable):
         // through the host's apply step, which writes what extract stated (wicked-garden#1362).
         assert_eq!(evaluator.depends_on, [EXTRACT_APPLY_STEP]);
