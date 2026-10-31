@@ -1000,6 +1000,17 @@ pub struct PhaseDef {
     /// default, so an owner-omitted def serializes byte-identically to before the field existed.
     #[serde(default, skip_serializing_if = "StepOwner::is_pa")]
     pub owner: StepOwner,
+    /// (domain-graph-3) A BOUNDED LOOP: on a Tool phase only, the id of an EARLIER phase the run
+    /// goes back to when this phase's command asks for another pass. After the unit PASSES its
+    /// gate, the engine reads the last `wicked-repeat {…}` line of its output
+    /// ([`crate::repeat::parse_signal`]): `continue` re-arms every unit from that phase through this
+    /// one at fresh attempts and runs them again; `ask` keeps the run here and asks the operator
+    /// (the command's own choices, or stop); `done` or no line moves on. The engine stops the loop
+    /// at [`crate::repeat::MAX_PASSES`] whatever the command says. The range may hold no `deliver`
+    /// phase, no `consent_before` gate and no other loop ([`WorkflowDef::validate`]). `None` (the
+    /// default; skipped on the wire, so defs authored before the field serialize byte-identically).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_from: Option<String>,
 }
 
 impl PhaseDef {
@@ -1030,6 +1041,7 @@ impl PhaseDef {
             executor: PhaseExecutor::default(),
             owner: StepOwner::default(),
             catalog: None,
+            repeat_from: None,
         }
     }
     fn gate(mut self, gt: GateType, spec: GateSpec) -> Self {
@@ -1220,6 +1232,13 @@ pub enum WorkflowDefError {
     },
     /// (core#850) `required_instruments` names an unknown instrument or repeats one.
     RequiredInstruments(String),
+    /// (domain-graph-3) A phase's `repeat_from` is not a loop the engine can run: the phase is
+    /// not a Tool, the target is not an earlier phase, or the range holds a `deliver` phase, a
+    /// `consent_before` gate or another loop. `why` says which.
+    RepeatRange {
+        phase: String,
+        why: String,
+    },
 }
 
 /// (core#810) The largest [`PhaseDef::pool`]: one creator plus the team's monitor ceiling.
@@ -1273,6 +1292,9 @@ impl std::fmt::Display for WorkflowDefError {
                 crate::team::supervisor::MAX_MONITORS
             ),
             WorkflowDefError::RequiredInstruments(why) => write!(f, "{why}"),
+            WorkflowDefError::RepeatRange { phase, why } => {
+                write!(f, "repeat_from on {phase} is not a loop the engine can run: {why}")
+            }
         }
     }
 }
@@ -1332,6 +1354,56 @@ impl WorkflowDef {
                         })
                     }
                     Some(_) => {}
+                }
+            }
+        }
+        // (domain-graph-3) A loop runs a Tool's own decision, backward, over phases the engine
+        // can run again unattended: nothing that ships (deliver), nothing that must ask before
+        // it acts (consent_before), and no loop inside another.
+        for (i, p) in self.phases.iter().enumerate() {
+            let Some(from) = p.repeat_from.as_deref() else {
+                continue;
+            };
+            let bad = |why: String| {
+                Err(WorkflowDefError::RepeatRange {
+                    phase: p.id.clone(),
+                    why,
+                })
+            };
+            if !matches!(p.executor, PhaseExecutor::Tool { .. }) {
+                return bad(
+                    "only a Tool phase decides a loop (an agent's output never does)".into(),
+                );
+            }
+            // Its own gate would fire after it, which a `continue` skips (codex/agy r1 on #1226):
+            // the deciding step asks through its decision, never through a human gate.
+            if p.gate != GateSpec::Auto {
+                return bad(
+                    "the deciding step asks through its own decision; it takes no human gate"
+                        .into(),
+                );
+            }
+            let start = match pos.get(from) {
+                Some(&s) if s < i => s,
+                Some(_) => return bad(format!("{from} is not declared before it")),
+                None => return bad(format!("{from} is not a phase of this workflow")),
+            };
+            for q in &self.phases[start..=i] {
+                if q.id == "deliver" || q.catalog.as_deref() == Some("deliver") {
+                    return bad(format!("the range holds the deliver phase {}", q.id));
+                }
+                if matches!(q.gate, GateSpec::ConsentBefore) {
+                    return bad(format!(
+                        "the range holds {}, which asks consent first",
+                        q.id
+                    ));
+                }
+                if q.id != p.id && q.repeat_from.is_some() {
+                    return bad(format!("the range holds another loop ({})", q.id));
+                }
+                // A team member's step owes the PA's acceptance of THAT work, once (codex r1).
+                if q.owner == StepOwner::Team {
+                    return bad(format!("the range holds {}, a team member's step", q.id));
                 }
             }
         }

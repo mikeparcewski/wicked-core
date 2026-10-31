@@ -36,6 +36,7 @@ use crate::{pipeline, resolve_scope, EntityMode, LaunchSpec};
 use wicked_apps_core::HardenedCommand;
 
 mod power_gate;
+mod repeat_gate;
 mod team_gate;
 pub use team_gate::{CONTINUE_WITHOUT_TEAM, TEAM_TRANSPORT_GATE};
 
@@ -5134,6 +5135,11 @@ pub(crate) fn resume_run_inner(
     ) {
         return Ok(session.status);
     }
+    // (domain-graph-3) A loop's open ask is answered through its gate, never resumed past: the
+    // asking step would run again with no answer (codex r1 on #1226).
+    if session.status == SessionStatus::AwaitingHuman && repeat_gate::ask_open(&*store, run_id)? {
+        return Ok(SessionStatus::AwaitingHuman);
+    }
     // (J4) An orphan: persisted `executing` with no worker in this process (the in-flight check
     // above), its cursor unit dispatched (`last_attempt`) and never folded (still `distributed`).
     // Its advance below re-dispatches that unit; it is not a step boundary.
@@ -7777,6 +7783,29 @@ fn apply_step_result(
         return Ok(StepApplied::Continuing);
     }
 
+    // (domain-graph-3) A Tool unit that decides a loop: its command's decision line sends the run
+    // back for another pass, or asks the operator, before anything advances past it.
+    if unit.repeat_from.is_some()
+        && unit.tool_cmd.is_some()
+        && output.status == crate::workflow::StepStatus::Ok
+    {
+        if let Some(applied) = repeat_gate::after_pass(
+            store,
+            subscribers,
+            runner,
+            self_tx,
+            &mut session,
+            output.unit_ix,
+            &output.output,
+            lifecycle_maps,
+            actor_maps,
+            process_gen,
+            is_acp,
+        )? {
+            return Ok(applied);
+        }
+    }
+
     // Approved → advance the resume cursor past the unit we just applied. (DES-L1 PR-1B) The next
     // unit's attempt is ITS `next_attempt` — 0 on a first pass, `last_attempt + 1` for a unit a
     // `request_changes` rewind re-armed — so the re-run never reuses a `(run, unit, attempt)` key.
@@ -7867,6 +7896,15 @@ pub(crate) fn apply_rework_marker(description: &str, round: u32, head: &str) -> 
         format!("{}…", cut.trim_end())
     };
     format!("{base}{lead}{head})")
+}
+
+/// `description` without its rework marker (domain-graph-3: a loop's new pass starts with the step's
+/// own words, not the previous pass's send-back, codex r2 on #1226).
+pub(crate) fn strip_rework_marker(description: &str) -> String {
+    match description.rfind(REWORK_MARKER_PREFIX) {
+        Some(ix) => description[..ix].to_string(),
+        None => description.to_string(),
+    }
 }
 
 /// The last `cap` chars of `s` (elision marked) — the rework context block's clip.
@@ -9225,6 +9263,15 @@ fn pause_for_human_keyed(
                 Vec::new()
             },
             consent: consent.map(Box::new),
+            // (domain-graph-3) A loop's ask names its command's choices and line.
+            repeat: (gate_kind == crate::repeat::GATE_KIND)
+                .then(|| {
+                    repeat_gate::signal_for(&*store, &session.id, ord)
+                        .ok()
+                        .flatten()
+                })
+                .flatten()
+                .map(Box::new),
         },
     );
     // If this run is a campaign node, free its slot for independent work (DES §6.5). Deferred to a
@@ -11331,6 +11378,14 @@ fn dispatch_unit(
             run_id: run_id.to_string(),
             ord: unit.ord,
             consent_choice: unit.consent_choice.clone(),
+            // (domain-graph-3) A loop's command learns which pass it decides after, and the
+            // operator's choice when it re-runs from its ask.
+            repeat: unit.repeat_from.is_some().then(|| {
+                (
+                    unit.repeat_passes.saturating_add(1),
+                    unit.repeat_choice.clone(),
+                )
+            }),
             evidence_root: session.evidence_root.clone(),
             tree_from: session.workdir.clone().zip(
                 session
@@ -11967,6 +12022,9 @@ struct ToolRunEnv {
     /// (core#820) The choice approved at this unit's consent gate, handed on as
     /// `WICKED_CONSENT_CHOICE` (unset when the gate offered none).
     consent_choice: Option<String>,
+    /// (domain-graph-3) On a unit that decides a loop: the pass it decides after
+    /// (`WICKED_REPEAT_PASS`) and the operator's choice at its ask (`WICKED_REPEAT_CHOICE`).
+    repeat: Option<(u32, Option<String>)>,
     evidence_root: Option<String>,
     tree_from: Option<(String, String)>,
 }
@@ -11982,6 +12040,12 @@ impl ToolRunEnv {
                 crate::consent_plan::CONSENT_CHOICE_ENV.to_string(),
                 choice.clone(),
             ));
+        }
+        if let Some((pass, choice)) = &self.repeat {
+            env.push((crate::repeat::PASS_ENV.to_string(), pass.to_string()));
+            if let Some(c) = choice {
+                env.push((crate::repeat::CHOICE_ENV.to_string(), c.clone()));
+            }
         }
         if let Some(root) = &self.evidence_root {
             env.push((
@@ -13558,12 +13622,27 @@ pub(crate) fn confirm_gate_as(
     )?
     .into_iter()
     .find(|r| r.gate_kind.as_deref() == Some(CONSENT_GATE_KIND));
+    // (domain-graph-3) A loop's ask answers with one of its command's choices (the consent
+    // grammar, `consent:<id>`), a plain approve (its recommended choice) or reject.
+    let repeat_row = crate::interaction::list_interactions(
+        &*store,
+        Some(run_id),
+        Some(crate::interaction::InteractionStatus::Open),
+    )?
+    .into_iter()
+    .find(|r| r.gate_kind.as_deref() == Some(crate::repeat::GATE_KIND));
+    let repeat_open = repeat_row.is_some();
+    let decision = match repeat_row.and_then(|r| r.ord) {
+        Some(ord) => repeat_gate::resolve_answer(store, run_id, ord, decision)?,
+        None => decision,
+    };
     let decision = match consent_row.and_then(|r| r.ord) {
         Some(ord) => resolve_consent_answer(store, run_id, ord, decision)?,
-        None if matches!(
-            decision,
-            crate::workflow::HumanDecision::ConsentChoice { .. }
-        ) =>
+        None if !repeat_open
+            && matches!(
+                decision,
+                crate::workflow::HumanDecision::ConsentChoice { .. }
+            ) =>
         {
             anyhow::bail!(
                 "run {run_id} has no consent gate open — a consent choice answers only a consent \
@@ -32650,6 +32729,7 @@ mod consent_plan_tests {
             run_id: run_id.into(),
             ord: 2,
             consent_choice: unit.consent_choice.clone(),
+            repeat: None,
             evidence_root: None,
             tree_from: None,
         }

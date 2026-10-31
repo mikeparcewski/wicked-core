@@ -575,6 +575,10 @@ pub enum CoreEvent {
         /// (per answer token) / `writePlanOrd` / `writeTargetsSkipped`, or `writeTargetsMissing`
         /// when no plan ran. `None` for every other kind, and then ABSENT on the wire.
         consent: Option<Box<crate::consent_plan::ConsentOffer>>,
+        /// (domain-graph-3) For a `repeat` pause: the loop command's decision — its choices
+        /// (`choices` / `recommended` / `choiceLabels`) and its line (`repeatLine`). `None` for
+        /// every other kind, and then ABSENT on the wire.
+        repeat: Option<Box<crate::repeat::Signal>>,
     },
     /// A paused run was resumed by a human approval (optionally with an amendment applied).
     Resumed { session: String, ord: u32 },
@@ -1234,6 +1238,18 @@ pub enum CoreEvent {
         /// or after the cursor), `request_changes` (the rewound creator; `ord` is that creator).
         /// Additive.
         scope: String,
+    },
+    /// (domain-graph-3) A Tool step that decides a loop ([`crate::repeat`]) sent the run back for
+    /// another pass: every unit from `from_ord` through `ord` was re-armed at a fresh attempt and
+    /// the run goes on from `from_ord`. `pass` counts the passes this loop has finished (1 after
+    /// the first); `line` is the command's own progress sentence (may be empty). Fires after the
+    /// units are durable and before the first of them is dispatched again.
+    StepRepeated {
+        session: String,
+        ord: u32,
+        from_ord: u32,
+        pass: u32,
+        line: String,
     },
     /// (core#555) A human APPROVED A GATE AND AMENDED THE RUN'S INTENT: the amendment was
     /// appended to every unit at or after `ord`, so the acceptance list each LATER EVALUATOR is
@@ -2128,10 +2144,16 @@ impl CoreEvent {
                 gate_kind,
                 finding_ids,
                 consent,
+                repeat,
             } => {
                 let mut j = json!({ "type": "awaitingHuman", "session": session, "ord": ord, "reviewingOrd": reviewing_ord, "prompt": prompt, "gateKind": gate_kind });
                 if let Some(offer) = consent {
                     for (k, v) in crate::consent_plan::event_fields(offer) {
+                        j[k] = v;
+                    }
+                }
+                if let Some(signal) = repeat {
+                    for (k, v) in crate::repeat::event_fields(signal) {
                         j[k] = v;
                     }
                 }
@@ -3163,6 +3185,20 @@ impl CoreEvent {
                 "updatedDescription": updated_description,
                 "scope": scope,
             }),
+            CoreEvent::StepRepeated {
+                session,
+                ord,
+                from_ord,
+                pass,
+                line,
+            } => json!({
+                "type": "stepRepeated",
+                "session": session,
+                "ord": ord,
+                "fromOrd": from_ord,
+                "pass": pass,
+                "line": line,
+            }),
             CoreEvent::IntentAmended {
                 session,
                 ord,
@@ -3329,6 +3365,7 @@ mod tests {
                     Vec::new()
                 },
                 consent: None,
+                repeat: None,
             }
             .to_json()
         };

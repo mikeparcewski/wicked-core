@@ -14,6 +14,24 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A domain-extraction run keeps mapping until the target, or until the operator says stop.** One run mapped one
+  page (300 behaviours) and ended, so wicked-crew (8,109 behaviours) needed about 27 runs to reach the 80% minimum.
+  - *A bounded loop over a run's own steps.* A Tool phase may declare `repeat_from: <earlier phase>` (a `run` plan
+    step only; the range may hold no `deliver`, no `consent_before` gate and no other loop, refused at registration).
+    When its unit PASSES, the last `wicked-repeat {"next": …}` line of its output decides: `continue` re-arms every
+    unit from the target through the loop step at fresh attempts (new event `stepRepeated {ord, fromOrd, pass,
+    line}`); `ask` stops the run at a `repeat` gate offering the command's own choices as `consent:<id>` tokens (the
+    consent gate's grammar, so every door that carries a consent choice carries these) plus reject (stop: the run is
+    cancelled and what it did is kept), and a choice re-runs the step with `WICKED_REPEAT_CHOICE`; `done`, no line or
+    a malformed one moves on. Every run of the step gets `WICKED_REPEAT_PASS`. Only a Tool unit whose def declares the
+    loop is read (a seat could print the marker); the engine stops a loop at 200 passes whatever it says.
+  - *The preset loops.* `domain-extraction` gains the host step `extract-next` (garden's `next_page.py`) after
+    `extract-apply`, looping back to `extract-prepare` until the repository's target, with the budget's ask (map
+    more, lower the target for this repository, or stop). The page review's instructions say the run maps page by
+    page.
+  - *A repository's own target.* `wicked-core requirements-target [--set N | --clear]` keeps it in the repository's
+    estate store; `coverage --min-coverage-pct` (bare), `domain-graph` and `requirements_graph_for_repo` hold the
+    graph to it before the daemon-wide minimum.
 - **A unit's floor, QE reviewer, team and judge no longer wait on each other.** After the seat's turn the engine
   ran the rest of a unit one step at a time: the isolated QE reviewer, then the team's final pass, then the judge,
   then the repository's checks. On rig run 5a88dcb6 (crew#1244) that put 86 s of team and judge in front of the

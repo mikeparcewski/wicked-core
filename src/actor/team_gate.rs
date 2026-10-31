@@ -3710,6 +3710,14 @@ pub(super) fn revise_units(
                 k.repo_checks = o.repo_checks.clone();
                 k.rework_of = o.rework_of;
                 k.rework_amendment = o.rework_amendment.clone();
+                // (domain-graph-3, codex r1 on #1226) A loop's progress and an answered ask are
+                // run state too — kept while the step still decides the same loop, else reset.
+                // …and what an earlier pass deferred to delivery, whatever else changed (codex r3).
+                k.carried_deferred = o.carried_deferred.clone();
+                if k.repeat_from == o.repeat_from {
+                    k.repeat_passes = o.repeat_passes;
+                    k.repeat_choice = o.repeat_choice.clone();
+                }
                 k.last_attempt = o.last_attempt.max(floor);
                 kept.push(k);
             }

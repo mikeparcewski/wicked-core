@@ -3973,6 +3973,7 @@ mod tests {
                 gate_kind: s(),
                 finding_ids: Vec::new(),
                 consent: None,
+                repeat: None,
             },
             "awaitingHuman",
             &[

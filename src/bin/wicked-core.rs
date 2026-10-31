@@ -151,14 +151,23 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          Build the requirements graph from the ANNOTATED estate graph and save it INTO the estate \
          store (domain, requirement and business-rule nodes, SatisfiedBy edges to code; what crew \
          reads). --out also writes it as a JSON export file. Fails closed below the configured \
-         minimum coverage (--min-coverage-pct, else $WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, else 80).",
+         minimum coverage (--min-coverage-pct, else the repository's own target \
+         (requirements-target), else $WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, else 80).",
     ),
     (
         "coverage",
         "wicked-core coverage [--db <path>] [--json] [--min-coverage-pct <N>]\n  \
          Recompute front-half coverage from the store and print the report. Reads only. With \
-         --min-coverage-pct (a bare flag reads $WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, else 80), \
+         --min-coverage-pct (a bare flag reads the repository's own target, else \
+         $WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, else 80), \
          exits 3 after writing the report when less than N% of behaviours are mapped.",
+    ),
+    (
+        "requirements-target",
+        "wicked-core requirements-target [--db <path>] [--set <N> | --clear] [--json]\n  \
+         The repository's own coverage target, kept in its estate store: the bar its requirements \
+         graph is held to before the daemon-wide minimum. --set N (1..100) WRITES it, --clear \
+         WRITES its removal; with neither it only reads. Prints the target in force and its source.",
     ),
     (
         "seed-domain-validators",
@@ -434,6 +443,7 @@ fn main() {
         Some("seed-domain-validators") => return seed_domain_validators_cmd(&args),
         Some("domain-graph") => return domain_graph_cmd(&args),
         Some("coverage") => return coverage_cmd(&args),
+        Some("requirements-target") => return requirements_target_cmd(&args),
         // `floor probe --repo <dir> --guide <file> [--check <name>]` (DES-BUILD-GUIDE): every piece
         // of a build guide checked in a scratch copy under the floor sandbox; writes `verified`.
         Some("floor") if args.get(2).map(String::as_str) == Some("probe") => {
@@ -983,7 +993,20 @@ fn drain_events(events: &std::sync::mpsc::Receiver<CoreEvent>, gate: Option<(&Co
                         session, prompt, ..
                     } if is_mine(session) => {
                         if let Some((core, run_id)) = gate {
-                            let decision = prompt_decision(prompt);
+                            // The answer tokens the gate offers (codex r1 on #1226: the loop's
+                            // ask could only be approved at its default from here).
+                            let choices: Vec<String> = ev.to_json()["choices"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|c| c.as_str())
+                                .filter(|c| c.starts_with("consent:"))
+                                .map(str::to_string)
+                                .collect();
+                            let Some(decision) = prompt_decision(prompt, &choices) else {
+                                println!("  (no answer: the gate stays open)");
+                                return;
+                            };
                             match core.confirm_gate(run_id, decision) {
                                 Ok(s) => println!("  → gate resolved: {s:?}"),
                                 Err(e) => {
@@ -1017,16 +1040,49 @@ fn drain_events(events: &std::sync::mpsc::Receiver<CoreEvent>, gate: Option<(&Co
 }
 
 /// Prompt the operator on stdin for a gate decision (a = approve, r = reject; default approve).
-fn prompt_decision(prompt: &str) -> HumanDecision {
-    println!("  ❓ {prompt}\n  [a]pprove / [r]eject ? ");
-    let mut line = String::new();
-    let _ = std::io::stdin().lock().read_line(&mut line);
-    match line.trim().chars().next() {
-        Some('r') | Some('R') => HumanDecision::Reject,
-        _ => HumanDecision::Approve {
+/// Ask the operator at a gate. `None` when stdin is closed or unreadable: the gate stays open and
+/// nothing is answered for them (codex r3 on #1226: EOF approved the recommended choice).
+fn prompt_decision(prompt: &str, choices: &[String]) -> Option<HumanDecision> {
+    if choices.is_empty() {
+        println!("  ❓ {prompt}\n  [a]pprove / [r]eject ? ");
+    } else {
+        // A gate that offers choices (a consent plan, a loop's ask): type one of its tokens.
+        println!(
+            "  ❓ {prompt}\n  {} / [a]pprove (its default) / [r]eject ? ",
+            choices.join(" / ")
+        );
+    }
+    loop {
+        let mut line = String::new();
+        match std::io::stdin().lock().read_line(&mut line) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        match parse_decision(&line, choices) {
+            Some(d) => return Some(d),
+            None => println!(
+                "  not an answer here — type one of: {}a, r",
+                choices.iter().map(|c| format!("{c}, ")).collect::<String>()
+            ),
+        }
+    }
+}
+
+/// An operator's typed answer at a gate: an offered token is that choice; `a`/`approve` or Enter
+/// is approve (the gate's default), `r`/`reject` is reject. Anything else is `None` — never
+/// approve (codex r3 on #1226: a mistyped choice approved hours of mapping).
+fn parse_decision(line: &str, choices: &[String]) -> Option<HumanDecision> {
+    let answer = line.trim();
+    if let Some(c) = choices.iter().find(|c| c.as_str() == answer) {
+        return Some(HumanDecision::ConsentChoice { choice: c.clone() });
+    }
+    match answer.to_ascii_lowercase().as_str() {
+        "" | "a" | "approve" => Some(HumanDecision::Approve {
             amend: None,
             amend_scope: Default::default(),
-        },
+        }),
+        "r" | "reject" => Some(HumanDecision::Reject),
+        _ => None,
     }
 }
 
@@ -1073,13 +1129,6 @@ fn domain_graph_cmd(args: &[String]) {
     // file — for garden's hermetic emit lane and ad-hoc inspection; nothing in the run reads it.
     let repo_root = flag(args, "--repo-root").map(std::path::PathBuf::from);
     let out_path = flag(args, "--out");
-    let min_pct = match min_coverage_pct_arg(args) {
-        Ok(v) => v,
-        Err(e) => {
-            fail(&format!("domain-graph: {e}"));
-            return;
-        }
-    };
     // The domain-model schema accepts 1.0.0 and 1.1.0; 1.1.0 is the contract that carries the
     // optional `metadata.coverage` + `requirement.corroboration` this build emits.
     let schema_version = flag(args, "--schema-version").unwrap_or_else(|| "1.1.0".to_string());
@@ -1088,6 +1137,13 @@ fn domain_graph_cmd(args: &[String]) {
         Ok(s) => s,
         Err(e) => {
             fail(&format!("domain-graph: open store failed: {e}"));
+            return;
+        }
+    };
+    let min_pct = match min_coverage_pct_arg(args, &store) {
+        Ok(v) => v,
+        Err(e) => {
+            fail(&format!("domain-graph: {e}"));
             return;
         }
     };
@@ -1263,7 +1319,7 @@ fn coverage_cmd(args: &[String]) {
     // `--min-coverage-pct` turns the report into a check (the coverage validator's recompute
     // branch): the report is written as always, then the exit says whether it met the minimum.
     let check = if args.iter().any(|a| a == "--min-coverage-pct") {
-        match min_coverage_pct_arg(args) {
+        match min_coverage_pct_arg(args, &store) {
             Ok(v) => Some(v),
             Err(e) => {
                 fail(&format!("coverage: {e}"));
@@ -1305,15 +1361,108 @@ fn coverage_cmd(args: &[String]) {
     coverage_check_exit(&report, check);
 }
 
-/// The configured minimum: `--min-coverage-pct N`, else [`wicked_governance::MIN_COVERAGE_ENV`],
-/// else the default (80). The flag with NO value (last, or followed by another flag) reads the
-/// env/default, so a validator script can pass the bare flag. A junk value — on the flag (`""`
-/// included) or in the variable — is an error, never a silent default.
-fn min_coverage_pct_arg(args: &[String]) -> Result<u8, String> {
+/// The configured minimum: `--min-coverage-pct N`, else the repository's own target in its store
+/// (domain-graph-3: set when the operator lowers it for this repository), else
+/// [`wicked_governance::MIN_COVERAGE_ENV`], else the default (80). The flag with NO value (last,
+/// or followed by another flag) reads the store/env/default, so a validator script can pass the
+/// bare flag. A junk value — on the flag (`""` included) or in the variable — is an error, never a
+/// silent default.
+fn min_coverage_pct_arg(
+    args: &[String],
+    store: &dyn wicked_apps_core::GraphRead,
+) -> Result<u8, String> {
     match flag(args, "--min-coverage-pct").filter(|v| !v.starts_with("--")) {
         Some(v) => wicked_governance::parse_min_coverage_pct(&v)
             .ok_or_else(|| format!("--min-coverage-pct {v:?} is not a whole percentage 1..100")),
-        None => wicked_governance::min_coverage_pct_from_env(),
+        None => wicked_governance::effective_min_coverage_pct(store),
+    }
+}
+
+/// `wicked-core requirements-target [--db <path>] [--set <N> | --clear] [--json]` — the
+/// repository's OWN coverage target (domain-graph-3), kept in its estate store: `--set` lowers
+/// (or raises) the bar this repository's requirements graph is held to, `--clear` returns it to the
+/// daemon-wide minimum. Prints the target in force and where it comes from.
+fn requirements_target_cmd(args: &[String]) {
+    // Flag PRESENCE is read on its own (codex/agy r1 on #1226): `--set` with no value, or beside
+    // `--clear`, is refused before the store is opened — never a read, never a silent clear.
+    let has_set = args.iter().any(|a| a == "--set");
+    let clear = args.iter().any(|a| a == "--clear");
+    if has_set && clear {
+        fail("requirements-target: --set and --clear are exclusive");
+        return;
+    }
+    let change = if has_set {
+        match flag(args, "--set").filter(|v| !v.starts_with("--")) {
+            Some(v) => match wicked_governance::parse_min_coverage_pct(&v) {
+                Some(pct) => Some(Some(pct)),
+                None => {
+                    fail(&format!(
+                        "requirements-target: --set {v:?} is not a whole percentage 1..100"
+                    ));
+                    return;
+                }
+            },
+            None => {
+                fail("requirements-target: --set needs a whole percentage 1..100");
+                return;
+            }
+        }
+    } else if clear {
+        Some(None)
+    } else {
+        None
+    };
+    let path = store_path(args);
+    if let Some(pct) = change {
+        let mut store = match wicked_apps_core::open_store(Some(&path)) {
+            Ok(s) => s,
+            Err(e) => {
+                fail(&format!("requirements-target: open store failed: {e}"));
+                return;
+            }
+        };
+        if let Err(e) = wicked_governance::set_repo_min_coverage_pct(&mut store, pct) {
+            fail(&format!("requirements-target: {e}"));
+            return;
+        }
+    }
+    // A read opens the store read-only: it never creates or changes one.
+    let store = match wicked_apps_core::open_store_ro(Some(&path)) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("requirements-target: open store failed: {e}"));
+            return;
+        }
+    };
+    let own = match wicked_governance::repo_min_coverage_pct(&store) {
+        Ok(v) => v,
+        Err(e) => {
+            fail(&format!("requirements-target: {e}"));
+            return;
+        }
+    };
+    let pct = match own {
+        Some(p) => p,
+        None => match wicked_governance::min_coverage_pct_from_env() {
+            Ok(p) => p,
+            Err(e) => {
+                fail(&format!("requirements-target: {e}"));
+                return;
+            }
+        },
+    };
+    let source = if own.is_some() {
+        "repository"
+    } else {
+        "daemon"
+    };
+    if args.iter().any(|a| a == "--json") {
+        println!(
+            "{}",
+            serde_json::json!({ "min_coverage_pct": pct, "source": source })
+        );
+    } else {
+        println!("requirements-target: {pct}% ({source})");
     }
 }
 
@@ -3011,6 +3160,35 @@ fn rules_retire_cmd(args: &[String]) {
 
 #[cfg(test)]
 mod seat_login_usage_tests {
+    /// codex r3 on #1226: a typed answer is an offered token, approve or reject — never a mistyped
+    /// token read as approve.
+    #[test]
+    fn a_typed_gate_answer_is_an_offered_choice_approve_or_reject_and_nothing_else() {
+        use super::{parse_decision, HumanDecision};
+        let offered = vec!["consent:more".to_string(), "consent:lower".to_string()];
+        assert!(matches!(
+            parse_decision("consent:lower\n", &offered),
+            Some(HumanDecision::ConsentChoice { choice }) if choice == "consent:lower"
+        ));
+        assert!(matches!(
+            parse_decision("\n", &offered),
+            Some(HumanDecision::Approve { .. })
+        ));
+        assert!(matches!(
+            parse_decision("A", &offered),
+            Some(HumanDecision::Approve { .. })
+        ));
+        assert!(matches!(
+            parse_decision("reject", &offered),
+            Some(HumanDecision::Reject)
+        ));
+        assert!(parse_decision("consent:lowe", &offered).is_none());
+        assert!(
+            parse_decision("retry", &offered).is_none(),
+            "an `r` word is not reject"
+        );
+    }
+
     #[test]
     fn seat_login_usage_lists_refresh() {
         let usage = super::SUBCOMMAND_USAGE

@@ -47,6 +47,14 @@ pub const EXTRACT_PREPARE_STEP: &str = "extract-prepare";
 /// tracks), refuses the rest, writes what passes with the harness's own validation and authorship,
 /// and writes [`COVERAGE_REPORT_FILE`] for the `coverage` step. Seats never gain write access.
 pub const EXTRACT_APPLY_STEP: &str = "extract-apply";
+/// The host step AFTER `extract-apply` that decides whether the run maps another page
+/// (domain-graph-3): garden's `next_page.py` measures the mapped share against the repository's
+/// target and the generation's budget, prints the one progress line ("Mapping wicked-crew · 3% →
+/// 12% · target 80% · page 2 · about 2 h left"), and ends with the loop's decision line
+/// ([`crate::repeat`]): another page from [`EXTRACT_PREPARE_STEP`] while the share is below the
+/// target and the budget holds, the operator's ask (map more, lower the target for this
+/// repository, or stop) when the budget is spent, and done once the target is reached.
+pub const EXTRACT_NEXT_STEP: &str = "extract-next";
 /// The worklist the host prepares, relative to the run's worktree (garden's `rules_file.WORKLIST_REL`).
 pub const WORKLIST_REL: &str = ".wicked/domain/worklist.json";
 /// The rules the seat states, relative to the run's worktree (garden's `rules_file.RULES_REL`).
@@ -59,17 +67,20 @@ pub const RULES_REL: &str = ".wicked/domain/rules.json";
 /// wicked-crew, 8,109 behaviours). Completeness is the coverage step's question, against the
 /// configured minimum; this review judges the rules that were stated.
 pub const RULES_REVIEW_INSTRUCTIONS: &str = "Review the rules the extract step stated in \
-`.wicked/domain/rules.json` against the units of `.wicked/domain/worklist.json`. This run maps one \
-page of the repository: the worklist, hub-first. Completeness is not your question. The coverage \
-step measures the mapped share against the configured minimum, and the next run continues from the \
-frontier; grouping by domain happens in the domain-graph step. Judge each stated rule: it names a \
-unit of the worklist, it states what the business requires rather than describing the code, it is \
-grounded in that unit's source, and its confidence is not inflated. An empty statement is right \
-where the source supports no rule (the host records it as a risk). You judge work another seat did; \
-change no file. List each problem as `ITEM n: FAIL — <symbol> — <why>`. End with `VERDICT: PASS` \
-when the stated rules are sound (the host re-checks every rule and flags weak ones as risks), or \
-`VERDICT: FAIL` when rules are invented, name symbols outside the worklist, or describe code \
-instead of requirements.";
+`.wicked/domain/rules.json` against the units of `.wicked/domain/worklist.json`. This run maps the \
+repository one page at a time: the worklist is the current page, hub-first. Completeness is not \
+your question. The host measures the mapped share after each page and maps the next page from the \
+frontier until the target is reached; grouping by domain happens in the domain-graph step. Judge \
+each stated rule: it names a unit of the worklist, it states what the business requires rather \
+than describing the code, it is grounded in that unit's source, and its confidence is not \
+inflated. An empty statement is right where the source supports no rule (the host records it as a \
+risk). You judge work another seat did; change no file. List each problem as `ITEM n: FAIL — \
+<symbol> — <why>`. Judge the PAGE: a weak or code-describing statement is a problem you list, and \
+the host records every statement under its confidence threshold as a risk, never as a validated \
+requirement. End with `VERDICT: PASS` when the page is sound as a whole (most stated rules are \
+grounded in their unit's source and name worklist units), or `VERDICT: FAIL` when it is not: \
+rules are invented, name symbols outside the worklist, were composed by a script from names \
+rather than read from the source, or most of them describe code instead of requirements.";
 
 /// The argv of a host step that runs a garden domain script on the run's repository: through the
 /// garden generation the run was admitted against (`WICKED_GARDEN_ROOT`, handed to every generic
@@ -225,6 +236,7 @@ mod tests {
                 "extract",
                 "critique",
                 EXTRACT_APPLY_STEP,
+                EXTRACT_NEXT_STEP,
                 "coverage",
                 "domain-graph"
             ],
@@ -257,7 +269,8 @@ mod tests {
         assert_eq!(creator.id, "extract");
         // coverage runs after extract (structural ordering — the DAG makes it non-negotiable):
         // through the host's apply step, which writes what extract stated (wicked-garden#1362).
-        assert_eq!(evaluator.depends_on, [EXTRACT_APPLY_STEP]);
+        // …and the next-page decision that loops back until the target (domain-graph-3).
+        assert_eq!(evaluator.depends_on, [EXTRACT_NEXT_STEP]);
         let apply = def
             .phases
             .iter()
@@ -378,8 +391,8 @@ mod tests {
         // the WorkUnit so the cli-runner invokes the right garden skill under the right brain-engine scope.
         let def = load_shipped_def();
         let units = plan_from_def(&def, "mine the legacy payments service", "s1");
-        assert_eq!(units.len(), 8);
-        let (extract, coverage) = (&units[3], &units[6]);
+        assert_eq!(units.len(), 9);
+        let (extract, coverage) = (&units[3], &units[7]);
         assert_eq!(
             extract.skill_ref.as_deref(),
             Some("wicked-garden-domain-extractor")

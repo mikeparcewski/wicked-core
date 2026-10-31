@@ -832,14 +832,16 @@ fn steering_author_preset() -> Vec<PlanStep> {
 /// extract → `produce` (the bold cell: kind recon → build; the seat states rules into a file);
 /// critique → `critique` (the page's review: the stated rules, not the repository's completeness);
 /// extract-apply → `run` (the host's Tool step: checks the rules file and writes the store);
+/// extract-next → `run` (the host's Tool step that loops back to extract-prepare for the next page
+/// until the target or the budget's ask, `repeat_from`);
 /// coverage → `domain_coverage`, which
 /// carries `COVERAGE_VALIDATOR_PIN` as data (the step restates it, a no-op), with `executes_code`
 /// raised and its report as the deliverable; domain-graph → `run`, the Tool step that builds the
 /// requirements graph, behind a `human_confirm` gate. The skills are the domain family's.
 fn domain_extraction_preset() -> Vec<PlanStep> {
     use crate::domain_extraction::{
-        garden_domain_step_cmd, COVERAGE_REPORT_FILE, EXTRACT_APPLY_STEP, EXTRACT_PREPARE_STEP,
-        RULES_REL, RULES_REVIEW_INSTRUCTIONS, WORKLIST_REL,
+        garden_domain_step_cmd, COVERAGE_REPORT_FILE, EXTRACT_APPLY_STEP, EXTRACT_NEXT_STEP,
+        EXTRACT_PREPARE_STEP, RULES_REL, RULES_REVIEW_INSTRUCTIONS, WORKLIST_REL,
     };
     use crate::workflow::{CODE_GRAPH_DB_TOKEN, REPO_ROOT_TOKEN};
     let step = |catalog: &str, id: &str, after: Option<&str>| PlanStep {
@@ -893,12 +895,23 @@ fn domain_extraction_preset() -> Vec<PlanStep> {
             }),
             ..step("run", EXTRACT_APPLY_STEP, Some("critique"))
         },
+        // domain-graph-3: the generation keeps going until the repository's target or the
+        // operator stops it — this host step decides each page's next (another page from the
+        // frontier, the budget's ask, or done), a bounded loop back to `extract-prepare`.
+        PlanStep {
+            gate_type: Some(None),
+            executor: Some(PhaseExecutor::Tool {
+                cmd: garden_domain_step_cmd(EXTRACT_NEXT_STEP, "scripts/domain/next_page.py", ""),
+            }),
+            repeat_from: Some(EXTRACT_PREPARE_STEP.to_string()),
+            ..step("run", EXTRACT_NEXT_STEP, Some(EXTRACT_APPLY_STEP))
+        },
         PlanStep {
             executes_code: Some(true),
             required_deliverables: Some(vec!["coverage-report.json".to_string()]),
             skill_ref: Some(DOMAIN_COVERAGE_SKILL.to_string()),
             validator_pin: Some(Some(COVERAGE_VALIDATOR_PIN.to_string())),
-            ..step("domain_coverage", "coverage", Some(EXTRACT_APPLY_STEP))
+            ..step("domain_coverage", "coverage", Some(EXTRACT_NEXT_STEP))
         },
         PlanStep {
             kind: Some(StageKind::Build),
@@ -1057,6 +1070,7 @@ fn entry(
         executor: PhaseExecutor::Agent,
         owner: StepOwner::Pa,
         catalog: None,
+        repeat_from: None,
     }
 }
 
@@ -1276,7 +1290,9 @@ mod tests {
     /// store and repository bound by placeholder, whole arguments only.
     #[test]
     fn domain_extraction_brackets_the_seat_with_host_steps() {
-        use crate::domain_extraction::{EXTRACT_APPLY_STEP, EXTRACT_PREPARE_STEP};
+        use crate::domain_extraction::{
+            EXTRACT_APPLY_STEP, EXTRACT_NEXT_STEP, EXTRACT_PREPARE_STEP,
+        };
         let def = composed("domain-extraction");
         assert_eq!(
             def.phases.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
@@ -1287,6 +1303,7 @@ mod tests {
                 "extract",
                 "critique",
                 EXTRACT_APPLY_STEP,
+                EXTRACT_NEXT_STEP,
                 "coverage",
                 "domain-graph"
             ]
@@ -1298,14 +1315,31 @@ mod tests {
         let review = by("critique");
         assert_eq!(review.role, PhaseRole::Evaluator);
         assert_eq!(review.depends_on, ["extract"]);
-        assert!(review.instructions.as_deref().is_some_and(
-            |i| i.contains("one page") && i.contains("Completeness is not your question")
-        ));
+        assert!(review
+            .instructions
+            .as_deref()
+            .is_some_and(|i| i.contains("one page at a time")
+                && i.contains("Completeness is not your question")));
         assert_eq!(by(EXTRACT_APPLY_STEP).depends_on, ["critique"]);
-        assert_eq!(by("coverage").depends_on, [EXTRACT_APPLY_STEP]);
+        // domain-graph-3: after each page the host decides the next — the loop back to
+        // extract-prepare (the generation keeps going until the target or the operator's word).
+        assert_eq!(by(EXTRACT_NEXT_STEP).depends_on, [EXTRACT_APPLY_STEP]);
+        assert_eq!(
+            by(EXTRACT_NEXT_STEP).repeat_from.as_deref(),
+            Some(EXTRACT_PREPARE_STEP)
+        );
+        assert!(
+            def.phases
+                .iter()
+                .filter(|p| p.repeat_from.is_some())
+                .count()
+                == 1
+        );
+        assert_eq!(by("coverage").depends_on, [EXTRACT_NEXT_STEP]);
         for (id, script) in [
             (EXTRACT_PREPARE_STEP, "scripts/domain/prepare_worklist.py"),
             (EXTRACT_APPLY_STEP, "scripts/domain/apply_rules.py"),
+            (EXTRACT_NEXT_STEP, "scripts/domain/next_page.py"),
         ] {
             let phase = by(id);
             assert_eq!(phase.role, PhaseRole::Neutral, "{id}");

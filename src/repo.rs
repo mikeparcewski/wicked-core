@@ -405,7 +405,10 @@ pub fn requirements_graph_for_repo(
         return Ok(serde_json::json!({ "graph": null, "coverage": null }));
     }
     let repo_store = wicked_apps_core::open_store_ro(Some(repo.code_graph_db.as_str()))?;
-    let min_pct = wicked_governance::min_coverage_pct_from_env().map_err(|e| anyhow::anyhow!(e))?;
+    // (domain-graph-3) The repository's own target first (lowered at a budget ask), else the
+    // daemon-wide minimum.
+    let min_pct = wicked_governance::effective_min_coverage_pct(&repo_store)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let report = wicked_governance::recompute_front_half_coverage(&repo_store)?;
     let coverage = wicked_governance::model_coverage(&report, min_pct);
     let graph = wicked_governance::load_domain_graph(&repo_store, Some(&coverage))?;
