@@ -14,6 +14,18 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **domain-extraction maps on the seat container floor: the host prepares the seat's work and applies what it
+  states (wicked-garden#1362).** A container seat has no `wicked-core`, no `wicked-estate` and a read-only store, so
+  `extract` mapped nothing ("Generate it" produced 0 items). The preset gains two host Tool steps around it:
+  `extract-prepare` (after `analyze`) runs garden's `prepare_worklist.py`, which writes the hub-first worklist of
+  unmapped behaviours in tracked files to `.wicked/domain/worklist.json` in the run's worktree. `extract-apply`
+  (after `extract`) runs garden's `apply_rules.py`, which checks the seat's `.wicked/domain/rules.json` against its
+  closed schema and the store, refuses what is outside it or about files git does not track, writes the rest with
+  the harness's own validation and writes `coverage-report.json`. `coverage` now waits for `extract-apply`. Both
+  steps run garden through the admitted generation's launcher (`$WICKED_GARDEN_ROOT`, never PATH) with
+  `{code_graph_db}` / `{repo_root}` bound as whole arguments. Seats never gain write access. Needs garden with
+  these scripts (wicked-garden#1363).
+
 - **The power-mode orchestrator hears the person's personality: `LaunchOptions.voice` (core#1216).** A launcher
   passes the person's voice block (their personality for the run's project) on a power launch; the engine keeps it
   on the run (`power.voice`) and appends it LAST to the orchestrator's brief, behind a governance line: it shapes

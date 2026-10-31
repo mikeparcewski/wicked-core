@@ -886,6 +886,33 @@
         "validator_pin": null
       },
       {
+        "id": "extract-prepare",
+        "kind": "recon",
+        "gate_type": null,
+        "gate": "auto",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "analyze"
+        ],
+        "role": "neutral",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": null,
+        "executor": {
+          "type": "tool",
+          "cmd": [
+            "bash",
+            "-c",
+            "exec \"${WICKED_GARDEN_ROOT:?the engine handed this Tool phase no garden root; refusing to resolve wicked-garden from PATH}/scripts/wicked-garden\" run scripts/domain/prepare_worklist.py --db \"$1\" --repo-root \"$2\" --out .wicked/domain/worklist.json",
+            "extract-prepare",
+            "{code_graph_db}",
+            "{repo_root}"
+          ]
+        }
+      },
+      {
         "id": "extract",
         "kind": "recon",
         "gate_type": "value",
@@ -894,12 +921,39 @@
         "verified_evidence": false,
         "required_deliverables": [],
         "depends_on": [
-          "analyze"
+          "extract-prepare"
         ],
         "role": "creator",
         "skill_ref": "wicked-garden-domain-extractor",
         "allowed_skills": [],
         "validator_pin": null
+      },
+      {
+        "id": "extract-apply",
+        "kind": "recon",
+        "gate_type": null,
+        "gate": "auto",
+        "executes_code": false,
+        "verified_evidence": false,
+        "required_deliverables": [],
+        "depends_on": [
+          "extract"
+        ],
+        "role": "neutral",
+        "skill_ref": null,
+        "allowed_skills": [],
+        "validator_pin": null,
+        "executor": {
+          "type": "tool",
+          "cmd": [
+            "bash",
+            "-c",
+            "exec \"${WICKED_GARDEN_ROOT:?the engine handed this Tool phase no garden root; refusing to resolve wicked-garden from PATH}/scripts/wicked-garden\" run scripts/domain/apply_rules.py --db \"$1\" --repo-root \"$2\" --rules .wicked/domain/rules.json --coverage-out coverage-report.json",
+            "extract-apply",
+            "{code_graph_db}",
+            "{repo_root}"
+          ]
+        }
       },
       {
         "id": "coverage",
@@ -914,7 +968,7 @@
           "coverage-report.json"
         ],
         "depends_on": [
-          "extract"
+          "extract-apply"
         ],
         "role": "evaluator",
         "skill_ref": "wicked-garden-domain-coverage",

@@ -282,6 +282,29 @@ fn db_in(name: &str) -> String {
 /// Per run: whether its `extract` unit reached the runner with a pinned git dir. Keyed by run id,
 /// so a parallel test's run never answers for this one's.
 static EXTRACT_PINNED: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
+/// Per run: whether its `extract` unit found the worklist the host's `extract-prepare` step wrote
+/// into the worktree (wicked-garden#1362: the seat reads only that file).
+static EXTRACT_SAW_WORKLIST: std::sync::Mutex<Vec<(String, bool)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The fixture generation's `scripts/wicked-garden` launcher: it stands in for garden's domain
+/// scripts and records how the engine ran each host step — its arguments, its working directory,
+/// and whether the seat's rules file was there — into `.wicked/domain/<script>.args`. The real
+/// scripts are garden's (`tests/domain/test_extraction_files.py`); this proves the plumbing.
+const FIXTURE_GARDEN_LAUNCHER: &str = r#"#!/bin/sh
+[ "$1" = run ] || exit 64
+script=$(basename "$2")
+shift 2
+mkdir -p .wicked/domain
+{
+  printf '%s\n' "$@"
+  printf 'cwd=%s\n' "$(pwd -P)"
+  if [ -f .wicked/domain/rules.json ]; then echo rules=yes; else echo rules=no; fi
+} > ".wicked/domain/$script.args"
+if [ "$script" = prepare_worklist.py ]; then
+  printf '{"schema":"wicked-garden/domain-worklist@1","units":[]}' > .wicked/domain/worklist.json
+fi
+"#;
 
 struct DomainExtractionRunner {
     db: String,
@@ -322,6 +345,20 @@ impl StepRunner for DomainExtractionRunner {
                 .lock()
                 .unwrap()
                 .push((i.run_id.clone(), pinned));
+            if let Some(wd) = i.workdir.as_ref() {
+                let domain = wd.join(".wicked").join("domain");
+                EXTRACT_SAW_WORKLIST
+                    .lock()
+                    .unwrap()
+                    .push((i.run_id.clone(), domain.join("worklist.json").is_file()));
+                // The seat's half: rules into the worktree, never into a store.
+                std::fs::create_dir_all(&domain).unwrap();
+                std::fs::write(
+                    domain.join("rules.json"),
+                    r#"{"schema":"wicked-garden/domain-rules@1","seat":"a","rules":[]}"#,
+                )
+                .unwrap();
+            }
         }
         let workdir = i.workdir.clone();
         let mut output = format!("{phase} done");
@@ -329,7 +366,7 @@ impl StepRunner for DomainExtractionRunner {
             // The PA's answer. This rig has no bus (an UN-TEAMED run), so a declared scope is never
             // diff-corrected and fails closed at 100: the plan pauses for approval (X1 r2 M1).
             output.push_str(
-                "\nSCOPE {\"touch\":[\"coverage-report.json\",\"requirements_graph.json\"]}",
+                "\nSCOPE {\"touch\":[\"coverage-report.json\",\"requirements_graph.json\",\".wicked/domain/rules.json\"]}",
             );
         }
         if let Some((p, ref text)) = self.out_override {
@@ -428,6 +465,13 @@ fn setup(
             "000001",
             DOMAIN_EXTRACTION_SKILLS,
         );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let launcher = snapshot.join("scripts").join("wicked-garden");
+            std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+            std::fs::write(&launcher, FIXTURE_GARDEN_LAUNCHER).unwrap();
+            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         std::env::set_var("WICKED_SKILLS_SNAPSHOT", &snapshot);
         std::env::remove_var("WICKED_WORKER_INHERIT_OPERATOR_CONFIG");
     });
@@ -650,6 +694,54 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
          seat refuses it otherwise)"
     );
     let wt = worktree(&repo, "run-happy");
+    // wicked-garden#1362: the host prepared the seat's work and applied what it stated, through
+    // the admitted garden generation, with the run's store and repository bound, in the worktree.
+    let saw: Vec<bool> = EXTRACT_SAW_WORKLIST
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(run, _)| run == "run-happy")
+        .map(|(_, saw)| *saw)
+        .collect();
+    assert_eq!(saw, vec![true], "extract found the host-prepared worklist");
+    let entry = core
+        .list_repos()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == repo_id)
+        .unwrap();
+    let real_wt = std::fs::canonicalize(&wt).unwrap();
+    for (script, rest, rules) in [
+        (
+            "prepare_worklist.py",
+            vec!["--out", wicked_core::WORKLIST_REL],
+            "rules=no",
+        ),
+        (
+            "apply_rules.py",
+            vec![
+                "--rules",
+                wicked_core::RULES_REL,
+                "--coverage-out",
+                "coverage-report.json",
+            ],
+            "rules=yes",
+        ),
+    ] {
+        let args =
+            std::fs::read_to_string(wt.join(".wicked/domain").join(format!("{script}.args")))
+                .unwrap_or_else(|e| panic!("{script} never ran on the host: {e}"));
+        let mut want: Vec<String> = vec![
+            "--db".into(),
+            entry.code_graph_db.clone(),
+            "--repo-root".into(),
+            entry.root_path.clone(),
+        ];
+        want.extend(rest.iter().map(|a| a.to_string()));
+        want.push(format!("cwd={}", real_wt.display()));
+        want.push(rules.into());
+        assert_eq!(args.lines().collect::<Vec<_>>(), want, "{script}");
+    }
     assert!(
         wt.join("coverage-report.json").is_file(),
         "the coverage phase wrote a store-recomputed coverage-report.json into the worktree"
