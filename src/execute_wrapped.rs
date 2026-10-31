@@ -3704,7 +3704,19 @@ impl WrappedCliStepRunner {
                     );
                 }
                 let gateway_dir = self.operational_home.as_deref().map(|h| h.join("gateway"));
-                match crate::container_floor::arm(
+                // The seat image was missing and was built for this unit: said on the run as
+                // soon as it is built (whatever the rest of the arming decides), so a slow start
+                // reads as a rebuild, never as a stalled seat.
+                let mut on_built = |image: &str, waited: Duration| {
+                    self.emit_event(crate::event::CoreEvent::SeatImageRebuilt {
+                        session: input.run_id.clone(),
+                        ord: input.unit.ord,
+                        cli: cli_key.clone(),
+                        image: image.to_string(),
+                        secs: waited.as_secs(),
+                    });
+                };
+                match crate::container_floor::arm_noting(
                     &plan.inputs,
                     &argv,
                     &input.run_id,
@@ -3713,6 +3725,7 @@ impl WrappedCliStepRunner {
                     member_view.as_deref(),
                     Some(prompt.as_str()),
                     gateway_dir.as_deref(),
+                    &mut on_built,
                 ) {
                     // The hook route rides the gateway: a claude unit whose relay the gateway
                     // could not reach is refused, never run with its hook calls failing open.
