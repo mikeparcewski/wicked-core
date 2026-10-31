@@ -245,7 +245,7 @@ pub use domain::{
 };
 pub use domain_extraction::{
     coverage_eq_one_validator, provision_and_approve_coverage_validator, COVERAGE_CRITERION,
-    COVERAGE_SCRIPT, COVERAGE_VALIDATOR_PIN, DOMAIN_EXTRACTION_WORKFLOW_ID,
+    COVERAGE_SCRIPT, COVERAGE_VALIDATOR_PIN, DOMAIN_EXTRACTION_WORKFLOW_ID, REQUIREMENTS_GRAPH_REL,
 };
 pub use event::{BaseSkill, CoreEvent, InjectedContext, StepFailureKind};
 pub use execute_wrapped::WrappedCliStepRunner;

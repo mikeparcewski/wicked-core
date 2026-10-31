@@ -34,6 +34,34 @@ Two release tracks share this file, newest entry first regardless of track:
   text) of distinct choices within the bounds, recorded as the array's JSON text in the choices' order; anything else
   is refused and the question stays open.
 
+- **A repository's requirements graph can now be generated: it lands where crew reads it, at a configurable minimum
+  coverage, mapped hub-first, with each item's corroboration (core#1213; operator ruling 2026-10-31).**
+  - *Path.* The `domain-extraction` preset's last step runs `wicked-core domain-graph --db {code_graph_db}
+    --repo-root {repo_root}`; under `--repo-root` the default out is `<root>/.wicked-estate/requirements/
+    requirements_graph.json` (`REQUIREMENTS_GRAPH_REL`), the path crew's `GET /repos/:id/requirements` reads. It used
+    to be `--out requirements_graph.json`, i.e. the run worktree's root, so a finished run still answered
+    `notGenerated`. The e2e test now runs the preset's real argv and reads crew's path.
+  - *Minimum coverage, 80% by default.* The graph is built once the mapped share of behaviour-bearing nodes reaches
+    the configured minimum: `--min-coverage-pct`, else `WICKED_REQUIREMENTS_MIN_COVERAGE_PCT` (crew exports its
+    `requirementsGraph.minCoveragePct` setting), else 80. Exact integer arithmetic; 100 is exactly the old
+    `unaccounted == 0`. Below it `domain-graph` writes nothing and says "N% mapped, minimum M% (… of … behaviours)";
+    the mapping already done stays in the estate store, so the next run continues from it. `wicked-core coverage
+    --min-coverage-pct` writes the report and exits 3 below the minimum; the pinned coverage validator's recompute
+    branch now runs it (new pin `313df7270f380e53`; the validator runner hands it the variable explicitly), and the
+    no-store file fallback still demands 1.0. A coverage denial leads with the same sentence.
+  - *Coverage label.* The graph carries `metadata.coverage` (`mapped_pct` floored, `min_pct`, counts).
+  - *Corroboration.* Every requirement carries `corroboration`: `validated` when two or more independent sources
+    support it (distinct non-test callers, tests, docs naming it, extractor seats beyond the first), else
+    `unconfirmed` with a `why` code and sentence (`unindexed_file` when a tracked source file the index skipped names
+    it — estate#374's shape —, `dead_code`, `config_only`, `single_caller`, `test_only`, `doc_only`,
+    `extractors_only`). It also rides the persisted requirement node's metadata.
+  - *Schema.* domain-model 1.1.0 (bundle 1.2.3): the two optional fields; `schema_version` accepts 1.0.0 and 1.1.0;
+    `domain-graph` emits 1.1.0, and a 1.0.0 build keeps the 1.0.0 shape (an unknown version is refused).
+  - *Partial builds stay honest.* A requirement's id is its node's slot among the domain's behaviour-bearing nodes,
+    mapped or not, so ids (and crew's overrides keyed by them, and the persisted `SatisfiedBy` edges) stay put as the
+    mapping grows; a description alone never becomes a requirement (the coverage gate's own predicate); extractor
+    seats are counted by annotation author, never provenance; a set-but-invalid minimum is an error (exit 1, the
+    validator passes it through so the gate fails closed), never 80.
 - **A floor override carries to a later floor on the same tree when it fails on what the operator ruled on
   (core#1186).** The override now records the failure's identity (`floorOverride.fingerprint`) and, where the floor
   showed it complete and file-qualified, the failing tests (`floorOverride.failing`, `<dir>|<check>: <test>`), both

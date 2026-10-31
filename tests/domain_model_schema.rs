@@ -76,25 +76,40 @@ fn built_domain_model_validates_against_the_kept_schema() {
         coverage: 1.0,
         ..Default::default()
     };
-    let model = build_domain_model(&store, &coverage, "1.0.0").expect("build");
-    let instance = serde_json::to_value(&model).unwrap();
+    // Both contract versions the builder emits: 1.0.0 (no coverage/corroboration) and 1.1.0
+    // (`metadata.coverage` + every requirement's `corroboration`).
+    let old = build_domain_model(&store, &coverage, "1.0.0").expect("build 1.0.0");
+    let opts = wicked_governance::DomainBuildOptions {
+        min_coverage_pct: 80,
+        repo_root: None,
+    };
+    let new = wicked_governance::build_domain_model_with(&store, &coverage, "1.1.0", &opts)
+        .expect("build 1.1.0");
+    assert!(new.metadata.coverage.is_some());
+    assert!(new
+        .domains
+        .values()
+        .flat_map(|d| d.requirements.values())
+        .all(|r| r.corroboration.is_some()));
 
     let schema: serde_json::Value = serde_json::from_str(SCHEMA).expect("schema parses");
     let compiled = jsonschema::JSONSchema::compile(&schema).expect("schema compiles");
-    let pretty = serde_json::to_string_pretty(&instance).unwrap();
-
-    let violations: Vec<String> = match compiled.validate(&instance) {
-        Ok(()) => Vec::new(),
-        Err(errors) => errors
-            .map(|e| format!("{} @ {}", e, e.instance_path))
-            .collect(),
-    };
-    assert!(
-        violations.is_empty(),
-        "builder output must validate against domain-model.schema.json; violations:\n{}\n\ninstance:\n{}",
-        violations.join("\n"),
-        pretty
-    );
+    for model in [old, new] {
+        let instance = serde_json::to_value(&model).unwrap();
+        let pretty = serde_json::to_string_pretty(&instance).unwrap();
+        let violations: Vec<String> = match compiled.validate(&instance) {
+            Ok(()) => Vec::new(),
+            Err(errors) => errors
+                .map(|e| format!("{} @ {}", e, e.instance_path))
+                .collect(),
+        };
+        assert!(
+            violations.is_empty(),
+            "builder output must validate against domain-model.schema.json; violations:\n{}\n\ninstance:\n{}",
+            violations.join("\n"),
+            pretty
+        );
+    }
 }
 
 // ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────

@@ -919,7 +919,7 @@
         "role": "evaluator",
         "skill_ref": "wicked-garden-domain-coverage",
         "allowed_skills": [],
-        "validator_pin": "bfe4020a365c598b"
+        "validator_pin": "313df7270f380e53"
       },
       {
         "id": "domain-graph",
@@ -947,8 +947,8 @@
             "domain-graph",
             "--db",
             "{code_graph_db}",
-            "--out",
-            "requirements_graph.json"
+            "--repo-root",
+            "{repo_root}"
           ]
         }
       }

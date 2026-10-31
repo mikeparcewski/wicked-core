@@ -34,6 +34,29 @@ pub struct Metadata {
     pub migration_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// How much of the code this model maps (domain-model 1.1.0, bundle 1.2.3, optional). A graph is built once the
+    /// mapped share reaches the configured minimum ([`MIN_COVERAGE_ENV`], default
+    /// [`DEFAULT_MIN_COVERAGE_PCT`]), so a reader needs the share to read the graph honestly:
+    /// "82% of behaviours mapped".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<ModelCoverage>,
+}
+
+/// The coverage a domain model was built at (`metadata.coverage`, domain-model 1.1.0).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCoverage {
+    /// `floor(mapped * 100 / behavior_bearing)`; 100 on an empty denominator.
+    pub mapped_pct: u8,
+    /// The minimum the build was held to.
+    pub min_pct: u8,
+    /// Behavior-bearing nodes (the denominator).
+    pub behavior_bearing: u64,
+    /// Behavior-bearing nodes mapped (resolved + risk-flagged).
+    pub mapped: u64,
+    /// Of those, resolved to a stated business rule.
+    pub resolved: u64,
+    /// Behavior-bearing nodes not mapped yet (left for the next extraction run).
+    pub unmapped: u64,
 }
 
 /// A capability domain: its requirements + the entities they operate on.
@@ -79,6 +102,10 @@ pub struct Requirement {
     pub disposition_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merged_programs: Vec<String>,
+    /// How many independent sources support this requirement (domain-model 1.1.0, bundle 1.2.3, optional):
+    /// `validated` with its count, or `unconfirmed` with why. See [`crate::corroboration`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corroboration: Option<crate::corroboration::Corroboration>,
 }
 
 /// A business rule (`id`, `statement`, `confidence`, `provenance` required by the schema).
@@ -650,11 +677,96 @@ fn env_f64(key: &str, default: f64) -> f64 {
 /// Concentration catches it where the predicate cannot — this turns the [`RequirementReuse`] SIGNAL
 /// into a gate.
 pub fn assert_front_half_coverage(report: &CoverageReport) -> anyhow::Result<()> {
-    // Gate on the EXACT integer `unaccounted`, NOT the 4-dp-rounded `coverage` float. On a large graph a
-    // single hole (e.g. 1/20000) rounds up to coverage==1.0, so a float-epsilon test would fail OPEN and
-    // translate a graph with a real hole. `unaccounted == 0` is the definitive completeness condition and
-    // preserves the vacuous pass (empty graph ⇒ behavior_bearing==0 ⇒ unaccounted==0 ⇒ Ok).
-    if report.unaccounted != 0 {
+    assert_front_half_coverage_min(report, 100)
+}
+
+/// The default minimum share of behavior-bearing nodes a requirements graph must map before it is
+/// built (operator ruling 2026-10-31). Adjustable per daemon: crew's
+/// `requirementsGraph.minCoveragePct` setting, exported as [`MIN_COVERAGE_ENV`].
+pub const DEFAULT_MIN_COVERAGE_PCT: u8 = 80;
+
+/// The variable carrying the configured minimum (an integer percentage, 1..=100). The daemon
+/// exports it at boot and on every settings change; `wicked-core domain-graph` and `wicked-core
+/// coverage --min-coverage-pct` read it, and the coverage validator is handed it explicitly.
+pub const MIN_COVERAGE_ENV: &str = "WICKED_REQUIREMENTS_MIN_COVERAGE_PCT";
+
+/// Parse a minimum: an integer 1..=100 (surrounding whitespace and one trailing `%` allowed).
+#[must_use]
+pub fn parse_min_coverage_pct(raw: &str) -> Option<u8> {
+    let t = raw.trim();
+    let t = t.strip_suffix('%').unwrap_or(t).trim();
+    t.parse::<u8>().ok().filter(|v| (1..=100).contains(v))
+}
+
+/// The configured minimum from [`MIN_COVERAGE_ENV`], or [`DEFAULT_MIN_COVERAGE_PCT`] when it is
+/// absent or not a valid percentage.
+///
+/// Absent (or empty) is the default. A value that is SET but not a whole percentage 1..=100 is an
+/// error, never the default: a typo'd `95.5` silently becoming 80 would approve a graph below the
+/// bar the operator set. Callers fail closed on it.
+pub fn min_coverage_pct_from_env() -> Result<u8, String> {
+    match std::env::var(MIN_COVERAGE_ENV) {
+        Ok(v) if !v.trim().is_empty() => parse_min_coverage_pct(&v)
+            .ok_or_else(|| format!("{MIN_COVERAGE_ENV}={v:?} is not a whole percentage 1..100")),
+        _ => Ok(DEFAULT_MIN_COVERAGE_PCT),
+    }
+}
+
+/// Mapped behavior-bearing nodes (resolved + risk-flagged).
+fn mapped_count(report: &CoverageReport) -> u64 {
+    report.resolved + report.risk_flagged
+}
+
+/// `floor(mapped * 100 / behavior_bearing)`, 100 on an empty denominator. Floored so the number
+/// shown never rounds up past the minimum it is compared to.
+#[must_use]
+pub fn mapped_pct(report: &CoverageReport) -> u8 {
+    let den = denominator(report);
+    if den == 0 {
+        return 100;
+    }
+    let pct = u128::from(mapped_count(report)) * 100 / u128::from(den);
+    pct.min(100) as u8
+}
+
+/// The denominator a report is judged on: `behavior_bearing`, or the bucket sum when a hand-built
+/// or inconsistent report claims fewer behaviours than its buckets hold — never a smaller number
+/// than the holes it lists, so an inconsistent report can only read WORSE, not better.
+fn denominator(report: &CoverageReport) -> u64 {
+    report
+        .behavior_bearing
+        .max(mapped_count(report) + report.unaccounted)
+}
+
+/// Whether the report maps at least `min_pct` percent of the behavior-bearing nodes. Exact
+/// integer arithmetic, never the rounded `coverage` float: on a large graph a single hole rounds
+/// up to 1.0, so a float test would fail open. `min_pct == 100` is exactly `unaccounted == 0`.
+#[must_use]
+pub fn meets_minimum(report: &CoverageReport, min_pct: u8) -> bool {
+    if min_pct >= 100 && report.unaccounted != 0 {
+        return false;
+    }
+    u128::from(mapped_count(report)) * 100 >= u128::from(min_pct) * u128::from(denominator(report))
+}
+
+/// The one-line verdict, e.g. `"42% mapped, minimum 80% (336 of 800 behaviours)"`.
+#[must_use]
+pub fn coverage_verdict(report: &CoverageReport, min_pct: u8) -> String {
+    format!(
+        "{}% mapped, minimum {}% ({} of {} behaviours)",
+        mapped_pct(report),
+        min_pct,
+        mapped_count(report),
+        denominator(report)
+    )
+}
+
+/// [`assert_front_half_coverage`] against a configured minimum: the builder REFUSES to translate a
+/// graph that maps less than `min_pct` percent of its behavior-bearing nodes, and says how far it
+/// got. The mapping already done stays in the estate store (annotations are never rolled back), so
+/// the next extraction run continues from it rather than starting over.
+pub fn assert_front_half_coverage_min(report: &CoverageReport, min_pct: u8) -> anyhow::Result<()> {
+    if !meets_minimum(report, min_pct) {
         let shown: Vec<&str> = report
             .unaccounted_nodes
             .iter()
@@ -665,12 +777,12 @@ pub fn assert_front_half_coverage(report: &CoverageReport) -> anyhow::Result<()>
         // consumers (unit denial_reason, logs) keep the TAIL of long output — the line a human
         // must read has to be the last one, not buried above a 20-item symbol list.
         anyhow::bail!(
-            "first unaccounted (sample of {}): {:?}\nfront-half coverage {:.4} — {} behavior-bearing \
-             node(s) unaccounted; run extraction + coverage first (refusing to translate an \
-             unannotated graph).",
+            "first unaccounted (sample of {}): {:?}\n{} — {} behavior-bearing node(s) still \
+             unmapped. The mapping so far is kept in the estate store; the next domain-extraction \
+             run continues from it (refusing to build a requirements graph below the minimum).",
             shown.len(),
             shown,
-            report.coverage,
+            coverage_verdict(report, min_pct),
             report.unaccounted
         );
     }
@@ -769,19 +881,93 @@ pub fn build_domain_model(
     coverage: &CoverageReport,
     schema_version: &str,
 ) -> anyhow::Result<DomainModel> {
+    build_domain_model_with(
+        store,
+        coverage,
+        schema_version,
+        &DomainBuildOptions::default(),
+    )
+}
+
+/// How [`build_domain_model_with`] builds: the coverage minimum and, optionally, the repository
+/// root (to name tracked files the index skipped when an item is unconfirmed).
+#[derive(Debug, Clone)]
+pub struct DomainBuildOptions<'a> {
+    /// The share of behavior-bearing nodes that must be mapped, 1..=100.
+    pub min_coverage_pct: u8,
+    pub repo_root: Option<&'a std::path::Path>,
+}
+
+impl Default for DomainBuildOptions<'_> {
+    /// Full coverage, no repository root: [`build_domain_model`]'s historical contract.
+    fn default() -> Self {
+        DomainBuildOptions {
+            min_coverage_pct: 100,
+            repo_root: None,
+        }
+    }
+}
+
+/// [`build_domain_model`] at a configured minimum (operator ruling 2026-10-31): the graph is built
+/// once `min_coverage_pct` percent of the behavior-bearing nodes are mapped, carries that share on
+/// `metadata.coverage`, and every requirement carries its corroboration.
+pub fn build_domain_model_with(
+    store: &dyn GraphRead,
+    coverage: &CoverageReport,
+    schema_version: &str,
+    opts: &DomainBuildOptions<'_>,
+) -> anyhow::Result<DomainModel> {
+    if !(1..=100).contains(&opts.min_coverage_pct) {
+        anyhow::bail!("min_coverage_pct {} out of 1..=100", opts.min_coverage_pct);
+    }
+    let min_pct = opts.min_coverage_pct;
+    // 1.1.0 carries `metadata.coverage` + `requirement.corroboration`; a 1.0.0 document must not
+    // (its schema's objects are closed), so a caller asking for 1.0.0 gets the 1.0.0 shape.
+    let rich = match schema_version {
+        "1.1.0" => true,
+        "1.0.0" => false,
+        other => anyhow::bail!(
+            "schema_version {other:?} has no domain-model schema here (accepted: 1.0.0, 1.1.0)"
+        ),
+    };
     // Gate on the PASSED report (back-compat) AND, defense-in-depth, on a fresh STORE recompute — so a
     // hand-fed `coverage:1.0` can never translate a graph that actually has an unaccounted behavior node
     // (DES-OUTGOV-005 decision #4). The store is the source of truth; the file is a cross-check. The extra
     // store traversal here is a DELIBERATE correctness-over-perf choice for a fail-closed governance gate:
     // trusting the caller's report would reintroduce the trust-boundary hole this milestone closes. It is
     // a single O(nodes) pass, run once per build (not hot-path).
-    assert_front_half_coverage(coverage)?;
+    assert_front_half_coverage_min(coverage, min_pct)?;
     let recomputed = recompute_front_half_coverage(store)?;
-    assert_front_half_coverage(&recomputed)?;
+    assert_front_half_coverage_min(&recomputed, min_pct)?;
+    let corroboration = if rich {
+        Some(crate::corroboration::CorroborationIndex::build(
+            store,
+            opts.repo_root,
+        )?)
+    } else {
+        None
+    };
 
     let mut domains: std::collections::BTreeMap<String, Domain> = std::collections::BTreeMap::new();
     let mut nodes = store.all_nodes()?;
     nodes.sort_by(|a, b| a.symbol.cmp(&b.symbol)); // stable, UNIQUE visitation order
+
+    // STABLE requirement ids across a growing mapping. A requirement's number is its node's slot
+    // among the domain's behaviour-bearing (or mapped) nodes in SymbolId order — whether or not it
+    // is mapped yet. Numbering only the EMITTED requirements (the old `len() + 1`) was stable only
+    // while every build was complete: once a graph is built at a partial minimum, mapping one more
+    // node would renumber every later requirement, so `REQ-001` would mean another node, its
+    // persisted `SatisfiedBy` edge would point at the old one, and crew's overrides (keyed
+    // `domain::REQ-NNN`) would land on the wrong item. Gaps in the numbering are unmapped nodes.
+    let cfg = CoverageConfig::default();
+    let mut has_behavior_out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in store.all_edges()? {
+        if is_behavior_out_edge(&e.kind) {
+            has_behavior_out.insert(e.source.as_str().to_string());
+        }
+    }
+    let mut unknown_other = std::collections::BTreeSet::new();
+    let mut slots: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
 
     for node in &nodes {
         let semantics = store.node_semantics(&node.symbol)?;
@@ -821,10 +1007,22 @@ pub fn build_domain_model(
             .as_deref()
             .is_some_and(|r| !r.trim().is_empty());
         let resolved = has_requirement || !business_rules.is_empty();
-        // Genuinely structural (nothing accounted) → skip. Everything the gate counted survives.
-        if !resolved && risk_notes.is_empty() && description_text.is_none() {
+        let behavior = is_behavior_bearing(node, &has_behavior_out, &cfg, &mut unknown_other);
+        let accounted = resolved || !risk_notes.is_empty();
+        let slot = if behavior || accounted {
+            let n = slots.entry(package_dir(&node.location.file)).or_insert(0);
+            *n += 1;
+            Some(*n)
+        } else {
+            None
+        };
+        // Nothing accounted → skip: exactly the coverage gate's predicate. A DESCRIPTION alone is not
+        // accounting (coverage counts a merely-described behaviour as a hole), so it never becomes a
+        // requirement either — under a partial minimum it would otherwise turn an unmapped node into
+        // an item with a synthesized rule.
+        let Some(slot) = slot.filter(|_| accounted) else {
             continue;
-        }
+        };
 
         // minItems:1 — synthesize ONE fallback rule when there is no real business rule (carries the
         // risk statement if risk-flagged, else the requirement/description text; `domain_graph.py`'s
@@ -882,7 +1080,20 @@ pub fn build_domain_model(
             cluster_id: None,
             ..Default::default()
         });
+        // Distinct extractor SEATS that stated a real business rule (a RISK flag is not one). The seat
+        // is the annotation's `author`, never its `provenance`: provenance says where one extractor's
+        // evidence came from, so counting it would let one seat citing two places corroborate itself.
+        // A rule with no recorded author is one anonymous seat.
+        let extractor_sources = annotations
+            .iter()
+            .filter(|a| a.r#type == BUSINESS_RULE_ANN)
+            .map(|a| a.author.trim())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len() as u32;
         let requirement = Requirement {
+            corroboration: corroboration
+                .as_ref()
+                .map(|c| c.assess(node, extractor_sources)),
             title: node.name.clone(),
             description: requirement_text
                 .or(description_text)
@@ -892,8 +1103,8 @@ pub fn build_domain_model(
             business_rules,
             ..Default::default()
         };
-        // Per-domain sequential requirement id — unique within the domain, deterministic.
-        let req_id = format!("REQ-{:03}", domain.requirements.len() + 1);
+        // The node's stable slot in its domain (see `slots` above) — unique, deterministic.
+        let req_id = format!("REQ-{slot:03}");
         domain.requirements.insert(req_id, requirement);
     }
 
@@ -903,6 +1114,14 @@ pub fn build_domain_model(
             // M5 package-dir grouping IS the schema's "functional" (capability-grouped) mode.
             migration_mode: "functional".to_string(),
             source: Some("estate-graph".to_string()),
+            coverage: rich.then(|| ModelCoverage {
+                mapped_pct: mapped_pct(&recomputed),
+                min_pct,
+                behavior_bearing: recomputed.behavior_bearing,
+                mapped: mapped_count(&recomputed),
+                resolved: recomputed.resolved,
+                unmapped: recomputed.unaccounted,
+            }),
         },
         domains,
     })
@@ -1051,6 +1270,12 @@ pub fn persist_domain_model(
                     serde_json::json!(req.dependencies),
                 );
             }
+            // Corroboration rides on the node too, so a graph query sees validated vs unconfirmed.
+            if let Some(c) = &req.corroboration {
+                if let Ok(v) = serde_json::to_value(c) {
+                    rnode.metadata.insert("corroboration".to_string(), v);
+                }
+            }
             nodes.push(rnode);
 
             // domain CONTAINS requirement
@@ -1172,6 +1397,7 @@ mod tests {
                 schema_version: "1.0.0".to_string(),
                 migration_mode: "functional".to_string(),
                 source: None,
+                coverage: None,
             },
             domains,
         };
@@ -1304,6 +1530,7 @@ mod tests {
                 schema_version: "1.0.0".to_string(),
                 migration_mode: "functional".to_string(),
                 source: None,
+                coverage: None,
             },
             domains,
         };
@@ -1388,6 +1615,56 @@ mod tests {
         // Round-trips back to an equal JSON value (serde symmetry; schema conformance is proven by
         // the integration test in tests/domain_model_schema.rs which validates against the schema).
         assert_eq!(serde_json::to_value(&model).unwrap(), json);
+    }
+
+    /// Operator ruling 2026-10-31: the gate is the CONFIGURED MINIMUM (default 80%), compared in
+    /// exact integers, and the refusal says how far the mapping got.
+    #[test]
+    fn the_coverage_gate_holds_at_the_configured_minimum() {
+        let report = |bb: u64, resolved: u64, risk: u64| CoverageReport {
+            behavior_bearing: bb,
+            resolved,
+            risk_flagged: risk,
+            unaccounted: bb - resolved - risk,
+            ..Default::default()
+        };
+        // 80 of 100 mapped (60 resolved + 20 risk): meets 80, misses 81.
+        let r = report(100, 60, 20);
+        assert_eq!(mapped_pct(&r), 80);
+        assert!(meets_minimum(&r, 80));
+        assert!(assert_front_half_coverage_min(&r, 80).is_ok());
+        let err = assert_front_half_coverage_min(&r, 81)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("80% mapped, minimum 81% (80 of 100 behaviours)")
+                && err.contains("kept in the estate store"),
+            "{err}"
+        );
+        // Floored, never rounded up past the bar: 7999/10000 is 79%, below 80.
+        let r = report(10_000, 7_999, 0);
+        assert_eq!(mapped_pct(&r), 79);
+        assert!(!meets_minimum(&r, 80));
+        // 100 is exactly the historical `unaccounted == 0`, including the one-hole-in-20k case.
+        assert!(!meets_minimum(&report(20_000, 19_999, 0), 100));
+        assert!(assert_front_half_coverage(&report(3, 3, 0)).is_ok());
+        // An inconsistent report can only read worse (xreview on core#1215, agy P3): holes beyond
+        // a too-small `behavior_bearing` still count, and 100 still means zero holes.
+        let lying = CoverageReport {
+            behavior_bearing: 0,
+            unaccounted: 1,
+            ..Default::default()
+        };
+        assert!(!meets_minimum(&lying, 100) && !meets_minimum(&lying, 80));
+        // The empty graph stays a vacuous pass.
+        assert!(meets_minimum(&report(0, 0, 0), 80));
+        assert_eq!(mapped_pct(&report(0, 0, 0)), 100);
+        // The setting's parse: whole percentages 1..=100 only.
+        assert_eq!(parse_min_coverage_pct(" 80 "), Some(80));
+        assert_eq!(parse_min_coverage_pct("75%"), Some(75));
+        for bad in ["0", "101", "eighty", "80.5", ""] {
+            assert_eq!(parse_min_coverage_pct(bad), None, "{bad}");
+        }
     }
 
     #[test]
@@ -1642,6 +1919,168 @@ mod tests {
         }
         fn cov(store: &SqliteStore) -> CoverageReport {
             recompute_front_half_coverage(store).unwrap()
+        }
+
+        /// Map node `name` with a validated requirement + a business rule by `author`.
+        fn map(store: &mut SqliteStore, n: &Node, author: &str, provenance: &str) {
+            store
+                .set_node_semantics(
+                    &n.symbol,
+                    None,
+                    Some(&format!("{} holds", n.name)),
+                    Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+                )
+                .unwrap();
+            store
+                .annotate(
+                    &n.symbol,
+                    Annotation::new("business_rule", provenance, format!("{} holds", n.name))
+                        .with_confidence(0.9)
+                        .with_provenance(provenance)
+                        .with_author(author),
+                )
+                .unwrap();
+        }
+
+        fn build_at(store: &SqliteStore, min: u8) -> DomainModel {
+            let opts = DomainBuildOptions {
+                min_coverage_pct: min,
+                repo_root: None,
+            };
+            build_domain_model_with(store, &cov(store), "1.1.0", &opts).unwrap()
+        }
+
+        /// xreview on core#1215 (codex P2): requirement ids are STABLE as the mapping grows. With
+        /// a..e and b..e mapped (80%), `b` must keep its id when `a` is mapped next, and the
+        /// persisted `SatisfiedBy` edges must still point each requirement at its own node.
+        #[test]
+        fn requirement_ids_stay_put_as_coverage_grows_and_satisfaction_follows() {
+            use wicked_apps_core::{synthetic_symbol, EdgeKind, GraphRead};
+            let mut s = store();
+            let nodes: Vec<Node> = ["a", "b", "c", "d", "e"]
+                .iter()
+                .map(|n| node(&mut s, n, NodeKind::Function, "pkg/ops.rs"))
+                .collect();
+            for n in &nodes[1..] {
+                map(&mut s, n, "seat-1", "extract-loop");
+            }
+            let first = build_at(&s, 80);
+            let title_of = |m: &DomainModel, id: &str| {
+                m.domains["pkg"]
+                    .requirements
+                    .get(id)
+                    .map(|r| r.title.clone())
+            };
+            assert_eq!(
+                title_of(&first, "REQ-001"),
+                None,
+                "a's slot is a gap while unmapped"
+            );
+            assert_eq!(title_of(&first, "REQ-002").as_deref(), Some("b"));
+            persist_domain_model(&mut s, &first).unwrap();
+
+            map(&mut s, &nodes[0], "seat-1", "extract-loop");
+            let second = build_at(&s, 80);
+            assert_eq!(title_of(&second, "REQ-001").as_deref(), Some("a"));
+            assert_eq!(
+                title_of(&second, "REQ-002").as_deref(),
+                Some("b"),
+                "b kept its id"
+            );
+            persist_domain_model(&mut s, &second).unwrap();
+            let edges = s.all_edges().unwrap();
+            for (id, want) in [("REQ-001", "a"), ("REQ-002", "b")] {
+                let rsym = synthetic_symbol("requirement", &format!("pkg/{id}"));
+                let targets: Vec<String> = edges
+                    .iter()
+                    .filter(|e| e.source == rsym && e.kind == EdgeKind::SatisfiedBy)
+                    .map(|e| s.get_node(&e.target).unwrap().unwrap().name)
+                    .collect();
+                assert_eq!(
+                    targets,
+                    vec![want.to_string()],
+                    "{id} is satisfied by {want} alone"
+                );
+            }
+        }
+
+        /// xreview on core#1215 (codex P2): a DESCRIPTION-only behaviour is a coverage hole, so a
+        /// partial build must not turn it into a requirement with a synthesized rule.
+        #[test]
+        fn a_description_only_hole_is_not_a_requirement() {
+            let mut s = store();
+            let nodes: Vec<Node> = ["a", "b", "c", "d", "e"]
+                .iter()
+                .map(|n| node(&mut s, n, NodeKind::Function, "pkg/ops.rs"))
+                .collect();
+            for n in &nodes[1..] {
+                map(&mut s, n, "seat-1", "extract-loop");
+            }
+            s.set_node_semantics(&nodes[0].symbol, Some("adds numbers"), None, None)
+                .unwrap();
+            let m = build_at(&s, 80);
+            assert_eq!(m.domains["pkg"].requirements.len(), 4, "{m:?}");
+            assert!(m.domains["pkg"]
+                .requirements
+                .values()
+                .all(|r| r.title != "a"));
+            assert_eq!(m.metadata.coverage.as_ref().unwrap().mapped, 4);
+        }
+
+        /// xreview on core#1215 (codex P2): extractor SEATS are counted by author, not provenance.
+        #[test]
+        fn one_seat_citing_two_provenances_is_one_extractor() {
+            let mut s = store();
+            let a = node(&mut s, "settle", NodeKind::Function, "pkg/ops.rs");
+            map(&mut s, &a, "seat-1", "code-body");
+            s.annotate(
+                &a.symbol,
+                Annotation::new("business_rule", "r2", "settle holds")
+                    .with_confidence(0.9)
+                    .with_provenance("comment")
+                    .with_author("seat-1"),
+            )
+            .unwrap();
+            let one = build_at(&s, 80);
+            let c = one.domains["pkg"].requirements["REQ-001"]
+                .corroboration
+                .clone()
+                .unwrap();
+            assert_eq!((c.status.as_str(), c.extra_extractors), ("unconfirmed", 0));
+            // A second seat agreeing is a source; two more make it validated.
+            for seat in ["seat-2", "seat-3"] {
+                s.annotate(
+                    &a.symbol,
+                    Annotation::new("business_rule", seat, "settle holds")
+                        .with_confidence(0.9)
+                        .with_author(seat),
+                )
+                .unwrap();
+            }
+            let c = build_at(&s, 80).domains["pkg"].requirements["REQ-001"]
+                .corroboration
+                .clone()
+                .unwrap();
+            assert_eq!((c.status.as_str(), c.extra_extractors), ("validated", 2));
+        }
+
+        /// xreview on core#1215 (agy P2): a 1.0.0 document keeps the 1.0.0 shape; an unknown
+        /// version is refused rather than emitted.
+        #[test]
+        fn a_1_0_0_build_carries_no_1_1_0_fields_and_unknown_versions_are_refused() {
+            let mut s = store();
+            let a = node(&mut s, "settle", NodeKind::Function, "pkg/ops.rs");
+            map(&mut s, &a, "seat-1", "code-body");
+            let opts = DomainBuildOptions {
+                min_coverage_pct: 80,
+                repo_root: None,
+            };
+            let old = build_domain_model_with(&s, &cov(&s), "1.0.0", &opts).unwrap();
+            assert!(old.metadata.coverage.is_none());
+            assert!(old.domains["pkg"].requirements["REQ-001"]
+                .corroboration
+                .is_none());
+            assert!(build_domain_model_with(&s, &cov(&s), "9.9.9", &opts).is_err());
         }
 
         #[test]

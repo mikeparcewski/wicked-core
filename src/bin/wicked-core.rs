@@ -68,8 +68,10 @@
 //!       # projects' (DC-S1). Read-only.
 //!   wicked-core coverage [--out F]                # recompute front-half coverage FROM THE STORE →
 //!       # coverage-report.json (schema-exact; two-predicate: bare/description-only behavior nodes are holes)
-//!   wicked-core domain-graph [--coverage F] [--out F]  # translate the annotated estate graph into
-//!       # requirements_graph.json (front-half coverage RECOMPUTED from the store, FAIL-CLOSED on < 1.0;
+//!   wicked-core domain-graph [--repo-root D] [--min-coverage-pct N] [--coverage F] [--out F]
+//!       # translate the annotated estate graph into requirements_graph.json at
+//!       # <D>/.wicked-estate/requirements/ (front-half coverage RECOMPUTED from the store, FAIL-CLOSED
+//!       # below the configured minimum, default 80%;
 //!       # a supplied --coverage file is an optional cross-check that must agree; modern package-dir grouping)
 //!   [--db <path>]                                 # else $WICKED_ESTATE_DB, else ./wicked-estate.db
 
@@ -144,15 +146,18 @@ const ROOT_USAGE: &str = "usage: wicked-core <status | repos | register-repo --p
 const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
     (
         "domain-graph",
-        "wicked-core domain-graph [--db <path>] [--coverage <F>] [--out <F>] [--schema-version <V>]\n  \
+        "wicked-core domain-graph [--db <path>] [--repo-root <dir>] [--min-coverage-pct <N>] [--coverage <F>] [--out <F>] [--schema-version <V>]\n  \
          Translate the ANNOTATED estate graph into requirements_graph.json (default out: \
-         .wicked-estate/requirements/requirements_graph.json, cwd-relative). Fails closed when the \
-         domain-extraction front-half has not annotated the graph.",
+         <repo-root>/.wicked-estate/requirements/requirements_graph.json, the path crew reads; \
+         cwd-relative without --repo-root). Fails closed below the configured minimum coverage \
+         (--min-coverage-pct, else $WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, else 80).",
     ),
     (
         "coverage",
-        "wicked-core coverage [--db <path>] [--json]\n  \
-         Recompute front-half coverage from the store and print the report. Reads only.",
+        "wicked-core coverage [--db <path>] [--json] [--min-coverage-pct <N>]\n  \
+         Recompute front-half coverage from the store and print the report. Reads only. With \
+         --min-coverage-pct (a bare flag reads $WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, else 80), \
+         exits 3 after writing the report when less than N% of behaviours are mapped.",
     ),
     (
         "seed-domain-validators",
@@ -1046,11 +1051,28 @@ fn print_status(core: &Core) {
 /// trust-boundary hole (a stale report can no longer green-light a different graph) that the prior
 /// increment left as a follow-on.
 fn domain_graph_cmd(args: &[String]) {
-    let out_path = flag(args, "--out")
-        .unwrap_or_else(|| ".wicked-estate/requirements/requirements_graph.json".to_string());
-    // The schema pins metadata.schema_version to const "1.0.0" — a consumer rejects a version it has
-    // no validator for, so the emitted document must carry exactly this.
-    let schema_version = flag(args, "--schema-version").unwrap_or_else(|| "1.0.0".to_string());
+    // `--repo-root` is how the `domain-extraction` preset says WHICH checkout the graph belongs to
+    // (`{repo_root}`, bound per run). The tool step runs in the run's worktree, so a cwd-relative
+    // default wrote the graph where crew never reads it (wicked-core#1213); with the root, the
+    // default is crew's read path, `<root>/.wicked-estate/requirements/requirements_graph.json`.
+    let repo_root = flag(args, "--repo-root").map(std::path::PathBuf::from);
+    let out_path = flag(args, "--out").unwrap_or_else(|| {
+        let rel = std::path::Path::new(wicked_core::REQUIREMENTS_GRAPH_REL);
+        match &repo_root {
+            Some(root) => root.join(rel).to_string_lossy().into_owned(),
+            None => rel.to_string_lossy().into_owned(),
+        }
+    });
+    let min_pct = match min_coverage_pct_arg(args) {
+        Ok(v) => v,
+        Err(e) => {
+            fail(&format!("domain-graph: {e}"));
+            return;
+        }
+    };
+    // The domain-model schema accepts 1.0.0 and 1.1.0; 1.1.0 is the contract that carries the
+    // optional `metadata.coverage` + `requirement.corroboration` this build emits.
+    let schema_version = flag(args, "--schema-version").unwrap_or_else(|| "1.1.0".to_string());
 
     let mut store = match wicked_apps_core::open_store(Some(&store_path(args))) {
         Ok(s) => s,
@@ -1132,15 +1154,21 @@ fn domain_graph_cmd(args: &[String]) {
         }
     }
 
-    // Fail-closed: `build_domain_model` bails when coverage < 1.0 (never translates a partial graph) AND
-    // recomputes internally, so a store hole denies even if the passed report claimed 1.0.
-    let model = match wicked_governance::build_domain_model(&store, &coverage, &schema_version) {
-        Ok(m) => m,
-        Err(e) => {
-            fail(&format!("domain-graph: {e}"));
-            return;
-        }
+    // Fail-closed: the builder bails below the configured minimum (never translates a graph that maps
+    // less) AND recomputes internally, so a store hole denies even if the passed report claimed more.
+    let opts = wicked_governance::DomainBuildOptions {
+        min_coverage_pct: min_pct,
+        repo_root: repo_root.as_deref(),
     };
+    let model =
+        match wicked_governance::build_domain_model_with(&store, &coverage, &schema_version, &opts)
+        {
+            Ok(m) => m,
+            Err(e) => {
+                fail(&format!("domain-graph: {e}"));
+                return;
+            }
+        };
 
     // The domain graph belongs IN the estate DB, not only as a JSON file (operator directive; the
     // locked "domain data lives in estate's graph" direction). Persist the assembled model as
@@ -1171,8 +1199,9 @@ fn domain_graph_cmd(args: &[String]) {
     let json = serde_json::to_string_pretty(&model).expect("DomainModel serializes to JSON");
     match std::fs::write(&out_path, json) {
         Ok(()) => println!(
-            "domain-graph: wrote {} domain(s) → {out_path}",
-            model.domains.len()
+            "domain-graph: wrote {} domain(s) → {out_path} ({})",
+            model.domains.len(),
+            wicked_governance::coverage_verdict(&coverage, min_pct)
         ),
         Err(e) => fail(&format!("domain-graph: cannot write {out_path}: {e}")),
     }
@@ -1198,10 +1227,24 @@ fn coverage_cmd(args: &[String]) {
             return;
         }
     };
+    // `--min-coverage-pct` turns the report into a check (the coverage validator's recompute
+    // branch): the report is written as always, then the exit says whether it met the minimum.
+    let check = if args.iter().any(|a| a == "--min-coverage-pct") {
+        match min_coverage_pct_arg(args) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                fail(&format!("coverage: {e}"));
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let json = serde_json::to_string_pretty(&report).expect("CoverageReport serializes to JSON");
     if json_stdout {
         // --json: emit to stdout so callers (e.g. wicked-crew) don't need a temp file.
         println!("{json}");
+        coverage_check_exit(&report, check);
         return;
     }
     let out_path = flag(args, "--out").unwrap_or_else(|| "coverage-report.json".to_string());
@@ -1221,8 +1264,44 @@ fn coverage_cmd(args: &[String]) {
             "coverage: {:.4} ({} behavior-bearing, {} unaccounted) → {out_path}",
             report.coverage, report.behavior_bearing, report.unaccounted
         ),
-        Err(e) => fail(&format!("coverage: cannot write {out_path}: {e}")),
+        Err(e) => {
+            fail(&format!("coverage: cannot write {out_path}: {e}"));
+            return;
+        }
     }
+    coverage_check_exit(&report, check);
+}
+
+/// The configured minimum: `--min-coverage-pct N`, else [`wicked_governance::MIN_COVERAGE_ENV`],
+/// else the default (80). The flag with NO value (last, or followed by another flag) reads the
+/// env/default, so a validator script can pass the bare flag. A junk value — on the flag (`""`
+/// included) or in the variable — is an error, never a silent default.
+fn min_coverage_pct_arg(args: &[String]) -> Result<u8, String> {
+    match flag(args, "--min-coverage-pct").filter(|v| !v.starts_with("--")) {
+        Some(v) => wicked_governance::parse_min_coverage_pct(&v)
+            .ok_or_else(|| format!("--min-coverage-pct {v:?} is not a whole percentage 1..100")),
+        None => wicked_governance::min_coverage_pct_from_env(),
+    }
+}
+
+/// Exit 3 with the verdict when a `--min-coverage-pct` check is below its minimum; print the
+/// verdict and return otherwise.
+fn coverage_check_exit(report: &wicked_governance::CoverageReport, check: Option<u8>) {
+    let Some(min) = check else { return };
+    let verdict = wicked_governance::coverage_verdict(report, min);
+    if wicked_governance::meets_minimum(report, min) && report.behavior_bearing > 0 {
+        eprintln!("coverage: {verdict}");
+        return;
+    }
+    if report.behavior_bearing == 0 {
+        eprintln!("coverage: no behavior-bearing nodes in this store: nothing to map (index the repo first)");
+    } else {
+        eprintln!(
+            "coverage: {verdict}. The mapping so far is kept in the estate store; the next \
+             domain-extraction run continues from it."
+        );
+    }
+    std::process::exit(3);
 }
 
 /// `wicked-core rules ingest <dir> [--db F]` — populate the store with governance POLICIES (the

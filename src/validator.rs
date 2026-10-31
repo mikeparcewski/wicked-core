@@ -1788,6 +1788,15 @@ pub fn run_validator_reporting_with_env(
             cmd.env(crate::gate_hook::COVERAGE_DB_ENV, abs);
         }
     }
+    // The configured requirements-graph minimum (crew's `requirementsGraph.minCoveragePct`, which
+    // the daemon exports): an explicit injection — the env was cleared, and `COVERAGE_SCRIPT`'s
+    // `coverage --min-coverage-pct` reads it (absent ⇒ 80). Passed through AS SET, valid or not:
+    // dropping an invalid value would let the binary fall back to 80 (a mistyped `95.5` approving
+    // an 80% graph); handed on, the binary refuses it and the gate fails closed. The script never
+    // expands the value, so it is data to the binary, not to the shell.
+    if let Some(min) = std::env::var_os(wicked_governance::MIN_COVERAGE_ENV) {
+        cmd.env(wicked_governance::MIN_COVERAGE_ENV, min);
+    }
 
     // Every non-Passed outcome denies, exactly as before; the variant only records WHY, so the gate can
     // say "the shell could not be spawned" instead of attributing that to the operator's worktree.

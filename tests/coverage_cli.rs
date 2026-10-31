@@ -155,6 +155,189 @@ fn domain_graph_translates_a_fully_accounted_store_with_no_coverage_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Seed `n` behavior nodes, the first `accounted` of them mapped (validated requirement + rule).
+fn seed_many(db: &str, n: usize, accounted: usize) {
+    let mut store = open_store(Some(db)).unwrap();
+    let nodes: Vec<Node> = (0..n)
+        .map(|i| {
+            Node::new(
+                synthetic_symbol("code", &format!("op{i}")),
+                NodeKind::Function,
+                format!("op{i}"),
+                Language::new(SYMBOL_SCHEME),
+                Location::new("billing/ops.rs".to_string(), Span::ZERO),
+            )
+        })
+        .collect();
+    store.begin_batch().unwrap();
+    store.upsert_nodes(&nodes).unwrap();
+    store.commit_batch().unwrap();
+    for n in nodes.iter().take(accounted) {
+        store
+            .set_node_semantics(
+                &n.symbol,
+                None,
+                Some(&format!("REQ for {}", n.name)),
+                Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+            )
+            .unwrap();
+        store
+            .annotate(
+                &n.symbol,
+                Annotation::new("business_rule", "r", format!("{} holds", n.name))
+                    .with_confidence(0.9),
+            )
+            .unwrap();
+    }
+}
+
+/// Operator ruling 2026-10-31: the graph is built once coverage reaches the configured minimum
+/// (default 80%), labelled with its share, and written under `--repo-root` where crew reads it.
+#[test]
+fn domain_graph_builds_at_the_minimum_and_lands_at_crews_read_path() {
+    let dir = scratch("min80");
+    let db = dir.join("estate.db");
+    seed_many(db.to_str().unwrap(), 5, 4); // 80% mapped
+    let root = dir.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let out = Command::new(BIN)
+        .env_remove("WICKED_REQUIREMENTS_MIN_COVERAGE_PCT")
+        .args([
+            "domain-graph",
+            "--db",
+            db.to_str().unwrap(),
+            "--repo-root",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "80% mapped meets the default minimum: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let path = root.join(".wicked-estate/requirements/requirements_graph.json");
+    let graph: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("crew's read path")).unwrap();
+    let cov = &graph["metadata"]["coverage"];
+    assert_eq!(cov["mapped_pct"], 80, "{cov}");
+    assert_eq!(cov["min_pct"], 80);
+    assert_eq!(cov["behavior_bearing"], 5);
+    assert_eq!(cov["mapped"], 4);
+    assert_eq!(cov["unmapped"], 1);
+    let reqs = graph["domains"]["billing"]["requirements"]
+        .as_object()
+        .unwrap();
+    assert_eq!(
+        reqs.len(),
+        4,
+        "only the mapped behaviours become requirements"
+    );
+    assert!(
+        reqs.values()
+            .all(|r| r["corroboration"]["status"] == "unconfirmed"
+                && r["corroboration"]["why"]["code"] == "dead_code"),
+        "nothing calls these: unconfirmed, and why: {reqs:?}"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("80% mapped, minimum 80%"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn domain_graph_refuses_below_the_configured_minimum_and_says_how_far_it_got() {
+    let dir = scratch("min90");
+    let db = dir.join("estate.db");
+    seed_many(db.to_str().unwrap(), 5, 4); // 80% mapped
+    let rg = dir.join("rg.json");
+    for (flag, env) in [(Some("90"), None), (None, Some("90"))] {
+        let mut cmd = Command::new(BIN);
+        cmd.env_remove("WICKED_REQUIREMENTS_MIN_COVERAGE_PCT");
+        if let Some(e) = env {
+            cmd.env("WICKED_REQUIREMENTS_MIN_COVERAGE_PCT", e);
+        }
+        cmd.args([
+            "domain-graph",
+            "--db",
+            db.to_str().unwrap(),
+            "--out",
+            rg.to_str().unwrap(),
+        ]);
+        if let Some(f) = flag {
+            cmd.args(["--min-coverage-pct", f]);
+        }
+        let out = cmd.output().unwrap();
+        assert!(!out.status.success(), "80% is below a 90% minimum");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("80% mapped, minimum 90% (4 of 5 behaviours)"),
+            "names how far it got: {err}"
+        );
+        assert!(err.contains("kept in the estate store"), "{err}");
+        assert!(!rg.exists(), "no graph below the minimum");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn coverage_min_check_exits_3_below_the_minimum_after_writing_the_report() {
+    let dir = scratch("check");
+    let db = dir.join("estate.db");
+    seed_many(db.to_str().unwrap(), 5, 4);
+    let out_file = dir.join("coverage-report.json");
+    let run = |min: &str| {
+        Command::new(BIN)
+            .env_remove("WICKED_REQUIREMENTS_MIN_COVERAGE_PCT")
+            .args([
+                "coverage",
+                "--db",
+                db.to_str().unwrap(),
+                "--out",
+                out_file.to_str().unwrap(),
+                "--min-coverage-pct",
+                min,
+            ])
+            .output()
+            .unwrap()
+    };
+    let below = run("85");
+    assert_eq!(below.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&below.stderr).contains("80% mapped, minimum 85%"));
+    assert!(out_file.is_file(), "the report is written either way");
+    assert!(run("80").status.success());
+    let junk = run("eighty");
+    assert_eq!(
+        junk.status.code(),
+        Some(1),
+        "a junk minimum is an error, never a default"
+    );
+    assert_eq!(run("").status.code(), Some(1), "an empty value is junk too");
+    // xreview on core#1215: a SET-but-invalid variable fails closed (exit 1), never becomes 80 —
+    // for the bare flag (the validator's call) and for domain-graph alike.
+    for cmd in ["coverage", "domain-graph"] {
+        let mut c = Command::new(BIN);
+        c.env("WICKED_REQUIREMENTS_MIN_COVERAGE_PCT", "95.5")
+            .arg(cmd);
+        if cmd == "coverage" {
+            c.args([
+                "--db",
+                db.to_str().unwrap(),
+                "--out",
+                out_file.to_str().unwrap(),
+            ]);
+            c.arg("--min-coverage-pct");
+        } else {
+            let rg = dir.join("rg.json");
+            c.args(["--db", db.to_str().unwrap(), "--out", rg.to_str().unwrap()]);
+        }
+        let o = c.output().unwrap();
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(1), "{cmd}: {err}");
+        assert!(err.contains("not a whole percentage"), "{cmd}: {err}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────
 /// Arm the hermetic emit spool BEFORE main (pre-main is single-threaded, so no test thread can
 /// race it): engine paths under test fire coarse fire-and-forget `wicked.*` emissions, and with
