@@ -160,7 +160,21 @@ pub(super) fn after_pass(
                     && u.tool_cmd.is_none()
                     && u.status == crate::domain::UnitStatus::Done
                 {
-                    let out = crate::domain::get_work_output(&*store, &u.id).unwrap_or_default();
+                    // The approved output, else (an operator-landed review: its output record stays
+                    // rejected) the landed round's findings — the deliver gate's own fallback
+                    // (codex r4 on #1226).
+                    let out = crate::domain::get_work_output(&*store, &u.id)
+                        .or_else(|| {
+                            u.review_rounds
+                                .iter()
+                                .rev()
+                                .find(|r| {
+                                    r.outcome.as_deref()
+                                        == Some(crate::review_context::REVIEW_LANDED)
+                                })
+                                .map(|r| r.findings.clone())
+                        })
+                        .unwrap_or_default();
                     for item in crate::review_context::parse_review_items(&out) {
                         if item.status == crate::review_context::DEFERRED
                             && !u.carried_deferred.contains(&item.line)
@@ -509,6 +523,31 @@ mod tests {
             UnitStatus::Done,
             "nothing was re-armed"
         );
+    }
+
+    /// codex r4 on #1226: an operator-landed review (its output record stays rejected) still hands
+    /// its deferred checks on to delivery when the loop goes on.
+    #[test]
+    fn a_landed_reviews_deferred_checks_survive_the_next_pass() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut critique = WorkUnit::pending("landed:critique", "landed", 0, "critique");
+        critique.role = crate::workflow::PhaseRole::Evaluator;
+        critique.status = UnitStatus::Done;
+        critique.last_attempt = Some(2);
+        critique.review_rounds.push(crate::domain::ReviewRound {
+            attempt: 2,
+            findings: "ITEM 2: DEFERRED — confirm first-page CI\nVERDICT: FAIL".into(),
+            outcome: Some(crate::review_context::REVIEW_LANDED.to_string()),
+        });
+        let ix = seed(&mut store, "landed", vec![critique], |_| {});
+        let (r, _) = run(&mut store, "landed", ix, CONTINUE);
+        assert!(r.is_some());
+        let critique = unit(&store, "landed", 2);
+        assert_eq!(
+            critique.carried_deferred,
+            ["ITEM 2: DEFERRED — confirm first-page CI"]
+        );
+        assert!(critique.review_rounds.is_empty());
     }
 
     /// codex r1/r2 on #1226: a new pass carries nothing of the last pass's reviews, send-back or
