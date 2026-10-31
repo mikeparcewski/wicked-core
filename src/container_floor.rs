@@ -1044,6 +1044,8 @@ pub(crate) fn build_image(
 
 /// The image `cli`'s seat runs: the operator's override as-is, else the engine's seat image,
 /// built on first use (one build at a time per process).
+// The seat sign-in path (unix) and the tests use it; native Windows runs no container floor.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn ensure_seat_image(rt: &Runtime, cli: &str) -> Result<String, String> {
     ensure_seat_image_noting(rt, cli).map(|(tag, _)| tag)
 }
@@ -2622,8 +2624,9 @@ pub(crate) fn container_name(cli: &str, run_id: &str, ord: u32) -> String {
 /// computation), find the runtime, the seat image and the network, and render the wrapper. `Err`
 /// names why the unit cannot run in a container; the caller refuses it (fail closed).
 /// `read_view` is a team member turn's repository view, mounted read-only ([`add_read_view`]).
-/// [`arm_noting`] with no build note (the tests' spelling).
+/// [`arm_noting`] with no build note (the tests' spelling; unix-only tests).
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn arm(
     inp: &crate::worker_sandbox::FloorInputs,
