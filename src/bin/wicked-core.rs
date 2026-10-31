@@ -997,7 +997,10 @@ fn drain_events(events: &std::sync::mpsc::Receiver<CoreEvent>, gate: Option<(&Co
                                 .filter(|c| c.starts_with("consent:"))
                                 .map(str::to_string)
                                 .collect();
-                            let decision = prompt_decision(prompt, &choices);
+                            let Some(decision) = prompt_decision(prompt, &choices) else {
+                                println!("  (no answer: the gate stays open)");
+                                return;
+                            };
                             match core.confirm_gate(run_id, decision) {
                                 Ok(s) => println!("  → gate resolved: {s:?}"),
                                 Err(e) => {
@@ -1031,7 +1034,9 @@ fn drain_events(events: &std::sync::mpsc::Receiver<CoreEvent>, gate: Option<(&Co
 }
 
 /// Prompt the operator on stdin for a gate decision (a = approve, r = reject; default approve).
-fn prompt_decision(prompt: &str, choices: &[String]) -> HumanDecision {
+/// Ask the operator at a gate. `None` when stdin is closed or unreadable: the gate stays open and
+/// nothing is answered for them (codex r3 on #1226: EOF approved the recommended choice).
+fn prompt_decision(prompt: &str, choices: &[String]) -> Option<HumanDecision> {
     if choices.is_empty() {
         println!("  ❓ {prompt}\n  [a]pprove / [r]eject ? ");
     } else {
@@ -1041,18 +1046,37 @@ fn prompt_decision(prompt: &str, choices: &[String]) -> HumanDecision {
             choices.join(" / ")
         );
     }
-    let mut line = String::new();
-    let _ = std::io::stdin().lock().read_line(&mut line);
+    loop {
+        let mut line = String::new();
+        match std::io::stdin().lock().read_line(&mut line) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        match parse_decision(&line, choices) {
+            Some(d) => return Some(d),
+            None => println!(
+                "  not an answer here — type one of: {}a, r",
+                choices.iter().map(|c| format!("{c}, ")).collect::<String>()
+            ),
+        }
+    }
+}
+
+/// An operator's typed answer at a gate: an offered token is that choice; `a`/`approve` or Enter
+/// is approve (the gate's default), `r`/`reject` is reject. Anything else is `None` — never
+/// approve (codex r3 on #1226: a mistyped choice approved hours of mapping).
+fn parse_decision(line: &str, choices: &[String]) -> Option<HumanDecision> {
     let answer = line.trim();
     if let Some(c) = choices.iter().find(|c| c.as_str() == answer) {
-        return HumanDecision::ConsentChoice { choice: c.clone() };
+        return Some(HumanDecision::ConsentChoice { choice: c.clone() });
     }
-    match answer.chars().next() {
-        Some('r') | Some('R') => HumanDecision::Reject,
-        _ => HumanDecision::Approve {
+    match answer.to_ascii_lowercase().as_str() {
+        "" | "a" | "approve" => Some(HumanDecision::Approve {
             amend: None,
             amend_scope: Default::default(),
-        },
+        }),
+        "r" | "reject" => Some(HumanDecision::Reject),
+        _ => None,
     }
 }
 
@@ -3130,6 +3154,35 @@ fn rules_retire_cmd(args: &[String]) {
 
 #[cfg(test)]
 mod seat_login_usage_tests {
+    /// codex r3 on #1226: a typed answer is an offered token, approve or reject — never a mistyped
+    /// token read as approve.
+    #[test]
+    fn a_typed_gate_answer_is_an_offered_choice_approve_or_reject_and_nothing_else() {
+        use super::{parse_decision, HumanDecision};
+        let offered = vec!["consent:more".to_string(), "consent:lower".to_string()];
+        assert!(matches!(
+            parse_decision("consent:lower\n", &offered),
+            Some(HumanDecision::ConsentChoice { choice }) if choice == "consent:lower"
+        ));
+        assert!(matches!(
+            parse_decision("\n", &offered),
+            Some(HumanDecision::Approve { .. })
+        ));
+        assert!(matches!(
+            parse_decision("A", &offered),
+            Some(HumanDecision::Approve { .. })
+        ));
+        assert!(matches!(
+            parse_decision("reject", &offered),
+            Some(HumanDecision::Reject)
+        ));
+        assert!(parse_decision("consent:lowe", &offered).is_none());
+        assert!(
+            parse_decision("retry", &offered).is_none(),
+            "an `r` word is not reject"
+        );
+    }
+
     #[test]
     fn seat_login_usage_lists_refresh() {
         let usage = super::SUBCOMMAND_USAGE
