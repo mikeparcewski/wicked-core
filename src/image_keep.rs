@@ -436,6 +436,35 @@ pub(crate) fn list(rt: &Runtime) -> Result<Vec<Holder>, String> {
         .map_err(|e| format!("listing holders: {e}"))
 }
 
+/// Put `image`'s tag back on the image its holder still holds, when the tag alone was removed (an
+/// image with two tags: a kubelet's cleanup untags each, and the runtime lets a tag go while
+/// another names the image). `true` when the tag names its held image again.
+pub(crate) fn restore(rt: &Runtime, image: &str) -> bool {
+    if !supported(rt) {
+        return false;
+    }
+    let Ok(holders) = list(rt) else {
+        return false;
+    };
+    // The newest holder of this reference whose image is still there.
+    let mut mine: Vec<&Holder> = holders
+        .iter()
+        .filter(|h| h.image == image && !h.id.is_empty())
+        .collect();
+    mine.sort_by_key(|h| std::cmp::Reverse(h.at));
+    for h in mine {
+        if crate::container_floor::image_id_of(rt, &h.id).is_some()
+            && run(rt, &["tag".into(), h.id.clone(), image.into()]).is_ok()
+        {
+            eprintln!(
+                "wicked-core: {image} had lost its tag; restored it on the image its holder kept"
+            );
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether `holders` hold `(image, id)`.
 pub(crate) fn holds(holders: &[Holder], image: &str, id: &str) -> bool {
     holders
@@ -688,6 +717,34 @@ mod tests {
             !calls.contains("create") && !calls.contains("rm "),
             "{calls}"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_tag_the_cleanup_took_is_put_back_on_the_image_its_holder_kept() {
+        // The base had two tags: the cleanup untagged ours; the holder kept the image.
+        let dir = temp();
+        let log = dir.join("calls.log");
+        let id = format!("sha256:{}", "9".repeat(64));
+        let rt = stub(
+            &dir,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+                 case \"$1 $2\" in\n\
+                 'image inspect') case \"$*\" in *{id}*) echo {id} ;; *) exit 1 ;; esac ;;\n\
+                 'ps -a') printf 'wicked-keep-b\\tseat-base:rust\\t{id}\\t5\\n' ;;\n\
+                 esac\nexit 0\n",
+                log = log.display(),
+            ),
+        );
+        assert!(restore(&rt, "seat-base:rust"));
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains(&format!("tag {id} seat-base:rust")),
+            "{calls}"
+        );
+        // Nothing holds another reference: nothing to put back.
+        assert!(!restore(&rt, "other:1"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

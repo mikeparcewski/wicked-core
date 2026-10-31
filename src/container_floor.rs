@@ -655,6 +655,12 @@ fn valid_image_id(id: &str) -> Option<String> {
     (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_string())
 }
 
+/// [`image_present`], putting back a tag a runtime's cleanup removed while its holder kept the
+/// image ([`crate::image_keep::restore`]).
+pub(crate) fn image_present_or_restored(rt: &Runtime, tag: &str) -> bool {
+    image_present(rt, tag) || crate::image_keep::restore(rt, tag)
+}
+
 pub(crate) fn image_present(rt: &Runtime, tag: &str) -> bool {
     let mut c = rt.cmd();
     c.args(["image", "inspect", "--format", "{{.Id}}", tag]);
@@ -706,7 +712,7 @@ fn build_seat_image_on(
 ) -> Result<String, String> {
     let tag = seat_image_tag(cli, &base.image).expect("package exists");
     if base.operator {
-        if image_present(rt, &base.image) {
+        if image_present_or_restored(rt, &base.image) {
             // Held before the build, whatever the build does: a local-only base must not be
             // left to the image cleanup while a seat image builds on it.
             let _ = crate::image_keep::hold_now(rt, &[&base.image]);
@@ -1063,7 +1069,11 @@ fn ensure_seat_image_with(
     base: &SeatBase,
 ) -> Result<(String, Option<Duration>), String> {
     if let Some(img) = over {
-        // An operator's own seat image does not build on the seat base: only it is held.
+        // An operator's own seat image does not build on the seat base: only it is held (its
+        // tag put back first if a cleanup took the tag but the holder kept the image).
+        if !image_present(rt, &img) {
+            let _ = crate::image_keep::restore(rt, &img);
+        }
         let _ = crate::image_keep::hold(rt, &[&img]);
         return Ok((img, None));
     }
@@ -1071,7 +1081,7 @@ fn ensure_seat_image_with(
         seat_package(cli).ok_or_else(|| format!("no seat image is defined for `{cli}`"))?;
     static BUILD: Mutex<()> = Mutex::new(());
     let tag = seat_image_tag(cli, &base.image).expect("package exists");
-    if image_present(rt, &tag) {
+    if image_present_or_restored(rt, &tag) {
         hold_seat_images(rt, &tag, base, false);
         return Ok((tag, None));
     }
@@ -3432,6 +3442,21 @@ pub fn seat_image_main(args: &[String]) -> i32 {
         }
         Some("build") => {
             let mut rc = 0;
+            // What only the operator can rebuild is held before anything builds (a build can push
+            // the disk past the cleanup line): the seat base and their own seat images.
+            if crate::image_keep::supported(&rt) {
+                let mut first: Vec<String> = configured_base().into_iter().collect();
+                first.extend(wanted.iter().filter_map(|c| image_override(c)));
+                let present: Vec<&str> = first
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|r| image_present_or_restored(&rt, r))
+                    .collect();
+                if let Err(e) = crate::image_keep::hold_now(&rt, &present) {
+                    eprintln!("not held against image cleanup: {e}");
+                    rc = 1;
+                }
+            }
             match ensure_floor_image(&rt) {
                 Ok(tag) => println!("floor: {tag}"),
                 Err(e) => {
@@ -3559,7 +3584,7 @@ fn hold_present(rt: &Runtime, clis: &[String]) -> Result<(), String> {
     let (present, missing): (Vec<&str>, Vec<&str>) = refs
         .iter()
         .map(String::as_str)
-        .partition(|r| image_present(rt, r));
+        .partition(|r| image_present_or_restored(rt, r));
     for m in &missing {
         println!("missing (not held): {m}");
     }
