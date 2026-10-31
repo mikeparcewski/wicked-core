@@ -26084,6 +26084,7 @@ mod seat_failover_tests {
                 question: "pick one".into(),
                 choices: Some(vec!["A".into(), "B".into()]),
                 recommended: None,
+                multi: None,
             },
         );
         if let Some(event) = created {

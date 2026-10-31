@@ -628,6 +628,7 @@ mod tests {
                 question: "Continue?".into(),
                 choices: None,
                 recommended: None,
+                multi: None,
             },
         )
     }

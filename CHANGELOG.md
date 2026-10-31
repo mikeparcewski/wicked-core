@@ -25,6 +25,15 @@ Two release tracks share this file, newest entry first regardless of track:
   a lower bound (its envelope's `output_tokens` is set at the message's start). `costUsd` only where the stream states
   one, else `null`; the attempt's `cliUsage` stays the record. Logged with the run (crew's in-flight check reads it);
   not mirrored to the bus.
+
+- **A seat's `ask` can let the operator pick several choices (guided asks).** `AskRequest.multi: {min?, max?}`
+  (`openAsk` JSON `multi`) makes a question multi-select: it needs `choices`, and the bounds default to 1 and every
+  choice (`1 <= min <= max <= choices`, checked after duplicates go). Its `elicitationCreated` frame says
+  `propType: "array"` and carries `multi: {min, max}` (absent on every other question, so the legacy frame is
+  byte-identical). The engine checks the answer against the question it answers: a JSON array (or that array as JSON
+  text) of distinct choices within the bounds, recorded as the array's JSON text in the choices' order; anything else
+  is refused and the question stays open.
+
 - **A floor override carries to a later floor on the same tree when it fails on what the operator ruled on
   (core#1186).** The override now records the failure's identity (`floorOverride.fingerprint`) and, where the floor
   showed it complete and file-qualified, the failing tests (`floorOverride.failing`, `<dir>|<check>: <test>`), both
