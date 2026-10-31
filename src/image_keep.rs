@@ -336,7 +336,14 @@ fn is_holder_of(rt: &Runtime, name: &str, image: &str, id: &str) -> bool {
 fn hold_unmemoized(rt: &Runtime, images: &[&str]) -> Result<(), String> {
     let mut wanted: Vec<(String, String)> = Vec::new();
     for i in images {
-        if let Some(id) = crate::container_floor::image_id_of(rt, i) {
+        // A reference whose tag a cleanup took while its holder kept the image is put back first,
+        // so its lease is renewed rather than left to run out.
+        let id = crate::container_floor::image_id_of(rt, i).or_else(|| {
+            restore(rt, i)
+                .then(|| crate::container_floor::image_id_of(rt, i))
+                .flatten()
+        });
+        if let Some(id) = id {
             wanted.push((i.to_string(), id));
         }
     }
@@ -453,9 +460,15 @@ pub(crate) fn restore(rt: &Runtime, image: &str) -> bool {
         .collect();
     mine.sort_by_key(|h| std::cmp::Reverse(h.at));
     for h in mine {
-        if crate::container_floor::image_id_of(rt, &h.id).is_some()
-            && run(rt, &["tag".into(), h.id.clone(), image.into()]).is_ok()
-        {
+        if crate::container_floor::image_id_of(rt, &h.id).is_none() {
+            continue;
+        }
+        // Read again right before the write: an image published under the tag meanwhile (a
+        // rebuild by another engine) is kept, never overwritten with the held one.
+        if crate::container_floor::image_id_of(rt, image).is_some() {
+            return true;
+        }
+        if run(rt, &["tag".into(), h.id.clone(), image.into()]).is_ok() {
             eprintln!(
                 "wicked-core: {image} had lost its tag; restored it on the image its holder kept"
             );
@@ -745,6 +758,38 @@ mod tests {
         );
         // Nothing holds another reference: nothing to put back.
         assert!(!restore(&rt, "other:1"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_tag_published_meanwhile_is_never_overwritten_with_the_held_image() {
+        // The first read of the tag misses; by the read right before the write, another engine
+        // has published a new image under it: no `tag` is written.
+        let dir = temp();
+        let log = dir.join("calls.log");
+        let n = dir.join("n");
+        let id = format!("sha256:{}", "8".repeat(64));
+        let rt = stub(
+            &dir,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+                 case \"$1 $2\" in\n\
+                 'image inspect') case \"$*\" in *{id}*) echo {id} ;;\n\
+                   *) echo x >> '{n}'; [ $(wc -l < '{n}') -le 1 ] && exit 1; echo sha256:{new} ;; esac ;;\n\
+                 'ps -a') printf 'wicked-keep-b\\tseat-base:rust\\t{id}\\t5\\n' ;;\n\
+                 esac\nexit 0\n",
+                log = log.display(),
+                n = n.display(),
+                new = "7".repeat(64),
+            ),
+        );
+        assert!(!crate::container_floor::image_present(
+            &rt,
+            "seat-base:rust"
+        ));
+        assert!(restore(&rt, "seat-base:rust"));
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(!calls.contains("tag "), "{calls}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
