@@ -10737,7 +10737,8 @@ fn dispatch_unit(
     // one, every such unit failed `root_unresolvable` on every seat and the run could not go on
     // (rig run a4c6a389). What the baseline TRIGGERS stays keyed on the unit's own flags (the
     // guard on `worktree_guarded`, the tree-changed floor on `default_floor`), so taking it here
-    // adds the pin and the secret scan, nothing else.
+    // adds the pin (the dependency install's git dir with it), the seat secret scan, an author
+    // probe taken from it and the clear-and-retake on an approved gate; no guard, floor or judge.
     let mut baseline_fresh = false;
     if unit.tool_cmd.is_none() && unit.worktree_baseline.is_none() {
         if let Some(wd) = session.workdir.as_deref() {

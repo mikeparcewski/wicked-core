@@ -279,8 +279,9 @@ fn db_in(name: &str) -> String {
 /// validator greps `coverage-report.json` in the worktree); `domain-graph` shells the REAL
 /// `wicked-core domain-graph` → writes `requirements_graph.json`. `out_override` lets a test inject a
 /// policy-tripping output for one phase.
-/// 0 = `extract` never dispatched, 1 = it carried a pinned git dir, 2 = it did not.
-static EXTRACT_PINNED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Per run: whether its `extract` unit reached the runner with a pinned git dir. Keyed by run id,
+/// so a parallel test's run never answers for this one's.
+static EXTRACT_PINNED: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
 
 struct DomainExtractionRunner {
     db: String,
@@ -317,10 +318,10 @@ impl StepRunner for DomainExtractionRunner {
                 .as_ref()
                 .and_then(|b| b.git_dir.as_deref())
                 .is_some();
-            EXTRACT_PINNED.store(
-                if pinned { 1 } else { 2 },
-                std::sync::atomic::Ordering::SeqCst,
-            );
+            EXTRACT_PINNED
+                .lock()
+                .unwrap()
+                .push((i.run_id.clone(), pinned));
         }
         let workdir = i.workdir.clone();
         let mut output = format!("{phase} done");
@@ -635,9 +636,16 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
         "the run's skills were admitted against the fixture generation 000001 at {}: {handed:?}",
         snapshot.display()
     );
+    let seen: Vec<bool> = EXTRACT_PINNED
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(run, _)| run == "run-happy")
+        .map(|(_, pinned)| *pinned)
+        .collect();
     assert_eq!(
-        EXTRACT_PINNED.load(std::sync::atomic::Ordering::SeqCst),
-        1,
+        seen,
+        vec![true],
         "the `extract` unit reached its seat with the worktree's git dir pinned (a container \
          seat refuses it otherwise)"
     );
