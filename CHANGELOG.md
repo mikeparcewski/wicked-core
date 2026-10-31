@@ -20,7 +20,10 @@ Two release tracks share this file, newest entry first regardless of track:
   - `persist_domain_model` replaces the previous build whole (old nodes with all their edges) in one batch, so the
     store holds exactly the latest build, and stores the requirement and domain documents and rule provenance on
     their nodes. `stabilize_requirement_ids` gives each requirement the id the previous build gave the same code, so
-    ids (and crew's overrides keyed on them) follow the code when behaviours are added or deleted.
+    ids (and crew's overrides keyed on them) follow the code when behaviours are added or deleted. A build record
+    beside the graph keeps the generation, the model metadata and every requirement number each domain has used:
+    a retired id is never reused, an empty build reads back as built, a read that overlaps a rebuild starts over, and
+    a build numbered against an older generation is refused.
   - The new `wicked_governance::load_domain_graph` reads back the build's exact document (it validates against the
     domain-model schema),
     and `repo::requirements_graph_for_repo` wraps it as `{ graph, coverage }`. core-ts exposes the same read as

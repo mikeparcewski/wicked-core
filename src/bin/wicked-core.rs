@@ -1175,19 +1175,23 @@ fn domain_graph_cmd(args: &[String]) {
         };
     // A requirement keeps the id the previous build gave the same code, so ids (and crew's
     // overrides keyed on them) follow the code when behaviours are added or deleted.
-    if let Err(e) = wicked_governance::stabilize_requirement_ids(&store, &mut model) {
-        fail(&format!(
-            "domain-graph: reading the previous build failed: {e}"
-        ));
-        return;
-    }
+    let generation = match wicked_governance::stabilize_requirement_ids(&store, &mut model) {
+        Ok(g) => g,
+        Err(e) => {
+            fail(&format!(
+                "domain-graph: reading the previous build failed: {e}"
+            ));
+            return;
+        }
+    };
 
     // The domain graph belongs IN the estate DB, not only as a JSON file (operator directive; the
     // locked "domain data lives in estate's graph" direction). Persist the assembled model as
     // nodes/edges into the SAME store it was built from — this is the source of truth; the JSON
     // --out below is an optional export. Fail-closed: if the graph cannot be persisted, the phase
     // has produced no durable evidence, so the command must not report success.
-    match wicked_governance::persist_domain_model(&mut store, &model) {
+    // Refused (nothing written) if another build committed after the ids above were numbered.
+    match wicked_governance::persist_domain_model_expecting(&mut store, &model, Some(generation)) {
         Ok((nodes, edges)) => {
             eprintln!(
                 "domain-graph: persisted {nodes} node(s) + {edges} edge(s) into the estate store"
