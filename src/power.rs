@@ -1123,9 +1123,11 @@ pub fn launch_voice(voice: Option<&str>) -> Option<String> {
 
 /// The section a voice block rides in the orchestrator's prompt, governance first: the person's
 /// personality shapes how the orchestrator talks to them, never what it does. Empty when there is
-/// no voice. Only the orchestrator's brief (and its restart statement) carry it: the PA's scope
-/// step, the hand-off's reviews, judges and QE are briefed without it, so evaluator independence
-/// does not depend on the person's tone settings.
+/// no voice. Only the orchestrator's brief and its later turns' statements carry it: the PA's
+/// scope step, the hand-off's reviewers, judges and QE are briefed without it, so evaluator
+/// independence does not depend on the person's tone settings. (Under reduced assurance a reviewer
+/// on the orchestrator's own seat and posture resumes its session and so reads its whole history,
+/// the voice included; that is the disclosed creator-seat waiver, not a separate channel.)
 pub fn voice_section(voice: Option<&str>) -> String {
     let Some(v) = voice.map(str::trim).filter(|v| !v.is_empty()) else {
         return String::new();
@@ -1298,11 +1300,10 @@ pub fn continuation_prompt(
         "\n\nThe change, for reference:\n{}",
         clip(task, 4000)
     ));
-    // A restarted session never read the first brief, so it hears the person's voice again
-    // (core#1216); a resumed one already has it.
-    if restarted {
-        out.push_str(&voice_section(voice));
-    }
+    // Every later turn restates the person's voice (core#1216): whether the carrier really resumed
+    // the session that read the first brief is not known here (a seat with no resume adapter starts
+    // fresh even in the container floor), and the block is short.
+    out.push_str(&voice_section(voice));
     out
 }
 
@@ -1550,7 +1551,7 @@ pub struct BuildArm {
     /// The run's base commit: every checkpoint measures the WHOLE change from it (a rework round's
     /// own small diff must never read as "the change got easier").
     pub base: Option<String>,
-    /// The person's voice block (core#1216), restated when a turn's session cannot be resumed.
+    /// The person's voice block (core#1216), restated on every later turn.
     pub voice: Option<String>,
 }
 
@@ -2241,19 +2242,16 @@ mod tests {
         assert_eq!(launch_voice(Some(" x \n")).as_deref(), Some("x"));
     }
 
-    /// (core#1216) A session that could not be resumed never read the first brief: its restart
-    /// statement carries the voice again. A resumed turn already has it, so it is not repeated.
+    /// (core#1216) Every later turn restates the voice, resumed or not: whether the carrier really
+    /// resumed the session that read the first brief is not known where the prompt is built.
     #[test]
-    fn a_restarted_turn_hears_the_voice_again_and_a_resumed_one_does_not_repeat_it() {
+    fn every_later_turn_restates_the_voice_resumed_or_restarted() {
         let a = CheckpointAnswer::default();
-        let restarted = continuation_prompt("fix it", 2, 5, &a, "did x", true, Some(VOICE));
-        assert!(restarted.contains(VOICE_GOVERNANCE), "{restarted}");
-        assert!(
-            restarted.trim_end().ends_with("- Keep it short."),
-            "{restarted}"
-        );
-        let resumed = continuation_prompt("fix it", 2, 5, &a, "did x", false, Some(VOICE));
-        assert!(!resumed.contains("## Voice"), "{resumed}");
+        for restarted in [true, false] {
+            let p = continuation_prompt("fix it", 2, 5, &a, "did x", restarted, Some(VOICE));
+            assert!(p.contains(VOICE_GOVERNANCE), "{p}");
+            assert!(p.trim_end().ends_with("- Keep it short."), "{p}");
+        }
         let none = continuation_prompt("fix it", 2, 5, &a, "did x", true, None);
         assert!(!none.contains(VOICE_GOVERNANCE), "{none}");
     }

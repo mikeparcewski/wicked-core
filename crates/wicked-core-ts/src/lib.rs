@@ -832,7 +832,7 @@ pub struct LaunchOptions {
     pub power: Option<bool>,
     /// (core#1216) The person's VOICE BLOCK (their personality, resolved for the run's project):
     /// how the power-mode ORCHESTRATOR talks to them. Tone only: appended last to the
-    /// orchestrator's brief under a governance line (and to its restart statement); the PA's scope
+    /// orchestrator's brief under a governance line (and to each later turn); the PA's scope
     /// step, the hand-off's reviewers, judges and QE never receive it, and no gate reads it. At
     /// most 4096 bytes (a longer one REJECTS the launch). Ignored on a phased run. An older addon
     /// drops the field, so the orchestrator simply runs without a voice.
