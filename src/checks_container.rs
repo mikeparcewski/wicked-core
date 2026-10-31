@@ -1191,17 +1191,24 @@ impl ChecksFloor {
         let (memory, _, jobs) =
             memory_and_jobs(std::env::var(MEMORY_ENV).ok().as_deref(), cpus).map_err(no)?;
         let tag = image_tag();
+        let mut built = false;
         if !crate::container_floor::image_present(&rt, &tag) {
             static BUILD: Mutex<()> = Mutex::new(());
             let _one = BUILD.lock();
             if !crate::container_floor::image_present(&rt, &tag) {
                 eprintln!("wicked-core: building the checks floor image {tag} (first use)");
                 crate::container_floor::build_image(&rt, DOCKERFILE, &tag, &[]).map_err(no)?;
-                let _ = crate::image_keep::hold_now(&rt, &[&tag]);
+                // Held at once, past the per-process memo (it is a new image).
+                if let Err(e) = crate::image_keep::hold_now(&rt, &[&tag]) {
+                    eprintln!("wicked-core: could not hold {tag} against image cleanup: {e}");
+                }
+                built = true;
             }
         }
         // Held against the runtime's image cleanup (a kubelet's image GC), like the seat images.
-        let _ = crate::image_keep::hold(&rt, &[&tag]);
+        if !built {
+            let _ = crate::image_keep::hold(&rt, &[&tag]);
+        }
         let image_id = rt_run(
             &rt,
             &["image", "inspect", "--format", "{{.Id}}", &tag],

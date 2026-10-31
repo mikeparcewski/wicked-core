@@ -259,7 +259,11 @@ pub(crate) fn hold(rt: &Runtime, images: &[&str]) -> Result<(), String> {
     if due.is_empty() {
         return Ok(());
     }
-    hold_now(rt, &due)
+    let r = hold_now(rt, &due);
+    if let Err(e) = &r {
+        eprintln!("wicked-core: could not hold the seat images against image cleanup: {e}");
+    }
+    r
 }
 
 /// [`hold`] without the per-process memo: right after a build (the image is new, whatever the memo
@@ -268,11 +272,7 @@ pub(crate) fn hold_now(rt: &Runtime, images: &[&str]) -> Result<(), String> {
     if !supported(rt) {
         return Ok(());
     }
-    let r = hold_unmemoized(rt, images);
-    if let Err(e) = &r {
-        eprintln!("wicked-core: could not hold the seat images against image cleanup: {e}");
-    }
-    r
+    hold_unmemoized(rt, images)
 }
 
 fn run(rt: &Runtime, args: &[String]) -> Result<String, String> {
@@ -340,22 +340,35 @@ fn hold_unmemoized(rt: &Runtime, images: &[&str]) -> Result<(), String> {
             wanted.push((i.to_string(), id));
         }
     }
+    let memo_all = |except: &[&str]| {
+        let mut g = checked().lock().unwrap_or_else(|p| p.into_inner());
+        for i in images
+            .iter()
+            .filter(|i| !i.is_empty() && !except.contains(i))
+        {
+            g.insert(memo_key(rt, i), Instant::now());
+        }
+    };
+    if wanted.is_empty() {
+        // Nothing here to hold (an image that is not there): checked, so a dispatch does not
+        // re-ask the runtime before the memo runs out; a build holds at once regardless.
+        memo_all(&[]);
+        return Ok(());
+    }
     let holders = parse_list(&run(rt, &list_argv()).map_err(|e| format!("listing holders: {e}"))?);
     let now = now_secs();
     let p = plan(&holders, &wanted, now);
     let mut errs: Vec<String> = Vec::new();
-    for name in &p.retire {
-        if let Err(e) = remove(rt, name) {
-            errs.push(e);
-        }
-    }
     let mut held: Vec<&str> = Vec::new();
     for (image, id) in &p.create {
-        // The tag may have moved since it was read (another engine rebuilt it): hold only what it
-        // names now, and leave the other engine's holder alone.
+        // The tag may have moved since it was read (another engine rebuilt it): this engine holds
+        // nothing for it and leaves the other engine's holder alone; said, so a caller retries.
         if crate::container_floor::image_id_of(rt, image)
             .is_none_or(|now_id| bare(&now_id) != bare(id))
         {
+            errs.push(format!(
+                "{image} changed while it was being held; not held, check again"
+            ));
             continue;
         }
         match declares_volumes(rt, id) {
@@ -385,7 +398,8 @@ fn hold_unmemoized(rt: &Runtime, images: &[&str]) -> Result<(), String> {
             Err(e) => errs.push(format!("holding {image}: {e}")),
         }
     }
-    // A renewed holder's old ones go only once its new one exists.
+    // A renewed holder's old ones go only once its new one exists; stale holders go after the new
+    // ones are made (never a window where an image another holder covered is unheld).
     for (image, name) in &p.renewed {
         if held.contains(&image.as_str()) {
             if let Err(e) = remove(rt, name) {
@@ -393,15 +407,18 @@ fn hold_unmemoized(rt: &Runtime, images: &[&str]) -> Result<(), String> {
             }
         }
     }
-    {
-        let mut g = checked().lock().unwrap_or_else(|p| p.into_inner());
-        for (image, _) in &wanted {
-            let ok = !p.create.iter().any(|(i, _)| i == image) || held.contains(&image.as_str());
-            if ok {
-                g.insert(memo_key(rt, image), Instant::now());
-            }
+    for name in &p.retire {
+        if let Err(e) = remove(rt, name) {
+            errs.push(e);
         }
     }
+    let failed: Vec<&str> = p
+        .create
+        .iter()
+        .map(|(i, _)| i.as_str())
+        .filter(|i| !held.contains(i))
+        .collect();
+    memo_all(&failed);
     if errs.is_empty() {
         Ok(())
     } else {
@@ -426,7 +443,8 @@ pub(crate) fn holds(holders: &[Holder], image: &str, id: &str) -> bool {
         .any(|h| h.image == image && bare(&h.id) == bare(id))
 }
 
-#[cfg(test)]
+// The fixtures are shell stubs: unix only, as the container floor's own tests.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -663,7 +681,8 @@ mod tests {
                 b = "b".repeat(64)
             ),
         );
-        hold_now(&rt, &["seat-z:1"]).unwrap();
+        let e = hold_now(&rt, &["seat-z:1"]).unwrap_err();
+        assert!(e.contains("changed while it was being held"), "{e}");
         let calls = std::fs::read_to_string(&log).unwrap();
         assert!(
             !calls.contains("create") && !calls.contains("rm "),
