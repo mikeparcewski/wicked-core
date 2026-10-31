@@ -107,15 +107,58 @@ pub(crate) struct ClaudeStreamJson {
     emitted_text: bool,
     /// Live per-tool frames for the unit (`toolActivity`), when its actor is reachable.
     pub(crate) activity: Option<crate::tool_activity::ToolActivitySink>,
+    /// Each assistant message's usage so far (`message.id` → fresh + cache input, output), summed
+    /// into the live `usageProgress` total. A message's blocks repeat its usage; the newest wins.
+    msg_usage: Vec<(String, u64, u64)>,
 }
 
 impl ClaudeStreamJson {
     /// The adapter with live per-tool frames sent to `activity` (none when `None`).
     pub(crate) fn with_activity(activity: Option<crate::tool_activity::ToolActivitySink>) -> Self {
         Self {
-            emitted_text: false,
             activity,
+            ..Self::default()
         }
+    }
+
+    /// An assistant message's usage: the live running total of the attempt, to the sink. Only the
+    /// main loop's messages count, as `result.usage` (the unit's `cliUsage`) counts them: a
+    /// subagent's (`parent_tool_use_id` set) is left out (xreview on #1212). `output_tokens` is what
+    /// the message envelope reports, which claude fills at the message's start, so the live output
+    /// count is a lower bound until the result's total lands as `cliUsage`.
+    fn live_usage(&mut self, line: &serde_json::Value) {
+        let message = line.get("message");
+        if line.get("parent_tool_use_id").is_some_and(|p| !p.is_null()) {
+            return;
+        }
+        let Some(a) = self.activity.as_mut() else {
+            return;
+        };
+        let (Some(id), Some(u)) = (
+            message.and_then(|m| m.get("id")).and_then(|i| i.as_str()),
+            message.and_then(|m| m.get("usage")),
+        ) else {
+            return;
+        };
+        let field = |k: &str| u.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+        let input = field("input_tokens")
+            .saturating_add(field("cache_read_input_tokens"))
+            .saturating_add(field("cache_creation_input_tokens"));
+        let output = field("output_tokens");
+        match self.msg_usage.iter_mut().find(|(m, _, _)| m == id) {
+            Some(slot) => {
+                slot.1 = input;
+                slot.2 = output;
+            }
+            None => self.msg_usage.push((id.to_string(), input, output)),
+        }
+        let (i, o) = self
+            .msg_usage
+            .iter()
+            .fold((0u64, 0u64), |(i, o), (_, a, b)| {
+                (i.saturating_add(*a), o.saturating_add(*b))
+            });
+        a.usage(i, o, None);
     }
 }
 
@@ -152,6 +195,7 @@ impl OutputAdapter for ClaudeStreamJson {
         let mut out = AdapterOut::default();
         match v.get("type").and_then(|t| t.as_str()) {
             Some("assistant") => {
+                self.live_usage(&v);
                 let content = v.get("message").and_then(|m| m.get("content"));
                 match content {
                     // (S3a) `content` is a bare STRING (a valid-JSON shape that `as_array()` misses, so
@@ -371,6 +415,9 @@ impl OutputAdapter for CodexJsonl {
                             cost_usd: None,
                         },
                     };
+                    if let Some(a) = self.activity.as_mut() {
+                        a.usage(total.input_tokens, total.output_tokens, None);
+                    }
                     self.usage = Some(total.clone());
                     out.usage = Some(total);
                 }
@@ -501,6 +548,9 @@ impl OutputAdapter for PiJson {
                     (a, b) => a.or(b),
                 },
             };
+            if let Some(a) = self.activity.as_mut() {
+                a.usage(total.input_tokens, total.output_tokens, total.cost_usd);
+            }
             self.usage = Some(total.clone());
             out.usage = Some(total);
         }

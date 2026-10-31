@@ -14,6 +14,17 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A live token meter for a working step: `usageProgress`.** A unit's `cliUsage` lands when the attempt ends, so a
+  long chat turn or a power build showed no tokens until it was over. The seat's own stream now feeds the attempt's
+  running TOTAL to the run as `usageProgress {session, ord, attempt, at, inputTokens, outputTokens, costUsd}` (fresh
+  + cache input, as `cliUsage` counts it): claude from each assistant message's usage (a message's repeated blocks
+  count once), pi from each `message_end` (with its stated cost), codex at each `turn.completed`. One frame when the
+  total changed, at most one per 3 s; a total held by that limit is sent on the next heartbeat tick or when the
+  stream closes. The total is the attempt's (a power build's turns add up, as its `cliUsage` sums them) and the main
+  loop's (a claude subagent's messages are left out, as `result.usage` leaves them out); claude's live output count is
+  a lower bound (its envelope's `output_tokens` is set at the message's start). `costUsd` only where the stream states
+  one, else `null`; the attempt's `cliUsage` stays the record. Logged with the run (crew's in-flight check reads it);
+  not mirrored to the bus.
 - **A floor override carries to a later floor on the same tree when it fails on what the operator ruled on
   (core#1186).** The override now records the failure's identity (`floorOverride.fingerprint`) and, where the floor
   showed it complete and file-qualified, the failing tests (`floorOverride.failing`, `<dir>|<check>: <test>`), both
