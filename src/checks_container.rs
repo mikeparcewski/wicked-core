@@ -1197,6 +1197,7 @@ impl ChecksFloor {
             if !crate::container_floor::image_present(&rt, &tag) {
                 eprintln!("wicked-core: building the checks floor image {tag} (first use)");
                 crate::container_floor::build_image(&rt, DOCKERFILE, &tag, &[]).map_err(no)?;
+                let _ = crate::image_keep::hold_now(&rt, &[&tag]);
             }
         }
         // Held against the runtime's image cleanup (a kubelet's image GC), like the seat images.
