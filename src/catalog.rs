@@ -828,11 +828,18 @@ fn steering_author_preset() -> Vec<PlanStep> {
 }
 
 /// `domain-extraction` (M6): §11.2's row. survey, analyze → `understand` (no gate type);
-/// extract → `produce` (the bold cell: kind recon → build); coverage → `domain_coverage`, which
+/// extract-prepare → `run` (the host's Tool step: the hub-first worklist, wicked-garden#1362);
+/// extract → `produce` (the bold cell: kind recon → build; the seat states rules into a file);
+/// extract-apply → `run` (the host's Tool step: checks the rules file and writes the store);
+/// coverage → `domain_coverage`, which
 /// carries `COVERAGE_VALIDATOR_PIN` as data (the step restates it, a no-op), with `executes_code`
 /// raised and its report as the deliverable; domain-graph → `run`, the Tool step that builds the
 /// requirements graph, behind a `human_confirm` gate. The skills are the domain family's.
 fn domain_extraction_preset() -> Vec<PlanStep> {
+    use crate::domain_extraction::{
+        garden_domain_step_cmd, COVERAGE_REPORT_FILE, EXTRACT_APPLY_STEP, EXTRACT_PREPARE_STEP,
+        RULES_REL, WORKLIST_REL,
+    };
     use crate::workflow::{CODE_GRAPH_DB_TOKEN, REPO_ROOT_TOKEN};
     let step = |catalog: &str, id: &str, after: Option<&str>| PlanStep {
         catalog: catalog.to_string(),
@@ -851,16 +858,40 @@ fn domain_extraction_preset() -> Vec<PlanStep> {
             skill_ref: Some("wicked-garden-domain".to_string()),
             ..step("understand", "analyze", Some("survey"))
         },
+        // wicked-garden#1362: the seat cannot reach a store or the engine's binaries, so the host
+        // prepares its work list and applies what it states — files in the worktree between them.
+        PlanStep {
+            gate_type: Some(None),
+            executor: Some(PhaseExecutor::Tool {
+                cmd: garden_domain_step_cmd(
+                    EXTRACT_PREPARE_STEP,
+                    "scripts/domain/prepare_worklist.py",
+                    &format!("--out {WORKLIST_REL}"),
+                ),
+            }),
+            ..step("run", EXTRACT_PREPARE_STEP, Some("analyze"))
+        },
         PlanStep {
             skill_ref: Some("wicked-garden-domain-extractor".to_string()),
-            ..step("produce", "extract", Some("analyze"))
+            ..step("produce", "extract", Some(EXTRACT_PREPARE_STEP))
+        },
+        PlanStep {
+            gate_type: Some(None),
+            executor: Some(PhaseExecutor::Tool {
+                cmd: garden_domain_step_cmd(
+                    EXTRACT_APPLY_STEP,
+                    "scripts/domain/apply_rules.py",
+                    &format!("--rules {RULES_REL} --coverage-out {COVERAGE_REPORT_FILE}"),
+                ),
+            }),
+            ..step("run", EXTRACT_APPLY_STEP, Some("extract"))
         },
         PlanStep {
             executes_code: Some(true),
             required_deliverables: Some(vec!["coverage-report.json".to_string()]),
             skill_ref: Some(DOMAIN_COVERAGE_SKILL.to_string()),
             validator_pin: Some(Some(COVERAGE_VALIDATOR_PIN.to_string())),
-            ..step("domain_coverage", "coverage", Some("extract"))
+            ..step("domain_coverage", "coverage", Some(EXTRACT_APPLY_STEP))
         },
         PlanStep {
             kind: Some(StageKind::Build),
@@ -1228,6 +1259,62 @@ mod tests {
                 unconditional: false
             }
         );
+    }
+
+    /// wicked-garden#1362: a seat container has no `wicked-core`, `wicked-estate` or writable
+    /// store, so the host brackets the seat's `extract`: `extract-prepare` writes the worklist
+    /// before it, `extract-apply` checks and writes its rules after it, and coverage waits for the
+    /// apply. Both are Tool steps (the engine's own command on the host, no seat) that run garden's
+    /// scripts through the admitted generation's launcher — never a PATH `wicked-garden` — with the
+    /// store and repository bound by placeholder, whole arguments only.
+    #[test]
+    fn domain_extraction_brackets_the_seat_with_host_steps() {
+        use crate::domain_extraction::{EXTRACT_APPLY_STEP, EXTRACT_PREPARE_STEP};
+        let def = composed("domain-extraction");
+        assert_eq!(
+            def.phases.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            [
+                "survey",
+                "analyze",
+                EXTRACT_PREPARE_STEP,
+                "extract",
+                EXTRACT_APPLY_STEP,
+                "coverage",
+                "domain-graph"
+            ]
+        );
+        let by = |id: &str| def.phases.iter().find(|p| p.id == id).unwrap();
+        assert_eq!(by("extract").depends_on, [EXTRACT_PREPARE_STEP]);
+        assert_eq!(by(EXTRACT_APPLY_STEP).depends_on, ["extract"]);
+        assert_eq!(by("coverage").depends_on, [EXTRACT_APPLY_STEP]);
+        for (id, script) in [
+            (EXTRACT_PREPARE_STEP, "scripts/domain/prepare_worklist.py"),
+            (EXTRACT_APPLY_STEP, "scripts/domain/apply_rules.py"),
+        ] {
+            let phase = by(id);
+            assert_eq!(phase.role, PhaseRole::Neutral, "{id}");
+            assert_eq!(phase.gate, GateSpec::Auto, "{id}");
+            let PhaseExecutor::Tool { cmd } = &phase.executor else {
+                panic!("{id} is not a Tool step");
+            };
+            assert_eq!(&cmd[..2], ["bash", "-c"], "{id}");
+            assert!(
+                cmd[2].starts_with("exec \"${WICKED_GARDEN_ROOT:?")
+                    && cmd[2].contains(&format!("/scripts/wicked-garden\" run {script} "))
+                    && cmd[2].contains("--db \"$1\" --repo-root \"$2\""),
+                "{id}: {}",
+                cmd[2]
+            );
+            assert_eq!(
+                &cmd[3..],
+                [
+                    id,
+                    crate::workflow::CODE_GRAPH_DB_TOKEN,
+                    crate::workflow::REPO_ROOT_TOKEN
+                ],
+                "{id}"
+            );
+        }
     }
 
     /// M3/M4: `chat` (read-only) and `onboarding` (tool-only) have no creator step, so the PA does

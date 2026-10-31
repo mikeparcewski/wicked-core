@@ -43,6 +43,40 @@ pub const COVERAGE_CRITERION: &str =
 /// where crew never looked).
 pub const REQUIREMENTS_GRAPH_REL: &str = ".wicked-estate/requirements/requirements_graph.json";
 
+/// The host step BEFORE the seat's `extract` (wicked-garden#1362): a seat container has no
+/// `wicked-core`, no `wicked-estate` and no writable store (the broker relay is read-only by
+/// design), so the HOST prepares the work. It runs garden's `prepare_worklist.py`: `wicked-core
+/// coverage`'s unmapped behaviours in files the repository tracks, hub-first, framed into
+/// [`WORKLIST_REL`] in the run's worktree.
+pub const EXTRACT_PREPARE_STEP: &str = "extract-prepare";
+/// The host step AFTER the seat's `extract`: garden's `apply_rules.py` checks the seat's
+/// [`RULES_REL`] against its closed schema and the store (an unmapped behaviour, in a file git
+/// tracks), refuses the rest, writes what passes with the harness's own validation and authorship,
+/// and writes [`COVERAGE_REPORT_FILE`] for the `coverage` step. Seats never gain write access.
+pub const EXTRACT_APPLY_STEP: &str = "extract-apply";
+/// The worklist the host prepares, relative to the run's worktree (garden's `rules_file.WORKLIST_REL`).
+pub const WORKLIST_REL: &str = ".wicked/domain/worklist.json";
+/// The rules the seat states, relative to the run's worktree (garden's `rules_file.RULES_REL`).
+pub const RULES_REL: &str = ".wicked/domain/rules.json";
+
+/// The argv of a host step that runs a garden domain script on the run's repository: through the
+/// garden generation the run was admitted against (`WICKED_GARDEN_ROOT`, handed to every generic
+/// Tool unit — never a `wicked-garden` from the daemon's PATH), with the store and the repository
+/// root as positional parameters so the planner binds the `{code_graph_db}` / `{repo_root}`
+/// placeholders (whole arguments only, [`crate::plan::bind_repo_paths`]).
+pub fn garden_domain_step_cmd(step: &str, script: &str, rest: &str) -> Vec<String> {
+    vec![
+        "bash".to_string(),
+        "-c".to_string(),
+        format!(
+            "exec \"${{WICKED_GARDEN_ROOT:?the engine handed this Tool phase no garden root; refusing to resolve wicked-garden from PATH}}/scripts/wicked-garden\" run {script} --db \"$1\" --repo-root \"$2\" {rest}"
+        ),
+        step.to_string(),
+        crate::workflow::CODE_GRAPH_DB_TOKEN.to_string(),
+        crate::workflow::REPO_ROOT_TOKEN.to_string(),
+    ]
+}
+
 /// The deterministic re-verify (port of `coverage.py --check`): exit 0 IFF FULL coverage EVERYWHERE.
 /// When `WICKED_COVERAGE_DB` is set (injected by the validator runner from the actor's store path — its
 /// own carrier, so the OPERATIONAL `WICKED_ESTATE_DB` can be removed from the validator env entirely,
@@ -172,8 +206,17 @@ mod tests {
         let ids: Vec<&str> = def.phases.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["survey", "analyze", "extract", "coverage", "domain-graph"],
-            "phases map anti-legacy's front half in order"
+            vec![
+                "survey",
+                "analyze",
+                EXTRACT_PREPARE_STEP,
+                "extract",
+                EXTRACT_APPLY_STEP,
+                "coverage",
+                "domain-graph"
+            ],
+            "phases map anti-legacy's front half in order, the seat's extract bracketed by the \
+             host's prepare and apply (wicked-garden#1362)"
         );
         // The whole thing must satisfy the DAG/uniqueness invariants (backward-only depends_on).
         def.validate().expect("shipped def is a valid WorkflowDef");
@@ -196,8 +239,15 @@ mod tests {
             .unwrap();
         assert_eq!(creator.id, "extract");
         assert_eq!(evaluator.id, "coverage");
-        // coverage depends_on extract (structural ordering — the DAG makes it non-negotiable).
-        assert!(evaluator.depends_on.contains(&"extract".to_string()));
+        // coverage runs after extract (structural ordering — the DAG makes it non-negotiable):
+        // through the host's apply step, which writes what extract stated (wicked-garden#1362).
+        assert_eq!(evaluator.depends_on, [EXTRACT_APPLY_STEP]);
+        let apply = def
+            .phases
+            .iter()
+            .find(|p| p.id == EXTRACT_APPLY_STEP)
+            .unwrap();
+        assert_eq!(apply.depends_on, ["extract"]);
 
         let coverage = def.phases.iter().find(|p| p.id == "coverage").unwrap();
         assert_eq!(coverage.kind, StageKind::Test);
@@ -312,23 +362,32 @@ mod tests {
         // the WorkUnit so the cli-runner invokes the right garden skill under the right brain-engine scope.
         let def = load_shipped_def();
         let units = plan_from_def(&def, "mine the legacy payments service", "s1");
-        assert_eq!(units.len(), 5);
+        assert_eq!(units.len(), 7);
+        let (extract, coverage) = (&units[3], &units[5]);
         assert_eq!(
-            units[2].skill_ref.as_deref(),
+            extract.skill_ref.as_deref(),
             Some("wicked-garden-domain-extractor")
         );
         assert!(
-            units[2].allowed_skills.is_empty(),
+            extract.allowed_skills.is_empty(),
             "the retired brain allowlist is gone"
         );
         assert_eq!(
-            units[3].skill_ref.as_deref(),
+            coverage.skill_ref.as_deref(),
             Some("wicked-garden-domain-coverage")
         );
-        assert!(units[3].allowed_skills.is_empty());
+        assert!(coverage.allowed_skills.is_empty());
         // The evaluator≠creator role survives onto the units.
-        assert_eq!(units[2].role, PhaseRole::Creator);
-        assert_eq!(units[3].role, PhaseRole::Evaluator);
+        assert_eq!(extract.role, PhaseRole::Creator);
+        assert_eq!(coverage.role, PhaseRole::Evaluator);
+        // The host steps are Tool units: no seat, no skill (wicked-garden#1362).
+        for host in [&units[2], &units[4]] {
+            assert!(
+                host.tool_cmd.is_some() && host.skill_ref.is_none(),
+                "{}",
+                host.id
+            );
+        }
     }
 
     #[test]
