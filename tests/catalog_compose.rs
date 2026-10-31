@@ -449,7 +449,7 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
         "allowed_skills": [], "required_deliverables": [], "depends_on": [],
         "executor": {"type": "agent"}, "owner": "team", "kind": "build", "role": "creator",
         "added_by": "floor", "floor_reason": "band 20-39 requires build",
-        "floor_rule": "TST-1002"});
+        "floor_rule": "TST-1002", "repeat_from": "y"});
     let parsed: wicked_core::PlanStep = serde_json::from_value(full_step).unwrap();
     let mut keys: Vec<String> = serde_json::to_value(&parsed)
         .unwrap()
@@ -496,6 +496,14 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
             (
                 vec![("full", json!({"kind": "recon"}), "kind_not_allowed")],
                 ("full", json!({"kind": "build"})),
+            ),
+        ),
+        (
+            // domain-graph-3: a loop is a `run` step's (a Tool command's) decision only.
+            "repeat_from",
+            (
+                vec![("full", json!({"repeat_from": "x"}), "repeat_not_allowed")],
+                ("full", json!({"repeat_from": null})),
             ),
         ),
         (

@@ -727,6 +727,9 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
             ],
             "rules=yes",
         ),
+        // domain-graph-3: after each page the host decides the next (this fixture prints no
+        // decision line, so the run moves on to coverage as before).
+        ("next_page.py", vec![], "rules=yes"),
     ] {
         let args =
             std::fs::read_to_string(wt.join(".wicked/domain").join(format!("{script}.args")))

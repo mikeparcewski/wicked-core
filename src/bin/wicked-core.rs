@@ -151,14 +151,23 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          Build the requirements graph from the ANNOTATED estate graph and save it INTO the estate \
          store (domain, requirement and business-rule nodes, SatisfiedBy edges to code; what crew \
          reads). --out also writes it as a JSON export file. Fails closed below the configured \
-         minimum coverage (--min-coverage-pct, else $WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, else 80).",
+         minimum coverage (--min-coverage-pct, else the repository's own target \
+         (requirements-target), else $WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, else 80).",
     ),
     (
         "coverage",
         "wicked-core coverage [--db <path>] [--json] [--min-coverage-pct <N>]\n  \
          Recompute front-half coverage from the store and print the report. Reads only. With \
-         --min-coverage-pct (a bare flag reads $WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, else 80), \
+         --min-coverage-pct (a bare flag reads the repository's own target, else \
+         $WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, else 80), \
          exits 3 after writing the report when less than N% of behaviours are mapped.",
+    ),
+    (
+        "requirements-target",
+        "wicked-core requirements-target [--db <path>] [--set <N> | --clear] [--json]\n  \
+         The repository's own coverage target, kept in its estate store: the bar its requirements \
+         graph is held to before the daemon-wide minimum. --set N (1..100) WRITES it, --clear \
+         WRITES its removal; with neither it only reads. Prints the target in force and its source.",
     ),
     (
         "seed-domain-validators",
@@ -428,6 +437,7 @@ fn main() {
         Some("seed-domain-validators") => return seed_domain_validators_cmd(&args),
         Some("domain-graph") => return domain_graph_cmd(&args),
         Some("coverage") => return coverage_cmd(&args),
+        Some("requirements-target") => return requirements_target_cmd(&args),
         // `floor probe --repo <dir> --guide <file> [--check <name>]` (DES-BUILD-GUIDE): every piece
         // of a build guide checked in a scratch copy under the floor sandbox; writes `verified`.
         Some("floor") if args.get(2).map(String::as_str) == Some("probe") => {
@@ -1067,13 +1077,6 @@ fn domain_graph_cmd(args: &[String]) {
     // file — for garden's hermetic emit lane and ad-hoc inspection; nothing in the run reads it.
     let repo_root = flag(args, "--repo-root").map(std::path::PathBuf::from);
     let out_path = flag(args, "--out");
-    let min_pct = match min_coverage_pct_arg(args) {
-        Ok(v) => v,
-        Err(e) => {
-            fail(&format!("domain-graph: {e}"));
-            return;
-        }
-    };
     // The domain-model schema accepts 1.0.0 and 1.1.0; 1.1.0 is the contract that carries the
     // optional `metadata.coverage` + `requirement.corroboration` this build emits.
     let schema_version = flag(args, "--schema-version").unwrap_or_else(|| "1.1.0".to_string());
@@ -1082,6 +1085,13 @@ fn domain_graph_cmd(args: &[String]) {
         Ok(s) => s,
         Err(e) => {
             fail(&format!("domain-graph: open store failed: {e}"));
+            return;
+        }
+    };
+    let min_pct = match min_coverage_pct_arg(args, &store) {
+        Ok(v) => v,
+        Err(e) => {
+            fail(&format!("domain-graph: {e}"));
             return;
         }
     };
@@ -1257,7 +1267,7 @@ fn coverage_cmd(args: &[String]) {
     // `--min-coverage-pct` turns the report into a check (the coverage validator's recompute
     // branch): the report is written as always, then the exit says whether it met the minimum.
     let check = if args.iter().any(|a| a == "--min-coverage-pct") {
-        match min_coverage_pct_arg(args) {
+        match min_coverage_pct_arg(args, &store) {
             Ok(v) => Some(v),
             Err(e) => {
                 fail(&format!("coverage: {e}"));
@@ -1299,15 +1309,89 @@ fn coverage_cmd(args: &[String]) {
     coverage_check_exit(&report, check);
 }
 
-/// The configured minimum: `--min-coverage-pct N`, else [`wicked_governance::MIN_COVERAGE_ENV`],
-/// else the default (80). The flag with NO value (last, or followed by another flag) reads the
-/// env/default, so a validator script can pass the bare flag. A junk value — on the flag (`""`
-/// included) or in the variable — is an error, never a silent default.
-fn min_coverage_pct_arg(args: &[String]) -> Result<u8, String> {
+/// The configured minimum: `--min-coverage-pct N`, else the repository's own target in its store
+/// (domain-graph-3: set when the operator lowers it for this repository), else
+/// [`wicked_governance::MIN_COVERAGE_ENV`], else the default (80). The flag with NO value (last,
+/// or followed by another flag) reads the store/env/default, so a validator script can pass the
+/// bare flag. A junk value — on the flag (`""` included) or in the variable — is an error, never a
+/// silent default.
+fn min_coverage_pct_arg(
+    args: &[String],
+    store: &dyn wicked_apps_core::GraphRead,
+) -> Result<u8, String> {
     match flag(args, "--min-coverage-pct").filter(|v| !v.starts_with("--")) {
         Some(v) => wicked_governance::parse_min_coverage_pct(&v)
             .ok_or_else(|| format!("--min-coverage-pct {v:?} is not a whole percentage 1..100")),
-        None => wicked_governance::min_coverage_pct_from_env(),
+        None => wicked_governance::effective_min_coverage_pct(store),
+    }
+}
+
+/// `wicked-core requirements-target [--db <path>] [--set <N> | --clear] [--json]` — the
+/// repository's OWN coverage target (domain-graph-3), kept in its estate store: `--set` lowers
+/// (or raises) the bar this repository's requirements graph is held to, `--clear` returns it to the
+/// daemon-wide minimum. Prints the target in force and where it comes from.
+fn requirements_target_cmd(args: &[String]) {
+    let set = flag(args, "--set");
+    let clear = args.iter().any(|a| a == "--clear");
+    if set.is_some() && clear {
+        fail("requirements-target: --set and --clear are exclusive");
+        return;
+    }
+    let mut store = match wicked_apps_core::open_store(Some(&store_path(args))) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("requirements-target: open store failed: {e}"));
+            return;
+        }
+    };
+    let change = match (set, clear) {
+        (Some(v), _) => match wicked_governance::parse_min_coverage_pct(&v) {
+            Some(pct) => Some(Some(pct)),
+            None => {
+                fail(&format!(
+                    "requirements-target: --set {v:?} is not a whole percentage 1..100"
+                ));
+                return;
+            }
+        },
+        (None, true) => Some(None),
+        (None, false) => None,
+    };
+    if let Some(pct) = change {
+        if let Err(e) = wicked_governance::set_repo_min_coverage_pct(&mut store, pct) {
+            fail(&format!("requirements-target: {e}"));
+            return;
+        }
+    }
+    let own = match wicked_governance::repo_min_coverage_pct(&store) {
+        Ok(v) => v,
+        Err(e) => {
+            fail(&format!("requirements-target: {e}"));
+            return;
+        }
+    };
+    let pct = match own {
+        Some(p) => p,
+        None => match wicked_governance::min_coverage_pct_from_env() {
+            Ok(p) => p,
+            Err(e) => {
+                fail(&format!("requirements-target: {e}"));
+                return;
+            }
+        },
+    };
+    let source = if own.is_some() {
+        "repository"
+    } else {
+        "daemon"
+    };
+    if args.iter().any(|a| a == "--json") {
+        println!(
+            "{}",
+            serde_json::json!({ "min_coverage_pct": pct, "source": source })
+        );
+    } else {
+        println!("requirements-target: {pct}% ({source})");
     }
 }
 

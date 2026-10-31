@@ -1182,6 +1182,19 @@ pub struct WorkUnit {
     /// command as `WICKED_CONSENT_CHOICE`. `None` for every other unit (skipped on the wire).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consent_choice: Option<String>,
+    /// (domain-graph-3) The earlier phase this Tool unit's command may send the run back to
+    /// ([`crate::workflow::PhaseDef::repeat_from`]), carried at plan time. `None` for every unit
+    /// that decides no loop (skipped on the wire).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_from: Option<String>,
+    /// (domain-graph-3) How many times this unit's command sent the run back for another pass
+    /// ([`crate::repeat`]). 0 (skipped on the wire) until the first.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub repeat_passes: u32,
+    /// (domain-graph-3) The choice an operator made at this unit's `repeat` ask, handed to the
+    /// re-run command as `WICKED_REPEAT_CHOICE` and cleared when the loop goes on. `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_choice: Option<String>,
     /// The APPROVED, pinned deterministic validator for this unit's phase (rev0.4 gate layer-1). When
     /// present, the gate RE-VERIFIES it against the worktree after the governance pass — a fail denies
     /// the unit (deny-dominates). Authored + approved out of band; `None` ⇒ no validator (the pre-gate
@@ -1738,6 +1751,9 @@ impl WorkUnit {
             pool: None,
             pool_seating: None,
             consent_choice: None,
+            repeat_from: None,
+            repeat_passes: 0,
+            repeat_choice: None,
             validator: None,
             required_deliverables: Vec::new(),
             executes_code: false,

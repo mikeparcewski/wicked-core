@@ -108,6 +108,7 @@ mod preset;
 mod project;
 mod qe_acceptance;
 mod remote_write_fence;
+mod repeat;
 mod repo;
 mod repo_checks;
 mod repo_intel;

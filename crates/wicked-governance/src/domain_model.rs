@@ -1510,6 +1510,72 @@ fn read_build_record(store: &dyn GraphRead) -> anyhow::Result<BuildRecord> {
     })
 }
 
+/// (domain-graph-3) The repository's OWN coverage target, beside the build record
+/// (`requirements-graph/target`): set when the operator lowers the target for this repository at a
+/// generation's budget ask, so every reader of this store — `wicked-core coverage`, `domain-graph`
+/// and the requirements read — holds the graph to it before the daemon-wide minimum.
+const TARGET_ID: &str = "target";
+const TARGET_KEY: &str = "min_coverage_pct";
+
+/// The repository's own coverage target, if one is set in its store (a whole percentage 1..=100;
+/// anything else stored there is ignored, never trusted).
+pub fn repo_min_coverage_pct(store: &dyn GraphRead) -> anyhow::Result<Option<u8>> {
+    let sym = wicked_apps_core::synthetic_symbol(BUILD_SCHEME, TARGET_ID);
+    Ok(store.get_node(&sym)?.and_then(|n| {
+        n.metadata
+            .get(TARGET_KEY)
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u8::try_from(v).ok())
+            .filter(|v| (1..=100).contains(v))
+    }))
+}
+
+/// Set (`Some`) or clear (`None`) the repository's own coverage target in its store. A value
+/// outside 1..=100 is refused.
+pub fn set_repo_min_coverage_pct(
+    store: &mut dyn wicked_apps_core::GraphStore,
+    pct: Option<u8>,
+) -> anyhow::Result<()> {
+    use wicked_apps_core::{
+        synthetic_symbol, Language, Location, Node, NodeKind, Span, SYMBOL_SCHEME,
+    };
+    let file = format!("{BUILD_SCHEME}/{TARGET_ID}");
+    let Some(pct) = pct else {
+        store.begin_batch()?;
+        store.remove_file(&file)?;
+        store.commit_batch()?;
+        return Ok(());
+    };
+    if !(1..=100).contains(&pct) {
+        anyhow::bail!("a coverage target is a whole percentage 1..100, not {pct}");
+    }
+    let mut node = Node::new(
+        synthetic_symbol(BUILD_SCHEME, TARGET_ID),
+        NodeKind::Other("requirements_target".to_string()),
+        "requirements graph target".to_string(),
+        Language::new(SYMBOL_SCHEME),
+        Location::new(file, Span::ZERO),
+    );
+    node.metadata
+        .insert(TARGET_KEY.to_string(), serde_json::json!(pct));
+    store.begin_batch()?;
+    store.upsert_nodes(&[node])?;
+    store.commit_batch()?;
+    Ok(())
+}
+
+/// The minimum this store's graph is held to: the repository's own target when one is set
+/// ([`repo_min_coverage_pct`]), else the daemon-wide setting ([`min_coverage_pct_from_env`]).
+pub fn effective_min_coverage_pct(store: &dyn GraphRead) -> Result<u8, String> {
+    match repo_min_coverage_pct(store) {
+        Ok(Some(pct)) => Ok(pct),
+        Ok(None) => min_coverage_pct_from_env(),
+        Err(e) => Err(format!(
+            "the repository's coverage target could not be read: {e}"
+        )),
+    }
+}
+
 /// The highest requirement number each domain has used: the build record's marks merged with the
 /// numbers of the requirement nodes in the store (a graph persisted before the record existed
 /// carries only those).
@@ -1890,6 +1956,39 @@ mod tests {
     /// The domain graph lands IN the estate store as queryable nodes + edges — not a JSON file.
     /// Falsifiable: delete the `upsert_edges` line in production and the Contains-edge assertion
     /// fails; delete `upsert_nodes` and the node lookups fail.
+    /// domain-graph-3: the repository's own target lives in its store, beside the build record,
+    /// and comes before the daemon-wide minimum; clearing it hands the bar back; a value outside
+    /// 1..=100 is refused, and a persisted graph build never touches it.
+    #[test]
+    fn a_repositorys_own_target_is_kept_in_its_store_and_comes_first() {
+        use wicked_apps_core::SqliteStore;
+        let mut st = SqliteStore::in_memory().unwrap();
+        assert_eq!(repo_min_coverage_pct(&st).unwrap(), None);
+        set_repo_min_coverage_pct(&mut st, Some(23)).unwrap();
+        assert_eq!(repo_min_coverage_pct(&st).unwrap(), Some(23));
+        assert_eq!(effective_min_coverage_pct(&st), Ok(23));
+        assert!(set_repo_min_coverage_pct(&mut st, Some(0)).is_err());
+        assert!(set_repo_min_coverage_pct(&mut st, Some(101)).is_err());
+        assert_eq!(
+            repo_min_coverage_pct(&st).unwrap(),
+            Some(23),
+            "a refusal keeps it"
+        );
+        let model: DomainModel = serde_json::from_value(serde_json::json!({
+            "domains": {},
+            "metadata": {"schema_version": "1.0.0", "migration_mode": "functional"}
+        }))
+        .unwrap();
+        persist_domain_model(&mut st, &model).unwrap();
+        assert_eq!(
+            repo_min_coverage_pct(&st).unwrap(),
+            Some(23),
+            "a build keeps the target"
+        );
+        set_repo_min_coverage_pct(&mut st, None).unwrap();
+        assert_eq!(repo_min_coverage_pct(&st).unwrap(), None);
+    }
+
     #[test]
     fn persist_domain_model_writes_the_graph_into_the_store() {
         use wicked_apps_core::{synthetic_symbol, EdgeKind, GraphRead, NodeKind, SqliteStore};

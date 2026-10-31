@@ -242,6 +242,9 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // declaration must ride the unit.
             unit.executes_code = phase.executes_code;
             unit.budget_secs = phase.budget_secs;
+            // (domain-graph-3) The loop a Tool phase decides rides the unit: the fold that reads
+            // the command's decision has no route back to the def.
+            unit.repeat_from = phase.repeat_from.clone();
             // (core#810) The phase's worker pool rides the unit: distribution reads it to seat the
             // creator's monitors, and has no route back to the def.
             unit.pool = phase.pool;
@@ -644,6 +647,10 @@ pub struct PlanStep {
     /// Output-only, as `added_by`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floor_rule: Option<String>,
+    /// (domain-graph-3) Only on `run` (a Tool step): the earlier step the run goes back to when
+    /// this step's command asks for another pass ([`crate::workflow::PhaseDef::repeat_from`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_from: Option<String>,
 }
 
 impl PlanStep {
@@ -692,6 +699,8 @@ pub enum PlanRefusal {
     CaptureReportLowered { step: String, catalog: String },
     /// The step sets a `kind` other than its entry's on an entry other than `run`.
     KindNotAllowed { step: String, catalog: String },
+    /// (domain-graph-3) The step sets `repeat_from` on an entry other than `run`.
+    RepeatNotAllowed { step: String, catalog: String },
     /// The step sets an `executor` on an Agent entry.
     ExecutorNotAllowed { step: String, catalog: String },
     /// A Tool-entry step (`run`, `deliver`) supplies no non-empty Tool command.
@@ -773,6 +782,7 @@ impl PlanRefusal {
             PlanRefusal::WritesNothingOnCode { .. } => "writes_nothing_on_code",
             PlanRefusal::CaptureReportLowered { .. } => "capture_report_lowered",
             PlanRefusal::KindNotAllowed { .. } => "kind_not_allowed",
+            PlanRefusal::RepeatNotAllowed { .. } => "repeat_not_allowed",
             PlanRefusal::ExecutorNotAllowed { .. } => "executor_not_allowed",
             PlanRefusal::ToolCommandMissing { .. } => "tool_command_missing",
             PlanRefusal::ToolCommandChanged { .. } => "tool_command_changed",
@@ -859,6 +869,11 @@ impl std::fmt::Display for PlanRefusal {
             PlanRefusal::KindNotAllowed { step, catalog } => write!(
                 f,
                 "{r}: step {step} changes {catalog}'s kind — only a run step sets its kind"
+            ),
+            PlanRefusal::RepeatNotAllowed { step, catalog } => write!(
+                f,
+                "{r}: step {step} sets repeat_from on {catalog} — only a run step (a Tool command) \
+                 decides a loop"
             ),
             PlanRefusal::ExecutorNotAllowed { step, catalog } => write!(
                 f,
@@ -1029,6 +1044,7 @@ pub const STEP_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("added_by", FieldRule::Record),
     ("floor_reason", FieldRule::Record),
     ("floor_rule", FieldRule::Record),
+    ("repeat_from", FieldRule::RunOnly),
 ];
 
 /// A gate's position on the §8.3 ladder: `auto` < `human_confirm_if` <
@@ -1303,6 +1319,14 @@ fn apply_step(
         phase.owner = owner;
     }
     // added_by, floor_reason, floor_rule — Record: nothing to apply.
+    // repeat_from — RunOnly: a loop is a Tool step's decision (the def's validation judges the
+    // range: an earlier step, no deliver, no consent gate, no nested loop).
+    if let Some(from) = &step.repeat_from {
+        if step.catalog != "run" {
+            return refuse(|step, catalog| PlanRefusal::RepeatNotAllowed { step, catalog });
+        }
+        phase.repeat_from = Some(from.clone());
+    }
     Ok(phase)
 }
 
@@ -2115,6 +2139,36 @@ mod tests {
     /// has none to its own value, lowers one that has a budget, may not raise it (named refusal),
     /// and the composed phase's budget lands on the unit like its gate — the `understand`
     /// answer shape (gate raised, budget 600) composes as one plan step, no new catalog entry.
+    #[test]
+    fn repeat_from_composes_on_a_run_step_only_and_lands_on_the_unit() {
+        let catalog = crate::catalog::catalog();
+        let tool = serde_json::json!({"type": "tool", "cmd": ["true"]});
+        let plan: PlanSteps = serde_json::from_value(serde_json::json!({"steps": [
+            {"catalog": "run", "id": "page", "executor": tool},
+            {"catalog": "run", "id": "next", "executor": tool, "repeat_from": "page"}
+        ]}))
+        .unwrap();
+        let def = compose(catalog, &plan).expect("a loop over run steps composes");
+        assert_eq!(def.phases[1].repeat_from.as_deref(), Some("page"));
+        let units = plan_from_def(&def, "map it", "r1");
+        assert_eq!(units[1].repeat_from.as_deref(), Some("page"));
+        assert_eq!(units[0].repeat_from, None);
+        // On an agent step it is refused by name; a backward-only range is the def's rule.
+        let agent: PlanSteps = serde_json::from_value(serde_json::json!({"steps": [
+            {"catalog": "understand", "id": "a"},
+            {"catalog": "understand", "id": "b", "repeat_from": "a"}
+        ]}))
+        .unwrap();
+        let err = compose(catalog, &agent).unwrap_err();
+        assert_eq!(err.reason(), "repeat_not_allowed", "{err}");
+        let forward: PlanSteps = serde_json::from_value(serde_json::json!({"steps": [
+            {"catalog": "run", "id": "a", "executor": tool, "repeat_from": "b"},
+            {"catalog": "run", "id": "b", "executor": tool}
+        ]}))
+        .unwrap();
+        assert!(compose(catalog, &forward).is_err());
+    }
+
     #[test]
     fn budget_secs_composes_tighten_only_and_lands_on_the_unit() {
         use crate::workflow::GateSpec;

@@ -289,7 +289,7 @@
    {
     "catalog": "critique",
     "id": "critique",
-    "instructions": "Review the rules the extract step stated in `.wicked/domain/rules.json` against the units of `.wicked/domain/worklist.json`. This run maps one page of the repository: the worklist, hub-first. Completeness is not your question. The coverage step measures the mapped share against the configured minimum, and the next run continues from the frontier; grouping by domain happens in the domain-graph step. Judge each stated rule: it names a unit of the worklist, it states what the business requires rather than describing the code, it is grounded in that unit's source, and its confidence is not inflated. An empty statement is right where the source supports no rule (the host records it as a risk). You judge work another seat did; change no file. List each problem as `ITEM n: FAIL — <symbol> — <why>`. End with `VERDICT: PASS` when the stated rules are sound (the host re-checks every rule and flags weak ones as risks), or `VERDICT: FAIL` when rules are invented, name symbols outside the worklist, or describe code instead of requirements.",
+    "instructions": "Review the rules the extract step stated in `.wicked/domain/rules.json` against the units of `.wicked/domain/worklist.json`. This run maps the repository one page at a time: the worklist is the current page, hub-first. Completeness is not your question. The host measures the mapped share after each page and maps the next page from the frontier until the target is reached; grouping by domain happens in the domain-graph step. Judge each stated rule: it names a unit of the worklist, it states what the business requires rather than describing the code, it is grounded in that unit's source, and its confidence is not inflated. An empty statement is right where the source supports no rule (the host records it as a risk). You judge work another seat did; change no file. List each problem as `ITEM n: FAIL — <symbol> — <why>`. End with `VERDICT: PASS` when the stated rules are sound (the host re-checks every rule and flags weak ones as risks), or `VERDICT: FAIL` when rules are invented, name symbols outside the worklist, or describe code instead of requirements.",
     "depends_on": [
      "extract"
     ]
@@ -314,6 +314,26 @@
     }
    },
    {
+    "catalog": "run",
+    "id": "extract-next",
+    "gate_type": null,
+    "depends_on": [
+     "extract-apply"
+    ],
+    "executor": {
+     "type": "tool",
+     "cmd": [
+      "bash",
+      "-c",
+      "exec \"${WICKED_GARDEN_ROOT:?the engine handed this Tool phase no garden root; refusing to resolve wicked-garden from PATH}/scripts/wicked-garden\" run scripts/domain/next_page.py --db \"$1\" --repo-root \"$2\" ",
+      "extract-next",
+      "{code_graph_db}",
+      "{repo_root}"
+     ]
+    },
+    "repeat_from": "extract-prepare"
+   },
+   {
     "catalog": "domain_coverage",
     "id": "coverage",
     "executes_code": true,
@@ -321,7 +341,7 @@
      "coverage-report.json"
     ],
     "depends_on": [
-     "extract-apply"
+     "extract-next"
     ],
     "skill_ref": "wicked-garden-domain-coverage",
     "validator_pin": "313df7270f380e53"
