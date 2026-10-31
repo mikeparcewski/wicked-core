@@ -23,6 +23,7 @@ Two release tracks share this file, newest entry first regardless of track:
   QE are briefed without it (under reduced assurance a reviewer on the orchestrator's own seat and posture resumes its
   session, history included: the disclosed creator-seat waiver). Ignored on a phased run;
   over 4096 bytes refuses the launch (nothing persisted); an older addon drops the field.
+
 - **A creator whose deliverable is not code can run in a seat container.** The container floor refuses a worktree
   whose git pointer has no git dir pinned from the registered repository (`verify_linked_worktree`, fail closed), and
   that pin rides the unit's worktree baseline, which dispatch took only for guarded or default-floored units. A
