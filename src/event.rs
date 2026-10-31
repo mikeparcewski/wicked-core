@@ -1466,6 +1466,17 @@ pub enum CoreEvent {
         cli: String,
         reason: String,
     },
+    /// A seat's container image was not on the container runtime when its unit was dispatched (its
+    /// first use, or a runtime's image cleanup deleted it) and the engine built it before the
+    /// seat ran, `secs` long: the unit waited for the build, it did not fail. `image` is the tag
+    /// built. Additive: a new frame.
+    SeatImageRebuilt {
+        session: String,
+        ord: u32,
+        cli: String,
+        image: String,
+        secs: u64,
+    },
     /// (PRODUCT-WORKS J4) A seat-container unit failed while the host's container runtime was
     /// not answering (a desktop runtime restarting): an infrastructure fault, not the seat's. The
     /// runner waits for the runtime with backoff, within a bounded window, and re-runs the unit on
@@ -2385,6 +2396,20 @@ impl CoreEvent {
                 "ord": ord,
                 "cli": cli,
                 "reason": reason,
+            }),
+            CoreEvent::SeatImageRebuilt {
+                session,
+                ord,
+                cli,
+                image,
+                secs,
+            } => json!({
+                "type": "seatImageRebuilt",
+                "session": session,
+                "ord": ord,
+                "cli": cli,
+                "image": image,
+                "secs": secs,
             }),
             CoreEvent::ContainerRuntimeWait {
                 session,

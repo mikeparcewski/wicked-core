@@ -69,6 +69,10 @@ pub(crate) const RUNTIME_ENV: &str = "WICKED_CONTAINER_RUNTIME";
 /// A Debian-based base image to build the seat images on instead of the default (a project's own
 /// toolchain image). Part of the image tag, so a change rebuilds.
 pub(crate) const BASE_IMAGE_ENV: &str = "WICKED_SEAT_BASE_IMAGE";
+/// The Dockerfile [`BASE_IMAGE_ENV`]'s image is built from (no build context), for a base that
+/// exists only on this runtime: when the base is missing (a runtime's image cleanup deleted it),
+/// the engine rebuilds it from this file before it builds a seat image on it.
+pub(crate) const BASE_DOCKERFILE_ENV: &str = "WICKED_SEAT_BASE_DOCKERFILE";
 /// `none` runs seats with no network at all; otherwise each seat gets its own internal network.
 pub(crate) const NETWORK_ENV: &str = "WICKED_SEAT_NETWORK";
 /// The container's memory limit, otherwise `3g`.
@@ -639,6 +643,11 @@ fn image_id(rt: &Runtime, tag: &str) -> Option<String> {
         .and_then(|o| valid_image_id(String::from_utf8_lossy(&o.stdout).trim()))
 }
 
+/// [`image_id`] for the image holders ([`crate::image_keep`]).
+pub(crate) fn image_id_of(rt: &Runtime, tag: &str) -> Option<String> {
+    image_id(rt, tag)
+}
+
 /// An immutable local image id as the runtime spells it: docker's `sha256:<64 hex>` or podman's
 /// bare `<64 hex>` (codex ln-r2). Kept in that spelling for the runtime's own later commands.
 fn valid_image_id(id: &str) -> Option<String> {
@@ -656,26 +665,81 @@ pub(crate) fn image_present(rt: &Runtime, tag: &str) -> bool {
 pub(crate) fn build_seat_image(rt: &Runtime, cli: &str) -> Result<String, String> {
     let package =
         seat_package(cli).ok_or_else(|| format!("no seat image is defined for `{cli}`"))?;
-    let base = base_image();
+    build_seat_image_on(rt, cli, package, &base_image(), base_recipe().as_deref())
+}
+
+/// [`build_seat_image`] on `base`, rebuilding a missing base from `recipe` first.
+fn build_seat_image_on(
+    rt: &Runtime,
+    cli: &str,
+    package: SeatPackage,
+    base: &str,
+    recipe: Option<&Path>,
+) -> Result<String, String> {
+    let base = base.to_string();
     let tag = seat_image_tag(cli, &base).expect("package exists");
+    let base_missing = !image_present(rt, &base);
+    if base_missing {
+        if let Some(recipe) = recipe {
+            rebuild_base(rt, &base, recipe)?;
+        }
+    }
     let mut args = vec![format!("BASE={base}"), format!("CLI={cli}")];
     args.extend(package.build_args());
-    build_image(rt, SEAT_DOCKERFILE, &tag, &args)
+    build_image(rt, SEAT_DOCKERFILE, &tag, &args).map_err(|e| {
+        if base_missing && !image_present(rt, &base) {
+            missing_base_error(&base, &e)
+        } else {
+            e
+        }
+    })
+}
+
+/// [`BASE_DOCKERFILE_ENV`], when set.
+fn base_recipe() -> Option<PathBuf> {
+    std::env::var_os(BASE_DOCKERFILE_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Build the missing seat base `base` from `recipe` (a Dockerfile, no build context).
+pub(crate) fn rebuild_base(rt: &Runtime, base: &str, recipe: &Path) -> Result<(), String> {
+    let df = std::fs::read_to_string(recipe).map_err(|e| {
+        format!(
+            "the seat base image {base} is missing and its Dockerfile {} ({BASE_DOCKERFILE_ENV}) \
+             cannot be read: {e}",
+            recipe.display()
+        )
+    })?;
+    eprintln!(
+        "wicked-core: the seat base image {base} is missing; rebuilding it from {}",
+        recipe.display()
+    );
+    build_image(rt, &df, base, &[]).map(|_| ())
+}
+
+/// The error of a seat build whose base is not on the runtime and could not be pulled.
+pub(crate) fn missing_base_error(base: &str, build_error: &str) -> String {
+    format!(
+        "the seat base image {base} is not on the container runtime and could not be pulled \
+         (a runtime's image cleanup may have deleted it); rebuild it, or set \
+         {BASE_DOCKERFILE_ENV} to its Dockerfile so the engine rebuilds it: {build_error}"
+    )
 }
 
 /// The floor image ([`FLOOR_DOCKERFILE`]), built on first use (one build at a time).
 pub(crate) fn ensure_floor_image(rt: &Runtime) -> Result<String, String> {
     static BUILD: Mutex<()> = Mutex::new(());
     let tag = floor_image_tag();
-    if image_present(rt, &tag) {
-        return Ok(tag);
+    if !image_present(rt, &tag) {
+        let _one = BUILD.lock();
+        if !image_present(rt, &tag) {
+            eprintln!("wicked-core: building floor image {tag} (first use)");
+            build_image(rt, FLOOR_DOCKERFILE, &tag, &[])?;
+        }
     }
-    let _one = BUILD.lock();
-    if image_present(rt, &tag) {
-        return Ok(tag);
-    }
-    eprintln!("wicked-core: building floor image {tag} (first use)");
-    build_image(rt, FLOOR_DOCKERFILE, &tag, &[])
+    let _ = crate::image_keep::hold(rt, &[&tag]);
+    Ok(tag)
 }
 
 /// What the engine learned about one seat image (by image id): the paths in its root filesystem
@@ -831,20 +895,20 @@ const NETNS_DOCKERFILE: &str = include_str!("../containers/seats/netns.Dockerfil
 /// The sidecar image, built on first use (tagged by its Dockerfile's hash).
 pub(crate) fn ensure_netns_image(rt: &Runtime) -> Result<String, String> {
     let tag = format!("wicked-seat-netns:{}", content_tag(&[NETNS_DOCKERFILE]));
-    if image_present(rt, &tag) {
-        return Ok(tag);
+    if !image_present(rt, &tag) {
+        static BUILD: Mutex<()> = Mutex::new(());
+        let _one = BUILD.lock();
+        if !image_present(rt, &tag) {
+            build_image(
+                rt,
+                NETNS_DOCKERFILE,
+                &tag,
+                &["BASE=alpine:3.22".to_string()],
+            )?;
+        }
     }
-    static BUILD: Mutex<()> = Mutex::new(());
-    let _one = BUILD.lock();
-    if image_present(rt, &tag) {
-        return Ok(tag);
-    }
-    build_image(
-        rt,
-        NETNS_DOCKERFILE,
-        &tag,
-        &["BASE=alpine:3.22".to_string()],
-    )
+    let _ = crate::image_keep::hold(rt, &[&tag]);
+    Ok(tag)
 }
 
 /// Build `df` alone (no build context) as `tag`, streaming the runtime's progress to the engine's
@@ -931,21 +995,47 @@ pub(crate) fn build_image(
 /// The image `cli`'s seat runs: the operator's override as-is, else the engine's seat image,
 /// built on first use (one build at a time per process).
 pub(crate) fn ensure_seat_image(rt: &Runtime, cli: &str) -> Result<String, String> {
+    ensure_seat_image_noting(rt, cli).map(|(tag, _)| tag)
+}
+
+/// [`ensure_seat_image`], also saying how long it took when it had to build the image (it was
+/// missing: a first use, or a runtime's image cleanup deleted it), for the unit's note.
+pub(crate) fn ensure_seat_image_noting(
+    rt: &Runtime,
+    cli: &str,
+) -> Result<(String, Option<Duration>), String> {
     if let Some(img) = image_override(cli) {
-        return Ok(img);
+        hold_seat_images(rt, &img);
+        return Ok((img, None));
     }
     static BUILD: Mutex<()> = Mutex::new(());
     let tag = seat_image_tag(cli, &base_image())
         .ok_or_else(|| format!("no seat image is defined for `{cli}`"))?;
     if image_present(rt, &tag) {
-        return Ok(tag);
+        hold_seat_images(rt, &tag);
+        return Ok((tag, None));
     }
     let _one = BUILD.lock();
     if image_present(rt, &tag) {
-        return Ok(tag);
+        hold_seat_images(rt, &tag);
+        return Ok((tag, None));
     }
-    eprintln!("wicked-core: building seat image {tag} (first use)");
-    build_seat_image(rt, cli)
+    eprintln!("wicked-core: building seat image {tag} (it is not on the container runtime)");
+    let start = Instant::now();
+    let built = build_seat_image(rt, cli)?;
+    hold_seat_images(rt, &built);
+    Ok((built, Some(start.elapsed())))
+}
+
+/// Hold `seat` and the operator's seat base (when [`BASE_IMAGE_ENV`] names one) against the
+/// runtime's image cleanup ([`crate::image_keep`]). Best effort.
+fn hold_seat_images(rt: &Runtime, seat: &str) {
+    let base = configured_base();
+    let mut refs = vec![seat];
+    if let Some(b) = base.as_deref() {
+        refs.push(b);
+    }
+    let _ = crate::image_keep::hold(rt, &refs);
 }
 
 /// Whether seats run with no network at all ([`NETWORK_ENV`]` = none`).
@@ -2289,6 +2379,8 @@ pub(crate) struct ArmedContainer {
     /// What the seat container mounts, for narrowing a claude seat's fence to it
     /// (`execute_wrapped::narrow_container_fence`).
     pub(crate) view: MountView,
+    /// The seat image this arming had to build (tag, how long), for the unit's note.
+    pub(crate) image_built: Option<(String, Duration)>,
 }
 
 impl std::fmt::Debug for ArmedContainer {
@@ -2510,7 +2602,9 @@ pub(crate) fn arm(
     let rt = runtime().map_err(|w| (w, String::new()))?;
     static SWEEP: Once = Once::new();
     SWEEP.call_once(|| sweep(&rt, SWEEP_AGE));
-    let image = ensure_seat_image(&rt, cli).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
+    let (image, built_in) =
+        ensure_seat_image_noting(&rt, cli).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
+    let image_built = built_in.map(|d| (image.clone(), d));
     let floor_image = ensure_floor_image(&rt)
         .and_then(|t| image_id(&rt, &t).ok_or_else(|| format!("floor image {t} vanished")))
         .map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
@@ -2699,6 +2793,7 @@ pub(crate) fn arm(
         lease,
         copilot_account,
         view,
+        image_built,
     })
 }
 
@@ -3213,9 +3308,18 @@ pub fn seat_image_main(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let wanted: Vec<String> = match args.get(1..) {
-        Some(rest) if !rest.is_empty() && !rest.iter().any(|a| a == "all") => rest.to_vec(),
-        _ => seat_clis().map(str::to_string).collect(),
+    let json = args.iter().any(|a| a == "--json");
+    let rest: Vec<String> = args
+        .get(1..)
+        .unwrap_or_default()
+        .iter()
+        .filter(|a| *a != "--json")
+        .cloned()
+        .collect();
+    let wanted: Vec<String> = if !rest.is_empty() && !rest.iter().any(|a| a == "all") {
+        rest
+    } else {
+        seat_clis().map(str::to_string).collect()
     };
     match args.first().map(String::as_str) {
         Some("build") => {
@@ -3229,7 +3333,15 @@ pub fn seat_image_main(args: &[String]) -> i32 {
             }
             for cli in &wanted {
                 match build_seat_image(&rt, cli) {
-                    Ok(tag) => println!("{cli}: built {tag}"),
+                    Ok(tag) => {
+                        println!("{cli}: built {tag}");
+                        let base = configured_base();
+                        let mut refs = vec![tag.as_str()];
+                        refs.extend(base.as_deref());
+                        if let Err(e) = crate::image_keep::hold_now(&rt, &refs) {
+                            eprintln!("{cli}: built, but not held against image cleanup: {e}");
+                        }
+                    }
                     Err(e) => {
                         eprintln!("{cli}: {e}");
                         rc = 1;
@@ -3238,33 +3350,238 @@ pub fn seat_image_main(args: &[String]) -> i32 {
             }
             rc
         }
-        Some("status") => {
-            println!("runtime: {}", rt.cli.display());
-            let floor = floor_image_tag();
-            println!(
-                "floor: {floor} {}",
-                if image_present(&rt, &floor) {
-                    "present"
-                } else {
-                    "missing"
+        Some("hold") => {
+            // Hold what is already there (no build): the seat images of `wanted`, the operator's
+            // base, the floor image.
+            let mut refs: Vec<String> = wanted
+                .iter()
+                .filter_map(|cli| {
+                    image_override(cli).or_else(|| seat_image_tag(cli, &base_image()))
+                })
+                .collect();
+            refs.extend(configured_base());
+            refs.push(floor_image_tag());
+            let present: Vec<&str> = refs
+                .iter()
+                .map(String::as_str)
+                .filter(|r| image_present(&rt, r))
+                .collect();
+            match crate::image_keep::hold_now(&rt, &present) {
+                Ok(()) => {
+                    for r in &present {
+                        println!("held: {r}");
+                    }
+                    0
                 }
+                Err(e) => {
+                    eprintln!("seat-image hold: {e}");
+                    1
+                }
+            }
+        }
+        Some("status") => {
+            let st = image_status(&rt, &wanted);
+            if json {
+                println!("{}", serde_json::to_string(&st).unwrap_or_default());
+                return 0;
+            }
+            println!("runtime: {}", rt.cli.display());
+            let word = |present: bool, held: bool| match (present, held) {
+                (true, true) => "present, held",
+                (true, false) => "present, not held",
+                _ => "missing",
+            };
+            if let Some(b) = &st.base {
+                println!("base: {} {}", b.image, word(b.present, b.held));
+            }
+            println!(
+                "floor: {} {}",
+                st.floor.image,
+                word(st.floor.present, st.floor.held)
             );
-            for cli in &wanted {
-                let tag = image_override(cli)
-                    .or_else(|| seat_image_tag(cli, &base_image()))
-                    .unwrap_or_else(|| "(no image defined)".into());
-                let present = image_present(&rt, &tag);
+            for s in &st.seats {
+                println!("{}: {} {}", s.cli, s.image, word(s.present, s.held));
+            }
+            if let Some(d) = &st.disk {
                 println!(
-                    "{cli}: {tag} {}",
-                    if present { "present" } else { "missing" }
+                    "runtime disk: {}% used ({} of {} bytes free)",
+                    d.used_pct, d.avail_bytes, d.total_bytes
                 );
             }
             0
         }
         _ => {
-            eprintln!("usage: wicked-core seat-image build [<cli>…|all] | seat-image status");
+            eprintln!(
+                "usage: wicked-core seat-image build [<cli>…|all] | seat-image hold [<cli>…|all] | seat-image status [--json] [<cli>…]"
+            );
             2
         }
+    }
+}
+
+/// [`BASE_IMAGE_ENV`], when the operator set one.
+fn configured_base() -> Option<String> {
+    std::env::var(BASE_IMAGE_ENV)
+        .ok()
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty())
+}
+
+/// One image in [`ImageStatus`].
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImageState {
+    pub(crate) image: String,
+    pub(crate) present: bool,
+    /// A holder container keeps it ([`crate::image_keep`]).
+    pub(crate) held: bool,
+}
+
+/// One seat CLI's image in [`ImageStatus`].
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SeatImageState {
+    pub(crate) cli: String,
+    pub(crate) image: String,
+    pub(crate) present: bool,
+    pub(crate) held: bool,
+    /// The operator's own image (`WICKED_SEAT_IMAGE_<CLI>`): the engine never builds it.
+    pub(crate) operator_image: bool,
+}
+
+/// The runtime VM's disk, read inside a throwaway container (its root is on that disk).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeDisk {
+    pub(crate) total_bytes: u64,
+    pub(crate) avail_bytes: u64,
+    /// `(total - available) / total`, rounded up: the reading a kubelet's image GC compares to its
+    /// threshold.
+    pub(crate) used_pct: u64,
+}
+
+/// `seat-image status --json`: what the seats need, whether it is there and held, and the disk.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImageStatus {
+    pub(crate) runtime: String,
+    /// The operator's seat base ([`BASE_IMAGE_ENV`]); `null` when the default base is used.
+    pub(crate) base: Option<ImageState>,
+    /// Whether [`BASE_DOCKERFILE_ENV`] names a recipe the engine can rebuild the base from.
+    pub(crate) base_recipe: bool,
+    pub(crate) floor: ImageState,
+    pub(crate) seats: Vec<SeatImageState>,
+    /// `null` when the probe container could not run (no floor image yet, a runtime error).
+    pub(crate) disk: Option<RuntimeDisk>,
+    /// Kubernetes' default `imageGCHighThresholdPercent`: past it a kubelet deletes unheld images.
+    pub(crate) image_gc_high_pct: u64,
+}
+
+/// Parse `df -P -k /` (POSIX, 1024-byte blocks) into a [`RuntimeDisk`].
+pub(crate) fn parse_df(out: &str) -> Option<RuntimeDisk> {
+    let line = out.lines().nth(1)?;
+    let f: Vec<&str> = line.split_whitespace().collect();
+    let total: u64 = f.get(1)?.parse().ok()?;
+    let avail: u64 = f.get(3)?.parse().ok()?;
+    if total == 0 {
+        return None;
+    }
+    let used = total.saturating_sub(avail);
+    Some(RuntimeDisk {
+        total_bytes: total * 1024,
+        avail_bytes: avail * 1024,
+        used_pct: (used * 100).div_ceil(total),
+    })
+}
+
+fn image_status(rt: &Runtime, clis: &[String]) -> ImageStatus {
+    let holders = crate::image_keep::list(rt).unwrap_or_default();
+    // One listing for every image (a status answers inside a Nerve Center probe's bound); a
+    // reference it does not spell as asked (podman's `localhost/` prefix) is inspected alone.
+    let listed: std::collections::HashMap<String, String> = {
+        let mut c = rt.cmd();
+        c.args([
+            "images",
+            "--no-trunc",
+            "--format",
+            "{{.Repository}}:{{.Tag}}\t{{.ID}}",
+        ]);
+        output_within(c, rt.bound(PROBE_TIMEOUT))
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter_map(|l| {
+                        let (r, i) = l.split_once('\t')?;
+                        Some((r.trim().to_string(), valid_image_id(i.trim())?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let bare = |id: &str| id.strip_prefix("sha256:").unwrap_or(id).to_string();
+    let state = |image: &str| -> ImageState {
+        let id = listed.get(image).cloned().or_else(|| image_id(rt, image));
+        ImageState {
+            image: image.to_string(),
+            present: id.is_some(),
+            held: id.is_some_and(|id| {
+                holders
+                    .iter()
+                    .any(|h| h.image == image && bare(&h.id) == bare(&id))
+            }),
+        }
+    };
+    let floor = state(&floor_image_tag());
+    let base = configured_base().map(|b| state(&b));
+    let seats = clis
+        .iter()
+        .filter_map(|cli| {
+            let over = image_override(cli);
+            let image = over
+                .clone()
+                .or_else(|| seat_image_tag(cli, &base_image()))?;
+            let s = state(&image);
+            Some(SeatImageState {
+                cli: cli.clone(),
+                image,
+                present: s.present,
+                held: s.held,
+                operator_image: over.is_some(),
+            })
+        })
+        .collect();
+    let disk = if floor.present {
+        let mut c = rt.cmd();
+        c.args([
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--pull",
+            "never",
+            "--entrypoint",
+            "/busybox",
+            &floor.image,
+            "df",
+            "-P",
+            "-k",
+            "/",
+        ]);
+        output_within(c, rt.bound(PROBE_TIMEOUT))
+            .filter(|o| o.status.success())
+            .and_then(|o| parse_df(&String::from_utf8_lossy(&o.stdout)))
+    } else {
+        None
+    };
+    ImageStatus {
+        runtime: rt.cli.display().to_string(),
+        base,
+        base_recipe: base_recipe().is_some(),
+        floor,
+        seats,
+        disk,
+        image_gc_high_pct: 85,
     }
 }
 
@@ -3291,6 +3608,116 @@ mod agy_tests;
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// A runtime stub that logs its argv and answers `image inspect` only for the tags a `build`
+    /// made (or `present` names).
+    fn image_stub(dir: &Path, present: &[&str]) -> PathBuf {
+        let rt = dir.join("runtime");
+        let have = dir.join("have");
+        std::fs::write(
+            &have,
+            present.iter().map(|p| format!("{p}\n")).collect::<String>(),
+        )
+        .unwrap();
+        crate::test_env::install_stub(
+            &rt,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+                 case \"$1 $2\" in\n\
+                 'image inspect') last=; for a in \"$@\"; do last=$a; done\n\
+                   grep -qx \"$last\" '{have}' || exit 1\n\
+                   echo sha256:{id}; exit 0 ;;\n\
+                 esac\n\
+                 if [ \"$1\" = build ]; then cat > /dev/null; t=; while [ $# -gt 0 ]; do\n\
+                   [ \"$1\" = -t ] && t=$2; shift; done; echo \"$t\" >> '{have}'; fi\n\
+                 exit 0\n",
+                log = dir.join("calls.log").display(),
+                have = have.display(),
+                id = "b".repeat(64)
+            ),
+        );
+        rt
+    }
+
+    #[test]
+    fn a_missing_seat_base_is_rebuilt_from_its_recipe_before_the_seat_image() {
+        let dir = c4_temp();
+        let recipe = dir.join("base.Dockerfile");
+        std::fs::write(&recipe, "FROM node:22-trixie-slim\n").unwrap();
+        let rt = Runtime::answering(image_stub(&dir, &[]));
+        let pkg = seat_package("claude").unwrap();
+        let tag = build_seat_image_on(&rt, "claude", pkg, "seat-base:rust", Some(&recipe)).unwrap();
+        let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        let base_build = calls
+            .find("-t seat-base:rust -")
+            .expect("the base was built");
+        let seat_build = calls
+            .find(&format!("-t {tag} -"))
+            .expect("the seat image was built");
+        assert!(base_build < seat_build, "{calls}");
+        assert!(calls.contains("--build-arg BASE=seat-base:rust"), "{calls}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_present_seat_base_is_not_rebuilt() {
+        let dir = c4_temp();
+        let recipe = dir.join("base.Dockerfile");
+        std::fs::write(&recipe, "FROM node:22-trixie-slim\n").unwrap();
+        let rt = Runtime::answering(image_stub(&dir, &["seat-base:rust"]));
+        let pkg = seat_package("codex").unwrap();
+        build_seat_image_on(&rt, "codex", pkg, "seat-base:rust", Some(&recipe)).unwrap();
+        let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert!(!calls.contains("-t seat-base:rust"), "{calls}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_base_with_no_recipe_names_the_base_and_the_fix() {
+        let dir = c4_temp();
+        let rt = dir.join("runtime");
+        // Every build fails as a pull of a local-only base does.
+        crate::test_env::install_stub(
+            &rt,
+            "#!/bin/sh\ncase \"$1\" in image) exit 1 ;; build) cat >/dev/null; \
+             echo 'FAKE pull access denied for seat-base' >&2; exit 1 ;; esac\nexit 0\n",
+        );
+        let rt = Runtime::answering(rt);
+        let pkg = seat_package("claude").unwrap();
+        let e = build_seat_image_on(&rt, "claude", pkg, "seat-base:rust", None).unwrap_err();
+        assert!(e.contains("seat base image seat-base:rust"), "{e}");
+        assert!(e.contains(BASE_DOCKERFILE_ENV), "{e}");
+        assert!(e.contains("FAKE pull access denied"), "{e}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_runtime_disk_reads_as_a_kubelet_reads_it() {
+        let out = "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
+                   overlay 102625208 40367848 56998148 41% /\n";
+        let d = parse_df(out).unwrap();
+        assert_eq!(d.total_bytes, 102625208 * 1024);
+        assert_eq!(d.avail_bytes, 56998148 * 1024);
+        // (total - available) / total, so ext4's reserve counts as used: 45, not df's 41.
+        assert_eq!(d.used_pct, 45);
+        assert!(parse_df("garbage").is_none());
+        assert!(parse_df("h\nx 0 0 0 0% /\n").is_none());
+    }
+
+    #[test]
+    fn a_missing_seat_image_is_built_and_says_so_and_a_present_one_is_not() {
+        let dir = c4_temp();
+        let rt = Runtime::answering(image_stub(&dir, &[]));
+        // The default base (no operator base in a test process).
+        let (tag, built) = ensure_seat_image_noting(&rt, "pi").unwrap();
+        assert!(built.is_some(), "a missing image is built and noted");
+        let (again, built) = ensure_seat_image_noting(&rt, "pi").unwrap();
+        assert_eq!(tag, again);
+        assert!(built.is_none(), "a present image is not rebuilt");
+        let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        assert_eq!(calls.matches(&format!("-t {tag} -")).count(), 1, "{calls}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn c4_temp() -> PathBuf {
         let base = wicked_apps_core::spawn::hermetic_test_worker_home();

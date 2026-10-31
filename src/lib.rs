@@ -64,6 +64,7 @@ mod gate_hook;
 mod graph_browser;
 mod headless;
 mod hook_relay;
+mod image_keep;
 mod install_fence;
 mod interaction;
 mod knowledge;

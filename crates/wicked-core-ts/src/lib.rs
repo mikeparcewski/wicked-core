@@ -4259,6 +4259,17 @@ mod tests {
             &["type", "session", "ord", "cli", "reason"],
         );
         check(
+            CoreEvent::SeatImageRebuilt {
+                session: s(),
+                ord: 2,
+                cli: s(),
+                image: s(),
+                secs: 90,
+            },
+            "seatImageRebuilt",
+            &["type", "session", "ord", "cli", "image", "secs"],
+        );
+        check(
             CoreEvent::ContainerRuntimeWait {
                 session: s(),
                 ord: 2,

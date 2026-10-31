@@ -1199,6 +1199,8 @@ impl ChecksFloor {
                 crate::container_floor::build_image(&rt, DOCKERFILE, &tag, &[]).map_err(no)?;
             }
         }
+        // Held against the runtime's image cleanup (a kubelet's image GC), like the seat images.
+        let _ = crate::image_keep::hold(&rt, &[&tag]);
         let image_id = rt_run(
             &rt,
             &["image", "inspect", "--format", "{{.Id}}", &tag],

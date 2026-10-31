@@ -3727,6 +3727,17 @@ impl WrappedCliStepRunner {
                         );
                     }
                     Ok(mut c) => {
+                        // The seat image was missing and was built for this unit: said on the
+                        // run, so a slow start reads as a rebuild, never as a stalled seat.
+                        if let Some((image, took)) = c.image_built.take() {
+                            self.emit_event(crate::event::CoreEvent::SeatImageRebuilt {
+                                session: input.run_id.clone(),
+                                ord: input.unit.ord,
+                                cli: cli_key.clone(),
+                                image,
+                                secs: took.as_secs(),
+                            });
+                        }
                         // A claude seat's fence reflects what its container mounts: a host
                         // rule over an ancestor of its own tree (`~/.wicked` above
                         // `~/.wicked/repos`) is narrowed to the other mounted entries there.
