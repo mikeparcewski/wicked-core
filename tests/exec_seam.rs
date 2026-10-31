@@ -131,6 +131,7 @@ fn spec(session_id: &str) -> LaunchSpec {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     }
@@ -570,6 +571,7 @@ fn a_conditional_gate_approve_re_runs_the_unit_under_exec_mediation() {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     })

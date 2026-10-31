@@ -80,6 +80,7 @@ fn spec(session_id: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     }

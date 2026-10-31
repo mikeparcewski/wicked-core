@@ -1261,6 +1261,8 @@ pub(crate) fn run(
                     qe_acceptance,
                     // The legacy straight-through path runs no plan, so no power build.
                     power: _,
+                    // …and no orchestrator to hear a voice (core#1216).
+                    voice: _,
                 } = spec;
                 // (DES-TEAMING-002 T3) A plan — user-composed, or a preset's steps — must reach
                 // its approval gate; this straight-through path honours no gate, so it refuses one
@@ -1396,6 +1398,9 @@ pub(crate) fn run(
                         home.as_deref(),
                     )
                     .map_err(|e| anyhow::anyhow!(e))?;
+                    // (core#1216) The orchestrator's voice block: bounded, refused with NO
+                    // session persisted.
+                    crate::power::validate_voice(spec.voice.as_deref())?;
                     // core#411 / wicked-crew#497: the state-home INTAKE fence. An entry under the
                     // handed snapshot's state home that the registry cannot classify would refuse
                     // EVERY worker launch of this run — surfaced, until now, at the first worker
@@ -4672,10 +4677,11 @@ fn register_launch_plan(
         s.team_plan = Some(state.clone());
         // (program DES-POWER-MODE) The run's power record starts with the launch's switch.
         if state.power && s.power.is_none() {
-            s.power = Some(crate::power::PowerState::launched(
-                true,
-                crate::interaction::now_millis(),
-            ));
+            let mut p = crate::power::PowerState::launched(true, crate::interaction::now_millis());
+            // (core#1216) The person's voice for the orchestrator, kept on the run so a rework
+            // round or a restarted session hears it too.
+            p.voice = crate::power::launch_voice(spec.voice.as_deref());
+            s.power = Some(p);
         }
         put_node(store, s.to_node())?;
     }
@@ -4787,6 +4793,8 @@ pub(crate) fn launch_run_inner(
         // (WT-C2) The evidence root: same judgement, same synchronous refusal.
         crate::walkthrough::validate_evidence_root(spec.evidence_root.as_deref(), home.as_deref())
             .map_err(|e| anyhow::anyhow!(e))?;
+        // (core#1216) The orchestrator's voice block: same synchronous refusal.
+        crate::power::validate_voice(spec.voice.as_deref())?;
     }
     // If the run targets a registered repo, create its isolated worktree first.
     let (repo_ref, workdir) = resolve_workdir(store, &spec.repo_ref, &run_id)?;
@@ -10448,10 +10456,13 @@ fn power_dispatch(
             let power = s.power.as_ref().unwrap_or(power);
             let round = power.handoff.as_ref().map_or(1, |h| h.round.max(1));
             let task = unit.description.clone();
+            // (core#1216) The person's voice rides THIS brief only: the PA's scope step, the
+            // hand-off's reviewers, judges and QE are dispatched without it.
             unit.description.push_str(&crate::power::orchestrator_brief(
                 power.rigor,
                 power.plan.as_ref(),
                 round,
+                power.voice.as_deref(),
             ));
             crate::power::arm_build(
                 &session.id,
@@ -10462,6 +10473,7 @@ fn power_dispatch(
                     cli: unit.assigned_cli.clone().unwrap_or_default(),
                     round,
                     base: session.base_commit.clone(),
+                    voice: power.voice.clone(),
                 },
             );
             if let Some(p) = s.power.as_mut() {

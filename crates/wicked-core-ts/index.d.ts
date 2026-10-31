@@ -151,6 +151,15 @@ export interface LaunchOptions {
    */
   power?: boolean
   /**
+   * (core#1216) The person's VOICE BLOCK (their personality, resolved for the run's project):
+   * how the power-mode ORCHESTRATOR talks to them. Tone only: appended last to the
+   * orchestrator's brief under a governance line (and to each later turn); the PA's scope
+   * step, the hand-off's reviewers, judges and QE never receive it, and no gate reads it. At
+   * most 4096 bytes (a longer one REJECTS the launch). Ignored on a phased run. An older addon
+   * drops the field, so the orchestrator simply runs without a voice.
+   */
+  voice?: string
+  /**
    * (X-MIG M9, core#649) The run's DECLARED DELIVERABLES on a plan or preset launch (`plan` or a
    * preset `workflow`): absolute paths inside a declared write root (or worktree-relative paths)
    * the run must write. They join the `required_deliverables` of the plan's last creator step, so

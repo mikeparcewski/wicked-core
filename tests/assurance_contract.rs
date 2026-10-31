@@ -146,6 +146,7 @@ fn spec(sid: &str, workflow: &str, reduced: bool) -> LaunchSpec {
         primary: None,
         reduced_assurance: reduced,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     }

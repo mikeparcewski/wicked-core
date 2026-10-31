@@ -641,6 +641,7 @@ fn the_straight_through_path_refuses_every_qe_word() {
             primary: None,
             reduced_assurance: false,
             power: false,
+            voice: None,
             deliverables: Vec::new(),
             qe_acceptance: word.clone(),
         });

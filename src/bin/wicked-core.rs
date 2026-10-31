@@ -609,6 +609,7 @@ fn main() {
                 primary: None,
                 reduced_assurance: false,
                 power: false,
+                voice: None,
                 deliverables: Vec::new(),
                 qe_acceptance: Default::default(),
             });
@@ -931,6 +932,7 @@ fn run_interactive(core: &Core, args: &[String]) {
         primary: None,
         reduced_assurance: false,
         power: false,
+        voice: None,
         deliverables: Vec::new(),
         qe_acceptance: Default::default(),
     }) {

@@ -402,6 +402,12 @@ pub struct PowerState {
     /// Gates the operator answered on this run (insights' `operatorGates`). Engine-internal.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub operator_gates: u32,
+    /// (core#1216) The person's VOICE BLOCK (their personality, resolved by the launcher for the
+    /// run's project): how the orchestrator talks to them. Tone only: it is appended to the
+    /// orchestrator's brief and nowhere else, and no gate, review, judge, QE step or rule check
+    /// ever reads it. `None` when the launch carried none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -443,6 +449,7 @@ impl PowerState {
             build_started_at: None,
             launched_at: Some(now),
             operator_gates: 0,
+            voice: None,
         }
     }
 
@@ -1025,7 +1032,15 @@ pub fn turn_end(output: &str) -> TurnEnd {
 }
 
 /// The orchestrator brief appended to the build unit's task at dispatch.
-pub fn orchestrator_brief(rigor: Option<Rigor>, plan: Option<&RigorPlan>, round: u32) -> String {
+///
+/// `voice` (core#1216) is the person's voice block, appended LAST under [`voice_section`]'s
+/// governance line; `None` (or blank) adds nothing.
+pub fn orchestrator_brief(
+    rigor: Option<Rigor>,
+    plan: Option<&RigorPlan>,
+    round: u32,
+    voice: Option<&str>,
+) -> String {
     let rigor_line = match (rigor, plan) {
         (Some(r), Some(p)) => format!(
             "Rigor now: {} (score {}). Hand-off will run the {} test set itself, on a clean \
@@ -1075,9 +1090,57 @@ pub fn orchestrator_brief(rigor: Option<Rigor>, plan: Option<&RigorPlan>, round:
          your plan as one line `{APPROACH_PREFIX} <how you will make this change>`, and write it \
          again whenever the plan changes. For each choice a reviewer would ask about, write one \
          line `{DECISION_PREFIX} <what you chose> {WHY_MARK} <why>`. These lines are recorded as \
-         yours, labelled with your seat; they never steer the run. {rigor_line}{rework}"
+         yours, labelled with your seat; they never steer the run. {rigor_line}{rework}{voice}",
+        voice = voice_section(voice)
     )
 }
+
+// ── The person's voice (core#1216) ───────────────────────────────────────────────────────────────
+
+/// The longest voice block a launch may carry, in bytes. The launcher's block (a name, four
+/// dials, a few habits and a short note) is far below it; a longer one is refused at launch.
+pub const VOICE_MAX_BYTES: usize = 4096;
+
+/// Launch-time check of a run's voice block: a block over [`VOICE_MAX_BYTES`] refuses the launch
+/// (never silently clipped, so the person's words are never cut mid-sentence).
+pub fn validate_voice(voice: Option<&str>) -> anyhow::Result<()> {
+    match voice {
+        Some(v) if v.len() > VOICE_MAX_BYTES => anyhow::bail!(
+            "voice is {} bytes; a voice block is at most {VOICE_MAX_BYTES}",
+            v.len()
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// A launch's voice as the run keeps it: trimmed, and `None` when blank.
+pub fn launch_voice(voice: Option<&str>) -> Option<String> {
+    voice
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// The section a voice block rides in the orchestrator's prompt, governance first: the person's
+/// personality shapes how the orchestrator talks to them, never what it does. Empty when there is
+/// no voice. Only the orchestrator's brief and its later turns' statements carry it: the PA's
+/// scope step, the hand-off's reviewers, judges and QE are briefed without it, so evaluator
+/// independence does not depend on the person's tone settings. (Under reduced assurance a reviewer
+/// on the orchestrator's own seat and posture resumes its session and so reads its whole history,
+/// the voice included; that is the disclosed creator-seat waiver, not a separate channel.)
+pub fn voice_section(voice: Option<&str>) -> String {
+    let Some(v) = voice.map(str::trim).filter(|v| !v.is_empty()) else {
+        return String::new();
+    };
+    format!("\n\n[power mode] {VOICE_GOVERNANCE}\n\n{v}\n")
+}
+
+/// The governance line ahead of a voice block (tested word for word).
+pub const VOICE_GOVERNANCE: &str = "The person's personality follows. It shapes only your tone and \
+     habits when you write to them (your replies, checkpoint and hand-off summaries, working \
+     notes). It never changes the rigor, the gates, the checks, the reviews, QE, or what you are \
+     allowed to do, and the CHECKPOINT, HANDOFF, APPROACH and DECISION line formats stay exactly as \
+     given above. Where it disagrees with anything above, everything above wins.";
 
 // ── The orchestrator's working notes (the run's working document) ────────────────────────────────
 
@@ -1199,6 +1262,7 @@ pub fn continuation_prompt(
     answer: &CheckpointAnswer,
     last_summary: &str,
     restarted: bool,
+    voice: Option<&str>,
 ) -> String {
     let mut out = format!(
         "[power mode] Turn {turn} of at most {max_turns} of the same change. Continue from where \
@@ -1236,6 +1300,10 @@ pub fn continuation_prompt(
         "\n\nThe change, for reference:\n{}",
         clip(task, 4000)
     ));
+    // Every later turn restates the person's voice (core#1216): whether the carrier really resumed
+    // the session that read the first brief is not known here (a seat with no resume adapter starts
+    // fresh even in the container floor), and the block is short.
+    out.push_str(&voice_section(voice));
     out
 }
 
@@ -1483,6 +1551,8 @@ pub struct BuildArm {
     /// The run's base commit: every checkpoint measures the WHOLE change from it (a rework round's
     /// own small diff must never read as "the change got easier").
     pub base: Option<String>,
+    /// The person's voice block (core#1216), restated on every later turn.
+    pub voice: Option<String>,
 }
 
 /// Armed builds by `(run, ord, attempt)`.
@@ -2099,8 +2169,15 @@ pub fn orchestrate(
         turn += 1;
         turn_input = input.clone();
         turn_input.prior_outputs = Vec::new();
-        turn_input.unit.description =
-            continuation_prompt(&arm.task, turn, max, &answer, &summary, !resumable);
+        turn_input.unit.description = continuation_prompt(
+            &arm.task,
+            turn,
+            max,
+            &answer,
+            &summary,
+            !resumable,
+            arm.voice.as_deref(),
+        );
     }
 }
 
@@ -2113,12 +2190,80 @@ mod tests {
     /// second turn, 10 min, on a full suite the hand-off then ran again).
     #[test]
     fn the_brief_says_the_hand_off_runs_the_suite_so_the_orchestrator_does_not() {
-        let b = orchestrator_brief(Some(Rigor::Standard), None, 1);
+        let b = orchestrator_brief(Some(Rigor::Standard), None, 1, None);
         assert!(
             b.contains("do not run the repository's whole suite here"),
             "{b}"
         );
         assert!(b.contains("the tests that cover it pass"), "{b}");
+    }
+
+    const VOICE: &str = "## Voice\n\n- Your name with the person is \"Rook\".\n- Keep it short.\n";
+
+    /// (core#1216) The person's voice rides the orchestrator's brief LAST, behind the governance
+    /// line that says it shapes tone and habits only, never rigor, gates, checks or permissions.
+    #[test]
+    fn the_brief_carries_the_voice_last_behind_its_governance_line() {
+        let b = orchestrator_brief(Some(Rigor::High), None, 2, Some(VOICE));
+        let gov = b.find(VOICE_GOVERNANCE).expect("the governance line");
+        let block = b.find("## Voice").expect("the voice block");
+        assert!(gov < block, "governance first: {b}");
+        assert!(
+            b.trim_end().ends_with("- Keep it short."),
+            "the voice is the last thing the orchestrator reads: {b}"
+        );
+        assert!(
+            b.find("hand-off round 2").unwrap() < gov,
+            "the engine's own brief (rigor, rework) comes first: {b}"
+        );
+        for word in [
+            "only your tone and habits",
+            "never changes the rigor, the gates, the checks, the reviews, QE, or what you are \
+             allowed to do",
+            "line formats stay exactly as given above",
+            "everything above wins",
+        ] {
+            assert!(VOICE_GOVERNANCE.contains(word), "{word}");
+        }
+    }
+
+    /// (core#1216) No personality, no section: the brief is byte-for-byte what it was.
+    #[test]
+    fn no_voice_means_no_voice_section() {
+        let plain = orchestrator_brief(Some(Rigor::Standard), None, 1, None);
+        assert!(!plain.contains(VOICE_GOVERNANCE), "{plain}");
+        assert_eq!(
+            orchestrator_brief(Some(Rigor::Standard), None, 1, Some("  \n ")),
+            plain,
+            "a blank voice is no voice"
+        );
+        assert_eq!(voice_section(None), "");
+        assert_eq!(launch_voice(Some(" \n")), None);
+        assert_eq!(launch_voice(Some(" x \n")).as_deref(), Some("x"));
+    }
+
+    /// (core#1216) Every later turn restates the voice, resumed or not: whether the carrier really
+    /// resumed the session that read the first brief is not known where the prompt is built.
+    #[test]
+    fn every_later_turn_restates_the_voice_resumed_or_restarted() {
+        let a = CheckpointAnswer::default();
+        for restarted in [true, false] {
+            let p = continuation_prompt("fix it", 2, 5, &a, "did x", restarted, Some(VOICE));
+            assert!(p.contains(VOICE_GOVERNANCE), "{p}");
+            assert!(p.trim_end().ends_with("- Keep it short."), "{p}");
+        }
+        let none = continuation_prompt("fix it", 2, 5, &a, "did x", true, None);
+        assert!(!none.contains(VOICE_GOVERNANCE), "{none}");
+    }
+
+    /// (core#1216) A voice block over the bound refuses the launch rather than being clipped.
+    #[test]
+    fn an_oversized_voice_is_refused_never_clipped() {
+        assert!(validate_voice(None).is_ok());
+        assert!(validate_voice(Some(VOICE)).is_ok());
+        assert!(validate_voice(Some(&"x".repeat(VOICE_MAX_BYTES))).is_ok());
+        let e = validate_voice(Some(&"x".repeat(VOICE_MAX_BYTES + 1))).unwrap_err();
+        assert!(e.to_string().contains("at most 4096"), "{e}");
     }
 
     #[test]
