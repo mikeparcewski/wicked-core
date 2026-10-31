@@ -1110,15 +1110,47 @@ mod tests {
 
     #[test]
     fn ask_open_json_passes_multi_through() {
-        let r: AskMulti = serde_json::from_str(r#"{"min":2}"#).unwrap();
+        // Through the napi's JSON face: the bounds reach the frame, normalised, and an array answer is recorded.
+        let f = Fixture::new(SessionStatus::AwaitingHuman);
+        let events = f.core.subscribe();
+        let token = McpToken::mint();
+        let _binding = token.bind(unit(&f.run));
+        let req = serde_json::json!({
+            "token": token.value(),
+            "question": "Which branches?",
+            "choices": ["main", "release", "develop"],
+            "multi": { "min": 2 }
+        });
+        let ticket: serde_json::Value =
+            serde_json::from_str(&open_ask_json(&f.core, &req.to_string()).unwrap()).unwrap();
+        let created = frame(&events, "elicitationCreated");
+        assert_eq!(created["propType"], "array");
+        assert_eq!(created["multi"], serde_json::json!({"min": 2, "max": 3}));
+        let id = ticket["elicitationId"].as_str().unwrap().to_owned();
+        assert!(f
+            .core
+            .resolve_elicitation(
+                &f.run,
+                &id,
+                "accept".into(),
+                Some(serde_json::json!(["main"]))
+            )
+            .is_err());
+        f.core
+            .resolve_elicitation(
+                &f.run,
+                &id,
+                "accept".into(),
+                Some(serde_json::json!(["develop", "main"])),
+            )
+            .unwrap();
         assert_eq!(
-            r,
-            AskMulti {
-                min: Some(2),
-                max: None
-            }
+            f.core.run_events(&f.run)[1]["answer"],
+            r#"["main","develop"]"#
         );
-        assert!(serde_json::from_str::<AskMulti>(r#"{"most":2}"#).is_err());
+        // An unknown bound is refused at the JSON face.
+        let bad = serde_json::json!({ "token": token.value(), "question": "q", "choices": ["a", "b"], "multi": { "most": 2 } });
+        assert!(open_ask_json(&f.core, &bad.to_string()).is_err());
     }
 
     #[test]
