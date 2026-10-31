@@ -13807,6 +13807,66 @@ exit 1
         }
     }
 
+    /// (power-speed-2, rig run 5a88dcb6) A verify floor that reused the creator floor's checks
+    /// says so on each reused row, not only at the frame's top: the row's duration and retries
+    /// are the creator floor's. A check that ran here carries no mark, and neither does any row
+    /// of a reuse that was set aside (those ran here).
+    #[test]
+    fn each_reused_check_row_names_the_floor_it_was_reused_from() {
+        let frame = |voided: Option<String>| {
+            crate::event::CoreEvent::RepoChecksEvaluated {
+                session: "s".into(),
+                ord: 4,
+                attempt: 0,
+                passed: true,
+                criterion: "c".into(),
+                checks: vec![
+                    run_named("install", Some(0), false),
+                    run_named("typecheck", Some(0), false),
+                    run_named("test", Some(0), false),
+                ],
+                skipped: Vec::new(),
+                sandbox_level: "sandboxed".into(),
+                sandbox_error: None,
+                detect_error: None,
+                outcome: "passed".into(),
+                floor: "verify".into(),
+                claim: None,
+                env: None,
+                changed: Vec::new(),
+                changed_truncated: false,
+                reused_from: Some(FloorReuse {
+                    phase: Some("fix".into()),
+                    ord: 2,
+                    attempt: 0,
+                    reused: vec!["typecheck".into(), "test".into()],
+                    fresh: vec!["install".into()],
+                    voided,
+                }),
+                floor_runner: None,
+            }
+            .to_json()
+        };
+        let v = frame(None);
+        let row = |v: &serde_json::Value, name: &str| {
+            v["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["name"] == name)
+                .cloned()
+                .unwrap()
+        };
+        let from = serde_json::json!({"phase": "fix", "ord": 2, "attempt": 0});
+        assert_eq!(row(&v, "typecheck")["reusedFrom"], from);
+        assert_eq!(row(&v, "test")["reusedFrom"], from);
+        assert!(row(&v, "install").get("reusedFrom").is_none(), "{v:#}");
+        let set_aside = frame(Some("a fresh check failed after them".into()));
+        for name in ["install", "typecheck", "test"] {
+            assert!(row(&set_aside, name).get("reusedFrom").is_none(), "{name}");
+        }
+    }
+
     /// (deliver honors an override) A floor result's key: only the ordinary floor that RAN is keyed —
     /// never one that did not run, an operator's re-run or a floor with waived checks — and the
     /// digest moves with the stage, the package dir and every check's identity (a forced install

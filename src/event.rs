@@ -3039,6 +3039,23 @@ impl CoreEvent {
                 // before the field.
                 if let Some(r) = reused_from {
                     v["reusedFrom"] = serde_json::to_value(r).unwrap_or(serde_json::Value::Null);
+                    // (power-speed-2) …and on each reused check's own row: its durationMs, exit
+                    // and retries are the creator floor's, and a reader of one row must not take
+                    // them for a run on this floor. Not on a reuse that was set aside (`voided`):
+                    // those checks ran here.
+                    if r.voided.is_none() {
+                        let from = json!({ "phase": r.phase, "ord": r.ord, "attempt": r.attempt });
+                        if let Some(rows) = v["checks"].as_array_mut() {
+                            for row in rows {
+                                let reused = row["name"]
+                                    .as_str()
+                                    .is_some_and(|n| r.reused.iter().any(|x| x == n));
+                                if reused {
+                                    row["reusedFrom"] = from.clone();
+                                }
+                            }
+                        }
+                    }
                 }
                 // (DES-FLOOR-CONTAINER) Absent on a frame from before the field.
                 if let Some(r) = floor_runner {

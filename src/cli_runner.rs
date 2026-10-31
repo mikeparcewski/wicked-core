@@ -1006,9 +1006,10 @@ fn run_floor_fix(
 /// floor as stalled (disclosed; the engine does not read crew settings).
 const FLOOR_HEARTBEAT_EVERY: Duration = Duration::from_secs(300);
 
-/// (rig run 1d372696) The unit's live note while a distinct seat judges the change, before the
-/// repository's checks run (the hand-off to floor gap read as 1.5 min with no event).
-const JUDGE_NOTE: &str = "judge: a judge seat is reviewing the change before the checks run";
+/// (rig run 1d372696) The unit's live note while a distinct seat judges the change (the hand-off
+/// to floor gap read as 1.5 min with no event). A floor on a clean checkout runs alongside it
+/// (power-speed-2), so the note no longer says "before the checks run".
+const JUDGE_NOTE: &str = "judge: a judge seat is reviewing the change";
 
 /// Run `work` while a scoped side thread emits `"<label> — N min"` through `emit` at `t = 0` and
 /// then every `every` until `work` returns — liveness for a long, otherwise silent phase on the
@@ -2302,12 +2303,319 @@ fn judge_error_or_fallback(
     held_with_fallback_failures(who, held, refusals, fb)
 }
 
+/// F-039 REPO CHECKS FLOOR — what a unit's floor runs on, owned, so it can run on its own thread
+/// ([`run_floor_plan`]). The floor runs only for the def's code-verifying unit (or a bound agent
+/// unit that changed its tree, or an operator's re-check), only when the unit folded Ok, and not
+/// when the guard already caught the seat rewriting the tree (checks over a rewritten tree would
+/// certify the wrong code, and the gate denies on the mutation regardless).
+#[derive(Debug, Clone)]
+struct FloorPlan {
+    wd: std::path::PathBuf,
+    ord: u32,
+    attempt: u32,
+    run_id: String,
+    phase: Option<String>,
+    stage: crate::repo_checks::FloorStage,
+    ctx: crate::repo_checks::FloorContext,
+    rerun: Option<crate::repo_checks::FloorRerun>,
+    /// (core#417, operator ruling (a)) A GUARDED verify floor runs on a clean checkout of exactly
+    /// the tree the guard checked, never the live worktree — an untracked or ignored file there
+    /// cannot steer the checks.
+    guarded: bool,
+    /// The tree the GUARD checked: its first look, which judged the tree clean.
+    guard_tree: Option<String>,
+    /// (core#1144) The CREATOR floor runs on a clean checkout of the tree the seat left too,
+    /// whenever that tree and the pinned git dir are known — so its results are as trustworthy as
+    /// the verify floor's, and the verify floor of the same tree and base reuses them instead of
+    /// running the same checks again.
+    creator_tree: Option<String>,
+    git_dir: Option<String>,
+    /// (core#544) The tree id as it stood after the seat's turn.
+    current_tree: Option<String>,
+}
+
+impl FloorPlan {
+    /// The clean checkout this floor runs on — `(tree, pinned git dir)` — or `None` when it runs in
+    /// the live worktree (a repo-less run: no git, no snapshot).
+    fn clean_target(&self) -> Option<(&str, &str)> {
+        let tree = if self.guarded {
+            self.guard_tree.as_deref()
+        } else {
+            self.creator_tree.as_deref()
+        };
+        tree.zip(self.git_dir.as_deref())
+    }
+
+    fn journal_for(&self, tree: &str) -> crate::repo_checks::FloorJournal {
+        crate::repo_checks::FloorJournal {
+            ord: self.ord,
+            attempt: self.attempt,
+            tree: tree.to_string(),
+            phase: self.phase.clone(),
+        }
+    }
+
+    fn label(&self) -> String {
+        format!(
+            "repo checks floor ({}): running the repository's own checks",
+            self.stage.as_wire()
+        )
+    }
+
+    /// The report's identity and the log line, on every floor the plan ran.
+    fn finish(
+        &self,
+        mut report: crate::repo_checks::RepoChecksReport,
+        ran_on: Option<&str>,
+    ) -> crate::repo_checks::RepoChecksReport {
+        // (core#544) The tree these checks judged — the one this unit's next attempt compares
+        // against before it re-runs or carries this verdict.
+        report.tree = self.current_tree.clone();
+        // (deliver honors an override) The result's exact identity — the tree the checks RAN
+        // on, the base and the check set — so an operator's override of it can be stood on at
+        // deliver, and only there, when all three are unchanged. Only a GUARDED floor is
+        // keyed: it ran on a clean checkout of exactly that tree, as deliver's own floor does;
+        // a floor on the live worktree (an untracked or ignored file could have steered it)
+        // is never stood on in place of a clean one (xreview r1). The creator floor's key
+        // carries the creator stage in its check-set digest, so deliver never stands on it.
+        report.key = report.key_for(ran_on, &self.ctx);
+        eprintln!(
+            "wicked-core: repo checks floor ({}) for unit {}: {} — {}",
+            self.stage.as_wire(),
+            self.ord,
+            report.outcome().to_ascii_uppercase(),
+            report.summary()
+        );
+        report
+    }
+}
+
+/// What [`run_floor_plan`] did.
+enum FloorRun {
+    /// The floor ran (or was refused); its report.
+    Done(Box<crate::repo_checks::RepoChecksReport>),
+    /// Not run: it would have run in the live worktree, which only [`floor_live`] does, after the
+    /// judge.
+    LiveWorktree,
+}
+
+/// The unit's floor plan ([`FloorPlan`]), or `None` when no floor runs for it.
+#[allow(clippy::too_many_arguments)]
+fn floor_plan(
+    input: &StepInput,
+    output: &StepOutput,
+    floor_rerun: Option<&crate::repo_checks::FloorRerun>,
+    guard_first_look: Option<&crate::worktree_guard::WorktreeGuardOutcome>,
+    current_tree: Option<&str>,
+    default_floor_applies: bool,
+    recheck_armed: bool,
+) -> Option<FloorPlan> {
+    let guard_denies = matches!(
+        guard_first_look,
+        Some(crate::worktree_guard::WorktreeGuardOutcome::Mutated(m)) if m.denies()
+    ) || matches!(
+        guard_first_look,
+        Some(crate::worktree_guard::WorktreeGuardOutcome::Unverifiable(_))
+    );
+    let wd = input.workdir.as_deref()?;
+    if !((input.unit.repo_checks_floor || default_floor_applies || recheck_armed)
+        && input.unit.tool_cmd.is_none()
+        && output.status == StepStatus::Ok
+        && !guard_denies)
+    {
+        return None;
+    }
+    eprintln!(
+        "wicked-core: repo checks floor — running the repository's own checks in {} for unit {} \
+         ({})",
+        wd.display(),
+        input.unit.ord,
+        if input.unit.repo_checks_floor {
+            "F-039: the def's verified_evidence phase"
+        } else if default_floor_applies {
+            "F-7R2-005: the unit changed the worktree tree — default floor"
+        } else {
+            "an operator retry re-runs the floor on the unchanged tree — once"
+        }
+    );
+    // core#467 / core#469: WHOSE floor this is decides the test set (targeted first at the
+    // creator) and whether the transcript's "pre-existing" claim is judged; the RUN base (recorded
+    // on the unit at dispatch — or, unrecorded, the dispatch baseline's HEAD) is the base the
+    // baseline diff compares against, through the PINNED git dir the baseline was taken through.
+    let stage = if input.unit.repo_checks_floor {
+        crate::repo_checks::FloorStage::Verify
+    } else {
+        crate::repo_checks::FloorStage::Creator
+    };
+    let baseline = input.unit.worktree_baseline.as_ref();
+    let ctx = crate::repo_checks::FloorContext {
+        stage,
+        force_install: false,
+        // The run base first (F-RC2-009): a creator that committed its work has moved the
+        // baseline's HEAD onto the head itself, and base == head compares nothing.
+        base_head: input
+            .unit
+            .run_base_commit
+            .clone()
+            .filter(|h| !h.is_empty())
+            .or_else(|| baseline.map(|b| b.head.clone()).filter(|h| !h.is_empty())),
+        git_dir: baseline
+            .and_then(|b| b.git_dir.clone())
+            .map(std::path::PathBuf::from),
+        claim_text: (stage == crate::repo_checks::FloorStage::Creator)
+            .then(|| output.output.clone()),
+        package_dir: None,
+        run_id: Some(input.run_id.clone()),
+        // (core#1187) The creator floor's affected set reads the repo's code graph.
+        code_graph: input
+            .governance
+            .as_ref()
+            .and_then(|g| g.code_graph_db.as_deref())
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from),
+    };
+    let guard_tree = match guard_first_look {
+        Some(crate::worktree_guard::WorktreeGuardOutcome::Clean { after, .. }) => {
+            Some(after.tree.clone())
+        }
+        _ => None,
+    };
+    Some(FloorPlan {
+        wd: wd.to_path_buf(),
+        ord: input.unit.ord,
+        attempt: input.attempt,
+        run_id: input.run_id.clone(),
+        phase: input.unit.phase_id().map(str::to_string),
+        stage,
+        ctx,
+        rerun: floor_rerun.cloned(),
+        guarded: stage == crate::repo_checks::FloorStage::Verify && input.unit.worktree_guarded,
+        guard_tree,
+        creator_tree: (stage == crate::repo_checks::FloorStage::Creator)
+            .then(|| current_tree.map(str::to_string))
+            .flatten(),
+        git_dir: baseline.and_then(|b| b.git_dir.clone()),
+        current_tree: current_tree.map(str::to_string),
+    })
+}
+
+/// Run the plan's floor on its clean checkout. A guarded verify floor whose checkout cannot be
+/// made is refused (fail-closed). A creator floor whose checkout cannot be made — or a floor with
+/// no clean target at all — runs in the live worktree ([`floor_live`]) only when `live_ok`;
+/// otherwise it is handed back ([`FloorRun::LiveWorktree`]) to run after the judge.
+///
+/// crew #581 (F-BM-010): the floor heartbeats through the unit's sink — an ordinary
+/// `unitOutputDelta` at the start and every 5 min until it returns — so the stall watchdog never
+/// reads a long floor as a wedged worker; the per-check durations stay on
+/// `repoChecksEvaluated.checks[].durationMs`.
+fn run_floor_plan(plan: &FloorPlan, emit_delta: &DeltaSink, live_ok: bool) -> FloorRun {
+    let Some((tree, git_dir)) = plan.clean_target() else {
+        return if live_ok {
+            FloorRun::Done(Box::new(floor_live(plan, emit_delta)))
+        } else {
+            FloorRun::LiveWorktree
+        };
+    };
+    let checkout = crate::repo_checks::checkout_guarded_tree(
+        &plan.wd,
+        std::path::Path::new(git_dir),
+        tree,
+        &format!("{}-{}-a{}", plan.run_id, plan.ord, plan.attempt),
+    );
+    match checkout {
+        Ok(checkout) => {
+            let report =
+                with_floor_heartbeat(emit_delta, &plan.label(), FLOOR_HEARTBEAT_EVERY, || {
+                    checkout.run_floor_journaled(
+                        &plan.ctx,
+                        plan.rerun.as_ref(),
+                        &plan.journal_for(tree),
+                    )
+                });
+            drop(checkout);
+            FloorRun::Done(Box::new(plan.finish(report, Some(tree))))
+        }
+        Err(why) if plan.guarded => FloorRun::Done(Box::new(plan.finish(
+            crate::repo_checks::guarded_checkout_refused(&plan.wd, &plan.ctx, &why),
+            None,
+        ))),
+        Err(why) => {
+            eprintln!(
+                "wicked-core: repo checks floor (creator) for unit {}: the tree could not be \
+                 checked out clean ({why}); the checks run in the live worktree, and the verify \
+                 floor will not reuse them",
+                plan.ord
+            );
+            if live_ok {
+                FloorRun::Done(Box::new(floor_live(plan, emit_delta)))
+            } else {
+                FloorRun::LiveWorktree
+            }
+        }
+    }
+}
+
+/// The plan's floor in the LIVE worktree: a creator floor whose clean checkout could not be made
+/// (unkeyed, never reused), or a repo-less run's. (J4) Journaled on the tree the worktree holds
+/// now, so a floor a daemon restart interrupts resumes on the same tree.
+fn floor_live(plan: &FloorPlan, emit_delta: &DeltaSink) -> crate::repo_checks::RepoChecksReport {
+    let report = with_floor_heartbeat(emit_delta, &plan.label(), FLOOR_HEARTBEAT_EVERY, || {
+        crate::repo_checks::run_floor_journaled(
+            &plan.wd,
+            &plan.ctx,
+            plan.rerun.as_ref(),
+            plan.current_tree
+                .as_deref()
+                .map(|t| plan.journal_for(t))
+                .as_ref(),
+        )
+    });
+    plan.finish(report, None)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_unit_and_judge_on(
     runner: &Arc<dyn StepRunner>,
     input: &StepInput,
     agent_review_target: Option<&str>,
     emit_delta: &DeltaSink,
+    roster: &[crate::AgenticCli],
+    run_roster: &[String],
+    benched: &[String],
+    fallback: JudgeFallbackCtx<'_>,
+    exec_bus: Option<&str>,
+    team: Option<&crate::team::runner::TeamRunner>,
+) -> (
+    StepOutput,
+    Option<crate::validator::AgentVerdict>,
+    crate::workflow::UnitEvidence,
+) {
+    // (power-speed-2) The scope the unit's early floor runs in: it is joined where the floor's
+    // result is read, and in any case before this returns.
+    std::thread::scope(|scope| {
+        run_unit_and_judge_in(
+            scope,
+            runner,
+            input,
+            agent_review_target,
+            emit_delta,
+            roster,
+            run_roster,
+            benched,
+            fallback,
+            exec_bus,
+            team,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_unit_and_judge_in<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    runner: &Arc<dyn StepRunner>,
+    input: &StepInput,
+    agent_review_target: Option<&str>,
+    emit_delta: &'env DeltaSink,
     roster: &[crate::AgenticCli],
     run_roster: &[String],
     benched: &[String],
@@ -2532,6 +2840,126 @@ fn run_unit_and_judge_on(
             }
         },
     };
+    // (F-7R2-005) DID THE UNIT CHANGE THE TREE? For a bound AGENT unit the guard does not cover
+    // (a creator, a prose-planned unit), compare the worktree against the baseline the actor
+    // snapshotted at dispatch. `Some(true)` arms the DEFAULT floor + judge below; an unknown
+    // (no baseline persisted, git failed) is treated as CHANGED — the checks run rather than a
+    // change slipping through ungated. A guarded unit keeps `None`: the guard owns its tree.
+    let bound_agent = output.status == StepStatus::Ok
+        && input.unit.tool_cmd.is_none()
+        && input.unit.default_floor
+        && input.workdir.is_some()
+        && !crate::worktree_guard::applies_to(&input.unit);
+    let tree_changed: Option<bool> = if bound_agent {
+        let wd = input.workdir.as_deref().expect("bound");
+        match input.unit.worktree_baseline.as_ref() {
+            Some(baseline) => match crate::worktree_guard::tree_changed_since(wd, baseline) {
+                Ok(changed) => Some(changed),
+                Err(e) => {
+                    eprintln!(
+                        "wicked-core: unit {} — could not compare the worktree against its \
+                         dispatch baseline ({e}); treating the tree as CHANGED so the default \
+                         repo-checks floor runs (fail-closed, F-7R2-005)",
+                        input.unit.ord
+                    );
+                    Some(true)
+                }
+            },
+            None => {
+                eprintln!(
+                    "wicked-core: unit {} carries no dispatch baseline; treating the tree as \
+                     CHANGED so the default repo-checks floor runs (fail-closed, F-7R2-005)",
+                    input.unit.ord
+                );
+                Some(true)
+            }
+        }
+    } else {
+        None
+    };
+    // (core#544) The tree id as it stands now: the floor's report records the tree it ran
+    // ON, so a rework that leaves the tree identical to the one the unit's last floor judged
+    // carries that verdict forward (the fold), while a tree no floor of this unit has judged —
+    // an operator's hand edit between attempts — runs the checks even though this attempt
+    // changed nothing.
+    let current_tree: Option<String> = bound_agent
+        .then(|| {
+            let wd = input.workdir.as_deref()?;
+            let git_dir = input.unit.worktree_baseline.as_ref()?.git_dir.as_deref()?;
+            crate::worktree_guard::snapshot_through(wd, std::path::Path::new(git_dir))
+                .map(|s| s.tree)
+                .ok()
+        })
+        .flatten();
+    let unfloored_tree =
+        input.unit.repo_checks.as_ref().is_some_and(|r| {
+            current_tree.is_none() || r.tree.as_deref() != current_tree.as_deref()
+        });
+    // The DEFAULT floor applies to a bound agent unit that changed (or may have changed) its
+    // tree: the repository's own checks run and, when an eligible non-creator seat exists, a
+    // judge distinct from the creator renders a verdict (F-7R2-005) — and to one whose
+    // tree no floor of this unit has judged yet, or whose floor the operator asked to re-run.
+    let default_floor_applies =
+        bound_agent && (tree_changed != Some(false) || unfloored_tree || floor_rerun.is_some());
+    // (rejudge) The DEFAULT judge re-runs on a re-judge even though the tree is the one its floor
+    // already judged — the judge is what the operator asked for; the checks are not re-run.
+    let default_judge_applies = default_floor_applies || (bound_agent && rejudge.is_some());
+    // An OPERATOR RETRY of this unit's escalation gate armed ONE re-run of its floor
+    // (`RepoChecksReport::recheck`): the checks run on the tree as it stands even when this
+    // attempt left it unchanged — the single exception to the core#544 carry-forward, so a flaky
+    // result is not sticky per tree. The checks only; the judge arms exactly as before.
+    let recheck_armed = bound_agent
+        && input
+            .unit
+            .repo_checks
+            .as_ref()
+            .is_some_and(|r| r.recheck.is_some());
+    // F-036 WORKTREE GUARD, first look — taken right after the seat's own work so the repo checks
+    // below are never run over a tree the seat already rewrote (they would certify the wrong
+    // code). This is NOT the outcome the gate sees: the FINAL comparison is taken at the very end
+    // of this function, after the judge and the checks, so a write that lands after the seat
+    // returns (a backgrounded process, a "passing" check script that edits a tracked file) is
+    // caught too (codex review on #414). Only for a unit that folded Ok: a failed unit fails on
+    // its own account and never reaches the gate this feeds. (power-speed-2) Taken before the QE
+    // reviewer and the team's final pass, which run alongside the floor: neither may write the
+    // tree, and the final comparison below still catches one that did.
+    let guard_first_look = if output.status == StepStatus::Ok {
+        crate::worktree_guard::outcome_for_unit(&input.unit, input.workdir.as_deref())
+    } else {
+        None
+    };
+    // DES-002 §8.8: the PA's review of a member's step has no judge and no floor (below).
+    let member_reviewing = input
+        .unit
+        .member_step
+        .as_ref()
+        .is_some_and(|m| m.reviewing.is_some());
+    // F-039 REPO CHECKS FLOOR: whether it runs, and on what ([`FloorPlan`]).
+    let floor_plan = if member_reviewing {
+        None
+    } else {
+        floor_plan(
+            input,
+            &output,
+            floor_rerun,
+            guard_first_look.as_ref(),
+            current_tree.as_deref(),
+            default_floor_applies,
+            recheck_armed,
+        )
+    };
+    // (power-speed-2) A floor that runs on a CLEAN CHECKOUT of a known tree starts now, on its own
+    // thread, while the QE reviewer, the team's final pass and the judge do their work: the
+    // checks run on that copy (or on a container's copy of it), so nothing they build can reach
+    // the worktree those read, and nothing those do can reach the copy. A floor that would run in
+    // the live worktree never starts early: it runs after the judge, as it always has.
+    let early_floor = floor_plan
+        .as_ref()
+        .filter(|p| p.clean_target().is_some())
+        .map(|p| {
+            let p = p.clone();
+            scope.spawn(move || run_floor_plan(&p, emit_delta, false))
+        });
     // (DES-QE-EVERY-SEAT) THE ISOLATED QE REVIEWER. For the run's QE unit with a `required`
     // decision, the turn above was the EXECUTOR (writer + executor, no QE verdict); the engine now
     // runs the reviewer as its own fresh worker session on a run seat, handed only the evidence
@@ -2539,43 +2967,46 @@ fn run_unit_and_judge_on(
     // log, folded as that turn's (the record carries its nonce and flags); the unit's output stays
     // the executor's. A floor re-run runs no reviewer (the seat does not run again): it carries or
     // invalidates the last record.
-    let qe_review = match floor_rerun {
-        Some(r) => crate::qe_acceptance::review::on_floor_rerun(&input.unit, r.fix.is_some()),
-        // (rejudge) Nor does a judge re-run: the seat did not run, the tree is the reviewed one.
-        None if rejudge.is_some() => {
-            crate::qe_acceptance::review::on_floor_rerun(&input.unit, false)
-        }
-        None => {
-            crate::qe_acceptance::review::run(runner, input, &output, qe_not_before, emit_delta)
-        }
-    };
-    // T5: `step.completed`, then the bounded gate wait for S's `ledger.folded` (fail-closed
-    // synthesis on timeout). The snapshot is the attempt's `UnitEvidence.team`.
-    let mut team_snapshot: Option<crate::domain::UnitTeamSnapshot> = match &attempt_team {
-        crate::team::runner::Attempt::NotTeam => None,
-        crate::team::runner::Attempt::Local(s) => Some((**s).clone()),
-        // Presented = the block was built from a read stream AND a seat turn consumed it: a
-        // repo-checks re-run never runs the seat, and a carrier that refused the launch before
-        // any prompt (a skills refusal) returns a failed output with no turn behind it (codex
-        // review of #740 round 7) — only an `Ok` turn proves the seat saw its prior context.
-        crate::team::runner::Attempt::Claimed(c) => Some(crate::team::runner::complete_with(
-            c,
-            &output,
-            boundary_read
-                && floor_rerun.is_none()
-                && rejudge.is_none()
-                && output.status == StepStatus::Ok,
-        )),
-    };
+    //
+    // (power-speed-2) It runs alongside the team's final pass below (and the early floor above):
+    // the reviewer reads the evidence the executor recorded, the monitors read the executor's
+    // answer, and neither reads the other's result.
+    let (qe_review, mut team_snapshot) = std::thread::scope(|s| {
+        let qe = s.spawn(|| match floor_rerun {
+            Some(r) => crate::qe_acceptance::review::on_floor_rerun(&input.unit, r.fix.is_some()),
+            // (rejudge) Nor does a judge re-run: the seat did not run, the tree is the reviewed one.
+            None if rejudge.is_some() => {
+                crate::qe_acceptance::review::on_floor_rerun(&input.unit, false)
+            }
+            None => {
+                crate::qe_acceptance::review::run(runner, input, &output, qe_not_before, emit_delta)
+            }
+        });
+        // T5: `step.completed`, then the bounded gate wait for S's `ledger.folded` (fail-closed
+        // synthesis on timeout). The snapshot is the attempt's `UnitEvidence.team`.
+        let team: Option<crate::domain::UnitTeamSnapshot> = match &attempt_team {
+            crate::team::runner::Attempt::NotTeam => None,
+            crate::team::runner::Attempt::Local(s) => Some((**s).clone()),
+            // Presented = the block was built from a read stream AND a seat turn consumed it: a
+            // repo-checks re-run never runs the seat, and a carrier that refused the launch before
+            // any prompt (a skills refusal) returns a failed output with no turn behind it (codex
+            // review of #740 round 7) — only an `Ok` turn proves the seat saw its prior context.
+            crate::team::runner::Attempt::Claimed(c) => Some(crate::team::runner::complete_with(
+                c,
+                &output,
+                boundary_read
+                    && floor_rerun.is_none()
+                    && rejudge.is_none()
+                    && output.status == StepStatus::Ok,
+            )),
+        };
+        let qe = qe.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+        (qe, team)
+    });
     // DES-002 §8.8: the PA's review of a member's step is team evidence, never the gate — the
     // member's step already had its gate (its creator, the member, excluded). No judge, no floor:
     // the engine reads the `STEP` verdict and the attempt's ledger from this result.
-    if input
-        .unit
-        .member_step
-        .as_ref()
-        .is_some_and(|m| m.reviewing.is_some())
-    {
+    if member_reviewing {
         return (
             output,
             None,
@@ -2839,92 +3270,6 @@ fn run_unit_and_judge_on(
                 }
             }
         }
-    };
-    // (F-7R2-005) DID THE UNIT CHANGE THE TREE? For a bound AGENT unit the guard does not cover
-    // (a creator, a prose-planned unit), compare the worktree against the baseline the actor
-    // snapshotted at dispatch. `Some(true)` arms the DEFAULT floor + judge below; an unknown
-    // (no baseline persisted, git failed) is treated as CHANGED — the checks run rather than a
-    // change slipping through ungated. A guarded unit keeps `None`: the guard owns its tree.
-    let bound_agent = output.status == StepStatus::Ok
-        && input.unit.tool_cmd.is_none()
-        && input.unit.default_floor
-        && input.workdir.is_some()
-        && !crate::worktree_guard::applies_to(&input.unit);
-    let tree_changed: Option<bool> = if bound_agent {
-        let wd = input.workdir.as_deref().expect("bound");
-        match input.unit.worktree_baseline.as_ref() {
-            Some(baseline) => match crate::worktree_guard::tree_changed_since(wd, baseline) {
-                Ok(changed) => Some(changed),
-                Err(e) => {
-                    eprintln!(
-                        "wicked-core: unit {} — could not compare the worktree against its \
-                         dispatch baseline ({e}); treating the tree as CHANGED so the default \
-                         repo-checks floor runs (fail-closed, F-7R2-005)",
-                        input.unit.ord
-                    );
-                    Some(true)
-                }
-            },
-            None => {
-                eprintln!(
-                    "wicked-core: unit {} carries no dispatch baseline; treating the tree as \
-                     CHANGED so the default repo-checks floor runs (fail-closed, F-7R2-005)",
-                    input.unit.ord
-                );
-                Some(true)
-            }
-        }
-    } else {
-        None
-    };
-    // (core#544) The tree id as it stands now: the floor's report records the tree it ran
-    // ON, so a rework that leaves the tree identical to the one the unit's last floor judged
-    // carries that verdict forward (the fold), while a tree no floor of this unit has judged —
-    // an operator's hand edit between attempts — runs the checks even though this attempt
-    // changed nothing.
-    let current_tree: Option<String> = bound_agent
-        .then(|| {
-            let wd = input.workdir.as_deref()?;
-            let git_dir = input.unit.worktree_baseline.as_ref()?.git_dir.as_deref()?;
-            crate::worktree_guard::snapshot_through(wd, std::path::Path::new(git_dir))
-                .map(|s| s.tree)
-                .ok()
-        })
-        .flatten();
-    let unfloored_tree =
-        input.unit.repo_checks.as_ref().is_some_and(|r| {
-            current_tree.is_none() || r.tree.as_deref() != current_tree.as_deref()
-        });
-    // The DEFAULT floor applies to a bound agent unit that changed (or may have changed) its
-    // tree: the repository's own checks run and, when an eligible non-creator seat exists, a
-    // judge distinct from the creator renders a verdict (F-7R2-005) — and to one whose
-    // tree no floor of this unit has judged yet, or whose floor the operator asked to re-run.
-    let default_floor_applies =
-        bound_agent && (tree_changed != Some(false) || unfloored_tree || floor_rerun.is_some());
-    // (rejudge) The DEFAULT judge re-runs on a re-judge even though the tree is the one its floor
-    // already judged — the judge is what the operator asked for; the checks are not re-run.
-    let default_judge_applies = default_floor_applies || (bound_agent && rejudge.is_some());
-    // An OPERATOR RETRY of this unit's escalation gate armed ONE re-run of its floor
-    // (`RepoChecksReport::recheck`): the checks run on the tree as it stands even when this
-    // attempt left it unchanged — the single exception to the core#544 carry-forward, so a flaky
-    // result is not sticky per tree. The checks only; the judge arms exactly as before.
-    let recheck_armed = bound_agent
-        && input
-            .unit
-            .repo_checks
-            .as_ref()
-            .is_some_and(|r| r.recheck.is_some());
-    // F-036 WORKTREE GUARD, first look — taken right after the seat's own work so the repo checks
-    // below are never run over a tree the seat already rewrote (they would certify the wrong
-    // code). This is NOT the outcome the gate sees: the FINAL comparison is taken at the very end
-    // of this function, after the judge and the checks, so a write that lands after the seat
-    // returns (a backgrounded process, a "passing" check script that edits a tracked file) is
-    // caught too (codex review on #414). Only for a unit that folded Ok: a failed unit fails on
-    // its own account and never reaches the gate this feeds.
-    let guard_first_look = if output.status == StepStatus::Ok {
-        crate::worktree_guard::outcome_for_unit(&input.unit, input.workdir.as_deref())
-    } else {
-        None
     };
     let work_owned = select_work_for_agent(
         input.unit.role,
@@ -3456,203 +3801,21 @@ fn run_unit_and_judge_on(
             emit_delta,
         )
     });
-    // F-039 REPO CHECKS FLOOR — the engine runs the repository's own checks LAST (slowest, and
-    // its build artifacts must not colour the guard's comparison or the judge's evidence above),
-    // only for the def's code-verifying unit, only when the unit folded Ok, and not when the
-    // guard already caught the seat rewriting the tree (checks over a rewritten tree would
-    // certify the wrong code, and the gate denies on the mutation regardless).
-    let guard_denies = matches!(
-        &guard_first_look,
-        Some(crate::worktree_guard::WorktreeGuardOutcome::Mutated(m)) if m.denies()
-    ) || matches!(
-        &guard_first_look,
-        Some(crate::worktree_guard::WorktreeGuardOutcome::Unverifiable(_))
-    );
-    let repo_checks = match input.workdir.as_deref() {
-        Some(wd)
-            if (input.unit.repo_checks_floor || default_floor_applies || recheck_armed)
-                && input.unit.tool_cmd.is_none()
-                && output.status == StepStatus::Ok
-                && !guard_denies =>
-        {
-            eprintln!(
-                "wicked-core: repo checks floor — running the repository's own checks in {} for \
-                 unit {} ({})",
-                wd.display(),
-                input.unit.ord,
-                if input.unit.repo_checks_floor {
-                    "F-039: the def's verified_evidence phase"
-                } else if default_floor_applies {
-                    "F-7R2-005: the unit changed the worktree tree — default floor"
-                } else {
-                    "an operator retry re-runs the floor on the unchanged tree — once"
-                }
-            );
-            // core#467 / core#469: WHOSE floor this is decides the test set (targeted first at
-            // the creator) and whether the transcript's "pre-existing" claim is judged; the RUN
-            // base (recorded on the unit at dispatch — or, unrecorded, the dispatch baseline's
-            // HEAD) is the base the baseline diff compares against, through the PINNED git dir
-            // the baseline was taken through.
-            let stage = if input.unit.repo_checks_floor {
-                crate::repo_checks::FloorStage::Verify
-            } else {
-                crate::repo_checks::FloorStage::Creator
-            };
-            let baseline = input.unit.worktree_baseline.as_ref();
-            let ctx = crate::repo_checks::FloorContext {
-                stage,
-                force_install: false,
-                // The run base first (F-RC2-009): a creator that committed its work has moved
-                // the baseline's HEAD onto the head itself, and base == head compares nothing.
-                base_head: input
-                    .unit
-                    .run_base_commit
-                    .clone()
-                    .filter(|h| !h.is_empty())
-                    .or_else(|| baseline.map(|b| b.head.clone()).filter(|h| !h.is_empty())),
-                git_dir: baseline
-                    .and_then(|b| b.git_dir.clone())
-                    .map(std::path::PathBuf::from),
-                claim_text: (stage == crate::repo_checks::FloorStage::Creator)
-                    .then(|| output.output.clone()),
-                package_dir: None,
-                run_id: Some(input.run_id.clone()),
-                // (core#1187) The creator floor's affected set reads the repo's code graph.
-                code_graph: input
-                    .governance
-                    .as_ref()
-                    .and_then(|g| g.code_graph_db.as_deref())
-                    .filter(|p| !p.is_empty())
-                    .map(std::path::PathBuf::from),
-            };
-            // crew #581 (F-BM-010): the floor runs on THIS thread after the runner returned, so
-            // the unit's live-output stream went silent for its whole duration (run 8: crew's
-            // `test` > 25 min under a 3600 s bound → the stall watchdog read 30 min of silence as
-            // a wedged worker and re-dispatched a second creator into the same worktree). The
-            // floor now heartbeats through the sink this thread ALREADY holds — an ordinary
-            // `unitOutputDelta` at the start and every 5 min until `run_floor` returns — so the
-            // watchdog's ladder resets on the existing frame (crew clocks any frame carrying the
-            // session). No new frame, hook, exemption or `FloorContext` change; the per-check
-            // durations stay on `repoChecksEvaluated.checks[].durationMs`.
-            // (core#417, operator ruling (a)) A GUARDED verify floor runs on a clean checkout of
-            // exactly the tree the guard checked, never the live worktree — an untracked or
-            // ignored file there cannot steer the checks.
-            let guarded =
-                stage == crate::repo_checks::FloorStage::Verify && input.unit.worktree_guarded;
-            let git_dir = baseline.and_then(|b| b.git_dir.as_deref());
-            // The tree the GUARD checked: its first look, which judged the tree clean (the floor
-            // does not run over a mutated or unverifiable one).
-            let guard_tree = match &guard_first_look {
-                Some(crate::worktree_guard::WorktreeGuardOutcome::Clean { after, .. }) => {
-                    Some(after.tree.as_str())
-                }
-                _ => None,
-            };
-            // (core#1144) The CREATOR floor runs on a clean checkout of the tree the seat left
-            // too, whenever that tree and the pinned git dir are known — so its results are as
-            // trustworthy as the verify floor's, and the verify floor of the same tree and base
-            // reuses them instead of running the same checks again. A checkout that cannot be made
-            // falls back to the live worktree (the creator floor's historical place, unkeyed and
-            // never reused); the verify floor stays fail-closed.
-            let creator_tree = (stage == crate::repo_checks::FloorStage::Creator)
-                .then_some(current_tree.as_deref())
-                .flatten();
-            let phase = input.unit.phase_id().map(str::to_string);
-            let journal_for = |tree: &str| crate::repo_checks::FloorJournal {
-                ord: input.unit.ord,
-                attempt: input.attempt,
-                tree: tree.to_string(),
-                phase: phase.clone(),
-            };
-            let (report, ran_on) = with_floor_heartbeat(
-                emit_delta,
-                &format!(
-                    "repo checks floor ({}): running the repository's own checks",
-                    stage.as_wire()
-                ),
-                FLOOR_HEARTBEAT_EVERY,
-                || {
-                    let checkout = |tree: &str, git_dir: &str| {
-                        crate::repo_checks::checkout_guarded_tree(
-                            wd,
-                            std::path::Path::new(git_dir),
-                            tree,
-                            &format!("{}-{}-a{}", input.run_id, input.unit.ord, input.attempt),
-                        )
-                    };
-                    match (guarded, guard_tree, creator_tree, git_dir) {
-                        (true, Some(tree), _, Some(git_dir)) => match checkout(tree, git_dir) {
-                            Ok(checkout) => (
-                                checkout.run_floor_journaled(&ctx, floor_rerun, &journal_for(tree)),
-                                Some(tree),
-                            ),
-                            Err(why) => (
-                                crate::repo_checks::guarded_checkout_refused(wd, &ctx, &why),
-                                None,
-                            ),
-                        },
-                        (false, _, Some(tree), Some(git_dir)) => match checkout(tree, git_dir) {
-                            Ok(checkout) => (
-                                checkout.run_floor_journaled(&ctx, floor_rerun, &journal_for(tree)),
-                                Some(tree),
-                            ),
-                            Err(why) => {
-                                eprintln!(
-                                    "wicked-core: repo checks floor (creator) for unit {}: the \
-                                     tree could not be checked out clean ({why}); the checks run \
-                                     in the live worktree, and the verify floor will not reuse \
-                                     them",
-                                    input.unit.ord
-                                );
-                                (
-                                    crate::repo_checks::run_floor_journaled(
-                                        wd,
-                                        &ctx,
-                                        floor_rerun,
-                                        Some(&journal_for(tree)),
-                                    ),
-                                    None,
-                                )
-                            }
-                        },
-                        // No guard tree (a repo-less run: no git, no snapshot) — there is
-                        // no guarded tree to check out, so the floor stays where the run is.
-                        // (J4) Journaled on the tree the worktree holds now, so a floor a
-                        // daemon restart interrupts resumes on the same tree.
-                        _ => (
-                            crate::repo_checks::run_floor_journaled(
-                                wd,
-                                &ctx,
-                                floor_rerun,
-                                current_tree.as_deref().map(journal_for).as_ref(),
-                            ),
-                            None,
-                        ),
-                    }
-                },
-            );
-            // (core#544) The tree these checks judged — the one this unit's next attempt compares
-            // against before it re-runs or carries this verdict.
-            let mut report = report;
-            report.tree = current_tree.clone();
-            // (deliver honors an override) The result's exact identity — the tree the checks RAN
-            // on, the base and the check set — so an operator's override of it can be stood on at
-            // deliver, and only there, when all three are unchanged. Only a GUARDED floor is
-            // keyed: it ran on a clean checkout of exactly that tree, as deliver's own floor does;
-            // a floor on the live worktree (an untracked or ignored file could have steered it)
-            // is never stood on in place of a clean one (xreview r1). The creator floor's key
-            // carries the creator stage in its check-set digest, so deliver never stands on it.
-            report.key = report.key_for(ran_on, &ctx);
-            eprintln!(
-                "wicked-core: repo checks floor ({}) for unit {}: {} — {}",
-                stage.as_wire(),
-                input.unit.ord,
-                report.outcome().to_ascii_uppercase(),
-                report.summary()
-            );
-            Some(report)
-        }
-        _ => None,
+    // F-039 REPO CHECKS FLOOR ([`FloorPlan`]). A floor on a clean checkout started right after the
+    // seat's turn (`early_floor`) and is joined here; a floor in the live worktree runs here, LAST
+    // (slowest, and its build artifacts must not colour the guard's comparison or the judge's
+    // evidence above), as it always has.
+    let repo_checks = match early_floor.map(|h| h.join()) {
+        Some(Ok(FloorRun::Done(report))) => Some(*report),
+        Some(Err(panic)) => std::panic::resume_unwind(panic),
+        // The clean checkout could not be made: the creator floor runs in the live worktree, now.
+        Some(Ok(FloorRun::LiveWorktree)) => floor_plan.as_ref().map(|p| floor_live(p, emit_delta)),
+        None => floor_plan
+            .as_ref()
+            .map(|plan| match run_floor_plan(plan, emit_delta, true) {
+                FloorRun::Done(report) => *report,
+                FloorRun::LiveWorktree => floor_live(plan, emit_delta),
+            }),
     };
     // F-036 WORKTREE GUARD, the FINAL comparison — the last thing this thread does before the
     // result is posted to the gate fold. Everything the phase owned has run and been quiesced by
@@ -6022,6 +6185,140 @@ mod tests {
             "without it the seat runs, and an unchanged floored tree convenes no judge"
         );
         assert!(verdict.is_none());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// (power-speed-2, rig run 5a88dcb6) A floor on a clean checkout of the creator's tree starts
+    /// as soon as the seat's turn ends, and the judge reviews the change while it runs — the
+    /// unit's tail was seat → team → judge → floor, one after another (the judge's 17 s and the
+    /// team's 69 s before a 4.7 min floor). The judge here waits (bounded) for the floor's start
+    /// note: before the change the floor could only start after the judge returned.
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_checkout_floor_runs_while_the_judge_reviews_the_change() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::sync::Mutex;
+        struct Seats {
+            deltas: Arc<Mutex<Vec<String>>>,
+            judge_saw_floor: Mutex<Option<bool>>,
+        }
+        impl StepRunner for Seats {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let judging = input.unit.assigned_cli.as_deref() != Some("agy");
+                if judging {
+                    let t0 = std::time::Instant::now();
+                    let seen = loop {
+                        let running = self
+                            .deltas
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|d| d.contains("repo checks floor (creator): running"));
+                        if running || t0.elapsed() > Duration::from_secs(30) {
+                            break running;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    };
+                    *self.judge_saw_floor.lock().unwrap() = Some(seen);
+                }
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: if judging {
+                        "PASS\nthe change is right\nPASS".into()
+                    } else {
+                        "I changed a.txt to the fix.".into()
+                    },
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            // spawn-audit: test-only — a git fixture building the layout under test; reads no engine state.
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let repo =
+            std::env::temp_dir().join(format!("wicked-core-early-floor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        git(&repo, &["init", "-q", "."]);
+        git(&repo, &["config", "user.email", "t@example.invalid"]);
+        git(&repo, &["config", "user.name", "t"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+        std::fs::write(
+            repo.join(crate::repo_checks::CONFIG_PATH),
+            serde_json::json!({"test": ["sh", "-c", "echo checked"]}).to_string(),
+        )
+        .unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        let baseline = crate::worktree_guard::snapshot(&repo, &repo).unwrap();
+        std::fs::write(repo.join("a.txt"), "the fix\n").unwrap();
+        let mut unit = crate::domain::WorkUnit::pending("r:u2", "r", 2, "fix the retry");
+        unit.role = crate::workflow::PhaseRole::Creator;
+        unit.assigned_cli = Some("agy".into());
+        unit.default_floor = true;
+        unit.run_base_commit = Some(base);
+        unit.worktree_baseline = Some(baseline);
+        let input = StepInput {
+            run_id: format!("early-floor-{}", std::process::id()),
+            unit_ix: 1,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(repo.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let roster = vec![
+            seat("agy", "agy run {PROMPT}"),
+            seat("pi", "pi ask {PROMPT}"),
+        ];
+        let deltas: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let d2 = deltas.clone();
+        let sink = move |c: &str| d2.lock().unwrap().push(c.to_string());
+        let seats = Arc::new(Seats {
+            deltas,
+            judge_saw_floor: Mutex::new(None),
+        });
+        let runner: Arc<dyn StepRunner> = seats.clone();
+        let (_, verdict, evidence) =
+            run_unit_and_judge_with_roster(&runner, &input, None, &sink, &roster, &[], &[]);
+        let report = evidence.repo_checks.expect("the default floor ran");
+        if report.sandbox_error.is_some() {
+            eprintln!("no sandbox tool here — the floor cannot run");
+            let _ = std::fs::remove_dir_all(&repo);
+            return;
+        }
+        assert!(verdict.expect("the default judge ruled").pass);
+        assert_eq!(
+            *seats.judge_saw_floor.lock().unwrap(),
+            Some(true),
+            "the floor was running while the judge reviewed"
+        );
+        assert!(report.passed, "{report:#?}");
+        assert!(
+            report.key.is_some(),
+            "it ran on the clean checkout of the creator's tree: {report:#?}"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 
