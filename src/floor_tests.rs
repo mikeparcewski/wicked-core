@@ -4771,6 +4771,26 @@ fn core_1152_a_verify_only_check_ordered_last_runs_fresh_and_the_rest_is_reused(
         assert_eq!(stdout_of(&verify, name), stdout_of(&creator, name));
     }
     assert!(stdout_of(&verify, "e2e").contains("nonce-"), "e2e ran here");
+    // (power-speed-2) Each reused run carries where it came from; the fresh one carries nothing.
+    let mark = |name: &str| {
+        verify
+            .checks
+            .iter()
+            .find(|c| c.name == name)
+            .and_then(|c| c.reused_from.clone())
+    };
+    let from = crate::repo_checks::CheckReuse {
+        phase: Some("fix".into()),
+        ord: 4,
+        attempt: 1,
+    };
+    assert_eq!(mark("lint"), Some(from.clone()));
+    assert_eq!(mark("test"), Some(from));
+    assert_eq!(mark("e2e"), None);
+    assert!(
+        creator.checks.iter().all(|c| c.reused_from.is_none()),
+        "the creator floor ran its own"
+    );
     let note = verify.classification_note().unwrap_or_default();
     assert!(
         note.contains(

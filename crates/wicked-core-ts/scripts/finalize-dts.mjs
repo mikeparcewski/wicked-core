@@ -410,6 +410,10 @@ export interface RepoCheckRunJson {
   /** (core#1187) What the engine selected for a cargo workspace test at the creator floor, and
    * why; null for every other check. */
   selection: FloorTestSelectionJson | null
+  /** (power-speed-2) Present only on a check this floor did NOT run: a verify floor reused the creator
+   * floor's result of the same tree and base, so \`durationMs\`, the exit and the retries are that floor's.
+   * \`phase\` is null when the creator unit's phase is unknown. */
+  reusedFrom?: { phase: string | null; ord: number; attempt: number }
 }
 
 /** (core#1187) The engine's affected-set selection for one cargo workspace test check. */
