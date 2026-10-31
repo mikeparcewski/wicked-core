@@ -39,6 +39,7 @@ macro_rules! eprintln {
 }
 
 mod conformance;
+pub mod corroboration;
 mod domain;
 mod domain_model;
 mod drift;
@@ -101,12 +102,17 @@ pub use scoreboard::{
 
 // Domain-model output artifact + front-half coverage gate (PR-D foundation — DES-OUTGOV-001 §10).
 pub use domain_model::{
-    assert_front_half_coverage, build_domain_model, persist_domain_model,
+    assert_front_half_coverage, assert_front_half_coverage_min, build_domain_model,
+    build_domain_model_with, coverage_verdict, mapped_pct, meets_minimum,
+    min_coverage_pct_from_env, parse_min_coverage_pct, persist_domain_model,
     recompute_front_half_coverage, recompute_front_half_coverage_with, CoverageConfig,
-    CoverageReport, Domain, DomainModel, Entity, EntityField, ErrorPath,
-    Metadata as DomainMetadata, PerApp, Provenance as DomainProvenance, Requirement,
-    Rule as DomainRule, UnaccountedNode, Validation, DEFAULT_RESOLVE_THRESHOLD,
+    CoverageReport, Domain, DomainBuildOptions, DomainModel, Entity, EntityField, ErrorPath,
+    Metadata as DomainMetadata, ModelCoverage, PerApp, Provenance as DomainProvenance, Requirement,
+    Rule as DomainRule, UnaccountedNode, Validation, DEFAULT_MIN_COVERAGE_PCT,
+    DEFAULT_RESOLVE_THRESHOLD, MIN_COVERAGE_ENV,
 };
+// Corroboration of each requirement (operator ruling 2026-10-31, "validation by duplication").
+pub use corroboration::{Corroboration, CorroborationIndex, Unconfirmed, VALIDATED_MIN_SOURCES};
 pub use ingest::{
     ingest_from, normalize_bundle, ComplianceFramework, FilesystemAdapter, FrameworkRegistry,
     NoopFramework, SourceAdapter, StubAdapter,

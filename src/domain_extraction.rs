@@ -28,8 +28,20 @@ pub const DOMAIN_EXTRACTION_WORKFLOW_ID: &str = "domain-extraction";
 /// (CONTRACT-3 §2: "resolved-or-flagged coverage == 1.0 (zero unaccounted behavior-bearing nodes)").
 /// Substance check added: at least one requirement must be genuinely resolved (not solely RISK-flagged),
 /// closing the gameable-by-RISK-placeholders case (FINDING-D1, 2026-08-12).
+///
+/// The bar is the CONFIGURED MINIMUM (operator ruling 2026-10-31: 80% by default, crew's
+/// `requirementsGraph.minCoveragePct`), not 1.0: a large repository is mapped hub-first over several
+/// runs, and the graph is built and shown, labelled with its share, once the minimum is reached.
+/// Without a store to recompute from, the file-only fallback still demands full coverage.
 pub const COVERAGE_CRITERION: &str =
-    "at least one behavior-bearing node, resolved-or-flagged coverage == 1.0 over them (zero unaccounted), and at least one requirement genuinely resolved (resolved > 0)";
+    "at least one behavior-bearing node, resolved-or-flagged coverage at or above the configured minimum (WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, default 80%) recomputed from the store, or == 1.0 with zero unaccounted when no store is given, and at least one requirement genuinely resolved (resolved > 0)";
+
+/// Where a repository's requirements graph lives, relative to its registered root — the ONE path
+/// the producer (`wicked-core domain-graph --repo-root`, the `domain-extraction` preset's last step)
+/// and the reader (crew's `repoPaths.requirementsGraph`, `GET /repos/:id/requirements`) agree on
+/// (wicked-core#1213: the preset used to write `requirements_graph.json` at the run worktree's root,
+/// where crew never looked).
+pub const REQUIREMENTS_GRAPH_REL: &str = ".wicked-estate/requirements/requirements_graph.json";
 
 /// The deterministic re-verify (port of `coverage.py --check`): exit 0 IFF FULL coverage EVERYWHERE.
 /// When `WICKED_COVERAGE_DB` is set (injected by the validator runner from the actor's store path — its
@@ -65,7 +77,14 @@ pub const COVERAGE_CRITERION: &str =
 /// binary without relying on PATH. It used to inject `current_exe()`, which is the NODE binary when
 /// the engine runs as a napi addon — so the script ran `node coverage` and the floor never executed
 /// on a real run (FINDING-093).
-pub const COVERAGE_SCRIPT: &str = r#"( test -n "${WICKED_COVERAGE_DB}" && "${WICKED_CORE_EXE:-wicked-core}" coverage ) || ( test -z "${WICKED_COVERAGE_DB}" && test -f coverage-report.json ) && test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json && grep -Eq '"behavior_bearing":[[:space:]]*[1-9]' coverage-report.json && grep -Eq '"resolved":[[:space:]]*[1-9]' coverage-report.json"#;
+///
+/// MINIMUM, not 1.0 (operator ruling 2026-10-31): the recompute branch runs `wicked-core coverage
+/// --min-coverage-pct`, which writes the report and EXITS NON-ZERO below the configured minimum
+/// (`WICKED_REQUIREMENTS_MIN_COVERAGE_PCT`, injected by the validator runner from the daemon's
+/// setting; the bare flag falls back to 80) — exact integer arithmetic in the binary, because grep
+/// cannot compare a ratio to a number. The full-coverage greps moved INTO the no-store fallback
+/// branch: without a store there is nothing to recompute, so a file alone still has to show 1.0.
+pub const COVERAGE_SCRIPT: &str = r#"( test -n "${WICKED_COVERAGE_DB}" && "${WICKED_CORE_EXE:-wicked-core}" coverage --min-coverage-pct ) || ( test -z "${WICKED_COVERAGE_DB}" && test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json ) && test -f coverage-report.json && grep -Eq '"behavior_bearing":[[:space:]]*[1-9]' coverage-report.json && grep -Eq '"resolved":[[:space:]]*[1-9]' coverage-report.json"#;
 
 /// The coverage report's filename, relative to the run's worktree.
 ///
@@ -97,7 +116,7 @@ pub const COVERAGE_REPORT_FILE: &str = "coverage-report.json";
 /// [`crate::validator_vault::pin`]. Re-derived and asserted equal to the vaulted approved copy and to
 /// the JSON's embedded pin by [`tests::embedded_pin_matches_the_approved_vaulted_validator`]; if the
 /// criterion or script ever changes, that test fails loudly and this const must be regenerated.
-pub const COVERAGE_VALIDATOR_PIN: &str = "bfe4020a365c598b";
+pub const COVERAGE_VALIDATOR_PIN: &str = "313df7270f380e53";
 
 /// The authored (UNAPPROVED) coverage validator — the artifact a human/council reviews before it can
 /// gate. Authoring never authorizes running: `approved == false` (rev0.4 fork 3). Route it through the
@@ -194,7 +213,7 @@ mod tests {
         assert_eq!(
             coverage.validator_pin.as_deref(),
             Some(COVERAGE_VALIDATOR_PIN),
-            "the coverage phase carries the approved coverage==1.0 pin"
+            "the coverage phase carries the approved configured-minimum coverage pin"
         );
     }
 
@@ -224,6 +243,15 @@ mod tests {
                     cmd.iter().any(|a| a == crate::workflow::CODE_GRAPH_DB_TOKEN),
                     "targets the repo's own code graph via {} so the persist lands in the repo store",
                     crate::workflow::CODE_GRAPH_DB_TOKEN
+                );
+                // wicked-core#1213: the graph is written under the REGISTERED repo root (crew's read
+                // path), never at the run worktree's root. Mutation: restore `--out
+                // requirements_graph.json` and this fails.
+                let root = cmd.iter().position(|a| a == "--repo-root").expect("names --repo-root");
+                assert_eq!(cmd[root + 1], crate::workflow::REPO_ROOT_TOKEN);
+                assert!(
+                    !cmd.iter().any(|a| a == "--out"),
+                    "no --out: the CLI's default under --repo-root IS crew's read path: {cmd:?}"
                 );
             }
             other => panic!(
@@ -517,6 +545,50 @@ mod tests {
             !ok,
             "a recompute failure with the store set must FAIL CLOSED, not trust the stale passing report"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The recompute branch asks the binary for the CONFIGURED MINIMUM (operator ruling 2026-10-31):
+    /// a recompute that writes a report and exits non-zero (the binary's below-minimum exit 3) must
+    /// deny, even though the report it wrote would satisfy every grep that follows. Mutation: drop
+    /// `--min-coverage-pct` from the script, or put the `||` fallback back in front of the greps, and
+    /// the below-minimum stub passes.
+    #[test]
+    fn coverage_gate_denies_a_recompute_below_the_configured_minimum() {
+        use wicked_apps_core::HardenedCommand;
+        assert!(
+            COVERAGE_SCRIPT.contains("coverage --min-coverage-pct"),
+            "the recompute is a minimum check"
+        );
+        let dir = std::env::temp_dir().join(format!("cov_belowmin_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Writes a substantive report (passes the trailing greps), then exits 3 = below the minimum.
+        // It also records its argv, so the test sees the flag reach the binary.
+        let stub = dir.join("stub-belowmin.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho \"$@\" > argv.txt\ncat > coverage-report.json <<'JSON'\n{\"total\":900,\"behavior_bearing\":42,\"resolved\":20,\"risk_flagged\":0,\"unaccounted\":22,\"coverage\":0.4762}\nJSON\nexit 3\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let ok = std::process::Command::new("sh")
+            .hardened()
+            .arg("-c")
+            .arg(COVERAGE_SCRIPT)
+            .current_dir(&dir)
+            .env(crate::gate_hook::COVERAGE_DB_ENV, dir.join("repo.db"))
+            .env(crate::gate_hook::WICKED_CORE_EXE_ENV, &stub)
+            .status()
+            .map(|st| st.success())
+            .unwrap_or(false);
+        assert!(!ok, "a recompute below the configured minimum denies");
+        let argv = std::fs::read_to_string(dir.join("argv.txt")).unwrap();
+        assert_eq!(argv.trim(), "coverage --min-coverage-pct");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

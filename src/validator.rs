@@ -1788,6 +1788,15 @@ pub fn run_validator_reporting_with_env(
             cmd.env(crate::gate_hook::COVERAGE_DB_ENV, abs);
         }
     }
+    // The configured requirements-graph minimum (crew's `requirementsGraph.minCoveragePct`, which
+    // the daemon exports): an explicit, VALIDATED injection like the store above — the env was
+    // cleared, and `COVERAGE_SCRIPT`'s `coverage --min-coverage-pct` reads it (absent ⇒ 80).
+    if let Some(min) = std::env::var(wicked_governance::MIN_COVERAGE_ENV)
+        .ok()
+        .and_then(|v| wicked_governance::parse_min_coverage_pct(&v))
+    {
+        cmd.env(wicked_governance::MIN_COVERAGE_ENV, min.to_string());
+    }
 
     // Every non-Passed outcome denies, exactly as before; the variant only records WHY, so the gate can
     // say "the shell could not be spawned" instead of attributing that to the operator's worktree.

@@ -340,19 +340,10 @@ impl StepRunner for DomainExtractionRunner {
                     &["coverage", "--db", &self.db, "--out", out.to_str().unwrap()],
                     "coverage",
                 );
-            } else if phase == "domain-graph" {
-                let out = wd.join("requirements_graph.json");
-                shell(
-                    &[
-                        "domain-graph",
-                        "--db",
-                        &self.db,
-                        "--out",
-                        out.to_str().unwrap(),
-                    ],
-                    "domain-graph",
-                );
             }
+            // `domain-graph` is a Tool unit: the engine runs the preset's REAL argv
+            // (`wicked-core domain-graph --db {code_graph_db} --repo-root {repo_root}`), never this
+            // runner — so the artifact the tests read is the one the shipped preset writes.
         }
         StepOutput {
             run_id: i.run_id.clone(),
@@ -628,10 +619,31 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
         wt.join("coverage-report.json").is_file(),
         "the coverage phase wrote a store-recomputed coverage-report.json into the worktree"
     );
+    // wicked-core#1213: the graph lands where crew reads it — the REGISTERED checkout's
+    // `.wicked-estate/requirements/requirements_graph.json` — not at the run worktree's root.
+    let graph_path = repo.join(wicked_core::REQUIREMENTS_GRAPH_REL);
     assert!(
-        wt.join("requirements_graph.json").is_file(),
-        "the domain-graph phase produced requirements_graph.json"
+        graph_path.is_file(),
+        "the domain-graph phase wrote {} (crew's read path)",
+        graph_path.display()
     );
+    assert!(
+        !wt.join("requirements_graph.json").is_file(),
+        "nothing is written at the worktree root any more"
+    );
+    let graph: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&graph_path).unwrap()).unwrap();
+    assert_eq!(
+        graph["metadata"]["coverage"]["mapped_pct"], 100,
+        "the graph carries its coverage label: {graph}"
+    );
+    assert_eq!(graph["metadata"]["coverage"]["min_pct"], 80);
+    let req = &graph["domains"]["billing"]["requirements"]["REQ-001"];
+    assert_eq!(
+        req["corroboration"]["status"], "unconfirmed",
+        "a function nothing calls is unconfirmed: {req}"
+    );
+    assert_eq!(req["corroboration"]["why"]["code"], "dead_code");
 
     // Approve the human gate → the run completes.
     core.confirm_gate(
@@ -680,9 +692,8 @@ fn a_policy_violation_denies_a_phase_and_halts_the_run() {
         UnitStatus::Rejected,
         "the extractor phase is the denied unit"
     );
-    let wt = worktree(&repo, "run-deny");
     assert!(
-        !wt.join("requirements_graph.json").is_file(),
+        !repo.join(wicked_core::REQUIREMENTS_GRAPH_REL).is_file(),
         "the run halted at the denied phase — no downstream requirements_graph.json"
     );
 }

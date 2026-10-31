@@ -2581,14 +2581,24 @@ fn failing_measurement(cwd: &std::path::Path) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
     let f = |k: &str| v.get(k).and_then(serde_json::Value::as_f64);
-    // Only the fields the criterion actually turns on. A dump of the whole report would bury the
-    // one number the operator needs.
+    // Only the fields the criterion actually turns on, led by the operator's sentence ("42%
+    // mapped, minimum 80% (…)"). A dump of the whole report would bury the one number they need.
+    let report = wicked_governance::CoverageReport {
+        behavior_bearing: n("behavior_bearing")?,
+        resolved: n("resolved")?,
+        risk_flagged: n("risk_flagged")?,
+        unaccounted: n("unaccounted")?,
+        ..Default::default()
+    };
+    let min = wicked_governance::min_coverage_pct_from_env();
     Some(format!(
-        "measured: behavior_bearing={}, resolved={}, risk_flagged={}, unaccounted={}, coverage={}",
-        n("behavior_bearing")?,
-        n("resolved")?,
-        n("risk_flagged")?,
-        n("unaccounted")?,
+        "{}; the mapping so far is kept for the next run — measured: behavior_bearing={}, \
+         resolved={}, risk_flagged={}, unaccounted={}, coverage={}",
+        wicked_governance::coverage_verdict(&report, min),
+        report.behavior_bearing,
+        report.resolved,
+        report.risk_flagged,
+        report.unaccounted,
         f("coverage")?
     ))
 }

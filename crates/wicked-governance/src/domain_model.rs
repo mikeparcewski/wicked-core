@@ -34,6 +34,29 @@ pub struct Metadata {
     pub migration_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// How much of the code this model maps (bundle 1.3.0, optional). A graph is built once the
+    /// mapped share reaches the configured minimum ([`MIN_COVERAGE_ENV`], default
+    /// [`DEFAULT_MIN_COVERAGE_PCT`]), so a reader needs the share to read the graph honestly:
+    /// "82% of behaviours mapped".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<ModelCoverage>,
+}
+
+/// The coverage a domain model was built at (`metadata.coverage`, bundle 1.3.0).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCoverage {
+    /// `floor(mapped * 100 / behavior_bearing)`; 100 on an empty denominator.
+    pub mapped_pct: u8,
+    /// The minimum the build was held to.
+    pub min_pct: u8,
+    /// Behavior-bearing nodes (the denominator).
+    pub behavior_bearing: u64,
+    /// Behavior-bearing nodes mapped (resolved + risk-flagged).
+    pub mapped: u64,
+    /// Of those, resolved to a stated business rule.
+    pub resolved: u64,
+    /// Behavior-bearing nodes not mapped yet (left for the next extraction run).
+    pub unmapped: u64,
 }
 
 /// A capability domain: its requirements + the entities they operate on.
@@ -79,6 +102,10 @@ pub struct Requirement {
     pub disposition_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merged_programs: Vec<String>,
+    /// How many independent sources support this requirement (bundle 1.3.0, optional):
+    /// `validated` with its count, or `unconfirmed` with why. See [`crate::corroboration`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corroboration: Option<crate::corroboration::Corroboration>,
 }
 
 /// A business rule (`id`, `statement`, `confidence`, `provenance` required by the schema).
@@ -650,11 +677,80 @@ fn env_f64(key: &str, default: f64) -> f64 {
 /// Concentration catches it where the predicate cannot — this turns the [`RequirementReuse`] SIGNAL
 /// into a gate.
 pub fn assert_front_half_coverage(report: &CoverageReport) -> anyhow::Result<()> {
-    // Gate on the EXACT integer `unaccounted`, NOT the 4-dp-rounded `coverage` float. On a large graph a
-    // single hole (e.g. 1/20000) rounds up to coverage==1.0, so a float-epsilon test would fail OPEN and
-    // translate a graph with a real hole. `unaccounted == 0` is the definitive completeness condition and
-    // preserves the vacuous pass (empty graph ⇒ behavior_bearing==0 ⇒ unaccounted==0 ⇒ Ok).
-    if report.unaccounted != 0 {
+    assert_front_half_coverage_min(report, 100)
+}
+
+/// The default minimum share of behavior-bearing nodes a requirements graph must map before it is
+/// built (operator ruling 2026-10-31). Adjustable per daemon: crew's
+/// `requirementsGraph.minCoveragePct` setting, exported as [`MIN_COVERAGE_ENV`].
+pub const DEFAULT_MIN_COVERAGE_PCT: u8 = 80;
+
+/// The variable carrying the configured minimum (an integer percentage, 1..=100). The daemon
+/// exports it at boot and on every settings change; `wicked-core domain-graph` and `wicked-core
+/// coverage --min-coverage-pct` read it, and the coverage validator is handed it explicitly.
+pub const MIN_COVERAGE_ENV: &str = "WICKED_REQUIREMENTS_MIN_COVERAGE_PCT";
+
+/// Parse a minimum: an integer 1..=100 (surrounding whitespace and one trailing `%` allowed).
+#[must_use]
+pub fn parse_min_coverage_pct(raw: &str) -> Option<u8> {
+    let t = raw.trim();
+    let t = t.strip_suffix('%').unwrap_or(t).trim();
+    t.parse::<u8>().ok().filter(|v| (1..=100).contains(v))
+}
+
+/// The configured minimum from [`MIN_COVERAGE_ENV`], or [`DEFAULT_MIN_COVERAGE_PCT`] when it is
+/// absent or not a valid percentage.
+#[must_use]
+pub fn min_coverage_pct_from_env() -> u8 {
+    std::env::var(MIN_COVERAGE_ENV)
+        .ok()
+        .and_then(|v| parse_min_coverage_pct(&v))
+        .unwrap_or(DEFAULT_MIN_COVERAGE_PCT)
+}
+
+/// Mapped behavior-bearing nodes (resolved + risk-flagged).
+fn mapped_count(report: &CoverageReport) -> u64 {
+    report.resolved + report.risk_flagged
+}
+
+/// `floor(mapped * 100 / behavior_bearing)`, 100 on an empty denominator. Floored so the number
+/// shown never rounds up past the minimum it is compared to.
+#[must_use]
+pub fn mapped_pct(report: &CoverageReport) -> u8 {
+    if report.behavior_bearing == 0 {
+        return 100;
+    }
+    let pct = u128::from(mapped_count(report)) * 100 / u128::from(report.behavior_bearing);
+    pct.min(100) as u8
+}
+
+/// Whether the report maps at least `min_pct` percent of the behavior-bearing nodes. Exact
+/// integer arithmetic, never the rounded `coverage` float: on a large graph a single hole rounds
+/// up to 1.0, so a float test would fail open. `min_pct == 100` is exactly `unaccounted == 0`.
+#[must_use]
+pub fn meets_minimum(report: &CoverageReport, min_pct: u8) -> bool {
+    u128::from(mapped_count(report)) * 100
+        >= u128::from(min_pct) * u128::from(report.behavior_bearing)
+}
+
+/// The one-line verdict, e.g. `"42% mapped, minimum 80% (336 of 800 behaviours)"`.
+#[must_use]
+pub fn coverage_verdict(report: &CoverageReport, min_pct: u8) -> String {
+    format!(
+        "{}% mapped, minimum {}% ({} of {} behaviours)",
+        mapped_pct(report),
+        min_pct,
+        mapped_count(report),
+        report.behavior_bearing
+    )
+}
+
+/// [`assert_front_half_coverage`] against a configured minimum: the builder REFUSES to translate a
+/// graph that maps less than `min_pct` percent of its behavior-bearing nodes, and says how far it
+/// got. The mapping already done stays in the estate store (annotations are never rolled back), so
+/// the next extraction run continues from it rather than starting over.
+pub fn assert_front_half_coverage_min(report: &CoverageReport, min_pct: u8) -> anyhow::Result<()> {
+    if !meets_minimum(report, min_pct) {
         let shown: Vec<&str> = report
             .unaccounted_nodes
             .iter()
@@ -665,12 +761,12 @@ pub fn assert_front_half_coverage(report: &CoverageReport) -> anyhow::Result<()>
         // consumers (unit denial_reason, logs) keep the TAIL of long output — the line a human
         // must read has to be the last one, not buried above a 20-item symbol list.
         anyhow::bail!(
-            "first unaccounted (sample of {}): {:?}\nfront-half coverage {:.4} — {} behavior-bearing \
-             node(s) unaccounted; run extraction + coverage first (refusing to translate an \
-             unannotated graph).",
+            "first unaccounted (sample of {}): {:?}\n{} — {} behavior-bearing node(s) still \
+             unmapped. The mapping so far is kept in the estate store; the next domain-extraction \
+             run continues from it (refusing to build a requirements graph below the minimum).",
             shown.len(),
             shown,
-            report.coverage,
+            coverage_verdict(report, min_pct),
             report.unaccounted
         );
     }
@@ -769,15 +865,56 @@ pub fn build_domain_model(
     coverage: &CoverageReport,
     schema_version: &str,
 ) -> anyhow::Result<DomainModel> {
+    build_domain_model_with(
+        store,
+        coverage,
+        schema_version,
+        &DomainBuildOptions::default(),
+    )
+}
+
+/// How [`build_domain_model_with`] builds: the coverage minimum and, optionally, the repository
+/// root (to name tracked files the index skipped when an item is unconfirmed).
+#[derive(Debug, Clone)]
+pub struct DomainBuildOptions<'a> {
+    /// The share of behavior-bearing nodes that must be mapped, 1..=100.
+    pub min_coverage_pct: u8,
+    pub repo_root: Option<&'a std::path::Path>,
+}
+
+impl Default for DomainBuildOptions<'_> {
+    /// Full coverage, no repository root: [`build_domain_model`]'s historical contract.
+    fn default() -> Self {
+        DomainBuildOptions {
+            min_coverage_pct: 100,
+            repo_root: None,
+        }
+    }
+}
+
+/// [`build_domain_model`] at a configured minimum (operator ruling 2026-10-31): the graph is built
+/// once `min_coverage_pct` percent of the behavior-bearing nodes are mapped, carries that share on
+/// `metadata.coverage`, and every requirement carries its corroboration.
+pub fn build_domain_model_with(
+    store: &dyn GraphRead,
+    coverage: &CoverageReport,
+    schema_version: &str,
+    opts: &DomainBuildOptions<'_>,
+) -> anyhow::Result<DomainModel> {
+    if !(1..=100).contains(&opts.min_coverage_pct) {
+        anyhow::bail!("min_coverage_pct {} out of 1..=100", opts.min_coverage_pct);
+    }
+    let min_pct = opts.min_coverage_pct;
     // Gate on the PASSED report (back-compat) AND, defense-in-depth, on a fresh STORE recompute — so a
     // hand-fed `coverage:1.0` can never translate a graph that actually has an unaccounted behavior node
     // (DES-OUTGOV-005 decision #4). The store is the source of truth; the file is a cross-check. The extra
     // store traversal here is a DELIBERATE correctness-over-perf choice for a fail-closed governance gate:
     // trusting the caller's report would reintroduce the trust-boundary hole this milestone closes. It is
     // a single O(nodes) pass, run once per build (not hot-path).
-    assert_front_half_coverage(coverage)?;
+    assert_front_half_coverage_min(coverage, min_pct)?;
     let recomputed = recompute_front_half_coverage(store)?;
-    assert_front_half_coverage(&recomputed)?;
+    assert_front_half_coverage_min(&recomputed, min_pct)?;
+    let corroboration = crate::corroboration::CorroborationIndex::build(store, opts.repo_root)?;
 
     let mut domains: std::collections::BTreeMap<String, Domain> = std::collections::BTreeMap::new();
     let mut nodes = store.all_nodes()?;
@@ -882,7 +1019,15 @@ pub fn build_domain_model(
             cluster_id: None,
             ..Default::default()
         });
+        // Distinct extractor provenances that stated a real business rule (a RISK flag is not one).
+        let extractor_sources = annotations
+            .iter()
+            .filter(|a| a.r#type == BUSINESS_RULE_ANN)
+            .map(|a| a.provenance.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len() as u32;
         let requirement = Requirement {
+            corroboration: Some(corroboration.assess(node, extractor_sources)),
             title: node.name.clone(),
             description: requirement_text
                 .or(description_text)
@@ -903,6 +1048,14 @@ pub fn build_domain_model(
             // M5 package-dir grouping IS the schema's "functional" (capability-grouped) mode.
             migration_mode: "functional".to_string(),
             source: Some("estate-graph".to_string()),
+            coverage: Some(ModelCoverage {
+                mapped_pct: mapped_pct(&recomputed),
+                min_pct,
+                behavior_bearing: recomputed.behavior_bearing,
+                mapped: mapped_count(&recomputed),
+                resolved: recomputed.resolved,
+                unmapped: recomputed.unaccounted,
+            }),
         },
         domains,
     })
@@ -1051,6 +1204,12 @@ pub fn persist_domain_model(
                     serde_json::json!(req.dependencies),
                 );
             }
+            // Corroboration rides on the node too, so a graph query sees validated vs unconfirmed.
+            if let Some(c) = &req.corroboration {
+                if let Ok(v) = serde_json::to_value(c) {
+                    rnode.metadata.insert("corroboration".to_string(), v);
+                }
+            }
             nodes.push(rnode);
 
             // domain CONTAINS requirement
@@ -1172,6 +1331,7 @@ mod tests {
                 schema_version: "1.0.0".to_string(),
                 migration_mode: "functional".to_string(),
                 source: None,
+                coverage: None,
             },
             domains,
         };
@@ -1304,6 +1464,7 @@ mod tests {
                 schema_version: "1.0.0".to_string(),
                 migration_mode: "functional".to_string(),
                 source: None,
+                coverage: None,
             },
             domains,
         };
@@ -1388,6 +1549,48 @@ mod tests {
         // Round-trips back to an equal JSON value (serde symmetry; schema conformance is proven by
         // the integration test in tests/domain_model_schema.rs which validates against the schema).
         assert_eq!(serde_json::to_value(&model).unwrap(), json);
+    }
+
+    /// Operator ruling 2026-10-31: the gate is the CONFIGURED MINIMUM (default 80%), compared in
+    /// exact integers, and the refusal says how far the mapping got.
+    #[test]
+    fn the_coverage_gate_holds_at_the_configured_minimum() {
+        let report = |bb: u64, resolved: u64, risk: u64| CoverageReport {
+            behavior_bearing: bb,
+            resolved,
+            risk_flagged: risk,
+            unaccounted: bb - resolved - risk,
+            ..Default::default()
+        };
+        // 80 of 100 mapped (60 resolved + 20 risk): meets 80, misses 81.
+        let r = report(100, 60, 20);
+        assert_eq!(mapped_pct(&r), 80);
+        assert!(meets_minimum(&r, 80));
+        assert!(assert_front_half_coverage_min(&r, 80).is_ok());
+        let err = assert_front_half_coverage_min(&r, 81)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("80% mapped, minimum 81% (80 of 100 behaviours)")
+                && err.contains("kept in the estate store"),
+            "{err}"
+        );
+        // Floored, never rounded up past the bar: 7999/10000 is 79%, below 80.
+        let r = report(10_000, 7_999, 0);
+        assert_eq!(mapped_pct(&r), 79);
+        assert!(!meets_minimum(&r, 80));
+        // 100 is exactly the historical `unaccounted == 0`, including the one-hole-in-20k case.
+        assert!(!meets_minimum(&report(20_000, 19_999, 0), 100));
+        assert!(assert_front_half_coverage(&report(3, 3, 0)).is_ok());
+        // The empty graph stays a vacuous pass.
+        assert!(meets_minimum(&report(0, 0, 0), 80));
+        assert_eq!(mapped_pct(&report(0, 0, 0)), 100);
+        // The setting's parse: whole percentages 1..=100 only.
+        assert_eq!(parse_min_coverage_pct(" 80 "), Some(80));
+        assert_eq!(parse_min_coverage_pct("75%"), Some(75));
+        for bad in ["0", "101", "eighty", "80.5", ""] {
+            assert_eq!(parse_min_coverage_pct(bad), None, "{bad}");
+        }
     }
 
     #[test]
