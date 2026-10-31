@@ -304,6 +304,9 @@ fn a_hand_off_not_pass_goes_back_to_the_orchestrator_on_its_own() {
 /// (core#1216) The person's voice reaches the ORCHESTRATOR and nobody else: its first brief and
 /// its rework round carry it; the PA's scope step, the hand-off's reviewers and the gate judges
 /// are briefed without it (evaluator independence never depends on the person's tone settings).
+/// Not on Windows, for the hand-off tests' reason above: the floor has no write boundary to arm
+/// there, so the hand-off fails closed before a reviewer runs and no rework round follows.
+#[cfg(not(windows))]
 #[test]
 fn only_the_orchestrator_hears_the_voice_never_the_pa_reviewers_or_judges() {
     if crate::validator::skip_when_nested(
