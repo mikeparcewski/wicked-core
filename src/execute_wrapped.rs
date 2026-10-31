@@ -121,8 +121,16 @@ impl ClaudeStreamJson {
         }
     }
 
-    /// An assistant message's usage: the live running total of the attempt, to the sink.
-    fn live_usage(&mut self, message: Option<&serde_json::Value>) {
+    /// An assistant message's usage: the live running total of the attempt, to the sink. Only the
+    /// main loop's messages count, as `result.usage` (the unit's `cliUsage`) counts them: a
+    /// subagent's (`parent_tool_use_id` set) is left out (xreview on #1212). `output_tokens` is what
+    /// the message envelope reports, which claude fills at the message's start, so the live output
+    /// count is a lower bound until the result's total lands as `cliUsage`.
+    fn live_usage(&mut self, line: &serde_json::Value) {
+        let message = line.get("message");
+        if line.get("parent_tool_use_id").is_some_and(|p| !p.is_null()) {
+            return;
+        }
         let Some(a) = self.activity.as_mut() else {
             return;
         };
@@ -187,7 +195,7 @@ impl OutputAdapter for ClaudeStreamJson {
         let mut out = AdapterOut::default();
         match v.get("type").and_then(|t| t.as_str()) {
             Some("assistant") => {
-                self.live_usage(v.get("message"));
+                self.live_usage(&v);
                 let content = v.get("message").and_then(|m| m.get("content"));
                 match content {
                     // (S3a) `content` is a bare STRING (a valid-JSON shape that `as_array()` misses, so

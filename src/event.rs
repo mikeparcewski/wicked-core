@@ -1357,7 +1357,10 @@ pub enum CoreEvent {
     /// usage; the frame is the attempt's TOTAL so far (fresh + cache input, as [`CoreEvent::CliUsage`]
     /// counts it), sent when it changed, at most one per [`crate::tool_activity::USAGE_EVERY_MS`].
     /// `cost_usd` only where the seat's stream states one (pi), else `None`: the unit's
-    /// `CliUsage` at its end stays the record. See [`crate::tool_activity`].
+    /// `CliUsage` at its end stays the record. The total is the ATTEMPT's (a power build's turns
+    /// add up) and the main loop's only (a claude subagent's messages are left out, as its
+    /// `result.usage` leaves them out). Claude fills a message's `output_tokens` at its start, so
+    /// its live output count is a lower bound until `CliUsage` lands. See [`crate::tool_activity`].
     UsageProgress {
         session: String,
         ord: u32,

@@ -51,11 +51,16 @@ pub const HEARTBEAT_MS: u64 = 15_000;
 /// The least time between two `usageProgress` frames of one attempt.
 pub const USAGE_EVERY_MS: u64 = 3_000;
 
-/// The attempt's live usage: the newest total seen, when one was last sent, and one held back by
-/// [`USAGE_EVERY_MS`] (sent by the next heartbeat tick, or at close).
+/// One unit attempt's live usage, shared by every sink of that attempt (a power orchestrator runs
+/// one seat invocation per turn, each with its own sink and stream totals, all under one attempt
+/// whose final `cliUsage` sums them; xreview on #1212): each invocation's running total, the
+/// newest attempt total seen, when one was last sent, and one held back by [`USAGE_EVERY_MS`]
+/// (sent by the next heartbeat tick, or at close).
 #[derive(Default)]
 struct UsageState {
-    /// The newest total seen (sent or held).
+    /// Per invocation (sink): its stream's running total (input, output, cost).
+    turns: HashMap<u64, (u64, u64, Option<f64>)>,
+    /// The newest attempt total seen (sent or held).
     latest: Option<(u64, u64)>,
     sent_at: u64,
     held: Option<CoreEvent>,
@@ -63,13 +68,38 @@ struct UsageState {
 
 type SharedUsage = Arc<std::sync::Mutex<UsageState>>;
 
-/// Send `held` when the limit allows it (`force`: whatever the limit, the stream closed).
+/// The usage state of each live unit attempt, released when its run ends ([`forget_run`]).
+type AttemptUsage = std::sync::Mutex<HashMap<(String, u32, u32), SharedUsage>>;
+
+fn attempt_usage() -> &'static AttemptUsage {
+    static S: std::sync::OnceLock<AttemptUsage> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+fn usage_of(run_id: &str, ord: u32, attempt: u32) -> SharedUsage {
+    Arc::clone(
+        attempt_usage()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry((run_id.to_string(), ord, attempt))
+            .or_default(),
+    )
+}
+
+/// Each sink's key in its attempt's [`UsageState::turns`].
+fn next_sink_id() -> u64 {
+    static N: AtomicU64 = AtomicU64::new(1);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Send `held` when the limit allows it (`force`: whatever the limit, the stream closed). The lock
+/// is held through the send, so two threads (the heartbeat tick, the stream's close) can never
+/// publish an older total after a newer one (xreview on #1212).
 fn flush_usage(state: &SharedUsage, tx: &Emit, now: u64, force: bool) {
     let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
     if st.held.is_some() && (force || now.saturating_sub(st.sent_at) >= USAGE_EVERY_MS) {
         let ev = st.held.take().expect("checked");
         st.sent_at = now;
-        drop(st);
         (tx)(ev);
     }
 }
@@ -99,6 +129,10 @@ pub fn forget_run(run_id: &str) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .retain(|(r, _, _), _| r != run_id);
+    attempt_usage()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|(r, _, _), _| r != run_id);
 }
 
 /// One unit attempt's live tool frames.
@@ -114,8 +148,10 @@ pub struct ToolActivitySink {
     seat: String,
     /// When this attempt last sent any frame (epoch ms), shared with its [`Heartbeat`].
     last_frame: Arc<AtomicU64>,
-    /// The attempt's live usage, shared with its [`Heartbeat`].
+    /// The attempt's live usage, shared with its [`Heartbeat`] and every other sink of the attempt.
     usage: SharedUsage,
+    /// This sink's key in the attempt's usage (one invocation's stream).
+    usage_id: u64,
 }
 
 impl ToolActivitySink {
@@ -161,7 +197,8 @@ impl ToolActivitySink {
             window: (Instant::now(), 0),
             seat: "seat".to_string(),
             last_frame: Arc::new(AtomicU64::new(now_ms())),
-            usage: SharedUsage::default(),
+            usage: usage_of(run_id, ord, attempt),
+            usage_id: next_sink_id(),
         }
     }
 
@@ -184,9 +221,11 @@ impl ToolActivitySink {
         }
     }
 
-    /// The attempt's running usage so far, a TOTAL (fresh + cache input, output; `cost_usd` only
-    /// where the stream states one): a `usageProgress` frame when it changed, at most one per
-    /// [`USAGE_EVERY_MS`]. A newer total inside the limit is held for the next heartbeat tick or
+    /// This invocation's running usage so far, a TOTAL of its own stream (fresh + cache input,
+    /// output; `cost_usd` only where the stream states one). The frame carries the ATTEMPT's
+    /// total: this invocation's plus every earlier one of the same attempt (a power build's
+    /// turns), as the attempt's `cliUsage` sums them. A frame when it changed, at most one per
+    /// [`USAGE_EVERY_MS`]; a newer total inside the limit is held for the next heartbeat tick or
     /// the close. It is not a tool frame: the "still working" clock is left alone.
     pub fn usage(&mut self, input_tokens: u64, output_tokens: u64, cost_usd: Option<f64>) {
         self.usage_at(now_ms(), input_tokens, output_tokens, cost_usd);
@@ -196,25 +235,37 @@ impl ToolActivitySink {
         if input_tokens == 0 && output_tokens == 0 {
             return;
         }
+        let mut st = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+        st.turns
+            .insert(self.usage_id, (input_tokens, output_tokens, cost_usd));
+        let (i, o, c) =
+            st.turns
+                .values()
+                .fold((0u64, 0u64, None::<f64>), |(i, o, c), (a, b, d)| {
+                    let cost = match (c, d) {
+                        (Some(x), Some(y)) => Some(x + y),
+                        (x, y) => x.or(*y),
+                    };
+                    (i.saturating_add(*a), o.saturating_add(*b), cost)
+                });
+        // The same total again (claude repeats a message's usage on each of its blocks): nothing new.
+        if st.latest == Some((i, o)) {
+            return;
+        }
+        st.latest = Some((i, o));
         let ev = CoreEvent::UsageProgress {
             session: self.run_id.clone(),
             ord: self.ord,
             attempt: self.attempt,
             at: now as i64,
-            input_tokens,
-            output_tokens,
-            cost_usd,
+            input_tokens: i,
+            output_tokens: o,
+            cost_usd: c,
         };
-        let mut st = self.usage.lock().unwrap_or_else(|p| p.into_inner());
-        // The same total again (claude repeats a message's usage on each of its blocks): nothing new.
-        if st.latest == Some((input_tokens, output_tokens)) {
-            return;
-        }
-        st.latest = Some((input_tokens, output_tokens));
         if st.sent_at == 0 || now.saturating_sub(st.sent_at) >= USAGE_EVERY_MS {
             st.held = None;
             st.sent_at = now;
-            drop(st);
+            // Sent under the lock: no other thread's older total can follow it.
             (self.tx)(ev);
         } else {
             st.held = Some(ev);
@@ -1320,5 +1371,105 @@ mod tests {
         assert!(u[0]["costUsd"].is_null());
         forget_run("usage-pi");
         forget_run("usage-codex");
+    }
+
+    /// (xreview on #1212) A power build runs one seat invocation per turn under one attempt, each
+    /// with its own sink: the frame is the attempt's total (turn 1's plus turn 2's so far), as its
+    /// `cliUsage` sums them, never a reset to the new turn's count.
+    #[test]
+    fn two_invocations_of_one_attempt_add_up() {
+        let (mut t1, seen) = sink("/w/repo", "usage-turns");
+        t1.usage_at(1_000, 1000, 10, Some(0.01));
+        drop(t1);
+        let s2 = Arc::clone(&seen);
+        let mut t2 = ToolActivitySink::new(
+            "usage-turns",
+            3,
+            0,
+            Path::new("/w/repo"),
+            Box::new(move |ev| s2.lock().unwrap().push(ev.to_json())),
+        );
+        t2.usage_at(1_000 + USAGE_EVERY_MS, 200, 5, Some(0.002));
+        let seen = seen.lock().unwrap();
+        let u: Vec<&Value> = seen
+            .iter()
+            .filter(|f| f["type"] == "usageProgress")
+            .collect();
+        assert_eq!(u.len(), 2, "{seen:?}");
+        assert_eq!(u[1]["inputTokens"], 1200, "turn 1 + turn 2, not a reset");
+        assert_eq!(u[1]["outputTokens"], 15);
+        assert!((u[1]["costUsd"].as_f64().unwrap() - 0.012).abs() < 1e-9);
+        drop(seen);
+        forget_run("usage-turns");
+    }
+
+    /// (xreview on #1212) A subagent's messages are not the main loop's: `result.usage` (the unit's
+    /// `cliUsage`) leaves them out, so the live total does too.
+    #[test]
+    fn a_claude_subagents_messages_are_not_counted() {
+        use crate::execute_wrapped::{ClaudeStreamJson, OutputAdapter};
+        let (s, seen) = sink("/w/repo", "usage-sub");
+        let mut a = ClaudeStreamJson::with_activity(Some(s));
+        a.on_line(r#"{"type":"assistant","parent_tool_use_id":"toolu_task","message":{"id":"sub1","role":"assistant","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":5000,"output_tokens":50}}}"#);
+        a.on_line(r#"{"type":"assistant","parent_tool_use_id":null,"message":{"id":"main1","role":"assistant","content":[{"type":"text","text":"y"}],"usage":{"input_tokens":700,"output_tokens":7}}}"#);
+        let seen = seen.lock().unwrap();
+        let u: Vec<&Value> = seen
+            .iter()
+            .filter(|f| f["type"] == "usageProgress")
+            .collect();
+        assert_eq!(u.len(), 1, "{seen:?}");
+        assert_eq!(u[0]["inputTokens"], 700);
+        drop(seen);
+        forget_run("usage-sub");
+    }
+
+    /// (xreview on #1212) Totals only grow, and frames go out in the order they were decided: many
+    /// streams of one attempt and a heartbeat ticking at once never publish an older total last.
+    #[test]
+    fn concurrent_usage_and_ticks_never_publish_an_older_total_last() {
+        let (first, seen) = sink("/w/repo", "usage-race");
+        let hb = first.heartbeat();
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let s2 = Arc::clone(&seen);
+            handles.push(std::thread::spawn(move || {
+                let mut s = ToolActivitySink::new(
+                    "usage-race",
+                    3,
+                    0,
+                    Path::new("/w/repo"),
+                    Box::new(move |ev| s2.lock().unwrap().push(ev.to_json())),
+                );
+                for k in 1..=200u64 {
+                    s.usage_at(k * 1_000, k * 10, k, None);
+                    if k % 7 == 0 {
+                        s.close();
+                    }
+                }
+            }));
+        }
+        let ticker = std::thread::spawn(move || {
+            for k in 0..400u64 {
+                hb.tick_at(k * 1_000 + USAGE_EVERY_MS, 0);
+            }
+        });
+        for h in handles {
+            h.join().unwrap();
+        }
+        ticker.join().unwrap();
+        let seen = seen.lock().unwrap();
+        let totals: Vec<u64> = seen
+            .iter()
+            .filter(|f| f["type"] == "usageProgress")
+            .map(|f| f["inputTokens"].as_u64().unwrap())
+            .collect();
+        assert!(!totals.is_empty());
+        assert!(
+            totals.windows(2).all(|w| w[0] <= w[1]),
+            "an older total was published after a newer one: {totals:?}"
+        );
+        drop(seen);
+        drop(first);
+        forget_run("usage-race");
     }
 }
