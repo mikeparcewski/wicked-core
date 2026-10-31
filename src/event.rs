@@ -1577,6 +1577,9 @@ pub enum CoreEvent {
         /// the unit's seat for that attempt, so a consumer names the asker without reading which
         /// seat the run is running now. Absent for every other producer.
         seat: Option<String>,
+        /// (guided asks, additive) A multi-select: the answer picks `min..=max` of `options` and is
+        /// recorded as a JSON array of them (`propType: "array"`). Absent for a single choice or free text.
+        multi: Option<crate::ask::AskMulti>,
     },
     /// The elicitation identified by `elicitation_id` reached a terminal state. `session` is the
     /// `run_id`. `action` mirrors the resolved `action` field from the `elicitation/create`
@@ -3198,6 +3201,7 @@ impl CoreEvent {
                 ord,
                 attempt,
                 seat,
+                multi,
             } => {
                 let mut v = json!({
                     "type": "elicitationCreated",
@@ -3223,6 +3227,9 @@ impl CoreEvent {
                 }
                 if let Some(seat) = seat {
                     v["seat"] = json!(seat);
+                }
+                if let Some(multi) = multi {
+                    v["multi"] = json!(multi);
                 }
                 v
             }
@@ -3384,6 +3391,7 @@ mod tests {
                 ord: None,
                 attempt: None,
                 seat: None,
+                multi: None,
             }
             .to_json()
         };
@@ -3406,6 +3414,7 @@ mod tests {
             ord: None,
             attempt: None,
             seat: None,
+            multi: None,
         }
         .to_json();
         assert_eq!(

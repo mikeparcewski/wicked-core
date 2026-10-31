@@ -31,7 +31,7 @@ mod acp_permission;
 mod acp_runner;
 mod actor;
 pub(crate) mod ask;
-pub use ask::{AskError, AskRequest, AskTicket, AskUnit};
+pub use ask::{AskError, AskMulti, AskRequest, AskTicket, AskUnit};
 mod applications;
 pub mod assumptions;
 pub mod assurance;

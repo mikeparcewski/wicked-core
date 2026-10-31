@@ -1504,7 +1504,7 @@ impl Core {
         task(move || core.ask_unit_json(&token).map_err(err))
     }
 
-    /// Open an operator question with `{token, question, choices?, recommended?}`.
+    /// Open an operator question with `{token, question, choices?, recommended?, multi?: {min?, max?}}`.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn open_ask(&self, request_json: String) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();

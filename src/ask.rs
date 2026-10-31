@@ -13,6 +13,20 @@ pub struct AskRequest {
     pub question: String,
     pub choices: Option<Vec<String>>,
     pub recommended: Option<u32>,
+    /// (guided asks, additive) The person may pick several of `choices`: `min..=max` of them. The answer is then a
+    /// JSON array of distinct choices, checked here against the question it answers. `None` = one choice (or free text).
+    #[serde(default)]
+    pub multi: Option<AskMulti>,
+}
+
+/// How many of a multi-select question's `choices` an answer picks. Absent bounds default to `1` and to every choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskMulti {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<u32>,
 }
 
 impl AskRequest {
@@ -52,8 +66,24 @@ impl AskRequest {
             self.recommended = recommended_choice
                 .and_then(|choice| choices.iter().position(|s| *s == choice))
                 .map(|i| i as u32);
+            if let Some(m) = self.multi {
+                let n = choices.len() as u32;
+                let min = m.min.unwrap_or(1);
+                let max = m.max.unwrap_or(n);
+                if min < 1 || min > max || max > n {
+                    return Err(AskError::BadRequest(format!(
+                        "multi must pick 1 <= min <= max <= {n} choices"
+                    )));
+                }
+                self.multi = Some(AskMulti {
+                    min: Some(min),
+                    max: Some(max),
+                });
+            }
         } else if self.recommended.is_some() {
             return Err(AskError::BadRequest("recommended requires choices".into()));
+        } else if self.multi.is_some() {
+            return Err(AskError::BadRequest("multi requires choices".into()));
         }
         Ok(self)
     }
@@ -158,8 +188,17 @@ fn created(id: &str, p: &Pending) -> CoreEvent {
         elicitation_id: id.into(),
         message: p.request.question.clone(),
         options: p.request.choices.clone(),
-        prop_type: Some("string".into()),
+        // A multi-select answers with an array of the options (DES-002's `propType: "array"`).
+        prop_type: Some(
+            if p.request.multi.is_some() {
+                "array"
+            } else {
+                "string"
+            }
+            .into(),
+        ),
         recommended: p.request.recommended,
+        multi: p.request.multi,
         source: Some("ask".into()),
         ord: Some(p.ord),
         attempt: Some(p.attempt),
@@ -202,6 +241,54 @@ fn resolved(id: &str, p: Pending, action: &str, reason: &str, answer: Option<Str
         answer,
         held_ms: Some(p.opened_at.elapsed().as_millis().min(u64::MAX as u128) as u64),
     }
+}
+
+/// A multi-select answer: a JSON array of distinct `choices` (or that array as JSON text), `min..=max` long, in the
+/// order the question listed them. Recorded as the array's JSON text, so `answer` stays a string on the wire.
+fn multi_answer(
+    choices: &[String],
+    multi: AskMulti,
+    response: Option<&Value>,
+) -> anyhow::Result<String> {
+    let parsed;
+    let value = match response {
+        Some(Value::String(s)) => {
+            parsed = serde_json::from_str::<Value>(s)
+                .map_err(|_| anyhow::anyhow!("a multi-select answer is an array of the choices"))?;
+            &parsed
+        }
+        Some(v) => v,
+        None => anyhow::bail!("accept requires a response"),
+    };
+    let picked: Vec<&str> = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("a multi-select answer is an array of the choices"))?
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .ok_or_else(|| anyhow::anyhow!("a multi-select answer holds only choices"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    if let Some(bad) = picked.iter().find(|p| !choices.iter().any(|c| c == *p)) {
+        anyhow::bail!("{bad:?} is not one of the choices");
+    }
+    let mut ordered: Vec<&str> = choices
+        .iter()
+        .map(String::as_str)
+        .filter(|c| picked.contains(c))
+        .collect();
+    ordered.dedup();
+    if ordered.len() != picked.len() {
+        anyhow::bail!("a multi-select answer names each choice once");
+    }
+    let (min, max) = (
+        multi.min.unwrap_or(1) as usize,
+        multi.max.unwrap_or(u32::MAX) as usize,
+    );
+    if ordered.len() < min || ordered.len() > max {
+        anyhow::bail!("pick {min} to {max} of the choices");
+    }
+    Ok(serde_json::to_string(&ordered).expect("strings serialize"))
 }
 
 impl Registry {
@@ -278,15 +365,22 @@ impl Registry {
         if !matches!(action, "accept" | "decline" | "cancel") {
             anyhow::bail!("invalid elicitation action");
         }
-        let answer = if action == "accept" {
+        let answer = if action != "accept" {
+            None
+        } else if let Some(multi) = self.entries.get(id).and_then(|p| p.request.multi) {
+            let pending = self.entries.get(id).expect("entry checked above");
+            Some(multi_answer(
+                pending.request.choices.as_deref().unwrap_or_default(),
+                multi,
+                response,
+            )?)
+        } else {
             Some(
                 response
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("accept requires a string response"))?
                     .to_owned(),
             )
-        } else {
-            None
         };
         let p = self.entries.remove(id).expect("entry checked above");
         Ok(Some(resolve_and_promote(
@@ -338,6 +432,8 @@ pub(crate) fn open_ask_json(core: &Core, request_json: &str) -> Result<String, S
         question: String,
         choices: Option<Vec<String>>,
         recommended: Option<u32>,
+        #[serde(default)]
+        multi: Option<AskMulti>,
     }
     let r: Request = serde_json::from_str(request_json)
         .map_err(|e| AskError::BadRequest(e.to_string()).to_string())?;
@@ -348,6 +444,7 @@ pub(crate) fn open_ask_json(core: &Core, request_json: &str) -> Result<String, S
                 question: r.question,
                 choices: r.choices,
                 recommended: r.recommended,
+                multi: r.multi,
             },
         )
         .map_err(|e| e.to_string())?;
@@ -369,6 +466,7 @@ mod tests {
             question: "pick one".into(),
             choices: Some(vec!["A".into(), "B".into()]),
             recommended: Some(1),
+            multi: None,
         }
     }
     fn unit(run_id: &str) -> McpUnit {
@@ -893,6 +991,134 @@ mod tests {
         let records = f.core.run_events(&f.run);
         assert_eq!(records.len(), 2);
         assert_eq!(records[1]["answer"], "B");
+    }
+
+    fn multi_request() -> AskRequest {
+        AskRequest {
+            question: "Which branches?".into(),
+            choices: Some(vec!["main".into(), "release".into(), "develop".into()]),
+            recommended: Some(0),
+            multi: Some(AskMulti {
+                min: None,
+                max: Some(2),
+            }),
+        }
+    }
+
+    #[test]
+    fn ask_multi_frame_says_array_and_the_bounds() {
+        let f = Fixture::new(SessionStatus::AwaitingHuman);
+        let events = f.core.subscribe();
+        let token = McpToken::mint();
+        let _binding = token.bind(unit(&f.run));
+        f.core.open_ask(token.value(), multi_request()).unwrap();
+        let created = frame(&events, "elicitationCreated");
+        assert_eq!(created["propType"], "array");
+        assert_eq!(created["multi"], serde_json::json!({"min": 1, "max": 2}));
+        // A single-choice question carries no `multi` and stays a string.
+        let single = Fixture::new(SessionStatus::AwaitingHuman);
+        let events = single.core.subscribe();
+        let token = McpToken::mint();
+        let _binding = token.bind(unit(&single.run));
+        single.core.open_ask(token.value(), request()).unwrap();
+        let created = frame(&events, "elicitationCreated");
+        assert_eq!(created["propType"], "string");
+        assert!(created.get("multi").is_none());
+    }
+
+    #[test]
+    fn ask_multi_answer_is_checked_against_the_question_and_recorded_in_choice_order() {
+        let f = Fixture::new(SessionStatus::AwaitingHuman);
+        let token = McpToken::mint();
+        let _binding = token.bind(unit(&f.run));
+        let ticket = f.core.open_ask(token.value(), multi_request()).unwrap();
+        for response in [
+            None,
+            Some(serde_json::json!("main")),
+            Some(serde_json::json!([])),
+            Some(serde_json::json!(["main", "main"])),
+            Some(serde_json::json!(["main", "nope"])),
+            Some(serde_json::json!(["main", "release", "develop"])),
+            Some(serde_json::json!([1])),
+        ] {
+            assert!(
+                f.core
+                    .resolve_elicitation(
+                        &f.run,
+                        &ticket.elicitation_id,
+                        "accept".into(),
+                        response.clone()
+                    )
+                    .is_err(),
+                "{response:?}"
+            );
+            assert_eq!(
+                f.core.run_events(&f.run).len(),
+                1,
+                "a refused answer keeps the question open"
+            );
+        }
+        f.core
+            .resolve_elicitation(
+                &f.run,
+                &ticket.elicitation_id,
+                "accept".into(),
+                // The JSON text of the array is accepted too (a string-only caller).
+                Some(serde_json::json!(r#"["develop","main"]"#)),
+            )
+            .unwrap();
+        let records = f.core.run_events(&f.run);
+        assert_eq!(records[1]["type"], "elicitationResolved");
+        assert_eq!(records[1]["answer"], r#"["main","develop"]"#);
+    }
+
+    #[test]
+    fn ask_multi_validation() {
+        let mut r = multi_request();
+        r.multi = Some(AskMulti {
+            min: None,
+            max: None,
+        });
+        assert_eq!(
+            r.validate().unwrap().multi,
+            Some(AskMulti {
+                min: Some(1),
+                max: Some(3)
+            })
+        );
+        for (min, max) in [(Some(0), None), (Some(3), Some(2)), (None, Some(4))] {
+            let mut r = multi_request();
+            r.multi = Some(AskMulti { min, max });
+            assert!(
+                matches!(r.validate(), Err(AskError::BadRequest(_))),
+                "{min:?} {max:?}"
+            );
+        }
+        let mut r = multi_request();
+        r.choices = None;
+        r.recommended = None;
+        assert!(matches!(r.validate(), Err(AskError::BadRequest(_))));
+        // The bound is checked after the duplicates go.
+        let mut r = multi_request();
+        r.choices = Some(vec!["a".into(), "a".into(), "b".into()]);
+        r.multi = Some(AskMulti {
+            min: None,
+            max: Some(3),
+        });
+        assert!(matches!(r.validate(), Err(AskError::BadRequest(_))));
+    }
+
+    #[test]
+    fn ask_open_json_passes_multi_through() {
+        let r: AskMulti = serde_json::from_str(r#"{"min":2}"#).unwrap();
+        assert_eq!(
+            r,
+            AskMulti {
+                min: Some(2),
+                max: None
+            }
+        );
+        assert!(serde_json::from_str::<AskMulti>(r#"{"most":2}"#).is_err());
     }
 
     #[test]
