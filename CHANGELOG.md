@@ -23,13 +23,13 @@ Two release tracks share this file, newest entry first regardless of track:
   still follows the team (it reads the team's ledger and leaves its monitors out), the final worktree guard is
   still the last comparison, and a floor that would run in the live worktree still runs last. The same checks,
   judges and gates run; only the order changed. The judge's live note now reads "judge: a judge seat is reviewing
-  the change".
+  the change"; once the judge is done, the floor's own note says it is still running.
 - **Each reused check says so on its own row.** A verify floor that reused the creator floor's checks said so at
   the top of `repoChecksEvaluated` (`reusedFrom`), but each reused row repeated the creator floor's `durationMs`
-  and retries unmarked, so a reader of one row saw the test suite run again. Each reused row now carries
-  `reusedFrom: {phase, ord, attempt}`; a check that ran on this floor, or any row of a reuse that was set aside,
-  carries none.
-
+  and retries unmarked, so a reader of one row saw the test suite run again. Each reused run now carries where
+  it came from (`CheckRun.reused_from`; on the wire `checks[].reusedFrom: {phase, ord, attempt}`, declared on
+  core-ts's `RepoCheckRunJson`). A check that ran on this floor carries none, even beside a reused check of the
+  same name.
 - **domain-extraction reviews the page it mapped, not the whole repository.** A run maps one page of a
   repository (the hub-first worklist, up to 300 behaviours by default), but the floor's generic `critique` judged
   that page as an incomplete domain model and failed every run of a large repository (rig run 7588cff1 on

@@ -2516,25 +2516,22 @@ fn run_floor_plan(plan: &FloorPlan, emit_delta: &DeltaSink, live_ok: bool) -> Fl
             FloorRun::LiveWorktree
         };
     };
-    let checkout = crate::repo_checks::checkout_guarded_tree(
-        &plan.wd,
-        std::path::Path::new(git_dir),
-        tree,
-        &format!("{}-{}-a{}", plan.run_id, plan.ord, plan.attempt),
-    );
-    match checkout {
-        Ok(checkout) => {
-            let report =
-                with_floor_heartbeat(emit_delta, &plan.label(), FLOOR_HEARTBEAT_EVERY, || {
-                    checkout.run_floor_journaled(
-                        &plan.ctx,
-                        plan.rerun.as_ref(),
-                        &plan.journal_for(tree),
-                    )
-                });
-            drop(checkout);
-            FloorRun::Done(Box::new(plan.finish(report, Some(tree))))
-        }
+    // The heartbeat covers the checkout's export and its removal too, not only the checks: a
+    // slow export or cleanup must never read as a wedged worker (xreview on #1224).
+    let ran = with_floor_heartbeat(emit_delta, &plan.label(), FLOOR_HEARTBEAT_EVERY, || {
+        let checkout = crate::repo_checks::checkout_guarded_tree(
+            &plan.wd,
+            std::path::Path::new(git_dir),
+            tree,
+            &format!("{}-{}-a{}", plan.run_id, plan.ord, plan.attempt),
+        )?;
+        let report =
+            checkout.run_floor_journaled(&plan.ctx, plan.rerun.as_ref(), &plan.journal_for(tree));
+        drop(checkout);
+        Ok::<_, String>(report)
+    });
+    match ran {
+        Ok(report) => FloorRun::Done(Box::new(plan.finish(report, Some(tree)))),
         Err(why) if plan.guarded => FloorRun::Done(Box::new(plan.finish(
             crate::repo_checks::guarded_checkout_refused(&plan.wd, &plan.ctx, &why),
             None,
@@ -2840,12 +2837,20 @@ fn run_unit_and_judge_in<'scope, 'env>(
             }
         },
     };
+    // DES-002 §8.8: the PA's review of a member's step has no judge and no floor (below), so
+    // none of the floor's inputs below is computed for it.
+    let member_reviewing = input
+        .unit
+        .member_step
+        .as_ref()
+        .is_some_and(|m| m.reviewing.is_some());
     // (F-7R2-005) DID THE UNIT CHANGE THE TREE? For a bound AGENT unit the guard does not cover
     // (a creator, a prose-planned unit), compare the worktree against the baseline the actor
     // snapshotted at dispatch. `Some(true)` arms the DEFAULT floor + judge below; an unknown
     // (no baseline persisted, git failed) is treated as CHANGED — the checks run rather than a
     // change slipping through ungated. A guarded unit keeps `None`: the guard owns its tree.
     let bound_agent = output.status == StepStatus::Ok
+        && !member_reviewing
         && input.unit.tool_cmd.is_none()
         && input.unit.default_floor
         && input.workdir.is_some()
@@ -2923,17 +2928,11 @@ fn run_unit_and_judge_in<'scope, 'env>(
     // its own account and never reaches the gate this feeds. (power-speed-2) Taken before the QE
     // reviewer and the team's final pass, which run alongside the floor: neither may write the
     // tree, and the final comparison below still catches one that did.
-    let guard_first_look = if output.status == StepStatus::Ok {
+    let guard_first_look = if output.status == StepStatus::Ok && !member_reviewing {
         crate::worktree_guard::outcome_for_unit(&input.unit, input.workdir.as_deref())
     } else {
         None
     };
-    // DES-002 §8.8: the PA's review of a member's step has no judge and no floor (below).
-    let member_reviewing = input
-        .unit
-        .member_step
-        .as_ref()
-        .is_some_and(|m| m.reviewing.is_some());
     // F-039 REPO CHECKS FLOOR: whether it runs, and on what ([`FloorPlan`]).
     let floor_plan = if member_reviewing {
         None
@@ -2958,7 +2957,10 @@ fn run_unit_and_judge_in<'scope, 'env>(
         .filter(|p| p.clean_target().is_some())
         .map(|p| {
             let p = p.clone();
-            scope.spawn(move || run_floor_plan(&p, emit_delta, false))
+            (
+                std::time::Instant::now(),
+                scope.spawn(move || run_floor_plan(&p, emit_delta, false)),
+            )
         });
     // (DES-QE-EVERY-SEAT) THE ISOLATED QE REVIEWER. For the run's QE unit with a `required`
     // decision, the turn above was the EXECUTOR (writer + executor, no QE verdict); the engine now
@@ -3805,7 +3807,22 @@ fn run_unit_and_judge_in<'scope, 'env>(
     // seat's turn (`early_floor`) and is joined here; a floor in the live worktree runs here, LAST
     // (slowest, and its build artifacts must not colour the guard's comparison or the judge's
     // evidence above), as it always has.
-    let repo_checks = match early_floor.map(|h| h.join()) {
+    let early_floor = early_floor.map(|(started, h)| {
+        // Still running once the judge is done: the unit's live note says so, not the judge's
+        // (xreview on #1224) — in the floor's own form, so studio reads it as the floor.
+        if let (false, Some(plan)) = (h.is_finished(), floor_plan.as_ref()) {
+            engine_note(
+                emit_delta,
+                &format!(
+                    "{} — {} min",
+                    plan.label(),
+                    started.elapsed().as_secs() / 60
+                ),
+            );
+        }
+        h.join()
+    });
+    let repo_checks = match early_floor {
         Some(Ok(FloorRun::Done(report))) => Some(*report),
         Some(Err(panic)) => std::panic::resume_unwind(panic),
         // The clean checkout could not be made: the creator floor runs in the live worktree, now.
@@ -6320,6 +6337,62 @@ mod tests {
             "it ran on the clean checkout of the creator's tree: {report:#?}"
         );
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// (power-speed-2, xreview on #1224) The early floor's heartbeat covers making the clean
+    /// checkout too (a slow export must not read as a wedged worker), and a CREATOR checkout that
+    /// cannot be made is handed back un-run — the live-worktree floor only ever runs after the
+    /// judge — while a guarded verify floor's is refused, fail-closed, as before.
+    #[test]
+    fn an_early_floor_heartbeats_through_its_checkout_and_never_runs_live() {
+        use std::sync::Mutex;
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-core-early-floor-no-checkout-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan = FloorPlan {
+            wd: dir.clone(),
+            ord: 2,
+            attempt: 0,
+            run_id: "r".into(),
+            phase: Some("fix".into()),
+            stage: crate::repo_checks::FloorStage::Creator,
+            ctx: crate::repo_checks::FloorContext::default(),
+            rerun: None,
+            guarded: false,
+            guard_tree: None,
+            creator_tree: Some("0000000000000000000000000000000000000000".into()),
+            git_dir: Some(dir.join("no-such-git-dir").to_string_lossy().into_owned()),
+            current_tree: None,
+        };
+        let deltas: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let d2 = deltas.clone();
+        let sink = move |c: &str| d2.lock().unwrap().push(c.to_string());
+        assert!(matches!(
+            run_floor_plan(&plan, &sink, false),
+            FloorRun::LiveWorktree
+        ));
+        assert!(
+            deltas
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|d| d.contains(&format!("{} — 0 min", plan.label()))),
+            "the checkout ran under the floor's heartbeat: {deltas:?}"
+        );
+        let guarded = FloorPlan {
+            stage: crate::repo_checks::FloorStage::Verify,
+            guarded: true,
+            guard_tree: plan.creator_tree.clone(),
+            creator_tree: None,
+            ..plan
+        };
+        match run_floor_plan(&guarded, &sink, false) {
+            FloorRun::Done(report) => assert!(!report.passed, "refused: {report:#?}"),
+            FloorRun::LiveWorktree => panic!("a guarded verify floor never runs live"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// (rejudge) The readiness the gate serves is the judge's own selection: the work's author,

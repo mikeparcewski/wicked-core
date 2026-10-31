@@ -1612,6 +1612,17 @@ fn changed_path_json(c: &crate::worktree_guard::ChangedPath) -> serde_json::Valu
 /// The wire form of one check run on `repoChecksEvaluated` — camelCase like every other event
 /// field, tails included verbatim (already bounded by `repo_checks::TAIL_BYTES`).
 fn check_run_json(c: &crate::repo_checks::CheckRun) -> serde_json::Value {
+    let mut v = check_run_fields(c);
+    // (power-speed-2, additive) A check this floor did NOT run — its duration, exit and retries are
+    // the creator floor's it was reused from. Absent on every check that ran here.
+    if let Some(r) = &c.reused_from {
+        v["reusedFrom"] =
+            serde_json::json!({ "phase": r.phase, "ord": r.ord, "attempt": r.attempt });
+    }
+    v
+}
+
+fn check_run_fields(c: &crate::repo_checks::CheckRun) -> serde_json::Value {
     serde_json::json!({
         "name": c.name,
         "argv": c.argv,
@@ -3039,23 +3050,6 @@ impl CoreEvent {
                 // before the field.
                 if let Some(r) = reused_from {
                     v["reusedFrom"] = serde_json::to_value(r).unwrap_or(serde_json::Value::Null);
-                    // (power-speed-2) …and on each reused check's own row: its durationMs, exit
-                    // and retries are the creator floor's, and a reader of one row must not take
-                    // them for a run on this floor. Not on a reuse that was set aside (`voided`):
-                    // those checks ran here.
-                    if r.voided.is_none() {
-                        let from = json!({ "phase": r.phase, "ord": r.ord, "attempt": r.attempt });
-                        if let Some(rows) = v["checks"].as_array_mut() {
-                            for row in rows {
-                                let reused = row["name"]
-                                    .as_str()
-                                    .is_some_and(|n| r.reused.iter().any(|x| x == n));
-                                if reused {
-                                    row["reusedFrom"] = from.clone();
-                                }
-                            }
-                        }
-                    }
                 }
                 // (DES-FLOOR-CONTAINER) Absent on a frame from before the field.
                 if let Some(r) = floor_runner {
