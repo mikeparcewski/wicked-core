@@ -198,6 +198,13 @@ pub(super) fn after_pass(
                 u.rework_of = None;
                 u.rework_amendment = None;
                 u.worker_failed_clis.clear();
+                // Who wrote the previous page is not who writes this one: the page's reviewer is
+                // excluded only by this pass's authors (codex r5 on #1226: a seat switch between
+                // pages left both seats authors and no reviewer could be seated). Earlier passes'
+                // authorship stays on the record in their events.
+                u.authored_by.clear();
+                u.authored_binaries.clear();
+                u.author_probe = None;
                 u.review_rounds.clear();
                 u.operator_rulings.clear();
                 u.floor_auto_retries = 0;
@@ -392,6 +399,8 @@ mod tests {
             outcome: Some(crate::domain::REVIEW_SENT_BACK.to_string()),
         });
         page.worker_failed_clis.push("codex".into());
+        page.authored_by = vec!["claude".into(), "codex".into()];
+        page.authored_binaries = vec!["claude".into()];
         put_node(store, page.to_node()).unwrap();
         let mut ord = 2;
         for mut u in extra {
@@ -592,6 +601,13 @@ mod tests {
             "{page:?}"
         );
         assert_eq!(page.description, "page", "the send-back marker is gone");
+        // The re-armed step is dispatched again at once (its seat may stamp itself as this pass's
+        // author); the previous pass's other author is gone.
+        assert!(
+            !page.authored_by.iter().any(|a| a == "codex"),
+            "this pass's authors only: {:?}",
+            page.authored_by
+        );
         assert_eq!(
             unit(&store, "fresh", 2).carried_deferred,
             ["ITEM 2: DEFERRED — confirm page-one CI"]
