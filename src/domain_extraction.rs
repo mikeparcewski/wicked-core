@@ -59,6 +59,25 @@ pub const WORKLIST_REL: &str = ".wicked/domain/worklist.json";
 /// The rules the seat states, relative to the run's worktree (garden's `rules_file.RULES_REL`).
 pub const RULES_REL: &str = ".wicked/domain/rules.json";
 
+/// The run's own review of what the seat stated, between `extract` and `extract-apply` (a `critique`
+/// step, so the floor adds no generic one). A run maps ONE page of a repository (the worklist,
+/// hub-first, up to garden's default of 300 behaviours): a generic critique judged that page as an
+/// incomplete domain model and failed every run of a large repository (rig run 7588cff1 on
+/// wicked-crew, 8,109 behaviours). Completeness is the coverage step's question, against the
+/// configured minimum; this review judges the rules that were stated.
+pub const RULES_REVIEW_INSTRUCTIONS: &str = "Review the rules the extract step stated in \
+`.wicked/domain/rules.json` against the units of `.wicked/domain/worklist.json`. This run maps one \
+page of the repository: the worklist, hub-first. Completeness is not your question. The coverage \
+step measures the mapped share against the configured minimum, and the next run continues from the \
+frontier; grouping by domain happens in the domain-graph step. Judge each stated rule: it names a \
+unit of the worklist, it states what the business requires rather than describing the code, it is \
+grounded in that unit's source, and its confidence is not inflated. An empty statement is right \
+where the source supports no rule (the host records it as a risk). You judge work another seat did; \
+change no file. List each problem as `ITEM n: FAIL — <symbol> — <why>`. End with `VERDICT: PASS` \
+when the stated rules are sound (the host re-checks every rule and flags weak ones as risks), or \
+`VERDICT: FAIL` when rules are invented, name symbols outside the worklist, or describe code \
+instead of requirements.";
+
 /// The argv of a host step that runs a garden domain script on the run's repository: through the
 /// garden generation the run was admitted against (`WICKED_GARDEN_ROOT`, handed to every generic
 /// Tool unit — never a `wicked-garden` from the daemon's PATH), with the store and the repository
@@ -211,6 +230,7 @@ mod tests {
                 "analyze",
                 EXTRACT_PREPARE_STEP,
                 "extract",
+                "critique",
                 EXTRACT_APPLY_STEP,
                 "coverage",
                 "domain-graph"
@@ -232,13 +252,16 @@ mod tests {
             .iter()
             .find(|p| p.role == PhaseRole::Creator)
             .unwrap();
-        let evaluator = def
+        // Two evaluators: the page's review of the stated rules, then the coverage judge.
+        let evaluators: Vec<&str> = def
             .phases
             .iter()
-            .find(|p| p.role == PhaseRole::Evaluator)
-            .unwrap();
+            .filter(|p| p.role == PhaseRole::Evaluator)
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(evaluators, ["critique", "coverage"]);
+        let evaluator = def.phases.iter().find(|p| p.id == "coverage").unwrap();
         assert_eq!(creator.id, "extract");
-        assert_eq!(evaluator.id, "coverage");
         // coverage runs after extract (structural ordering — the DAG makes it non-negotiable):
         // through the host's apply step, which writes what extract stated (wicked-garden#1362).
         assert_eq!(evaluator.depends_on, [EXTRACT_APPLY_STEP]);
@@ -247,7 +270,7 @@ mod tests {
             .iter()
             .find(|p| p.id == EXTRACT_APPLY_STEP)
             .unwrap();
-        assert_eq!(apply.depends_on, ["extract"]);
+        assert_eq!(apply.depends_on, ["critique"]);
 
         let coverage = def.phases.iter().find(|p| p.id == "coverage").unwrap();
         assert_eq!(coverage.kind, StageKind::Test);
@@ -362,8 +385,8 @@ mod tests {
         // the WorkUnit so the cli-runner invokes the right garden skill under the right brain-engine scope.
         let def = load_shipped_def();
         let units = plan_from_def(&def, "mine the legacy payments service", "s1");
-        assert_eq!(units.len(), 7);
-        let (extract, coverage) = (&units[3], &units[5]);
+        assert_eq!(units.len(), 8);
+        let (extract, coverage) = (&units[3], &units[6]);
         assert_eq!(
             extract.skill_ref.as_deref(),
             Some("wicked-garden-domain-extractor")
@@ -381,7 +404,8 @@ mod tests {
         assert_eq!(extract.role, PhaseRole::Creator);
         assert_eq!(coverage.role, PhaseRole::Evaluator);
         // The host steps are Tool units: no seat, no skill (wicked-garden#1362).
-        for host in [&units[2], &units[4]] {
+        assert_eq!(units[4].role, PhaseRole::Evaluator, "the page's own review");
+        for host in [&units[2], &units[5]] {
             assert!(
                 host.tool_cmd.is_some() && host.skill_ref.is_none(),
                 "{}",

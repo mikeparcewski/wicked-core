@@ -12781,6 +12781,7 @@ mod tests {
                 "bug/verify",
                 "demo/review",
                 "domain-extraction/coverage",
+                "domain-extraction/critique",
                 "editor-plugin/security-review",
                 "editor-plugin/test",
                 "feature/adversarial-review",

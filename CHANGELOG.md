@@ -14,6 +14,13 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **domain-extraction reviews the page it mapped, not the whole repository.** A run maps one page of a
+  repository (the hub-first worklist, up to 300 behaviours by default), but the floor's generic `critique` judged
+  that page as an incomplete domain model and failed every run of a large repository (rig run 7588cff1 on
+  wicked-crew, 8,109 behaviours). The preset now carries its own `critique` step between `extract` and
+  `extract-apply` (so the floor adds none). Its instructions judge the stated rules: they are grounded in their
+  unit's source, they state requirements rather than describe code, and their confidence isn't inflated.
+  Completeness stays the coverage step's question, against the configured minimum.
 - **The repo-checks floor can run in a fresh Linux container (DES-FLOOR-CONTAINER).** On a macOS host every
   process a check spawns paid for endpoint scanning and the sandbox profile: one crew full-suite floor took 79-123
   min under load. With `WICKED_FLOOR_RUNNER=auto` (the default) a macOS host whose container runtime answers runs
