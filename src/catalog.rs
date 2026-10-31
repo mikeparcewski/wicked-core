@@ -830,6 +830,7 @@ fn steering_author_preset() -> Vec<PlanStep> {
 /// `domain-extraction` (M6): §11.2's row. survey, analyze → `understand` (no gate type);
 /// extract-prepare → `run` (the host's Tool step: the hub-first worklist, wicked-garden#1362);
 /// extract → `produce` (the bold cell: kind recon → build; the seat states rules into a file);
+/// critique → `critique` (the page's review: the stated rules, not the repository's completeness);
 /// extract-apply → `run` (the host's Tool step: checks the rules file and writes the store);
 /// coverage → `domain_coverage`, which
 /// carries `COVERAGE_VALIDATOR_PIN` as data (the step restates it, a no-op), with `executes_code`
@@ -838,7 +839,7 @@ fn steering_author_preset() -> Vec<PlanStep> {
 fn domain_extraction_preset() -> Vec<PlanStep> {
     use crate::domain_extraction::{
         garden_domain_step_cmd, COVERAGE_REPORT_FILE, EXTRACT_APPLY_STEP, EXTRACT_PREPARE_STEP,
-        RULES_REL, WORKLIST_REL,
+        RULES_REL, RULES_REVIEW_INSTRUCTIONS, WORKLIST_REL,
     };
     use crate::workflow::{CODE_GRAPH_DB_TOKEN, REPO_ROOT_TOKEN};
     let step = |catalog: &str, id: &str, after: Option<&str>| PlanStep {
@@ -875,6 +876,12 @@ fn domain_extraction_preset() -> Vec<PlanStep> {
             skill_ref: Some("wicked-garden-domain-extractor".to_string()),
             ..step("produce", "extract", Some(EXTRACT_PREPARE_STEP))
         },
+        // The page's own review (a `critique`, so the floor adds no generic one that judges a page
+        // as an incomplete model): before the host writes anything.
+        PlanStep {
+            instructions: Some(RULES_REVIEW_INSTRUCTIONS.to_string()),
+            ..step("critique", "critique", Some("extract"))
+        },
         PlanStep {
             gate_type: Some(None),
             executor: Some(PhaseExecutor::Tool {
@@ -884,7 +891,7 @@ fn domain_extraction_preset() -> Vec<PlanStep> {
                     &format!("--rules {RULES_REL} --coverage-out {COVERAGE_REPORT_FILE}"),
                 ),
             }),
-            ..step("run", EXTRACT_APPLY_STEP, Some("extract"))
+            ..step("run", EXTRACT_APPLY_STEP, Some("critique"))
         },
         PlanStep {
             executes_code: Some(true),
@@ -1278,6 +1285,7 @@ mod tests {
                 "analyze",
                 EXTRACT_PREPARE_STEP,
                 "extract",
+                "critique",
                 EXTRACT_APPLY_STEP,
                 "coverage",
                 "domain-graph"
@@ -1285,7 +1293,15 @@ mod tests {
         );
         let by = |id: &str| def.phases.iter().find(|p| p.id == id).unwrap();
         assert_eq!(by("extract").depends_on, [EXTRACT_PREPARE_STEP]);
-        assert_eq!(by(EXTRACT_APPLY_STEP).depends_on, ["extract"]);
+        // The page's review sits between the seat and the host's write, judging stated rules
+        // (rig run 7588cff1: a generic critique failed a page of wicked-crew as incomplete).
+        let review = by("critique");
+        assert_eq!(review.role, PhaseRole::Evaluator);
+        assert_eq!(review.depends_on, ["extract"]);
+        assert!(review.instructions.as_deref().is_some_and(
+            |i| i.contains("one page") && i.contains("Completeness is not your question")
+        ));
+        assert_eq!(by(EXTRACT_APPLY_STEP).depends_on, ["critique"]);
         assert_eq!(by("coverage").depends_on, [EXTRACT_APPLY_STEP]);
         for (id, script) in [
             (EXTRACT_PREPARE_STEP, "scripts/domain/prepare_worklist.py"),
