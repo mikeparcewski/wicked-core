@@ -36,13 +36,6 @@ pub const DOMAIN_EXTRACTION_WORKFLOW_ID: &str = "domain-extraction";
 pub const COVERAGE_CRITERION: &str =
     "at least one behavior-bearing node, resolved-or-flagged coverage at or above the configured minimum (WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, default 80%) recomputed from the store, or == 1.0 with zero unaccounted when no store is given, and at least one requirement genuinely resolved (resolved > 0)";
 
-/// Where a repository's requirements graph lives, relative to its registered root — the ONE path
-/// the producer (`wicked-core domain-graph --repo-root`, the `domain-extraction` preset's last step)
-/// and the reader (crew's `repoPaths.requirementsGraph`, `GET /repos/:id/requirements`) agree on
-/// (wicked-core#1213: the preset used to write `requirements_graph.json` at the run worktree's root,
-/// where crew never looked).
-pub const REQUIREMENTS_GRAPH_REL: &str = ".wicked-estate/requirements/requirements_graph.json";
-
 /// The host step BEFORE the seat's `extract` (wicked-garden#1362): a seat container has no
 /// `wicked-core`, no `wicked-estate` and no writable store (the broker relay is read-only by
 /// design), so the HOST prepares the work. It runs garden's `prepare_worklist.py`: `wicked-core
@@ -317,14 +310,14 @@ mod tests {
                     "targets the repo's own code graph via {} so the persist lands in the repo store",
                     crate::workflow::CODE_GRAPH_DB_TOKEN
                 );
-                // wicked-core#1213: the graph is written under the REGISTERED repo root (crew's read
-                // path), never at the run worktree's root. Mutation: restore `--out
-                // requirements_graph.json` and this fails.
+                // The graph is saved into the estate store and nowhere else (operator ruling
+                // 2026-10-31): no `--out` export file in the run. `--repo-root` names the checkout
+                // whose tracked files the corroboration reads.
                 let root = cmd.iter().position(|a| a == "--repo-root").expect("names --repo-root");
                 assert_eq!(cmd[root + 1], crate::workflow::REPO_ROOT_TOKEN);
                 assert!(
                     !cmd.iter().any(|a| a == "--out"),
-                    "no --out: the CLI's default under --repo-root IS crew's read path: {cmd:?}"
+                    "no --out: the run writes no JSON file: {cmd:?}"
                 );
             }
             other => panic!(

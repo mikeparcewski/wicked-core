@@ -103,8 +103,8 @@ pub use scoreboard::{
 // Domain-model output artifact + front-half coverage gate (PR-D foundation — DES-OUTGOV-001 §10).
 pub use domain_model::{
     assert_front_half_coverage, assert_front_half_coverage_min, build_domain_model,
-    build_domain_model_with, coverage_verdict, mapped_pct, meets_minimum,
-    min_coverage_pct_from_env, parse_min_coverage_pct, persist_domain_model,
+    build_domain_model_with, coverage_verdict, load_domain_graph, mapped_pct, meets_minimum,
+    min_coverage_pct_from_env, model_coverage, parse_min_coverage_pct, persist_domain_model,
     recompute_front_half_coverage, recompute_front_half_coverage_with, CoverageConfig,
     CoverageReport, Domain, DomainBuildOptions, DomainModel, Entity, EntityField, ErrorPath,
     Metadata as DomainMetadata, ModelCoverage, PerApp, Provenance as DomainProvenance, Requirement,

@@ -192,9 +192,10 @@ fn seed_many(db: &str, n: usize, accounted: usize) {
 }
 
 /// Operator ruling 2026-10-31: the graph is built once coverage reaches the configured minimum
-/// (default 80%), labelled with its share, and written under `--repo-root` where crew reads it.
+/// (default 80%), labelled with its share, and saved INTO the estate store — no JSON file in the
+/// checkout (operator ruling 2026-10-31); `--out` is the explicit export.
 #[test]
-fn domain_graph_builds_at_the_minimum_and_lands_at_crews_read_path() {
+fn domain_graph_builds_at_the_minimum_into_estate_and_writes_no_file() {
     let dir = scratch("min80");
     let db = dir.join("estate.db");
     seed_many(db.to_str().unwrap(), 5, 4); // 80% mapped
@@ -217,9 +218,16 @@ fn domain_graph_builds_at_the_minimum_and_lands_at_crews_read_path() {
         "80% mapped meets the default minimum: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let path = root.join(".wicked-estate/requirements/requirements_graph.json");
-    let graph: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).expect("crew's read path")).unwrap();
+    assert!(
+        !root.join(".wicked-estate").exists(),
+        "no requirements JSON in the checkout"
+    );
+    let store = wicked_apps_core::open_store_ro(Some(db.to_str().unwrap())).unwrap();
+    let report = wicked_governance::recompute_front_half_coverage(&store).unwrap();
+    let label = wicked_governance::model_coverage(&report, 80);
+    let graph = wicked_governance::load_domain_graph(&store, Some(&label))
+        .unwrap()
+        .expect("the graph is in estate");
     let cov = &graph["metadata"]["coverage"];
     assert_eq!(cov["mapped_pct"], 80, "{cov}");
     assert_eq!(cov["min_pct"], 80);

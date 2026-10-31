@@ -381,6 +381,31 @@ pub fn coverage_report_for_repo(
     wicked_governance::recompute_front_half_coverage(&repo_store)
 }
 
+/// ONE registered repo's requirements graph, read from that repo's OWN estate store — the source of
+/// truth `wicked-core domain-graph` persists into (`wicked_governance::persist_domain_model`), never
+/// a JSON file in the checkout (operator ruling 2026-10-31). Same discipline as
+/// [`coverage_report_for_repo`]: the repo resolves from the registry on `daemon`, its
+/// `code_graph_db` opens READ-ONLY. Returns `{ "graph": <domain-model document or null>,
+/// "coverage": { mapped_pct, min_pct, behavior_bearing, mapped, resolved, unmapped } }`; the
+/// coverage is recomputed from the store's own counts at read time against the configured minimum
+/// (`WICKED_REQUIREMENTS_MIN_COVERAGE_PCT`, else 80), so a run that maps more shows up without a
+/// rebuild. `graph` is null until a build has reached the minimum. An unknown `repo_ref` errors.
+pub fn requirements_graph_for_repo(
+    daemon: &dyn GraphRead,
+    daemon_db: &str,
+    repo_ref: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let _state_home = crate::code_graph::StateHomeScope::for_store(daemon_db);
+    let repo = get_repo(daemon, repo_ref)?
+        .ok_or_else(|| anyhow::anyhow!("no registered repo '{repo_ref}'"))?;
+    let repo_store = wicked_apps_core::open_store_ro(Some(repo.code_graph_db.as_str()))?;
+    let min_pct = wicked_governance::min_coverage_pct_from_env().map_err(|e| anyhow::anyhow!(e))?;
+    let report = wicked_governance::recompute_front_half_coverage(&repo_store)?;
+    let coverage = wicked_governance::model_coverage(&report, min_pct);
+    let graph = wicked_governance::load_domain_graph(&repo_store, Some(&coverage))?;
+    Ok(serde_json::json!({ "graph": graph, "coverage": coverage }))
+}
+
 /// A summary of ONE registered repo's code graph — node counts by kind — read over that repo's OWN
 /// graph store (its engine-resolved `code_graph_db`), never the daemon store (same discipline as
 /// [`coverage_report_for_repo`]; FINDING-009/067/122). This is the read half of #122's web surface:

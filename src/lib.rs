@@ -247,8 +247,7 @@ pub use domain::{
 pub use domain_extraction::{
     coverage_eq_one_validator, provision_and_approve_coverage_validator, COVERAGE_CRITERION,
     COVERAGE_SCRIPT, COVERAGE_VALIDATOR_PIN, DOMAIN_EXTRACTION_WORKFLOW_ID, EXTRACT_APPLY_STEP,
-    EXTRACT_PREPARE_STEP, REQUIREMENTS_GRAPH_REL, RULES_REL, RULES_REVIEW_INSTRUCTIONS,
-    WORKLIST_REL,
+    EXTRACT_PREPARE_STEP, RULES_REL, RULES_REVIEW_INSTRUCTIONS, WORKLIST_REL,
 };
 pub use event::{BaseSkill, CoreEvent, InjectedContext, StepFailureKind};
 pub use execute_wrapped::WrappedCliStepRunner;
@@ -317,8 +316,9 @@ pub use project::{
     MEMBER_KIND_RUN, PROJECT, PROJECT_MEMBER,
 };
 pub use repo::{
-    coverage_report_for_repo, get_repo, graph_kinds_for_repo, RepoEntry, RepoFinding, RepoSpec,
-    FINDING_CODE_GRAPH_ROOT_UNRESOLVABLE, FINDING_IN_TREE_CODE_GRAPH_IGNORED,
+    coverage_report_for_repo, get_repo, graph_kinds_for_repo, requirements_graph_for_repo,
+    RepoEntry, RepoFinding, RepoSpec, FINDING_CODE_GRAPH_ROOT_UNRESOLVABLE,
+    FINDING_IN_TREE_CODE_GRAPH_IGNORED,
 };
 pub use repo_checks::{
     BaseRun, CheckDecision, CheckRun, ClaimCheck, FloorContext, FloorEnv, FloorStage, RepoCheck,

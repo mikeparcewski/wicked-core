@@ -14,6 +14,18 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The requirements graph lives in estate and is read from there (operator ruling 2026-10-31).** `wicked-core
+  domain-graph` already saved the graph into the repo's estate store (domain, requirement and business-rule nodes,
+  `SatisfiedBy` edges to code, corroboration on each requirement). Now it is the only copy:
+  - `persist_domain_model` removes the domain, requirement and rule nodes an earlier build wrote that this build no
+    longer has, so the store holds the latest build. Ids stay stable as coverage grows.
+  - The new `wicked_governance::load_domain_graph` reads the graph back from the store in the domain-model shape,
+    and `repo::requirements_graph_for_repo` wraps it as `{ graph, coverage }`. core-ts exposes the same read as
+    `getRequirementsGraphForRepo`. The coverage label comes from the store's own counts at read time, checked
+    against the configured minimum.
+  - `domain-graph` writes `requirements_graph.json` only when `--out` names it, as an export for garden's hermetic
+    emit lane and ad-hoc use. The preset writes no file into the checkout, and `REQUIREMENTS_GRAPH_REL` is gone.
+
 - **domain-extraction reviews the page it mapped, not the whole repository.** A run maps one page of a
   repository (the hub-first worklist, up to 300 behaviours by default), but the floor's generic `critique` judged
   that page as an incomplete domain model and failed every run of a large repository (rig run 7588cff1 on

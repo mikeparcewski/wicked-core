@@ -912,11 +912,11 @@ fn domain_extraction_preset() -> Vec<PlanStep> {
                     "domain-graph",
                     "--db",
                     CODE_GRAPH_DB_TOKEN,
-                    // The graph lands where crew reads it: `<repo root>/` +
-                    // `domain_extraction::REQUIREMENTS_GRAPH_REL` (the CLI's default out under
-                    // `--repo-root`). It used to be `--out requirements_graph.json`, i.e. the
-                    // run worktree's root, which nothing reads (wicked-core#1213). The coverage
-                    // minimum reaches the step through the daemon's environment
+                    // The graph is saved into the repo's estate store (`--db`), where crew reads
+                    // it (`requirements_graph_for_repo`); no file is written into the checkout
+                    // (operator ruling 2026-10-31). `--repo-root` names the checkout whose
+                    // tracked files the corroboration reads. The coverage minimum reaches the
+                    // step through the daemon's environment
                     // (`WICKED_REQUIREMENTS_MIN_COVERAGE_PCT`, crew's setting).
                     "--repo-root",
                     REPO_ROOT_TOKEN,

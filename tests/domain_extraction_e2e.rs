@@ -651,7 +651,7 @@ fn worktree(repo_root: &std::path::Path, run_id: &str) -> std::path::PathBuf {
 #[test]
 fn a_governed_run_produces_coverage_and_requirements_graph() {
     let db = db_in("happy");
-    let (core, repo_id, _db, repo) = setup(
+    let (core, repo_id, dbp, repo) = setup(
         "happy",
         DomainExtractionRunner {
             db,
@@ -746,20 +746,26 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
         wt.join("coverage-report.json").is_file(),
         "the coverage phase wrote a store-recomputed coverage-report.json into the worktree"
     );
-    // wicked-core#1213: the graph lands where crew reads it — the REGISTERED checkout's
-    // `.wicked-estate/requirements/requirements_graph.json` — not at the run worktree's root.
-    let graph_path = repo.join(wicked_core::REQUIREMENTS_GRAPH_REL);
+    // Operator ruling 2026-10-31: the graph is saved into the repo's estate store and read from
+    // there (crew's read, `requirements_graph_for_repo`); no JSON file lands in the checkout or the
+    // worktree.
+    for dir in [&repo, &wt] {
+        assert!(
+            !dir.join(".wicked-estate/requirements/requirements_graph.json")
+                .exists()
+                && !dir.join("requirements_graph.json").exists(),
+            "no requirements JSON file under {}",
+            dir.display()
+        );
+    }
+    let daemon = wicked_apps_core::open_store_ro(Some(&dbp)).unwrap();
+    let read = wicked_core::requirements_graph_for_repo(&daemon, &dbp, &repo_id).unwrap();
+    let graph = read["graph"].clone();
     assert!(
-        graph_path.is_file(),
-        "the domain-graph phase wrote {} (crew's read path)",
-        graph_path.display()
+        graph.is_object(),
+        "the graph reads back from estate: {read}"
     );
-    assert!(
-        !wt.join("requirements_graph.json").is_file(),
-        "nothing is written at the worktree root any more"
-    );
-    let graph: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&graph_path).unwrap()).unwrap();
+    assert_eq!(read["coverage"]["mapped_pct"], 100, "{read}");
     assert_eq!(
         graph["metadata"]["coverage"]["mapped_pct"], 100,
         "the graph carries its coverage label: {graph}"
@@ -791,7 +797,7 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
 fn a_policy_violation_denies_a_phase_and_halts_the_run() {
     let db = db_in("deny");
     // Trip a deny on the extractor phase (`extract`) via a token in its output.
-    let (core, repo_id, dbp, repo) = setup(
+    let (core, repo_id, dbp, _repo) = setup(
         "deny",
         DomainExtractionRunner {
             db,
@@ -819,9 +825,11 @@ fn a_policy_violation_denies_a_phase_and_halts_the_run() {
         UnitStatus::Rejected,
         "the extractor phase is the denied unit"
     );
+    let daemon = wicked_apps_core::open_store_ro(Some(&dbp)).unwrap();
+    let read = wicked_core::requirements_graph_for_repo(&daemon, &dbp, &repo_id).unwrap();
     assert!(
-        !repo.join(wicked_core::REQUIREMENTS_GRAPH_REL).is_file(),
-        "the run halted at the denied phase — no downstream requirements_graph.json"
+        read["graph"].is_null(),
+        "the run halted at the denied phase — no requirements graph in estate: {read}"
     );
 }
 

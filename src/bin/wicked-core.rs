@@ -147,10 +147,10 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
     (
         "domain-graph",
         "wicked-core domain-graph [--db <path>] [--repo-root <dir>] [--min-coverage-pct <N>] [--coverage <F>] [--out <F>] [--schema-version <V>]\n  \
-         Translate the ANNOTATED estate graph into requirements_graph.json (default out: \
-         <repo-root>/.wicked-estate/requirements/requirements_graph.json, the path crew reads; \
-         cwd-relative without --repo-root). Fails closed below the configured minimum coverage \
-         (--min-coverage-pct, else $WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, else 80).",
+         Build the requirements graph from the ANNOTATED estate graph and save it INTO the estate \
+         store (domain, requirement and business-rule nodes, SatisfiedBy edges to code; what crew \
+         reads). --out also writes it as a JSON export file. Fails closed below the configured \
+         minimum coverage (--min-coverage-pct, else $WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, else 80).",
     ),
     (
         "coverage",
@@ -1058,18 +1058,13 @@ fn print_status(core: &Core) {
 /// trust-boundary hole (a stale report can no longer green-light a different graph) that the prior
 /// increment left as a follow-on.
 fn domain_graph_cmd(args: &[String]) {
-    // `--repo-root` is how the `domain-extraction` preset says WHICH checkout the graph belongs to
-    // (`{repo_root}`, bound per run). The tool step runs in the run's worktree, so a cwd-relative
-    // default wrote the graph where crew never reads it (wicked-core#1213); with the root, the
-    // default is crew's read path, `<root>/.wicked-estate/requirements/requirements_graph.json`.
+    // `--repo-root` names the checkout the graph belongs to (`{repo_root}` in the preset): the
+    // corroboration reads which files git tracks there. The graph itself is saved into the estate
+    // store (operator ruling 2026-10-31: never a JSON file in the repository); crew reads it from
+    // there (`requirements_graph_for_repo`). `--out` writes the same document as an optional EXPORT
+    // file — for garden's hermetic emit lane and ad-hoc inspection; nothing in the run reads it.
     let repo_root = flag(args, "--repo-root").map(std::path::PathBuf::from);
-    let out_path = flag(args, "--out").unwrap_or_else(|| {
-        let rel = std::path::Path::new(wicked_core::REQUIREMENTS_GRAPH_REL);
-        match &repo_root {
-            Some(root) => root.join(rel).to_string_lossy().into_owned(),
-            None => rel.to_string_lossy().into_owned(),
-        }
-    });
+    let out_path = flag(args, "--out");
     let min_pct = match min_coverage_pct_arg(args) {
         Ok(v) => v,
         Err(e) => {
@@ -1194,7 +1189,18 @@ fn domain_graph_cmd(args: &[String]) {
         }
     }
 
-    if let Some(parent) = std::path::Path::new(&out_path).parent() {
+    let Some(out_path) = out_path else {
+        println!(
+            "domain-graph: built {} domain(s) into the estate store ({})",
+            model.domains.len(),
+            wicked_governance::coverage_verdict(&coverage, min_pct)
+        );
+        return;
+    };
+    if let Some(parent) = std::path::Path::new(&out_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
         if let Err(e) = std::fs::create_dir_all(parent) {
             fail(&format!(
                 "domain-graph: cannot create {}: {e}",

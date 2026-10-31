@@ -1016,6 +1016,14 @@ export declare class Core {
    */
   getCoverageReportForRepo(repoRef: string): Promise<string>
   /**
+   * ONE registered repo's requirements graph, read from that repo's OWN estate store (the source
+   * of truth `domain-graph` persists into; never a file in the checkout), with its coverage label
+   * recomputed from the store's own counts against the configured minimum. Resolves to a JSON
+   * string `{ "graph": <domain-model document | null>, "coverage": {...} }`; `graph` is null until
+   * a build reached the minimum. An unknown `repo_ref` REJECTS.
+   */
+  getRequirementsGraphForRepo(repoRef: string): Promise<string>
+  /**
    * Node-count-by-kind summary of ONE registered repo's code graph, over that repo's OWN store
    * (#122). Resolves to a JSON string: an array of `{ "kind": string, "count": number }`,
    * kind-sorted. An unknown `repo_ref` REJECTS — never a silent empty summary.
