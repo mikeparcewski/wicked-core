@@ -23,7 +23,7 @@ use wicked_apps_core::GraphRead;
 pub const VALIDATED_MIN_SOURCES: u32 = 2;
 
 /// The corroboration of ONE requirement, as emitted on `requirements_graph.json` (domain-model
-/// bundle 1.3.0, optional `requirement.corroboration`).
+/// 1.1.0, bundle 1.2.3, optional `requirement.corroboration`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Corroboration {
     /// `"validated"` (≥ [`VALIDATED_MIN_SOURCES`] independent sources) or `"unconfirmed"`.
@@ -70,6 +70,8 @@ pub fn is_test_path(file: &str) -> bool {
     let base = f.rsplit('/').next().unwrap_or(&f);
     f.starts_with("test/")
         || f.starts_with("tests/")
+        || f.starts_with("spec/")
+        || f.starts_with("__tests__/")
         || f.contains("/test/")
         || f.contains("/tests/")
         || f.contains("/__tests__/")
@@ -137,6 +139,15 @@ fn identifiers(text: &str) -> impl Iterator<Item = &str> {
         })
 }
 
+/// Repo-relative, forward slashes, no leading `./` — so the index's and git's spellings compare.
+fn normalize_path(p: &str) -> String {
+    let p = p.replace('\\', "/");
+    p.strip_prefix("./").unwrap_or(&p).to_string()
+}
+
+/// How many skipped files are remembered per identifier (enough to skip the node's own file).
+const MAX_FILES_PER_MENTION: usize = 3;
+
 /// How many tracked-but-unindexed files are scanned, and how big one may be.
 const MAX_UNINDEXED_FILES: usize = 200;
 const MAX_UNINDEXED_BYTES: u64 = 8 * 1024 * 1024;
@@ -147,8 +158,9 @@ pub struct CorroborationIndex {
     users: HashMap<String, BTreeSet<(String, bool)>>,
     /// identifier → how many indexed doc files name it.
     doc_mentions: HashMap<String, u32>,
-    /// identifier → the first tracked source file the index skipped that names it.
-    unindexed_mentions: HashMap<String, String>,
+    /// identifier → up to [`MAX_FILES_PER_MENTION`] tracked source files the index skipped that
+    /// name it.
+    unindexed_mentions: HashMap<String, Vec<String>>,
 }
 
 impl CorroborationIndex {
@@ -159,13 +171,33 @@ impl CorroborationIndex {
         let by_symbol: HashMap<&str, &wicked_apps_core::Node> =
             nodes.iter().map(|n| (n.symbol.as_str(), n)).collect();
         let mut users: HashMap<String, BTreeSet<(String, bool)>> = HashMap::new();
+        // Rust's inline tests: the index does not model `mod tests`, so a test function there has a
+        // plain file-level symbol and any name. Where the file's stored text has a `#[cfg(test)]`,
+        // a node that starts after it is test code (per file, read once).
+        let mut cfg_test_at: HashMap<String, Option<u32>> = HashMap::new();
+        let mut inline_test = |n: &wicked_apps_core::Node| -> bool {
+            if !n.location.file.ends_with(".rs") {
+                return false;
+            }
+            let at = cfg_test_at
+                .entry(n.location.file.clone())
+                .or_insert_with(|| {
+                    store
+                        .file_content(&n.location.file)
+                        .ok()
+                        .flatten()
+                        .and_then(|t| t.find("#[cfg(test)]"))
+                        .and_then(|i| u32::try_from(i).ok())
+                });
+            at.is_some_and(|at| n.location.span.start_byte > at)
+        };
         for e in store.all_edges()? {
             if !is_use_edge(&e.kind) || e.source == e.target {
                 continue;
             }
             let is_test = by_symbol
                 .get(e.source.as_str())
-                .is_some_and(|n| is_test_node(n));
+                .is_some_and(|n| is_test_node(n) || inline_test(n));
             users
                 .entry(e.target.as_str().to_string())
                 .or_default()
@@ -246,7 +278,14 @@ impl CorroborationIndex {
         // A skipped file that names the symbol explains a missing caller better than anything else:
         // the caller may well exist, the index just never saw it.
         if is_meaningful_name(&node.name) {
-            if let Some(file) = self.unindexed_mentions.get(&node.name) {
+            // Never the node's OWN file: a definition names itself, and a path spelled differently
+            // in the index than in git must not turn that into a phantom caller.
+            let own = normalize_path(&node.location.file);
+            let other = self
+                .unindexed_mentions
+                .get(&node.name)
+                .and_then(|files| files.iter().find(|f| normalize_path(f) != own));
+            if let Some(file) = other {
                 return mk(
                     "unindexed_file",
                     format!(
@@ -274,7 +313,7 @@ impl CorroborationIndex {
                 "Only a doc names it; no caller or test in the indexed code.".to_string(),
             );
         }
-        if extra_extractors == 1 {
+        if extra_extractors >= 1 {
             return mk(
                 "extractors_only",
                 "Only the extractors agree on it; no caller, test or doc corroborates it."
@@ -300,9 +339,9 @@ impl CorroborationIndex {
 /// Tracked source files (by the extensions the index DID parse elsewhere in this repo) that the
 /// index holds no record of, and the identifiers each names. `git ls-files` failing (not a git
 /// checkout, git missing) yields an empty map: the reason is then simply never offered.
-fn unindexed_mentions(root: &Path, indexed: &[String]) -> HashMap<String, String> {
+fn unindexed_mentions(root: &Path, indexed: &[String]) -> HashMap<String, Vec<String>> {
     use wicked_apps_core::HardenedCommand;
-    let indexed_set: HashSet<&str> = indexed.iter().map(String::as_str).collect();
+    let indexed_set: HashSet<String> = indexed.iter().map(|f| normalize_path(f)).collect();
     let code_exts: HashSet<String> = indexed
         .iter()
         .filter(|f| !is_doc_path(f) && !is_config_path(f))
@@ -322,11 +361,11 @@ fn unindexed_mentions(root: &Path, indexed: &[String]) -> HashMap<String, String
         Ok(o) if o.status.success() => o.stdout,
         _ => return HashMap::new(),
     };
-    let mut mentions: HashMap<String, String> = HashMap::new();
+    let mut mentions: HashMap<String, Vec<String>> = HashMap::new();
     let tracked = String::from_utf8_lossy(&out);
     let mut scanned = 0usize;
     for file in tracked.split('\0').filter(|f| !f.is_empty()) {
-        if indexed_set.contains(file) {
+        if indexed_set.contains(&normalize_path(file)) {
             continue;
         }
         let Some(ext) = Path::new(file).extension().map(|e| e.to_string_lossy()) else {
@@ -347,10 +386,11 @@ fn unindexed_mentions(root: &Path, indexed: &[String]) -> HashMap<String, String
         };
         scanned += 1;
         let text = String::from_utf8_lossy(&bytes);
-        for id in identifiers(&text) {
-            mentions
-                .entry(id.to_string())
-                .or_insert_with(|| file.to_string());
+        for id in identifiers(&text).collect::<HashSet<_>>() {
+            let files = mentions.entry(id.to_string()).or_default();
+            if files.len() < MAX_FILES_PER_MENTION {
+                files.push(file.to_string());
+            }
         }
     }
     mentions

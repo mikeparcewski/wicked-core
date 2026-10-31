@@ -56,7 +56,12 @@ Two release tracks share this file, newest entry first regardless of track:
     it — estate#374's shape —, `dead_code`, `config_only`, `single_caller`, `test_only`, `doc_only`,
     `extractors_only`). It also rides the persisted requirement node's metadata.
   - *Schema.* domain-model 1.1.0 (bundle 1.2.3): the two optional fields; `schema_version` accepts 1.0.0 and 1.1.0;
-    `domain-graph` emits 1.1.0.
+    `domain-graph` emits 1.1.0, and a 1.0.0 build keeps the 1.0.0 shape (an unknown version is refused).
+  - *Partial builds stay honest.* A requirement's id is its node's slot among the domain's behaviour-bearing nodes,
+    mapped or not, so ids (and crew's overrides keyed by them, and the persisted `SatisfiedBy` edges) stay put as the
+    mapping grows; a description alone never becomes a requirement (the coverage gate's own predicate); extractor
+    seats are counted by annotation author, never provenance; a set-but-invalid minimum is an error (exit 1, the
+    validator passes it through so the gate fails closed), never 80.
 - **A floor override carries to a later floor on the same tree when it fails on what the operator ruled on
   (core#1186).** The override now records the failure's identity (`floorOverride.fingerprint`) and, where the floor
   showed it complete and file-qualified, the failing tests (`floorOverride.failing`, `<dir>|<check>: <test>`), both

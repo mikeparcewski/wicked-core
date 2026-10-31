@@ -1273,14 +1273,14 @@ fn coverage_cmd(args: &[String]) {
 }
 
 /// The configured minimum: `--min-coverage-pct N`, else [`wicked_governance::MIN_COVERAGE_ENV`],
-/// else the default (80). A flag with no value (or followed by another flag) reads the env/default,
-/// so a validator script can pass the bare flag; a junk value is an error, never a silent default.
+/// else the default (80). The flag with NO value (last, or followed by another flag) reads the
+/// env/default, so a validator script can pass the bare flag. A junk value — on the flag (`""`
+/// included) or in the variable — is an error, never a silent default.
 fn min_coverage_pct_arg(args: &[String]) -> Result<u8, String> {
-    match flag(args, "--min-coverage-pct").filter(|v| !v.starts_with("--") && !v.trim().is_empty())
-    {
+    match flag(args, "--min-coverage-pct").filter(|v| !v.starts_with("--")) {
         Some(v) => wicked_governance::parse_min_coverage_pct(&v)
             .ok_or_else(|| format!("--min-coverage-pct {v:?} is not a whole percentage 1..100")),
-        None => Ok(wicked_governance::min_coverage_pct_from_env()),
+        None => wicked_governance::min_coverage_pct_from_env(),
     }
 }
 

@@ -311,6 +311,30 @@ fn coverage_min_check_exits_3_below_the_minimum_after_writing_the_report() {
         Some(1),
         "a junk minimum is an error, never a default"
     );
+    assert_eq!(run("").status.code(), Some(1), "an empty value is junk too");
+    // xreview on core#1215: a SET-but-invalid variable fails closed (exit 1), never becomes 80 —
+    // for the bare flag (the validator's call) and for domain-graph alike.
+    for cmd in ["coverage", "domain-graph"] {
+        let mut c = Command::new(BIN);
+        c.env("WICKED_REQUIREMENTS_MIN_COVERAGE_PCT", "95.5")
+            .arg(cmd);
+        if cmd == "coverage" {
+            c.args([
+                "--db",
+                db.to_str().unwrap(),
+                "--out",
+                out_file.to_str().unwrap(),
+            ]);
+            c.arg("--min-coverage-pct");
+        } else {
+            let rg = dir.join("rg.json");
+            c.args(["--db", db.to_str().unwrap(), "--out", rg.to_str().unwrap()]);
+        }
+        let o = c.output().unwrap();
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(1), "{cmd}: {err}");
+        assert!(err.contains("not a whole percentage"), "{cmd}: {err}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

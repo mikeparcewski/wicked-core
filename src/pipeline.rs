@@ -2590,11 +2590,27 @@ fn failing_measurement(cwd: &std::path::Path) -> Option<String> {
         unaccounted: n("unaccounted")?,
         ..Default::default()
     };
-    let min = wicked_governance::min_coverage_pct_from_env();
+    // The sentence names what actually failed: a minimum the operator mistyped, a store with
+    // nothing to map, the share itself, or (share met) no requirement genuinely resolved.
+    let lead = match wicked_governance::min_coverage_pct_from_env() {
+        Err(e) => format!("the configured minimum is invalid ({e})"),
+        Ok(_) if report.behavior_bearing == 0 => {
+            "no behaviour-bearing code in the store to map (index the repository first)".to_string()
+        }
+        Ok(min) if wicked_governance::meets_minimum(&report, min) && report.resolved == 0 => {
+            format!(
+                "{}, but no requirement is genuinely resolved (every mapped node is a RISK flag)",
+                wicked_governance::coverage_verdict(&report, min)
+            )
+        }
+        Ok(min) => format!(
+            "{}; the mapping so far is kept for the next run",
+            wicked_governance::coverage_verdict(&report, min)
+        ),
+    };
     Some(format!(
-        "{}; the mapping so far is kept for the next run — measured: behavior_bearing={}, \
-         resolved={}, risk_flagged={}, unaccounted={}, coverage={}",
-        wicked_governance::coverage_verdict(&report, min),
+        "{lead} — measured: behavior_bearing={}, resolved={}, risk_flagged={}, unaccounted={}, \
+         coverage={}",
         report.behavior_bearing,
         report.resolved,
         report.risk_flagged,
