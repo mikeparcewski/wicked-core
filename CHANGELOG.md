@@ -24,6 +24,17 @@ Two release tracks share this file, newest entry first regardless of track:
   session, history included: the disclosed creator-seat waiver). Ignored on a phased run;
   over 4096 bytes refuses the launch (nothing persisted); an older addon drops the field.
 
+- **A creator whose deliverable is not code can run in a seat container.** The container floor refuses a worktree
+  whose git pointer has no git dir pinned from the registered repository (`verify_linked_worktree`, fail closed), and
+  that pin rides the unit's worktree baseline, which dispatch took only for guarded or default-floored units. A
+  creator with `executes_code: false` followed by a verifying phase (domain-extraction's `extract`, a `produce` step
+  before a verify) got none, so every container seat refused it with `root_unresolvable` and the run could not go
+  on (rig run a4c6a389, on pi and on claude). Dispatch now takes the baseline for every bound agent unit; what it
+  triggers stays keyed on the unit's own flags (the guard on `worktree_guarded`, the tree-changed floor on
+  `default_floor`), so the unit gains the pin (and with it the seat dependency install's git dir), the seat secret scan, an author probe
+  taken from that baseline, and the usual clear-and-retake when a gate on it is approved; no guard, floor or judge. The domain-extraction e2e asserts
+  `extract` reaches its seat pinned.
+
 - **A live token meter for a working step: `usageProgress`.** A unit's `cliUsage` lands when the attempt ends, so a
   long chat turn or a power build showed no tokens until it was over. The seat's own stream now feeds the attempt's
   running TOTAL to the run as `usageProgress {session, ord, attempt, at, inputTokens, outputTokens, costUsd}` (fresh

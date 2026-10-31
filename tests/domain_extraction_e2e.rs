@@ -279,6 +279,10 @@ fn db_in(name: &str) -> String {
 /// validator greps `coverage-report.json` in the worktree); `domain-graph` shells the REAL
 /// `wicked-core domain-graph` → writes `requirements_graph.json`. `out_override` lets a test inject a
 /// policy-tripping output for one phase.
+/// Per run: whether its `extract` unit reached the runner with a pinned git dir. Keyed by run id,
+/// so a parallel test's run never answers for this one's.
+static EXTRACT_PINNED: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
+
 struct DomainExtractionRunner {
     db: String,
     out_override: Option<(&'static str, String)>,
@@ -302,6 +306,23 @@ impl StepRunner for DomainExtractionRunner {
             };
         }
         let phase = i.unit.id.rsplit(':').next().unwrap_or_default();
+        // The seat container needs the worktree's git dir pinned from the registered repository
+        // (`verify_linked_worktree`); the actor hands it on the unit's baseline. `extract` is a
+        // creator with no code deliverable and a verifying phase after it, i.e. neither guarded
+        // nor floored — it used to dispatch with NO pin and fail `root_unresolvable` on every
+        // seat (rig run a4c6a389).
+        if phase == "extract" {
+            let pinned = i
+                .unit
+                .worktree_baseline
+                .as_ref()
+                .and_then(|b| b.git_dir.as_deref())
+                .is_some();
+            EXTRACT_PINNED
+                .lock()
+                .unwrap()
+                .push((i.run_id.clone(), pinned));
+        }
         let workdir = i.workdir.clone();
         let mut output = format!("{phase} done");
         if phase == "pa-scope" {
@@ -614,6 +635,19 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
             }),
         "the run's skills were admitted against the fixture generation 000001 at {}: {handed:?}",
         snapshot.display()
+    );
+    let seen: Vec<bool> = EXTRACT_PINNED
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(run, _)| run == "run-happy")
+        .map(|(_, pinned)| *pinned)
+        .collect();
+    assert_eq!(
+        seen,
+        vec![true],
+        "the `extract` unit reached its seat with the worktree's git dir pinned (a container \
+         seat refuses it otherwise)"
     );
     let wt = worktree(&repo, "run-happy");
     assert!(
